@@ -86,8 +86,14 @@ def init_wandb(config: dict, run: Path, disabled: bool = False):
         print('wandb: not installed, skipping')
         return None
     Path(cfg.get('path', '.')).mkdir(parents=True, exist_ok=True)
+    # <timestamp>-<run folder name>. The folder name alone is not unique -- runs/a/w9 and
+    # runs/b/w9 both read `w9` in the UI, and wandb only guarantees uniqueness on the run ID --
+    # and re-running into the same --out is the normal way to resume here. `%Y%m%d_%H%M%S` is
+    # wandb's own directory convention (`run-20260727_113457-ukt14i7c`), so it sorts
+    # lexicographically and carries no spaces or colons.
+    name = f'{time.strftime("%Y%m%d_%H%M%S")}-{run.name}'
     wandb.init(project=cfg.get('project_name', 'tailcyclenet'), dir=cfg.get('path'),
-               mode=cfg.get('mode', 'offline'), name=run.name, config=config)
+               mode=cfg.get('mode', 'offline'), name=name, config=config)
     print(f'wandb: {cfg.get("mode", "offline")} | {wandb.run.name}')
     return wandb
 

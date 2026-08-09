@@ -24,6 +24,28 @@ from .format import Registry
 from .model import build_model
 
 
+def check_image_size(config: dict) -> None:
+    """`[model].image_size` and `[data].image_size` must agree. Nothing else notices if they do not.
+
+    The loader resizes every crop so its long side is `[data].image_size`, while the weights bake
+    `[model].image_size` into the decode arithmetic -- `PadToSize` (tracker_encoder.py:192),
+    `points_pred + image_size // 2` for the absolute 2D bins (:609), and
+    `p3d_cams * image_size` for gridresid's metric motion (:697). `PadToSize` only ever pads UP,
+    so a smaller data size leaves the crop in the corner of a zero-padded canvas while the
+    cameras describe the unpadded one; either way 2D shifts by half the difference and 3D scales
+    by their ratio. Both silent.
+    """
+    model_px = config.get('model', {}).get('image_size')
+    data_px = config.get('data', {}).get('image_size')
+    if model_px is None or data_px is None or int(model_px) == int(data_px):
+        return
+    raise ValueError(
+        f'[model].image_size = {model_px} but [data].image_size = {data_px}. These must agree: '
+        f'the loader resizes crops to {data_px} while the model decodes as if they were '
+        f'{model_px}, shifting 2D predictions by {(int(model_px) - int(data_px)) // 2} px and '
+        f'scaling the 3D residual by {int(model_px) / int(data_px):g}.')
+
+
 def resolve_checkpoint(folder: Path, checkpoint: str | None = None, min_age_s: float = 60.0):
     """The newest complete checkpoint in `folder`.
 
@@ -83,6 +105,7 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu', eval_weight
     run = Path(run)
     with open(run / 'config.toml', 'rb') as f:
         config = tomllib.load(f)
+    check_image_size(config)
     registry = Registry.load(run / 'keypoint_registry.toml')
     path = resolve_checkpoint(run / 'checkpoints', checkpoint)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)

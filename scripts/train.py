@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from posetail.posetail.losses import TotalLoss
 
-from tailcyclenet.checkpoints import (resolve_checkpoint, save_checkpoint, save_run_meta,
-                                      warm_start)
+from tailcyclenet.checkpoints import (check_image_size, resolve_checkpoint, save_checkpoint,
+                                      save_run_meta, warm_start)
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
@@ -102,6 +102,7 @@ def main():
 
     with open(args.config, 'rb') as f:
         config = tomllib.load(f)
+    check_image_size(config)
     data_cfg, train_cfg = config['data'], config['training']
     if args.data:
         data_cfg['path'] = str(args.data)

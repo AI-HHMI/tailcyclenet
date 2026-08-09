@@ -139,6 +139,42 @@ def test_kpt_chunk_leaves_no_stash_behind(moving_batch):
     assert model._kpt_ids_all is None and model._kpt_cursor == 0
 
 
+# ----------------------------------------------------------------------------------------------
+# configs this architecture does not implement
+# ----------------------------------------------------------------------------------------------
+
+def test_unsupported_config_is_rejected():
+    """Every one of these is accepted by the library and wrong here. Construction only, no forward.
+
+    `output_mode` is the dangerous one: the library DEFAULTS to 'direct', so a config that merely
+    omits the key builds a model whose predictions `_reanchor_per_frame` misdescribes -- and
+    nothing raises.
+    """
+    with pytest.raises(AssertionError, match='use_volume_embedding'):
+        build_model({**SMALL, 'use_volume_embedding': True}, n_keypoints=3)
+
+    for mode in ('direct', 'residual', 'grid', 'resdirect', 'gridnorm'):
+        with pytest.raises(AssertionError, match='output_mode'):
+            build_model({**SMALL, 'output_mode': mode}, n_keypoints=3)
+
+    with pytest.raises(AssertionError, match='mode_3d'):
+        build_model({**SMALL, 'mode_3d': 'tapnext'}, n_keypoints=3)
+
+    # Omitting the key must NOT fall through to the library's 'direct'.
+    cfg = {k: v for k, v in SMALL.items() if k != 'output_mode'}
+    assert build_model(cfg, n_keypoints=3).output_mode == 'gridresid'
+
+
+def test_mismatched_image_size_is_rejected():
+    """Two keys named image_size that must agree, and nothing else notices when they do not."""
+    from tailcyclenet.checkpoints import check_image_size
+
+    check_image_size({'model': {'image_size': 256}, 'data': {'image_size': 256}})
+    check_image_size({'model': {'image_size': 256}})                 # absent -> nothing to check
+    with pytest.raises(ValueError, match='image_size'):
+        check_image_size({'model': {'image_size': 256}, 'data': {'image_size': 128}})
+
+
 def test_moving_camera_query_projects_per_frame(moving_batch):
     """The query anchor must project to a DIFFERENT pixel each frame on a moving camera.
 

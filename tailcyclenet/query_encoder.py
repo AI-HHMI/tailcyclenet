@@ -58,6 +58,12 @@ class PoseQueryEncoder(QueryEncoder):
     def __init__(self, *args, n_keypoints, **kwargs):
         super().__init__(*args, **kwargs)
         self.n_keypoints = n_keypoints
+        # `forward` below builds no volume term and `term_names()` has no slot for one, so the
+        # base checkpoint's volume gate row has nowhere to go. Caught here rather than as the
+        # assertion it would otherwise become deep inside `inflate_stock_gate`, a warm start later.
+        assert not self.use_volume_embedding, (
+            'use_volume_embedding is not supported: this encoder builds no volume term, so the '
+            "base checkpoint's volume gate row has no slot here. Set use_volume_embedding = false.")
 
         # One learned vector per keypoint id. The ids are GLOBAL (see format.Registry), so this
         # table spans every dataset in the run and a later run that appends datasets keeps the

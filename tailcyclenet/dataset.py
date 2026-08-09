@@ -118,6 +118,13 @@ class _Item:
 class PoseDataset(Dataset):
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
                  train: bool | None = None, seed: int = 0):
+        # Gotcha #1, and the clamp-pad in `_frames` does NOT cover it: that pads a short GROUP up
+        # to `cfg.n_frames`, which does nothing when `cfg.n_frames` is itself 1. A 1-frame window
+        # gives posetail `gT = T // tubelet_size = 0` and a zero-length positional embedding.
+        assert cfg.n_frames >= 2, (
+            f'n_frames = {cfg.n_frames} is not usable: posetail computes gT = T // tubelet_size '
+            '(encoder_decoder.py:748), which is 0 at T=1 and yields a zero-length pos_embed. '
+            'Use n_frames >= 2; short groups are clamp-padded up to it.')
         self.cfg = cfg
         self.split = split
         self.train = (split == 'train') if train is None else train

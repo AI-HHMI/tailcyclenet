@@ -276,8 +276,35 @@ def _reanchor_ce_target(out, src):
 
 
 def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
-    """`[model]` splatted into the constructor, with this repo's two keys pulled out first."""
+    """`[model]` splatted into the constructor, with this repo's two keys pulled out first.
+
+    Two of the library's options are checked HERE rather than in the constructor, because both
+    are wrong in a way that produces numbers instead of exceptions and the message needs to name
+    the config key rather than surface later as bad accuracy.
+    """
     cfg = dict(model_cfg)
     query = cfg.pop('query', 'prior')
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
+
+    # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
+    # `_reanchor_per_frame` recovers the world residual as (3d_pred_cams_direct - query), which
+    # is only true where the library actually anchored the residual on the query
+    # (tracker_encoder.py:670 -- 'residual' and 'gridresid' only). Under any other mode it
+    # subtracts the query from something that was never added to it and adds the difference to
+    # every frame's triangulation: the re-anchoring runs backwards, silently.
+    output_mode = cfg.setdefault('output_mode', 'gridresid')
+    assert output_mode == 'gridresid', (
+        f'output_mode = {output_mode!r} is not supported. model._reanchor_per_frame recovers '
+        'the residual as (3d_pred_cams_direct - query), which the library only makes true for '
+        '"gridresid"; any other mode re-anchors a prediction that was never query-anchored and '
+        'silently corrupts coords_pred. Set output_mode = "gridresid".')
+
+    # Upstream this selects the CLASS (train_utils.py:439 -- 'encoder' -> TrackerEncoder,
+    # 'tapnext' -> TrackerTapNext). Here it is stored and never read, so anything else would be
+    # accepted and then quietly ignored -- and TrackerTapNext is not moving-cam-safe anyway.
+    mode_3d = cfg.setdefault('mode_3d', 'encoder')
+    assert mode_3d == 'encoder', (
+        f'mode_3d = {mode_3d!r} is not supported: build_model always constructs a '
+        'PoseTrackerEncoder, so any other value would be silently ignored rather than honoured.')
+
     return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, **cfg)

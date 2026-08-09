@@ -150,12 +150,16 @@ def test_keypoints_are_never_filtered(tiny_root):
 
 
 def test_window_is_at_least_two_frames(tiny_root):
-    """T=1 routes posetail into gT = T // tubelet_size = 0 and a zero-length pos_embed."""
+    """T=1 routes posetail into gT = T // tubelet_size = 0 and a zero-length pos_embed.
+
+    This used to assert `shape[1] >= 1`, which is true of the exact 1-frame window it exists to
+    forbid -- so it passed while the guard did not exist. `n_frames = 1` is now refused outright:
+    the clamp-pad in `_frames` lengthens a short GROUP, not a short configured window.
+    """
     cfg = LoaderConfig(n_frames=1, image_size=64, aug_prob=0.0, crop_jitter=0.0)
-    ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg)
-    # n_frames=1 is legal in the format; the loader must still not hand the model a 1-frame clip
-    b = _batch(ds)
-    assert b.views[0].shape[1] >= 1
+    with pytest.raises(AssertionError, match='n_frames'):
+        PoseDataset(tiny_root / 'ratlike', 'train', cfg)
+
     cfg2 = LoaderConfig(n_frames=8, image_size=64, aug_prob=0.0, crop_jitter=0.0)
     ds2 = PoseDataset(tiny_root / 'ratlike', 'train', cfg2)   # groups are only 4 frames long
     b2 = _batch(ds2)

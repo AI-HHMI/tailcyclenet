@@ -111,6 +111,24 @@ class PoseTrackerEncoder(TrackerEncoder):
             time_embed_mode=old.time_embed_mode,
             n_keypoints=n_keypoints)
 
+    def _decode_from_scene(self, scene_features, views_norm, coords, *args, **kwargs):
+        """Hand the query encoder the keypoint slice belonging to THIS chunk.
+
+        `_forward_window` slices `coords[:, k0:k1]` when `kpt_chunk` is set and calls this once
+        per chunk, in order, without passing the bounds down -- so the offset is a running
+        cursor. `forward` asserts it lands exactly on K, which turns a future reordering into a
+        failure rather than one chunk's queries silently wearing another chunk's identities.
+
+        posetail-pose avoided half of this by routing ids through the `occlusion` channel, which
+        the library slices for free (`posetail_pose/model.py:718`); gotcha #5 deliberately freed
+        that channel here. Its `_query_ok` had this bug unfixed. Both halves are handled here.
+        """
+        k0, n = self._kpt_cursor, coords.shape[1]
+        self.query_encoder._kpt_ids = self._kpt_ids_all[:, k0:k0 + n]
+        self.query_encoder._query_ok = self._query_ok_all[:, k0:k0 + n]
+        self._kpt_cursor = k0 + n
+        return super()._decode_from_scene(scene_features, views_norm, coords, *args, **kwargs)
+
     def forward(self, views, kpt_ids, camera_group, mode, kpt_prior=None, prompt_time=None,
                 kpt_chunk=None):
         """
@@ -123,6 +141,10 @@ class PoseTrackerEncoder(TrackerEncoder):
             kpt_prior: (B,K,R) or None. Per-keypoint prior; NaN where a keypoint has none.
                 Ignored entirely when `query == "none"`.
             prompt_time: (B,K) int or None -- the frame each prior describes.
+            kpt_chunk: decode the keypoints in slices of this size, reusing one scene encode.
+                INFERENCE ONLY -- the library drops the loss-only `grid` tensors when chunking
+                (`_CHUNK_SKIP`), so `_reanchor_ce_target` correctly no-ops. Ignored when
+                `output_mode == 'gridnorm'`, whose per-camera gauge solve couples points.
         """
         assert mode in ('2d', '3d'), mode
         B, K = kpt_ids.shape
@@ -150,9 +172,13 @@ class PoseTrackerEncoder(TrackerEncoder):
         # The query-validity mask comes from the PRIOR's own finiteness, not from `coords_q` --
         # which has already had absent priors replaced by the derived point. This is what the
         # no-query tokens key off.
-        self.query_encoder._query_ok = (torch.isfinite(prior).all(-1) if prior is not None
-                                        else torch.zeros((B, K), dtype=torch.bool, device=device))
-        self.query_encoder._kpt_ids = kpt_ids.to(device).long()
+        #
+        # Stashed at FULL K here; `_decode_from_scene` below hands the query encoder the slice
+        # belonging to the chunk being decoded.
+        self._query_ok_all = (torch.isfinite(prior).all(-1) if prior is not None
+                              else torch.zeros((B, K), dtype=torch.bool, device=device))
+        self._kpt_ids_all = kpt_ids.to(device).long()
+        self._kpt_cursor = 0
 
         # The frame the prompt describes. INT and CLAMPED: the library uses this as a
         # `torch.gather` index on the learnable-scale and gridnorm paths, so an out-of-range or
@@ -169,9 +195,16 @@ class PoseTrackerEncoder(TrackerEncoder):
         try:
             out = super().forward(views, coords_q, camera_group, query_times=qt,
                                   occlusion=None, kpt_chunk=kpt_chunk)
+            # AFTER the call, not in the `finally`: an assertion there would mask whatever real
+            # exception got us out. Every keypoint must have been decoded exactly once.
+            assert self._kpt_cursor == K, (
+                f'{self._kpt_cursor} of {K} keypoints were decoded; _decode_from_scene is not '
+                'being called once per chunk in order, so the id slices are unreliable')
         finally:
             # Always clear: a leaked stash would apply one item's ids to the next forward,
             # silently, and only on multi-call paths like eval and the windowed driver.
+            self._query_ok_all = self._kpt_ids_all = None
+            self._kpt_cursor = 0
             self.query_encoder._query_ok = None
             self.query_encoder._kpt_ids = None
 

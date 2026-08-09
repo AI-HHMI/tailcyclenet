@@ -43,6 +43,7 @@ class InferConfig:
     min_crop_dim: int = 64
     anchor: str = 'carry'
     max_animals: int = 0          # 0 -> every animal the box source offers
+    kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
     device: str = 'cuda:0'
 
 
@@ -81,6 +82,23 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode):
 def _to_device(cgroup, device):
     return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
             for c in cgroup]
+
+
+def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
+    """Re-query at the model's OWN frame-0 prediction. THE label-free prompted regime.
+
+    `first` is a completed prior-free pass. Its frame-0 pose becomes the prior for a second pass,
+    which is what a deployed model does on the first window of a clip and what the periodic val
+    eval reports alongside the prior-free number. No ground truth is read, so no gate reopens.
+
+    Shared with the trainer deliberately: this repo has one window loop and it should have one
+    self-prompt, or the number training reports and the number inference produces drift apart.
+    """
+    p = first['coords_pred'][0].detach()
+    prior = p[0][None].clone()                         # (1,K,R), the frame-0 pose
+    qt = torch.zeros(prior.shape[:2], dtype=torch.int32, device=prior.device)
+    return model(views, kpt_ids, cgroup, mode=mode, kpt_prior=prior, prompt_time=qt,
+                 kpt_chunk=kpt_chunk)
 
 
 @torch.no_grad()
@@ -182,16 +200,15 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             prior, prompt_t = _build_prior(cfg, carried[a], src[a], frames, boxes, scales,
                                            mode, K, R)
             dev = cfg.device
+            chunk = cfg.kpt_chunk or None
             out = model([v.to(dev) for v in views], kpt_ids.to(dev), _to_device(cgroup, dev),
                         mode=mode,
                         kpt_prior=None if prior is None else prior.to(dev),
-                        prompt_time=None if prompt_t is None else prompt_t.to(dev))
+                        prompt_time=None if prompt_t is None else prompt_t.to(dev),
+                        kpt_chunk=chunk)
             if cfg.anchor == 'self':
-                p = out['coords_pred'][0].detach().cpu()
-                prior2 = p[0].clone()
-                out = model([v.to(dev) for v in views], kpt_ids.to(dev),
-                            _to_device(cgroup, dev), mode=mode, kpt_prior=prior2[None].to(dev),
-                            prompt_time=torch.zeros((1, K), dtype=torch.int32).to(dev))
+                out = self_prompt(model, [v.to(dev) for v in views], kpt_ids.to(dev),
+                                  _to_device(cgroup, dev), mode, out, kpt_chunk=chunk)
 
             p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
             if mode == '2d':

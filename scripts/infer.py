@@ -58,6 +58,10 @@ def main():
                          'not from labels.')
     ap.add_argument('--det-score', type=float, default=0.05)
     ap.add_argument('--max-animals', type=int, default=0)
+    ap.add_argument('--kpt-chunk', type=int, default=0,
+                    help='decode keypoints in slices of this size, reusing one scene encode. '
+                         'Lowers peak memory on large keypoint sets; the prediction is '
+                         'unchanged. 0 = one pass.')
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
@@ -70,7 +74,8 @@ def main():
         n_frames=args.n_frames or int(config['data'].get('n_frames', 24)),
         overlap=args.overlap, image_size=int(config['data'].get('image_size', 256)),
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
-        anchor=args.anchor, max_animals=args.max_animals, device=device)
+        anchor=args.anchor, max_animals=args.max_animals, kpt_chunk=args.kpt_chunk,
+        device=device)
     if args.anchor == 'labels':
         print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
               'upper bound, not a deployment number. Label it as such wherever you quote it.')

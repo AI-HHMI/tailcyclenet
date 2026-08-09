@@ -77,6 +77,68 @@ def test_moving_camera_forward(moving_batch):
     assert torch.isfinite(p).all()
 
 
+def test_kpt_chunk_matches_unchunked(moving_batch):
+    """Chunked decoding must be numerically identical, not merely well-shaped.
+
+    `_forward_window` slices the query set and calls `_decode_from_scene` once per chunk. The
+    keypoint ids and the query-validity mask live on a stash the library knows nothing about, so
+    without a per-chunk slice every chunk would receive the FULL-K stash: `_tile_to_query_axis`
+    asserts on a non-divisible chunk, and hands back the wrong identities whenever it happens to
+    divide. Neither failure is visible in a prediction that still has the right shape -- which is
+    why this compares values.
+    """
+    b = moving_batch
+    K = b.kpt_ids.shape[1]
+    assert K >= 3, 'need enough keypoints for an uneven chunk'
+    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+
+    # Record what each chunk was actually handed. Without this the test would still pass if the
+    # library silently declined to chunk at all -- comparing a single pass against itself.
+    seen = []
+    decode = type(model)._decode_from_scene
+
+    def spy(self, sf, vn, coords, *a, **k):
+        out = decode(self, sf, vn, coords, *a, **k)
+        seen.append(tuple(self.query_encoder._kpt_ids[0].tolist()))
+        return out
+
+    def run(chunk):
+        seen.clear()
+        with torch.no_grad():
+            type(model)._decode_from_scene = spy
+            try:
+                out = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=b.kpt_prior,
+                            prompt_time=b.prompt_t, kpt_chunk=chunk)['coords_pred']
+            finally:
+                type(model)._decode_from_scene = decode
+        return out, list(seen)
+
+    ids = tuple(b.kpt_ids[0].tolist())
+    whole, chunks = run(None)
+    assert chunks == [ids], 'unchunked must be one pass over every keypoint'
+
+    # 2 does not divide 3: the chunk loop ends on a SHORT slice, which is where an offset that is
+    # assumed rather than tracked goes wrong.
+    got, chunks = run(2)
+    assert chunks == [ids[:2], ids[2:]], f'chunking did not engage or mis-sliced ids: {chunks}'
+    torch.testing.assert_close(got, whole, equal_nan=True)
+
+    got, chunks = run(1)
+    assert chunks == [(i,) for i in ids], f'chunking did not engage or mis-sliced ids: {chunks}'
+    torch.testing.assert_close(got, whole, equal_nan=True)
+
+
+def test_kpt_chunk_leaves_no_stash_behind(moving_batch):
+    """A leaked stash applies one forward's identities to the next, silently."""
+    b = moving_batch
+    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    with torch.no_grad():
+        model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=b.kpt_prior,
+              prompt_time=b.prompt_t, kpt_chunk=2)
+    assert model.query_encoder._kpt_ids is None and model.query_encoder._query_ok is None
+    assert model._kpt_ids_all is None and model._kpt_cursor == 0
+
+
 def test_moving_camera_query_projects_per_frame(moving_batch):
     """The query anchor must project to a DIFFERENT pixel each frame on a moving camera.
 

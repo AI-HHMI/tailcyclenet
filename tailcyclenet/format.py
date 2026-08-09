@@ -487,15 +487,18 @@ class Session:
         the box loader pass (S,K,3) whose axis -3 is the ANIMAL, not time -- so handing them a
         (T,4,4) camera silently projects animal `i` through frame `i`'s pose.
         """
-        moving = [n for n in self.cam_names if self.rig.moving[n]]
-        if not moving:
+        if not any(self.rig.moving.values()):
             return self.rig.posetail(device=device)
 
         import torch
         ext = self.labels(gid).ext                      # (C,T,4,4), coverage already checked
         sel = slice(None) if frames is None else frames
+        # EVERY camera gets the per-frame form, not just the moving ones. `_decode_from_scene`
+        # stacks `cam['ext']` across cameras (tracker_encoder.py:623), so a mixed rig with one
+        # (T,4,4) and two (4,4) cameras is a stack error. `labels()` already back-fills a static
+        # camera's rows with its own constant pose, so this is the same geometry either way.
         moving_ext = {n: torch.as_tensor(ext[i][sel], dtype=torch.float)
-                      for i, n in enumerate(self.cam_names) if self.rig.moving[n]}
+                      for i, n in enumerate(self.cam_names)}
         return self.rig.posetail(device=device, moving_ext=moving_ext)
 
     def labels(self, gid: str) -> Labels:

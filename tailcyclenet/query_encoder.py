@@ -172,16 +172,33 @@ class PoseQueryEncoder(QueryEncoder):
             torch.tensor([v.shape[-1], v.shape[-2]], dtype=query_coords.dtype,
                          device=query_coords.device) for v in preprocessed_views])   # (cams, 2)
 
+        # A moving camera's extrinsic is (T,4,4), and `project_cam` aligns it against axis -3 of
+        # the points (cube.py:95-99) -- so the query axis has to be un-flattened to (t n) first.
+        # Both this and the visibility branch below exist in the stock QueryEncoder and were lost
+        # in the port (posetail-pose's kpt_query_encoder.py:361,392 dropped them too; it never
+        # ran a moving rig through its own encoder).
+        moving = not is_2d and any(c['ext'].ndim == 3 for c in camera_group)
+        T_clip = preprocessed_views[0].shape[1]
+
         # When every keypoint shares one query -- the unprompted case, where they all sit at the
         # scene centre -- the position-derived terms are constant along a query axis that is
         # T*K long (1128 on a 24-frame 47-keypoint window). Compute at width 1 and expand.
         # Asserted rather than assumed, with a full-width fallback.
-        uniform = bool(torch.equal(query_coords, query_coords[:, :1].expand_as(query_coords)))
+        #
+        # NOT AVAILABLE ON A MOVING RIG. One shared query point still projects to a DIFFERENT
+        # pixel every frame, so a width-1 axis cannot represent the answer -- and it cannot be
+        # reshaped to (t n) either.
+        uniform = (not moving
+                   and bool(torch.equal(query_coords, query_coords[:, :1].expand_as(query_coords))))
         Tq = 1 if uniform else T_query
         qc = query_coords[:, :1] if uniform else query_coords
 
         if is_2d:
             p2d_full = rearrange(qc, 'b t r -> 1 b t r')
+        elif moving:
+            qc_btn = rearrange(qc, 'b (t n) r -> b t n r', t=T_clip)
+            p2d_full = rearrange(project_points_torch(camera_group, qc_btn),
+                                 'cams b t n r -> cams b (t n) r')
         else:
             p2d_full = project_points_torch(camera_group, qc)
 
@@ -210,10 +227,18 @@ class PoseQueryEncoder(QueryEncoder):
             dr = rearrange(torch.log(raw + 1e-6) * self.depth_norm_scale, 'b t c -> b t c 1')
             embed_depth = self.linear_depth(torch.cat(
                 [dr, get_fourier_encoding(dr, min_freq=0, max_freq=self.max_freq)], dim=-1))
-            qflat = rearrange(qc, 'b t r -> (b t) r')
-            visible = torch.stack([is_point_visible(c, qflat, margin=2) for c in camera_group])
-            embed_vis = self.vis_embed(
-                rearrange(visible, 'ncams (b t) -> b t ncams', b=B).to(torch.int32))
+            if moving:
+                # Per-frame: the anchor is in view for some frames of the window and not others.
+                qc_btn = rearrange(qc, 'b (t n) r -> b t n r', t=T_clip)
+                visible = torch.stack([is_point_visible(c, qc_btn, margin=2)
+                                       for c in camera_group])          # (cams,b,t,n)
+                visible = rearrange(visible, 'ncams b t n -> b (t n) ncams')
+            else:
+                qflat = rearrange(qc, 'b t r -> (b t) r')
+                visible = torch.stack([is_point_visible(c, qflat, margin=2)
+                                       for c in camera_group])
+                visible = rearrange(visible, 'ncams (b t) -> b t ncams', b=B)
+            embed_vis = self.vis_embed(visible.to(torch.int32))
 
         embed_pp = embed_intrinsic = None
         if self.principal_point_embedding:

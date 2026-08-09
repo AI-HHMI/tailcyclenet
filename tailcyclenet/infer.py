@@ -83,13 +83,17 @@ def _to_device(cgroup, device):
 
 @torch.no_grad()
 def run_group(model, session: Session, gid: str, registry, dataset_name: str,
-              cfg: InferConfig, box_points=None) -> dict:
+              cfg: InferConfig, box_points=None, boxes_stc=None) -> dict:
     """Predict every animal in one group. Returns arrays in the SOURCE coordinate frame.
 
-    `box_points` supplies the points the crop follows, shaped like the labels
-    ((S,T,K,3) world or (S,T,K,2) pixels). Passing the labels themselves is the GT-crop upper
-    bound; passing a detector's output is the deployment number. They are not comparable and the
-    caller must say which it used.
+    Crops come from exactly one of two sources, and they are NOT comparable:
+
+    - `box_points` (S,T,K,R): points the crop rule follows, shaped like the labels. Passing the
+      labels themselves is the GT-crop upper bound.
+    - `boxes_stc` (S,T,C,4): boxes given directly, from a detector or a detections file. This is
+      the deployment number.
+
+    Whichever was used is recorded in the result so a caller cannot quote one as the other.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
@@ -106,7 +110,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     src = box_points if box_points is not None else (
         lab.points3d if mode == '3d' else lab.points2d[..., 0, :])
-    S = src.shape[0] if cfg.max_animals == 0 else min(src.shape[0], cfg.max_animals)
+    n_src = boxes_stc.shape[0] if boxes_stc is not None else src.shape[0]
+    S = n_src if cfg.max_animals == 0 else min(n_src, cfg.max_animals)
     cam_ix = list(range(len(session.rig)))
 
     pred = np.full((S, T_total, K, R), np.nan, np.float32)
@@ -118,12 +123,40 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
             frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
         for a in range(S):
-            pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
-            if not torch.isfinite(pts).all(-1).any():
-                continue
-            cgroup, boxes = boxes_from_points(pts, session.rig, cam_ix, cfg.min_crop_dim, mode)
-            if cgroup is None:
-                continue
+            if boxes_stc is not None:
+                # Boxes given directly (detector / detections file). One box per camera for
+                # this window: the union over the window's frames, so the animal does not walk
+                # out of its own crop mid-window.
+                bb = boxes_stc[a][frames]                          # (t, C, 4)
+                if not np.isfinite(bb).all(-1).any():
+                    continue
+                cgroup = [session.rig.posetail()[i] for i in cam_ix]
+                boxes = []
+                for i in range(len(cam_ix)):
+                    v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
+                    if not len(v):
+                        boxes = None
+                        break
+                    # int32 and clamped into the image, exactly like the crop rule's own box:
+                    # a float or off-frame box produces a negative cam['offset'] and breaks
+                    # project_cam far downstream.
+                    w, h = (int(x) for x in session.rig.size(session.cam_names[cam_ix[i]]))
+                    x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
+                    y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
+                    x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
+                    y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
+                    boxes.append(torch.tensor([x0, y0, x1, y1], dtype=torch.int32))
+                if boxes is None:
+                    continue
+                cgroup = [cropmod.apply_crop(c, b) for c, b in zip(cgroup, boxes)]
+            else:
+                pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
+                if not torch.isfinite(pts).all(-1).any():
+                    continue
+                cgroup, boxes = boxes_from_points(pts, session.rig, cam_ix, cfg.min_crop_dim,
+                                                  mode)
+                if cgroup is None:
+                    continue
             scales = []
             for i, cam in enumerate(cgroup):
                 cam, s = _resize_camera(cam, cfg.image_size)
@@ -167,7 +200,9 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(lab.animal_ids[:S], object),
             'mode': mode, 'group_id': gid, 'session': session.session_id,
-            'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total}
+            'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total,
+            'boxes_from': 'detector' if boxes_stc is not None else
+                          ('given points' if box_points is not None else 'labels')}
 
 
 def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R):

@@ -161,3 +161,33 @@ def mota(pred, true, max_dist, ignore=None) -> dict:
             'miss_rate': misses / gt if gt else float('nan'),
             'fp_rate': fps / gt if gt else float('nan'),
             'idsw_rate': switches / gt if gt else float('nan')}
+
+
+def matched_error(pred, true, max_dist=np.inf) -> dict:
+    """MPJPE over HUNGARIAN-MATCHED instances, for multi-animal predictions.
+
+    Row index is not identity. When boxes come from a detector, prediction row `a` and label row
+    `a` are different animals, and a row-indexed MPJPE then measures nothing -- it reported 385 px
+    on a fly dataset whose animals are ~30 px across. Match first, then measure.
+
+    `unmatched_true` is part of the answer, not a footnote: a method that predicts one animal
+    well and ignores nine looks excellent on `err` alone.
+    """
+    pred, true = np.asarray(pred, float), np.asarray(true, float)
+    pairs = match_instances(pred, true, max_dist)
+    T = true.shape[1]
+    dists, n_true_inst, n_matched_inst = [], 0, 0
+    for t in range(T):
+        present = np.isfinite(true[:, t]).all(-1).any(-1)
+        n_true_inst += int(present.sum())
+        n_matched_inst += len(pairs[t])
+        for i, j, _ in pairs[t]:
+            dists.append(_dist(pred[i, t], true[j, t]))
+    if not dists:
+        return {'err': float('nan'), 'median': float('nan'), 'coverage': 0.0,
+                'n_true_inst': n_true_inst, 'n_matched_inst': 0}
+    d = np.concatenate(dists)
+    return {'err': float(np.nanmean(d)), 'median': float(np.nanmedian(d)),
+            'coverage': float(np.isfinite(d).sum() / max(1, np.isfinite(true).all(-1).sum())),
+            'n_true_inst': n_true_inst, 'n_matched_inst': n_matched_inst,
+            'unmatched_true': n_true_inst - n_matched_inst}

@@ -144,7 +144,26 @@ Box sources are the annotation set, a detections npz, or a per-dataset detector.
 `overlap >= 1`), `self` (two passes per window). Rendering is a flag, not a separate script.
 
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
-bootstrap), PCK, coverage, MOTA/miss/FP/idsw.
+bootstrap), PCK, coverage, MOTA/miss/FP/idsw. Multi-animal rows report **matched** MPJPE: row
+index is not identity once boxes come from a detector, and scoring row-to-row measured 385 px on
+flies that are 30 px across.
+
+## The detector
+
+```bash
+pixi run python scripts/train_detector.py --data <ONE dataset root> --out runs/det-<name>
+pixi run python scripts/infer.py --run runs/w9 --data <dataset> --detector runs/det-<name> ...
+```
+
+**One detector per dataset**, and `--input-wh` defaults to an aspect-matched size rather than a
+square. This is not fussiness: rat-city's frames are 2.29:1, so a square 416 letterbox wastes 56%
+of the canvas and delivers the median rat at 15.8 x 12.5 px — about 2 x 1.6 cells at stride 8 and
+absent from strides 16 and 32, so two thirds of the FPN cannot represent it. Same detector on
+square 1024x1024 fly frames reaches AP50 0.985 where rat-city sits near 0.50.
+
+The regression target is `crop.crop_box_for_points`, i.e. the detector reproduces *the crop the
+pose model was trained on*, not "a box around the animal". `tests/test_detector.py` asserts that
+against the crop rule directly.
 
 ---
 

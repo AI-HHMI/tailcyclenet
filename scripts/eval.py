@@ -27,7 +27,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.format import Session, load_dataset
-from tailcyclenet.metrics import error_and_coverage, mota, paired_bootstrap, pck
+from tailcyclenet.metrics import (error_and_coverage, matched_error, mota,
+                                  paired_bootstrap, pck)
 
 
 def load_predictions(path: Path):
@@ -87,6 +88,15 @@ def main():
         pred, true = pred[:S, :T], true[:S, :T]
 
         m = error_and_coverage(pred, true)
+        if S > 1:
+            # Row index is not identity once boxes come from a detector. Match, then measure.
+            with np.errstate(all='ignore'):
+                span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
+                extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+            mm = matched_error(pred, true, max_dist=extent if np.isfinite(extent) else np.inf)
+            m['err_rowwise'] = m['err']
+            m.update({k: v for k, v in mm.items() if k in ('err', 'median', 'coverage')})
+            m['unmatched'] = mm.get('unmatched_true', 0)
         m['group'] = key
         m['mode'] = mode
         m['S'] = S
@@ -98,10 +108,14 @@ def main():
         return
 
     unit = 'mm' if rows[0]['mode'] == '3d' else 'px'
-    print(f'\n{"group":52s} {"S":>3s} {"err":>9s} {"med":>8s} {"cov":>7s} {"n":>8s}')
+    multi_any = any(m['S'] > 1 for m in rows)
+    if multi_any:
+        print('\nmulti-animal: err is over HUNGARIAN-MATCHED instances. Row index is not '
+              'identity once boxes come from a detector.')
+    print(f'\n{"group":48s} {"S":>3s} {"err":>9s} {"med":>8s} {"cov":>7s} {"unmatched":>10s}')
     for m in rows:
-        print(f'{m["group"][:52]:52s} {m["S"]:3d} {m["err"]:9.3f} {m["median"]:8.3f} '
-              f'{m["coverage"]:7.3f} {m["n_true"]:8d}')
+        print(f'{m["group"][:48]:48s} {m["S"]:3d} {m["err"]:9.3f} {m["median"]:8.3f} '
+              f'{m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
 
     boot = paired_bootstrap(per_group, seed=args.seed)
     n_true = sum(m['n_true'] for m in rows)

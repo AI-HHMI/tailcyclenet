@@ -53,6 +53,10 @@ def main():
     ap.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
     ap.add_argument('--boxes', type=Path, default=None,
                     help='npz of crop points per group; default is to crop from the labels')
+    ap.add_argument('--detector', type=Path, default=None,
+                    help='a detector run folder. THE deployment path: boxes come from pixels, '
+                         'not from labels.')
+    ap.add_argument('--det-score', type=float, default=0.05)
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
@@ -72,6 +76,11 @@ def main():
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
 
     boxes = dict(np.load(args.boxes, allow_pickle=True)) if args.boxes else {}
+    det = det_wh = None
+    if args.detector:
+        from tailcyclenet.detector import detect_group, load_detector
+        det, det_wh, det_ds = load_detector(args.detector, device)
+        print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r})')
     ds_name, sessions = sessions_for(args.data, args.split)
     want = set(args.groups.split(',')) if args.groups else None
 
@@ -82,8 +91,13 @@ def main():
             if want and gid not in want:
                 continue
             key = f'{sess.session_id}/{gid}'
+            det_boxes = None
+            if det is not None:
+                det_boxes = detect_group(det, det_wh, sess, gid,
+                                         args.max_animals or 1, device=device,
+                                         score_thresh=args.det_score)
             out = run_group(model, sess, gid, registry, ds_name, cfg,
-                            box_points=boxes.get(key))
+                            box_points=boxes.get(key), boxes_stc=det_boxes)
             results[key] = out
             print(f'{key}: {out["pred"].shape} '
                   f'{np.isfinite(out["pred"]).all(-1).mean():.3f} finite')
@@ -96,7 +110,9 @@ def main():
     flat['__keys__'] = np.asarray(list(results), object)
     flat['__run__'] = np.asarray(str(args.run))
     flat['__anchor__'] = np.asarray(cfg.anchor)
-    flat['__boxes__'] = np.asarray('labels' if not args.boxes else str(args.boxes))
+    flat['__boxes__'] = np.asarray(
+        str(args.detector) if args.detector else
+        (str(args.boxes) if args.boxes else 'labels'))
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
 

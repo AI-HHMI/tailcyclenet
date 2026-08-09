@@ -364,6 +364,7 @@ class Session:
     flip_pairs: list[list[str]] = field(default_factory=list)
     provenance: dict = field(default_factory=dict)
     assoc_res_max_px: float = 30.0
+    _label_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def session_id(self) -> str:
@@ -450,8 +451,21 @@ class Session:
             g.session = sess
         return sess
 
+    def preload(self) -> None:
+        """Scatter every group now and drop the parquet tables.
+
+        Call this in the PARENT process before forking dataloader workers: the dense arrays are
+        then shared copy-on-write, where lazy per-worker scattering would give 12 workers their
+        own copy of a 44 MB table apiece.
+        """
+        for gid in self.groups:
+            self.labels(gid)
+        self.__dict__.pop('_tables', None)
+
     def labels(self, gid: str) -> Labels:
         """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12."""
+        if gid in self._label_cache:
+            return self._label_cache[gid]
         group = self.groups[gid]
         T, K, C = group.n_frames, len(self.names), len(self.rig)
         t = self._tables
@@ -519,8 +533,10 @@ class Session:
                     if not self.rig.moving[cam.get_name()]:
                         ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
-        return Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
-                      vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
+        out = Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
+                     vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
+        self._label_cache[gid] = out
+        return out
 
 
 # --------------------------------------------------------------------------------------------

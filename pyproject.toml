@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=64,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tailcyclenet"
+version = "0.1.0"
+description = "finetune a posetail tracker into an animal pose estimator (3D multiview, 3D single-view, 2D single-view)"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["tailcyclenet*"]
+
+[tool.pixi.system-requirements]
+libc = { family = "glibc", version = "2.34" }
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.activation.env]
+# The env ships libstdc++.so.6.0.35; the host may ship an older one (RHEL9 has 6.0.29, which has
+# no CXXABI_1.3.15). Without this the system copy wins the loader search and `import
+# scipy.optimize` dies inside _highspy with an ImportError that names CXXABI and nothing else --
+# a failure that looks like a broken install rather than a library-path ordering problem.
+LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
+
+[tool.pixi.pypi-dependencies]
+# posetail is a LIBRARY here and is never modified: pinned to the PyPI release, not a path dep.
+# A checkout lives at ../../posetail/posetail-next for READING only.
+posetail = "==0.3.0"
+tailcyclenet = { path = ".", editable = true }
+torch = { version = "<3", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+cuda-toolkit = "12.8.*"
+numpy = "==1.26"
+scipy = "<1.17"
+setuptools = "<81"
+pip = "*"
+pyarrow = "*"
+matplotlib = "*"
+pytest = "*"
+
+[tool.pixi.tasks]
+test = "pytest tests/ -q"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

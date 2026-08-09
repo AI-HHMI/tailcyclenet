@@ -192,6 +192,42 @@ def test_mixed_2d_and_3d_in_one_run(tiny_root):
     assert modes == {'2d', '3d'}
 
 
+def test_registry_ids_survive_a_later_run(tiny_root):
+    """Ids must be APPEND-ONLY against an existing registry, or warm start remaps the embedding.
+
+    Discovery order is a directory listing, so it is not a stable thing to number against: with
+    no base, seeing the same two datasets in the other order moves every id, and each row of
+    `kpt_embed` then means a different body part than the checkpoint trained it to mean. Nothing
+    in the loss curve shows it -- gotcha #4.
+    """
+    from tailcyclenet.format import load_datasets
+
+    ds = load_datasets(tiny_root)
+    first = Registry.build(ds)
+    assert dict(Registry.build(list(reversed(ds))).datasets) != dict(first.datasets), \
+        'the fixture must be order-sensitive, or this test proves nothing'
+
+    again = Registry.build(list(reversed(ds)), first)
+    assert dict(again.datasets) == dict(first.datasets)
+    assert again.names == first.names
+
+
+def test_registry_appends_a_new_dataset_without_moving_old_ids(tiny_root, tmp_path):
+    from tailcyclenet.format import load_datasets
+
+    base = Registry.build(load_datasets(tiny_root))
+    grown = Registry.build(load_datasets(tiny_root) + [_FakeDataset('zzz', ['a', 'b'])], base)
+    assert grown.names[:len(base.names)] == base.names
+    assert list(grown.ids_for('zzz')) == [len(base.names), len(base.names) + 1]
+
+
+class _FakeDataset:
+    """The two attributes Registry.build reads. Cheaper than writing a session to disk."""
+
+    def __init__(self, name, names):
+        self.name, self.names = name, names
+
+
 def test_val_windows_are_deterministic(tiny_root):
     ds = PoseDataset(tiny_root / 'ratlike', 'val', CFG)
     a = pose_collate([ds[0]])

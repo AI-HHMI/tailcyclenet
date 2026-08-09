@@ -68,6 +68,28 @@ def build_optimizer(model, fresh: set[str], cfg: dict):
     return opt
 
 
+def base_registry(run: Path, checkpoint_path):
+    """An existing keypoint registry to append to, or None.
+
+    Looked for in the run folder first (resuming into the same `--out`), then beside the
+    warm-start checkpoint -- `Path(<run>/checkpoints).parent` is the run folder, so one lookup
+    covers both that layout and a bare checkpoint directory.
+
+    Without this every run renumbers the keypoints from scratch, and warm-starting from a run
+    whose datasets were discovered in a different order quietly points each embedding row at a
+    different body part. `Registry.build` raises rather than renumbering, so a genuine conflict
+    is loud.
+    """
+    candidates = [run / 'keypoint_registry.toml']
+    if checkpoint_path:
+        candidates.append(Path(checkpoint_path).parent / 'keypoint_registry.toml')
+    for p in candidates:
+        if p.exists():
+            print(f'keypoint registry: appending to {p}')
+            return Registry.load(p)
+    return None
+
+
 def to_device(batch, device):
     views = [v.to(device, non_blocking=True) for v in batch.views]
     cgroup = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
@@ -117,7 +139,8 @@ def main():
     # -- data ------------------------------------------------------------------------------
     lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
                          if k in LoaderConfig.__dataclass_fields__})
-    train_ds = PoseDataset(data_cfg['path'], 'train', lc)
+    train_ds = PoseDataset(data_cfg['path'], 'train', lc,
+                           registry_base=base_registry(run, train_cfg.get('checkpoint_path')))
     registry = train_ds.registry
     print(f'train: {len(train_ds)} windows across {len(train_ds.datasets)} dataset(s), '
           f'{registry.n_keypoints} keypoints')

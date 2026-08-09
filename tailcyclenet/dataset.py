@@ -117,7 +117,8 @@ class _Item:
 
 class PoseDataset(Dataset):
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
-                 train: bool | None = None, seed: int = 0):
+                 train: bool | None = None, seed: int = 0,
+                 registry_base: Registry | None = None):
         # Gotcha #1, and the clamp-pad in `_frames` does NOT cover it: that pads a short GROUP up
         # to `cfg.n_frames`, which does nothing when `cfg.n_frames` is itself 1. A 1-frame window
         # gives posetail `gT = T // tubelet_size = 0` and a zero-length positional embedding.
@@ -129,7 +130,11 @@ class PoseDataset(Dataset):
         self.split = split
         self.train = (split == 'train') if train is None else train
         self.datasets = load_datasets(path)
-        self.registry = registry or Registry.build(self.datasets)
+        # `registry_base` makes the ids APPEND-ONLY against a run that already exists, so the
+        # embedding rows behind them survive a warm start. Without it a second run over the same
+        # datasets in a different order silently remaps every row of `kpt_embed` -- gotcha #4,
+        # and invisible in the loss curve. `Registry.build` raises if an old id would move.
+        self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
 
         # Scatter every session's parquet into dense arrays HERE, in the parent process, and drop

@@ -59,7 +59,7 @@ depth_log_max = 2.5
 
 [training]
 out = "runs/w9"
-n_iterations = 300
+n_iterations = 100
 seed = 0
 checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260727_113457-ukt14i7c/files/checkpoints"
 init_from = ""

@@ -1,0 +1,189 @@
+"""THE inference path. One window loop.
+
+posetail-pose had ten scripts that ran a model and three separate window loops, and all three
+got the loop wrong in different ways. There is one here, and everything else -- eval, rendering,
+long clips, multi-animal -- is an argument to it.
+
+The loop, per group:
+
+    for each window of T frames, stepping by T - overlap:
+        get a crop box per camera        (from labels, from a detections file, or from a detector)
+        build the cropped+resized cameras
+        read the pixels
+        build the prior                  (none / carry / self)
+        forward
+        map the prediction back into the source coordinate frame
+
+**The prompt regime is the thing to get right.** `none` is query-free. `carry` seeds each window
+from the model's own previous prediction -- label-free, and what deployment actually does; it
+requires `overlap >= 1` or there is nothing to carry. `self` runs each window twice, seeding the
+second pass from the first. `labels` seeds from ground truth and is an ORACLE: it is not a
+deployment number and is off by default, because in the project this descends from, ungated
+GT-derived priors inflated every anchored number that was ever published.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from . import crop as cropmod
+from .dataset import _resize_camera, read_frames
+from .format import VISIBLE, Labels, Session
+
+ANCHORS = ('none', 'carry', 'self', 'labels')
+
+
+@dataclass
+class InferConfig:
+    n_frames: int = 24
+    overlap: int = 4
+    image_size: int = 256
+    min_crop_dim: int = 64
+    anchor: str = 'carry'
+    max_animals: int = 0          # 0 -> every animal the box source offers
+    device: str = 'cuda:0'
+
+
+def _window_starts(n_frames: int, T: int, overlap: int):
+    """Contiguous windows covering [0, n_frames), stepping by T - overlap.
+
+    The last window is pulled back to end exactly at n_frames rather than padded, so no frame is
+    predicted from duplicated pixels.
+    """
+    step = max(1, T - overlap)
+    if n_frames <= T:
+        return [0]
+    starts = list(range(0, n_frames - T + 1, step))
+    if starts[-1] + T < n_frames:
+        starts.append(n_frames - T)
+    return starts
+
+
+def boxes_from_points(points, rig, cam_ix, min_crop_dim, mode):
+    """Crop boxes for one animal in one window, from points. THE crop rule, shared with training.
+
+    In 3D the points are world coordinates and get projected; in 2D they are already pixels.
+    Returns None when nothing is finite -- the animal is not croppable in this window.
+    """
+    cgroup = rig.posetail()
+    cgroup = [cgroup[i] for i in cam_ix]
+    if mode == '3d':
+        cg, boxes = cropmod.crop_to_points_3d(cgroup, points, min_crop_dim)
+        return (cg, boxes) if cg is not None else (None, None)
+    cam, box, _ = cropmod.crop_to_points_2d(cgroup[0], points, min_crop_dim)
+    return ([cam], [box]) if cam is not None else (None, None)
+
+
+def _to_device(cgroup, device):
+    return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
+            for c in cgroup]
+
+
+@torch.no_grad()
+def run_group(model, session: Session, gid: str, registry, dataset_name: str,
+              cfg: InferConfig, box_points=None) -> dict:
+    """Predict every animal in one group. Returns arrays in the SOURCE coordinate frame.
+
+    `box_points` supplies the points the crop follows, shaped like the labels
+    ((S,T,K,3) world or (S,T,K,2) pixels). Passing the labels themselves is the GT-crop upper
+    bound; passing a detector's output is the deployment number. They are not comparable and the
+    caller must say which it used.
+    """
+    assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
+    if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
+        raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
+                         'overlap >= 1; got 0')
+
+    group = session.groups[gid]
+    lab: Labels = session.labels(gid)
+    mode = session.mode
+    K = session.n_keypoints
+    R = 3 if mode == '3d' else 2
+    T_total = group.n_frames
+    kpt_ids = torch.as_tensor(registry.ids_for(dataset_name), dtype=torch.long)[None]
+
+    src = box_points if box_points is not None else (
+        lab.points3d if mode == '3d' else lab.points2d[..., 0, :])
+    S = src.shape[0] if cfg.max_animals == 0 else min(src.shape[0], cfg.max_animals)
+    cam_ix = list(range(len(session.rig)))
+
+    pred = np.full((S, T_total, K, R), np.nan, np.float32)
+    conf = np.full((S, T_total, K), np.nan, np.float32)
+    carried = [None] * S                      # per-animal prior for the next window
+
+    for start in _window_starts(T_total, cfg.n_frames, cfg.overlap):
+        frames = np.arange(start, min(start + cfg.n_frames, T_total))
+        if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
+            frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
+        for a in range(S):
+            pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
+            if not torch.isfinite(pts).all(-1).any():
+                continue
+            cgroup, boxes = boxes_from_points(pts, session.rig, cam_ix, cfg.min_crop_dim, mode)
+            if cgroup is None:
+                continue
+            scales = []
+            for i, cam in enumerate(cgroup):
+                cam, s = _resize_camera(cam, cfg.image_size)
+                cgroup[i], _ = cam, scales.append(s)
+
+            views = []
+            for i, ci in enumerate(cam_ix):
+                imgs = read_frames(group, session.cam_names[ci], frames,
+                                   crop_coords=boxes[i],
+                                   target_size=cgroup[i]['size'].tolist())
+                if any(im is None for im in imgs):
+                    break
+                views.append(torch.as_tensor(np.asarray(imgs), dtype=torch.float32)[None] / 255.0)
+            if len(views) != len(cam_ix):
+                continue
+
+            prior, prompt_t = _build_prior(cfg, carried[a], src[a], frames, boxes, scales,
+                                           mode, K, R)
+            dev = cfg.device
+            out = model([v.to(dev) for v in views], kpt_ids.to(dev), _to_device(cgroup, dev),
+                        mode=mode,
+                        kpt_prior=None if prior is None else prior.to(dev),
+                        prompt_time=None if prompt_t is None else prompt_t.to(dev))
+            if cfg.anchor == 'self':
+                p = out['coords_pred'][0].detach().cpu()
+                prior2 = p[0].clone()
+                out = model([v.to(dev) for v in views], kpt_ids.to(dev),
+                            _to_device(cgroup, dev), mode=mode, kpt_prior=prior2[None].to(dev),
+                            prompt_time=torch.zeros((1, K), dtype=torch.int32).to(dev))
+
+            p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
+            if mode == '2d':
+                # crop pixels -> source pixels: undo the resize, then the crop origin
+                p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
+            pred[a, frames] = p
+            if 'vis_pred' in out:
+                v = out['vis_pred'][0].detach().cpu().numpy()
+                conf[a, frames] = v.reshape(len(frames), K)
+            carried[a] = (torch.as_tensor(p[-cfg.overlap] if cfg.overlap else p[-1]),
+                          int(frames[-cfg.overlap] if cfg.overlap else frames[-1]))
+
+    return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(lab.animal_ids[:S], object),
+            'mode': mode, 'group_id': gid, 'session': session.session_id,
+            'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total}
+
+
+def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R):
+    """The per-keypoint prior for this window, in the model's coordinate frame."""
+    if cfg.anchor in ('none', 'self'):
+        return None, None
+    if cfg.anchor == 'labels':
+        # ORACLE. Ground truth as the prior; not a deployment number.
+        p = torch.as_tensor(src_animal[frames[0]], dtype=torch.float32)
+    else:                                    # 'carry'
+        if carried is None:
+            return None, None
+        p = carried[0].clone().float()
+    if p.shape != (K, R):
+        return None, None
+    if mode == '2d':
+        # the carried/labelled pose is in SOURCE pixels; the model works in crop pixels
+        p = (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
+    return p[None], torch.zeros((1, K), dtype=torch.int32)

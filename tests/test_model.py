@@ -139,6 +139,45 @@ def test_kpt_chunk_leaves_no_stash_behind(moving_batch):
     assert model._kpt_ids_all is None and model._kpt_cursor == 0
 
 
+def test_the_prior_reaches_the_query_encoder(moving_batch):
+    """Withholding the prior must actually change what the encoder is told.
+
+    This is what the periodic val eval depends on: `val/*` runs prior-free because the loader's
+    `kpt_prior` is ground truth (evaluation rule 7), and that is only a meaningful gate if the
+    prior was reaching the model in the first place. Asserted at the ENCODER, not at
+    `coords_pred`: an untrained model's grid head saturates to the grid centre for every query,
+    so comparing predictions would pass whether or not the prior was plumbed through.
+    """
+    b = moving_batch
+    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    seen = {}
+    qe = type(model.query_encoder)
+    orig = qe.forward
+
+    def spy(self, *a, **k):
+        out = orig(self, *a, **k)
+        seen[spy.tag] = (self._query_ok.clone(), k['query_coords'].clone(), out.clone())
+        return out
+
+    qe.forward = spy
+    try:
+        with torch.no_grad():
+            spy.tag = 'free'
+            model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=None, prompt_time=None)
+            spy.tag = 'prompted'
+            model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=b.kpt_prior,
+                  prompt_time=b.prompt_t)
+    finally:
+        qe.forward = orig
+
+    ok_free, q_free, e_free = seen['free']
+    ok_prompt, q_prompt, e_prompt = seen['prompted']
+    assert not ok_free.any(), 'prior-free must mark every query unprompted'
+    assert ok_prompt.any(), 'a finite prior must mark queries prompted'
+    assert not torch.allclose(q_free, q_prompt), 'the prior must move the query position'
+    assert not torch.allclose(e_free, e_prompt), 'the two regimes must reach the decoder apart'
+
+
 # ----------------------------------------------------------------------------------------------
 # configs this architecture does not implement
 # ----------------------------------------------------------------------------------------------

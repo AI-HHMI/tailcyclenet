@@ -11,6 +11,7 @@ registry and the checkpoints -- so eval and inference take only `--run <folder>`
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 import tomllib
@@ -68,6 +69,39 @@ def build_optimizer(model, fresh: set[str], cfg: dict):
     return opt
 
 
+def init_wandb(config: dict, run: Path, disabled: bool = False):
+    """wandb from the existing `[wandb]` block, or None. No wrapper, no logger abstraction.
+
+    THE RUN FOLDER STAYS `--out`. Both reference implementations put the run folder inside
+    `wandb.run.dir`, which is how eval ends up needing a wandb path to find a checkpoint. Here
+    `--run <folder>` is the whole model specification (`checkpoints.load_run`), so wandb gets
+    `dir` for its own bookkeeping and the run folder is left alone.
+    """
+    cfg = config.get('wandb')
+    if disabled or not cfg:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print('wandb: not installed, skipping')
+        return None
+    Path(cfg.get('path', '.')).mkdir(parents=True, exist_ok=True)
+    wandb.init(project=cfg.get('project_name', 'tailcyclenet'), dir=cfg.get('path'),
+               mode=cfg.get('mode', 'offline'), name=run.name, config=config)
+    print(f'wandb: {cfg.get("mode", "offline")} | {wandb.run.name}')
+    return wandb
+
+
+def log(wb, values: dict, step: int) -> None:
+    if wb is not None:
+        wb.log(values, step=step)
+
+
+def _brief(m: dict) -> str:
+    keys = ('mpjpe', 'mte', 'delta_x_avg', 'survival_rate', 'n_nonfinite')
+    return ' '.join(f'{k}={m[k]:.4g}' for k in keys if k in m)
+
+
 def base_registry(run: Path, checkpoint_path):
     """An existing keypoint registry to append to, or None.
 
@@ -110,6 +144,65 @@ def run_batch(model, loss_fn, batch, device):
     return loss, out
 
 
+@torch.no_grad()
+def evaluate(model, batches, optimizer, device, self_prompted=False):
+    """Val metrics on a FIXED set of windows. Two regimes, and both are reported.
+
+    `self_prompted=False` is the PRIOR-FREE regime. The loader's `kpt_prior` is ground truth
+    (evaluation rule 7), so it is gated off here -- letting it through inflates every number, and
+    in the project this descends from it inflated every anchored number ever published.
+
+    But prior-free is a structurally DIFFERENT forward from training on a `query = "prior"` arm:
+    with no prior every query sits at the derived scene centre, `uniform` flips True in the query
+    encoder, and the patch term collapses from K independent patches to one broadcast patch. So
+    checkpoint selection on that number alone judges an arm by a path it is not trained on.
+
+    `self_prompted=True` is the deployable version: predict prior-free, then re-query at the
+    model's OWN frame-0 prediction. Label-free, so no gate reopens, and it is the same
+    construction `run_windowed(anchor='self')` uses -- literally, via `infer.self_prompt`.
+
+    `optimizer.eval()` swaps the schedule-free averaged iterate `x` into the parameters IN PLACE,
+    which is the weight that gets deployed; the `finally` puts `y` back even if a batch raises.
+    """
+    from posetail.posetail.eval_metrics import get_eval_metrics, get_vis_true
+
+    from tailcyclenet.infer import self_prompt
+
+    model.eval()
+    if hasattr(optimizer, 'eval'):
+        optimizer.eval()
+    mets, skipped = [], 0
+    try:
+        for batch in batches:
+            views, cgroup = to_device(batch, device)
+            kpt_ids, coords = batch.kpt_ids.to(device), batch.coords.to(device)
+            mode = batch.sample_info['mode']
+            out = model(views, kpt_ids, cgroup, mode=mode, kpt_prior=None, prompt_time=None)
+            if self_prompted:
+                out = self_prompt(model, views, kpt_ids, cgroup, mode, out)
+            m = get_eval_metrics(
+                vis_pred=out['vis_pred'],
+                vis_true=(batch.vis.to(device) if batch.vis is not None
+                          else get_vis_true(coords)),
+                coords_pred=out['coords_pred'], coords_true=coords, prefix='')
+            m = {k: float(v) for k, v in m.items() if np.ndim(v) == 0}
+            if not all(np.isfinite(v) for v in m.values()):
+                skipped += 1
+            mets.append(m)
+    finally:
+        model.train()
+        if hasattr(optimizer, 'train'):
+            optimizer.train()
+    if not mets:
+        return {}
+    # nanmean, and the skip count alongside: a val curve quietly averaging over half its batches
+    # is the same trap as a train curve that does.
+    out = {k: float(np.nanmean([m[k] for m in mets])) for k in mets[0]}
+    out['n_batches'] = len(mets)
+    out['n_nonfinite'] = skipped
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -120,6 +213,7 @@ def main():
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--num-workers', type=int, default=None)
     ap.add_argument('--no-warm-start', action='store_true')
+    ap.add_argument('--no-wandb', action='store_true', help='ignore the [wandb] config block')
     args = ap.parse_args()
 
     with open(args.config, 'rb') as f:
@@ -158,6 +252,16 @@ def main():
         train_ds, batch_size=1, shuffle=True, num_workers=nw, collate_fn=pose_collate,
         persistent_workers=nw > 0, pin_memory=True, drop_last=True)
 
+    # THE SAME WINDOWS EVERY TIME. `PoseDataset` seeds val items by index, so materialising the
+    # first `val_batches` of them once makes every evaluation comparable to the last -- which is
+    # the only thing that lets a val curve mean anything across iterations.
+    val_freq = int(train_cfg.get('val_freq', 0))
+    val_batches = []
+    if val_ds is not None and val_freq:
+        val_batches = [pose_collate([val_ds[i]])
+                       for i in range(min(int(train_cfg.get('val_batches', 20)), len(val_ds)))]
+        print(f'val:   {len(val_batches)} fixed window(s) every {val_freq} iterations')
+
     # -- model -----------------------------------------------------------------------------
     model = build_model(config['model'], n_keypoints=registry.n_keypoints)
     fresh: set[str] = set()
@@ -176,6 +280,12 @@ def main():
     loss_fn = TotalLoss(**config['training']['losses'])
     save_run_meta(run, config, registry)
     print(f'run folder: {run.resolve()}')
+    wb = init_wandb(config, run, disabled=args.no_wandb)
+    log_path = run / 'log.jsonl'                  # the numbers survive without wandb
+
+    def record(rec):
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(rec) + '\n')
 
     # -- loop ------------------------------------------------------------------------------
     max_grad = float(train_cfg.get('max_grad_norm', 0)) or None
@@ -183,7 +293,8 @@ def main():
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
     model.train()
     opt.train()
-    it, skipped, t0, running = 0, 0, time.time(), []
+    it, skipped, t0, running, clipped = 0, 0, time.time(), [], []
+    best_mpjpe, best_iter = float('inf'), 0
     while it < n_iter:
         for batch in loader:
             if it >= n_iter:
@@ -206,7 +317,8 @@ def main():
                 it += 1
                 continue
             opt.step()
-            running.append(float(loss))
+            running.append(float(loss.detach()))
+            clipped.append(float(max_grad is not None and float(gn) > max_grad))
             it += 1
 
             if it % print_freq == 0:
@@ -215,11 +327,41 @@ def main():
                       f'{dt:5.2f}s/it  skipped {skipped}  '
                       f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                       f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
+                # `clipped` is the running fraction of steps hitting max_grad_norm. At
+                # batch_size 1 it has measured ~50%, which makes it the most informative
+                # training-health number here -- and it was being computed and thrown away.
+                log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
+                         'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
+                         'train/sec_per_it': dt,
+                         'train/skipped_frac': skipped / max(it, 1)}, it)
                 running, t0 = [], time.time()
+
+            if val_batches and it % val_freq == 0:
+                m = evaluate(model, val_batches, opt, device)
+                ms = evaluate(model, val_batches, opt, device, self_prompted=True)
+                print(f'  EVAL  prior-free {_brief(m)}\n'
+                      f'        self-prompted {_brief(ms)}', flush=True)
+                log(wb, {f'val/{k}': v for k, v in m.items()}, it)
+                log(wb, {f'val_self/{k}': v for k, v in ms.items()}, it)
+                if np.isfinite(m.get('mpjpe', np.nan)) and m['mpjpe'] < best_mpjpe:
+                    best_mpjpe, best_iter = m['mpjpe'], it
+                # Plateaus in this project break late -- one arm stalled 2600 iterations and then
+                # improved -- so the stopping rule reads a number instead of an eyeball.
+                log(wb, {'val/no_new_best_span': it - best_iter}, it)
+                if wb is not None:
+                    wb.run.summary['best_mpjpe'] = best_mpjpe
+                    wb.run.summary['best_iter'] = best_iter
+                record({'iter': it, 'val': m, 'val_self': ms,
+                        'best_mpjpe': best_mpjpe, 'best_iter': best_iter})
+
             if it % ckpt_freq == 0 or it == n_iter:
                 p = save_checkpoint(run, it, model, opt, config)
                 print(f'saved {p}')
     print(f'done: {it} iterations, {skipped} skipped')
+    record({'iter': it, 'done': True, 'skipped': skipped,
+            'best_mpjpe': best_mpjpe, 'best_iter': best_iter})
+    if wb is not None:
+        wb.finish()
 
 
 if __name__ == '__main__':

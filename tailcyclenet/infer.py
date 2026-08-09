@@ -61,14 +61,16 @@ def _window_starts(n_frames: int, T: int, overlap: int):
     return starts
 
 
-def boxes_from_points(points, rig, cam_ix, min_crop_dim, mode):
+def boxes_from_points(points, cgroup, min_crop_dim, mode):
     """Crop boxes for one animal in one window, from points. THE crop rule, shared with training.
 
     In 3D the points are world coordinates and get projected; in 2D they are already pixels.
     Returns None when nothing is finite -- the animal is not croppable in this window.
+
+    `cgroup` is built by the caller (once per window, via `Session.cgroup`) rather than here:
+    building it per animal both dropped the per-frame extrinsics and rebuilt every camera once
+    per animal.
     """
-    cgroup = rig.posetail()
-    cgroup = [cgroup[i] for i in cam_ix]
     if mode == '3d':
         cg, boxes = cropmod.crop_to_points_3d(cgroup, points, min_crop_dim)
         return (cg, boxes) if cg is not None else (None, None)
@@ -122,6 +124,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
             frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
+        # ONE camera group per window, carrying per-frame extrinsics where a camera moves. Built
+        # here rather than per animal: the old per-animal build dropped `moving_ext` entirely and
+        # cost O(C^2) `format_camera` calls per animal.
+        window_cams = session.cgroup(gid, frames)
         for a in range(S):
             if boxes_stc is not None:
                 # Boxes given directly (detector / detections file). One box per camera for
@@ -130,7 +136,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 bb = boxes_stc[a][frames]                          # (t, C, 4)
                 if not np.isfinite(bb).all(-1).any():
                     continue
-                cgroup = [session.rig.posetail()[i] for i in cam_ix]
+                cgroup = [window_cams[i] for i in cam_ix]
                 boxes = []
                 for i in range(len(cam_ix)):
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
@@ -153,8 +159,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
                 if not torch.isfinite(pts).all(-1).any():
                     continue
-                cgroup, boxes = boxes_from_points(pts, session.rig, cam_ix, cfg.min_crop_dim,
-                                                  mode)
+                cgroup, boxes = boxes_from_points(pts, [window_cams[i] for i in cam_ix],
+                                                  cfg.min_crop_dim, mode)
                 if cgroup is None:
                     continue
             scales = []

@@ -241,11 +241,7 @@ class PoseDataset(Dataset):
         K = sess.n_keypoints
         augment = self.train and rng.random() < 1.0        # per-camera rolls happen below
 
-        moving_ext = None
-        if lab.ext is not None:
-            moving_ext = {n: torch.as_tensor(lab.ext[i][frames], dtype=torch.float)
-                          for i, n in enumerate(sess.cam_names) if sess.rig.moving[n]}
-        cgroup = sess.rig.posetail(moving_ext=moving_ext)
+        cgroup = sess.cgroup(item.gid, frames)
 
         true_2d = sess.mode == '2d'
         single_view = (not true_2d and self.train

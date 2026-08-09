@@ -89,7 +89,9 @@ class BoxDataset(Dataset):
         sess, gid, f, ci = self.index[i]
         group = sess.groups[gid]
         lab = sess.labels(gid)
-        cam = sess.rig.posetail()[ci]
+        # Frame-indexed, not whole-group: `pts` below is (S,K,3) whose axis -3 is the ANIMAL, so a
+        # moving camera's (T,4,4) extrinsic would project animal `i` through frame `i`'s pose.
+        cam = sess.cgroup(gid, f)[ci]
 
         if sess.mode == '3d':
             pts = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)      # (S,K,3)

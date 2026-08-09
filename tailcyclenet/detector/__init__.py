@@ -46,7 +46,10 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     T, C = group.n_frames, len(session.rig)
     S = max_instances or 1
     out = np.full((S, T, C, 4), np.nan, np.float32)
-    cgroup = session.rig.posetail()
+    # Static rig: build once. Moving rig: `associate` triangulates per frame from (n,2) centres,
+    # so it needs that frame's own (4,4) extrinsic -- built inside the loop below.
+    moving = any(session.rig.moving.values())
+    cgroup = None if moving else session.cgroup(gid)
 
     for start in range(0, T, batch):
         frames = list(range(start, min(start + batch, T)))
@@ -73,7 +76,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                 for a in range(min(S, b.shape[0])):
                     out[a, t, 0] = b[a].numpy()
             else:
-                groups = associate(cgroup, [per_cam[c][j] for c in range(C)],
+                cams = session.cgroup(gid, t) if moving else cgroup
+                groups = associate(cams, [per_cam[c][j] for c in range(C)],
                                    max_res_px=session.assoc_res_max_px, max_instances=S)
                 for a, g in enumerate(groups[:S]):
                     for c, box in g['boxes'].items():

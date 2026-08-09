@@ -30,6 +30,11 @@ LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 # posetail is a LIBRARY here and is never modified: pinned to the PyPI release, not a path dep.
 # A checkout lives at ../../posetail/posetail-next for READING only.
 posetail = "==0.3.0"
+# The pytorch branch, not PyPI's 0.8.0: its Camera is an nn.Module whose projection,
+# triangulation and Jacobians are torch ops, so camera geometry runs on GPU alongside the model
+# instead of round-tripping through numpy. Declares itself 0.7.2, which satisfies posetail's
+# `aniposelib>=0.7.0`.
+aniposelib = { git = "https://github.com/lambdaloop/anipose-lib.git", branch = "pytorch" }
 tailcyclenet = { path = ".", editable = true }
 torch = { version = "<3", index = "https://download.pytorch.org/whl/cu128" }
 torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu128" }

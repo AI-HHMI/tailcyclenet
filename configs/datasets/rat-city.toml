@@ -1,0 +1,49 @@
+# rat-city: 12 rats, ONE overhead camera, 4 keypoints, 4696x2048 frames.
+#
+# `names` is sourced from posetail_preprocessing/datasets/rat_city.py::KEYPOINTS ("4 keypoints, in
+# the order stored as kp0..kp3 in solution_keypoints.csv"). The npz carries no `keypoints` array,
+# so check_npz cannot verify this -- the provenance comment IS the verification.
+#
+# CAVEAT worth carrying: rat-city/train is a SINGLE trial (57594 frames). There is no session
+# diversity, so every rat-city number is within-session by construction.
+name = "rat-city"
+mode = "2d"
+units = "px"
+max_instances = 12
+image_wh = [4696, 2048]
+holdout_sessions = []
+min_crop_dim = 64
+
+# THE ONLY DATASET THAT IS NOT A SQUARE 416 DETECTOR INPUT, because it is the only one whose frame
+# is nowhere near square (2.29:1).
+#
+# At the square default `letterbox` scales by min(416/2048, 416/4696) = 0.089, so a 4696x2048
+# frame becomes 416x181 in a 416x416 canvas -- 56% black padding -- and the median rat arrives as
+# 15.8 x 12.5 px. YOLOX pools at strides 8/16/32, so that animal is ~2 x 1.6 cells at the finest
+# level and absent from the other two: two thirds of the FPN cannot represent it. Measured against
+# branson-fly, same detector and same 416 but a square 1024x1024 frame, the median fly arrives at
+# 26.5 x 28.1 px and reaches AP50 0.985 where rat-city sits near 0.50.
+#
+# 896x384 matches the aspect ratio to 1.7% padding for 1.99x the pixels of 416^2, and puts the
+# median rat at 33.4 x 26.4 px -- the regime the fly detector already works in. Kept out of `sha`:
+# it is a detector input size, not part of what the keypoint table means.
+det_input_wh = [896, 384]
+
+names = [
+  "nose", "left_ear", "right_ear", "tail_base",
+]
+
+skeleton = [
+  ["nose", "left_ear"],
+  ["nose", "right_ear"],
+  ["left_ear", "tail_base"],
+  ["right_ear", "tail_base"],
+]
+
+flip_pairs = [
+  ["left_ear", "right_ear"],
+]
+
+# Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
+default_iterations = 20000
+iterations_is_floor = false

@@ -18,7 +18,7 @@ def test_roundtrip_2d(tiny_root):
     assert sess.mode == '2d' and sess.units == 'px'
     assert sess.names == KPTS_2D
     assert sess.cam_names == ['cam0']
-    assert not sess.cameras[0].calibrated       # a 2D camera may omit its intrinsics
+    assert not sess.rig.calibrated['cam0']     # a 2D camera may omit its intrinsics
 
     lab = sess.labels('g000')
     assert lab.animal_ids == ['a01', 'a02']
@@ -64,7 +64,7 @@ def test_vis_is_an_int8_compare(tiny_root):
 def test_moving_camera(tiny_root):
     """extrinsics.pq gives (C,T,4,4); static cameras in the same session broadcast to constant."""
     sess = fmt.Session.load(tiny_root / 'mouselike' / 'train' / 'sess_moving')
-    assert [c.moving for c in sess.cameras] == [True, False, False]
+    assert [sess.rig.moving[n] for n in sess.cam_names] == [True, False, False]
     ext = sess.labels('g000').ext
     assert ext.shape == (3, 4, 4, 4)
     np.testing.assert_allclose(ext[0, :, 0, 3], [0.0, 1.0, 2.0, 3.0])
@@ -160,8 +160,8 @@ def test_rule_7_frame_count_must_match_n_frames(tmp_path):
 def test_rule_8_image_size_must_match_calibration(tmp_path):
     _session_2d(tmp_path / 'ds' / 'train' / 'a')
     calib = tmp_path / 'ds' / 'train' / 'a' / 'calibration.toml'
-    calib.write_text(calib.read_text().replace('image_size = [ 64, 48,]',
-                                               'image_size = [ 32, 48,]'))
+    calib.write_text(calib.read_text().replace('size = [ 64, 48,]',
+                                               'size = [ 32, 48,]'))
     errs = fmt.validate_session(fmt.Session.load(tmp_path / 'ds' / 'train' / 'a'))
     assert _rule(errs, 8)
 

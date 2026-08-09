@@ -108,24 +108,33 @@ the session id, this document is the version, and fps is declared per group (§6
 
 ## 5. `calibration.toml`
 
-An aniposelib `CameraGroup` file with four added per-camera keys. It is **always present**,
-including for `mode = "2d"`, so there is exactly one place camera geometry lives.
+An aniposelib `CameraGroup` file with **two** added per-camera keys, `offset` and `moving`. It
+is **always present**, including for `mode = "2d"`, so there is exactly one place camera geometry
+lives. Everything else is aniposelib's own schema, read and written by `CameraGroup`; lens model
+is aniposelib's existing `fisheye` flag, not a new field.
 
 ```toml
 [cam_0]
 name        = "cam088"
-type        = "pinhole"        # "pinhole" | "fisheye"     (added)
-size        = [1440, 1080]     # SENSOR size -- what `matrix` and `distortions` describe
+size        = [1200, 800]      # size of the image ON DISK; asserted against the files
 matrix      = [[1852.4, 0.0, 719.5], [0.0, 1852.4, 539.5], [0.0, 0.0, 1.0]]
 distortions = [-0.0361, 0.0, 0.0, 0.0, 0.0]
 rotation    = [0.0041, -0.0017, 0.0045]     # Rodrigues, world -> cam
 translation = [2.5517, -1.2033, 310.44]
-offset      = [180, 100]       # origin of the stored image inside the sensor frame   (added)
-image_size  = [1080, 880]      # size of the stored image; asserted against the files (added)
-moving      = false            # per-frame extrinsics live in extrinsics.pq           (added)
+fisheye     = false            # aniposelib's own flag; picks the FisheyeCamera class
+offset      = [120, 140]       # origin of the stored image inside the sensor frame (ADDED)
+moving      = false            # per-frame extrinsics live in extrinsics.pq         (ADDED)
 
 [metadata]
 ```
+
+**`size` is the stored image; `matrix` is in sensor coordinates.** Projecting is "apply `matrix`,
+then subtract `offset`" -- posetail's convention (`cube.project_cam` subtracts `cam['offset']`
+after the intrinsic matmul; `undistort_points` adds it back) and aniposelib's (`set_size` is the
+image being worked on). Note the example above: a principal point of 719.5 belongs to a
+1440-wide sensor, while the file on disk is 1200 wide at `offset = [120, 140]`. There is
+deliberately **no sensor-size field**: nothing consumes it, none of the source datasets record
+it, and a field nobody reads is a field that silently goes wrong.
 
 **Why the crop lives here.** `offset` is the only thing relating the pixels on disk to the sensor
 the calibration describes, so it belongs with the calibration and not in a second file that can
@@ -138,15 +147,21 @@ difference into ~12 mm.
 system of **the image on disk**. The mapping to the sensor lives in exactly one place,
 `offset`.
 
-For `mode = "2d"`: one camera, `offset = [0, 0]`, `image_size == size`, and
+For `mode = "2d"`: one camera, `offset = [0, 0]`, and
 `matrix` / `rotation` / `translation` / `distortions` may be omitted — the consumer substitutes a
 nominal pinhole (posetail's `_make_nominal_2d_camera`). Writing real values for a single
 calibrated camera is legal and lets the same session be read in 3D single-view mode.
 
-The four added keys are ignored by aniposelib's own loader — verified: `CameraGroup.load` on a
-file written by `dump_calibration` returns the right cameras and sizes — so an anipose user can
-read this file directly. `tailcyclenet` parses it itself rather than through aniposelib, so their
-survival does not depend on that tolerance continuing.
+`offset` and `moving` are ignored by aniposelib's loader — verified: `CameraGroup.load` on a file
+written by `dump_calibration` returns the right cameras and sizes — so an anipose user can read
+this file directly. `tailcyclenet` uses `CameraGroup.from_dicts` for the camera itself and reads
+only those two keys separately; there is no reimplementation of a camera in this repo.
+
+`tailcyclenet` pins the **`pytorch` branch** of aniposelib, whose `Camera` is an `nn.Module` with
+torch intrinsics and extrinsics, so projection and triangulation run on GPU. One consequence to
+know about: those tensors are `nn.Parameter`s and arrive with `requires_grad=True`, so the
+adapter that hands cameras to posetail detaches them — otherwise every projection in the loss
+would build an autograd graph through the calibration.
 
 ## 6. `groups.pq`
 
@@ -234,7 +249,7 @@ One row per animal per view per frame **where a determination was made**.
 **Box encoding.** `[x0, x1) × [y0, y1)`, top-left inclusive, bottom-right exclusive, so width is
 `x1 - x0`. This matches the array-slicing convention of the crop rule (`tailcyclenet/crop.py`,
 int32 `[x0, y0, x1, y1]`). Floats are allowed — annotators are not pixel-snapped. A box with
-`x1 <= x0` or `y1 <= y0` is empty and equivalent to no box. Boxes are not clipped to `image_size`;
+`x1 <= x0` or `y1 <= y0` is empty and equivalent to no box. Boxes are not clipped to `size`;
 a validator may warn.
 
 `animal_id` is a **cross-view identity**: the same string in `cam088` and `cam091` is the same
@@ -270,8 +285,7 @@ Checkable rules, so `tests/test_format.py` can be written without re-deriving th
 3. **Cross-session agreement:** every session under one dataset root carries identical `names`.
    `mode` and `units` may differ.
 4. `calibration.toml` exists, and its camera `name`s are exactly the camera dirs/videos present
-   under every group. Every camera has `type` ∈ {`pinhole`, `fisheye`}, `size`, `offset`,
-   `image_size`.
+   under every group. Every camera has a non-empty `name`, a `size` and an `offset`.
 5. `mode = "3d"` ⇒ ≥ 2 cameras, each with `matrix`, `rotation`, `translation`.
    `mode = "2d"` ⇒ exactly 1 camera.
 6. Every `bodypart` ∈ `names`; every `camera` ∈ `calibration.toml`; every `group_id` ∈
@@ -281,7 +295,7 @@ Checkable rules, so `tests/test_format.py` can be written without re-deriving th
    contiguous from `000000`, **one extension per directory**. (Positional and contiguous because
    the loader indexes by `sorted(listdir)[start:end:step]`; mixing extensions would produce two
    files claiming the same index.)
-8. Every image's dimensions equal that camera's `image_size`. Video frame size likewise.
+8. Every image's dimensions equal that camera's `size`. Video frame size likewise.
 9. No duplicate key in any table: `(group_id, frame, animal_id, camera, bodypart)` for
    `keypoints.pq`, `(group_id, frame, animal_id, bodypart)` for `points3d.pq`,
    `(group_id, frame, animal_id, camera)` for `instances.pq`, `(group_id, frame, camera)` for
@@ -340,7 +354,7 @@ rat-city's 2.8M rows and ~3 s for branson-fly's 16M.
 | `pose3d.npz['keypoints']` | `session.toml` `names` — but see the column-sort note below |
 | `pose3d.npz['ids'] (S,)` | `animal_id`; row index when absent |
 | `metadata.yaml` `intrinsic/extrinsic/distortion_matrices` | `calibration.toml` |
-| `metadata.yaml` `offset_dict`, `camera_widths/heights` | `calibration.toml` `offset`, `image_size` |
+| `metadata.yaml` `offset_dict`, `camera_widths/heights` | `calibration.toml` `offset`, `size` |
 | `metadata.yaml` `fps`, `num_frames` | `groups.pq` `fps`, `n_frames` |
 | `img/<cam>/` or `vid/<cam>.mp4` | `groups/<gid>/<cam>/` or `groups/<gid>/<cam>.mp4` — symlinked |
 
@@ -354,7 +368,7 @@ are name-indexed, so the artifact cannot recur; do not carry a `coord_perm` fiel
 `n_frames = 1` is a fully valid group and is exactly that case: one annotated moment becomes one
 single-frame group, `CollectedData.csv` melts to `keypoints.pq` (NaN cells become `missing` rows,
 unassessed content becomes no rows), `config.toml`'s `offset = [x0,y0,w,h]` splits into
-`calibration.toml`'s `offset` + `image_size`, `anipose_metadata.csv`'s `framenum` becomes
+`calibration.toml`'s `offset` + `size`, `anipose_metadata.csv`'s `framenum` becomes
 `source_frame_start`, and `CollectedData_lili.csv` / `_lara.csv` become two dataset roots
 distinguished by `[provenance] annotator`.
 
@@ -412,7 +426,7 @@ groups in three splits of one session name.
 ```
 rat-city/train/cohort7_20251209_1659/
   session.toml     mode="2d" units="px" names=["nose","left_ear","right_ear","tail_base"]
-  calibration.toml  [cam_0] name="cam0" size=[4696,2048] offset=[0,0] image_size=[4696,2048]
+  calibration.toml  [cam_0] name="cam0" size=[4696,2048] offset=[0,0]
   groups.pq        group_id="ix0" n_frames=57594 fps=40.0 source_frame_start=0
   keypoints.pq     2,764,512 rows
   groups/ix0/cam0 -> …/posetail-finetuning-v3/rat-city/train/cohort7_20251209_1659/ix0/img/cam0
@@ -478,11 +492,9 @@ it as 2 frames (§14).
 ```
 [cam_0]                                    # calibration.toml
 name = "handheld"
-type = "pinhole"
 size = [1920, 1080]
 matrix = [[1400.0, 0.0, 960.0], [0.0, 1400.0, 540.0], [0.0, 0.0, 1.0]]
 offset = [0, 0]
-image_size = [1920, 1080]
 moving = true                              # rotation/translation ignored; extrinsics.pq wins
 ```
 

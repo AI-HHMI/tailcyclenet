@@ -9,10 +9,9 @@ channel and is dictionary-encoded in parquet, which means "is this point visible
 compare on the dictionary codes rather than a string comparison -- the reason the format uses
 parquet at all.
 
-Calibration is written in aniposelib's `CameraGroup.dump` layout (so anipose can read it) but
-parsed here directly, because this format adds four per-camera keys (`type`, `offset`,
-`image_size`, `moving`) and going through aniposelib's loader would make their survival depend on
-its tolerance for unknown keys.
+Camera geometry is aniposelib's job -- `Rig` wraps a `CameraGroup` and adds only the two facts
+aniposelib has no field for (`offset`, `moving`). calibration.toml is aniposelib's own layout, so
+anipose can read it directly.
 """
 from __future__ import annotations
 
@@ -45,115 +44,137 @@ class FormatError(Exception):
 # cameras
 # --------------------------------------------------------------------------------------------
 
+def nominal_camera(name: str, size, dist=None):
+    """An aniposelib Camera for an uncalibrated single view (a 2D session).
+
+    Focal length max(W, H) so normalised coords land in ~[-0.5, 0.5]; the value is irrelevant
+    because posetail's intrinsic embedding uses its missing-intrinsic token. `set_size` must be
+    the real image so `p2d / size` is pixel-normalised.
+    """
+    from aniposelib.cameras import Camera
+
+    w, h = int(size[0]), int(size[1])
+    f = float(max(w, h))
+    cam = Camera(matrix=np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]]),
+                 dist=np.zeros(5) if dist is None else np.asarray(dist, float).ravel(),
+                 rvec=np.zeros(3), tvec=np.zeros(3), name=name)
+    cam.set_size((w, h))
+    return cam
+
+
 @dataclass
-class Camera:
-    """One camera. `size` is the SENSOR; `image_size` is what is on disk at `offset` inside it."""
-    name: str
-    type: str                       # 'pinhole' | 'fisheye'
-    size: tuple[int, int]           # sensor (W, H) -- what `matrix`/`dist` describe
-    offset: tuple[float, float]     # origin of the stored image inside the sensor frame
-    image_size: tuple[int, int]     # (W, H) of the stored image
-    moving: bool = False
-    matrix: np.ndarray | None = None       # (3,3); None -> nominal pinhole (2D sessions)
-    dist: np.ndarray | None = None         # (5,)
-    rvec: np.ndarray | None = None         # (3,) Rodrigues, world -> cam
-    tvec: np.ndarray | None = None         # (3,)
+class Rig:
+    """An aniposelib `CameraGroup` plus the three per-camera facts it does not model.
+
+    aniposelib owns the geometry -- intrinsics, distortion, extrinsics, projection,
+    triangulation. This adds only what the format needs on top and aniposelib has no field for:
+
+    - `offset`: origin of the stored image inside the sensor frame. `matrix` and `distortions`
+      are in SENSOR coordinates and `size` is the image ON DISK, so projecting is "apply matrix,
+      then subtract offset" -- posetail's convention (`cube.project_cam` subtracts
+      `cam['offset']` after the intrinsic matmul; `undistort_points` adds it back).
+    - `moving`: whether per-frame extrinsics live in `extrinsics.pq`.
+    - `calibrated`: whether the file actually carried a matrix, or `nominal_camera` invented one.
+
+    `fisheye` is aniposelib's own per-camera flag and is what `CameraGroup.from_dicts` keys the
+    `FisheyeCamera` subclass off, so it is not duplicated here -- `cam_type` reads it back.
+    """
+    cgroup: object                              # aniposelib.cameras.CameraGroup
+    offset: dict[str, tuple[float, float]]
+    moving: dict[str, bool]
+    calibrated: dict[str, bool]
 
     @property
-    def calibrated(self) -> bool:
-        return self.matrix is not None and self.rvec is not None and self.tvec is not None
+    def cameras(self):
+        return self.cgroup.cameras
 
-    def to_aniposelib(self):
-        """An aniposelib Camera. For an uncalibrated 2D camera, a nominal pinhole.
+    @property
+    def names(self) -> list[str]:
+        return [c.get_name() for c in self.cgroup.cameras]
 
-        The nominal focal length is max(W, H) so normalised coords land in ~[-0.5, 0.5]; the
-        value is irrelevant because the intrinsic embedding uses its missing-intrinsic token.
-        `set_size` must be the real image so `p2d / size` is pixel-normalised.
+    def __len__(self) -> int:
+        return len(self.cgroup.cameras)
+
+    def size(self, name: str) -> tuple[int, int]:
+        return tuple(int(v) for v in self.by_name(name).get_size())
+
+    def by_name(self, name: str):
+        for c in self.cgroup.cameras:
+            if c.get_name() == name:
+                return c
+        raise KeyError(f'no camera named {name!r}')
+
+    def cam_type(self, name: str) -> str:
+        from aniposelib.cameras import FisheyeCamera
+        return 'fisheye' if isinstance(self.by_name(name), FisheyeCamera) else 'pinhole'
+
+    def posetail(self, device='cpu', moving_ext: dict | None = None) -> list[dict]:
+        """posetail's camera dicts, DETACHED.
+
+        On the pytorch branch aniposelib's intrinsics and extrinsics are `nn.Parameter`s, so
+        `format_camera` hands back tensors with `requires_grad=True`. Left attached, every
+        projection in the loss would build an autograd graph through the calibration and
+        gradients would flow into camera intrinsics we are not training.
         """
-        from aniposelib.cameras import Camera as ACamera
+        import torch
+        from posetail.posetail.train_utils import format_camera
 
-        if self.calibrated:
-            mat, dist, rvec, tvec = self.matrix, self.dist, self.rvec, self.tvec
-        else:
-            w, h = self.image_size
-            f = float(max(w, h))
-            mat = np.array([[f, 0.0, w / 2.0], [0.0, f, h / 2.0], [0.0, 0.0, 1.0]])
-            dist = np.zeros(5)
-            rvec = np.zeros(3)
-            tvec = np.zeros(3)
-        cam = ACamera(matrix=mat, dist=dist if dist is not None else np.zeros(5),
-                      rvec=rvec, tvec=tvec, name=self.name)
-        cam.set_size(tuple(int(v) for v in self.size))
-        return cam
+        out = []
+        with torch.no_grad():
+            for cam in self.cgroup.cameras:
+                n = cam.get_name()
+                d = format_camera(cam, {n: self.offset[n]}, self.cam_type(n), device,
+                                  ext_override=None if moving_ext is None else moving_ext.get(n))
+                out.append({k: (v.detach() if torch.is_tensor(v) else v) for k, v in d.items()})
+        return out
 
 
-def _ext_to_rt(ext) -> tuple[np.ndarray, np.ndarray]:
-    """4x4 world->cam -> (rvec, tvec)."""
-    import cv2
-    ext = np.asarray(ext, dtype=np.float64).reshape(4, 4)
-    rvec = cv2.Rodrigues(ext[:3, :3])[0].ravel()
-    return rvec, ext[:3, 3].copy()
+def load_calibration(path: Path) -> Rig:
+    """Parse a calibration.toml into a Rig. Camera order is the file's section order."""
+    from aniposelib.cameras import CameraGroup
 
-
-def _rt_to_ext(rvec, tvec) -> np.ndarray:
-    import cv2
-    ext = np.eye(4)
-    ext[:3, :3] = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64))[0]
-    ext[:3, 3] = np.asarray(tvec, dtype=np.float64)
-    return ext
-
-
-def load_calibration(path: Path) -> list[Camera]:
-    """Parse a calibration.toml. Camera order is the file's section order."""
     with open(path, 'rb') as f:
         doc = tomllib.load(f)
-    cams = []
-    for key, block in doc.items():
-        if key == 'metadata' or not isinstance(block, dict):
-            continue
-        name = block.get('name', key)
+
+    blocks = [b for k, b in doc.items() if k != 'metadata' and isinstance(b, dict)]
+    if not blocks:
+        raise FormatError(f'{path}: no camera sections')
+
+    cams, offset, moving, calibrated = [], {}, {}, {}
+    for block in blocks:
+        name = str(block.get('name', ''))
         if 'size' not in block:
             raise FormatError(f'{path}: camera {name!r} has no size')
-        arr = lambda k: np.asarray(block[k], dtype=np.float64) if k in block else None
-        cams.append(Camera(
-            name=name,
-            type=block.get('type', 'pinhole'),
-            size=tuple(int(v) for v in block['size']),
-            offset=tuple(float(v) for v in block.get('offset', (0.0, 0.0))),
-            image_size=tuple(int(v) for v in block.get('image_size', block['size'])),
-            moving=bool(block.get('moving', False)),
-            matrix=arr('matrix'),
-            dist=None if arr('distortions') is None else arr('distortions').ravel(),
-            rvec=None if arr('rotation') is None else arr('rotation').ravel(),
-            tvec=None if arr('translation') is None else arr('translation').ravel(),
-        ))
-    if not cams:
-        raise FormatError(f'{path}: no camera sections')
-    return cams
+        if 'matrix' in block:
+            cams.append(CameraGroup.from_dicts([block]).cameras[0])
+        else:
+            cams.append(nominal_camera(name, block['size'], block.get('distortions')))
+        offset[name] = tuple(float(v) for v in block.get('offset', (0.0, 0.0)))
+        moving[name] = bool(block.get('moving', False))
+        calibrated[name] = 'matrix' in block
+    return Rig(cgroup=CameraGroup(cams), offset=offset, moving=moving, calibrated=calibrated)
 
 
-def dump_calibration(path: Path, cams: list[Camera]) -> None:
-    """Write calibration.toml in aniposelib's layout plus this format's four added keys."""
+def dump_calibration(path: Path, rig: Rig) -> None:
+    """Write calibration.toml: aniposelib's own dicts plus `offset` / `moving`.
+
+    `fisheye` comes from aniposelib's `get_dict`; an uncalibrated camera writes only what it
+    really knows (name, size, offset) so that reading it back rebuilds the nominal camera rather
+    than resurrecting an invented matrix as if it were a calibration.
+    """
     import toml
 
     doc = {}
-    for i, cam in enumerate(cams):
-        block = {
-            'name': cam.name,
-            'type': cam.type,
-            'size': [int(v) for v in cam.size],
-            'offset': [float(v) for v in cam.offset],
-            'image_size': [int(v) for v in cam.image_size],
-            'moving': bool(cam.moving),
-        }
-        if cam.calibrated:
-            block['matrix'] = np.asarray(cam.matrix, dtype=float).tolist()
-            block['distortions'] = np.asarray(
-                cam.dist if cam.dist is not None else np.zeros(5), dtype=float).ravel().tolist()
-            block['rotation'] = np.asarray(cam.rvec, dtype=float).ravel().tolist()
-            block['translation'] = np.asarray(cam.tvec, dtype=float).ravel().tolist()
+    for i, cam in enumerate(rig.cgroup.cameras):
+        name = cam.get_name()
+        if rig.calibrated[name]:
+            block = cam.get_dict()
+        else:
+            block = {'name': name, 'size': [int(v) for v in cam.get_size()]}
+        block['offset'] = [float(v) for v in rig.offset[name]]
+        block['moving'] = bool(rig.moving[name])
         doc[f'cam_{i}'] = block
-    doc['metadata'] = {}
+    doc['metadata'] = getattr(rig.cgroup, 'metadata', {}) or {}
     path.write_text(toml.dumps(doc))
 
 
@@ -330,7 +351,7 @@ class Session:
     mode: str                       # '2d' | '3d'
     units: str
     names: list[str]                # keypoint names, THE authority for the keypoint axis
-    cameras: list[Camera]
+    rig: Rig
     groups: dict[str, Group]
     skeleton: list[list[str]] = field(default_factory=list)
     flip_pairs: list[list[str]] = field(default_factory=list)
@@ -346,8 +367,12 @@ class Session:
         return self.path.parent.name
 
     @property
+    def cameras(self):
+        return self.rig.cameras
+
+    @property
     def cam_names(self) -> list[str]:
-        return [c.name for c in self.cameras]
+        return self.rig.names
 
     @property
     def n_keypoints(self) -> int:
@@ -359,7 +384,7 @@ class Session:
 
     @cached_property
     def _cam_vocab(self) -> dict[str, int]:
-        return {c.name: i for i, c in enumerate(self.cameras)}
+        return {n: i for i, n in enumerate(self.rig.names)}
 
     def _table(self, stem: str) -> pa.Table | None:
         p = self.path / f'{stem}.pq'
@@ -385,7 +410,7 @@ class Session:
         if not cfg['names']:
             raise FormatError(f'{cfg_path}: names is empty')
 
-        cams = load_calibration(path / 'calibration.toml')
+        rig = load_calibration(path / 'calibration.toml')
 
         gt = pq.read_table(path / 'groups.pq').to_pydict()
         groups: dict[str, Group] = {}
@@ -407,7 +432,7 @@ class Session:
             mode=cfg['mode'],
             units=cfg['units'],
             names=list(cfg['names']),
-            cameras=cams,
+            rig=rig,
             groups=groups,
             skeleton=[list(p) for p in cfg.get('skeleton', [])],
             flip_pairs=[list(p) for p in cfg.get('flip_pairs', [])],
@@ -421,7 +446,7 @@ class Session:
     def labels(self, gid: str) -> Labels:
         """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12."""
         group = self.groups[gid]
-        T, K, C = group.n_frames, len(self.names), len(self.cameras)
+        T, K, C = group.n_frames, len(self.names), len(self.rig)
         t = self._tables
         animals = _animal_vocab([t['keypoints'], t['points3d'], t['instances']], gid)
         avocab = {a: i for i, a in enumerate(animals)}
@@ -470,7 +495,7 @@ class Session:
                 boxes[a, f, c] = box
 
         ext = None
-        if t['extrinsics'] is not None and any(c.moving for c in self.cameras):
+        if t['extrinsics'] is not None and any(self.rig.moving.values()):
             tab = t['extrinsics']
             gcodes, gvals = _codes(tab, 'group_id')
             if gid in gvals:
@@ -483,9 +508,9 @@ class Session:
                     zero_copy_only=False)[sel]).astype(np.float64)
                 ext = np.tile(np.eye(4), (C, T, 1, 1))
                 ext[c, f] = raw.reshape(-1, 4, 4)
-                for i, cam in enumerate(self.cameras):
-                    if not cam.moving and cam.calibrated:
-                        ext[i] = _rt_to_ext(cam.rvec, cam.tvec)
+                for i, cam in enumerate(self.rig.cameras):
+                    if not self.rig.moving[cam.get_name()]:
+                        ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
         return Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
                       vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
@@ -495,7 +520,7 @@ class Session:
 # writing -- the exact inverse of Session.labels, so a round-trip test is meaningful
 # --------------------------------------------------------------------------------------------
 
-def write_session(path: Path, *, mode: str, units: str, names: list[str], cameras: list[Camera],
+def write_session(path: Path, *, mode: str, units: str, names: list[str], rig: Rig,
                   groups: dict[str, Group], labels: dict[str, Labels],
                   skeleton=(), flip_pairs=(), provenance=None,
                   assoc_res_max_px: float | None = None) -> None:
@@ -517,7 +542,7 @@ def write_session(path: Path, *, mode: str, units: str, names: list[str], camera
         cfg['assoc_res_max_px'] = float(assoc_res_max_px)
     cfg['provenance'] = dict(provenance or {})
     (path / 'session.toml').write_text(toml.dumps(cfg))
-    dump_calibration(path / 'calibration.toml', cameras)
+    dump_calibration(path / 'calibration.toml', rig)
 
     order = list(groups)
     write_table(path / 'groups.pq', {
@@ -530,7 +555,7 @@ def write_session(path: Path, *, mode: str, units: str, names: list[str], camera
         'notes': np.array([groups[g].notes for g in order], dtype=object),
     }, dict_cols=())
 
-    cam_names = [c.name for c in cameras]
+    cam_names = rig.names
     kpt = _inv(KPT_STATUS)
     inst = _inv(INST_STATUS)
     tables: dict[str, dict[str, list]] = {
@@ -579,12 +604,12 @@ def write_session(path: Path, *, mode: str, units: str, names: list[str], camera
                  status=[inst[v] for v in lab.instance[s, t, c]])
 
         if lab.ext is not None:
-            for ci, cam in enumerate(cameras):
-                if not cam.moving:
+            for ci, name in enumerate(cam_names):
+                if not rig.moving[name]:
                     continue
                 T = lab.ext.shape[1]
                 push('extrinsics', group_id=[gid] * T, frame=np.arange(T, dtype=np.int32),
-                     camera=[cam.name] * T, ext=[e.ravel().tolist() for e in lab.ext[ci]])
+                     camera=[name] * T, ext=[e.ravel().tolist() for e in lab.ext[ci]])
 
     for stem, cols in tables.items():
         if not cols['group_id']:
@@ -760,17 +785,19 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
             bad(2, f'flip_pairs has a self-pair at {a!r}')
 
     # 4/5. cameras and calibration
-    for cam in sess.cameras:
-        if cam.type not in ('pinhole', 'fisheye'):
-            bad(4, f'camera {cam.name!r} has type {cam.type!r}')
+    for name in sess.cam_names:
+        if not name:
+            bad(4, 'a camera has an empty name')
+        if not sess.rig.size(name):
+            bad(4, f'camera {name!r} has no size')
     if sess.mode == '3d':
-        if len(sess.cameras) < 2:
-            bad(5, f'mode=3d with {len(sess.cameras)} camera(s)')
-        for cam in sess.cameras:
-            if not cam.calibrated:
-                bad(5, f'mode=3d but camera {cam.name!r} has no matrix/rotation/translation')
-    elif len(sess.cameras) != 1:
-        bad(5, f'mode=2d with {len(sess.cameras)} cameras')
+        if len(sess.rig) < 2:
+            bad(5, f'mode=3d with {len(sess.rig)} camera(s)')
+        for name in sess.cam_names:
+            if not sess.rig.calibrated[name]:
+                bad(5, f'mode=3d but camera {name!r} has no matrix/rotation/translation')
+    elif len(sess.rig) != 1:
+        bad(5, f'mode=2d with {len(sess.rig)} cameras')
 
     if not (sess.path / 'keypoints.pq').exists() and not (sess.path / 'points3d.pq').exists():
         bad(6, 'neither keypoints.pq nor points3d.pq exists')
@@ -815,7 +842,7 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
 
     # 13. extrinsics only for cameras declared moving
     te = sess._tables['extrinsics']
-    moving = {c.name for c in sess.cameras if c.moving}
+    moving = {n for n in sess.cam_names if sess.rig.moving[n]}
     if te is not None and len(te):
         _, cams = _codes(te, 'camera')
         for name in cams:
@@ -826,30 +853,30 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
 
     # 6/7/8. per group: frames in range, pixels present and the right shape
     for gid, g in sess.groups.items():
-        for cam in sess.cameras:
+        for cname in sess.cam_names:
             try:
-                kind, p = g.pixels(cam.name)
+                kind, p = g.pixels(cname)
             except FormatError as e:
                 bad(7, str(e))
                 continue
             if kind != 'frames':
                 continue
-            files = g.frame_paths(cam.name)
+            files = g.frame_paths(cname)
             if len(files) != g.n_frames:
-                bad(7, f'group {gid!r} camera {cam.name!r}: {len(files)} files, '
+                bad(7, f'group {gid!r} camera {cname!r}: {len(files)} files, '
                        f'n_frames={g.n_frames}')
             exts = {f.suffix for f in files}
             if len(exts) > 1:
-                bad(7, f'group {gid!r} camera {cam.name!r}: mixed extensions {sorted(exts)}')
-            if files and [f.stem for f in files[:len(files)]] != [
-                    f'{i:06d}' for i in range(len(files))]:
-                bad(7, f'group {gid!r} camera {cam.name!r}: names are not contiguous %06d')
+                bad(7, f'group {gid!r} camera {cname!r}: mixed extensions {sorted(exts)}')
+            if files and [f.stem for f in files] != [f'{i:06d}' for i in range(len(files))]:
+                bad(7, f'group {gid!r} camera {cname!r}: names are not contiguous %06d')
             if check_images and files:
                 from PIL import Image
                 with Image.open(files[0]) as im:
-                    if tuple(im.size) != tuple(cam.image_size):
-                        bad(8, f'group {gid!r} camera {cam.name!r}: image is {im.size}, '
-                               f'image_size is {tuple(cam.image_size)}')
+                    want = sess.rig.size(cname)
+                    if tuple(im.size) != want:
+                        bad(8, f'group {gid!r} camera {cname!r}: image is {im.size}, '
+                               f'calibration size is {want}')
         try:
             sess.labels(gid)          # raises on unknown bodypart/camera/animal or bad frame
         except FormatError as e:

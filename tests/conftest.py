@@ -14,15 +14,23 @@ KPTS_2D = ['nose', 'left_ear', 'right_ear', 'tail_base']
 KPTS_3D = ['nose', 'neck', 'tail_base']
 
 
-def _cam(name, w, h, calibrated=True, moving=False, offset=(0.0, 0.0), idx=0):
-    f = float(max(w, h))
-    return fmt.Camera(
-        name=name, type='pinhole', size=(w, h), offset=offset, image_size=(w, h), moving=moving,
-        matrix=np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]]) if calibrated else None,
-        dist=np.zeros(5) if calibrated else None,
-        rvec=np.array([0.0, 0.1 * idx, 0.0]) if calibrated else None,
-        tvec=np.array([10.0 * idx, 0.0, 300.0]) if calibrated else None,
-    )
+def _rig(specs):
+    """specs: [(name, w, h, calibrated, moving, idx)] -> a Rig of aniposelib cameras."""
+    from aniposelib.cameras import Camera, CameraGroup
+
+    cams, offset, moving_d, calib_d = [], {}, {}, {}
+    for name, w, h, calibrated, moving, idx in specs:
+        f = float(max(w, h))
+        if calibrated:
+            cam = Camera(matrix=np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]]),
+                         dist=np.zeros(5), rvec=np.array([0.0, 0.1 * idx, 0.0]),
+                         tvec=np.array([10.0 * idx, 0.0, 300.0]), name=name)
+            cam.set_size((w, h))
+        else:
+            cam = fmt.nominal_camera(name, (w, h))
+        cams.append(cam)
+        offset[name], moving_d[name], calib_d[name] = (0.0, 0.0), moving, calibrated
+    return fmt.Rig(CameraGroup(cams), offset=offset, moving=moving_d, calibrated=calib_d)
 
 
 def _write_frames(group_dir, cam, n_frames, size):
@@ -36,7 +44,7 @@ def _write_frames(group_dir, cam, n_frames, size):
 def _session_2d(path, T=4, S=2):
     """rat-city's shape: one uncalibrated camera, several animals, pixel labels."""
     W, H = 64, 48
-    cams = [_cam('cam0', W, H, calibrated=False)]
+    rig = _rig([('cam0', W, H, False, False, 0)])
     K = len(KPTS_2D)
     lab = fmt.empty_labels(S, T, K, 1, mode3d=False, animal_ids=['a01', 'a02'])
     rng = np.random.default_rng(0)
@@ -55,7 +63,7 @@ def _session_2d(path, T=4, S=2):
     lab.boxes[1, 1, 0] = [10.0, 10.0, 30.0, 30.0]
 
     groups = {'g000': fmt.Group('g000', T, fps=40.0, source_video='movie.avi')}
-    fmt.write_session(path, mode='2d', units='px', names=KPTS_2D, cameras=cams, groups=groups,
+    fmt.write_session(path, mode='2d', units='px', names=KPTS_2D, rig=rig, groups=groups,
                       labels={'g000': lab}, flip_pairs=[['left_ear', 'right_ear']],
                       provenance={'source': 'synthetic'})
     _write_frames(path / 'groups' / 'g000', 'cam0', T, (W, H))
@@ -65,7 +73,7 @@ def _session_2d(path, T=4, S=2):
 def _session_3d(path, T=4, moving=False):
     """allen-mouse's shape: native 3D plus coordinate-free per-camera visibility rows."""
     W, H = 64, 48
-    cams = [_cam(f'cam{i}', W, H, idx=i + 1, moving=moving and i == 0) for i in range(3)]
+    rig = _rig([(f'cam{i}', W, H, True, moving and i == 0, i + 1) for i in range(3)])
     K = len(KPTS_3D)
     lab = fmt.empty_labels(1, T, K, 3, mode3d=True, animal_ids=['m1'])
     rng = np.random.default_rng(1)
@@ -80,15 +88,15 @@ def _session_3d(path, T=4, moving=False):
         lab.ext = np.tile(np.eye(4), (3, T, 1, 1))
         for t in range(T):
             lab.ext[0, t, 0, 3] = float(t)          # camera 0 slides along x
-        for i, cam in enumerate(cams):
-            if not cam.moving:
-                lab.ext[i] = fmt._rt_to_ext(cam.rvec, cam.tvec)
+        for i, cam in enumerate(rig.cameras):
+            if not rig.moving[cam.get_name()]:
+                lab.ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
     groups = {'g000': fmt.Group('g000', T, fps=200.0)}
-    fmt.write_session(path, mode='3d', units='mm', names=KPTS_3D, cameras=cams, groups=groups,
+    fmt.write_session(path, mode='3d', units='mm', names=KPTS_3D, rig=rig, groups=groups,
                       labels={'g000': lab}, provenance={'source': 'synthetic'})
-    for cam in cams:
-        _write_frames(path / 'groups' / 'g000', cam.name, T, (W, H))
+    for name in rig.names:
+        _write_frames(path / 'groups' / 'g000', name, T, (W, H))
     return lab
 
 

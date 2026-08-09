@@ -1,0 +1,110 @@
+# allen-mouse: 47 keypoints, one animal, 7 calibrated cameras.
+#
+# The authoritative list is `kpt_names.ALLEN_KEYPOINTS`; `dataset_spec.allen_spec()` asserts this
+# file agrees with it, so kpt_names.py's import-time transposition checks stay live.
+#
+# npz_column_sorted repairs the upstream writer bug: pose3d.npz stores `pose` COLUMN-sorted and
+# `keypoints` NAME-sorted, which transposes all 8 `X` / `X-base` pairs (16 positions). Full
+# derivation and the 8/8 anatomical confirmation are in kpt_names.py.
+name = "allen-mouse"
+mode = "3d"
+units = "mm"
+max_instances = 1
+npz_column_sorted = true
+holdout_sessions = ["769890"]
+min_crop_dim = 64
+
+names = [
+  "L-ear", "LF-elbow", "LF-index", "LF-index-base",
+  "LF-middle", "LF-pinkie", "LF-pinkie-base", "LF-ring",
+  "LF-shoulder", "LF-wrist", "LH-hip", "LH-index",
+  "LH-knee", "LH-middle", "LH-pinkie", "LH-pinkie-base",
+  "LH-ring", "LH-thumb", "LH-thumb-base", "LH-wrist",
+  "R-ear", "RF-elbow", "RF-index", "RF-index-base",
+  "RF-middle", "RF-pinkie", "RF-pinkie-base", "RF-ring",
+  "RF-shoulder", "RF-wrist", "RH-hip", "RH-index",
+  "RH-knee", "RH-middle", "RH-pinkie", "RH-pinkie-base",
+  "RH-ring", "RH-thumb", "RH-thumb-base", "RH-wrist",
+  "neck", "nose", "spine-mid", "tail-1/3",
+  "tail-2/3", "tail-base", "tail-end",
+]
+
+# Follows the anipose `constraints` / `constraints_weak` lists that produced the GT, so the
+# bone-length diagnostic reproduces a constraint the GT genuinely satisfies.
+skeleton = [
+  ["nose", "L-ear"],
+  ["nose", "R-ear"],
+  ["L-ear", "neck"],
+  ["R-ear", "neck"],
+  ["neck", "spine-mid"],
+  ["spine-mid", "tail-base"],
+  ["tail-base", "tail-1/3"],
+  ["tail-1/3", "tail-2/3"],
+  ["tail-2/3", "tail-end"],
+  ["neck", "LF-shoulder"],
+  ["LF-shoulder", "LF-elbow"],
+  ["LF-elbow", "LF-wrist"],
+  ["LF-wrist", "LF-index-base"],
+  ["LF-index-base", "LF-index"],
+  ["LF-wrist", "LF-pinkie-base"],
+  ["LF-pinkie-base", "LF-pinkie"],
+  ["LF-wrist", "LF-middle"],
+  ["LF-wrist", "LF-ring"],
+  ["neck", "RF-shoulder"],
+  ["RF-shoulder", "RF-elbow"],
+  ["RF-elbow", "RF-wrist"],
+  ["RF-wrist", "RF-index-base"],
+  ["RF-index-base", "RF-index"],
+  ["RF-wrist", "RF-pinkie-base"],
+  ["RF-pinkie-base", "RF-pinkie"],
+  ["RF-wrist", "RF-middle"],
+  ["RF-wrist", "RF-ring"],
+  ["tail-base", "LH-hip"],
+  ["LH-hip", "LH-knee"],
+  ["LH-knee", "LH-wrist"],
+  ["LH-wrist", "LH-thumb-base"],
+  ["LH-thumb-base", "LH-thumb"],
+  ["LH-wrist", "LH-pinkie-base"],
+  ["LH-pinkie-base", "LH-pinkie"],
+  ["LH-wrist", "LH-index"],
+  ["LH-wrist", "LH-middle"],
+  ["LH-wrist", "LH-ring"],
+  ["tail-base", "RH-hip"],
+  ["RH-hip", "RH-knee"],
+  ["RH-knee", "RH-wrist"],
+  ["RH-wrist", "RH-thumb-base"],
+  ["RH-thumb-base", "RH-thumb"],
+  ["RH-wrist", "RH-pinkie-base"],
+  ["RH-pinkie-base", "RH-pinkie"],
+  ["RH-wrist", "RH-index"],
+  ["RH-wrist", "RH-middle"],
+  ["RH-wrist", "RH-ring"],
+]
+
+# 20 bilateral pairs; the 7 midline keypoints (neck, nose, spine-mid, tail-1/3, tail-2/3, tail-base, tail-end) map to themselves.
+flip_pairs = [
+  ["L-ear", "R-ear"],
+  ["LF-elbow", "RF-elbow"],
+  ["LF-index", "RF-index"],
+  ["LF-index-base", "RF-index-base"],
+  ["LF-middle", "RF-middle"],
+  ["LF-pinkie", "RF-pinkie"],
+  ["LF-pinkie-base", "RF-pinkie-base"],
+  ["LF-ring", "RF-ring"],
+  ["LF-shoulder", "RF-shoulder"],
+  ["LF-wrist", "RF-wrist"],
+  ["LH-hip", "RH-hip"],
+  ["LH-index", "RH-index"],
+  ["LH-knee", "RH-knee"],
+  ["LH-middle", "RH-middle"],
+  ["LH-pinkie", "RH-pinkie"],
+  ["LH-pinkie-base", "RH-pinkie-base"],
+  ["LH-ring", "RH-ring"],
+  ["LH-thumb", "RH-thumb"],
+  ["LH-thumb-base", "RH-thumb-base"],
+  ["LH-wrist", "RH-wrist"],
+]
+
+# Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
+default_iterations = 60000
+iterations_is_floor = true

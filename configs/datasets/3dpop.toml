@@ -1,0 +1,33 @@
+# 3D-POP: pigeons, 4 calibrated cameras, up to 10 birds per sequence.
+#
+# `names` is transcribed directly from pose3d.npz['keypoints'], and `check_npz` re-asserts that on
+# every load, so this file cannot drift from the data.
+#
+# bp1-bp4 and hd1-hd4 are backpack / head marker points whose left-right correspondence is not
+# recoverable from the names. `flip_pairs` and `skeleton` are therefore left EMPTY rather than
+# partially filled -- a partial bilateral map would silently mislabel the markers it omits, and a
+# partial skeleton would make bone-length dispersion measure an invented constraint.
+name = "3dpop"
+mode = "3d"
+units = "mm"
+max_instances = 10
+holdout_sessions = []
+min_crop_dim = 64
+# 3-POP frames are 3840 px wide, so the association gate is looser than a 256 px rig would need.
+assoc_res_max_px = 40.0
+
+names = [
+  "bp1", "bp2", "bp3",
+  "bp4", "bp_bottomKeel", "bp_leftShoulder",
+  "bp_rightShoulder", "bp_tail", "bp_topKeel",
+  "hd1", "hd2", "hd3",
+  "hd4", "hd_beak", "hd_leftEye",
+  "hd_nose", "hd_rightEye",
+]
+
+skeleton = []
+flip_pairs = []
+
+# Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
+default_iterations = 30000
+iterations_is_floor = false

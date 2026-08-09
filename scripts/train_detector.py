@@ -26,6 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tailcyclenet.format import load_datasets
 from tailcyclenet.detector import (BoxDataset, YOLOXNano, box_collate, box_iou, decode,
                                    detector_loss)
 
@@ -50,7 +51,6 @@ def evaluate(model, loader, device, iou_thresh=0.5, limit=50):
             break
         x = x.to(device)
         obj, boxes = model(x)
-        anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
         for b in range(x.shape[0]):
             g = gt[b][torch.isfinite(gt[b]).all(-1)]
             if not g.numel():
@@ -78,10 +78,14 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    probe = BoxDataset(args.data, 'train', input_wh=(64, 64), max_frames_per_group=1)
-    wh = tuple(args.input_wh) if args.input_wh else default_input_wh(probe.ds)
-    print(f'input {wh[0]}x{wh[1]}  (frame '
-          f'{probe.ds.all_sessions()[0].rig.size(probe.ds.all_sessions()[0].cam_names[0])})')
+    # Just the camera size, so just the discovery -- building a BoxDataset here scattered every
+    # session's parquet into dense arrays to read two integers.
+    roots = load_datasets(args.data)
+    if len(roots) != 1:
+        raise SystemExit(f'{args.data}: the detector is trained per dataset; found {len(roots)}')
+    probe_sess = roots[0].all_sessions()[0]
+    wh = tuple(args.input_wh) if args.input_wh else default_input_wh(roots[0])
+    print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     train = BoxDataset(args.data, 'train', input_wh=wh,
                        max_frames_per_group=args.frames_per_group)
@@ -120,7 +124,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             opt.step()
             sched.step()
-            running.append(float(loss))
+            running.append(float(loss.detach()))
             it += 1
             if it % 50 == 0:
                 print(f'{it:7d}/{args.iters}  loss {np.mean(running):7.4f}  '

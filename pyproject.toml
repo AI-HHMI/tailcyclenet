@@ -56,6 +56,14 @@ pip = "*"
 pyarrow = "*"
 matplotlib = "*"
 pytest = "*"
+# NOT listed here, deliberately: toml, opencv, pillow, wandb, schedulefree, decord. This repo
+# imports all six directly, so declaring them looks right -- but posetail pins them EXACTLY
+# (`wandb==0.19.5`, `opencv-python==4.9.0.80`, `toml==0.10.2`) and posetail itself is pinned, so
+# the versions are already determined and captured in pixi.lock. Re-declaring them either
+# duplicates a pin that will conflict the moment posetail moves, or asks for `*` and conflicts
+# immediately -- conda's wandb 0.28.1 against posetail's 0.19.5 makes the solve unsatisfiable.
+# Tried; reverted. If posetail ever drops one, add it HERE as a pypi dependency at posetail's
+# own version, not as a conda package.
 
 [tool.pixi.tasks]
 test = "pytest tests/ -q"

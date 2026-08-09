@@ -9,7 +9,7 @@ One class, so YOLOX simplifies hard:
 
 ~1M params. The regression target is the SAME crop box the pose pipeline uses
 (`tailcyclenet.crop.crop_box_for_points`), so the detector reproduces the crop the pose model
-was trained on rather than some other box. `tests/test_crop.py` is what keeps that true.
+was trained on rather than some other box. `tests/test_dataset.py` is what keeps that true.
 
 Lifted from posetail-pose unchanged: it is a clean YOLOX-Nano with no exploration in it.
 """

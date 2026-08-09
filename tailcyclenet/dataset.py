@@ -251,7 +251,6 @@ class PoseDataset(Dataset):
             return None
         a, T = item.animal, len(frames)
         K = sess.n_keypoints
-        augment = self.train and rng.random() < 1.0        # per-camera rolls happen below
 
         cgroup = sess.cgroup(item.gid, frames)
 

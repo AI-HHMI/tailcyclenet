@@ -167,47 +167,54 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 bb = boxes_stc[a][frames]                          # (t, C, 4)
                 if not np.isfinite(bb).all(-1).any():
                     continue
-                cgroup = [window_cams[i] for i in cam_ix]
-                boxes = []
-                for i in range(len(cam_ix)):
+                # USE THE CAMERAS THAT SAW IT, not all or nothing. A detector legitimately
+                # misses a view -- cross-view association leaves an unmatched camera NaN -- and
+                # requiring a box in every camera dropped the whole animal for the window even
+                # when two views had it. The model is trained on camera subsets already
+                # (`cams_to_sample`, and `prob_2d_only` trains the one-camera case outright), so
+                # a subset is a supported input; silently discarding the animal is pure lost
+                # coverage, and coverage is a number this repo reports.
+                use, boxes = [], []
+                for i, ci in enumerate(cam_ix):
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
                     if not len(v):
-                        boxes = None
-                        break
+                        continue
                     # int32 and clamped into the image, exactly like the crop rule's own box:
                     # a float or off-frame box produces a negative cam['offset'] and breaks
                     # project_cam far downstream.
-                    w, h = (int(x) for x in session.rig.size(session.cam_names[cam_ix[i]]))
+                    w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
                     x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
                     y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
                     x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
                     y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
                     boxes.append(torch.tensor([x0, y0, x1, y1], dtype=torch.int32))
-                if boxes is None:
+                    use.append(ci)
+                if not use:
                     continue
-                cgroup = [cropmod.apply_crop(c, b) for c, b in zip(cgroup, boxes)]
+                cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
             else:
                 pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
                 if not torch.isfinite(pts).all(-1).any():
                     continue
+                use = cam_ix
                 cgroup, boxes = boxes_from_points(pts, [window_cams[i] for i in cam_ix],
                                                   cfg.min_crop_dim, mode)
                 if cgroup is None:
                     continue
             scales = []
             for i, cam in enumerate(cgroup):
-                cam, s = _resize_camera(cam, cfg.image_size)
-                cgroup[i], _ = cam, scales.append(s)
+                cgroup[i], s = _resize_camera(cam, cfg.image_size)
+                scales.append(s)
 
             views = []
-            for i, ci in enumerate(cam_ix):
+            for i, ci in enumerate(use):
                 imgs = read_frames(group, session.cam_names[ci], frames,
                                    crop_coords=boxes[i],
                                    target_size=cgroup[i]['size'].tolist())
                 if any(im is None for im in imgs):
                     break
                 views.append(torch.as_tensor(np.asarray(imgs), dtype=torch.float32)[None] / 255.0)
-            if len(views) != len(cam_ix):
+            if len(views) != len(use):
                 continue
 
             prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,

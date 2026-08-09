@@ -76,6 +76,28 @@ def test_more_detector_rows_than_label_rows(scene):
         assert all(str(i).startswith('det') for i in out['animal_ids'][len(lab.animal_ids):])
 
 
+def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
+    """Use the cameras that saw it, not all or nothing.
+
+    Cross-view association leaves an unmatched camera NaN, which is the normal outcome when a
+    detector misses one view. Requiring a box in every camera discarded the animal for the whole
+    window even when the others had it -- measured as coverage 0.000 where it should be 1.000 on
+    a three-camera rig whose first view went unmatched. The model is trained on camera subsets
+    already, so a subset is a supported input, not a degenerate one.
+    """
+    model, sess, registry, name = scene
+    C = len(sess.rig)
+    if C < 2:
+        pytest.skip('needs a multi-camera rig')
+    w, h = sess.rig.size(sess.cam_names[0])
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h
+    boxes[:, :, 0] = np.nan                       # camera 0 saw nothing
+
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
+    assert np.isfinite(out['pred']).all(-1).any(), 'the surviving cameras must still predict'
+
+
 def test_group_shorter_than_the_overlap(scene):
     """`p[-overlap]` ran off the front of a window with fewer frames than the step."""
     model, sess, registry, name = scene

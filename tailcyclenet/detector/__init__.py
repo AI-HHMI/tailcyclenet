@@ -1,8 +1,6 @@
 import torch
 
 from .assign import assign, box_iou, decode, detector_loss, giou_loss
-
-_no_grad = torch.no_grad()
 from .associate import associate
 from .data import BoxDataset, box_collate, letterbox, unletterbox_boxes
 from .yolox import YOLOXNano
@@ -24,7 +22,7 @@ def load_detector(path, device='cpu'):
     return model.to(device).eval(), tuple(ckpt['input_wh']), str(ckpt.get('dataset', ''))
 
 
-@_no_grad
+@torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
                  score_thresh=0.05):
     """Run the detector over every frame and camera of a group -> boxes (S,T,C,4).

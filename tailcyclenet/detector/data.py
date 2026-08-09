@@ -19,7 +19,7 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import crop_box_for_points
 from ..dataset import read_frames
-from ..format import load_datasets
+from ..format import UNLABELED, load_datasets
 
 
 def letterbox(img, out_wh):
@@ -73,7 +73,7 @@ class BoxDataset(Dataset):
                 if vis is None:
                     continue
                 v = vis.reshape(vis.shape[0], vis.shape[1], -1)
-                frames = np.flatnonzero((v != -1).any((0, 2)))
+                frames = np.flatnonzero((v != UNLABELED).any((0, 2)))
                 if frames.size > max_frames_per_group:
                     frames = rng.choice(frames, max_frames_per_group, replace=False)
                 for f in sorted(frames):

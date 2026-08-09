@@ -737,7 +737,7 @@ class Dataset:
 
 
 def _is_dataset_root(path: Path) -> bool:
-    return (path / 'train').is_dir() or any((path / s).is_dir() for s in SPLITS)
+    return any((path / s).is_dir() for s in SPLITS)
 
 
 def load_dataset(root: Path) -> Dataset:

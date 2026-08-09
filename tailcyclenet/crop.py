@@ -8,7 +8,7 @@ The arithmetic is lifted verbatim from posetail-pose's verified copy, which was 
 line by line against `PosetailDataset.crop_cgroup_to_points` (`posetail_dataset.py:1189-1236`):
 same 20 px pad, same clamp to [0, size], same `base = max(min_crop_dim, w, h)`, same per-axis cap
 at the image dimension, same centre-and-clamp when an axis is under `base`.
-`tests/test_crop.py` asserts it is int32-EXACT against what the library actually produces. If
+`tests/test_dataset.py` asserts it is int32-EXACT against what the library actually produces. If
 that assertion ever fails, every detector number is invalid.
 
 posetail exposes the rule only inline inside `crop_cgroup_to_points`, with no way to reach it for

@@ -216,3 +216,20 @@ def test_prompt_dropout_withholds_priors(tiny_root):
     ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg)
     b = _batch(ds)
     assert torch.isnan(b.kpt_prior).all()      # every keypoint unprompted -> learned tokens
+
+
+def test_vis_targets_carry_no_nan(tiny_root):
+    """posetail's visibility BCE has no missing-value mask.
+
+    `losses.py:901` is a plain binary_cross_entropy_with_logits with reduction='mean'. A NaN
+    target does not get skipped: the forward drops the term but its gradient still flows, and
+    every parameter comes back NaN with the loss looking perfectly healthy. This cost 36 of 40
+    training steps before it was found, so the loader must never emit a NaN visibility target.
+    """
+    for name in ('ratlike', 'mouselike'):
+        ds = PoseDataset(tiny_root / name, 'train', CFG)
+        for i in range(len(ds)):
+            b = pose_collate([ds[i]])
+            for t in (b.vis, b.vis_2d):
+                if t is not None:
+                    assert torch.isfinite(t).all(), f'{name}: NaN in a visibility target'

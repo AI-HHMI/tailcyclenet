@@ -1,0 +1,114 @@
+[data]
+path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets"
+n_frames = 24
+image_size = 256
+cams_to_sample = 0
+prob_2d_only = 0.25
+balance_datasets = true
+aug_prob = 0.25
+crop_jitter = 0.3
+crop_jitter_scale = 0.3
+min_crop_dim = 64
+prompt_dropout = 0.4
+num_workers = 12
+
+[model]
+query = "prior"
+mode_3d = "encoder"
+video_encoder_version = "large"
+video_encoder_requires_grad = false
+video_encoder_hierarchical = true
+soft_argmax_temperature_learnable = true
+stride_length = 24
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+occlusion_embedding = true
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+scene_encoder_proj = true
+cross_attn_dim = 512
+scene_proj_dim = 512
+scene_proj_prenorm = false
+scene_proj_mlp = false
+scene_pos_embed_mode = "ropepos"
+rope_base = 100.0
+time_embed_mode = "fourier_rel"
+output_mode = "gridresid"
+head_3d_grid_size = 1024
+head_3d_grid_radius = 1.8
+log_3d_output = true
+log_3d_eps = 0.1
+soft_argmax_threshold = 60
+grid_decode_space = "warped"
+enable_subpixel_refinement = false
+depth_log_min = -2.5
+depth_log_max = 2.5
+
+[training]
+out = "runs/w9"
+n_iterations = 120
+seed = 0
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260727_113457-ukt14i7c/files/checkpoints"
+init_from = ""
+max_grad_norm = 10.0
+checkpoint_freq = 1000
+val_freq = 200
+val_batches = 20
+print_freq = 20
+freeze_encoder = true
+
+[wandb]
+project_name = "tailcyclenet"
+path = "/groups/karashchuk/home/karashchukl/results/tailcyclenet"
+mode = "offline"
+
+[training.optimizer]
+learning_rate = 3e-5
+kpt_lr = 0.0005
+encoder_lr_scale = 0.1
+weight_decay = 0.002
+warmup_steps = 500
+beta1 = 0.9
+beta2 = 0.95
+
+[training.losses]
+gamma = 0.8
+pixel_thresh = 3
+delta = 6
+use_huber_loss = true
+vis_loss_weight = 5.0
+vis_loss_3d_weight = 1.0
+conf_loss_weight = 0.0
+conf_2d_loss_weight = 0.0
+occluded_coords_loss_weight = 0.1
+feature_loss_weight = 0.0
+coords_loss_weight = 0.1
+coords_loss_direct_weight = 0.1
+coords_loss_rays_weight = 0.0
+coords_loss_triangulate_weight = 0.1
+coords_loss_2d_weight = 1.5
+coords_loss_depth_weight = 0.5
+coords_loss_direct_reproj_weight = 1.0
+coords_loss_rays_reproj_weight = 0.05
+coords_loss_triangulate_reproj_weight = 2.0
+coords_softmax_2d_weight = 0.6
+coords_softmax_3d_weight = 0.4
+depth_softmax_weight = 1.5
+coords_3d_loss_scale = 50.0
+smoothness_loss_3d_weight = 0.5
+smoothness_loss_2d_weight = 0.5
+smoothness_loss_order = 4
+smoothness_loss_tolerance = 1.5

@@ -255,11 +255,20 @@ class PoseDataset(Dataset):
         else:
             coords = torch.as_tensor(lab.points3d[a][frames], dtype=torch.float32)
             if lab.vis2d is not None:
-                v2 = lab.vis2d[a][frames][:, :, cam_ix]            # (T,K,c)
-                vis_2d = torch.as_tensor(np.where(v2 == UNLABELED, np.nan,
-                                                  (v2 == VISIBLE).astype(np.float32)))
-                vis = torch.as_tensor(np.nan_to_num(
-                    (v2 == VISIBLE).astype(np.float32), nan=1.0).sum(-1) >= 1)
+                v2 = lab.vis2d[a][frames][:, :, cam_ix]            # (T,K,c), 3-state
+                # THE LOSS CANNOT SEE A THIRD STATE. posetail's visibility term is a plain
+                # `binary_cross_entropy_with_logits(..., reduction='mean')` with no missing-value
+                # mask (`losses.py:901`), so a NaN target does not merely get skipped -- the
+                # forward drops the term but its gradient still flows, and every parameter comes
+                # back NaN. (Measured: 36 of 40 steps skipped, loss finite the whole time.)
+                #
+                # `unlabeled` therefore collapses to "not visible" here. That is safe rather than
+                # merely convenient: vis2d is only unlabeled where the point has no 3D label
+                # either, so it carries no coordinate supervision in any case. The three-state
+                # distinction is preserved in the FORMAT, where it belongs; it is this consumer
+                # that cannot express it.
+                vis_2d = torch.as_tensor((v2 == VISIBLE).astype(np.float32))
+                vis = torch.as_tensor((v2 == VISIBLE).any(-1))
             else:
                 # No per-camera assessment (3dpop): let the loss derive both masks
                 # geometrically. vis and vis_2d are both-or-neither -- one without the other

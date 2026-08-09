@@ -55,17 +55,24 @@ def scene_center(camera_group):
 
     Feeding this as `coords` to the stock forward makes the library derive every remaining
     scene scalar (`cube_scale`, `scene_radius`) correctly by itself.
+
+    ON A MOVING RIG, every FRAME contributes its own ray. The query anchor is structurally one
+    point per keypoint for the whole window, so the per-frame rays have to be reduced somehow --
+    and taking frame 0 alone put the anchor where the rig started rather than where it looked,
+    which for a rig that travels during the window is a different place. Solving over all
+    (camera, frame) rays at once is the same least-squares problem with more rows.
     """
     origins, dirs = [], []
     for cam in camera_group:
         px = (cam['size'].to(torch.float64) / 2.0).reshape(1, 2)
         und = undistort_points(cam, px)
         ray_cam = torch.cat([und[0], und.new_ones(1)])
-        ext = cam['ext'][0] if cam['ext'].ndim == 3 else cam['ext']
-        d = ext[:3, :3].to(torch.float64).t() @ ray_cam
-        dirs.append(d / d.norm())
-        centre = cam['center'][0] if cam['center'].ndim == 2 else cam['center']
-        origins.append(centre.to(torch.float64))
+        ext = cam['ext'] if cam['ext'].ndim == 3 else cam['ext'][None]
+        centre = cam['center'] if cam['center'].ndim == 2 else cam['center'][None]
+        for t in range(ext.shape[0]):
+            d = ext[t, :3, :3].to(torch.float64).t() @ ray_cam
+            dirs.append(d / d.norm())
+            origins.append(centre[t].to(torch.float64))
     origins, dirs = torch.stack(origins), torch.stack(dirs)
 
     # Least-squares point minimising distance to a set of lines:

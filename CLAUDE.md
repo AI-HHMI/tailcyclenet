@@ -23,13 +23,13 @@ dev/
 scratch/              LLM scratch space. May be deleted between sessions. Artifacts untracked.
 tailcyclenet/
   format.py           read/validate a session -> dense arrays; the keypoint registry
-  dataset.py          torch Dataset over the format; 2D/3D/fake-2D; collate
+  dataset.py          torch Dataset over the format; 3D multiview / 3D single-view / 2D
   crop.py             crop_box_for_points -- THE crop rule, int32-exact
   model.py            PoseTrackerEncoder + build_model + the query-free scene centre
   query_encoder.py    PoseQueryEncoder with missing-query tokens
   checkpoints.py      run folders, save/load, warm start
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
-  infer.py            THE inference path (windowed, crops, tracks, fusion)
+  infer.py            THE inference path: one window loop
   detector/           YOLOX-Nano box predictor + cross-view association
 scripts/              convert_v4.py  train.py  train_detector.py  infer.py  eval.py
 configs/              example configs, hand-written. NOT generated, NOT one per experiment.
@@ -67,7 +67,7 @@ Spec: `docs/annotation_format.md`. Summary of the shape:
 ```
 <dataset_root>/<split>/<session_id>/
     session.toml       keypoint identity (names, mode, units) + provenance
-    calibration.toml   ALL camera geometry: aniposelib + type + crop offset + image_size + moving
+    calibration.toml   ALL camera geometry: aniposelib CameraGroup + crop offset + moving
     groups.pq          one row per group (a group is a CONTIGUOUS CLIP)
     keypoints.pq       per-camera 2D + per-camera visibility
     points3d.pq        3D -- first-class, not derived from 2D
@@ -97,7 +97,7 @@ Five things that are easy to get wrong:
 ## Training
 
 ```bash
-pixi run python scripts/train.py --config configs/w9_allen.toml
+pixi run python scripts/train.py --config configs/w9.toml
 ```
 
 `[data].path` is either a dataset root (has `train/`, optionally `val/` and `test/`) or a folder

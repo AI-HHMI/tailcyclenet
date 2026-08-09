@@ -26,7 +26,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.format import Session, load_dataset
+from tailcyclenet.format import INST_PRESENT, Session, load_dataset
 from tailcyclenet.metrics import (error_and_coverage, matched_error, mota,
                                   paired_bootstrap, pck)
 
@@ -64,7 +64,8 @@ def main():
     ap.add_argument('--split', default='test')
     ap.add_argument('--pck', default=None, help='comma-separated thresholds; default per mode')
     ap.add_argument('--mota-dist', type=float, default=None,
-                    help='match radius for MOTA; default 0.1 x the median animal extent')
+                    help='match radius for MOTA; default is half the median animal extent '
+                         '(the DIAGONAL of its keypoint box, not a per-axis span)')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
@@ -89,17 +90,21 @@ def main():
 
         m = error_and_coverage(pred, true)
         if S > 1:
-            # Row index is not identity once boxes come from a detector. Match, then measure.
+            # Row index is not identity once boxes come from a detector. Match, then measure --
+            # and take the matched COUNTS too, so the coverage quoted below describes the same
+            # points as the error above it.
             with np.errstate(all='ignore'):
                 span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
                 extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
             mm = matched_error(pred, true, max_dist=extent if np.isfinite(extent) else np.inf)
             m['err_rowwise'] = m['err']
-            m.update({k: v for k, v in mm.items() if k in ('err', 'median', 'coverage')})
+            m.update({k: v for k, v in mm.items()
+                      if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')})
             m['unmatched'] = mm.get('unmatched_true', 0)
         m['group'] = key
         m['mode'] = mode
         m['S'] = S
+        m['_pred'], m['_true'] = pred, true      # already sliced to (S, T); PCK reuses these
         rows.append(m)
         per_group.append(m['err'])
 
@@ -107,7 +112,6 @@ def main():
         print('nothing scored')
         return
 
-    unit = 'mm' if rows[0]['mode'] == '3d' else 'px'
     multi_any = any(m['S'] > 1 for m in rows)
     if multi_any:
         print('\nmulti-animal: err is over HUNGARIAN-MATCHED instances. Row index is not '
@@ -117,47 +121,60 @@ def main():
         print(f'{m["group"][:48]:48s} {m["S"]:3d} {m["err"]:9.3f} {m["median"]:8.3f} '
               f'{m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
 
-    boot = paired_bootstrap(per_group, seed=args.seed)
-    n_true = sum(m['n_true'] for m in rows)
-    n_match = sum(m['n_matched'] for m in rows)
-    print(f'\nMPJPE {boot["mean"]:.3f} {unit}  '
-          f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% paired bootstrap over {boot["n"]} groups')
-    print(f'coverage {n_match / n_true:.4f}  ({n_match} of {n_true} labelled points)')
+    # ONE AGGREGATE PER MODE. A split may hold both 2D and 3D sessions, and averaging pixels
+    # with millimetres produces a number in no unit at all.
+    for mode in ('3d', '2d'):
+        block = [m for m in rows if m['mode'] == mode]
+        if not block:
+            continue
+        unit = 'mm' if mode == '3d' else 'px'
+        boot = paired_bootstrap([m['err'] for m in block], seed=args.seed)
+        n_true = sum(m['n_true'] for m in block)
+        n_match = sum(m['n_matched'] for m in block)
+        print(f'\n[{mode}] MPJPE {boot["mean"]:.3f} {unit}  '
+              f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% bootstrap over {boot["n"]} group(s)')
+        print(f'[{mode}] coverage {n_match / n_true:.4f}  ({n_match} of {n_true} labelled '
+              f'points{", matched" if any(m["S"] > 1 for m in block) else ""})')
 
-    thresholds = ([float(t) for t in args.pck.split(',')] if args.pck
-                  else ([2.0, 5.0, 10.0] if unit == 'mm' else [5.0, 10.0, 20.0]))
-    allp = np.concatenate([preds[m['group']]['pred'].reshape(-1, preds[m['group']]['pred']
-                                                             .shape[-1]) for m in rows])
-    allt = np.concatenate([
-        (labels[m['group']][0].points3d if m['mode'] == '3d'
-         else labels[m['group']][0].points2d[..., 0, :])[:preds[m['group']]['pred'].shape[0],
-                                                         :preds[m['group']]['pred'].shape[1]]
-        .reshape(-1, preds[m['group']]['pred'].shape[-1]) for m in rows])
-    n = min(len(allp), len(allt))
-    for k, v in pck(allp[:n], allt[:n], thresholds).items():
-        print(f'{k} ({unit})  {v:.4f}')
+        thresholds = ([float(t) for t in args.pck.split(',')] if args.pck
+                      else ([2.0, 5.0, 10.0] if unit == 'mm' else [5.0, 10.0, 20.0]))
+        # The SAME arrays the table was computed from. Rebuilding them from the npz re-derived
+        # the slicing and got it wrong whenever pred and true disagreed on S or T, silently
+        # comparing one animal's points against another's.
+        allp = np.concatenate([m['_pred'].reshape(-1, m['_pred'].shape[-1]) for m in block])
+        allt = np.concatenate([m['_true'].reshape(-1, m['_true'].shape[-1]) for m in block])
+        for k, v in pck(allp, allt, thresholds).items():
+            print(f'[{mode}] {k} ({unit})  {v:.4f}')
 
     multi = [m for m in rows if m['S'] > 1]
     if multi:
         print()
         for m in multi:
             lab, _ = labels[m['group']]
-            out = preds[m['group']]
-            true = lab.points3d if m['mode'] == '3d' else lab.points2d[..., 0, :]
-            S, T = m['S'], min(out['pred'].shape[1], true.shape[1])
+            pred, true = m['_pred'], m['_true']
+            S, T = pred.shape[0], pred.shape[1]
+            unit = 'mm' if m['mode'] == '3d' else 'px'
             # Match radius scaled to the animal's own size: the DIAGONAL of its keypoint
             # bounding box, not a per-axis span. Taking the per-axis span and median-ing it
             # across axes gave 1.6 px on rat-city -- tighter than the labelling noise, so
             # every instance read as a miss AND a false positive and MOTA went negative.
             with np.errstate(all='ignore'):
-                span = np.nanmax(true[:S, :T], axis=2) - np.nanmin(true[:S, :T], axis=2)
+                span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
                 extent = np.nanmedian(np.linalg.norm(span, axis=-1))
             radius = args.mota_dist or float(extent) * 0.5
-            r = mota(out['pred'][:S, :T], true[:S, :T], radius,
-                     ignore=None if lab.instance is None else
-                     (lab.instance[:S, :T] == 1).any(-1))
+            # Present-but-unannotated animals, WITH their boxes where the format carries them:
+            # an unmatched prediction is then excused only if it actually lands on one. Without
+            # boxes the fallback excuses every unmatched prediction on such a frame, so
+            # `fp_ignored` is printed to show how much of the FP term that took.
+            ig = ig_boxes = None
+            if lab.instance is not None:
+                ig = (lab.instance[:S, :T] == INST_PRESENT).any(-1)
+                if lab.boxes is not None:
+                    ig_boxes = lab.boxes[:S, :T, 0]           # xyxy in the first camera
+            r = mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes)
             print(f'{m["group"][:40]:40s} MOTA {r["mota"]:.3f}  miss {r["miss_rate"]:.3f}  '
-                  f'fp {r["fp_rate"]:.3f}  idsw {r["idsw_rate"]:.4f}  (r={radius:.1f}{unit})')
+                  f'fp {r["fp_rate"]:.3f}  idsw {r["idsw_rate"]:.4f}  '
+                  f'fp_ignored {r["fp_ignored"]:d}  (r={radius:.1f}{unit})')
 
 
 if __name__ == '__main__':

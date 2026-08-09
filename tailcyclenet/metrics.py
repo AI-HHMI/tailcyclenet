@@ -87,55 +87,68 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
 # multi-instance
 # ----------------------------------------------------------------------------------------------
 
-def match_instances(pred, true, max_dist=np.inf, ignore=None):
+def match_instances(pred, true, max_dist=np.inf):
     """Hungarian match predicted instances to labelled ones, per frame.
 
     Args:
         pred: (Sp, T, K, R), NaN where absent
         true: (St, T, K, R), NaN where absent
         max_dist: a pair further apart than this is not a match
-        ignore: (St, T) bool -- instances that are present but unannotated. A prediction matched
-            to one of these is neither a true nor a false positive. This exists because 73% of a
-            tracker's false positives on rat-city were measured to be real animals the annotator
-            skipped, and counting them cost 0.017 MOTA.
 
     Returns a list per frame of (pred_ix, true_ix, dist).
+
+    The pairwise cost is vectorised rather than a double Python loop. rat-city is ONE group of
+    57,594 frames, so ten animals meant 5.7M `_dist` calls per eval and multi-animal scoring was
+    effectively unrunnable.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     T = true.shape[1]
     out = []
-    for t in range(T):
-        p, q = pred[:, t], true[:, t]                    # (Sp,K,R), (St,K,R)
-        cost = np.full((p.shape[0], q.shape[0]), np.nan)
-        for i in range(p.shape[0]):
-            for j in range(q.shape[0]):
-                d = _dist(p[i], q[j])
-                cost[i, j] = np.nanmean(d) if np.isfinite(d).any() else np.nan
-        big = np.nanmax(cost) + 1 if np.isfinite(cost).any() else 1.0
-        ri, ci = linear_sum_assignment(np.where(np.isfinite(cost), cost, big))
-        pairs = [(int(i), int(j), float(cost[i, j])) for i, j in zip(ri, ci)
-                 if np.isfinite(cost[i, j]) and cost[i, j] <= max_dist]
-        out.append(pairs)
+    with np.errstate(invalid='ignore'):
+        for t in range(T):
+            p, q = pred[:, t], true[:, t]                # (Sp,K,R), (St,K,R)
+            d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)          # (Sp,St,K)
+            ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
+            n_ok = ok.sum(-1)
+            cost = np.where(n_ok > 0, np.where(ok, d, 0.0).sum(-1) / np.maximum(n_ok, 1), np.nan)
+            big = np.nanmax(cost) + 1 if np.isfinite(cost).any() else 1.0
+            ri, ci = linear_sum_assignment(np.where(np.isfinite(cost), cost, big))
+            out.append([(int(i), int(j), float(cost[i, j])) for i, j in zip(ri, ci)
+                        if np.isfinite(cost[i, j]) and cost[i, j] <= max_dist])
     return out
 
 
-def mota(pred, true, max_dist, ignore=None) -> dict:
+def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
     """MOTA and its three components, with an explicit ignore region.
 
     MOTA = 1 - (misses + false positives + id switches) / labelled instances. Report the
     components: two methods with the same MOTA and different miss/FP splits are not the same
     method, and only MOTA replicates across seeds -- and only above a +-0.023 seed floor.
+
+    Args:
+        ignore: (St, T) bool -- instances asserted PRESENT but not annotated. 73% of a tracker's
+            false positives on rat-city were measured to be real animals the annotator skipped,
+            and counting them cost 0.017 MOTA.
+        ignore_boxes: (St, T, 4) xyxy for those instances. WITH boxes, an unmatched prediction is
+            excused only if its own centroid falls inside one. WITHOUT them there is nothing to
+            localise against, so presence alone excuses every unmatched prediction on the frame
+            -- which can zero the FP term outright. Either way the count is returned as
+            `fp_ignored` rather than folded silently into the score.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
-    matches = match_instances(pred, true, max_dist, ignore)
+    matches = match_instances(pred, true, max_dist)
     T = true.shape[1]
     true_present = np.isfinite(true).all(-1).any(-1)          # (St,T)
     pred_present = np.isfinite(pred).all(-1).any(-1)          # (Sp,T)
     if ignore is not None:
         ignore = np.asarray(ignore, bool)
+    if ignore_boxes is not None:
+        ignore_boxes = np.asarray(ignore_boxes, float)
 
-    misses = fps = switches = gt = 0
+    misses = fps = switches = gt = ignored = 0
     last = {}
+    with np.errstate(invalid='ignore'):
+        centroid = np.nanmean(pred, axis=2)                   # (Sp,T,R)
     for t in range(T):
         pairs = matches[t]
         matched_true = {j for _, j, _ in pairs}
@@ -143,13 +156,12 @@ def mota(pred, true, max_dist, ignore=None) -> dict:
         present = np.flatnonzero(true_present[:, t])
         gt += len(present)
         misses += sum(1 for j in present if j not in matched_true)
+        rows = np.flatnonzero(ignore[:, t]) if ignore is not None else np.empty(0, int)
         for i in np.flatnonzero(pred_present[:, t]):
             if i in matched_pred:
                 continue
-            if ignore is not None and ignore[:, t].any():
-                # An unmatched prediction that lands on a present-but-unannotated animal is
-                # neither a TP nor an FP. Without a box we cannot localise it, so the presence
-                # assertion alone suppresses one FP -- deliberately conservative.
+            if len(rows) and _in_ignore(centroid[i, t], rows, t, ignore_boxes):
+                ignored += 1
                 continue
             fps += 1
         for i, j, _ in pairs:
@@ -158,9 +170,28 @@ def mota(pred, true, max_dist, ignore=None) -> dict:
             last[j] = i
     return {'mota': 1.0 - (misses + fps + switches) / gt if gt else float('nan'),
             'misses': misses, 'fp': fps, 'idsw': switches, 'gt': gt,
+            'fp_ignored': ignored,
             'miss_rate': misses / gt if gt else float('nan'),
             'fp_rate': fps / gt if gt else float('nan'),
             'idsw_rate': switches / gt if gt else float('nan')}
+
+
+def _in_ignore(centroid, rows, t, ignore_boxes) -> bool:
+    """Does this prediction land on a present-but-unannotated animal?
+
+    No boxes -> the frame-wide fallback: presence alone excuses it. That is the blanket rule, and
+    it is why `fp_ignored` is reported.
+    """
+    if ignore_boxes is None:
+        return True
+    if not np.isfinite(centroid[:2]).all():
+        return False
+    x, y = centroid[0], centroid[1]
+    for j in rows:
+        b = ignore_boxes[j, t]
+        if np.isfinite(b).all() and b[0] <= x <= b[2] and b[1] <= y <= b[3]:
+            return True
+    return False
 
 
 def matched_error(pred, true, max_dist=np.inf) -> dict:
@@ -183,11 +214,18 @@ def matched_error(pred, true, max_dist=np.inf) -> dict:
         n_matched_inst += len(pairs[t])
         for i, j, _ in pairs[t]:
             dists.append(_dist(pred[i, t], true[j, t]))
+    # The POINT counts, not just the instance counts. The caller reports `err` over matched
+    # points and must report the coverage that produced it -- quoting a matched error beside a
+    # row-indexed coverage describes two different quantities as if they were one.
+    n_true = int(np.isfinite(true).all(-1).sum())
     if not dists:
         return {'err': float('nan'), 'median': float('nan'), 'coverage': 0.0,
-                'n_true_inst': n_true_inst, 'n_matched_inst': 0}
+                'n_true': n_true, 'n_matched': 0,
+                'n_true_inst': n_true_inst, 'n_matched_inst': 0,
+                'unmatched_true': n_true_inst}
     d = np.concatenate(dists)
     return {'err': float(np.nanmean(d)), 'median': float(np.nanmedian(d)),
-            'coverage': float(np.isfinite(d).sum() / max(1, np.isfinite(true).all(-1).sum())),
+            'coverage': float(np.isfinite(d).sum() / max(1, n_true)),
+            'n_true': n_true, 'n_matched': int(np.isfinite(d).sum()),
             'n_true_inst': n_true_inst, 'n_matched_inst': n_matched_inst,
             'unmatched_true': n_true_inst - n_matched_inst}

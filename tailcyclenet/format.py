@@ -471,6 +471,33 @@ class Session:
             self.labels(gid)
         self.__dict__.pop('_tables', None)
 
+    def cgroup(self, gid: str, frames=None, device='cpu') -> list[dict]:
+        """posetail cameras for a group, carrying per-frame extrinsics where a camera moves.
+
+        THE one place a camera group is built. There were five, and four of them silently dropped
+        `moving_ext` and used the static extrinsic instead.
+
+        `frames`:
+          - None       -> the whole group; a moving camera's `ext` is (T,4,4)
+          - a sequence -> (T_win,4,4) aligned to that window
+          - an INT     -> static (4,4) cameras at that one frame
+
+        The int form is what the per-frame consumers need. `project_cam` aligns a (T,4,4)
+        extrinsic against axis -3 of the points (cube.py:95-99), and cross-view association and
+        the box loader pass (S,K,3) whose axis -3 is the ANIMAL, not time -- so handing them a
+        (T,4,4) camera silently projects animal `i` through frame `i`'s pose.
+        """
+        moving = [n for n in self.cam_names if self.rig.moving[n]]
+        if not moving:
+            return self.rig.posetail(device=device)
+
+        import torch
+        ext = self.labels(gid).ext                      # (C,T,4,4), coverage already checked
+        sel = slice(None) if frames is None else frames
+        moving_ext = {n: torch.as_tensor(ext[i][sel], dtype=torch.float)
+                      for i, n in enumerate(self.cam_names) if self.rig.moving[n]}
+        return self.rig.posetail(device=device, moving_ext=moving_ext)
+
     def labels(self, gid: str) -> Labels:
         """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12."""
         if gid in self._label_cache:
@@ -525,22 +552,41 @@ class Session:
                 boxes[a, f, c] = box
 
         ext = None
-        if t['extrinsics'] is not None and any(self.rig.moving.values()):
+        moving = [n for n in self.rig.names if self.rig.moving[n]]
+        if moving:
+            # A gap here is NOT benign: the array is pre-filled with eye(4), which is a
+            # perfectly valid-looking extrinsic that puts the camera at the world origin. So the
+            # coverage is checked HERE rather than only in validate_session -- every consumer
+            # goes through labels(), and validation is opt-in.
             tab = t['extrinsics']
-            gcodes, gvals = _codes(tab, 'group_id')
-            if gid in gvals:
-                sel = np.flatnonzero(gcodes == gvals.index(gid))
-                ccodes, cvals = _codes(tab, 'camera')
-                c = _remap(ccodes, cvals, self._cam_vocab, 'camera', where, sel)
-                f = tab.column('frame').combine_chunks().to_numpy(
-                    zero_copy_only=False)[sel].astype(np.int64)
-                raw = np.stack(tab.column('ext').combine_chunks().to_numpy(
-                    zero_copy_only=False)[sel]).astype(np.float64)
-                ext = np.tile(np.eye(4), (C, T, 1, 1))
-                ext[c, f] = raw.reshape(-1, 4, 4)
-                for i, cam in enumerate(self.rig.cameras):
-                    if not self.rig.moving[cam.get_name()]:
-                        ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
+            gvals = _codes(tab, 'group_id')[1] if tab is not None else []
+            if tab is None or gid not in gvals:
+                raise FormatError(
+                    f'{where}: cameras {moving} are moving=true but extrinsics.pq has no rows '
+                    f'for this group')
+            gcodes, _ = _codes(tab, 'group_id')
+            sel = np.flatnonzero(gcodes == gvals.index(gid))
+            ccodes, cvals = _codes(tab, 'camera')
+            c = _remap(ccodes, cvals, self._cam_vocab, 'camera', where, sel)
+            f = tab.column('frame').combine_chunks().to_numpy(
+                zero_copy_only=False)[sel].astype(np.int64)
+            if f.size and (f.min() < 0 or f.max() >= T):
+                raise FormatError(f'{where}: extrinsics has a frame outside [0, {T})')
+            seen = np.zeros((C, T), bool)
+            seen[c, f] = True
+            for i, name in enumerate(self.rig.names):
+                if self.rig.moving[name] and not seen[i].all():
+                    raise FormatError(
+                        f'{where}: moving camera {name!r} has extrinsics for '
+                        f'{int(seen[i].sum())} of {T} frames; a gap would silently become the '
+                        f'identity pose')
+            raw = np.stack(tab.column('ext').combine_chunks().to_numpy(
+                zero_copy_only=False)[sel]).astype(np.float64)
+            ext = np.tile(np.eye(4), (C, T, 1, 1))
+            ext[c, f] = raw.reshape(-1, 4, 4)
+            for i, cam in enumerate(self.rig.cameras):
+                if not self.rig.moving[cam.get_name()]:
+                    ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
         out = Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
                      vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
@@ -872,7 +918,10 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if (~vis).any() and np.isfinite(xy[~vis]).any():
             bad(10, 'keypoints.pq has a non-visible row carrying coordinates')
 
-    # 13. extrinsics only for cameras declared moving
+    # 13. extrinsics only for cameras declared moving, and EVERY frame of every moving camera.
+    # A missing frame is not a gap: labels() pre-fills eye(4), so it reads as a real pose at the
+    # world origin. Reported here as well as raised in labels() so a bulk validate lists every
+    # bad session instead of stopping at the first.
     te = sess._tables['extrinsics']
     moving = {n for n in sess.cam_names if sess.rig.moving[n]}
     if te is not None and len(te):
@@ -880,6 +929,23 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         for name in cams:
             if name not in moving:
                 bad(13, f'extrinsics.pq names camera {name!r}, which is not moving=true')
+        gcodes, gvals = _codes(te, 'group_id')
+        frames = te.column('frame').combine_chunks().to_numpy(zero_copy_only=False)
+        ccodes, cvals = _codes(te, 'camera')
+        for gid, g in sess.groups.items():
+            if gid not in gvals:
+                bad(13, f'group {gid!r}: cameras {sorted(moving)} are moving=true but '
+                        f'extrinsics.pq has no rows for it')
+                continue
+            sel = gcodes == gvals.index(gid)
+            for name in sorted(moving):
+                if name not in cvals:
+                    bad(13, f'group {gid!r}: no extrinsics for moving camera {name!r}')
+                    continue
+                n = len(np.unique(frames[sel & (ccodes == cvals.index(name))]))
+                if n != g.n_frames:
+                    bad(13, f'group {gid!r} camera {name!r}: extrinsics for {n} of '
+                            f'{g.n_frames} frames')
     elif moving:
         bad(13, f'cameras {sorted(moving)} are moving=true but extrinsics.pq is absent/empty')
 

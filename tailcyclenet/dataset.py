@@ -160,7 +160,17 @@ class PoseDataset(Dataset):
 
         Train indexes at animal granularity and picks the start inside `__getitem__`, so a
         57,594-frame rat-city group costs 12 index entries instead of 691,000. Val and test
-        enumerate fixed non-overlapping windows so a metric is reproducible.
+        enumerate fixed windows so a metric is reproducible.
+
+        THE FIRST FRAME OF A WINDOW NEED NOT BE LABELLED, on either path. The old v4 loader
+        admitted a training window only if its first frame had a finite coordinate, so a group
+        whose labels sat in the middle yielded zero windows -- and the natural annotation shape,
+        a label with context on both sides, was silently unusable. Here the window is placed
+        around the label instead of the label being required at the window's edge.
+
+        Windows are also clamped into the group rather than running off the end: a start beyond
+        `n_frames - T` would be clamp-padded with duplicates of the last frame while real context
+        sat unused earlier in the group.
         """
         labelled = self._labelled_frames(vis, a)
         if labelled.size == 0:
@@ -170,7 +180,12 @@ class PoseDataset(Dataset):
         T = self.cfg.n_frames
         stride = self.cfg.val_stride or T
         lo, hi = int(labelled[0]), int(labelled[-1])
-        return list(range(lo, max(lo + 1, min(hi + 1, n_frames - T + 1)), stride))
+        limit = max(0, n_frames - T)
+        # Start half a window before the first label so the label sits inside the window rather
+        # than at frame 0 -- frame 0 is the one frame where per-frame anchoring contributes
+        # nothing, so putting every label there would measure the wrong thing.
+        first = int(np.clip(lo - T // 2, 0, limit))
+        return sorted({min(s, limit) for s in range(first, hi + 1, stride)}) or [0]
 
     def __len__(self):
         return len(self.index)

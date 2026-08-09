@@ -379,13 +379,17 @@ distinguished by `[provenance] annotator`.
   (`encoder_decoder.py:748`, `tracker_encoder.py:518`). Authoring `n_frames = 1` is fine;
   the loader duplicates or pads. Real context frames are better than a duplicated one — the
   duplication handicap was measured at **+0.405 mm (+41.8%)**.
-- **Prefer ≥ 2 labeled frames per group.** Frame 0's prediction is algebraically independent of
-  the triangulation, so it is the one frame where per-frame anchoring contributes nothing. One
-  label at frame 0 is admissible but forfeits the anchor on its only label.
-- **A label anywhere in the group is usable.** Unlike the old v4 loader — whose
-  `get_start_ixs_train` admitted a window only if its *first* frame had a finite coordinate, so a
-  group with a centered label yielded zero windows — this format's loader places the window
-  itself. Centered labels are the natural shape and are supported.
+- **A label anywhere in the group is usable, and a centered label is the preferred shape.**
+  Unlike the old v4 loader — whose `get_start_ixs_train` admitted a window only if its *first*
+  frame had a finite coordinate, so a group with a centered label yielded **zero** windows — this
+  loader places the window around the label rather than requiring the label at the window's edge.
+  It also avoids putting the label on frame 0, which is the one frame where per-frame anchoring
+  contributes nothing (frame 0's prediction is algebraically independent of the triangulation).
+  Both the training and the val/test paths are checked for this
+  (`tests/test_dataset.py::test_centred_labels_are_usable`).
+- **Give the label context on both sides when you can.** Nothing requires it, but a window that
+  can see before and after the labelled frame is what the temporal model is for. Context frames
+  need no labels of their own.
 
 ## 15. Alternatives considered
 

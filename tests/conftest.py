@@ -122,3 +122,31 @@ def dataset_2d(tiny_root):
 @pytest.fixture(scope='session')
 def dataset_3d(tiny_root):
     return fmt.load_dataset(tiny_root / 'mouselike')
+
+
+def _session_centred_labels(path, T=24, labelled=(11, 12, 13)):
+    """A group whose labels sit ONLY in the middle -- the shape the old loader could not use.
+
+    posetail-pose's `get_start_ixs_train` admitted a window only if its FIRST frame had a finite
+    coordinate, so a group like this yielded zero training windows and the natural annotation
+    shape (a label with context on both sides) was silently unusable.
+    """
+    W = H = 48
+    K = len(KPTS_3D)
+    rig = _rig([('cam0', W, H, False, False, 0)])
+    lab = fmt.empty_labels(1, T, K, 1, mode3d=False)
+    lab.vis2d[0, list(labelled), :, 0] = fmt.VISIBLE
+    lab.points2d[0, list(labelled), :, 0] = np.array(
+        [[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]], np.float32)
+    groups = {'g0': fmt.Group('g0', T)}
+    fmt.write_session(path, mode='2d', units='px', names=KPTS_3D, rig=rig,
+                      groups=groups, labels={'g0': lab})
+    _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
+    return list(labelled)
+
+
+@pytest.fixture(scope='session')
+def centred_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp('centred')
+    _session_centred_labels(root / 'mid' / 'train' / 's')
+    return root / 'mid'

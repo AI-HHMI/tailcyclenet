@@ -290,3 +290,56 @@ def test_no_visibility_supervision_without_ground_truth(tiny_root, monkeypatch):
     except SystemExit:
         pass
     assert seen == [(True, True)], 'a dataset without visibility labels must pass None, not zeros'
+
+
+# ----------------------------------------------------------------------------------------------
+# a label in the middle of a group must be usable -- on BOTH paths
+# ----------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('train', [True, False])
+@pytest.mark.parametrize('n_frames', [8, 24])
+def test_centred_labels_are_usable(centred_root, train, n_frames):
+    """The old loader required the window's FIRST frame to be labelled; this one does not.
+
+    A group with labels only at frames 11-13 must still yield windows, every window must contain
+    a label, and the label must not be forced to frame 0 -- frame 0 is the one frame where
+    per-frame anchoring contributes nothing.
+    """
+    cfg = LoaderConfig(n_frames=n_frames, image_size=32, aug_prob=0.0, crop_jitter=0.0,
+                       prompt_dropout=0.0)
+    ds = PoseDataset(centred_root, 'train', cfg, train=train)
+    assert len(ds) > 0, 'a group whose labels are centred must still produce windows'
+
+    n = 40 if train else len(ds)
+    at_frame_zero = 0
+    for i in range(n):
+        b = pose_collate([ds[i % len(ds)]])
+        finite = torch.isfinite(b.coords[0]).all(-1)          # (T,K)
+        assert finite.any(), 'every window must contain at least one labelled frame'
+        at_frame_zero += int(finite[0].any())
+    assert at_frame_zero < n, 'the label must not always land on frame 0'
+
+
+def test_val_windows_do_not_pad_when_the_group_is_long_enough(centred_root):
+    """A start past `n_frames - T` clamp-pads with duplicates of the last frame.
+
+    That wastes real context: with T=24 on a 24-frame group whose labels are at 11-13, starting
+    at the first labelled frame padded 13 duplicated frames while frames 0-10 sat unused.
+    """
+    cfg = LoaderConfig(n_frames=24, image_size=32, aug_prob=0.0, crop_jitter=0.0)
+    ds = PoseDataset(centred_root, 'train', cfg, train=False)
+    for item in ds.index:
+        assert 0 <= item.start <= max(0, item.session.groups[item.gid].n_frames - 24)
+    b = pose_collate([ds[0]])
+    assert b.sample_info['start'] == 0
+    assert b.fnums[0].tolist() == list(range(24)), 'no duplicated frames'
+
+
+def test_prompt_time_is_not_forced_to_zero(centred_root):
+    """prompt_t is the first LABELLED frame, which is > 0 whenever labels are centred."""
+    cfg = LoaderConfig(n_frames=24, image_size=32, aug_prob=0.0, crop_jitter=0.0,
+                       prompt_dropout=0.0)
+    ds = PoseDataset(centred_root, 'train', cfg, train=False)
+    b = pose_collate([ds[0]])
+    assert (b.prompt_t[0] == 11).all(), 'the prompt must point at the real first label'
+    assert torch.isfinite(b.kpt_prior[0]).all(), 'and the prior must be taken from there'

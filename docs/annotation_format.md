@@ -271,7 +271,7 @@ A camera appearing here must have `moving = true` in `calibration.toml`, and mus
 every frame of every group it appears in — a partially-specified moving camera is an error, not
 an interpolation request. Intrinsics and distortion stay time-invariant (posetail asserts this).
 
-This maps onto posetail 0.3.0's moving-camera support directly:
+This maps onto posetail's moving-camera support directly:
 `format_camera_group(cgroup, offset_dict, cam_type, device, moving_ext={name: (T,4,4)})`.
 
 ## 11. Validation contract
@@ -376,7 +376,7 @@ distinguished by `[provenance] annotator`.
 
 - **`n_frames = 1` groups are materialised as ≥ 2 frames by the loader.** `T = 1` routes posetail
   down its image path into the `gT = T // tubelet_size = 0` bug
-  (`encoder_decoder.py:748`, `tracker_encoder.py:518` in 0.3.0). Authoring `n_frames = 1` is fine;
+  (`encoder_decoder.py:748`, `tracker_encoder.py:518`). Authoring `n_frames = 1` is fine;
   the loader duplicates or pads. Real context frames are better than a duplicated one — the
   duplication handicap was measured at **+0.405 mm (+41.8%)**.
 - **Prefer ≥ 2 labeled frames per group.** Frame 0's prediction is algebraically independent of

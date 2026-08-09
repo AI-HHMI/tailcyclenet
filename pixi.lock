@@ -354,7 +354,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/66/b1/af3142c4a85cba6da9f4ebb5ff4e21e2616309552caca5e8acefe9840622/imgaug-0.4.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/66/ca/95aa4d0e5b7ea4f20e4d577c42d001ed9df207569fdb063cc5ed4ebb496b/yarl-1.24.5-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
-      - pypi: https://files.pythonhosted.org/packages/6d/48/d390fe02c6175c9a6f9996aca651e2a5b24e67fe24fe32fcc57a18fc6108/posetail-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/71/43/1947f06babed6b3f1d7f38b0c767f52df66bfb2bc10b468c4a7de9eceff2/aiohappyeyeballs-2.7.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/71/60/917329f640924b18ff085ab889a11c763e0b573da888e8404ff486657602/pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/74/4f/256aca690709e9b008b7108bc85fba619a2bc37c6d80743d18abad16ee09/uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
@@ -385,6 +384,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/a5/b9/2b8f0c0ce09c87a1daf80fd483431b56b1435d3f62789bc86f572e1245de/aiohttp-3.14.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/ab/b5/36c712098e6191d1b4e349304ef73a8d06aed77e56ceaac8c0a306c7bda1/jupyterlab_widgets-3.0.16-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/ad/66/0d785f0bc5e4315a96c989bb476d0fc07ea4f85132550c7b156ca2035d52/traitlets-5.16.1-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/af/5a/98e80aa96cab5a10f39294dfdd17af7cb5ad73645b58578bc7ac0052ed4a/posetail-0.3.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/b5/09/6ea3ea725f82e1e76684f0708bbedd871fc96da89945adeba65c3835a64c/nvidia_nvshmem_cu12-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/b5/70/5d8df3b09e25bce090399cf48e452d25c935ab72dad19406c77f4e828045/psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/bb/fe/1bcba1dfbfb8d01be8d93f07bfc502c93fa23afa6fd5ab3fc7c1df71038a/nvidia_cufile_cu12-1.13.1.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -5612,32 +5612,6 @@ packages:
   - multidict>=4.0
   - propcache>=0.2.1
   requires_python: '>=3.10'
-- pypi: https://files.pythonhosted.org/packages/6d/48/d390fe02c6175c9a6f9996aca651e2a5b24e67fe24fe32fcc57a18fc6108/posetail-0.3.0-py3-none-any.whl
-  name: posetail
-  version: 0.3.0
-  sha256: 393e24527f2342ca16f1889adf4a6a11325fb9e296fb5bd59884f143e211e12b
-  requires_dist:
-  - aniposelib>=0.7.0
-  - easydict==1.13
-  - einops==0.7.0
-  - opencv-python==4.9.0.80
-  - toml==0.10.2
-  - tomlkit>=0.12
-  - wandb==0.19.5
-  - lightning>=2.5.6,<3
-  - rerun-sdk[notebook]<=0.22.1
-  - numpy==1.26
-  - imgaug
-  - imagecorruptions
-  - setuptools<81
-  - schedulefree
-  - decord
-  - tqdm
-  - fastapi>=0.111
-  - uvicorn[standard]>=0.29
-  - python-multipart>=0.0.9
-  - requests>=2.31
-  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/71/43/1947f06babed6b3f1d7f38b0c767f52df66bfb2bc10b468c4a7de9eceff2/aiohappyeyeballs-2.7.1-py3-none-any.whl
   name: aiohappyeyeballs
   version: 2.7.1
@@ -6234,6 +6208,32 @@ packages:
   - pytest-mypy-testing ; implementation_name != 'pypy' and extra == 'test'
   - pytest>=7.0,<10.0 ; extra == 'test'
   requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/af/5a/98e80aa96cab5a10f39294dfdd17af7cb5ad73645b58578bc7ac0052ed4a/posetail-0.3.2-py3-none-any.whl
+  name: posetail
+  version: 0.3.2
+  sha256: f2bc436dd7fcbd64788e40aea9330c75ad54ae346541f005fc5c509c5044fdb9
+  requires_dist:
+  - aniposelib>=0.7.0
+  - easydict==1.13
+  - einops==0.7.0
+  - opencv-python==4.9.0.80
+  - toml==0.10.2
+  - tomlkit>=0.12
+  - wandb==0.19.5
+  - lightning>=2.5.6,<3
+  - rerun-sdk[notebook]<=0.22.1
+  - numpy==1.26
+  - imgaug
+  - imagecorruptions
+  - setuptools<81
+  - schedulefree
+  - decord
+  - tqdm
+  - fastapi>=0.111
+  - uvicorn[standard]>=0.29
+  - python-multipart>=0.0.9
+  - requests>=2.31
+  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/b5/09/6ea3ea725f82e1e76684f0708bbedd871fc96da89945adeba65c3835a64c/nvidia_nvshmem_cu12-3.4.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
   name: nvidia-nvshmem-cu12
   version: 3.4.5

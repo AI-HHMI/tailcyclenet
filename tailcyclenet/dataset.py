@@ -255,19 +255,19 @@ class PoseDataset(Dataset):
         else:
             coords = torch.as_tensor(lab.points3d[a][frames], dtype=torch.float32)
             if lab.vis2d is not None:
-                v2 = lab.vis2d[a][frames][:, :, cam_ix]            # (T,K,c), 3-state
-                # THE LOSS CANNOT SEE A THIRD STATE. posetail's visibility term is a plain
-                # `binary_cross_entropy_with_logits(..., reduction='mean')` with no missing-value
-                # mask (`losses.py:901`), so a NaN target does not merely get skipped -- the
-                # forward drops the term but its gradient still flows, and every parameter comes
-                # back NaN. (Measured: 36 of 40 steps skipped, loss finite the whole time.)
-                #
-                # `unlabeled` therefore collapses to "not visible" here. That is safe rather than
-                # merely convenient: vis2d is only unlabeled where the point has no 3D label
-                # either, so it carries no coordinate supervision in any case. The three-state
-                # distinction is preserved in the FORMAT, where it belongs; it is this consumer
-                # that cannot express it.
-                vis_2d = torch.as_tensor((v2 == VISIBLE).astype(np.float32))
+                v2 = lab.vis2d[a][frames][:, :, cam_ix]            # (T,K,c), three-state
+                # PER-CAMERA: three states, passed through as three states. NaN means "not
+                # assessed", and posetail >= 0.3.2 masks it out of the visibility BCE so those
+                # entries produce no gradient instead of being trained as "not visible". Under
+                # 0.3.0 a NaN here silently returned NaN gradients for every parameter while the
+                # loss curve looked healthy, and this had to be collapsed to two states.
+                vis_2d = torch.as_tensor(np.where(v2 == UNLABELED, np.nan,
+                                                  (v2 == VISIBLE).astype(np.float32)))
+                # 3D NOISY-OR: bool, and two-state by construction -- the loss inverts it with
+                # `~` to build its occluded-point target (`losses.py:440`), which no float can
+                # satisfy. That is the right semantics anyway: this layer answers "is the point
+                # reconstructible in 3D", and where no camera assessed it there is no 3D label
+                # either, so `False` is a fact rather than a guess.
                 vis = torch.as_tensor((v2 == VISIBLE).any(-1))
             else:
                 # No per-camera assessment (3dpop): let the loss derive both masks

@@ -14,7 +14,7 @@
 | `scripts/convert_v4.py` | 357 | the converter |
 
 **2,735 lines**, against posetail-pose's ~30,000. One architecture switch (`query`), one config
-per intent rather than 86 generated arms, 31 tests.
+per intent rather than 86 generated arms.
 
 ## Training works
 
@@ -61,17 +61,23 @@ subsets the cameras to one and adds `p2d`, and **never reassigns `coords`** — 
 world-metric. So the mode teaches metric 3D from a single view, which is one of the three
 settings this repo is for. Caught by reading the library rather than by any test.
 
-**2. A NaN visibility target silently destroys every gradient.** posetail's visibility term is a
-plain `binary_cross_entropy_with_logits(..., reduction='mean')` with no missing-value mask
-(`losses.py:901`). The format has three visibility states, so `unlabeled` mapped naturally to
-NaN — and the result was that the **forward loss stayed finite and healthy-looking while 36 of
-40 steps were skipped on a non-finite gradient**. The forward drops the NaN term; its gradient
-still flows.
+**2. A NaN visibility target silently destroyed every gradient — since fixed upstream.**
+posetail 0.3.0's visibility term was a plain
+`binary_cross_entropy_with_logits(..., reduction='mean')` with no missing-value mask. The format
+has three visibility states, so `unlabeled` mapped naturally to NaN — and the result was that the
+**forward loss stayed finite and healthy-looking while 36 of 40 steps were skipped on a
+non-finite gradient**. `TotalLoss` drops a non-finite sub-loss from its forward sum, but that
+filter is a `masked_select` whose backward hands the dropped element a real `0.0`, and
+`0.0 * (sigmoid(x) - NaN) = NaN`. Filtering is not detaching.
 
-`unlabeled` therefore collapses to "not visible" in the loader. That is safe rather than merely
-convenient: `vis2d` is only unlabeled where the point has no 3D label either, so it carries no
-coordinate supervision in any case. The three-state distinction stays in the format, where it
-belongs; it is this consumer that cannot express it.
+Fixed in **posetail 0.3.2** (`BCELossVis` masks non-finite targets; `TotalLoss` now raises naming
+any sub-loss that goes non-finite while still attached to the graph). The loader passes
+three-state `vis_2d` straight through, so on allen-mouse the ~18% of per-camera entries nobody
+assessed produce no gradient instead of being trained as "not visible".
+
+The 3D noisy-OR `vis` stays **bool**: the loss inverts it with `~` (`losses.py:440`), which no
+float survives. That is the right semantics anyway — the 3D layer answers "is this point
+reconstructible", and where no camera assessed it there is no 3D label either.
 
 Both the skip counter and the anomaly trace mattered. A trainer that did not count skips would
 have shown a perfectly plausible loss curve produced by 4 of 40 steps.

@@ -81,9 +81,12 @@ def _session_3d(path, T=4, moving=False):
     lab.points3d[:] = rng.uniform(-50, 50, size=(1, T, K, 3)).astype(np.float32)
     lab.vis3d[0, 1, 2] = fmt.MISSING
     lab.points3d[0, 1, 2] = np.nan
-    # per-camera visibility with NO x,y -- the rule 10 exemption
+    # per-camera visibility with NO x,y -- the rule 10 exemption.
+    # Three states on purpose: visible, assessed-but-occluded, and never assessed. The last one
+    # is what must survive to the loss as NaN rather than being collapsed into "not visible".
     lab.vis2d[:] = fmt.VISIBLE
     lab.vis2d[0, :, 0, 2] = fmt.MISSING
+    lab.vis2d[0, 1, 2] = fmt.UNLABELED          # keypoint 2, frame 1: nobody looked
     if moving:
         lab.ext = np.tile(np.eye(4), (3, T, 1, 1))
         for t in range(T):

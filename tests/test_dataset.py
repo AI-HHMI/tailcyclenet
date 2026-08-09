@@ -218,18 +218,75 @@ def test_prompt_dropout_withholds_priors(tiny_root):
     assert torch.isnan(b.kpt_prior).all()      # every keypoint unprompted -> learned tokens
 
 
-def test_vis_targets_carry_no_nan(tiny_root):
-    """posetail's visibility BCE has no missing-value mask.
+def test_visibility_stays_three_state(tiny_root):
+    """"Not assessed" must reach the loss as NaN, not as "not visible".
 
-    `losses.py:901` is a plain binary_cross_entropy_with_logits with reduction='mean'. A NaN
-    target does not get skipped: the forward drops the term but its gradient still flows, and
-    every parameter comes back NaN with the loss looking perfectly healthy. This cost 36 of 40
-    training steps before it was found, so the loader must never emit a NaN visibility target.
+    posetail >= 0.3.2 masks non-finite visibility targets, so an unassessed keypoint-camera pair
+    produces no gradient. Collapsing it to 0 instead would train the visibility head on ~18% of
+    allen-mouse's targets that nobody ever labelled. Under 0.3.0 the collapse was forced: a NaN
+    target there returned NaN gradients for every parameter while the loss looked healthy.
     """
-    for name in ('ratlike', 'mouselike'):
-        ds = PoseDataset(tiny_root / name, 'train', CFG)
-        for i in range(len(ds)):
-            b = pose_collate([ds[i]])
-            for t in (b.vis, b.vis_2d):
-                if t is not None:
-                    assert torch.isfinite(t).all(), f'{name}: NaN in a visibility target'
+    ds = PoseDataset(tiny_root / 'mouselike', 'train', CFG)
+    saw_unassessed = False
+    for i in range(len(ds)):
+        b = pose_collate([ds[i]])
+        if b.vis_2d is None:
+            continue
+        finite = b.vis_2d[torch.isfinite(b.vis_2d)]
+        assert set(finite.unique().tolist()) <= {0.0, 1.0}, 'assessed entries are 0 or 1'
+        saw_unassessed |= bool(torch.isnan(b.vis_2d).any())
+    assert saw_unassessed, 'the 3D fixture carries unassessed entries; they must survive as NaN'
+
+
+def test_gradients_survive_unassessed_visibility():
+    """The property the loader depends on, asserted against the INSTALLED posetail.
+
+    The failure this guards is invisible from the loss: it stays finite and falls normally while
+    every parameter receives NaN. Pinning it here means a dependency downgrade fails loudly
+    instead of quietly wasting a training run.
+    """
+    from posetail.posetail.losses import BCELossVis
+
+    pred = torch.zeros(2, 4, 3, 1, requires_grad=True)
+    target = torch.randint(0, 2, (2, 4, 3, 1)).float()
+    target[0, 1, 2, 0] = float('nan')          # not assessed
+    loss = BCELossVis(weight=1.0)(pred, target, device='cpu')
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(pred.grad).all(), (
+        'installed posetail poisons the gradient on an unassessed visibility target; '
+        'needs >= 0.3.2')
+
+
+def test_no_visibility_supervision_without_ground_truth(tiny_root, monkeypatch):
+    """A dataset with no visibility labels must not have its visibility head trained.
+
+    3dpop, rat-city and branson-fly ship no per-camera visibility, so the loader emits
+    `vis = vis_2d = None`. posetail then sets `valid_vis = False` and hard-zeros BOTH visibility
+    terms (`losses.py:493-508`). It still DERIVES a geometric `vis_true` -- but only to mask the
+    coordinate losses, never to supervise visibility.
+
+    That distinction matters: the geometric proxy is "does the GT point project inside the
+    image", which the model could compute from its own prediction. Training the visibility head
+    against it would teach a tautology and call it supervision.
+    """
+    from posetail.posetail.losses import TotalLoss
+
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG)   # a 2D root: no visibility labels
+    b = _batch(ds)
+    assert b.vis is None and b.vis_2d is None
+
+    seen = []
+    real = TotalLoss.forward
+
+    class Spy(TotalLoss):
+        def forward(self, model, outputs, coords_true, vis_true, vis_true_cams, **kw):
+            seen.append((vis_true is None, vis_true_cams is None))
+            raise SystemExit                      # we only need the arguments, not the loss
+
+    spy = Spy(vis_loss_weight=5.0, vis_loss_3d_weight=1.0)
+    try:
+        spy(None, {}, b.coords, b.vis, b.vis_2d)
+    except SystemExit:
+        pass
+    assert seen == [(True, True)], 'a dataset without visibility labels must pass None, not zeros'

@@ -49,7 +49,7 @@ pixi run python -c "import posetail, tailcyclenet"
 pixi run test
 ```
 
-`posetail==0.3.0` comes from **PyPI**, pinned. A checkout of the same version lives at
+`posetail==0.3.2` comes from **PyPI**, pinned. A checkout of the same version lives at
 `../../posetail/posetail-next` for reading source; do not depend on it by path and do not modify
 it. (posetail-pose's `path = "../posetail-next"` dep is how it ended up importing nothing after a
 directory move.)
@@ -174,7 +174,7 @@ against the crop rule directly.
    same shape. The fix existed on the abandoned `memory` branch
    (`gT = feat.shape[1] // (gH*gW)`) and was **lost in the moving-cams merge**. Never sample
    fewer than 2 frames; single-frame groups are padded at ingest.
-2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.0.**
+2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x.**
    Encoder sharing for inference goes through `SceneRepresentation` directly, or the private
    `_forward_window` / `_decode_from_scene`.
 3. **`batch_size` is structurally 1.** `custom_collate` keeps only item 0's `cgroup`
@@ -187,16 +187,16 @@ against the crop rule directly.
    `occlusion+1` into `[0,2]`. Never share that tensor between the two consumers.
 6. **`vis` and `vis_2d` are both-or-neither** — supplying one dies inside einops. And
    `get_eval_metrics` wants the trailing dim `(B,T,N,1)`.
-7. **The crop rule is exact, not approximate.** `crop.py` is lifted verbatim from posetail-pose's
-   verified copy (`crop_box_for_points` does not exist in 0.3.0 — it was a `memory`-branch
+8. **The crop rule is exact, not approximate.** `crop.py` is lifted verbatim from posetail-pose's
+   verified copy (`crop_box_for_points` does not exist in 0.3.x — it was a `memory`-branch
    method). A test asserts it is int32-exact against `crop_cgroup_to_points`. If that fails,
    every detector number is invalid.
-8. **Moving-camera inference is not supported upstream.**
+9. **Moving-camera inference is not supported upstream.**
    `inference_utils.load_camera_group_from_metadata` ignores `moving_cams` entirely; we build the
    camera group ourselves via `format_camera_group(..., moving_ext={cam: (T,4,4)})`. Only
    `TrackerEncoder` is moving-cam-safe — `ScorerEncoder` and `TrackerTapNext` shape-error on
    `(T,3)` centres.
-9. **allen-mouse's npz is column-sorted.** `pose3d.npz['pose']` is ordered by
+10. **allen-mouse's npz is column-sorted.** `pose3d.npz['pose']` is ordered by
    `sorted(f'{name}_{axis}')` while `keypoints` is name-sorted, which transposes all 8
    `X` / `X-base` pairs — 16 of 47 keypoints. The converter applies the permutation once. Zipping
    `pose` against `keypoints` silently mislabels them and nothing downstream notices.

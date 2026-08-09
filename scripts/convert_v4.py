@@ -267,7 +267,7 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
 
             for session_id, ts, ms, rig in buckets:
                 dst = out / split / session_id
-                groups, labels = {}, {}
+                groups, labels, empty = {}, {}, []
                 for t, m in zip(ts, ms):
                     gid = t.name
                     pix = trial_pixels(t, rig.names)
@@ -278,6 +278,12 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                     if n_pose != T:
                         print(f'   ! {session_id}/{gid}: pose has {n_pose} frames, pixels have '
                               f'{T}; truncated to {T}')
+                    if not lab.animal_ids:
+                        # v4's score-cleaning can NaN out an entire trial (3dpop val Pigeon01
+                        # Sequence49 is 16 frames of nothing). A group with no labels carries no
+                        # supervision, so drop it -- loudly, never silently.
+                        empty.append(gid)
+                        continue
                     groups[gid] = fmt.Group(
                         gid, T,
                         fps=float(m['fps']) if m and 'fps' in m else float('nan'),
@@ -290,10 +296,13 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                         for cam, (kind, s) in pix.items():
                             link(gdir / (cam if kind == 'frames' else cam + s.suffix), s)
 
+                note = f'  [dropped {len(empty)} all-NaN group(s)]' if empty else ''
                 print(f'   {split}/{session_id}: {len(groups)} group(s), '
                       f'{sum(g.n_frames for g in groups.values())} frames, '
-                      f'{len(rig)} cam(s)')
-                if dry_run:
+                      f'{len(rig)} cam(s){note}')
+                if dry_run or not groups:
+                    if not groups:
+                        print(f'   ! {split}/{session_id}: no labelled groups, session not written')
                     continue
                 fmt.write_session(
                     dst, mode=spec['mode'], units=spec['units'], names=list(spec['names']),

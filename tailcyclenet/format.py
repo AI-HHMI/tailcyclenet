@@ -191,14 +191,21 @@ def _codes(table: pa.Table, col: str) -> tuple[np.ndarray, list[str]]:
 
 
 def _remap(codes: np.ndarray, values: list[str], vocab: dict[str, int],
-           what: str, where: str) -> np.ndarray:
-    """Translate dictionary codes into `vocab` indices. Unknown value is a FormatError."""
-    lut = np.empty(len(values), dtype=np.int32)
-    for i, v in enumerate(values):
-        if v not in vocab:
-            raise FormatError(f'{where}: unknown {what} {v!r}')
-        lut[i] = vocab[v]
-    return lut[codes]
+           what: str, where: str, sel: np.ndarray | None = None) -> np.ndarray:
+    """Translate dictionary codes into `vocab` indices, restricted to `sel` rows.
+
+    The restriction matters: a parquet dictionary is per FILE, not per group, so a session whose
+    groups hold different numbers of animals has `animal_id` values in the dictionary that the
+    group being read has never heard of. Validating the whole dictionary rejected every
+    branson-fly session, where the fly count varies 5..10 between trials.
+    """
+    lut = np.array([vocab.get(v, -1) for v in values], dtype=np.int32)
+    codes = codes if sel is None else codes[sel]
+    out = lut[codes]
+    if (out < 0).any():
+        unknown = sorted({values[c] for c in np.unique(codes[out < 0])})
+        raise FormatError(f'{where}: unknown {what} {unknown[0]!r}')
+    return out
 
 
 def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
@@ -268,21 +275,21 @@ def _scatter(table, gid, T, kpt_vocab, cam_vocab, animals, where, per_camera, n_
         raise FormatError(f'{where}: group {gid!r} has a frame outside [0, {T})')
 
     acodes, avals = _codes(table, 'animal_id')
-    a = _remap(acodes, avals, animals, 'animal_id', where)[sel]
+    a = _remap(acodes, avals, animals, 'animal_id', where, sel)
 
     k = None
     if 'bodypart' in table.column_names:
         kcodes, kvals = _codes(table, 'bodypart')
-        k = _remap(kcodes, kvals, kpt_vocab, 'bodypart', where)[sel]
+        k = _remap(kcodes, kvals, kpt_vocab, 'bodypart', where, sel)
 
     c = None
     if per_camera:
         ccodes, cvals = _codes(table, 'camera')
-        c = _remap(ccodes, cvals, cam_vocab, 'camera', where)[sel]
+        c = _remap(ccodes, cvals, cam_vocab, 'camera', where, sel)
 
     scodes, svals = _codes(table, 'status')
     enum = INST_STATUS if n_extra == 4 else KPT_STATUS
-    status = _remap(scodes, svals, enum, 'status', where)[sel]
+    status = _remap(scodes, svals, enum, 'status', where, sel)
 
     return sel, a, frame, k, c, status
 
@@ -501,7 +508,7 @@ class Session:
             if gid in gvals:
                 sel = np.flatnonzero(gcodes == gvals.index(gid))
                 ccodes, cvals = _codes(tab, 'camera')
-                c = _remap(ccodes, cvals, self._cam_vocab, 'camera', where)[sel]
+                c = _remap(ccodes, cvals, self._cam_vocab, 'camera', where, sel)
                 f = tab.column('frame').combine_chunks().to_numpy(
                     zero_copy_only=False)[sel].astype(np.int64)
                 raw = np.stack(tab.column('ext').combine_chunks().to_numpy(

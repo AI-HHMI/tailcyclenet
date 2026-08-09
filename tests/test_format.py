@@ -190,3 +190,32 @@ def test_unknown_bodypart_is_an_error(tmp_path):
     sess = fmt.Session.load(tmp_path / 'ds' / 'train' / 'a')
     with pytest.raises(fmt.FormatError, match='unknown bodypart'):
         sess.labels('g000')
+
+
+def test_animal_count_may_vary_between_groups(tmp_path):
+    """A parquet dictionary is per FILE, not per group.
+
+    branson-fly sessions hold 5..10 flies depending on the trial, so a session's `animal_id`
+    dictionary names animals that any individual group has never seen. Reading one group must
+    not trip over the others' animals.
+    """
+    from aniposelib.cameras import CameraGroup
+
+    W = H = 32
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
+                  calibrated={'cam0': False})
+    groups, labels = {}, {}
+    for gid, n_animals in (('g_small', 2), ('g_big', 5)):
+        lab = fmt.empty_labels(n_animals, 2, len(KPTS_2D), 1, mode3d=False)
+        lab.vis2d[:] = fmt.VISIBLE
+        lab.points2d[..., 0, :] = 10.0
+        groups[gid] = fmt.Group(gid, 2)
+        labels[gid] = lab
+
+    path = tmp_path / 'ds' / 'train' / 's'
+    fmt.write_session(path, mode='2d', units='px', names=KPTS_2D, rig=rig,
+                      groups=groups, labels=labels)
+    sess = fmt.Session.load(path)
+    assert sess.labels('g_small').n_animals == 2
+    assert sess.labels('g_big').n_animals == 5

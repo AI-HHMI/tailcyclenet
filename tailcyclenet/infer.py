@@ -133,6 +133,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     n_src = boxes_stc.shape[0] if boxes_stc is not None else src.shape[0]
     S = n_src if cfg.max_animals == 0 else min(n_src, cfg.max_animals)
     cam_ix = list(range(len(session.rig)))
+    # A DETECTOR ROW IS NOT A LABEL ROW. `S` comes from the box source, which on the deployment
+    # path is the detector and can offer more animals than the session ever labelled -- so `src`
+    # is indexable only up to its own length, and the surplus rows get an invented id.
+    n_lab = 0 if src is None else len(src)
+    animal_ids = [lab.animal_ids[a] if a < len(lab.animal_ids) else f'det{a:02d}'
+                  for a in range(S)]
 
     pred = np.full((S, T_total, K, R), np.nan, np.float32)
     conf = np.full((S, T_total, K), np.nan, np.float32)
@@ -197,8 +203,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             if len(views) != len(cam_ix):
                 continue
 
-            prior, prompt_t = _build_prior(cfg, carried[a], src[a], frames, boxes, scales,
-                                           mode, K, R)
+            prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,
+                                           frames, boxes, scales, mode, K, R)
             dev = cfg.device
             chunk = cfg.kpt_chunk or None
             out = model([v.to(dev) for v in views], kpt_ids.to(dev), _to_device(cgroup, dev),
@@ -218,10 +224,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy()
                 conf[a, frames] = v.reshape(len(frames), K)
-            carried[a] = (torch.as_tensor(p[-cfg.overlap] if cfg.overlap else p[-1]),
-                          int(frames[-cfg.overlap] if cfg.overlap else frames[-1]))
+            # The pose the NEXT window opens on. Clamped from the front: a group shorter than
+            # `overlap` gives a window with fewer frames than the step, and a plain negative
+            # index runs off the start of it.
+            j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
+            carried[a] = (torch.as_tensor(p[j]), int(frames[j]))
 
-    return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(lab.animal_ids[:S], object),
+    return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
             'mode': mode, 'group_id': gid, 'session': session.session_id,
             'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total,
             'boxes_from': 'detector' if boxes_stc is not None else
@@ -234,6 +243,8 @@ def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R):
         return None, None
     if cfg.anchor == 'labels':
         # ORACLE. Ground truth as the prior; not a deployment number.
+        if src_animal is None:                   # a detector row with no label row behind it
+            return None, None
         p = torch.as_tensor(src_animal[frames[0]], dtype=torch.float32)
     else:                                    # 'carry'
         if carried is None:

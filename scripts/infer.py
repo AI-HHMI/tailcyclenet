@@ -98,9 +98,15 @@ def main():
             key = f'{sess.session_id}/{gid}'
             det_boxes = None
             if det is not None:
-                det_boxes = detect_group(det, det_wh, sess, gid,
-                                         args.max_animals or 1, device=device,
+                # Default to what the session actually holds, not to 1. `detect_group` caps
+                # detections at this count, so a bare --detector run on a ten-animal dataset
+                # used to return one animal per frame and read as a catastrophic miss rate
+                # rather than as a missing flag.
+                n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
+                det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
                                          score_thresh=args.det_score)
+                print(f'{key}: detecting up to {n_want} animal(s)'
+                      f'{"" if args.max_animals else " (from the labels; set --max-animals)"}')
             out = run_group(model, sess, gid, registry, ds_name, cfg,
                             box_points=boxes.get(key), boxes_stc=det_boxes)
             results[key] = out

@@ -216,10 +216,19 @@ def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
 
 
 def write_table(path: Path, rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> None:
-    """Write a tidy-long table, dictionary-encoding the columns the spec says are dictionaries."""
+    """Write a tidy-long table, dictionary-encoding the columns the spec says are dictionaries.
+
+    Non-finite floats are written as NULL, not as NaN. The spec says a `missing` row's `x,y` are
+    empty, and a null is what "empty" means in parquet -- it costs a validity bit instead of four
+    bytes, and any other reader sees the absence rather than a sentinel it has to know about.
+    """
     arrays, names = [], []
     for name, values in rows.items():
-        arr = pa.array(values)
+        values = np.asarray(values) if not isinstance(values, list) else values
+        if isinstance(values, np.ndarray) and values.dtype.kind == 'f':
+            arr = pa.array(values, mask=~np.isfinite(values))
+        else:
+            arr = pa.array(values)
         if name in dict_cols:
             arr = arr.dictionary_encode()
         arrays.append(arr)

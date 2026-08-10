@@ -126,14 +126,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     K = session.n_keypoints
     R = 3 if mode == '3d' else 2
     T_total = group.n_frames
-    kpt_ids = torch.as_tensor(registry.ids_for(dataset_name), dtype=torch.long)[None]
-    # The registry is per DATASET and the keypoint axis is per SESSION; format rule 3 makes them
-    # agree. When they do not, the mismatch surfaces 80 lines later as a broadcast error against
-    # the output array, naming neither the session nor the registry.
-    assert kpt_ids.shape[1] == K, (
-        f'{session.session_id}: session has {K} keypoints but the registry gives '
-        f'{kpt_ids.shape[1]} for dataset {dataset_name!r}; sessions in one dataset must share '
-        f'`names` (annotation_format rule 3)')
+    # The registry is per DATASET and the keypoint axis is per SESSION -- and `scripts/infer.py`
+    # will happily hand us a bare session directory. `ids_for` aligns to the axis we actually
+    # hold, by name, so a session that reorders the root's keypoints or carries a subset of them
+    # is predicted correctly instead of being silently relabelled.
+    kpt_ids = torch.as_tensor(registry.ids_for(dataset_name, session.names),
+                              dtype=torch.long)[None]
+    assert kpt_ids.shape[1] == K
 
     src = box_points if box_points is not None else (
         lab.points3d if mode == '3d' else lab.points2d[..., 0, :])

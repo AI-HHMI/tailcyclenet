@@ -727,10 +727,28 @@ class Dataset:
 
     @property
     def names(self) -> list[str]:
-        for group in self.sessions.values():
-            if group:
-                return group[0].names
-        raise FormatError(f'{self.root}: no sessions')
+        """The root's keypoint axis: the UNION of its sessions' names, in load order.
+
+        A session may declare the same names in a different order, or only a subset of them --
+        `allen-mouse-combined` holds 80 hand-annotated sessions in anatomical order beside a
+        tracked one in name-sorted order. Ids are handed out against THIS list and then remapped
+        per session by `Registry.ids_for`, which is what keeps a session's dense K axis (built
+        from its own `_kpt_vocab`) attached to the right embedding rows.
+
+        Order is deterministic -- `SPLITS` is a fixed tuple and `load_dataset` sorts `iterdir()`
+        -- and for a root whose sessions all agree this is exactly the first session's list, so
+        no existing registry's ids move.
+        """
+        names: list[str] = []
+        seen: set[str] = set()
+        for sess in self.all_sessions():
+            for n in sess.names:
+                if n not in seen:
+                    seen.add(n)
+                    names.append(n)
+        if not names:
+            raise FormatError(f'{self.root}: no sessions')
+        return names
 
     def all_sessions(self) -> list[Session]:
         return [s for group in self.sessions.values() for s in group]
@@ -792,11 +810,42 @@ class Registry:
     def n_keypoints(self) -> int:
         return len(self.names)
 
-    def ids_for(self, dataset: str) -> np.ndarray:
+    def ids_for_dataset(self, dataset: str) -> np.ndarray:
+        """Global ids in the DATASET's own name order, i.e. aligned to `Dataset.names`."""
         for name, ids in self.datasets:
             if name == dataset:
                 return np.asarray(ids, dtype=np.int64)
         raise KeyError(f'{dataset!r} is not in this registry: {[d for d, _ in self.datasets]}')
+
+    def local_names(self, dataset: str) -> list[str]:
+        """That dataset's own keypoint names, un-prefixed, in registry-id order."""
+        got = [self.names[i] for i in self.ids_for_dataset(dataset)]
+        p = f'{dataset}-'
+        return [n[len(p):] for n in got] if all(n.startswith(p) for n in got) else got
+
+    def ids_for(self, dataset: str, names) -> np.ndarray:
+        """Global ids ALIGNED TO `names` -- the keypoint axis the caller actually holds.
+
+        `names` is required and not defaulted. A per-dataset id vector applied to a session that
+        declares the same names in a different order is a silent relabel: the session scatters
+        its rows through its own `_kpt_vocab`, so `nose` coordinates would train the `L-ear`
+        embedding row and nothing downstream would notice (gotcha #4). A session may carry any
+        SUBSET of the dataset's names, in any order; a name the dataset does not have is an
+        error, loudly.
+        """
+        ids = self.ids_for_dataset(dataset)
+        local = self.local_names(dataset)
+        names = list(names)
+        if names == local:
+            return ids
+        ix = {n: i for i, n in enumerate(local)}
+        unknown = [n for n in names if n not in ix]
+        if unknown:
+            raise FormatError(
+                f'{dataset}: keypoints {unknown} are not in this registry. The registry holds '
+                f'{len(local)} names for this dataset; a session may reorder them or use a '
+                f'subset, but not invent one. Retrain, or fix the session\'s `names`.')
+        return ids[[ix[n] for n in names]]
 
     @classmethod
     def build(cls, datasets: list[Dataset], base: 'Registry | None' = None) -> 'Registry':
@@ -990,11 +1039,17 @@ def validate_dataset(ds: Dataset, check_images: bool = True) -> list[str]:
     sessions = ds.all_sessions()
     if not sessions:
         return [f'{ds.root}: no sessions']
-    # 3. cross-session agreement on names
-    ref = sessions[0]
-    for s in sessions[1:]:
-        if s.names != ref.names:
-            errs.append(f'{s.path}: [rule 3] names differ from {ref.path}')
+    # 3. cross-session agreement on names. A WARNING, not an error: `Registry.ids_for` resolves a
+    # session's axis BY NAME, so a reordering or a subset is handled rather than mislabelled. It
+    # is still worth saying out loud -- a "missing" keypoint is usually a typo, not a decision.
+    axis = ds.names
+    for s in sessions:
+        if s.names == axis:
+            continue
+        missing = [n for n in axis if n not in set(s.names)]
+        what = (f'is missing {len(missing)} of the root\'s {len(axis)} keypoints ({missing})'
+                if missing else 'declares the root\'s keypoints in a different order')
+        errs.append(f'{s.path}: [rule 3 WARNING] {what}; resolved by name')
     # 14. leak: a session folder name used in more than one split
     seen: dict[str, str] = {}
     for split, group in ds.sessions.items():

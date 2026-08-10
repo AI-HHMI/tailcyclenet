@@ -188,7 +188,7 @@ def test_mixed_2d_and_3d_in_one_run(tiny_root):
         b = pose_collate([ds[i % len(ds)]])
         modes.add(b.sample_info['mode'])
         ids = b.kpt_ids[0].tolist()
-        assert ids == list(ds.registry.ids_for(b.sample_info['dataset']))
+        assert ids == list(ds.registry.ids_for_dataset(b.sample_info['dataset']))
     assert modes == {'2d', '3d'}
 
 
@@ -218,7 +218,7 @@ def test_registry_appends_a_new_dataset_without_moving_old_ids(tiny_root, tmp_pa
     base = Registry.build(load_datasets(tiny_root))
     grown = Registry.build(load_datasets(tiny_root) + [_FakeDataset('zzz', ['a', 'b'])], base)
     assert grown.names[:len(base.names)] == base.names
-    assert list(grown.ids_for('zzz')) == [len(base.names), len(base.names) + 1]
+    assert list(grown.ids_for_dataset('zzz')) == [len(base.names), len(base.names) + 1]
 
 
 class _FakeDataset:

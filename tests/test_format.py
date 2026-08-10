@@ -97,7 +97,7 @@ def test_discovery_dataset_vs_collection(tiny_root):
 def test_registry_single_dataset_does_not_prefix(dataset_2d):
     reg = fmt.Registry.build([dataset_2d])
     assert list(reg.names) == KPTS_2D
-    np.testing.assert_array_equal(reg.ids_for('ratlike'), [0, 1, 2, 3])
+    np.testing.assert_array_equal(reg.ids_for_dataset('ratlike'), [0, 1, 2, 3])
 
 
 def test_registry_prefixes_across_datasets(dataset_2d, dataset_3d):
@@ -105,7 +105,11 @@ def test_registry_prefixes_across_datasets(dataset_2d, dataset_3d):
     assert reg.n_keypoints == len(KPTS_2D) + len(KPTS_3D)
     assert 'ratlike-nose' in reg.names and 'mouselike-nose' in reg.names
     # disjoint id blocks: a shared bare name must not collide across datasets
-    assert set(reg.ids_for('ratlike')).isdisjoint(set(reg.ids_for('mouselike')))
+    assert set(reg.ids_for_dataset('ratlike')).isdisjoint(set(reg.ids_for_dataset('mouselike')))
+    # ... and a session still asks in its own BARE names, so the prefix has to come back off
+    assert reg.local_names('ratlike') == KPTS_2D
+    np.testing.assert_array_equal(reg.ids_for('ratlike', KPTS_2D[::-1]),
+                                  reg.ids_for_dataset('ratlike')[::-1])
 
 
 def test_registry_is_append_only(dataset_2d, dataset_3d, tmp_path):
@@ -116,9 +120,72 @@ def test_registry_is_append_only(dataset_2d, dataset_3d, tmp_path):
     assert fmt.Registry.load(p) == first
 
     grown = fmt.Registry.build([dataset_2d, dataset_3d], base=first)
-    np.testing.assert_array_equal(grown.ids_for('ratlike'), first.ids_for('ratlike'))
-    np.testing.assert_array_equal(grown.ids_for('mouselike'), first.ids_for('mouselike'))
+    for name in ('ratlike', 'mouselike'):
+        np.testing.assert_array_equal(grown.ids_for_dataset(name), first.ids_for_dataset(name))
     assert grown.names[:first.n_keypoints] == first.names
+
+
+def _rewrite_names(path, names):
+    """Restate a session's keypoint axis. Legal: the parquet tables are keyed by NAME."""
+    import tomllib
+
+    import toml
+    cfg = path / 'session.toml'
+    with open(cfg, 'rb') as f:
+        doc = tomllib.load(f)
+    doc['names'] = list(names)
+    cfg.write_text(toml.dumps(doc))
+
+
+def _drop_keypoint(path, name):
+    """A session that never labelled one keypoint: off the axis AND out of the tables."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+    _rewrite_names(path, [n for n in KPTS_2D if n != name])
+    t = pq.read_table(path / 'keypoints.pq')
+    keep = pc.not_equal(t.column('bodypart').cast(pa.string()), name)
+    pq.write_table(t.filter(keep), path / 'keypoints.pq', compression='zstd')
+
+
+def test_ids_follow_each_sessions_own_keypoint_axis(tmp_path):
+    """A session may reorder the root's keypoints, or carry only some of them.
+
+    Both used to be silent relabels: the session scatters its rows through its OWN `names`
+    (`_kpt_vocab`), while the id vector came from the FIRST session's list. Same length,
+    different order, `nose` coordinates training the `left_ear` embedding row -- gotcha #4, and
+    invisible in the loss curve. `Registry.ids_for` now resolves by name.
+    """
+    root = tmp_path / 'ds'
+    lab_a = _session_2d(root / 'train' / 'a')
+    lab_b = _session_2d(root / 'train' / 'b')
+    _session_2d(root / 'train' / 'c')
+    _rewrite_names(root / 'train' / 'b', KPTS_2D[::-1])
+    _drop_keypoint(root / 'train' / 'c', 'left_ear')
+
+    ds = fmt.load_dataset(root)
+    a, b, c = (ds.sessions['train'][i] for i in range(3))
+    assert ds.names == KPTS_2D                        # the union, in load order
+    assert b.names == KPTS_2D[::-1] and c.n_keypoints == len(KPTS_2D) - 1
+
+    reg = fmt.Registry.build([ds])
+    for s in (a, b, c):
+        ids = reg.ids_for('ds', s.names)
+        assert [reg.names[i] for i in ids] == s.names, s.path
+
+    # the id permutation and the DATA permutation agree: same name -> same coordinates
+    for k, name in enumerate(b.names):
+        np.testing.assert_allclose(b.labels('g000').points2d[..., k, 0, :],
+                                   lab_b.points2d[..., KPTS_2D.index(name), 0, :])
+    np.testing.assert_allclose(lab_a.points2d, a.labels('g000').points2d)
+
+    # reordering and subsetting are reported, not fatal
+    warns = _rule(fmt.validate_dataset(ds, check_images=False), 3)
+    assert len(warns) == 2 and all('WARNING' in w for w in warns)
+
+    # a name the root does not have is still an error, and it says which
+    with pytest.raises(fmt.FormatError, match='snoot'):
+        reg.ids_for('ds', ['snoot'] + KPTS_2D[1:])
 
 
 # ----------------------------------------------------------------------------------------------

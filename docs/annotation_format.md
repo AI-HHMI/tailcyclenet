@@ -30,8 +30,9 @@ labels**, not what shape the data has. This format encodes that and nothing else
 3. **Multi-animal from the start.** `animal_id` is a cross-view, cross-frame identity.
 4. **The 3D layer is first-class.** A session may carry native 3D, native per-camera 2D, or both.
    3D is *not* required to be derived from 2D.
-5. **`mode` is a per-session property.** One `train/` may hold 2D and 3D sessions together;
-   cross-session agreement covers `names` only.
+5. **`mode` is a per-session property.** One `train/` may hold 2D and 3D sessions together.
+   Sessions need not agree on `names` either: the keypoint axis is per session, and a consumer
+   resolves it **by name** against the root's union (§4, rule 3).
 6. **`status` is the visibility channel**, in every label table. There is no separate `vis`
    column and no NaN-means-something convention.
 7. **Sparsity is a row count, not a mode.** A row exists only where a determination was made; a
@@ -97,11 +98,19 @@ created        = "YYYY-MM-DD"
 There is no dataset `name`, no `session_id` and no `fps`: the folder name is the session id, and
 fps is declared per group (§6).
 
-- **Keypoint names live here, per session.** Every session under one dataset root must carry
-  identical `names` (validation rule 3). `mode` and `units` may differ between sessions — that is
-  what lets a `train/` mix 2D and 3D.
+- **Keypoint names live here, per session, and `names` is that session's keypoint axis.** Sessions
+  under one dataset root need not carry identical `names`: a session may list the same keypoints
+  in a different order, or only a **subset** of them. The root's axis is the **union** of its
+  sessions' names, and a consumer maps each session onto it by name. `mode` and `units` may differ
+  too — that is what lets a `train/` mix 2D and 3D.
+
+  A session must, however, hold up its own end: a `bodypart` in a table that is not in that
+  session's `names` is an error (rule 6). Dropping a keypoint from `names` means dropping its
+  rows. Validation rule 3 reports the disagreements it sees, because a "missing" keypoint is more
+  often a typo than a decision.
 - The tables are **name-indexed**, which is what makes a keypoint-axis ordering mistake
-  impossible to carry forward. See §13 for why that matters.
+  impossible to carry forward, and what makes the mixed-`names` root above safe rather than
+  merely tolerated. See §13 for why that matters.
 - `skeleton` and `flip_pairs` are optional and expected to be empty for most data — they are
   needed only for bone-length diagnostics and bilateral flip augmentation. When present, every
   name must be in `names`, and `flip_pairs` lists each pair **once** (the involution is its
@@ -269,8 +278,10 @@ Checkable rules, so a validator can be written without re-deriving them.
    the folder name; the split is its parent folder name.
 2. `names` has no duplicates; every `skeleton` / `flip_pairs` name is in `names`; no keypoint
    appears in two flip pairs with different partners, and no pair maps a name to itself.
-3. **Cross-session agreement:** every session under one dataset root carries identical `names`.
-   `mode` and `units` may differ.
+3. **Cross-session agreement (WARNING, not an error):** a session whose `names` are a reordering
+   of, or a subset of, the root's union is reported and then resolved by name. `mode` and `units`
+   may differ. There is no failing case here — a name no other session has simply widens the
+   union, which is why the warning names it.
 4. `calibration.toml` exists, and its camera `name`s are exactly the camera dirs/videos present
    under every group. Every camera has a non-empty `name`, a `size` and an `offset`.
 5. `mode = "3d"` ⇒ ≥ 2 cameras, each with `matrix`, `rotation`, `translation`.

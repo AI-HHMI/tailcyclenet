@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -142,10 +143,17 @@ class PoseDataset(Dataset):
         # its own copy of a 44 MB table (12 workers x rat-city would be half a gigabyte).
         self.index: list[_Item] = []
         self.by_dataset: list[list[int]] = []
+        # Ids are per SESSION, not per dataset: a session may declare the root's keypoints in a
+        # different order or use only a subset of them, and its dense K axis follows its OWN
+        # `names`. Resolved here so a root that cannot be mapped fails at construction rather
+        # than in the middle of an epoch.
+        self._kpt_ids: dict[Path, torch.Tensor] = {}
         for di, ds in enumerate(self.datasets):
             mine = []
             for sess in ds.sessions.get(split, []):
                 sess.preload()
+                self._kpt_ids[sess.path] = torch.as_tensor(
+                    self.registry.ids_for(ds.name, sess.names), dtype=torch.long)
                 for gid, group in sess.groups.items():
                     lab = sess.labels(gid)
                     vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
@@ -376,8 +384,7 @@ class PoseDataset(Dataset):
             drop = torch.as_tensor(rng.random(K) < self.cfg.prompt_dropout)
             kpt_prior[drop] = float('nan')
 
-        kpt_ids = torch.as_tensor(self.registry.ids_for(self.datasets[item.ds].name),
-                                  dtype=torch.long)
+        kpt_ids = self._kpt_ids[sess.path]      # aligned to THIS session's axis, not the root's
         query_times = torch.zeros(K, dtype=torch.int32)
         query_occlusion = torch.full((K, len(cgroup)), -1, dtype=torch.int64)
         row = {'dataset': self.datasets[item.ds].name, 'session': sess.session_id,
@@ -419,7 +426,9 @@ def pose_collate(batch):
     """posetail's collate for the first ten fields, plus this repo's three.
 
     `custom_collate` keeps only item 0's `cgroup` and asserts a batch does not mix 2D and 3D --
-    which is why batch_size is structurally 1 here and why there is no DDP.
+    which is why batch_size is structurally 1 here and why there is no DDP. The same reason
+    covers K: sessions may carry different keypoint subsets, so a batch that mixed two of them
+    would fail the `kpt_ids` stack below. Loud, and unreachable at batch_size 1.
     """
     batch = [b for b in batch if b is not None]
     out = custom_collate([b[:10] for b in batch])

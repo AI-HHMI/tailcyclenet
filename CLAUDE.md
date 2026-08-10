@@ -82,8 +82,11 @@ Five things that are easy to get wrong:
   session — rat-city's train/val/test are one recording — so a session-level field could not
   express them.
 - **`mode` is per-session.** One `train/` may hold 2D and 3D sessions; the model trains on both
-  and both head-bank slots (`mode_idx` 0 and 1) get gradient. Cross-session agreement covers
-  `names` only.
+  and both head-bank slots (`mode_idx` 0 and 1) get gradient. Sessions need not agree on `names`
+  either: `Dataset.names` is the **union** over the root's sessions and `Registry.ids_for` remaps
+  each session's own axis onto it **by name**, so a session may reorder the keypoints or carry a
+  subset of them. `allen-mouse-combined` is exactly this — 80 hand-annotated sessions in
+  anatomical order beside a tracked one in name-sorted order.
 - **A group is a contiguous clip**, `n_frames` unbounded. rat-city's 57,594 frames are ONE group
   whose `cam0` is a single symlink. ~900 symlinks across all four datasets, not 550k.
 - **`status` is the visibility channel**, in both label tables. Dictionary-encoded in parquet, so

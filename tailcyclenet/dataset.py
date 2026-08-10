@@ -39,7 +39,7 @@ from posetail.datasets.posetail_dataset import (custom_collate, rotate_camera_im
 from posetail.posetail.cube import is_point_visible, project_points_torch
 
 from . import crop as cropmod
-from .format import MISSING, UNLABELED, VISIBLE, Registry, load_datasets
+from .format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
 
 
 @dataclass
@@ -458,7 +458,11 @@ class PoseDataset(Dataset):
                 # entries produce no gradient instead of being trained as "not visible". Under
                 # 0.3.0 a NaN here silently returned NaN gradients for every parameter while the
                 # loss curve looked healthy, and this had to be collapsed to two states.
-                vis_2d = torch.as_tensor(np.where(v2 == UNLABELED, np.nan,
+                # `projected` joins UNLABELED on the NaN side: it is a POSITION with no
+                # visibility claim (johnson-mouse labels all 24 keypoints in all 16 views,
+                # including ones the body hides), so training BCE on it would teach the head
+                # "always visible" from 1.4M points that assert nothing.
+                vis_2d = torch.as_tensor(np.where(np.isin(v2, (UNLABELED, PROJECTED)), np.nan,
                                                   (v2 == VISIBLE).astype(np.float32)))
                 # 3D NOISY-OR: bool, and two-state by construction -- the loss inverts it with
                 # `~` to build its occluded-point target (`losses.py:440`), which no float can
@@ -466,6 +470,12 @@ class PoseDataset(Dataset):
                 # reconstructible in 3D", and where no camera assessed it there is no 3D label
                 # either, so `False` is a fact rather than a guess.
                 vis = torch.as_tensor((v2 == VISIBLE).any(-1))
+                if not torch.isfinite(vis_2d).any():
+                    # Nothing in this window carries a visibility ASSESSMENT -- every row is
+                    # `projected`. There is no noisy-OR to take: all-False would assert that no
+                    # point is reconstructible in 3D, which is a stronger lie than all-True.
+                    # Drop to the 3dpop path and let the loss derive both masks geometrically.
+                    vis = vis_2d = None
             else:
                 # No per-camera assessment (3dpop): let the loss derive both masks
                 # geometrically. vis and vis_2d are both-or-neither -- one without the other

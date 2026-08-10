@@ -212,9 +212,12 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
                 continue
             kp = np.asarray(a['keypoints'], dtype=np.float64).reshape(K, 3)
             seen = kp[:, 2] > 0
-            # flag 0 is a real (if near-extinct: 18 rows in train) assessed-but-absent mark
-            lab.vis2d[0, t, ~seen, ci] = fmt.MISSING
-            lab.vis2d[0, t, seen, ci] = fmt.VISIBLE
+            # PROJECTED, not VISIBLE. The source flags 1,235,334 points "visible" against 18 "not
+            # visible" across 16 views of a mouse on a dome -- the far-side limbs cannot all have
+            # been seen, so these are inferred positions and the visibility flag asserts nothing.
+            # The 18 zero-flag points carry (0,0), the source's null marker, so they get no row at
+            # all: `missing` would claim someone looked and judged them occluded (spec 13).
+            lab.vis2d[0, t, seen, ci] = fmt.PROJECTED
             lab.points2d[0, t, seen, ci] = kp[seen, :2].astype(np.float32)
 
             x, y, w, h = (float(v) for v in a['bbox'])

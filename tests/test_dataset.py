@@ -618,3 +618,28 @@ def test_prompt_time_is_not_forced_to_zero(centred_root):
     b = pose_collate([ds[0]])
     assert (b.prompt_t[0] == 11).all(), 'the prompt must point at the real first label'
     assert torch.isfinite(b.kpt_prior[0]).all(), 'and the prior must be taken from there'
+
+
+def test_projected_carries_position_but_trains_no_visibility(projected_root):
+    """`projected` is a 2D position with no visibility claim, and must reach the loss as neither.
+
+    johnson-mouse asks its annotators to place all 24 keypoints in all 16 views, inferring the
+    ones the body hides, and flags 1,235,334 of them "visible" against 18 "not". Written as
+    `visible` that trains the per-camera head toward "always visible" from labels that assert
+    nothing. Written as `missing` the positions are lost. The failure mode one level up is worse:
+    the 3D noisy-OR `any(status == visible)` reads all-False and claims no point is
+    reconstructible, so the whole visibility target has to be withheld, not merely masked.
+    """
+    from tailcyclenet import format as fmt
+
+    sess = fmt.Session.load(projected_root / 'train' / 's')
+    assert not [e for e in fmt.validate_session(sess) if 'WARNING' not in e]
+
+    lab = sess.labels('g000')
+    assert (lab.vis2d == fmt.PROJECTED).all()
+    assert np.isfinite(lab.points2d).all(), 'a projected row carries its position'
+
+    cfg = LoaderConfig(n_frames=2, image_size=32, aug_prob=0.0, crop_jitter=0.0)
+    b = pose_collate([PoseDataset(projected_root, 'train', cfg, train=False)[0]])
+    assert b.vis is None and b.vis_2d is None, 'no visibility target may be built from projected'
+    assert torch.isfinite(b.coords).any(), 'the 3D targets still arrive'

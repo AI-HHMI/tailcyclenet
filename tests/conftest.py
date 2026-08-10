@@ -133,6 +133,39 @@ def dataset_3d(tiny_root):
     return fmt.load_dataset(tiny_root / 'mouselike')
 
 
+def _session_projected(path, T=4):
+    """johnson-mouse's shape: per-camera 2D POSITIONS with no visibility assessment anywhere.
+
+    Every 2D row is `projected` -- the annotator placed the point in this view but never judged
+    whether it was actually seen there. The positions must survive, and no visibility target may
+    be built from them, in either direction: `visible` would train "always visible" and the
+    noisy-OR of "no camera says visible" would train "nothing is reconstructible".
+    """
+    W, H = 64, 48
+    rig = _rig([(f'cam{i}', W, H, True, False, i + 1) for i in range(3)])
+    K = len(KPTS_3D)
+    lab = fmt.empty_labels(1, T, K, 3, mode3d=True, animal_ids=['m1'])
+    rng = np.random.default_rng(7)
+    lab.vis3d[:] = fmt.VISIBLE
+    lab.points3d[:] = rng.uniform(-20, 20, size=(1, T, K, 3)).astype(np.float32)
+    lab.vis2d[:] = fmt.PROJECTED
+    lab.points2d[:] = rng.uniform(5, 40, size=(1, T, K, 3, 2)).astype(np.float32)
+
+    groups = {'g000': fmt.Group('g000', T, fps=100.0)}
+    fmt.write_session(path, mode='3d', units='mm', names=KPTS_3D, rig=rig, groups=groups,
+                      labels={'g000': lab}, provenance={'source': 'synthetic'})
+    for name in rig.names:
+        _write_frames(path / 'groups' / 'g000', name, T, (W, H))
+    return lab
+
+
+@pytest.fixture(scope='session')
+def projected_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp('projected')
+    _session_projected(root / 'proj' / 'train' / 's')
+    return root / 'proj'
+
+
 def _session_centred_labels(path, T=24, labelled=(11, 12, 13)):
     """A group whose labels sit ONLY in the middle -- the shape the old loader could not use.
 

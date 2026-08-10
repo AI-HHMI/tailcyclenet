@@ -25,11 +25,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # Visibility codes, shared by points3d and keypoints. -1 doubles as "no row".
-UNLABELED, MISSING, VISIBLE = -1, 0, 1
+# PROJECTED is a position with NO visibility claim: the annotator placed the point in this view
+# but never judged whether it was actually seen there. Consumers must not train visibility on it.
+UNLABELED, MISSING, VISIBLE, PROJECTED = -1, 0, 1, 2
+# The statuses that carry coordinates.
+POSITIONED = (VISIBLE, PROJECTED)
 # Instance codes. -1 doubles as "no row" == no determination.
 INST_NONE, INST_ABSENT, INST_PRESENT, INST_LABELED = -1, 0, 1, 2
 
-KPT_STATUS = {'unlabeled': UNLABELED, 'missing': MISSING, 'visible': VISIBLE}
+KPT_STATUS = {'unlabeled': UNLABELED, 'missing': MISSING, 'visible': VISIBLE,
+              'projected': PROJECTED}
 INST_STATUS = {'absent': INST_ABSENT, 'present': INST_PRESENT, 'labeled': INST_LABELED}
 IMAGE_EXTS = ('.png', '.jpg')
 VIDEO_EXTS = ('.mp4', '.avi')
@@ -547,7 +552,7 @@ class Session:
             if r is not None:
                 sel, a, f, k, _, status = r
                 vis3d[a, f, k] = status
-                m = status == VISIBLE
+                m = np.isin(status, POSITIONED)
                 n = len(t['points3d'])
                 xyz = np.stack([_floats(t['points3d'], c, n)[sel] for c in 'xyz'], -1)
                 points3d[a[m], f[m], k[m]] = xyz[m]
@@ -560,7 +565,7 @@ class Session:
             if r is not None:
                 sel, a, f, k, c, status = r
                 vis2d[a, f, k, c] = status
-                m = status == VISIBLE
+                m = np.isin(status, POSITIONED)
                 n = len(t['keypoints'])
                 xy = np.stack([_floats(t['keypoints'], q, n)[sel] for q in 'xy'], -1)
                 points2d[a[m], f[m], k[m], c[m]] = xy[m]
@@ -973,26 +978,27 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if n and len(table.select(cols).group_by(list(cols)).aggregate([])) != n:
             bad(9, f'{stem}.pq has duplicate keys')
 
-    # 10. a visible row carries its coordinates
+    # 10. a positioned row (visible or projected) carries its coordinates
+    positioned = ('visible', 'projected')
     t3 = sess._tables['points3d']
     if t3 is not None and len(t3):
         st, vals = _codes(t3, 'status')
-        vis = np.isin(st, [i for i, v in enumerate(vals) if v == 'visible'])
+        vis = np.isin(st, [i for i, v in enumerate(vals) if v in positioned])
         xyz = np.stack([_floats(t3, c, len(t3)) for c in 'xyz'], -1)
         if vis.any() and not np.isfinite(xyz[vis]).all():
             bad(10, 'points3d.pq has a visible row without x,y,z')
         if (~vis).any() and np.isfinite(xyz[~vis]).any():
-            bad(10, 'points3d.pq has a non-visible row carrying coordinates')
+            bad(10, 'points3d.pq has a missing/unlabeled row carrying coordinates')
 
     tk = sess._tables['keypoints']
     if tk is not None and len(tk):
         st, vals = _codes(tk, 'status')
-        vis = np.isin(st, [i for i, v in enumerate(vals) if v == 'visible'])
+        vis = np.isin(st, [i for i, v in enumerate(vals) if v in positioned])
         xy = np.stack([_floats(tk, c, len(tk)) for c in 'xy'], -1)
         if vis.any() and not np.isfinite(xy[vis]).all() and t3 is None:
             bad(10, 'keypoints.pq has a visible row without x,y and there is no 3D layer')
         if (~vis).any() and np.isfinite(xy[~vis]).any():
-            bad(10, 'keypoints.pq has a non-visible row carrying coordinates')
+            bad(10, 'keypoints.pq has a missing/unlabeled row carrying coordinates')
 
     # 13. extrinsics only for cameras declared moving, and EVERY frame of every moving camera.
     # A missing frame is not a gap: labels() pre-fills eye(4), so it reads as a real pose at the

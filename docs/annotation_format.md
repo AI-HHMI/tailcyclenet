@@ -183,8 +183,8 @@ One row per **assessed** (group, frame, animal, camera, bodypart).
 |---|---|---|---|
 | `group_id`, `animal_id`, `camera`, `bodypart` | dictionary\<int32,str\> | ✓ | the key |
 | `frame` | int32 | ✓ | 0-based index into the group |
-| `status` | dictionary\<int8,str\> | ✓ | `visible` \| `missing` \| `unlabeled` |
-| `x`, `y` | float32 | | stored-image px; **null** unless `visible`. See the rule below. |
+| `status` | dictionary\<int8,str\> | ✓ | `visible` \| `projected` \| `missing` \| `unlabeled` |
+| `x`, `y` | float32 | | stored-image px; **null** unless `visible` or `projected`. See below. |
 | `score` | float32 | | confidence in [0,1]; null for human labels |
 
 - **`visible`** — the point is there. `x,y` are required **unless** a `points3d` row exists for
@@ -192,6 +192,16 @@ One row per **assessed** (group, frame, animal, camera, bodypart).
   observation*: "visible in this camera; the position is in the 3D layer". This exists because
   some pipelines produce a genuine per-camera visibility array with no per-camera 2D at all, and
   reprojecting the 3D to manufacture an `x,y` would present a derived number as an observation.
+- **`projected`** — a position with **no visibility claim**. `x,y` are required and mean the same
+  thing they do on a `visible` row; what is absent is the judgement about whether the point was
+  actually seen in this camera. This is the common case for a source that asks its annotators to
+  place every keypoint in every view, inferring the ones the body hides, and never records
+  occlusion at all: johnson-mouse marks 1,235,334 points "visible" against 18 "not visible" across
+  16 views of a mouse, which is not an assessment anyone made. Writing those as `visible` would
+  train a visibility head toward "always visible" from labels that assert nothing; writing them as
+  `missing` would throw the positions away. **Consumers must exclude `projected` from any
+  visibility target** — it contributes a position and nothing else. It is a 2D-layer status:
+  `points3d.pq` has no per-camera visibility question to leave open.
 - **`missing`** — looked at, judged occluded or outside the frame. `x,y` are null: an occluded
   point is not annotated. The occluded-vs-outside distinction is deliberately collapsed; it is
   resolved downstream by reprojecting derived 3D whenever 3D exists.
@@ -298,11 +308,11 @@ Checkable rules, so a validator can be written without re-deriving them.
    `keypoints.pq`, `(group_id, frame, animal_id, bodypart)` for `points3d.pq`,
    `(group_id, frame, animal_id, camera)` for `instances.pq`, `(group_id, frame, camera)` for
    `extrinsics.pq`.
-10. A `visible` row has its coordinates: `points3d.pq` requires `x,y,z`; `keypoints.pq` requires
-    `x,y` **unless** a `points3d` row exists for the same key. `missing` and `unlabeled` rows have
-    null coordinates in both tables.
-11. If `instances.pq` exists, every `visible`/`missing` keypoint row has a matching instance row
-    with `status = labeled`, and a `labeled` instance has at least one `visible`/`missing` row.
+10. A positioned row — `visible` or `projected` — has its coordinates: `points3d.pq` requires
+    `x,y,z`; `keypoints.pq` requires `x,y` **unless** a `points3d` row exists for the same key.
+    `missing` and `unlabeled` rows have null coordinates in both tables.
+11. If `instances.pq` exists, every positioned or `missing` keypoint row has a matching instance
+    row with `status = labeled`, and a `labeled` instance has at least one such row.
     `unlabeled` rows are exempt — they are progress markers. Fewer than `K` assessed rows is
     legal.
 12. `mode = "3d"` with per-camera 2D: every `animal_id` with ≥ 2 `labeled` views triangulates
@@ -322,10 +332,10 @@ to do it before forking any worker processes so the arrays are shared rather tha
 
 ```
 animal_ids  (S,)                       str, sorted
-points3d    (S, T, K, 3)    float32    NaN where not visible
+points3d    (S, T, K, 3)    float32    NaN where not positioned
 vis3d       (S, T, K)       int8       -1 unlabeled/absent, 0 missing, 1 visible
-points2d    (S, T, K, C, 2) float32    NaN where not visible or not observed
-vis2d       (S, T, K, C)    int8       same codes
+points2d    (S, T, K, C, 2) float32    NaN where not positioned or not observed
+vis2d       (S, T, K, C)    int8       same codes, plus 2 projected (position, no claim)
 boxes       (S, T, C, 4)    float32    NaN where no box
 instance    (S, T, C)       int8       -1 none, 0 absent, 1 present(ignore), 2 labeled
 ext         (C, T, 4, 4)    float64    only when a camera is moving
@@ -338,11 +348,17 @@ in the group; `T` the group's `n_frames`.
 comparison — this is the whole reason `status` is dictionary-encoded, and it is why the format is
 parquet rather than CSV. Scattering costs well under a second for a few million rows.
 
-**A note on the third state.** Many training losses accept only a two-state visibility target. If
-yours does, be careful how you collapse `unlabeled`: mapping it to "not visible" trains the model
-on an assertion nobody made. Mapping it to a masked-out value is correct, and a loss that
-silently accepts `NaN` may not do what you expect — check that the *gradient* survives, not just
-that the loss is finite.
+**A note on the non-assertive states.** Many training losses accept only a two-state visibility
+target. If yours does, be careful how you collapse `unlabeled` and `projected`: mapping either to
+"not visible" trains the model on an assertion nobody made. Mapping them to a masked-out value is
+correct, and a loss that silently accepts `NaN` may not do what you expect — check that the
+*gradient* survives, not just that the loss is finite.
+
+The same care applies one level up. A 3D visibility target built as a noisy-OR over cameras
+(`any(status == visible)`) reads all-`False` on a session that is entirely `projected`, which
+asserts that no point is reconstructible — a stronger falsehood than the all-`True` the naive
+encoding would have produced. When nothing in a window carries an assessment, supply no visibility
+target at all and let the loss derive one geometrically.
 
 ## 13. Converting from an array format
 

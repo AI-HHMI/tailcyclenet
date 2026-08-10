@@ -91,7 +91,12 @@ Five things that are easy to get wrong:
 - **A group is a contiguous clip**, `n_frames` unbounded. rat-city's 57,594 frames are ONE group
   whose `cam0` is a single symlink. ~900 symlinks across all four datasets, not 550k.
 - **`status` is the visibility channel**, in both label tables. Dictionary-encoded in parquet, so
-  `vis = codes == VISIBLE` is a vectorized int8 compare.
+  `vis = codes == VISIBLE` is a vectorized int8 compare. But **coordinates live on `VISIBLE` *or*
+  `PROJECTED`** (`fmt.POSITIONED`): `projected` is a position with no visibility claim, for a
+  source that had its annotators place every keypoint in every view and never recorded occlusion
+  (johnson-mouse: 1,235,334 "visible" vs 18 "not"). It must never reach a visibility target —
+  `dataset.py` NaNs it out, and withholds `vis`/`vis_2d` entirely when a window has no assessment
+  at all, because the noisy-OR would otherwise assert that nothing is reconstructible in 3D.
 - **`keypoints.pq` `x,y` may be null on a `visible` row** iff a `points3d` row exists for the same
   key. That row is a *visibility observation* — allen-mouse ships a real per-camera
   `vis (S,T,K,7)` with no per-camera 2D, and this is how it is kept without inventing positions.

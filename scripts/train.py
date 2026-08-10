@@ -351,6 +351,7 @@ def main():
                 log(wb, {f'val_self/{k}': v for k, v in ms.items()}, it)
                 if np.isfinite(m.get('mpjpe', np.nan)) and m['mpjpe'] < best_mpjpe:
                     best_mpjpe, best_iter = m['mpjpe'], it
+                    save_checkpoint(run, it, model, opt, config, name='best')
                 # Plateaus in this project break late -- one arm stalled 2600 iterations and then
                 # improved -- so the stopping rule reads a number instead of an eyeball.
                 log(wb, {'val/no_new_best_span': it - best_iter}, it)

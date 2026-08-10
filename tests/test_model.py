@@ -214,6 +214,25 @@ def test_mismatched_image_size_is_rejected():
         check_image_size({'model': {'image_size': 256}, 'data': {'image_size': 128}})
 
 
+def test_resolve_checkpoint_prefers_last(tmp_path):
+    """`last` is the default by name, not by sort order, and old numbered folders still resolve."""
+    from tailcyclenet.checkpoints import resolve_checkpoint
+
+    with pytest.raises(FileNotFoundError):
+        resolve_checkpoint(tmp_path)
+
+    # An external base-checkpoint folder: numbered names, newest by name.
+    for n in (1000, 2000):
+        (tmp_path / f'checkpoint_{n:08d}.pth').touch()
+    assert resolve_checkpoint(tmp_path).name == 'checkpoint_00002000.pth'
+
+    # A run folder: `last` is the default, and no sort order gets a say in it.
+    (tmp_path / 'checkpoint_best.pth').touch()
+    (tmp_path / 'checkpoint_last.pth').touch()
+    assert resolve_checkpoint(tmp_path).name == 'checkpoint_last.pth'
+    assert resolve_checkpoint(tmp_path, 'checkpoint_best.pth').name == 'checkpoint_best.pth'
+
+
 def test_moving_camera_query_projects_per_frame(moving_batch):
     """The query anchor must project to a DIFFERENT pixel each frame on a moving camera.
 

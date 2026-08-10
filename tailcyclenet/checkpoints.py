@@ -11,7 +11,6 @@ a silent accuracy loss, so both are saved explicitly and `load_run` defaults to 
 """
 from __future__ import annotations
 
-import time
 import tomllib
 from pathlib import Path
 
@@ -46,12 +45,16 @@ def check_image_size(config: dict) -> None:
         f'scaling the 3D residual by {int(model_px) / int(data_px):g}.')
 
 
-def resolve_checkpoint(folder: Path, checkpoint: str | None = None, min_age_s: float = 60.0):
-    """The newest complete checkpoint in `folder`.
+def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
+    """An explicit name, else `checkpoint_last.pth`, else the newest by name.
 
-    The age guard is not paranoia: these files are ~5.6 GB, and a half-written one is
-    indistinguishable from a complete one to `glob`. Picking one up mid-write fails deep inside
-    `torch.load` with an error that names nothing.
+    `checkpoint_last.pth` is the default DELIBERATELY, not by alphabetical accident: it is the
+    weight a run resumes from. Pass `checkpoint='checkpoint_best.pth'` for the best-val one.
+
+    The newest-by-name fallback is for external base-checkpoint folders, which still carry
+    `checkpoint_00001000.pth`-style names (`[training].checkpoint_path` in configs/w9.toml), and
+    for run folders written before the two-file scheme. There is no half-written file to guard
+    against -- `save_checkpoint` renames into place atomically.
     """
     folder = Path(folder)
     if checkpoint:
@@ -59,15 +62,13 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None, min_age_s: f
         if not p.exists():
             raise FileNotFoundError(p)
         return p
+    last = folder / 'checkpoint_last.pth'
+    if last.exists():
+        return last
     files = sorted(folder.glob('checkpoint_*.pth'))
     if not files:
         raise FileNotFoundError(f'{folder}: no checkpoint_*.pth')
-    now = time.time()
-    ready = [f for f in files if now - f.stat().st_mtime >= min_age_s]
-    if not ready:
-        # Everything is young; the newest may still be being written, so take the one before it.
-        ready = files[:-1] or files
-    return ready[-1]
+    return files[-1]
 
 
 def save_run_meta(run: Path, config: dict, registry: Registry) -> None:
@@ -77,12 +78,18 @@ def save_run_meta(run: Path, config: dict, registry: Registry) -> None:
     registry.save(run / 'keypoint_registry.toml')
 
 
-def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict) -> Path:
-    """Save both schedule-free iterates.
+def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
+                    name: str = 'last') -> Path:
+    """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
     `model_state` is the raw training weight (resume from this). `model_state_eval` is the
     averaged weight (evaluate with this) and is captured by flipping the optimizer into eval
     mode, which swaps the model's parameter tensors in place, then flipping back.
+
+    Only two names are ever written -- `last` and `best` -- because these files are ~5.6 GB and a
+    60k-iteration run kept a dozen of them. Overwriting in place is only safe because the write
+    goes to a sibling temp file and is renamed atomically: a reader never sees a partial file, so
+    there is nothing for `resolve_checkpoint` to guard against.
     """
     ckpt_dir = run / 'checkpoints'
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -92,11 +99,13 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict) -
         optimizer.eval()
         eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         optimizer.train()
-    path = ckpt_dir / f'checkpoint_{iteration:08d}.pth'
+    path = ckpt_dir / f'checkpoint_{name}.pth'
+    tmp = path.with_suffix('.tmp')
     torch.save({'iteration': iteration, 'model_state': state,
                 'model_state_eval': eval_state,
                 'optimizer_state': optimizer.state_dict(), 'model_config': config.get('model')},
-               path)
+               tmp)
+    tmp.replace(path)
     return path
 
 

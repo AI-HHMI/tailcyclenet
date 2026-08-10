@@ -130,6 +130,29 @@ def base_registry(run: Path, checkpoint_path):
     return None
 
 
+def timed(loader, acc):
+    """Yield from `loader`, accumulating seconds spent BLOCKED on the next batch into `acc[0]`.
+
+    This is the starvation canary, and it is the only honest way to answer "is the loader
+    bottlenecking the GPU" -- `sec_per_it` folds data wait and compute together, so a loader that
+    is fine and a loader that is starving look identical in it.
+
+    What it measures is genuine: the step ahead of it ends in `float(loss.detach())`, which syncs
+    the GPU, so any time `next()` blocks is time the GPU spent idle waiting for pixels. Wrapping
+    the iterator rather than timing inside the loop body keeps it correct across the `continue`
+    paths that skip a non-finite step.
+    """
+    it = iter(loader)
+    while True:
+        t = time.time()
+        try:
+            batch = next(it)
+        except StopIteration:
+            return
+        acc[0] += time.time() - t
+        yield batch
+
+
 def to_device(batch, device):
     views = [v.to(device, non_blocking=True) for v in batch.views]
     cgroup = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
@@ -302,8 +325,9 @@ def main():
     opt.train()
     it, skipped, t0, running, clipped = 0, 0, time.time(), [], []
     best_mpjpe, best_iter = float('inf'), 0
+    waited = [0.0]
     while it < n_iter:
-        for batch in loader:
+        for batch in timed(loader, waited):
             if it >= n_iter:
                 break
             loss, _ = run_batch(model, loss_fn, batch, device)
@@ -329,9 +353,14 @@ def main():
             it += 1
 
             if it % print_freq == 0:
-                dt = (time.time() - t0) / print_freq
+                elapsed = time.time() - t0
+                dt = elapsed / print_freq
+                # The fraction of wall time the GPU spent waiting for pixels. Near zero means the
+                # loader is keeping up and no amount of loader work will speed this run up;
+                # anything large is the signal to look at `dataset.py` rather than the model.
+                wait_frac = waited[0] / elapsed if elapsed > 0 else 0.0
                 print(f'{it:7d}/{n_iter}  loss {np.mean(running):8.4f}  '
-                      f'{dt:5.2f}s/it  skipped {skipped}  '
+                      f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  skipped {skipped}  '
                       f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                       f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
                 # `clipped` is the running fraction of steps hitting max_grad_norm. At
@@ -339,9 +368,9 @@ def main():
                 # training-health number here -- and it was being computed and thrown away.
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
                          'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
-                         'train/sec_per_it': dt,
+                         'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
                          'train/skipped_frac': skipped / max(it, 1)}, it)
-                running, t0 = [], time.time()
+                running, t0, waited[0] = [], time.time(), 0.0
 
             if val_batches and it % val_freq == 0:
                 m = evaluate(model, val_batches, opt, device)

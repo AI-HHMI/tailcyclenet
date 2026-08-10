@@ -158,11 +158,30 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     # Names are computed, not listed. Frame files are `%06d.<ext>` contiguous from 000000 by spec
     # (§12, enforced by `validate_session`), and listing the directory to select T of them cost
     # 0.90 s of a 1.06 s rat-city item -- its `cam0` holds 57,594 entries.
-    paths = [os.path.join(src, f'{i:06d}{ext}') for i in frames]
+    #
+    # DECODE EACH DISTINCT FRAME ONCE. `_frames` clamp-pads a window that runs past the end of its
+    # group, and a group shorter than `n_frames` pads entirely -- 251 of johnson-mouse's 624 train
+    # windows come from `n_frames = 1` groups, where all 24 indices are frame 0. Without the dedupe
+    # that window decodes 24 copies of one image per camera (384 decodes for 16 distinct frames).
+    want = [int(i) for i in frames]
+    path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
     if pool is None:
-        return [load_image(p, crop_coords, target_size, rotation) for p in paths]
-    return [f.result() for f in
-            [pool.submit(load_image, p, crop_coords, target_size, rotation) for p in paths]]
+        got = {i: load_image(path(i), crop_coords, target_size, rotation) for i in set(want)}
+    else:
+        fs = {i: pool.submit(load_image, path(i), crop_coords, target_size, rotation)
+              for i in set(want)}
+        got = {i: f.result() for i, f in fs.items()}
+    if any(v is None for v in got.values()):
+        return [got[i] for i in want]          # the caller checks for None and drops the item
+    # A repeat gets a COPY, not the same array object. `_augment`'s cutout writes in place, so an
+    # aliased list would have every repeat sharing one buffer. That is harmless today (imgaug
+    # returns fresh arrays, and painting a constant rect twice is idempotent) but it is a trap not
+    # worth leaving: the copy is ~20 us against the 27 ms decode it replaces.
+    seen, out = set(), []
+    for i in want:
+        out.append(got[i].copy() if i in seen else got[i])
+        seen.add(i)
+    return out
 
 
 # ----------------------------------------------------------------------------------------------

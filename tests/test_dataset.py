@@ -173,6 +173,35 @@ def test_computed_frame_paths_match_the_listing(dataset_3d):
             np.testing.assert_array_equal(a, b)
         # and the frames really are distinguishable, or the assertion above proves nothing
         assert not np.array_equal(got[0], got[2])
+        # a repeated index is decoded once but must not be ALIASED -- cutout writes in place
+        assert got[1] is not got[3]
+
+
+def test_repeated_frames_are_decoded_once(dataset_3d, monkeypatch):
+    """A clamp-padded window must not decode the same file T times.
+
+    `_frames` pads a group shorter than `n_frames` by repeating its last frame, and 251 of
+    johnson-mouse's 624 train windows come from `n_frames = 1` groups -- 24 copies of frame 0 per
+    camera, which was 384 decodes for 16 distinct images on a 16-camera session.
+    """
+    from tailcyclenet import dataset as dsmod
+
+    sess = dataset_3d.sessions['train'][0]
+    group = sess.groups['g000']
+    calls, real = [], dsmod.load_image
+
+    def counted(p, *a, **k):
+        calls.append(p)
+        return real(p, *a, **k)
+
+    # read_frames resolves `load_image` as a module global per call, so patching it here is enough
+    monkeypatch.setattr(dsmod, 'load_image', counted)
+
+    out = dsmod.read_frames(group, sess.cam_names[0], [0] * 24)
+    assert len(out) == 24
+    assert len(calls) == 1, f'decoded {len(calls)} times for one distinct frame'
+    for im in out:
+        np.testing.assert_array_equal(im, out[0])
 
 
 # ----------------------------------------------------------------------------------------------

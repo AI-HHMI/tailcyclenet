@@ -162,15 +162,38 @@ def to_device(batch, device):
 
 
 def run_batch(model, loss_fn, batch, device):
+    """One forward + loss. A non-finite sub-loss comes back as NaN, never as an exception.
+
+    posetail's `TotalLoss.forward` RAISES on a poisoned sub-loss (`losses.py:873`). That is right
+    for its own purpose -- a NaN term silently dropped from the total still returns NaN gradients --
+    but it turns one intermittent bad step into a dead run, and this loop already has the handler
+    for exactly this case (`torch.isfinite(loss)` in the training loop). So the raise is converted
+    into the signal that handler reads: a detached NaN, which skips the step, runs no backward, lets
+    nothing NaN reach the optimizer, and shows up in `skipped N` and `train/skipped_frac`.
+
+    NOT a root-cause fix, and the difference matters. The NaN is real and is not understood:
+    measured on 3dpop's `query = "none"` arm, the whole forward goes NaN while the parameters,
+    `scene_center` and every target are finite, and it is intermittent (step 16 and step 31 on two
+    runs of one config). `scratch/sweep/probe.py` is the instrument for chasing it.
+
+    WATCH `skipped`. A few isolated steps is the case this handles. A rising fraction means the
+    model is sitting in a NaN state and the run is dead while still printing -- kill it.
+    """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device))
-    loss = loss_fn(
-        model, out, coords_true=batch.coords.to(device),
-        vis_true=None if batch.vis is None else batch.vis.to(device),
-        vis_true_cams=None if batch.vis_2d is None else batch.vis_2d.to(device),
-        cgroup=cgroup, p2d=None if batch.p2d is None else batch.p2d.to(device), device=device)
+    try:
+        loss = loss_fn(
+            model, out, coords_true=batch.coords.to(device),
+            vis_true=None if batch.vis is None else batch.vis.to(device),
+            vis_true_cams=None if batch.vis_2d is None else batch.vis_2d.to(device),
+            cgroup=cgroup, p2d=None if batch.p2d is None else batch.p2d.to(device), device=device)
+    except ValueError as e:
+        if 'non-finite' not in str(e):
+            raise
+        print(f'  non-finite loss -> skipping step: {e}', flush=True)
+        loss = torch.tensor(float('nan'), device=device)
     return loss, out
 
 

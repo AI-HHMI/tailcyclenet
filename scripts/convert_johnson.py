@@ -228,7 +228,19 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
     ok = np.isfinite(p3d).all(-1)
     lab.vis3d[0][ok] = fmt.VISIBLE
     lab.points3d[0][ok] = p3d[ok].astype(np.float32)
-    return lab, rejected
+
+    # A rejected observation is demonstrably in the wrong place, so it leaves keypoints.pq too --
+    # as NO ROW, not `missing`: `missing` would claim someone looked and judged it occluded.
+    bad = rejected.reshape(C, T, K).transpose(1, 2, 0)                    # (T,K,C)
+    lab.vis2d[0][bad] = fmt.UNLABELED
+    lab.points2d[0][bad] = np.nan
+    # A view that lost every observation also loses its box: the source box is the keypoint hull,
+    # so it carries the same displacement. Dropping it keeps rule 11 (a `labeled` instance must
+    # still have keypoint rows) as well.
+    dead = (lab.vis2d[0] == fmt.UNLABELED).all(1) & (lab.instance[0] != fmt.INST_NONE)
+    lab.instance[0][dead] = fmt.INST_NONE
+    lab.boxes[0][dead] = np.nan
+    return lab, int(rejected.sum())
 
 
 def _np(x) -> np.ndarray:

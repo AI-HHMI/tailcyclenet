@@ -281,12 +281,25 @@ def main():
         print(f'val:   none ({e})')
 
     nw = args.num_workers if args.num_workers is not None else int(data_cfg.get('num_workers', 8))
+    # ONE epoch for the whole run, not one per pass over the index. rat-city's train index is 12
+    # windows, so `shuffle=True` exhausted and reset the iterator every 12 steps and drained the
+    # prefetch queue each time -- 26% of its wall clock, and visible as a `wait` cycle with period
+    # lcm(print_freq, 12). Sampling with replacement costs nothing here: `_starts` returns a single
+    # -1 per animal on train and `_item` re-picks the window start inside `__getitem__`, so which
+    # index came up carries no information anyway.
+    #
+    # prefetch_factor 4, not the default 2: an item is a burst of T decodes (24 of 4696x2048 on
+    # rat-city, ~0.9 CPU-seconds) so arrivals are lumpy, and a deeper queue is worth another 13% on
+    # that arm. Affordable only because views are uint8 -- 12 workers x 4 is ~230 MB there, ~1.8 GB
+    # on johnson's widest windows.
+    #
     # batch_size is structurally 1: posetail's collate keeps only item 0's camera group, and the
     # model takes one camera group per batch. This is also why there is no DDP.
     loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=1, shuffle=True, num_workers=nw, collate_fn=pose_collate,
+        train_ds, batch_size=1, num_workers=nw, collate_fn=pose_collate,
+        sampler=torch.utils.data.RandomSampler(train_ds, replacement=True, num_samples=n_iter),
         persistent_workers=nw > 0, pin_memory=True, drop_last=True,
-        worker_init_fn=worker_init)
+        prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init)
 
     # THE SAME WINDOWS EVERY TIME. `PoseDataset` seeds val items by index, so materialising the
     # first `val_batches` of them once makes every evaluation comparable to the last -- which is

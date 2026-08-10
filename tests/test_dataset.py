@@ -192,7 +192,9 @@ def test_2d_item_shapes(tiny_root):
     b = _batch(ds)
     assert len(b.views) == 1
     assert b.views[0].shape[:2] == (1, 4)                 # (B, T, H, W, 3)
-    assert b.views[0].max() <= 1.0 and b.views[0].min() >= 0.0
+    # uint8 out of the loader: 4x fewer bytes to queue and pin. `model.forward` divides by 255 on
+    # device, so a float here would mean the pixels get scaled twice.
+    assert b.views[0].dtype == torch.uint8
     assert b.coords.shape == (1, 4, 4, 2)                 # R=2 for a true-2D session
     assert b.p2d.shape == (1, 1, 4, 4, 2)                 # 2D needs p2d; the loss reads it
     assert b.kpt_ids.shape == (1, 4)

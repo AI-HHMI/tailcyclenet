@@ -150,6 +150,11 @@ class PoseTrackerEncoder(TrackerEncoder):
         B, K = kpt_ids.shape
         n_cams = len(views)
         device = views[0].device
+        # The loader hands over uint8 -- 4x fewer bytes to queue from the worker and to pin. The
+        # library's `transform_norm` wants [0,1] floats, so the divide happens HERE, after the
+        # transfer, where it is free. One seam for train, infer, eval and the tests; a no-op for
+        # anything that already arrives as float.
+        views = [v.float().div_(255) if v.dtype == torch.uint8 else v for v in views]
         prior = None if self.query == 'none' or kpt_prior is None else kpt_prior.to(device).float()
 
         if mode == '2d':

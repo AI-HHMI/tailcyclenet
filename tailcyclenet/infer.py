@@ -212,7 +212,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                                    target_size=cgroup[i]['size'].tolist())
                 if any(im is None for im in imgs):
                     break
-                views.append(torch.as_tensor(np.asarray(imgs), dtype=torch.float32)[None] / 255.0)
+                # uint8; the model divides on device. Same contract as the training loader.
+                views.append(torch.from_numpy(np.asarray(imgs))[None])
             if len(views) != len(use):
                 continue
 

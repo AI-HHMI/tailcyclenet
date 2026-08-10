@@ -414,7 +414,11 @@ class PoseDataset(Dataset):
                                    rotation=rotation_info[cnum], pool=pool)
                 if any(im is None for im in imgs):
                     return None
-                views.append(torch.as_tensor(np.asarray(imgs), dtype=torch.float32) / 255.0)
+                # UINT8, not float32/255. The model divides on device (`model.py`), where it is
+                # free, and this is 4x fewer bytes to collate, queue and pin -- 33 MB instead of
+                # 132 MB for a 7-camera window, so 12 workers x prefetch 2 hold ~0.8 GB of pinned
+                # host memory rather than ~3.2 GB.
+                views.append(torch.from_numpy(np.asarray(imgs)))
 
         # -- the query prior -------------------------------------------------------------
         # kpt_prior is the pose at the prompt frame: at training time the GT, at deployment the

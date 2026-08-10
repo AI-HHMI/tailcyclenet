@@ -23,6 +23,8 @@ There is ONE architecture switch, `query`:
 - `"none"`   -- query-free. No prior is read at all; every keypoint is queried at the derived
    point and told only its identity.
 """
+from contextlib import contextmanager
+
 import torch
 from einops import einsum, repeat
 
@@ -97,6 +99,8 @@ class PoseTrackerEncoder(TrackerEncoder):
         super().__init__(*args, **kwargs)
         self.n_keypoints = n_keypoints
         self.query = query
+        # None -> encode per forward, the normal path. `share_scene` swaps in a dict.
+        self._shared_scene = None
 
         # Replace the stock query encoder with the pose one, built from the same kwargs the
         # parent used so it is a drop-in.
@@ -110,6 +114,26 @@ class PoseTrackerEncoder(TrackerEncoder):
             occlusion_embedding=old.occlusion_embedding,
             time_embed_mode=old.time_embed_mode,
             n_keypoints=n_keypoints)
+
+    def _forward_window(self, views_norm, *args, **kwargs):
+        """Reuse one scene encode across several decodes over the SAME pixels.
+
+        Inside `share_scene`, `scene_features` is computed on the first call and reused after. Only
+        the encode is shareable: the decode also needs `cube_scale` / `scene_center` /
+        `scene_radius`, which `forward` derives from `coords_q` and which the prior changes -- so
+        they arrive per call in `*args` and are passed through untouched.
+
+        Outside the context, and whenever `kpt_chunk` is set, this delegates to the library
+        verbatim. That is deliberate: training and chunked inference must not route through a
+        reimplementation of a private method. Gotcha #2 -- `scene_features=` was dropped from
+        `TrackerEncoder.forward` in 0.3.x, so this seam is the sanctioned way to share an encode.
+        """
+        if self._shared_scene is None or kwargs.get('kpt_chunk'):
+            return super()._forward_window(views_norm, *args, **kwargs)
+        if 'f' not in self._shared_scene:
+            self._shared_scene['f'] = self.scene_encoder(views_norm)
+        kwargs.pop('kpt_chunk', None)
+        return self._decode_from_scene(self._shared_scene['f'], views_norm, *args, **kwargs)
 
     def _decode_from_scene(self, scene_features, views_norm, coords, *args, **kwargs):
         """Hand the query encoder the keypoint slice belonging to THIS chunk.
@@ -226,6 +250,29 @@ class PoseTrackerEncoder(TrackerEncoder):
             # residual stands. This is the path `prob_2d_only` trains.
             return out
         return _reanchor_per_frame(out, coords_q)
+
+
+@contextmanager
+def share_scene(model):
+    """Encode the scene ONCE for every forward inside the block. The pixels must be identical.
+
+    The val loop runs two forwards over one window -- prior-free, then re-queried at the model's own
+    frame-0 prediction -- and the video encoder is frozen, so encoding twice is pure waste. It is
+    also the bulk of the forward: johnson-mouse's 16-camera eval ran ~200 s per val step.
+
+    The caller owns the "identical pixels" precondition, which is why the scope is one window rather
+    than one eval: nothing here checks that `views_norm` matches between calls, because the tensors
+    are large and comparing them would cost what the sharing saves.
+
+    Only the encode is shared. `cube_scale`, `scene_center` and `scene_radius` are derived from
+    `coords_q`, which the prior changes, so the decode still runs per forward.
+    """
+    prev = model._shared_scene
+    model._shared_scene = {}
+    try:
+        yield model
+    finally:
+        model._shared_scene = prev
 
 
 def _reanchor_per_frame(out, anchor):

@@ -175,21 +175,28 @@ def run_batch(model, loss_fn, batch, device):
 
 
 @torch.no_grad()
-def evaluate(model, batches, optimizer, device, self_prompted=False):
-    """Val metrics on a FIXED set of windows. Two regimes, and both are reported.
+def evaluate(model, batches, optimizer, device):
+    """Val metrics on a FIXED set of windows. BOTH regimes, from ONE pass. Returns (prior_free,
+    self_prompted).
 
-    `self_prompted=False` is the PRIOR-FREE regime. The loader's `kpt_prior` is ground truth
-    (evaluation rule 7), so it is gated off here -- letting it through inflates every number, and
-    in the project this descends from it inflated every anchored number ever published.
+    The prior-free number is the honest one: the loader's `kpt_prior` is ground truth (evaluation
+    rule 7), so it is gated off -- letting it through inflates every number, and in the project this
+    descends from it inflated every anchored number ever published.
 
     But prior-free is a structurally DIFFERENT forward from training on a `query = "prior"` arm:
     with no prior every query sits at the derived scene centre, `uniform` flips True in the query
     encoder, and the patch term collapses from K independent patches to one broadcast patch. So
-    checkpoint selection on that number alone judges an arm by a path it is not trained on.
+    checkpoint selection on that number alone judges an arm by a path it is not trained on. Hence
+    the second, deployable regime: predict prior-free, then re-query at the model's OWN frame-0
+    prediction. Label-free, so no gate reopens, and it is the same construction
+    `run_windowed(anchor='self')` uses -- literally, via `infer.self_prompt`.
 
-    `self_prompted=True` is the deployable version: predict prior-free, then re-query at the
-    model's OWN frame-0 prediction. Label-free, so no gate reopens, and it is the same
-    construction `run_windowed(anchor='self')` uses -- literally, via `infer.self_prompt`.
+    ONE pass over the batches, not two. This used to be two calls, and the second recomputed a
+    bit-identical prior-free forward before self-prompting from it -- 3 full forwards per window
+    where 2 will do. That cost real time: johnson-mouse's eval ran ~200 s against a 2.9 s/it step,
+    +1.0 s/it amortized at `val_freq = 200`, and for allen more than half the projected wall time of
+    a 60k run was eval rather than training. `share_scene` then reuses the frozen encoder across the
+    two remaining forwards, which see identical pixels.
 
     `optimizer.eval()` swaps the schedule-free averaged iterate `x` into the parameters IN PLACE,
     which is the weight that gets deployed; the `finally` puts `y` back even if a batch raises.
@@ -197,36 +204,44 @@ def evaluate(model, batches, optimizer, device, self_prompted=False):
     from posetail.posetail.eval_metrics import get_eval_metrics, get_vis_true
 
     from tailcyclenet.infer import self_prompt
+    from tailcyclenet.model import share_scene
 
     model.eval()
     if hasattr(optimizer, 'eval'):
         optimizer.eval()
-    mets, skipped = [], 0
+    free, prompted = [], []
     try:
         for batch in batches:
             views, cgroup = to_device(batch, device)
             kpt_ids, coords = batch.kpt_ids.to(device), batch.coords.to(device)
             mode = batch.sample_info['mode']
-            out = model(views, kpt_ids, cgroup, mode=mode, kpt_prior=None, prompt_time=None)
-            if self_prompted:
-                out = self_prompt(model, views, kpt_ids, cgroup, mode, out)
-            m = get_eval_metrics(
-                vis_pred=out['vis_pred'],
-                vis_true=(batch.vis.to(device) if batch.vis is not None
-                          else get_vis_true(coords)),
-                coords_pred=out['coords_pred'], coords_true=coords, prefix='')
-            m = {k: float(v) for k, v in m.items() if np.ndim(v) == 0}
-            if not all(np.isfinite(v) for v in m.values()):
-                skipped += 1
-            mets.append(m)
+            vis_true = (batch.vis.to(device) if batch.vis is not None else get_vis_true(coords))
+
+            def score(out):
+                m = get_eval_metrics(vis_pred=out['vis_pred'], vis_true=vis_true,
+                                     coords_pred=out['coords_pred'], coords_true=coords, prefix='')
+                return {k: float(v) for k, v in m.items() if np.ndim(v) == 0}
+
+            with share_scene(model):
+                out = model(views, kpt_ids, cgroup, mode=mode, kpt_prior=None, prompt_time=None)
+                free.append(score(out))
+                prompted.append(score(self_prompt(model, views, kpt_ids, cgroup, mode, out)))
     finally:
         model.train()
         if hasattr(optimizer, 'train'):
             optimizer.train()
+    return _reduce(free), _reduce(prompted)
+
+
+def _reduce(mets):
+    """nanmean over windows, with the non-finite count alongside.
+
+    A val curve quietly averaging over half its batches is the same trap as a train curve that
+    does, so the skip count is reported rather than absorbed.
+    """
     if not mets:
         return {}
-    # nanmean, and the skip count alongside: a val curve quietly averaging over half its batches
-    # is the same trap as a train curve that does.
+    skipped = sum(not all(np.isfinite(v) for v in m.values()) for m in mets)
     out = {k: float(np.nanmean([m[k] for m in mets])) for k in mets[0]}
     out['n_batches'] = len(mets)
     out['n_nonfinite'] = skipped
@@ -340,11 +355,24 @@ def main():
     max_grad = float(train_cfg.get('max_grad_norm', 0)) or None
     print_freq = int(train_cfg.get('print_freq', 20))
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
+    # `best` is written at checkpoint boundaries using THAT iteration's val, so a val has to land
+    # on one. Loud rather than silent: misaligned, no best checkpoint would ever be written and
+    # nothing else would say so.
+    if val_batches and val_freq and ckpt_freq % val_freq:
+        print(f'WARNING: checkpoint_freq {ckpt_freq} is not a multiple of val_freq {val_freq}, so '
+              'no evaluation lands on a checkpoint boundary and checkpoint_best.pth will never be '
+              'written. Pick freqs that divide.')
     model.train()
     opt.train()
     it, skipped, t0, running, clipped = 0, 0, time.time(), [], []
-    best_mpjpe, best_iter = float('inf'), 0
-    waited = [0.0]
+    # best_mpjpe/best_iter: the best val at ANY val step -- a number, used for plateau detection.
+    # saved_mpjpe: the metric of the file currently on disk as `checkpoint_best.pth`. The two are
+    # different on purpose; only the second one costs a 3.15 GB write. `latest` is the most recent
+    # val and the iteration it came from, so the checkpoint block can tell a fresh number from a
+    # stale one.
+    best_mpjpe, best_iter, saved_mpjpe = float('inf'), 0, float('inf')
+    latest = (float('inf'), -1)
+    waited, evalled, ckpted = [0.0], [0.0], [0.0]
     while it < n_iter:
         for batch in timed(loader, waited):
             if it >= n_iter:
@@ -372,14 +400,21 @@ def main():
             it += 1
 
             if it % print_freq == 0:
-                elapsed = time.time() - t0
+                wall = time.time() - t0
+                # `s/it` is the TRAINING step, with eval and checkpointing taken out. Left in, the
+                # print after a val step read 4.9 s/it on allen and 12.1 on johnson and meant
+                # nothing -- and what it hid was not noise: eval was the larger half of allen's
+                # projected wall time, and a checkpoint is 3.15 GB written on every val improvement.
+                elapsed = max(wall - evalled[0] - ckpted[0], 1e-9)
                 dt = elapsed / print_freq
-                # The fraction of wall time the GPU spent waiting for pixels. Near zero means the
+                # Fraction of that step time the GPU spent BLOCKED on pixels. Near zero means the
                 # loader is keeping up and no amount of loader work will speed this run up;
                 # anything large is the signal to look at `dataset.py` rather than the model.
-                wait_frac = waited[0] / elapsed if elapsed > 0 else 0.0
+                wait_frac = waited[0] / elapsed
+                eval_frac = evalled[0] / wall if wall > 0 else 0.0
                 print(f'{it:7d}/{n_iter}  loss {np.mean(running):8.4f}  '
-                      f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  skipped {skipped}  '
+                      f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  eval {eval_frac:4.0%}  '
+                      f'skipped {skipped}  '
                       f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                       f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
                 # `clipped` is the running fraction of steps hitting max_grad_norm. At
@@ -388,19 +423,28 @@ def main():
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
                          'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
                          'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
+                         'train/eval_frac': eval_frac,
+                         'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
                          'train/skipped_frac': skipped / max(it, 1)}, it)
-                running, t0, waited[0] = [], time.time(), 0.0
+                running, t0 = [], time.time()
+                waited[0] = evalled[0] = ckpted[0] = 0.0
 
             if val_batches and it % val_freq == 0:
-                m = evaluate(model, val_batches, opt, device)
-                ms = evaluate(model, val_batches, opt, device, self_prompted=True)
-                print(f'  EVAL  prior-free {_brief(m)}\n'
+                t_val = time.time()
+                m, ms = evaluate(model, val_batches, opt, device)
+                evalled[0] += time.time() - t_val
+                print(f'  EVAL  ({time.time() - t_val:.0f}s)  prior-free {_brief(m)}\n'
                       f'        self-prompted {_brief(ms)}', flush=True)
                 log(wb, {f'val/{k}': v for k, v in m.items()}, it)
                 log(wb, {f'val_self/{k}': v for k, v in ms.items()}, it)
-                if np.isfinite(m.get('mpjpe', np.nan)) and m['mpjpe'] < best_mpjpe:
-                    best_mpjpe, best_iter = m['mpjpe'], it
-                    save_checkpoint(run, it, model, opt, config, name='best')
+                # Tracked on EVERY val because it is just a number; the checkpoint it would justify
+                # is written at `checkpoint_freq` instead (below). Writing on every improvement
+                # meant a 3.15 GB file every `val_freq` iterations early in a run, which showed up
+                # as multi-second stalls in `s/it` that had nothing to do with training.
+                if np.isfinite(m.get('mpjpe', np.nan)):
+                    latest = (m['mpjpe'], it)
+                    if m['mpjpe'] < best_mpjpe:
+                        best_mpjpe, best_iter = m['mpjpe'], it
                 # Plateaus in this project break late -- one arm stalled 2600 iterations and then
                 # improved -- so the stopping rule reads a number instead of an eyeball.
                 log(wb, {'val/no_new_best_span': it - best_iter}, it)
@@ -411,8 +455,19 @@ def main():
                         'best_mpjpe': best_mpjpe, 'best_iter': best_iter})
 
             if it % ckpt_freq == 0 or it == n_iter:
+                t_ck = time.time()
                 p = save_checkpoint(run, it, model, opt, config)
-                print(f'saved {p}')
+                # `best` is decided HERE, not at every val: these are the only iterations whose
+                # weights are written at all, so they are the only ones that can honestly be
+                # labelled best. The comparison is against the metric of the file already on disk,
+                # and it uses THIS iteration's val -- an earlier, better val describes weights that
+                # no longer exist.
+                if latest[1] == it and latest[0] < saved_mpjpe:
+                    saved_mpjpe = latest[0]
+                    save_checkpoint(run, it, model, opt, config, name='best')
+                    print(f'  new best: mpjpe {saved_mpjpe:.4g} -> checkpoint_best.pth')
+                ckpted[0] += time.time() - t_ck
+                print(f'saved {p} ({time.time() - t_ck:.0f}s)')
     print(f'done: {it} iterations, {skipped} skipped')
     record({'iter': it, 'done': True, 'skipped': skipped,
             'best_mpjpe': best_mpjpe, 'best_iter': best_iter})

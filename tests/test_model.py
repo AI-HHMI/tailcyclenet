@@ -128,6 +128,51 @@ def test_kpt_chunk_matches_unchunked(moving_batch):
     torch.testing.assert_close(got, whole, equal_nan=True)
 
 
+def test_share_scene_matches_encoding_every_time(moving_batch):
+    """Sharing the scene encode must change nothing about the output.
+
+    The val loop runs two forwards per window over identical pixels -- prior-free, then re-queried
+    at the model's own frame-0 prediction -- and the encoder is frozen, so `share_scene` encodes
+    once. It is the whole basis of the optimisation that the second forward's DECODE still runs:
+    `cube_scale` / `scene_center` / `scene_radius` come from `coords_q`, which the prior changes.
+    A version that wrongly reused the decode too would still produce finite, well-shaped output.
+
+    Also asserts the encode really is called once -- otherwise this compares a pass against itself.
+    """
+    from tailcyclenet.model import share_scene
+
+    b = moving_batch
+    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    n_enc = [0]
+    real = model.scene_encoder.forward
+
+    def counted(*a, **k):
+        n_enc[0] += 1
+        return real(*a, **k)
+
+    model.scene_encoder.forward = counted
+    kw = dict(mode='3d', prompt_time=b.prompt_t)
+    with torch.no_grad():
+        free = model(b.views, b.kpt_ids, b.cgroup, kpt_prior=None, **kw)['coords_pred']
+        prior = model(b.views, b.kpt_ids, b.cgroup, kpt_prior=b.kpt_prior, **kw)['coords_pred']
+        assert n_enc[0] == 2, 'baseline should encode once per forward'
+
+        n_enc[0] = 0
+        with share_scene(model):
+            s_free = model(b.views, b.kpt_ids, b.cgroup, kpt_prior=None, **kw)['coords_pred']
+            s_prior = model(b.views, b.kpt_ids, b.cgroup, kpt_prior=b.kpt_prior, **kw)['coords_pred']
+        assert n_enc[0] == 1, f'scene encoded {n_enc[0]} times inside share_scene, want 1'
+        # and the context restores itself, so training does not silently keep a stale encode
+        assert model._shared_scene is None
+        model(b.views, b.kpt_ids, b.cgroup, kpt_prior=None, **kw)
+        assert n_enc[0] == 2
+
+    torch.testing.assert_close(s_free, free, equal_nan=True)
+    torch.testing.assert_close(s_prior, prior, equal_nan=True)
+    # the two regimes must genuinely differ, or "unchanged" is a vacuous claim
+    assert not torch.allclose(free, prior, equal_nan=True)
+
+
 def test_kpt_chunk_leaves_no_stash_behind(moving_batch):
     """A leaked stash applies one forward's identities to the next, silently."""
     b = moving_batch

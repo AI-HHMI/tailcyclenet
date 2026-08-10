@@ -33,8 +33,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from posetail.datasets.posetail_dataset import (custom_collate, load_image,
-                                                rotate_camera_image_plane_3d,
+from posetail.datasets.posetail_dataset import (custom_collate, rotate_camera_image_plane_3d,
                                                 rotate_points_image_plane)
 from posetail.posetail.cube import is_point_visible, project_points_torch
 
@@ -62,30 +61,74 @@ class LoaderConfig:
 # pixels
 # ----------------------------------------------------------------------------------------------
 
+def _crop_affine(src_wh, crop_coords, target_size, rotation):
+    """The one dst<-src affine for rotate -> crop -> resize. Returns (M_2x3, (w, h)) or None.
+
+    None means all three are no-ops and the caller should not warp at all (the detector reads
+    whole frames).
+
+    Composing them is not a micro-optimisation. Done in sequence, the rotation warps the WHOLE
+    frame and the crop then throws >95% of it away: 44 ms per frame on rat-city's 4696x2048
+    against 0.2 ms for the composed warp, plus an expanded rotation canvas and a zero-filled crop
+    buffer that both disappear here. It also resamples once instead of twice.
+
+    The composition uses the CORNER convention, `x_dst = (x_src - x1) * sx`, not `cv2.resize`'s
+    half-pixel one. That is deliberate rather than incidental: `crop.apply_crop` sets
+    `cam['offset'] += x1` and `_resize_camera` scales `cam['mat']`, which is exactly this affine on
+    continuous coordinates -- so the pixels now agree with the intrinsics that
+    `project_points_torch` reprojects through, where the old `resize` was off by half a pixel.
+    `test_the_fused_warp_agrees_with_the_camera` is what holds that.
+
+    Out-of-source pixels arrive as BORDER_CONSTANT zeros, which is what the old pad-safe crop
+    buffer existed to produce. One behavioural difference, and it is unreachable in practice: a box
+    reaching outside the rotated canvas used to be zero-filled there, and now samples the source
+    instead (real pixels the inscribed-rect canvas had excluded). `crop_box_for_points` clamps
+    every box to the camera's own size, so the loader cannot produce one.
+    """
+    w, h = src_wh
+    M = np.eye(3)
+    if rotation is not None:
+        M_rot, (w, h) = rotation
+        M[:2] = M_rot
+    box = (0, 0, w, h) if crop_coords is None else tuple(int(c) for c in crop_coords)
+    x1, y1, x2, y2 = box
+    tw, th = ((x2 - x1, y2 - y1) if target_size is None
+              else (int(target_size[0]), int(target_size[1])))
+    if rotation is None and box == (0, 0, w, h) and (tw, th) == (w, h):
+        return None
+    sx, sy = tw / (x2 - x1), th / (y2 - y1)
+    A = np.array([[sx, 0.0, -sx * x1], [0.0, sy, -sy * y1]])
+    return (A @ M).astype(np.float32), (tw, th)
+
+
+def load_image(path, crop_coords=None, target_size=None, rotation=None):
+    """One decode and one affine -> (H,W,3) uint8 RGB. None if the file will not decode.
+
+    Replaces the library's `load_image`, which did the rotation, the crop and the resize as three
+    separate full-size buffers. BGR->RGB runs on the OUTPUT, which is the small one.
+    """
+    import cv2
+
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    aff = _crop_affine((img.shape[1], img.shape[0]), crop_coords, target_size, rotation)
+    if aff is not None:
+        img = cv2.warpAffine(img, aff[0], aff[1], flags=cv2.INTER_LINEAR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def _read_video(path, frames, crop_coords, target_size, rotation):
     """Frames from a video file. Only 3dpop's test split needs this."""
     import cv2
     from decord import VideoReader
 
     vr = VideoReader(str(path))
-    imgs = vr.get_batch(list(frames)).asnumpy()
-    out = []
-    for img in imgs:
-        if rotation is not None:
-            M, new_size = rotation
-            img = cv2.warpAffine(img, M, new_size)
-        if crop_coords is not None:
-            x1, y1, x2, y2 = (int(c) for c in crop_coords)
-            h, w = img.shape[:2]
-            buf = np.zeros((y2 - y1, x2 - x1, img.shape[2]), img.dtype)
-            sx1, sy1, sx2, sy2 = max(x1, 0), max(y1, 0), min(x2, w), min(y2, h)
-            if sx2 > sx1 and sy2 > sy1:
-                buf[sy1 - y1:sy2 - y1, sx1 - x1:sx2 - x1] = img[sy1:sy2, sx1:sx2]
-            img = buf
-        if target_size is not None:
-            img = cv2.resize(img, tuple(target_size))
-        out.append(img)
-    return out
+    imgs = vr.get_batch(list(frames)).asnumpy()          # decord hands back RGB
+    aff = _crop_affine((imgs.shape[2], imgs.shape[1]), crop_coords, target_size, rotation)
+    if aff is None:
+        return list(imgs)
+    return [cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR) for im in imgs]
 
 
 def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation=None,

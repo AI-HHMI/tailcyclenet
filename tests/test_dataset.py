@@ -96,6 +96,59 @@ def test_jitter_stays_inside_the_image():
 # reading pixels
 # ----------------------------------------------------------------------------------------------
 
+@pytest.mark.parametrize('angle', [0.0, 20.0, -35.0])
+def test_the_fused_warp_agrees_with_the_camera(angle):
+    """The composed rotate->crop->resize affine must land pixels where the CAMERA says they go.
+
+    Two halves of the same transform live apart: the camera side is `rotate_camera_image_plane_3d`
+    + `crop.apply_crop` (offset += x1) + `_resize_camera` (mat *= s), and the pixel side is
+    `_crop_affine`. If they disagree, every reprojection is off by that much and nothing in the
+    loss curve says so -- so paint a marker at a known projection, run the image through one half
+    and the camera through the other, and check they still agree.
+
+    This is also the only way the `A @ M3` composition can be silently wrong. Comparing pixels
+    against the old three-step path would not do it: that path is expected to differ (it resampled
+    twice and used cv2.resize's half-pixel convention).
+    """
+    import cv2
+
+    from tailcyclenet import format as fmt
+    from tailcyclenet.dataset import _crop_affine, _resize_camera
+    from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
+    from posetail.posetail.cube import project_points_torch
+
+    W, H = 320, 240
+    from aniposelib.cameras import CameraGroup
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
+                  calibrated={'cam0': True})
+    cam = rig.posetail()[0]
+
+    # a point that projects well inside the frame: f = max(W,H) = 320, principal point (160,120)
+    pt = torch.tensor([[[0.4, 0.2, 4.0]]])                      # (T=1, K=1, 3)
+    src = project_points_torch([cam], pt)[0][0, 0]
+    img = np.zeros((H, W, 3), np.uint8)
+    img[int(round(float(src[1]))), int(round(float(src[0])))] = 255
+
+    rotation = None
+    if angle:
+        cam, rotation = rotate_camera_image_plane_3d(cam, angle)
+    box = cropmod.crop_box_for_points(project_points_torch([cam], pt)[0], cam['size'], 96)
+    cam = cropmod.apply_crop(cam, box)
+    cam, _ = _resize_camera(cam, 64)
+
+    want = project_points_torch([cam], pt)[0][0, 0]             # where the camera says it is now
+    M, size = _crop_affine((W, H), box, cam['size'].tolist(), rotation)
+    out = cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR)
+
+    # bilinear spreads the marker over up to 4 pixels; its intensity centroid is the position
+    ys, xs = np.nonzero(out[..., 0])
+    assert xs.size, 'the marker fell outside the crop -- the test setup is wrong, not the code'
+    wgt = out[ys, xs, 0].astype(np.float64)
+    got = np.array([(xs * wgt).sum() / wgt.sum(), (ys * wgt).sum() / wgt.sum()])
+    assert np.allclose(got, np.asarray(want, np.float64), atol=1.0), f'{got} vs {want}'
+
+
 def test_computed_frame_paths_match_the_listing(dataset_3d):
     """`read_frames` computes `%06d.<ext>` instead of listing the directory. Same pixels.
 

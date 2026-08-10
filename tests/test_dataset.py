@@ -262,6 +262,29 @@ def test_single_view_keeps_3d_targets(tiny_root):
     assert b.sample_info['single_view'] is True
 
 
+def test_cams_to_sample_takes_a_range(tiny_root):
+    """`[low, high]` draws a per-item camera count, as posetail's `sample_cameras` does.
+
+    This is the lever that took johnson-mouse from 2.9 s/it to under 1: its sessions carry 16
+    cameras and a fixed count fed all of them through the model every step. It is also what the
+    warm-start checkpoint was trained with ([1, 8]), so a fixed count is out of distribution too.
+
+    The fixture's 3D sessions have 3 cameras, so a range topping out above that must clamp to 3
+    rather than raise -- the reference's `if len(cam_names) > num_cams_to_sample` guard.
+    """
+    def counts(spec, n=60):
+        cfg = LoaderConfig(n_frames=4, image_size=64, cams_to_sample=spec, prob_2d_only=0.0,
+                           aug_prob=0.0, crop_jitter=0.0, prompt_dropout=0.0)
+        ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
+        return [len(ds[i % len(ds)][0]) for i in range(n)]
+
+    assert set(counts([1, 3])) == {1, 2, 3}      # every value in range actually occurs
+    assert set(counts([2, 2])) == {2}            # a degenerate range is a fixed count
+    assert set(counts([1, 8])) == {1, 2, 3}      # clamped to what the session has, not an error
+    assert set(counts(0)) == {3}                 # 0 still means "all cameras"
+    assert set(counts(2)) == {2}                 # the int form is unchanged
+
+
 def test_mixed_2d_and_3d_in_one_run(tiny_root):
     """One `train/` may hold both; the registry spans them and ids are disjoint."""
     ds = PoseDataset(tiny_root, 'train', CFG)

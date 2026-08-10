@@ -20,8 +20,10 @@ Three source facts decide the shape of this script:
 
 - **There is no 3D in the source**, but a `mode="3d"` session is unusable without points3d.pq
   (`dataset.py` and `detector/data.py` both index `lab.points3d` unconditionally) and `mode="2d"`
-  demands exactly one camera. So the 3D layer here is DERIVED -- DLT-triangulated from the 16-view
-  2D, which reprojects at ~0.6 px. `provenance.points3d_source` says so, and `--check` measures it.
+  demands exactly one camera. So the 3D layer here is DERIVED -- triangulated from the 16-view 2D,
+  which reprojects at ~0.6 px. `provenance.points3d_source` says so, and `--check` measures it.
+  The fit rejects outliers (`triangulate_robust`) because plain least squares has no breakdown
+  point and one bad view is enough to make all sixteen look bad.
 
 - **1,871 ghost jpgs** sit on disk unreferenced by the current annotations. Everything is driven
   from the JSON `images` list; a filesystem walk would silently enrol unlabelled frames.
@@ -151,19 +153,46 @@ def modal_step(frames: list[int]) -> int:
 # labels
 # ----------------------------------------------------------------------------------------------
 
+def triangulate_robust(cgroup, p2d: np.ndarray, reject_px: float,
+                       iters: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """DLT, then drop grossly disagreeing observations and refit. Returns (p3d, rejected mask).
+
+    Plain least squares has no breakdown point: ONE view off by an image height puts every one of
+    the other 15 reprojections at 130-400 px, which reads as "all views disagree" when in fact 15
+    of them agree to 0.6 px. That is exactly what 2025_02_12/Cam2006054 does on 10 framesets.
+
+    Rejection is per (point, camera), not per camera, so the offending view still contributes its
+    other keypoints. The threshold is `max(reject_px, 5x the point's median residual)`: relative,
+    because on the first pass a dragged fit makes every residual large, and absolute, so a clean
+    fit at 0.6 px never starts trimming its own tail.
+    """
+    p2 = p2d.copy()
+    p3 = _np(cgroup.triangulate(p2, progress=False))
+    rejected = np.zeros(p2.shape[:2], bool)                                      # (C, N)
+    for _ in range(iters):
+        e = np.linalg.norm(_np(cgroup.reprojection_error(p3, p2)), axis=-1)      # (C, N)
+        with np.errstate(invalid='ignore'):
+            med = np.nanmedian(np.where(np.isfinite(e), e, np.nan), axis=0)      # (N,)
+        bad = e > np.maximum(reject_px, 5.0 * med)
+        if not bad.any():
+            break
+        rejected |= bad
+        p2[bad] = np.nan
+        p3 = _np(cgroup.triangulate(p2, progress=False))
+    return p3, rejected
+
+
 def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig: fmt.Rig,
-                 K: int, max_reproj: float) -> tuple[fmt.Labels, int]:
+                 K: int, reject_px: float) -> tuple[fmt.Labels, int]:
     """Dense arrays for one group. 2D + boxes from the JSON, 3D triangulated from the 2D.
 
     An image with no annotation leaves every cell UNLABELED (no row) rather than `present`: the
     source records no determination about those views, and inventing one would be an annotation
     nobody made.
 
-    The 3D layer is derived, so it carries a quality gate the 2D does not: a point whose median
-    reprojection exceeds `max_reproj` gets no 3D row. 240 points -- 10 consecutive framesets at
-    the head of 2025_02_12, where all 16 views disagree by 200+ px -- fail it, against a p99 of
-    1.3 px everywhere else. The 2D behind them is still exported verbatim; it is the source's
-    annotation and not ours to censor.
+    Outlier 2D is rejected from the TRIANGULATION only. It is still exported verbatim to
+    keypoints.pq: it is the annotators' work, and the derived layer is the one that gets to be
+    opinionated about it.
     """
     cams = rig.names
     C, T = len(cams), len(run)
@@ -194,16 +223,12 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
 
     # 2D -> 3D. aniposelib's triangulate is NaN-safe and returns NaN below 2 views.
     p2d = np.moveaxis(lab.points2d[0], 2, 0).reshape(C, T * K, 2).astype(np.float64)
-    p3d = _np(rig.cgroup.triangulate(p2d, progress=False))
-    e = np.linalg.norm(_np(rig.cgroup.reprojection_error(p3d, p2d)), axis=-1)
-    with np.errstate(invalid='ignore'):
-        med = np.nanmedian(np.where(np.isfinite(e), e, np.nan), axis=0)
+    p3d, rejected = triangulate_robust(rig.cgroup, p2d, reject_px)
     p3d = p3d.reshape(T, K, 3)
-    finite = np.isfinite(p3d).all(-1)
-    ok = finite & (med.reshape(T, K) <= max_reproj)
+    ok = np.isfinite(p3d).all(-1)
     lab.vis3d[0][ok] = fmt.VISIBLE
     lab.points3d[0][ok] = p3d[ok].astype(np.float32)
-    return lab, int(finite.sum() - ok.sum())
+    return lab, rejected
 
 
 def _np(x) -> np.ndarray:
@@ -222,7 +247,7 @@ def link(dst: Path, src: Path) -> None:
 # ----------------------------------------------------------------------------------------------
 
 def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_groups: int | None,
-            dry_run: bool, max_reproj: float) -> None:
+            dry_run: bool, reject_px: float) -> None:
     for split in SPLITS:
         d = read_split(src, split)
         names = list(d['keypoint_names'])
@@ -258,7 +283,7 @@ def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_grou
                                         source_video=str(src / split / trial),
                                         source_frame_start=run[0],
                                         source_frame_step=modal_step(run))
-                labels[gid], n = build_labels(d, run, fsets, rig, K, max_reproj)
+                labels[gid], n = build_labels(d, run, fsets, rig, K, reject_px)
                 gated += n
                 if dry_run:
                     continue
@@ -270,7 +295,8 @@ def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_grou
                         link(cdir / f'{t:06d}.jpg', s)
 
             n_lab = sum(int((lab.vis2d != fmt.UNLABELED).any(2).sum()) for lab in labels.values())
-            note = f', {gated} point(s) failed the {max_reproj:g}px 3D gate' if gated else ''
+            note = (f', {gated} outlier 2D observation(s) rejected from the triangulation'
+                    if gated else '')
             print(f'   {split}/{trial}: {len(groups)} group(s), '
                   f'{sum(g.n_frames for g in groups.values())} frames, {len(rig)} cams, '
                   f'{n_lab} labelled views{note}')
@@ -340,15 +366,16 @@ def main() -> None:
                     help='skip opening one image per group during validation')
     ap.add_argument('--max-reproj-px', type=float, default=2.0,
                     help='fail a session whose median reprojection exceeds this (default 2.0)')
-    ap.add_argument('--gate-reproj-px', type=float, default=10.0,
-                    help='drop the 3D row for a point reprojecting worse than this (default 10)')
+    ap.add_argument('--reject-px', type=float, default=20.0,
+                    help='reject a 2D observation from the triangulation above this residual '
+                         '(default 20)')
     ap.add_argument('--clean', action='store_true', help='remove the output dir first')
     args = ap.parse_args()
 
     if args.clean and args.out.exists() and not args.dry_run:
         shutil.rmtree(args.out)
     convert(args.src, args.out, args.max_gap, args.trials, args.max_groups, args.dry_run,
-            args.gate_reproj_px)
+            args.reject_px)
     if args.dry_run:
         return
 

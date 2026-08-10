@@ -15,6 +15,7 @@ import json
 import sys
 import time
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -269,8 +270,13 @@ def main():
           f'{registry.n_keypoints} keypoints')
     val_ds = None
     try:
-        val_ds = PoseDataset(data_cfg['path'], 'val', lc, registry=registry)
-        print(f'val:   {len(val_ds)} windows')
+        # Val gets its OWN camera count, like the reference's separate [dataset.val] block. It
+        # matters more than it looks: johnson's val sessions carry 16 cameras, so a 20-window
+        # eval at full width cost ~200 s every 200 iterations -- +1.0 s/it amortized onto a
+        # 2.9 s/it step. Everything else about the val loader is deliberately shared.
+        val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
+        val_ds = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry)
+        print(f'val:   {len(val_ds)} windows, {lc.val_cams_to_sample} camera(s) each')
     except (ValueError, KeyError) as e:
         print(f'val:   none ({e})')
 

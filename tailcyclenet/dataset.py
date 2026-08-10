@@ -47,7 +47,13 @@ class LoaderConfig:
     """Everything the loader is allowed to vary. Deliberately short."""
     n_frames: int = 24
     image_size: int = 256              # cameras are resized so max(W,H) == this
-    cams_to_sample: int = 0            # 0 -> all cameras of a 3D session
+    # An int, or a [low, high] pair drawn per item -- posetail's own `sample_cameras`
+    # (`posetail_dataset.py:1258`). 0 means every camera. The pretrained tracker this finetunes
+    # from was trained at [1, 8] (`config_encoder_3d_finetuning_h100.toml:22`), so a fixed count
+    # above that is out of distribution as well as slow: johnson-mouse's 16-camera sessions ran
+    # at 2.9 s/it against branson's 0.25, and s/it tracks camera count almost linearly.
+    cams_to_sample: int | list = 0
+    val_cams_to_sample: int | list = 5  # the reference's [dataset.val] value
     prob_2d_only: float = 0.25         # rate at which a 3D session is shown a single camera
     balance_datasets: bool = True      # sample datasets uniformly, not proportionally
     aug_prob: float = 0.25             # in-plane rotation, per-camera appearance, cutout
@@ -162,6 +168,20 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
 # ----------------------------------------------------------------------------------------------
 # appearance augmentation
 # ----------------------------------------------------------------------------------------------
+
+def _n_cams(spec, rng):
+    """How many cameras this item shows. `spec` is an int, or a [low, high] pair drawn per item.
+
+    The pair form is posetail's (`PosetailDataset.sample_cameras`, `posetail_dataset.py:1258-1266`)
+    and it is what the pretrained tracker was finetuned with, at [1, 8]. Returning a number larger
+    than the session has is fine -- the caller takes every camera in that case, exactly as the
+    reference's `if len(cam_names) > num_cams_to_sample` guard does.
+    """
+    if isinstance(spec, (list, tuple)):
+        lo, hi = int(spec[0]), int(spec[1])
+        return int(rng.integers(lo, hi + 1))
+    return int(spec)
+
 
 def _build_augmenters(cfg):
     """The two appearance pipelines, taken from the reference (`posetail_dataset.py:570-588`).
@@ -397,10 +417,12 @@ class PoseDataset(Dataset):
             cam_ix = [0]
         elif single_view:
             cam_ix = [int(rng.integers(len(cgroup)))]
-        elif self.cfg.cams_to_sample and self.cfg.cams_to_sample < len(cgroup):
-            cam_ix = sorted(rng.choice(len(cgroup), self.cfg.cams_to_sample, replace=False))
         else:
-            cam_ix = list(range(len(cgroup)))
+            n = _n_cams(self.cfg.cams_to_sample, rng)
+            # sorted(), where the reference leaves the draw unsorted: camera order is arbitrary
+            # either way, and a stable one makes a window comparable to itself across runs.
+            cam_ix = (sorted(rng.choice(len(cgroup), n, replace=False)) if 0 < n < len(cgroup)
+                      else list(range(len(cgroup))))
         cgroup = [cgroup[i] for i in cam_ix]
         cam_names = [sess.cam_names[i] for i in cam_ix]
 

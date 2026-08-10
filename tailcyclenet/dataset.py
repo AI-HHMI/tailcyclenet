@@ -91,11 +91,13 @@ def _read_video(path, frames, crop_coords, target_size, rotation):
 def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation=None,
                 pool: ThreadPoolExecutor | None = None):
     """(T,H,W,3) uint8 RGB for one camera, from an image directory or a video."""
-    kind, src = group.pixels(cam)
+    kind, src, ext = group.source(cam)
     if kind == 'video':
         return _read_video(src, frames, crop_coords, target_size, rotation)
-    names = sorted(f for f in os.listdir(src) if os.path.splitext(f)[1] in ('.png', '.jpg'))
-    paths = [os.path.join(src, names[i]) for i in frames]
+    # Names are computed, not listed. Frame files are `%06d.<ext>` contiguous from 000000 by spec
+    # (§12, enforced by `validate_session`), and listing the directory to select T of them cost
+    # 0.90 s of a 1.06 s rat-city item -- its `cam0` holds 57,594 entries.
+    paths = [os.path.join(src, f'{i:06d}{ext}') for i in frames]
     if pool is None:
         return [load_image(p, crop_coords, target_size, rotation) for p in paths]
     return [f.result() for f in

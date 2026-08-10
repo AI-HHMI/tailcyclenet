@@ -332,10 +332,34 @@ class Group:
     source_frame_step: int = 1
     notes: str = ''
     session: 'Session' = field(default=None, repr=False, compare=False)
+    _src: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def dir(self) -> Path:
         return self.session.path / 'groups' / self.group_id
+
+    def source(self, cam: str) -> tuple[str, Path, str]:
+        """('frames', dir, ext) or ('video', file, '') for one camera. Cached.
+
+        `pixels` costs three stats and the extension needs one more, and neither answer changes
+        during a run -- but the loader asks once per camera per item, so both were being paid
+        168 times per allen-mouse window.
+
+        The extension is all a caller needs to compute any frame's path: §12 of the spec
+        guarantees an image dir holds exactly `%06d.<ext>` contiguous from `000000` with one
+        extension per directory, and `validate_session` enforces it. Listing the directory
+        instead cost 0.90 s of a 1.06 s rat-city item, whose `cam0` holds 57,594 entries.
+        """
+        if cam not in self._src:
+            kind, p = self.pixels(cam)
+            ext = ''
+            if kind == 'frames':
+                ext = next((e for e in IMAGE_EXTS if (p / f'{0:06d}{e}').exists()), '')
+                if not ext:
+                    raise FormatError(f'{p}: no 000000{{{",".join(IMAGE_EXTS)}}} -- frame names '
+                                      'must be contiguous %06d (see docs/annotation_format.md)')
+            self._src[cam] = (kind, p, ext)
+        return self._src[cam]
 
     def pixels(self, cam: str) -> tuple[str, Path]:
         """('frames', dir) or ('video', file) for one camera. Raises if neither or both exist."""

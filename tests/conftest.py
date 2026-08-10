@@ -34,11 +34,20 @@ def _rig(specs):
 
 
 def _write_frames(group_dir, cam, n_frames, size):
+    """Frames whose CONTENT identifies (cam, frame), not a constant.
+
+    A test that reads frame 3 and gets frame 4 cannot fail against all-zero images, and the
+    loader now computes frame paths from the `%06d` rule instead of listing the directory -- so
+    an off-by-one there has to be detectable in the pixels.
+    """
     d = group_dir / cam
     d.mkdir(parents=True, exist_ok=True)
-    img = Image.fromarray(np.zeros((size[1], size[0], 3), np.uint8))
+    W, H = size
+    y, x = np.mgrid[0:H, 0:W]
     for i in range(n_frames):
-        img.save(d / f'{i:06d}.png')
+        px = np.stack([(x * 3 + i * 11) % 256, (y * 5 + i * 7) % 256,
+                       np.full((H, W), (i * 37 + len(cam) * 3) % 256)], -1).astype(np.uint8)
+        Image.fromarray(px).save(d / f'{i:06d}.png')
 
 
 def _session_2d(path, T=4, S=2):

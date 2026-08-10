@@ -93,6 +93,36 @@ def test_jitter_stays_inside_the_image():
 
 
 # ----------------------------------------------------------------------------------------------
+# reading pixels
+# ----------------------------------------------------------------------------------------------
+
+def test_computed_frame_paths_match_the_listing(dataset_3d):
+    """`read_frames` computes `%06d.<ext>` instead of listing the directory. Same pixels.
+
+    Listing rat-city's 57,594-entry `cam0` cost 0.90 s of a 1.06 s item, and the spec guarantees
+    the names, so the loader computes them. This is the check that the guarantee is being read
+    correctly -- including the extension probe, since the fixture writes `.png` and a default of
+    `.jpg` would find nothing. The fixture's frames differ per (cam, frame), so an off-by-one is
+    visible in the pixels rather than hidden by constant images.
+    """
+    from tailcyclenet.dataset import load_image, read_frames
+
+    sess = dataset_3d.sessions['train'][0]
+    group = sess.groups['g000']
+    for cam in sess.cam_names:
+        kind, src, ext = group.source(cam)
+        assert (kind, ext) == ('frames', '.png')
+        listed = sorted(f for f in src.iterdir() if f.suffix in ('.png', '.jpg'))
+        frames = [3, 0, 2, 0]                       # out of order and repeated, as windows are
+        want = [load_image(str(listed[i])) for i in frames]
+        got = read_frames(group, cam, frames)
+        for a, b in zip(want, got):
+            np.testing.assert_array_equal(a, b)
+        # and the frames really are distinguishable, or the assertion above proves nothing
+        assert not np.array_equal(got[0], got[2])
+
+
+# ----------------------------------------------------------------------------------------------
 # the loader
 # ----------------------------------------------------------------------------------------------
 

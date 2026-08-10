@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -118,13 +119,22 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+@lru_cache(maxsize=8)
+def _reader(path: str):
+    """One `VideoReader` per file per process. Opening the container and building its frame index
+    is not per-window work, but `read_frames` is called once per window per camera -- so a
+    windowed pass over 3dpop's test videos paid it hundreds of times. Small cache: the readers
+    hold decode buffers, and inference walks one video at a time."""
+    from decord import VideoReader
+
+    return VideoReader(path)
+
+
 def _read_video(path, frames, crop_coords, target_size, rotation):
     """Frames from a video file. Only 3dpop's test split needs this."""
     import cv2
-    from decord import VideoReader
 
-    vr = VideoReader(str(path))
-    imgs = vr.get_batch(list(frames)).asnumpy()          # decord hands back RGB
+    imgs = _reader(str(path)).get_batch(list(frames)).asnumpy()    # decord hands back RGB
     aff = _crop_affine((imgs.shape[2], imgs.shape[1]), crop_coords, target_size, rotation)
     if aff is None:
         return list(imgs)

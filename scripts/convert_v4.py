@@ -21,6 +21,7 @@ provenance comment in those files IS the verification.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import tomllib
@@ -36,7 +37,12 @@ from tailcyclenet import format as fmt
 V4 = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v4')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets')
 SPECS = Path(__file__).resolve().parent.parent / 'configs' / 'datasets'
-DATASETS = ('rat-city', 'allen-mouse', '3dpop', 'branson-fly')
+DATASETS = ('rat-city', 'allen-mouse', '3dpop', 'branson-fly', 'johnson-mouse')
+
+# v4 cuts one recording into several trials named `<recording>_ix<N>`, where N is the source frame
+# of the trial's frame 0. Nothing else encodes that, and `source_frame_start = 0` on a trial that
+# starts at 9000 is a false statement about the provenance.
+_IX = re.compile(r'_ix(\d+)$')
 
 
 # ----------------------------------------------------------------------------------------------
@@ -73,6 +79,11 @@ def column_sort_perm(names):
 def load_spec(name: str) -> dict:
     with open(SPECS / f'{name}.toml', 'rb') as f:
         return tomllib.load(f)
+
+
+def out_dir(name: str, out_root: Path) -> Path:
+    """`out_name` distinguishes a tracked root from the hand-annotated root of the same rig."""
+    return out_root / load_spec(name).get('out_name', name)
 
 
 def read_metadata(trial: Path) -> dict | None:
@@ -174,18 +185,24 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     `missing` is written.
     """
     mode3d = spec['mode'] == '3d'
-    npz = np.load(trial / ('pose3d.npz' if mode3d else 'pose2d.npz'))
+    # allow_pickle: johnson-mouse writes `keypoints` as dtype('O') where allen writes '<U14'.
+    npz = np.load(trial / ('pose3d.npz' if mode3d else 'pose2d.npz'), allow_pickle=True)
     pose = npz['pose']
     names = list(spec['names'])
     K, C = len(names), len(rig)
+
+    # The one check that makes a keypoint-axis mistake (gotcha 4, spec 13) impossible to carry
+    # forward. Unconditional: it has nothing to do with the allen column-sort repair below, and a
+    # dataset that ships names and is never compared against the spec is exactly the silent failure.
+    if 'keypoints' in npz:
+        stored = [str(s) for s in npz['keypoints']]
+        assert stored == names, (
+            f'{trial}: npz keypoints disagree with the spec:\n  npz  {stored}\n  spec {names}')
 
     if spec.get('npz_column_sorted'):
         perm = column_sort_perm(names)
         if perm is not None:
             assert 'keypoints' in npz, f'{trial}: npz_column_sorted but no keypoints array'
-            stored = [str(s) for s in npz['keypoints']]
-            assert stored == names, (
-                f'{trial}: npz keypoints disagree with the spec:\n  npz  {stored}\n  spec {names}')
             pose = pose[:, :, perm]
 
     if pose.shape[2] != K:
@@ -239,7 +256,7 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                     dry_run: bool) -> None:
     spec = load_spec(name)
     src = src_root / name
-    out = out_root / name
+    out = out_dir(name, out_root)
     print(f'== {name}  ({spec["mode"]}, {len(spec["names"])} keypoints)')
 
     for split in fmt.SPLITS:
@@ -274,7 +291,8 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                     T = min(n_pixel_frames(*pix[n], m) for n in rig.names)
                     lab = build_labels(t, spec, rig, T)
                     n_pose = np.load(t / ('pose3d.npz' if spec['mode'] == '3d'
-                                          else 'pose2d.npz'))['pose'].shape[1]
+                                          else 'pose2d.npz'),
+                                     allow_pickle=True)['pose'].shape[1]
                     if n_pose != T:
                         print(f'   ! {session_id}/{gid}: pose has {n_pose} frames, pixels have '
                               f'{T}; truncated to {T}')
@@ -284,11 +302,12 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                         # supervision, so drop it -- loudly, never silently.
                         empty.append(gid)
                         continue
+                    ix = _IX.search(gid)
                     groups[gid] = fmt.Group(
                         gid, T,
                         fps=float(m['fps']) if m and 'fps' in m else float('nan'),
                         source_video=str(pix[rig.names[0]][1]),
-                        source_frame_start=0, source_frame_step=1)
+                        source_frame_start=int(ix.group(1)) if ix else 0, source_frame_step=1)
                     labels[gid] = lab
                     if not dry_run:
                         gdir = dst / 'groups' / gid
@@ -314,8 +333,8 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                         'annotator': '', 'annotator_tool': 'scripts/convert_v4.py',
                         'names_provisional': bool(spec.get('names_provisional', False)),
                         'animal_id_source': 'npz ids' if len(ts) and 'ids' in np.load(
-                            ts[0] / ('pose3d.npz' if spec['mode'] == '3d' else 'pose2d.npz'))
-                        else 'row index',
+                            ts[0] / ('pose3d.npz' if spec['mode'] == '3d' else 'pose2d.npz'),
+                            allow_pickle=True) else 'row index',
                     })
 
 
@@ -336,14 +355,14 @@ def main() -> None:
 
     names = DATASETS if 'all' in args.dataset else tuple(args.dataset)
     for name in names:
-        if args.clean and (args.out / name).exists() and not args.dry_run:
-            shutil.rmtree(args.out / name)
+        if args.clean and out_dir(name, args.out).exists() and not args.dry_run:
+            shutil.rmtree(out_dir(name, args.out))
         convert_dataset(name, args.src, args.out, args.max_groups, args.dry_run)
 
     if args.validate and not args.dry_run:
         bad = 0
         for name in names:
-            errs = fmt.validate_dataset(fmt.load_dataset(args.out / name),
+            errs = fmt.validate_dataset(fmt.load_dataset(out_dir(name, args.out)),
                                         check_images=not args.no_image_check)
             hard = [e for e in errs if 'WARNING' not in e]
             for e in errs:

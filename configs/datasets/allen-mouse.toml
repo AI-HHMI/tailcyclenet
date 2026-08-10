@@ -7,6 +7,8 @@
 # `keypoints` NAME-sorted, which transposes all 8 `X` / `X-base` pairs (16 positions). Full
 # derivation and the 8/8 anatomical confirmation are in kpt_names.py.
 name = "allen-mouse"
+# The v4 root is the TRACKED counterpart of allen-mouse-annotated (scripts/convert_annotated.py).
+out_name = "allen-mouse-tracked"
 mode = "3d"
 units = "mm"
 max_instances = 1

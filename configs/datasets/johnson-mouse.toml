@@ -1,0 +1,67 @@
+# johnson-mouse (TRACKED): 24 keypoints, one animal, 16 calibrated cameras at 3208x2200.
+#
+# The dense machine-derived counterpart of `johnson-mouse-annotated`, which scripts/convert_johnson.py
+# builds from the hand-annotated `johnson-mouse/merge` JSON. Same rig, same 24 names; this root is a
+# tracker's output and is a consistency target, not ground truth.
+#
+# `names` is in the npz's own order (name-sorted), NOT the anatomical order the annotated root uses,
+# because convert_v4.build_labels indexes `pose` positionally against this list. No name here is a
+# prefix of another, so `column_sort_perm` is the identity and the allen transposition repair
+# (`npz_column_sorted`) does not apply -- checked, do not add it.
+#
+# `Snout` and `TailTip` are all-NaN in all three trials. They stay in the list because the pose axis
+# is 24 wide; they simply get no rows.
+name = "johnson-mouse"
+out_name = "johnson-mouse-tracked"
+mode = "3d"
+units = "mm"
+max_instances = 1
+
+names = [
+  "AnkleL", "AnkleR", "EarL", "EarR",
+  "ElbowL", "ElbowR", "FootL", "FootR",
+  "HandL", "HandR", "KneeL", "KneeR",
+  "Neck", "ShoulderL", "ShoulderR", "Snout",
+  "SpineL", "Tail1Q", "Tail3Q", "TailBase",
+  "TailMid", "TailTip", "WristL", "WristR",
+]
+
+# Lifted verbatim from the source annotation JSON via johnson-mouse-annotated/*/session.toml. Both
+# lists are name-indexed, so they are unaffected by the ordering difference above.
+skeleton = [
+  ["Snout", "EarL"],
+  ["Snout", "EarR"],
+  ["EarL", "Neck"],
+  ["EarR", "Neck"],
+  ["Neck", "SpineL"],
+  ["SpineL", "TailBase"],
+  ["Neck", "ShoulderL"],
+  ["ShoulderL", "ElbowL"],
+  ["ElbowL", "WristL"],
+  ["WristL", "HandL"],
+  ["Neck", "ShoulderR"],
+  ["ShoulderR", "ElbowR"],
+  ["ElbowR", "WristR"],
+  ["WristR", "HandR"],
+  ["SpineL", "KneeL"],
+  ["KneeL", "AnkleL"],
+  ["AnkleL", "FootL"],
+  ["SpineL", "KneeR"],
+  ["KneeR", "AnkleR"],
+  ["AnkleR", "FootR"],
+  ["TailBase", "Tail1Q"],
+  ["Tail1Q", "TailMid"],
+  ["TailMid", "Tail3Q"],
+  ["Tail3Q", "TailTip"],
+]
+
+flip_pairs = [
+  ["EarL", "EarR"],
+  ["ShoulderL", "ShoulderR"],
+  ["ElbowL", "ElbowR"],
+  ["WristL", "WristR"],
+  ["HandL", "HandR"],
+  ["KneeL", "KneeR"],
+  ["AnkleL", "AnkleR"],
+  ["FootL", "FootR"],
+]

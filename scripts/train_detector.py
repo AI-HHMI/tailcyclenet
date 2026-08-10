@@ -26,6 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tailcyclenet.dataset import worker_init
 from tailcyclenet.format import load_datasets
 from tailcyclenet.detector import (BoxDataset, YOLOXNano, box_collate, box_iou, decode,
                                    detector_loss)
@@ -92,7 +93,8 @@ def main():
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
         train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-        collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0)
+        collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0,
+        worker_init_fn=worker_init)
     val_loader = None
     try:
         val = BoxDataset(args.data, 'val', input_wh=wh, max_frames_per_group=8)

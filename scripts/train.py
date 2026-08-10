@@ -26,7 +26,7 @@ from posetail.posetail.losses import TotalLoss
 
 from tailcyclenet.checkpoints import (check_image_size, resolve_checkpoint, save_checkpoint,
                                       save_run_meta, warm_start)
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
+from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate, worker_init
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
 
@@ -256,7 +256,8 @@ def main():
     # model takes one camera group per batch. This is also why there is no DDP.
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, shuffle=True, num_workers=nw, collate_fn=pose_collate,
-        persistent_workers=nw > 0, pin_memory=True, drop_last=True)
+        persistent_workers=nw > 0, pin_memory=True, drop_last=True,
+        worker_init_fn=worker_init)
 
     # THE SAME WINDOWS EVERY TIME. `PoseDataset` seeds val items by index, so materialising the
     # first `val_batches` of them once makes every evaluation comparable to the last -- which is

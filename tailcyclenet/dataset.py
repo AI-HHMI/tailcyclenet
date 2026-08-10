@@ -424,6 +424,26 @@ def _resize_camera(cam, target_res):
     return cam, scale
 
 
+def worker_init(worker_id):
+    """A DataLoader `worker_init_fn`: pin cv2's thread pool to one thread.
+
+    OpenCV sizes its pool to the machine -- 128 threads here -- and each of `num_workers`
+    processes runs a 16-thread `ThreadPoolExecutor` on top of that, so the nesting is pure
+    contention: the frames of a window are already being decoded in parallel. Measured
+    0.210 -> 0.180 s/it at 12 workers, and the gap widens on a smaller machine.
+
+    It does NOT reseed numpy, and must not: `torch/utils/data/_utils/worker.py:261-265` already
+    calls `np.random.seed` per worker with a SeedSequence-derived state, so the global stream that
+    `rotate_camera_group` and the imgaug pipelines draw from is decorrelated for free. The
+    library's `make_worker_init_fn` exists to fold in a DDP rank, which torch's own seeding
+    ignores; there is no DDP here (batch_size is structurally 1), so reusing it would only
+    downgrade torch's seed derivation to `base + worker_id`.
+    `tests/test_dataset.py::test_workers_do_not_share_a_numpy_stream` pins this.
+    """
+    import cv2
+    cv2.setNumThreads(1)
+
+
 def pose_collate(batch):
     """posetail's collate for the first ten fields, plus this repo's three.
 

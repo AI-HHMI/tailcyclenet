@@ -258,6 +258,29 @@ class _FakeDataset:
         self.name, self.names = name, names
 
 
+def test_workers_do_not_share_a_numpy_stream(tiny_root):
+    """Workers must draw independent augmentation from the GLOBAL `np.random`.
+
+    `rotate_camera_group` and the appearance pipelines draw from `np.random`, which fork copies
+    rather than reseeds. torch seeds it per worker for us
+    (`torch/utils/data/_utils/worker.py:261-265`), which is why `worker_init` deliberately does
+    NOT -- but that is torch's promise, not ours, so it is worth a test rather than a comment. If
+    this ever fails, `worker_init` has to start seeding numpy itself.
+    """
+    from tailcyclenet.dataset import worker_init
+
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                       crop_jitter=0.0, prompt_dropout=0.0)
+    ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=1, num_workers=2, collate_fn=pose_collate,
+        sampler=[0, 0, 0, 0], worker_init_fn=worker_init)
+    # cgroup[0]['ext'] carries the random world rotation, so it fingerprints the draw. Items 0
+    # and 1 go to different workers; equal sums would mean one shared stream.
+    draws = [float(b.cgroup[0]['ext'].sum()) for b in loader]
+    assert draws[0] != pytest.approx(draws[1])
+
+
 def test_val_windows_are_deterministic(tiny_root):
     ds = PoseDataset(tiny_root / 'ratlike', 'val', CFG)
     a = pose_collate([ds[0]])

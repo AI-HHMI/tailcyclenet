@@ -313,27 +313,102 @@ class _FakeDataset:
         self.name, self.names = name, names
 
 
-def test_workers_do_not_share_a_numpy_stream(tiny_root):
-    """Workers must draw independent augmentation from the GLOBAL `np.random`.
+def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
+    """The per-camera/per-frame split is the design, so it gets the test.
 
-    `rotate_camera_group` and the appearance pipelines draw from `np.random`, which fork copies
-    rather than reseeds. torch seeds it per worker for us
-    (`torch/utils/data/_utils/worker.py:261-265`), which is why `worker_init` deliberately does
-    NOT -- but that is torch's promise, not ours, so it is worth a test rather than a comment. If
-    this ever fails, `worker_init` has to start seeding numpy itself.
+    A camera's colour and focus must hold steady for the whole clip -- appearance is an identity
+    cue for a tracker, and re-rolling hue every frame teaches it that appearance is noise. Sensor
+    noise and motion blur are the opposite and must vary. Fed T copies of ONE image, the first
+    pipeline has to return T identical frames and the second T different ones.
+    """
+    from tailcyclenet.dataset import _build_augmenters
+
+    defocus, per_camera, per_image = _build_augmenters(
+        LoaderConfig(aug_prob=1.0, per_image_aug_prob=1.0))
+    img = (np.mgrid[0:64, 0:64][0][..., None] * np.ones((1, 1, 3))).astype(np.uint8)
+
+    det = per_camera.to_deterministic()
+    same = [det(image=img.copy()) for _ in range(4)]
+    for s in same[1:]:
+        np.testing.assert_array_equal(same[0], s)
+    assert not np.array_equal(same[0], img), 'per-camera pipeline did nothing at aug_prob=1'
+
+    varied = [per_image(image=img.copy()) for _ in range(4)]
+    assert any(not np.array_equal(varied[0], v) for v in varied[1:])
+
+
+def test_cutout_marks_covered_keypoints_not_visible():
+    """A keypoint under a cutout rect must be labelled not-visible, including where it was NaN.
+
+    Asking the model to report "visible" for a patch that has been painted over is the one
+    visibility label that is certainly wrong. And `vis_2d` is three-state here: NaN means nobody
+    assessed that camera, and cutout turning NaN into 0 is a fact about the image we just made,
+    not an invention -- so the test covers that entry specifically.
+    """
+    from tailcyclenet.dataset import _cutout_rects
+
+    rng = np.random.default_rng(0)
+    T, K, C = 4, 6, 2
+    size = torch.tensor([200, 160], dtype=torch.int32)
+    p2d = torch.stack([torch.as_tensor(rng.uniform([0, 0], [200, 160], (T, K, 2)),
+                                       dtype=torch.float32) for _ in range(C)])
+    vis_2d = torch.ones((T, K, C))
+    vis_2d[0, 0, 0] = float('nan')                 # never assessed by this camera
+    covered_nan = False
+    for _ in range(40):                            # rects are random; drive it until NaN is hit
+        v = vis_2d.clone()
+        rects = _cutout_rects(rng, size, p2d, v, 0)
+        assert rects, 'cutout produced no rectangles'
+        for x1, y1, x2, y2, fill in rects:
+            assert 0 <= x1 < x2 <= 200 and 0 <= y1 < y2 <= 160
+            assert len(fill) == 3 and all(0 <= c < 256 for c in fill)
+            inside = ((p2d[0, ..., 0] >= x1) & (p2d[0, ..., 0] <= x2) &
+                      (p2d[0, ..., 1] >= y1) & (p2d[0, ..., 1] <= y2))
+            assert (v[..., 0][inside] == 0).all()
+            if inside[0, 0]:
+                covered_nan = True
+        assert torch.isnan(v[..., 1]).sum() == 0 and (v[..., 1] == 1).all()   # other cam untouched
+    assert covered_nan, 'never covered the NaN keypoint -- the NaN -> 0 path went untested'
+
+
+def test_appearance_augmentation_is_train_only(tiny_root):
+    """Val pixels must be clean: an augmented val metric is not comparable to the last one."""
+    aug = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=1.0,
+                       crop_jitter=0.0, prompt_dropout=0.0)
+    train_ds = PoseDataset(tiny_root / 'ratlike', 'train', aug)
+    assert train_ds._aug is not None
+    assert PoseDataset(tiny_root / 'ratlike', 'val', aug)._aug is None
+    # and the train path really changes pixels rather than silently no-opping
+    plain = pose_collate([PoseDataset(tiny_root / 'ratlike', 'train', CFG)[0]])
+    assert not torch.equal(plain.views[0], pose_collate([train_ds[0]]).views[0])
+
+
+def test_workers_do_not_share_a_random_stream(tiny_root):
+    """Two workers must not produce identically-augmented items. Two RNGs decide that.
+
+    `rotate_camera_group` draws from the global `np.random`, which torch already reseeds per
+    worker (`torch/utils/data/_utils/worker.py:261-265`) -- that is torch's promise rather than
+    ours, so it is worth a test rather than a comment.
+
+    imgaug is the half that genuinely breaks: it keeps its OWN global RNG, which fork copies and
+    nothing reseeds, so without `worker_init` every worker's k-th `to_deterministic()` picks the
+    same gamma and hue. Invisible in the loss curve -- it just divides the appearance diversity by
+    `num_workers`.
     """
     from tailcyclenet.dataset import worker_init
 
-    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=1.0,
+                       per_image_aug_prob=0.0, grayscale_prob=0.0,
                        crop_jitter=0.0, prompt_dropout=0.0)
     ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=1, num_workers=2, collate_fn=pose_collate,
         sampler=[0, 0, 0, 0], worker_init_fn=worker_init)
-    # cgroup[0]['ext'] carries the random world rotation, so it fingerprints the draw. Items 0
-    # and 1 go to different workers; equal sums would mean one shared stream.
-    draws = [float(b.cgroup[0]['ext'].sum()) for b in loader]
-    assert draws[0] != pytest.approx(draws[1])
+    got = [(float(b.cgroup[0]['ext'].sum()), b.views[0].float().mean().item())
+           for b in loader]
+    # items 0 and 1 land on different workers; equality would mean one shared stream
+    assert got[0][0] != pytest.approx(got[1][0]), 'np.random is shared across workers'
+    assert got[0][1] != pytest.approx(got[1][1]), 'imgaug RNG is shared across workers'
 
 
 def test_val_windows_are_deterministic(tiny_root):

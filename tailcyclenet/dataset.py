@@ -50,7 +50,9 @@ class LoaderConfig:
     cams_to_sample: int = 0            # 0 -> all cameras of a 3D session
     prob_2d_only: float = 0.25         # rate at which a 3D session is shown a single camera
     balance_datasets: bool = True      # sample datasets uniformly, not proportionally
-    aug_prob: float = 0.25             # in-plane rotation + photometric
+    aug_prob: float = 0.25             # in-plane rotation, per-camera appearance, cutout
+    per_image_aug_prob: float = 0.25   # per-FRAME appearance: motion blur, sensor noise
+    grayscale_prob: float = 0.2        # rate at which a train item drops colour entirely
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
     crop_jitter_scale: float = 0.3     # box scale jitter
     min_crop_dim: int = 64
@@ -158,6 +160,71 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
 
 
 # ----------------------------------------------------------------------------------------------
+# appearance augmentation
+# ----------------------------------------------------------------------------------------------
+
+def _build_augmenters(cfg):
+    """The two appearance pipelines, taken from the reference (`posetail_dataset.py:570-588`).
+
+    The SPLIT is the point, not the list. `per_camera` is sampled once per camera and replayed
+    frame by frame, so a camera's colour, gamma and focus hold steady down a clip: appearance is
+    an identity cue for a tracker, and re-rolling hue every frame teaches that it is noise.
+    `per_image` is resampled per frame, which is what sensor noise and motion blur actually are.
+
+    Cost, measured on 24 crops of 256x256 with every augmenter firing: 0.141 s for `per_camera`
+    (`DefocusBlur` is 4.2 ms/frame of it, the most expensive single entry) and 0.052 s for
+    `per_image`. Watch `train/loader_wait_frac`; if it climbs, DefocusBlur is the first to drop.
+    """
+    import imgaug.augmenters as iaa
+
+    p, q = cfg.aug_prob, cfg.per_image_aug_prob
+    # DefocusBlur is kept OUT of the sequential because it cannot run on a small crop: the
+    # imagecorruptions functions it wraps assert both sides >= 32 px (`imgcorruptlike.py:175`) and
+    # raise otherwise, which inside a worker is a dead run rather than a skipped augmentation. A
+    # crop is square-ish, so real data clears 32 comfortably -- but "comfortably" is not a
+    # guarantee, and `_augment` gates on the actual crop instead of assuming.
+    defocus = iaa.Sometimes(p, iaa.imgcorruptlike.DefocusBlur(severity=(1, 1)))
+    per_camera = iaa.Sequential([
+        iaa.Sometimes(p, iaa.GammaContrast((0.6, 1.8))),
+        iaa.Sometimes(p, iaa.AddToSaturation((-50, 30))),
+        iaa.Sometimes(p, iaa.AddToHue((-10, 10))),
+    ])
+    per_image = iaa.Sequential([
+        iaa.Sometimes(q, iaa.MotionBlur(k=(3, 5))),
+        iaa.Sometimes(q, iaa.AdditiveGaussianNoise(scale=(0, 0.04 * 255))),
+        iaa.Sometimes(q, iaa.Multiply((0.9, 1.1))),
+        iaa.Sometimes(q, iaa.SaltAndPepper(0.004)),
+    ])
+    return defocus, per_camera, per_image
+
+
+def _cutout_rects(rng, size, p2d, vis_2d, cnum):
+    """Random-erasing rectangles for one camera, in crop pixels. Mutates `vis_2d` in place.
+
+    A keypoint underneath a rect is no longer visible, and saying so is the whole point: without
+    it the model is asked to report "visible" for a patch that has been painted over, which is the
+    one label that is definitely wrong.
+
+    `vis_2d` here is THREE-state -- NaN means "no one assessed this camera". Cutout overwrites
+    NaN with 0, and that is right rather than an invention: the pixels are now literally covered,
+    so "not visible" became a fact about the image we just produced.
+    """
+    w, h = int(size[0]), int(size[1])
+    rects = []
+    for _ in range(int(rng.integers(1, 4))):
+        rw, rh = int(w * 0.15), int(h * 0.15)
+        rx = int(rng.integers(0, max(w - rw, 1)))
+        ry = int(rng.integers(0, max(h - rh, 1)))
+        rects.append((rx, ry, rx + rw, ry + rh, rng.integers(0, 256, 3).tolist()))
+        if vis_2d is not None:
+            pts = p2d[cnum]                                    # (T,K,2), crop pixels
+            inside = ((pts[..., 0] >= rx) & (pts[..., 0] <= rx + rw) &
+                      (pts[..., 1] >= ry) & (pts[..., 1] <= ry + rh))
+            vis_2d[:, :, cnum][inside] = 0
+    return rects
+
+
+# ----------------------------------------------------------------------------------------------
 # the dataset
 # ----------------------------------------------------------------------------------------------
 
@@ -192,6 +259,10 @@ class PoseDataset(Dataset):
         # and invisible in the loss curve. `Registry.build` raises if an old id would move.
         self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
+        # Appearance augmentation is train-only, and `None` is also the flag the pixel path reads.
+        # Val must stay clean: a metric computed on augmented pixels is not comparable to the last
+        # one, and `test_val_windows_are_deterministic` would fail outright.
+        self._aug = _build_augmenters(cfg) if self.train and cfg.aug_prob > 0 else None
 
         # Scatter every session's parquet into dense arrays HERE, in the parent process, and drop
         # the tables. Forked workers then share the arrays copy-on-write instead of each holding
@@ -380,7 +451,7 @@ class PoseDataset(Dataset):
             coords = coords * scale
             coords = _mask_outside(coords, cam['size'])
             cgroup, boxes = [cam], [box]
-            p2d = coords[None]
+            p2d = p2d_all = coords[None]
             R = 2
         else:
             # 3D path, one camera or several. Single-view differs ONLY in how many cameras are
@@ -412,10 +483,18 @@ class PoseDataset(Dataset):
                 from posetail.datasets.posetail_dataset import PosetailDataset
                 cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
             # `p2d` is the reprojection AFTER crop/resize/rotate, so it lands in crop pixels.
-            p2d = project_points_torch(cgroup, coords) if single_view else None
+            # Cutout needs it too, in the same frame -- projected once and shared, since a second
+            # `project_points_torch` is a float64 reprojection of every point in the window.
+            p2d_all = (project_points_torch(cgroup, coords)
+                       if single_view or self._aug is not None else None)
+            p2d = p2d_all if single_view else None
             R = 3
 
         # -- pixels ----------------------------------------------------------------------
+        # Appearance augmentation runs HERE, on the final crops, not on the source frames: the
+        # crops are ~256 px where a source frame can be 4696x2048, so it is the same augmentation
+        # for a fraction of the work.
+        gray = self._aug is not None and rng.random() < self.cfg.grayscale_prob
         with ThreadPoolExecutor(max_workers=16) as pool:
             views = []
             for cnum, cam_name in enumerate(cam_names):
@@ -424,6 +503,9 @@ class PoseDataset(Dataset):
                                    rotation=rotation_info[cnum], pool=pool)
                 if any(im is None for im in imgs):
                     return None
+                if self._aug is not None:
+                    imgs = self._augment(imgs, cnum, cgroup[cnum]['size'], p2d_all, vis_2d,
+                                         gray, rng)
                 # UINT8, not float32/255. The model divides on device (`model.py`), where it is
                 # free, and this is 4x fewer bytes to collate, queue and pin -- 33 MB instead of
                 # 132 MB for a 7-camera window, so 12 workers x prefetch 2 hold ~0.8 GB of pinned
@@ -452,6 +534,25 @@ class PoseDataset(Dataset):
 
         return (views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
                 vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t)
+
+    def _augment(self, imgs, cnum, size, p2d, vis_2d, gray, rng):
+        """Appearance augmentation for one camera's T crops. `vis_2d` is mutated by cutout."""
+        import cv2
+
+        defocus, per_camera, per_image = self._aug
+        # to_deterministic() freezes this camera's sampled parameters so every frame gets the
+        # SAME gamma/hue/blur -- see `_build_augmenters`. Only the apply is per-frame.
+        cam_det = per_camera.to_deterministic()
+        blur = defocus.to_deterministic() if min(imgs[0].shape[:2]) >= 32 else None
+        imgs = [per_image(image=cam_det(image=im if blur is None else blur(image=im)))
+                for im in imgs]
+        if rng.random() < self.cfg.aug_prob:
+            for x1, y1, x2, y2, fill in _cutout_rects(rng, size, p2d, vis_2d, cnum):
+                for im in imgs:
+                    im[y1:y2, x1:x2] = fill
+        if gray:
+            imgs = [np.stack([cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)] * 3, -1) for im in imgs]
+        return imgs
 
     def _jitter(self, rng):
         if not self.train or self.cfg.crop_jitter <= 0:
@@ -482,23 +583,33 @@ def _resize_camera(cam, target_res):
 
 
 def worker_init(worker_id):
-    """A DataLoader `worker_init_fn`: pin cv2's thread pool to one thread.
+    """A DataLoader `worker_init_fn`. Two things, both per-worker and both easy to miss.
 
-    OpenCV sizes its pool to the machine -- 128 threads here -- and each of `num_workers`
-    processes runs a 16-thread `ThreadPoolExecutor` on top of that, so the nesting is pure
-    contention: the frames of a window are already being decoded in parallel. Measured
-    0.210 -> 0.180 s/it at 12 workers, and the gap widens on a smaller machine.
+    1. **Pin cv2's thread pool to one thread.** OpenCV sizes it to the machine -- 128 threads here
+       -- and each of `num_workers` processes runs a 16-thread `ThreadPoolExecutor` on top of
+       that, so the nesting is pure contention: the frames of a window are already being decoded
+       in parallel. Measured 0.210 -> 0.180 s/it at 12 workers, and the gap widens on a smaller
+       machine.
 
-    It does NOT reseed numpy, and must not: `torch/utils/data/_utils/worker.py:261-265` already
-    calls `np.random.seed` per worker with a SeedSequence-derived state, so the global stream that
-    `rotate_camera_group` and the imgaug pipelines draw from is decorrelated for free. The
-    library's `make_worker_init_fn` exists to fold in a DDP rank, which torch's own seeding
-    ignores; there is no DDP here (batch_size is structurally 1), so reusing it would only
-    downgrade torch's seed derivation to `base + worker_id`.
-    `tests/test_dataset.py::test_workers_do_not_share_a_numpy_stream` pins this.
+    2. **Reseed imgaug.** It keeps its OWN global RNG, which fork copies and nothing else
+       reseeds, so every worker's k-th `to_deterministic()` would draw the same gamma, hue and
+       blur -- the appearance diversity silently divides by `num_workers`, and the loss curve
+       looks identical either way. The seed is drawn from `np.random`, which torch HAS already
+       decorrelated per worker (`torch/utils/data/_utils/worker.py:261-265`).
+
+    numpy itself is deliberately NOT reseeded here, for that same reason. The library's
+    `make_worker_init_fn` exists to fold in a DDP rank, which torch's seeding ignores; there is
+    no DDP here (batch_size is structurally 1), so reusing it would only downgrade torch's seed
+    derivation to `base + worker_id`.
+    `tests/test_dataset.py::test_workers_do_not_share_a_random_stream` pins both halves.
     """
     import cv2
     cv2.setNumThreads(1)
+    try:
+        import imgaug
+    except ImportError:
+        return
+    imgaug.random.seed(int(np.random.randint(2 ** 31)))
 
 
 def pose_collate(batch):

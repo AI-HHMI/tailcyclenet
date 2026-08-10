@@ -17,10 +17,10 @@ pyproject.toml        package + [tool.pixi.*] env. There is no separate pixi.tom
 CLAUDE.md             this file
 docs/                 HUMAN-OWNED. Do not edit without explicit instruction.
   annotation_format.md  THE data format spec. Code is written against it, not the reverse.
-dev/
+dev/                  UNTRACKED. working notes, not the repo's product
   plans/              design docs, one per non-obvious decision
   reports/            progress + measurement reports as things land
-scratch/              LLM scratch space. May be deleted between sessions. Artifacts untracked.
+scratch/              UNTRACKED. LLM scratch space. May be deleted between sessions.
 tailcyclenet/
   format.py           read/validate a session -> dense arrays; the keypoint registry
   dataset.py          torch Dataset over the format; 3D multiview / 3D single-view / 2D
@@ -36,7 +36,8 @@ configs/              example configs, hand-written. NOT generated, NOT one per 
 tests/
 ```
 
-**Who may write where.** `dev/` and `scratch/` are yours. `docs/` is the human's — ask first.
+**Who may write where.** `dev/` and `scratch/` are yours, and both are gitignored — a conclusion
+that should outlive the session belongs in this file or `docs/`. `docs/` is the human's — ask first.
 `../posetail-pose` and `../../posetail/posetail-next` are read-only reference.
 
 ---

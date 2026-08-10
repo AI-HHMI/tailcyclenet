@@ -5,10 +5,8 @@ runs/
 __pycache__/
 *.pyc
 
-# scratch/ is LLM working space and may be deleted between sessions. Keep the drivers, not the
-# artifacts: an arm list is the only record of what was actually run.
-scratch/**/*.npz
-scratch/**/*.mp4
-scratch/**/*.log
-scratch/**/*.txt
-scratch/**/*.png
+# scratch/ is LLM working space and may be deleted between sessions; dev/ is its notes and
+# reports. Both are working material, not the repo's product -- what they concluded belongs in
+# CLAUDE.md or docs/, which is the only place worth versioning it.
+scratch/
+dev/

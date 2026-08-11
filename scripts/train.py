@@ -15,6 +15,7 @@ import json
 import sys
 import time
 import tomllib
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -306,6 +307,11 @@ def main():
     registry = train_ds.registry
     print(f'train: {len(train_ds)} windows across {len(train_ds.datasets)} dataset(s), '
           f'{registry.n_keypoints} keypoints')
+    # The sampling mix, not the window count. An index entry is one (session, group, animal)
+    # whatever the group's length, so window counts say nothing about what the model will
+    # actually see -- allen-mouse-combined reads 1108 windows either way, while the share of
+    # steps reaching the 3D head bank moves from 9.6% to 88%. Invisible in the loss curve.
+    print('train: mix ' + '  '.join(f'{k}={v:.1%}' for k, v in train_ds.mix().items()))
     val_ds = None
     try:
         # Val gets its OWN camera count, like the reference's separate [dataset.val] block. It
@@ -339,15 +345,27 @@ def main():
         persistent_workers=nw > 0, pin_memory=True, drop_last=True,
         prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init)
 
-    # THE SAME WINDOWS EVERY TIME. `PoseDataset` seeds val items by index, so materialising the
-    # first `val_batches` of them once makes every evaluation comparable to the last -- which is
-    # the only thing that lets a val curve mean anything across iterations.
+    # THE SAME WINDOWS EVERY TIME. `PoseDataset` seeds val items by index, so materialising a
+    # fixed set of them once makes every evaluation comparable to the last -- which is the only
+    # thing that lets a val curve mean anything across iterations.
+    #
+    # SPREAD ACROSS THE INDEX, not the first N. The index is ordered dataset -> session -> group,
+    # so a prefix is a prefix of the SESSION list: allen's first 20 of 65 val windows were 3 from
+    # `behavior_750095` and 17 from `behavior_750096`, and the tracked `mouse1` session -- the one
+    # this project's reference numbers were measured on -- contributed 2 windows and never
+    # entered the metric at all. Checkpoint selection ran off that number. `linspace` costs
+    # nothing and keeps every val session represented.
     val_freq = int(train_cfg.get('val_freq', 0))
     val_batches = []
     if val_ds is not None and val_freq:
-        val_batches = [pose_collate([val_ds[i]])
-                       for i in range(min(int(train_cfg.get('val_batches', 20)), len(val_ds)))]
-        print(f'val:   {len(val_batches)} fixed window(s) every {val_freq} iterations')
+        n_val = min(int(train_cfg.get('val_batches', 20)), len(val_ds))
+        idxs = np.unique(np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))
+        val_batches = [pose_collate([val_ds[int(i)]]) for i in idxs]
+        seen = Counter(val_ds.index[int(i)].session.session_id for i in idxs)
+        print(f'val:   {len(val_batches)} fixed window(s) every {val_freq} iterations, '
+              f'over {len(seen)}/{len({it.session.session_id for it in val_ds.index})} session(s)')
+        for sid, n in sorted(seen.items()):
+            print(f'         {n:3d}  {sid}')
 
     # -- model -----------------------------------------------------------------------------
     model = build_model(config['model'], n_keypoints=registry.n_keypoints)

@@ -64,6 +64,13 @@ class LoaderConfig:
     min_crop_dim: int = 64
     prompt_dropout: float = 0.4        # fraction of keypoints whose prior is withheld
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
+    # Train sampling mix, a TWO-LEVEL draw: source first, then mode within that source. Either
+    # level is skipped where a dataset offers no choice -- an all-tracked root ignores
+    # `annot_frac`, a single-mode root ignores `mode_3d_frac` -- so one setting serves every root.
+    # None leaves that level alone (entries keep their natural share); both None is uniform, which
+    # is what every run before this change did. See `_pool_weights` for why this is load-bearing.
+    annot_frac: float | None = None    # P(a step comes from an `annotated` session)
+    mode_3d_frac: float | None = None  # P(3d | source), i.e. applied WITHIN each source
 
 
 # ----------------------------------------------------------------------------------------------
@@ -333,6 +340,15 @@ class PoseDataset(Dataset):
         if not self.index:
             raise ValueError(f'{path}: split {split!r} yielded no usable windows')
 
+        # Sampling pools. A pool is a set of index positions plus an optional cumulative weight
+        # array; `_pick` draws a pool, then an entry inside it. Balancing across datasets is the
+        # only thing that makes more than one pool, and it is train-only -- val and test address
+        # `self.index` directly so a window's identity stays tied to its index.
+        multi = self.train and cfg.balance_datasets and len(self.datasets) > 1
+        pools = self.by_dataset if multi else [list(range(len(self.index)))]
+        self._pools = [(np.asarray(p, dtype=np.int64),
+                        self._pool_weights(p) if self.train else None) for p in pools if p]
+
     # -- indexing ------------------------------------------------------------------------
     def _labelled_frames(self, vis, a):
         """Frames where this animal has at least one assessed keypoint."""
@@ -375,13 +391,100 @@ class PoseDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
+    def _pool_weights(self, pool):
+        """Cumulative per-entry weights for one pool, or None to sample it uniformly.
+
+        WHY THIS EXISTS. `_starts` returns one index entry per (session, group, animal) on train,
+        whatever the group's length, and the sampler draws entries uniformly -- so an entry IS a
+        sampling weight, and it is decoupled from how much data sits behind it. On
+        allen-mouse-combined that put 90.4% of steps on 63 per-camera 2D sessions holding 1,023
+        labelled frames between them, and 3.9% on the tracked session holding 21,500: a 500-frame
+        tracked clip is one group, so it buys exactly one entry, the same price a single
+        hand-annotated still pays. `mode='2d'` routes to head bank 0 and fires ~3 of 15 loss terms,
+        so the 3D bank that validation reads was getting under a tenth of the gradient. On
+        johnson-mouse-combined the tracked source sat at 0.3%.
+
+        THE DRAW IS TWO-LEVEL: source (`annot_frac`), then mode WITHIN that source
+        (`mode_3d_frac`), then uniform over the entries in that cell. The levels are independent
+        by construction rather than jointly fitted, so they can never be mutually infeasible --
+        `mode_3d_frac` is a conditional P(3d | source), not a second marginal.
+
+        A level with nothing to choose between is skipped, which is what lets one setting serve
+        every root: an all-tracked dataset ignores `annot_frac`, a single-mode one ignores
+        `mode_3d_frac`, and a root that is both -- 3dpop, branson-fly, rat-city -- is untouched.
+        A level left at None keeps its cells' natural entry shares, so it is not a silent
+        rebalance.
+
+        Returned flattened: the product of the two levels is one cumulative array and one
+        `searchsorted`, which is the same distribution as drawing twice for less work.
+        """
+        cfg = self.cfg
+        if cfg.annot_frac is None and cfg.mode_3d_frac is None:
+            return None
+        for name, v in (('annot_frac', cfg.annot_frac), ('mode_3d_frac', cfg.mode_3d_frac)):
+            if v is not None and not 0.0 <= float(v) <= 1.0:
+                raise ValueError(f'{name} must be in [0, 1], got {v}')
+
+        cells: dict[tuple[str, str], list[int]] = {}
+        for j in pool:
+            sess = self.index[j].session
+            cells.setdefault((sess.label_source, sess.mode), []).append(j)
+
+        def share(key, present, frac, n):
+            """P(key) across `present`: the configured fraction, or the natural entry share."""
+            if len(present) == 1:
+                return 1.0
+            if frac is None:
+                return n[key] / sum(n.values())
+            return float(frac) if key == present[0] else 1.0 - float(frac)
+
+        srcs = [s for s in ('annotated', 'tracked') if any(k[0] == s for k in cells)]
+        n_src = {s: sum(len(v) for k, v in cells.items() if k[0] == s) for s in srcs}
+        pos = {j: i for i, j in enumerate(pool)}
+        w = np.zeros(len(pool), dtype=np.float64)
+        for s in srcs:
+            p_src = share(s, srcs, cfg.annot_frac, n_src)
+            modes = [m for m in ('3d', '2d') if (s, m) in cells]
+            n_mode = {m: len(cells[(s, m)]) for m in modes}
+            for m in modes:
+                js = cells[(s, m)]
+                w[[pos[j] for j in js]] = (p_src * share(m, modes, cfg.mode_3d_frac, n_mode)
+                                           / len(js))
+        if w.sum() <= 0:
+            raise ValueError('sampling weights are all zero -- check annot_frac / mode_3d_frac')
+        return np.cumsum(w / w.sum())
+
+    def mix(self):
+        """Realised share of train steps per (label_source, mode) cell. Reporting only.
+
+        Printed at startup because the mix is the single easiest thing here to get wrong by
+        accident and the hardest to see afterwards: it is invisible in the loss curve, and the
+        arithmetic that produces it lives in three places (index construction, dataset balancing,
+        the two fractions).
+        """
+        out: dict[str, float] = {}
+        for p, cum in self._pools:
+            wt = np.diff(cum, prepend=0.0) if cum is not None else np.full(len(p), 1.0 / len(p))
+            for j, x in zip(p, wt / len(self._pools)):
+                sess = self.index[j].session
+                out[f'{sess.mode}-{sess.label_source}'] = (
+                    out.get(f'{sess.mode}-{sess.label_source}', 0.0) + float(x))
+        return dict(sorted(out.items()))
+
     def _pick(self, idx, rng):
-        if not (self.train and self.cfg.balance_datasets and len(self.datasets) > 1):
+        # Val and test address the index directly -- a window's identity is its index, which is
+        # what `test_val_windows_are_deterministic` rests on.
+        if not self.train:
             return self.index[idx]
-        # Uniform over datasets, then uniform within: without this, branson-fly's 194 groups
-        # would outvote allen-mouse's 45 by 4:1 for no reason anyone chose.
-        pool = self.by_dataset[rng.integers(len(self.by_dataset))]
-        return self.index[pool[rng.integers(len(pool))]]
+        # Uniform over datasets, then weighted within: without the outer level, branson-fly's 194
+        # groups would outvote allen-mouse's 45 by 4:1 for no reason anyone chose.
+        pool, cum = (self._pools[rng.integers(len(self._pools))] if len(self._pools) > 1
+                     else self._pools[0])
+        if cum is None:
+            # Byte-for-byte the previous behaviour, so an unconfigured run is unchanged: one pool
+            # replays `idx` straight from the sampler, many pools draw uniformly inside the pool.
+            return self.index[idx if len(self._pools) == 1 else pool[rng.integers(len(pool))]]
+        return self.index[int(pool[np.searchsorted(cum, rng.random())])]
 
     # -- item ----------------------------------------------------------------------------
     def __getitem__(self, idx):

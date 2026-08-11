@@ -5,6 +5,8 @@ reproduce the pose crop, which is why a detector box costs ~0.02 mm instead of w
 independently-plausible rule would cost. `test_crop_rule_is_int32_exact` is what licenses that,
 and it compares against the library's own inline arithmetic rather than a transcription of it.
 """
+from collections import Counter
+
 import numpy as np
 import pytest
 import torch
@@ -643,3 +645,70 @@ def test_projected_carries_position_but_trains_no_visibility(projected_root):
     b = pose_collate([PoseDataset(projected_root, 'train', cfg, train=False)[0]])
     assert b.vis is None and b.vis_2d is None, 'no visibility target may be built from projected'
     assert torch.isfinite(b.coords).any(), 'the 3D targets still arrive'
+
+
+# ----------------------------------------------------------------------------------------------
+# the training mix
+# ----------------------------------------------------------------------------------------------
+
+def test_sampling_mix_is_two_level_and_skips_absent_levels(mixed_source_root):
+    """`annot_frac` then `mode_3d_frac` WITHIN each source, and the realised draw matches.
+
+    What this guards is the bug that made it necessary: `_starts` yields one index entry per
+    (session, group, animal) whatever the group's length, and the sampler draws entries
+    uniformly, so an entry is a sampling weight decoupled from the data behind it. On
+    allen-mouse-combined that put 90.4% of steps on the 2D path -- head bank 0, ~3 of 15 loss
+    terms -- and 3.9% on the tracked session holding 95% of the labelled frames.
+
+    `mixed_source_root` has no `2d-tracked` cell, so the mode level is SKIPPED inside `tracked`
+    and that source's 0.6 lands entirely on 3D. That asymmetry is the whole reason the two
+    fractions are conditional rather than joint marginals: as marginals they would be
+    over-constrained here, and `annot_frac = 1 - mode_3d_frac` would be the only feasible pair.
+
+    Both `mix()` and `_pick` are checked. They are computed from the same weights, but `mix()` is
+    what gets printed at startup and `_pick` is what the model actually sees; a reporting bug
+    that says the mix is fixed when it is not is the exact failure this whole change exists to
+    prevent.
+    """
+    cfg = LoaderConfig(n_frames=2, image_size=32, annot_frac=0.4, mode_3d_frac=0.7)
+    ds = PoseDataset(mixed_source_root, 'train', cfg)
+    want = {'2d-annotated': 0.4 * 0.3, '3d-annotated': 0.4 * 0.7, '3d-tracked': 0.6}
+    assert ds.mix() == pytest.approx(want, abs=1e-9)
+
+    rng = np.random.default_rng(0)
+    n = 20000
+    drawn = Counter()
+    for i in range(n):
+        s = ds._pick(i % len(ds.index), rng).session
+        drawn[f'{s.mode}-{s.label_source}'] += 1
+    for k, p in want.items():
+        assert drawn[k] / n == pytest.approx(p, abs=0.02), f'{k}: {drawn[k] / n:.3f} != {p}'
+
+
+def test_sampling_mix_defaults_to_the_uniform_draw(mixed_source_root):
+    """Unset fractions must reproduce the previous behaviour exactly, not approximately.
+
+    Eight arms of a sweep were mid-flight when this landed. An unconfigured run that merely
+    *resembled* the old draw would silently make every one of them incomparable to its successor.
+    """
+    cfg = LoaderConfig(n_frames=2, image_size=32)
+    ds = PoseDataset(mixed_source_root, 'train', cfg)
+    assert ds._pools[0][1] is None, 'no weights should be built when neither fraction is set'
+    rng = np.random.default_rng(0)
+    assert [ds._pick(i, rng) for i in range(len(ds.index))] == ds.index
+
+    # One level configured leaves the other alone: entries keep their natural share within a
+    # source, rather than the source being silently rebalanced to uniform-over-modes.
+    only_src = PoseDataset(mixed_source_root, 'train',
+                           LoaderConfig(n_frames=2, image_size=32, annot_frac=0.4)).mix()
+    assert only_src['3d-tracked'] == pytest.approx(0.6)
+    assert only_src['2d-annotated'] + only_src['3d-annotated'] == pytest.approx(0.4)
+    assert only_src['2d-annotated'] > only_src['3d-annotated'], (
+        'the 2D session carries 2 animals to the 3D session\'s 1, so with mode_3d_frac unset it '
+        'should keep the larger share')
+
+
+def test_sampling_mix_rejects_a_fraction_outside_the_unit_interval(mixed_source_root):
+    with pytest.raises(ValueError, match=r'annot_frac must be in \[0, 1\]'):
+        PoseDataset(mixed_source_root, 'train',
+                    LoaderConfig(n_frames=2, image_size=32, annot_frac=1.4))

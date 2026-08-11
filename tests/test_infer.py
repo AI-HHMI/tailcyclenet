@@ -118,3 +118,35 @@ def test_carry_requires_overlap(scene):
     model, sess, registry, name = scene
     with pytest.raises(ValueError, match='overlap'):
         run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', overlap=0))
+
+
+def test_carried_prior_is_bounds_masked_and_dated():
+    """The two defects in the deployed prompt, both of which were silent.
+
+    `prompt_time = 0` is right for interior windows and wrong on the last window of a group, which
+    `_window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
+    was handed in as a confident prior instead of as "I was not told".
+    """
+    from tailcyclenet.infer import _build_prior
+
+    K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
+    cgroup = [{'size': size}]
+    cfg = InferConfig(anchor='carry')
+    frames = np.arange(20, 28)
+    boxes = [(0, 0, 100, 100)]
+
+    # Two keypoints inside the crop, two outside it.
+    pose = torch.tensor([[10.0, 10.0], [90.0, 90.0], [-5.0, 10.0], [10.0, 400.0]])
+    prior, qt = _build_prior(cfg, (pose, 23), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+
+    assert torch.isfinite(prior[0, :2]).all(), 'in-crop keypoints must survive'
+    assert torch.isnan(prior[0, 2:]).all(), 'out-of-crop keypoints must become NaN'
+    assert qt.shape == (1, K)
+    assert (qt == 3).all(), f'prompt frame 23 is index 3 of a window starting at 20, got {qt}'
+
+    # A prompt from before the window cannot be expressed and clamps into range rather than
+    # indexing off the front of it.
+    _, early = _build_prior(cfg, (pose, 2), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    assert (early == 0).all()
+    _, late = _build_prior(cfg, (pose, 999), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    assert (late == len(frames) - 1).all()

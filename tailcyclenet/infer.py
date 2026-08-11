@@ -28,6 +28,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from posetail.posetail.cube import is_point_visible
+
 from . import crop as cropmod
 from .dataset import _resize_camera, read_frames
 from .format import VISIBLE, Labels, Session
@@ -218,7 +220,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 continue
 
             prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,
-                                           frames, boxes, scales, mode, K, R)
+                                           frames, boxes, scales, mode, K, R, cgroup)
             dev = cfg.device
             chunk = cfg.kpt_chunk or None
             out = model([v.to(dev) for v in views], kpt_ids.to(dev), _to_device(cgroup, dev),
@@ -251,8 +253,22 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                           ('given points' if box_points is not None else 'labels')}
 
 
-def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R):
-    """The per-keypoint prior for this window, in the model's coordinate frame."""
+def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cgroup):
+    """The per-keypoint prior for this window, in the model's coordinate frame.
+
+    Two things the prompt has to get right, both of which were wrong here and both silent:
+
+    THE PROMPT FRAME IS NOT ALWAYS 0. `carried[1]` already holds the frame the carried pose
+    describes. Hardcoding 0 is correct for interior windows and wrong on the LAST window of every
+    group, which `_window_starts` pulls back to `n_frames - T` so it overlaps its predecessor by
+    more than `overlap` -- the carried pose then describes a frame in the middle of the window and
+    the model samples its patch from the wrong one.
+
+    A PRIOR OUTSIDE THE CROP IS NOT A PRIOR. A carried keypoint that left the new box was being
+    handed in as confident. Masking it was worth MOTA +0.041, miss -0.032 SIG and idsw 24 -> 13 on
+    rat-city. NaN is the right value: it is exactly what the no-query tokens key off, so a
+    departed keypoint degrades to "I was not told" instead of "I was told a lie".
+    """
     if cfg.anchor in ('none', 'self'):
         return None, None
     if cfg.anchor == 'labels':
@@ -260,13 +276,30 @@ def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R):
         if src_animal is None:                   # a detector row with no label row behind it
             return None, None
         p = torch.as_tensor(src_animal[frames[0]], dtype=torch.float32)
+        qt = 0
     else:                                    # 'carry'
         if carried is None:
             return None, None
         p = carried[0].clone().float()
+        qt = int(carried[1]) - int(frames[0])
     if p.shape != (K, R):
         return None, None
     if mode == '2d':
         # the carried/labelled pose is in SOURCE pixels; the model works in crop pixels
         p = (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
-    return p[None], torch.zeros((1, K), dtype=torch.int32)
+        w, h = (float(x) for x in cgroup[0]['size'][:2])
+        outside = ((p[:, 0] < 0) | (p[:, 0] >= w) | (p[:, 1] < 0) | (p[:, 1] >= h))
+    else:
+        # A 3D point no PAIR of cameras can see is not reconstructible, so it cannot be a prior
+        # the model should trust -- the 3D analogue of leaving the crop. A MOVING camera answers
+        # per frame ((T,K), not (K,)), and the prior is one pose for the whole window, so a
+        # camera counts if it sees the point at any point during it.
+        seen = []
+        for c in cgroup:
+            v = is_point_visible(c, p, margin=2)
+            seen.append(v.any(0) if v.ndim > 1 else v)
+        outside = torch.stack(seen).sum(0) < 2
+    p = p.clone()
+    p[outside] = float('nan')
+    qt = min(max(qt, 0), len(frames) - 1)
+    return p[None], torch.full((1, K), qt, dtype=torch.int32)

@@ -10,7 +10,7 @@
 # A dataset root (has train/, optionally val/ and test/) OR a folder of dataset roots. The
 # second case trains one estimator across all of them, prefixing keypoint names by dataset.
 path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/allen-mouse"
-n_frames = 24
+n_frames = 24               # a CEILING: a train window is sized to the labelled span it covers
 image_size = 256
 cams_to_sample = 0          # 0 -> every camera of a 3D session
 prob_2d_only = 0.25         # rate at which a 3D session is shown ONE camera (3D single-view)
@@ -19,11 +19,17 @@ aug_prob = 0.25
 crop_jitter = 0.3           # 0.3/0.3 cut the cost of detector crops from +0.545 to +0.115 mm
 crop_jitter_scale = 0.3     # AND improved base accuracy -- a tight box teaches the model that
 min_crop_dim = 64           # the animal always fills the frame, which no detector delivers
-prompt_dropout = 0.4        # fraction of keypoints whose prior is withheld -> no-query tokens
+prompt_dropout = 0.5        # fraction of STEPS run fully query-free -> no-query tokens
+prompt_noise = 1.0          # sigma on the prior, in the session's units. The prior deploys as
+                            # the model's own prediction; trained on exact GT it learns to trust
+                            # a precision the carried signal does not have.
 num_workers = 12
 
 [model]
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
+query_encoder = "wide"      # "wide" (512-dim, identity + time) | "pose" (256-dim, ten terms)
+query_pos_embedding = true  # wide only: WHERE the query is. Without it wide ignores the prior
+query_patch_embedding = true  # wide only: WHAT is at the query. Reuses the pretrained patch CNN
 
 mode_3d = "encoder"
 video_encoder_version = "large"
@@ -83,7 +89,7 @@ print_freq = 20
 freeze_encoder = true       # a DEPLOYMENT decision: one frozen encoder forward feeds both models
 
 [training.optimizer]
-learning_rate = 3e-5
+learning_rate = 1e-4        # what every hop of the golden chain actually ran
 kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
 encoder_lr_scale = 0.1
 weight_decay = 0.002

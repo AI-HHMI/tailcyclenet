@@ -90,6 +90,10 @@ Five things that are easy to get wrong:
   anatomical order beside a tracked one in name-sorted order.
 - **A group is a contiguous clip**, `n_frames` unbounded. rat-city's 57,594 frames are ONE group
   whose `cam0` is a single symlink. ~900 symlinks across all four datasets, not 550k.
+  **A group's length is not its label count.** allen's annotated groups are 65 frames carrying
+  exactly ONE labelled frame — context around a single hand-annotated still — while a tracked
+  group is labelled throughout. This is why a train window's T is derived from the labels rather
+  than configured (gotcha 1), and why an index entry is a poor sampling weight (`_pool_weights`).
 - **`status` is the visibility channel**, in both label tables. Dictionary-encoded in parquet, so
   `vis = codes == VISIBLE` is a vectorized int8 compare. But **coordinates live on `VISIBLE` *or*
   `PROJECTED`** (`fmt.POSITIONED`): `projected` is a position with no visibility claim, for a
@@ -119,25 +123,48 @@ run folder as `keypoint_registry.toml` and read back at inference. Given an exis
 later run **appends** new names so old ids — and the embedding rows behind them — survive warm
 start.
 
-### The architecture: one switch
+### The architecture: two switches
 
 ```toml
 [model]
-query = "prior"   # per-keypoint prior + missing-query tokens  (was posetail-pose's w9_honest)
-# query = "none"  # query-free: no prior at all
+query = "prior"               # per-keypoint prior + missing-query tokens (posetail-pose w9_honest)
+# query = "none"              # query-free: no prior at all
+query_encoder = "wide"        # 512-dim, identity + time + the two query terms below
+# query_encoder = "pose"      # 256-dim, ten terms, 27 of 30 tensors inherited
+query_pos_embedding = true    # wide only: WHERE the query is
+query_patch_embedding = true  # wide only: WHAT is at the query
 ```
 
-`query = "prior"` carries a per-keypoint prior `kpt_prior (B,K,R)` plus `prompt_time (B,K)`.
-Every position-derived fusion term — `pos`, `patch`, `vis`, and `depth` in 3D — carries a
-**learned no-query token** where a keypoint has no prior, instead of a value computed from the
-crop centre and presented as real. The instance-anchor machinery from posetail-pose
-(`instance_anchor`, `anchor_mode`, `anchor_fallback`, `anchor_dropout`, `anchor_noise`,
-`anchor_attn_bias`) is **deleted**, not defaulted off.
+They are **orthogonal**: `query` decides whether a prior is supplied, `query_encoder` decides
+which module consumes it.
 
-Also deleted, deliberately: `WideQueryEncoder` / `query_encoder='wide'`, `query_pos_embedding`,
-`kpt_table_mlp`, the crowd head, distractor crops, prompt corruption, `crop_side_mode`,
-`curriculum`. If 3D accuracy disappoints, the first thing to try is re-adding `wide` — it beat
-`pose` on allen-mouse 3D (3.395 vs 4.021 mm) in posetail-pose.
+`query = "prior"` carries a per-keypoint prior `kpt_prior (B,K,R)` plus `prompt_time (B,K)`.
+Every position-derived fusion term — `pos`, `patch`, `vis`, and `depth` in 3D on `pose`; `qpos`
+and `patch` on `wide` — carries a **learned no-query token** where a keypoint has no prior,
+instead of a value computed from the crop centre and presented as real. `prompt_dropout` is the
+fraction of **steps** that run fully query-free, drawn per item as the reference draws it — per
+keypoint it would be 0.4⁴⁷ and the query-free forward would never be trained. The instance-anchor
+machinery (`instance_anchor`, `anchor_mode`, `anchor_fallback`, `anchor_attn_bias`) is **deleted**,
+not defaulted off — including `j7`, the best row on record (3.140 allen cross-animal).
+
+`wide` is the pre-port encoder, and the record says it wins **whenever no prior is supplied**:
+query-free, `pose`'s four distinguishing terms are computed from the same derived scene point for
+every keypoint, so they are constants and `pose` is a lower-capacity `wide`. Its two query terms
+are optional because **both off plus `query = "none"` is golden's `j3` encoder** — until they
+existed, golden could not be constructed here at all and scoring it needed posetail-pose's own
+package, env and weights. `wide` + `prior` with both off is refused at build: without a
+position-derived term the prior has no route in, which is how six posetail-pose configs were
+reported as anchored arms whose anchor was a literal no-op.
+
+`query_patch_embedding` builds its `PatchProcessor` at the base checkpoint's `embed_dim` and
+projects to the fusion width, so all ~5.4M of the pretrained patch CNN load by name. Building it
+at 512 instead would inherit 93k of 5.5M and silently retrain the rest from noise.
+
+Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, prompt corruption,
+`crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
+is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:
+pose, no jitter, **12k**). The one-key figure from that ledger is **3.535 vs 4.021**, unpaired,
+one seed each, no CI, never re-run.
 
 ---
 
@@ -183,6 +210,15 @@ against the crop rule directly.
    same shape. The fix existed on the abandoned `memory` branch
    (`gT = feat.shape[1] // (gH*gW)`) and was **lost in the moving-cams merge**. Never sample
    fewer than 2 frames; single-frame groups are padded at ingest.
+
+   Relatedly, **a training window's T is derived, not configured.** `[data].n_frames` is only a
+   ceiling: `_frames` sizes each train window to the labelled span it covers, rounded up to an
+   even number (tubelet 2), floor 2. The annotated sessions carry ONE labelled frame per 65-frame
+   group, so a fixed T = 24 spent 24 encodes to supervise 1 — 40% of steps at `annot_frac = 0.4`.
+   Val and test still enumerate fixed `n_frames` windows, or the metric would not be comparable
+   across checkpoints. And **`SmoothnessLoss` raises below `smoothness_loss_order + 1` frames**
+   (`losses.py:1146` narrows by `T - k`), so `run_batch` clamps the order per batch; at T = 2 it
+   degrades to a first difference rather than being disabled.
 2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x.**
    Encoder sharing for inference goes through `SceneRepresentation` directly, or the private
    `_forward_window` / `_decode_from_scene`.

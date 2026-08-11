@@ -27,9 +27,8 @@ num_workers = 12
 
 [model]
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
-query_encoder = "wide"      # "wide" (512-dim, identity + time) | "pose" (256-dim, ten terms)
-query_pos_embedding = true  # wide only: WHERE the query is. Without it wide ignores the prior
-query_patch_embedding = true  # wide only: WHAT is at the query. Reuses the pretrained patch CNN
+query_encoder = "wide"      # "wide" (512-dim, identity + time + the two query terms,
+                            # which are built iff query = "prior") | "pose" (256-dim, ten)
 
 mode_3d = "encoder"
 video_encoder_version = "large"

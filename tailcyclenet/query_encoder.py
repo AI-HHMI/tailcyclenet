@@ -375,7 +375,7 @@ class WideQueryEncoder(nn.Module):
     identity table at 47x512 is twice the capacity for the one mechanism that distinguishes
     LH-wrist from RH-wrist, which is load-bearing in a query-free model.
 
-    TWO OPTIONAL TERMS put the prior back, and they are what make this more than a reproduction:
+    TWO TERMS put the prior back, and they are what make this more than a reproduction:
 
     - `query_pos_embedding` -- where the query is. Without it this encoder ignores `query_coords`
       ENTIRELY, which is how six posetail-pose configs declared an anchor, trained, and were
@@ -385,8 +385,12 @@ class WideQueryEncoder(nn.Module):
       with an identical scorer, and the difference between those two queries is exactly a patch
       sampled at the query position.
 
-    Both off plus `query = "none"` is golden's `j3` encoder, which until now could not be built in
-    this repo at all -- scoring it needed posetail-pose's own package, env and weights.
+    THEY ARE NOT SEPARATELY CONFIGURABLE. `PoseTrackerEncoder` builds both iff `query = "prior"`,
+    because under `query = "none"` the prior is never read: `_query_ok` is all-False for the whole
+    run, `_sub_unprompted` substitutes both tokens on every query, and the terms are two constant
+    vectors feeding two dead gate inputs. Both off is therefore what `query = "none"` MEANS here
+    -- and that is exactly golden's `j3` encoder, which until now could not be built in this repo
+    at all: scoring it needed posetail-pose's own package, env and weights.
 
     UNLIKE posetail-pose's copy, both terms carry a learned no-query token. Its source note says
     missing-query tokens cannot work here because there is no position-derived term to be honest

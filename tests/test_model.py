@@ -391,3 +391,57 @@ def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
     for name in ('kpt_embed.weight', 'gate.0.weight', 'linear_qpos.weight', 'patch_proj.weight',
                  'missing_qpos', 'missing_patch'):
         assert f'query_encoder.{name}' in fresh, name
+
+
+def test_wide_query_terms_follow_the_query_mode():
+    """`qpos` and `patch` exist iff a prior is supplied. They are not separately configurable.
+
+    Under `query = "none"` the prior is never read, so `_query_ok` is all-False for the whole run
+    and `_sub_unprompted` swaps both terms for their no-query token on every query -- two constant
+    vectors feeding two dead gate inputs. And with both absent `wide` ignores `query_coords`
+    entirely, so `query = "prior"` could not reach the encoder: that is the combination six
+    posetail-pose configs shipped as anchored arms whose anchor was a literal no-op.
+    """
+    prior = build_model(small('wide', query='prior'), n_keypoints=5).query_encoder
+    free = build_model(small('wide', query='none'), n_keypoints=5).query_encoder
+
+    assert prior.term_names() == ['kpt', 'query_time', 'target_time', 'gap', 'qpos', 'patch',
+                                  'pp', 'intrinsic']
+    # 6 terms, no qpos, no patch: this IS golden's j3 encoder.
+    assert free.term_names() == ['kpt', 'query_time', 'target_time', 'gap', 'pp', 'intrinsic']
+    assert not hasattr(free, 'linear_qpos') and not hasattr(free, 'patch_processor')
+    assert free.n_fusion_terms == 6 and prior.n_fusion_terms == 8
+
+    for dead in ('query_pos_embedding', 'query_patch_embedding'):
+        with pytest.raises(AssertionError, match='not configurable'):
+            build_model(small('wide', **{dead: True}), n_keypoints=5)
+
+
+def test_item_dropout_reproduces_the_deployment_geometry(moving_batch):
+    """A fully-dropped window must put the scene scalars exactly where deployment puts them.
+
+    This is what per-ITEM dropout buys and per-keypoint dropout cannot. The decode is per-keypoint
+    independent -- there is no attention across the query axis -- but `scene_center`,
+    `scene_radius` and `cube_scale` are derived from the WHOLE `coords_q` set
+    (`tracker_encoder.py:318,356`) and scale the depth and 3D outputs. Leave even a few keypoints
+    prompted and those scalars are partly GT-derived, which is a condition deployment never meets:
+    on allen, a per-keypoint draw at p = 0.5 lands `scene_center` 13.6 mm off (0 of 200 draws
+    within 1 mm), where a per-item drop lands it at exactly 0.
+    """
+    from tailcyclenet.model import scene_center
+
+    b = moving_batch
+    K = b.kpt_ids.shape[1]
+    q0 = scene_center(b.cgroup).view(1, 3).expand(K, 3)
+    prior = b.kpt_prior[0]
+    assert torch.isfinite(prior).any(), 'the fixture must carry a real prior to withhold'
+
+    def centre(mask):                      # mask True -> that keypoint keeps its prior
+        return torch.nanmean(torch.where(mask[:, None], prior, q0).float(), 0)
+
+    deployed = centre(torch.zeros(K, dtype=torch.bool))
+    torch.testing.assert_close(deployed, q0[0])                    # all dropped == query-free
+    partial = centre(torch.tensor([True] + [False] * (K - 1)))     # ONE keypoint kept
+    assert not torch.allclose(partial, deployed), (
+        'a partially-prompted window must NOT share the query-free scene centre -- if it does, '
+        'this test can no longer tell per-item from per-keypoint dropout')

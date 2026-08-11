@@ -127,34 +127,39 @@ start.
 
 ```toml
 [model]
-query = "prior"               # per-keypoint prior + missing-query tokens (posetail-pose w9_honest)
-# query = "none"              # query-free: no prior at all
-query_encoder = "wide"        # 512-dim, identity + time + the two query terms below
-# query_encoder = "pose"      # 256-dim, ten terms, 27 of 30 tensors inherited
-query_pos_embedding = true    # wide only: WHERE the query is
-query_patch_embedding = true  # wide only: WHAT is at the query
+query = "prior"           # per-keypoint prior + missing-query tokens (posetail-pose w9_honest)
+# query = "none"          # query-free: no prior at all
+query_encoder = "wide"    # 512-dim, identity + time, + two query terms iff query = "prior"
+# query_encoder = "pose"  # 256-dim, ten terms, 27 of 30 tensors inherited
 ```
 
 They are **orthogonal**: `query` decides whether a prior is supplied, `query_encoder` decides
-which module consumes it.
+which module consumes it. There is no third key — `wide`'s two query terms (`qpos`, `patch`) are
+**derived** from `query`, because under `query = "none"` the prior is never read, so `_query_ok`
+is all-False for the whole run and both terms collapse to constant no-query tokens feeding dead
+gate inputs. So `wide` + `none` is a 6-term encoder and `wide` + `prior` an 8-term one, and
+`wide` + `none` **is** golden's `j3`.
 
 `query = "prior"` carries a per-keypoint prior `kpt_prior (B,K,R)` plus `prompt_time (B,K)`.
 Every position-derived fusion term — `pos`, `patch`, `vis`, and `depth` in 3D on `pose`; `qpos`
 and `patch` on `wide` — carries a **learned no-query token** where a keypoint has no prior,
 instead of a value computed from the crop centre and presented as real. `prompt_dropout` is the
-fraction of **steps** that run fully query-free, drawn per item as the reference draws it — per
-keypoint it would be 0.4⁴⁷ and the query-free forward would never be trained. The instance-anchor
+fraction of **steps** that run fully query-free, drawn per item as the reference draws it. The
+decode itself is per-keypoint independent — there is no attention across the query axis — but
+`scene_center`, `scene_radius` and `cube_scale` are derived from the WHOLE `coords_q` set
+(`tracker_encoder.py:318,356`) and scale the depth and 3D outputs. Measured on allen: a
+per-keypoint draw at p = 0.5 puts `scene_center` 13.6 mm from its deployment value (0 of 200 draws
+within 1 mm), where a per-item drop puts it at exactly 0. Per keypoint, the geometry the model
+meets at deployment is never trained. The instance-anchor
 machinery (`instance_anchor`, `anchor_mode`, `anchor_fallback`, `anchor_attn_bias`) is **deleted**,
 not defaulted off — including `j7`, the best row on record (3.140 allen cross-animal).
 
 `wide` is the pre-port encoder, and the record says it wins **whenever no prior is supplied**:
 query-free, `pose`'s four distinguishing terms are computed from the same derived scene point for
-every keypoint, so they are constants and `pose` is a lower-capacity `wide`. Its two query terms
-are optional because **both off plus `query = "none"` is golden's `j3` encoder** — until they
-existed, golden could not be constructed here at all and scoring it needed posetail-pose's own
-package, env and weights. `wide` + `prior` with both off is refused at build: without a
-position-derived term the prior has no route in, which is how six posetail-pose configs were
-reported as anchored arms whose anchor was a literal no-op.
+every keypoint, so they are constants and `pose` is a lower-capacity `wide`. Tying its two query
+terms to `query` also makes the old wiring trap unrepresentable — `wide` with both terms off
+ignores `query_coords` entirely, which is how six posetail-pose configs declared an anchor,
+trained, and were reported as anchored arms whose anchor was a literal no-op.
 
 `query_patch_embedding` builds its `PatchProcessor` at the base checkpoint's `embed_dim` and
 projects to the fusion width, so all ~5.4M of the pretrained patch CNN load by name. Building it

@@ -276,10 +276,13 @@ def test_window_is_at_least_two_frames(tiny_root):
     with pytest.raises(AssertionError, match='n_frames'):
         PoseDataset(tiny_root / 'ratlike', 'train', cfg)
 
+    # A 4-frame group under a ceiling of 8 now yields 4, not 8: T is sized to the labelled span,
+    # so the window is no longer padded out with duplicates of the last frame. Never 1, though --
+    # that is the whole point of this test.
     cfg2 = LoaderConfig(n_frames=8, image_size=64, aug_prob=0.0, crop_jitter=0.0)
     ds2 = PoseDataset(tiny_root / 'ratlike', 'train', cfg2)   # groups are only 4 frames long
     b2 = _batch(ds2)
-    assert b2.views[0].shape[1] == 8                          # clamp-padded, not truncated
+    assert b2.views[0].shape[1] == 4
 
 
 def test_single_view_keeps_3d_targets(tiny_root):
@@ -487,12 +490,64 @@ def test_prompt_is_the_first_labelled_frame(tiny_root):
                                        b.coords[0, b.prompt_t[0, k].long(), k])
 
 
-def test_prompt_dropout_withholds_priors(tiny_root):
-    cfg = LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
-                       prompt_dropout=1.0, prob_2d_only=0.0)
-    ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg)
-    b = _batch(ds)
-    assert torch.isnan(b.kpt_prior).all()      # every keypoint unprompted -> learned tokens
+def test_prompt_dropout_is_per_item_not_per_keypoint(tiny_root):
+    """`prompt_dropout` is the fraction of STEPS that run fully query-free, per the reference.
+
+    Drawn i.i.d. per keypoint instead, P(a fully unprompted window) is 0.4^K -- 1e-19 at allen's
+    47 keypoints -- so the query-free forward that val and `best_mpjpe` score is never trained. A
+    per-keypoint draw also passes the `1.0` case below, which is why the mid-rate case is here:
+    at p = 0.5 every window must be ALL NaN or NO NaN, never a mixture.
+    """
+    def cfg(p):
+        return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                            prompt_dropout=p, prob_2d_only=0.0)
+
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg(1.0))
+    assert torch.isnan(_batch(ds).kpt_prior).all()     # unprompted -> learned tokens
+    ds0 = PoseDataset(tiny_root / 'ratlike', 'train', cfg(0.0))
+    assert not torch.isnan(_batch(ds0).kpt_prior).any()
+
+    ds5 = PoseDataset(tiny_root / 'ratlike', 'train', cfg(0.5))
+    seen = set()
+    for _ in range(40):
+        nan = torch.isnan(_batch(ds5).kpt_prior)
+        assert nan.all() or not nan.any(), 'dropout mixed within one window -> it is per-keypoint'
+        seen.add(bool(nan.all()))
+    assert seen == {True, False}, f'p=0.5 never produced both outcomes in 40 draws: {seen}'
+
+
+def test_prompt_noise_perturbs_only_real_priors(tiny_root):
+    """Exposure bias: the prior trains on exact GT and deploys as the model's own prediction."""
+    def cfg(sigma, drop):
+        return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                            prompt_dropout=drop, prompt_noise=sigma, prob_2d_only=0.0)
+
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg(0.0, 0.0))
+    clean = _batch(ds).kpt_prior
+    noisy = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg(5.0, 0.0))).kpt_prior
+    assert torch.isfinite(noisy).all()
+    assert not torch.allclose(clean, noisy)
+    # NaN + noise is still NaN, so a withheld prior stays withheld with no masking needed.
+    dropped = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg(5.0, 1.0))).kpt_prior
+    assert torch.isnan(dropped).all()
+
+
+def test_window_is_sized_to_the_labelled_span(centred_root):
+    """T is derived from the labels, not configured; `n_frames` is only its ceiling.
+
+    The annotated sessions carry ONE labelled frame per 65-frame group, so a fixed T = 24 encodes
+    24 frames to supervise 1. This fixture labels frames 11-13 of a 24-frame group: span 3, so T
+    rounds up to 4 and the window must actually COVER 11..13 rather than merely touch one of them.
+    """
+    cfg = LoaderConfig(n_frames=24, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                       prompt_dropout=0.0)
+    ds = PoseDataset(centred_root, 'train', cfg)
+    for _ in range(20):
+        b = _batch(ds)
+        T = b.views[0].shape[1]
+        assert T == 4, T
+        assert set(range(11, 14)) <= set(b.fnums[0].tolist()), b.fnums[0].tolist()
+
 
 
 def test_visibility_stays_three_state(tiny_root):

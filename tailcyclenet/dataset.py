@@ -62,7 +62,8 @@ class LoaderConfig:
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
     crop_jitter_scale: float = 0.3     # box scale jitter
     min_crop_dim: int = 64
-    prompt_dropout: float = 0.4        # fraction of keypoints whose prior is withheld
+    prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
+    prompt_noise: float = 0.0          # sigma on the prior, in the session's own units
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
     # Train sampling mix, a TWO-LEVEL draw: source first, then mode within that source. Either
     # level is skipped where a dataset offers no choice -- an all-tracked root ignores
@@ -207,6 +208,18 @@ def _n_cams(spec, rng):
         lo, hi = int(spec[0]), int(spec[1])
         return int(rng.integers(lo, hi + 1))
     return int(spec)
+
+
+def _even_span(span, ceiling):
+    """Round a labelled span up to an even window length in [2, ceiling].
+
+    EVEN because the scene encoder tokenises in tubelets of 2 (`vjepa2.py:103`,
+    `gT = view.shape[1] // tubelet_size`), so an odd T silently drops a frame's worth of tokens.
+    FLOOR OF 2 because T = 1 gives `gT = 0` and a zero-length pos_embed -- gotcha 1, the failure
+    that cost the `memory` branch.
+    """
+    hi = max(2, int(ceiling) - int(ceiling) % 2)
+    return min(max(2, int(span) + int(span) % 2), hi)
 
 
 def _build_augmenters(cfg):
@@ -499,7 +512,22 @@ class PoseDataset(Dataset):
         raise RuntimeError(f'{self.split}: 8 consecutive items failed to build')
 
     def _frames(self, item, lab, group, rng):
-        """T frame indices, clamp-padded so a short group still yields T >= 2."""
+        """T frame indices, clamp-padded so a short group still yields T >= 2.
+
+        ON TRAIN, T IS DERIVED FROM THE LABELS, and `cfg.n_frames` is only its ceiling. The
+        annotated sessions carry ONE labelled frame per 65-frame group, so a fixed T = 24 encodes
+        24 frames to supervise 1 -- and with `annot_frac = 0.4` that is 40% of all steps paying 12x
+        for nothing. Sizing the window to the labelled span makes those steps T = 2.
+
+        This does NOT mean every encoded frame is supervised: two frames is the floor (gotcha 1 --
+        a single-frame window gives `gT = 0` and a zero-length pos_embed), so one label still
+        carries an unsupervised partner, and labels that are not adjacent force every frame
+        between them to be encoded to span the pair. The claim is only that no frame is encoded
+        which is not needed to reach a label.
+
+        VAL AND TEST ARE UNTOUCHED -- `_starts` enumerates fixed `cfg.n_frames` windows there, and
+        a metric whose window length moved would not be comparable across checkpoints.
+        """
         T = self.cfg.n_frames
         vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
         labelled = self._labelled_frames(vis, item.animal)
@@ -512,8 +540,20 @@ class PoseDataset(Dataset):
             # required the window's FIRST frame to be labelled, which silently discarded any
             # group whose labels sat in the middle; here the window moves to the label.
             anchor = int(labelled[rng.integers(labelled.size)])
-            lo = max(0, anchor - T + 1)
-            hi = min(anchor, max(0, group.n_frames - T))
+            # Shrink T to the labelled frames this window could actually reach. `near` is every
+            # label some placement of a full-width window over the anchor would cover, so
+            # spanning first..last of them is the most T ever has to be.
+            near = labelled[(labelled > anchor - T) & (labelled < anchor + T)]
+            first, last = int(near[0]), int(near[-1])
+            T = _even_span(last - first + 1, T)
+            if last - first + 1 > T:
+                # The span is wider than the ceiling allows; no placement covers it, so fall back
+                # to the anchor and let the draw pick which end of the span it lands on.
+                first = last = anchor
+            # Bounds that COVER first..last rather than merely containing the anchor -- sizing T
+            # to a span and then placing the window off it would pay for frames it never reads.
+            lo = max(0, last - T + 1)
+            hi = min(first, max(0, group.n_frames - T))
             start = int(rng.integers(lo, hi + 1)) if hi > lo else lo
         f = np.clip(np.arange(start, start + T), 0, group.n_frames - 1)
         return f
@@ -675,9 +715,27 @@ class PoseDataset(Dataset):
         prompt_t = prompt_t.to(torch.int32)
         kpt_prior = coords[prompt_t, torch.arange(K)].clone()      # (K,R)
         kpt_prior[~finite.any(0)] = float('nan')
-        if self.train and self.cfg.prompt_dropout > 0:
-            drop = torch.as_tensor(rng.random(K) < self.cfg.prompt_dropout)
-            kpt_prior[drop] = float('nan')
+        # PER ITEM, NOT PER KEYPOINT. The reference draws one coin for the whole window
+        # (`posetail_pose/model.py:619-621`, shape (B,1,1) broadcast over K), which is what makes
+        # `prompt_dropout` the fraction of TRAINING STEPS that run fully query-free -- so one set
+        # of weights serves both the first window of a clip and every window after it. Drawing
+        # i.i.d. per keypoint instead put P(a fully unprompted window) at 0.4^47 ~ 1e-19: the
+        # query-free forward, which is the path val and `best_mpjpe` score, was never trained.
+        # It also left the prompted windows partially dense where `--anchor carry` supplies a
+        # 100%-dense prior, so training and deployment disagreed on prompt density too.
+        if self.train and rng.random() < self.cfg.prompt_dropout:
+            kpt_prior[:] = float('nan')
+        # EXPOSURE BIAS. The prior trains on exact GT and deploys as the model's own prediction;
+        # an arm trained only on exact priors learns to trust a precision the carried signal does
+        # not have. On rat-city, over the same 138 instance-windows, the (0, 0) control had carry
+        # HURT by +1.815 mm while the (0.4, 5.7) recipe had it HELP by -0.749. NaN + noise is
+        # still NaN, so a withheld prior stays withheld with no mask.
+        #
+        # `# ponytail:` sigma is in the SESSION's own units and this is one value for the run,
+        # which is wrong for a root mixing mm and px sessions -- per-dataset sigma if that lands.
+        if self.train and self.cfg.prompt_noise > 0:
+            kpt_prior += torch.as_tensor(
+                rng.normal(0.0, self.cfg.prompt_noise, kpt_prior.shape), dtype=kpt_prior.dtype)
 
         kpt_ids = self._kpt_ids[sess.path]      # aligned to THIS session's axis, not the root's
         query_times = torch.zeros(K, dtype=torch.int32)

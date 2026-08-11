@@ -36,7 +36,7 @@ from torch.utils.data import Dataset
 
 from posetail.datasets.posetail_dataset import (custom_collate, rotate_camera_image_plane_3d,
                                                 rotate_points_image_plane)
-from posetail.posetail.cube import is_point_visible, project_points_torch
+from posetail.posetail.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
 from .format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
@@ -63,7 +63,7 @@ class LoaderConfig:
     crop_jitter_scale: float = 0.3     # box scale jitter
     min_crop_dim: int = 64
     prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
-    prompt_noise: float = 0.0          # sigma on the prior, in the session's own units
+    prompt_noise_px: float = 0.0       # sigma on the prior, in PIXELS (3D scales by cube_scale)
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
     # Train sampling mix, a TWO-LEVEL draw: source first, then mode within that source. Either
     # level is skipped where a dataset offers no choice -- an all-tracked root ignores
@@ -731,11 +731,21 @@ class PoseDataset(Dataset):
         # HURT by +1.815 mm while the (0.4, 5.7) recipe had it HELP by -0.749. NaN + noise is
         # still NaN, so a withheld prior stays withheld with no mask.
         #
-        # `# ponytail:` sigma is in the SESSION's own units and this is one value for the run,
-        # which is wrong for a root mixing mm and px sessions -- per-dataset sigma if that lands.
-        if self.train and self.cfg.prompt_noise > 0:
+        # SIGMA IS IN PIXELS, AND 3D CONVERTS. One scalar in the SESSION's own units cannot work:
+        # `allen-mouse-combined` alone holds 63 px sessions beside 14 mm ones, so a single 1.0
+        # meant a 1 px nudge on one and a 1 mm nudge on the other. `cube_scale` is world units per
+        # pixel -- the same conversion `WeightedMAELoss` uses to enter the Huber in pixels
+        # (`losses.py:1070-1080`) -- so scaling by it makes ONE setting mean the same visual
+        # displacement on a 30 px fly and a 57,594-frame rat rig alike. Measured at the prior's own
+        # position, through THIS window's cropped and resized cameras, so crop jitter is included.
+        if self.train and self.cfg.prompt_noise_px > 0 and bool(torch.isfinite(kpt_prior).any()):
+            sigma = float(self.cfg.prompt_noise_px)
+            if R == 3:
+                pts = kpt_prior[torch.isfinite(kpt_prior).all(-1)][None]     # (1,n,3)
+                scale = torch.nanmedian(get_camera_scale(cgroup, pts))
+                sigma *= float(scale)
             kpt_prior += torch.as_tensor(
-                rng.normal(0.0, self.cfg.prompt_noise, kpt_prior.shape), dtype=kpt_prior.dtype)
+                rng.normal(0.0, sigma, kpt_prior.shape), dtype=kpt_prior.dtype)
 
         kpt_ids = self._kpt_ids[sess.path]      # aligned to THIS session's axis, not the root's
         query_times = torch.zeros(K, dtype=torch.int32)

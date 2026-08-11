@@ -520,7 +520,7 @@ def test_prompt_noise_perturbs_only_real_priors(tiny_root):
     """Exposure bias: the prior trains on exact GT and deploys as the model's own prediction."""
     def cfg(sigma, drop):
         return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
-                            prompt_dropout=drop, prompt_noise=sigma, prob_2d_only=0.0)
+                            prompt_dropout=drop, prompt_noise_px=sigma, prob_2d_only=0.0)
 
     ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg(0.0, 0.0))
     clean = _batch(ds).kpt_prior
@@ -767,3 +767,40 @@ def test_sampling_mix_rejects_a_fraction_outside_the_unit_interval(mixed_source_
     with pytest.raises(ValueError, match=r'annot_frac must be in \[0, 1\]'):
         PoseDataset(mixed_source_root, 'train',
                     LoaderConfig(n_frames=2, image_size=32, annot_frac=1.4))
+
+
+def test_prompt_noise_is_in_pixels_on_both_modes(tiny_root):
+    """One sigma must mean the same VISUAL displacement whatever the session's units.
+
+    A single scalar in each session's own units cannot: `allen-mouse-combined` alone holds 63 px
+    sessions beside 14 mm ones, so `1.0` was a 1 px nudge on one and a 1 mm nudge on the other,
+    and across the sweep rat-city is px where allen 3D is mm. `cube_scale` is world units per
+    pixel -- the same conversion the metric losses use -- so the 3D sigma is the pixel sigma
+    times it, and the displacement matches by construction.
+    """
+    from posetail.posetail.cube import get_camera_scale
+
+    SIG = 3.0
+
+    def spread(root, sigma):
+        """Median |prior - clean| over many draws, in the session's own units."""
+        def mk(s):
+            return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                                prompt_dropout=0.0, prompt_noise_px=s, prob_2d_only=0.0)
+        clean = _batch(PoseDataset(root, 'train', mk(0.0))).kpt_prior
+        ds = PoseDataset(root, 'train', mk(sigma))
+        d = torch.stack([(_batch(ds).kpt_prior - clean).abs().median() for _ in range(30)])
+        return float(d.median())
+
+    px = spread(tiny_root / 'ratlike', SIG)          # mode='2d', units='px'
+    mm = spread(tiny_root / 'mouselike', SIG)        # mode='3d', units='mm'
+
+    # 2D is already pixels -- the sigma is applied verbatim.
+    assert 0.3 * SIG < px < 3 * SIG, px
+    # 3D is scaled by cube_scale, so it must NOT equal the pixel sigma; convert back and compare.
+    b = _batch(PoseDataset(tiny_root / 'mouselike', 'train',
+                           LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                                        prompt_dropout=0.0, prob_2d_only=0.0)))
+    scale = float(torch.nanmedian(get_camera_scale(b.cgroup, b.kpt_prior)))
+    assert scale > 0
+    assert 0.3 * SIG < mm / scale < 3 * SIG, (mm, scale, mm / scale)

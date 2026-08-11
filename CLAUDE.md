@@ -144,7 +144,12 @@ gate inputs. So `wide` + `none` is a 6-term encoder and `wide` + `prior` an 8-te
 Every position-derived fusion term — `pos`, `patch`, `vis`, and `depth` in 3D on `pose`; `qpos`
 and `patch` on `wide` — carries a **learned no-query token** where a keypoint has no prior,
 instead of a value computed from the crop centre and presented as real. `prompt_dropout` is the
-fraction of **steps** that run fully query-free, drawn per item as the reference draws it. The
+fraction of **steps** that run fully query-free, drawn per item as the reference draws it, and
+`prompt_noise_px` is the jitter on the priors it keeps — **in pixels**, converted for 3D by
+`cube_scale` (world units per pixel), the same normalisation the metric losses use to enter the
+Huber in pixels. One scalar in each session's own units could not work: `allen-mouse-combined`
+alone holds 63 px sessions beside 14 mm ones. Ship it WITH the dropout — dropout alone is retired
+at +0.146 SIG worse on fly. The
 decode itself is per-keypoint independent — there is no attention across the query axis — but
 `scene_center`, `scene_radius` and `cube_scale` are derived from the WHOLE `coords_q` set
 (`tracker_encoder.py:318,356`) and scale the depth and 3D outputs. Measured on allen: a

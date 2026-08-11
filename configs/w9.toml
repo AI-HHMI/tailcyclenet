@@ -22,9 +22,13 @@ crop_jitter = 0.3           # 0.3/0.3 cut the cost of detector crops from +0.545
 crop_jitter_scale = 0.3     # AND improved base accuracy -- a tight box teaches the model that
 min_crop_dim = 64           # the animal always fills the frame, which no detector delivers
 prompt_dropout = 0.5        # fraction of STEPS run fully query-free -> no-query tokens
-prompt_noise = 1.0          # sigma on the prior, in the session's units. The prior deploys as
-                            # the model's own prediction; trained on exact GT it learns to trust
-                            # a precision the carried signal does not have.
+prompt_noise_px = 3.0       # sigma on the prior, in PIXELS. 3D converts via cube_scale (world
+                            # units per pixel), the same normalisation the metric losses use, so
+                            # ONE setting means the same visual displacement on a 30 px fly and on
+                            # allen's mm-space rig. Trained on exact GT the prior learns to trust a
+                            # precision the carried signal lacks: on rat-city the (0,0) control had
+                            # carry HURT +1.815 where the recipe row had it HELP -0.749. Ships WITH
+                            # the dropout -- dropout alone is retired at +0.146 SIG worse on fly.
 num_workers = 12
 
 [model]

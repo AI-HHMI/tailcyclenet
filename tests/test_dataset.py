@@ -380,7 +380,7 @@ def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
     """
     from tailcyclenet.dataset import _build_augmenters
 
-    defocus, per_camera, per_image = _build_augmenters(
+    per_camera, per_image = _build_augmenters(
         LoaderConfig(aug_prob=1.0, per_image_aug_prob=1.0))
     img = (np.mgrid[0:64, 0:64][0][..., None] * np.ones((1, 1, 3))).astype(np.uint8)
 
@@ -548,6 +548,41 @@ def test_window_is_sized_to_the_labelled_span(centred_root):
         assert T == 4, T
         assert set(range(11, 14)) <= set(b.fnums[0].tolist()), b.fnums[0].tolist()
 
+
+
+def test_frame_strides_widen_the_window_on_the_lattice(dense_root, centred_root):
+    """A strided train window must stay ON its lattice, in the group, and over its anchor label.
+
+    Stride is posetail's `interval` (`posetail_dataset.py:343-361`). It composes with the derived-T
+    rule by restricting the labelled span to the frames a stride-s window through the anchor can
+    actually reach -- so the two assertions that matter are that the spacing never silently
+    collapses (clamping off the end of the group would do exactly that, and would look like a
+    shorter window rather than an error) and that val is left at stride 1.
+    """
+    def cfg(strides, n=8):
+        return LoaderConfig(n_frames=n, image_size=32, aug_prob=0.0, crop_jitter=0.0,
+                            prompt_dropout=0.0, frame_strides=strides)
+
+    # 3 as well as 4: an odd stride does not divide the group, so the anchor's lattice offset eats
+    # into the room at the end of it. Sizing T from frame 0 instead lets the tail clamp onto the
+    # last frame, which shows up as a shorter window rather than as the error it is.
+    for s in (4, 3):
+        ds = PoseDataset(dense_root, 'train', cfg([s]))
+        for _ in range(30):
+            f = pose_collate([ds[0]]).fnums[0].numpy()
+            assert list(np.diff(f)) == [s] * (len(f) - 1), f  # no clamping, no off-lattice start
+            assert f.max() < 32 and f.min() >= 0, f
+
+    # A one-label lattice: labels sit at 11-13, so at stride 4 only the anchor is reachable and T
+    # falls to the floor of 2 -- more motion for the same two encodes. This is the allen shape.
+    mid = PoseDataset(centred_root, 'train', cfg([4], n=24))
+    for _ in range(20):
+        f = pose_collate([mid[0]]).fnums[0].numpy()
+        assert len(f) == 2 and f[1] - f[0] == 4, f
+        assert set(f) & {11, 12, 13}, f
+
+    val = PoseDataset(dense_root, 'train', cfg([4]), train=False)
+    assert list(np.diff(pose_collate([val[0]]).fnums[0].numpy())) == [1] * 7
 
 
 def test_visibility_stays_three_state(tiny_root):

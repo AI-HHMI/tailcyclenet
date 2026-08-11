@@ -65,6 +65,10 @@ class LoaderConfig:
     prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
     prompt_noise_px: float = 0.0       # sigma on the prior, in PIXELS (3D scales by cube_scale)
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
+    # Frame stride for a TRAIN window, drawn per item -- posetail's `interval`
+    # (`posetail_dataset.py:343-361`). [1] is consecutive frames, i.e. no augmentation. Repeat an
+    # entry to weight it: [1, 1, 2, 4] draws stride 1 half the time. Val/test are always 1.
+    frame_strides: list = field(default_factory=lambda: [1])
     # Train sampling mix, a TWO-LEVEL draw: source first, then mode within that source. Either
     # level is skipped where a dataset offers no choice -- an all-tracked root ignores
     # `annot_frac`, a single-mode root ignores `mode_3d_frac` -- so one setting serves every root.
@@ -230,19 +234,14 @@ def _build_augmenters(cfg):
     an identity cue for a tracker, and re-rolling hue every frame teaches that it is noise.
     `per_image` is resampled per frame, which is what sensor noise and motion blur actually are.
 
-    Cost, measured on 24 crops of 256x256 with every augmenter firing: 0.141 s for `per_camera`
-    (`DefocusBlur` is 4.2 ms/frame of it, the most expensive single entry) and 0.052 s for
-    `per_image`. Watch `train/loader_wait_frac`; if it climbs, DefocusBlur is the first to drop.
+    Cost was last measured at 0.141 s for `per_camera` and 0.052 s for `per_image` on 24 crops of
+    256x256 with every augmenter firing, but that predates dropping `DefocusBlur` -- which was
+    4.2 ms/frame, the most expensive single entry -- so `per_camera` is now well under it. Watch
+    `train/loader_wait_frac`; re-measure the same way before blaming augmentation for it.
     """
     import imgaug.augmenters as iaa
 
     p, q = cfg.aug_prob, cfg.per_image_aug_prob
-    # DefocusBlur is kept OUT of the sequential because it cannot run on a small crop: the
-    # imagecorruptions functions it wraps assert both sides >= 32 px (`imgcorruptlike.py:175`) and
-    # raise otherwise, which inside a worker is a dead run rather than a skipped augmentation. A
-    # crop is square-ish, so real data clears 32 comfortably -- but "comfortably" is not a
-    # guarantee, and `_augment` gates on the actual crop instead of assuming.
-    defocus = iaa.Sometimes(p, iaa.imgcorruptlike.DefocusBlur(severity=(1, 1)))
     per_camera = iaa.Sequential([
         iaa.Sometimes(p, iaa.GammaContrast((0.6, 1.8))),
         iaa.Sometimes(p, iaa.AddToSaturation((-50, 30))),
@@ -252,9 +251,8 @@ def _build_augmenters(cfg):
         iaa.Sometimes(q, iaa.MotionBlur(k=(3, 5))),
         iaa.Sometimes(q, iaa.AdditiveGaussianNoise(scale=(0, 0.04 * 255))),
         iaa.Sometimes(q, iaa.Multiply((0.9, 1.1))),
-        iaa.Sometimes(q, iaa.SaltAndPepper(0.004)),
     ])
-    return defocus, per_camera, per_image
+    return per_camera, per_image
 
 
 def _cutout_rects(rng, size, p2d, vis_2d, cnum):
@@ -525,37 +523,61 @@ class PoseDataset(Dataset):
         between them to be encoded to span the pair. The claim is only that no frame is encoded
         which is not needed to reach a label.
 
-        VAL AND TEST ARE UNTOUCHED -- `_starts` enumerates fixed `cfg.n_frames` windows there, and
-        a metric whose window length moved would not be comparable across checkpoints.
+        ON TRAIN THE FRAMES MAY ALSO BE STRIDED, by `cfg.frame_strides` -- posetail's `interval`
+        (`posetail_dataset.py:343-361`), which this loader dropped when it moved to picking the
+        start inside `__getitem__`. A stride of s widens the window to s times the wall time for
+        the same T, so the model meets motion at more than one time scale. Everything below is the
+        derived-T rule re-expressed on a LATTICE of spacing s: a strided window through the anchor
+        can only reach labels congruent to it mod s, so the span is measured in lattice steps and
+        the start is snapped onto the lattice.
+
+        VAL AND TEST ARE UNTOUCHED -- `_starts` enumerates fixed `cfg.n_frames` windows there at
+        stride 1, and a metric whose window geometry moved would not be comparable across
+        checkpoints.
         """
         T = self.cfg.n_frames
         vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
         labelled = self._labelled_frames(vis, item.animal)
         if labelled.size == 0:
             return None
+        s = 1
         if item.start >= 0:
             start = item.start
         else:
+            # A stride is admissible if the group holds the FLOOR window of two frames at it; T
+            # is then capped by what the group actually has room for at that stride. Testing the
+            # full ceiling instead would reject stride exactly where it is most useful -- an
+            # allen group is 65 frames with T = 24, and a 24-wide stride-4 window needs 93.
+            fit = [x for x in self.cfg.frame_strides if x <= group.n_frames - 1]
+            s = int(fit[rng.integers(len(fit))]) if fit else 1
             # Anchor on a labelled frame, then place the window around it. The old v4 loader
             # required the window's FIRST frame to be labelled, which silently discarded any
             # group whose labels sat in the middle; here the window moves to the label.
             anchor = int(labelled[rng.integers(labelled.size)])
+            # Cap T at what the group holds ON THIS ANCHOR'S LATTICE -- the offset eats into the
+            # room, and measuring from frame 0 instead lets the last frames clamp onto the end,
+            # which reads as a shorter window rather than as the error it is.
+            T = min(T, (group.n_frames - 1 - anchor % s) // s + 1)
             # Shrink T to the labelled frames this window could actually reach. `near` is every
             # label some placement of a full-width window over the anchor would cover, so
-            # spanning first..last of them is the most T ever has to be.
-            near = labelled[(labelled > anchor - T) & (labelled < anchor + T)]
+            # spanning first..last of them is the most T ever has to be. Off-lattice labels are
+            # unreachable at this stride, so they are dropped before the span is measured.
+            near = labelled[(labelled > anchor - T * s) & (labelled < anchor + T * s)]
+            near = near[(near - anchor) % s == 0]
             first, last = int(near[0]), int(near[-1])
-            T = _even_span(last - first + 1, T)
-            if last - first + 1 > T:
+            T = _even_span((last - first) // s + 1, T)
+            if last - first > (T - 1) * s:
                 # The span is wider than the ceiling allows; no placement covers it, so fall back
                 # to the anchor and let the draw pick which end of the span it lands on.
                 first = last = anchor
             # Bounds that COVER first..last rather than merely containing the anchor -- sizing T
             # to a span and then placing the window off it would pay for frames it never reads.
-            lo = max(0, last - T + 1)
-            hi = min(first, max(0, group.n_frames - T))
-            start = int(rng.integers(lo, hi + 1)) if hi > lo else lo
-        f = np.clip(np.arange(start, start + T), 0, group.n_frames - 1)
+            span = (T - 1) * s
+            lo = max(0, last - span)
+            hi = min(first, max(0, group.n_frames - 1 - span))
+            lo += (anchor - lo) % s                 # snap up onto the anchor's lattice
+            start = int(lo + s * rng.integers(0, (hi - lo) // s + 1)) if hi > lo else lo
+        f = np.clip(np.arange(start, start + T * s, s), 0, group.n_frames - 1)
         return f
 
     def _item(self, idx, rng):
@@ -761,13 +783,11 @@ class PoseDataset(Dataset):
         """Appearance augmentation for one camera's T crops. `vis_2d` is mutated by cutout."""
         import cv2
 
-        defocus, per_camera, per_image = self._aug
+        per_camera, per_image = self._aug
         # to_deterministic() freezes this camera's sampled parameters so every frame gets the
-        # SAME gamma/hue/blur -- see `_build_augmenters`. Only the apply is per-frame.
+        # SAME gamma/hue -- see `_build_augmenters`. Only the apply is per-frame.
         cam_det = per_camera.to_deterministic()
-        blur = defocus.to_deterministic() if min(imgs[0].shape[:2]) >= 32 else None
-        imgs = [per_image(image=cam_det(image=im if blur is None else blur(image=im)))
-                for im in imgs]
+        imgs = [per_image(image=cam_det(image=im)) for im in imgs]
         if rng.random() < self.cfg.aug_prob:
             for x1, y1, x2, y2, fill in _cutout_rects(rng, size, p2d, vis_2d, cnum):
                 for im in imgs:

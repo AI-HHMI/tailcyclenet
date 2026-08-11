@@ -256,7 +256,12 @@ against the crop rule directly.
    even number (tubelet 2), floor 2. The annotated sessions carry ONE labelled frame per 65-frame
    group, so a fixed T = 24 spent 24 encodes to supervise 1 — 40% of steps at `annot_frac = 0.4`.
    Val and test still enumerate fixed `n_frames` windows, or the metric would not be comparable
-   across checkpoints. And **`SmoothnessLoss` raises below `smoothness_loss_order + 1` frames**
+   across checkpoints. A train window may also be **strided**, by `[data].frame_strides` (default
+   `[1]`, i.e. off) — posetail's `interval`. The derived-T rule then runs on a lattice of spacing
+   s: only labels congruent to the anchor mod s are reachable, and T is capped by the room left on
+   *that* lattice, not the room from frame 0. Note `SmoothnessLoss` has no notion of dt, so its
+   effective weight rises with s; upstream ships both and never couples them, so neither does
+   this. And **`SmoothnessLoss` raises below `smoothness_loss_order + 1` frames**
    (`losses.py:1146` narrows by `T - k`), so `run_batch` clamps the order per batch; at T = 2 it
    degrades to a first difference rather than being disabled.
 2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x.**

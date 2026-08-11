@@ -199,8 +199,8 @@ def _session_centred_labels(path, T=24, labelled=(11, 12, 13)):
     rig = _rig([('cam0', W, H, False, False, 0)])
     lab = fmt.empty_labels(1, T, K, 1, mode3d=False)
     lab.vis2d[0, list(labelled), :, 0] = fmt.VISIBLE
-    lab.points2d[0, list(labelled), :, 0] = np.array(
-        [[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]], np.float32)
+    lab.points2d[0, list(labelled), :, 0] = (
+        10.0 + 10.0 * np.arange(len(labelled), dtype=np.float32))[:, None, None] % (W - 10)
     groups = {'g0': fmt.Group('g0', T)}
     fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_3D,
                       rig=rig, groups=groups, labels={'g0': lab})
@@ -213,3 +213,11 @@ def centred_root(tmp_path_factory):
     root = tmp_path_factory.mktemp('centred')
     _session_centred_labels(root / 'mid' / 'train' / 's')
     return root / 'mid'
+
+
+@pytest.fixture(scope='session')
+def dense_root(tmp_path_factory):
+    """A fully-labelled 32-frame group -- long enough for a strided window to have room."""
+    root = tmp_path_factory.mktemp('dense')
+    _session_centred_labels(root / 'dense' / 'train' / 's', T=32, labelled=tuple(range(32)))
+    return root / 'dense'

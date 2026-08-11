@@ -32,9 +32,10 @@ from posetail.posetail.cube import (from_homogeneous, get_camera_scale, to_homog
                                     undistort_points)
 from posetail.posetail.tracker_encoder import TrackerEncoder
 
-from .query_encoder import PoseQueryEncoder
+from .query_encoder import PoseQueryEncoder, WideQueryEncoder
 
 QUERY_MODES = ('prior', 'none')
+QUERY_ENCODERS = ('pose', 'wide')
 
 
 # ----------------------------------------------------------------------------------------------
@@ -94,26 +95,51 @@ def scene_center(camera_group):
 # ----------------------------------------------------------------------------------------------
 
 class PoseTrackerEncoder(TrackerEncoder):
-    def __init__(self, *args, n_keypoints, query='prior', **kwargs):
+    def __init__(self, *args, n_keypoints, query='prior', query_encoder='pose',
+                 query_pos_embedding=True, query_patch_embedding=True, **kwargs):
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
+        assert query_encoder in QUERY_ENCODERS, \
+            f'query_encoder must be one of {QUERY_ENCODERS}, got {query_encoder!r}'
         super().__init__(*args, **kwargs)
         self.n_keypoints = n_keypoints
         self.query = query
         # None -> encode per forward, the normal path. `share_scene` swaps in a dict.
         self._shared_scene = None
 
-        # Replace the stock query encoder with the pose one, built from the same kwargs the
-        # parent used so it is a drop-in.
+        # Replace the stock query encoder, built from the same kwargs the parent used so it is a
+        # drop-in either way.
         old = self.query_encoder
-        self.query_encoder = PoseQueryEncoder(
-            embed_dim=old.embed_dim, decoder_dim=old.decoder_dim, n_frames=old.n_frames,
-            corr_radius=old.corr_radius, max_freq=old.max_freq, patch_size=old.patch_size,
-            use_volume_embedding=old.use_volume_embedding,
-            principal_point_embedding=old.principal_point_embedding,
-            intrinsic_embedding=old.intrinsic_embedding,
-            occlusion_embedding=old.occlusion_embedding,
-            time_embed_mode=old.time_embed_mode,
-            n_keypoints=n_keypoints)
+        if query_encoder == 'pose':
+            self.query_encoder = PoseQueryEncoder(
+                embed_dim=old.embed_dim, decoder_dim=old.decoder_dim, n_frames=old.n_frames,
+                corr_radius=old.corr_radius, max_freq=old.max_freq, patch_size=old.patch_size,
+                use_volume_embedding=old.use_volume_embedding,
+                principal_point_embedding=old.principal_point_embedding,
+                intrinsic_embedding=old.intrinsic_embedding,
+                occlusion_embedding=old.occlusion_embedding,
+                time_embed_mode=old.time_embed_mode,
+                n_keypoints=n_keypoints)
+        else:
+            # THE WIRING TRAP. `wide` without either query term ignores `query_coords` entirely,
+            # so a prior would have no route into the model at all. Six posetail-pose configs
+            # declared an anchor, trained, and were reported as anchored arms while the anchor was
+            # a literal no-op. Refuse the combination rather than train an unreadable headline.
+            assert not (query == 'prior' and not (query_pos_embedding or query_patch_embedding)), (
+                'query = "prior" with query_encoder = "wide" needs query_pos_embedding or '
+                'query_patch_embedding: without a position-derived term the prior cannot reach '
+                'the encoder and the arm would measure query-free behaviour under another name.')
+            self.query_encoder = WideQueryEncoder(
+                dim=self.latent_dim, embed_dim=old.embed_dim, decoder_dim=old.decoder_dim,
+                n_frames=old.n_frames, max_freq=old.max_freq, patch_size=old.patch_size,
+                principal_point_embedding=old.principal_point_embedding,
+                intrinsic_embedding=old.intrinsic_embedding,
+                time_embed_mode=old.time_embed_mode,
+                query_pos_embedding=query_pos_embedding,
+                query_patch_embedding=query_patch_embedding,
+                n_keypoints=n_keypoints)
+            print(f'query encoder: wide, dim {self.latent_dim}, '
+                  f'{self.query_encoder.n_fusion_terms} terms '
+                  f'({", ".join(self.query_encoder.term_names())})')
 
     def _forward_window(self, views_norm, *args, **kwargs):
         """Reuse one scene encode across several decodes over the SAME pixels.
@@ -336,6 +362,17 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     """
     cfg = dict(model_cfg)
     query = cfg.pop('query', 'prior')
+    # `query_encoder` picks the MODULE, `query` picks whether a prior is supplied to it: the two
+    # are orthogonal, and `wide` + `none` is golden's own recipe. The two embedding flags are
+    # `wide`-only -- `PoseQueryEncoder` must stay at ten terms or the pretrained (10, 2560) gate
+    # stops loading, which is why they are asserted rather than silently ignored below.
+    enc = cfg.pop('query_encoder', 'pose')
+    qpos = cfg.pop('query_pos_embedding', True)
+    qpatch = cfg.pop('query_patch_embedding', True)
+    assert enc == 'wide' or ('query_pos_embedding' not in model_cfg
+                             and 'query_patch_embedding' not in model_cfg), (
+        'query_pos_embedding / query_patch_embedding apply only to query_encoder = "wide"; '
+        'PoseQueryEncoder builds both terms unconditionally and cannot resize its gate.')
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
 
     # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
@@ -359,4 +396,5 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         f'mode_3d = {mode_3d!r} is not supported: build_model always constructs a '
         'PoseTrackerEncoder, so any other value would be silently ignored rather than honoured.')
 
-    return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, **cfg)
+    return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc,
+                              query_pos_embedding=qpos, query_patch_embedding=qpatch, **cfg)

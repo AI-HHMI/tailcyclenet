@@ -150,8 +150,13 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True) -> set[str]:
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
 
+    # `WideQueryEncoder` inherits no fusion behaviour to preserve -- it is 512-dim where the base
+    # is 256 and shares only the patch CNN -- so it has no `inflate_stock_gate` and its gate is
+    # simply left fresh. `_filter_shape_mismatch` + `_report` below name every base tensor that
+    # finds no home, which for that encoder is most of `query_encoder.*` and is expected.
     gate_w, gate_b = 'query_encoder.gate.0.weight', 'query_encoder.gate.0.bias'
-    if gate_w in state and state[gate_w].shape != model.query_encoder.gate[0].weight.shape:
+    if (gate_w in state and hasattr(model.query_encoder, 'inflate_stock_gate')
+            and state[gate_w].shape != model.query_encoder.gate[0].weight.shape):
         state[gate_w], state[gate_b] = model.query_encoder.inflate_stock_gate(
             state[gate_w], state[gate_b])
         if verbose:

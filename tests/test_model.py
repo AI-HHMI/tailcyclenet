@@ -36,6 +36,15 @@ SMALL = dict(
 CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                    crop_jitter=0.0, prompt_dropout=0.0)
 
+# Both query encoders, everywhere it is structural. `wide` is a hand-written forward rather than a
+# `QueryEncoder` subclass, so the moving-rig reshape and the per-chunk id slice are reimplemented
+# there and would break silently -- which is the whole reason this file exists.
+ENCODERS = ('pose', 'wide')
+
+
+def small(query_encoder='pose', **over):
+    return {**SMALL, 'query_encoder': query_encoder, **over}
+
 
 @pytest.fixture(scope='module')
 def moving_batch():
@@ -50,7 +59,8 @@ def moving_batch():
     return pose_collate([ds[0]])
 
 
-def test_moving_camera_forward(moving_batch):
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_moving_camera_forward(moving_batch, enc):
     """A moving rig must reach a finite prediction. It could not before.
 
     Two failures were in the way, and each was silent in a different way:
@@ -68,7 +78,7 @@ def test_moving_camera_forward(moving_batch):
     assert any(c['ext'].ndim == 3 for c in b.cgroup), 'the fixture must carry a moving camera'
     assert len({c['ext'].ndim for c in b.cgroup}) == 1, 'every camera needs the same ext rank'
 
-    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    model = build_model(small(enc), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
     with torch.no_grad():
         out = model(b.views, b.kpt_ids, b.cgroup, mode='3d',
                     kpt_prior=b.kpt_prior, prompt_time=b.prompt_t)
@@ -77,7 +87,8 @@ def test_moving_camera_forward(moving_batch):
     assert torch.isfinite(p).all()
 
 
-def test_kpt_chunk_matches_unchunked(moving_batch):
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_kpt_chunk_matches_unchunked(moving_batch, enc):
     """Chunked decoding must be numerically identical, not merely well-shaped.
 
     `_forward_window` slices the query set and calls `_decode_from_scene` once per chunk. The
@@ -90,7 +101,7 @@ def test_kpt_chunk_matches_unchunked(moving_batch):
     b = moving_batch
     K = b.kpt_ids.shape[1]
     assert K >= 3, 'need enough keypoints for an uneven chunk'
-    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    model = build_model(small(enc), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
 
     # Record what each chunk was actually handed. Without this the test would still pass if the
     # library silently declined to chunk at all -- comparing a single pass against itself.
@@ -184,7 +195,8 @@ def test_kpt_chunk_leaves_no_stash_behind(moving_batch):
     assert model._kpt_ids_all is None and model._kpt_cursor == 0
 
 
-def test_the_prior_reaches_the_query_encoder(moving_batch):
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_the_prior_reaches_the_query_encoder(moving_batch, enc):
     """Withholding the prior must actually change what the encoder is told.
 
     This is what the periodic val eval depends on: `val/*` runs prior-free because the loader's
@@ -194,7 +206,7 @@ def test_the_prior_reaches_the_query_encoder(moving_batch):
     so comparing predictions would pass whether or not the prior was plumbed through.
     """
     b = moving_batch
-    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    model = build_model(small(enc), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
     seen = {}
     qe = type(model.query_encoder)
     orig = qe.forward
@@ -298,3 +310,84 @@ def test_moving_camera_query_projects_per_frame(moving_batch):
     per_frame = p2d[moving_cam, 0].reshape(T, N, 2)[:, 0]
     assert not torch.allclose(per_frame[0], per_frame[-1]), \
         'per-frame extrinsics did not reach the projection'
+
+
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_missing_tokens_fire_per_keypoint(moving_batch, enc):
+    """Withholding ONE keypoint's prior must move ONLY that keypoint's fused query.
+
+    This is the behavioural form of posetail-pose's defect 0.0, which was live for its whole
+    W4/W5 series: the validity mask is one flag per KEYPOINT, `(B, N)`, but the axis the
+    position-derived terms live on is `(B, T*N)`. Its shape-mismatch branch broadcast keypoint 0's
+    validity over every keypoint, so a single withheld prior either silenced all of them or none.
+
+    A string grep cannot check this -- the comment explaining the bug quotes the code that caused
+    it -- so the check has to be a differential forward. `wide` reimplements the forward by hand,
+    which is exactly how such a bug comes back.
+    """
+    b = moving_batch
+    K = b.kpt_ids.shape[1]
+    model = build_model(small(enc), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+
+    qe = type(model.query_encoder)
+    orig, seen = qe.forward, {}
+
+    def spy(self, *a, **k):
+        out = orig(self, *a, **k)
+        seen[spy.tag] = out.clone()
+        return out
+
+    def run(tag, prior):
+        spy.tag = tag
+        with torch.no_grad():
+            model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=prior,
+                  prompt_time=b.prompt_t)
+
+    qe.forward = spy
+    try:
+        run('all', b.kpt_prior)
+        dropped = b.kpt_prior.clone()
+        dropped[:, 0] = float('nan')          # withhold keypoint 0 and nothing else
+        run('one', dropped)
+    finally:
+        qe.forward = orig
+
+    # The fused query axis is (B, T*K), t-major -- so keypoint k is every k-th column.
+    a, c = seen['all'], seen['one']
+    per_kpt = [torch.allclose(a[:, k::K], c[:, k::K]) for k in range(K)]
+    assert not per_kpt[0], 'withholding keypoint 0 did not change its own query'
+    assert all(per_kpt[1:]), f'it also changed other keypoints: {per_kpt}'
+
+
+def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
+    """`wide`'s patch CNN must LOAD, not re-initialise. Nothing else would show if it did not.
+
+    `PatchProcessor`'s convs are independent of `embed_dim` (~93k params) but its MLP is not
+    (~5.4M at 256). Building it at `wide`'s fusion width would inherit 93k of 5.5M and silently
+    retrain 98% of the patch CNN from noise -- with no symptom other than a worse number months
+    later. Building it at the pretrained width and projecting instead makes every tensor load by
+    name at matching shape, which is why `warm_start` needs no special case for it at all.
+    """
+    from tailcyclenet.checkpoints import warm_start
+
+    base = build_model(small('pose'), n_keypoints=5)
+    ckpt = tmp_path / 'base.pth'
+    torch.save({'model_state': base.state_dict()}, ckpt)
+
+    model = build_model(small('wide'), n_keypoints=5)
+    before = {k: v.clone() for k, v in model.query_encoder.patch_processor.state_dict().items()}
+    fresh = warm_start(model, ckpt, verbose=False)
+
+    patch = [n for n in fresh if 'patch_processor' in n]
+    assert not patch, f'the patch CNN was left fresh instead of loaded: {patch}'
+    after = model.query_encoder.patch_processor.state_dict()
+    src = base.query_encoder.patch_processor.state_dict()
+    assert after.keys() == before.keys()
+    for k in after:
+        torch.testing.assert_close(after[k], src[k])       # came from the checkpoint...
+        assert not torch.allclose(after[k], before[k]), k  # ...and is not the fresh init
+
+    # Everything genuinely new to this encoder MUST be fresh -- it inherits no fusion behaviour.
+    for name in ('kpt_embed.weight', 'gate.0.weight', 'linear_qpos.weight', 'patch_proj.weight',
+                 'missing_qpos', 'missing_patch'):
+        assert f'query_encoder.{name}' in fresh, name

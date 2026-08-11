@@ -39,6 +39,11 @@ INST_STATUS = {'absent': INST_ABSENT, 'present': INST_PRESENT, 'labeled': INST_L
 IMAGE_EXTS = ('.png', '.jpg')
 VIDEO_EXTS = ('.mp4', '.avi')
 SPLITS = ('train', 'val', 'test')
+# session.toml `labels` (§4, decision 6): who produced the labels. Closed vocabulary, so a typo is
+# a FormatError rather than a silent third category. Exposed on Session as `label_source`, NOT as
+# `labels` -- `Session.labels(gid)` is the method that returns a group's label arrays, and a
+# dataclass field of that name would shadow it on every instance.
+LABEL_SOURCES = ('annotated', 'tracked')
 
 
 class FormatError(Exception):
@@ -395,6 +400,7 @@ class Session:
     path: Path
     mode: str                       # '2d' | '3d'
     units: str
+    label_source: str               # session.toml `labels`: 'annotated' | 'tracked'
     names: list[str]                # keypoint names, THE authority for the keypoint axis
     rig: Rig
     groups: dict[str, Group]
@@ -448,11 +454,14 @@ class Session:
             raise FormatError(f'{path}: no session.toml')
         with open(cfg_path, 'rb') as f:
             cfg = tomllib.load(f)
-        for key in ('mode', 'units', 'names'):
+        for key in ('mode', 'units', 'labels', 'names'):
             if key not in cfg:
                 raise FormatError(f'{cfg_path}: missing {key!r}')
         if cfg['mode'] not in ('2d', '3d'):
             raise FormatError(f'{cfg_path}: mode must be "2d" or "3d", got {cfg["mode"]!r}')
+        if cfg['labels'] not in LABEL_SOURCES:
+            raise FormatError(f'{cfg_path}: labels must be one of {LABEL_SOURCES}, '
+                              f'got {cfg["labels"]!r}')
         if not cfg['names']:
             raise FormatError(f'{cfg_path}: names is empty')
 
@@ -477,6 +486,7 @@ class Session:
             path=path,
             mode=cfg['mode'],
             units=cfg['units'],
+            label_source=cfg['labels'],
             names=list(cfg['names']),
             rig=rig,
             groups=groups,
@@ -630,8 +640,8 @@ class Session:
 # writing -- the exact inverse of Session.labels, so a round-trip test is meaningful
 # --------------------------------------------------------------------------------------------
 
-def write_session(path: Path, *, mode: str, units: str, names: list[str], rig: Rig,
-                  groups: dict[str, Group], labels: dict[str, Labels],
+def write_session(path: Path, *, mode: str, units: str, label_source: str, names: list[str],
+                  rig: Rig, groups: dict[str, Group], labels: dict[str, Labels],
                   skeleton=(), flip_pairs=(), provenance=None,
                   assoc_res_max_px: float | None = None) -> None:
     """Write session.toml, calibration.toml and the label tables. Pixels are the caller's job.
@@ -639,11 +649,19 @@ def write_session(path: Path, *, mode: str, units: str, names: list[str], rig: R
     `labels` maps group_id -> dense arrays in exactly the layout `Session.labels` returns; a row
     is emitted only where the status array says a determination was made, which is what makes
     sparse hand annotation and dense tracking the same code path.
+
+    `label_source` is written as the `labels` KEY of session.toml -- the two names differ because
+    this function's `labels` argument is already the label tables. It is required and not
+    defaulted on purpose: a converter has to state whether a human or a machine produced these
+    points, and a default would let the next converter quietly inherit someone else's answer.
     """
     import toml
 
+    if label_source not in LABEL_SOURCES:
+        raise FormatError(f'{path}: label_source must be one of {LABEL_SOURCES}, '
+                          f'got {label_source!r}')
     path.mkdir(parents=True, exist_ok=True)
-    cfg = {'mode': mode, 'units': units, 'names': list(names)}
+    cfg = {'mode': mode, 'units': units, 'labels': label_source, 'names': list(names)}
     if skeleton:
         cfg['skeleton'] = [list(p) for p in skeleton]
     if flip_pairs:

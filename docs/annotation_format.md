@@ -17,7 +17,12 @@ Pose training data usually arrives in one of two shapes, and neither can do the 
   a single `NaN` that conflates "assessed and occluded" with "never looked at".
 
 The difference between a hand-labelled session and a machine-tracked one is **how many rows carry
-labels**, not what shape the data has. This format encodes that and nothing else.
+labels**, not what shape the data has. This format encodes that and nothing else — one set of
+tables serves both, and neither gets a special case.
+
+The session does, however, **say which it is**, in `labels` (§4). That is a one-word declaration,
+not a second shape: consumers weight the two sources differently when training, and re-deriving
+the distinction from row counts in every consumer is guesswork the producer can settle once.
 
 ## 2. Decisions (locked)
 
@@ -33,20 +38,24 @@ labels**, not what shape the data has. This format encodes that and nothing else
 5. **`mode` is a per-session property.** One `train/` may hold 2D and 3D sessions together.
    Sessions need not agree on `names` either: the keypoint axis is per session, and a consumer
    resolves it **by name** against the root's union (§4, rule 3).
-6. **`status` is the visibility channel**, in every label table. There is no separate `vis`
+6. **`labels` is a per-session property, and required.** `"annotated"` (a human placed these) or
+   `"tracked"` (a machine produced them). The vocabulary is closed at two values so that a typo is
+   a validation error rather than a silent third category. A session that is genuinely both is two
+   sessions — the same rule decision 11 applies to annotators.
+7. **`status` is the visibility channel**, in every label table. There is no separate `vis`
    column and no NaN-means-something convention.
-7. **Sparsity is a row count, not a mode.** A row exists only where a determination was made; a
+8. **Sparsity is a row count, not a mode.** A row exists only where a determination was made; a
    missing row means "no determination". A dense session simply has a row everywhere.
-8. **Partial assessment is legal.** Completeness is a read-time policy; the format never
+9. **Partial assessment is legal.** Completeness is a read-time policy; the format never
    enforces it.
-9. **A box per animal per view, always optional** — for `labeled`, `present` and `absent` alike.
-   When given it is a human judgment enclosing the animal; it is *not* required to match the
-   keypoint extent or any particular crop rule.
-10. **No `annotator` column.** Multiple annotators = separate dataset roots, the annotator named
+10. **A box per animal per view, always optional** — for `labeled`, `present` and `absent` alike.
+    When given it is a human judgment enclosing the animal; it is *not* required to match the
+    keypoint extent or any particular crop rule.
+11. **No `annotator` column.** Multiple annotators = separate dataset roots, the annotator named
     in `session.toml` `[provenance]`. Two annotators on one point would collide with the row key.
-11. **All camera geometry lives in `calibration.toml`**, including the crop. `session.toml` is
-    keypoint identity and provenance only.
-12. **Tables are Parquet.** `.pq`, tidy long form, one row per assessed thing.
+12. **All camera geometry lives in `calibration.toml`**, including the crop. `session.toml` is
+    keypoint identity, label source and provenance only.
+13. **Tables are Parquet.** `.pq`, tidy long form, one row per assessed thing.
 
 ## 3. Directory layout
 
@@ -54,7 +63,7 @@ labels**, not what shape the data has. This format encodes that and nothing else
 <dataset_root>/
   <split>/                            # train | val | test
     <session_id>/                     # the folder name IS the session id
-      session.toml                    # keypoint identity + provenance
+      session.toml                    # keypoint identity + label source + provenance
       calibration.toml                # ALL camera geometry incl. crop; always present
       groups.pq                       # one row per group
       keypoints.pq                    # per-camera 2D + per-camera visibility   (optional)
@@ -81,8 +90,9 @@ table set.
 ## 4. `session.toml`
 
 ```toml
-mode  = "3d"        # "3d" -> >= 2 cameras + full calibration; "2d" -> exactly 1 camera
-units = "mm"        # units of 3D. Pixel labels are ALWAYS pixels, in every mode.
+mode   = "3d"       # "3d" -> >= 2 cameras + full calibration; "2d" -> exactly 1 camera
+units  = "mm"       # units of 3D. Pixel labels are ALWAYS pixels, in every mode.
+labels = "annotated"   # "annotated" (a human placed these) | "tracked" (a machine produced them)
 
 names      = [ ... ]   # ordered keypoint names -- THE authority for the keypoint axis
 skeleton   = []        # OPTIONAL, usually empty: [["a","b"], ...] name pairs
@@ -115,6 +125,12 @@ fps is declared per group (§6).
   needed only for bone-length diagnostics and bilateral flip augmentation. When present, every
   name must be in `names`, and `flip_pairs` lists each pair **once** (the involution is its
   symmetric closure).
+- **`labels` says who produced the labels, not how many there are.** It is the one thing a
+  consumer cannot recover reliably from the tables: a training sampler weights hand-annotated
+  stills against machine-tracked clips, and a root that mixes them gives no other honest signal.
+  Row counts *correlate* with it — annotated sessions are usually sparse and tracked ones dense —
+  but they are not the same claim, and a densely-annotated clip is legal and would declare
+  `"annotated"`. A consumer that needs volume should measure volume.
 - `assoc_res_max_px` (optional, default `30.0`) is the reprojection-residual gate used by
   validation rule 12. Rigs with high-resolution sensors need a looser value.
 
@@ -284,8 +300,9 @@ is outside this format as written.
 
 Checkable rules, so a validator can be written without re-deriving them.
 
-1. Every session has `session.toml` with `mode`, `units` and non-empty `names`. The session id is
-   the folder name; the split is its parent folder name.
+1. Every session has `session.toml` with `mode`, `units`, `labels` and non-empty `names`. `mode` is
+   `"2d"` or `"3d"`; `labels` is `"annotated"` or `"tracked"`. The session id is the folder name;
+   the split is its parent folder name.
 2. `names` has no duplicates; every `skeleton` / `flip_pairs` name is in `names`; no keypoint
    appears in two flip pairs with different partners, and no pair maps a name to itself.
 3. **Cross-session agreement (WARNING, not an error):** a session whose `names` are a reordering
@@ -446,7 +463,8 @@ three splits that share a session name — which rule 14 warns about and does no
 
 ```
 arena-2d/train/rec_20251209/
-  session.toml      mode="2d" units="px" names=["nose","left_ear","right_ear","tail_base"]
+  session.toml      mode="2d" units="px" labels="tracked"
+                    names=["nose","left_ear","right_ear","tail_base"]
   calibration.toml  [cam_0] name="cam0" size=[4696,2048] offset=[0,0]
   groups.pq         group_id="clip0" n_frames=57594 fps=40.0 source_frame_start=0
   keypoints.pq      2,764,512 rows

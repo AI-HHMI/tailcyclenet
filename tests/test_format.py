@@ -281,8 +281,51 @@ def test_animal_count_may_vary_between_groups(tmp_path):
         labels[gid] = lab
 
     path = tmp_path / 'ds' / 'train' / 's'
-    fmt.write_session(path, mode='2d', units='px', names=KPTS_2D, rig=rig,
-                      groups=groups, labels=labels)
+    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_2D,
+                      rig=rig, groups=groups, labels=labels)
     sess = fmt.Session.load(path)
     assert sess.labels('g_small').n_animals == 2
     assert sess.labels('g_big').n_animals == 5
+
+
+def test_labels_key_is_required_and_closed(tmp_path):
+    """§4 / decision 6: `labels` is required, and its vocabulary is two values.
+
+    The point of a closed vocabulary is that a typo fails loudly. An open one would make
+    `labels = "traked"` a third source that every consumer silently weights on its own.
+
+    It is checked on BOTH seams -- `Session.load` for data already on disk, `write_session` for
+    data being produced -- because the loader is what protects a training run and the writer is
+    what stops a converter shipping 259 files that need backfilling again.
+    """
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    cfg = path / 'session.toml'
+    good = cfg.read_text()
+    assert 'labels = "annotated"' in good, 'the fixture should declare its label source'
+
+    cfg.write_text(good.replace('labels = "annotated"\n', ''))
+    with pytest.raises(fmt.FormatError, match="missing 'labels'"):
+        fmt.Session.load(path)
+
+    cfg.write_text(good.replace('"annotated"', '"traked"'))
+    with pytest.raises(fmt.FormatError, match='labels must be one of'):
+        fmt.Session.load(path)
+
+    cfg.write_text(good)
+    assert fmt.Session.load(path).label_source == 'annotated'
+
+    with pytest.raises(fmt.FormatError, match='label_source must be one of'):
+        _session_2d(tmp_path / 'ds' / 'train' / 'b', label_source='human')
+
+
+def test_label_source_does_not_shadow_the_labels_method(tiny_root):
+    """`Session.labels(gid)` stays callable.
+
+    session.toml spells the key `labels`; `Session` exposes it as `label_source`. That mismatch
+    is deliberate and this is what it buys -- a `labels` FIELD would shadow the method on every
+    instance, and ~35 call sites would fail with "'str' object is not callable" at run time.
+    """
+    sess = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
+    assert sess.label_source in fmt.LABEL_SOURCES
+    assert sess.labels('g000').n_animals == 2

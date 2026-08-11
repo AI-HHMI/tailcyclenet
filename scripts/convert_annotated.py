@@ -219,7 +219,8 @@ def write_3d(dst: Path, cfg: dict, rig, groups, labels, names, root, sid, gate) 
         stats['gated'] += g
         stats['missing'] += m
     fmt.write_session(
-        dst, mode='3d', units='mm', names=names, rig=rig, groups=groups, labels=labels,
+        dst, mode='3d', units='mm', label_source='annotated', names=names, rig=rig,
+        groups=groups, labels=labels,
         skeleton=cfg.get('skeleton', []), flip_pairs=cfg.get('flip_pairs', []),
         provenance={
             'source': f'{SRC.name}/{root}/{sid}',
@@ -267,8 +268,8 @@ def write_2d(out_split: Path, cfg, rig, groups, labels, names, root, sid, pixels
         if not dry:
             write_pixels(dst, gsub, pixels, [cam])
             fmt.write_session(
-                dst, mode='2d', units='px', names=names, rig=sub_rig(rig, cam),
-                groups=gsub, labels=lsub,
+                dst, mode='2d', units='px', label_source='annotated', names=names,
+                rig=sub_rig(rig, cam), groups=gsub, labels=lsub,
                 skeleton=cfg.get('skeleton', []), flip_pairs=cfg.get('flip_pairs', []),
                 provenance={
                     'source': f'{SRC.name}/{root}/{sid}',

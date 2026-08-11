@@ -318,7 +318,8 @@ def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_grou
             if dry_run:
                 continue
             fmt.write_session(
-                dst, mode='3d', units='mm', names=names, rig=rig, groups=groups, labels=labels,
+                dst, mode='3d', units='mm', label_source='annotated', names=names, rig=rig,
+                groups=groups, labels=labels,
                 skeleton=skeleton, flip_pairs=flip_pairs,
                 provenance={
                     'source': f'johnson-mouse/merge/{split}/{trial}',

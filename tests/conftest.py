@@ -50,8 +50,12 @@ def _write_frames(group_dir, cam, n_frames, size):
         Image.fromarray(px).save(d / f'{i:06d}.png')
 
 
-def _session_2d(path, T=4, S=2):
-    """rat-city's shape: one uncalibrated camera, several animals, pixel labels."""
+def _session_2d(path, T=4, S=2, label_source='annotated'):
+    """rat-city's shape: one uncalibrated camera, several animals, pixel labels.
+
+    `label_source` is a parameter only so a test can drive an invalid value through
+    `write_session`; every fixture below leaves it at the default.
+    """
     W, H = 64, 48
     rig = _rig([('cam0', W, H, False, False, 0)])
     K = len(KPTS_2D)
@@ -72,14 +76,15 @@ def _session_2d(path, T=4, S=2):
     lab.boxes[1, 1, 0] = [10.0, 10.0, 30.0, 30.0]
 
     groups = {'g000': fmt.Group('g000', T, fps=40.0, source_video='movie.avi')}
-    fmt.write_session(path, mode='2d', units='px', names=KPTS_2D, rig=rig, groups=groups,
+    fmt.write_session(path, mode='2d', units='px', label_source=label_source, names=KPTS_2D,
+                      rig=rig, groups=groups,
                       labels={'g000': lab}, flip_pairs=[['left_ear', 'right_ear']],
                       provenance={'source': 'synthetic'})
     _write_frames(path / 'groups' / 'g000', 'cam0', T, (W, H))
     return lab
 
 
-def _session_3d(path, T=4, moving=False):
+def _session_3d(path, T=4, moving=False, label_source='tracked'):
     """allen-mouse's shape: native 3D plus coordinate-free per-camera visibility rows."""
     W, H = 64, 48
     rig = _rig([(f'cam{i}', W, H, True, moving and i == 0, i + 1) for i in range(3)])
@@ -105,11 +110,26 @@ def _session_3d(path, T=4, moving=False):
                 lab.ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
     groups = {'g000': fmt.Group('g000', T, fps=200.0)}
-    fmt.write_session(path, mode='3d', units='mm', names=KPTS_3D, rig=rig, groups=groups,
+    fmt.write_session(path, mode='3d', units='mm', label_source=label_source, names=KPTS_3D,
+                      rig=rig, groups=groups,
                       labels={'g000': lab}, provenance={'source': 'synthetic'})
     for name in rig.names:
         _write_frames(path / 'groups' / 'g000', name, T, (W, H))
     return lab
+
+
+@pytest.fixture(scope='session')
+def mixed_source_root(tmp_path_factory):
+    """One root holding three of the four (mode, label_source) cells -- allen's exact shape.
+
+    The missing cell is the point: `2d-tracked` is absent, so a scheme that fits both fractions
+    as joint marginals would be over-constrained here. The two-level draw is not.
+    """
+    root = tmp_path_factory.mktemp('mixed') / 'ds'
+    _session_2d(root / 'train' / 'a_2d_annot', label_source='annotated')
+    _session_3d(root / 'train' / 'b_3d_annot', label_source='annotated')
+    _session_3d(root / 'train' / 'c_3d_tracked', label_source='tracked')
+    return root
 
 
 @pytest.fixture(scope='session')
@@ -152,7 +172,8 @@ def _session_projected(path, T=4):
     lab.points2d[:] = rng.uniform(5, 40, size=(1, T, K, 3, 2)).astype(np.float32)
 
     groups = {'g000': fmt.Group('g000', T, fps=100.0)}
-    fmt.write_session(path, mode='3d', units='mm', names=KPTS_3D, rig=rig, groups=groups,
+    fmt.write_session(path, mode='3d', units='mm', label_source='tracked', names=KPTS_3D,
+                      rig=rig, groups=groups,
                       labels={'g000': lab}, provenance={'source': 'synthetic'})
     for name in rig.names:
         _write_frames(path / 'groups' / 'g000', name, T, (W, H))
@@ -181,8 +202,8 @@ def _session_centred_labels(path, T=24, labelled=(11, 12, 13)):
     lab.points2d[0, list(labelled), :, 0] = np.array(
         [[10.0, 10.0], [20.0, 20.0], [30.0, 30.0]], np.float32)
     groups = {'g0': fmt.Group('g0', T)}
-    fmt.write_session(path, mode='2d', units='px', names=KPTS_3D, rig=rig,
-                      groups=groups, labels={'g0': lab})
+    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_3D,
+                      rig=rig, groups=groups, labels={'g0': lab})
     _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
     return list(labelled)
 

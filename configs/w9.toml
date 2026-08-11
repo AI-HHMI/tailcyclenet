@@ -13,7 +13,9 @@ path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-dat
 n_frames = 24               # a CEILING: a train window is sized to the labelled span it covers
 image_size = 256
 cams_to_sample = 0          # 0 -> every camera of a 3D session
-prob_2d_only = 0.25         # rate at which a 3D session is shown ONE camera (3D single-view)
+prob_2d_only = 0            # 3D single-view has no triangulation, so a non-query point has
+                            # nothing to predict there and leaves the 3D target. Off by default:
+                            # golden spent 0% of its steps on this path.
 balance_datasets = true
 aug_prob = 0.25
 crop_jitter = 0.3           # 0.3/0.3 cut the cost of detector crops from +0.545 to +0.115 mm

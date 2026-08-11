@@ -445,3 +445,86 @@ def test_item_dropout_reproduces_the_deployment_geometry(moving_batch):
     assert not torch.allclose(partial, deployed), (
         'a partially-prompted window must NOT share the query-free scene centre -- if it does, '
         'this test can no longer tell per-item from per-keypoint dropout')
+
+
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_query_free_prediction_is_the_triangulation(moving_batch, enc):
+    """With no prior anywhere, gridresid must not operate: the prediction IS the triangulation.
+
+    A gridresid residual is an offset from the query point. Query-free, that point is the derived
+    scene centre -- identical for every keypoint and carrying no information -- so the residual
+    would have to explain the whole centre-to-keypoint offset from a fixed anchor.
+    """
+    b = moving_batch
+    model = build_model(small(enc, query='none'), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    with torch.no_grad():
+        out = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=None, prompt_time=None)
+
+    tri = out['3d_pred_triangulate']
+    torch.testing.assert_close(out['coords_pred'], tri, equal_nan=True)
+    # The 3D grid CE has nothing to supervise; losses.py:680 gates on `'grid' in outputs`.
+    assert 'grid' not in out, 'the grid CE target must be dropped when no point is query-anchored'
+
+
+def test_prior_points_are_query_anchored_and_others_triangulated(moving_batch):
+    """Per-KEYPOINT selection: a prompted keypoint uses the residual, an unprompted one does not."""
+    b = moving_batch
+    K = b.kpt_ids.shape[1]
+    model = build_model(small('wide', query='prior'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+
+    prior = b.kpt_prior.clone()
+    assert torch.isfinite(prior).all(), 'fixture must start fully prompted'
+    prior[:, 1:] = float('nan')                      # keypoint 0 prompted, the rest not
+    with torch.no_grad():
+        out = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=prior,
+                    prompt_time=b.prompt_t)
+
+    tri, pred = out['3d_pred_triangulate'], out['coords_pred']
+    assert not torch.allclose(pred[:, :, 0], tri[:, :, 0]), \
+        'the prompted keypoint must use the query-anchored residual, not the triangulation'
+    torch.testing.assert_close(pred[:, :, 1:], tri[:, :, 1:], equal_nan=True)
+    assert 'grid' in out, 'a partially prompted window still has a CE target to supervise'
+
+
+def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
+    """The loss gate. Substituting the DETACHED triangulation makes the direct term constant at
+    unprompted points, so `coords_loss_direct*` contributes exactly zero gradient there -- which
+    is how the direct head is supervised on query points only without forking posetail's loss.
+    """
+    b = moving_batch
+    model = build_model(small('wide', query='prior'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    prior = b.kpt_prior.clone()
+    prior[:, 1:] = float('nan')
+    out = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=prior,
+                prompt_time=b.prompt_t)
+
+    direct = out['3d_pred_cams_direct']
+    params = [p for p in model.parameters() if p.requires_grad]
+
+    def n_reached(k):
+        """How many parameters keypoint k's direct output carries gradient to."""
+        gs = torch.autograd.grad(direct[:, :, :, k].sum(), params,
+                                 retain_graph=True, allow_unused=True)
+        return sum(g is not None and bool(g.abs().sum() > 0) for g in gs)
+
+    # Every parameter, not one chosen by hand: in this deliberately tiny model the soft-argmax
+    # saturates, so only the final 3D head carries gradient even for a prompted point. Naming a
+    # specific tensor would make the test pass for the wrong reason.
+    assert n_reached(0) > 0, 'the prompted keypoint must still reach the direct head'
+    for k in range(1, b.kpt_ids.shape[1]):
+        assert n_reached(k) == 0, f'unprompted keypoint {k} still reaches {n_reached(k)} params'
+
+
+def test_single_view_hands_up_a_mask_instead_of_a_prediction(moving_batch):
+    """3D single-view has no triangulation, so non-query points leave the 3D target entirely."""
+    b = moving_batch
+    model = build_model(small('wide', query='none'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    one = [b.views[0]], [b.cgroup[0]]
+    with torch.no_grad():
+        out = model(one[0], b.kpt_ids, one[1], mode='3d', kpt_prior=None, prompt_time=None)
+    assert out.get('3d_pred_triangulate') is None, 'one camera cannot triangulate'
+    mask = out.get('loss_kpt_mask')
+    assert mask is not None and not mask.any(), 'query-free single-view drops every 3D point'

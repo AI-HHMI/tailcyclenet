@@ -66,3 +66,35 @@ def test_other_value_errors_still_propagate():
 
     with pytest.raises(ValueError, match='real bug'):
         tr.run_batch(model, broken, _batch(), 'cpu')
+
+
+def test_short_window_survives_the_smoothness_loss():
+    """T = 2 must not raise inside `SmoothnessLoss`, and must not be silently disabled either.
+
+    `SmoothnessLoss.forward` narrows by `T - k` (`posetail/losses.py:1146`), so a window shorter
+    than `order + 1` frames raises on a negative length -- and `torch.diff(n=k)` is undefined
+    there anyway. Both weights are 0.5, so the `weight == 0` early return does not cover it. Now
+    that the loader sizes T to the labelled span, T = 2 is the COMMON case on annotated sessions:
+    without the clamp every one of those steps would die.
+    """
+    from posetail.posetail.losses import TotalLoss
+
+    mod = _train_module()
+    loss_fn = TotalLoss(smoothness_loss_3d_weight=0.5, smoothness_loss_2d_weight=0.5,
+                        smoothness_loss_order=4)
+    assert loss_fn.smoothness_loss_3d.order == 4
+
+    # The real call raises before the clamp is applied...
+    pred = torch.zeros(1, 2, 3, 3)
+    with pytest.raises(RuntimeError):
+        loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1), time_dim=1)
+
+    # ...and does not after it. Degraded to a first difference, not disabled.
+    mod._clamp_smoothness_order(loss_fn, 2)
+    assert loss_fn.smoothness_loss_3d.order == 1
+    assert torch.isfinite(loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1),
+                                                     time_dim=1))
+
+    # A full-length window gets the configured order back -- the clamp is per batch, not sticky.
+    mod._clamp_smoothness_order(loss_fn, 24)
+    assert loss_fn.smoothness_loss_3d.order == 4

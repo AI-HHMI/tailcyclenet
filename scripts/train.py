@@ -162,6 +162,36 @@ def to_device(batch, device):
     return views, cgroup
 
 
+def _clamp_smoothness_order(loss_fn, T):
+    """Hold the smoothness order below the window length. Mutates `loss_fn` in place.
+
+    `SmoothnessLoss.forward` builds its stencil mask with `valid.narrow(time_dim, 0, T - k)`
+    (`posetail/losses.py:1146`), so a window shorter than `k + 1` frames RAISES on a negative
+    narrow length -- and `torch.diff(n=k)` is undefined there anyway. Both weights are 0.5, so the
+    `weight == 0` early return does not cover it.
+
+    Now that the loader sizes T to the labelled span, T = 2 is the common case on annotated
+    sessions and k = 4 would kill every one of those steps. Clamping degrades rather than
+    disables: at T = 2 the penalty becomes a first difference, which is a real smoothness term.
+    And on the windows this actually fires for it changes nothing measurable -- the stencil
+    requires all k+1 frames valid, so a single labelled frame gives an empty mask and the loss
+    returns 0 either way.
+
+    `# ponytail:` mutating the loss module's order per batch is the small diff; a second
+    `TotalLoss` built for short windows is the upgrade path if the two ever need to differ by
+    more than this.
+    """
+    for name in ('smoothness_loss_3d', 'smoothness_loss_2d'):
+        sl = getattr(loss_fn, name, None)      # a stub loss in the tests has neither
+        if sl is None:
+            continue
+        # Latch the configured order on first use rather than at construction: one place holds
+        # this rule, so there is no second site to keep in sync with `TotalLoss(**losses)`.
+        if not hasattr(sl, '_configured_order'):
+            sl._configured_order = sl.order
+        sl.order = min(sl._configured_order, max(1, T - 1))
+
+
 def run_batch(model, loss_fn, batch, device):
     """One forward + loss. A non-finite sub-loss comes back as NaN, never as an exception.
 
@@ -182,6 +212,7 @@ def run_batch(model, loss_fn, batch, device):
     """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
+    _clamp_smoothness_order(loss_fn, int(views[0].shape[1]))
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device))
     try:

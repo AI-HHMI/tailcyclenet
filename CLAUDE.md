@@ -165,14 +165,23 @@ trained, and were reported as anchored arms whose anchor was a literal no-op.
 projects to the fusion width, so all ~5.4M of the pretrained patch CNN load by name. Building it
 at 512 instead would inherit 93k of 5.5M and silently retrain the rest from noise.
 
-### The 3D output: gridresid is an offset from the query
+### The 3D output: `gridresid_offset`
 
 `output_mode = "gridresid"` reconstructs `world = query + R @ residual` with ONE anchor for the
-whole window (`tracker_encoder.py:736`). That is the right structure only where the query is a
-real prior. So `model._query_anchored` keeps the native output **per keypoint** where a prior
-exists and substitutes that frame's own **triangulation** everywhere else — which under
-`query = "none"` is every point, so the prediction there is the triangulation outright and the
-`grid` CE target is dropped (`losses.py:680` gates on `'grid' in outputs`).
+whole window (`tracker_encoder.py:736`). What that anchor is is a switch:
+
+- **`gridresid_offset = "query"`** — the native structure, kept **per keypoint** only where a real
+  prior anchored it; every other keypoint falls back to that frame's own **triangulation**. Under
+  `query = "none"` that is every point, so the prediction is the triangulation outright and the
+  `grid` CE target is dropped (`losses.py:680` gates on `'grid' in outputs`).
+- **`gridresid_offset = "triangulated"`** — recover the residual and re-add it to **each frame's**
+  own triangulation, for every keypoint. This is posetail-pose's `_reanchor_per_frame`, which it
+  applies unconditionally (`model.py:756`), measured 2.07 → 1.37 mm within-session.
+
+Pair them with `query`: a residual measured from the query point only means something when the
+query is a real prior, and per-frame re-anchoring exists specifically to rescue a scene-centre
+anchor. So `prior` → `"query"` and `none` → `"triangulated"`, which also makes `wide` + `none` +
+`"triangulated"` a faithful **golden j3** architecture.
 
 The substitution uses the **detached** triangulation, and that is also the loss gate: the direct
 term is then constant at unprompted points, contributing exactly zero gradient, so
@@ -180,10 +189,11 @@ term is then constant at unprompted points, contributing exactly zero gradient, 
 `TotalLoss`. `prob_2d_only = 0`, because 3D single-view has no triangulation to fall back to; if
 it is ever turned back on, non-query points leave the 3D target via `out['loss_kpt_mask']`.
 
-This **replaces** per-frame re-anchoring, which re-added the recovered residual to every frame's
-triangulation and measured 2.07 → 1.37 mm within-session in posetail-pose. That mechanism existed
-to rescue a fixed scene-centre anchor; it is deliberately gone rather than defaulted off. If 3D
-accuracy regresses against the sweep before it, this is the first thing to suspect.
+**The shipped sweep is therefore a TWO-LEVER comparison** — `prior` and `none` differ in `query`
+*and* `gridresid_offset`. That is deliberate (each arm gets the offset its query implies) but it
+means a `prior` − `none` delta cannot be attributed to the prior alone. Say so when reporting it;
+eval rule 4, and `improvement_leads.md` opens by retracting a claim of exactly this shape.
+Isolating either lever needs a third arm.
 
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, prompt corruption,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that

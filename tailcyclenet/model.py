@@ -9,21 +9,30 @@ estimator, and `forward` is the only method overridden:
    centre. A per-keypoint prior, when present, replaces it. Keypoint identity rides in a
    dedicated fusion term (see `query_encoder.py`), which is what tells the K queries apart.
 
-2. **The gridresid residual is honoured only where the query is real.** The library reconstructs
-   `world = query + R @ residual` with one anchor for the whole window, which is the right
-   structure when the query is a genuine prior and the wrong one when it is the derived scene
-   centre -- identical for every keypoint, so the residual would carry the whole
-   centre-to-keypoint offset. So a keypoint WITH a prior gets the native query-anchored output;
-   every other keypoint gets that frame's own triangulation, and the direct head is supervised on
-   query points only. See `_query_anchored`.
+2. **What the 3D residual is an offset FROM is a switch.** The library reconstructs
+   `world = query + R @ residual` with one anchor for the whole window. That is right when the
+   query is a genuine prior and wrong when it is the derived scene centre -- identical for every
+   keypoint, so the residual would have to carry the whole centre-to-keypoint offset.
 
-There is ONE architecture switch, `query`:
+Two switches, and they are orthogonal:
+
+`query` -- whether a prior is supplied:
 
 - `"prior"`  -- a per-keypoint prior (`kpt_prior`), the previous window's pose at deployment,
    with a learned no-query token wherever a keypoint has none. This is posetail-pose's
    `w9_honest` with the instance-anchor machinery removed rather than defaulted off.
 - `"none"`   -- query-free. No prior is read at all; every keypoint is queried at the derived
    point and told only its identity.
+
+`gridresid_offset` -- what the residual is measured from:
+
+- `"query"`         -- the library's NATIVE structure, kept per keypoint only where a real prior
+   anchored it; every other keypoint falls back to that frame's own triangulation, and the direct
+   head is supervised on query points only. See `_query_anchored`.
+- `"triangulated"`  -- the residual is recovered and re-added to EACH frame's own triangulation,
+   for every keypoint. Measured 2.07 -> 1.37 mm within-session in posetail-pose, where it was the
+   largest single architectural effect; it exists to rescue the fixed scene-centre anchor, so it
+   is the sensible pairing for `query = "none"`. See `_reanchor_per_frame`.
 """
 from contextlib import contextmanager
 
@@ -38,6 +47,8 @@ from .query_encoder import PoseQueryEncoder, WideQueryEncoder
 
 QUERY_MODES = ('prior', 'none')
 QUERY_ENCODERS = ('pose', 'wide')
+# What the gridresid residual is an offset FROM. See `_query_anchored` / `_reanchor_per_frame`.
+GRIDRESID_OFFSETS = ('query', 'triangulated')
 
 
 # ----------------------------------------------------------------------------------------------
@@ -97,13 +108,17 @@ def scene_center(camera_group):
 # ----------------------------------------------------------------------------------------------
 
 class PoseTrackerEncoder(TrackerEncoder):
-    def __init__(self, *args, n_keypoints, query='prior', query_encoder='pose', **kwargs):
+    def __init__(self, *args, n_keypoints, query='prior', query_encoder='pose',
+                 gridresid_offset='query', **kwargs):
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
         assert query_encoder in QUERY_ENCODERS, \
             f'query_encoder must be one of {QUERY_ENCODERS}, got {query_encoder!r}'
+        assert gridresid_offset in GRIDRESID_OFFSETS, \
+            f'gridresid_offset must be one of {GRIDRESID_OFFSETS}, got {gridresid_offset!r}'
         super().__init__(*args, **kwargs)
         self.n_keypoints = n_keypoints
         self.query = query
+        self.gridresid_offset = gridresid_offset
         # None -> encode per forward, the normal path. `share_scene` swaps in a dict.
         self._shared_scene = None
 
@@ -273,7 +288,13 @@ class PoseTrackerEncoder(TrackerEncoder):
             out = dict(out)
             out['coords_pred'] = out['2d_pred'][0]
             return out
-        return _query_anchored(out, query_ok)
+        if self.gridresid_offset == 'query':
+            return _query_anchored(out, query_ok)
+        if out.get('3d_pred_triangulate') is None:
+            # 3D single-view: nothing to re-anchor onto, so the library's query-anchored residual
+            # stands. This is the path `prob_2d_only` trains.
+            return out
+        return _reanchor_per_frame(out, coords_q)
 
 
 @contextmanager
@@ -356,6 +377,58 @@ def _query_anchored(out, query_ok):
     return out
 
 
+def _reanchor_per_frame(out, anchor):
+    """Re-anchor the 3D residual on EACH frame's own triangulation.
+
+    The anchor is recoverable from the outputs -- `3d_pred_cams_direct = query + R @ residual` --
+    so subtracting the query returns the world-space residual, which is then added to each
+    frame's own (detached) triangulation. No change to posetail is needed.
+    """
+    src = out['3d_pred_triangulate']
+    # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
+    # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
+    # numerator, full denominator), which is exactly how a wrong comparison gets published.
+    src = torch.where(torch.isfinite(src), src, out['3d_pred_rays'])
+
+    residual = out['3d_pred_cams_direct'] - anchor[:, None, :, :][None]
+    new_direct = src.detach()[None] + residual
+    conf = torch.softmax(out['conf_3d'], dim=0)
+    coords_pred = torch.einsum('cbtnr,cbtn->btnr', new_direct, conf)
+
+    out = dict(out)
+    out['3d_pred_cams_direct'] = new_direct
+    out['3d_pred_direct'] = coords_pred
+    out['coords_pred'] = coords_pred
+    out['3d_pred_triangulate'] = src
+    return _reanchor_ce_target(out, src)
+
+
+def _reanchor_ce_target(out, src):
+    """Move the 3D cross-entropy target onto the SAME anchor the outputs now use.
+
+    Without this, `grid['anchor_local']` still describes the query-anchored task, so with
+    `coords_softmax_3d_weight = 0.4` roughly 40% of the 3D objective would train fixed-anchor
+    propagation while every metric and reprojection term sees per-frame refinement -- two
+    objectives pulling in different directions.
+
+    float64 is mandatory, not defensive: the library does this einsum in float64 precisely so
+    `(p_raylocal - anchor_local)` cancels exactly. In float32 the ray-local coordinates are large
+    and nearly equal, and the difference annihilates.
+    """
+    grid = out.get('grid')
+    if grid is None or grid.get('anchor_local') is None or grid.get('rays_c') is None:
+        return out
+    n_cams = grid['anchor_local'].shape[0]
+    aw = repeat(src, 'b t n r -> cams b t n r', cams=n_cams)
+    anchor_local = from_homogeneous(einsum(
+        grid['rays_c'].to(torch.float64), to_homogeneous(aw.to(torch.float64)),
+        'cams x r, cams b t n r -> cams b t n x'))
+    grid = dict(grid)
+    grid['anchor_local'] = anchor_local.to(grid['anchor_local'].dtype).detach()
+    out['grid'] = grid
+    return out
+
+
 def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     """`[model]` splatted into the constructor, with this repo's two keys pulled out first.
 
@@ -370,6 +443,7 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     # So `query_encoder = "wide"` with `query = "none"` is exactly golden's j3 encoder, with no
     # third key to get wrong.
     enc = cfg.pop('query_encoder', 'pose')
+    offset = cfg.pop('gridresid_offset', 'query')
     for dead in ('query_pos_embedding', 'query_patch_embedding'):
         assert dead not in cfg, (
             f'{dead} is not configurable: `wide` builds both query terms iff query = "prior", '
@@ -378,17 +452,19 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
 
     # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
-    # `_query_anchored` keeps the direct output only where the query is a real prior, which is
-    # only a meaningful distinction when the output IS anchored on the query -- the library adds
-    # `query_world` for 'residual' and 'gridresid' alone (tracker_encoder.py:670). Under 'direct'
-    # or 'grid' the prediction never depended on the query, so gating it by query validity would
-    # discard a perfectly good absolute output at every unprompted point.
+    # BOTH `gridresid_offset` paths need the output to be query-anchored in the first place, and
+    # the library only adds `query_world` for 'residual' and 'gridresid' (tracker_encoder.py:670).
+    # Under 'direct' or 'grid' the prediction never depended on the query, so `"query"` would gate
+    # away a perfectly good absolute output at every unprompted point, and `"triangulated"` would
+    # subtract the query from something it was never added to and re-add the difference to every
+    # frame -- running the re-anchoring backwards, silently.
     output_mode = cfg.setdefault('output_mode', 'gridresid')
     assert output_mode == 'gridresid', (
-        f'output_mode = {output_mode!r} is not supported. model._query_anchored keeps the direct '
-        'head only where a real prior anchored it, which the library only makes true for '
-        '"gridresid"; under an absolute mode that gate would throw away a valid prediction at '
-        'every unprompted point. Set output_mode = "gridresid".')
+        f'output_mode = {output_mode!r} is not supported: both gridresid_offset modes assume the '
+        'library anchored the residual on the query, which it only does for "gridresid". Under '
+        'an absolute mode "query" discards a valid prediction at every unprompted point and '
+        '"triangulated" re-anchors a prediction that was never query-anchored. '
+        'Set output_mode = "gridresid".')
 
     # Upstream this selects the CLASS (train_utils.py:439 -- 'encoder' -> TrackerEncoder,
     # 'tapnext' -> TrackerTapNext). Here it is stored and never read, so anything else would be
@@ -398,4 +474,5 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         f'mode_3d = {mode_3d!r} is not supported: build_model always constructs a '
         'PoseTrackerEncoder, so any other value would be silently ignored rather than honoured.')
 
-    return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc, **cfg)
+    return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc,
+                              gridresid_offset=offset, **cfg)

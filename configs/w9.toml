@@ -31,6 +31,12 @@ num_workers = 12
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
 query_encoder = "wide"      # "wide" (512-dim, identity + time + the two query terms,
                             # which are built iff query = "prior") | "pose" (256-dim, ten)
+gridresid_offset = "query"  # what the 3D residual is an offset FROM. "query": the library's
+                            # native structure, kept per keypoint only where a real prior anchored
+                            # it, triangulation elsewhere, direct head supervised on query points
+                            # only. "triangulated": recover the residual and re-add it to EACH
+                            # frame's own triangulation for every keypoint (2.07 -> 1.37 mm in
+                            # posetail-pose) -- the pairing that rescues a scene-centre anchor.
 
 mode_3d = "encoder"
 video_encoder_version = "large"

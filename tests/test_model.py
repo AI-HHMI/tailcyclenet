@@ -456,7 +456,8 @@ def test_query_free_prediction_is_the_triangulation(moving_batch, enc):
     would have to explain the whole centre-to-keypoint offset from a fixed anchor.
     """
     b = moving_batch
-    model = build_model(small(enc, query='none'), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    model = build_model(small(enc, query='none', gridresid_offset='query'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
     with torch.no_grad():
         out = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=None, prompt_time=None)
 
@@ -470,7 +471,7 @@ def test_prior_points_are_query_anchored_and_others_triangulated(moving_batch):
     """Per-KEYPOINT selection: a prompted keypoint uses the residual, an unprompted one does not."""
     b = moving_batch
     K = b.kpt_ids.shape[1]
-    model = build_model(small('wide', query='prior'),
+    model = build_model(small('wide', query='prior', gridresid_offset='query'),
                         n_keypoints=int(b.kpt_ids.max()) + 1).eval()
 
     prior = b.kpt_prior.clone()
@@ -493,7 +494,7 @@ def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
     is how the direct head is supervised on query points only without forking posetail's loss.
     """
     b = moving_batch
-    model = build_model(small('wide', query='prior'),
+    model = build_model(small('wide', query='prior', gridresid_offset='query'),
                         n_keypoints=int(b.kpt_ids.max()) + 1).eval()
     prior = b.kpt_prior.clone()
     prior[:, 1:] = float('nan')
@@ -520,7 +521,7 @@ def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
 def test_single_view_hands_up_a_mask_instead_of_a_prediction(moving_batch):
     """3D single-view has no triangulation, so non-query points leave the 3D target entirely."""
     b = moving_batch
-    model = build_model(small('wide', query='none'),
+    model = build_model(small('wide', query='none', gridresid_offset='query'),
                         n_keypoints=int(b.kpt_ids.max()) + 1).eval()
     one = [b.views[0]], [b.cgroup[0]]
     with torch.no_grad():
@@ -528,3 +529,37 @@ def test_single_view_hands_up_a_mask_instead_of_a_prediction(moving_batch):
     assert out.get('3d_pred_triangulate') is None, 'one camera cannot triangulate'
     mask = out.get('loss_kpt_mask')
     assert mask is not None and not mask.any(), 'query-free single-view drops every 3D point'
+
+
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
+    """`gridresid_offset` picks what the residual is measured FROM, and the two must differ.
+
+    "triangulated" recovers the residual and re-adds it to EACH frame's own triangulation for
+    every keypoint -- posetail-pose's `_reanchor_per_frame` (its model.py:756, applied
+    unconditionally), measured 2.07 -> 1.37 mm within-session. "query" keeps the library's native
+    query anchor, but only where a real prior supplied one.
+
+    Query-free the two are maximally far apart: "triangulated" still produces a residual on top of
+    the triangulation, while "query" has no valid anchor anywhere and returns the triangulation
+    itself. If these ever compare equal the switch is not wired to anything.
+    """
+    b = moving_batch
+    n_kpt = int(b.kpt_ids.max()) + 1
+    outs = {}
+    for off in ('query', 'triangulated'):
+        m = build_model(small(enc, query='none', gridresid_offset=off), n_keypoints=n_kpt).eval()
+        torch.manual_seed(0)
+        with torch.no_grad():
+            outs[off] = m(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=None,
+                          prompt_time=None)
+
+    q, t = outs['query'], outs['triangulated']
+    torch.testing.assert_close(q['coords_pred'], q['3d_pred_triangulate'], equal_nan=True)
+    assert not torch.allclose(t['coords_pred'], t['3d_pred_triangulate'], equal_nan=True), \
+        '"triangulated" must add a residual on top of the triangulation, not return it'
+    # "triangulated" keeps the CE target (re-based onto the new anchor); "query" drops it.
+    assert 'grid' in t and 'grid' not in q
+
+    with pytest.raises(AssertionError, match='gridresid_offset'):
+        build_model(small(enc, gridresid_offset='nonsense'), n_keypoints=n_kpt)

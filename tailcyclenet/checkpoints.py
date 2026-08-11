@@ -165,9 +165,13 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True) -> set[str]:
                   f'{len(model.query_encoder.term_names())} terms, by name')
 
     state = _convert_cross_attn(state, model)
-    state, interpolated = _interp_res_params(state, model)   # returns (dict, changed_keys)
+    # Returns (dict, BOOL) -- not a key list, and the flag is set by ANY shape mismatch, including
+    # the many that fall through every interpolation branch untouched. `len()` on it was a latent
+    # crash that only fires when something mismatches: with `pose` the gate is inflated above so
+    # nothing does, and `wide` mismatches most of `query_encoder.*` by construction.
+    state, interpolated = _interp_res_params(state, model)
     if interpolated and verbose:
-        print(f'warm start: {len(interpolated)} resolution-coupled tensor(s) interpolated')
+        print('warm start: resolution-coupled tensors checked; see any res-interp lines above')
     state, dropped = _filter_shape_mismatch(state, model)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if verbose:

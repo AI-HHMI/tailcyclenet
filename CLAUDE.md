@@ -165,6 +165,26 @@ trained, and were reported as anchored arms whose anchor was a literal no-op.
 projects to the fusion width, so all ~5.4M of the pretrained patch CNN load by name. Building it
 at 512 instead would inherit 93k of 5.5M and silently retrain the rest from noise.
 
+### The 3D output: gridresid is an offset from the query
+
+`output_mode = "gridresid"` reconstructs `world = query + R @ residual` with ONE anchor for the
+whole window (`tracker_encoder.py:736`). That is the right structure only where the query is a
+real prior. So `model._query_anchored` keeps the native output **per keypoint** where a prior
+exists and substitutes that frame's own **triangulation** everywhere else — which under
+`query = "none"` is every point, so the prediction there is the triangulation outright and the
+`grid` CE target is dropped (`losses.py:680` gates on `'grid' in outputs`).
+
+The substitution uses the **detached** triangulation, and that is also the loss gate: the direct
+term is then constant at unprompted points, contributing exactly zero gradient, so
+`coords_loss_direct*` and `coords_softmax_3d` supervise query points only — without forking
+`TotalLoss`. `prob_2d_only = 0`, because 3D single-view has no triangulation to fall back to; if
+it is ever turned back on, non-query points leave the 3D target via `out['loss_kpt_mask']`.
+
+This **replaces** per-frame re-anchoring, which re-added the recovered residual to every frame's
+triangulation and measured 2.07 → 1.37 mm within-session in posetail-pose. That mechanism existed
+to rescue a fixed scene-centre anchor; it is deliberately gone rather than defaulted off. If 3D
+accuracy regresses against the sweep before it, this is the first thing to suspect.
+
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, prompt corruption,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
 is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:

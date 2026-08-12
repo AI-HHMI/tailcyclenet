@@ -414,7 +414,15 @@ def main():
     model = model.to(device)
 
     opt = build_optimizer(model, fresh, config['training']['optimizer'])
-    loss_fn = TotalLoss(**config['training']['losses'])
+    # `per_camera_cube_scale` is a GAUGE, and the model and the loss have to agree on it. It lives
+    # in `[model]`, and `TotalLoss` defaults it False (`losses.py:98`) -- so leaving it out of
+    # `[training.losses]` had the loss take the median over cameras while the model kept its own
+    # per camera. Derived rather than duplicated: two copies of one gauge is a config away from
+    # silently disagreeing again.
+    losses = dict(config['training']['losses'])
+    losses.setdefault('per_camera_cube_scale',
+                      bool(config['model'].get('per_camera_cube_scale', False)))
+    loss_fn = TotalLoss(**losses)
     save_run_meta(run, config, registry)
     print(f'run folder: {run.resolve()}')
     wb = init_wandb(config, run, disabled=args.no_wandb)
@@ -423,6 +431,14 @@ def main():
     def record(rec):
         with open(log_path, 'a') as f:
             f.write(json.dumps(rec) + '\n')
+
+    # The sampling mix goes in the LOG, not just stdout. It is not recoverable from `config.toml`
+    # after the fact -- `annot_frac` and `mode_3d_frac` are conditionals whose realised shares
+    # depend on which levels each dataset actually has, so a root with no 2D session skips the
+    # mode level entirely and its whole annotated share lands on 3D. Reconstructing that by hand
+    # is how a 9.6% figure (the uniform-over-entries baseline) got read as the run's real 88%.
+    record({'iter': 0, 'mix': train_ds.mix(), 'n_windows': len(train_ds),
+            'n_keypoints': registry.n_keypoints})
 
     # -- loop ------------------------------------------------------------------------------
     max_grad = float(train_cfg.get('max_grad_norm', 0)) or None

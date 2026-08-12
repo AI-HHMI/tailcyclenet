@@ -21,7 +21,7 @@ import itertools
 import numpy as np
 import torch
 
-from posetail.posetail.cube import project_points_torch, triangulate_simple_batch_reg
+from posetail.posetail.cube import project_points_torch
 
 
 def _centres(boxes):

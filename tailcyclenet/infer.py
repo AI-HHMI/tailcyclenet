@@ -56,6 +56,10 @@ class InferConfig:
     max_animals: int = 0          # 0 -> every animal the box source offers
     max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
     kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
+    # None -> carry every keypoint the bounds mask keeps. A float drops the carried keypoints whose
+    # own `vis_pred` LOGIT is below it, per keypoint, before they become a prior. Not a row gate:
+    # this decides what the model is told, not what it reports.
+    prior_vis_thresh: float | None = None
     device: str = 'cuda:0'
     # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
@@ -251,15 +255,23 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
                     if not len(v):
                         continue
-                    # int32 and clamped into the image, exactly like the crop rule's own box:
-                    # a float or off-frame box produces a negative cam['offset'] and breaks
-                    # project_cam far downstream.
-                    w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
-                    x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
-                    y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
-                    x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
-                    y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
-                    boxes.append(torch.tensor([x0, y0, x1, y1], dtype=torch.int32))
+                    # THROUGH THE CROP RULE, not around it. This used to be a hand-rolled
+                    # floor/ceil/clip of the union extent, which produced a NON-SQUARE box with no
+                    # `min_crop_dim` floor -- a crop rule the pose model was never trained on, on
+                    # the one path that is supposed to be the deployment path (gotcha 8). The
+                    # corners re-enter at `pad = 0` because a detector box, an `instances.pq`
+                    # extent and a previous crop-rule output are all ALREADY padded; min/max over
+                    # the four corners of each box is min/max over the points they came from, so
+                    # the union is exactly the box those points would have produced.
+                    size = torch.as_tensor(
+                        [int(x) for x in session.rig.size(session.cam_names[ci])],
+                        dtype=torch.int32)
+                    box = cropmod.crop_box_for_points(
+                        torch.as_tensor(cropmod.box_corners(v), dtype=torch.float32),
+                        size, cfg.min_crop_dim, pad=0)
+                    if box is None:
+                        continue
+                    boxes.append(box)
                     use.append(ci)
                 if not use:
                     outcome[a, wi] = OUTCOMES.index('no camera')
@@ -335,14 +347,17 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # crop pixels -> source pixels: undo the resize, then the crop origin
                 p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
             pred[a, frames] = p
+            vlogit = None
             if 'vis_pred' in out:
-                v = out['vis_pred'][0].detach().cpu().numpy()
-                conf[a, frames] = v.reshape(len(frames), K)
+                v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
+                conf[a, frames] = v
+                vlogit = v
             # The pose the NEXT window opens on. Clamped from the front: a group shorter than
             # `overlap` gives a window with fewer frames than the step, and a plain negative
             # index runs off the start of it.
             j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
-            carried[a] = (torch.as_tensor(p[j]), int(frames[j]))
+            carried[a] = (torch.as_tensor(p[j]), int(frames[j]),
+                          None if vlogit is None else torch.as_tensor(vlogit[j]))
 
     return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
             'outcome': outcome, 'crop': crop, 'window_start': np.asarray(starts),
@@ -383,6 +398,15 @@ def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cg
             return None, None
         p = carried[0].clone().float()
         qt = int(carried[1]) - int(frames[0])
+        # A KEYPOINT THE MODEL ITSELF DOUBTED IS NOT A PRIOR EITHER. The bounds mask below drops
+        # what left the crop; this drops what the previous window reported as not visible, in the
+        # same currency the no-query tokens already speak (NaN = "I was not told"). `vis_pred`, not
+        # `conf`: `conf_pred_2d` is an unnormalised sigmoid whose scale means nothing here.
+        # posetail-pose ships this default-off and byte-identical, and it was refuted for the
+        # purpose it was built for -- so off is the default here too.
+        vis = carried[2] if len(carried) > 2 else None
+        if cfg.prior_vis_thresh is not None and vis is not None and vis.shape == p.shape[:1]:
+            p[vis < cfg.prior_vis_thresh] = float('nan')
         # A STALE PRIOR IS NOT A PRIOR. `carried` is only written on a window that predicted, so an
         # animal the box source lost for a few windows keeps handing back a pose from before this
         # one -- and `qt` clamps to 0 below, presenting it as this window's first frame. Within the

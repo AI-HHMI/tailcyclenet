@@ -735,8 +735,7 @@ class PoseDataset(Dataset):
         if self.cfg.box_source != 'instances' or lab.boxes is None:
             return None
         b = lab.boxes[a][frames][:, cam_ix]                        # (T,C,4) = x0,y0,x1,y1
-        corners = np.stack([b[..., [0, 1]], b[..., [2, 1]], b[..., [2, 3]], b[..., [0, 3]]], -2)
-        return torch.as_tensor(corners, dtype=torch.float32)
+        return torch.as_tensor(cropmod.box_corners(b), dtype=torch.float32)
 
     def _item(self, idx, rng):
         item = self._pick(idx, rng)

@@ -14,6 +14,7 @@ that assertion ever fails, every detector number is invalid.
 posetail exposes the rule only inline inside `crop_cgroup_to_points`, with no way to reach it for
 a single camera -- hence a free function here rather than a call into the library.
 """
+import numpy as np
 import torch
 
 from posetail.posetail.cube import project_points_torch
@@ -73,6 +74,20 @@ def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
         high[1] = low[1] + min_dim_y
 
     return torch.cat([low, high])
+
+
+def box_corners(boxes):
+    """(..., 4) xyxy -> (..., 4, 2), ALL FOUR corners. numpy in, numpy out; torch in, torch out.
+
+    Two diagonal corners are not enough. An in-plane rotation turns the box into a rotated
+    rectangle, and the extent of its two diagonal corners is strictly inside the extent of all
+    four, so a two-corner version crops the animal. Shared by the loader (`dataset._crop_pts`,
+    which rotates them) and by inference (`infer.run_group`, which unions them over a window), so
+    the two cannot end up bounding different things.
+    """
+    lib = torch if torch.is_tensor(boxes) else np
+    b = boxes
+    return lib.stack([b[..., [0, 1]], b[..., [2, 1]], b[..., [2, 3]], b[..., [0, 3]]], -2)
 
 
 def apply_crop(cam, box):

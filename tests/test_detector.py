@@ -256,6 +256,40 @@ def test_collate_pads_uneven_animal_counts():
     assert torch.isnan(boxes[0, 2:]).all()
 
 
+def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
+    """`min_views = 2` is the ALGORITHM, not a threshold.
+
+    Every group `associate` emits starts from a cross-camera pair, so `len(members) >= 2` always
+    and the floor never fires -- an animal only one camera saw is dropped from the frame outright.
+    `min_views = 1` is a different rule: it emits each leftover box as a single-view instance, which
+    the pose model supports (`prob_2d_only` trains exactly that input).
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    from tailcyclenet.detector import associate
+    from tailcyclenet.format import Session
+
+    cf._session_3d(tmp_path / 'ds' / 'test' / 's')
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    cams = sess.cgroup('g000', 0)
+
+    # One animal both of the first two cameras see at the image centre, plus a box in camera 2 that
+    # no pair can agree with (it sits in a corner).
+    centre = torch.tensor([[24., 16., 40., 32.]])
+    per_cam = [centre, centre, torch.cat([centre, torch.tensor([[0., 0., 8., 8.]])])]
+
+    two = associate(cams, per_cam, max_res_px=30.0, min_views=2)
+    one = associate(cams, per_cam, max_res_px=30.0, min_views=1)
+    assert len(one) == len(two) + 1, f'{len(two)} -> {len(one)}: the leftover box must appear'
+    extra = one[len(two)]
+    assert list(extra['boxes']) == [2] and torch.isnan(extra['point']).all(), \
+        'a single ray has no triangulated point, and inventing a depth would be a lie'
+
+
 def test_link_rows_follows_one_animal():
     """Unlinked rows are score-ordered, so the window-union crop spans several animals.
 

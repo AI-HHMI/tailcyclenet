@@ -73,6 +73,13 @@ def main():
                     help='follow one animal per instance row across frames (greedy IoU). Detector '
                          'rows are score-ordered and unlinked by default, which makes the window '
                          'crop the union over several different animals.')
+    ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
+                    help='3D only. 2 is cross-view association as it stands: every instance is '
+                         'built from a camera PAIR, so an animal only one view saw is dropped from '
+                         'the frame entirely. 1 also emits each leftover box as a single-view '
+                         'instance -- an input the pose model supports (`prob_2d_only`), and pure '
+                         'coverage against pure precision, since a leftover box is exactly one the '
+                         'geometry never corroborated.')
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
@@ -87,6 +94,11 @@ def main():
                     help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
                          'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
                          'unreadable. A view only -- it changes nothing that was predicted.')
+    ap.add_argument('--prior-vis-thresh', type=float, default=None,
+                    help='drop a CARRIED keypoint from the prompt when the previous window\'s own '
+                         '`vis_pred` LOGIT for it is below this. A logit, not a probability: 0.0 is '
+                         'p = 0.5. Gates individual prompt keypoints, not rows -- it changes what '
+                         'the model is told, never what it reports. Off by default.')
     ap.add_argument('--kpt-chunk', type=int, default=0,
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
@@ -114,7 +126,10 @@ def main():
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
-        kpt_chunk=args.kpt_chunk, device=device)
+        kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh, device=device)
+    if args.prior_vis_thresh is not None and args.anchor != 'carry':
+        raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
+                         f'under --anchor carry; got {args.anchor!r}.')
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')
@@ -154,7 +169,7 @@ def main():
     # different detector, threshold or animal count would quietly make one arm incomparable to
     # the next, which is the kind of mismatch that gets published (eval rule 4).
     stamp = repr([str(args.detector), args.det_score, args.max_animals, bool(args.link_boxes),
-                  list(args.det_input_wh or ()), args.max_frames])
+                  list(args.det_input_wh or ()), args.max_frames, args.min_views])
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
         loaded = dict(np.load(args.det_cache, allow_pickle=True))
@@ -191,7 +206,8 @@ def main():
                     det_boxes, det_scores = detect_group(
                         det, det_wh, sess, gid, n_want, device=device,
                         score_thresh=args.det_score, link=args.link_boxes,
-                        reduce=det_red, max_frames=args.max_frames)
+                        reduce=det_red, max_frames=args.max_frames,
+                        min_views=args.min_views)
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True

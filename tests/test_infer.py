@@ -103,6 +103,29 @@ def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
     assert np.isfinite(out['pred']).all(-1).any(), 'the surviving cameras must still predict'
 
 
+def test_the_window_union_box_obeys_the_crop_rule(scene):
+    """THE DEPLOYMENT PATH USED ITS OWN CROP RULE. The union over a window's boxes was a
+    hand-rolled floor/ceil/clip: not square, and with no `min_crop_dim` floor. The pose model is
+    trained on `crop_box_for_points` output and nothing else, so the box it is served has to be
+    that -- and the union of already-padded boxes must not be padded a second time."""
+    model, sess, registry, name = scene
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    # A box far under the 16 px floor this cfg asks for, and moving across the window.
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    for t in range(4):
+        boxes[0, t, :] = [10 + t, 12, 14 + t, 16]
+
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
+    crop = out['crop'][0, 0]                              # (C,4), the first window's box per cam
+    for ci in range(C):
+        x0, y0, x1, y1 = crop[ci]
+        assert (x1 - x0) == (y1 - y0) == 16, f'cam {ci}: {crop[ci]} is not the 16 px square floor'
+        assert 0 <= x0 and x1 <= w and 0 <= y0 and y1 <= h
+        # the union spans t = 0..3, so it must contain the last frame's box too
+        assert x0 <= 10 and x1 >= 17, f'cam {ci}: {crop[ci]} does not cover the window'
+
+
 def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
     """ONE DECODE PER (CAMERA, FRAME), shared by every animal in the window.
 
@@ -176,6 +199,16 @@ def test_carried_prior_is_bounds_masked_and_dated():
     assert (early == 0).all()
     _, late = _build_prior(cfg, (pose, 999), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
     assert (late == len(frames) - 1).all()
+
+    # A KEYPOINT THE MODEL ITSELF DOUBTED, gated in the same currency (NaN = "I was not told").
+    gated = InferConfig(anchor='carry', prior_vis_thresh=0.0)
+    vis = torch.tensor([2.0, -1.0, 3.0, -5.0])
+    pri, _ = _build_prior(gated, (pose, 23, vis), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    assert torch.isfinite(pri[0, 0]).all(), 'a confident in-crop keypoint must survive'
+    assert torch.isnan(pri[0, 1]).all(), 'a keypoint below the logit threshold must be dropped'
+    # ...and the default keeps it, so an unconfigured run is byte-identical.
+    keep, _ = _build_prior(cfg, (pose, 23, vis), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    assert torch.isfinite(keep[0, 1]).all()
 
     # STALER THAN THE OVERLAP IS NOT A PRIOR. `carried` is only written by a window that predicted,
     # so an animal the box source lost for a few windows keeps offering a pose from before this

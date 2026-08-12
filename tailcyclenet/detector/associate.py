@@ -62,8 +62,20 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         boxes_per_cam: list of (N_c, 4) tensors, per camera, in that camera's pixels
         max_res_px: a group whose median reprojection residual exceeds this is rejected
 
-    Returns a list of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float}.
+        min_views: the floor on how many cameras an instance may be built from. **2 is not a
+            parameter, it is the algorithm**: every group below starts from a cross-camera PAIR, so
+            `len(members) >= 2` always and the check never fires. `min_views = 1` is therefore a
+            different rule, not a looser threshold -- it emits each LEFTOVER box, one no pair
+            claimed, as its own single-view instance with no triangulated point. The pose model
+            supports that input outright (`prob_2d_only` trains the one-camera case), and dropping
+            those boxes is pure lost coverage. It cannot be free: a leftover box is one the
+            geometry never corroborated, so it is also where a false positive lives.
+
+    Returns a list of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float}. A
+    single-view instance has `point` all-NaN and `residual` inf: there is nothing to triangulate
+    from one ray, and inventing a depth would be a position no camera claimed.
     """
+    assert min_views in (1, 2), f'min_views is 1 or 2, got {min_views}'
     centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
     n_cams = len(cgroup)
 
@@ -111,4 +123,17 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         used.update((c, members[c]) for c in members)
         if max_instances and len(out) >= max_instances:
             break
+
+    if min_views == 1:
+        # Whatever no pair claimed, in camera order then score order (the boxes arrive score-ordered
+        # from `decode`). Deterministic, so two arms over one clip see the same rows.
+        for c in range(n_cams):
+            for i in range(centres[c].shape[0]):
+                if max_instances and len(out) >= max_instances:
+                    return out
+                if (c, i) in used:
+                    continue
+                out.append({'point': torch.full((3,), float('nan')), 'residual': float('inf'),
+                            'boxes': {c: boxes_per_cam[c][i]}, 'members': {c: i}})
+                used.add((c, i))
     return out

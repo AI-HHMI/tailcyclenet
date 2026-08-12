@@ -150,3 +150,40 @@ def test_carried_prior_is_bounds_masked_and_dated():
     assert (early == 0).all()
     _, late = _build_prior(cfg, (pose, 999), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
     assert (late == len(frames) - 1).all()
+
+
+def test_max_frames_takes_a_prefix(scene):
+    """A PREFIX, not a sample: `carry` needs the frames contiguous, and the rat-city protocol is
+    frames 0-479 of one trial. `n_frames` in the result must describe what was actually predicted,
+    or the render and the eval disagree about which clip this is."""
+    model, sess, registry, name = scene
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
+    assert out['pred'].shape[1] == 3
+    assert out['n_frames'] == 3
+    # 0 and a ceiling above the group both mean "the whole group".
+    for m in (0, 99):
+        assert run_group(model, sess, 'g000', registry, name,
+                         _cfg(anchor='none', max_frames=m))['pred'].shape[1] == 4
+
+
+def test_render_writes_every_predicted_frame(scene):
+    """The mp4 must hold exactly the frames the prediction covers -- a render one frame short of
+    its npz is how a clip and its numbers drift apart."""
+    import cv2
+
+    from tailcyclenet.render import render_group
+
+    model, sess, registry, name = scene
+    if sess.mode != '2d':
+        pytest.skip('3D sessions are not drawn yet')
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
+    path = Path(tempfile.mkdtemp()) / 'clip.mp4'
+    render_group(sess, 'g000', out['pred'], path, max_side=64, fps=5)
+
+    assert path.stat().st_size > 0
+    cap = cv2.VideoCapture(str(path))
+    n = 0
+    while cap.read()[0]:
+        n += 1
+    cap.release()
+    assert n == 3, f'wrote {n} frames for a 3-frame prediction'

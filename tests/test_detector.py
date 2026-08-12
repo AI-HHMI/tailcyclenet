@@ -108,3 +108,49 @@ def test_collate_pads_uneven_animal_counts():
     x, boxes = box_collate([a, b])
     assert x.shape == (2, 3, 8, 8) and boxes.shape == (2, 5, 4)
     assert torch.isnan(boxes[0, 2:]).all()
+
+
+def test_link_rows_follows_one_animal():
+    """Unlinked rows are score-ordered, so the window-union crop spans several animals.
+
+    Two animals crossing the frame in opposite directions, with their rows swapped on every odd
+    frame the way a score reordering would swap them. Linking must undo that: the give-away is
+    the UNION box, which is the thing `run_group` actually crops to.
+    """
+    import numpy as np
+
+    from tailcyclenet.detector import link_rows
+
+    T = 20
+    boxes = np.full((2, T, 1, 4), np.nan, np.float32)
+    for t in range(T):
+        a = np.array([10 + t, 10, 40 + t, 40], np.float32)      # drifts right
+        b = np.array([110 - t, 10, 140 - t, 40], np.float32)    # drifts left
+        boxes[0, t, 0], boxes[1, t, 0] = (a, b) if t % 2 == 0 else (b, a)
+
+    union = lambda x: np.concatenate([x[..., :2].min(0), x[..., 2:].max(0)], -1)  # noqa: E731
+    before = union(boxes[0, :, 0])
+    linked = link_rows(boxes.copy())
+    after = union(linked[0, :, 0])
+
+    assert (before[2] - before[0]) > 120, 'the swapped rows should span the whole frame'
+    assert (after[2] - after[0]) < (before[2] - before[0]) / 2, \
+        f'linking must shrink the union crop, got {after} from {before}'
+    # Every frame still holds both animals -- linking reorders, it never drops.
+    assert np.isfinite(linked).all()
+
+
+def test_link_rows_survives_a_dropped_frame():
+    """Matching is against each row's LAST KNOWN box, so a one-frame miss cannot break the chain."""
+    import numpy as np
+
+    from tailcyclenet.detector import link_rows
+
+    boxes = np.full((2, 4, 1, 4), np.nan, np.float32)
+    for t in range(4):
+        boxes[0, t, 0] = [10 + t, 10, 40 + t, 40]
+        boxes[1, t, 0] = [110, 10, 140, 40]
+    boxes[:, 2, 0] = np.nan                       # the detector sees nothing at frame 2
+    linked = link_rows(boxes.copy())
+    assert linked[0, 3, 0][0] == 13, 'row 0 must still be the left animal after the gap'
+    assert linked[1, 3, 0][0] == 110

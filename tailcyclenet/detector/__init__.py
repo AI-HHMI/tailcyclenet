@@ -9,28 +9,45 @@ __all__ = ['YOLOXNano', 'BoxDataset', 'box_collate', 'letterbox', 'unletterbox_b
            'assign', 'box_iou', 'decode', 'detector_loss', 'giou_loss', 'associate']
 
 
-def load_detector(path, device='cpu'):
-    """(model, input_wh, dataset_name) from a detector run folder or a .pth."""
+def load_detector(path, device='cpu', input_wh=None):
+    """(model, input_wh, dataset_name) from a detector run folder or a .pth.
+
+    THE INPUT SIZE IS PART OF THE WEIGHTS, not a runtime choice: the letterbox the detector was
+    trained under decides what an animal looks like to it, and a square 416 puts the median rat
+    at 15.8 x 12.5 px where an aspect-matched 896x384 does not. So it is read from the checkpoint
+    -- except that posetail-pose's own detectors predate that field entirely (they carry
+    `dataset`, `epoch`, `eval`, `max_instances`, `strategy` and nothing else) and the size lives
+    in a config file this repo does not have. `input_wh` supplies it for those; guessing a default
+    would silently run a detector at a size it never saw.
+    """
     import torch
     from pathlib import Path
     p = Path(path)
     if p.is_dir():
         p = p / 'detector.pth'
     ckpt = torch.load(p, map_location='cpu', weights_only=False)
+    wh = input_wh or ckpt.get('input_wh') or ckpt.get('det_input_wh')
+    if wh is None:
+        raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
+                         'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
+                         'branson-fly 416 416).')
     model = YOLOXNano()
     model.load_state_dict(ckpt['model_state'])
-    return model.to(device).eval(), tuple(ckpt['input_wh']), str(ckpt.get('dataset', ''))
+    return model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', ''))
 
 
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
-                 score_thresh=0.05):
+                 score_thresh=0.05, link=False):
     """Run the detector over every frame and camera of a group -> boxes (S,T,C,4).
 
     2D / single camera: instances are the NMS survivors, ordered by score, and the row index is
     the only identity there is -- it is NOT tracked, so row `a` at frame t and frame t+1 need not
     be the same animal. Feeding these straight to the pose model is the honest deployment
     baseline for a single window and nothing more; a tracker belongs on top.
+
+    `link=True` puts the smallest possible one there -- see `link_rows`. Off by default so the
+    contract in the paragraph above stays the contract.
 
     3D multiview: rows come from cross-view association, so a row IS one physical animal within
     a frame, again untracked across frames.
@@ -80,4 +97,60 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                 for a, g in enumerate(groups[:S]):
                     for c, box in g['boxes'].items():
                         out[a, t, c] = box.numpy()
-    return out
+    return link_rows(out) if link else out
+
+
+def link_rows(boxes):
+    """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns it.
+
+    WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
+    and row 0 at frame t+1 are unrelated -- measured on branson-fly, the median IoU between a
+    row's own consecutive boxes is 0.000 across ten near-identical flies. That matters because
+    `infer.run_group` crops each window to the UNION of its frames' boxes, to stop an animal
+    walking out of its own crop: fed unlinked rows, that union is 45x (branson-fly) / 59x
+    (rat-city) the area of one animal and the pose model receives the whole arena squeezed into
+    256 px.
+
+    Matching is on IoU against each row's LAST KNOWN box, not against frame t-1, so a one-frame
+    detector miss does not break the chain.
+
+    ponytail: greedy per-frame Hungarian on IoU, nothing else. No births, no deaths, no
+    re-identification after a long occlusion, no appearance model -- a row that drifts onto
+    another animal stays there. posetail-pose needed six more flags on top of this
+    (`--track-bridge`, `--rebirth`, `--birth-score`, `--dup-action`, `--pose-arbitrate`,
+    `--max-age-frames`) to reach MOTA 0.69 on rat-city, and `reports/crowding.md` is the record of
+    why. Upgrade path is that report, not another heuristic here.
+    """
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    from .assign import box_iou as _iou
+
+    S, T, C, _ = boxes.shape
+    last = boxes[:, 0].copy()                     # (S,C,4), each row's most recent known box
+    for t in range(1, T):
+        cur = boxes[:, t]
+        cost = np.zeros((S, S), np.float32)
+        for c in range(C):
+            ok_p = np.isfinite(last[:, c]).all(-1)
+            ok_c = np.isfinite(cur[:, c]).all(-1)
+            if not (ok_p.any() and ok_c.any()):
+                continue
+            iou = _iou(torch.as_tensor(last[ok_p, c]), torch.as_tensor(cur[ok_c, c])).numpy()
+            cost[np.ix_(ok_p, ok_c)] += iou
+        rows, cols = linear_sum_assignment(-cost)
+        perm = np.arange(S)
+        # An unmatched row keeps its own slot; only positive-overlap pairs are moved, or two
+        # animals that never touch would be swapped by an all-zero cost matrix's arbitrary
+        # optimum.
+        taken = {}
+        for r, c_ in zip(rows, cols):
+            if cost[r, c_] > 0:
+                taken[r] = c_
+        free = [i for i in range(S) if i not in taken.values()]
+        for r in range(S):
+            perm[r] = taken[r] if r in taken else (free.pop(0) if free else r)
+        boxes[:, t] = cur[perm]
+        seen = np.isfinite(boxes[:, t]).all(-1)
+        last = np.where(seen[..., None], boxes[:, t], last)
+    return boxes

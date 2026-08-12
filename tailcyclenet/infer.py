@@ -45,6 +45,7 @@ class InferConfig:
     min_crop_dim: int = 64
     anchor: str = 'carry'
     max_animals: int = 0          # 0 -> every animal the box source offers
+    max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
     kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
     device: str = 'cuda:0'
 
@@ -127,7 +128,9 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     mode = session.mode
     K = session.n_keypoints
     R = 3 if mode == '3d' else 2
-    T_total = group.n_frames
+    # A PREFIX of the group, not a sample of it: `carry` needs the frames contiguous, and
+    # rat-city's posetail-pose protocol is frames 0-479 of its one test trial.
+    T_total = min(group.n_frames, cfg.max_frames or group.n_frames)
     # The registry is per DATASET and the keypoint axis is per SESSION -- and `scripts/infer.py`
     # will happily hand us a bare session directory. `ids_for` aligns to the axis we actually
     # hold, by name, so a session that reorders the root's keypoints or carries a subset of them

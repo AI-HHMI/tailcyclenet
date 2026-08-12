@@ -139,12 +139,16 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=32)
 def _reader(path: str):
     """One `VideoReader` per file per process. Opening the container and building its frame index
     is not per-window work, but `read_frames` is called once per window per camera -- so a
-    windowed pass over 3dpop's test videos paid it hundreds of times. Small cache: the readers
-    hold decode buffers, and inference walks one video at a time."""
+    windowed pass over 3dpop's test videos paid it hundreds of times.
+
+    THE CACHE MUST HOLD A WHOLE RIG. Inference walks one group at a time but touches every camera
+    within each window, so a cache smaller than the camera count misses on *every* call -- at
+    3dpop's 4 cameras the old size of 8 hid that, and a 16-camera video rig re-opened all 16
+    containers per window."""
     from decord import VideoReader
 
     return VideoReader(path)

@@ -56,8 +56,29 @@ def main():
     ap.add_argument('--detector', type=Path, default=None,
                     help='a detector run folder. THE deployment path: boxes come from pixels, '
                          'not from labels.')
+    ap.add_argument('--det-input-wh', type=int, nargs=2, default=None,
+                    help='letterbox size the detector was TRAINED at. Only needed for a '
+                         'posetail-pose checkpoint, which keeps it in a config file rather than '
+                         'in the weights.')
     ap.add_argument('--det-score', type=float, default=0.05)
+    ap.add_argument('--link-boxes', action='store_true',
+                    help='follow one animal per instance row across frames (greedy IoU). Detector '
+                         'rows are score-ordered and unlinked by default, which makes the window '
+                         'crop the union over several different animals.')
     ap.add_argument('--max-animals', type=int, default=0)
+    ap.add_argument('--max-frames', type=int, default=0,
+                    help='predict only the first N frames of each group. A PREFIX, not a sample: '
+                         '`carry` needs the frames contiguous.')
+    ap.add_argument('--render', type=Path, default=None,
+                    help='also write <dir>/<session>__<group>__<cam>.mp4 of the prediction. A 3D '
+                         'prediction is REPROJECTED into each rendered camera.')
+    ap.add_argument('--render-cams', default='0',
+                    help='comma-separated camera indices to render. A reprojection hides a depth '
+                         'error along its own ray, so a 3D render wants more than one.')
+    ap.add_argument('--render-zoom', type=int, default=0,
+                    help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
+                         'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
+                         'unreadable. A view only -- it changes nothing that was predicted.')
     ap.add_argument('--kpt-chunk', type=int, default=0,
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
@@ -74,8 +95,8 @@ def main():
         n_frames=args.n_frames or int(config['data'].get('n_frames', 24)),
         overlap=args.overlap, image_size=int(config['data'].get('image_size', 256)),
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
-        anchor=args.anchor, max_animals=args.max_animals, kpt_chunk=args.kpt_chunk,
-        device=device)
+        anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
+        kpt_chunk=args.kpt_chunk, device=device)
     if args.anchor == 'labels':
         print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
@@ -84,10 +105,11 @@ def main():
     det = det_wh = None
     if args.detector:
         from tailcyclenet.detector import detect_group, load_detector
-        det, det_wh, det_ds = load_detector(args.detector, device)
+        det, det_wh, det_ds = load_detector(args.detector, device, input_wh=args.det_input_wh)
         print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r})')
     ds_name, sessions = sessions_for(args.data, args.split)
     want = set(args.groups.split(',')) if args.groups else None
+    render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
 
     results = {}
     for sess in sessions:
@@ -104,7 +126,7 @@ def main():
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
                 det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
-                                         score_thresh=args.det_score)
+                                         score_thresh=args.det_score, link=args.link_boxes)
                 print(f'{key}: detecting up to {n_want} animal(s)'
                       f'{"" if args.max_animals else " (from the labels; set --max-animals)"}')
             out = run_group(model, sess, gid, registry, ds_name, cfg,
@@ -112,6 +134,14 @@ def main():
             results[key] = out
             print(f'{key}: {out["pred"].shape} '
                   f'{np.isfinite(out["pred"]).all(-1).mean():.3f} finite')
+            if args.render is not None:
+                from tailcyclenet.render import render_group
+                for ci in render_cams:
+                    cam_name = sess.cam_names[ci]
+                    mp4 = render_group(sess, gid, out['pred'],
+                                       args.render / f'{key.replace("/", "__")}__{cam_name}.mp4',
+                                       cam=ci, zoom=args.render_zoom)
+                    print(f'{key}: wrote {mp4}')
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     flat = {}

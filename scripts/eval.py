@@ -27,7 +27,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.format import INST_PRESENT, Session, load_dataset
-from tailcyclenet.metrics import (error_and_coverage, matched_error, mota,
+from tailcyclenet.metrics import (error_and_coverage, match_instances, matched_error, mota,
                                   paired_bootstrap, pck)
 
 
@@ -96,11 +96,26 @@ def main():
             with np.errstate(all='ignore'):
                 span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
                 extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
-            mm = matched_error(pred, true, max_dist=extent if np.isfinite(extent) else np.inf)
+            max_dist = extent if np.isfinite(extent) else np.inf
+            mm = matched_error(pred, true, max_dist=max_dist)
             m['err_rowwise'] = m['err']
             m.update({k: v for k, v in mm.items()
                       if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')})
             m['unmatched'] = mm.get('unmatched_true', 0)
+            # AND PCK GETS THE SAME PAIRING. It reads `_pred` positionally, so on detector boxes
+            # it was scoring animal i's prediction against animal j's label under a heading that
+            # said HUNGARIAN-MATCHED -- branson-fly read MPJPE 0.705 px beside pck@5 0.0000,
+            # which cannot both be true of one set of points.
+            #
+            # NOT shared with MOTA, which reads the RAW rows below. Hungarian-aligning rows
+            # before MOTA would zero `idsw` by construction -- an identity switch is precisely a
+            # frame where the best assignment changed, and re-matching every frame independently
+            # defines that away.
+            aligned = np.full_like(pred, np.nan)
+            for t, frame_pairs in enumerate(match_instances(pred, true, max_dist)):
+                for i, j, _ in frame_pairs:
+                    aligned[j, t] = pred[i, t]
+            m['_pred_matched'] = aligned
         m['group'] = key
         m['mode'] = mode
         m['S'] = S
@@ -141,7 +156,8 @@ def main():
         # The SAME arrays the table was computed from. Rebuilding them from the npz re-derived
         # the slicing and got it wrong whenever pred and true disagreed on S or T, silently
         # comparing one animal's points against another's.
-        allp = np.concatenate([m['_pred'].reshape(-1, m['_pred'].shape[-1]) for m in block])
+        allp = np.concatenate([m.get('_pred_matched', m['_pred']).reshape(-1, m['_pred'].shape[-1])
+                               for m in block])
         allt = np.concatenate([m['_true'].reshape(-1, m['_true'].shape[-1]) for m in block])
         for k, v in pck(allp, allt, thresholds).items():
             print(f'[{mode}] {k} ({unit})  {v:.4f}')

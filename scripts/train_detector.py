@@ -75,6 +75,10 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--num-workers', type=int, default=8)
     ap.add_argument('--frames-per-group', type=int, default=40)
+    ap.add_argument('--val-frames-per-group', type=int, default=8,
+                    help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
+                         'branson-fly each hold a single val group, so the default 8 makes the '
+                         'recall readout 8 images; raise it to the group\'s labelled length.')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
 
@@ -97,7 +101,8 @@ def main():
         worker_init_fn=worker_init)
     val_loader = None
     try:
-        val = BoxDataset(args.data, 'val', input_wh=wh, max_frames_per_group=8)
+        val = BoxDataset(args.data, 'val', input_wh=wh,
+                         max_frames_per_group=args.val_frames_per_group)
         val_loader = torch.utils.data.DataLoader(val, batch_size=args.batch_size,
                                                  num_workers=2, collate_fn=box_collate)
         print(f'val:   {len(val)} views')

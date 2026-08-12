@@ -3,11 +3,24 @@
 Two properties here are the kind that a refactor breaks quietly: the vectorised Hungarian cost
 must equal the loop it replaced, and the ignore region must excuse only what it actually covers.
 """
+import importlib.util
+from pathlib import Path
+
 import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
 from tailcyclenet.metrics import _dist, match_instances, matched_error, mota
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _eval_module():
+    """Import scripts/eval.py without running main()."""
+    spec = importlib.util.spec_from_file_location('tcn_eval', REPO / 'scripts' / 'eval.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _naive_match(pred, true, max_dist=np.inf):
@@ -82,6 +95,42 @@ def test_a_surplus_predicted_row_is_a_false_positive():
     r = mota(pred, true, 1.0)
     assert (r['fp'], r['misses'], r['gt']) == (6, 0, 3)
     assert matched_error(pred, true)['unmatched_true'] == 0
+
+
+def test_the_fp_term_separates_duplicates_from_nothing():
+    """The two halves want opposite fixes, so an undifferentiated `fp` cannot pick one.
+
+    Arbitration removes a second crop on an animal something else already claimed; a score
+    threshold removes a box on nothing. `match_instances` is one-to-one, so the duplicate is never
+    assigned and falls out as an ordinary false positive -- the proximity has to be tested for.
+    """
+    true = np.zeros((1, 1, 2, 2))                             # one animal at the origin
+    pred = np.array([[[[0., 0.], [0., 0.]]],                  # matches it
+                     [[[1., 1.], [1., 1.]]],                  # a second crop on the SAME animal
+                     [[[500., 500.], [500., 500.]]]])         # on nothing at all
+    r = mota(pred, true, 10.0)
+    assert (r['fp'], r['fp_dup'], r['fp_none']) == (2, 1, 1)
+    # The radius is the whole definition of "the same animal": tighten it and the duplicate is a
+    # box on nothing instead.
+    assert mota(pred, true, 0.5)['fp_dup'] == 0
+
+
+def test_a_paired_delta_uses_only_the_points_both_arms_matched():
+    """Eval rule 6, as code. An arm that declines the hard points has a better mean over its OWN
+    matched set and must not read as better than one that attempted them."""
+    ev = _eval_module()
+    true = np.zeros((1, 4, 1, 2))
+    good = np.zeros((1, 4, 1, 2))                             # exact on all four frames
+    good[0, 2] = 3.0                                          # except one, where it is 3 off
+    picky = np.full((1, 4, 1, 2), np.nan)
+    picky[0, :2] = 0.0                                        # attempts only the two easy frames
+
+    ea, eb, n, nlab = ev._shared_error({'_pred': good, '_true': true}, {'_pred': picky,
+                                                                       '_true': true})
+    assert (n, nlab) == (2, 4)
+    assert ea == eb == 0.0, 'over the shared points the two are identical, and the delta is 0'
+    # ...where a whole-set comparison would have made the picky arm look better by 3/4 of a unit.
+    assert np.nanmean(np.linalg.norm(good - true, axis=-1)) > 0
 
 
 def test_matched_error_reports_the_counts_behind_its_coverage():

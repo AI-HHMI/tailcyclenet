@@ -164,7 +164,8 @@ def main():
                              f'{" " * len(str(args.det_cache))}  now running {stamp}\n'
                              'Delete it or point --det-cache somewhere else.')
         det_cache = loaded
-        print(f'detector boxes: {len(det_cache)} cached group(s) from {args.det_cache}')
+        print(f'detector boxes: {sum(1 for k in det_cache if not k.endswith("|score"))} '
+              f'cached group(s) from {args.det_cache}')
 
     results = {}
     for sess in sessions:
@@ -173,7 +174,7 @@ def main():
             if want and gid not in want:
                 continue
             key = f'{sess.session_id}/{gid}'
-            det_boxes = None
+            det_boxes = det_scores = None
             if det is not None:
                 # Default to what the session actually holds, not to 1. `detect_group` caps
                 # detections at this count, so a bare --detector run on a ten-animal dataset
@@ -181,18 +182,25 @@ def main():
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
                 if key in det_cache:
-                    det_boxes = det_cache[key]
+                    det_boxes, det_scores = det_cache[key], det_cache.get(f'{key}|score')
                     print(f'{key}: up to {n_want} animal(s), boxes from --det-cache')
                 else:
                     print(f'{key}: detecting up to {n_want} animal(s)'
                           f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
                           flush=True)
-                    det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
-                                             score_thresh=args.det_score, link=args.link_boxes,
-                                             reduce=det_red, max_frames=args.max_frames)
-                    det_cache[key], cache_dirty = det_boxes, True
+                    det_boxes, det_scores = detect_group(
+                        det, det_wh, sess, gid, n_want, device=device,
+                        score_thresh=args.det_score, link=args.link_boxes,
+                        reduce=det_red, max_frames=args.max_frames)
+                    det_cache[key] = det_boxes
+                    det_cache[f'{key}|score'] = det_scores
+                    cache_dirty = True
             out = run_group(model, sess, gid, registry, ds_name, cfg,
                             box_points=boxes.get(key), boxes_stc=det_boxes)
+            if det_scores is not None:
+                # The objectness each crop was accepted on, beside the prediction it produced.
+                # `--det-score` is then an offline sweep instead of a re-detection per threshold.
+                out['det_score'] = det_scores[:, :out['pred'].shape[1]]
             results[key] = out
             print(f'{key}: {out["pred"].shape} '
                   f'{np.isfinite(out["pred"]).all(-1).mean():.3f} finite')

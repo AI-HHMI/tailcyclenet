@@ -55,7 +55,12 @@ def load_detector(path, device='cpu', input_wh=None):
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
                  score_thresh=0.05, link=False, reduce=False, max_frames=0):
-    """Run the detector over every frame and camera of a group -> boxes (S,T,C,4).
+    """Run the detector over every frame and camera of a group -> (boxes, scores).
+
+    boxes (S,T,C,4), scores (S,T,C). The score is the objectness the box survived NMS on, and it
+    is returned rather than dropped because `--det-score` is otherwise a re-detection per
+    threshold: detection is the expensive half of a run, and a sweep over a threshold that only
+    ever *removes* boxes can be done offline from what one pass already computed.
 
     `max_frames` is the same PREFIX `infer.run_group` takes, and it has to be honoured here or the
     two disagree about the clip: rat-city's one test group is 57,594 frames and the protocol is its
@@ -83,6 +88,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     C = len(session.rig)
     S = max_instances or 1
     out = np.full((S, T, C, 4), np.nan, np.float32)
+    sc = np.full((S, T, C), np.nan, np.float32)
     # Static rig: build once. Moving rig: `associate` triangulates per frame from (n,2) centres,
     # so it needs that frame's own (4,4) extrinsic -- built inside the loop below.
     moving = any(session.rig.moving.values())
@@ -109,27 +115,29 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
             cam_frames = []
             for j in range(len(frames)):
                 b, s = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh)
-                cam_frames.append(unletterbox_boxes(b.cpu(), *metas[j]) if b.numel()
-                                  else b.cpu())
+                cam_frames.append((unletterbox_boxes(b.cpu(), *metas[j]) if b.numel()
+                                   else b.cpu(), s.cpu()))
             per_cam.append(cam_frames)
 
         for j, t in enumerate(frames):
             if C == 1:
-                b = per_cam[0][j]
+                b, s = per_cam[0][j]
                 for a in range(min(S, b.shape[0])):
                     out[a, t, 0] = b[a].numpy()
+                    sc[a, t, 0] = float(s[a])
             else:
                 cams = session.cgroup(gid, t) if moving else cgroup
-                groups = associate(cams, [per_cam[c][j] for c in range(C)],
+                groups = associate(cams, [per_cam[c][j][0] for c in range(C)],
                                    max_res_px=session.assoc_res_max_px, max_instances=S)
                 for a, g in enumerate(groups[:S]):
                     for c, box in g['boxes'].items():
                         out[a, t, c] = box.numpy()
-    return link_rows(out) if link else out
+                        sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
+    return link_rows(out, sc) if link else (out, sc)
 
 
-def link_rows(boxes):
-    """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns it.
+def link_rows(boxes, scores=None):
+    """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
     and row 0 at frame t+1 are unrelated -- measured on branson-fly, the median IoU between a
@@ -179,6 +187,9 @@ def link_rows(boxes):
         for r in range(S):
             perm[r] = taken[r] if r in taken else (free.pop(0) if free else r)
         boxes[:, t] = cur[perm]
+        if scores is not None:
+            # The SAME permutation, or the score stops describing the box beside it.
+            scores[:, t] = scores[:, t][perm]
         seen = np.isfinite(boxes[:, t]).all(-1)
         last = np.where(seen[..., None], boxes[:, t], last)
-    return boxes
+    return boxes if scores is None else (boxes, scores)

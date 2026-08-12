@@ -14,7 +14,14 @@ What it prints, and why each column is there:
   correlated, and resampling them would give an interval several times too tight.
 - multi-animal rows add MOTA with its components split out. Two methods with the same MOTA and
   different miss/FP splits are not the same method, and only MOTA replicates across seeds --
-  above a +-0.023 seed floor.
+  above a +-0.023 seed floor. The FP term splits again into `dup` (a second prediction on an
+  animal something else already claimed) and `none` (a prediction on no labelled animal): the
+  first is what arbitration removes and the second what a score threshold removes.
+
+`--vs other.npz` reports the difference between two prediction files over the groups both scored
+and the points BOTH matched, under a paired bootstrap. That restriction is the point: an arm which
+declines the hard points has a better mean over its own matched set, so an unrestricted delta
+rewards lost coverage (eval rule 6).
 """
 from __future__ import annotations
 
@@ -39,7 +46,9 @@ def load_predictions(path: Path):
         out[key] = {f.split('|', 1)[1]: z[f] for f in z.files
                     if f.startswith(key + '|')}
     meta = {'run': str(z['__run__']), 'anchor': str(z['__anchor__']),
-            'boxes': str(z['__boxes__'])}
+            'boxes': str(z['__boxes__']),
+            # Written since the detector's own crop rule became checkable; absent in older files.
+            'box_source': str(z['__box_source__']) if '__box_source__' in z.files else ''}
     return out, meta
 
 
@@ -56,29 +65,18 @@ def label_lookup(data: Path, split: str):
     return out
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('predictions', type=Path)
-    ap.add_argument('--data', required=True, type=Path)
-    ap.add_argument('--split', default='test')
-    ap.add_argument('--pck', default=None, help='comma-separated thresholds; default per mode')
-    ap.add_argument('--mota-dist', type=float, default=None,
-                    help='match radius for MOTA; default is half the median animal extent '
-                         '(the DIAGONAL of its keypoint box, not a per-axis span)')
-    ap.add_argument('--seed', type=int, default=0)
-    args = ap.parse_args()
+def score(preds, labels, mota_dist=None, quiet=False):
+    """One row per group: the error, the coverage behind it, and MOTA where there are instances.
 
-    preds, meta = load_predictions(args.predictions)
-    labels = label_lookup(args.data, args.split)
-    print(f'run={meta["run"]}  anchor={meta["anchor"]}  boxes={meta["boxes"]}')
-    if meta['anchor'] == 'labels':
-        print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
-
-    per_group, rows = [], []
+    Factored out of `main` so `--vs` scores the second file through the IDENTICAL path. A baseline
+    computed a different way is not a baseline (eval rule 2), and a paired comparison whose two
+    sides derived their matching separately is not paired.
+    """
+    rows = []
     for key, out in sorted(preds.items()):
         if key not in labels:
-            print(f'{key}: no labels, skipped')
+            if not quiet:
+                print(f'{key}: no labels, skipped')
             continue
         lab, sess = labels[key]
         mode = str(out['mode'])
@@ -132,9 +130,67 @@ def main():
         m['S'] = S
         m['S_pred'], m['S_true'] = Sp, St
         m['_pred'], m['_true'] = pred, true      # already sliced to (S, T); PCK reuses these
+        if S > 1:
+            m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist)
         rows.append(m)
-        per_group.append(m['err'])
+    return rows
 
+
+def _mota_for(m, lab, mota_dist):
+    """(radius, mota dict) for one group. The ignore region is built here, from the labels."""
+    pred, true = m['_pred'], m['_true']
+    St, T = true.shape[0], true.shape[1]
+    # Match radius scaled to the animal's own size: the DIAGONAL of its keypoint bounding box, not
+    # a per-axis span. Taking the per-axis span and median-ing it across axes gave 1.6 px on
+    # rat-city -- tighter than the labelling noise, so every instance read as a miss AND a false
+    # positive and MOTA went negative.
+    with np.errstate(all='ignore'):
+        span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
+        extent = np.nanmedian(np.linalg.norm(span, axis=-1))
+    radius = mota_dist or float(extent) * 0.5
+    # Present-but-unannotated animals, WITH their boxes where the format carries them: an unmatched
+    # prediction is then excused only if it actually lands on one. Without boxes the fallback
+    # excuses every unmatched prediction on such a frame, so `fp_ignored` is printed to show how
+    # much of the FP term that took.
+    ig = ig_boxes = None
+    if lab.instance is not None:
+        ig = (lab.instance[:St, :T] == INST_PRESENT).any(-1)
+        # BOXES ARE PIXELS. `_in_ignore` compares a prediction centroid against them componentwise,
+        # and in 3D that centroid is world millimetres in a frame the boxes know nothing about --
+        # so every test fails and the whole ignore region silently degrades to the box-free
+        # fallback, which excuses MORE. Presence alone, printed as `fp_ignored`, is the honest
+        # answer there.
+        if lab.boxes is not None and m['mode'] == '2d':
+            ig_boxes = lab.boxes[:St, :T, 0]              # xyxy in the first camera
+    return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('predictions', type=Path)
+    ap.add_argument('--data', required=True, type=Path)
+    ap.add_argument('--split', default='test')
+    ap.add_argument('--pck', default=None, help='comma-separated thresholds; default per mode')
+    ap.add_argument('--mota-dist', type=float, default=None,
+                    help='match radius for MOTA; default is half the median animal extent '
+                         '(the DIAGONAL of its keypoint box, not a per-axis span)')
+    ap.add_argument('--vs', type=Path, default=None,
+                    help='a second prediction npz, reported as `predictions` minus this one under '
+                         'a PAIRED bootstrap over the groups both scored, on the points BOTH '
+                         'matched. Without the shared point set an error delta is confounded by '
+                         'coverage (eval rule 6): the arm that declined more points reads better.')
+    ap.add_argument('--seed', type=int, default=0)
+    args = ap.parse_args()
+
+    preds, meta = load_predictions(args.predictions)
+    labels = label_lookup(args.data, args.split)
+    print(f'run={meta["run"]}  anchor={meta["anchor"]}  boxes={meta["boxes"]}'
+          + (f'  box_source={meta["box_source"]}' if meta.get('box_source') else ''))
+    if meta['anchor'] == 'labels':
+        print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
+
+    rows = score(preds, labels, args.mota_dist)
     if not rows:
         print('nothing scored')
         return
@@ -178,40 +234,82 @@ def main():
     if multi:
         print()
         for m in multi:
-            lab, _ = labels[m['group']]
-            pred, true = m['_pred'], m['_true']
-            St, T = true.shape[0], true.shape[1]
-            unit = 'mm' if m['mode'] == '3d' else 'px'
-            # Match radius scaled to the animal's own size: the DIAGONAL of its keypoint
-            # bounding box, not a per-axis span. Taking the per-axis span and median-ing it
-            # across axes gave 1.6 px on rat-city -- tighter than the labelling noise, so
-            # every instance read as a miss AND a false positive and MOTA went negative.
-            with np.errstate(all='ignore'):
-                span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-                extent = np.nanmedian(np.linalg.norm(span, axis=-1))
-            radius = args.mota_dist or float(extent) * 0.5
-            # Present-but-unannotated animals, WITH their boxes where the format carries them:
-            # an unmatched prediction is then excused only if it actually lands on one. Without
-            # boxes the fallback excuses every unmatched prediction on such a frame, so
-            # `fp_ignored` is printed to show how much of the FP term that took.
-            ig = ig_boxes = None
-            if lab.instance is not None:
-                ig = (lab.instance[:St, :T] == INST_PRESENT).any(-1)
-                # BOXES ARE PIXELS. `_in_ignore` compares a prediction centroid against them
-                # componentwise, and in 3D that centroid is world millimetres in a frame the boxes
-                # know nothing about -- so every test fails and the whole ignore region silently
-                # degrades to the box-free fallback, which excuses MORE. Presence alone, printed as
-                # `fp_ignored`, is the honest answer there.
-                if lab.boxes is not None and m['mode'] == '2d':
-                    ig_boxes = lab.boxes[:St, :T, 0]          # xyxy in the first camera
-            r = mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes)
-            # BOTH radii, because they are different quantities and always were: MPJPE matches at
-            # the animal's full keypoint-box diagonal and MOTA at half of it, so the two tables
-            # above and below can disagree about whether an instance was found at all.
+            r, unit = m['mota'], 'mm' if m['mode'] == '3d' else 'px'
+            # THE FP TERM SPLIT: `dup` landed on an animal something else already claimed, `none`
+            # landed on no labelled animal at all. Arbitration can only remove the first kind and a
+            # score threshold only the second, so an undifferentiated `fp` said nothing about which
+            # to build. BOTH radii too, because they are different quantities and always were:
+            # MPJPE matches at the animal's full keypoint-box diagonal and MOTA at half of it, so
+            # the two tables can disagree about whether an instance was found at all.
             print(f'{m["group"][:40]:40s} MOTA {r["mota"]:.3f}  miss {r["miss_rate"]:.3f}  '
-                  f'fp {r["fp_rate"]:.3f}  idsw {r["idsw_rate"]:.4f}  '
+                  f'fp {r["fp_rate"]:.3f} (dup {r["fp_dup_rate"]:.3f} none '
+                  f'{r["fp_none_rate"]:.3f})  idsw {r["idsw_rate"]:.4f}  '
                   f'fp_ignored {r["fp_ignored"]:d}  '
-                  f'(mota r={radius:.1f}, mpjpe r={m["mpjpe_r"]:.1f} {unit})')
+                  f'(mota r={m["mota_r"]:.1f}, mpjpe r={m["mpjpe_r"]:.1f} {unit})')
+
+    if args.vs:
+        other, ometa = load_predictions(args.vs)
+        print(f'\nPAIRED: {args.predictions} minus {args.vs}')
+        print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
+        by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True)}
+        pairs = [(m, by_key[m['group']]) for m in rows if m['group'] in by_key]
+        if not pairs:
+            print('  no shared groups')
+            return
+        for mode in ('3d', '2d'):
+            block = [(a, b) for a, b in pairs if a['mode'] == mode]
+            if not block:
+                continue
+            unit = 'mm' if mode == '3d' else 'px'
+            ea, eb, shared, nlab = [], [], 0, 0
+            for a, b in block:
+                da, db, n, nl = _shared_error(a, b)
+                ea.append(da)
+                eb.append(db)
+                shared += n
+                nlab += nl
+            d = paired_bootstrap(ea, eb, seed=args.seed)
+            ci = ('DEGENERATE (one group -- no interval exists)' if d['n'] < 2
+                  else f'[{d["lo"]:+.4f}, {d["hi"]:+.4f}]'
+                       + ('' if d['lo'] <= 0 <= d['hi'] else '  *'))
+            print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}')
+            # THE SHARED SET IS THE HEADLINE, not a footnote. A delta over points only one arm
+            # attempted measures which arm declined more.
+            print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '
+                  f'({shared / nlab:.4f}) in {len(block)} group(s)')
+            for name in ('mota', 'miss_rate', 'fp_rate', 'idsw_rate'):
+                got = [(a['mota'][name], b['mota'][name]) for a, b in block if 'mota' in a
+                       and 'mota' in b]
+                if not got:
+                    continue
+                dm = paired_bootstrap([x for x, _ in got], [y for _, y in got], seed=args.seed)
+                tail = ('DEGENERATE (one group)' if dm['n'] < 2
+                        else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
+                             + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
+                print(f'[{mode}] {name:>9s} {dm["mean"]:+.4f}  {tail}')
+
+
+def _shared_error(a, b):
+    """(err_a, err_b, n_shared, n_labelled) over the points BOTH arms matched.
+
+    Both sides' predictions are already aligned to the LABEL rows (`_pred_matched`), so the two are
+    directly comparable point by point. Restricting to the intersection is what makes the delta a
+    statement about accuracy rather than about coverage: an arm that predicts fewer, easier points
+    has a better mean over its own set and a worse one here.
+    """
+    pa = a.get('_pred_matched', a['_pred'])
+    pb = b.get('_pred_matched', b['_pred'])
+    true = a['_true']
+    S = min(pa.shape[0], pb.shape[0], true.shape[0])
+    T = min(pa.shape[1], pb.shape[1], true.shape[1])
+    pa, pb, true = pa[:S, :T], pb[:S, :T], true[:S, :T]
+    ok = (np.isfinite(pa).all(-1) & np.isfinite(pb).all(-1) & np.isfinite(true).all(-1))
+    n_lab = int(np.isfinite(true).all(-1).sum())
+    if not ok.any():
+        return float('nan'), float('nan'), 0, n_lab
+    da = np.linalg.norm(pa[ok] - true[ok], axis=-1)
+    db = np.linalg.norm(pb[ok] - true[ok], axis=-1)
+    return float(da.mean()), float(db.mean()), int(ok.sum()), n_lab
 
 
 if __name__ == '__main__':

@@ -39,6 +39,12 @@ from .model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 
+# WHY AN (ANIMAL, WINDOW) PRODUCED NOTHING. Five separate aborts in the loop below wrote the same
+# NaN, so a coverage number could not be decomposed at all -- "the detector offered no box", "the
+# association matched no camera", "the crop rule refused" and "the file would not decode" are four
+# different problems with four different fixes, and they arrived indistinguishable.
+OUTCOMES = ('ok', 'no box', 'no camera', 'no points', 'crop failed', 'decode failed')
+
 
 @dataclass
 class InferConfig:
@@ -200,8 +206,14 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     pred = np.full((S, T_total, K, R), np.nan, np.float32)
     conf = np.full((S, T_total, K), np.nan, np.float32)
     carried = [None] * S                      # per-animal prior for the next window
+    # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
+    # Both are what makes a coverage delta readable -- 08's crop-inflation measurement needed the
+    # box, and every one of the five aborts below needed to be distinguishable from the others.
+    starts = _window_starts(T_total, cfg.n_frames, cfg.overlap)
+    outcome = np.full((S, len(starts)), OUTCOMES.index('no box'), np.int8)
+    crop = np.full((S, len(starts), len(session.rig), 4), np.nan, np.float32)
 
-    for start in _window_starts(T_total, cfg.n_frames, cfg.overlap):
+    for wi, start in enumerate(starts):
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
             frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
@@ -250,21 +262,28 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     boxes.append(torch.tensor([x0, y0, x1, y1], dtype=torch.int32))
                     use.append(ci)
                 if not use:
+                    outcome[a, wi] = OUTCOMES.index('no camera')
                     continue
                 cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
             else:
                 pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
                 if not torch.isfinite(pts).all(-1).any():
+                    outcome[a, wi] = OUTCOMES.index('no points')
                     continue
                 use = cam_ix
                 cgroup, boxes = boxes_from_points(pts, [window_cams[i] for i in cam_ix],
                                                   cfg.min_crop_dim, mode)
                 if cgroup is None:
+                    outcome[a, wi] = OUTCOMES.index('crop failed')
                     continue
             scales = []
             for i, cam in enumerate(cgroup):
                 cgroup[i], s = _resize_camera(cam, cfg.image_size)
                 scales.append(s)
+            # The box BEFORE the pixels, so a decode failure still shows what it was reaching for.
+            for i, ci in enumerate(use):
+                crop[a, wi, ci] = np.asarray(boxes[i], np.float32)
+            outcome[a, wi] = OUTCOMES.index('decode failed')
             plans.append((a, use, boxes, cgroup, scales))
 
         # ONE DECODE PER (CAMERA, FRAME) PER WINDOW, shared by every animal in it.
@@ -291,7 +310,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # uint8; the model divides on device. Same contract as the training loader.
             views = [crops[a, ci] for ci in use]
             if any(v is None for v in views):
-                continue
+                continue                        # already marked 'decode failed' above
+            outcome[a, wi] = OUTCOMES.index('ok')
 
             prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,
                                            frames, boxes, scales, mode, K, R, cgroup)
@@ -325,6 +345,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             carried[a] = (torch.as_tensor(p[j]), int(frames[j]))
 
     return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
+            'outcome': outcome, 'crop': crop, 'window_start': np.asarray(starts),
+            'outcome_names': np.asarray(OUTCOMES, object),
             'mode': mode, 'group_id': gid, 'session': session.session_id,
             'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total,
             'boxes_from': 'detector' if boxes_stc is not None else

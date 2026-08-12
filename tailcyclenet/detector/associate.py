@@ -104,7 +104,10 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         pts = torch.stack([centres[c][members[c]] for c in cams])
         refined = _triangulate(cgroup, cams, pts)
         out.append({'point': refined, 'residual': _residual(cgroup, cams, pts, refined),
-                    'boxes': {c: boxes_per_cam[c][members[c]] for c in cams}})
+                    'boxes': {c: boxes_per_cam[c][members[c]] for c in cams},
+                    # WHICH detection in each camera, so a caller holding a per-camera score array
+                    # can follow it through the association instead of re-deriving the match.
+                    'members': {c: members[c] for c in cams}})
         used.update((c, members[c]) for c in members)
         if max_instances and len(out) >= max_instances:
             break

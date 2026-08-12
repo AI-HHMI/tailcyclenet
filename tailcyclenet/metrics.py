@@ -14,6 +14,8 @@ Three rules are baked in because breaking them is how wrong numbers get publishe
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from scipy.optimize import linear_sum_assignment
@@ -134,6 +136,15 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
             localise against, so presence alone excuses every unmatched prediction on the frame
             -- which can zero the FP term outright. Either way the count is returned as
             `fp_ignored` rather than folded silently into the score.
+
+    THE FP TERM IS SPLIT, because the two halves want opposite fixes. `fp_dup` is an unmatched
+    prediction sitting within `max_dist` of a GT that something else already claimed -- two crops
+    on one animal, which arbitration removes. `fp_none` landed on no labelled animal at all, which
+    arbitration cannot touch and a detector threshold can. They are one undifferentiated counter in
+    MOTA itself and were one here, so "MOTA is FP-limited" said nothing about what to build.
+    Duplicates are not otherwise representable: `match_instances` is one-to-one by construction
+    (`linear_sum_assignment`), so no second prediction is ever assigned to a claimed GT -- it falls
+    out as an ordinary false positive and the proximity has to be tested for separately.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     matches = match_instances(pred, true, max_dist)
@@ -145,10 +156,14 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
     if ignore_boxes is not None:
         ignore_boxes = np.asarray(ignore_boxes, float)
 
-    misses = fps = switches = gt = ignored = 0
+    misses = fps = switches = gt = ignored = dups = 0
     last = {}
-    with np.errstate(invalid='ignore'):
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        # An instance with no finite keypoint has no centroid, and NaN is the answer -- not a
+        # warning. `_in_ignore` and the duplicate test below both check for it explicitly.
+        warnings.simplefilter('ignore', RuntimeWarning)
         centroid = np.nanmean(pred, axis=2)                   # (Sp,T,R)
+        true_centroid = np.nanmean(true, axis=2)              # (St,T,R)
     for t in range(T):
         pairs = matches[t]
         matched_true = {j for _, j, _ in pairs}
@@ -157,6 +172,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
         gt += len(present)
         misses += sum(1 for j in present if j not in matched_true)
         rows = np.flatnonzero(ignore[:, t]) if ignore is not None else np.empty(0, int)
+        claimed = np.asarray(sorted(matched_true), int)
         for i in np.flatnonzero(pred_present[:, t]):
             if i in matched_pred:
                 continue
@@ -164,15 +180,20 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
                 ignored += 1
                 continue
             fps += 1
+            if len(claimed) and np.isfinite(centroid[i, t]).all():
+                d = np.linalg.norm(true_centroid[claimed, t] - centroid[i, t], axis=-1)
+                dups += int(np.nanmin(d) <= max_dist) if np.isfinite(d).any() else 0
         for i, j, _ in pairs:
             if last.get(j) is not None and last[j] != i:
                 switches += 1
             last[j] = i
     return {'mota': 1.0 - (misses + fps + switches) / gt if gt else float('nan'),
             'misses': misses, 'fp': fps, 'idsw': switches, 'gt': gt,
-            'fp_ignored': ignored,
+            'fp_ignored': ignored, 'fp_dup': dups, 'fp_none': fps - dups,
             'miss_rate': misses / gt if gt else float('nan'),
             'fp_rate': fps / gt if gt else float('nan'),
+            'fp_dup_rate': dups / gt if gt else float('nan'),
+            'fp_none_rate': (fps - dups) / gt if gt else float('nan'),
             'idsw_rate': switches / gt if gt else float('nan')}
 
 

@@ -255,22 +255,35 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 
 - **`--det-score 0.99`.** The objectness is saturated — 98.5% of rat-city's boxes and 99.98% of
   3dpop's sit at exactly 1.0 — so a sweep over 0.05–0.5 moves 1–3% of boxes and does nothing. Above
-  0.99 it is the best free lever on record: MOTA **+0.073** (rat-city) and **+0.074** (3dpop), and on
-  3dpop MPJPE −2.11 mm and coverage **+0.010**, all three intervals clear of zero over 58 groups. The
-  gain is entirely `fp_none`, which is what a score threshold should remove.
+  0.99: MOTA **+0.074** [+0.009, +0.154] on 3dpop with MPJPE −2.11 mm and coverage +0.010 also SIG,
+  and +0.073 on rat-city. **The size tracks how many boxes are actually below the threshold** — 6–8%
+  on those two, 0.9% on calms21, where it reads +0.012 n.s. Check the distribution (it is in the npz)
+  before quoting a number. The gain is `fp_none`, which is what a threshold should remove.
 - **`--vis-thresh`.** `vis_pred` was write-only. Read as a row gate it is worth MOTA +0.049
-  [+0.011, +0.110] on 3dpop at 7.3% of rows and 0.601 → 0.628 on rat-city at 14%, where a
-  **rate-matched random rejection** gains nothing (+0.001 [−0.017, +0.028]). Always report that
-  control: any rejection flatters a mean over matched points. The threshold is a LOGIT and is **not
-  portable** — rat-city's median is +2.7 and 3dpop's +15.4 — so there is no default.
+  [+0.011, +0.110] on 3dpop at 7.3% of rows and 0.601 → 0.628 on rat-city at 14% — and **−0.037 to
+  −0.123 SIG on calms21**, whose converter writes every point `VISIBLE` so the head trained against
+  an all-true target (`occlusion_acc = 1.0`), and whose baseline coverage of 0.995 leaves almost
+  nothing junk to remove. So it is **dataset-conditional, not a default**, in two ways: the threshold
+  is a LOGIT with no portable value (medians +2.7 / +4.0 / +15.4 across the three roots), and the
+  lever itself can be negative. **Never quote it without the rate-matched random rejection of the
+  same number of rows** — any rejection flatters a mean over matched points, and the control is the
+  entire reason the number means anything.
 - **`--n-frames` shorter is a trade, not a win.** 24 → 12 → 8 on 3dpop moves MOTA 0 → +0.106 → +0.130
   and pck@10 0.103 → 0.074 → 0.067, monotonically in both directions, with MPJPE inside its interval
   throughout. A shorter window shrinks the crop union AND cuts temporal context; the first buys
-  instance recall, the second pays for it. Crop refinement is the arm that should get one without the
-  other.
+  instance recall, the second pays for it.
+- **`--refine`** re-crops each window to the first pass's own prediction, label-free, at 2× the pose
+  compute. It improves every PCK threshold on all three roots (calms21 +0.028/+0.031/+0.021) and
+  leaves MPJPE, coverage and MOTA inside their intervals on both interval-bearing datasets. This is
+  the arm that shrinks the crop union WITHOUT shortening the window.
 
-Together the first two beat a 7.7×-compute detector on 3dpop (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
+On 3dpop the first two together beat a 7.7×-compute detector (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
 0.572) with no retraining.
+
+**Read the FP split per dataset before choosing a fix.** The detector's FP rise over the GT crop is
+91% `fp_none` on 3dpop (4 cameras, low overlap) and 90% `fp_dup` on calms21 (two mice, heavy
+overlap). Cross-track arbitration is therefore worthless on the first and addresses nearly the whole
+term on the second — opposite conclusions from one undifferentiated `fp_rate` of +0.029 either way.
 
 **Do NOT put the window union box through `crop_box_for_points`.** 08 §1.3 asks for it on gotcha-8
 grounds and it is measured worse: 3dpop +3.06 mm MPJPE and −0.032 MOTA, both SIG, and rat-city −0.040
@@ -281,9 +294,11 @@ because the per-frame extents that would be unioned before squaring are not reco
 
 **A GT crop is only an upper bound where the labels are dense.** The crop rule follows the *labelled*
 keypoints, and rat-city labels 2.02 of its 4 per animal-frame, so its GT crop is built from one or two
-points and floors at 64 px — the detector arms beat it on MPJPE there. 3dpop labels all 17 densely and
-its GT crop beats every detector arm by +8.57 mm [+4.08, +14.02]. **The "GT crop" row means different
-things on the two datasets.**
+points and floors at 64 px — the detector arms beat it on MPJPE there. Everywhere the labels are
+complete the GT crop wins by a wide margin: +8.57 mm [+4.08, +14.02] on 3dpop (17 of 17) and
++14.93 px [+9.06, +21.21] on calms21 (7 of 7). calms21 is the control that settles it — 2D,
+multi-animal and *heavier* overlap than rat-city, so **the inversion is label sparsity and nothing
+else**. The "GT crop" row means different things on different roots; say which.
 
 ## The detector
 

@@ -67,7 +67,11 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, wh, _, mcd, red = load_detector(args.run, device=device)
+    model, wh, _, mcd, red, trained_on = load_detector(args.run, device=device)
+    if trained_on != args.boxes:
+        print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
+              f'against {args.boxes!r} ones. That measures the crop source, not accuracy '
+              '(eval rule 2).')
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
                     min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                     max_frames_per_group=args.frames_per_group)
@@ -92,7 +96,10 @@ def main():
         print(f'{name:>5s} {b["mean"]:7.3f}  {ci}')
 
     if args.compare:
-        m2, wh2, _, mcd2, red2 = load_detector(args.compare, device=device)
+        m2, wh2, _, mcd2, red2, trained_on2 = load_detector(args.compare, device=device)
+        if trained_on2 != trained_on:
+            print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
+                  f'{trained_on2!r}. The paired delta below moves TWO keys (eval rule 4).')
         if wh2 != wh:
             # Pairable, and worth saying why: a letterbox is a uniform scale plus a translation
             # applied to the prediction AND the ground truth alike, and IoU is invariant under

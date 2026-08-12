@@ -84,11 +84,18 @@ def main():
         mode = str(out['mode'])
         true = lab.points3d if mode == '3d' else lab.points2d[..., 0, :]
         pred = out['pred']
-        S = min(pred.shape[0], true.shape[0])
+        # SURPLUS PREDICTED ROWS ARE NOT DISCARDABLE. A detector offers as many animals as it
+        # finds, which on 3dpop's ten pigeons is routinely more or fewer than the label table
+        # holds, and truncating `pred` to `true`'s row count silently deleted whichever rows sat
+        # past the end -- as coverage, not as false positives. `matched_error`, `match_instances`
+        # and `mota` all take Sp != St; only `error_and_coverage` needs equal shapes, and it is the
+        # row-indexed number that is meaningless under detector boxes anyway.
         T = min(pred.shape[1], true.shape[1])
-        pred, true = pred[:S, :T], true[:S, :T]
+        pred, true = pred[:, :T], true[:, :T]
+        Sp, St = pred.shape[0], true.shape[0]
+        S = max(Sp, St)
 
-        m = error_and_coverage(pred, true)
+        m = error_and_coverage(pred[:min(Sp, St)], true[:min(Sp, St)])
         if S > 1:
             # Row index is not identity once boxes come from a detector. Match, then measure --
             # and take the matched COUNTS too, so the coverage quoted below describes the same
@@ -111,14 +118,19 @@ def main():
             # before MOTA would zero `idsw` by construction -- an identity switch is precisely a
             # frame where the best assignment changed, and re-matching every frame independently
             # defines that away.
-            aligned = np.full_like(pred, np.nan)
+            # Shaped like TRUE, not like pred: `j` is a label row, and PCK below concatenates this
+            # against `_true`. With more predicted rows than labelled ones the pred-shaped version
+            # merely carried dead rows; with fewer, `aligned[j]` indexed off the end.
+            aligned = np.full_like(true, np.nan)
             for t, frame_pairs in enumerate(match_instances(pred, true, max_dist)):
                 for i, j, _ in frame_pairs:
                     aligned[j, t] = pred[i, t]
             m['_pred_matched'] = aligned
+            m['mpjpe_r'] = max_dist
         m['group'] = key
         m['mode'] = mode
         m['S'] = S
+        m['S_pred'], m['S_true'] = Sp, St
         m['_pred'], m['_true'] = pred, true      # already sliced to (S, T); PCK reuses these
         rows.append(m)
         per_group.append(m['err'])
@@ -131,10 +143,10 @@ def main():
     if multi_any:
         print('\nmulti-animal: err is over HUNGARIAN-MATCHED instances. Row index is not '
               'identity once boxes come from a detector.')
-    print(f'\n{"group":48s} {"S":>3s} {"err":>9s} {"med":>8s} {"cov":>7s} {"unmatched":>10s}')
+    print(f'\n{"group":48s} {"S p/t":>7s} {"err":>9s} {"med":>8s} {"cov":>7s} {"unmatched":>10s}')
     for m in rows:
-        print(f'{m["group"][:48]:48s} {m["S"]:3d} {m["err"]:9.3f} {m["median"]:8.3f} '
-              f'{m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
+        print(f'{m["group"][:48]:48s} {m["S_pred"]:3d}/{m["S_true"]:<3d} {m["err"]:9.3f} '
+              f'{m["median"]:8.3f} {m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
 
     # ONE AGGREGATE PER MODE. A split may hold both 2D and 3D sessions, and averaging pixels
     # with millimetres produces a number in no unit at all.
@@ -168,7 +180,7 @@ def main():
         for m in multi:
             lab, _ = labels[m['group']]
             pred, true = m['_pred'], m['_true']
-            S, T = pred.shape[0], pred.shape[1]
+            St, T = true.shape[0], true.shape[1]
             unit = 'mm' if m['mode'] == '3d' else 'px'
             # Match radius scaled to the animal's own size: the DIAGONAL of its keypoint
             # bounding box, not a per-axis span. Taking the per-axis span and median-ing it
@@ -184,13 +196,22 @@ def main():
             # `fp_ignored` is printed to show how much of the FP term that took.
             ig = ig_boxes = None
             if lab.instance is not None:
-                ig = (lab.instance[:S, :T] == INST_PRESENT).any(-1)
-                if lab.boxes is not None:
-                    ig_boxes = lab.boxes[:S, :T, 0]           # xyxy in the first camera
+                ig = (lab.instance[:St, :T] == INST_PRESENT).any(-1)
+                # BOXES ARE PIXELS. `_in_ignore` compares a prediction centroid against them
+                # componentwise, and in 3D that centroid is world millimetres in a frame the boxes
+                # know nothing about -- so every test fails and the whole ignore region silently
+                # degrades to the box-free fallback, which excuses MORE. Presence alone, printed as
+                # `fp_ignored`, is the honest answer there.
+                if lab.boxes is not None and m['mode'] == '2d':
+                    ig_boxes = lab.boxes[:St, :T, 0]          # xyxy in the first camera
             r = mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes)
+            # BOTH radii, because they are different quantities and always were: MPJPE matches at
+            # the animal's full keypoint-box diagonal and MOTA at half of it, so the two tables
+            # above and below can disagree about whether an instance was found at all.
             print(f'{m["group"][:40]:40s} MOTA {r["mota"]:.3f}  miss {r["miss_rate"]:.3f}  '
                   f'fp {r["fp_rate"]:.3f}  idsw {r["idsw_rate"]:.4f}  '
-                  f'fp_ignored {r["fp_ignored"]:d}  (r={radius:.1f}{unit})')
+                  f'fp_ignored {r["fp_ignored"]:d}  '
+                  f'(mota r={radius:.1f}, mpjpe r={m["mpjpe_r"]:.1f} {unit})')
 
 
 if __name__ == '__main__':

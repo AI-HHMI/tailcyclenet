@@ -99,8 +99,17 @@ def main():
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device)
     print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)')
 
+    trained_frames = int(config['data'].get('n_frames', 24))
+    # LONGER THAN THE TRAINED WINDOW IS NOT A KNOB. `n_frames` sizes the temporal pos_embed the
+    # checkpoint carries; asking for more frames than it was built for interpolates at best and
+    # shape-errors deep inside the encoder at worst. Shorter is safe -- val/test already enumerate
+    # fixed windows -- so only the ceiling is guarded.
+    if args.n_frames and args.n_frames > trained_frames:
+        raise SystemExit(f'--n-frames {args.n_frames} exceeds the run\'s trained window '
+                         f'({trained_frames}). Shorter windows are fine; longer is not the same '
+                         'model.')
     cfg = InferConfig(
-        n_frames=args.n_frames or int(config['data'].get('n_frames', 24)),
+        n_frames=args.n_frames or trained_frames,
         overlap=args.overlap, image_size=int(config['data'].get('image_size', 256)),
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
         box_source=config['data'].get('box_source', 'keypoints'),
@@ -117,9 +126,10 @@ def main():
     det = det_wh = None
     if args.detector:
         from tailcyclenet.detector import detect_group, load_detector
-        det, det_wh, det_ds, det_mcd, det_red = load_detector(args.detector, device,
-                                                              input_wh=args.det_input_wh)
-        print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r})')
+        det, det_wh, det_ds, det_mcd, det_red, det_boxsrc = load_detector(
+            args.detector, device, input_wh=args.det_input_wh)
+        print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r}, '
+              f'boxes={det_boxsrc or "keypoints"})')
         # The detector regresses THE CROP RULE'S box, so its floor has to be the pose model's
         # floor. Same shapes and same losses if they differ, so nothing else would say so.
         if det_mcd != cfg.min_crop_dim:
@@ -127,6 +137,15 @@ def main():
                 f'{args.detector}: trained at min_crop_dim={det_mcd}, but this run\'s '
                 f'[data].min_crop_dim is {cfg.min_crop_dim}. The detector reproduces the crop '
                 'rule; two floors are two rules.')
+        # THE OTHER HALF OF THE SAME CONTRACT, and it is not a hard failure: a detector trained on
+        # `instances` boxes is the best rat-city detector on record (recall 0.531 vs 0.429) while
+        # every rat-city pose run was trained on keypoint-extent crops, so this arm is a legitimate
+        # thing to run -- it just is not a detector-quality comparison against a keypoint-trained
+        # one, because the crop source moved too (eval rule 4). The npz records which.
+        if (det_boxsrc or 'keypoints') != cfg.box_source:
+            print(f'WARNING: detector boxes are {det_boxsrc!r} but this run was trained on '
+                  f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '
+                  'a delta against a run whose detector matched as a detector-quality result.')
     ds_name, sessions = sessions_for(args.data, args.split)
     want = set(args.groups.split(',')) if args.groups else None
     render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
@@ -135,7 +154,7 @@ def main():
     # different detector, threshold or animal count would quietly make one arm incomparable to
     # the next, which is the kind of mismatch that gets published (eval rule 4).
     stamp = repr([str(args.detector), args.det_score, args.max_animals, bool(args.link_boxes),
-                  list(args.det_input_wh or ())])
+                  list(args.det_input_wh or ()), args.max_frames])
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
         loaded = dict(np.load(args.det_cache, allow_pickle=True))
@@ -170,7 +189,7 @@ def main():
                           flush=True)
                     det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
                                              score_thresh=args.det_score, link=args.link_boxes,
-                                             reduce=det_red)
+                                             reduce=det_red, max_frames=args.max_frames)
                     det_cache[key], cache_dirty = det_boxes, True
             out = run_group(model, sess, gid, registry, ds_name, cfg,
                             box_points=boxes.get(key), boxes_stc=det_boxes)
@@ -197,6 +216,11 @@ def main():
     flat['__boxes__'] = np.asarray(
         str(args.detector) if args.detector else
         (str(args.boxes) if args.boxes else 'labels'))
+    # WHICH CROP RULE PRODUCED THESE PIXELS, in the file rather than in a shell history. The run's
+    # own `[data].box_source` on the label path; the detector's own on the deployment path, which
+    # is the one that can disagree with it.
+    flat['__box_source__'] = np.asarray((det_boxsrc or 'keypoints') if args.detector
+                                        else cfg.box_source)
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
 

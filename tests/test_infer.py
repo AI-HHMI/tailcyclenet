@@ -59,9 +59,12 @@ def test_more_detector_rows_than_label_rows(scene):
     `S` comes from the box source. On the deployment path that is the detector, which can offer
     more animals than the session ever labelled -- and `src[a]` was evaluated for every one of
     them, on every anchor mode including `none`. Plain IndexError.
+
+    And EVERY row is a detector row there, not just the surplus ones: they are score-ordered or
+    association-ordered, so lending the first few the labels' own ids claims an identity nothing
+    established.
     """
     model, sess, registry, name = scene
-    lab = sess.labels('g000')
     w, h = sess.rig.size(sess.cam_names[0])
     boxes = np.zeros((5, 4, len(sess.rig), 4), np.float32)
     boxes[..., 2], boxes[..., 3] = w, h
@@ -70,10 +73,12 @@ def test_more_detector_rows_than_label_rows(scene):
         out = run_group(model, sess, 'g000', registry, name, _cfg(anchor=anchor),
                         boxes_stc=boxes)
         assert out['pred'].shape[0] == 5
-        # the id list must match the prediction row count, and name the surplus rows honestly
+        # the id list must match the prediction row count, and name every row honestly
         assert len(out['animal_ids']) == 5
-        assert list(out['animal_ids'][:len(lab.animal_ids)]) == list(lab.animal_ids)
-        assert all(str(i).startswith('det') for i in out['animal_ids'][len(lab.animal_ids):])
+        assert all(str(i).startswith('det') for i in out['animal_ids'])
+    # ...while the LABEL path keeps the labels' ids, which are identity there.
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
+    assert list(out['animal_ids']) == list(sess.labels('g000').animal_ids)
 
 
 def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
@@ -96,6 +101,27 @@ def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
 
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
     assert np.isfinite(out['pred']).all(-1).any(), 'the surviving cameras must still predict'
+
+
+def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
+    """ONE DECODE PER (CAMERA, FRAME), shared by every animal in the window.
+
+    The crop differs per animal and the decode does not, so the decode moved out of the animal
+    loop and the crop became an affine on the already-decoded frame. That is only a speed change if
+    it is bit-identical to what `load_image` produced when it did both at once.
+    """
+    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.infer import _crop_views
+
+    _, sess, _, _ = scene
+    group, cam = sess.groups['g000'], sess.cam_names[0]
+    frames = [0, 1, 2, 1]                       # a repeat, which `read_frames` dedupes
+    box = torch.tensor([3, 5, 40, 44], dtype=torch.int32)
+    target = [32, 32]
+
+    at_decode = np.asarray(read_frames(group, cam, frames, crop_coords=box, target_size=target))
+    hoisted = _crop_views(read_frames(group, cam, frames), box, target)
+    np.testing.assert_array_equal(hoisted[0].numpy(), at_decode)
 
 
 def test_group_shorter_than_the_overlap(scene):
@@ -144,12 +170,18 @@ def test_carried_prior_is_bounds_masked_and_dated():
     assert qt.shape == (1, K)
     assert (qt == 3).all(), f'prompt frame 23 is index 3 of a window starting at 20, got {qt}'
 
-    # A prompt from before the window cannot be expressed and clamps into range rather than
-    # indexing off the front of it.
-    _, early = _build_prior(cfg, (pose, 2), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    # A prompt from just before the window -- inside the overlap, so the ordinary case -- cannot be
+    # expressed as a frame index and clamps into range rather than indexing off the front.
+    _, early = _build_prior(cfg, (pose, 17), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
     assert (early == 0).all()
     _, late = _build_prior(cfg, (pose, 999), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
     assert (late == len(frames) - 1).all()
+
+    # STALER THAN THE OVERLAP IS NOT A PRIOR. `carried` is only written by a window that predicted,
+    # so an animal the box source lost for a few windows keeps offering a pose from before this
+    # one, and the clamp above would present it as this window's first frame.
+    assert _build_prior(cfg, (pose, 2), None, frames, boxes, [1.0], '2d', K, 2,
+                        cgroup) == (None, None)
 
 
 def test_max_frames_takes_a_prefix(scene):

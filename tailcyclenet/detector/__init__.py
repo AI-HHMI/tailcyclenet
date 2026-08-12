@@ -12,7 +12,7 @@ __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox'
 
 
 def load_detector(path, device='cpu', input_wh=None):
-    """(model, input_wh, dataset_name, min_crop_dim, reduce) from a run folder or a .pth.
+    """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source) from a folder or a .pth.
 
     THE INPUT SIZE IS PART OF THE WEIGHTS, not a runtime choice: the letterbox the detector was
     trained under decides what an animal looks like to it, and a square 416 puts the median rat
@@ -26,6 +26,13 @@ def load_detector(path, device='cpu', input_wh=None):
     rule the detector exists to reproduce, so a pose run whose `[data].min_crop_dim` differs is
     being served boxes from a different rule -- silently, since the shapes and the losses are
     identical either way. 64 for a checkpoint predating the field; every shipped config says 64.
+
+    `box_source` rides along for the third time on the same theme: it says whether the boxes this
+    detector reproduces came from the keypoint extent or from `instances.pq`, which are two
+    different crop rules. The caller checks it against the pose run's own -- as a warning, not a
+    failure, because the best rat-city detector on record is `instances`-trained while every
+    rat-city pose run is keypoint-trained, and running that pair is a legitimate arm as long as
+    nobody reads its delta as detector quality.
     """
     import torch
     from pathlib import Path
@@ -41,13 +48,19 @@ def load_detector(path, device='cpu', input_wh=None):
     model = YOLOXNano()
     model.load_state_dict(ckpt['model_state'])
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
-            int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)))
+            int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)),
+            str(ckpt.get('box_source', 'keypoints')))
 
 
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
-                 score_thresh=0.05, link=False, reduce=False):
+                 score_thresh=0.05, link=False, reduce=False, max_frames=0):
     """Run the detector over every frame and camera of a group -> boxes (S,T,C,4).
+
+    `max_frames` is the same PREFIX `infer.run_group` takes, and it has to be honoured here or the
+    two disagree about the clip: rat-city's one test group is 57,594 frames and the protocol is its
+    first 480, so detecting the whole group threw away 99.2% of the detection -- which is the
+    expensive half of a run.
 
     2D / single camera: instances are the NMS survivors, ordered by score, and the row index is
     the only identity there is -- it is NOT tracked, so row `a` at frame t and frame t+1 need not
@@ -66,7 +79,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     from .data import letterbox, reduce_factor, unletterbox_boxes
 
     group = session.groups[gid]
-    T, C = group.n_frames, len(session.rig)
+    T = min(group.n_frames, max_frames or group.n_frames)
+    C = len(session.rig)
     S = max_instances or 1
     out = np.full((S, T, C, 4), np.nan, np.float32)
     # Static rig: build once. Moving rig: `associate` triangulates per frame from (n,2) centres,

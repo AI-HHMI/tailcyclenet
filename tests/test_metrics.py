@@ -69,6 +69,21 @@ def test_ignore_boxes_excuse_only_what_they_cover():
     assert (plain['fp'], plain['fp_ignored']) == (2, 0)
 
 
+def test_a_surplus_predicted_row_is_a_false_positive():
+    """A detector offers as many animals as it finds, not as many as were labelled.
+
+    `eval.py` used to truncate `pred` to `true`'s row count, which deleted the surplus rows before
+    anything could score them -- so a detector that hallucinated a second animal in every frame
+    read as perfect. They are false positives.
+    """
+    true = np.zeros((1, 3, 4, 2))
+    pred = np.zeros((3, 3, 4, 2))
+    pred[1:] = 500.0                                          # two animals that are not there
+    r = mota(pred, true, 1.0)
+    assert (r['fp'], r['misses'], r['gt']) == (6, 0, 3)
+    assert matched_error(pred, true)['unmatched_true'] == 0
+
+
 def test_matched_error_reports_the_counts_behind_its_coverage():
     """`err` is a mean over MATCHED points, so it needs the matched count, not a rowwise one."""
     true = np.zeros((2, 3, 4, 2))

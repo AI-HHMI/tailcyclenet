@@ -23,6 +23,8 @@ GT-derived priors inflated every anchored number that was ever published.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,8 +33,9 @@ import torch
 from posetail.posetail.cube import is_point_visible
 
 from . import crop as cropmod
-from .dataset import _resize_camera, read_frames
+from .dataset import _crop_affine, _resize_camera, read_frames
 from .format import VISIBLE, Labels, Session
+from .model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 
@@ -89,6 +92,23 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode):
 def _to_device(cgroup, device):
     return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
             for c in cgroup]
+
+
+def _crop_views(imgs, box, target_size):
+    """Crop+resize one camera's ALREADY-DECODED window -> (1,T,H,W,3) uint8.
+
+    The same fused rotate/crop/resize affine `load_image` applies at decode time, applied here
+    instead. The decode is per (camera, frame) and the crop is per (animal, camera, frame), so
+    doing both inside the animal loop paid the full-frame decode once per animal: rat-city's
+    twelve rats over a 24-frame window decoded the same 24 images twelve times. The warp itself
+    is ~0.2 ms against ~27 ms for the decode it no longer repeats.
+    """
+    import cv2
+
+    aff = _crop_affine((imgs[0].shape[1], imgs[0].shape[0]), box, target_size, None)
+    out = [im if aff is None else cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR)
+           for im in imgs]
+    return torch.from_numpy(np.asarray(out))[None]
 
 
 def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
@@ -160,13 +180,22 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                                 and bool(np.isfinite(lab.boxes).any())) else None)
     n_src = boxes_stc.shape[0] if boxes_stc is not None else src.shape[0]
     S = n_src if cfg.max_animals == 0 else min(n_src, cfg.max_animals)
-    cam_ix = list(range(len(session.rig)))
+    # ONE camera in 2D, exactly as the loader picks it (`dataset.py`, `true_2d -> cam_ix = [0]`).
+    # A 2D session may still ship a multi-camera rig -- rat-city's `calibration.toml` describes the
+    # arena, not the pose input -- and the library asserts a single view for R == 2. Unbranched,
+    # the box path reached that assert and the keypoint path raised IndexError before it, because
+    # `boxes_from_points` returns one box while `use` stayed the full rig.
+    cam_ix = [0] if mode == '2d' else list(range(len(session.rig)))
     # A DETECTOR ROW IS NOT A LABEL ROW. `S` comes from the box source, which on the deployment
     # path is the detector and can offer more animals than the session ever labelled -- so `src`
-    # is indexable only up to its own length, and the surplus rows get an invented id.
+    # is indexable only up to its own length. And once boxes come from a detector, row `a` is not
+    # label row `a` for ANY `a`: the rows are score-ordered, or association-ordered, and the
+    # labels' own ids would be a claim about identity that nothing established. So every row wears
+    # an invented id on that path, and `eval.py` Hungarian-matches rather than trusting the index.
     n_lab = 0 if src is None else len(src)
-    animal_ids = [lab.animal_ids[a] if a < len(lab.animal_ids) else f'det{a:02d}'
-                  for a in range(S)]
+    animal_ids = ([f'det{a:02d}' for a in range(S)] if boxes_stc is not None else
+                  [lab.animal_ids[a] if a < len(lab.animal_ids) else f'det{a:02d}'
+                   for a in range(S)])
 
     pred = np.full((S, T_total, K, R), np.nan, np.float32)
     conf = np.full((S, T_total, K), np.nan, np.float32)
@@ -180,6 +209,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         # here rather than per animal: the old per-animal build dropped `moving_ext` entirely and
         # cost O(C^2) `format_camera` calls per animal.
         window_cams = session.cgroup(gid, frames)
+        # GEOMETRY FIRST, PIXELS SECOND. Every animal's crop boxes are settled before anything is
+        # decoded, so the decode loop below can read each (camera, frame) once and hand the same
+        # buffer to every animal that wants it.
+        plans = []
         for a in range(S):
             bb = None
             if boxes_stc is not None:
@@ -232,31 +265,50 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             for i, cam in enumerate(cgroup):
                 cgroup[i], s = _resize_camera(cam, cfg.image_size)
                 scales.append(s)
+            plans.append((a, use, boxes, cgroup, scales))
 
-            views = []
-            for i, ci in enumerate(use):
-                imgs = read_frames(group, session.cam_names[ci], frames,
-                                   crop_coords=boxes[i],
-                                   target_size=cgroup[i]['size'].tolist())
-                if any(im is None for im in imgs):
-                    break
-                # uint8; the model divides on device. Same contract as the training loader.
-                views.append(torch.from_numpy(np.asarray(imgs))[None])
-            if len(views) != len(use):
+        # ONE DECODE PER (CAMERA, FRAME) PER WINDOW, shared by every animal in it.
+        #
+        # ponytail: peak memory is one camera's window of FULL frames plus every animal's crops --
+        # 24 x 21 MB on johnson-mouse's 3208x2200 rig, which has one animal. A wide rig with many
+        # animals would want the frame loop chunked; nothing shipped is both.
+        crops = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for ci in sorted({c for _, use, *_ in plans for c in use}):
+                imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
+                # A file that will not decode is a property of the file, not of the animal, so it
+                # takes out every animal that wanted this camera -- which is what the per-animal
+                # decode did too, one animal at a time.
+                ok = not any(im is None for im in imgs)
+                for a, use, boxes, cgroup, _ in plans:
+                    if ci in use:
+                        i = use.index(ci)
+                        crops[a, ci] = (_crop_views(imgs, boxes[i], cgroup[i]['size'].tolist())
+                                        if ok else None)
+                del imgs
+
+        for a, use, boxes, cgroup, scales in plans:
+            # uint8; the model divides on device. Same contract as the training loader.
+            views = [crops[a, ci] for ci in use]
+            if any(v is None for v in views):
                 continue
 
             prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,
                                            frames, boxes, scales, mode, K, R, cgroup)
             dev = cfg.device
             chunk = cfg.kpt_chunk or None
-            out = model([v.to(dev) for v in views], kpt_ids.to(dev), _to_device(cgroup, dev),
-                        mode=mode,
-                        kpt_prior=None if prior is None else prior.to(dev),
-                        prompt_time=None if prompt_t is None else prompt_t.to(dev),
-                        kpt_chunk=chunk)
-            if cfg.anchor == 'self':
-                out = self_prompt(model, [v.to(dev) for v in views], kpt_ids.to(dev),
-                                  _to_device(cgroup, dev), mode, out, kpt_chunk=chunk)
+            views = [v.to(dev) for v in views]
+            cgroup_d = _to_device(cgroup, dev)
+            # ONE encode for both passes of `self`: the pixels are identical, and the encode is
+            # the bulk of the forward. A no-op under `kpt_chunk` (`model._forward_window`).
+            with share_scene(model) if cfg.anchor == 'self' else nullcontext():
+                out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
+                            kpt_prior=None if prior is None else prior.to(dev),
+                            prompt_time=None if prompt_t is None else prompt_t.to(dev),
+                            kpt_chunk=chunk)
+                if cfg.anchor == 'self':
+                    out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
+                                      kpt_chunk=chunk)
 
             p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
             if mode == '2d':
@@ -309,6 +361,14 @@ def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cg
             return None, None
         p = carried[0].clone().float()
         qt = int(carried[1]) - int(frames[0])
+        # A STALE PRIOR IS NOT A PRIOR. `carried` is only written on a window that predicted, so an
+        # animal the box source lost for a few windows keeps handing back a pose from before this
+        # one -- and `qt` clamps to 0 below, presenting it as this window's first frame. Within the
+        # overlap that is the ordinary case (the carried frame IS in the previous window's tail);
+        # beyond it the pose describes a frame the model was never shown, and in 3D the bounds mask
+        # cannot catch it, because a pose that is stale but still visible to two cameras passes.
+        if -qt > cfg.overlap:
+            return None, None
     if p.shape != (K, R):
         return None, None
     if mode == '2d':

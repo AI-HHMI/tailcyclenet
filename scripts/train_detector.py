@@ -55,12 +55,66 @@ def default_input_wh(dataset, target_px=416 * 416):
     return max(ow, 64), max(oh, 64)
 
 
+def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416):
+    """Aspect-matched, then RAISED until the median animal is `min_box_px` across.
+
+    A pixel budget is a property of the frame; what the detector can represent is a property of
+    the ANIMAL. YOLOX pools at strides 8/16/32, and an object spans at least one cell of stride s
+    only when its side is at least s -- so `min_box_px = 32`, the coarsest stride, is the size at
+    which the typical animal exists at all three FPN levels instead of only the finest. Below it,
+    two thirds of the pyramid is being trained on something it cannot see.
+
+    Measured at the plain 416^2 budget, median animal side in detector pixels (p10 in brackets):
+
+        calms21    108  [87]      already 3.4x the coarsest stride
+        rat-city    32  [26]      exactly at it
+        3dpop       23  [17]      HALF a cell at stride 32 for the smaller decile
+
+    This is a FLOOR, never a ceiling: calms21's rule-implied size is 0.30x its budget, and
+    shrinking a dataset that already works to make its animals merely adequate would be a strange
+    thing to do with the saving. `max_px` caps the other end, and the cap is reported rather than
+    applied quietly -- a dataset that hits it is one where the animals stay unrepresentable and
+    that is a fact about the run.
+    """
+    base = default_input_wh(dataset)
+    if min_box_px <= 0:
+        return base
+    ds = BoxDataset(path, 'train', input_wh=base, box_source=box_source, max_frames_per_group=4)
+    ix = np.random.default_rng(0).choice(len(ds), min(300, len(ds)), replace=False)
+    sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
+                       for b in (ds.boxes_for(int(i)) for i in ix)])
+    sides = sides[torch.isfinite(sides)]
+    if not sides.numel():
+        return base
+    med, p10 = float(sides.median()), float(sides.quantile(0.1))
+    print(f'median animal {med:.1f} px (p10 {p10:.1f}) at {base[0]}x{base[1]}', end='')
+    if med >= min_box_px:
+        print(f' -- already >= {min_box_px} (stride 32), keeping it')
+        return base
+    s = min_box_px / med
+    if base[0] * base[1] * s * s > max_px:
+        s = (max_px / (base[0] * base[1])) ** 0.5
+        print(f' -- want x{min_box_px / med:.2f}, CAPPED at x{s:.2f} by max_px={max_px}; the '
+              f'median animal lands at {med * s:.1f} px, still under {min_box_px}', end='')
+    ow = max(64, int(round(base[0] * s / 32) * 32))
+    oh = max(64, int(round(base[1] * s / 32) * 32))
+    print(f' -> {ow}x{oh}')
+    return ow, oh
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--data', required=True, type=Path, help='ONE dataset root')
     ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--input-wh', type=int, nargs=2, default=None)
+    ap.add_argument('--input-wh', type=int, nargs=2, default=None,
+                    help='overrides --min-box-px entirely')
+    ap.add_argument('--min-box-px', type=int, default=32,
+                    help='raise the input size until the MEDIAN animal is this many detector '
+                         'pixels across. 32 is YOLOX\'s coarsest stride, i.e. the size at which '
+                         'the typical animal spans at least one cell at every FPN level. A floor '
+                         'only -- it never shrinks a dataset whose animals are already large. '
+                         '0 disables it and restores the plain 416^2 aspect-matched budget.')
     ap.add_argument('--iters', type=int, default=20000)
     ap.add_argument('--batch-size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-3)
@@ -103,7 +157,8 @@ def main():
     if len(roots) != 1:
         raise SystemExit(f'{args.data}: the detector is trained per dataset; found {len(roots)}')
     probe_sess = roots[0].all_sessions()[0]
-    wh = tuple(args.input_wh) if args.input_wh else default_input_wh(roots[0])
+    wh = (tuple(args.input_wh) if args.input_wh
+          else input_wh_for(args.data, roots[0], args.boxes, args.min_box_px))
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,

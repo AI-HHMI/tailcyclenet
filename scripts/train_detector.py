@@ -77,6 +77,10 @@ def main():
                     help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
                          'branson-fly each hold a single val group, so the default 8 makes the '
                          'recall readout 8 images; raise it to the group\'s labelled length.')
+    ap.add_argument('--augment', action='store_true',
+                    help='random similarity + brightness on the TRAIN split. Helps where a '
+                         'dataset fits its training data and lags on val; on one that fits '
+                         'neither it is the wrong lever. Read the train/val gap first.')
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--eval-batches', type=int, default=25,
                     help='batches per split at each checkpoint. TRAIN is scored too: the '
@@ -96,7 +100,7 @@ def main():
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
-                       min_crop_dim=args.min_crop_dim,
+                       min_crop_dim=args.min_crop_dim, augment=args.augment,
                        max_frames_per_group=args.frames_per_group)
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
@@ -156,7 +160,8 @@ def main():
                         batches=args.eval_batches, num_workers=2))
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
                         'dataset': train.ds.name, 'box_source': args.boxes,
-                        'min_crop_dim': args.min_crop_dim, 'eval': scores}
+                        'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
+                        'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 torch.save(ckpt, args.out / 'detector.pth')
                 history.append({'iteration': it, **{f'{k}_{m}': v[m] for k, v in scores.items()

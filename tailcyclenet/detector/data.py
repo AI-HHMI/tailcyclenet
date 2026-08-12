@@ -25,7 +25,7 @@ from torch.utils.data import Dataset
 from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
-from ..dataset import read_frames
+from ..dataset import _apply_affine, read_frames
 from ..format import UNLABELED, load_datasets
 
 
@@ -63,6 +63,24 @@ def unletterbox_boxes(boxes, scale, pad):
     return out
 
 
+def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
+    """A random similarity about the image centre, source pixels in and out, as a 2x3.
+
+    Deliberately a similarity and not YOLOX's shear-and-perspective: the target is
+    `crop_box_for_points`, an AXIS-ALIGNED extent, and a shear turns a box into a parallelogram
+    whose extent is no longer the crop rule's box for anything.
+
+    No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
+    relabelling left to right is a permutation of that set and the extent is unchanged.
+    """
+    w, h = float(size[0]), float(size[1])
+    s = rng.uniform(*scale)
+    sx = -s if rng.random() < hflip else s
+    cx, cy = w / 2, h / 2
+    return np.array([[sx, 0.0, cx - sx * cx + rng.uniform(-translate, translate) * w],
+                     [0.0, s, cy - s * cy + rng.uniform(-translate, translate) * h]], np.float32)
+
+
 class BoxDataset(Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
@@ -71,10 +89,16 @@ class BoxDataset(Dataset):
     """
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
-                 max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints'):
+                 max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
+                 augment=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
+        # Off by default and requested explicitly, not inferred from the split: it is a key, and
+        # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
+        # or test loader built by a script that passes `augment=True` blindly stays deterministic.
+        self.augment = augment
+        self.seed = seed
         self.datasets = load_datasets(path)
         if len(self.datasets) != 1:
             raise ValueError(
@@ -115,12 +139,17 @@ class BoxDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
-    def boxes_for(self, i):
+    def boxes_for(self, i, warp=None):
         """The letterboxed target boxes for item `i`, without decoding its image.
 
         Split out of `__getitem__` so `scripts/diag_assign.py` can read what the loss is actually
         assigned over a few hundred views without paying for the pixels -- and so there is one
         copy of the box rule rather than a second one in the diagnostic that can drift from it.
+
+        `warp` is an augmentation's 2x3 in SOURCE pixels. The geometry moves through it and the
+        box is then RE-DERIVED by the crop rule, never scaled: the 20 px pad would scale with the
+        image but the `min_crop_dim` floor would not, so a floored box scaled by 0.8 is a box the
+        rule can never emit and the detector would be trained off its own target (gotcha 8).
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -144,7 +173,21 @@ class BoxDataset(Dataset):
             if self.box_source == 'instances' and lab.boxes is not None:
                 b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
                 if torch.isfinite(b).all():
-                    src, pad = b.view(2, 2), 0
+                    # FOUR corners, not two. Under a rotation or a flip the extent of the two
+                    # diagonal corners is strictly inside the extent of all four, so a two-corner
+                    # warp crops the animal the box exists to enclose.
+                    x0, y0, x1, y1 = b
+                    src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
+                                       torch.stack([x1, y1]), torch.stack([x0, y1])])
+                    pad = 0
+            if warp is not None:
+                src = _apply_affine(src, (warp, None))   # shared with the pose loader's rotation
+                # A point warped off the frame is not a point. Dropping it shrinks the box to the
+                # visible part, which is what a real crop of a half-out animal looks like; drop
+                # them all and `crop_box_for_points` returns None, i.e. "no animal here".
+                w, h = float(cam['size'][0]), float(cam['size'][1])
+                out = (src[..., 0] < 0) | (src[..., 0] > w) | (src[..., 1] < 0) | (src[..., 1] > h)
+                src = torch.where(out[..., None], torch.nan, src)
             box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
@@ -154,17 +197,35 @@ class BoxDataset(Dataset):
         return boxes
 
     def __getitem__(self, i):
+        import cv2
+
         sess, gid, f, ci = self.index[i]
-        boxes = self.boxes_for(i)
+        size = tuple(sess.rig.size(sess.cam_names[ci]))
+        # Per item and per epoch, off the item index -- a worker-local RNG would hand every
+        # worker the same stream, and a shared one would make the draw depend on how the
+        # DataLoader happened to interleave.
+        rng = (np.random.default_rng([self.seed, i]) if self.augment and self.train else None)
+        warp = random_affine(size, rng) if rng is not None else None
+        boxes = self.boxes_for(i, warp)
+
         img = read_frames(sess.groups[gid], sess.cam_names[ci], [f])[0]
         if img is None:
             raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
         # The box transform is derived from the rig's recorded size, so a frame that disagrees
         # with it would put the boxes in a different letterbox than the pixels, silently.
-        assert (img.shape[1], img.shape[0]) == tuple(sess.rig.size(sess.cam_names[ci])), \
+        assert (img.shape[1], img.shape[0]) == size, \
             f'{gid}/{sess.cam_names[ci]} frame {f}: image is {img.shape[1]}x{img.shape[0]}, rig '\
-            f'says {sess.rig.size(sess.cam_names[ci])}'
-        img, _, _ = letterbox(img, self.input_wh)
+            f'says {size}'
+        if warp is None:
+            img, _, _ = letterbox(img, self.input_wh)
+        else:
+            # ONE warpAffine for augmentation AND letterbox. Two would resize rat-city's
+            # 4696x2048 frame twice, and the loader is already the expensive half of an iteration.
+            scale, pad = letterbox_transform(size, self.input_wh)
+            L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
+            M = (L @ np.vstack([warp, [0, 0, 1]]))[:2]
+            img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
+            img = np.clip(img * rng.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         return x, boxes
 

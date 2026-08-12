@@ -143,6 +143,66 @@ def test_targets_are_the_crop_rule(tiny_root):
         torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
 
 
+def test_augmented_targets_are_still_the_crop_rule(tiny_root):
+    """Augmentation warps the GEOMETRY and re-derives the box; it never scales the box.
+
+    Scaling the box with the image breaks the rule: the 20 px pad scales but the `min_crop_dim`
+    floor does not, so a floored box scaled by 0.8 is a box `crop_box_for_points` can never emit
+    and the detector trains off its own target.
+    """
+    from tailcyclenet.detector.data import random_affine
+
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True)
+    plain = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                       max_frames_per_group=2)
+    sess, gid, f, ci = ds.index[0]
+    cam = sess.rig.posetail()[ci]
+    warp = random_affine(cam['size'], np.random.default_rng([ds.seed, 0]))
+    got = ds.boxes_for(0, warp)
+
+    _, scale, pad = letterbox(np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8),
+                              ds.input_wh)
+    lab = sess.labels(gid)
+    for s in range(got.shape[0]):
+        p = torch.as_tensor(lab.points2d[s, f, :, ci], dtype=torch.float32)
+        p = p @ torch.as_tensor(warp[:, :2]).T + torch.as_tensor(warp[:, 2])
+        w, h = float(cam['size'][0]), float(cam['size'][1])
+        outside = (p[:, 0] < 0) | (p[:, 0] > w) | (p[:, 1] < 0) | (p[:, 1] > h)
+        want = crop_box_for_points(torch.where(outside[:, None], torch.nan, p),
+                                   cam['size'], ds.min_crop_dim)
+        if want is None:
+            assert torch.isnan(got[s]).all()
+            continue
+        back = unletterbox_boxes(got[s][None], scale, pad)[0]
+        torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
+
+    # And with no warp it is byte-identical to the unaugmented loader -- `augment` must be a key
+    # you turn on, not a thing that leaks into a run that did not ask for it.
+    torch.testing.assert_close(ds.boxes_for(0), plain.boxes_for(0))
+
+
+def test_a_rotated_box_needs_four_corners_in_the_detector(tiny_root):
+    """Two diagonal corners are not a box under a flip: their extent is strictly inside all four.
+
+    The stored `instances.pq` extent enters the detector as geometry, so it has to be expanded
+    before the warp -- the same property `test_a_rotated_box_needs_four_corners` asserts for the
+    pose loader.
+    """
+    b = torch.tensor([10.0, 20.0, 50.0, 40.0])
+    x0, y0, x1, y1 = b
+    four = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
+                        torch.stack([x1, y1]), torch.stack([x0, y1])])
+    two = b.view(2, 2)
+    M = torch.tensor([[0.8, -0.6, 5.0], [0.6, 0.8, -3.0]])
+    f4 = four @ M[:, :2].T + M[:, 2]
+    f2 = two @ M[:, :2].T + M[:, 2]
+    ext = lambda p: torch.cat([p.min(0).values, p.max(0).values])   # noqa: E731
+    e4, e2 = ext(f4), ext(f2)
+    assert (e4[:2] <= e2[:2]).all() and (e4[2:] >= e2[2:]).all()
+    assert not torch.allclose(e4, e2), 'two corners would crop the animal the box encloses'
+
+
 def test_chunk_is_one_containers_worth_of_index(tiny_root):
     """`ChunkShuffle`'s block must be one video, or the locality it exists for is not there.
 

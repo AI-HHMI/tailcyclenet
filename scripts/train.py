@@ -216,15 +216,6 @@ def run_batch(model, loss_fn, batch, device):
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device))
     coords_true = batch.coords.to(device)
-    # 3D SINGLE-VIEW ONLY. There is no triangulation for a non-query point to fall back to, so the
-    # model hands the query mask up and those points leave the 3D target entirely -- rather than
-    # training a residual anchored on the scene centre as if it were a prediction. NaN is the
-    # right value: `WeightedMAELoss` (losses.py:1067) and `grid_softmax_loss` (:50) both drop a
-    # non-finite target without poisoning the backward pass. `prob_2d_only = 0` ships, so this is
-    # normally unreachable.
-    kpt_mask = out.pop('loss_kpt_mask', None)      # popped: TotalLoss must not see an extra key
-    if kpt_mask is not None:
-        coords_true = coords_true.masked_fill(~kpt_mask[:, None, :, None], float('nan'))
     try:
         loss = loss_fn(
             model, out, coords_true=coords_true,

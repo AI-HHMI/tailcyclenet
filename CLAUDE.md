@@ -191,8 +191,19 @@ anchor. So `prior` → `"query"` and `none` → `"triangulated"`, which also mak
 The substitution uses the **detached** triangulation, and that is also the loss gate: the direct
 term is then constant at unprompted points, contributing exactly zero gradient, so
 `coords_loss_direct*` and `coords_softmax_3d` supervise query points only — without forking
-`TotalLoss`. `prob_2d_only = 0`, because 3D single-view has no triangulation to fall back to; if
-it is ever turned back on, non-query points leave the 3D target via `out['loss_kpt_mask']`.
+`TotalLoss`. In 3D single-view there is no triangulation, so the substituted anchor is the
+conf-weighted **mean** of the back-projected rays (`_rays_fallback`) — not the library's
+`3d_pred_rays`, which is a weighted *sum*: `conf_pred_2d` is an unnormalised sigmoid and
+`tracker_encoder.py:637` never divides by it, so at one camera it lands about half way from the
+world origin to the animal.
+
+**Turning off the 3D CE means NaN-ing `grid['anchor_local']`, never popping `grid`.**
+`losses.py:680` gates `depth_softmax` — weight 1.5, the largest CE term in `w9.toml`, and
+query-*independent* — on the same `'grid' in outputs`, and `losses.py:458` reads `f_eff` out of
+the same dict to normalise the depth Huber. Measured on one unprompted window: popping took the
+depth CE from 6.24 to off and the depth Huber from 0.617 to 39.49, a 64× renormalisation. A
+non-finite anchor is the library's own off switch — `grid_softmax_loss` (`losses.py:45-52`) drops
+non-finite targets and returns 0 when all are dropped.
 
 **The shipped sweep is therefore a TWO-LEVER comparison** — `prior` and `none` differ in `query`
 *and* `gridresid_offset`. That is deliberate (each arm gets the offset its query implies) but it

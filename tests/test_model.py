@@ -41,6 +41,14 @@ CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
 # there and would break silently -- which is the whole reason this file exists.
 ENCODERS = ('pose', 'wide')
 
+# The 3D single-view tests slice ONE camera out of the fixture rig, and it has to be one that can
+# actually see the animal. `conftest._session_3d`'s camera 0 cannot: none of its three synthetic
+# keypoints project inside its 64x48 crop. `get_camera_scale` then leaves `sensitivity` NaN and
+# `fill_nan_with_batch_median` (cube.py:466) has no sibling camera to fill from, so `cube_scale`
+# comes back NaN and the whole forward follows. That is a real -- if narrow -- edge case (the sole
+# camera loses the animal), not the path these tests are about.
+SEEING_CAM = 1
+
 
 def small(query_encoder='pose', **over):
     return {**SMALL, 'query_encoder': query_encoder, **over}
@@ -463,8 +471,47 @@ def test_query_free_prediction_is_the_triangulation(moving_batch, enc):
 
     tri = out['3d_pred_triangulate']
     torch.testing.assert_close(out['coords_pred'], tri, equal_nan=True)
-    # The 3D grid CE has nothing to supervise; losses.py:680 gates on `'grid' in outputs`.
-    assert 'grid' not in out, 'the grid CE target must be dropped when no point is query-anchored'
+    # The 3D grid CE has nothing to supervise, so its ANCHOR goes non-finite and
+    # `grid_softmax_loss` (losses.py:45-52) drops the target. The `grid` dict itself must stay:
+    # `losses.py:680` gates `depth_softmax` (weight 1.5) on `'grid' in outputs` too, and
+    # `losses.py:458` reads `f_eff` out of it to normalise the depth Huber.
+    assert not torch.isfinite(out['grid']['anchor_local']).any()
+    assert torch.isfinite(out['grid']['logits_depth']).all()
+    assert out['grid']['f_eff'] is not None
+
+
+@pytest.mark.parametrize('prompted', [True, False], ids=['prompted', 'query_free'])
+def test_query_free_keeps_the_depth_ce_and_drops_only_the_3d_ce(moving_batch, prompted):
+    """The whole point of NaN-ing `anchor_local` instead of popping `grid`.
+
+    `losses.py:680` gates BOTH `coords_softmax_3d` (weight 0.4) and `depth_softmax` (weight 1.5 --
+    the largest CE term in w9.toml) on `'grid' in outputs`. Only the first is query-anchored; the
+    depth target (`losses.py:769`) is `log(depths_true / (cube_scale * f_eff * sdep))`, which has
+    nothing to do with the query. Popping `grid` therefore switched off the heavier of the two on
+    every fully-unprompted step -- ~half of all steps at `prompt_dropout = 0.5`, and never on a
+    `none` arm, which routes through `_reanchor_per_frame` and keeps `grid` alive.
+    """
+    from posetail.posetail.losses import TotalLoss
+
+    b = moving_batch
+    model = build_model(small('wide', query='prior', gridresid_offset='query'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    prior = b.kpt_prior.clone() if prompted else None
+    out = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=prior,
+                prompt_time=b.prompt_t if prompted else None)
+
+    loss_fn = TotalLoss(coords_softmax_3d_weight=0.4, depth_softmax_weight=1.5,
+                        per_camera_cube_scale=True)
+    loss_fn(model, out, coords_true=b.coords, vis_true=None, vis_true_cams=None,
+            cgroup=b.cgroup, p2d=None, device='cpu')
+
+    depth_ce = loss_fn.loss_history['depth_softmax_loss'][-1]
+    grid_ce = loss_fn.loss_history['3d_softmax_loss'][-1]
+    assert depth_ce > 0, 'the depth CE is query-independent and must fire either way'
+    if prompted:
+        assert grid_ce > 0
+    else:
+        assert grid_ce == 0, 'a non-finite anchor must zero the 3D CE, via losses.py:45-52'
 
 
 def test_prior_points_are_query_anchored_and_others_triangulated(moving_batch):
@@ -492,6 +539,12 @@ def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
     """The loss gate. Substituting the DETACHED triangulation makes the direct term constant at
     unprompted points, so `coords_loss_direct*` contributes exactly zero gradient there -- which
     is how the direct head is supervised on query points only without forking posetail's loss.
+
+    Multiview only. The single-view path substitutes a different anchor and is covered by
+    `test_single_view_substitutes_the_detached_rays`, which checks it by VALUE: at one camera this
+    tiny model's soft-argmax saturates so hard that every parameter reads zero gradient, including
+    for a prompted keypoint, so the positive control below cannot be established there and the
+    negative one would pass vacuously.
     """
     b = moving_batch
     model = build_model(small('wide', query='prior', gridresid_offset='query'),
@@ -518,17 +571,73 @@ def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
         assert n_reached(k) == 0, f'unprompted keypoint {k} still reaches {n_reached(k)} params'
 
 
-def test_single_view_hands_up_a_mask_instead_of_a_prediction(moving_batch):
-    """3D single-view has no triangulation, so non-query points leave the 3D target entirely."""
+def test_single_view_predicts_from_rays_instead_of_dropping_the_step(moving_batch):
+    """3D single-view has no triangulation, so the back-projected rays are the anchor.
+
+    This used to hand a `loss_kpt_mask` up and let `run_batch` NaN the entire 3D target, which
+    made the whole STEP non-finite whenever no keypoint had a prior. `cams_to_sample = [1, 8]`
+    draws one camera on 1/8 of 3D items, so at `prompt_dropout = 0.5` that binned ~6% of every
+    `prior` arm's gradient updates while the matched `none` arm kept all of its own.
+    """
     b = moving_batch
     model = build_model(small('wide', query='none', gridresid_offset='query'),
                         n_keypoints=int(b.kpt_ids.max()) + 1).eval()
-    one = [b.views[0]], [b.cgroup[0]]
     with torch.no_grad():
-        out = model(one[0], b.kpt_ids, one[1], mode='3d', kpt_prior=None, prompt_time=None)
+        out = model([b.views[SEEING_CAM]], b.kpt_ids, [b.cgroup[SEEING_CAM]], mode='3d',
+                    kpt_prior=None, prompt_time=None)
+
     assert out.get('3d_pred_triangulate') is None, 'one camera cannot triangulate'
-    mask = out.get('loss_kpt_mask')
-    assert mask is not None and not mask.any(), 'query-free single-view drops every 3D point'
+    assert 'loss_kpt_mask' not in out, 'the mask is retired -- the rays are a real prediction'
+    assert torch.isfinite(out['coords_pred']).all(), 'a finite prediction, not a dropped step'
+    assert 'grid' in out, 'the depth CE (weight 1.5) must survive the single-view path'
+
+
+def test_rays_fallback_is_a_mean_not_the_library_weighted_sum(moving_batch):
+    """At one camera the prediction must BE that camera's ray point.
+
+    `3d_pred_rays` is `sum_c sigmoid(conf_c) * X_c` with no division (`tracker_encoder.py:637`),
+    so at one camera it lands a factor `sigmoid(conf)` -- about half -- of the way from the world
+    origin to the animal. Substituting it verbatim would have made the single-view path finite and
+    wrong, which is worse than skipping the step.
+    """
+    b = moving_batch
+    model = build_model(small('wide', query='none', gridresid_offset='query'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    with torch.no_grad():
+        out = model([b.views[SEEING_CAM]], b.kpt_ids, [b.cgroup[SEEING_CAM]], mode='3d',
+                    kpt_prior=None, prompt_time=None)
+    torch.testing.assert_close(out['coords_pred'], out['3d_pred_cams_rays'][0])
+
+
+def test_single_view_substitutes_the_detached_rays(moving_batch):
+    """The loss gate on the single-view path, checked by value rather than by gradient.
+
+    The substituted anchor must be bit-identical to the rays point and carry no grad_fn, which is
+    what makes `coords_loss_direct*` constant -- and therefore zero-gradient -- at unprompted
+    points. If the detach were dropped, the direct head would silently reopen on every unprompted
+    keypoint of every single-camera step.
+    """
+    b = moving_batch
+    model = build_model(small('wide', query='prior', gridresid_offset='query'),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    prior = b.kpt_prior.clone()
+    prior[:, 1:] = float('nan')                      # keypoint 0 prompted, the rest not
+    out = model([b.views[SEEING_CAM]], b.kpt_ids, [b.cgroup[SEEING_CAM]], mode='3d',
+                kpt_prior=prior, prompt_time=b.prompt_t)
+
+    rays = out['3d_pred_cams_rays']
+    unprompted = out['3d_pred_cams_direct'][0, :, :, 1:]
+    torch.testing.assert_close(unprompted, rays[0][:, :, 1:].detach())
+
+    def grad_to_rays(t):
+        g, = torch.autograd.grad(t.sum(), rays, retain_graph=True, allow_unused=True)
+        return 0.0 if g is None else float(g.abs().sum())
+
+    # Positive control: the rays tensor IS in the graph and gradient does flow through the einsum
+    # that reduces it. Without this the negative below would pass for the wrong reason. Checking
+    # `requires_grad` would not work either -- `torch.where` propagates it from the OTHER branch.
+    assert grad_to_rays(out['3d_pred_rays']) > 0
+    assert grad_to_rays(unprompted) == 0.0, 'the substituted anchor must be detached'
 
 
 @pytest.mark.parametrize('enc', ENCODERS)
@@ -558,8 +667,14 @@ def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
     torch.testing.assert_close(q['coords_pred'], q['3d_pred_triangulate'], equal_nan=True)
     assert not torch.allclose(t['coords_pred'], t['3d_pred_triangulate'], equal_nan=True), \
         '"triangulated" must add a residual on top of the triangulation, not return it'
-    # "triangulated" keeps the CE target (re-based onto the new anchor); "query" drops it.
-    assert 'grid' in t and 'grid' not in q
+    # "triangulated" keeps a finite CE target (re-based onto the new anchor); "query" has no valid
+    # anchor query-free, so it NaNs `anchor_local` -- which is the library's own off switch for the
+    # 3D CE alone. It must NOT drop the `grid` dict: `depth_softmax` (weight 1.5) and `f_eff` live
+    # behind the same `'grid' in outputs` gate (losses.py:458,680) and are query-independent.
+    assert torch.isfinite(t['grid']['anchor_local']).all()
+    assert 'grid' in q and not torch.isfinite(q['grid']['anchor_local']).any()
+    for k in ('logits_depth', 'f_eff', 'cube_scale'):
+        assert torch.isfinite(q['grid'][k]).all(), f'{k} must survive the query-free path'
 
     with pytest.raises(AssertionError, match='gridresid_offset'):
         build_model(small(enc, gridresid_offset='nonsense'), n_keypoints=n_kpt)

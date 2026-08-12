@@ -320,6 +320,25 @@ def share_scene(model):
         model._shared_scene = prev
 
 
+def _rays_fallback(out):
+    """The conf-weighted MEAN of the per-camera ray points -- the honest version of `3d_pred_rays`.
+
+    `3d_pred_rays` is a weighted SUM, not a mean: `conf_pred_2d` is an unnormalized sigmoid
+    (`tracker_encoder.py:554`) and line 637 einsums it straight over the camera axis with no
+    division. So the library's own ray point is off by a factor of `sum_c conf_c`, which is ~C/2 at
+    C cameras and ~0.5 at one -- a single-camera "prediction" that lands halfway to the world
+    origin. Nothing pins that factor either: `coords_loss_rays_weight = 0` ships and the only
+    pressure is `coords_loss_rays_reproj` at 0.05/16, one weak term asked to satisfy every camera
+    count in `cams_to_sample` at once.
+
+    Used wherever a triangulation is missing or degenerate, so the scale error would otherwise be
+    inherited by the substituted point.
+    """
+    w = torch.sigmoid(out['conf_pred_2d'])                          # (cams,b,t,n)
+    num = einsum(out['3d_pred_cams_rays'], w, 'c b t n r, c b t n -> b t n r')
+    return num / w.sum(0)[..., None].clamp_min(1e-6)
+
+
 def _query_anchored(out, query_ok):
     """gridresid is an OFFSET FROM THE QUERY POINT, so honour it only where the query is real.
 
@@ -345,35 +364,49 @@ def _query_anchored(out, query_ok):
     tri = out.get('3d_pred_triangulate')
     out = dict(out)
     if tri is None:
-        # 3D SINGLE-VIEW: there is no triangulation to fall back to, so a non-query point has
-        # nothing honest to predict. Hand the mask up and let `run_batch` drop those points from
-        # the 3D target rather than train a scene-centre-anchored residual as if it were real.
-        # `prob_2d_only = 0` in the shipped configs, so this path is unused by default.
-        out['loss_kpt_mask'] = query_ok
-        return out
-
-    # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
-    # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
-    # numerator, full denominator), which is exactly how a wrong comparison gets published.
-    tri = torch.where(torch.isfinite(tri), tri, out['3d_pred_rays'])
-    out['3d_pred_triangulate'] = tri
+        # 3D SINGLE-VIEW: no triangulation exists, so the back-projected rays are the only anchor
+        # there is. This USED to hand `loss_kpt_mask` up and let `run_batch` NaN the whole 3D
+        # target, which killed the step outright whenever no keypoint had a prior -- and
+        # `cams_to_sample = [1, 8]` draws exactly that on 1/8 of 3D items, so with
+        # `prompt_dropout = 0.5` it silently binned ~6% of every `prior` arm's steps (measured:
+        # johnson 6.20% excess skips over the matched `none` arm, predicted 6.25%).
+        sub = _rays_fallback(out)
+    else:
+        # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
+        # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
+        # numerator, full denominator), which is exactly how a wrong comparison gets published.
+        sub = torch.where(torch.isfinite(tri), tri, _rays_fallback(out))
+        # NOT written back on the single-view path: this key drives `coords_loss_triangulate_reproj`
+        # at weight 2.0, so pointing it at the rays would reweight the rays supervision by 40x.
+        out['3d_pred_triangulate'] = sub
 
     m = query_ok[None, :, None, :, None]                    # -> (cams, b, t, n, r)
-    direct = torch.where(m, out['3d_pred_cams_direct'], tri.detach()[None])
+    direct = torch.where(m, out['3d_pred_cams_direct'], sub.detach()[None])
     conf = torch.softmax(out['conf_3d'], dim=0)
     coords_pred = torch.einsum('cbtnr,cbtn->btnr', direct, conf)
     out['3d_pred_cams_direct'] = direct
     out['3d_pred_direct'] = coords_pred
     out['coords_pred'] = coords_pred
 
-    if not bool(query_ok.any()):
-        # Nothing to supervise the 3D grid CE with -- every point is triangulated. `losses.py:680`
-        # gates on `'grid' in outputs`, the same seam chunked inference already uses, so dropping
-        # it turns off `coords_softmax_3d` without touching the library. In a PARTIALLY prompted
-        # window the CE stays on and masks itself: a keypoint with no prior in a kept window is
-        # one with no GT at its prompt frame, so its target is non-finite and both
-        # `WeightedMAELoss` (losses.py:1067) and `grid_softmax_loss` (:50) already drop it.
-        out.pop('grid', None)
+    if not bool(query_ok.any()) and out.get('grid') is not None:
+        # Nothing to supervise the 3D grid CE with -- every point is triangulated. Kill THAT term
+        # and nothing else. Popping `grid` (what this used to do) overshoots badly, because
+        # `losses.py:680` gates on `'grid' in outputs` and TWO other things live behind it:
+        #   - `depth_softmax` (losses.py:756-772), weight 1.5, the LARGEST CE term in w9.toml,
+        #     whose target (`:769`) is `log(depths_true / (cube_scale * f_eff * sdep))` -- nothing
+        #     to do with the query anchor.
+        #   - `f_eff` itself (losses.py:458), so the depth regression Huber silently reswitches
+        #     its normaliser mid-run and the arm trains two different depth losses in alternation.
+        # With `prompt_dropout = 0.5` that fired on ~half the steps of every `prior` arm and never
+        # on a `none` arm, contaminating the shipped sweep delta.
+        #
+        # A non-finite anchor is the library's own off switch: `anchor_local` is read at exactly
+        # one place (`losses.py:738`, `target_3d = (p_raylocal - anchor_local) / denom_resid`), and
+        # `grid_softmax_loss` (`:45-52`) drops non-finite targets and returns 0 when all are
+        # dropped. In a PARTIALLY prompted window the CE stays on and masks itself the same way.
+        grid = dict(out['grid'])
+        grid['anchor_local'] = torch.full_like(grid['anchor_local'], float('nan'))
+        out['grid'] = grid
     return out
 
 
@@ -388,7 +421,7 @@ def _reanchor_per_frame(out, anchor):
     # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
     # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
     # numerator, full denominator), which is exactly how a wrong comparison gets published.
-    src = torch.where(torch.isfinite(src), src, out['3d_pred_rays'])
+    src = torch.where(torch.isfinite(src), src, _rays_fallback(out))
 
     residual = out['3d_pred_cams_direct'] - anchor[:, None, :, :][None]
     new_direct = src.detach()[None] + residual

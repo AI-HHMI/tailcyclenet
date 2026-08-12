@@ -7,8 +7,9 @@ import numpy as np
 import torch
 
 from tailcyclenet.crop import crop_box_for_points
-from tailcyclenet.detector import (BoxDataset, YOLOXNano, assign, box_collate, box_iou, decode,
-                                   detector_loss, giou_loss, letterbox, unletterbox_boxes)
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
+                                   box_iou, decode, detector_loss, giou_loss, letterbox,
+                                   unletterbox_boxes)
 
 
 def test_forward_shapes_and_anchor_order():
@@ -20,6 +21,23 @@ def test_forward_shapes_and_anchor_order():
         'anchor_points must match forward()s flattening order exactly'
     assert boxes.shape == (2, anchors.shape[0], 4)
     assert (boxes[..., 2] >= boxes[..., 0]).all() and (boxes[..., 3] >= boxes[..., 1]).all()
+
+
+def test_chunk_shuffle_is_a_permutation_that_keeps_locality():
+    """Every index exactly once (or it silently drops training data), and few videos at a time.
+
+    The locality bound is the whole point: `_reader` caches per worker, so a draw that ranges
+    over more than `mix` blocks re-opens containers and costs 486 ms/batch instead of 40.
+    """
+    chunk, mix, n_pools = 512, 4, 3
+    n = chunk * mix * n_pools                     # exact multiple, so pools are position-aligned
+    s = ChunkShuffle(n, chunk=chunk, mix=mix, seed=0)
+    order = list(iter(s))
+    assert sorted(order) == list(range(n)), 'must visit every index exactly once'
+    assert order != list(range(n)), 'must actually shuffle'
+    for i in range(0, n, chunk * mix):            # one pool = at most `mix` distinct videos
+        assert len({j // chunk for j in order[i:i + chunk * mix]}) == mix
+    assert list(iter(s)) != order, 'a second epoch must reshuffle'
 
 
 def test_giou_is_zero_for_a_perfect_box():

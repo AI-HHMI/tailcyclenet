@@ -28,8 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.format import load_datasets
-from tailcyclenet.detector import (BoxDataset, YOLOXNano, box_collate, box_iou, decode,
-                                   detector_loss)
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate, box_iou,
+                                   decode, detector_loss)
 
 
 def default_input_wh(dataset, target_px=416 * 416):
@@ -96,7 +96,8 @@ def main():
                        max_frames_per_group=args.frames_per_group)
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
-        train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+        train, batch_size=args.batch_size, sampler=ChunkShuffle(len(train)),
+        num_workers=args.num_workers,
         collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0,
         worker_init_fn=worker_init)
     val_loader = None

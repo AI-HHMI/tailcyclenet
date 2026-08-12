@@ -2,11 +2,12 @@ import torch
 
 from .assign import assign, box_iou, decode, detector_loss, giou_loss
 from .associate import associate
-from .data import BoxDataset, box_collate, letterbox, unletterbox_boxes
+from .data import BoxDataset, ChunkShuffle, box_collate, letterbox, unletterbox_boxes
 from .yolox import YOLOXNano
 
-__all__ = ['YOLOXNano', 'BoxDataset', 'box_collate', 'letterbox', 'unletterbox_boxes',
-           'assign', 'box_iou', 'decode', 'detector_loss', 'giou_loss', 'associate']
+__all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
+           'unletterbox_boxes', 'assign', 'box_iou', 'decode', 'detector_loss', 'giou_loss',
+           'associate']
 
 
 def load_detector(path, device='cpu', input_wh=None):

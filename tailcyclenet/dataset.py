@@ -148,10 +148,17 @@ def _reader(path: str):
     THE CACHE MUST HOLD A WHOLE RIG. Inference walks one group at a time but touches every camera
     within each window, so a cache smaller than the camera count misses on *every* call -- at
     3dpop's 4 cameras the old size of 8 hid that, and a 16-camera video rig re-opened all 16
-    containers per window."""
+    containers per window.
+
+    `num_threads=1` because decord's default (0 = one decode context per core) costs 0.60 GB of
+    RSS per open reader on a 128-core host against 0.24 GB at one thread -- and the cache holds
+    32 of them, per worker process. At calms21's 63 one-video sessions that difference is 154 GB
+    vs 61 GB across 8 loader workers: the default OOM-kills the workers, and the memory pressure
+    evicts the page cache, which turns every re-open from 45 ms warm into 0.4-2.9 s cold off
+    /groups. Single-threaded decode is 4.5 -> 7.3 ms/frame, which the loader never notices."""
     from decord import VideoReader
 
-    return VideoReader(path)
+    return VideoReader(path, num_threads=1)
 
 
 def _read_video(path, frames, crop_coords, target_size, rotation):

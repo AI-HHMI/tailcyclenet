@@ -134,11 +134,18 @@ query_encoder = "wide"    # 512-dim, identity + time, + two query terms iff quer
 ```
 
 They are **orthogonal**: `query` decides whether a prior is supplied, `query_encoder` decides
-which module consumes it. There is no third key — `wide`'s two query terms (`qpos`, `patch`) are
-**derived** from `query`, because under `query = "none"` the prior is never read, so `_query_ok`
-is all-False for the whole run and both terms collapse to constant no-query tokens feeding dead
-gate inputs. So `wide` + `none` is a 6-term encoder and `wide` + `prior` an 8-term one, and
-`wide` + `none` **is** golden's `j3`.
+which module consumes it. `wide`'s two query terms (`qpos`, `patch`) **default to** `query`,
+because under `query = "none"` the prior is never read, so `_query_ok` is all-False for the whole
+run and both terms collapse to constant no-query tokens feeding dead gate inputs. So `wide` +
+`none` is a 6-term encoder and `wide` + `prior` an 8-term one, and `wide` + `none` **is**
+golden's `j3`.
+
+Either term may be **overridden** — `query_pos_embedding = true, query_patch_embedding = false`
+is the 7-term `j4_prior` recipe, 3.317 mm allen cross-animal with the anchor gated off and the
+only non-anchor arm on record to beat golden j3's 3.394. Two combinations stay unbuildable, and
+`build_model` says which key is wrong: both terms off under `query = "prior"` (the prior would
+have no route into the encoder), and either term on under `query = "none"` (constant all run).
+They only apply to `wide`; naming one beside `pose` asserts rather than silently doing nothing.
 
 `query = "prior"` carries a per-keypoint prior `kpt_prior (B,K,R)` plus `prompt_time (B,K)`.
 Every position-derived fusion term — `pos`, `patch`, `vis`, and `depth` in 3D on `pose`; `qpos`
@@ -161,8 +168,8 @@ not defaulted off — including `j7`, the best row on record (3.140 allen cross-
 
 `wide` is the pre-port encoder, and the record says it wins **whenever no prior is supplied**:
 query-free, `pose`'s four distinguishing terms are computed from the same derived scene point for
-every keypoint, so they are constants and `pose` is a lower-capacity `wide`. Tying its two query
-terms to `query` also makes the old wiring trap unrepresentable — `wide` with both terms off
+every keypoint, so they are constants and `pose` is a lower-capacity `wide`. Defaulting its two
+query terms to `query` also keeps the old wiring trap unrepresentable — `wide` with both terms off
 ignores `query_coords` entirely, which is how six posetail-pose configs declared an anchor,
 trained, and were reported as anchored arms whose anchor was a literal no-op.
 

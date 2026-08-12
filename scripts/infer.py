@@ -161,11 +161,17 @@ def main():
                 # used to return one animal per frame and read as a catastrophic miss rate
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
-                det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
-                                         score_thresh=args.det_score, link=args.link_boxes,
-                                         reduce=det_red)
-                print(f'{key}: detecting up to {n_want} animal(s)'
-                      f'{"" if args.max_animals else " (from the labels; set --max-animals)"}')
+                if key in det_cache:
+                    det_boxes = det_cache[key]
+                    print(f'{key}: up to {n_want} animal(s), boxes from --det-cache')
+                else:
+                    print(f'{key}: detecting up to {n_want} animal(s)'
+                          f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
+                          flush=True)
+                    det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
+                                             score_thresh=args.det_score, link=args.link_boxes,
+                                             reduce=det_red)
+                    det_cache[key], cache_dirty = det_boxes, True
             out = run_group(model, sess, gid, registry, ds_name, cfg,
                             box_points=boxes.get(key), boxes_stc=det_boxes)
             results[key] = out

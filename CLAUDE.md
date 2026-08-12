@@ -270,9 +270,15 @@ against the crop rule directly.
    across checkpoints. A train window may also be **strided**, by `[data].frame_strides` (default
    `[1]`, i.e. off) — posetail's `interval`. The derived-T rule then runs on a lattice of spacing
    s: only labels congruent to the anchor mod s are reachable, and T is capped by the room left on
-   *that* lattice, not the room from frame 0. Note `SmoothnessLoss` has no notion of dt, so its
-   effective weight rises with s; upstream ships both and never couples them, so neither does
-   this. And **`SmoothnessLoss` raises below `smoothness_loss_order + 1` frames**
+   *that* lattice, not the room from frame 0. `SmoothnessLoss` has no notion of dt — `torch.diff`
+   is an UNDIVIDED difference — so its k-th difference grows like `s^k` (256× at k = 4, s = 4) and
+   its magnitude would ride on a per-item draw. `_tune_smoothness` divides that out per batch,
+   reading the stride off `sample_info['stride']`. What it cannot fix, and what any
+   `frame_strides` arm must declare: the HINGE is scale-invariant, and striding genuinely loosens
+   it — the threshold tracks the trajectory's k-th derivative, which grows like `s^k`, while the
+   per-frame jitter it exists to catch is white and s-independent. **This used to be documented
+   backwards** ("effective weight rises with s"): the magnitude rose, the hinge got looser.
+   And **`SmoothnessLoss` raises below `smoothness_loss_order + 1` frames**
    (`losses.py:1146` narrows by `T - k`), so `run_batch` clamps the order per batch; at T = 2 it
    degrades to a first difference rather than being disabled.
 2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x.**

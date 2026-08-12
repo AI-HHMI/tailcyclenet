@@ -162,8 +162,8 @@ def to_device(batch, device):
     return views, cgroup
 
 
-def _clamp_smoothness_order(loss_fn, T):
-    """Hold the smoothness order below the window length. Mutates `loss_fn` in place.
+def _tune_smoothness(loss_fn, T, stride=1):
+    """Hold the smoothness order below the window length, and undo the stride. Mutates in place.
 
     `SmoothnessLoss.forward` builds its stencil mask with `valid.narrow(time_dim, 0, T - k)`
     (`posetail/losses.py:1146`), so a window shorter than `k + 1` frames RAISES on a negative
@@ -177,7 +177,22 @@ def _clamp_smoothness_order(loss_fn, T):
     requires all k+1 frames valid, so a single labelled frame gives an empty mask and the loss
     returns 0 either way.
 
-    `# ponytail:` mutating the loss module's order per batch is the small diff; a second
+    STRIDE. `SmoothnessLoss` uses `torch.diff`, an UNDIVIDED difference with no notion of dt, so on
+    a stride-s lattice its k-th difference grows like `s^k` -- 256x at k = 4, s = 4. `excess` is
+    homogeneous of degree 1 in that, so the term's magnitude, and therefore its effective weight
+    against every other loss, would depend on a per-item draw. Dividing by `s^k` puts it back in
+    per-frame units. Folded into `weight` because `forward` divides `excess` by `scale`, and
+    `scale` is TotalLoss's to set.
+
+    What this does NOT fix, because nothing can: the HINGE is scale-invariant --
+    `clamp(|d_pred| - 1.5|d_true|, 0) > 0` is unchanged by rescaling both sides -- and striding
+    genuinely loosens it. The threshold tracks the true trajectory's k-th derivative, which grows
+    like `s^k`, while the per-frame jitter the hinge exists to catch is white and s-independent. So
+    at large s the term stops firing on jitter. That is a real change of meaning, not a bug to
+    normalise away; declare it when reporting a `frame_strides` arm. (CLAUDE.md used to state the
+    effective weight RISES with stride. It is the magnitude that rose; the hinge got looser.)
+
+    `# ponytail:` mutating the loss module's order and weight per batch is the small diff; a second
     `TotalLoss` built for short windows is the upgrade path if the two ever need to differ by
     more than this.
     """
@@ -185,11 +200,14 @@ def _clamp_smoothness_order(loss_fn, T):
         sl = getattr(loss_fn, name, None)      # a stub loss in the tests has neither
         if sl is None:
             continue
-        # Latch the configured order on first use rather than at construction: one place holds
-        # this rule, so there is no second site to keep in sync with `TotalLoss(**losses)`.
+        # Latch the configured order and weight on first use rather than at construction: one place
+        # holds this rule, so there is no second site to keep in sync with `TotalLoss(**losses)`.
+        # Latching also makes both mutations idempotent -- they are re-derived from the configured
+        # values every batch, never compounded onto the previous batch's.
         if not hasattr(sl, '_configured_order'):
-            sl._configured_order = sl.order
+            sl._configured_order, sl._configured_weight = sl.order, sl.weight
         sl.order = min(sl._configured_order, max(1, T - 1))
+        sl.weight = sl._configured_weight / float(stride) ** sl.order
 
 
 def run_batch(model, loss_fn, batch, device):
@@ -212,7 +230,7 @@ def run_batch(model, loss_fn, batch, device):
     """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
-    _clamp_smoothness_order(loss_fn, int(views[0].shape[1]))
+    _tune_smoothness(loss_fn, int(views[0].shape[1]), batch.sample_info.get('stride', 1))
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device))
     coords_true = batch.coords.to(device)

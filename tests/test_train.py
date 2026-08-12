@@ -90,11 +90,42 @@ def test_short_window_survives_the_smoothness_loss():
         loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1), time_dim=1)
 
     # ...and does not after it. Degraded to a first difference, not disabled.
-    mod._clamp_smoothness_order(loss_fn, 2)
+    mod._tune_smoothness(loss_fn, 2)
     assert loss_fn.smoothness_loss_3d.order == 1
     assert torch.isfinite(loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1),
                                                      time_dim=1))
 
     # A full-length window gets the configured order back -- the clamp is per batch, not sticky.
-    mod._clamp_smoothness_order(loss_fn, 24)
+    mod._tune_smoothness(loss_fn, 24)
     assert loss_fn.smoothness_loss_3d.order == 4
+
+
+def test_stride_is_divided_out_of_the_smoothness_weight():
+    """`torch.diff` is UNDIVIDED, so a stride-s window's k-th difference is s^k times a stride-1
+    one and the term's effective weight against every other loss would ride on a per-item draw.
+
+    Checked against the loss's own output rather than the attribute, because that is the thing
+    that has to be stride-invariant. A pure ramp is the right probe: its 1st difference is exactly
+    `s` per step, so an unnormalised term reads s times larger at stride s.
+    """
+    from posetail.posetail.losses import TotalLoss
+
+    mod = _train_module()
+    loss_fn = TotalLoss(smoothness_loss_3d_weight=0.5, smoothness_loss_2d_weight=0.5,
+                        smoothness_loss_order=1)
+    vis = torch.ones(1, 4, 3, 1)
+
+    def excess(stride):
+        mod._tune_smoothness(loss_fn, 4, stride)
+        t = torch.arange(4, dtype=torch.float32).view(1, 4, 1, 1) * stride
+        pred = t.expand(1, 4, 3, 3).contiguous()           # a ramp at this stride's rate
+        return float(loss_fn.smoothness_loss_3d(pred, torch.zeros_like(pred), vis, time_dim=1))
+
+    base = excess(1)
+    assert base > 0, 'the probe must actually reach the hinge, or the test proves nothing'
+    for s in (2, 4):
+        assert abs(excess(s) - base) < 1e-6, f'stride {s} changed the term by {excess(s) / base:.1f}x'
+
+    # And it is idempotent -- re-derived from the configured weight each call, never compounded.
+    mod._tune_smoothness(loss_fn, 4, 1)
+    assert loss_fn.smoothness_loss_3d.weight == 0.5

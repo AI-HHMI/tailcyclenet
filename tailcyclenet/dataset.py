@@ -776,9 +776,16 @@ class PoseDataset(Dataset):
         kpt_ids = self._kpt_ids[sess.path]      # aligned to THIS session's axis, not the root's
         query_times = torch.zeros(K, dtype=torch.int32)
         query_occlusion = torch.full((K, len(cgroup)), -1, dtype=torch.int64)
+        # The stride is read back off `frames` rather than threaded out of `_frames`: `SmoothnessLoss`
+        # has no notion of dt and its k-th difference grows like s^k, so `run_batch` has to undo
+        # that or the term's effective weight would depend on a draw. MEDIAN, not `frames[1] -
+        # frames[0]`: a window clipped at a group edge (`_frames`, np.clip) repeats its last frame,
+        # and those zero gaps must not be read as stride 1.
+        stride = max(1, int(np.median(np.diff(frames)))) if len(frames) > 1 else 1
         row = {'dataset': self.datasets[item.ds].name, 'session': sess.session_id,
                'group': item.gid, 'animal': lab.animal_ids[a], 'mode': '2d' if R == 2 else '3d',
-               'single_view': single_view, 'start': int(frames[0]), 'cameras': cam_names}
+               'single_view': single_view, 'start': int(frames[0]), 'cameras': cam_names,
+               'stride': stride}
 
         return (views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
                 vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t)

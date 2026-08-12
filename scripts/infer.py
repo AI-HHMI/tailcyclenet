@@ -61,6 +61,14 @@ def main():
                          'posetail-pose checkpoint, which keeps it in a config file rather than '
                          'in the weights.')
     ap.add_argument('--det-score', type=float, default=0.05)
+    ap.add_argument('--det-cache', type=Path, default=None,
+                    help='npz of per-group detector boxes; read if it exists, written if not. '
+                         'Detection is the expensive half of a run and depends on no model, so '
+                         'several arms over one clip set should share ONE set of boxes -- which '
+                         'makes them a matched comparison by construction instead of by trusting '
+                         'the detector to be deterministic. The box source is recorded in it and '
+                         'checked on load, so a cache from a different detector cannot be reused '
+                         'silently.')
     ap.add_argument('--link-boxes', action='store_true',
                     help='follow one animal per instance row across frames (greedy IoU). Detector '
                          'rows are score-ordered and unlinked by default, which makes the window '
@@ -123,6 +131,22 @@ def main():
     want = set(args.groups.split(',')) if args.groups else None
     render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
 
+    # The box cache. `stamp` is every input the boxes depend on: reusing a cache written under a
+    # different detector, threshold or animal count would quietly make one arm incomparable to
+    # the next, which is the kind of mismatch that gets published (eval rule 4).
+    stamp = repr([str(args.detector), args.det_score, args.max_animals, bool(args.link_boxes),
+                  list(args.det_input_wh or ())])
+    det_cache, cache_dirty = {}, False
+    if args.det_cache and args.det_cache.exists():
+        loaded = dict(np.load(args.det_cache, allow_pickle=True))
+        got = str(loaded.pop('__stamp__', ''))
+        if got != stamp:
+            raise SystemExit(f'{args.det_cache}: written for {got}\n'
+                             f'{" " * len(str(args.det_cache))}  now running {stamp}\n'
+                             'Delete it or point --det-cache somewhere else.')
+        det_cache = loaded
+        print(f'detector boxes: {len(det_cache)} cached group(s) from {args.det_cache}')
+
     results = {}
     for sess in sessions:
         sess.preload()
@@ -169,6 +193,13 @@ def main():
         (str(args.boxes) if args.boxes else 'labels'))
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
+
+    # AFTER the prediction is on disk, never before: the cache is an optimisation for the next
+    # run and a failure writing it must not lose the run that just paid for the detection.
+    if args.det_cache and cache_dirty:
+        args.det_cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.det_cache, __stamp__=np.asarray(stamp), **det_cache)
+        print(f'wrote {args.det_cache} ({len(det_cache)} group(s) of boxes)')
 
 
 if __name__ == '__main__':

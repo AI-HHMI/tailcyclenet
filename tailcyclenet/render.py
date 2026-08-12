@@ -92,7 +92,7 @@ def follow(pred, zoom, W, H, smooth=15):
 
 
 def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, show_ids=True,
-                 zoom=0, follow_from=None, boxes=None, frames=None, ids=None):
+                 zoom=0, follow_from=None, boxes=None, frames=None, ids=None, label=''):
     """Predicted tracks over one group's frames -> an mp4 at `out_path`.
 
     `pred` is `run_group`'s own output: `(S,T,K,2)` in SOURCE pixels for a 2D session, or
@@ -183,6 +183,12 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
                                  f'{drawn} tracked',
                             (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                             cv2.LINE_AA)
+                if label:
+                    # WHICH METHOD DREW THIS. Several arms over one clip are the same pixels with
+                    # the same overlay otherwise, and a tiled comparison of them is unreadable --
+                    # or worse, readable and mislabelled.
+                    cv2.putText(img, label, (10, size[1] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                                (60, 255, 255), 2, cv2.LINE_AA)
                 writer.write(img)
     finally:
         writer.release()

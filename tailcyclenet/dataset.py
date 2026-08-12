@@ -144,15 +144,28 @@ def _crop_affine(src_wh, crop_coords, target_size, rotation):
     return (A @ M).astype(np.float32), (tw, th)
 
 
-def load_image(path, crop_coords=None, target_size=None, rotation=None):
+def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1):
     """One decode and one affine -> (H,W,3) uint8 RGB. None if the file will not decode.
 
     Replaces the library's `load_image`, which did the rotation, the crop and the resize as three
     separate full-size buffers. BGR->RGB runs on the OUTPUT, which is the small one.
+
+    `reduce` in {1,2,4,8} decodes at 1/N via libjpeg's DCT-domain decimation -- a proper box
+    filter, and cheaper than decoding full size. It is only valid when the caller wants the WHOLE
+    frame: `crop_coords` are source pixels and would land in the wrong place at 1/N, so the two
+    are mutually exclusive and this asserts rather than silently cropping the wrong region.
+    See `detector.data.reduce_factor` for how N is chosen.
     """
     import cv2
 
-    img = cv2.imread(path)
+    if reduce == 1:
+        img = cv2.imread(path)
+    else:
+        assert crop_coords is None and rotation is None, \
+            'reduce decodes at 1/N, so source-pixel crop_coords/rotation would be misplaced'
+        flag = {2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4,
+                8: cv2.IMREAD_REDUCED_COLOR_8}[reduce]
+        img = cv2.imread(path, flag)
     if img is None:
         return None
     aff = _crop_affine((img.shape[1], img.shape[0]), crop_coords, target_size, rotation)
@@ -215,8 +228,13 @@ def _read_video(path, frames, crop_coords, target_size, rotation):
 
 
 def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation=None,
-                pool: ThreadPoolExecutor | None = None):
-    """(T,H,W,3) uint8 RGB for one camera, from an image directory or a video."""
+                pool: ThreadPoolExecutor | None = None, reduce=1):
+    """(T,H,W,3) uint8 RGB for one camera, from an image directory or a video.
+
+    `reduce` is honoured for image directories and IGNORED for video: decord has no
+    decode-time decimation, so a video root silently returns full-size frames. The caller must
+    therefore letterbox with `src_wh` and never assume the returned size.
+    """
     kind, src, ext = group.source(cam)
     if kind == 'video':
         return _read_video(src, frames, crop_coords, target_size, rotation)
@@ -231,9 +249,10 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     want = [int(i) for i in frames]
     path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
     if pool is None:
-        got = {i: load_image(path(i), crop_coords, target_size, rotation) for i in set(want)}
+        got = {i: load_image(path(i), crop_coords, target_size, rotation, reduce)
+               for i in set(want)}
     else:
-        fs = {i: pool.submit(load_image, path(i), crop_coords, target_size, rotation)
+        fs = {i: pool.submit(load_image, path(i), crop_coords, target_size, rotation, reduce)
               for i in set(want)}
         got = {i: f.result() for i, f in fs.items()}
     if any(v is None for v in got.values()):

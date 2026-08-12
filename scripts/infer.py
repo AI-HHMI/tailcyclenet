@@ -109,8 +109,8 @@ def main():
     det = det_wh = None
     if args.detector:
         from tailcyclenet.detector import detect_group, load_detector
-        det, det_wh, det_ds, det_mcd = load_detector(args.detector, device,
-                                                     input_wh=args.det_input_wh)
+        det, det_wh, det_ds, det_mcd, det_red = load_detector(args.detector, device,
+                                                              input_wh=args.det_input_wh)
         print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r})')
         # The detector regresses THE CROP RULE'S box, so its floor has to be the pose model's
         # floor. Same shapes and same losses if they differ, so nothing else would say so.
@@ -138,7 +138,8 @@ def main():
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
                 det_boxes = detect_group(det, det_wh, sess, gid, n_want, device=device,
-                                         score_thresh=args.det_score, link=args.link_boxes)
+                                         score_thresh=args.det_score, link=args.link_boxes,
+                                         reduce=det_red)
                 print(f'{key}: detecting up to {n_want} animal(s)'
                       f'{"" if args.max_animals else " (from the labels; set --max-animals)"}')
             out = run_group(model, sess, gid, registry, ds_name, cfg,

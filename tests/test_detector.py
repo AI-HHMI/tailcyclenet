@@ -109,6 +109,38 @@ def test_decode_suppresses_duplicates():
     assert s[0] > s[1]
 
 
+def test_reduce_factor_never_decodes_below_the_target():
+    from tailcyclenet.detector import reduce_factor
+
+    assert reduce_factor((4696, 2048), (640, 288)) == 4       # rat-city: 1174x512, still above
+    assert reduce_factor((4696, 2048), (896, 384)) == 4       # 1174x512 still clears 896x384
+    assert reduce_factor((1024, 570), (544, 320)) == 1        # calms21: 1/2 is already below
+    assert reduce_factor((640, 480), (640, 480)) == 1
+    for src, out in (((4696, 2048), (640, 288)), ((3840, 2160), (544, 320))):
+        n = reduce_factor(src, out)
+        assert src[0] / n >= out[0] and src[1] / n >= out[1], 'the remaining resize must be a '\
+            'downscale, or the letterbox is upsampling a decimated frame'
+
+
+def test_letterbox_scale_is_in_source_units_under_reduction():
+    """`unletterbox_boxes` undoes the letterbox with this scale, and it never sees the decode.
+
+    A reduced decode that changed the returned scale would move every predicted box by the
+    reduction factor -- 4x on rat-city -- with nothing in the output to say so.
+    """
+    full = np.zeros((2048, 4696, 3), np.uint8)
+    quarter = np.zeros((512, 1174, 3), np.uint8)
+    a, s_a, p_a = letterbox(full, (640, 288))
+    b, s_b, p_b = letterbox(quarter, (640, 288), src_wh=(4696, 2048))
+    assert a.shape == b.shape
+    assert s_a == s_b and p_a == p_b
+    box = torch.tensor([[100.0, 50.0, 700.0, 400.0]])
+    moved = box.clone()
+    moved[:, 0::2] = moved[:, 0::2] * s_b + p_b[0]
+    moved[:, 1::2] = moved[:, 1::2] * s_b + p_b[1]
+    torch.testing.assert_close(unletterbox_boxes(moved, s_b, p_b), box, atol=1e-3, rtol=0)
+
+
 def test_letterbox_round_trip():
     img = np.zeros((200, 400, 3), np.uint8)
     out, scale, pad = letterbox(img, (416, 416))

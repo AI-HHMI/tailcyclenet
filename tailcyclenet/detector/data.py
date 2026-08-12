@@ -29,13 +29,43 @@ from ..dataset import _apply_affine, read_frames
 from ..format import UNLABELED, load_datasets
 
 
-def letterbox(img, out_wh):
-    """Resize preserving aspect ratio, pad with grey. Returns (img, scale, (padx, pady))."""
+def reduce_factor(size, out_wh):
+    """The largest `cv2.IMREAD_REDUCED_COLOR_N` that still decodes above the letterbox target.
+
+    rat-city's frames are 4696x2048 and the detector letterboxes them into 640x288 -- a 7.3x
+    downscale, which `cv2.resize`'s default INTER_LINEAR does by sampling 2x2 of every 7x7 block.
+    That is not a resize, it is aliasing: an animal 32 px across in the target is being built out
+    of a handful of source pixels chosen by position rather than content, and which ones depends
+    on the sub-pixel phase.
+
+    libjpeg's DCT-domain decimation is a proper box filter AND halves the decode, so the fix is to
+    ask for fewer pixels rather than to throw more away afterwards. `INTER_AREA` would also filter
+    correctly but costs 15.4 ms against INTER_LINEAR's 0.26 ms at this scale -- roughly +40% on a
+    loader-bound iteration -- where reducing at decode is free twice over.
+
+    N stays a power of two at or below 8 (what libjpeg offers) and never takes the decode below
+    the letterbox target, so the remaining resize is still a downscale.
+    """
+    w, h = float(size[0]), float(size[1])
+    n = 1
+    while n < 8 and w / (2 * n) >= out_wh[0] and h / (2 * n) >= out_wh[1]:
+        n *= 2
+    return n
+
+
+def letterbox(img, out_wh, src_wh=None):
+    """Resize preserving aspect ratio, pad with grey. Returns (img, scale, (padx, pady)).
+
+    `src_wh` is the size of the image BEFORE any decode-time reduction. The returned `scale` is
+    then dst<-source rather than dst<-decoded, which is what keeps `unletterbox_boxes` and the box
+    target correct without either of them knowing a reduction happened.
+    """
     import cv2
     H, W = img.shape[:2]
     ow, oh = out_wh
-    s = min(ow / W, oh / H)
-    nw, nh = int(round(W * s)), int(round(H * s))
+    sw, sh = (W, H) if src_wh is None else (float(src_wh[0]), float(src_wh[1]))
+    s = min(ow / sw, oh / sh)
+    nw, nh = int(round(sw * s)), int(round(sh * s))
     resized = cv2.resize(img, (nw, nh))
     canvas = np.full((oh, ow, 3), 114, np.uint8)
     px, py = (ow - nw) // 2, (oh - nh) // 2
@@ -90,7 +120,7 @@ class BoxDataset(Dataset):
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
-                 augment=False):
+                 augment=False, reduce=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -98,6 +128,12 @@ class BoxDataset(Dataset):
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
         self.augment = augment
+        # Off by default, and it is a KEY rather than a loader detail: it changes which source
+        # pixels reach the model, so every arm measured without it stays comparable only against
+        # other arms without it. It rides in the checkpoint and `detect_group` reads it back,
+        # because a detector fed differently-sampled pixels at deployment is off its own training
+        # distribution with nothing in the output to say so.
+        self.reduce = reduce
         self.seed = seed
         self.datasets = load_datasets(path)
         if len(self.datasets) != 1:
@@ -208,22 +244,30 @@ class BoxDataset(Dataset):
         warp = random_affine(size, rng) if rng is not None else None
         boxes = self.boxes_for(i, warp)
 
-        img = read_frames(sess.groups[gid], sess.cam_names[ci], [f])[0]
+        r = reduce_factor(size, self.input_wh) if self.reduce else 1
+        img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
         if img is None:
             raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
-        # The box transform is derived from the rig's recorded size, so a frame that disagrees
-        # with it would put the boxes in a different letterbox than the pixels, silently.
-        assert (img.shape[1], img.shape[0]) == size, \
-            f'{gid}/{sess.cam_names[ci]} frame {f}: image is {img.shape[1]}x{img.shape[0]}, rig '\
-            f'says {size}'
+        dec = (img.shape[1], img.shape[0])
+        # A video root IGNORES `reduce`, so the frame comes back full size -- both are legal, and
+        # what is not legal is a frame that matches neither. The box transform is derived from the
+        # rig's recorded size, so that would letterbox the boxes and the pixels differently and
+        # say nothing about it.
+        want = tuple(-(-size[a] // r) for a in (0, 1))                  # libjpeg rounds up
+        assert dec == want or dec == size, \
+            f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
+            f'or {size} unreduced'
+        d = size[0] / dec[0]                     # decoded pixels -> source pixels, 1.0 for video
         if warp is None:
-            img, _, _ = letterbox(img, self.input_wh)
+            img, _, _ = letterbox(img, self.input_wh, src_wh=size)
         else:
-            # ONE warpAffine for augmentation AND letterbox. Two would resize rat-city's
-            # 4696x2048 frame twice, and the loader is already the expensive half of an iteration.
+            # ONE warpAffine for the decode scale, the augmentation AND the letterbox. Three would
+            # resample rat-city's frame three times, and the loader is the expensive half of an
+            # iteration.
             scale, pad = letterbox_transform(size, self.input_wh)
             L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
-            M = (L @ np.vstack([warp, [0, 0, 1]]))[:2]
+            D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
+            M = (L @ np.vstack([warp, [0, 0, 1]]) @ D)[:2]
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
             img = np.clip(img * rng.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0

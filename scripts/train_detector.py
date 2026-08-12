@@ -81,6 +81,13 @@ def main():
                     help='random similarity + brightness on the TRAIN split. Helps where a '
                          'dataset fits its training data and lags on val; on one that fits '
                          'neither it is the wrong lever. Read the train/val gap first.')
+    ap.add_argument('--reduce', action='store_true',
+                    help='decode JPEGs at 1/N via libjpeg where the frame is far above the '
+                         'letterbox target. A KEY, not a loader detail: it changes which source '
+                         'pixels reach the model. rat-city 37.0 -> 21.8 ms/item, and it replaces '
+                         'a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block '
+                         '-- with a proper box filter. Stored in the checkpoint; inference '
+                         'reads it back. No effect on a video root.')
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--eval-batches', type=int, default=25,
                     help='batches per split at each checkpoint. TRAIN is scored too: the '
@@ -100,7 +107,7 @@ def main():
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
-                       min_crop_dim=args.min_crop_dim, augment=args.augment,
+                       min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group)
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
@@ -111,7 +118,7 @@ def main():
     val = None
     try:
         val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
-                         min_crop_dim=args.min_crop_dim,
+                         min_crop_dim=args.min_crop_dim, reduce=args.reduce,
                          max_frames_per_group=args.val_frames_per_group)
         print(f'val:   {len(val)} views')
     except ValueError as e:
@@ -161,6 +168,7 @@ def main():
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
+                        'reduce': args.reduce,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 torch.save(ckpt, args.out / 'detector.pth')

@@ -3,16 +3,16 @@ import torch
 from .assign import assign, box_iou, decode, detector_loss, giou_loss
 from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, box_collate, letterbox, letterbox_transform,
-                   unletterbox_boxes)
+                   reduce_factor, unletterbox_boxes)
 from .yolox import YOLOXNano
 
 __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
-           'letterbox_transform', 'unletterbox_boxes', 'assign', 'box_iou', 'decode',
-           'detector_loss', 'giou_loss', 'associate']
+           'letterbox_transform', 'reduce_factor', 'unletterbox_boxes', 'assign', 'box_iou',
+           'decode', 'detector_loss', 'giou_loss', 'associate']
 
 
 def load_detector(path, device='cpu', input_wh=None):
-    """(model, input_wh, dataset_name, min_crop_dim) from a detector run folder or a .pth.
+    """(model, input_wh, dataset_name, min_crop_dim, reduce) from a run folder or a .pth.
 
     THE INPUT SIZE IS PART OF THE WEIGHTS, not a runtime choice: the letterbox the detector was
     trained under decides what an animal looks like to it, and a square 416 puts the median rat
@@ -41,12 +41,12 @@ def load_detector(path, device='cpu', input_wh=None):
     model = YOLOXNano()
     model.load_state_dict(ckpt['model_state'])
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
-            int(ckpt.get('min_crop_dim', 64)))
+            int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)))
 
 
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
-                 score_thresh=0.05, link=False):
+                 score_thresh=0.05, link=False, reduce=False):
     """Run the detector over every frame and camera of a group -> boxes (S,T,C,4).
 
     2D / single camera: instances are the NMS survivors, ordered by score, and the row index is
@@ -63,7 +63,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     import numpy as np
     import torch
     from ..dataset import read_frames
-    from .data import letterbox, unletterbox_boxes
+    from .data import letterbox, reduce_factor, unletterbox_boxes
 
     group = session.groups[gid]
     T, C = group.n_frames, len(session.rig)
@@ -78,10 +78,16 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
         frames = list(range(start, min(start + batch, T)))
         per_cam = []
         for ci, cam_name in enumerate(session.cam_names):
-            imgs = read_frames(group, cam_name, frames)
+            # THE SAME DECODE THE DETECTOR WAS TRAINED ON. `BoxDataset` reduces at decode where
+            # the frame is far above the letterbox target, and a detector fed differently-sampled
+            # pixels at deployment is being run off its own training distribution -- silently,
+            # since nothing about the shapes or the scores would say so.
+            src = session.rig.size(cam_name)
+            r = reduce_factor(src, input_wh) if reduce else 1
+            imgs = read_frames(group, cam_name, frames, reduce=r)
             packed, metas = [], []
             for im in imgs:
-                lb, scale, pad = letterbox(im, input_wh)
+                lb, scale, pad = letterbox(im, input_wh, src_wh=src)
                 packed.append(torch.as_tensor(lb, dtype=torch.float32).permute(2, 0, 1) / 255.0)
                 metas.append((scale, pad))
             x = torch.stack(packed).to(device)

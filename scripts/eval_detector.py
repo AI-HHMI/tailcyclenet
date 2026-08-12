@@ -61,9 +61,9 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, wh, _, mcd = load_detector(args.run, device=device)
+    model, wh, _, mcd, red = load_detector(args.run, device=device)
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
-                    min_crop_dim=args.min_crop_dim or mcd,
+                    min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                     max_frames_per_group=args.frames_per_group)
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=args.score_thresh,

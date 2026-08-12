@@ -314,6 +314,19 @@ against the crop rule directly.
    `sorted(f'{name}_{axis}')` while `keypoints` is name-sorted, which transposes all 8
    `X` / `X-base` pairs — 16 of 47 keypoints. The converter applies the permutation once. Zipping
    `pose` against `keypoints` silently mislabels them and nothing downstream notices.
+11. **Nothing in the parent process may decode video before the loader forks.** On a video-backed
+   root that initialises decord in the parent, and the forked workers then deadlock in a futex
+   while holding an open container: 0% GPU, ~0 worker CPU, no traceback, no timeout, forever.
+   `scripts/train.py` materialises its fixed val windows before the train loader's first `next()`
+   (`persistent_workers` forks there, not at construction), so it used to be the parent that
+   decoded; it now pulls them through a one-worker `DataLoader`, which is byte-identical because
+   `PoseDataset` seeds val items by index. Measured on calms21: hangs at every
+   `TAILCYCLENET_READER_CACHE` size, never hangs when the parent decodes nothing.
+   `scratch/calms21_loader_repro.py` isolates it in seconds, without the model.
+   **3dpop is video-backed too and survives it** — which is the only reason the five-dataset sweep
+   never hit this, and why "the sweep works" was not evidence that the pose loader was fork-safe.
+   Only calms21 and 3dpop ship `.mp4`; the other four roots are image directories and cannot
+   trigger it.
 
 ---
 

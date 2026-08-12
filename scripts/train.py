@@ -410,7 +410,21 @@ def main():
     if val_ds is not None and val_freq:
         n_val = min(int(train_cfg.get('val_batches', 20)), len(val_ds))
         idxs = np.unique(np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))
-        val_batches = [pose_collate([val_ds[int(i)]]) for i in idxs]
+        # THROUGH A CHILD, NOT IN THIS PROCESS, and that is a hang not a preference. These windows
+        # used to be decoded here, in the parent, which is BEFORE the train loader above forks its
+        # workers (`persistent_workers` forks on the first `next()`, not at construction). On a
+        # video-backed root that initialises decord in the parent, and the forked workers then
+        # deadlock in a futex while holding an open container -- 0% GPU, zero worker CPU, no error,
+        # forever. Measured on calms21: hangs at every reader-cache size, and does not hang when the
+        # parent decodes nothing. 3dpop is video-backed too and survives it, which is the only
+        # reason the five-dataset sweep never hit this.
+        #
+        # One worker, no shuffle, `Subset` in `idxs` order, so `val_batches` is the same list in the
+        # same order it always was -- and it is byte-identical, not merely equivalent, because
+        # `PoseDataset` seeds val items by index rather than by RNG draw.
+        val_batches = list(torch.utils.data.DataLoader(
+            torch.utils.data.Subset(val_ds, [int(i) for i in idxs]), batch_size=1,
+            num_workers=1, collate_fn=pose_collate, worker_init_fn=worker_init))
         seen = Counter(val_ds.index[int(i)].session.session_id for i in idxs)
         print(f'val:   {len(val_batches)} fixed window(s) every {val_freq} iterations, '
               f'over {len(seen)}/{len({it.session.session_id for it in val_ds.index})} session(s)')

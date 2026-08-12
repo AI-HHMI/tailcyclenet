@@ -103,6 +103,14 @@ class BoxDataset(Dataset):
                         self.index.append((sess, gid, int(f), ci))
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
+        # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
+        # be. Its old hardcoded 512 was set against rat-city, where the whole split is one group;
+        # on calms21 a session contributes `max_frames_per_group` = 40 positions, so a 512-block
+        # spanned 13 videos and a 4-block pool spanned 52. The reader cache then held 8 of 52 and
+        # ran at a 16% hit rate -- and at the cache size that thrash used to need, ~1 GB of open
+        # decord reader each, it OOM-killed the workers.
+        n_src = len({(s.session_id, g, c) for s, g, _, c in self.index})   # (group, camera) = file
+        self.chunk = max(1, len(self.index) // n_src)
 
     def __len__(self):
         return len(self.index)
@@ -170,6 +178,10 @@ class ChunkShuffle(torch.utils.data.Sampler):
     batch of 16, against a 16 ms GPU step. Shuffling BLOCKS instead, and pooling `mix` of them so
     a batch still spans several sessions, costs 40 ms -- 12x faster, and 7 sessions per batch so
     BatchNorm does not end up normalising one animal's lighting.
+
+    PASS `chunk=dataset.chunk`. The default 512 was set against rat-city, whose whole split is one
+    group; a dataset with 40 index positions per video gets 13 videos to a block and 52 to a pool,
+    which is not locality at all. `BoxDataset` derives the right value from its own index.
 
     Image-directory datasets do not need this and are not harmed by it: their frames are separate
     files, so locality buys nothing and costs nothing.

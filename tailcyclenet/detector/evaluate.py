@@ -117,7 +117,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     """
     was_training = model.training
     model.eval()
-    order = list(iter(ChunkShuffle(len(ds), seed=seed)))[:batches * batch_size]
+    order = list(iter(ChunkShuffle(len(ds), chunk=ds.chunk, seed=seed)))[:batches * batch_size]
     loader = torch.utils.data.DataLoader(
         ds, batch_size=batch_size, sampler=order, num_workers=num_workers,
         collate_fn=box_collate)

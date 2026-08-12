@@ -100,7 +100,7 @@ def main():
                        max_frames_per_group=args.frames_per_group)
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
-        train, batch_size=args.batch_size, sampler=ChunkShuffle(len(train)),
+        train, batch_size=args.batch_size, sampler=ChunkShuffle(len(train), chunk=train.chunk),
         num_workers=args.num_workers,
         collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0,
         worker_init_fn=worker_init)

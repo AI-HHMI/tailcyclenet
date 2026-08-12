@@ -143,6 +143,19 @@ def test_targets_are_the_crop_rule(tiny_root):
         torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
 
 
+def test_chunk_is_one_containers_worth_of_index(tiny_root):
+    """`ChunkShuffle`'s block must be one video, or the locality it exists for is not there.
+
+    A hardcoded 512 spanned 13 calms21 videos per block and 52 per pool, which ran the reader
+    cache at a 16% hit rate and, at the cache size that thrash needed, OOM-killed the workers at
+    ~1 GB of open decord reader each.
+    """
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 64), max_frames_per_group=2)
+    n_src = len({(s.session_id, g, c) for s, g, _, c in ds.index})
+    assert ds.chunk == len(ds.index) // n_src
+    assert ds.chunk < len(ds.index) or n_src == 1
+
+
 def test_collate_pads_uneven_animal_counts():
     a = (torch.zeros(3, 8, 8), torch.zeros(2, 4))
     b = (torch.zeros(3, 8, 8), torch.zeros(5, 4))

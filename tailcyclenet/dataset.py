@@ -161,23 +161,36 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-@lru_cache(maxsize=32)
+# AN OPEN DECORD READER COSTS ABOUT A GIGABYTE, SO THIS NUMBER IS A MEMORY BUDGET, NOT A HINT.
+# A `VideoReader` is cheap until it decodes; the first seek allocates a frame pool sized by the
+# video, and on calms21's 1024x570 mpeg4s that settles at ~1.0 GB each. Measured on one loader
+# process walking calms21 train: 0.98 GB with the index built, 44 GB once 32 readers were live,
+# back to 10.4 GB on `cache_clear()`. Times 8 workers that is 350 GB, which is how the calms21
+# runs got OOM-killed on a 503 GB host -- twice, silently, as "DataLoader worker killed by
+# signal: Killed".
+#
+# 8 is chosen against `ChunkShuffle`, which is what decides how many videos a worker is inside at
+# once: `mix=4` blocks of contiguous index positions, so 4 sessions x however many cameras. That
+# fits at 8 for a single-camera root and spills for a 4-camera one -- deliberately, because
+# spilling costs 45 ms of warm re-open and not spilling costs a gigabyte. Raise it with
+# TAILCYCLENET_READER_CACHE when a rig is wide AND the frames are small.
+_READER_CACHE = int(os.environ.get('TAILCYCLENET_READER_CACHE', 8))
+
+
+@lru_cache(maxsize=_READER_CACHE)
 def _reader(path: str):
     """One `VideoReader` per file per process. Opening the container and building its frame index
     is not per-window work, but `read_frames` is called once per window per camera -- so a
     windowed pass over 3dpop's test videos paid it hundreds of times.
 
-    THE CACHE MUST HOLD A WHOLE RIG. Inference walks one group at a time but touches every camera
-    within each window, so a cache smaller than the camera count misses on *every* call -- at
-    3dpop's 4 cameras the old size of 8 hid that, and a 16-camera video rig re-opened all 16
-    containers per window.
+    THE CACHE SHOULD HOLD A WHOLE RIG. Inference walks one group at a time but touches every
+    camera within each window, so a cache smaller than the camera count misses on *every* call --
+    at 3dpop's 4 cameras a size of 2 would hide that, and a 16-camera video rig would re-open all
+    16 containers per window. See `_READER_CACHE` for the other side of that trade.
 
     `num_threads=1` because decord's default (0 = one decode context per core) costs 0.60 GB of
-    RSS per open reader on a 128-core host against 0.24 GB at one thread -- and the cache holds
-    32 of them, per worker process. At calms21's 63 one-video sessions that difference is 154 GB
-    vs 61 GB across 8 loader workers: the default OOM-kills the workers, and the memory pressure
-    evicts the page cache, which turns every re-open from 45 ms warm into 0.4-2.9 s cold off
-    /groups. Single-threaded decode is 4.5 -> 7.3 ms/frame, which the loader never notices."""
+    RSS per open reader on a 128-core host against 0.24 GB at one thread. Single-threaded decode
+    is 4.5 -> 7.3 ms/frame, which the loader never notices."""
     from decord import VideoReader
 
     return VideoReader(path, num_threads=1)

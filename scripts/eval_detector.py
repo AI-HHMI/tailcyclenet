@@ -42,6 +42,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path, help='detector run folder or .pth')
+    ap.add_argument('--compare', type=Path, default=None,
+                    help='a second run, scored on the SAME groups, reported as `--run` minus this '
+                         'one under a PAIRED bootstrap. Unpaired intervals on the same groups '
+                         'overstate the uncertainty enough to hide a real effect (eval rule 3): '
+                         'augmentation on 3dpop reads +0.005 r@.5 [-0.000, +0.010] paired, and '
+                         'two overlapping [0.93, 0.98] intervals unpaired.')
     ap.add_argument('--data', required=True, type=Path, help='ONE dataset root')
     ap.add_argument('--split', default='test')
     ap.add_argument('--boxes', default='keypoints', choices=BOX_SOURCES,
@@ -84,6 +90,30 @@ def main():
         ci = ('DEGENERATE (one group -- no interval exists)' if b['n'] < 2
               else f'[{b["lo"]:.3f}, {b["hi"]:.3f}] 95% over {b["n"]} groups')
         print(f'{name:>5s} {b["mean"]:7.3f}  {ci}')
+
+    if args.compare:
+        m2, wh2, _, mcd2, red2 = load_detector(args.compare, device=device)
+        if wh2 != wh:
+            raise SystemExit(f'{args.compare} was trained at {wh2}, --run at {wh} -- an input '
+                             'size is not a key you can pair over, it changes what a box is')
+        ds2 = BoxDataset(args.data, args.split, input_wh=wh2, box_source=args.boxes,
+                         min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
+                         max_frames_per_group=args.frames_per_group)
+        other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
+                              seed=args.seed, score_thresh=args.score_thresh,
+                              num_workers=args.num_workers, max_animals=args.max_animals)
+        keys = sorted(set(rows) & set(other))
+        print(f'\nPAIRED: {args.run} minus {args.compare}, over {len(keys)} shared group(s)')
+        for name in ('r50', 'r75', 'iou', 'fp', 'mota'):
+            d = paired_bootstrap([rows[k][name] for k in keys],
+                                 [other[k][name] for k in keys], seed=args.seed)
+            if d['n'] < 2:
+                print(f'{name:>5s} {d["mean"]:+7.4f}  DEGENERATE (one group)')
+                continue
+            # A sign flip inside the interval means the arms are not distinguished on this
+            # column. Saying so beats leaving a reader to compare two overlapping intervals.
+            star = '' if d['lo'] <= 0 <= d['hi'] else '  *'
+            print(f'{name:>5s} {d["mean"]:+7.4f}  [{d["lo"]:+.4f}, {d["hi"]:+.4f}]{star}')
 
 
 if __name__ == '__main__':

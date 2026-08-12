@@ -8,6 +8,13 @@ of whatever an independently-plausible box rule would cost.
 An animal with no finite point in a view gets a **NaN box**, not a dropped frame. Objectness
 still has to learn "no animal here" for that view, and silently dropping those frames would
 train a detector that has never seen an empty image.
+
+`box_source='instances'` takes the extent from `instances.pq` instead, for a dataset whose stored
+keypoints are too sparse to bound the animal: rat-city's converter dropped noisy points, leaving
+25,777 train instances with NO finite point at all -- each one a NaN box teaching "no animal here"
+where a rat plainly is. It is opt-in rather than "use the table when it exists" because an
+`instances.pq` box is not a crop box in general (spec §9 says so outright; johnson-mouse ships COCO
+boxes and calms21 ships MARS ones), and defaulting to it would silently retarget those detectors.
 """
 from __future__ import annotations
 
@@ -17,7 +24,7 @@ from torch.utils.data import Dataset
 
 from posetail.posetail.cube import project_points_torch
 
-from ..crop import crop_box_for_points
+from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import read_frames
 from ..format import UNLABELED, load_datasets
 
@@ -52,7 +59,10 @@ class BoxDataset(Dataset):
     """
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
-                 max_frames_per_group: int = 40, seed: int = 0):
+                 max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints'):
+        assert box_source in BOX_SOURCES, \
+            f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
+        self.box_source = box_source
         self.datasets = load_datasets(path)
         if len(self.datasets) != 1:
             raise ValueError(
@@ -101,7 +111,16 @@ class BoxDataset(Dataset):
 
         boxes = []
         for s in range(p2d.shape[0]):
-            box = crop_box_for_points(p2d[s], cam['size'], self.min_crop_dim)
+            # A stored box is an ALREADY-PADDED extent, so it re-enters the rule at pad 0 and
+            # picks up only the min_crop_dim floor and the clamp. Per animal, not per session:
+            # rat-city's boxes come from a tracker that loses animals, and where it did the
+            # keypoints are still the best -- and only -- source left.
+            src, pad = p2d[s], 20
+            if self.box_source == 'instances' and lab.boxes is not None:
+                b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
+                if torch.isfinite(b).all():
+                    src, pad = b.view(2, 2), 0
+            box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
 

@@ -39,6 +39,7 @@ from posetail.datasets.posetail_dataset import (custom_collate, rotate_camera_im
 from posetail.posetail.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
+from .crop import BOX_SOURCES
 from .format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
 
 
@@ -62,6 +63,14 @@ class LoaderConfig:
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
     crop_jitter_scale: float = 0.3     # box scale jitter
     min_crop_dim: int = 64
+    # What the crop rule bounds. `keypoints` is the labels themselves. `instances` bounds the
+    # `instances.pq` box instead, for a root whose stored keypoints are too sparse to enclose the
+    # animal: rat-city's converter dropped noisy points, leaving 26k train instances with NO
+    # finite point. OPT-IN rather than "use the table when it exists" -- an instances box is not a
+    # crop box in general (spec §9), johnson-mouse ships COCO boxes and calms21 MARS ones, and
+    # defaulting to them would silently retarget those crops. A view whose box is absent falls
+    # back to its keypoints (`crop._crop_source`), so one setting serves a multi-root run.
+    box_source: str = 'keypoints'
     prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
     prompt_noise_px: float = 0.0       # sigma on the prior, in PIXELS (3D scales by cube_scale)
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
@@ -81,6 +90,19 @@ class LoaderConfig:
 # ----------------------------------------------------------------------------------------------
 # pixels
 # ----------------------------------------------------------------------------------------------
+
+def _apply_affine(pts, rotation):
+    """Move (...,2) pixel points through a rotation's own 2x3, or pass them through untouched.
+
+    Both rotation helpers return `(M_2x3, (w, h))` (`posetail_dataset.py:104,175`), and this is
+    the same line `rotate_points_image_plane` applies to the coords -- shared so a stored box and
+    the labels can never end up in different frames.
+    """
+    if pts is None or rotation is None:
+        return pts
+    M = torch.as_tensor(rotation[0], dtype=pts.dtype)
+    return pts @ M[:, :2].T + M[:, 2]
+
 
 def _crop_affine(src_wh, crop_coords, target_size, rotation):
     """The one dst<-src affine for rotate -> crop -> resize. Returns (M_2x3, (w, h)) or None.
@@ -317,6 +339,10 @@ class PoseDataset(Dataset):
             f'n_frames = {cfg.n_frames} is not usable: posetail computes gT = T // tubelet_size '
             '(encoder_decoder.py:748), which is 0 at T=1 and yields a zero-length pos_embed. '
             'Use n_frames >= 2; short groups are clamp-padded up to it.')
+        # A typo here would silently mean `keypoints`, which is the old behaviour and so leaves
+        # nothing to notice: same shapes, same losses, a run that just quietly ignored the boxes.
+        assert cfg.box_source in BOX_SOURCES, \
+            f'box_source must be one of {BOX_SOURCES}, got {cfg.box_source!r}'
         self.cfg = cfg
         self.split = split
         self.train = (split == 'train') if train is None else train
@@ -342,10 +368,12 @@ class PoseDataset(Dataset):
         # `names`. Resolved here so a root that cannot be mapped fails at construction rather
         # than in the middle of an epoch.
         self._kpt_ids: dict[Path, torch.Tensor] = {}
+        boxed: list[tuple[str, int, int]] = []
         for di, ds in enumerate(self.datasets):
-            mine = []
+            mine, n_box, n_sess = [], 0, 0
             for sess in ds.sessions.get(split, []):
                 sess.preload()
+                n_sess += 1
                 self._kpt_ids[sess.path] = torch.as_tensor(
                     self.registry.ids_for(ds.name, sess.names), dtype=torch.long)
                 for gid, group in sess.groups.items():
@@ -358,9 +386,19 @@ class PoseDataset(Dataset):
                         for st in starts:
                             mine.append(len(self.index))
                             self.index.append(_Item(di, sess, gid, a, st))
+                n_box += (sess.path / 'instances.pq').exists()
+            boxed.append((ds.name, n_box, n_sess))
             self.by_dataset.append(mine)
         if not self.index:
             raise ValueError(f'{path}: split {split!r} yielded no usable windows')
+        if cfg.box_source == 'instances':
+            # Which roots the switch actually reached. The keypoint fallback is per view and
+            # silent by design, so a root that carries no `instances.pq` trains exactly as it did
+            # before -- invisible in a loss curve, and the reason this is printed rather than
+            # assumed.
+            print(f'{split}: box_source=instances  ' + '  '.join(
+                f'{n}/{t} {name}' + ('' if n == t else ' (keypoint fallback)')
+                for name, n, t in boxed))
 
         # Sampling pools. A pool is a set of index positions plus an optional cumulative weight
         # array; `_pick` draws a pool, then an entry inside it. Balancing across datasets is the
@@ -591,6 +629,22 @@ class PoseDataset(Dataset):
         f = np.clip(np.arange(start, start + T * s, s), 0, group.n_frames - 1)
         return f
 
+    def _crop_pts(self, lab, a, frames, cam_ix):
+        """One animal's stored boxes over a window, as points the crop rule can bound.
+
+        (T, C, 4, 2) -- FOUR corners per box, not the two the table stores. An in-plane rotation
+        turns the box into a rotated rectangle, and the extent of its two diagonal corners is
+        strictly inside the extent of all four, so a two-corner version would crop the animal.
+
+        None when the switch is off or the session has no `instances.pq` at all. An all-NaN
+        result is legal and handled downstream: `crop._crop_source` falls back per view.
+        """
+        if self.cfg.box_source != 'instances' or lab.boxes is None:
+            return None
+        b = lab.boxes[a][frames][:, cam_ix]                        # (T,C,4) = x0,y0,x1,y1
+        corners = np.stack([b[..., [0, 1]], b[..., [2, 1]], b[..., [2, 3]], b[..., [0, 3]]], -2)
+        return torch.as_tensor(corners, dtype=torch.float32)
+
     def _item(self, idx, rng):
         item = self._pick(idx, rng)
         sess, group = item.session, item.session.groups[item.gid]
@@ -620,6 +674,7 @@ class PoseDataset(Dataset):
                       else list(range(len(cgroup))))
         cgroup = [cgroup[i] for i in cam_ix]
         cam_names = [sess.cam_names[i] for i in cam_ix]
+        crop_pts = self._crop_pts(lab, a, frames, cam_ix)      # (T,C,4,2) source px, or None
 
         # -- targets and visibility ------------------------------------------------------
         if true_2d:
@@ -666,12 +721,15 @@ class PoseDataset(Dataset):
         if true_2d:
             cam = cgroup[0]
             coords = _mask_outside(coords, cam['size'])
+            cp = None if crop_pts is None else crop_pts[:, 0]
             if self.train and rng.random() < self.cfg.aug_prob:
                 cam, coords, rot = rotate_points_image_plane(cam, coords,
                                                              float(rng.uniform(-45, 45)))
                 rotation_info = [rot]
+                cp = _apply_affine(cp, rot)
             jit = self._jitter(rng)
-            cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim, jit)
+            cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim, jit,
+                                                         crop_pts=cp)
             if cam is None:
                 return None
             cam, scale = _resize_camera(cam, self.cfg.image_size)
@@ -698,8 +756,13 @@ class PoseDataset(Dataset):
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
                             vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
+            # A stored box lives in SOURCE pixels, so it follows each camera's own in-plane
+            # rotation -- the same affine `rotate_camera_image_plane_3d` hands back for the warp.
+            cp3 = None if crop_pts is None else [
+                _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
             jit = self._jitter(rng)
-            cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim, jit)
+            cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim, jit,
+                                                      crop_pts=cp3)
             if cgroup is None:
                 return None
             cgroup = [_resize_camera(c, self.cfg.image_size)[0] for c in cgroup]

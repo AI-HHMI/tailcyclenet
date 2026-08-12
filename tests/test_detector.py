@@ -4,6 +4,7 @@ The point of this detector is not that it finds animals -- it is that it reprodu
 RULE'S box. If it learned some other plausible box, every downstream pose number would shift.
 """
 import numpy as np
+import pytest
 import torch
 
 from tailcyclenet.crop import crop_box_for_points
@@ -172,3 +173,40 @@ def test_link_rows_survives_a_dropped_frame():
     linked = link_rows(boxes.copy())
     assert linked[0, 3, 0][0] == 13, 'row 0 must still be the left animal after the gap'
     assert linked[1, 3, 0][0] == 110
+
+
+def test_box_source_instances_retargets_only_where_a_box_exists(tiny_root):
+    """`--boxes instances` regresses the stored extent, and falls back per animal.
+
+    Both halves matter for rat-city: the table is what rescues the 26k instances whose keypoints
+    were cleaned away, and the fallback is what keeps the rest on the rule they always had.
+    """
+    # min_crop_dim 8, not the default 64: the fixture frame is 64x48, so a 64 px floor forces
+    # every crop to the whole image and the two sources would agree for the wrong reason.
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=4, box_source='instances')
+    base = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                      max_frames_per_group=4)
+    # the fixture's one stored box is a02 on frame 1
+    i = next(i for i, (_, _, f, _) in enumerate(ds.index) if f == 1)
+    _, boxes = ds[i]
+    _, plain = base[i]
+    sess, gid, f, ci = ds.index[i]
+    lab = sess.labels(gid)
+    cam = sess.rig.posetail()[ci]
+    img = np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8)
+    _, scale, pad = letterbox(img, ds.input_wh)
+
+    # a02 (row 1) carries the box: the target is the STORED corners at pad=0, not the keypoints
+    want = crop_box_for_points(torch.as_tensor(lab.boxes[1, f, ci]).view(2, 2),
+                               cam['size'], ds.min_crop_dim, pad=0)
+    back = unletterbox_boxes(boxes[1][None], scale, pad)[0]
+    torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
+    assert not torch.allclose(boxes[1], plain[1], atol=0.51)
+    # a01 has no stored box, so it is byte-identical to the keypoint target
+    torch.testing.assert_close(boxes[0], plain[0])
+
+
+def test_box_source_rejects_a_typo(tiny_root):
+    with pytest.raises(AssertionError, match='box_source'):
+        BoxDataset(tiny_root / 'ratlike', 'train', box_source='instance')

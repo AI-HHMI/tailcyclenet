@@ -48,6 +48,10 @@ class InferConfig:
     max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
     kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
     device: str = 'cuda:0'
+    # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
+    # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
+    # rule it never saw, and there would be nothing in the output to say so.
+    box_source: str = 'keypoints'
 
 
 def _window_starts(n_frames: int, T: int, overlap: int):
@@ -141,6 +145,19 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     src = box_points if box_points is not None else (
         lab.points3d if mode == '3d' else lab.points2d[..., 0, :])
+    # The run's own crop rule, applied to the GT-crop path. `lab.boxes` is ALREADY the (S,T,C,4)
+    # `boxes_stc` shape and the union-over-window logic below is already right for a pre-padded
+    # box, so this needs no second code path. An explicit detector or `--boxes` npz still wins:
+    # those are what the caller asked for, and both are recorded in `boxes_from`.
+    #
+    # Kept SEPARATE from `boxes_stc` rather than assigned into it, because the two fail
+    # differently. A detector that offers no box for an animal has said something; a tracker that
+    # lost it has not, and the loader's own answer there is to fall back to the keypoints. Folding
+    # this into `boxes_stc` would drop those animals from the window instead -- pure lost
+    # coverage, silently, and coverage is a number this repo reports.
+    inst_boxes = (lab.boxes if (boxes_stc is None and box_points is None
+                                and cfg.box_source == 'instances' and lab.boxes is not None
+                                and bool(np.isfinite(lab.boxes).any())) else None)
     n_src = boxes_stc.shape[0] if boxes_stc is not None else src.shape[0]
     S = n_src if cfg.max_animals == 0 else min(n_src, cfg.max_animals)
     cam_ix = list(range(len(session.rig)))
@@ -164,13 +181,19 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         # cost O(C^2) `format_camera` calls per animal.
         window_cams = session.cgroup(gid, frames)
         for a in range(S):
+            bb = None
             if boxes_stc is not None:
-                # Boxes given directly (detector / detections file). One box per camera for
-                # this window: the union over the window's frames, so the animal does not walk
-                # out of its own crop mid-window.
                 bb = boxes_stc[a][frames]                          # (t, C, 4)
                 if not np.isfinite(bb).all(-1).any():
                     continue
+            elif inst_boxes is not None and a < len(inst_boxes):
+                bb = inst_boxes[a][frames]
+                if not np.isfinite(bb).all(-1).any():
+                    bb = None                                      # keypoint fallback, per animal
+            if bb is not None:
+                # Boxes given directly (detector / detections file / instances.pq). One box per
+                # camera for this window: the union over the window's frames, so the animal does
+                # not walk out of its own crop mid-window.
                 # USE THE CAMERAS THAT SAW IT, not all or nothing. A detector legitimately
                 # misses a view -- cross-view association leaves an unmatched camera NaN -- and
                 # requiring a box in every camera dropped the whole animal for the window even
@@ -253,7 +276,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             'mode': mode, 'group_id': gid, 'session': session.session_id,
             'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total,
             'boxes_from': 'detector' if boxes_stc is not None else
-                          ('given points' if box_points is not None else 'labels')}
+                          ('given points' if box_points is not None else
+                           ('instances.pq' if inst_boxes is not None else 'labels'))}
 
 
 def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cgroup):

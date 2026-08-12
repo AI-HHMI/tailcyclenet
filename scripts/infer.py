@@ -95,8 +95,12 @@ def main():
         n_frames=args.n_frames or int(config['data'].get('n_frames', 24)),
         overlap=args.overlap, image_size=int(config['data'].get('image_size', 256)),
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
+        box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk, device=device)
+    if cfg.box_source != 'keypoints':
+        print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
+              'instances.pq falls back to its keypoints')
     if args.anchor == 'labels':
         print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
               'upper bound, not a deployment number. Label it as such wherever you quote it.')

@@ -13,6 +13,10 @@ fly arrives at 26.5 x 28.1 px and reaches AP50 0.985 where rat-city sits near 0.
 
 So `--input-wh` defaults to an aspect-matched size rather than a square, and training the
 detector across datasets is not offered: one letterbox cannot serve both.
+
+`--boxes instances` regresses the dataset's own `instances.pq` extent instead of the keypoint
+extent. rat-city wants it: its converter dropped noisy points, so 26k train instances carry no
+finite keypoint at all and would otherwise be trained as "no animal here".
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.format import load_datasets
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate, box_iou,
@@ -75,6 +80,10 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--num-workers', type=int, default=8)
     ap.add_argument('--frames-per-group', type=int, default=40)
+    ap.add_argument('--boxes', default='keypoints', choices=BOX_SOURCES,
+                    help='what the regression target bounds. `instances` needs a dataset whose '
+                         'instances.pq boxes ARE crop extents -- rat-city\'s are; johnson-mouse '
+                         'ships COCO boxes and calms21 MARS ones, which are not.')
     ap.add_argument('--val-frames-per-group', type=int, default=8,
                     help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
                          'branson-fly each hold a single val group, so the default 8 makes the '
@@ -92,7 +101,7 @@ def main():
     wh = tuple(args.input_wh) if args.input_wh else default_input_wh(roots[0])
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
-    train = BoxDataset(args.data, 'train', input_wh=wh,
+    train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
                        max_frames_per_group=args.frames_per_group)
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
@@ -102,7 +111,7 @@ def main():
         worker_init_fn=worker_init)
     val_loader = None
     try:
-        val = BoxDataset(args.data, 'val', input_wh=wh,
+        val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
                          max_frames_per_group=args.val_frames_per_group)
         val_loader = torch.utils.data.DataLoader(val, batch_size=args.batch_size,
                                                  num_workers=2, collate_fn=box_collate)

@@ -839,3 +839,80 @@ def test_prompt_noise_is_in_pixels_on_both_modes(tiny_root):
     scale = float(torch.nanmedian(get_camera_scale(b.cgroup, b.kpt_prior)))
     assert scale > 0
     assert 0.3 * SIG < mm / scale < 3 * SIG, (mm, scale, mm / scale)
+
+
+# ----------------------------------------------------------------------------------------------
+# box_source: cropping on instances.pq instead of the labels
+# ----------------------------------------------------------------------------------------------
+
+# min_crop_dim 8, not the default 64: the fixture image is 64x48, so a 64 px floor would force
+# every crop to the whole frame and the test would pass whatever the box source did.
+BOXCFG = dict(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+              crop_jitter=0.0, prompt_dropout=0.0, min_crop_dim=8)
+
+
+def _boxed_animal(root, source):
+    """The val window for a02 -- the one animal the 2D fixture gives a stored box."""
+    ds = PoseDataset(root / 'ratlike', 'val', LoaderConfig(box_source=source, **BOXCFG))
+    a = next(i for i, it in enumerate(ds.index) if it.animal == 1)
+    return _batch(ds, a)
+
+
+def test_box_source_instances_crops_on_the_stored_box(tiny_root):
+    """The stored extent, not the keypoints, decides the crop -- and it re-enters at pad=0.
+
+    The fixture gives a02 exactly one box, [10,10,30,30] on frame 1, while its keypoints are
+    scattered over [5,43]. So the two sources cannot agree by accident.
+    """
+    b = _boxed_animal(tiny_root, 'instances')
+    box = cropmod.crop_box_for_points(torch.tensor([[10.0, 10.0], [30.0, 30.0]]),
+                                      torch.tensor([64, 48], dtype=torch.int32), 8, pad=0)
+    assert box.tolist() == [10, 10, 30, 30], 'a padded extent must not be padded a second time'
+    # `apply_crop` moves the origin to the box and `_resize_camera` scales it by 64/20.
+    torch.testing.assert_close(b.cgroup[0]['offset'],
+                               torch.tensor([10.0, 10.0]) * (64 / 20))
+    assert not torch.allclose(b.cgroup[0]['offset'],
+                              _boxed_animal(tiny_root, 'keypoints').cgroup[0]['offset'])
+
+
+def test_box_source_falls_back_per_view(tiny_root):
+    """An animal with no stored box trains EXACTLY as it did before the switch existed.
+
+    This is what makes `box_source = "instances"` safe to set once for a run that mixes a root
+    carrying `instances.pq` with roots that do not -- the fallback is silent, so it is tested.
+    """
+    def a01(source):
+        ds = PoseDataset(tiny_root / 'ratlike', 'val',
+                         LoaderConfig(box_source=source, **BOXCFG))
+        a = next(i for i, it in enumerate(ds.index) if it.animal == 0)
+        return _batch(ds, a)
+
+    got, want = a01('instances'), a01('keypoints')
+    # equal_nan: the fixture carries a deliberately MISSING point, so both sides hold a NaN there
+    torch.testing.assert_close(got.coords, want.coords, equal_nan=True)
+    torch.testing.assert_close(got.cgroup[0]['offset'], want.cgroup[0]['offset'])
+    np.testing.assert_array_equal(got.views[0].numpy(), want.views[0].numpy())
+
+
+def test_a_rotated_box_needs_four_corners():
+    """Why `_crop_pts` stores four corners and not the two `instances.pq` holds.
+
+    Under an in-plane rotation the extent of the two diagonal corners is strictly inside the
+    extent of all four, so a two-corner version would crop the animal it was meant to enclose.
+    """
+    import cv2
+
+    from tailcyclenet.dataset import _apply_affine
+
+    box = torch.tensor([10.0, 10.0, 30.0, 20.0])
+    rot = (cv2.getRotationMatrix2D((20.0, 15.0), 30.0, 1.0), (64, 48))
+    four = _apply_affine(torch.stack([box[[0, 1]], box[[2, 1]], box[[2, 3]], box[[0, 3]]]), rot)
+    two = _apply_affine(torch.stack([box[[0, 1]], box[[2, 3]]]), rot)
+    assert (four.amin(0) <= two.amin(0)).all() and (four.amax(0) >= two.amax(0)).all()
+    assert (four.amax(0) - four.amin(0) > two.amax(0) - two.amin(0)).any()
+
+
+def test_box_source_rejects_a_typo(tiny_root):
+    """`keypoint` (singular) would otherwise mean "silently ignore the boxes"."""
+    with pytest.raises(AssertionError, match='box_source'):
+        PoseDataset(tiny_root / 'ratlike', 'val', LoaderConfig(box_source='keypoint', **BOXCFG))

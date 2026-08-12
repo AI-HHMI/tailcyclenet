@@ -169,12 +169,19 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None):
 # runs got OOM-killed on a 503 GB host -- twice, silently, as "DataLoader worker killed by
 # signal: Killed".
 #
-# 8 is chosen against `ChunkShuffle`, which is what decides how many videos a worker is inside at
-# once: `mix=4` blocks of contiguous index positions, so 4 sessions x however many cameras. That
-# fits at 8 for a single-camera root and spills for a 4-camera one -- deliberately, because
-# spilling costs 45 ms of warm re-open and not spilling costs a gigabyte. Raise it with
-# TAILCYCLENET_READER_CACHE when a rig is wide AND the frames are small.
-_READER_CACHE = int(os.environ.get('TAILCYCLENET_READER_CACHE', 8))
+# 4 is `ChunkShuffle.mix`, which is exactly how many containers a loader worker is inside at once
+# -- and one past it the curve is flat while the memory is not. Measured on calms21 train, 600
+# items through one process:
+#
+#   size 2 -> 2.57 GB, 48% hits, 52.8 ms/item      the pool has 4 videos; 2 of them thrash
+#   size 4 -> 2.03 GB, 97% hits,  9.4 ms/item      <-- default
+#   size 8 -> 6.62 GB, 97% hits,  9.8 ms/item      3x the memory, no hits, no speed
+#   size 32 -> 44 GB (the shipped default), and 8 workers of that is what got OOM-killed
+#
+# CEILING: a rig with more than 4 cameras. The pose loader touches every camera within one
+# window, so a cache below the camera count misses on every call. Raise it with
+# TAILCYCLENET_READER_CACHE=<n_cameras> for a wide video rig, and budget ~1 GB per entry.
+_READER_CACHE = int(os.environ.get('TAILCYCLENET_READER_CACHE', 4))
 
 
 @lru_cache(maxsize=_READER_CACHE)
@@ -185,8 +192,8 @@ def _reader(path: str):
 
     THE CACHE SHOULD HOLD A WHOLE RIG. Inference walks one group at a time but touches every
     camera within each window, so a cache smaller than the camera count misses on *every* call --
-    at 3dpop's 4 cameras a size of 2 would hide that, and a 16-camera video rig would re-open all
-    16 containers per window. See `_READER_CACHE` for the other side of that trade.
+    a 16-camera video rig at the default 4 re-opens 12 containers per window. See `_READER_CACHE`
+    for the other side of that trade, which is a gigabyte an entry.
 
     `num_threads=1` because decord's default (0 = one decode context per core) costs 0.60 GB of
     RSS per open reader on a 128-core host against 0.24 GB at one thread. Single-threaded decode

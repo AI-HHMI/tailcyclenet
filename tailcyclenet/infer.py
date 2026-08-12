@@ -60,6 +60,14 @@ class InferConfig:
     # own `vis_pred` LOGIT is below it, per keypoint, before they become a prior. Not a row gate:
     # this decides what the model is told, not what it reports.
     prior_vis_thresh: float | None = None
+    # None -> report every row predicted. A float withholds an (animal, frame) row whose MEDIAN
+    # `vis_pred` logit across keypoints is below it. Measured against a rate-matched random
+    # rejection, which is the only honest control (any rejection improves a mean over matched
+    # points): 3dpop MOTA +0.049 [+0.011, +0.110] SIG at 7.3% of rows, where the control reads
+    # +0.001 [-0.017, +0.028]; rat-city 0.601 -> 0.628 at 14%, control 0.493. THE THRESHOLD IS NOT
+    # PORTABLE -- rat-city's logits have median +2.7 and 3dpop's +15.4 -- so there is no default and
+    # a shipped one would have to be a quantile. See dev/reports/11 §3 item 20.
+    vis_thresh: float | None = None
     device: str = 'cuda:0'
     # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
@@ -261,23 +269,32 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
                     if not len(v):
                         continue
-                    # THROUGH THE CROP RULE, not around it. This used to be a hand-rolled
-                    # floor/ceil/clip of the union extent, which produced a NON-SQUARE box with no
-                    # `min_crop_dim` floor -- a crop rule the pose model was never trained on, on
-                    # the one path that is supposed to be the deployment path (gotcha 8). The
-                    # corners re-enter at `pad = 0` because a detector box, an `instances.pq`
-                    # extent and a previous crop-rule output are all ALREADY padded; min/max over
-                    # the four corners of each box is min/max over the points they came from, so
-                    # the union is exactly the box those points would have produced.
-                    size = torch.as_tensor(
-                        [int(x) for x in session.rig.size(session.cam_names[ci])],
-                        dtype=torch.int32)
-                    box = cropmod.crop_box_for_points(
-                        torch.as_tensor(cropmod.box_corners(v), dtype=torch.float32),
-                        size, cfg.min_crop_dim, pad=0)
-                    if box is None:
-                        continue
-                    boxes.append(box)
+                    # THE UNION EXTENT, NOT `crop_box_for_points`, and that is measured rather than
+                    # lazy. 08 §1.3 asks for the crop rule here, on the grounds that the deployment
+                    # path must use the rule the model was trained on (gotcha 8). Running it costs
+                    # 3dpop +3.06 mm [+1.86, +4.41] MPJPE and -0.032 MOTA, both SIG over 58 groups,
+                    # and rat-city -0.040 MOTA. The reason is in the crop field of those two npz
+                    # files: the union of per-frame crop-rule boxes is ALREADY near-square (aspect
+                    # median 1.047), and squaring it again grows the p90 box AREA by 82% -- an
+                    # elongated union, which is an animal crossing the window, becomes a large
+                    # square and the resize to 256 px shrinks the animal inside it.
+                    #
+                    # The premise is also weaker than it reads: a detector box IS a crop-rule box,
+                    # so it already satisfies the `min_crop_dim` floor, and a union of boxes that
+                    # each satisfy the floor satisfies it too. And the rule cannot be reproduced
+                    # exactly from boxes in any case -- `pad = 0` would fix double-padding, but the
+                    # per-frame extents that would have to be unioned BEFORE squaring are not
+                    # recoverable from the boxes. See dev/reports/11 §3 item 16.
+                    #
+                    # int32 and clamped into the image, exactly like the crop rule's own box: a
+                    # float or off-frame box produces a negative cam['offset'] and breaks
+                    # project_cam far downstream.
+                    w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
+                    x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
+                    y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
+                    x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
+                    y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
+                    boxes.append(torch.tensor([x0, y0, x1, y1], dtype=torch.int32))
                     use.append(ci)
                 if not use:
                     outcome[a, wi] = OUTCOMES.index('no camera')
@@ -362,6 +379,17 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # `overlap` gives a window with fewer frames than the step, and a plain negative
             # index runs off the start of it.
             j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
+            # THE ROW GATE, applied to what is REPORTED and never to what is carried -- `carried`
+            # reads `p`, which is untouched below. Two levers in one flag would be one lever too
+            # many (eval rule 4), and a gate that also blinded the next window's prompt would be
+            # measuring the prompt.
+            if cfg.vis_thresh is not None and vlogit is not None:
+                with np.errstate(all='ignore'):
+                    # The MEDIAN over keypoints: a mean lets one confident keypoint carry a row the
+                    # model otherwise declined.
+                    drop = np.nanmedian(vlogit, axis=-1) < cfg.vis_thresh
+                pred[a, frames[drop]] = np.nan
+                conf[a, frames[drop]] = np.nan
             carried[a] = (torch.as_tensor(p[j]), int(frames[j]),
                           None if vlogit is None else torch.as_tensor(vlogit[j]))
 

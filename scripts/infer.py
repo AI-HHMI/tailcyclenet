@@ -77,9 +77,11 @@ def main():
                     help='3D only. 2 is cross-view association as it stands: every instance is '
                          'built from a camera PAIR, so an animal only one view saw is dropped from '
                          'the frame entirely. 1 also emits each leftover box as a single-view '
-                         'instance -- an input the pose model supports (`prob_2d_only`), and pure '
-                         'coverage against pure precision, since a leftover box is exactly one the '
-                         'geometry never corroborated.')
+                         'instance -- coverage against precision, since a leftover box is exactly '
+                         'one the geometry never corroborated. Whether the pose model can USE a '
+                         'one-camera 3D window is the run\'s own `[data].prob_2d_only`: the shipped '
+                         '3dpop and rat-city runs set 0.25, configs/w9.toml sets 0, and under 0 it '
+                         'is an untrained input shape. Measured on 3dpop: no metric moves.')
     ap.add_argument('--dup-res-px', type=float, default=None,
                     help='only with --min-views 1: drop a leftover single-view box that reprojects '
                          'within this many pixels of an instance already accepted in that camera. '
@@ -100,6 +102,15 @@ def main():
                     help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
                          'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
                          'unreadable. A view only -- it changes nothing that was predicted.')
+    ap.add_argument('--vis-thresh', type=float, default=None,
+                    help='withhold an (animal, frame) row whose MEDIAN `vis_pred` logit across '
+                         'keypoints is below this. Measured against a rate-matched random rejection '
+                         '-- the only honest control, since any rejection flatters a mean over '
+                         'matched points -- it is worth MOTA +0.049 SIG on 3dpop at 7.3% of rows '
+                         'and 0.601 -> 0.628 on rat-city at 14%, where the control gains nothing. '
+                         'A LOGIT, and NOT PORTABLE: rat-city sits at a median of +2.7 and 3dpop at '
+                         '+15.4, so pick it per dataset from the run\'s own `conf` field. Applies '
+                         'to what is reported, never to the carried prompt.')
     ap.add_argument('--prior-vis-thresh', type=float, default=None,
                     help='drop a CARRIED keypoint from the prompt when the previous window\'s own '
                          '`vis_pred` LOGIT for it is below this. A logit, not a probability: 0.0 is '
@@ -132,7 +143,8 @@ def main():
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
-        kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh, device=device)
+        kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
+        vis_thresh=args.vis_thresh, device=device)
     if args.prior_vis_thresh is not None and args.anchor != 'carry':
         raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
                          f'under --anchor carry; got {args.anchor!r}.')
@@ -174,9 +186,16 @@ def main():
     # The box cache. `stamp` is every input the boxes depend on: reusing a cache written under a
     # different detector, threshold or animal count would quietly make one arm incomparable to
     # the next, which is the kind of mismatch that gets published (eval rule 4).
-    stamp = repr([str(args.detector), args.det_score, args.max_animals, bool(args.link_boxes),
-                  list(args.det_input_wh or ()), args.max_frames, args.min_views,
-                  args.dup_res_px])
+    #
+    # ONLY THE OPTIONS THAT DIFFER FROM THEIR DEFAULTS, and sorted by name. A positional list of
+    # every value invalidated every cache on disk each time a new flag was added to the end of it --
+    # three times in one afternoon, twice in the middle of a sweep, each time refusing boxes that
+    # were in fact exactly the right boxes. Under this form a new option carrying its default leaves
+    # the stamp untouched, while any option a run actually set is still in it.
+    stamp = repr(sorted((k, str(getattr(args, k))) for k in
+                        ('detector', 'det_score', 'max_animals', 'link_boxes', 'det_input_wh',
+                         'max_frames', 'min_views', 'dup_res_px')
+                        if getattr(args, k) != ap.get_default(k)))
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
         loaded = dict(np.load(args.det_cache, allow_pickle=True))

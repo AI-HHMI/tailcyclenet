@@ -103,27 +103,28 @@ def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
     assert np.isfinite(out['pred']).all(-1).any(), 'the surviving cameras must still predict'
 
 
-def test_the_window_union_box_obeys_the_crop_rule(scene):
-    """THE DEPLOYMENT PATH USED ITS OWN CROP RULE. The union over a window's boxes was a
-    hand-rolled floor/ceil/clip: not square, and with no `min_crop_dim` floor. The pose model is
-    trained on `crop_box_for_points` output and nothing else, so the box it is served has to be
-    that -- and the union of already-padded boxes must not be padded a second time."""
+def test_the_window_union_covers_the_window_and_stays_in_the_image(scene):
+    """The union box, which is DELIBERATELY not re-entered into the crop rule.
+
+    Squaring a union of crop-rule boxes was measured at 3dpop +3.06 mm MPJPE / -0.032 MOTA (both
+    SIG) because it grows the p90 box area by 82%; `run_group` carries the numbers. What the box
+    must still be: the union over the window's frames, int32, and inside the image -- an off-frame
+    box gives a negative `cam['offset']` and breaks `project_cam` far downstream.
+    """
     model, sess, registry, name = scene
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
-    # A box far under the 16 px floor this cfg asks for, and moving across the window.
     boxes = np.zeros((1, 4, C, 4), np.float32)
     for t in range(4):
-        boxes[0, t, :] = [10 + t, 12, 14 + t, 16]
+        boxes[0, t, :] = [10 + t, 12, 14 + t, 16]         # drifts right across the window
 
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
     crop = out['crop'][0, 0]                              # (C,4), the first window's box per cam
     for ci in range(C):
         x0, y0, x1, y1 = crop[ci]
-        assert (x1 - x0) == (y1 - y0) == 16, f'cam {ci}: {crop[ci]} is not the 16 px square floor'
-        assert 0 <= x0 and x1 <= w and 0 <= y0 and y1 <= h
-        # the union spans t = 0..3, so it must contain the last frame's box too
-        assert x0 <= 10 and x1 >= 17, f'cam {ci}: {crop[ci]} does not cover the window'
+        assert (x0, y0, x1, y1) == (10.0, 12.0, 17.0, 16.0), \
+            f'cam {ci}: {crop[ci]} is not the union over t = 0..3'
+        assert 0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h
 
 
 def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
@@ -215,6 +216,25 @@ def test_carried_prior_is_bounds_masked_and_dated():
     # one, and the clamp above would present it as this window's first frame.
     assert _build_prior(cfg, (pose, 2), None, frames, boxes, [1.0], '2d', K, 2,
                         cgroup) == (None, None)
+
+
+def test_the_row_gate_withholds_rows_but_not_the_carried_prompt(scene):
+    """`--vis-thresh` gates what is REPORTED. Gating the prompt too would be a second lever in one
+    flag, and it is `--prior-vis-thresh` that owns that one.
+
+    A threshold above every logit must empty the prediction; one below every logit must leave it
+    byte-identical, so an unconfigured run is unchanged.
+    """
+    model, sess, registry, name = scene
+    base = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry'))
+    lo = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', vis_thresh=-1e9))
+    hi = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', vis_thresh=1e9))
+
+    np.testing.assert_array_equal(np.isnan(lo['pred']), np.isnan(base['pred']))
+    assert np.isnan(hi['pred']).all(), 'every row is below an infinite threshold'
+    # The gate ran per window, and `carried` was taken from the ungated pose, so the windows after
+    # the first still predicted -- which is what `outcome` all-ok proves.
+    assert (hi['outcome'] == 0).all(), 'the gate must not abort a window'
 
 
 def test_max_frames_takes_a_prefix(scene):

@@ -240,7 +240,50 @@ Box sources are the annotation set, a detections npz, or a per-dataset detector.
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw. Multi-animal rows report **matched** MPJPE: row
 index is not identity once boxes come from a detector, and scoring row-to-row measured 385 px on
-flies that are 30 px across.
+flies that are 30 px across. `--vs other.npz` pairs two prediction files over the groups both scored
+and the points **both matched** — including coverage and the FP split, because a delta over points
+only one arm attempted measures which arm declined more (eval rule 6).
+
+**A window that predicted nothing says why.** `run_group` writes an `outcome` code per (animal,
+window) — `ok / no box / no camera / no points / crop failed / decode failed` — and the crop box it
+used. Five aborts wrote the same NaN before, so a coverage number could not be attributed to a cause.
+The FP term is split too: `fp_dup` is a second prediction on an animal something else already claimed
+and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `fp_none` is ~10×
+`fp_dup` on every arm, which is why cross-track arbitration is not worth building.
+
+### The three inference levers that are measured (dev/reports/11_inference_verified.md)
+
+- **`--det-score 0.99`.** The objectness is saturated — 98.5% of rat-city's boxes and 99.98% of
+  3dpop's sit at exactly 1.0 — so a sweep over 0.05–0.5 moves 1–3% of boxes and does nothing. Above
+  0.99 it is the best free lever on record: MOTA **+0.073** (rat-city) and **+0.074** (3dpop), and on
+  3dpop MPJPE −2.11 mm and coverage **+0.010**, all three intervals clear of zero over 58 groups. The
+  gain is entirely `fp_none`, which is what a score threshold should remove.
+- **`--vis-thresh`.** `vis_pred` was write-only. Read as a row gate it is worth MOTA +0.049
+  [+0.011, +0.110] on 3dpop at 7.3% of rows and 0.601 → 0.628 on rat-city at 14%, where a
+  **rate-matched random rejection** gains nothing (+0.001 [−0.017, +0.028]). Always report that
+  control: any rejection flatters a mean over matched points. The threshold is a LOGIT and is **not
+  portable** — rat-city's median is +2.7 and 3dpop's +15.4 — so there is no default.
+- **`--n-frames` shorter is a trade, not a win.** 24 → 12 → 8 on 3dpop moves MOTA 0 → +0.106 → +0.130
+  and pck@10 0.103 → 0.074 → 0.067, monotonically in both directions, with MPJPE inside its interval
+  throughout. A shorter window shrinks the crop union AND cuts temporal context; the first buys
+  instance recall, the second pays for it. Crop refinement is the arm that should get one without the
+  other.
+
+Together the first two beat a 7.7×-compute detector on 3dpop (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
+0.572) with no retraining.
+
+**Do NOT put the window union box through `crop_box_for_points`.** 08 §1.3 asks for it on gotcha-8
+grounds and it is measured worse: 3dpop +3.06 mm MPJPE and −0.032 MOTA, both SIG, and rat-city −0.040
+MOTA. The union of per-frame crop-rule boxes is already near-square (aspect median 1.047) and
+squaring it again grows the p90 box AREA by 82%. A detector box is already a crop-rule box, so the
+union already satisfies the `min_crop_dim` floor; and the rule cannot be reproduced from boxes anyway,
+because the per-frame extents that would be unioned before squaring are not recoverable.
+
+**A GT crop is only an upper bound where the labels are dense.** The crop rule follows the *labelled*
+keypoints, and rat-city labels 2.02 of its 4 per animal-frame, so its GT crop is built from one or two
+points and floors at 64 px — the detector arms beat it on MPJPE there. 3dpop labels all 17 densely and
+its GT crop beats every detector arm by +8.57 mm [+4.08, +14.02]. **The "GT crop" row means different
+things on the two datasets.**
 
 ## The detector
 
@@ -258,6 +301,29 @@ square 1024x1024 fly frames reaches AP50 0.985 where rat-city sits near 0.50.
 The regression target is `crop.crop_box_for_points`, i.e. the detector reproduces *the crop the
 pose model was trained on*, not "a box around the animal". `tests/test_detector.py` asserts that
 against the crop rule directly.
+
+`--boxes` is part of that rule, and **nothing used to check it across the two models**: a detector
+trained on `instances.pq` boxes serves a keypoint-trained pose run a different crop rule, silently.
+`scripts/infer.py` now warns and records `__box_source__` in the npz — a warning and not a failure,
+because `scratch/phase1/rat-city-inst` is the best rat-city detector on record (recall 0.531 vs 0.429)
+while every rat-city pose run is keypoint-trained, so the mismatched pair is worth running. Its delta
+against a matched pair moves two keys and is not a detector-quality result.
+
+**`min_views = 2` in `associate` was never a threshold — it is the algorithm.** Every instance is
+built from a cross-camera PAIR, so `len(members) >= 2` holds by construction and the check could not
+fire. `min_views = 1` is a different rule that emits each leftover box as a single-view instance;
+`--dup-res-px` gates one that reprojects onto an instance already accepted in that camera, which is
+`fp_dup` rather than coverage. Both ship default-off: on 3dpop `min_views = 1` halves the `no box`
+outcome rate (0.016 → 0.008) and moves no metric, because `associate` stops at the session's animal
+count and with four cameras it already fills every row. And whether the pose model can *use* a
+one-camera 3D window is the run's own `[data].prob_2d_only` — 0.25 in the shipped 3dpop and rat-city
+runs, **0** in `configs/w9.toml`, where it would be an untrained input shape.
+
+Detection is the expensive half of a run, so `--det-cache` exists to share one box set across arms —
+which makes them matched by construction instead of by trusting the detector to be deterministic. Its
+stamp is the set of box-affecting options that **differ from their defaults**, deliberately: a
+positional list of every value meant that adding one flag refused every cache on disk, which happened
+three times in one afternoon and twice mid-sweep.
 
 ---
 

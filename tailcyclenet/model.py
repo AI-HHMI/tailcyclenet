@@ -109,7 +109,7 @@ def scene_center(camera_group):
 
 class PoseTrackerEncoder(TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='pose',
-                 gridresid_offset='query', **kwargs):
+                 gridresid_offset='query', query_terms=None, **kwargs):
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
         assert query_encoder in QUERY_ENCODERS, \
             f'query_encoder must be one of {QUERY_ENCODERS}, got {query_encoder!r}'
@@ -136,23 +136,34 @@ class PoseTrackerEncoder(TrackerEncoder):
                 time_embed_mode=old.time_embed_mode,
                 n_keypoints=n_keypoints)
         else:
-            # `wide`'s two query terms FOLLOW `query`; they are not separately configurable.
-            # Under `query = "none"` the prior is never read, so `_query_ok` is all-False for the
-            # whole run and `_sub_unprompted` swaps both terms for their learned no-query token on
-            # every query -- two constant vectors and two dead gate inputs. And with both off,
-            # `wide` ignores `query_coords` entirely, so `query = "prior"` could not reach the
-            # encoder at all: that combination is how six posetail-pose configs declared an anchor,
-            # trained, and were reported as anchored arms whose anchor was a literal no-op. Tying
-            # them to `query` makes both the waste and the trap unrepresentable.
-            terms = query == 'prior'
+            # `wide`'s two query terms DEFAULT to following `query`. Under `query = "none"` the
+            # prior is never read, so `_query_ok` is all-False for the whole run and
+            # `_sub_unprompted` swaps both terms for their learned no-query token on every query --
+            # two constant vectors and two dead gate inputs.
+            #
+            # `query_terms` overrides the pair, which is what the `j4_prior` recipe needs (pos but
+            # no patch). The one combination that stays unrepresentable is the trap: with BOTH off,
+            # `wide` ignores `query_coords` entirely, so a declared prior cannot reach the encoder
+            # at all. That is how six posetail-pose configs declared an anchor, trained, and were
+            # reported as anchored arms whose anchor was a literal no-op.
+            terms = dict.fromkeys(('query_pos_embedding', 'query_patch_embedding'),
+                                  query == 'prior')
+            terms.update(query_terms or {})
+            if query == 'prior':
+                assert any(terms.values()), (
+                    'query = "prior" with both query terms off: `wide` would ignore `query_coords` '
+                    'entirely and the prior would be a no-op. Set at least one of '
+                    'query_pos_embedding / query_patch_embedding, or use query = "none".')
+            else:
+                assert not any(terms.values()), (
+                    f'query = "none" supplies no prior, so {[k for k, v in terms.items() if v]} '
+                    'would be constant no-query tokens feeding dead gate inputs for the whole run.')
             self.query_encoder = WideQueryEncoder(
                 dim=self.latent_dim, embed_dim=old.embed_dim, decoder_dim=old.decoder_dim,
                 n_frames=old.n_frames, max_freq=old.max_freq, patch_size=old.patch_size,
                 principal_point_embedding=old.principal_point_embedding,
                 intrinsic_embedding=old.intrinsic_embedding,
-                time_embed_mode=old.time_embed_mode,
-                query_pos_embedding=terms, query_patch_embedding=terms,
-                n_keypoints=n_keypoints)
+                time_embed_mode=old.time_embed_mode, n_keypoints=n_keypoints, **terms)
             print(f'query encoder: wide, dim {self.latent_dim}, '
                   f'{self.query_encoder.n_fusion_terms} terms '
                   f'({", ".join(self.query_encoder.term_names())})')
@@ -477,11 +488,13 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     # third key to get wrong.
     enc = cfg.pop('query_encoder', 'pose')
     offset = cfg.pop('gridresid_offset', 'query')
-    for dead in ('query_pos_embedding', 'query_patch_embedding'):
-        assert dead not in cfg, (
-            f'{dead} is not configurable: `wide` builds both query terms iff query = "prior", '
-            'because under query = "none" they are constant no-query tokens for the whole run '
-            'and with both off the prior has no route into the encoder.')
+    # `wide`'s two query terms DEFAULT to `query`, and setting one is the `j4_prior` recipe (pos,
+    # no patch). Only `wide` reads them -- `pose` derives its ten terms from the query directly --
+    # so naming one alongside `pose` is a silent no-op and must not be silent.
+    query_terms = {k: bool(cfg.pop(k)) for k in
+                   ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
+    assert not (query_terms and enc != 'wide'), (
+        f'{sorted(query_terms)} only apply to query_encoder = "wide"; {enc!r} would ignore them.')
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
 
     # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
@@ -508,4 +521,4 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         'PoseTrackerEncoder, so any other value would be silently ignored rather than honoured.')
 
     return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc,
-                              gridresid_offset=offset, **cfg)
+                              gridresid_offset=offset, query_terms=query_terms, **cfg)

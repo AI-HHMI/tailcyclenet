@@ -402,7 +402,7 @@ def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
 
 
 def test_wide_query_terms_follow_the_query_mode():
-    """`qpos` and `patch` exist iff a prior is supplied. They are not separately configurable.
+    """`qpos` and `patch` DEFAULT to `query`, and the two useless combinations stay unbuildable.
 
     Under `query = "none"` the prior is never read, so `_query_ok` is all-False for the whole run
     and `_sub_unprompted` swaps both terms for their no-query token on every query -- two constant
@@ -420,9 +420,22 @@ def test_wide_query_terms_follow_the_query_mode():
     assert not hasattr(free, 'linear_qpos') and not hasattr(free, 'patch_processor')
     assert free.n_fusion_terms == 6 and prior.n_fusion_terms == 8
 
-    for dead in ('query_pos_embedding', 'query_patch_embedding'):
-        with pytest.raises(AssertionError, match='not configurable'):
-            build_model(small('wide', **{dead: True}), n_keypoints=5)
+    # Overriding the pair is allowed, and pos-without-patch is the `j4_prior` recipe.
+    j4 = build_model(small('wide', query='prior', query_patch_embedding=False),
+                     n_keypoints=5).query_encoder
+    assert j4.term_names() == ['kpt', 'query_time', 'target_time', 'gap', 'qpos', 'pp', 'intrinsic']
+    assert j4.n_fusion_terms == 7 and not hasattr(j4, 'patch_processor')
+
+    # The trap stays unrepresentable: a declared prior with no route into the encoder.
+    with pytest.raises(AssertionError, match='no-op'):
+        build_model(small('wide', query='prior', query_pos_embedding=False,
+                          query_patch_embedding=False), n_keypoints=5)
+    # As does paying for a term that is constant all run.
+    with pytest.raises(AssertionError, match='dead gate inputs'):
+        build_model(small('wide', query='none', query_pos_embedding=True), n_keypoints=5)
+    # And naming them on the encoder that cannot read them.
+    with pytest.raises(AssertionError, match='only apply to'):
+        build_model(small('pose', query='prior', query_pos_embedding=True), n_keypoints=5)
 
 
 def test_item_dropout_reproduces_the_deployment_geometry(moving_batch):

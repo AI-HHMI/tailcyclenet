@@ -916,3 +916,65 @@ def test_box_source_rejects_a_typo(tiny_root):
     """`keypoint` (singular) would otherwise mean "silently ignore the boxes"."""
     with pytest.raises(AssertionError, match='box_source'):
         PoseDataset(tiny_root / 'ratlike', 'val', LoaderConfig(box_source='keypoint', **BOXCFG))
+
+
+# ----------------------------------------------------------------------------------------------
+# the reader cache size
+# ----------------------------------------------------------------------------------------------
+
+# `_reader_cache_size` is pure given `ram_gb`, which is the whole point: the sizing rule is
+# asserted here on any host, with no video, no decode and no GPU. The failure it exists to catch is
+# SILENT -- a cache below the camera count misses on every call and only shows up as a 2.5x
+# slowdown in a log nobody diffs.
+
+def test_reader_cache_holds_a_whole_rig_in_one_process():
+    """A single process streaming windows must cache every camera, or it misses on every call."""
+    from tailcyclenet.dataset import _reader_cache_size
+
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16
+    assert _reader_cache_size(4, (1024, 570), None, ram_gb=503) == 4
+    # a narrow rig still gets ChunkShuffle.mix, not 1: the detector loader at 1 cost 52.8 ms/item
+    assert _reader_cache_size(1, (1024, 570), None, ram_gb=503) == 4
+
+
+def test_reader_cache_does_not_multiply_by_worker_count():
+    """12 workers x a 16-camera rig x 2.56 GB would be 480 GB. A worker wants ChunkShuffle.mix."""
+    from tailcyclenet.dataset import _reader_cache_size
+
+    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=503) == 4
+    assert _reader_cache_size(1, (1024, 570), 12, ram_gb=503) == 4
+
+
+def test_reader_cache_degrades_instead_of_oom_on_a_small_host():
+    """The count is a wish and RAM is the constraint; the clamp binds before the OOM killer does."""
+    from tailcyclenet.dataset import _reader_cache_size
+
+    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=64) == 1
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=64) < 16
+    # never zero -- one reader is the minimum that can serve a read at all
+    assert _reader_cache_size(16, (3208, 2200), 64, ram_gb=1) == 1
+
+
+def test_reader_cache_env_var_overrides_everything(monkeypatch):
+    """The knob survives as an OVERRIDE, and is now read at first use rather than at import."""
+    from tailcyclenet.dataset import _reader_cache_size
+
+    monkeypatch.setenv('TAILCYCLENET_READER_CACHE', '1')
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 1
+    monkeypatch.setenv('TAILCYCLENET_READER_CACHE', '32')
+    assert _reader_cache_size(1, (1024, 570), 12, ram_gb=64) == 32
+
+
+def test_reader_cache_size_does_not_touch_the_filesystem(monkeypatch):
+    """GOTCHA 11. Opening a container in the parent deadlocks every forked worker, forever, so the
+    sizing rule may read toml-derived numbers and nothing else."""
+    import builtins
+
+    from tailcyclenet.dataset import _reader_cache_size
+
+    def boom(*a, **k):
+        raise AssertionError('the sizing rule must not open anything')
+
+    monkeypatch.setattr(builtins, 'open', boom)
+    monkeypatch.setattr('os.stat', boom)
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16

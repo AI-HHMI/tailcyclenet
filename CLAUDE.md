@@ -320,13 +320,23 @@ against the crop rule directly.
    `scripts/train.py` materialises its fixed val windows before the train loader's first `next()`
    (`persistent_workers` forks there, not at construction), so it used to be the parent that
    decoded; it now pulls them through a one-worker `DataLoader`, which is byte-identical because
-   `PoseDataset` seeds val items by index. Measured on calms21: hangs at every
-   `TAILCYCLENET_READER_CACHE` size, never hangs when the parent decodes nothing.
+   `PoseDataset` seeds val items by index. Measured on calms21: hangs at every reader-cache size,
+   never hangs when the parent decodes nothing.
    `scratch/calms21_loader_repro.py` isolates it in seconds, without the model.
    **3dpop is video-backed too and survives it** — which is the only reason the five-dataset sweep
    never hit this, and why "the sweep works" was not evidence that the pose loader was fork-safe.
-   Only calms21 and 3dpop ship `.mp4`; the other four roots are image directories and cannot
-   trigger it.
+   Of the shipped roots only calms21 and 3dpop hold `.mp4`; the rest are image directories and
+   cannot trigger it — but **any** video-backed root can, including ones a converter makes later
+   (`scratch/johnson-mouse/.../johnson-mouse-combined` is 16 cameras of `.mp4`), so this is a
+   property of the pixels, not a list of four names.
+
+   This is also why **the reader cache may never be sized by probing.** `_reader_cache_size`
+   (`dataset.py`) derives it from a camera count, a frame size and `get_worker_info()` — all
+   parsed-toml or in-process facts — because opening one `VideoReader` in the parent to measure
+   anything is the deadlock. A single process streaming windows gets `len(rig)`, a loader worker
+   gets 4, both clamped by half of physical RAM split across `num_workers`, and
+   `TAILCYCLENET_READER_CACHE` is an override rather than a per-dataset requirement. A cache below
+   the camera count misses on *every* call: a 16-camera rig at 4 ran detection 2.5× slower.
 
 ---
 

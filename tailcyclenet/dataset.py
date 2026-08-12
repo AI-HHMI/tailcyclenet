@@ -174,7 +174,7 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-# AN OPEN DECORD READER COSTS ABOUT A GIGABYTE, SO THIS NUMBER IS A MEMORY BUDGET, NOT A HINT.
+# AN OPEN DECORD READER COSTS ABOUT A GIGABYTE, SO THE CACHE SIZE IS A MEMORY BUDGET, NOT A HINT.
 # A `VideoReader` is cheap until it decodes; the first seek allocates a frame pool sized by the
 # video, and on calms21's 1024x570 mpeg4s that settles at ~1.0 GB each. Measured on one loader
 # process walking calms21 train: 0.98 GB with the index built, 44 GB once 32 readers were live,
@@ -191,22 +191,56 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1
 #   size 8 -> 6.62 GB, 97% hits,  9.8 ms/item      3x the memory, no hits, no speed
 #   size 32 -> 44 GB (the shipped default), and 8 workers of that is what got OOM-killed
 #
-# CEILING: a rig with more than 4 cameras. The pose loader touches every camera within one
-# window, so a cache below the camera count misses on every call. Raise it with
-# TAILCYCLENET_READER_CACHE=<n_cameras> for a wide video rig, and budget ~1 GB per entry.
-_READER_CACHE = int(os.environ.get('TAILCYCLENET_READER_CACHE', 4))
+# A rig with more than 4 cameras is the other end of the trade: the pose loader touches every
+# camera within one window, so a cache below the camera count misses on every call -- a 16-camera
+# video rig at 4 re-opened 12 containers per window and ran detection 2.5x slower. Both ends are
+# now derived per process by `_reader_cache_size`; `TAILCYCLENET_READER_CACHE` only overrides it.
 
 
-@lru_cache(maxsize=_READER_CACHE)
-def _reader(path: str):
+def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None = None) -> int:
+    """How many open decord readers this process may hold.
+
+    THIS FUNCTION MUST NOT DECODE, STAT, OR OPEN ANYTHING (gotcha 11). It reads the environment,
+    `os.sysconf`, a camera count and a frame size -- all of which come from parsed toml -- because
+    opening a `VideoReader` in the parent to measure anything is what deadlocks the forked
+    workers. It is pure given `ram_gb`, which is what makes the sizing testable on any host.
+
+    Two axes, because one number cannot serve both callers:
+
+    - **Role.** A single process streaming windows (inference, rendering, `detect_group`) wants the
+      WHOLE rig, or it misses on every call. A loader worker wants 4 -- `ChunkShuffle.mix`, how
+      many containers a worker is inside at once, where the hit curve above flattens and the memory
+      does not. `workers is None` means the main process, which `get_worker_info` also returns for
+      `num_workers = 0`; that genuinely is one process, so the divisor below is 1.
+    - **Memory.** The count is a wish; RAM is the constraint, and it is per PROCESS while the
+      workers multiply it. Half of physical memory, split across the workers, is the ceiling.
+
+    `per_gb` is `1.0 + 0.25/megapixel`, a line through the only two points anyone has measured:
+    calms21's 1024x570 settles at ~1.0 GB an entry and johnson's 3208x2200 at 2.56 GB (41 GB
+    across 16). Both terms are rounded up from the fit, so the estimate errs toward a smaller
+    cache -- and the clamp only ever binds inside workers, where small is the safe direction. The
+    flat "~1 GB per entry" this replaces was wrong by 2.5x on the rig that needed it most.
+    """
+    env = os.environ.get('TAILCYCLENET_READER_CACHE')
+    if env:
+        return max(1, int(env))
+    if ram_gb is None:
+        ram_gb = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 2 ** 30
+    want = 4 if workers else max(int(n_cams), 4)
+    per_gb = 1.0 + 0.25 * (int(wh[0]) * int(wh[1])) / 1e6
+    return max(1, min(want, int(0.5 * ram_gb / max(workers or 1, 1) / per_gb)))
+
+
+# Built at the FIRST video read, not at import: `lru_cache`'s maxsize is fixed at decoration and
+# cannot be changed afterwards -- `cache_parameters()` hands back a copy and assigning `.maxsize`
+# silently does nothing -- so the only way to size it from the data is to wrap it late.
+_readers = None
+
+
+def _open_reader(path: str):
     """One `VideoReader` per file per process. Opening the container and building its frame index
     is not per-window work, but `read_frames` is called once per window per camera -- so a
     windowed pass over 3dpop's test videos paid it hundreds of times.
-
-    THE CACHE SHOULD HOLD A WHOLE RIG. Inference walks one group at a time but touches every
-    camera within each window, so a cache smaller than the camera count misses on *every* call --
-    a 16-camera video rig at the default 4 re-opens 12 containers per window. See `_READER_CACHE`
-    for the other side of that trade, which is a gigabyte an entry.
 
     `num_threads=1` because decord's default (0 = one decode context per core) costs 0.60 GB of
     RSS per open reader on a 128-core host against 0.24 GB at one thread. Single-threaded decode
@@ -216,11 +250,31 @@ def _reader(path: str):
     return VideoReader(path, num_threads=1)
 
 
-def _read_video(path, frames, crop_coords, target_size, rotation):
+def _reader(path: str, group, cam: str):
+    """The cached `_open_reader`, sized on first use from the rig this group belongs to.
+
+    `group.session` is not checked: `group.source(cam)` reached us through `Group.dir`, which
+    already dereferences `self.session.path`, so a session-less Group cannot get this far.
+
+    FIRST VIDEO READ WINS. A process that later walks a root with a wider rig keeps the size it
+    picked, because resizing means dropping live readers.
+    # ponytail: first-rig sizing, revisit if one process ever streams two video roots of different
+    # widths -- the memory clamp bounds it either way.
+    """
+    global _readers
+    if _readers is None:
+        info = torch.utils.data.get_worker_info()
+        rig = group.session.rig
+        _readers = lru_cache(maxsize=_reader_cache_size(
+            len(rig), rig.size(cam), None if info is None else info.num_workers))(_open_reader)
+    return _readers(path)
+
+
+def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     """Frames from a video file. Only 3dpop's test split needs this."""
     import cv2
 
-    imgs = _reader(str(path)).get_batch(list(frames)).asnumpy()    # decord hands back RGB
+    imgs = _reader(str(path), group, cam).get_batch(list(frames)).asnumpy()   # decord gives RGB
     aff = _crop_affine((imgs.shape[2], imgs.shape[1]), crop_coords, target_size, rotation)
     if aff is None:
         return list(imgs)
@@ -237,7 +291,7 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     """
     kind, src, ext = group.source(cam)
     if kind == 'video':
-        return _read_video(src, frames, crop_coords, target_size, rotation)
+        return _read_video(src, group, cam, frames, crop_coords, target_size, rotation)
     # Names are computed, not listed. Frame files are `%06d.<ext>` contiguous from 000000 by spec
     # (§12, enforced by `validate_session`), and listing the directory to select T of them cost
     # 0.90 s of a 1.06 s rat-city item -- its `cam0` holds 57,594 entries.

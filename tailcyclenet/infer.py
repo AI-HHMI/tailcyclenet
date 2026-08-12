@@ -68,6 +68,10 @@ class InferConfig:
     # PORTABLE -- rat-city's logits have median +2.7 and 3dpop's +15.4 -- so there is no default and
     # a shipped one would have to be a quantile. See dev/reports/11 §3 item 20.
     vis_thresh: float | None = None
+    # Re-crop each window to the FIRST PASS's own prediction and predict again. Label-free, and it
+    # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
+    # pixels and no scene encode can be shared). See `run_group`.
+    refine: bool = False
     device: str = 'cuda:0'
     # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
@@ -326,28 +330,31 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         # ponytail: peak memory is one camera's window of FULL frames plus every animal's crops --
         # 24 x 21 MB on johnson-mouse's 3208x2200 rig, which has one animal. A wide rig with many
         # animals would want the frame loop chunked; nothing shipped is both.
-        crops = {}
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for ci in sorted({c for _, use, *_ in plans for c in use}):
-                imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
-                # A file that will not decode is a property of the file, not of the animal, so it
-                # takes out every animal that wanted this camera -- which is what the per-animal
-                # decode did too, one animal at a time.
-                ok = not any(im is None for im in imgs)
-                for a, use, boxes, cgroup, _ in plans:
-                    if ci in use:
-                        i = use.index(ci)
-                        crops[a, ci] = (_crop_views(imgs, boxes[i], cgroup[i]['size'].tolist())
-                                        if ok else None)
-                del imgs
+        def decode_crops(plans):
+            crops = {}
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for ci in sorted({c for _, use, *_ in plans for c in use}):
+                    imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
+                    # A file that will not decode is a property of the file, not of the animal, so
+                    # it takes out every animal that wanted this camera -- which is what the
+                    # per-animal decode did too, one animal at a time.
+                    ok = not any(im is None for im in imgs)
+                    for a, use, boxes, cgroup, _ in plans:
+                        if ci in use:
+                            i = use.index(ci)
+                            crops[a, ci] = (_crop_views(imgs, boxes[i],
+                                                        cgroup[i]['size'].tolist())
+                                            if ok else None)
+                    del imgs
+            return crops
 
-        for a, use, boxes, cgroup, scales in plans:
+        def forward(plan, crops):
+            """One animal, one window -> its prediction in the SOURCE frame, or None."""
+            a, use, boxes, cgroup, scales = plan
             # uint8; the model divides on device. Same contract as the training loader.
             views = [crops[a, ci] for ci in use]
             if any(v is None for v in views):
-                continue                        # already marked 'decode failed' above
-            outcome[a, wi] = OUTCOMES.index('ok')
-
+                return None                     # already marked 'decode failed' above
             prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,
                                            frames, boxes, scales, mode, K, R, cgroup)
             dev = cfg.device
@@ -364,11 +371,57 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 if cfg.anchor == 'self':
                     out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                       kpt_chunk=chunk)
-
             p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
             if mode == '2d':
                 # crop pixels -> source pixels: undo the resize, then the crop origin
                 p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
+            return p, out
+
+        crops = decode_crops(plans)
+
+        if cfg.refine:
+            # CROP REFINEMENT, label-free. The first pass's own prediction re-enters the crop rule
+            # as if it were the labels, so the second pass sees the box a GT crop would have given
+            # -- which is the only arm that beat every detector crop on 3dpop.
+            #
+            # This is the third answer to what item 17 measured: shortening the window bought MOTA
+            # +0.130 purely by shrinking the crop union, and paid pck@10 0.103 -> 0.067 in lost
+            # temporal context. Refining shrinks the union at FULL T, so it should buy the first
+            # without the second. It costs one extra forward AND one extra decode per animal per
+            # window -- the crop moved, so neither the pixels nor `share_scene` can be reused.
+            #
+            # An animal whose refined crop fails keeps its first-pass plan rather than being
+            # dropped: a bad prediction must not cost coverage a loose box already had.
+            refined = []
+            for plan in plans:
+                a, use, boxes, cgroup, scales = plan
+                got = forward(plan, crops)
+                if got is None:
+                    refined.append(plan)
+                    continue
+                pts = torch.as_tensor(got[0], dtype=torch.float32)
+                cg2, b2 = boxes_from_points(pts, [window_cams[i] for i in use],
+                                            cfg.min_crop_dim, mode)
+                if cg2 is None:
+                    refined.append(plan)
+                    continue
+                sc2 = []
+                for i, cam in enumerate(cg2):
+                    cg2[i], s = _resize_camera(cam, cfg.image_size)
+                    sc2.append(s)
+                for i, ci in enumerate(use):
+                    crop[a, wi, ci] = np.asarray(b2[i], np.float32)
+                refined.append((a, use, b2, cg2, sc2))
+            plans = refined
+            crops = decode_crops(plans)
+
+        for plan in plans:
+            a, use, boxes, cgroup, scales = plan
+            got = forward(plan, crops)
+            if got is None:
+                continue                        # already marked 'decode failed' above
+            p, out = got
+            outcome[a, wi] = OUTCOMES.index('ok')
             pred[a, frames] = p
             vlogit = None
             if 'vis_pred' in out:

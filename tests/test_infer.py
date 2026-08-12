@@ -218,6 +218,30 @@ def test_carried_prior_is_bounds_masked_and_dated():
                         cgroup) == (None, None)
 
 
+def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
+    """The second pass must be crop-rule boxes around the FIRST pass's prediction, and an animal
+    whose refined crop fails must keep the box it already had -- a bad prediction cannot be allowed
+    to cost coverage a loose box was already giving."""
+    model, sess, registry, name = scene
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h          # the whole frame: refinement must shrink it
+
+    plain = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
+    ref = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', refine=True),
+                    boxes_stc=boxes)
+
+    assert (ref['outcome'] == 0).all(), 'refinement must not drop an animal'
+    got = np.isfinite(ref['pred']).all(-1)
+    assert got.sum() >= np.isfinite(plain['pred']).all(-1).sum(), 'coverage must not fall'
+    # The recorded crop is the REFINED one, and a crop-rule box is square unless the image caps it.
+    cw = ref['crop'][0, 0, :, 2] - ref['crop'][0, 0, :, 0]
+    ch = ref['crop'][0, 0, :, 3] - ref['crop'][0, 0, :, 1]
+    assert (cw <= w).all() and (ch <= h).all()
+    assert ((cw < w) | (ch < h)).any(), 'a whole-frame box should have been refined smaller'
+
+
 def test_the_row_gate_withholds_rows_but_not_the_carried_prompt(scene):
     """`--vis-thresh` gates what is REPORTED. Gating the prompt too would be a second lever in one
     flag, and it is `--prior-vis-thresh` that owns that one.

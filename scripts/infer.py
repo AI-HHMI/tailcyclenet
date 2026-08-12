@@ -102,6 +102,13 @@ def main():
                     help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
                          'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
                          'unreadable. A view only -- it changes nothing that was predicted.')
+    ap.add_argument('--refine', action='store_true',
+                    help='re-crop each window to the first pass\'s OWN prediction and predict '
+                         'again, label-free. The prediction re-enters the crop rule as if it were '
+                         'the labels, so the second pass sees the box a GT crop would have given -- '
+                         'the only arm that beat every detector crop on 3dpop. Costs one extra '
+                         'forward AND one extra decode per animal per window: the crop moves, so '
+                         'neither the pixels nor the scene encode can be reused.')
     ap.add_argument('--vis-thresh', type=float, default=None,
                     help='withhold an (animal, frame) row whose MEDIAN `vis_pred` logit across '
                          'keypoints is below this. Measured against a rate-matched random rejection '
@@ -144,7 +151,7 @@ def main():
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
-        vis_thresh=args.vis_thresh, device=device)
+        vis_thresh=args.vis_thresh, refine=args.refine, device=device)
     if args.prior_vis_thresh is not None and args.anchor != 'carry':
         raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
                          f'under --anchor carry; got {args.anchor!r}.')

@@ -115,6 +115,10 @@ def main():
                          'the typical animal spans at least one cell at every FPN level. A floor '
                          'only -- it never shrinks a dataset whose animals are already large. '
                          '0 disables it and restores the plain 416^2 aspect-matched budget.')
+    ap.add_argument('--max-input-px', type=int, default=4 * 416 * 416,
+                    help='ceiling on --min-box-px. It BINDS: 3dpop needs 4.3x the 416^2 budget '
+                         'for a 48 px median and 7.7x for 64, so the cap is the difference '
+                         'between a rule and a blank cheque. Reported when it applies.')
     ap.add_argument('--iters', type=int, default=20000)
     ap.add_argument('--batch-size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-3)
@@ -158,7 +162,8 @@ def main():
         raise SystemExit(f'{args.data}: the detector is trained per dataset; found {len(roots)}')
     probe_sess = roots[0].all_sessions()[0]
     wh = (tuple(args.input_wh) if args.input_wh
-          else input_wh_for(args.data, roots[0], args.boxes, args.min_box_px))
+          else input_wh_for(args.data, roots[0], args.boxes, args.min_box_px,
+                            args.max_input_px))
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,

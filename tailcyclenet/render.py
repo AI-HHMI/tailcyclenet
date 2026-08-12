@@ -92,7 +92,7 @@ def follow(pred, zoom, W, H, smooth=15):
 
 
 def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, show_ids=True,
-                 zoom=0, follow_from=None):
+                 zoom=0, follow_from=None, boxes=None, frames=None, ids=None):
     """Predicted tracks over one group's frames -> an mp4 at `out_path`.
 
     `pred` is `run_group`'s own output: `(S,T,K,2)` in SOURCE pixels for a 2D session, or
@@ -105,6 +105,16 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
     array: two renders of the same clip are only comparable frame-by-frame if they share a
     window, and a window each method places for itself hides exactly the disagreement the
     comparison is for.
+
+    `boxes` is an optional `(S,T,4)` of `[x0,y0,x1,y1]` in the same source pixels, drawn in each
+    animal's own colour -- `instances.pq`, when there is one, so a render answers whether the box
+    and the keypoints describe the same animal.
+
+    `ids` labels each row with something other than its index -- `lab.animal_ids`, usually.
+
+    `frames` selects which of the group's frames to draw -- an int array of SOURCE indices, one
+    per column of `pred`. None means `0..T-1`. A clip out of the middle of a 21k-frame group is
+    otherwise unrenderable without slicing the pixels first.
 
     A 3D render is a REPROJECTION, not a measurement: a depth error along camera `cam`'s ray is
     invisible in it. Draw more than one camera before believing a 3D pose.
@@ -133,11 +143,15 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
     if not writer.isOpened():
         raise RuntimeError(f'cv2 could not open {out_path} for writing')
     T = pred.shape[1]
+    # `t` indexes a COLUMN of `pred`; `src[t]` is the frame that column was predicted from. They
+    # are the same thing only when the whole group is rendered.
+    src = np.arange(T) if frames is None else np.asarray(frames, np.int64)
+    assert len(src) == T, f'{len(src)} frames for {T} predicted columns'
     try:
         for lo in range(0, T, CHUNK):
-            frames = np.arange(lo, min(lo + CHUNK, T))
-            imgs = read_frames(group, cam_name, frames)
-            for t, rgb in zip(frames, imgs):
+            cols = np.arange(lo, min(lo + CHUNK, T))
+            imgs = read_frames(group, cam_name, src[cols])
+            for t, rgb in zip(cols, imgs):
                 if rgb is None:
                     continue
                 img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -152,13 +166,20 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
                     origin, s = (0, 0), scale
                 drawn = 0
                 for a in range(pred.shape[0]):
+                    colour = PALETTE[a % len(PALETTE)]
+                    # Before the keypoint test: a box with no keypoints behind it is exactly the
+                    # disagreement worth seeing.
+                    if boxes is not None and np.isfinite(boxes[a, t]).all():
+                        b = (boxes[a, t].reshape(2, 2) - origin) * s
+                        cv2.rectangle(img, tuple(np.int32(b[0])), tuple(np.int32(b[1])),
+                                      colour, 1, cv2.LINE_AA)
                     p = (pred[a, t] - origin) * s
                     if not np.isfinite(p).all(-1).any():
                         continue
-                    draw_instance(img, p, PALETTE[a % len(PALETTE)], skel_ix, a,
+                    draw_instance(img, p, colour, skel_ix, a if ids is None else ids[a],
                                   show_ids=show_ids)
                     drawn += 1
-                cv2.putText(img, f'{session.session_id} {gid} {cam_name}  frame {int(t)}  '
+                cv2.putText(img, f'{session.session_id} {gid} {cam_name}  frame {int(src[t])}  '
                                  f'{drawn} tracked',
                             (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                             cv2.LINE_AA)

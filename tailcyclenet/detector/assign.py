@@ -67,7 +67,15 @@ def assign(anchors, gt_boxes):
     gcy = (gt[:, 1] + gt[:, 3]) / 2
     r = CENTER_RADIUS * stride[:, None]
     near = ((cx[:, None] - gcx[None]).abs() < r) & ((cy[:, None] - gcy[None]).abs() < r)
-    ok = inside | near
+    # AND, not OR. `yolox.py` builds a box as `centre +- exp(ltrb) * stride` and `exp` is strictly
+    # positive, so a predicted box ALWAYS contains its own anchor centre: an anchor outside its
+    # assigned GT box has a target it cannot reach, while line 96 below simultaneously teaches
+    # objectness to fire there. Upstream YOLOX takes the OR as a SimOTA *candidate* set and then
+    # prunes it; with no SimOTA the candidate set is the positive set. Measured under `|`: 71% of
+    # rat-city's positives sat outside their own box and the model could not fit 64 images it had
+    # seen 1200 times (0.364 train recall at 0.66M params, 0.352 at 5.8M -- capacity is not the
+    # limit, the labels were). Under `&`, 0.94-0.97.
+    ok = inside & near
     if not ok.any():
         return (torch.zeros(0, dtype=torch.long, device=anchors.device),) * 2
 
@@ -96,7 +104,11 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0):
             target[b, pos] = 1.0
             losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
             n_pos += pos.numel()
-    obj = F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum') / max(n_pos, 1)
+    # Divide by the image count, never by 1, when a batch has no positive at all: every animal
+    # absent from every view is real on a multi-camera dataset, and a `sum` over 16 x 3780 anchors
+    # over 1 is a loss of order 600 and one enormous gradient step.
+    obj = (F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
+           / max(n_pos, B))
     box = (torch.cat(losses_box).sum() / max(n_pos, 1) if losses_box
            else torch.zeros((), device=device))
     return obj + box_weight * box, {'obj': float(obj.detach()), 'box': float(box.detach()),

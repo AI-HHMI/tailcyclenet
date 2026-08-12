@@ -61,6 +61,28 @@ def test_assign_ignores_nan_boxes():
     assert (gix == 1).all(), 'positives must point at the finite box, not the NaN one'
 
 
+def test_every_positive_anchor_is_inside_its_own_box():
+    """The whole guard on `inside & near`.
+
+    A predicted box is `centre +- exp(ltrb) * stride`, so it always contains its own anchor
+    centre. A positive whose centre is outside its assigned GT box therefore has an unreachable
+    regression target while objectness is taught to fire there. `inside | near` shipped for a
+    while and nothing in this file caught it: uniqueness held, NaNs were still skipped, the loss
+    stayed finite, and 71% of rat-city's positives were unreachable.
+    """
+    m = YOLOXNano()
+    anchors = m.anchor_points(256, 256, torch.device('cpu'))
+    gt = torch.tensor([[20.0, 20.0, 60.0, 70.0],        # small: radius reaches well past it
+                       [100.0, 30.0, 240.0, 200.0]])    # large: inside reaches past the radius
+    pos, gix = assign(anchors, gt)
+    assert pos.numel() > 0
+    cx, cy = anchors[pos, 0], anchors[pos, 1]
+    box = gt[gix]
+    assert ((cx > box[:, 0]) & (cx < box[:, 2]) & (cy > box[:, 1]) & (cy < box[:, 3])).all(), \
+        'a positive anchor outside its assigned box cannot reach the target it is given'
+    assert len(set(gix.tolist())) == 2, 'both boxes must keep positives'
+
+
 def test_assign_gives_each_anchor_one_box():
     m = YOLOXNano()
     anchors = m.anchor_points(128, 128, torch.device('cpu'))

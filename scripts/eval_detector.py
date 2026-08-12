@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, box_collate, box_iou, decode,
-                                   load_detector)
+                                   letterbox_transform, load_detector)
 from tailcyclenet.format import INST_PRESENT
 from tailcyclenet.metrics import mota, paired_bootstrap
 
@@ -67,14 +67,6 @@ def greedy_match(gt, pred):
         used_p.add(int(p))
         ious[g] = m[g, p]
     return ious, pred.shape[0] - len(used_p)
-
-
-def letterbox_transform(sess, ci, input_wh):
-    """(scale, (padx, pady)) for this camera, without decoding a frame. Mirrors `letterbox`."""
-    w, h = sess.rig.size(sess.cam_names[ci])
-    s = min(input_wh[0] / w, input_wh[1] / h)
-    nw, nh = int(round(w * s)), int(round(h * s))
-    return s, ((input_wh[0] - nw) // 2, (input_wh[1] - nh) // 2)
 
 
 def as_corner_points(boxes):
@@ -149,7 +141,7 @@ def box_mota(sess, gid, ci, store, input_wh):
 
     ig = ig_boxes = None
     if lab.instance is not None:
-        scale, pad = letterbox_transform(sess, ci, input_wh)
+        scale, pad = letterbox_transform(sess.rig.size(sess.cam_names[ci]), input_wh)
         ig = np.zeros((S, T), bool)
         n = min(S, lab.instance.shape[0])
         ig[:n] = (lab.instance[:n][:, frames, ci] == INST_PRESENT)

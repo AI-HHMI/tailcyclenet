@@ -43,6 +43,18 @@ def letterbox(img, out_wh):
     return canvas, s, (px, py)
 
 
+def letterbox_transform(size, out_wh):
+    """The (scale, (padx, pady)) `letterbox` would return for an image of `size` = (w, h).
+
+    Same arithmetic, no pixels: the box target and the assignment diagnostics need the transform
+    without paying rat-city's 39 ms JPEG decode to learn it.
+    """
+    w, h = float(size[0]), float(size[1])
+    s = min(out_wh[0] / w, out_wh[1] / h)
+    nw, nh = int(round(w * s)), int(round(h * s))
+    return s, ((out_wh[0] - nw) // 2, (out_wh[1] - nh) // 2)
+
+
 def unletterbox_boxes(boxes, scale, pad):
     """Detector-input boxes -> source-image boxes."""
     out = boxes.clone().float()
@@ -95,9 +107,14 @@ class BoxDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
-    def __getitem__(self, i):
+    def boxes_for(self, i):
+        """The letterboxed target boxes for item `i`, without decoding its image.
+
+        Split out of `__getitem__` so `scripts/diag_assign.py` can read what the loss is actually
+        assigned over a few hundred views without paying for the pixels -- and so there is one
+        copy of the box rule rather than a second one in the diagnostic that can drift from it.
+        """
         sess, gid, f, ci = self.index[i]
-        group = sess.groups[gid]
         lab = sess.labels(gid)
         # Frame-indexed, not whole-group: `pts` below is (S,K,3) whose axis -3 is the ANIMAL, so a
         # moving camera's (T,4,4) extrinsic would project animal `i` through frame `i`'s pose.
@@ -123,14 +140,23 @@ class BoxDataset(Dataset):
             box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
-
-        img = read_frames(group, sess.cam_names[ci], [f])[0]
-        if img is None:
-            raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
-        img, scale, pad = letterbox(img, self.input_wh)
+        scale, pad = letterbox_transform(cam['size'], self.input_wh)
         boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
         boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
+        return boxes
 
+    def __getitem__(self, i):
+        sess, gid, f, ci = self.index[i]
+        boxes = self.boxes_for(i)
+        img = read_frames(sess.groups[gid], sess.cam_names[ci], [f])[0]
+        if img is None:
+            raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
+        # The box transform is derived from the rig's recorded size, so a frame that disagrees
+        # with it would put the boxes in a different letterbox than the pixels, silently.
+        assert (img.shape[1], img.shape[0]) == tuple(sess.rig.size(sess.cam_names[ci])), \
+            f'{gid}/{sess.cam_names[ci]} frame {f}: image is {img.shape[1]}x{img.shape[0]}, rig '\
+            f'says {sess.rig.size(sess.cam_names[ci])}'
+        img, _, _ = letterbox(img, self.input_wh)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         return x, boxes
 

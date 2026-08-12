@@ -114,7 +114,11 @@ def main():
                          'pixels across. 32 is YOLOX\'s coarsest stride, i.e. the size at which '
                          'the typical animal spans at least one cell at every FPN level. A floor '
                          'only -- it never shrinks a dataset whose animals are already large. '
-                         '0 disables it and restores the plain 416^2 aspect-matched budget.')
+                         '0 disables it and restores the plain 416^2 aspect-matched budget. '
+                         'MEASURED on 3dpop test, paired over 16 groups against the 23 px '
+                         'baseline: 32 -> +0.049 r@.75 at 1.9x the pixels, 64 -> +0.102 at 7.7x. '
+                         'The curve keeps rising past 32; 32 is where it is free enough to be a '
+                         'default, not where it stops paying.')
     ap.add_argument('--max-input-px', type=int, default=4 * 416 * 416,
                     help='ceiling on --min-box-px. It BINDS: 3dpop needs 4.3x the 416^2 budget '
                          'for a 48 px median and 7.7x for 64, so the cap is the difference '

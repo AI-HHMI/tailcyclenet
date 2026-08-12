@@ -80,6 +80,12 @@ def main():
                          'instance -- an input the pose model supports (`prob_2d_only`), and pure '
                          'coverage against pure precision, since a leftover box is exactly one the '
                          'geometry never corroborated.')
+    ap.add_argument('--dup-res-px', type=float, default=None,
+                    help='only with --min-views 1: drop a leftover single-view box that reprojects '
+                         'within this many pixels of an instance already accepted in that camera. '
+                         'Those are second detections of an animal that is already in the output, '
+                         'so they are fp_dup rather than new coverage. Default keeps them all, '
+                         'which is the unconditional rule and carries the full FP risk.')
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
@@ -169,7 +175,8 @@ def main():
     # different detector, threshold or animal count would quietly make one arm incomparable to
     # the next, which is the kind of mismatch that gets published (eval rule 4).
     stamp = repr([str(args.detector), args.det_score, args.max_animals, bool(args.link_boxes),
-                  list(args.det_input_wh or ()), args.max_frames, args.min_views])
+                  list(args.det_input_wh or ()), args.max_frames, args.min_views,
+                  args.dup_res_px])
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
         loaded = dict(np.load(args.det_cache, allow_pickle=True))
@@ -207,7 +214,7 @@ def main():
                         det, det_wh, sess, gid, n_want, device=device,
                         score_thresh=args.det_score, link=args.link_boxes,
                         reduce=det_red, max_frames=args.max_frames,
-                        min_views=args.min_views)
+                        min_views=args.min_views, dup_res_px=args.dup_res_px)
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True

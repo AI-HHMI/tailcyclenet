@@ -289,6 +289,17 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
     assert list(extra['boxes']) == [2] and torch.isnan(extra['point']).all(), \
         'a single ray has no triangulated point, and inventing a depth would be a lie'
 
+    # A SECOND DETECTION OF AN ANIMAL ALREADY IN THE OUTPUT IS NOT NEW COVERAGE. The same box
+    # again, in a camera that already contributed to the triangulated instance, reprojects on top of
+    # it -- `fp_dup`, not a found animal -- and `dup_res_px` is the gate on that.
+    dup_cam = [centre, centre, torch.cat([centre, centre])]
+    assert len(associate(cams, dup_cam, max_res_px=30.0, min_views=1)) == len(two) + 1
+    assert len(associate(cams, dup_cam, max_res_px=30.0, min_views=1,
+                         dup_res_px=30.0)) == len(two)
+    # ...and the gate must not swallow the corner box, which is a different place.
+    assert len(associate(cams, per_cam, max_res_px=30.0, min_views=1,
+                         dup_res_px=30.0)) == len(two) + 1
+
 
 def test_link_rows_follows_one_animal():
     """Unlinked rows are score-ordered, so the window-union crop spans several animals.

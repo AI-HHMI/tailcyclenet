@@ -277,16 +277,28 @@ def main():
             # attempted measures which arm declined more.
             print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '
                   f'({shared / nlab:.4f}) in {len(block)} group(s)')
-            for name in ('mota', 'miss_rate', 'fp_rate', 'idsw_rate'):
-                got = [(a['mota'][name], b['mota'][name]) for a, b in block if 'mota' in a
-                       and 'mota' in b]
+
+            def paired(name, get):
+                got = [(get(a), get(b)) for a, b in block]
+                got = [(x, y) for x, y in got if x is not None and y is not None]
                 if not got:
-                    continue
+                    return
                 dm = paired_bootstrap([x for x, _ in got], [y for _, y in got], seed=args.seed)
                 tail = ('DEGENERATE (one group)' if dm['n'] < 2
                         else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
                              + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
-                print(f'[{mode}] {name:>9s} {dm["mean"]:+.4f}  {tail}')
+                print(f'[{mode}] {name:>13s} {dm["mean"]:+.4f}  {tail}')
+
+            # COVERAGE IS PAIRED TOO. It is half of every claim in this file -- `err` is a mean over
+            # matched points and means nothing without it -- and it was the one column a `--vs` run
+            # could not put an interval on.
+            paired('coverage', lambda m: m['coverage'])
+            # And the FP term SPLIT, not just its total: `dup` is what arbitration could remove and
+            # `none` is what a detector threshold could, so a paired `fp_rate` alone cannot say
+            # which of the two an arm moved.
+            for name in ('mota', 'miss_rate', 'fp_rate', 'fp_dup_rate', 'fp_none_rate',
+                         'idsw_rate'):
+                paired(name, lambda m, k=name: m['mota'][k] if 'mota' in m else None)
 
 
 def _shared_error(a, b):

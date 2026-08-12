@@ -54,7 +54,8 @@ def load_detector(path, device='cpu', input_wh=None):
 
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
-                 score_thresh=0.05, link=False, reduce=False, max_frames=0, min_views=2):
+                 score_thresh=0.05, link=False, reduce=False, max_frames=0, min_views=2,
+                 dup_res_px=None):
     """Run the detector over every frame and camera of a group -> (boxes, scores).
 
     boxes (S,T,C,4), scores (S,T,C). The score is the objectness the box survived NMS on, and it
@@ -129,7 +130,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                 cams = session.cgroup(gid, t) if moving else cgroup
                 groups = associate(cams, [per_cam[c][j][0] for c in range(C)],
                                    max_res_px=session.assoc_res_max_px, max_instances=S,
-                                   min_views=min_views)
+                                   min_views=min_views, dup_res_px=dup_res_px)
                 for a, g in enumerate(groups[:S]):
                     for c, box in g['boxes'].items():
                         out[a, t, c] = box.numpy()

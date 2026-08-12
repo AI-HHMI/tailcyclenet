@@ -246,10 +246,16 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # USE THE CAMERAS THAT SAW IT, not all or nothing. A detector legitimately
                 # misses a view -- cross-view association leaves an unmatched camera NaN -- and
                 # requiring a box in every camera dropped the whole animal for the window even
-                # when two views had it. The model is trained on camera subsets already
-                # (`cams_to_sample`, and `prob_2d_only` trains the one-camera case outright), so
-                # a subset is a supported input; silently discarding the animal is pure lost
-                # coverage, and coverage is a number this repo reports.
+                # when two views had it, which is pure lost coverage -- and coverage is a number
+                # this repo reports.
+                #
+                # WHETHER A SUBSET IS A *TRAINED* INPUT IS A PROPERTY OF THE RUN. `cams_to_sample`
+                # picks camera subsets and `prob_2d_only` trains the one-camera case, and both are
+                # per-run: the `3dpop-*` and `rat-city-*` runs set `prob_2d_only = 0.25`, while
+                # `configs/w9.toml` ships 0 ("golden spent 0% of its steps on this path"). Under a
+                # config like w9's, a one-camera window is an untrained input shape rather than a
+                # supported one. Predicting it beats dropping it either way, but do not read a
+                # single-view arm without checking the run's own `[data].prob_2d_only`.
                 use, boxes = [], []
                 for i, ci in enumerate(cam_ix):
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]

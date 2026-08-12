@@ -94,8 +94,15 @@ def main():
     if args.compare:
         m2, wh2, _, mcd2, red2 = load_detector(args.compare, device=device)
         if wh2 != wh:
-            raise SystemExit(f'{args.compare} was trained at {wh2}, --run at {wh} -- an input '
-                             'size is not a key you can pair over, it changes what a box is')
+            # Pairable, and worth saying why: a letterbox is a uniform scale plus a translation
+            # applied to the prediction AND the ground truth alike, and IoU is invariant under
+            # that. So recall, IoU and fp/box compare directly across input sizes, and box-MOTA
+            # does too -- its match radius is derived from the median box diagonal in whichever
+            # space it is measuring. What does NOT carry across is anything in absolute pixels,
+            # and this scorer reports none.
+            print(f'note: {args.compare} runs at {wh2[0]}x{wh2[1]} and --run at {wh[0]}x{wh[1]}. '
+                  'Each is scored in its own letterbox; IoU is scale-invariant, so the columns '
+                  'below are comparable.')
         ds2 = BoxDataset(args.data, args.split, input_wh=wh2, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
                          max_frames_per_group=args.frames_per_group)

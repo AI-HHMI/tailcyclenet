@@ -12,7 +12,7 @@ __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox'
 
 
 def load_detector(path, device='cpu', input_wh=None):
-    """(model, input_wh, dataset_name) from a detector run folder or a .pth.
+    """(model, input_wh, dataset_name, min_crop_dim) from a detector run folder or a .pth.
 
     THE INPUT SIZE IS PART OF THE WEIGHTS, not a runtime choice: the letterbox the detector was
     trained under decides what an animal looks like to it, and a square 416 puts the median rat
@@ -21,6 +21,11 @@ def load_detector(path, device='cpu', input_wh=None):
     `dataset`, `epoch`, `eval`, `max_instances`, `strategy` and nothing else) and the size lives
     in a config file this repo does not have. `input_wh` supplies it for those; guessing a default
     would silently run a detector at a size it never saw.
+
+    `min_crop_dim` rides along for the same reason at a smaller scale: it is the floor in the crop
+    rule the detector exists to reproduce, so a pose run whose `[data].min_crop_dim` differs is
+    being served boxes from a different rule -- silently, since the shapes and the losses are
+    identical either way. 64 for a checkpoint predating the field; every shipped config says 64.
     """
     import torch
     from pathlib import Path
@@ -35,7 +40,8 @@ def load_detector(path, device='cpu', input_wh=None):
                          'branson-fly 416 416).')
     model = YOLOXNano()
     model.load_state_dict(ckpt['model_state'])
-    return model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', ''))
+    return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
+            int(ckpt.get('min_crop_dim', 64)))
 
 
 @torch.no_grad()

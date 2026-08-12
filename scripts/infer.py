@@ -109,8 +109,16 @@ def main():
     det = det_wh = None
     if args.detector:
         from tailcyclenet.detector import detect_group, load_detector
-        det, det_wh, det_ds = load_detector(args.detector, device, input_wh=args.det_input_wh)
+        det, det_wh, det_ds, det_mcd = load_detector(args.detector, device,
+                                                     input_wh=args.det_input_wh)
         print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r})')
+        # The detector regresses THE CROP RULE'S box, so its floor has to be the pose model's
+        # floor. Same shapes and same losses if they differ, so nothing else would say so.
+        if det_mcd != cfg.min_crop_dim:
+            raise SystemExit(
+                f'{args.detector}: trained at min_crop_dim={det_mcd}, but this run\'s '
+                f'[data].min_crop_dim is {cfg.min_crop_dim}. The detector reproduces the crop '
+                'rule; two floors are two rules.')
     ds_name, sessions = sessions_for(args.data, args.split)
     want = set(args.groups.split(',')) if args.groups else None
     render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']

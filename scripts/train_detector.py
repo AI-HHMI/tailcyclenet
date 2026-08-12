@@ -17,10 +17,18 @@ detector across datasets is not offered: one letterbox cannot serve both.
 `--boxes instances` regresses the dataset's own `instances.pq` extent instead of the keypoint
 extent. rat-city wants it: its converter dropped noisy points, so 26k train instances carry no
 finite keypoint at all and would otherwise be trained as "no animal here".
+
+Every checkpoint is written as its own `detector_it<n>.pth` WITH its scores inside, plus a
+`metrics.json` of the whole history, and both splits are scored each time. A single rolling
+`detector.pth` carrying no score cannot be selected on -- johnson peaked at val recall 0.871 and
+shipped 0.706 -- and the TRAIN score is what says whether a dataset's problem is generalisation
+(a train/val gap) or capacity to fit at all (no gap, low absolute recall). Scoring is
+`detector.evaluate`, the same code `scripts/eval_detector.py` reports with.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -33,8 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.format import load_datasets
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate, box_iou,
-                                   decode, detector_loss)
+from tailcyclenet.detector import BoxDataset, ChunkShuffle, YOLOXNano, box_collate, detector_loss
+from tailcyclenet.detector.evaluate import overall, score_dataset
 
 
 def default_input_wh(dataset, target_px=416 * 416):
@@ -45,28 +53,6 @@ def default_input_wh(dataset, target_px=416 * 416):
     ow = int(round((target_px * ar) ** 0.5 / 32) * 32)
     oh = int(round((target_px / ar) ** 0.5 / 32) * 32)
     return max(ow, 64), max(oh, 64)
-
-
-@torch.no_grad()
-def evaluate(model, loader, device, iou_thresh=0.5, limit=50):
-    """AP50-ish: recall at IoU 0.5 with one box per animal. Enough to see training work."""
-    model.eval()
-    hits = total = 0
-    for i, (x, gt) in enumerate(loader):
-        if i >= limit:
-            break
-        x = x.to(device)
-        obj, boxes = model(x)
-        for b in range(x.shape[0]):
-            g = gt[b][torch.isfinite(gt[b]).all(-1)]
-            if not g.numel():
-                continue
-            pred, _ = decode(obj[b], boxes[b], top_k=max(1, g.shape[0]))
-            total += g.shape[0]
-            if pred.numel():
-                hits += int((box_iou(g.to(device), pred).max(1).values >= iou_thresh).sum())
-    model.train()
-    return hits / total if total else float('nan')
 
 
 def main():
@@ -80,6 +66,9 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--num-workers', type=int, default=8)
     ap.add_argument('--frames-per-group', type=int, default=40)
+    ap.add_argument('--min-crop-dim', type=int, default=64,
+                    help='MUST equal the pose run\'s [data].min_crop_dim -- it is the same crop '
+                         'rule. Stored in the checkpoint, and scripts/infer.py refuses a mismatch.')
     ap.add_argument('--boxes', default='keypoints', choices=BOX_SOURCES,
                     help='what the regression target bounds. `instances` needs a dataset whose '
                          'instances.pq boxes ARE crop extents -- rat-city\'s are; johnson-mouse '
@@ -88,6 +77,11 @@ def main():
                     help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
                          'branson-fly each hold a single val group, so the default 8 makes the '
                          'recall readout 8 images; raise it to the group\'s labelled length.')
+    ap.add_argument('--eval-every', type=int, default=2000)
+    ap.add_argument('--eval-batches', type=int, default=25,
+                    help='batches per split at each checkpoint. TRAIN is scored too: the '
+                         'train/val gap is what says whether a dataset needs augmentation '
+                         '(a gap) or resolution (no gap, low absolute recall).')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
 
@@ -102,6 +96,7 @@ def main():
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
+                       min_crop_dim=args.min_crop_dim,
                        max_frames_per_group=args.frames_per_group)
     print(f'train: {len(train)} views')
     loader = torch.utils.data.DataLoader(
@@ -109,12 +104,11 @@ def main():
         num_workers=args.num_workers,
         collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0,
         worker_init_fn=worker_init)
-    val_loader = None
+    val = None
     try:
         val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
+                         min_crop_dim=args.min_crop_dim,
                          max_frames_per_group=args.val_frames_per_group)
-        val_loader = torch.utils.data.DataLoader(val, batch_size=args.batch_size,
-                                                 num_workers=2, collate_fn=box_collate)
         print(f'val:   {len(val)} views')
     except ValueError as e:
         print(f'val:   none ({e})')
@@ -126,6 +120,7 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
 
     args.out.mkdir(parents=True, exist_ok=True)
+    history = []
     it, t0, running = 0, time.time(), []
     model.train()
     while it < args.iters:
@@ -148,13 +143,35 @@ def main():
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
                 running, t0 = [], time.time()
-            if it % 2000 == 0 or it == args.iters:
-                torch.save({'iteration': it, 'model_state': model.state_dict(),
-                            'input_wh': wh, 'dataset': train.ds.name},
-                           args.out / 'detector.pth')
-                if val_loader is not None:
-                    print(f'   recall@IoU0.5 = {evaluate(model, val_loader, device):.4f}')
-    print(f'done: {it} iterations -> {args.out / "detector.pth"}')
+            if it % args.eval_every == 0 or it == args.iters:
+                # Both splits, EVERY checkpoint, and the score stored beside the weights. A
+                # rolling `detector.pth` with no score cannot be selected on: johnson peaked at
+                # val recall 0.871 and shipped 0.706, branson peaked 0.885 and shipped 0.833.
+                scores = {}
+                for name, ds in (('train', train), ('val', val)):
+                    if ds is None:
+                        continue
+                    scores[name] = overall(score_dataset(
+                        model, ds, device, batch_size=args.batch_size,
+                        batches=args.eval_batches, num_workers=2))
+                ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
+                        'dataset': train.ds.name, 'box_source': args.boxes,
+                        'min_crop_dim': args.min_crop_dim, 'eval': scores}
+                torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
+                torch.save(ckpt, args.out / 'detector.pth')
+                history.append({'iteration': it, **{f'{k}_{m}': v[m] for k, v in scores.items()
+                                                    for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
+                (args.out / 'metrics.json').write_text(json.dumps(history, indent=1))
+                for name, s in scores.items():
+                    print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
+                          f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
+                          flush=True)
+                t0 = time.time()               # evaluation is not part of the s/it readout
+    best = max(history, key=lambda h: h.get('val_r50', h['train_r50'])) if history else None
+    print(f'done: {it} iterations -> {args.out}')
+    if best:
+        print(f'best: it {best["iteration"]}  ' +
+              '  '.join(f'{k} {v:.4f}' for k, v in best.items() if k != 'iteration'))
 
 
 if __name__ == '__main__':

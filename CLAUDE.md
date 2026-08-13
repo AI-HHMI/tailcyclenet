@@ -526,6 +526,11 @@ crowding and a stratification by animal count shows **no dose-response** (MOTA s
 animals**, where a memoryless pairwise search has almost nothing to get wrong: the headroom is real and
 rare, and a coverage claim needs a crowded benchmark 3dpop's test split does not provide. Use it where the
 rig is wide or the animals are many. Never quote the hard-clip numbers without the protocol ones.
+**What it DOES buy is crop discipline**: box slots filled 0.866 → 0.888 mean and 0.653 → 0.732 at p10 (so
+§2.1 was right about the BOXES), which does not convert to pose coverage because the union crop already
+rescued those rows from a single box — instead it halves the worst crop again (p99 750 → 376 px, max
+1312 → 570), which is what the significant `box_agree` (p99 0.603 → 0.332) and `motion_ratio` deltas
+measure. It refuses more windows too (`no box` 2.67% → 3.19%).
 
 **What it unambiguously buys is scale.** `detector/track.py`: ONE
 cross-view target set with one affinity and one Hungarian, replacing per-frame `associate` plus

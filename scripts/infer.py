@@ -172,7 +172,13 @@ def main():
                          'every `n_frames - overlap` frames. That seam is NOT small -- the one-frame '
                          'displacement at the boundary is 3.46x the interior value on 3dpop '
                          '(2.42 mm vs 0.70), 2.33x on johnson-mouse, 1.24-1.45x on the 2D roots. '
-                         '"blend" reports the mean of every window that decoded the frame.')
+                         '"blend" reports the mean of every window that decoded the frame, and is '
+                         'MEASURED NOT TO HELP: on 3dpop\'s 58 groups it leaves MPJPE unchanged and costs '
+                         'MOTA -0.0014 (SIG) at overlap 4, and the harm scales with the blended fraction '
+                         '(-0.0020 at overlap 12, 80% of frames). A seam is partly an IDENTITY '
+                         'discontinuity and averaging two identities is worse than picking one. Kept so the '
+                         'measurement is reproducible; it does move `motion_ratio` toward 1, which is why '
+                         'that statistic is not sufficient on its own.')
     ap.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
                     help='3D only, and only under --anchor carry: what the next window is seeded '
                          'with. "triangulate" (default) hands back the ANCHOR-FREE estimate, '

@@ -341,6 +341,16 @@ worse than picking one** — where two windows disagree about which animal a row
 neither and can fall outside a match radius either one would have satisfied. So the seam is real and
 averaging is the wrong instrument: the fix has to resolve the disagreement, not split it, which is what
 `--track` does (seam ratio 2.67 → 2.45 with no blending). Stays default-off.
+**Confirmed on a 4x stronger test**: at overlap 12, 80% of frames are averaged instead of 20%, and the harm
+SCALES (MOTA −0.0014 → −0.0020, miss +0.0007 → +0.0011) while MPJPE still does not improve (+0.005). What
+blending does do is move `motion_ratio` −0.016 SIG toward 1, because averaging smooths — so **`motion_ratio`
+near 1 is necessary but not sufficient**, and must be read beside the error and identity columns exactly as
+`err` must be read beside coverage. That is RC1's trap in mirror image.
+**Confirmed on a 4x stronger test**: at overlap 12, 80% of frames are averaged instead of 20%, and the harm
+SCALES (MOTA −0.0014 → −0.0020, miss +0.0007 → +0.0011) while MPJPE still does not improve (+0.005). What
+blending does do is move `motion_ratio` −0.016 SIG toward 1, because averaging smooths — so **`motion_ratio`
+near 1 is necessary but not sufficient**, and must be read beside the error and identity columns exactly as
+`err` must be read beside coverage. That is RC1's trap in mirror image.
 
 The npz also carries **`box_agree`** (S,T,C) — the predicted centroid's distance from the centre of
 the crop box that produced its pixels, in units of one box side, reprojected in 3D. The pipeline held

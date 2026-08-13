@@ -39,6 +39,17 @@ def scene(request):
     return model, sess, registry, ds.name
 
 
+@pytest.fixture(scope='module')
+def cli():
+    """`scripts/infer.py` as a module, without running main(). Same pattern as test_train.py."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'tcn_infer', Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _cfg(**kw):
     kw.setdefault('overlap', 2)
     return InferConfig(n_frames=4, image_size=64, min_crop_dim=16, device='cpu', **kw)
@@ -403,25 +414,27 @@ def test_seam_blend_averages_the_overlap_and_changes_only_the_overlap(scene):
     (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
     (['--prior-vis-thresh', '1.0', '--anchor', 'none'], 'only means anything'),
 ])
-def test_the_cli_refuses_incoherent_combinations_before_loading_anything(argv, expect):
+def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
+                                                                        argv, expect):
     """These are the combinations that used to run and produce a number instead of an error.
 
     The worst was `--anchor labels` with a box source: `run_group` seeds row `a` from LABEL row `a`,
     and detector rows are score- or association-ordered, so the arm whose whole purpose is to be an
     upper bound was being handed a DIFFERENT animal's ground truth.
 
-    Checked through the real entry point, and it must fail BEFORE `load_run` -- a 5.6 GB checkpoint
-    load is not an acceptable price for a typo, and paying it is also what would make this test too
-    slow to keep. `--run` points at nothing, so reaching the load at all raises something else.
+    Checked through the real entry point -- the script's own `main`, its own argparse, its own
+    guards -- but IN PROCESS rather than through six forks. Each fork re-imported
+    torch/torchvision/posetail for 13.7 s to reach an argument check, which was 60% of the whole
+    suite. `--run` still points at nothing, and that is what pins the property this test is for: a
+    guard that moved after `load_run` raises FileNotFoundError instead of a SystemExit carrying
+    `expect`, so it still fails here.
     """
-    import subprocess
     repo = Path(__file__).resolve().parent.parent
-    r = subprocess.run([sys.executable, str(repo / 'scripts' / 'infer.py'),
-                        '--run', str(repo / 'no_such_run'), '--data', str(repo),
-                        '--out', '/tmp/unused.npz'] + argv,
-                       capture_output=True, text=True, timeout=300)
-    assert r.returncode != 0
-    assert expect in (r.stderr + r.stdout), f'wanted {expect!r}, got:\n{r.stderr[-800:]}'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
+                                      '--data', str(repo), '--out', '/tmp/unused.npz'] + argv)
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert expect in str(e.value), f'wanted {expect!r}, got: {e.value}'
 
 
 def test_seam_blend_accumulates_a_repeated_frame_index():

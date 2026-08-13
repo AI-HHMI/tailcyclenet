@@ -6,9 +6,17 @@ coordinate-free (allen-mouse's shape), a moving camera, and an ignore region.
 """
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
 from tailcyclenet import format as fmt
+
+# CAP THE INTRAOP POOL, OR `-n` MAKES THE SUITE SLOWER. torch's pool is `nproc` wide (report 14's
+# 67 ms/frame uint8 convert is the same cause), so on a 128-core box eight xdist workers ask for
+# 1024 threads and the suite goes from 58 s serial to 269 s at `-n 8`. Capped: 33 s. Here rather
+# than in the pixi task because a bare `pytest -n 8` has to be safe too, and a single process
+# barely notices (41.6 s against 39.4 s at 8 threads, measured on tests/test_model.py).
+torch.set_num_threads(4)
 
 KPTS_2D = ['nose', 'left_ear', 'right_ear', 'tail_base']
 KPTS_3D = ['nose', 'neck', 'tail_base']

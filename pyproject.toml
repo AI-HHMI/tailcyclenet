@@ -56,6 +56,10 @@ pip = "*"
 pyarrow = "*"
 matplotlib = "*"
 pytest = "*"
+# The suite's cost is not its logic: it is 29 random inits of an 87.5M-parameter model at 0.8 s
+# each, and the box has 128 cores. noarch, pure python, needs only pytest + execnet, so it cannot
+# collide with the exact pins the note below is about.
+pytest-xdist = "*"
 # NOT listed here, deliberately: toml, opencv, pillow, wandb, schedulefree, decord. This repo
 # imports all six directly, so declaring them looks right -- but posetail pins them EXACTLY
 # (`wandb==0.19.5`, `opencv-python==4.9.0.80`, `toml==0.10.2`) and posetail itself is pinned, so
@@ -66,7 +70,10 @@ pytest = "*"
 # own version, not as a conda package.
 
 [tool.pixi.tasks]
-test = "pytest tests/ -q"
+# `-n 8`, and the default per-TEST distribution rather than `--dist loadfile`: loadfile pins all 29
+# model builds to one worker and the wall clock barely moves. Every worker re-pays the 14 s
+# torch/torchvision/posetail import, in parallel, which is the floor.
+test = "pytest tests/ -q -n 8"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

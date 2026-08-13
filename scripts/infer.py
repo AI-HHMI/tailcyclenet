@@ -388,12 +388,16 @@ def main():
                     print(f'{key}: detecting up to {n_want} animal(s)'
                           f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
                           flush=True)
-                    det_boxes, det_scores = detect_group(
+                    got = detect_group(
                         det, det_wh, sess, gid, n_want, device=device,
                         score_thresh=args.det_score, link=args.link_boxes,
                         reduce=det_red, max_frames=args.max_frames,
                         min_views=args.min_views, dup_res_px=args.dup_res_px,
                         track=args.track, max_move=args.max_move)
+                    # A keypoint-trained detector returns a third array; it is NOT cached, because
+                    # the cache exists to make arms share a BOX set and adding a per-detector-
+                    # shaped array to it would change what an old cache is allowed to satisfy.
+                    det_boxes, det_scores = got[0], got[1]
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True

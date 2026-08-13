@@ -92,7 +92,12 @@ class CrossViewTracker:
 
     # -- one frame ------------------------------------------------------------------------
     def step(self, cgroup, boxes_per_cam, scores_per_cam):
-        """Match, update, birth, retire. Returns (boxes (S,C,4), scores (S,C)) as numpy.
+        """Match, update, birth, retire. -> (boxes (S,C,4), scores (S,C), claimed (S,C)) numpy.
+
+        `claimed[s, c]` is the DETECTION INDEX slot `s` took in camera `c`, or -1. It is returned
+        rather than recomputed because any per-detection quantity a caller wants to carry along
+        (the keypoint branch's output, for one) has to follow the SAME assignment the boxes did,
+        and matching boxes back to detections afterwards is ambiguous wherever two overlap.
 
         `boxes_per_cam` is a list of (n_c, 4) tensors in each camera's own pixels, and
         `scores_per_cam` the matching (n_c,) objectness -- the same pair `associate` takes.
@@ -102,6 +107,7 @@ class CrossViewTracker:
         C = len(cgroup)
         out = np.full((self.n, C, 4), np.nan, np.float32)
         sc = np.full((self.n, C), np.nan, np.float32)
+        claimed_ix = np.full((self.n, C), -1, np.int32)
         centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
         sides = [_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
 
@@ -150,6 +156,7 @@ class CrossViewTracker:
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
+                claimed_ix[s, c] = j
             # AGE COUNTS FRAMES WITH NO EVIDENCE AT ALL. One camera is evidence: it cannot move the
             # point, but it says the animal is still there, which is what expiry is about.
             #
@@ -180,11 +187,12 @@ class CrossViewTracker:
                         det = keep[c][j]
                         out[s, c] = boxes_per_cam[c][det].numpy()
                         sc[s, c] = float(scores_per_cam[c][det])
+                        claimed_ix[s, c] = det
 
         # -- retire: a slot with no evidence for a window is free for whoever is there now ---
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
             del self.targets[s]
-        return out, sc
+        return out, sc, claimed_ix
 
 
 def demo():
@@ -237,11 +245,11 @@ def demo():
     # 3. A frame with no detections at all ages the targets and returns nothing, without dropping
     #    them -- a one-frame detector miss must not end a track.
     empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
-    out, _ = tr.step(cg, *empty)
+    out, _, _ = tr.step(cg, *empty)
     assert not np.isfinite(out).any() and len(tr.targets) == 2
     # 4. ...and they resume in the SAME slots afterwards.
     w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
-    resumed, _ = tr.step(cg, *boxes_at(w))
+    resumed, _, _ = tr.step(cg, *boxes_at(w))
     assert np.isfinite(resumed).all(-1).any(-1).sum() == 2
     for s in (0, 1):
         assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0

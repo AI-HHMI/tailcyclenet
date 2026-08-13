@@ -3,11 +3,12 @@ import torch
 from .assign import assign, box_iou, decode, detector_loss, giou_loss
 from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, box_collate, letterbox, letterbox_transform,
-                   reduce_factor, unletterbox_boxes)
+                   reduce_factor, unletterbox_boxes, unletterbox_keypoints)
 from .yolox import YOLOXNano
 
 __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
-           'letterbox_transform', 'reduce_factor', 'unletterbox_boxes', 'assign', 'box_iou',
+           'letterbox_transform', 'reduce_factor', 'unletterbox_boxes', 'unletterbox_keypoints',
+           'assign', 'box_iou',
            'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV']
 
 # BUMP THIS WHENEVER `link_rows` CHANGES WHAT IT EMITS. `--det-cache` stores boxes that have already
@@ -102,7 +103,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     import torch
     from concurrent.futures import ThreadPoolExecutor
     from ..dataset import read_frames
-    from .data import letterbox, reduce_factor, unletterbox_boxes
+    from .data import letterbox, reduce_factor, unletterbox_boxes, unletterbox_keypoints
 
     group = session.groups[gid]
     T = min(group.n_frames, max_frames or group.n_frames)
@@ -110,6 +111,11 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     S = max_instances or 1
     out = np.full((S, T, C, 4), np.nan, np.float32)
     sc = np.full((S, T, C), np.nan, np.float32)
+    # (S,T,C,K,3) of (x, y, score_logit) in SOURCE pixels, or None when this detector has no
+    # keypoint branch. Kept beside the boxes rather than returned separately-shaped so a caller
+    # that indexes `[a, t, ci]` for a box indexes the same way for its keypoints.
+    K_det = int(getattr(det, 'n_keypoints', 0))
+    kp = np.full((S, T, C, K_det, 3), np.nan, np.float32) if K_det else None
     # Static rig: build once. Moving rig: `associate` triangulates per frame from (n,2) centres,
     # so it needs that frame's own (4,4) extrinsic -- built inside the loop below.
     moving = any(session.rig.moving.values())
@@ -185,26 +191,44 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
             nxt = _submit(frames[-1] + 1)
             per_cam = []
             for ci, x, metas, src in fetched:
-                obj, boxes, _ = det(x.to(device))
+                obj, boxes, kpts = det(x.to(device))
                 cam_frames = []
                 for j in range(len(frames)):
-                    b, s = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh)
+                    b, s, ix = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh,
+                                      return_index=True)
+                    k = None
+                    if kpts is not None and b.numel():
+                        # THE SAME letterbox inverse the box goes through -- see
+                        # `unletterbox_keypoints`, which is why it lives next to the box version.
+                        k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)
                     cam_frames.append((unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
-                                       if b.numel() else b.cpu(), s.cpu()))
+                                       if b.numel() else b.cpu(), s.cpu(), k))
                 per_cam.append(cam_frames)
 
             for j, t in enumerate(frames):
                 if C == 1:
-                    b, s = per_cam[0][j]
+                    b, s, k = per_cam[0][j]
                     for a in range(min(S, b.shape[0])):
                         out[a, t, 0] = b[a].numpy()
                         sc[a, t, 0] = float(s[a])
+                        if kp is not None and k is not None:
+                            kp[a, t, 0] = k[a].numpy()
                 else:
                     cams = session.cgroup(gid, t) if moving else cgroup
                     if tracker is not None:
-                        out[:, t], sc[:, t] = tracker.step(
+                        out[:, t], sc[:, t], claimed = tracker.step(
                             cams, [per_cam[c][j][0] for c in range(C)],
                             [per_cam[c][j][1] for c in range(C)])
+                        if kp is not None:
+                            # `claimed[a, c]` is the DETECTION index that slot a took in camera c,
+                            # or -1. Gathering by it is the only way the keypoints follow the same
+                            # row assignment the boxes did.
+                            for a in range(S):
+                                for c in range(C):
+                                    d = int(claimed[a, c])
+                                    kk = per_cam[c][j][2]
+                                    if d >= 0 and kk is not None:
+                                        kp[a, t, c] = kk[d].numpy()
                         continue
                     groups = associate(cams, [per_cam[c][j][0] for c in range(C)],
                                        max_res_px=session.assoc_res_max_px, max_instances=S,
@@ -213,14 +237,19 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                         for c, box in g['boxes'].items():
                             out[a, t, c] = box.numpy()
                             sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
+                            kk = per_cam[c][j][2]
+                            if kp is not None and kk is not None:
+                                kp[a, t, c] = kk[g['members'][c]].numpy()
             frames, pending = nxt
     finally:
         frame_pool.shutdown()
         pool.shutdown()
-    return link_rows(out, sc, max_move=max_move) if (link and tracker is None) else (out, sc)
+    if link and tracker is None:
+        out, sc = link_rows(out, sc, max_move=max_move, extra=kp)
+    return (out, sc) if kp is None else (out, sc, kp)
 
 
-def link_rows(boxes, scores=None, max_move=1.0, max_age=24):
+def link_rows(boxes, scores=None, max_move=1.0, max_age=24, extra=None):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
@@ -306,12 +335,19 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24):
             taken[r] = c
         out = np.full_like(cur, np.nan)
         sc = None if scores is None else np.full_like(scores[:, t], np.nan)
+        # `extra` (S,T,C,...) rides the SAME permutation. Anything indexed by row has to, or it
+        # silently describes a different animal than the box beside it.
+        ex = None if extra is None else np.full_like(extra[:, t], np.nan)
         for r, c in taken.items():
             out[r] = cur[c]
             if sc is not None:
                 # The SAME assignment, or the score stops describing the box beside it.
                 sc[r] = scores[:, t][c]
+            if ex is not None:
+                ex[r] = extra[:, t][c]
         boxes[:, t] = out
+        if ex is not None:
+            extra[:, t] = ex
         if sc is not None:
             scores[:, t] = sc
         seen = np.isfinite(boxes[:, t]).all(-1)

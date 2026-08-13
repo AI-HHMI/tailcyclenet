@@ -115,6 +115,28 @@ def unletterbox_boxes(boxes, scale, pad, src_wh=None):
     return out
 
 
+def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
+    """Detector-input keypoints (N,K,3) -> source-image keypoints. Sibling of `unletterbox_boxes`.
+
+    Lives HERE, beside the box version, for the reason the box version gives for living here: it
+    is the one inverse every consumer goes through, and a keypoint un-letterboxed by a different
+    rule than its own box is the class of bug that is invisible in every downstream number.
+
+    Out-of-frame keypoints go NaN rather than clamping. A box is clamped because a partly-visible
+    animal still has a real extent inside the frame; a keypoint outside the frame was not observed
+    there, and clamping it to the border would invent a position on the edge -- which is precisely
+    what `dataset.py`'s prior bounds mask exists to refuse.
+    """
+    out = kpts.clone().float()
+    out[..., 0] = (out[..., 0] - pad[0]) / scale
+    out[..., 1] = (out[..., 1] - pad[1]) / scale
+    if src_wh is not None:
+        w, h = float(src_wh[0]), float(src_wh[1])
+        bad = ((out[..., 0] < 0) | (out[..., 0] > w) | (out[..., 1] < 0) | (out[..., 1] > h))
+        out[..., :2] = torch.where(bad[..., None], torch.nan, out[..., :2])
+    return out
+
+
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
     """A random similarity about the image centre, source pixels in and out, as a 2x3.
 

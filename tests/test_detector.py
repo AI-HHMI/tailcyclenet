@@ -541,7 +541,7 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
             per_cam.append(torch.stack([uv[:, 0] - 20, uv[:, 1] - 20,
                                         uv[:, 0] + 20, uv[:, 1] + 20], -1))
         scores = [torch.ones(1) for _ in cg]
-        got, _ = tr.step(cg, per_cam, scores)
+        got, _, _ = tr.step(cg, per_cam, scores)
         ref = associate(cg, per_cam, max_res_px=30.0, max_instances=1)
         assert len(ref) == 1
         for c, box in ref[0]['boxes'].items():

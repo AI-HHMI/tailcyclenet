@@ -185,23 +185,33 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     return total, parts
 
 
-def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5):
+def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5, return_index=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     `top_k` is the expected animal count, not a hard cap: it is applied AFTER NMS so a frame
     with fewer animals returns fewer boxes rather than padding with duplicates.
+
+    `return_index=True` adds the ANCHOR index of each kept box. The keypoint branch emits per
+    anchor, so that index is the only way to pair a surviving box with its own keypoints --
+    recovering it afterwards by matching box geometry is ambiguous wherever two anchors decode to
+    near-identical boxes, which is exactly what NMS is there to collapse.
     """
     scores = obj_logits.sigmoid()
     keep = scores >= score_thresh
     if not keep.any():
-        return boxes.new_zeros((0, 4)), scores.new_zeros((0,))
+        empty = (boxes.new_zeros((0, 4)), scores.new_zeros((0,)))
+        return (*empty, torch.zeros(0, dtype=torch.long, device=boxes.device)) \
+            if return_index else empty
     order = scores[keep].argsort(descending=True)
     b, s = boxes[keep][order], scores[keep][order]
+    ix = keep.nonzero().flatten()[order]
 
-    kept_b, kept_s = [], []
+    kept_b, kept_s, kept_i = [], [], []
     while b.numel() and len(kept_b) < top_k:
         kept_b.append(b[:1])
         kept_s.append(s[:1])
+        kept_i.append(ix[:1])
         survives = box_iou(b[:1], b)[0] < iou_thresh
-        b, s = b[survives], s[survives]
-    return torch.cat(kept_b), torch.cat(kept_s)
+        b, s, ix = b[survives], s[survives], ix[survives]
+    out = (torch.cat(kept_b), torch.cat(kept_s))
+    return (*out, torch.cat(kept_i)) if return_index else out

@@ -31,6 +31,7 @@ tailcyclenet/
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
   infer.py            THE inference path: one window loop
   detector/           YOLOX-Nano box predictor + cross-view association
+    track.py            ONE cross-view target set. `--track`; replaces associate+link_rows
 scripts/              convert_v4.py  train.py  train_detector.py  infer.py  eval.py
 configs/              example configs, hand-written. NOT generated, NOT one per experiment.
 tests/
@@ -123,6 +124,9 @@ run folder as `keypoint_registry.toml` and read back at inference. Given an exis
 later run **appends** new names so old ids — and the embedding rows behind them — survive warm
 start.
 
+A run folder also carries **`provenance.toml`** — the commit and a dirty flag at save time. It is
+there because a config is not a provenance record and gotcha 12 is what that cost.
+
 ### The architecture: two switches
 
 ```toml
@@ -195,6 +199,13 @@ query is a real prior, and per-frame re-anchoring exists specifically to rescue 
 anchor. So `prior` → `"query"` and `none` → `"triangulated"`, which also makes `wide` + `none` +
 `"triangulated"` a faithful **golden j3** architecture.
 
+**`gridresid_offset` HAS NO DEFAULT and an absent key raises.** The two values load the same
+tensors, so a checkpoint trained under one and built under the other produces numbers instead of an
+exception — measured at **+23.1 mm MPJPE and −0.18 MOTA** on 3dpop (report 13 §0b). Gotcha 12.
+`load_run(model_overrides=…)` / `scripts/infer.py --gridresid-offset` state the value for a run
+folder written before the key existed; that is an assertion about weights nobody recorded, and it
+is echoed as one.
+
 The substitution uses the **detached** triangulation, and that is also the loss gate: the direct
 term is then constant at unprompted points, contributing exactly zero gradient, so
 `coords_loss_direct*` and `coords_softmax_3d` supervise query points only — without forking
@@ -218,7 +229,18 @@ means a `prior` − `none` delta cannot be attributed to the prior alone. Say so
 eval rule 4, and `improvement_leads.md` opens by retracting a claim of exactly this shape.
 Isolating either lever needs a third arm.
 
-Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, prompt corruption,
+**Prompt corruption is REOPENED, with two of its three parts built** (`prompt_offset_px`,
+`prompt_stale_frames`, both default 0). The reason is that i.i.d. jitter is not the failure
+deployment produces: Gaussian noise averages to zero over the keypoint set, so it teaches the model
+to trust the prior's **centroid** exactly — the one quantity a whole-body lag gets wrong. The lag is
+real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion). Wrong-animal is *not*
+built, because by the time `kpt_prior` exists `coords` has been through the crop, the resize and a
+random world rotation whose matrix `rotate_camera_group` does not return; the offset term covers the
+displacement part and `scripts/infer.py --oracle-corrupt other` measures whether it is a distinct
+failure mode. Bar for keeping either: allen cross-animal inside the reproduction band (near
+3.394 mm) *and* a smaller `motion_ratio` gap on johnson. Ships WITH `prompt_dropout`.
+
+Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
 is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:
 pose, no jitter, **12k**). The one-key figure from that ledger is **3.535 vs 4.021**, unpaired,
@@ -236,6 +258,32 @@ There is **one** window loop. posetail-pose had three, and all three got it wron
 Box sources are the annotation set, a detections npz, or a per-dataset detector. Prompt regimes:
 `none` (query-free), `carry` (previous window's own prediction — what deployment does, requires
 `overlap >= 1`), `self` (two passes per window). Rendering is a flag, not a separate script.
+
+**`carry` feeds back the ANCHOR-FREE estimate, not the reported prediction** (`--carry-source`,
+default `triangulate`). Under `gridresid_offset = "query"` the reported 3D output *is*
+`query + R @ residual` with one anchor per keypoint for the whole window, so writing it back closes a
+loop with gain: whatever the prior was wrong by is re-added and only the residual carries new
+information. Measured on johnson-mouse, where the run is consistently trained so this is not
+gotcha 12: **23-39% of the animal's motion lost**, and every consistency statistic in the repo
+*rewarded* it (best jerk 0.392 vs 0.507, best bone CV 0.148 vs 0.251) because a locked pose is a
+smooth one. `3d_pred_triangulate` is re-derived from each window's own pixels every frame and is
+supervised on every keypoint, so carrying it changes no reported output and breaks only the feedback
+path. **2D is bit-identical either way** — one camera has nothing to triangulate and the grid head
+decodes absolute pixel bins — which is checked on calms21 and rat-city and pinned as a test, and is
+what confines the risk of this to the 3D roots. `--carry-source pred` restores the old behaviour so
+the comparison stays available.
+
+Nothing in training or val exercises `carry`: the training prior is GT ± i.i.d. jitter or absent, and
+val runs `none` then `self` (one window, same pixels, qt = 0). `--oracle-corrupt` (with
+`--anchor labels`, diagnostic only) is how the echo coefficient is measured without a training run —
+a whole-body offset in **crop widths**, a stale-frame prior, or the neighbouring animal's.
+
+The npz also carries **`box_agree`** (S,T,C) — the predicted centroid's distance from the centre of
+the crop box that produced its pixels, in units of one box side, reprojected in 3D. The pipeline held
+two independent statements about where an animal is, the box and the pose, and nothing compared them.
+In animal-size units, so unlike `--vis-thresh`'s logit one value means the same thing on every root.
+And **`pred_tri`** / **`tri_degenerate`**, because every fix above rests on the triangulation and
+nothing had ever scored it.
 
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw. Multi-animal rows report **matched** MPJPE: row
@@ -273,7 +321,12 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   is a LOGIT with no portable value (medians +2.7 / +4.0 / +15.4 across the three roots), and the
   lever itself can be negative. **Never quote it without the rate-matched random rejection of the
   same number of rows** — any rejection flatters a mean over matched points, and the control is the
-  entire reason the number means anything.
+  entire reason the number means anything. **Its measured justification is also not yet clean**: at
+  `eval.py --min-match-kpts 0` a predicted row that shares ONE keypoint with a GT row can win the
+  Hungarian on that keypoint alone, and this gate is precisely what makes rows sparse. Re-run it with
+  the guard on before quoting it again. An all-NaN-confidence row is no longer silently kept either
+  (`NaN < thresh` was False, so the row the model said least about was the one the gate could not
+  touch).
 - **`--n-frames` shorter is a trade, not a win.** 24 → 12 → 8 on 3dpop moves MOTA 0 → +0.106 → +0.130
   and pck@10 0.103 → 0.074 → 0.067, monotonically in both directions, with MPJPE inside its interval
   throughout. A shorter window shrinks the crop union AND cuts temporal context; the first buys
@@ -281,7 +334,16 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 - **`--refine`** re-crops each window to the first pass's own prediction, label-free, at 2× the pose
   compute. It improves every PCK threshold on all three roots (calms21 +0.028/+0.031/+0.021) and
   leaves MPJPE, coverage and MOTA inside their intervals on both interval-bearing datasets. This is
-  the arm that shrinks the crop union WITHOUT shortening the window.
+  the arm that shrinks the crop union WITHOUT shortening the window. It is now **bounded**: a refined
+  box that does not overlap the box it came from is rejected, because `crop_box_for_points` SQUARES
+  the extent and a pose that wandered lands somewhere else entirely (the giant squares in
+  `rat-city_best.npz`). And `crop` keeps the FIRST-PASS box — the refined one goes in `crop_refined`,
+  since `crop` is the only record of what the box source offered and every coverage and
+  crop-inflation number in reports 08 and 11 is computed from it.
+- **`--min-box-frames`** (default 1 = unchanged). One finite box out of T × C used to position a crop
+  for all 24 frames and mark every one `ok`: 3dpop reports 0.000 of (row, frame) with no pose against
+  2.1–2.2% with no camera at all. Raising it LOWERS reported coverage, which is the point; it moves
+  the same number the row matcher moves, so the two need separate arms.
 
 On 3dpop the first two together beat a 7.7×-compute detector (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
 0.572) with no retraining.
@@ -329,6 +391,36 @@ trained on `instances.pq` boxes serves a keypoint-trained pose run a different c
 because `scratch/phase1/rat-city-inst` is the best rat-city detector on record (recall 0.531 vs 0.429)
 while every rat-city pose run is keypoint-trained, so the mismatched pair is worth running. Its delta
 against a matched pair moves two keys and is not a detector-quality result.
+
+**`--link-boxes` is a per-frame Hungarian on CENTRE DISTANCE over the box side, gated at one side.**
+It used to be ungated IoU with a force-assign, and all three parts were wrong. IoU ranks by shape
+agreement, which is not identity — replaying calms21 frame 301→302 from the box cache, IoU scored the
+WRONG mouse at 0.512 against the right one's 0.233 (two touching 220 px mice overlap almost equally)
+and the pose error jumped from 4–10 px to 60–82 px; IoU is also exactly zero under fast motion, where
+it cannot rank at all. The gate at one box side has 10–16× headroom over real motion (p90 centre
+displacement is 0.06–0.11 body lengths on every multi-animal root) and rejects the 3.4–3.9% of 3dpop
+row transitions that jump beyond a body length. And an unmatched row now stays EMPTY instead of taking
+`free.pop(0)`, an arbitrary leftover: that was rat-city row 9, whose normal-sized boxes teleported
+across the arena and whose window union came out **1924×1924 against a 244 px rat**. Unclaimed
+detections may be born into an empty row; `last` expires after one window. **`LINK_REV` is in the
+`--det-cache` stamp** because the cache stores boxes that have already been linked, so changing this
+rule silently makes an old cache a different box set.
+
+**`--track` is the target state, and it is what deletes the above.** `detector/track.py`: ONE
+cross-view target set with one affinity and one Hungarian, replacing per-frame `associate` plus
+`link_rows`, which never exchanged anything with each other or with `carried`. Report 12 §2.1 measures
+the memoryless pass leaving **17.2% of offered boxes unclaimed** at 15 px jitter where target matching
+claims all of them, and §2.2 measures it at **4.1 s/frame at C = 16** against ~0.6 ms — johnson-mouse
+is a 16-camera rig, so any multi-animal 16-camera rig is currently unrunnable. `associate` stays for
+BIRTHS, which is the one place a memoryless pairwise search is right. The affinity is the reprojection
+distance of the target's held 3D point over the detection's box side — the same test as report 12's
+eq 4 point-to-ray, in the same units and with the same gate as `--link-boxes`, and with no `alpha_3d`
+constant to calibrate. Off by default until measured on 3dpop.
+
+**Every detector box is bounded in `unletterbox_boxes`.** `yolox.py:167` decodes a side as
+`exp(clamp(-6,6)) * stride` — up to ~12,910 px, ~137,000 source px after a 1/7 letterbox — and IoU-only
+NMS cannot suppress it (its IoU with the real box it swallows is ~0). Clamped into the frame; a box
+with no positive area comes back NaN, which every consumer already reads as "no box here".
 
 **`min_views = 2` in `associate` was never a threshold — it is the algorithm.** Every instance is
 built from a cross-camera PAIR, so `len(members) >= 2` holds by construction and the check could not
@@ -425,6 +517,20 @@ three times in one afternoon and twice mid-sweep.
    `TAILCYCLENET_READER_CACHE` is an override rather than a per-dataset requirement. A cache below
    the camera count misses on *every* call: a 16-camera rig at 4 ran detection 2.5× slower.
 
+12. **A RUN FOLDER USED TO RECORD NO COMMIT, and one config key had a default it could not
+   justify.** `runs/3dpop-prior` trained under unconditional per-frame re-anchoring, finished nine
+   hours before `bcbfbc1` replaced that with the query-anchored residual, and carries no
+   `gridresid_offset` — so `cfg.pop('gridresid_offset', 'query')` loaded it as the architecture it was
+   not trained as, for weeks, silently. It cost **+23.1 mm MPJPE [+22.3, +24.0] and −0.18 MOTA** on
+   3dpop against reading the same weights correctly, and the pose visibly lagged the animal until the
+   bounds mask dropped the prior and the fallback snapped it back to the triangulation it *was*
+   trained on. Both halves are now closed: `save_run_meta` writes `provenance.toml`, and the key
+   raises rather than defaulting. **The `-none` siblings are mismatched harder**: query-free,
+   `_query_anchored` substitutes the triangulation at every keypoint, so the residual head's output is
+   discarded outright. Keyless generations: `runs/*`, `runs/20260810/*`, `runs/20260810_1711/*`. 2D is
+   unaffected (`forward` returns at `model.py:300` before both offset paths), so rat-city and
+   branson-fly are keyless and harmless. Any 3D number published off those three needs re-checking.
+
 ---
 
 ## Evaluation rules carried over from posetail-pose
@@ -444,6 +550,17 @@ These are not style preferences; each one was learned by publishing a wrong numb
 7. **Anchor and prior inputs are GT-derived.** They must be gated off at eval by default. In
    posetail-pose their absence inflated *every* anchored number ever published there.
 8. Only MOTA replicates across seeds, and only above a ±0.023 seed floor.
+9. **The matcher itself can be fooled.** `match_instances`' cost is a mean over SHARED keypoints, so
+   at `--min-match-kpts 0` a row sharing one keypoint is scored on that keypoint and can hijack a GT
+   row. It is a FRACTION of K, not a count — K is 4 on rat-city and 47 on allen. Default 0 keeps every
+   published number reproducible; any claim about a lever that changes row sparsity needs it on.
+10. **Pairing is complete-case, which flatters the arm that failed more.** A group where either side
+   is non-finite leaves the comparison, so `paired_bootstrap` returns `n_dropped` and `eval.py --vs`
+   prints it. A delta over 9 of 17 groups is not a delta over 17.
+11. **There is now a temporal statistic, and there was not before.** `motion_ratio` / `path_length`,
+   paired over the steps both arms attempted. Every consistency number this repo had — jerk, bone CV —
+   *rewards* a prediction that stopped moving, which is how RC1 stayed invisible. And `box_agree` is
+   the pose-against-its-own-box check, in animal-size units.
 
 Reproduction note: posetail-pose's `reports/golden_allen_j3.json` is an exact-reproduction
 contract for *that* pipeline. This repo will not match it bit-for-bit and should not claim to.

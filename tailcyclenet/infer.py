@@ -48,6 +48,9 @@ SEAM_MODES = ('last', 'blend')
 # different problems with four different fixes, and they arrived indistinguishable.
 OUTCOMES = ('ok', 'no box', 'no camera', 'no points', 'crop failed', 'decode failed')
 
+# How many cameras `decode_crops` may decode at once. A memory bound, not a core count -- see there.
+_CAM_DECODE = 4
+
 
 @dataclass
 class InferConfig:
@@ -431,22 +434,45 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         # ponytail: peak memory is one camera's window of FULL frames plus every animal's crops --
         # 24 x 21 MB on johnson-mouse's 3208x2200 rig, which has one animal. A wide rig with many
         # animals would want the frame loop chunked; nothing shipped is both.
+        # AND THE CAMERAS OVERLAP, up to `_CAM_DECODE` of them. This loop used to be serial across
+        # cameras because `dataset._read_video` held ONE global lock, so a second thread would only
+        # have queued on it; the lock is now per container, and different cameras are different
+        # containers. Video is where it matters -- 3dpop decodes at ~44 ms per frame-camera against
+        # a pose forward two orders of magnitude cheaper -- but an image directory gains too, since
+        # `read_frames`'s own per-frame pool is per call and one camera at a time could not fill it.
+        #
+        # THE CAP IS MEMORY, NOT CORES. Each task holds one camera's whole window of FULL frames:
+        # 24 x 21 MB on johnson-mouse's 3208x2200 16-camera rig, so unbounded concurrency there is
+        # 8 GB of transient host memory for a rig that has one animal in it. 4 is decord's own
+        # `ChunkShuffle.mix` number and bounds it at four windows.
+        #
+        # `crops` is written from those threads: the keys are distinct per (animal, camera) and a
+        # dict store is atomic under the GIL, so the result does not depend on the order they land.
         def decode_crops(plans):
             crops = {}
+            cams = sorted({c for _, use, *_ in plans for c in use})
+
+            def one(ci, pool):
+                imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
+                # A file that will not decode is a property of the file, not of the animal, so
+                # it takes out every animal that wanted this camera -- which is what the
+                # per-animal decode did too, one animal at a time.
+                ok = not any(im is None for im in imgs)
+                for a, use, boxes, cgroup, _ in plans:
+                    if ci in use:
+                        i = use.index(ci)
+                        crops[a, ci] = (_crop_views(imgs, boxes[i], cgroup[i]['size'].tolist())
+                                        if ok else None)
+                del imgs
+
             with ThreadPoolExecutor(max_workers=8) as pool:
-                for ci in sorted({c for _, use, *_ in plans for c in use}):
-                    imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
-                    # A file that will not decode is a property of the file, not of the animal, so
-                    # it takes out every animal that wanted this camera -- which is what the
-                    # per-animal decode did too, one animal at a time.
-                    ok = not any(im is None for im in imgs)
-                    for a, use, boxes, cgroup, _ in plans:
-                        if ci in use:
-                            i = use.index(ci)
-                            crops[a, ci] = (_crop_views(imgs, boxes[i],
-                                                        cgroup[i]['size'].tolist())
-                                            if ok else None)
-                    del imgs
+                if len(cams) < 2:
+                    one(cams[0], pool) if cams else None
+                else:
+                    # A SECOND POOL: `one` runs in this one and waits on futures in `pool`, and a
+                    # pool that waits on itself deadlocks as soon as both are full.
+                    with ThreadPoolExecutor(max_workers=min(_CAM_DECODE, len(cams))) as cpool:
+                        list(cpool.map(lambda ci: one(ci, pool), cams))
             return crops
 
         def forward(plan, crops):

@@ -429,10 +429,10 @@ def main():
                 # inference that produced it, and it depends on nothing the loop mutates afterwards
                 # -- `out['pred']` and `det_boxes` are finished arrays by here.
                 #
-                # ONE worker, not several: `dataset._readers` is a module-level cache of stateful
-                # decord readers and `_read_video` now holds a lock around the decode, so extra
-                # render threads would queue on that lock rather than overlap. What overlaps is the
-                # ENCODE, which is where a render's time goes.
+                # ONE worker, not several. `_read_video`'s lock is now PER CONTAINER, so two
+                # renders of two cameras would genuinely overlap their decodes -- but a render
+                # holds a clip's worth of full frames and the encode, not the decode, is where a
+                # render's time goes. The reason is memory now, not the lock.
                 for ci in render_cams:
                     cam_name = sess.cam_names[ci]
                     # The per-frame boxes the crop rule was fed, in each row's own colour: a box

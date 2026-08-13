@@ -358,6 +358,17 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 On 3dpop the first two together beat a 7.7×-compute detector (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
 0.572) with no retraining.
 
+**`soft_argmax_threshold = 60` IS LOAD-BEARING — do not widen it.** `_grid_softmax` masks the softmax
+to `|argmax - index| <= threshold` bins, and the shipped runs set `head_3d_grid_size = 1024` (not the 64
+of the test config), so 60 is a window of 121 of 1024 bins — 12% of the grid, ±0.21 of the ±1.8
+head-unit radius. It reads like a bias that pulls extremities inward, and it does move them a lot
+(3dpop p50 5.88 mm, `bp_tail` 14.09, `bp_topKeel` 12.75, against 3.2-4.1 for body points) — but swept
+against the labels it is the OPTIMUM: 10/20/30/45/**60**/120/∞ read
+8.114/8.032/7.991/7.981/**7.976**/8.374/**11.032** mm. Removing the truncation costs +3.06 mm, 38%: it
+suppresses spurious far modes rather than introducing a bias, and 256 and ∞ are identical so the
+posterior never spreads further than that. It is a plain attribute, not in any `state_dict`, so it is
+sweepable at inference with no retrain — which is how this was settled, and it is settled.
+
 **Read the FP split per dataset before choosing a fix.** The detector's FP rise over the GT crop is
 91% `fp_none` on 3dpop (4 cameras, low overlap) and 90% `fp_dup` on calms21 (two mice, heavy
 overlap). Cross-track arbitration is therefore worthless on the first and addresses nearly the whole

@@ -610,9 +610,14 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             if blend is None:
                 pred[a, frames] = p
             else:
+                # `np.add.at`, NOT `+=`. A single-frame group is padded to two frames by REPEATING
+                # its index (see `frames` above), and `arr[[0, 0]] += x` applies only the last write
+                # -- so a plain `+=` would silently drop a contribution and leave the count and the
+                # sum both short. Every other write in this loop is an assignment, where a repeat is
+                # harmless; this is the one accumulation.
                 fin = np.isfinite(p).all(-1)
-                blend[0][a, frames] += np.where(fin[..., None], np.nan_to_num(p), 0.0)
-                blend[1][a, frames] += fin
+                np.add.at(blend[0], (a, frames), np.where(fin[..., None], np.nan_to_num(p), 0.0))
+                np.add.at(blend[1], (a, frames), fin)
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
                               None if vlogit is None else torch.as_tensor(vlogit[j]))

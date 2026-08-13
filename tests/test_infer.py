@@ -363,24 +363,36 @@ def test_seam_blend_averages_the_overlap_and_changes_only_the_overlap(scene):
     overlap frames, or it is averaging nothing.
     """
     model, sess, registry, name = scene
-    last = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', seam='last'))
-    blend = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', seam='blend'))
+    # n_frames=2, overlap=1 -- NOT `_cfg`'s defaults. The fixture groups are 4 frames long, so at
+    # n_frames=4 `_window_starts` returns a SINGLE window and there is no overlap to blend: an earlier
+    # version of this test guarded that with `pytest.skip` and therefore never ran on either fixture.
+    # 2 is the floor (gotcha 1: T = 1 hits posetail's gT = T // tubelet = 0).
+    NF, OV = 2, 1
+    kw = dict(anchor='none', n_frames=NF, overlap=OV)
+    last = run_group(model, sess, 'g000', registry, name,
+                     InferConfig(image_size=64, min_crop_dim=16, device='cpu', seam='last', **kw))
+    blend = run_group(model, sess, 'g000', registry, name,
+                      InferConfig(image_size=64, min_crop_dim=16, device='cpu', seam='blend', **kw))
     assert blend['pred'].shape == last['pred'].shape
     # Coverage cannot fall: a frame one window decoded is that window's value, nan-aware.
     assert (np.isfinite(blend['pred']).all(-1).sum()
             >= np.isfinite(last['pred']).all(-1).sum())
     starts = last['window_start']
-    if len(starts) < 2:
-        pytest.skip('needs at least two windows to have an overlap at all')
+    assert len(starts) >= 2, f'the fixture must produce several windows, got {starts}'
     T = last['pred'].shape[1]
     covered = np.zeros(T, int)
     for s0 in starts:
-        covered[s0:min(s0 + 4, T)] += 1          # _cfg uses n_frames=4
+        covered[s0:min(s0 + NF, T)] += 1
+    assert (covered > 1).any(), 'the fixture must actually overlap'
     solo = covered == 1
     if solo.any():
         np.testing.assert_allclose(blend['pred'][:, solo], last['pred'][:, solo],
                                    rtol=1e-5, atol=1e-5)
-    assert (covered > 1).any(), 'the fixture must actually overlap'
+    # ...and the overlap frames must actually MOVE, or nothing is being averaged.
+    over = covered > 1
+    ok = np.isfinite(blend['pred'][:, over]).all(-1) & np.isfinite(last['pred'][:, over]).all(-1)
+    assert ok.any(), 'need a finite overlap frame to compare'
+    assert not np.allclose(blend['pred'][:, over][ok], last['pred'][:, over][ok])
 
 
 @pytest.mark.parametrize('argv,expect', [
@@ -410,3 +422,52 @@ def test_the_cli_refuses_incoherent_combinations_before_loading_anything(argv, e
                        capture_output=True, text=True, timeout=300)
     assert r.returncode != 0
     assert expect in (r.stderr + r.stdout), f'wanted {expect!r}, got:\n{r.stderr[-800:]}'
+
+
+def test_seam_blend_accumulates_a_repeated_frame_index():
+    """`arr[[0, 0]] += x` applies only the LAST write, and `run_group` produces a repeated frame index.
+
+    A group shorter than two frames is padded by repeating its index (`np.clip(np.arange(start,
+    start + 2), ...)`), because T = 1 hits posetail's `gT = T // tubelet = 0` bug. Every other write in
+    the loop is an assignment, where a repeat is harmless; the blend accumulator is the one place it is
+    not, and numpy's fancy-index `+=` fails silently there rather than raising.
+    """
+    sum_ = np.zeros((1, 3, 1, 2))
+    cnt = np.zeros((1, 3, 1), int)
+    frames = np.array([0, 0])                      # what a one-frame group produces
+    p = np.array([[[1.0, 1.0]], [[3.0, 3.0]]])     # two decodes of the same frame
+    fin = np.isfinite(p).all(-1)
+    np.add.at(sum_, (0, frames), np.where(fin[..., None], p, 0.0))
+    np.add.at(cnt, (0, frames), fin)
+    assert cnt[0, 0, 0] == 2, 'both decodes of the repeated frame must be counted'
+    assert sum_[0, 0, 0, 0] == 4.0
+    # The mean is then 2.0. A plain `+=` would have given count 1 and sum 3.0, i.e. it would have
+    # thrown one decode away and still produced a plausible-looking number.
+    naive_s = np.zeros_like(sum_); naive_c = np.zeros_like(cnt)
+    naive_s[0, frames] += np.where(fin[..., None], p, 0.0)
+    naive_c[0, frames] += fin
+    assert naive_c[0, 0, 0] == 1 and naive_s[0, 0, 0, 0] == 3.0
+
+
+def test_the_tracker_projects_correctly_on_a_moving_rig():
+    """Gotcha 9's class: `project_points_torch` aligns a (T,4,4) extrinsic against axis -3 of the points,
+    which for a (n_targets, 1, 3) reshape would be the TARGET axis, silently projecting target i through
+    frame i's pose. `detect_group` avoids it by asking for one frame at a time -- `Session.cgroup(gid, t)`
+    with a scalar returns a (4,4) ext even on a moving rig -- and that is the property pinned here,
+    because it is a property of the CALLER and nothing in `track.py` would notice if it changed."""
+    import conftest as cf
+    from tailcyclenet.detector.track import _project
+    from tailcyclenet.format import Session
+
+    root = Path(tempfile.mkdtemp())
+    cf._session_3d(root / 'mv' / 'test' / 's_moving', moving=True)
+    sess = Session.load(root / 'mv' / 'test' / 's_moving')
+    sess.preload()
+    gid = list(sess.groups)[0]
+    per_frame = sess.cgroup(gid, 0)
+    assert all(c['ext'].ndim == 2 for c in per_frame), \
+        'a scalar frame must give a (4,4) ext, or the projection axis alignment below is wrong'
+    assert sess.cgroup(gid)[0]['ext'].ndim == 3, 'the whole-group form must still be per-frame'
+    for n in (1, 3):
+        out = _project(per_frame[0], np.zeros((n, 3), np.float32))
+        assert out.shape == (n, 2)

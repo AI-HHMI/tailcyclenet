@@ -88,7 +88,8 @@ class CrossViewTracker:
         self.max_age = int(max_age)
         self.min_views = int(min_views)
         self.dup_res_px = dup_res_px
-        self.targets = {}                  # slot -> {'point': (3,) float32 tensor, 'age': int}
+        # slot -> {'point': (3,) float32, 'age': int, 'stale': int, 'sides': {cam: float}}
+        self.targets = {}
 
     # -- one frame ------------------------------------------------------------------------
     def step(self, cgroup, boxes_per_cam, scores_per_cam):
@@ -117,8 +118,15 @@ class CrossViewTracker:
                 continue
             proj = _project(cgroup[c], pts)                                  # (n_t,2)
             d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)  # (n_t,n_det)
-            side = sides[c][None].clamp_min(1e-6)
-            gap = (d / (self.max_move * side)).numpy()
+            # NORMALISE BY THE MEAN OF BOTH SIDES, as `link_rows` does. Dividing by the DETECTION's
+            # side alone lets a spuriously large box buy itself a proportionally large gate, so the
+            # boxes most likely to be wrong are the ones most likely to be admitted. A target that
+            # has never claimed this camera has no side to average, and falls back to the detection's.
+            det_side = sides[c][None]                                        # (1,n_det)
+            prev = torch.tensor([self.targets[s]['sides'].get(c, float('nan')) for s in slots],
+                                dtype=det_side.dtype)[:, None]               # (n_t,1)
+            side = torch.where(torch.isfinite(prev), 0.5 * (prev + det_side), det_side)
+            gap = (d / (self.max_move * side.clamp_min(1e-6))).numpy()
             # THE GATE IS THE ALGORITHM, not a tie-break. A pair beyond one box side is not the same
             # animal, so it must be unavailable to Hungarian rather than merely expensive -- an
             # optimum over an all-bad cost matrix is an arbitrary permutation, which is exactly how
@@ -135,17 +143,27 @@ class CrossViewTracker:
         # -- update: re-triangulate from what this target actually claimed, else hold -------
         for s in slots:
             cams = tuple(sorted(got[s]))
+            fresh = False
             if len(cams) >= 2:
                 p = torch.stack([centres[c][got[s][c]] for c in cams])
                 new = _triangulate(cgroup, cams, p)
                 if bool(torch.isfinite(new).all()):
                     self.targets[s]['point'] = new
+                    fresh = True
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
+                self.targets[s]['sides'][c] = float(sides[c][j])
             # AGE COUNTS FRAMES WITH NO EVIDENCE AT ALL. One camera is evidence: it cannot move the
             # point, but it says the animal is still there, which is what expiry is about.
             self.targets[s]['age'] = 0 if got[s] else self.targets[s]['age'] + 1
+            # STALE COUNTS FRAMES THE POINT DID NOT MOVE, and it is a SECOND counter because `age`
+            # cannot see this: a target claiming exactly one camera every frame resets `age` forever
+            # while `len(cams) >= 2` above never fires, so it never re-triangulates and never
+            # expires -- an immortal target emitting one box per frame off a frozen point. That is a
+            # one-camera 3D window downstream (an untrained input shape at `prob_2d_only = 0`) and a
+            # garbage pose. Same `max_age`: a point nobody could re-derive for a window is not a track.
+            self.targets[s]['stale'] = 0 if fresh else self.targets[s]['stale'] + 1
 
         # -- births: whatever nobody claimed, through the memoryless pairwise search --------
         free = [s for s in range(self.n) if s not in self.targets]
@@ -159,14 +177,16 @@ class CrossViewTracker:
                                  min_views=self.min_views, max_instances=len(free),
                                  dup_res_px=self.dup_res_px)
                 for s, g in zip(free, born):
-                    self.targets[s] = {'point': g['point'], 'age': 0}
+                    self.targets[s] = {'point': g['point'], 'age': 0, 'stale': 0, 'sides': {}}
                     for c, j in g['members'].items():
                         det = keep[c][j]
                         out[s, c] = boxes_per_cam[c][det].numpy()
                         sc[s, c] = float(scores_per_cam[c][det])
+                        self.targets[s]['sides'][c] = float(sides[c][det])
 
         # -- retire: a slot with no evidence for a window is free for whoever is there now ---
-        for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
+        for s in [s for s, t in self.targets.items()
+                  if t['age'] > self.max_age or t['stale'] > self.max_age]:
             del self.targets[s]
         return out, sc
 
@@ -229,6 +249,28 @@ def demo():
     assert np.isfinite(resumed).all(-1).any(-1).sum() == 2
     for s in (0, 1):
         assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0
+    # 5. A target that claims exactly ONE camera every frame must still expire. `age` cannot see
+    #    this -- one camera resets it -- so this is what the second `stale` counter is for.
+    tr2 = CrossViewTracker(2, max_res_px=30.0, max_age=4)
+    per_cam, scores = boxes_at(w)
+    tr2.step(cg, per_cam, scores)
+    assert len(tr2.targets) == 2, 'births failed'
+    one_cam = ([per_cam[0]] + [torch.zeros((0, 4)) for _ in cg[1:]],
+               [scores[0]] + [torch.zeros((0,)) for _ in cg[1:]])
+    for _ in range(6):
+        out1, _ = tr2.step(cg, *one_cam)
+    assert not tr2.targets, 'a single-camera target never expired'
+    # 6. The gate normalises by the MEAN of the target's last side and the detection's, NOT by the
+    #    detection's alone -- otherwise a spuriously large box buys itself a proportionally large
+    #    gate, so the boxes most likely to be wrong are the ones most likely to be admitted.
+    #    Born at side 40, then offered a box inflated 4x: the gate is (40+160)/2 = 100 px, so a
+    #    130 px jump must be REFUSED. The detection-side-only form gated at 160 and took it.
+    for px, want in ((60.0, True), (130.0, False)):
+        tr3 = CrossViewTracker(1, max_res_px=30.0)
+        tr3.step(cg, *boxes_at([a]))                            # birth records side 40
+        moved, sc3 = boxes_at([a + [px * 900.0 / 800.0, 0, 0]], side=160.0)
+        got3, _ = tr3.step(cg, moved, sc3)
+        assert bool(np.isfinite(got3[0]).any()) == want, f'{px} px jump: gate followed the detection'
     print('track.demo: ok')
 
 

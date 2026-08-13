@@ -571,6 +571,21 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
     assert 'BooleanOptionalAction' in src, '--no-track must exist to restore the old behaviour'
 
 
+def test_the_npz_records_which_crop_source_made_it():
+    """`__box_source__` is the detector's TRAINING target and does not say what the crop came from.
+
+    Report 15 §6's two item-3 arms both wrote `__box_source__ = 'keypoints'` (same detector) and
+    nothing else distinguished them, so a `--crop-source` pair was told apart by filename alone --
+    the shape of gotcha 12, one field over. `--refine` rides the same field because it is the other
+    re-crop lever.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    assert "flat['__crop_source__']" in src, 'the crop source must be in the npz, not the shell'
+    assert '"+refine" if cfg.refine' in src, '--refine is a crop change and belongs in that field'
+
+
 def test_a_cache_without_keypoints_cannot_serve_the_keypoint_crop_source():
     """A cache hit must not silently turn `--crop-source keypoints` into `--crop-source boxes`.
 

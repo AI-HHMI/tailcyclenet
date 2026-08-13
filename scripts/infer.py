@@ -501,6 +501,13 @@ def main():
     # is the one that can disagree with it.
     flat['__box_source__'] = np.asarray((det_boxsrc or 'keypoints') if args.detector
                                         else cfg.box_source)
+    # WHAT THE CROP WAS BUILT FROM, which `__box_source__` above does NOT say -- that one is the
+    # detector's TRAINING target. Two arms differing only in `--crop-source` were previously
+    # identical in their own provenance, so report 15 §6's pair could be told apart only by
+    # filename. `--refine` rides here too, being the other re-crop lever, so a three-way comparison
+    # is legible from the files alone.
+    flat['__crop_source__'] = np.asarray(
+        f'{cfg.crop_source}{"+refine" if cfg.refine else ""}')
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
 

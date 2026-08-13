@@ -386,10 +386,16 @@ def _query_anchored(out, query_ok):
         # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
         # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
         # numerator, full denominator), which is exactly how a wrong comparison gets published.
+        bad = ~torch.isfinite(tri).all(-1)
         sub = torch.where(torch.isfinite(tri), tri, _rays_fallback(out))
         # NOT written back on the single-view path: this key drives `coords_loss_triangulate_reproj`
         # at weight 2.0, so pointing it at the rays would reweight the rays supervision by 40x.
         out['3d_pred_triangulate'] = sub
+        # WHERE THE REPAIR ACTUALLY FIRED. The substitution is silent by design -- one tensor for the
+        # loss and the metric -- but `--anchor carry` now SEEDS the next window from this tensor, and
+        # a seed taken from `_rays_fallback` is a point no camera claimed rather than a triangulated
+        # one. Recorded, not gated: the caller decides what a degenerate frame is worth.
+        out['tri_degenerate'] = bad
 
     m = query_ok[None, :, None, :, None]                    # -> (cams, b, t, n, r)
     direct = torch.where(m, out['3d_pred_cams_direct'], sub.detach()[None])
@@ -432,14 +438,16 @@ def _reanchor_per_frame(out, anchor):
     # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
     # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
     # numerator, full denominator), which is exactly how a wrong comparison gets published.
+    bad = ~torch.isfinite(src).all(-1)
     src = torch.where(torch.isfinite(src), src, _rays_fallback(out))
+    out = dict(out)
+    out['tri_degenerate'] = bad                    # see `_query_anchored`
 
     residual = out['3d_pred_cams_direct'] - anchor[:, None, :, :][None]
     new_direct = src.detach()[None] + residual
     conf = torch.softmax(out['conf_3d'], dim=0)
     coords_pred = torch.einsum('cbtnr,cbtn->btnr', new_direct, conf)
 
-    out = dict(out)
     out['3d_pred_cams_direct'] = new_direct
     out['3d_pred_direct'] = coords_pred
     out['coords_pred'] = coords_pred

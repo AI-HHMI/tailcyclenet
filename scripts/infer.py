@@ -85,6 +85,15 @@ def main():
                          'births into empty rows and expiry after a window. Detector rows are '
                          'score-ordered and unlinked by default, which makes the window crop the '
                          'union over several different animals.')
+    ap.add_argument('--track', action='store_true',
+                    help='3D multiview only. ONE cross-view target set with one affinity and one '
+                         'Hungarian, replacing per-frame `associate` plus `link_rows` -- see '
+                         'tailcyclenet/detector/track.py and dev/reports/12. Those two never talked '
+                         'to each other, which is where the teleporting rows and the starved animals '
+                         'come from. Report 12 §2.1 measures the memoryless pass leaving 17.2%% of '
+                         'offered boxes unclaimed at 15 px jitter, and §2.2 measures it at 4.1 s per '
+                         'frame on a 16-camera rig against ~0.6 ms here. Off by default until it is '
+                         'measured on 3dpop; implies --link-boxes, which it subsumes.')
     ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
                     help='3D only. 2 is cross-view association as it stands: every instance is '
                          'built from a camera PAIR, so an animal only one view saw is dropped from '
@@ -139,6 +148,16 @@ def main():
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
+    ap.add_argument('--oracle-corrupt', default=None,
+                    help='ONLY with --anchor labels, and never a deployment arm: break the oracle '
+                         'prior on purpose and see how far the output follows it. `off:<x>` offsets '
+                         'the WHOLE pose by x crop widths in one direction (the shape of a lag, '
+                         'which i.i.d. training jitter never is); `stale:<n>` supplies the pose from '
+                         'n frames earlier; `other` supplies the NEIGHBOURING animal\'s. Those are '
+                         'the three failures deployment produces and none of them is in training. '
+                         'The ratio of output displacement to prior displacement is the echo '
+                         'coefficient alpha, and alpha is what decides whether the prompt needs '
+                         'retraining.')
     ap.add_argument('--min-box-frames', type=int, default=1,
                     help='how many finite (frame, camera) boxes a row needs before it gets a window '
                          'crop. 1 is what the loop always did, and it is how coverage gets '
@@ -192,7 +211,21 @@ def main():
         kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
-        device=device)
+        oracle_corrupt=args.oracle_corrupt, device=device)
+    if args.oracle_corrupt:
+        from tailcyclenet.infer import ORACLE_CORRUPTIONS
+        kind = args.oracle_corrupt.split(':')[0]
+        if kind not in ORACLE_CORRUPTIONS:
+            raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '
+                             f'{ORACLE_CORRUPTIONS} (off:<x> | stale:<n> | other)')
+        if kind in ('off', 'stale') and ':' not in args.oracle_corrupt:
+            raise SystemExit(f'--oracle-corrupt {kind} needs an amount, e.g. {kind}:0.5')
+        if args.anchor != 'labels':
+            raise SystemExit('--oracle-corrupt breaks the ORACLE prior, so it only means anything '
+                             f'under --anchor labels; got {args.anchor!r}.')
+        print(f'*** DIAGNOSTIC: the oracle prior is deliberately corrupted '
+              f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
+              'prediction of anything. ***')
     if args.prior_vis_thresh is not None and args.anchor != 'carry':
         raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
                          f'under --anchor carry; got {args.anchor!r}.')
@@ -200,6 +233,17 @@ def main():
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')
     if args.anchor == 'labels':
+        # AN ORACLE PRIOR AND DETECTOR ROWS ARE INCOMPATIBLE, not merely a bad idea. `run_group`
+        # seeds row `a` from LABEL row `a`, and once boxes come from a detector row `a` is a
+        # score-ordered or association-ordered slot that is not label row `a` for any `a` -- so the
+        # arm that exists to be an upper bound was being handed a different animal's ground truth,
+        # and read as a poor oracle rather than as a broken one.
+        if args.detector or args.boxes:
+            raise SystemExit(
+                '--anchor labels seeds row `a` from LABEL row `a`, but --detector/--boxes rows are '
+                'score- or association-ordered and are not label rows. That is a different '
+                "animal's ground truth, not an oracle. Use --anchor labels with the label crop "
+                'path (no --detector, no --boxes), or --anchor carry / none with a box source.')
         print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
 
@@ -253,7 +297,7 @@ def main():
                         + ([('link_rev', str(LINK_REV))] if args.link_boxes else [])
                         + [(k, str(getattr(args, k))) for k in
                            ('detector', 'max_animals', 'link_boxes', 'det_input_wh',
-                            'max_frames', 'min_views', 'dup_res_px')
+                            'max_frames', 'min_views', 'dup_res_px', 'track')
                            if getattr(args, k) != ap.get_default(k)]))
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
@@ -292,7 +336,8 @@ def main():
                         det, det_wh, sess, gid, n_want, device=device,
                         score_thresh=args.det_score, link=args.link_boxes,
                         reduce=det_red, max_frames=args.max_frames,
-                        min_views=args.min_views, dup_res_px=args.dup_res_px)
+                        min_views=args.min_views, dup_res_px=args.dup_res_px,
+                        track=args.track)
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True
@@ -303,6 +348,15 @@ def main():
                 filled = float(np.isfinite(det_boxes).all(-1).mean())
                 print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
                       f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
+            # A MISSING `--boxes` KEY IS NOT AN ABSENT ARGUMENT. `boxes.get(key)` returning None
+            # silently falls back to cropping from the LABELS, so a run whose keys did not match --
+            # a different session naming, a stale npz, a typo in one group -- reported the GT-crop
+            # oracle under a heading that said otherwise. Nothing in the output said which.
+            if args.boxes and key not in boxes:
+                raise SystemExit(
+                    f'{args.boxes}: no entry for {key!r}. Falling back to the labels here would '
+                    'quietly turn this into the GT-crop upper bound. Keys present: '
+                    f'{sorted(k for k in boxes if not k.startswith("__"))[:5]} ...')
             out = run_group(model, sess, gid, registry, ds_name, cfg,
                             box_points=boxes.get(key), boxes_stc=det_boxes)
             if det_scores is not None:

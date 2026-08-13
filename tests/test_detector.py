@@ -463,3 +463,56 @@ def test_unletterbox_clamps_a_runaway_box_into_the_frame():
     assert torch.isnan(out[1]).all(), 'a box with no positive area is not a detection'
     # Without `src_wh` -- the training path, which has no frame to clamp against -- nothing changes.
     assert unletterbox_boxes(b, 1.0, (0, 0))[0, 2].item() == 20000.0
+
+
+def test_the_cross_view_tracker_holds_identity_where_the_two_old_passes_could_not():
+    """`track.demo()` as a test: report 12 R1's target state, on a three-camera rig.
+
+    `associate` was memoryless and `link_rows` matched per camera against last-known IoU, and the
+    two never exchanged anything -- so a row could be re-grouped from scratch in one pass and
+    re-permuted in the other. One target set with one affinity cannot disagree with itself.
+    """
+    from tailcyclenet.detector.track import demo
+    demo()
+
+
+def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
+    """The target state must not change the easy case, or it is not a drop-in.
+
+    One animal on three cameras with no ambiguity: both routes must produce the same boxes, which is
+    what licenses reading a delta on the crowded case as a crowding result rather than a rewrite.
+    """
+    import numpy as np
+
+    from tailcyclenet.detector.associate import associate
+    from tailcyclenet.detector.track import CrossViewTracker, _project
+
+    from aniposelib.cameras import Camera, CameraGroup
+    from tailcyclenet import format as fmt
+
+    cams = []
+    for i, ang in enumerate((-0.5, 0.0, 0.5)):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
+                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    cg = fmt.Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+                 moving=dict.fromkeys(names, False),
+                 calibrated=dict.fromkeys(names, True)).posetail()
+
+    tr = CrossViewTracker(1, max_res_px=30.0)
+    for t in range(5):
+        w = np.array([[10.0 * t, 0.0, 0.0]], np.float32)
+        per_cam = []
+        for cam in cg:
+            uv = _project(cam, w)
+            per_cam.append(torch.stack([uv[:, 0] - 20, uv[:, 1] - 20,
+                                        uv[:, 0] + 20, uv[:, 1] + 20], -1))
+        scores = [torch.ones(1) for _ in cg]
+        got, _ = tr.step(cg, per_cam, scores)
+        ref = associate(cg, per_cam, max_res_px=30.0, max_instances=1)
+        assert len(ref) == 1
+        for c, box in ref[0]['boxes'].items():
+            np.testing.assert_allclose(got[0, c], box.numpy(), atol=1e-4)

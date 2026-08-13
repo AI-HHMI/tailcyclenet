@@ -87,6 +87,11 @@ class InferConfig:
     # 2D is identical either way: there is no triangulation at one camera and `coords_pred` is an
     # absolute pixel decode, so nothing is being fed its own anchor.
     carry_source: str = 'triangulate'
+    # DELIBERATELY BREAK THE ORACLE PRIOR, to measure how far the output follows it. `--anchor
+    # labels` + this is the only cheap way to get the echo coefficient alpha = d(output)/d(prior)
+    # without a training run, and alpha is what decides whether the prior needs retraining at all.
+    # `off:<x>` | `stale:<n>` | `other`. See `_corrupt_prior`. Never a deployment arm.
+    oracle_corrupt: str | None = None
     device: str = 'cuda:0'
     # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
@@ -148,6 +153,30 @@ def _crop_views(imgs, box, target_size):
     return torch.from_numpy(np.asarray(out))[None]
 
 
+def prior_out_of_bounds(p, mode, cgroup):
+    """Which keypoints of a prior are NOT usable as one. (K,) bool, in the MODEL's own frame.
+
+    A PRIOR OUTSIDE THE CROP IS NOT A PRIOR. In 2D that is a point outside the crop rectangle; in
+    3D it is a point no PAIR of cameras can see, since a point one camera sees is not
+    reconstructible and so cannot be a position the model should trust. A MOVING camera answers per
+    frame ((T,K) rather than (K,)) and the prior is one pose for the whole window, so a camera
+    counts if it saw the point at any point during it.
+
+    ONE COPY OF THE RULE, called from both prompted regimes. `carry` had it and `self` did not, so
+    the two label-free regimes disagreed about what counts as a prior -- and `self` is the one the
+    periodic val eval reports, so training and deployment were being scored under different rules.
+    Masking this was worth MOTA +0.041, miss -0.032 SIG and idsw 24 -> 13 on rat-city under `carry`.
+    """
+    if mode == '2d':
+        w, h = (float(x) for x in cgroup[0]['size'][:2])
+        return (p[:, 0] < 0) | (p[:, 0] >= w) | (p[:, 1] < 0) | (p[:, 1] >= h)
+    seen = []
+    for c in cgroup:
+        v = is_point_visible(c, p, margin=2)
+        seen.append(v.any(0) if v.ndim > 1 else v)
+    return torch.stack(seen).sum(0) < 2
+
+
 def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
     """Re-query at the model's OWN frame-0 prediction. THE label-free prompted regime.
 
@@ -155,11 +184,18 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
     which is what a deployed model does on the first window of a clip and what the periodic val
     eval reports alongside the prior-free number. No ground truth is read, so no gate reopens.
 
+    The frame-0 pose is already in the model's own frame, so it needs no conversion -- but it does
+    need the same BOUNDS MASK `carry` gets, and it did not have one. A keypoint the first pass put
+    outside its own crop, or in 3D somewhere no camera pair can see, was handed back as a confident
+    prior; NaN is the right value, because it is what the no-query tokens key off, so the keypoint
+    degrades to "I was not told" instead of "I was told a lie".
+
     Shared with the trainer deliberately: this repo has one window loop and it should have one
     self-prompt, or the number training reports and the number inference produces drift apart.
     """
     p = first['coords_pred'][0].detach()
     prior = p[0][None].clone()                         # (1,K,R), the frame-0 pose
+    prior[0, prior_out_of_bounds(prior[0], mode, cgroup)] = float('nan')
     qt = torch.zeros(prior.shape[:2], dtype=torch.int32, device=prior.device)
     return model(views, kpt_ids, cgroup, mode=mode, kpt_prior=prior, prompt_time=qt,
                  kpt_chunk=kpt_chunk)
@@ -243,6 +279,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # the npz where `eval.py` can. Independent of `carry_source`, deliberately: it is a property of
     # the forward, not of what the loop chose to do with it.
     pred_tri = np.full((S, T_total, K, R), np.nan, np.float32) if mode == '3d' else None
+    tri_bad = np.zeros((S, T_total, K), bool) if mode == '3d' else None
     carried = [None] * S                      # per-animal prior for the next window
     # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
     # Both are what makes a coverage delta readable -- 08's crop-inflation measurement needed the
@@ -390,8 +427,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             views = [crops[a, ci] for ci in use]
             if any(v is None for v in views):
                 return None                     # already marked 'decode failed' above
-            prior, prompt_t = _build_prior(cfg, carried[a], src[a] if a < n_lab else None,
-                                           frames, boxes, scales, mode, K, R, cgroup)
+            prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
+                                           scales, mode, K, R, cgroup)
             dev = cfg.device
             chunk = cfg.kpt_chunk or None
             views = [v.to(dev) for v in views]
@@ -505,6 +542,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             pred[a, frames] = p
             if pred_tri is not None and out.get('3d_pred_triangulate') is not None:
                 pred_tri[a, frames] = out['3d_pred_triangulate'][0].detach().cpu().numpy()
+                if out.get('tri_degenerate') is not None:
+                    # A DEGENERATE SOLVE IS REPAIRED FROM THE RAYS, and `carry` now seeds the next
+                    # window from this tensor -- so how often that happened has to be visible rather
+                    # than absorbed into one silently-substituted array.
+                    tri_bad[a, frames] = out['tri_degenerate'][0].detach().cpu().numpy()
             _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
             vlogit = None
             if 'vis_pred' in out:
@@ -520,10 +562,15 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # many (eval rule 4), and a gate that also blinded the next window's prompt would be
             # measuring the prompt.
             if cfg.vis_thresh is not None and vlogit is not None:
-                with np.errstate(all='ignore'):
+                with warnings.catch_warnings(), np.errstate(all='ignore'):
+                    warnings.simplefilter('ignore', RuntimeWarning)       # an all-NaN row is legal
                     # The MEDIAN over keypoints: a mean lets one confident keypoint carry a row the
                     # model otherwise declined.
-                    drop = np.nanmedian(vlogit, axis=-1) < cfg.vis_thresh
+                    med = np.nanmedian(vlogit, axis=-1)
+                # AN UNSCORABLE ROW IS NOT A PASSING ROW. `NaN < thresh` is False, so a row whose
+                # every keypoint confidence was NaN used to sail through the gate -- the one row the
+                # model said least about was the one the gate could not touch.
+                drop = ~(med >= cfg.vis_thresh)
                 pred[a, frames[drop]] = np.nan
                 conf[a, frames[drop]] = np.nan
                 box_agree[a, frames[drop]] = np.nan
@@ -543,6 +590,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                               ('instances.pq' if inst_boxes is not None else 'labels'))}
     if pred_tri is not None:
         out_npz['pred_tri'] = pred_tri
+        out_npz['tri_degenerate'] = tri_bad
     if crop_refined is not None:
         out_npz['crop_refined'] = crop_refined
     return out_npz
@@ -581,7 +629,63 @@ def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
         box_agree[a, frames, ci] = np.linalg.norm(c - centre, axis=-1) / side
 
 
-def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cgroup):
+ORACLE_CORRUPTIONS = ('off', 'stale', 'other')
+
+
+def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup):
+    """The oracle prior, optionally broken on purpose. Returns (pose in the SOURCE frame, qt).
+
+    THIS MEASURES alpha = d(output)/d(prior), the echo coefficient, and it is the cheapest thing in
+    the whole programme: no training, one afternoon, and it decides whether the prompt needs
+    retraining at all. Near 0 means the model corrects a bad prior from the pixels; near 1 means it
+    echoes it, and a loop that feeds the model its own output then has gain.
+
+    The three corruptions are the three failures deployment actually produces, and NONE of them is
+    in training -- `dataset.py` offers GT plus i.i.d. Gaussian jitter, or nothing at all:
+
+    - `off:<x>`   a WHOLE-BODY offset of x crop widths, one direction for the whole pose. This is
+                  the shape of a lag: every keypoint wrong the same way, which i.i.d. noise never is.
+    - `stale:<n>` the pose from n frames earlier, which is what `carried` degrades into when the box
+                  source loses an animal for a few windows.
+    - `other`     the NEIGHBOURING animal's pose, which is what a row swap hands the next window.
+
+    The magnitude is in CROP WIDTHS, not pixels or millimetres, for the same reason
+    `prompt_noise_px` is in pixels and converts: `allen-mouse-combined` alone holds 63 px sessions
+    beside 14 mm ones. In 3D the conversion is `get_camera_scale` -- world units per crop pixel,
+    the same one `dataset.py` uses -- times `image_size`, i.e. one crop across.
+
+    The direction is drawn from a generator seeded on (row, window), so two arms over one clip
+    corrupt identically and the comparison is matched rather than merely similar.
+    """
+    kind, _, amt = (cfg.oracle_corrupt or '').partition(':')
+    row, t0 = a, int(frames[0])
+    if kind == 'other' and n_lab > 1:
+        row = (a + 1) % n_lab
+    elif kind == 'stale':
+        t0 = max(0, t0 - int(amt))
+    p = torch.as_tensor(src[row][t0], dtype=torch.float32)
+    if kind != 'off':
+        return p, int(t0) - int(frames[0]) if kind == 'stale' else 0
+    # ONE crop width, converted into whatever units the prior lives in.
+    if mode == '2d':
+        b = np.asarray(boxes[0], np.float64)
+        width = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
+    else:
+        from posetail.posetail.cube import get_camera_scale
+        fin = p[torch.isfinite(p).all(-1)]
+        if not len(fin):
+            return p, 0
+        scale = torch.nanmedian(get_camera_scale(cgroup, fin[None]))
+        if not torch.isfinite(scale):
+            return p, 0
+        width = float(scale) * cfg.image_size
+    rng = np.random.default_rng([a, int(frames[0])])
+    v = rng.normal(size=p.shape[-1])
+    v = v / max(float(np.linalg.norm(v)), 1e-9)
+    return p + torch.as_tensor(float(amt) * width * v, dtype=p.dtype), 0
+
+
+def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup):
     """The per-keypoint prior for this window, in the model's coordinate frame.
 
     Two things the prompt has to get right, both of which were wrong here and both silent:
@@ -601,10 +705,11 @@ def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cg
         return None, None
     if cfg.anchor == 'labels':
         # ORACLE. Ground truth as the prior; not a deployment number.
-        if src_animal is None:                   # a detector row with no label row behind it
+        if src is None or a >= n_lab:             # a detector row with no label row behind it
             return None, None
-        p = torch.as_tensor(src_animal[frames[0]], dtype=torch.float32)
-        qt = 0
+        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup)
+        if p is None:
+            return None, None
     else:                                    # 'carry'
         if carried is None:
             return None, None
@@ -632,19 +737,7 @@ def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cg
     if mode == '2d':
         # the carried/labelled pose is in SOURCE pixels; the model works in crop pixels
         p = (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
-        w, h = (float(x) for x in cgroup[0]['size'][:2])
-        outside = ((p[:, 0] < 0) | (p[:, 0] >= w) | (p[:, 1] < 0) | (p[:, 1] >= h))
-    else:
-        # A 3D point no PAIR of cameras can see is not reconstructible, so it cannot be a prior
-        # the model should trust -- the 3D analogue of leaving the crop. A MOVING camera answers
-        # per frame ((T,K), not (K,)), and the prior is one pose for the whole window, so a
-        # camera counts if it sees the point at any point during it.
-        seen = []
-        for c in cgroup:
-            v = is_point_visible(c, p, margin=2)
-            seen.append(v.any(0) if v.ndim > 1 else v)
-        outside = torch.stack(seen).sum(0) < 2
     p = p.clone()
-    p[outside] = float('nan')
+    p[prior_out_of_bounds(p, mode, cgroup)] = float('nan')
     qt = min(max(qt, 0), len(frames) - 1)
     return p[None], torch.full((1, K), qt, dtype=torch.int32)

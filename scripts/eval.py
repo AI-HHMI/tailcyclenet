@@ -65,7 +65,7 @@ def label_lookup(data: Path, split: str):
     return out
 
 
-def score(preds, labels, mota_dist=None, quiet=False):
+def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
     """One row per group: the error, the coverage behind it, and MOTA where there are instances.
 
     Factored out of `main` so `--vs` scores the second file through the IDENTICAL path. A baseline
@@ -102,7 +102,8 @@ def score(preds, labels, mota_dist=None, quiet=False):
                 span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
                 extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
             max_dist = extent if np.isfinite(extent) else np.inf
-            mm = matched_error(pred, true, max_dist=max_dist)
+            mm = matched_error(pred, true, max_dist=max_dist,
+                               min_kpts_frac=min_kpts_frac)
             m['err_rowwise'] = m['err']
             m.update({k: v for k, v in mm.items()
                       if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')})
@@ -120,7 +121,8 @@ def score(preds, labels, mota_dist=None, quiet=False):
             # against `_true`. With more predicted rows than labelled ones the pred-shaped version
             # merely carried dead rows; with fewer, `aligned[j]` indexed off the end.
             aligned = np.full_like(true, np.nan)
-            for t, frame_pairs in enumerate(match_instances(pred, true, max_dist)):
+            for t, frame_pairs in enumerate(match_instances(pred, true, max_dist,
+                                                            min_kpts_frac)):
                 for i, j, _ in frame_pairs:
                     aligned[j, t] = pred[i, t]
             m['_pred_matched'] = aligned
@@ -144,12 +146,12 @@ def score(preds, labels, mota_dist=None, quiet=False):
             m['box_agree'] = float(np.median(ba)) if ba.size else None
             m['box_agree_p99'] = float(np.quantile(ba, 0.99)) if ba.size else None
         if S > 1:
-            m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist)
+            m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac)
         rows.append(m)
     return rows
 
 
-def _mota_for(m, lab, mota_dist):
+def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0):
     """(radius, mota dict) for one group. The ignore region is built here, from the labels."""
     pred, true = m['_pred'], m['_true']
     St, T = true.shape[0], true.shape[1]
@@ -175,7 +177,8 @@ def _mota_for(m, lab, mota_dist):
         # answer there.
         if lab.boxes is not None and m['mode'] == '2d':
             ig_boxes = lab.boxes[:St, :T, 0]              # xyxy in the first camera
-    return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes)
+    return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes,
+                        min_kpts_frac=min_kpts_frac)
 
 
 def main():
@@ -193,6 +196,14 @@ def main():
                          'a PAIRED bootstrap over the groups both scored, on the points BOTH '
                          'matched. Without the shared point set an error delta is confounded by '
                          'coverage (eval rule 6): the arm that declined more points reads better.')
+    ap.add_argument('--min-match-kpts', type=float, default=0.0,
+                    help='the FRACTION of the keypoint set a predicted instance must share with a '
+                         'labelled one before its mean distance may stand for the pair. At 0 (the '
+                         'default, and what every published number here used) a row sharing ONE '
+                         'keypoint is scored on that keypoint and can hijack a GT row -- which '
+                         'inflates coverage and MOTA for whatever made the rows sparse, '
+                         '`--vis-thresh` being exactly such a thing. A fraction and not a count: K '
+                         'is 4 on rat-city and 47 on allen.')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
@@ -203,7 +214,7 @@ def main():
     if meta['anchor'] == 'labels':
         print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
 
-    rows = score(preds, labels, args.mota_dist)
+    rows = score(preds, labels, args.mota_dist, min_kpts_frac=args.min_match_kpts)
     if not rows:
         print('nothing scored')
         return
@@ -274,7 +285,8 @@ def main():
         other, ometa = load_predictions(args.vs)
         print(f'\nPAIRED: {args.predictions} minus {args.vs}')
         print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
-        by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True)}
+        by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,
+                                              min_kpts_frac=args.min_match_kpts)}
         pairs = [(m, by_key[m['group']]) for m in rows if m['group'] in by_key]
         if not pairs:
             print('  no shared groups')
@@ -295,7 +307,11 @@ def main():
             ci = ('DEGENERATE (one group -- no interval exists)' if d['n'] < 2
                   else f'[{d["lo"]:+.4f}, {d["hi"]:+.4f}]'
                        + ('' if d['lo'] <= 0 <= d['hi'] else '  *'))
-            print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}')
+            # THE DROPPED COUNT, because pairing is complete-case and that flatters the arm that
+            # failed more: a group where either side produced nothing leaves the comparison.
+            drop = f"  ({d['n_dropped']} group(s) DROPPED, one side non-finite)" if d.get(
+                'n_dropped') else ''
+            print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}{drop}')
             # THE SHARED SET IS THE HEADLINE, not a footnote. A delta over points only one arm
             # attempted measures which arm declined more.
             print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '

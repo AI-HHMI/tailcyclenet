@@ -76,13 +76,19 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
         keep &= np.isfinite(b)
         b = b[keep]
     a = a[keep]
+    dropped = int((~keep).sum())
     if a.size == 0:
-        return {'mean': float('nan'), 'lo': float('nan'), 'hi': float('nan'), 'n': 0}
+        return {'mean': float('nan'), 'lo': float('nan'), 'hi': float('nan'), 'n': 0,
+                'n_dropped': dropped}
     idx = rng.integers(0, a.size, size=(n, a.size))
     stat = a[idx].mean(1) if b is None else (a[idx] - b[idx]).mean(1)
     point = float(a.mean() if b is None else (a - b).mean())
+    # PAIRING IS COMPLETE-CASE, and that FLATTERS THE ARM THAT FAILED MORE: a unit where either side
+    # is non-finite leaves the comparison entirely, so an arm that produced nothing on the hardest
+    # groups is scored only on the ones it managed. The count is returned rather than absorbed.
     return {'mean': point, 'lo': float(np.quantile(stat, alpha / 2)),
-            'hi': float(np.quantile(stat, 1 - alpha / 2)), 'n': int(a.size)}
+            'hi': float(np.quantile(stat, 1 - alpha / 2)), 'n': int(a.size),
+            'n_dropped': dropped}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -114,7 +120,9 @@ def motion_ratio(pred, ref) -> dict:
     """Predicted path length over a reference's, over the steps BOTH sides have.
 
     `ref` is either the same shape as `pred` (the labels) or one position per instance-frame, e.g. a
-    box centre -- in which case the prediction's own centroid is what moves.
+    box centre -- in which case the prediction's own centroid is what moves. Both must live in the
+    SAME space: a 3D world path over a 2D pixel path is a number in no unit, so a box-centre
+    reference for a 3D prediction means reprojecting the prediction first.
 
     NOT the trustworthy form on its own. A box-centre denominator carries the detector's own jitter,
     which inflates it; the paired form (two arms over the SAME steps, `scripts/eval.py --vs`) is what
@@ -129,7 +137,10 @@ def motion_ratio(pred, ref) -> dict:
             p = np.nanmean(p, axis=-2, keepdims=True)
         r = r[..., None, :]
     if p.shape != r.shape:
-        raise ValueError(f'motion_ratio: pred {p.shape} vs ref {r.shape}')
+        raise ValueError(
+            f'motion_ratio: pred {p.shape} vs ref {r.shape}. The two must be in the same space -- '
+            'a 3D world path divided by a 2D pixel path is a number in no unit. Reproject the '
+            'prediction before comparing it with a box centre.')
     ok = np.isfinite(p).all(-1) & np.isfinite(r).all(-1)          # (..., T, K)
     both = ok[..., :-1, :] & ok[..., 1:, :]
     dp = np.linalg.norm(np.diff(p, axis=-3), axis=-1)
@@ -145,13 +156,24 @@ def motion_ratio(pred, ref) -> dict:
 # multi-instance
 # ----------------------------------------------------------------------------------------------
 
-def match_instances(pred, true, max_dist=np.inf):
+def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0):
     """Hungarian match predicted instances to labelled ones, per frame.
 
     Args:
         pred: (Sp, T, K, R), NaN where absent
         true: (St, T, K, R), NaN where absent
         max_dist: a pair further apart than this is not a match
+        min_kpts_frac: the fraction of K a pair must SHARE before its mean distance is allowed to
+            stand for the pair at all. The cost is a mean over shared keypoints, so at the default
+            of 0 a pair sharing ONE keypoint is scored on that keypoint -- and a near-empty
+            prediction row can therefore out-bid a dense one and hijack a GT row, which inflates
+            coverage and MOTA for whatever made the rows sparse. `--vis-thresh` is exactly such a
+            thing, and its measured justification (report 11 §3) was never controlled for this.
+
+            A FRACTION, not a count: K is 4 on rat-city, 7 on calms21, 17 on 3dpop, 24 on
+            johnson-mouse and 47 on allen, so "at least 2 keypoints" means five different things.
+            Rounded up, floor 1. The default is 0 because changing it moves every published number
+            in this repo, so it has to be an arm rather than a silent correction.
 
     Returns a list per frame of (pred_ix, true_ix, dist).
 
@@ -160,7 +182,8 @@ def match_instances(pred, true, max_dist=np.inf):
     effectively unrunnable.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
-    T = true.shape[1]
+    T, K = true.shape[1], true.shape[2]
+    need = max(1, int(np.ceil(min_kpts_frac * K)))
     out = []
     with np.errstate(invalid='ignore'):
         for t in range(T):
@@ -168,7 +191,8 @@ def match_instances(pred, true, max_dist=np.inf):
             d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)          # (Sp,St,K)
             ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
             n_ok = ok.sum(-1)
-            cost = np.where(n_ok > 0, np.where(ok, d, 0.0).sum(-1) / np.maximum(n_ok, 1), np.nan)
+            cost = np.where(n_ok >= need, np.where(ok, d, 0.0).sum(-1) / np.maximum(n_ok, 1),
+                            np.nan)
             big = np.nanmax(cost) + 1 if np.isfinite(cost).any() else 1.0
             ri, ci = linear_sum_assignment(np.where(np.isfinite(cost), cost, big))
             out.append([(int(i), int(j), float(cost[i, j])) for i, j in zip(ri, ci)
@@ -176,7 +200,7 @@ def match_instances(pred, true, max_dist=np.inf):
     return out
 
 
-def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
+def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0) -> dict:
     """MOTA and its three components, with an explicit ignore region.
 
     MOTA = 1 - (misses + false positives + id switches) / labelled instances. Report the
@@ -203,7 +227,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None) -> dict:
     out as an ordinary false positive and the proximity has to be tested for separately.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
-    matches = match_instances(pred, true, max_dist)
+    matches = match_instances(pred, true, max_dist, min_kpts_frac)
     T = true.shape[1]
     true_present = np.isfinite(true).all(-1).any(-1)          # (St,T)
     pred_present = np.isfinite(pred).all(-1).any(-1)          # (Sp,T)
@@ -271,7 +295,7 @@ def _in_ignore(centroid, rows, t, ignore_boxes) -> bool:
     return False
 
 
-def matched_error(pred, true, max_dist=np.inf) -> dict:
+def matched_error(pred, true, max_dist=np.inf, min_kpts_frac=0.0) -> dict:
     """MPJPE over HUNGARIAN-MATCHED instances, for multi-animal predictions.
 
     Row index is not identity. When boxes come from a detector, prediction row `a` and label row
@@ -282,7 +306,7 @@ def matched_error(pred, true, max_dist=np.inf) -> dict:
     well and ignores nine looks excellent on `err` alone.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
-    pairs = match_instances(pred, true, max_dist)
+    pairs = match_instances(pred, true, max_dist, min_kpts_frac)
     T = true.shape[1]
     dists, n_true_inst, n_matched_inst = [], 0, 0
     for t in range(T):

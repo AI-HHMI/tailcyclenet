@@ -235,11 +235,22 @@ def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
     assert (ref['outcome'] == 0).all(), 'refinement must not drop an animal'
     got = np.isfinite(ref['pred']).all(-1)
     assert got.sum() >= np.isfinite(plain['pred']).all(-1).sum(), 'coverage must not fall'
-    # The recorded crop is the REFINED one, and a crop-rule box is square unless the image caps it.
-    cw = ref['crop'][0, 0, :, 2] - ref['crop'][0, 0, :, 0]
-    ch = ref['crop'][0, 0, :, 3] - ref['crop'][0, 0, :, 1]
+    # `crop` KEEPS THE FIRST-PASS BOX -- it is the only record of what the box source offered, and
+    # every coverage and crop-inflation number in reports 08 and 11 is computed from it. The refined
+    # box is a second field, so both are readable rather than one overwriting the other.
+    np.testing.assert_array_equal(np.nan_to_num(ref['crop'], nan=-1),
+                                  np.nan_to_num(plain['crop'], nan=-1))
+    cw = ref['crop_refined'][0, 0, :, 2] - ref['crop_refined'][0, 0, :, 0]
+    ch = ref['crop_refined'][0, 0, :, 3] - ref['crop_refined'][0, 0, :, 1]
     assert (cw <= w).all() and (ch <= h).all()
     assert ((cw < w) | (ch < h)).any(), 'a whole-frame box should have been refined smaller'
+    # And a refined box must OVERLAP the box it came from, or it is not a refinement of it -- a pose
+    # that wandered squares into a box somewhere else entirely, at 2x the pose compute.
+    for ci in range(C):
+        b2, b1 = ref['crop_refined'][0, 0, ci], plain['crop'][0, 0, ci]
+        if np.isfinite(b2).all() and np.isfinite(b1).all():
+            assert min(b2[2], b1[2]) > max(b2[0], b1[0])
+            assert min(b2[3], b1[3]) > max(b2[1], b1[1])
 
 
 def test_the_row_gate_withholds_rows_but_not_the_carried_prompt(scene):

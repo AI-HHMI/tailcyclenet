@@ -978,3 +978,49 @@ def test_reader_cache_size_does_not_touch_the_filesystem(monkeypatch):
     monkeypatch.setattr(builtins, 'open', boom)
     monkeypatch.setattr('os.stat', boom)
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16
+
+
+def test_a_whole_body_offset_moves_every_keypoint_the_same_way(tiny_root):
+    """I.I.D. JITTER IS NOT THE FAILURE DEPLOYMENT PRODUCES.
+
+    `--anchor carry` hands the model its own previous output, whose error is a whole-body LAG: every
+    keypoint displaced the same way. Gaussian noise averages to zero over the keypoint set, so it
+    trains the model to trust the prior's CENTROID exactly -- the one quantity a lag gets wrong.
+    """
+    def cfg(**kw):
+        return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                            prompt_dropout=0.0, prob_2d_only=0.0, **kw)
+
+    clean = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg())).kpt_prior[0]
+    off = _batch(PoseDataset(tiny_root / 'ratlike', 'train',
+                             cfg(prompt_offset_px=8.0))).kpt_prior[0]
+    ok = torch.isfinite(clean).all(-1) & torch.isfinite(off).all(-1)
+    assert ok.sum() >= 2, 'need at least two real priors to compare displacements'
+    d = (off - clean)[ok]
+    assert d.abs().max() > 1e-4, 'the offset must actually move the prior'
+    # ONE vector for the whole pose: every keypoint's displacement is identical.
+    torch.testing.assert_close(d, d[:1].expand_as(d))
+    # ...where the i.i.d. jitter is not.
+    jit = _batch(PoseDataset(tiny_root / 'ratlike', 'train',
+                             cfg(prompt_noise_px=8.0))).kpt_prior[0]
+    dj = (jit - clean)[torch.isfinite(clean).all(-1) & torch.isfinite(jit).all(-1)]
+    assert not torch.allclose(dj, dj[:1].expand_as(dj))
+
+
+def test_a_stale_prior_is_a_wrong_position_not_a_withdrawn_one(tiny_root):
+    """`carried` degrades into a pose from an earlier frame than `prompt_t` claims when the box
+    source loses an animal. Swapping in NaN instead would just be `prompt_dropout` again."""
+    def cfg(**kw):
+        return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
+                            prompt_dropout=0.0, prob_2d_only=0.0, **kw)
+
+    base = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg()))
+    moved = False
+    for _ in range(20):
+        b = _batch(PoseDataset(tiny_root / 'ratlike', 'train', cfg(prompt_stale_frames=3)))
+        assert torch.isnan(b.kpt_prior).sum() == torch.isnan(base.kpt_prior).sum(), \
+            'staleness must not withhold a prior'
+        # `prompt_t` still claims the first labelled frame; only the POSE came from elsewhere.
+        assert (b.prompt_t == base.prompt_t).all()
+        moved |= not torch.allclose(b.kpt_prior, base.kpt_prior, equal_nan=True)
+    assert moved, 'prompt_stale_frames=3 never moved the prior in 20 draws'

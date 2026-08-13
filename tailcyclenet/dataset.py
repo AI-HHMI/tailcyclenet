@@ -73,6 +73,11 @@ class LoaderConfig:
     box_source: str = 'keypoints'
     prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
     prompt_noise_px: float = 0.0       # sigma on the prior, in PIXELS (3D scales by cube_scale)
+    # The two corruptions that have the SHAPE of a deployment failure, where the jitter above does
+    # not. Both off by default: CLAUDE.md lists prompt corruption as deliberately deleted, and these
+    # reopen it with a measurement behind them rather than by preference. See the prior block below.
+    prompt_offset_px: float = 0.0       # sigma of a WHOLE-BODY offset, one vector per item
+    prompt_stale_frames: int = 0        # max frames the prior may describe away from `prompt_t`
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
     # Frame stride for a TRAIN window, drawn per item -- posetail's `interval`
     # (`posetail_dataset.py:343-361`). [1] is consecutive frames, i.e. no augmentation. Repeat an
@@ -926,14 +931,44 @@ class PoseDataset(Dataset):
         # (`losses.py:1070-1080`) -- so scaling by it makes ONE setting mean the same visual
         # displacement on a 30 px fly and a 57,594-frame rat rig alike. Measured at the prior's own
         # position, through THIS window's cropped and resized cameras, so crop jitter is included.
-        if self.train and self.cfg.prompt_noise_px > 0 and bool(torch.isfinite(kpt_prior).any()):
-            sigma = float(self.cfg.prompt_noise_px)
-            if R == 3:
-                pts = kpt_prior[torch.isfinite(kpt_prior).all(-1)][None]     # (1,n,3)
-                scale = torch.nanmedian(get_camera_scale(cgroup, pts))
-                sigma *= float(scale)
+        #
+        # I.I.D. NOISE IS NOT THE FAILURE DEPLOYMENT PRODUCES, which is why the two extra
+        # corruptions below exist. `--anchor carry` hands back the model's own previous output, and
+        # its error is a WHOLE-BODY LAG -- every keypoint displaced the same way, growing window over
+        # window -- or a pose describing a different frame than the model is told. Gaussian jitter
+        # averages to zero over the keypoint set and so trains the model to trust the CENTROID of
+        # the prior exactly, which is precisely the quantity a lag gets wrong. Measured with
+        # `scripts/infer.py --oracle-corrupt`, which applies the same three failures at inference.
+        #
+        # ONE VECTOR FOR THE WHOLE POSE, drawn per item, in the same pixel units as the jitter.
+        px = 1.0
+        if R == 3 and (self.cfg.prompt_noise_px > 0 or self.cfg.prompt_offset_px > 0) \
+                and bool(torch.isfinite(kpt_prior).any()):
+            pts = kpt_prior[torch.isfinite(kpt_prior).all(-1)][None]     # (1,n,3)
+            px = float(torch.nanmedian(get_camera_scale(cgroup, pts)))
+            if not np.isfinite(px):
+                px = 1.0
+        # STALE: the pose from a DIFFERENT frame than `prompt_t` claims. What `carried` degrades into
+        # when the box source loses an animal for a window or two; the resulting error is the
+        # animal's own motion over that gap, correlated across keypoints exactly as a lag is.
+        if self.train and self.cfg.prompt_stale_frames > 0 \
+                and bool(torch.isfinite(kpt_prior).any()):
+            d = int(rng.integers(0, int(self.cfg.prompt_stale_frames) + 1))
+            if d:
+                t_alt = torch.clamp(prompt_t.long() + d, max=coords.shape[0] - 1)
+                alt = coords[t_alt, torch.arange(K)]
+                # Only where the OTHER frame has a point too: a stale prior is a wrong position, not
+                # a withdrawn one, and swapping in NaN would be `prompt_dropout` under another name.
+                swap = torch.isfinite(alt).all(-1) & torch.isfinite(kpt_prior).all(-1)
+                kpt_prior = torch.where(swap[:, None], alt, kpt_prior)
+        if self.train and self.cfg.prompt_offset_px > 0 and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(
-                rng.normal(0.0, sigma, kpt_prior.shape), dtype=kpt_prior.dtype)
+                rng.normal(0.0, float(self.cfg.prompt_offset_px) * px, (1, R)),
+                dtype=kpt_prior.dtype)
+        if self.train and self.cfg.prompt_noise_px > 0 and bool(torch.isfinite(kpt_prior).any()):
+            kpt_prior += torch.as_tensor(
+                rng.normal(0.0, float(self.cfg.prompt_noise_px) * px, kpt_prior.shape),
+                dtype=kpt_prior.dtype)
 
         kpt_ids = self._kpt_ids[sess.path]      # aligned to THIS session's axis, not the root's
         query_times = torch.zeros(K, dtype=torch.int32)

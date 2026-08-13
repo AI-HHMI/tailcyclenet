@@ -248,6 +248,12 @@ dynamic range of the drift sits inside the gap the mask does not cover. Bar for 
 `allen-mouse-combined/val`'s five sessions** (scored through `scratch/allen_eval3/rollup.py`, `checkpoint_best`
 not `last`) *and* the carry/no-anchor path ratio moving toward 1. Ships WITH
 `prompt_dropout`.
+**A `motion_ratio` THAT REACHES 1 NEEDS AN INERTNESS CONTROL.** "carry moves as much as none" has two
+opposite readings — the prior stopped distorting the motion, or the prior went inert so `carry` ≈ `none`
+trivially — and the ratio cannot separate them. The control is whether the prompt still does accuracy work,
+`prior_self` minus `prior_none` on the same checkpoint. Report it beside any ratio near 1 or the ratio means
+nothing.
+
 **`motion_ratio` IS NOT SINGLE-SIGNED — check which regime a root is in before setting a threshold on it.** It
 reads LOCK where the animal moves and JITTER where it does not: the same reference run gives johnson
 carry/none = **0.757** (24% of the path lost, 3.66 mm/step) and allen val **1.983** (twice the path, 0.331

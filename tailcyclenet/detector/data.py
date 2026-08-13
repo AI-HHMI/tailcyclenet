@@ -26,7 +26,7 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
-from ..format import UNLABELED, load_datasets
+from ..format import PROJECTED, UNLABELED, VISIBLE, load_datasets
 
 
 def reduce_factor(size, out_wh):
@@ -124,6 +124,14 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
 
     No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
     relabelling left to right is a permutation of that set and the extent is unchanged.
+
+    **THAT JUSTIFICATION DIES THE MOMENT KEYPOINTS ARE A TARGET**, which is why `BoxDataset`
+    passes `hflip=0` whenever it is emitting them. A mirrored frame swaps every left/right pair,
+    so without a `flip_pairs` map the head sees `left_wing` labelled at the right wing half the
+    time, learns their mean, and collapses both toward the midline -- degrading exactly the
+    lateral asymmetry cross-view association depends on. Real `flip_pairs` need a per-dataset name
+    mapping and branson's names are placeholders (`kp00..kp20`, `names_provisional = true`), so
+    losing the flip is the cheap correct answer rather than inventing one.
     """
     w, h = float(size[0]), float(size[1])
     s = rng.uniform(*scale)
@@ -142,10 +150,13 @@ class BoxDataset(Dataset):
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
-                 augment=False, reduce=False):
+                 augment=False, reduce=False, keypoints=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
+        # Opt-in, default off: with it absent this loader is byte-identical to what every recorded
+        # detector was trained on. See `random_affine` for why it also kills the horizontal flip.
+        self.keypoints = bool(keypoints)
         # Off by default and requested explicitly, not inferred from the split: it is a key, and
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
@@ -197,8 +208,21 @@ class BoxDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
-    def boxes_for(self, i, warp=None):
+    def boxes_for(self, i, warp=None, with_keypoints=False):
         """The letterboxed target boxes for item `i`, without decoding its image.
+
+        `with_keypoints=True` also returns the KEYPOINT target, (S,K,3) of (x, y, vis), in the
+        same letterboxed pixels. It is free: the keypoints are the input `crop_box_for_points`
+        is already called on, so there is no second data path and no second chance to disagree
+        about the transform -- which is the failure mode here (a keypoint letterboxed by a
+        different rule than its own box is invisible in the loss curve).
+
+        The `vis` channel is the format's `status`, NOT coordinate-finiteness. The two come apart
+        in both directions and conflating them re-creates a failure this repo has paid for:
+        supervising `isfinite(x, y)` teaches "was this annotated", which on calms21 -- whose
+        converter writes every point VISIBLE -- is an all-true target, `occlusion_acc` 1.0, and a
+        row gate worth -0.037 to -0.123 MOTA. `vis` is NaN where the session made no assessment
+        at all, so the score loss is withheld there rather than asserting "not visible".
 
         Split out of `__getitem__` so `scripts/diag_assign.py` can read what the loss is actually
         assigned over a few hundred views without paying for the pixels -- and so there is one
@@ -218,8 +242,31 @@ class BoxDataset(Dataset):
         if sess.mode == '3d':
             pts = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)      # (S,K,3)
             p2d = project_points_torch([cam], pts)[0]                            # (S,K,2)
+            vis = None if lab.vis3d is None else lab.vis3d[:, f]                 # (S,K)
         else:
             p2d = torch.as_tensor(lab.points2d[:, f, :, ci], dtype=torch.float32)
+            vis = None if lab.vis2d is None else lab.vis2d[:, f, :, ci]
+
+        # The keypoint target rides the SAME warp and the SAME letterbox as the boxes below, and
+        # is derived here so there is exactly one copy of that transform.
+        kpts = None
+        if with_keypoints:
+            k = p2d.clone()
+            if warp is not None:
+                k = _apply_affine(k, (warp, None))
+                w, h = float(cam['size'][0]), float(cam['size'][1])
+                out = (k[..., 0] < 0) | (k[..., 0] > w) | (k[..., 1] < 0) | (k[..., 1] > h)
+                k = torch.where(out[..., None], torch.nan, k)
+            # COORDINATES LIVE ON `VISIBLE` *OR* `PROJECTED` (fmt.POSITIONED), but only VISIBLE is
+            # a visibility CLAIM -- `projected` is a position from a source that never recorded
+            # occlusion. So a projected point keeps its coordinates and gets NO score target.
+            if vis is None:
+                v = torch.full(k.shape[:-1], float('nan'))
+            else:
+                vt = torch.as_tensor(np.asarray(vis))
+                v = torch.where(vt == PROJECTED, torch.nan,
+                                (vt == VISIBLE).to(torch.float32))
+            kpts = torch.cat([k, v[..., None].to(k.dtype)], -1)                 # (S,K,3)
 
         boxes = []
         for s in range(p2d.shape[0]):
@@ -252,7 +299,11 @@ class BoxDataset(Dataset):
         scale, pad = letterbox_transform(cam['size'], self.input_wh)
         boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
         boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
-        return boxes
+        if kpts is None:
+            return boxes
+        kpts[..., 0] = kpts[..., 0] * scale + pad[0]
+        kpts[..., 1] = kpts[..., 1] * scale + pad[1]
+        return boxes, kpts
 
     def __getitem__(self, i):
         import cv2
@@ -263,8 +314,10 @@ class BoxDataset(Dataset):
         # worker the same stream, and a shared one would make the draw depend on how the
         # DataLoader happened to interleave.
         rng = (np.random.default_rng([self.seed, i]) if self.augment and self.train else None)
-        warp = random_affine(size, rng) if rng is not None else None
-        boxes = self.boxes_for(i, warp)
+        warp = (random_affine(size, rng, hflip=0.0 if self.keypoints else 0.5)
+                if rng is not None else None)
+        got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
+        boxes, kpts = got if self.keypoints else (got, None)
 
         r = reduce_factor(size, self.input_wh) if self.reduce else 1
         img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
@@ -293,7 +346,7 @@ class BoxDataset(Dataset):
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
             img = np.clip(img * rng.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        return x, boxes
+        return (x, boxes) if kpts is None else (x, boxes, kpts)
 
 
 class ChunkShuffle(torch.utils.data.Sampler):
@@ -334,10 +387,21 @@ class ChunkShuffle(torch.utils.data.Sampler):
 
 
 def box_collate(batch):
-    """Pad the box axis with NaN so a batch can hold different animal counts."""
+    """Pad the box axis with NaN so a batch can hold different animal counts.
+
+    NaN, not zero, and that carries all the way to the loss: a padded row is "no animal", which is
+    the same signal a real animal with no finite point in this view sends. Keypoints pad the same
+    way, so a padded (S,K,3) slice is non-finite in every channel and every mask drops it.
+    """
     xs = torch.stack([b[0] for b in batch])
     n = max(b[1].shape[0] for b in batch)
     boxes = torch.full((len(batch), n, 4), float('nan'))
-    for i, (_, b) in enumerate(batch):
-        boxes[i, :b.shape[0]] = b
-    return xs, boxes
+    for i, b in enumerate(batch):
+        boxes[i, :b[1].shape[0]] = b[1]
+    if len(batch[0]) < 3:
+        return xs, boxes
+    K = batch[0][2].shape[1]
+    kpts = torch.full((len(batch), n, K, 3), float('nan'))
+    for i, b in enumerate(batch):
+        kpts[i, :b[2].shape[0]] = b[2]
+    return xs, boxes, kpts

@@ -611,6 +611,11 @@ These are not style preferences; each one was learned by publishing a wrong numb
    at `--min-match-kpts 0` a row sharing one keypoint is scored on that keypoint and can hijack a GT
    row. It is a FRACTION of K, not a count — K is 4 on rat-city and 47 on allen. Default 0 keeps every
    published number reproducible; any claim about a lever that changes row sparsity needs it on.
+   **But it is punitive at small K with sparse labels, so quote it with both.** rat-city has K = 4 and
+   labels 2.02 points per animal-frame, so 0.5 demands 2 shared points — nearly every labelled point —
+   and its absolute MOTA falls 0.587 → 0.092 while the *delta* between two arms barely moves
+   (+0.051 → +0.059). Use it for deltas, not for absolute MOTA, and never carry one value across roots
+   (0.25 rounds to 1 at K = 4, i.e. it is identical to 0 there).
 10. **Pairing is complete-case, which flatters the arm that failed more.** A group where either side
    is non-finite leaves the comparison, so `paired_bootstrap` returns `n_dropped` and `eval.py --vs`
    prints it. A delta over 9 of 17 groups is not a delta over 17.

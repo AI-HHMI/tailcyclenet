@@ -29,6 +29,7 @@ SMALL = dict(
     embedding_factor=2, use_camera_self_attention=True, use_temporal_self_attention=True,
     f_eff_scale=True, scene_encoder_proj=True, cross_attn_dim=64, scene_proj_dim=64,
     scene_pos_embed_mode='ropepos', rope_base=100.0, time_embed_mode='fourier_rel',
+    gridresid_offset='query',
     output_mode='gridresid', head_3d_grid_size=64, head_3d_grid_radius=1.8,
     log_3d_output=True, log_3d_eps=0.1, soft_argmax_threshold=60, grid_decode_space='warped',
 )
@@ -691,3 +692,11 @@ def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
 
     with pytest.raises(AssertionError, match='gridresid_offset'):
         build_model(small(enc, gridresid_offset='nonsense'), n_keypoints=n_kpt)
+
+    # AND AN ABSENT KEY IS AN ERROR, not `'query'`. Both values load the same tensors, so a
+    # checkpoint trained under one and built under the other is wrong without raising -- which is
+    # exactly what happened to every keyless pre-`bcbfbc1` 3D run.
+    cfg = small(enc)
+    cfg.pop('gridresid_offset')
+    with pytest.raises(KeyError, match='gridresid_offset'):
+        build_model(cfg, n_keypoints=n_kpt)

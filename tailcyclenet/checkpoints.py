@@ -71,11 +71,40 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     return files[-1]
 
 
+def provenance() -> dict:
+    """The commit this source tree is at, and whether it was dirty. Best effort.
+
+    A CONFIG IS NOT A PROVENANCE RECORD. `runs/3dpop-prior` trained under unconditional per-frame
+    re-anchoring, finished nine hours before `bcbfbc1` replaced that with the query-anchored
+    residual, and carries no `gridresid_offset` key -- so it was later loaded, silently, as the
+    architecture it was not trained with. Nothing in the folder could have said otherwise: it holds
+    `config.toml`, the registry, the checkpoints, and no statement about the code.
+
+    Empty dict when git is unavailable (an installed copy, a tarball). It is a record, not a gate.
+    """
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    try:
+        run = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                             capture_output=True, text=True, timeout=10)
+        if run.returncode:
+            return {}
+        commit = run.stdout.strip()
+        st = subprocess.run(['git', '-C', str(root), 'status', '--porcelain'],
+                            capture_output=True, text=True, timeout=10)
+        return {'commit': commit, 'dirty': bool(st.stdout.strip())}
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+
 def save_run_meta(run: Path, config: dict, registry: Registry) -> None:
     import toml
     run.mkdir(parents=True, exist_ok=True)
     (run / 'config.toml').write_text(toml.dumps(config))
     registry.save(run / 'keypoint_registry.toml')
+    prov = provenance()
+    if prov:
+        (run / 'provenance.toml').write_text(toml.dumps(prov))
 
 
 def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
@@ -109,12 +138,31 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     return path
 
 
-def load_run(run: Path, checkpoint: str | None = None, device='cpu', eval_weights: bool = True):
-    """(model, config, registry, checkpoint_path) from a run folder. Nothing else is needed."""
+def load_run(run: Path, checkpoint: str | None = None, device='cpu', eval_weights: bool = True,
+             model_overrides: dict | None = None):
+    """(model, config, registry, checkpoint_path) from a run folder. Nothing else is needed.
+
+    `model_overrides` patches `[model]` before the model is built, and exists for exactly one
+    situation: a run folder written before a key existed cannot say what it trained with, so the
+    caller has to. It is echoed loudly because it is a claim about weights nobody recorded.
+    """
     run = Path(run)
     with open(run / 'config.toml', 'rb') as f:
         config = tomllib.load(f)
     check_image_size(config)
+    if model_overrides:
+        config['model'] = {**config.get('model', {}), **model_overrides}
+        print(f'load_run: [model] OVERRIDDEN {model_overrides} -- this is an assertion about what '
+              'the checkpoint was trained with, not something read from it')
+    prov = run / 'provenance.toml'
+    if prov.exists():
+        with open(prov, 'rb') as f:
+            p = tomllib.load(f)
+        print(f'run provenance: {p.get("commit", "?")[:12]}'
+              f'{" +DIRTY" if p.get("dirty") else ""}')
+    else:
+        print(f'{run}: no provenance.toml -- this run predates commit recording, so which '
+              'architecture the weights were trained under cannot be read back from the folder')
     registry = Registry.load(run / 'keypoint_registry.toml')
     path = resolve_checkpoint(run / 'checkpoints', checkpoint)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)

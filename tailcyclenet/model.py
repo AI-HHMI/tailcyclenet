@@ -487,7 +487,30 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     # So `query_encoder = "wide"` with `query = "none"` is exactly golden's j3 encoder, with no
     # third key to get wrong.
     enc = cfg.pop('query_encoder', 'pose')
-    offset = cfg.pop('gridresid_offset', 'query')
+    # NO DEFAULT, DELIBERATELY. This key decides what the 3D residual is measured from, and the two
+    # values are different architectures sharing one set of tensor shapes -- so a checkpoint trained
+    # under one and loaded under the other produces numbers rather than an exception.
+    #
+    # That is not hypothetical. `runs/3dpop-prior` trained under unconditional per-frame
+    # re-anchoring, finished nine hours before `bcbfbc1` replaced it with the query-anchored
+    # residual, and has no `gridresid_offset` in its config -- so every later run of it inferred
+    # `world = prior + residual` from weights that learned `world = tri_t + residual_t`. Under
+    # `--anchor carry` that turns the prior into a static anchor the residual head never saw, and
+    # the pose lags the animal until the bounds mask drops the prior and the fallback snaps it back
+    # to the triangulation it was trained on. A default of `'query'` is what made that silent.
+    #
+    # A run folder from before this check has to be told which one it was, per
+    # `load_run(model_overrides=...)` / `scripts/infer.py --gridresid-offset`.
+    if 'gridresid_offset' not in cfg:
+        raise KeyError(
+            "[model].gridresid_offset is required, not defaulted: 'query' anchors the 3D residual "
+            "on the query point for the whole window and 'triangulated' re-anchors it on each "
+            'frame\'s own triangulation. Same shapes, same losses, different architecture -- so a '
+            'checkpoint trained under one and loaded under the other is wrong without ever '
+            'raising. Set it in the config, or for a run folder written before this key existed '
+            'pass --gridresid-offset (scripts/infer.py) / load_run(model_overrides=...) to state '
+            'which one those weights were trained with.')
+    offset = cfg.pop('gridresid_offset')
     # `wide`'s two query terms DEFAULT to `query`, and setting one is the `j4_prior` recipe (pos,
     # no patch). Only `wide` reads them -- `pose` derives its ten terms from the query directly --
     # so naming one alongside `pose` is a silent no-op and must not be silent.

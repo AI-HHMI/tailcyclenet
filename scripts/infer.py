@@ -137,13 +137,24 @@ def main():
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
+    ap.add_argument('--gridresid-offset', default=None, choices=('query', 'triangulated'),
+                    help='STATE what this run\'s 3D residual was anchored on, for a run folder '
+                         'written before `[model].gridresid_offset` existed. Those weights were '
+                         'trained under unconditional per-frame re-anchoring, i.e. '
+                         '"triangulated"; loading them as "query" infers `world = prior + '
+                         'residual` from a head that learned `world = tri_t + residual_t`. Not a '
+                         'sweep knob: on a run whose config names the key this must agree with it.')
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device)
-    print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)')
+    over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
+    model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
+                                             model_overrides=over)
+    print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)  '
+          f'query={config["model"].get("query", "prior")}  '
+          f'gridresid_offset={config["model"]["gridresid_offset"]}')
 
     trained_frames = int(config['data'].get('n_frames', 24))
     # LONGER THAN THE TRAINED WINDOW IS NOT A KNOB. `n_frames` sizes the temporal pos_embed the

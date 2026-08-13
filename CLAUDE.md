@@ -334,6 +334,14 @@ nan-aware, so a frame only one window decoded is that window's value exactly and
 The gate is applied to the window's own decode BEFORE it is recorded, so a gated frame is left out of
 the mean rather than blanked and then averaged back in.
 
+**MEASURED, AND IT DOES NOT WORK.** At overlap 4 on the 58-group protocol, blending is a no-op on error
+(MPJPE −0.0026 mm, n.s.) and slightly WORSE on identity (MOTA −0.0014, miss +0.0007, both SIG). The sign is
+the informative part: **a seam discontinuity is partly an IDENTITY discontinuity, and averaging identities is
+worse than picking one** — where two windows disagree about which animal a row is, their mean belongs to
+neither and can fall outside a match radius either one would have satisfied. So the seam is real and
+averaging is the wrong instrument: the fix has to resolve the disagreement, not split it, which is what
+`--track` does (seam ratio 2.67 → 2.45 with no blending). Stays default-off.
+
 The npz also carries **`box_agree`** (S,T,C) — the predicted centroid's distance from the centre of
 the crop box that produced its pixels, in units of one box side, reprojected in 3D. The pipeline held
 two independent statements about where an animal is, the box and the pose, and nothing compared them.

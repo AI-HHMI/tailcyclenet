@@ -39,6 +39,7 @@ from .format import VISIBLE, Labels, Session
 from .model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
+CARRY_SOURCES = ('triangulate', 'pred')
 
 # WHY AN (ANIMAL, WINDOW) PRODUCED NOTHING. Five separate aborts in the loop below wrote the same
 # NaN, so a coverage number could not be decomposed at all -- "the detector offered no box", "the
@@ -73,6 +74,13 @@ class InferConfig:
     # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
     # pixels and no scene encode can be shared). See `run_group`.
     refine: bool = False
+    # WHAT `carry` FEEDS BACK. See `run_group`'s carry note.
+    #   'triangulate' -- the ANCHOR-FREE estimate (`3d_pred_triangulate`). Breaks the loop.
+    #   'pred'        -- the reported prediction, which under gridresid_offset = "query" IS
+    #                    `prior + residual` and so integrates its own error window over window.
+    # 2D is identical either way: there is no triangulation at one camera and `coords_pred` is an
+    # absolute pixel decode, so nothing is being fed its own anchor.
+    carry_source: str = 'triangulate'
     device: str = 'cuda:0'
     # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
@@ -166,6 +174,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     Whichever was used is recorded in the result so a caller cannot quote one as the other.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
+    assert cfg.carry_source in CARRY_SOURCES, \
+        f'carry_source must be one of {CARRY_SOURCES}, got {cfg.carry_source!r}'
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
         raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
                          'overlap >= 1; got 0')
@@ -222,6 +232,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     pred = np.full((S, T_total, K, R), np.nan, np.float32)
     conf = np.full((S, T_total, K), np.nan, np.float32)
+    # THE ANCHOR-FREE ESTIMATE, kept beside the prediction in 3D. It is what `carry` now feeds back,
+    # every fix below rests on it, and nothing had ever scored it against the labels -- so it goes in
+    # the npz where `eval.py` can. Independent of `carry_source`, deliberately: it is a property of
+    # the forward, not of what the loop chose to do with it.
+    pred_tri = np.full((S, T_total, K, R), np.nan, np.float32) if mode == '3d' else None
     carried = [None] * S                      # per-animal prior for the next window
     # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
     # Both are what makes a coverage delta readable -- 08's crop-inflation measurement needed the
@@ -383,10 +398,42 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                       kpt_chunk=chunk)
             p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
+            # WHAT THE NEXT WINDOW OPENS ON, and it is not always what this window reports.
+            #
+            # Under `gridresid_offset = "query"` the reported 3D output is
+            # `query + R @ residual` with ONE anchor per keypoint for the whole window, so feeding
+            # it back as the next window's query closes a loop with GAIN: whatever the prior was
+            # wrong by is re-added, and only the residual carries new information. Measured on
+            # johnson-mouse, where the run is consistently trained so this is not RC0: a drift of
+            # p50 1.3-2.2 mm that changes by only 0.13-0.28 mm/frame (a smoothness ratio of 8-10),
+            # profiled as a SAWTOOTH locked to the window boundary, costing 30% of the animal's
+            # motion. The model has never seen a wrong prior either -- `dataset.py` offers GT
+            # +- i.i.d. 2.5 px or nothing at all -- so nothing trained it to correct one.
+            #
+            # `3d_pred_triangulate` is the anchor-free estimate: re-derived from THIS window's
+            # pixels every frame, supervised on every keypoint
+            # (`coords_loss_triangulate_weight` 0.1, `..._reproj_weight` 2.0), and already
+            # repaired for a degenerate solve by `model._query_anchored`. Carrying it leaves the
+            # reported output untouched -- so published numbers stay comparable -- and breaks the
+            # feedback path only.
+            q = None
             if mode == '2d':
                 # crop pixels -> source pixels: undo the resize, then the crop origin
                 p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
-            return p, out
+                # THE SAME TENSOR, deliberately: at one camera there is nothing to triangulate and
+                # the 2D grid head decodes ABSOLUTE pixel bins, so no anchor is being fed its own
+                # output. Every 2D root is therefore bit-identical under either `carry_source`,
+                # which is the free invariance check on this change.
+                q = p
+            elif cfg.carry_source == 'pred':
+                q = p
+            elif out.get('3d_pred_triangulate') is not None:
+                q = out['3d_pred_triangulate'][0].detach().cpu().numpy()
+            # else 3D SINGLE-VIEW: `_query_anchored` substitutes `_rays_fallback` there and
+            # deliberately does not write the key back, and a conf-weighted ray mean is too weak a
+            # position to seed the next window with. `carried[a]` is left alone, so the staleness
+            # bound in `_build_prior` retires it -- which is the honest answer, not a silent one.
+            return p, q, out
 
         crops = decode_crops(plans)
 
@@ -431,9 +478,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             got = forward(plan, crops)
             if got is None:
                 continue                        # already marked 'decode failed' above
-            p, out = got
+            p, q, out = got
             outcome[a, wi] = OUTCOMES.index('ok')
             pred[a, frames] = p
+            if pred_tri is not None and out.get('3d_pred_triangulate') is not None:
+                pred_tri[a, frames] = out['3d_pred_triangulate'][0].detach().cpu().numpy()
             _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
             vlogit = None
             if 'vis_pred' in out:
@@ -456,18 +505,23 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 pred[a, frames[drop]] = np.nan
                 conf[a, frames[drop]] = np.nan
                 box_agree[a, frames[drop]] = np.nan
-            carried[a] = (torch.as_tensor(p[j]), int(frames[j]),
-                          None if vlogit is None else torch.as_tensor(vlogit[j]))
+            if q is not None:
+                carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
+                              None if vlogit is None else torch.as_tensor(vlogit[j]))
 
-    return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
-            'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
-            'window_start': np.asarray(starts),
-            'outcome_names': np.asarray(OUTCOMES, object),
-            'mode': mode, 'group_id': gid, 'session': session.session_id,
-            'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total,
-            'boxes_from': 'detector' if boxes_stc is not None else
-                          ('given points' if box_points is not None else
-                           ('instances.pq' if inst_boxes is not None else 'labels'))}
+    out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
+               'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
+               'window_start': np.asarray(starts),
+               'outcome_names': np.asarray(OUTCOMES, object),
+               'mode': mode, 'group_id': gid, 'session': session.session_id,
+               'dataset': dataset_name, 'anchor': cfg.anchor,
+               'carry_source': cfg.carry_source, 'n_frames': T_total,
+               'boxes_from': 'detector' if boxes_stc is not None else
+                             ('given points' if box_points is not None else
+                              ('instances.pq' if inst_boxes is not None else 'labels'))}
+    if pred_tri is not None:
+        out_npz['pred_tri'] = pred_tri
+    return out_npz
 
 
 def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):

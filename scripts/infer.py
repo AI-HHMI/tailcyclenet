@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.checkpoints import load_run
 from tailcyclenet.format import Session, load_dataset
-from tailcyclenet.infer import ANCHORS, InferConfig, run_group
+from tailcyclenet.infer import ANCHORS, CARRY_SOURCES, InferConfig, run_group
 
 
 def sessions_for(path: Path, split: str):
@@ -137,6 +137,15 @@ def main():
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
+    ap.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
+                    help='3D only, and only under --anchor carry: what the next window is seeded '
+                         'with. "triangulate" (default) hands back the ANCHOR-FREE estimate, '
+                         're-derived from this window\'s pixels every frame. "pred" hands back the '
+                         'reported prediction, which under gridresid_offset = "query" is '
+                         '`prior + residual` -- a loop with gain, measured on johnson-mouse as a '
+                         'sawtooth locked to the window boundary that costs 30%% of the animal\'s '
+                         'motion. "pred" is what every arm before this flag existed did; it is kept '
+                         'so that comparison can be made. 2D is identical either way.')
     ap.add_argument('--gridresid-offset', default=None, choices=('query', 'triangulated'),
                     help='STATE what this run\'s 3D residual was anchored on, for a run folder '
                          'written before `[model].gridresid_offset` existed. Those weights were '
@@ -172,7 +181,8 @@ def main():
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
-        vis_thresh=args.vis_thresh, refine=args.refine, device=device)
+        vis_thresh=args.vis_thresh, refine=args.refine,
+        carry_source=args.carry_source, device=device)
     if args.prior_vis_thresh is not None and args.anchor != 'carry':
         raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
                          f'under --anchor carry; got {args.anchor!r}.')

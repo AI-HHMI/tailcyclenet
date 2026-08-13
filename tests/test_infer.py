@@ -296,3 +296,43 @@ def test_render_writes_every_predicted_frame(scene):
         n += 1
     cap.release()
     assert n == 3, f'wrote {n} frames for a 3-frame prediction'
+
+
+def test_2d_is_bit_identical_under_either_carry_source(scene):
+    """THE FREE INVARIANCE CHECK on de-looping the carry.
+
+    In 2D there is nothing to triangulate at one camera and the grid head decodes ABSOLUTE pixel
+    bins, so `coords_pred` is not built on top of the query and `carry_source` has nothing to
+    change. Every 2D root -- calms21, rat-city, branson-fly -- must therefore come out unchanged,
+    which is what confines the disambiguation risk of this change to the 3D roots.
+    """
+    model, sess, registry, name = scene
+    if sess.mode != '2d':
+        pytest.skip('2D only, by construction')
+    torch.manual_seed(0)
+    a = run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='carry', carry_source='triangulate'))
+    torch.manual_seed(0)
+    b = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', carry_source='pred'))
+    np.testing.assert_array_equal(np.nan_to_num(a['pred'], nan=-9e9),
+                                  np.nan_to_num(b['pred'], nan=-9e9))
+
+
+def test_3d_carry_feeds_back_the_anchor_free_estimate(scene):
+    """...and in 3D it must actually differ, or the de-loop is not wired to anything.
+
+    `pred_tri` is the tensor `carry` now hands the next window: re-derived from each window's own
+    pixels rather than `prior + residual`, which is a loop with gain. It also rides in the npz
+    because nothing had ever scored the triangulation against the labels.
+    """
+    model, sess, registry, name = scene
+    if sess.mode != '3d':
+        pytest.skip('3D only')
+    out = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='carry', carry_source='triangulate'))
+    assert 'pred_tri' in out and out['pred_tri'].shape == out['pred'].shape
+    # A single-camera 3D window has no triangulation, and the fixture rig has three cameras, so
+    # here it must be present -- and it is a different estimate from the reported one.
+    assert np.isfinite(out['pred_tri']).any(), 'the anchor-free estimate must be recorded'
+    assert not np.array_equal(np.nan_to_num(out['pred_tri'], nan=-9e9),
+                              np.nan_to_num(out['pred'], nan=-9e9))

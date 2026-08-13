@@ -359,6 +359,12 @@ only one arm attempted measures which arm declined more (eval rule 6).
 **A window that predicted nothing says why.** `run_group` writes an `outcome` code per (animal,
 window) — `ok / no box / no camera / no points / crop failed / decode failed` — and the crop box it
 used. Five aborts wrote the same NaN before, so a coverage number could not be attributed to a cause.
+**This is what makes the row-matcher fix readable rather than alarming:** on the 58-group 3dpop protocol
+the fixed arm's `no box` RISES from 1.65% to 2.67% while its coverage rises 0.933 → 0.985 and MOTA by
+0.343, because an unmatched row is now left EMPTY where `free.pop(0)` used to fill it with an arbitrary
+other animal. Without the split, "refuses more windows" and "covers more points" are two unexplained
+numbers pointing opposite ways. The crop inflation behind it is a TAIL fix: median 200 → 190 px, p90 566 →
+317 (−44%), max 1912 → 1312.
 The FP term is split too: `fp_dup` is a second prediction on an animal something else already claimed
 and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `fp_none` is ~10×
 `fp_dup` on every arm, which is why cross-track arbitration is not worth building.

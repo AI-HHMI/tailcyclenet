@@ -427,6 +427,10 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   no better than 4 (−0.049, n.s.). Coverage rises monotonically but trivially (+0.0005 at 12). Cost is
   windows: ~17% more forwards from 4 to 8, cheaper than `--refine`'s 100%. **The opposite trade from
   `--n-frames`** below, so do not sweep the two together.
+  **Overlap 2 and 4 give the SAME window count** (6 each over 120 frames -- `_window_starts` pulls the last
+  window back), so overlap 2's +0.460 mm and −0.011 MOTA cost the same compute and cannot be a context
+  effect: only the STALENESS BUDGET (`_build_prior` retires a prior staler than `overlap`) and the carried
+  frame index differ. That is the mechanism, at identical cost.
   **The optimum is the SEAM COUNT against the SEAM SIZE**: each seam shrinks with overlap (p50 3.95 → 3.24
   mm, ratio 2.95 → 2.49) while the fraction of steps that ARE seams grows (0.042 → 0.067), and their product
   bottoms out near 8. So `--seam blend`, which removes the per-seam jump, should move the optimum higher —

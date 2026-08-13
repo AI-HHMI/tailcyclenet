@@ -362,6 +362,19 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     # per-frame extents that would have to be unioned BEFORE squaring are not
                     # recoverable from the boxes. See dev/reports/11 §3 item 16.
                     #
+                    # THE UNION IS PER CAMERA, over that camera's OWN finite frames, so camera A's
+                    # crop can be positioned by frame 0 and camera B's by frame 23 -- the model then
+                    # triangulates across crops that are not contemporaneous. That is left alone on
+                    # measurement (`scratch/phase4/union_spans.py`, over every 3dpop box cache): of
+                    # 480 multi-camera animal-windows, the intersection of the contributing cameras'
+                    # spans has median 0.92-1.00 of the window, 12-15% fall below half, and only
+                    # 6-12 (1.3-2.5%) are DISJOINT with nothing contemporaneous at all. Both
+                    # alternatives -- requiring the spans to overlap, or unioning only over frames
+                    # two cameras share -- cost coverage on the other 97.5% to fix that, and a rule
+                    # tuned on 9 windows is a rule tuned on noise. `box_agree` is what makes it
+                    # visible where it happens: a crop cut from the wrong time is a camera whose box
+                    # the reprojected pose does not sit on.
+                    #
                     # int32 and clamped into the image, exactly like the crop rule's own box: a
                     # float or off-frame box produces a negative cam['offset'] and breaks
                     # project_cam far downstream.

@@ -246,9 +246,14 @@ wrong CROP, not a wrong prompt. The measured echo is alpha ~ 0.48-0.56 for offse
 half of a crop width, collapsing to 0.10 at a full one as the mask starts firing, so the whole
 dynamic range of the drift sits inside the gap the mask does not cover. Bar for keeping either: **`prior_self` not regressing beyond ~2.48 mm on
 `allen-mouse-combined/val`'s five sessions** (scored through `scratch/allen_eval3/rollup.py`, `checkpoint_best`
-not `last`) *and* johnson's POOLED carry/no-anchor path ratio above **0.757** (the reference
-loses 24.3% of the query-free path; pooled over the three clips, not a mean of their ratios). Ships WITH
+not `last`) *and* the carry/no-anchor path ratio moving toward 1. Ships WITH
 `prompt_dropout`.
+**`motion_ratio` IS NOT SINGLE-SIGNED — check which regime a root is in before setting a threshold on it.** It
+reads LOCK where the animal moves and JITTER where it does not: the same reference run gives johnson
+carry/none = **0.757** (24% of the path lost, 3.66 mm/step) and allen val **1.983** (twice the path, 0.331
+mm/step, an 11x slower animal). The two are not comparable and must never be pooled. An allen-trained arm also
+cannot be scored on johnson at all (47 keypoints against 24), so a motion bar has to be set on the root the arm
+was trained on, as |ratio − 1|.
 **NOT against 3.394 mm.** That is golden's CROSS-ANIMAL figure and `allen-mouse-combined/val` cannot produce
 one — all five of its sessions are a seen animal on an unseen session, since the other 769890 sessions live in
 `train/`. `allen_sweep3_60k.md` says so explicitly; scoring against 3.394 compares two axes and calls the

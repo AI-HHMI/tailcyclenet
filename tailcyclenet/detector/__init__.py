@@ -51,7 +51,7 @@ def load_detector(path, device='cpu', input_wh=None):
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
                          'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
                          'branson-fly 416 416).')
-    model = YOLOXNano()
+    model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)))
     model.load_state_dict(ckpt['model_state'])
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
             int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)),

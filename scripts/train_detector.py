@@ -155,6 +155,16 @@ def main():
                     help='batches per split at each checkpoint. TRAIN is scored too: the '
                          'train/val gap is what says whether a dataset needs augmentation '
                          '(a gap) or resolution (no gap, low absolute recall).')
+    ap.add_argument('--keypoints', action='store_true',
+                    help='train a bottom-up KEYPOINT BRANCH beside the box head. Off by default '
+                         'and off means NOT CONSTRUCTED: with this absent the model, the loader '
+                         'and the loss are byte-identical to every recorded detector, so no '
+                         'existing recipe needs a new flag to reproduce. K is derived from the '
+                         "dataset's own registry, never configured. Turning it on also disables "
+                         'the horizontal flip -- see `random_affine`, whose no-`flip_pairs` '
+                         'justification holds only while the target is a box.')
+    ap.add_argument('--kpt-weight', type=float, default=1.0)
+    ap.add_argument('--kpt-score-weight', type=float, default=1.0)
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
 
@@ -172,8 +182,13 @@ def main():
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
-                       max_frames_per_group=args.frames_per_group)
+                       max_frames_per_group=args.frames_per_group, keypoints=args.keypoints)
     print(f'train: {len(train)} views')
+    # DERIVED from the registry, never configured -- the same rule `n_keypoints` follows on the
+    # pose side. A configured K that disagreed with the data would mis-index every target.
+    n_kpts = len(roots[0].names) if args.keypoints else 0
+    if args.keypoints:
+        print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')
     loader = torch.utils.data.DataLoader(
         train, batch_size=args.batch_size, sampler=ChunkShuffle(len(train), chunk=train.chunk),
         num_workers=args.num_workers,
@@ -183,12 +198,13 @@ def main():
     try:
         val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim, reduce=args.reduce,
-                         max_frames_per_group=args.val_frames_per_group)
+                         max_frames_per_group=args.val_frames_per_group,
+                         keypoints=args.keypoints)
         print(f'val:   {len(val)} views')
     except ValueError as e:
         print(f'val:   none ({e})')
 
-    model = YOLOXNano().to(device)
+    model = YOLOXNano(n_keypoints=n_kpts).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX-Nano: {n / 1e6:.2f}M params')
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
@@ -199,13 +215,16 @@ def main():
     it, t0, running = 0, time.time(), []
     model.train()
     while it < args.iters:
-        for x, gt in loader:
+        for batch in loader:
             if it >= args.iters:
                 break
-            x, gt = x.to(device), gt.to(device)
+            x, gt = batch[0].to(device), batch[1].to(device)
+            gt_kpts = batch[2].to(device) if len(batch) > 2 else None
             obj, boxes, kpt = model(x)
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
-            loss, parts = detector_loss(obj, boxes, anchors, gt)
+            loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
+                                        kpt_weight=args.kpt_weight,
+                                        kpt_score_weight=args.kpt_score_weight)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -229,7 +248,13 @@ def main():
                     scores[name] = overall(score_dataset(
                         model, ds, device, batch_size=args.batch_size,
                         batches=args.eval_batches, num_workers=2))
+                # `n_keypoints` rides in the checkpoint beside `input_wh` for the same reason:
+                # it is part of the WEIGHTS, not a runtime choice, and absent reads as 0 -- which
+                # is a fact about the file ("no keypoint weights here"), not an assertion about
+                # how weights nobody recorded were trained. That distinction is what gotcha 12
+                # cost, one level down.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
+                        'n_keypoints': n_kpts,
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
                         'reduce': args.reduce,

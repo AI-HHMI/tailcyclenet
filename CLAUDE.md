@@ -244,8 +244,13 @@ widths (a different bird) and moves the output by 0.008 — alpha 0.005, 61% of 
 all — because the bounds mask withdraws a prior that far outside the crop. A row swap's damage is the
 wrong CROP, not a wrong prompt. The measured echo is alpha ~ 0.48-0.56 for offsets of a quarter to a
 half of a crop width, collapsing to 0.10 at a full one as the mask starts firing, so the whole
-dynamic range of the drift sits inside the gap the mask does not cover. Bar for keeping either: allen cross-animal inside the reproduction band (near
-3.394 mm) *and* a smaller `motion_ratio` gap on johnson. Ships WITH `prompt_dropout`.
+dynamic range of the drift sits inside the gap the mask does not cover. Bar for keeping either: **`prior_self` not regressing beyond ~2.48 mm on
+`allen-mouse-combined/val`'s five sessions** (scored through `scratch/allen_eval3/rollup.py`, `checkpoint_best`
+not `last`) *and* a smaller `motion_ratio` gap on johnson. Ships WITH `prompt_dropout`.
+**NOT against 3.394 mm.** That is golden's CROSS-ANIMAL figure and `allen-mouse-combined/val` cannot produce
+one — all five of its sessions are a seen animal on an unseen session, since the other 769890 sessions live in
+`train/`. `allen_sweep3_60k.md` says so explicitly; scoring against 3.394 compares two axes and calls the
+difference a result (eval rule 1).
 
 **The training-time signature to watch is `val` against `val_self`, not `val` alone.** `val` is the
 query-free forward and `val_self` re-queries at the model's own frame-0 prediction, i.e. the

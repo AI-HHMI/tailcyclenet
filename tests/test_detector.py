@@ -152,6 +152,36 @@ def test_letterbox_round_trip():
     torch.testing.assert_close(unletterbox_boxes(moved, scale, pad), box, atol=1e-4, rtol=0)
 
 
+def test_the_batched_pack_is_bit_identical_to_the_per_frame_one():
+    """PIXELS ARE A CONTRACT. `detect_group` packs a batch through numpy instead of one
+    `torch.as_tensor(lb, float32).permute(2,0,1) / 255.0` per frame, because handing a 0.5 MP
+    elementwise op to torch's `nproc`-wide intraop pool cost 67 ms per frame against 1.0 ms. Both
+    are uint8 -> float32 -> divide by 255, both correctly rounded, so the pixels the detector sees
+    must be EQUAL and not merely close -- one ulp here is a different box somewhere."""
+    rng = np.random.default_rng(0)
+    lbs = [rng.integers(0, 256, (32, 48, 3), dtype=np.uint8) for _ in range(5)]
+    old = torch.stack([torch.as_tensor(x, dtype=torch.float32).permute(2, 0, 1) / 255.0
+                       for x in lbs])
+    arr = np.ascontiguousarray(np.stack(lbs).transpose(0, 3, 1, 2))
+    new = torch.from_numpy(arr.astype(np.float32) / np.float32(255))
+    assert torch.equal(old, new)
+
+
+def test_a_video_read_locks_per_container_not_globally():
+    """`dataset._read_video` takes a lock PER PATH: two threads on ONE container interleave their
+    seeks, two threads on DIFFERENT containers share no state at all. The second is the whole of
+    `detect_group`'s multi-camera decode overlap (3.5x on 3dpop's four cameras), so a regression to
+    one global lock has to fail something."""
+    from tailcyclenet import dataset as ds
+
+    a, b = ds._read_lock_for('/x/cam0.mp4'), ds._read_lock_for('/x/cam1.mp4')
+    assert a is not b
+    assert ds._read_lock_for('/x/cam0.mp4') is a
+    with a:                       # holding one container's lock must not block another's
+        assert b.acquire(blocking=False)
+        b.release()
+
+
 def test_targets_are_the_crop_rule(tiny_root):
     """The regression target must BE crop_box_for_points, not something similar to it."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2)

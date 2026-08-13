@@ -139,7 +139,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
         # since nothing about the shapes or the scores would say so.
         src = session.rig.size(cam_name)
         r = reduce_factor(src, input_wh) if reduce else 1
-        imgs = read_frames(group, cam_name, frames, reduce=r)
+        imgs = read_frames(group, cam_name, frames, reduce=r, pool=frame_pool)
         lbs, metas = [], []
         for im in imgs:
             lb, scale, pad = letterbox(im, input_wh, src_wh=src)
@@ -156,7 +156,14 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
         arr = np.ascontiguousarray(np.stack(lbs).transpose(0, 3, 1, 2))
         return ci, torch.from_numpy(arr.astype(np.float32) / np.float32(255)), metas, src
 
+    # A SECOND POOL, FOR THE OTHER HALF OF THE ROOTS. `read_frames` threads an image directory over
+    # its FRAMES (it ignores `pool` for video, which decodes a batch in one `get_batch`), and that is
+    # where rat-city and branson-fly spend their time -- 39 ms per `cv2.imread` of a 4696x2048 JPEG
+    # (dev/reports/08), one frame at a time, on roots that are single-camera so the camera pool above
+    # buys them nothing. cv2 releases the GIL. It must NOT be `pool`: `_fetch` runs IN `pool` and
+    # waits on these futures, and a pool that waits on itself deadlocks the moment both are full.
     pool = ThreadPoolExecutor(max_workers=max(1, C)) if C > 1 else None
+    frame_pool = ThreadPoolExecutor(max_workers=min(16, max(1, batch)))
     try:
         for start in range(0, T, batch):
             frames = list(range(start, min(start + batch, T)))
@@ -193,6 +200,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                             out[a, t, c] = box.numpy()
                             sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
     finally:
+        frame_pool.shutdown()
         if pool is not None:
             pool.shutdown()
     return link_rows(out, sc, max_move=max_move) if (link and tracker is None) else (out, sc)

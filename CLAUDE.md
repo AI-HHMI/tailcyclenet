@@ -247,6 +247,19 @@ half of a crop width, collapsing to 0.10 at a full one as the mask starts firing
 dynamic range of the drift sits inside the gap the mask does not cover. Bar for keeping either: allen cross-animal inside the reproduction band (near
 3.394 mm) *and* a smaller `motion_ratio` gap on johnson. Ships WITH `prompt_dropout`.
 
+**The training-time signature to watch is `val` against `val_self`, not `val` alone.** `val` is the
+query-free forward and `val_self` re-queries at the model's own frame-0 prediction, i.e. the
+deployment-shaped path. On the shipped recipe the prompt HURTS — allen val 4.105 against val_self 4.253
+at 7.6k — which is exposure bias visible in training with no extra instrumentation. With
+`prompt_offset_px = 8` the ordering FLIPS (4.201 against 4.112): it pays ~0.10 mm query-free to gain
+~0.14 mm prompted. Early read only (eval rule 5), but it is the diagnostic that costs nothing to look at.
+
+**And `query = "prior"` + `gridresid_offset = "triangulated"` is confirmed a poor pairing, for a reason
+worth keeping.** Its two paths come out nearly equal (4.258 / 4.235) and both worst: re-anchoring every
+keypoint per frame is exactly the property that would free the motion the carry loop locks, and exactly
+why the prior stops paying for itself. **You cannot get per-frame freedom and a load-bearing prior from
+this one key** — fixing the motion lock needs a mechanism that decouples them.
+
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
 is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:

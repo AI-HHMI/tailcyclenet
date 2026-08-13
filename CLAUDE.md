@@ -403,6 +403,13 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 On 3dpop the first two together beat a 7.7×-compute detector (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
 0.572) with no retraining.
 
+**`grid_decode_space = "warped"` is the RIGHT value and the library's default is not.** `"head"`
+averages the convex-spaced bin centres directly and overshoots through the warp at large motion;
+`"warped"` averages in the uniform warped space first and is overshoot-free. Reverting costs +0.19 mm
+(6.4%) at every quantile on an oracle-prompted 3dpop probe. Also a plain attribute with no buffers, so
+it is a runtime knob — but only measurable on a PROMPTED arm, since query-free the tensor it touches
+never reaches the output (see `gridresid_offset`).
+
 **`soft_argmax_threshold = 60` IS LOAD-BEARING — do not widen it.** `_grid_softmax` masks the softmax
 to `|argmax - index| <= threshold` bins, and the shipped runs set `head_3d_grid_size = 1024` (not the 64
 of the test config), so 60 is a window of 121 of 1024 bins — 12% of the grid, ±0.21 of the ±1.8

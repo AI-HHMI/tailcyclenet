@@ -288,6 +288,17 @@ val runs `none` then `self` (one window, same pixels, qt = 0). `--oracle-corrupt
 `--anchor labels`, diagnostic only) is how the echo coefficient is measured without a training run —
 a whole-body offset in **crop widths**, a stale-frame prior, or the neighbouring animal's.
 
+**`--seam blend` averages the overlap; `last` is the default and it is a real discontinuity.** Under
+last-write-wins a frame in the overlap is reported from the window that saw it with the LEAST
+left-context, and the switch repeats every `n_frames - overlap` frames. Measured as the one-frame
+displacement AT the boundary against the same statistic in a window's interior: **3.46x on 3dpop**
+(2.42 mm vs 0.70), 4.49x without the tracker, 2.33x on johnson-mouse, 1.24-1.45x on the 2D roots —
+and on the mismatched phase3 3dpop arm the seam p90 is **182 mm against an interior p90 of 2.4**. At
+30 fps that is a ~1.5 Hz sawtooth, which is what a "low-frequency" wobble looks like. `blend` is
+nan-aware, so a frame only one window decoded is that window's value exactly and coverage cannot fall.
+The gate is applied to the window's own decode BEFORE it is recorded, so a gated frame is left out of
+the mean rather than blanked and then averaged back in.
+
 The npz also carries **`box_agree`** (S,T,C) — the predicted centroid's distance from the centre of
 the crop box that produced its pixels, in units of one box side, reprojected in 3D. The pipeline held
 two independent statements about where an animal is, the box and the pose, and nothing compared them.

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.checkpoints import load_run
 from tailcyclenet.format import Session, load_dataset
-from tailcyclenet.infer import ANCHORS, CARRY_SOURCES, InferConfig, run_group
+from tailcyclenet.infer import ANCHORS, CARRY_SOURCES, SEAM_MODES, InferConfig, run_group
 
 
 def sessions_for(path: Path, split: str):
@@ -165,6 +165,14 @@ def main():
                          'every one is marked `ok` -- 3dpop reports 0.000 of (row, frame) with no '
                          'pose against 2.1-2.2%% of (row, frame) with no camera at all. Raising this '
                          'LOWERS reported coverage on purpose.')
+    ap.add_argument('--seam', default='last', choices=SEAM_MODES,
+                    help='how overlapping frames are resolved. "last" is what the loop always did: '
+                         'the later window wins outright, so a frame in the overlap is reported from '
+                         'the window that saw it with the LEAST left-context, and the switch repeats '
+                         'every `n_frames - overlap` frames. That seam is NOT small -- the one-frame '
+                         'displacement at the boundary is 3.46x the interior value on 3dpop '
+                         '(2.42 mm vs 0.70), 2.33x on johnson-mouse, 1.24-1.45x on the 2D roots. '
+                         '"blend" reports the mean of every window that decoded the frame.')
     ap.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
                     help='3D only, and only under --anchor carry: what the next window is seeded '
                          'with. "triangulate" (default) hands back the ANCHOR-FREE estimate, '
@@ -211,7 +219,7 @@ def main():
         kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
-        oracle_corrupt=args.oracle_corrupt, device=device)
+        oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device)
     if args.oracle_corrupt:
         from tailcyclenet.infer import ORACLE_CORRUPTIONS
         kind = args.oracle_corrupt.split(':')[0]

@@ -40,6 +40,7 @@ from .model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 CARRY_SOURCES = ('triangulate', 'pred')
+SEAM_MODES = ('last', 'blend')
 
 # WHY AN (ANIMAL, WINDOW) PRODUCED NOTHING. Five separate aborts in the loop below wrote the same
 # NaN, so a coverage number could not be decomposed at all -- "the detector offered no box", "the
@@ -87,6 +88,16 @@ class InferConfig:
     # 2D is identical either way: there is no triangulation at one camera and `coords_pred` is an
     # absolute pixel decode, so nothing is being fed its own anchor.
     carry_source: str = 'triangulate'
+    # HOW OVERLAPPING FRAMES ARE RESOLVED.
+    #   'last'  -- the later window wins outright, which is what the loop always did.
+    #   'blend' -- the mean of every window that decoded the frame.
+    # The seam is not a small effect: measured as the one-frame displacement AT the boundary against
+    # the same statistic in a window's interior, it is 3.46x on 3dpop (2.42 mm vs 0.70), 4.49x without
+    # the tracker, 2.33x on johnson-mouse and 1.24-1.45x on the 2D roots -- and on the mismatched
+    # phase3 3dpop arm the seam p90 is 182 mm against an interior p90 of 2.4. Under `last`, a frame in
+    # the overlap is reported from the window that saw it with the LEAST left-context, and the switch
+    # happens every `n_frames - overlap` frames, which at 30 fps is a ~1.5 Hz sawtooth.
+    seam: str = 'last'
     # DELIBERATELY BREAK THE ORACLE PRIOR, to measure how far the output follows it. `--anchor
     # labels` + this is the only cheap way to get the echo coefficient alpha = d(output)/d(prior)
     # without a training run, and alpha is what decides whether the prior needs retraining at all.
@@ -218,6 +229,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     assert cfg.carry_source in CARRY_SOURCES, \
         f'carry_source must be one of {CARRY_SOURCES}, got {cfg.carry_source!r}'
+    assert cfg.seam in SEAM_MODES, f'seam must be one of {SEAM_MODES}, got {cfg.seam!r}'
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
         raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
                          'overlap >= 1; got 0')
@@ -279,6 +291,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # the npz where `eval.py` can. Independent of `carry_source`, deliberately: it is a property of
     # the forward, not of what the loop chose to do with it.
     pred_tri = np.full((S, T_total, K, R), np.nan, np.float32) if mode == '3d' else None
+    # BLENDING NEEDS A SUM AND A COUNT, not a second write. Kept nan-aware so a frame only one window
+    # decoded is that window's value exactly, and a frame no window decoded stays NaN.
+    blend = (np.zeros((S, T_total, K, R), np.float64),
+             np.zeros((S, T_total, K), np.int32)) if cfg.seam == 'blend' else None
     tri_bad = np.zeros((S, T_total, K), bool) if mode == '3d' else None
     carried = [None] * S                      # per-animal prior for the next window
     # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
@@ -552,7 +568,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 continue                        # already marked 'decode failed' above
             p, q, out = got
             outcome[a, wi] = OUTCOMES.index('ok')
-            pred[a, frames] = p
             if pred_tri is not None and out.get('3d_pred_triangulate') is not None:
                 pred_tri[a, frames] = out['3d_pred_triangulate'][0].detach().cpu().numpy()
                 if out.get('tri_degenerate') is not None:
@@ -584,12 +599,28 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # every keypoint confidence was NaN used to sail through the gate -- the one row the
                 # model said least about was the one the gate could not touch.
                 drop = ~(med >= cfg.vis_thresh)
-                pred[a, frames[drop]] = np.nan
+                # APPLIED TO `p` BEFORE IT IS RECORDED, not to `pred` after: under `seam = 'blend'` a
+                # gated frame must be left OUT of the mean rather than blanked once and then averaged
+                # back in by the next window. `q` is untouched, so the carried prompt is unaffected --
+                # two levers in one flag would be one too many (eval rule 4).
+                p = p.copy()
+                p[drop] = np.nan
                 conf[a, frames[drop]] = np.nan
                 box_agree[a, frames[drop]] = np.nan
+            if blend is None:
+                pred[a, frames] = p
+            else:
+                fin = np.isfinite(p).all(-1)
+                blend[0][a, frames] += np.where(fin[..., None], np.nan_to_num(p), 0.0)
+                blend[1][a, frames] += fin
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
                               None if vlogit is None else torch.as_tensor(vlogit[j]))
+
+    if blend is not None:
+        n = blend[1][..., None]
+        with np.errstate(invalid='ignore', divide='ignore'):
+            pred = np.where(n > 0, blend[0] / np.maximum(n, 1), np.nan).astype(np.float32)
 
     out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
                'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
@@ -597,7 +628,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                'outcome_names': np.asarray(OUTCOMES, object),
                'mode': mode, 'group_id': gid, 'session': session.session_id,
                'dataset': dataset_name, 'anchor': cfg.anchor,
-               'carry_source': cfg.carry_source, 'n_frames': T_total,
+               'carry_source': cfg.carry_source, 'seam': cfg.seam, 'n_frames': T_total,
                'boxes_from': 'detector' if boxes_stc is not None else
                              ('given points' if box_points is not None else
                               ('instances.pq' if inst_boxes is not None else 'labels'))}

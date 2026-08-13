@@ -352,3 +352,32 @@ def test_3d_carry_feeds_back_the_anchor_free_estimate(scene):
     assert np.isfinite(out['pred_tri']).any(), 'the anchor-free estimate must be recorded'
     assert not np.array_equal(np.nan_to_num(out['pred_tri'], nan=-9e9),
                               np.nan_to_num(out['pred'], nan=-9e9))
+
+
+def test_seam_blend_averages_the_overlap_and_changes_only_the_overlap(scene):
+    """The window seam is a discontinuity: measured at 3.46x the interior per-frame displacement on
+    3dpop and 2.33x on johnson-mouse, because `last` reports each overlap frame from the window that
+    saw it with the LEAST left-context.
+
+    `blend` must (a) leave frames only one window decoded exactly as they were, and (b) move the
+    overlap frames, or it is averaging nothing.
+    """
+    model, sess, registry, name = scene
+    last = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', seam='last'))
+    blend = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', seam='blend'))
+    assert blend['pred'].shape == last['pred'].shape
+    # Coverage cannot fall: a frame one window decoded is that window's value, nan-aware.
+    assert (np.isfinite(blend['pred']).all(-1).sum()
+            >= np.isfinite(last['pred']).all(-1).sum())
+    starts = last['window_start']
+    if len(starts) < 2:
+        pytest.skip('needs at least two windows to have an overlap at all')
+    T = last['pred'].shape[1]
+    covered = np.zeros(T, int)
+    for s0 in starts:
+        covered[s0:min(s0 + 4, T)] += 1          # _cfg uses n_frames=4
+    solo = covered == 1
+    if solo.any():
+        np.testing.assert_allclose(blend['pred'][:, solo], last['pred'][:, solo],
+                                   rtol=1e-5, atol=1e-5)
+    assert (covered > 1).any(), 'the fixture must actually overlap'

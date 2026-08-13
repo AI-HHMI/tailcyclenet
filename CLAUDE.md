@@ -306,6 +306,13 @@ In animal-size units, so unlike `--vis-thresh`'s logit one value means the same 
 And **`pred_tri`** / **`tri_degenerate`**, because every fix above rests on the triangulation and
 nothing had ever scored it.
 
+**`box_agree` IS A 3D DIAGNOSTIC. In 2D it is structurally bounded and says almost nothing** — the pose
+is decoded inside its own crop, so the centroid can be at most about half a box side from the centre by
+construction, and every 2D arm measures p99 0.31-0.56 with max 0.80. In 3D the pose is triangulated
+across cameras and its reprojection into any one camera can land anywhere, which is where values above
+one box side come from: 3dpop reads p99 0.451 with `--track` and **1.456** without, a significant paired
+delta. Report 13 retracts a pre-registered "rat-city p99 4.9 box-sides" that cannot occur in 2D.
+
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw. Multi-animal rows report **matched** MPJPE: row
 index is not identity once boxes come from a detector, and scoring row-to-row measured 385 px on

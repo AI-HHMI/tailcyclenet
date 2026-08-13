@@ -412,15 +412,17 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   arm at this run's logit scale, 6.0 drops nothing at all (0.0000 of rows below it) while the `--track`
   arm has 2.9% below it, because the tracker keeps the marginal — and therefore low-confidence — animals
   alive.
-- **`--overlap`: more is better, monotonically, and it buys LOCALISATION not recall.** Swept for the first
-  time on 3dpop's 58-group protocol (one shared cache, everything else held): MPJPE **12.985 / 12.841 /
-  12.507 mm** at overlap 2 / 4 / 8 and `motion_ratio` 1.113 / 1.104 / 1.095. Paired against the default,
-  overlap 2 costs +0.460 mm and −0.011 MOTA and +0.006 miss (all SIG) while overlap 8 buys −0.355 mm
-  [−0.751, −0.063] SIG and no MOTA back (+0.0005 n.s.). Cost is windows: step 22 → 20 → 16, ~17% more
-  forwards from 4 to 8, so a cheaper trade than `--refine`'s 100%. **The opposite trade from `--n-frames`**
-  below, so do not sweep the two together. The mechanism is probably the STALENESS BUDGET rather than
-  context — `overlap` is also what `_build_prior` retires a prior against, and under `--carry-source
-  triangulate` a surviving prior is a good seed — but that is not demonstrated.
+- **`--overlap` has an interior OPTIMUM at 8, and it buys LOCALISATION not recall.** Swept on 3dpop's
+  58-group protocol (one shared cache, everything else held): MPJPE **12.985 / 12.841 / 12.507 / 12.825 mm**
+  at overlap 2 / 4 / **8** / 12. Paired against the default, overlap 2 costs +0.460 mm, −0.011 MOTA and
+  +0.006 miss (all SIG); **overlap 8 buys −0.355 mm [−0.751, −0.063] SIG** and no MOTA back; overlap 12 is
+  no better than 4 (−0.049, n.s.). Coverage rises monotonically but trivially (+0.0005 at 12). Cost is
+  windows: ~17% more forwards from 4 to 8, cheaper than `--refine`'s 100%. **The opposite trade from
+  `--n-frames`** below, so do not sweep the two together.
+  **The optimum is the SEAM COUNT against the SEAM SIZE**: each seam shrinks with overlap (p50 3.95 → 3.24
+  mm, ratio 2.95 → 2.49) while the fraction of steps that ARE seams grows (0.042 → 0.067), and their product
+  bottoms out near 8. So `--seam blend`, which removes the per-seam jump, should move the optimum higher —
+  untested.
 - **`--n-frames` shorter is a trade, not a win.** 24 → 12 → 8 on 3dpop moves MOTA 0 → +0.106 → +0.130
   and pck@10 0.103 → 0.074 → 0.067, monotonically in both directions, with MPJPE inside its interval
   throughout. A shorter window shrinks the crop union AND cuts temporal context; the first buys

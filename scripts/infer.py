@@ -381,6 +381,7 @@ def main():
                 # used to return one animal per frame and read as a catastrophic miss rate
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
+                det_kpts = None
                 if key in det_cache:
                     det_boxes, det_scores = det_cache[key], det_cache.get(f'{key}|score')
                     print(f'{key}: up to {n_want} animal(s), boxes from --det-cache')
@@ -398,6 +399,7 @@ def main():
                     # the cache exists to make arms share a BOX set and adding a per-detector-
                     # shaped array to it would change what an old cache is allowed to satisfy.
                     det_boxes, det_scores = got[0], got[1]
+                    det_kpts = got[2] if len(got) > 2 else None
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True
@@ -418,7 +420,8 @@ def main():
                     'quietly turn this into the GT-crop upper bound. Keys present: '
                     f'{sorted(k for k in boxes if not k.startswith("__"))[:5]} ...')
             out = run_group(model, sess, gid, registry, ds_name, cfg,
-                            box_points=boxes.get(key), boxes_stc=det_boxes)
+                            box_points=boxes.get(key), boxes_stc=det_boxes,
+                            det_kpts_stc=det_kpts)
             if det_scores is not None:
                 # The objectness each crop was accepted on, beside the prediction it produced.
                 # `--det-score` is then an offline sweep instead of a re-detection per threshold.

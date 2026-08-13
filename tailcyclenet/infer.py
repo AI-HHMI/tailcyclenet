@@ -217,7 +217,7 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
 
 @torch.no_grad()
 def run_group(model, session: Session, gid: str, registry, dataset_name: str,
-              cfg: InferConfig, box_points=None, boxes_stc=None) -> dict:
+              cfg: InferConfig, box_points=None, boxes_stc=None, det_kpts_stc=None) -> dict:
     """Predict every animal in one group. Returns arrays in the SOURCE coordinate frame.
 
     Crops come from exactly one of two sources, and they are NOT comparable:
@@ -316,6 +316,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # (medians +2.7 / +4.0 / +15.4 across three roots, and a sign that flips per dataset) one value
     # means the same thing everywhere.
     box_agree = np.full((S, T_total, len(session.rig)), np.nan, np.float32)
+    # (S,T,C,K) pose-against-detector-keypoints, only when a keypoint-trained detector supplied
+    # them. Unlike `box_agree` this is per keypoint and structurally UNBOUNDED -- see
+    # `_fill_kpt_agreement`.
+    kpt_agree = (None if det_kpts_stc is None else
+                 np.full((S, T_total, len(session.rig), det_kpts_stc.shape[3]),
+                         np.nan, np.float32))
     crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
 
     for wi, start in enumerate(starts):
@@ -602,6 +608,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     # than absorbed into one silently-substituted array.
                     tri_bad[a, frames] = out['tri_degenerate'][0].detach().cpu().numpy()
             _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
+            if kpt_agree is not None:
+                _fill_kpt_agreement(kpt_agree, a, frames, use,
+                                    [det_kpts_stc[a, frames, ci] for ci in use],
+                                    p, mode, window_cams)
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
@@ -655,6 +665,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
                'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
+               **({} if kpt_agree is None else {'kpt_agree': kpt_agree}),
                'window_start': np.asarray(starts),
                'outcome_names': np.asarray(OUTCOMES, object),
                'mode': mode, 'group_id': gid, 'session': session.session_id,
@@ -677,6 +688,44 @@ def _overlaps(a, b):
     if not (np.isfinite(a).all() and np.isfinite(b).all()):
         return False
     return bool(min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1]))
+
+
+def _fill_kpt_agreement(kpt_agree, a, frames, use, det_kpts, p, mode, window_cams):
+    """PER-KEYPOINT distance from the pose to the DETECTOR's own keypoint, in box sides.
+
+    The third statement about where the animal is. `box_agree` compares the pose against its crop
+    BOX, and report 13 withdrew its 2D half because the pose is decoded inside that very box, which
+    bounds the statistic at about half a side by construction (every 2D arm reads p99 0.31-0.56).
+    **This has no such bound**: the detector regresses in the full frame, independent of the crop,
+    so pose and detector can disagree without limit and a large value means something in 2D too.
+
+    Per KEYPOINT rather than per centroid, so it localises WHICH joint the two disagree about --
+    and it needs no learned head and no per-dataset threshold, unlike `--vis-thresh`, whose logit
+    has no portable value across roots.
+
+    NOT a gate. Recorded as a diagnostic first; any gate built on it needs the rate-matched random
+    control that `--vis-thresh` is quoted with, for the same reason.
+    """
+    for i, ci in enumerate(use):
+        dk = det_kpts[i]                                  # (t,K,3) source pixels, or None
+        if dk is None:
+            continue
+        if mode == '2d':
+            q = np.asarray(p, np.float64)                 # already source pixels
+        else:
+            q = project_points_torch([window_cams[ci]],
+                                     torch.as_tensor(p, dtype=torch.float32))[0].numpy()
+        d = np.asarray(dk, np.float64)
+        # The detector's own box side, per frame, from its keypoint extent -- the same quantity
+        # every other distance in this file is normalised by.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            lo = np.nanmin(d[..., :2], axis=-2)
+            hi = np.nanmax(d[..., :2], axis=-2)
+        side = 0.5 * ((hi[..., 0] - lo[..., 0]) + (hi[..., 1] - lo[..., 1]))
+        side = np.where(np.isfinite(side) & (side > 1e-6), side, np.nan)
+        kpt_agree[a, frames, ci] = (np.linalg.norm(q - d[..., :2], axis=-1)
+                                    / side[..., None])
 
 
 def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):

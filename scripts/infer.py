@@ -369,7 +369,8 @@ def main():
                              f'{" " * len(str(args.det_cache))}  now running {stamp}\n'
                              'Delete it or point --det-cache somewhere else.')
         det_cache = loaded
-        print(f'detector boxes: {sum(1 for k in det_cache if not k.endswith("|score"))} '
+        print(f'detector boxes: '
+              f'{sum(1 for k in det_cache if not k.endswith(("|score", "|kpt")))} '
               f'cached group(s) from {args.det_cache}')
 
     results = {}
@@ -393,6 +394,19 @@ def main():
                 det_kpts = None
                 if key in det_cache:
                     det_boxes, det_scores = det_cache[key], det_cache.get(f'{key}|score')
+                    det_kpts = det_cache.get(f'{key}|kpt')
+                    # A CACHE WITHOUT KEYPOINTS CANNOT SERVE `--crop-source keypoints`, and the
+                    # failure would be SILENT: `run_group` takes `det_kpts_stc is not None` as the
+                    # switch, so a None here does not error, it quietly crops from the boxes and
+                    # reports the arm under the other arm's name. That is the `--boxes`-key trap
+                    # below, one flag over. Refused rather than warned, because the whole purpose of
+                    # a shared cache is that two arms differ in exactly one lever.
+                    if args.crop_source == 'keypoints' and det_kpts is None:
+                        raise SystemExit(
+                            f'{args.det_cache}: holds no keypoints for {key!r}, so --crop-source '
+                            'keypoints would silently fall back to cropping from the boxes and '
+                            'measure the arm it is being compared against. Delete it and re-detect '
+                            '(a keypoint-trained detector fills this in), or drop --det-cache.')
                     print(f'{key}: up to {n_want} animal(s), boxes from --det-cache')
                 else:
                     print(f'{key}: detecting up to {n_want} animal(s)'
@@ -404,13 +418,18 @@ def main():
                         reduce=det_red, max_frames=args.max_frames,
                         min_views=args.min_views, dup_res_px=args.dup_res_px,
                         track=args.track, max_move=args.max_move)
-                    # A keypoint-trained detector returns a third array; it is NOT cached, because
-                    # the cache exists to make arms share a BOX set and adding a per-detector-
-                    # shaped array to it would change what an old cache is allowed to satisfy.
+                    # A keypoint-trained detector returns a third array, cached under its own key.
+                    # This does NOT change what an old cache is allowed to satisfy: a box-only arm
+                    # never looks at it, and a keypoint-crop arm is refused above rather than served
+                    # boxes under the wrong name. Storing it is what lets the two crop sources share
+                    # ONE box set and so differ in exactly one lever (eval rule 4) -- report 15 §6
+                    # had to match its item-3 arms by configuration for want of this.
                     det_boxes, det_scores = got[0], got[1]
                     det_kpts = got[2] if len(got) > 2 else None
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
+                    if det_kpts is not None:
+                        det_cache[f'{key}|kpt'] = det_kpts
                     cache_dirty = True
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
                 # saturated on every detector shipped here; a detector whose scores are NOT

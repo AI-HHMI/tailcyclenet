@@ -571,6 +571,27 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
     assert 'BooleanOptionalAction' in src, '--no-track must exist to restore the old behaviour'
 
 
+def test_a_cache_without_keypoints_cannot_serve_the_keypoint_crop_source():
+    """A cache hit must not silently turn `--crop-source keypoints` into `--crop-source boxes`.
+
+    `run_group` switches on `det_kpts_stc is not None`, so a cache that holds only boxes does not
+    error -- it crops from the boxes and reports the arm under the other arm's name, which is the
+    one comparison item 3 exists to make. Two halves: keypoints are STORED under their own key, and
+    a cache lacking that key is REFUSED for this crop source rather than served.
+
+    A source check, like the `track` stamp test above and for the same reason: the guard is inside
+    `main`'s group loop, past `load_run`, so reaching it needs a trained detector and a checkpoint.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    assert "det_cache[f'{key}|kpt'] = det_kpts" in src, \
+        'detector keypoints must be cached, or the two crop sources cannot share one box set'
+    assert "args.crop_source == 'keypoints' and det_kpts is None" in src, \
+        'a keypoint-free cache must be refused for --crop-source keypoints, not silently accepted'
+    assert '"|score", "|kpt"' in src, 'the cached-group count must not count the keypoint entries'
+
+
 def test_keypoint_head_is_off_by_default():
     """`n_keypoints = 0` must be BYTE-identical to the head before the branch existed.
 

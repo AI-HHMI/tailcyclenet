@@ -247,7 +247,8 @@ the centroid by the full lag while i.i.d. draws cancel to sigma/sqrt(K) — **6.
 Matching the aggregate with jitter alone needs sigma = 8*sqrt(44) ~ 53 px, 21% of a 256 px crop, which destroys
 the per-keypoint marginal; one knob cannot set both channels. **NOT yet shown: that this channel is where the
 gain comes from.** A `prompt_noise_px = 10, prompt_offset_px = 0` arm has `offset8`'s per-keypoint marginal
-(10 vs 8.4 px) and 1/6.6 of its scene perturbation — if it matches, `prompt_offset_px` is redundant and goes. Wrong-animal is *not* built, and that is
+(10 vs 8.4 px) and 1/6.6 of its scene perturbation — if it matches, `prompt_offset_px` is redundant and goes.
+That arm is DEFERRED BY DECISION, so the key ships with its effect measured and its mechanism unresolved. Wrong-animal is *not* built, and that is
 now a measurement rather than a shrug: `--oracle-corrupt other` displaces the prior by 1.65 crop
 widths (a different bird) and moves the output by 0.008 — alpha 0.005, 61% of frames not moving at
 all — because the bounds mask withdraws a prior that far outside the crop. A row swap's damage is the

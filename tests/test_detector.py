@@ -516,3 +516,26 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
         assert len(ref) == 1
         for c, box in ref[0]['boxes'].items():
             np.testing.assert_allclose(got[0, c], box.numpy(), atol=1e-4)
+
+
+def test_the_tracker_is_the_default_and_can_be_turned_off():
+    """`--track` is ON by default (dev/reports/13), so `detect_group` must default to it too.
+
+    Pinned because the default is what every future arm inherits, and because the ONE thing that
+    makes flipping it safe is that `track` became unconditional in `--det-cache`'s stamp: a cache
+    written while it was off carries no `track` entry and must now be REFUSED rather than reused as
+    if it had been tracked. That is the same guard `det_score` needed when its default moved.
+    """
+    import inspect
+    from pathlib import Path
+
+    from tailcyclenet.detector import detect_group
+
+    sig = inspect.signature(detect_group)
+    assert sig.parameters['track'].default is True, 'the tracker is the default'
+    assert sig.parameters['link'].default is False, '--link-boxes is still opt-in'
+
+    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    assert "('track', str(args.track))" in src, \
+        'track must be UNCONDITIONAL in the cache stamp now that its default has moved'
+    assert 'BooleanOptionalAction' in src, '--no-track must exist to restore the old behaviour'

@@ -568,7 +568,17 @@ detections may be born into an empty row; `last` expires after one window. **`LI
 `--det-cache` stamp** because the cache stores boxes that have already been linked, so changing this
 rule silently makes an old cache a different box set.
 
-**`--track` IS A CAPABILITY, NOT A MEASURED ACCURACY WIN — off by default and keep it that way.** On
+**`--track` IS THE DEFAULT** (`--no-track` restores the memoryless pass). That is a judgement call taken
+against the protocol numbers below and in favour of the per-window ones: over 480 frames the memoryless pass
+grows +0.6 mm/window to 39.4 mm while the tracker holds 12-13 mm flat, the union crop widens 193 → 230 px
+against 187, the worst crop halves (p99 750 → 376), box slots filled rise 0.866 → 0.888, and it is 5-8x
+faster. Deployment clips are long — rat-city's test group is 57,594 frames, 480x the benchmark — so the
+per-window behaviour is the one that governs. **`track` is UNCONDITIONAL in the `--det-cache` stamp** for the
+third instance of the `det_score` reason: its default moved, so every cache written while it was off carries
+no `track` entry and is now REFUSED rather than reused as if it had been tracked. Reproducing any arm from
+reports 10-12 or from `scratch/phase{5,7,8}` needs `--no-track`, and those scripts now pass it.
+
+**What it does NOT buy, unchanged by the default flip.** On
 3dpop's own 58-group protocol, one lever against `associate` + `link_rows` rev 2, **none of report 12 §5's
 pre-registered primary endpoints moves**: coverage −0.0011, MOTA +0.0345, miss −0.0157, `fp_none` −0.0107,
 all n.s. What survives is MPJPE −2.62 [−6.69, −0.11], `motion_ratio` −0.037 and `box_agree` −0.0065 — small.

@@ -85,15 +85,23 @@ def main():
                          'births into empty rows and expiry after a window. Detector rows are '
                          'score-ordered and unlinked by default, which makes the window crop the '
                          'union over several different animals.')
-    ap.add_argument('--track', action='store_true',
-                    help='3D multiview only. ONE cross-view target set with one affinity and one '
-                         'Hungarian, replacing per-frame `associate` plus `link_rows` -- see '
-                         'tailcyclenet/detector/track.py and dev/reports/12. Those two never talked '
-                         'to each other, which is where the teleporting rows and the starved animals '
-                         'come from. Report 12 §2.1 measures the memoryless pass leaving 17.2%% of '
-                         'offered boxes unclaimed at 15 px jitter, and §2.2 measures it at 4.1 s per '
-                         'frame on a 16-camera rig against ~0.6 ms here. Off by default until it is '
-                         'measured on 3dpop; implies --link-boxes, which it subsumes.')
+    ap.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
+                    help='3D multiview only, and ON BY DEFAULT. ONE cross-view target set with one '
+                         'affinity and one Hungarian, replacing per-frame `associate` plus '
+                         '`link_rows` -- see tailcyclenet/detector/track.py and dev/reports/12. '
+                         'Those two never talked to each other, which is where the teleporting rows '
+                         'and the starved animals come from. `--no-track` restores the memoryless '
+                         'pass. What it buys, measured (dev/reports/13): over 480 frames the error '
+                         'of the memoryless pass grows +0.6 mm/window to 39.4 mm while this holds '
+                         '12-13 mm flat (-0.02/window), because the union crop widens 193 -> 230 px '
+                         'and this keeps it at 187; the worst crop halves (p99 750 -> 376 px, max '
+                         '1312 -> 570); box slots filled rise 0.866 -> 0.888 (p10 0.653 -> 0.732); '
+                         'and it is 5-8x faster, widening with camera count, which is what makes a '
+                         'multi-animal 16-camera rig runnable at all. What it does NOT buy: on '
+                         'report 11 §2\'s 120-frame protocol none of report 12 §5\'s pre-registered '
+                         'endpoints moves (coverage -0.001, MOTA +0.035, miss -0.016, all n.s.) -- '
+                         'that benchmark is six windows long, too short to show a per-window effect. '
+                         'It subsumes --link-boxes on a multi-camera rig.')
     ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
                     help='3D only. 2 is cross-view association as it stands: every instance is '
                          'built from a camera PAIR, so an animal only one view saw is dropped from '
@@ -312,12 +320,18 @@ def main():
     # `link_rev` for the same reason `det_score` is unconditional: the cache holds boxes that have
     # already been through `link_rows`, so changing that rule silently makes an old cache a
     # different box set. It only appears when linking is on, since it describes nothing otherwise.
+    #
+    # `track` IS UNCONDITIONAL TOO, and for the third instance of the same reason: its default moved
+    # from off to on, so "equals the default" means a different box set before and after. Every cache
+    # written while it was off carries no `track` entry, and under this line those caches are now
+    # REFUSED rather than silently reused as if they had been tracked -- which is the whole point of
+    # the stamp. Deleting them is correct; reproducing an untracked arm needs `--no-track`.
     from tailcyclenet.detector import LINK_REV
-    stamp = repr(sorted([('det_score', str(args.det_score))]
+    stamp = repr(sorted([('det_score', str(args.det_score)), ('track', str(args.track))]
                         + ([('link_rev', str(LINK_REV))] if args.link_boxes else [])
                         + [(k, str(getattr(args, k))) for k in
                            ('detector', 'max_animals', 'link_boxes', 'det_input_wh',
-                            'max_frames', 'min_views', 'dup_res_px', 'track')
+                            'max_frames', 'min_views', 'dup_res_px')
                            if getattr(args, k) != ap.get_default(k)]))
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():

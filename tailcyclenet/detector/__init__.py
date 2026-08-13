@@ -61,7 +61,7 @@ def load_detector(path, device='cpu', input_wh=None):
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
                  score_thresh=0.99, link=False, reduce=False, max_frames=0, min_views=2,
-                 dup_res_px=None, track=False):
+                 dup_res_px=None, track=True):
     """Run the detector over every frame and camera of a group -> (boxes, scores).
 
     boxes (S,T,C,4), scores (S,T,C). The score is the objectness the box survived NMS on, and it
@@ -89,8 +89,11 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     `link=True` puts the smallest possible one there -- see `link_rows`. Off by default so the
     contract in the paragraph above stays the contract.
 
-    3D multiview: rows come from cross-view association, so a row IS one physical animal within
-    a frame, again untracked across frames.
+    3D multiview: `track=True` (the DEFAULT) runs `track.CrossViewTracker` -- one cross-view target
+    set carried across frames, so a row is one physical animal both within a frame and along the
+    clip, and `link_rows` is not run on top of it. `track=False` restores the memoryless per-frame
+    `associate`, whose rows are one animal within a frame and untracked across them; that is the
+    arm every number before dev/reports/13 was measured on, so reproducing one needs it.
     """
     import numpy as np
     import torch

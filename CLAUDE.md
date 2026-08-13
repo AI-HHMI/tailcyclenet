@@ -283,6 +283,15 @@ decodes absolute pixel bins — which is checked on calms21 and rat-city and pin
 what confines the risk of this to the 3D roots. `--carry-source pred` restores the old behaviour so
 the comparison stays available.
 
+**AND ON A LONG CLIP THE LOOP IS UNBOUNDED.** Per-window divergence from the same run with no anchor
+grows without plateauing on two of johnson-mouse's three 600-frame clips — 1.5-2.0 mm over the first
+five windows rising to 23 mm and 62 mm by the last, slopes of +6.1 and +2.1 mm/window over the second
+half, against a mouse whose longest bone is 33 mm. The de-loop reduces that growth by 0-31% and does not
+remove it. rat-city's one test group is 57,594 frames, 96x these clips. So for a long deployment run
+prefer `--anchor none` until the architectural question above is settled, and say how short a clip any
+`carry` number came from. The only brake is the bounds mask, which fires at about one crop width and
+shows up in the trace as occasional windows of exactly 0.00 divergence.
+
 Nothing in training or val exercises `carry`: the training prior is GT ± i.i.d. jitter or absent, and
 val runs `none` then `self` (one window, same pixels, qt = 0). `--oracle-corrupt` (with
 `--anchor labels`, diagnostic only) is how the echo coefficient is measured without a training run —

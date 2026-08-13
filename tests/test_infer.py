@@ -187,7 +187,8 @@ def test_carried_prior_is_bounds_masked_and_dated():
 
     # Two keypoints inside the crop, two outside it.
     pose = torch.tensor([[10.0, 10.0], [90.0, 90.0], [-5.0, 10.0], [10.0, 400.0]])
-    prior, qt = _build_prior(cfg, (pose, 23), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    prior, qt = _build_prior(cfg, (pose, 23), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+                             cgroup)
 
     assert torch.isfinite(prior[0, :2]).all(), 'in-crop keypoints must survive'
     assert torch.isnan(prior[0, 2:]).all(), 'out-of-crop keypoints must become NaN'
@@ -196,25 +197,29 @@ def test_carried_prior_is_bounds_masked_and_dated():
 
     # A prompt from just before the window -- inside the overlap, so the ordinary case -- cannot be
     # expressed as a frame index and clamps into range rather than indexing off the front.
-    _, early = _build_prior(cfg, (pose, 17), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    _, early = _build_prior(cfg, (pose, 17), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+                            cgroup)
     assert (early == 0).all()
-    _, late = _build_prior(cfg, (pose, 999), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    _, late = _build_prior(cfg, (pose, 999), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+                           cgroup)
     assert (late == len(frames) - 1).all()
 
     # A KEYPOINT THE MODEL ITSELF DOUBTED, gated in the same currency (NaN = "I was not told").
     gated = InferConfig(anchor='carry', prior_vis_thresh=0.0)
     vis = torch.tensor([2.0, -1.0, 3.0, -5.0])
-    pri, _ = _build_prior(gated, (pose, 23, vis), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    pri, _ = _build_prior(gated, (pose, 23, vis), None, 0, 0, frames, boxes, [1.0], '2d', K,
+                          2, cgroup)
     assert torch.isfinite(pri[0, 0]).all(), 'a confident in-crop keypoint must survive'
     assert torch.isnan(pri[0, 1]).all(), 'a keypoint below the logit threshold must be dropped'
     # ...and the default keeps it, so an unconfigured run is byte-identical.
-    keep, _ = _build_prior(cfg, (pose, 23, vis), None, frames, boxes, [1.0], '2d', K, 2, cgroup)
+    keep, _ = _build_prior(cfg, (pose, 23, vis), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+                           cgroup)
     assert torch.isfinite(keep[0, 1]).all()
 
     # STALER THAN THE OVERLAP IS NOT A PRIOR. `carried` is only written by a window that predicted,
     # so an animal the box source lost for a few windows keeps offering a pose from before this
     # one, and the clamp above would present it as this window's first frame.
-    assert _build_prior(cfg, (pose, 2), None, frames, boxes, [1.0], '2d', K, 2,
+    assert _build_prior(cfg, (pose, 2), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                         cgroup) == (None, None)
 
 

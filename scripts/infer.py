@@ -60,7 +60,17 @@ def main():
                     help='letterbox size the detector was TRAINED at. Only needed for a '
                          'posetail-pose checkpoint, which keeps it in a config file rather than '
                          'in the weights.')
-    ap.add_argument('--det-score', type=float, default=0.05)
+    ap.add_argument('--det-score', type=float, default=0.99,
+                    help='objectness floor for a detection. 0.99, not the 0.05 that reads like a '
+                         'floor: the objectness is SATURATED -- 98.5%% of rat-city\'s boxes and '
+                         '99.98%% of 3dpop\'s sit at exactly 1.0 -- so anything between 0.05 and 0.5 '
+                         'moves 1-3%% of boxes and does nothing. At 0.99 it is worth MOTA +0.074 '
+                         '[+0.009, +0.154] on 3dpop with MPJPE -2.11 mm and coverage +0.010 also '
+                         'SIG, and +0.073 on rat-city. The gain is `fp_none`, which is what a score '
+                         'threshold should remove. Its SIZE tracks how many boxes are actually '
+                         'below it (6-8%% on those two, 0.9%% on calms21, where it reads +0.012 '
+                         'n.s.), so a detector whose scores are not saturated wants this lowered -- '
+                         'the per-group box coverage printed below is how that shows up.')
     ap.add_argument('--det-cache', type=Path, default=None,
                     help='npz of per-group detector boxes; read if it exists, written if not. '
                          'Detection is the expensive half of a run and depends on no model, so '
@@ -199,10 +209,16 @@ def main():
     # three times in one afternoon, twice in the middle of a sweep, each time refusing boxes that
     # were in fact exactly the right boxes. Under this form a new option carrying its default leaves
     # the stamp untouched, while any option a run actually set is still in it.
-    stamp = repr(sorted((k, str(getattr(args, k))) for k in
-                        ('detector', 'det_score', 'max_animals', 'link_boxes', 'det_input_wh',
-                         'max_frames', 'min_views', 'dup_res_px')
-                        if getattr(args, k) != ap.get_default(k)))
+    #
+    # `det_score` is UNCONDITIONAL, and that is the exception the rule needs: its default moved from
+    # 0.05 to 0.99, so "equals the default" means different boxes before and after. Omitting it would
+    # let a cache built under the old default be reused silently under the new one -- precisely the
+    # mismatch this stamp exists to catch. Anything whose default may move belongs on this line.
+    stamp = repr(sorted([('det_score', str(args.det_score))]
+                        + [(k, str(getattr(args, k))) for k in
+                           ('detector', 'max_animals', 'link_boxes', 'det_input_wh',
+                            'max_frames', 'min_views', 'dup_res_px')
+                           if getattr(args, k) != ap.get_default(k)]))
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
         loaded = dict(np.load(args.det_cache, allow_pickle=True))
@@ -244,6 +260,13 @@ def main():
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True
+                # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
+                # saturated on every detector shipped here; a detector whose scores are NOT
+                # saturated would lose most of its boxes to that, and this line is where that shows
+                # up rather than downstream as an unexplained miss rate.
+                filled = float(np.isfinite(det_boxes).all(-1).mean())
+                print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
+                      f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
             out = run_group(model, sess, gid, registry, ds_name, cfg,
                             box_points=boxes.get(key), boxes_stc=det_boxes)
             if det_scores is not None:

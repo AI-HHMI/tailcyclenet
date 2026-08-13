@@ -60,7 +60,11 @@ def main():
     ap.add_argument('--max-animals', type=int, default=None,
                     help='top_k for decode; default is the session\'s own animal count, which is '
                          'what scripts/infer.py supplies')
-    ap.add_argument('--score-thresh', type=float, default=0.05)
+    ap.add_argument('--score-thresh', type=float, default=0.05,
+                    help='0.05, where DEPLOYMENT runs at 0.99 (`scripts/infer.py --det-score`). '
+                         'Deliberately not the same number: this scores the detector as trained, and '
+                         'every figure in dev/reports/10 is at 0.05. Pass 0.99 to see the boxes the '
+                         'pose model is actually served.')
     ap.add_argument('--num-workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='cuda:0')

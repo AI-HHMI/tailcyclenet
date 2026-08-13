@@ -54,7 +54,7 @@ def load_detector(path, device='cpu', input_wh=None):
 
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
-                 score_thresh=0.05, link=False, reduce=False, max_frames=0, min_views=2,
+                 score_thresh=0.99, link=False, reduce=False, max_frames=0, min_views=2,
                  dup_res_px=None):
     """Run the detector over every frame and camera of a group -> (boxes, scores).
 
@@ -62,6 +62,13 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     is returned rather than dropped because `--det-score` is otherwise a re-detection per
     threshold: detection is the expensive half of a run, and a sweep over a threshold that only
     ever *removes* boxes can be done offline from what one pass already computed.
+
+    `score_thresh` DEFAULTS TO 0.99, not to `decode`'s 0.05. The objectness is saturated -- 98.5% of
+    rat-city's boxes and 99.98% of 3dpop's sit at exactly 1.0 -- so 0.05 through 0.5 are the same
+    threshold in practice and the live range starts at 0.99, where dropping the bottom few percent is
+    worth MOTA +0.074 [+0.009, +0.154] on 3dpop and +0.073 on rat-city, entirely out of `fp_none`.
+    `decode` keeps 0.05 deliberately: it is also the training-time and detector-scoring primitive,
+    and `eval_detector.py`'s numbers in dev/reports/10 are all at 0.05.
 
     `max_frames` is the same PREFIX `infer.run_group` takes, and it has to be honoured here or the
     two disagree about the clip: rat-city's one test group is 57,594 frames and the protocol is its

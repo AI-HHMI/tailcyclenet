@@ -253,12 +253,18 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 
 ### The three inference levers that are measured (dev/reports/11_inference_verified.md)
 
-- **`--det-score 0.99`.** The objectness is saturated — 98.5% of rat-city's boxes and 99.98% of
-  3dpop's sit at exactly 1.0 — so a sweep over 0.05–0.5 moves 1–3% of boxes and does nothing. Above
-  0.99: MOTA **+0.074** [+0.009, +0.154] on 3dpop with MPJPE −2.11 mm and coverage +0.010 also SIG,
-  and +0.073 on rat-city. **The size tracks how many boxes are actually below the threshold** — 6–8%
-  on those two, 0.9% on calms21, where it reads +0.012 n.s. Check the distribution (it is in the npz)
-  before quoting a number. The gain is `fp_none`, which is what a threshold should remove.
+- **`--det-score`, and it is now the DEFAULT at 0.99** (was 0.05, which was never a considered value
+  — it is `decode`'s primitive floor inherited by the deployment path). The objectness is saturated —
+  98.5% of rat-city's boxes and 99.98% of 3dpop's sit at exactly 1.0 — so a sweep over 0.05–0.5 moves
+  1–3% of boxes and does nothing. At 0.99: MOTA **+0.074** [+0.009, +0.154] on 3dpop with MPJPE
+  −2.11 mm and coverage +0.010 also SIG, and +0.073 on rat-city, whose MOTA at the new default
+  (0.660) now beats its own GT-crop upper bound (0.635). **The size tracks how many boxes are
+  actually below the threshold** — 6–8% on those two, 0.9% on calms21, where it reads +0.012 n.s.
+  A detector whose scores are NOT saturated wants this lowered; `scripts/infer.py` prints per-group
+  box coverage so that shows up where it happens. `decode` and `eval_detector.py` stay at 0.05 —
+  they are the training and detector-scoring paths, and report 10's figures are all at 0.05.
+  `det_score` is unconditional in the box-cache stamp for exactly this reason: the stamp otherwise
+  records only non-defaults, so moving a default would let an old cache be reused silently.
 - **`--vis-thresh`.** `vis_pred` was write-only. Read as a row gate it is worth MOTA +0.049
   [+0.011, +0.110] on 3dpop at 7.3% of rows and 0.601 → 0.628 on rat-city at 14% — and **−0.037 to
   −0.123 SIG on calms21**, whose converter writes every point `VISIBLE` so the head trained against

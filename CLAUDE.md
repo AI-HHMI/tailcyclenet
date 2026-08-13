@@ -384,7 +384,8 @@ the informative part: **a seam discontinuity is partly an IDENTITY discontinuity
 worse than picking one** — where two windows disagree about which animal a row is, their mean belongs to
 neither and can fall outside a match radius either one would have satisfied. So the seam is real and
 averaging is the wrong instrument: the fix has to resolve the disagreement, not split it, which is what
-`--track` does (seam ratio 2.67 → 2.45 with no blending). Stays default-off.
+`--track` does (seam ratio 2.67 → 2.45 with no blending). **`--seam blend` stays default-off** — that
+sentence is about blending, not about `--track`, which is ON.
 **Confirmed on a 4x stronger test**: at overlap 12, 80% of frames are averaged instead of 20%, and the harm
 SCALES (MOTA −0.0014 → −0.0020, miss +0.0007 → +0.0011) while MPJPE still does not improve (+0.005). What
 blending does do is move `motion_ratio` −0.016 SIG toward 1, because averaging smooths — so **`motion_ratio`
@@ -800,3 +801,10 @@ contract for *that* pipeline. This repo will not match it bit-for-bit and should
 The check here is a band: allen-mouse cross-animal MPJPE near 3.394 mm, human-vs-human baseline
 2.208 mm. A large gap is a port bug, and the first suspects are the allen column-sort permutation
 and the crop rule.
+
+**BUT NAME THE SPLIT WHEN YOU USE THAT BAND, because `allen-mouse-combined/val` CANNOT PRODUCE IT.** All five
+of its val sessions are a seen animal on an unseen session — the other 769890 sessions are in `train/` — so
+that root yields a seen-animal number (reference: `prior_self` 2.484, `prior_none` 2.642, `none` 2.786; golden
+on that axis is 2.274). 3.394 is a genuinely cross-animal figure and needs a split that holds an animal out.
+Report 13 corrected step 6's bar for exactly this: scoring a seen-animal arm against 3.394 compares two axes
+and reads the ~0.9 mm difference in axis as a result (eval rule 1).

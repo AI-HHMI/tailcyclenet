@@ -292,8 +292,17 @@ default `triangulate`). Under `gridresid_offset = "query"` the reported 3D outpu
 loop with gain: whatever the prior was wrong by is re-added and only the residual carries new
 information. `3d_pred_triangulate` is re-derived from each window's own pixels
 every frame and is supervised on every keypoint, so carrying it changes no reported output and breaks
-only the feedback path. Worth, on 3dpop, MPJPE −0.50 mm / coverage +0.0025 / MOTA +0.0041, all SIG, at
-+0.0011 of idsw; and it is what makes report 12's R3 safe to build.
+only the feedback path. Worth, on 3dpop's two 480-frame hard clips, MPJPE −0.50 mm / coverage +0.0025 /
+MOTA +0.0041, all SIG, at +0.0011 of idsw — **but on the 58-group 120-frame protocol the same lever is a NULL
+on every column** (MPJPE −0.106 [−0.349, +0.160], MOTA +0.0011, idsw +0.0000, all n.s.), because 120 frames is
+five carry hand-offs and too few for a loop effect to accumulate. It stays the default on the deployment case
+and the mechanism (α ≈ 0.5, brake only at animal-sized error, 2D bit-identical, and it is what makes report
+12's R3 safe to build) — **not** on the protocol number. Quote −0.50 mm only with "2 groups, 480 frames"
+attached.
+
+**Steps 3 and 7 share this shape, and it is a statement about the BENCHMARK.** Both target error that
+accumulates over a clip; report 11 §2's protocol is 120 frames, chosen so 58 groups fit in a GPU-hour; neither
+is confirmable on it. What this repo needs next is a long-clip protocol, not another lever.
 
 **IT IS NOT THE FIX FOR THE MOTION LOSS, and the mechanism there is worth stating exactly.** `--anchor
 carry` does lose **23-39% of johnson-mouse's motion** against the same run with no anchor — and every

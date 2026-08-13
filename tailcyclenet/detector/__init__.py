@@ -61,7 +61,7 @@ def load_detector(path, device='cpu', input_wh=None):
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
                  score_thresh=0.99, link=False, reduce=False, max_frames=0, min_views=2,
-                 dup_res_px=None, track=True):
+                 dup_res_px=None, track=True, max_move=1.0):
     """Run the detector over every frame and camera of a group -> (boxes, scores).
 
     boxes (S,T,C,4), scores (S,T,C). The score is the objectness the box survived NMS on, and it
@@ -119,7 +119,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     if track and C > 1:
         from .track import CrossViewTracker
         tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
-                                   min_views=min_views, dup_res_px=dup_res_px)
+                                   min_views=min_views, dup_res_px=dup_res_px,
+                                   max_move=max_move)
 
     for start in range(0, T, batch):
         frames = list(range(start, min(start + batch, T)))
@@ -166,7 +167,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                     for c, box in g['boxes'].items():
                         out[a, t, c] = box.numpy()
                         sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
-    return link_rows(out, sc) if (link and tracker is None) else (out, sc)
+    return link_rows(out, sc, max_move=max_move) if (link and tracker is None) else (out, sc)
 
 
 def link_rows(boxes, scores=None, max_move=1.0, max_age=24):

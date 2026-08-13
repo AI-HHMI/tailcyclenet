@@ -91,6 +91,14 @@ def main():
                          'score-ordered rows, and the union crop spanning several animals. Every 2D '
                          'number in reports 11 and 13 came from an explicit opt-in. '
                          '`--no-link-boxes` restores that memoryless pass.')
+    ap.add_argument('--max-move', type=float, default=1.0,
+                    help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a '
+                         'target-detection pair further apart than this is not the same animal and '
+                         'is unavailable to the Hungarian. 1.0 was calibrated against CENTROID '
+                         'displacement -- p90 0.06-0.11 body lengths on every multi-animal root, so '
+                         '10-16x headroom -- and that calibration does not transfer to any cost '
+                         'that measures something other than a centroid. Sweepable so the headroom '
+                         'can be checked rather than assumed.')
     ap.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
                     help='3D multiview only, and ON BY DEFAULT. ONE cross-view target set with one '
                          'affinity and one Hungarian, replacing per-frame `associate` plus '
@@ -341,7 +349,7 @@ def main():
                          ('link_boxes', str(args.link_boxes)), ('link_rev', str(LINK_REV))]
                         + [(k, str(getattr(args, k))) for k in
                            ('detector', 'max_animals', 'det_input_wh',
-                            'max_frames', 'min_views', 'dup_res_px')
+                            'max_frames', 'min_views', 'dup_res_px', 'max_move')
                            if getattr(args, k) != ap.get_default(k)]))
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
@@ -385,7 +393,7 @@ def main():
                         score_thresh=args.det_score, link=args.link_boxes,
                         reduce=det_red, max_frames=args.max_frames,
                         min_views=args.min_views, dup_res_px=args.dup_res_px,
-                        track=args.track)
+                        track=args.track, max_move=args.max_move)
                     det_cache[key] = det_boxes
                     det_cache[f'{key}|score'] = det_scores
                     cache_dirty = True

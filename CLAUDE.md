@@ -190,6 +190,11 @@ whole window (`tracker_encoder.py:736`). What that anchor is is a switch:
   prior anchored it; every other keypoint falls back to that frame's own **triangulation**. Under
   `query = "none"` that is every point, so the prediction is the triangulation outright and the
   `grid` CE target is dropped (`losses.py:680` gates on `'grid' in outputs`).
+  **A COROLLARY THAT COSTS AN EXPERIMENT IF YOU MISS IT: query-free, `out_3d` never reaches the
+  output**, so every `[model]` key that only affects it — `grid_decode_space`, `log_3d_output`,
+  `head_3d_grid_radius`, the subpixel 3D refinement — is INERT under `--anchor none`. A sweep over
+  one of them there returns bit-identical numbers, and that is not evidence the key does not
+  matter. Probe them with `--anchor labels` (oracle) or a prompted arm.
 - **`gridresid_offset = "triangulated"`** — recover the residual and re-add it to **each frame's**
   own triangulation, for every keypoint. This is posetail-pose's `_reanchor_per_frame`, which it
   applies unconditionally (`model.py:756`), measured 2.07 → 1.37 mm within-session.

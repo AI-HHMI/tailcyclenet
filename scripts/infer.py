@@ -280,9 +280,15 @@ def main():
                 from tailcyclenet.render import render_group
                 for ci in render_cams:
                     cam_name = sess.cam_names[ci]
+                    # The per-frame boxes the crop rule was fed, in each row's own colour: a box
+                    # with no skeleton in it is the disagreement worth seeing, and row `a` is not
+                    # label row `a` once boxes come from a detector. `crop` is per WINDOW and the
+                    # windows overlap, so it is not the array to draw here.
+                    bx = (det_boxes[:, :out['pred'].shape[1], ci]
+                          if det_boxes is not None else None)
                     mp4 = render_group(sess, gid, out['pred'],
                                        args.render / f'{key.replace("/", "__")}__{cam_name}.mp4',
-                                       cam=ci, zoom=args.render_zoom)
+                                       cam=ci, zoom=args.render_zoom, boxes=bx)
                     print(f'{key}: wrote {mp4}')
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

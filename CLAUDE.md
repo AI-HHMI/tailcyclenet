@@ -544,7 +544,11 @@ animals**, where a memoryless pairwise search has almost nothing to get wrong: t
 rare, and a coverage claim needs a crowded benchmark 3dpop's test split does not provide. **USE IT FOR LONG CLIPS — that, and not crowding, is what it fixes.** Matched MPJPE per window over 480
 frames (24 windows): `associate` + `link_rows` runs 16.9 → **39.4 mm** at +0.6 mm/window whether the carry
 source is `pred` or `triangulate`, while `--track` holds **12-13 mm flat** (−0.02 mm/window) and is 3× better
-by the last window. So the error growth over a clip is the CROP degrading, not the prompt. Report 11 §2's
+by the last window. So the error growth over a clip is the CROP degrading, not the prompt — shown directly, not just
+inferred: over the same 24 windows the median crop side goes **193 → 230 px (+19%, +1.13 px/window)** on both
+non-tracker arms and **190 → 187 (−0.19/window)** under the tracker, while `box_agree` barely moves, so the
+union is WIDENING rather than sliding off. (19% of crop growth does not by itself explain 133% of error
+growth; progressive identity drift is the likely remainder, and it is the same failure.) Report 11 §2's
 protocol is only **120 frames = 6 windows**, deliberately short, which is why the tracker reads insignificant
 there: the benchmark is too short to show the effect it fixes. rat-city's test group is 57,594 frames, 480×
 that. Quote it per window, not per arm.

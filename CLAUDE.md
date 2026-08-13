@@ -340,6 +340,15 @@ across cameras and its reprojection into any one camera can land anywhere, which
 one box side come from: 3dpop reads p99 0.451 with `--track` and **1.456** without, a significant paired
 delta. Report 13 retracts a pre-registered "rat-city p99 4.9 box-sides" that cannot occur in 2D.
 
+**AS A ROW GATE IT WORKS, AND IT IS PORTABLE WHERE `--vis-thresh` IS NOT.** On the 58-group 3dpop protocol
+`box_agree > 0.5` drops 1.24% of rows for **−0.29 mm and +0.007 MOTA**, beating its rate-matched random
+control at every threshold tried (2.0 / 1.0 / 0.75 / 0.5). It is not strictly better than the incumbent —
+at comparable rates `vis_pred` wins on MOTA and `box_agree` on MPJPE — so they are complementary and
+combining them is the next arm. What it has that `vis_pred` cannot: no learned head and no per-dataset
+threshold, so it cannot fail the way calms21 does, where the converter writes every point `VISIBLE`, the
+head trained against an all-true target, and the gate is worth −0.037 to −0.123 MOTA. Neither is a default
+and the rate-matched control is mandatory for both.
+
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw. Multi-animal rows report **matched** MPJPE: row
 index is not identity once boxes come from a detector, and scoring row-to-row measured 385 px on

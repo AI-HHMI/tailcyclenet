@@ -303,7 +303,13 @@ decodes absolute pixel bins — which is checked on calms21 and rat-city and pin
 what confines the risk of this to the 3D roots. `--carry-source pred` restores the old behaviour so
 the comparison stays available.
 
-**AND ON A LONG CLIP THE LOOP IS UNBOUNDED.** Per-window divergence from the same run with no anchor
+**AND THE ERROR GROWS WITH CLIP LENGTH — measured against LABELS on 3dpop's 58-group protocol.** Matched
+MPJPE per window index over 120 frames: the published `3dpop-and` arm runs **30.8 → 44.6 → 66.3 → 67.5 →
+71.2 → 76.7 mm, +8.9 mm per window**, while the fixed arms are flat (+0.29 and +0.14). So report 11's 3D
+figures are wrong in a way that GROWS with clip length, and their 120-frame means are averages over a
+rising curve. That also settles what the johnson divergence below was: error, not refinement.
+
+**ON A LONG CLIP THE LOOP IS UNBOUNDED.** Per-window divergence from the same run with no anchor
 grows without plateauing on two of johnson-mouse's three 600-frame clips — 1.5-2.0 mm over the first
 five windows rising to 23 mm and 62 mm by the last, slopes of +6.1 and +2.1 mm/window over the second
 half, against a mouse whose longest bone is 33 mm. The de-loop reduces that growth by 0-31% and does not

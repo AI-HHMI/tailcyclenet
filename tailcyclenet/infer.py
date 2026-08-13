@@ -74,6 +74,12 @@ class InferConfig:
     # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
     # pixels and no scene encode can be shared). See `run_group`.
     refine: bool = False
+    # How many finite (frame, camera) boxes a row needs before it gets a window crop at all. 1 is
+    # what the loop always did, and it is the reason coverage can be FABRICATED: `3dpop_nogate.npz`
+    # reports 0.000 of (row, frame) missing a pose while its box cache has 2.1-2.2% of (row, frame)
+    # with no camera at all -- one box out of T x C positions a crop for all 24 frames and every one
+    # of them is marked `ok`. Raising it LOWERS reported coverage, and that is the point.
+    min_box_frames: int = 1
     # WHAT `carry` FEEDS BACK. See `run_group`'s carry note.
     #   'triangulate' -- the ANCHOR-FREE estimate (`3d_pred_triangulate`). Breaks the loop.
     #   'pred'        -- the reported prediction, which under gridresid_offset = "query" IS
@@ -254,6 +260,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # (medians +2.7 / +4.0 / +15.4 across three roots, and a sign that flips per dataset) one value
     # means the same thing everywhere.
     box_agree = np.full((S, T_total, len(session.rig)), np.nan, np.float32)
+    crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
 
     for wi, start in enumerate(starts):
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
@@ -271,11 +278,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             bb = None
             if boxes_stc is not None:
                 bb = boxes_stc[a][frames]                          # (t, C, 4)
-                if not np.isfinite(bb).all(-1).any():
+                # NOT `.any()`: one finite box out of T x C used to position a crop for the whole
+                # window and mark every frame `ok`. See `cfg.min_box_frames`.
+                if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
                     continue
             elif inst_boxes is not None and a < len(inst_boxes):
                 bb = inst_boxes[a][frames]
-                if not np.isfinite(bb).all(-1).any():
+                if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
                     bb = None                                      # keypoint fallback, per animal
             if bb is not None:
                 # Boxes given directly (detector / detections file / instances.pq). One box per
@@ -463,12 +472,25 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 if cg2 is None:
                     refined.append(plan)
                     continue
+                # A REFINED BOX THAT DOES NOT OVERLAP THE BOX IT CAME FROM IS NOT A REFINEMENT.
+                # `boxes_from_points` runs the first pass's own prediction through
+                # `crop_box_for_points`, which SQUARES the extent -- so a pose that wandered (RC1's
+                # drift, or a crop that covered two animals) produces a box somewhere else
+                # entirely, at 2x the pose compute, and the giant squares in `rat-city_best.npz`
+                # are exactly that. Nothing bounded it. Requiring overlap with the first-pass box
+                # is the weakest test that catches "somewhere else", and it costs nothing.
+                if any(not _overlaps(b2[i], boxes[i]) for i in range(len(use))):
+                    refined.append(plan)
+                    continue
                 sc2 = []
                 for i, cam in enumerate(cg2):
                     cg2[i], s = _resize_camera(cam, cfg.image_size)
                     sc2.append(s)
+                # `crop` KEEPS THE FIRST-PASS BOX. Overwriting it lost the only record of what the
+                # detector actually offered, which is the box every coverage and crop-inflation
+                # number in reports 08 and 11 is computed from.
                 for i, ci in enumerate(use):
-                    crop[a, wi, ci] = np.asarray(b2[i], np.float32)
+                    crop_refined[a, wi, ci] = np.asarray(b2[i], np.float32)
                 refined.append((a, use, b2, cg2, sc2))
             plans = refined
             crops = decode_crops(plans)
@@ -521,7 +543,17 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                               ('instances.pq' if inst_boxes is not None else 'labels'))}
     if pred_tri is not None:
         out_npz['pred_tri'] = pred_tri
+    if crop_refined is not None:
+        out_npz['crop_refined'] = crop_refined
     return out_npz
+
+
+def _overlaps(a, b):
+    """Do two xyxy boxes share any area? Either being non-finite is not an overlap."""
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    if not (np.isfinite(a).all() and np.isfinite(b).all()):
+        return False
+    return bool(min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1]))
 
 
 def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):

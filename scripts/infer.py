@@ -80,9 +80,11 @@ def main():
                          'checked on load, so a cache from a different detector cannot be reused '
                          'silently.')
     ap.add_argument('--link-boxes', action='store_true',
-                    help='follow one animal per instance row across frames (greedy IoU). Detector '
-                         'rows are score-ordered and unlinked by default, which makes the window '
-                         'crop the union over several different animals.')
+                    help='follow one animal per instance row across frames -- per-frame Hungarian '
+                         'on centre distance in units of the box side, gated at one side, with '
+                         'births into empty rows and expiry after a window. Detector rows are '
+                         'score-ordered and unlinked by default, which makes the window crop the '
+                         'union over several different animals.')
     ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
                     help='3D only. 2 is cross-view association as it stands: every instance is '
                          'built from a camera PAIR, so an animal only one view saw is dropped from '
@@ -137,6 +139,13 @@ def main():
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
+    ap.add_argument('--min-box-frames', type=int, default=1,
+                    help='how many finite (frame, camera) boxes a row needs before it gets a window '
+                         'crop. 1 is what the loop always did, and it is how coverage gets '
+                         'FABRICATED: one box out of T x C positions the crop for all 24 frames and '
+                         'every one is marked `ok` -- 3dpop reports 0.000 of (row, frame) with no '
+                         'pose against 2.1-2.2%% of (row, frame) with no camera at all. Raising this '
+                         'LOWERS reported coverage on purpose.')
     ap.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
                     help='3D only, and only under --anchor carry: what the next window is seeded '
                          'with. "triangulate" (default) hands back the ANCHOR-FREE estimate, '
@@ -182,7 +191,8 @@ def main():
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
         vis_thresh=args.vis_thresh, refine=args.refine,
-        carry_source=args.carry_source, device=device)
+        carry_source=args.carry_source, min_box_frames=args.min_box_frames,
+        device=device)
     if args.prior_vis_thresh is not None and args.anchor != 'carry':
         raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
                          f'under --anchor carry; got {args.anchor!r}.')
@@ -235,7 +245,12 @@ def main():
     # 0.05 to 0.99, so "equals the default" means different boxes before and after. Omitting it would
     # let a cache built under the old default be reused silently under the new one -- precisely the
     # mismatch this stamp exists to catch. Anything whose default may move belongs on this line.
+    # `link_rev` for the same reason `det_score` is unconditional: the cache holds boxes that have
+    # already been through `link_rows`, so changing that rule silently makes an old cache a
+    # different box set. It only appears when linking is on, since it describes nothing otherwise.
+    from tailcyclenet.detector import LINK_REV
     stamp = repr(sorted([('det_score', str(args.det_score))]
+                        + ([('link_rev', str(LINK_REV))] if args.link_boxes else [])
                         + [(k, str(getattr(args, k))) for k in
                            ('detector', 'max_animals', 'link_boxes', 'det_input_wh',
                             'max_frames', 'min_views', 'dup_res_px')

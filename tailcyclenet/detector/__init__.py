@@ -8,7 +8,13 @@ from .yolox import YOLOXNano
 
 __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'unletterbox_boxes', 'assign', 'box_iou',
-           'decode', 'detector_loss', 'giou_loss', 'associate']
+           'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV']
+
+# BUMP THIS WHENEVER `link_rows` CHANGES WHAT IT EMITS. `--det-cache` stores boxes that have already
+# been linked, so a cache written under an older rule is a different box set under an identical
+# stamp -- exactly the silent mismatch the stamp exists to catch (`scripts/infer.py`). Rev 2 is the
+# gated centre-distance matcher with births and expiry; rev 1 was ungated IoU with `free.pop(0)`.
+LINK_REV = 2
 
 
 def load_detector(path, device='cpu', input_wh=None):
@@ -123,8 +129,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
             cam_frames = []
             for j in range(len(frames)):
                 b, s = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh)
-                cam_frames.append((unletterbox_boxes(b.cpu(), *metas[j]) if b.numel()
-                                   else b.cpu(), s.cpu()))
+                cam_frames.append((unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
+                                   if b.numel() else b.cpu(), s.cpu()))
             per_cam.append(cam_frames)
 
         for j, t in enumerate(frames):
@@ -145,7 +151,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     return link_rows(out, sc) if link else (out, sc)
 
 
-def link_rows(boxes, scores=None):
+def link_rows(boxes, scores=None, max_move=1.0, max_age=24):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
@@ -156,23 +162,50 @@ def link_rows(boxes, scores=None):
     (rat-city) the area of one animal and the pose model receives the whole arena squeezed into
     256 px.
 
-    Matching is on IoU against each row's LAST KNOWN box, not against frame t-1, so a one-frame
-    detector miss does not break the chain.
+    Matching is against each row's LAST KNOWN box, not against frame t-1, so a one-frame detector
+    miss does not break the chain -- but that box EXPIRES after `max_age` frames, because a
+    position more than a window old is not evidence about now, and an unexpiring one made a row
+    permanently unavailable for the animal that actually appeared there.
 
-    ponytail: greedy per-frame Hungarian on IoU, nothing else. No births, no deaths, no
-    re-identification after a long occlusion, no appearance model -- a row that drifts onto
-    another animal stays there. posetail-pose needed six more flags on top of this
-    (`--track-bridge`, `--rebirth`, `--birth-score`, `--dup-action`, `--pose-arbitrate`,
-    `--max-age-frames`) to reach MOTA 0.69 on rat-city, and `reports/crowding.md` is the record of
-    why. Upgrade path is that report, not another heuristic here.
+    Three things this used to get wrong, and all three are visible in `scratch/phase3`'s renders:
+
+    - **THE COST WAS IoU, WHICH IS NON-DISCRIMINATIVE IN EXACTLY THE CROWDED CASE.** Replaying
+      calms21 frame 301 -> 302 from the box cache: IoU picks the WRONG mouse (row0-det1 0.512
+      against row0-det0 0.233) because two touching 220 px mice overlap almost equally, while
+      centre distance picks the right one (0.24 against 0.50 box sides). Hungarian-matching the
+      pose to labels after that swap shows the error jump from 4-10 px to 60-82 px -- the user's
+      "the points go haywire". IoU is also exactly ZERO under fast motion, where it cannot rank at
+      all. So the cost is CENTRE DISTANCE OVER THE MEAN BOX SIDE, turned into an affinity that is
+      positive only inside the gate.
+    - **THERE WAS NO GATE.** The only test was `cost > 0`, i.e. any overlap whatsoever. Real motion
+      is tiny -- consecutive-frame box-centre displacement is p90 0.06-0.11 body lengths on all
+      three roots -- so a gate at ONE box side has 10-16x headroom and rejects essentially nothing
+      legitimate. What it does reject is the 3.4-3.9% of 3dpop row transitions that jump more than
+      a full body length (max 11) and rat-city's 8 jumps beyond two.
+    - **AN UNMATCHED ROW WAS FORCE-ASSIGNED SOMEBODY ELSE'S DETECTION** (`free.pop(0)`, an
+      arbitrary leftover). That is rat-city row 9, the user's "weird rat stretching across the
+      whole frame where there is no rat": its per-frame boxes are normal size (170x173, 278x169)
+      but TELEPORT -- x~3820 at t=0-10, x~1900 at t=12-14, back to 1937 at t=32, 3581 at t=42 --
+      and `run_group` then crops the window to their union, 1924x1924 against a 244 px rat, 62x the
+      area. Now an unmatched row stays EMPTY, which fixes the giant union crop at its source rather
+      than bounding it downstream.
+
+    A detection nobody claimed may still START a row, but only a row that is empty or expired --
+    which is a birth, not a swap. Beyond that it is dropped: there is no row for it, and inventing
+    one on top of a live animal is `fp_dup`.
+
+    ponytail: still per-frame Hungarian on geometry alone. No appearance model, no velocity (report
+    12 R2 measured that as not worth it), no re-identification after a long occlusion. `dev/reports/
+    12_crossview_tracking.md` R1 is the target state -- ONE cross-view target set with one affinity,
+    which deletes this function -- and this is the measurable interim that makes the renders usable
+    and gives R1 a baseline to beat.
     """
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
-    from .assign import box_iou as _iou
-
     S, T, C, _ = boxes.shape
     last = boxes[:, 0].copy()                     # (S,C,4), each row's most recent known box
+    age = np.zeros(S, int)                        # frames since this row was last seen
     for t in range(1, T):
         cur = boxes[:, t]
         cost = np.zeros((S, S), np.float32)
@@ -181,24 +214,41 @@ def link_rows(boxes, scores=None):
             ok_c = np.isfinite(cur[:, c]).all(-1)
             if not (ok_p.any() and ok_c.any()):
                 continue
-            iou = _iou(torch.as_tensor(last[ok_p, c]), torch.as_tensor(cur[ok_c, c])).numpy()
-            cost[np.ix_(ok_p, ok_c)] += iou
+            a, b = last[ok_p, c], cur[ok_c, c]
+            ca = np.stack([(a[:, 0] + a[:, 2]) / 2, (a[:, 1] + a[:, 3]) / 2], -1)
+            cb = np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], -1)
+            d = np.linalg.norm(ca[:, None] - cb[None], axis=-1)
+            sa = 0.5 * ((a[:, 2] - a[:, 0]) + (a[:, 3] - a[:, 1]))
+            sb = 0.5 * ((b[:, 2] - b[:, 0]) + (b[:, 3] - b[:, 1]))
+            side = 0.5 * (sa[:, None] + sb[None])
+            # IN UNITS OF THE ANIMAL'S OWN SIZE, never pixels: rat-city's rats are ~250 px and
+            # branson's flies ~30, so one pixel gate cannot serve both.
+            gap = np.where(side > 0, d / (max_move * np.maximum(side, 1e-6)), np.inf)
+            cost[np.ix_(ok_p, ok_c)] += np.clip(1.0 - gap, 0.0, None)
         rows, cols = linear_sum_assignment(-cost)
-        perm = np.arange(S)
-        # An unmatched row keeps its own slot; only positive-overlap pairs are moved, or two
-        # animals that never touch would be swapped by an all-zero cost matrix's arbitrary
-        # optimum.
-        taken = {}
-        for r, c_ in zip(rows, cols):
-            if cost[r, c_] > 0:
-                taken[r] = c_
-        free = [i for i in range(S) if i not in taken.values()]
-        for r in range(S):
-            perm[r] = taken[r] if r in taken else (free.pop(0) if free else r)
-        boxes[:, t] = cur[perm]
-        if scores is not None:
-            # The SAME permutation, or the score stops describing the box beside it.
-            scores[:, t] = scores[:, t][perm]
+        taken = {int(r): int(c) for r, c in zip(rows, cols) if cost[r, c] > 0}
+        # A BIRTH, and only into a slot no live animal is using.
+        claimed = set(taken.values())
+        free_dets = [c for c in range(S)
+                     if c not in claimed and np.isfinite(cur[c]).all(-1).any()]
+        open_rows = [r for r in range(S)
+                     if r not in taken and not np.isfinite(last[r]).all(-1).any()]
+        for r, c in zip(open_rows, free_dets):
+            taken[r] = c
+        out = np.full_like(cur, np.nan)
+        sc = None if scores is None else np.full_like(scores[:, t], np.nan)
+        for r, c in taken.items():
+            out[r] = cur[c]
+            if sc is not None:
+                # The SAME assignment, or the score stops describing the box beside it.
+                sc[r] = scores[:, t][c]
+        boxes[:, t] = out
+        if sc is not None:
+            scores[:, t] = sc
         seen = np.isfinite(boxes[:, t]).all(-1)
         last = np.where(seen[..., None], boxes[:, t], last)
+        age = np.where(seen.any(-1), 0, age + 1)
+        # EXPIRY IS A FORGET, not just a flag: a stale centre that stays in the cost matrix keeps
+        # competing for the detection that belongs to whoever is there now.
+        last[age > max_age] = np.nan
     return boxes if scores is None else (boxes, scores)

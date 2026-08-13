@@ -382,3 +382,84 @@ def test_box_source_instances_retargets_only_where_a_box_exists(tiny_root):
 def test_box_source_rejects_a_typo(tiny_root):
     with pytest.raises(AssertionError, match='box_source'):
         BoxDataset(tiny_root / 'ratlike', 'train', box_source='instance')
+
+
+def test_link_rows_never_force_assigns_another_animal():
+    """rat-city row 9: a row that matches nothing must stay EMPTY, not take a leftover.
+
+    `free.pop(0)` handed an unmatched row an arbitrary other detection. Its per-frame boxes then
+    looked normal-sized while TELEPORTING across the arena, and `run_group` crops the window to
+    their union -- 1924x1924 against a 244 px rat, 62x the area, which is the giant box the user saw
+    where there was no animal. Fixing the assignment fixes the crop at its source.
+    """
+    import numpy as np
+
+    from tailcyclenet.detector import link_rows
+
+    T = 6
+    boxes = np.full((2, T, 1, 4), np.nan, np.float32)
+    for t in range(T):
+        boxes[0, t, 0] = [10, 10, 40, 40]                      # a stationary animal
+    boxes[1, 3, 0] = [900, 900, 930, 930]                      # one far-away detection, once
+    linked = link_rows(boxes.copy())
+    assert np.allclose(linked[0, :, 0, 0], 10), 'the tracked row must not move'
+    # The far detection is a birth into the empty row 1 -- and it must never land in row 0.
+    assert not np.isfinite(linked[0, 3, 0]).all() or linked[0, 3, 0][0] == 10
+
+
+def test_link_rows_gates_on_the_animals_own_size():
+    """A jump of more than one box side is not motion. Real p90 is 0.06-0.11 body lengths."""
+    import numpy as np
+
+    from tailcyclenet.detector import link_rows
+
+    boxes = np.full((1, 2, 1, 4), np.nan, np.float32)
+    boxes[0, 0, 0] = [0, 0, 30, 30]
+    boxes[0, 1, 0] = [300, 0, 330, 30]                         # 10 box sides away
+    assert not np.isfinite(link_rows(boxes.copy())[0, 1, 0]).all(), \
+        'a 10-box-side jump must be rejected, not accepted as the same animal'
+    near = boxes.copy()
+    near[0, 1, 0] = [20, 0, 50, 30]                            # 0.67 of a side -- ordinary motion
+    assert np.isfinite(link_rows(near)[0, 1, 0]).all()
+
+
+def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
+    """IoU RANKS BY SHAPE AGREEMENT, WHICH IS NOT IDENTITY. Constructed, but the failure mode is
+    the one measured: replaying calms21 frame 301->302 from the box cache, IoU scored the WRONG
+    mouse at 0.512 against the right one's 0.233, and Hungarian-matching the pose to labels after
+    that swap showed the error jump from 4-10 px to 60-82 px.
+
+    Here the true continuation is a smaller box on the SAME centre (a mouse that curled up), and the
+    other animal's box happens to match the remembered box's size. IoU rewards the size match; the
+    union term punishes the true one for shrinking. Centre distance is not fooled.
+    """
+    import numpy as np
+
+    from tailcyclenet.detector import box_iou, link_rows
+
+    last = np.array([100.0, 100.0, 300.0, 300.0], np.float32)     # remembered, 200 px
+    near = np.array([170.0, 170.0, 230.0, 230.0], np.float32)      # same centre, 60 px
+    wide = np.array([150.0, 150.0, 350.0, 350.0], np.float32)      # 0.35 sides away, 200 px
+    iou = box_iou(torch.as_tensor(last[None]), torch.as_tensor(np.stack([near, wide])))[0]
+    assert iou[1] > iou[0], f'the fixture must be one IoU gets wrong, got {iou.tolist()}'
+
+    boxes = np.stack([np.stack([last, near]),
+                      np.stack([np.full(4, np.nan, np.float32), wide])])[:, :, None]
+    linked = link_rows(boxes.astype(np.float32).copy())
+    assert np.allclose(linked[0, 1, 0], near), \
+        f'centre distance must keep the nearer box, got {linked[0, 1, 0]}'
+    # ...and the other detection is a BIRTH into the empty row, not a dropped animal.
+    assert np.allclose(linked[1, 1, 0], wide)
+
+
+def test_unletterbox_clamps_a_runaway_box_into_the_frame():
+    """`yolox.py:167` decodes a side as exp(clamp(-6,6))*stride -- up to ~12,910 px, ~137,000 after
+    a 1/7 letterbox scale. IoU-only NMS cannot suppress it, and downstream it becomes the crop."""
+    from tailcyclenet.detector import unletterbox_boxes
+
+    b = torch.tensor([[-5000.0, -5000.0, 20000.0, 20000.0], [10.0, 10.0, 9.0, 40.0]])
+    out = unletterbox_boxes(b, 1.0, (0, 0), src_wh=(640, 480))
+    assert out[0].tolist() == [0.0, 0.0, 640.0, 480.0]
+    assert torch.isnan(out[1]).all(), 'a box with no positive area is not a detection'
+    # Without `src_wh` -- the training path, which has no frame to clamp against -- nothing changes.
+    assert unletterbox_boxes(b, 1.0, (0, 0))[0, 2].item() == 20000.0

@@ -128,7 +128,17 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         cams = tuple(sorted(members))
         pts = torch.stack([centres[c][members[c]] for c in cams])
         refined = _triangulate(cgroup, cams, pts)
-        out.append({'point': refined, 'residual': _residual(cgroup, cams, pts, refined),
+        # THE REFIT RESIDUAL WAS COMPUTED, STORED, AND NEVER TESTED. The group is accepted on the
+        # residual of the PAIR that seeded it -- a two-view reprojection residual, which is only an
+        # epipolar statistic and which two rays can always satisfy -- and then grown by adding a
+        # third and fourth camera each accepted against the PAIR's point. Re-triangulating over all
+        # of them can land somewhere none of the views actually agrees with, and that instance was
+        # emitted anyway. Testing the number that was already here costs nothing and is the one
+        # place in this function where the geometry can speak with more than two rays.
+        res_fit = _residual(cgroup, cams, pts, refined)
+        if res_fit > max_res_px:
+            continue
+        out.append({'point': refined, 'residual': res_fit,
                     'boxes': {c: boxes_per_cam[c][members[c]] for c in cams},
                     # WHICH detection in each camera, so a caller holding a per-camera score array
                     # can follow it through the association instead of re-deriving the match.

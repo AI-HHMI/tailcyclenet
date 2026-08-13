@@ -85,11 +85,33 @@ def letterbox_transform(size, out_wh):
     return s, ((out_wh[0] - nw) // 2, (out_wh[1] - nh) // 2)
 
 
-def unletterbox_boxes(boxes, scale, pad):
-    """Detector-input boxes -> source-image boxes."""
+def unletterbox_boxes(boxes, scale, pad, src_wh=None):
+    """Detector-input boxes -> source-image boxes. With `src_wh`, clamped into the frame.
+
+    THE CHOKE POINT EVERY DETECTOR BOX GOES THROUGH, which is why the bound is here and not in the
+    four callers. Nothing else bounds one: `yolox.py:167` decodes a side as
+    `exp(clamp(-6, 6)) * stride`, i.e. up to ~12,910 px per side at stride 32, and this function
+    then divides by a letterbox scale that can be 1/7 -- ~137,000 source pixels. IoU-only NMS
+    cannot suppress a box that big either, because its IoU with the real box it swallows is ~0.
+
+    Downstream that box becomes a crop: `run_group` unions the window's boxes and resizes the
+    result to 256 px, so ONE such frame delivers the whole arena as a thumbnail. A box with no
+    positive area after clamping is not a detection at all and comes back NaN, which every
+    consumer already reads as "no box here" -- `associate` skips a non-finite centre and
+    `run_group` counts it out of the union.
+
+    `src_wh` is optional only because `BoxDataset`'s training path has no frame to clamp against at
+    the point it calls this; every deployment caller passes it.
+    """
     out = boxes.clone().float()
     out[:, 0::2] = (out[:, 0::2] - pad[0]) / scale
     out[:, 1::2] = (out[:, 1::2] - pad[1]) / scale
+    if src_wh is not None:
+        w, h = float(src_wh[0]), float(src_wh[1])
+        out[:, 0::2] = out[:, 0::2].clamp(0.0, w)
+        out[:, 1::2] = out[:, 1::2].clamp(0.0, h)
+        dead = (out[:, 2] <= out[:, 0]) | (out[:, 3] <= out[:, 1])
+        out[dead] = float('nan')
     return out
 
 

@@ -682,6 +682,21 @@ stamp is the set of box-affecting options that **differ from their defaults**, d
 positional list of every value meant that adding one flag refused every cache on disk, which happened
 three times in one afternoon and twice mid-sweep.
 
+**AND ITS COST IS THE VIDEO DECODE, NOT THE GPU — measured, report 14.** The YOLOX-Nano forward is
+0.86 ms per frame-camera against a 44 ms decode of one 3840x2160 MPEG-4 frame, 50x, and detection
+runs at 0-3% GPU no matter what. Four things were wrong and all four are fixed bit-identically
+(8,370 finite box values, 0 differ, so **no `--det-cache` stamp entry** — this is the same box set):
+`detect_group` converted uint8 to float ONE 0.5 MP FRAME AT A TIME through torch, whose intraop pool
+is `nproc` wide, at **67 ms/frame against numpy's 1.0** and 62% of the whole pass; `_read_video` held
+ONE GLOBAL LOCK where the state is per container, so four cameras could not overlap (3.5x); the
+image-directory roots got no frame pool at all; and nothing was prefetched. 3dpop 136 s → 21 s
+quiet, **471 s → 38 s on a busy host** (the old path's cost RISES with contention), CPU 1451% → 411%,
+RSS 85 → 18 GB; rat-city 3.0x; `infer.py` end to end 1.61x with the same fix in `decode_crops`.
+**Do not chase NVDEC here**: 3dpop and calms21 are both MPEG-4 Part 2, and at 3840x2160 that is
+32,400 macroblocks against NVDEC's 8,192 cap for that codec — an H100 cannot decode these files at
+all. decord's PyPI build has no CUDA and torchcodec has no build for torch 2.11. The remaining lever
+is process count, which just got ~5x cheaper per process.
+
 ---
 
 ## Gotchas — every one of these has already cost someone a day

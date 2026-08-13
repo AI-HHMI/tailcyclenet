@@ -407,7 +407,10 @@ def main():
                             'keypoints would silently fall back to cropping from the boxes and '
                             'measure the arm it is being compared against. Delete it and re-detect '
                             '(a keypoint-trained detector fills this in), or drop --det-cache.')
-                    print(f'{key}: up to {n_want} animal(s), boxes from --det-cache')
+                    # `flush` for the same reason the detecting branch has it: redirected to a log,
+                    # stdout is block-buffered, so the CACHED path -- the fast one, which prints
+                    # little else -- shows nothing for minutes and reads as a hung run.
+                    print(f'{key}: up to {n_want} animal(s), boxes from --det-cache', flush=True)
                 else:
                     print(f'{key}: detecting up to {n_want} animal(s)'
                           f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
@@ -524,7 +527,12 @@ def main():
     if args.det_cache and cache_dirty:
         args.det_cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(args.det_cache, __stamp__=np.asarray(stamp), **det_cache)
-        print(f'wrote {args.det_cache} ({len(det_cache)} group(s) of boxes)')
+        # COUNT GROUPS, NOT KEYS. Each group holds boxes plus `|score` plus `|kpt` where a
+        # keypoint detector supplied them, so `len()` read 174 for 58 groups -- it was already
+        # double-counting before the keypoint key existed, which is why 2x looked plausible.
+        print(f'wrote {args.det_cache} '
+              f'({sum(1 for k in det_cache if not k.endswith(("|score", "|kpt")))} '
+              'group(s) of boxes)')
 
 
 if __name__ == '__main__':

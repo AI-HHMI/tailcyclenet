@@ -234,8 +234,13 @@ means a `prior` − `none` delta cannot be attributed to the prior alone. Say so
 eval rule 4, and `improvement_leads.md` opens by retracting a claim of exactly this shape.
 Isolating either lever needs a third arm.
 
-**Prompt corruption is REOPENED, with two of its three parts built** (`prompt_offset_px`,
-`prompt_stale_frames`, both default 0). The reason is that i.i.d. jitter is not the failure
+**Prompt corruption is REOPENED and `prompt_offset_px = 8` is MEASURED TO WORK** (report 13, step 6: three
+matched 60k allen arms). It beats a matched control by **−0.277 mm [−0.395, −0.171] paired** on the deployable
+`prior_self` pass (2.3275 against 2.5254; `checkpoint_last` agrees at 2.3051), and it cuts the carried prior's
+distortion of the motion by 29x — carry/none path ratio 1.034 against the control's 1.657, |r−1| 0.983 → 0.034.
+The inertness control passes: its prompt does the MOST accuracy work of any arm (self−none −0.366), so the prior
+is live rather than ignored. `prompt_stale_frames` is built and untested (step 1 measured staleness as not the
+failure mode). The reason is that i.i.d. jitter is not the failure
 deployment produces: Gaussian noise averages to zero over the keypoint set, so it teaches the model
 to trust the prior's **centroid** exactly — the one quantity a whole-body lag gets wrong. The lag is
 real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion).
@@ -291,8 +296,18 @@ lives for ~0.06 mm where it does not, which is the shape α ≈ 0.5 predicts. **
 iterations**: at 7.6k the control's prompt appeared to HURT (4.105 against 4.253) and by 15.4k it helped by
 0.231 mm, so an early read gives the opposite conclusion. Eval rule 5, learned again.
 
-**And `query = "prior"` + `gridresid_offset = "triangulated"` is confirmed a poor pairing, for a reason
-worth keeping.** Its two paths come out nearly equal (4.258 / 4.235) and both worst: re-anchoring every
+**`query = "prior"` + `gridresid_offset = "triangulated"` is REFUTED at 60k, with its reason.** It reaches the
+best motion ratio of any arm (**1.003**) and is the WORST on accuracy: `prior_self` 2.6595, **+0.289 [+0.115,
++0.473] paired worse than the control**, prompt doing the least work (−0.141). Per-frame re-anchoring frees the
+motion by leaving no static anchor to distort, and costs the accuracy by leaving the prior nothing to contribute
+— the same property both times. Do not use this pairing.
+
+**The run-to-run floor on that axis is ~0.041 mm**, measured by accident: `control` is a verbatim copy of the
+reference config and landed 2.5254 against its 2.4843 (different `best` iterations, 53,200 vs 55,000, and
+nondeterministic training). n = 2, so an estimate not a variance — but it is why a `vs bar` column partly
+measures seed noise and why an arm-vs-arm PAIRED comparison is the sound one.
+
+**The earlier training-curve read of this pairing, for the trail:** Its two paths come out nearly equal (4.258 / 4.235) and both worst: re-anchoring every
 keypoint per frame is exactly the property that would free the motion the carry loop locks, and exactly
 why the prior stops paying for itself. **You cannot get per-frame freedom and a load-bearing prior from
 this one key** — fixing the motion lock needs a mechanism that decouples them.

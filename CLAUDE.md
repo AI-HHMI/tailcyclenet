@@ -106,6 +106,40 @@ Five things that are easy to get wrong:
   key. That row is a *visibility observation* — allen-mouse ships a real per-camera
   `vis (S,T,K,7)` with no per-camera 2D, and this is how it is kept without inventing positions.
 
+### `rat-city-annotated` — the hand-annotated sibling, and its one trap
+
+`scripts/convert_apt_lbl.py` converts an APT (Animal Part Tracker) `.lbl` project. Shipped from
+`ratCity_round13_mjpegqv5_bounded.lbl`: 2D single-view, `labels = "annotated"`, **1,087 groups of
+65 frames each with ONE labelled frame centered at index 32** — allen-mouse's annotated shape,
+which is why the derived-T rule (gotcha 1) matters as much here. 2,847 instances, 11,168 keypoint
+rows (10,997 `visible` + 171 `missing`), K = 4 with names identical to the tracked `rat-city` so
+both roots share registry ids and therefore embedding rows. Split is **cross-cohort**: cohort5 is
+val, APT's own GT set is test. Round-tripped against the `.lbl`: every row, status, coordinate and
+box exact.
+
+**ITS PER-CAMERA VISIBILITY CHANNEL IS THE calms21 FAILURE MODE, BY DECISION.** APT records an
+occluded point the annotator still placed (`occ == 1`, 2,500 slots — 22.0% of all, 22.7% of the
+`visible` rows) and the format has no
+"occluded but positioned" status, so those are written **`visible` with their coordinates** —
+label density bought at the price of the visibility target. A `vis_pred` head trained on this root
+learns against a target that calls occluded points visible, exactly as calms21's all-`VISIBLE`
+converter did, and `--vis-thresh` is worth −0.037 to −0.123 MOTA there. Never use this root's vis
+head as a row gate without the rate-matched random control. `Inf` still becomes `missing` and
+`NaN` still becomes no row, so the negatives that exist are real — there are just only 171 of them.
+
+**AND ITS `p` COLUMN IS x-BLOCK-THEN-y-BLOCK, WHICH IS THE ONE THING THAT WOULD HAVE BEEN SILENT.**
+`labels{i}.p` is `(2K, n)` and decodes as `reshape(2, K, n)`, not `reshape(K, 2, n)`. Both readings
+give plausible-looking coordinates on a 4696x2048 frame, which is why this is asserted on values in
+`tests/test_convert_apt_lbl.py` and not on shapes: the interleaved reading puts **28.25% of points
+outside the frame against 0.01%**, and it smears the otherwise-perfect agreement between APT's
+`Inf`/`NaN` sentinels and its `occ` tag. Gotcha 10 in a new source.
+
+Two more things it will not tell you unless you look. Its five `original/merged_video_all_keyframes*`
+sessions are **4500x2050** where the 45 cohort sessions are 4696x2048, which is why the converter
+buckets one session per movie — calibration is a session property. And a labelled frame labels only
+*some* of the rats in it: APT's `labelsRoi` marks where labelling was complete and is NOT converted,
+so an unlabelled rat reads as background to the detector.
+
 ---
 
 ## Training

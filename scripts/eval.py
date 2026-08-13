@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.format import INST_PRESENT, Session, load_dataset
 from tailcyclenet.metrics import (error_and_coverage, match_instances, matched_error, mota,
-                                  paired_bootstrap, pck)
+                                  motion_ratio, paired_bootstrap, pck)
 
 
 def load_predictions(path: Path):
@@ -130,6 +130,19 @@ def score(preds, labels, mota_dist=None, quiet=False):
         m['S'] = S
         m['S_pred'], m['S_true'] = Sp, St
         m['_pred'], m['_true'] = pred, true      # already sliced to (S, T); PCK reuses these
+        # HOW MUCH THE PREDICTION MOVES, against how much the animal did. Unpaired here and only a
+        # screen: a carried prompt low-passes the prediction, which no error, coverage or MOTA column
+        # can see, and which every consistency statistic rewards. `--vs` reports the paired form.
+        mr = motion_ratio(m.get('_pred_matched', pred), true)
+        m['motion_ratio'] = mr['ratio'] if mr['n_steps'] else None
+        # WHERE THE POSE LANDED RELATIVE TO THE BOX IT WAS CROPPED FROM, in units of one box side.
+        # Written by `run_group` per (animal, window, camera): a pose that does not sit on its own
+        # crop is not a prediction of that animal, and it is the same quantity in every unit system.
+        if 'box_agree' in out:
+            ba = np.asarray(out['box_agree'], float)
+            ba = ba[np.isfinite(ba)]
+            m['box_agree'] = float(np.median(ba)) if ba.size else None
+            m['box_agree_p99'] = float(np.quantile(ba, 0.99)) if ba.size else None
         if S > 1:
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist)
         rows.append(m)
@@ -218,6 +231,16 @@ def main():
               f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% bootstrap over {boot["n"]} group(s)')
         print(f'[{mode}] coverage {n_match / n_true:.4f}  ({n_match} of {n_true} labelled '
               f'points{", matched" if any(m["S"] > 1 for m in block) else ""})')
+        mr = [m['motion_ratio'] for m in block if m.get('motion_ratio') is not None]
+        if mr:
+            print(f'[{mode}] motion_ratio {np.mean(mr):.3f}  (predicted path / label path over the '
+                  f'steps both have, {len(mr)} group(s) -- UNPAIRED, a screen not a claim; '
+                  '--vs pairs it)')
+        ba = [m['box_agree'] for m in block if m.get('box_agree') is not None]
+        if ba:
+            p99 = [m['box_agree_p99'] for m in block if m.get('box_agree_p99') is not None]
+            print(f'[{mode}] box_agree median {np.mean(ba):.3f} box-side(s), p99 '
+                  f'{np.mean(p99):.3f}  (pose centroid to its own crop box)')
 
         thresholds = ([float(t) for t in args.pck.split(',')] if args.pck
                       else ([2.0, 5.0, 10.0] if unit == 'mm' else [5.0, 10.0, 20.0]))
@@ -293,6 +316,19 @@ def main():
             # matched points and means nothing without it -- and it was the one column a `--vs` run
             # could not put an interval on.
             paired('coverage', lambda m: m['coverage'])
+            # MOTION IS PAIRED THE SAME WAY THE ERROR IS, and it has to be: a path length over an
+            # arm's own matched set rewards declining points, exactly like `err`. Both arms are
+            # measured against the SAME label path over the steps both attempted, so the delta is
+            # attenuation and nothing else.
+            mot = [(_shared_motion(a, b)) for a, b in block]
+            mot = [(x, y) for x, y, n in mot if n and np.isfinite(x) and np.isfinite(y)]
+            if mot:
+                dm = paired_bootstrap([x for x, _ in mot], [y for _, y in mot], seed=args.seed)
+                tail = ('DEGENERATE (one group)' if dm['n'] < 2
+                        else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
+                             + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
+                print(f'[{mode}] {"motion_ratio":>13s} {dm["mean"]:+.4f}  {tail}')
+            paired('box_agree', lambda m: m.get('box_agree'))
             # And the FP term SPLIT, not just its total: `dup` is what arbitration could remove and
             # `none` is what a detector threshold could, so a paired `fp_rate` alone cannot say
             # which of the two an arm moved.
@@ -322,6 +358,32 @@ def _shared_error(a, b):
     da = np.linalg.norm(pa[ok] - true[ok], axis=-1)
     db = np.linalg.norm(pb[ok] - true[ok], axis=-1)
     return float(da.mean()), float(db.mean()), int(ok.sum()), n_lab
+
+
+def _shared_motion(a, b):
+    """(motion_ratio_a, motion_ratio_b, n_steps) over the STEPS both arms and the label have.
+
+    The same restriction `_shared_error` makes, for the same reason: a path length summed over
+    whatever an arm happened to predict rewards the arm that predicted less. Both numerators and the
+    single shared denominator come from one step mask, so the difference is how much each arm moved
+    where they were both looking.
+    """
+    pa = a.get('_pred_matched', a['_pred'])
+    pb = b.get('_pred_matched', b['_pred'])
+    true = a['_true']
+    S = min(pa.shape[0], pb.shape[0], true.shape[0])
+    T = min(pa.shape[1], pb.shape[1], true.shape[1])
+    pa, pb, true = pa[:S, :T], pb[:S, :T], true[:S, :T]
+    ok = np.isfinite(pa).all(-1) & np.isfinite(pb).all(-1) & np.isfinite(true).all(-1)
+    both = ok[:, :-1] & ok[:, 1:]
+    if not both.any():
+        return float('nan'), float('nan'), 0
+    dt = np.linalg.norm(np.diff(true, axis=1), axis=-1)[both].sum()
+    if not dt:
+        return float('nan'), float('nan'), 0
+    da = np.linalg.norm(np.diff(pa, axis=1), axis=-1)[both].sum()
+    db = np.linalg.norm(np.diff(pb, axis=1), axis=-1)[both].sum()
+    return float(da / dt), float(db / dt), int(both.sum())
 
 
 if __name__ == '__main__':

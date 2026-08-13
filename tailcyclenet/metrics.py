@@ -86,6 +86,62 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
 
 
 # ----------------------------------------------------------------------------------------------
+# temporal
+# ----------------------------------------------------------------------------------------------
+
+def path_length(pred) -> dict:
+    """Total distance travelled, summed over keypoints, and the step count behind it.
+
+    THE ONLY TEMPORAL STATISTIC IN THIS FILE, and it is here because there was none. A prompt loop
+    that feeds each window its own previous output low-passes the prediction, and every consistency
+    number this repo already had REWARDED that: on johnson-mouse `--anchor carry` scored the best
+    jerk (0.392 vs 0.507) and the best bone CV (0.148 vs 0.251) of any arm while moving the median
+    per-keypoint speed from 1.182 to 0.796 mm/frame against the same run prior-free -- 30% of the
+    animal's motion, invisible to everything that was measured.
+
+    Steps with a missing end are SKIPPED, not bridged. Bridging would charge the whole excursion
+    across a gap to one step and read as more motion, so a method that predicts less would look
+    livelier the more it declined.
+    """
+    p = np.asarray(pred, float)
+    d = np.linalg.norm(np.diff(p, axis=-3), axis=-1)          # (..., T-1, K)
+    ok = np.isfinite(d)
+    return {'path': float(d[ok].sum()), 'n_steps': int(ok.sum()),
+            'speed': float(np.median(d[ok])) if ok.any() else float('nan')}
+
+
+def motion_ratio(pred, ref) -> dict:
+    """Predicted path length over a reference's, over the steps BOTH sides have.
+
+    `ref` is either the same shape as `pred` (the labels) or one position per instance-frame, e.g. a
+    box centre -- in which case the prediction's own centroid is what moves.
+
+    NOT the trustworthy form on its own. A box-centre denominator carries the detector's own jitter,
+    which inflates it; the paired form (two arms over the SAME steps, `scripts/eval.py --vs`) is what
+    licenses a claim. This is the label-free screen that says where to look.
+    """
+    p, r = np.asarray(pred, float), np.asarray(ref, float)
+    if r.ndim == p.ndim - 1:
+        # One reference position per instance-frame: the prediction's CENTROID is what moves. Kept
+        # as a length-1 keypoint axis so the time axis stays at -3 for both shapes.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)   # an all-NaN instance-frame is legal
+            p = np.nanmean(p, axis=-2, keepdims=True)
+        r = r[..., None, :]
+    if p.shape != r.shape:
+        raise ValueError(f'motion_ratio: pred {p.shape} vs ref {r.shape}')
+    ok = np.isfinite(p).all(-1) & np.isfinite(r).all(-1)          # (..., T, K)
+    both = ok[..., :-1, :] & ok[..., 1:, :]
+    dp = np.linalg.norm(np.diff(p, axis=-3), axis=-1)
+    dr = np.linalg.norm(np.diff(r, axis=-3), axis=-1)
+    if not both.any():
+        return {'ratio': float('nan'), 'pred_path': 0.0, 'ref_path': 0.0, 'n_steps': 0}
+    a, b = float(dp[both].sum()), float(dr[both].sum())
+    return {'ratio': a / b if b else float('nan'), 'pred_path': a, 'ref_path': b,
+            'n_steps': int(both.sum())}
+
+
+# ----------------------------------------------------------------------------------------------
 # multi-instance
 # ----------------------------------------------------------------------------------------------
 

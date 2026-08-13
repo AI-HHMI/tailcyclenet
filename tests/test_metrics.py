@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
-from tailcyclenet.metrics import _dist, match_instances, matched_error, mota
+from tailcyclenet.metrics import (_dist, match_instances, matched_error, mota, motion_ratio,
+                                  path_length)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -142,3 +143,45 @@ def test_matched_error_reports_the_counts_behind_its_coverage():
     assert m['n_true'] == int(np.isfinite(true).all(-1).sum())
     assert m['n_matched'] == pytest.approx(m['coverage'] * m['n_true'])
     assert m['unmatched_true'] == m['n_true_inst'] - m['n_matched_inst']
+
+
+def test_a_frozen_prediction_reads_as_less_motion_than_a_moving_one():
+    """The statistic RC1 needed and nothing had. A locked pose scores best on every consistency
+    number in the repo (jerk, bone CV) while losing 30% of the animal's motion."""
+    true = np.zeros((1, 5, 2, 3))
+    true[0, :, :, 0] = np.arange(5)[:, None]                   # the animal walks along x
+    moving = true.copy()
+    frozen = np.zeros_like(true)                               # predicts the same pose every frame
+
+    assert path_length(moving)['path'] == pytest.approx(8.0)   # 2 keypoints x 4 unit steps
+    assert path_length(frozen)['path'] == 0.0
+    assert motion_ratio(moving, true)['ratio'] == pytest.approx(1.0)
+    assert motion_ratio(frozen, true)['ratio'] == 0.0
+    # A step with a missing end is SKIPPED, not bridged -- bridging would charge the whole
+    # excursion across the gap to one step and read as MORE motion than the continuous arm.
+    gappy = moving.copy()
+    gappy[0, 2] = np.nan
+    assert path_length(gappy)['n_steps'] == 4                  # 2 kpts x 2 surviving steps
+    assert path_length(gappy)['path'] == pytest.approx(4.0)
+
+
+def test_motion_ratio_takes_a_centroid_reference():
+    """A box centre is one position per instance-frame, so the prediction's centroid is what moves."""
+    pred = np.zeros((1, 3, 4, 2))
+    pred[0, :, :, 0] = np.arange(3)[:, None] * 2.0             # centroid moves 2 px per frame
+    ref = np.zeros((1, 3, 2))
+    ref[0, :, 0] = np.arange(3)                                # the box moves 1 px per frame
+    assert motion_ratio(pred, ref)['ratio'] == pytest.approx(2.0)
+
+
+def test_paired_motion_uses_only_the_steps_both_arms_have():
+    """Eval rule 6 again: a path summed over whatever an arm predicted rewards predicting less."""
+    ev = _eval_module()
+    true = np.zeros((1, 4, 1, 2))
+    true[0, :, 0, 0] = np.arange(4)
+    full = true.copy()
+    picky = np.full((1, 4, 1, 2), np.nan)
+    picky[0, :2] = true[0, :2]                                 # only the first step
+    ra, rb, n = ev._shared_motion({'_pred': full, '_true': true},
+                                  {'_pred': picky, '_true': true})
+    assert n == 1 and ra == pytest.approx(1.0) and rb == pytest.approx(1.0)

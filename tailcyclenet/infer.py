@@ -23,6 +23,7 @@ GT-derived priors inflated every anchored number that was ever published.
 """
 from __future__ import annotations
 
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from posetail.posetail.cube import is_point_visible
+from posetail.posetail.cube import is_point_visible, project_points_torch
 
 from . import crop as cropmod
 from .dataset import _crop_affine, _resize_camera, read_frames
@@ -228,6 +229,16 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     starts = _window_starts(T_total, cfg.n_frames, cfg.overlap)
     outcome = np.full((S, len(starts)), OUTCOMES.index('no box'), np.int8)
     crop = np.full((S, len(starts), len(session.rig), 4), np.nan, np.float32)
+    # DOES THE POSE AGREE WITH THE BOX IT WAS CROPPED FROM? Per (animal, frame, camera), the distance
+    # from the predicted centroid to that camera's crop-box centre, in units of one box side.
+    #
+    # The pipeline holds TWO independent statements about where an animal is -- the box and the pose
+    # -- and nothing ever compared them. Every artifact worth fixing shows up here: a box that
+    # teleported onto another animal, a prompt loop whose pose lags the box it is being cropped by, a
+    # union crop covering the arena. And it is in ANIMAL-SIZE units, so unlike `vis_pred`'s logit
+    # (medians +2.7 / +4.0 / +15.4 across three roots, and a sign that flips per dataset) one value
+    # means the same thing everywhere.
+    box_agree = np.full((S, T_total, len(session.rig)), np.nan, np.float32)
 
     for wi, start in enumerate(starts):
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
@@ -423,6 +434,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             p, out = got
             outcome[a, wi] = OUTCOMES.index('ok')
             pred[a, frames] = p
+            _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
@@ -443,17 +455,44 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     drop = np.nanmedian(vlogit, axis=-1) < cfg.vis_thresh
                 pred[a, frames[drop]] = np.nan
                 conf[a, frames[drop]] = np.nan
+                box_agree[a, frames[drop]] = np.nan
             carried[a] = (torch.as_tensor(p[j]), int(frames[j]),
                           None if vlogit is None else torch.as_tensor(vlogit[j]))
 
     return {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
-            'outcome': outcome, 'crop': crop, 'window_start': np.asarray(starts),
+            'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
+            'window_start': np.asarray(starts),
             'outcome_names': np.asarray(OUTCOMES, object),
             'mode': mode, 'group_id': gid, 'session': session.session_id,
             'dataset': dataset_name, 'anchor': cfg.anchor, 'n_frames': T_total,
             'boxes_from': 'detector' if boxes_stc is not None else
                           ('given points' if box_points is not None else
                            ('instances.pq' if inst_boxes is not None else 'labels'))}
+
+
+def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
+    """Distance from the predicted centroid to each crop box's centre, in units of one box side.
+
+    A 3D pose is REPROJECTED through the source camera to be compared with a source-pixel box --
+    per frame, so a moving rig is handled by `project_points_torch`'s own (T,4,4) alignment rather
+    than by picking one extrinsic. The box is the window's union box, which is what the pixels were
+    actually cut with, so a value near 0 means the pose sits where the crop said the animal is.
+    """
+    for i, ci in enumerate(use):
+        b = np.asarray(boxes[i], np.float64)
+        side = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
+        if not (np.isfinite(b).all() and side > 0):
+            continue
+        if mode == '2d':
+            q = np.asarray(p, np.float64)                      # already source pixels
+        else:
+            q = project_points_torch([window_cams[ci]],
+                                     torch.as_tensor(p, dtype=torch.float32))[0].numpy()
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)    # a frame with no finite keypoint
+            c = np.nanmean(q, axis=-2)                         # (t,2)
+        centre = np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2])
+        box_agree[a, frames, ci] = np.linalg.norm(c - centre, axis=-1) / side
 
 
 def _build_prior(cfg, carried, src_animal, frames, boxes, scales, mode, K, R, cgroup):

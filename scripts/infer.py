@@ -193,6 +193,43 @@ def main():
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
 
+    # EVERY PURE-ARGUMENT CHECK BEFORE THE CHECKPOINT LOADS. These cost nothing and a typo
+    # should not cost a 5.6 GB load; it also makes them testable without a GPU.
+
+    if args.anchor == 'labels':
+        # AN ORACLE PRIOR AND DETECTOR ROWS ARE INCOMPATIBLE, not merely a bad idea. `run_group`
+        # seeds row `a` from LABEL row `a`, and once boxes come from a detector row `a` is a
+        # score-ordered or association-ordered slot that is not label row `a` for any `a` -- so the
+        # arm that exists to be an upper bound was being handed a different animal's ground truth,
+        # and read as a poor oracle rather than as a broken one.
+        if args.detector or args.boxes:
+            raise SystemExit(
+                '--anchor labels seeds row `a` from LABEL row `a`, but --detector/--boxes rows are '
+                'score- or association-ordered and are not label rows. That is a different '
+                "animal's ground truth, not an oracle. Use --anchor labels with the label crop "
+                'path (no --detector, no --boxes), or --anchor carry / none with a box source.')
+        print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
+              'upper bound, not a deployment number. Label it as such wherever you quote it.')
+
+    if args.oracle_corrupt:
+        from tailcyclenet.infer import ORACLE_CORRUPTIONS
+        kind = args.oracle_corrupt.split(':')[0]
+        if kind not in ORACLE_CORRUPTIONS:
+            raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '
+                             f'{ORACLE_CORRUPTIONS} (off:<x> | stale:<n> | other)')
+        if kind in ('off', 'stale') and ':' not in args.oracle_corrupt:
+            raise SystemExit(f'--oracle-corrupt {kind} needs an amount, e.g. {kind}:0.5')
+        if args.anchor != 'labels':
+            raise SystemExit('--oracle-corrupt breaks the ORACLE prior, so it only means anything '
+                             f'under --anchor labels; got {args.anchor!r}.')
+        print(f'*** DIAGNOSTIC: the oracle prior is deliberately corrupted '
+              f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
+              'prediction of anything. ***')
+
+    if args.prior_vis_thresh is not None and args.anchor != 'carry':
+        raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
+                         f'under --anchor carry; got {args.anchor!r}.')
+
     device = args.device if torch.cuda.is_available() else 'cpu'
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
@@ -220,40 +257,9 @@ def main():
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device)
-    if args.oracle_corrupt:
-        from tailcyclenet.infer import ORACLE_CORRUPTIONS
-        kind = args.oracle_corrupt.split(':')[0]
-        if kind not in ORACLE_CORRUPTIONS:
-            raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '
-                             f'{ORACLE_CORRUPTIONS} (off:<x> | stale:<n> | other)')
-        if kind in ('off', 'stale') and ':' not in args.oracle_corrupt:
-            raise SystemExit(f'--oracle-corrupt {kind} needs an amount, e.g. {kind}:0.5')
-        if args.anchor != 'labels':
-            raise SystemExit('--oracle-corrupt breaks the ORACLE prior, so it only means anything '
-                             f'under --anchor labels; got {args.anchor!r}.')
-        print(f'*** DIAGNOSTIC: the oracle prior is deliberately corrupted '
-              f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
-              'prediction of anything. ***')
-    if args.prior_vis_thresh is not None and args.anchor != 'carry':
-        raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
-                         f'under --anchor carry; got {args.anchor!r}.')
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')
-    if args.anchor == 'labels':
-        # AN ORACLE PRIOR AND DETECTOR ROWS ARE INCOMPATIBLE, not merely a bad idea. `run_group`
-        # seeds row `a` from LABEL row `a`, and once boxes come from a detector row `a` is a
-        # score-ordered or association-ordered slot that is not label row `a` for any `a` -- so the
-        # arm that exists to be an upper bound was being handed a different animal's ground truth,
-        # and read as a poor oracle rather than as a broken one.
-        if args.detector or args.boxes:
-            raise SystemExit(
-                '--anchor labels seeds row `a` from LABEL row `a`, but --detector/--boxes rows are '
-                'score- or association-ordered and are not label rows. That is a different '
-                "animal's ground truth, not an oracle. Use --anchor labels with the label crop "
-                'path (no --detector, no --boxes), or --anchor carry / none with a box source.')
-        print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
-              'upper bound, not a deployment number. Label it as such wherever you quote it.')
 
     boxes = dict(np.load(args.boxes, allow_pickle=True)) if args.boxes else {}
     det = det_wh = None

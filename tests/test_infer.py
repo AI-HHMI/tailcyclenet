@@ -381,3 +381,32 @@ def test_seam_blend_averages_the_overlap_and_changes_only_the_overlap(scene):
         np.testing.assert_allclose(blend['pred'][:, solo], last['pred'][:, solo],
                                    rtol=1e-5, atol=1e-5)
     assert (covered > 1).any(), 'the fixture must actually overlap'
+
+
+@pytest.mark.parametrize('argv,expect', [
+    (['--anchor', 'labels', '--detector', 'nope'], 'not label rows'),
+    (['--anchor', 'labels', '--boxes', 'nope.npz'], 'not label rows'),
+    (['--oracle-corrupt', 'nonsense'], 'kind must be one of'),
+    (['--oracle-corrupt', 'off'], 'needs an amount'),
+    (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
+    (['--prior-vis-thresh', '1.0', '--anchor', 'none'], 'only means anything'),
+])
+def test_the_cli_refuses_incoherent_combinations_before_loading_anything(argv, expect):
+    """These are the combinations that used to run and produce a number instead of an error.
+
+    The worst was `--anchor labels` with a box source: `run_group` seeds row `a` from LABEL row `a`,
+    and detector rows are score- or association-ordered, so the arm whose whole purpose is to be an
+    upper bound was being handed a DIFFERENT animal's ground truth.
+
+    Checked through the real entry point, and it must fail BEFORE `load_run` -- a 5.6 GB checkpoint
+    load is not an acceptable price for a typo, and paying it is also what would make this test too
+    slow to keep. `--run` points at nothing, so reaching the load at all raises something else.
+    """
+    import subprocess
+    repo = Path(__file__).resolve().parent.parent
+    r = subprocess.run([sys.executable, str(repo / 'scripts' / 'infer.py'),
+                        '--run', str(repo / 'no_such_run'), '--data', str(repo),
+                        '--out', '/tmp/unused.npz'] + argv,
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode != 0
+    assert expect in (r.stderr + r.stdout), f'wanted {expect!r}, got:\n{r.stderr[-800:]}'

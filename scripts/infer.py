@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -346,6 +347,10 @@ def main():
               f'cached group(s) from {args.det_cache}')
 
     results = {}
+    # `renders` holds the futures still encoding; drained after the npz is written, so a slow encode
+    # never delays the prediction reaching disk.
+    render_pool = ThreadPoolExecutor(max_workers=1)
+    renders = []
     for sess in sessions:
         sess.preload()
         for gid in sess.groups:
@@ -402,6 +407,15 @@ def main():
                   f'{np.isfinite(out["pred"]).all(-1).mean():.3f} finite')
             if args.render is not None:
                 from tailcyclenet.render import render_group
+                # RENDER ON A BACKGROUND THREAD so the loop can predict the next group while this
+                # one encodes. A render of a 480-frame 4696x2048 clip is comparable in cost to the
+                # inference that produced it, and it depends on nothing the loop mutates afterwards
+                # -- `out['pred']` and `det_boxes` are finished arrays by here.
+                #
+                # ONE worker, not several: `dataset._readers` is a module-level cache of stateful
+                # decord readers and `_read_video` now holds a lock around the decode, so extra
+                # render threads would queue on that lock rather than overlap. What overlaps is the
+                # ENCODE, which is where a render's time goes.
                 for ci in render_cams:
                     cam_name = sess.cam_names[ci]
                     # The per-frame boxes the crop rule was fed, in each row's own colour: a box
@@ -410,10 +424,14 @@ def main():
                     # windows overlap, so it is not the array to draw here.
                     bx = (det_boxes[:, :out['pred'].shape[1], ci]
                           if det_boxes is not None else None)
-                    mp4 = render_group(sess, gid, out['pred'],
-                                       args.render / f'{key.replace("/", "__")}__{cam_name}.mp4',
-                                       cam=ci, zoom=args.render_zoom, boxes=bx)
-                    print(f'{key}: wrote {mp4}')
+                    renders.append((key, render_pool.submit(
+                        render_group, sess, gid, out['pred'],
+                        args.render / f'{key.replace("/", "__")}__{cam_name}.mp4',
+                        cam=ci, zoom=args.render_zoom, boxes=bx)))
+                # Report whatever has landed, without waiting for anything.
+                for k, fut in [r for r in renders if r[1].done()]:
+                    print(f'{k}: wrote {fut.result()}')
+                    renders.remove((k, fut))
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     flat = {}
@@ -433,6 +451,14 @@ def main():
                                         else cfg.box_source)
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
+
+    # THE PREDICTION IS ON DISK FIRST, then the renders are waited on. A render is a view and must
+    # never be able to lose a run that has already paid for its inference.
+    if renders:
+        print(f'waiting on {len(renders)} render(s) still encoding', flush=True)
+    for k, fut in renders:
+        print(f'{k}: wrote {fut.result()}')
+    render_pool.shutdown()
 
     # AFTER the prediction is on disk, never before: the cache is an optimisation for the next
     # run and a failure writing it must not lose the run that just paid for the detection.

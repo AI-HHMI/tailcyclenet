@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -275,11 +276,22 @@ def _reader(path: str, group, cam: str):
     return _readers(path)
 
 
+# ONE LOCK AROUND THE DECODE, because `_readers` is a module-level cache of STATEFUL readers.
+# `VideoReader.get_batch` seeks, so two threads reading the same container interleave their seeks and
+# get each other's frames -- or crash inside decord. That did not matter while every caller was
+# sequential; `scripts/infer.py` now renders one group on a background thread while the loop predicts
+# the next, and on a video-backed root both touch the same reader. The lock costs nothing on an
+# image-directory root (this function is not called) and serialises only the decode, so the encode
+# half of a render still overlaps -- which is where a render's time actually goes.
+_read_lock = threading.Lock()
+
+
 def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     """Frames from a video file. Only 3dpop's test split needs this."""
     import cv2
 
-    imgs = _reader(str(path), group, cam).get_batch(list(frames)).asnumpy()   # decord gives RGB
+    with _read_lock:
+        imgs = _reader(str(path), group, cam).get_batch(list(frames)).asnumpy()  # decord gives RGB
     aff = _crop_affine((imgs.shape[2], imgs.shape[1]), crop_coords, target_size, rotation)
     if aff is None:
         return list(imgs)

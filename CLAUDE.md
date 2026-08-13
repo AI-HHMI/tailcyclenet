@@ -539,8 +539,13 @@ crowding and a stratification by animal count shows **no dose-response** (MOTA s
 2-group 10-animal band; MPJPE significant in the 1-2 and 3-5 bands and not the crowded ones). Report 12
 §2.1's 17.2% unclaimed-box headroom does not translate because **41 of the 58 test groups hold 1-2
 animals**, where a memoryless pairwise search has almost nothing to get wrong: the headroom is real and
-rare, and a coverage claim needs a crowded benchmark 3dpop's test split does not provide. Use it where the
-rig is wide or the animals are many. Never quote the hard-clip numbers without the protocol ones.
+rare, and a coverage claim needs a crowded benchmark 3dpop's test split does not provide. **USE IT FOR LONG CLIPS — that, and not crowding, is what it fixes.** Matched MPJPE per window over 480
+frames (24 windows): `associate` + `link_rows` runs 16.9 → **39.4 mm** at +0.6 mm/window whether the carry
+source is `pred` or `triangulate`, while `--track` holds **12-13 mm flat** (−0.02 mm/window) and is 3× better
+by the last window. So the error growth over a clip is the CROP degrading, not the prompt. Report 11 §2's
+protocol is only **120 frames = 6 windows**, deliberately short, which is why the tracker reads insignificant
+there: the benchmark is too short to show the effect it fixes. rat-city's test group is 57,594 frames, 480×
+that. Quote it per window, not per arm.
 **What it DOES buy is crop discipline**: box slots filled 0.866 → 0.888 mean and 0.653 → 0.732 at p10 (so
 §2.1 was right about the BOXES), which does not convert to pose coverage because the union crop already
 rescued those rows from a single box — instead it halves the worst crop again (p99 750 → 376 px, max

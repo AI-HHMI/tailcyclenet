@@ -265,12 +265,20 @@ Box sources are the annotation set, a detections npz, or a per-dataset detector.
 default `triangulate`). Under `gridresid_offset = "query"` the reported 3D output *is*
 `query + R @ residual` with one anchor per keypoint for the whole window, so writing it back closes a
 loop with gain: whatever the prior was wrong by is re-added and only the residual carries new
-information. Measured on johnson-mouse, where the run is consistently trained so this is not
-gotcha 12: **23-39% of the animal's motion lost**, and every consistency statistic in the repo
-*rewarded* it (best jerk 0.392 vs 0.507, best bone CV 0.148 vs 0.251) because a locked pose is a
-smooth one. `3d_pred_triangulate` is re-derived from each window's own pixels every frame and is
-supervised on every keypoint, so carrying it changes no reported output and breaks only the feedback
-path. **2D is bit-identical either way** — one camera has nothing to triangulate and the grid head
+information. `3d_pred_triangulate` is re-derived from each window's own pixels
+every frame and is supervised on every keypoint, so carrying it changes no reported output and breaks
+only the feedback path. Worth, on 3dpop, MPJPE −0.50 mm / coverage +0.0025 / MOTA +0.0041, all SIG, at
++0.0011 of idsw; and it is what makes report 12's R3 safe to build.
+
+**IT IS NOT THE FIX FOR THE MOTION LOSS, and the mechanism there is worth stating exactly.** `--anchor
+carry` does lose **23-39% of johnson-mouse's motion** against the same run with no anchor — and every
+consistency statistic in this repo *rewarded* that (best jerk 0.392 vs 0.507, best bone CV 0.148 vs
+0.251), because a locked pose is a smooth one. But switching what is carried recovers only 0.5-9.1% of
+the path (measured, report 13). The cause is query-anchoring itself: with ANY prior the output is
+`prior + R @ residual` off one anchor for the whole window, so all its temporal variation comes from
+the residual head, where `--anchor none` substitutes the per-frame triangulation. Only removing the
+prior or re-anchoring the output per frame can touch that, which makes it a `prior` + `triangulated`
+TRAINING question — the pre-`bcbfbc1` pairing — and an open one. **2D is bit-identical either way** — one camera has nothing to triangulate and the grid head
 decodes absolute pixel bins — which is checked on calms21 and rat-city and pinned as a test, and is
 what confines the risk of this to the 3D roots. `--carry-source pred` restores the old behaviour so
 the comparison stays available.

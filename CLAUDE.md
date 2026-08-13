@@ -259,6 +259,13 @@ one — all five of its sessions are a seen animal on an unseen session, since t
 `train/`. `allen_sweep3_60k.md` says so explicitly; scoring against 3.394 compares two axes and calls the
 difference a result (eval rule 1).
 
+**`checkpoint_best` IS SELECTED ON `val`, THE PRIOR-FREE PASS** (`train.py:567`), not on `val_self`. Their
+argmins differ by up to 13,600 iterations in practice, so on any run whose deployable regime is prompted,
+`best` is not the checkpoint you want — and it penalises exactly the arm that trades query-free accuracy for
+prompted accuracy, which is what `prompt_offset_px` does by design. Score `best` AND `last`, and know that
+neither may sit at `argmin val_self`; a run that wants the prompted optimum needs `train.py` to select on
+`ms['mpjpe']` instead, which is a one-line change and a config key nobody has added.
+
 **The training-time signature to watch is `val` against `val_self`, not `val` alone.** `val` is the
 query-free forward and `val_self` re-queries at the model's own frame-0 prediction, i.e. the
 deployment-shaped path. With `prompt_offset_px = 8` the prompted path is better at every matched

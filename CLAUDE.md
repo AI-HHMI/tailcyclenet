@@ -233,11 +233,13 @@ Isolating either lever needs a third arm.
 `prompt_stale_frames`, both default 0). The reason is that i.i.d. jitter is not the failure
 deployment produces: Gaussian noise averages to zero over the keypoint set, so it teaches the model
 to trust the prior's **centroid** exactly — the one quantity a whole-body lag gets wrong. The lag is
-real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion). Wrong-animal is *not*
-built, because by the time `kpt_prior` exists `coords` has been through the crop, the resize and a
-random world rotation whose matrix `rotate_camera_group` does not return; the offset term covers the
-displacement part and `scripts/infer.py --oracle-corrupt other` measures whether it is a distinct
-failure mode. Bar for keeping either: allen cross-animal inside the reproduction band (near
+real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion). Wrong-animal is *not* built, and that is
+now a measurement rather than a shrug: `--oracle-corrupt other` displaces the prior by 1.65 crop
+widths (a different bird) and moves the output by 0.008 — alpha 0.005, 61% of frames not moving at
+all — because the bounds mask withdraws a prior that far outside the crop. A row swap's damage is the
+wrong CROP, not a wrong prompt. The measured echo is alpha ~ 0.48-0.56 for offsets of a quarter to a
+half of a crop width, collapsing to 0.10 at a full one as the mask starts firing, so the whole
+dynamic range of the drift sits inside the gap the mask does not cover. Bar for keeping either: allen cross-animal inside the reproduction band (near
 3.394 mm) *and* a smaller `motion_ratio` gap on johnson. Ships WITH `prompt_dropout`.
 
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,

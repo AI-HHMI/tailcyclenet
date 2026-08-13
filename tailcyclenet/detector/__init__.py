@@ -100,6 +100,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     """
     import numpy as np
     import torch
+    from concurrent.futures import ThreadPoolExecutor
     from ..dataset import read_frames
     from .data import letterbox, reduce_factor, unletterbox_boxes
 
@@ -122,51 +123,78 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                                    min_views=min_views, dup_res_px=dup_res_px,
                                    max_move=max_move)
 
-    for start in range(0, T, batch):
-        frames = list(range(start, min(start + batch, T)))
-        per_cam = []
-        for ci, cam_name in enumerate(session.cam_names):
-            # THE SAME DECODE THE DETECTOR WAS TRAINED ON. `BoxDataset` reduces at decode where
-            # the frame is far above the letterbox target, and a detector fed differently-sampled
-            # pixels at deployment is being run off its own training distribution -- silently,
-            # since nothing about the shapes or the scores would say so.
-            src = session.rig.size(cam_name)
-            r = reduce_factor(src, input_wh) if reduce else 1
-            imgs = read_frames(group, cam_name, frames, reduce=r)
-            packed, metas = [], []
-            for im in imgs:
-                lb, scale, pad = letterbox(im, input_wh, src_wh=src)
-                packed.append(torch.as_tensor(lb, dtype=torch.float32).permute(2, 0, 1) / 255.0)
-                metas.append((scale, pad))
-            x = torch.stack(packed).to(device)
-            obj, boxes = det(x)
-            cam_frames = []
-            for j in range(len(frames)):
-                b, s = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh)
-                cam_frames.append((unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
-                                   if b.numel() else b.cpu(), s.cpu()))
-            per_cam.append(cam_frames)
+    # ONE THREAD PER CAMERA FOR THE DECODE, and it is where this function's wall clock lives:
+    # profiled on 3dpop (four 3840x2160 cameras) the decode is 35-48 ms per frame-camera against a
+    # 0.4 ms detector forward, 100x. decord releases the GIL inside `get_batch` and the four
+    # containers share no state, so they overlap 3.5x -- but only since `dataset._read_video` took
+    # a lock PER PATH instead of one global one. Sized to the rig, because that is how many
+    # independent containers there are; more threads would contend on the same reader.
+    # THE FORWARD STAYS SERIAL AND IN CAMERA ORDER: it is 1% of the time and moving it would put
+    # two streams on one CUDA context for nothing.
+    def _fetch(ci_cam):
+        ci, cam_name = ci_cam
+        # THE SAME DECODE THE DETECTOR WAS TRAINED ON. `BoxDataset` reduces at decode where
+        # the frame is far above the letterbox target, and a detector fed differently-sampled
+        # pixels at deployment is being run off its own training distribution -- silently,
+        # since nothing about the shapes or the scores would say so.
+        src = session.rig.size(cam_name)
+        r = reduce_factor(src, input_wh) if reduce else 1
+        imgs = read_frames(group, cam_name, frames, reduce=r)
+        lbs, metas = [], []
+        for im in imgs:
+            lb, scale, pad = letterbox(im, input_wh, src_wh=src)
+            lbs.append(lb)
+            metas.append((scale, pad))
+        # ONE numpy CONVERSION FOR THE WHOLE BATCH, NOT ONE torch OP PER FRAME. Bit-identical --
+        # uint8 -> float32 and a divide by 255 are both correctly rounded either way, checked in
+        # `tests/test_detector.py` -- and 64x faster in wall clock: a 544x320 frame is 0.5 MP, so
+        # `torch.as_tensor(...).permute(...) / 255.0` hands a tiny elementwise op to torch's
+        # intraop pool, which is `nproc` wide (96 here). Measured at 67 ms PER FRAME against 1.0 ms
+        # through numpy, and it was 62% of this function's wall clock and ~2,200% of one process's
+        # CPU with every GPU idle. The pose loader already avoids this by keeping uint8 to the
+        # device (`dataset.py`, "UINT8, not float32/255"); the detector was the one path left.
+        arr = np.ascontiguousarray(np.stack(lbs).transpose(0, 3, 1, 2))
+        return ci, torch.from_numpy(arr.astype(np.float32) / np.float32(255)), metas, src
 
-        for j, t in enumerate(frames):
-            if C == 1:
-                b, s = per_cam[0][j]
-                for a in range(min(S, b.shape[0])):
-                    out[a, t, 0] = b[a].numpy()
-                    sc[a, t, 0] = float(s[a])
-            else:
-                cams = session.cgroup(gid, t) if moving else cgroup
-                if tracker is not None:
-                    out[:, t], sc[:, t] = tracker.step(
-                        cams, [per_cam[c][j][0] for c in range(C)],
-                        [per_cam[c][j][1] for c in range(C)])
-                    continue
-                groups = associate(cams, [per_cam[c][j][0] for c in range(C)],
-                                   max_res_px=session.assoc_res_max_px, max_instances=S,
-                                   min_views=min_views, dup_res_px=dup_res_px)
-                for a, g in enumerate(groups[:S]):
-                    for c, box in g['boxes'].items():
-                        out[a, t, c] = box.numpy()
-                        sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
+    pool = ThreadPoolExecutor(max_workers=max(1, C)) if C > 1 else None
+    try:
+        for start in range(0, T, batch):
+            frames = list(range(start, min(start + batch, T)))
+            todo = list(enumerate(session.cam_names))
+            fetched = list(map(_fetch, todo) if pool is None else pool.map(_fetch, todo))
+            per_cam = []
+            for ci, x, metas, src in fetched:
+                obj, boxes = det(x.to(device))
+                cam_frames = []
+                for j in range(len(frames)):
+                    b, s = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh)
+                    cam_frames.append((unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
+                                       if b.numel() else b.cpu(), s.cpu()))
+                per_cam.append(cam_frames)
+
+            for j, t in enumerate(frames):
+                if C == 1:
+                    b, s = per_cam[0][j]
+                    for a in range(min(S, b.shape[0])):
+                        out[a, t, 0] = b[a].numpy()
+                        sc[a, t, 0] = float(s[a])
+                else:
+                    cams = session.cgroup(gid, t) if moving else cgroup
+                    if tracker is not None:
+                        out[:, t], sc[:, t] = tracker.step(
+                            cams, [per_cam[c][j][0] for c in range(C)],
+                            [per_cam[c][j][1] for c in range(C)])
+                        continue
+                    groups = associate(cams, [per_cam[c][j][0] for c in range(C)],
+                                       max_res_px=session.assoc_res_max_px, max_instances=S,
+                                       min_views=min_views, dup_res_px=dup_res_px)
+                    for a, g in enumerate(groups[:S]):
+                        for c, box in g['boxes'].items():
+                            out[a, t, c] = box.numpy()
+                            sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
+    finally:
+        if pool is not None:
+            pool.shutdown()
     return link_rows(out, sc, max_move=max_move) if (link and tracker is None) else (out, sc)
 
 

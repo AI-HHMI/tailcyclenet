@@ -241,6 +241,7 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
 # cannot be changed afterwards -- `cache_parameters()` hands back a copy and assigning `.maxsize`
 # silently does nothing -- so the only way to size it from the data is to wrap it late.
 _readers = None
+_cache_lock = threading.Lock()
 
 
 def _open_reader(path: str):
@@ -266,32 +267,54 @@ def _reader(path: str, group, cam: str):
     picked, because resizing means dropping live readers.
     # ponytail: first-rig sizing, revisit if one process ever streams two video roots of different
     # widths -- the memory clamp bounds it either way.
+
+    `_cache_lock` covers BOTH the late build and the lookup, because the cameras of one rig are now
+    decoded concurrently (`detector.detect_group`): two threads racing the `is None` test would
+    build two caches and the first one's readers would leak, and two `lru_cache` misses on the same
+    path would open the same 4K container twice. Opening is once per file and off the hot path, so
+    holding the lock across it costs nothing measurable; the DECODE is not under it.
     """
     global _readers
-    if _readers is None:
-        info = torch.utils.data.get_worker_info()
-        rig = group.session.rig
-        _readers = lru_cache(maxsize=_reader_cache_size(
-            len(rig), rig.size(cam), None if info is None else info.num_workers))(_open_reader)
-    return _readers(path)
+    with _cache_lock:
+        if _readers is None:
+            info = torch.utils.data.get_worker_info()
+            rig = group.session.rig
+            _readers = lru_cache(maxsize=_reader_cache_size(
+                len(rig), rig.size(cam), None if info is None else info.num_workers))(_open_reader)
+        return _readers(path)
 
 
-# ONE LOCK AROUND THE DECODE, because `_readers` is a module-level cache of STATEFUL readers.
-# `VideoReader.get_batch` seeks, so two threads reading the same container interleave their seeks and
-# get each other's frames -- or crash inside decord. That did not matter while every caller was
-# sequential; `scripts/infer.py` now renders one group on a background thread while the loop predicts
-# the next, and on a video-backed root both touch the same reader. The lock costs nothing on an
-# image-directory root (this function is not called) and serialises only the decode, so the encode
-# half of a render still overlaps -- which is where a render's time actually goes.
-_read_lock = threading.Lock()
+# ONE LOCK PER CONTAINER AROUND THE DECODE, because `_readers` is a module-level cache of STATEFUL
+# readers. `VideoReader.get_batch` seeks, so two threads reading the SAME container interleave their
+# seeks and get each other's frames -- or crash inside decord. That did not matter while every caller
+# was sequential; `scripts/infer.py` renders one group on a background thread while the loop predicts
+# the next, and on a video-backed root both touch the same reader.
+#
+# IT USED TO BE ONE GLOBAL LOCK, WHICH ALSO SERIALISED DIFFERENT FILES -- and different files share
+# no state at all, so that was a bound nothing needed. It cost the whole of the multi-camera win:
+# 3dpop's four 3840x2160 cameras decode at ~62 ms/frame each on one thread and at ~18 ms/frame-camera
+# when the four containers run concurrently (3.5x, measured; decord releases the GIL inside
+# `get_batch`). A 16-camera rig is the same argument four times over. The per-path dict is guarded by
+# `_lock_lock`, which is held only for the dict lookup and never across a decode.
+_lock_lock = threading.Lock()
+_path_locks: dict[str, threading.Lock] = {}
+
+
+def _read_lock_for(path: str) -> threading.Lock:
+    with _lock_lock:
+        lk = _path_locks.get(path)
+        if lk is None:
+            lk = _path_locks[path] = threading.Lock()
+        return lk
 
 
 def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     """Frames from a video file. Only 3dpop's test split needs this."""
     import cv2
 
-    with _read_lock:
-        imgs = _reader(str(path), group, cam).get_batch(list(frames)).asnumpy()  # decord gives RGB
+    key = str(path)
+    with _read_lock_for(key):
+        imgs = _reader(key, group, cam).get_batch(list(frames)).asnumpy()  # decord gives RGB
     aff = _crop_affine((imgs.shape[2], imgs.shape[1]), crop_coords, target_size, rotation)
     if aff is None:
         return list(imgs)

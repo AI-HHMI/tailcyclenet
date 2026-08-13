@@ -88,7 +88,7 @@ class CrossViewTracker:
         self.max_age = int(max_age)
         self.min_views = int(min_views)
         self.dup_res_px = dup_res_px
-        # slot -> {'point': (3,) float32, 'age': int, 'stale': int, 'sides': {cam: float}}
+        # slot -> {'point': (3,) float32, 'age': int, 'stale': int}
         self.targets = {}
 
     # -- one frame ------------------------------------------------------------------------
@@ -118,15 +118,18 @@ class CrossViewTracker:
                 continue
             proj = _project(cgroup[c], pts)                                  # (n_t,2)
             d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)  # (n_t,n_det)
-            # NORMALISE BY THE MEAN OF BOTH SIDES, as `link_rows` does. Dividing by the DETECTION's
-            # side alone lets a spuriously large box buy itself a proportionally large gate, so the
-            # boxes most likely to be wrong are the ones most likely to be admitted. A target that
-            # has never claimed this camera has no side to average, and falls back to the detection's.
-            det_side = sides[c][None]                                        # (1,n_det)
-            prev = torch.tensor([self.targets[s]['sides'].get(c, float('nan')) for s in slots],
-                                dtype=det_side.dtype)[:, None]               # (n_t,1)
-            side = torch.where(torch.isfinite(prev), 0.5 * (prev + det_side), det_side)
-            gap = (d / (self.max_move * side.clamp_min(1e-6))).numpy()
+            # NORMALISE BY THE DETECTION'S OWN SIDE. This looks like an inconsistency with
+            # `link_rows`, which uses the mean of both boxes' sides, and MAKING IT CONSISTENT WAS
+            # MEASURED WORSE -- +1.71 mm MPJPE [+0.27, +3.15] and -0.038 MOTA [-0.070, -0.006],
+            # paired over 131,887 points on the two ten-bird clips. The two paths are not
+            # analogous: `link_rows` averages two boxes observed in the SAME frame, while a
+            # target's remembered side is a property it carries forward, so a target that once
+            # claimed one oversized box keeps an oversized gate for the rest of its life. That is a
+            # persistent failure where "a big detection buys a big gate" is a per-frame one. Box
+            # slots filled RISE under the mean form (0.7605 -> 0.8075) while pose coverage FALLS
+            # (-0.0139): the extra boxes are the wrong boxes. See the ledger, step 1.
+            side = sides[c][None].clamp_min(1e-6)
+            gap = (d / (self.max_move * side)).numpy()
             # THE GATE IS THE ALGORITHM, not a tie-break. A pair beyond one box side is not the same
             # animal, so it must be unavailable to Hungarian rather than merely expensive -- an
             # optimum over an all-bad cost matrix is an arbitrary permutation, which is exactly how
@@ -153,7 +156,6 @@ class CrossViewTracker:
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
-                self.targets[s]['sides'][c] = float(sides[c][j])
             # AGE COUNTS FRAMES WITH NO EVIDENCE AT ALL. One camera is evidence: it cannot move the
             # point, but it says the animal is still there, which is what expiry is about.
             self.targets[s]['age'] = 0 if got[s] else self.targets[s]['age'] + 1
@@ -177,12 +179,11 @@ class CrossViewTracker:
                                  min_views=self.min_views, max_instances=len(free),
                                  dup_res_px=self.dup_res_px)
                 for s, g in zip(free, born):
-                    self.targets[s] = {'point': g['point'], 'age': 0, 'stale': 0, 'sides': {}}
+                    self.targets[s] = {'point': g['point'], 'age': 0, 'stale': 0}
                     for c, j in g['members'].items():
                         det = keep[c][j]
                         out[s, c] = boxes_per_cam[c][det].numpy()
                         sc[s, c] = float(scores_per_cam[c][det])
-                        self.targets[s]['sides'][c] = float(sides[c][det])
 
         # -- retire: a slot with no evidence for a window is free for whoever is there now ---
         for s in [s for s, t in self.targets.items()
@@ -260,17 +261,17 @@ def demo():
     for _ in range(6):
         out1, _ = tr2.step(cg, *one_cam)
     assert not tr2.targets, 'a single-camera target never expired'
-    # 6. The gate normalises by the MEAN of the target's last side and the detection's, NOT by the
-    #    detection's alone -- otherwise a spuriously large box buys itself a proportionally large
-    #    gate, so the boxes most likely to be wrong are the ones most likely to be admitted.
-    #    Born at side 40, then offered a box inflated 4x: the gate is (40+160)/2 = 100 px, so a
-    #    130 px jump must be REFUSED. The detection-side-only form gated at 160 and took it.
-    for px, want in ((60.0, True), (130.0, False)):
+    # 6. THE GATE SCALES WITH THE DETECTION'S OWN SIDE, and that is a MEASURED choice, not an
+    #    oversight -- normalising by the mean of the target's remembered side and the detection's
+    #    (the `link_rows` form) cost +1.71 mm MPJPE and -0.038 MOTA paired on the ten-bird clips.
+    #    A target born at side 40 offered a box inflated 4x therefore gates at 160, not at 100, so
+    #    a 130 px jump is ADMITTED. Pinned so the "consistency" fix is not re-attempted blind.
+    for px, want in ((130.0, True), (200.0, False)):
         tr3 = CrossViewTracker(1, max_res_px=30.0)
-        tr3.step(cg, *boxes_at([a]))                            # birth records side 40
+        tr3.step(cg, *boxes_at([a]))
         moved, sc3 = boxes_at([a + [px * 900.0 / 800.0, 0, 0]], side=160.0)
         got3, _ = tr3.step(cg, moved, sc3)
-        assert bool(np.isfinite(got3[0]).any()) == want, f'{px} px jump: gate followed the detection'
+        assert bool(np.isfinite(got3[0]).any()) == want, f'{px} px jump: gate is not the det side'
     print('track.demo: ok')
 
 

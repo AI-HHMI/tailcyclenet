@@ -163,6 +163,10 @@ def main():
                          "dataset's own registry, never configured. Turning it on also disables "
                          'the horizontal flip -- see `random_affine`, whose no-`flip_pairs` '
                          'justification holds only while the target is a box.')
+    ap.add_argument('--no-hflip', action='store_true',
+                    help='drop the horizontal flip from the augmentation. `--keypoints` already '
+                         'does this implicitly, so this exists for the box-only CONTROL arm that '
+                         'has to match it -- otherwise the control differs in two levers.')
     ap.add_argument('--kpt-weight', type=float, default=1.0)
     ap.add_argument('--kpt-score-weight', type=float, default=1.0)
     ap.add_argument('--device', default='cuda:0')
@@ -182,7 +186,8 @@ def main():
 
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
-                       max_frames_per_group=args.frames_per_group, keypoints=args.keypoints)
+                       max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
+                       hflip=0.0 if args.no_hflip else None)
     print(f'train: {len(train)} views')
     # DERIVED from the registry, never configured -- the same rule `n_keypoints` follows on the
     # pose side. A configured K that disagreed with the data would mis-index every target.

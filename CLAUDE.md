@@ -810,6 +810,13 @@ is process count, which just got ~5x cheaper per process.
    `TAILCYCLENET_READER_CACHE` is an override rather than a per-dataset requirement. A cache below
    the camera count misses on *every* call: a 16-camera rig at 4 ran detection 2.5× slower.
 
+   **DO NOT SET `TAILCYCLENET_READER_CACHE` BY HAND.** The sizing is automatic and it already
+   knows the two things that matter — the camera count and whether it is inside a loader worker.
+   Setting it on a command line is at best a no-op that repeats the derived value and at worst
+   silently overrides the per-worker clamp, which is the one thing standing between a 16-camera
+   rig and swapping. If a run needs a different cache the fix belongs in `_reader_cache_size`,
+   where it applies to every caller and is testable, not in one invocation's environment.
+
 12. **A RUN FOLDER USED TO RECORD NO COMMIT, and one config key had a default it could not
    justify.** `runs/3dpop-prior` trained under unconditional per-frame re-anchoring, finished nine
    hours before `bcbfbc1` replaced that with the query-anchored residual, and carries no

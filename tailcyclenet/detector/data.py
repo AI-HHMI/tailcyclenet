@@ -150,13 +150,18 @@ class BoxDataset(Dataset):
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
-                 augment=False, reduce=False, keypoints=False):
+                 augment=False, reduce=False, keypoints=False, hflip=None):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
         # Opt-in, default off: with it absent this loader is byte-identical to what every recorded
         # detector was trained on. See `random_affine` for why it also kills the horizontal flip.
         self.keypoints = bool(keypoints)
+        # `hflip=None` means "decide from `keypoints`", which is the safe default. It is separable
+        # ONLY so a box-only CONTROL arm can match the keypoint arm's augmentation exactly: the
+        # keypoint arm necessarily loses the flip, so a control that keeps it differs in two
+        # levers and measures neither (eval rule 4).
+        self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
         # Off by default and requested explicitly, not inferred from the split: it is a key, and
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
@@ -314,8 +319,7 @@ class BoxDataset(Dataset):
         # worker the same stream, and a shared one would make the draw depend on how the
         # DataLoader happened to interleave.
         rng = (np.random.default_rng([self.seed, i]) if self.augment and self.train else None)
-        warp = (random_affine(size, rng, hflip=0.0 if self.keypoints else 0.5)
-                if rng is not None else None)
+        warp = random_affine(size, rng, hflip=self.hflip) if rng is not None else None
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
 

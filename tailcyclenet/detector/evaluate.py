@@ -125,7 +125,12 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     per_group = defaultdict(lambda: {'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0.0, 'fp': 0})
     tracks = defaultdict(dict)                  # (key, ci) -> frame -> (pred (P,4), gt (S,4))
     sessions, n_want = {}, {}
-    for bi, (x, gt) in enumerate(loader):
+    # `batch[2:]` is the keypoint target when the loader is emitting one. Scoring here is
+    # box-only by design -- `n_keypoints` must not change what r@.5 means -- so it is dropped
+    # rather than unpacked, and a keypoint-trained detector stays comparable to every box-only
+    # number in reports 10-13.
+    for bi, batch in enumerate(loader):
+        x, gt = batch[0], batch[1]
         obj, pred_boxes, _ = model(x.to(device))
         for j in range(x.shape[0]):
             sess, gid, f, ci = ds.index[order[bi * batch_size + j]]

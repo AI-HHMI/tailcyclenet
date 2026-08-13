@@ -189,6 +189,23 @@ def main():
     n_kpts = len(roots[0].names) if args.keypoints else 0
     if args.keypoints:
         print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')
+        # A MASKED KEYPOINT GETS ZERO GRADIENT, so a rarely-labelled one is never trained -- and
+        # it still emits a number at inference, off the conv bias. That is the accepted cost of
+        # "predict all K always", but it must be VISIBLE: a hollow output should be a line in this
+        # log rather than a mystery at eval time. Sampled, not exhaustive; the point is the shape.
+        cen = np.zeros(n_kpts)
+        step = max(1, len(train) // 200)
+        seen = 0
+        for j in range(0, len(train), step):
+            _, k = train.boxes_for(j, None, with_keypoints=True)
+            cen += np.isfinite(k[..., :2].numpy()).all(-1).sum(0)
+            seen += k.shape[0]
+        frac = cen / max(seen, 1)
+        names = roots[0].names
+        thin = [f'{names[i]} {frac[i]:.2f}' for i in np.argsort(frac)[:5]]
+        print(f'  labelled fraction per keypoint over {seen} sampled instances: '
+              f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
+        print(f'  thinnest: {", ".join(thin)}', flush=True)
     loader = torch.utils.data.DataLoader(
         train, batch_size=args.batch_size, sampler=ChunkShuffle(len(train), chunk=train.chunk),
         num_workers=args.num_workers,
@@ -233,8 +250,10 @@ def main():
             running.append(float(loss.detach()))
             it += 1
             if it % 50 == 0:
+                kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
+                      if 'kpt' in parts else '')
                 print(f'{it:7d}/{args.iters}  loss {np.mean(running):7.4f}  '
-                      f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}  '
+                      f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
                 running, t0 = [], time.time()
             if it % args.eval_every == 0 or it == args.iters:

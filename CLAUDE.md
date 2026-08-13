@@ -249,10 +249,12 @@ dynamic range of the drift sits inside the gap the mask does not cover. Bar for 
 
 **The training-time signature to watch is `val` against `val_self`, not `val` alone.** `val` is the
 query-free forward and `val_self` re-queries at the model's own frame-0 prediction, i.e. the
-deployment-shaped path. On the shipped recipe the prompt HURTS — allen val 4.105 against val_self 4.253
-at 7.6k — which is exposure bias visible in training with no extra instrumentation. With
-`prompt_offset_px = 8` the ordering FLIPS (4.201 against 4.112): it pays ~0.10 mm query-free to gain
-~0.14 mm prompted. Early read only (eval rule 5), but it is the diagnostic that costs nothing to look at.
+deployment-shaped path. With `prompt_offset_px = 8` the prompted path is better at every matched
+iteration — allen val_self 3.593 against the control's 3.673 at 15.4k, best-so-far 3.513 against 3.593 —
+paid for on the query-free path (3.968 against 3.904). So the offset buys ~0.08-0.09 mm where deployment
+lives for ~0.06 mm where it does not, which is the shape α ≈ 0.5 predicts. **Do not read this before ~15k
+iterations**: at 7.6k the control's prompt appeared to HURT (4.105 against 4.253) and by 15.4k it helped by
+0.231 mm, so an early read gives the opposite conclusion. Eval rule 5, learned again.
 
 **And `query = "prior"` + `gridresid_offset = "triangulated"` is confirmed a poor pairing, for a reason
 worth keeping.** Its two paths come out nearly equal (4.258 / 4.235) and both worst: re-anchoring every

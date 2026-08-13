@@ -238,7 +238,16 @@ Isolating either lever needs a third arm.
 `prompt_stale_frames`, both default 0). The reason is that i.i.d. jitter is not the failure
 deployment produces: Gaussian noise averages to zero over the keypoint set, so it teaches the model
 to trust the prior's **centroid** exactly — the one quantity a whole-body lag gets wrong. The lag is
-real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion). Wrong-animal is *not* built, and that is
+real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion).
+**PER KEYPOINT THE TWO CORRUPTIONS ARE INDISTINGUISHABLE** — the decode has no attention across the query axis,
+so each keypoint sees only its own displacement and the marginals are identical (measured: 0.7086 vs 0.7084 mm
+at sigma = 8 px). They differ ONLY through the scalars that read the WHOLE prior set: `scene_center =
+nanmean(coords_q, dim=1)` (`tracker_encoder.py:356`) and `cube_scale` (`:318`), where a whole-body offset moves
+the centroid by the full lag while i.i.d. draws cancel to sigma/sqrt(K) — **6.6x apart at allen's K = 44**.
+Matching the aggregate with jitter alone needs sigma = 8*sqrt(44) ~ 53 px, 21% of a 256 px crop, which destroys
+the per-keypoint marginal; one knob cannot set both channels. **NOT yet shown: that this channel is where the
+gain comes from.** A `prompt_noise_px = 10, prompt_offset_px = 0` arm has `offset8`'s per-keypoint marginal
+(10 vs 8.4 px) and 1/6.6 of its scene perturbation — if it matches, `prompt_offset_px` is redundant and goes. Wrong-animal is *not* built, and that is
 now a measurement rather than a shrug: `--oracle-corrupt other` displaces the prior by 1.65 crop
 widths (a different bird) and moves the output by 0.008 — alpha 0.005, 61% of frames not moving at
 all — because the bounds mask withdraws a prior that far outside the crop. A row swap's damage is the

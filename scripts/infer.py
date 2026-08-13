@@ -80,12 +80,17 @@ def main():
                          'the detector to be deterministic. The box source is recorded in it and '
                          'checked on load, so a cache from a different detector cannot be reused '
                          'silently.')
-    ap.add_argument('--link-boxes', action='store_true',
+    ap.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
                     help='follow one animal per instance row across frames -- per-frame Hungarian '
                          'on centre distance in units of the box side, gated at one side, with '
-                         'births into empty rows and expiry after a window. Detector rows are '
-                         'score-ordered and unlinked by default, which makes the window crop the '
-                         'union over several different animals.')
+                         'births into empty rows and expiry after a window. ON BY DEFAULT, and it '
+                         'only ever runs where `--track` cannot: `detect_group` builds the tracker '
+                         'when `track and C > 1` and otherwise falls through to here, so this is '
+                         'the whole of 2D single-view identity. It was off while `--track` was on, '
+                         'which left the shipped 2D default with NO cross-frame identity at all -- '
+                         'score-ordered rows, and the union crop spanning several animals. Every 2D '
+                         'number in reports 11 and 13 came from an explicit opt-in. '
+                         '`--no-link-boxes` restores that memoryless pass.')
     ap.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
                     help='3D multiview only, and ON BY DEFAULT. ONE cross-view target set with one '
                          'affinity and one Hungarian, replacing per-frame `associate` plus '
@@ -320,7 +325,11 @@ def main():
     # mismatch this stamp exists to catch. Anything whose default may move belongs on this line.
     # `link_rev` for the same reason `det_score` is unconditional: the cache holds boxes that have
     # already been through `link_rows`, so changing that rule silently makes an old cache a
-    # different box set. It only appears when linking is on, since it describes nothing otherwise.
+    # different box set. It USED to appear only when linking was on -- which was safe only while
+    # linking defaulted off. Now that `--link-boxes` defaults ON, "equals the default" means a
+    # different box set before and after, exactly as it did for `track`: a cache written under the
+    # old default carries no `link_rev` and no `link_boxes` entry, and under this line is REFUSED
+    # rather than reused as if it had been linked. This is the FOURTH instance of the same trap.
     #
     # `track` IS UNCONDITIONAL TOO, and for the third instance of the same reason: its default moved
     # from off to on, so "equals the default" means a different box set before and after. Every cache
@@ -328,10 +337,10 @@ def main():
     # REFUSED rather than silently reused as if they had been tracked -- which is the whole point of
     # the stamp. Deleting them is correct; reproducing an untracked arm needs `--no-track`.
     from tailcyclenet.detector import LINK_REV
-    stamp = repr(sorted([('det_score', str(args.det_score)), ('track', str(args.track))]
-                        + ([('link_rev', str(LINK_REV))] if args.link_boxes else [])
+    stamp = repr(sorted([('det_score', str(args.det_score)), ('track', str(args.track)),
+                         ('link_boxes', str(args.link_boxes)), ('link_rev', str(LINK_REV))]
                         + [(k, str(getattr(args, k))) for k in
-                           ('detector', 'max_animals', 'link_boxes', 'det_input_wh',
+                           ('detector', 'max_animals', 'det_input_wh',
                             'max_frames', 'min_views', 'dup_res_px')
                            if getattr(args, k) != ap.get_default(k)]))
     det_cache, cache_dirty = {}, False

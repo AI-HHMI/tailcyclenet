@@ -86,8 +86,11 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     be the same animal. Feeding these straight to the pose model is the honest deployment
     baseline for a single window and nothing more; a tracker belongs on top.
 
-    `link=True` puts the smallest possible one there -- see `link_rows`. Off by default so the
-    contract in the paragraph above stays the contract.
+    `link=True` puts the smallest possible one there -- see `link_rows`. `scripts/infer.py` passes
+    it ON by default; it stays off HERE because this function's contract is the honest untracked
+    baseline and callers that want a tracker should say so. Note the two levers do not overlap:
+    the tracker below is built when `track and C > 1`, and `link_rows` runs only when it was not,
+    so in 2D single-view `link` is the whole of cross-frame identity.
 
     3D multiview: `track=True` (the DEFAULT) runs `track.CrossViewTracker` -- one cross-view target
     set carried across frames, so a row is one physical animal both within a frame and along the

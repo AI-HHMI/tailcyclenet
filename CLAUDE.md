@@ -403,6 +403,14 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 On 3dpop the first two together beat a 7.7×-compute detector (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
 0.572) with no retraining.
 
+**EVERY 3D FIGURE IN REPORT 11 §2 IS A MISMATCHED READ (gotcha 12) AND IS SUPERSEDED.** On its own
+58-group protocol, the same detector and the same flags on a consistently-trained run read
+**MPJPE 12.87 mm [9.92, 17.21] against the published 59.30**, coverage 0.985 against 0.933, pck@10 0.605
+against 0.105, MOTA +0.343 [+0.243, +0.448] — paired over 56 scoring groups. `motion_ratio` goes 0.634 to
+1.111, i.e. the published arms travelled 63% of the labels' path. That is a many-lever delta (the run, the
+carry source, the box path, the guards); report 13 measures each. Do not compare a new arm against report
+11's absolute 3D numbers — regenerate the baseline.
+
 **`grid_decode_space = "warped"` is the RIGHT value and the library's default is not.** `"head"`
 averages the convex-spaced bin centres directly and overshoots through the warp at large motion;
 `"warped"` averages in the uniform warped space first and is overshoot-free. Reverting costs +0.19 mm

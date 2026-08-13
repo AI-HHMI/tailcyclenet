@@ -131,8 +131,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     # independent containers there are; more threads would contend on the same reader.
     # THE FORWARD STAYS SERIAL AND IN CAMERA ORDER: it is 1% of the time and moving it would put
     # two streams on one CUDA context for nothing.
-    def _fetch(ci_cam):
-        ci, cam_name = ci_cam
+    def _fetch(job):
+        ci, cam_name, frames = job
         # THE SAME DECODE THE DETECTOR WAS TRAINED ON. `BoxDataset` reduces at decode where
         # the frame is far above the letterbox target, and a detector fed differently-sampled
         # pixels at deployment is being run off its own training distribution -- silently,
@@ -162,13 +162,27 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     # (dev/reports/08), one frame at a time, on roots that are single-camera so the camera pool above
     # buys them nothing. cv2 releases the GIL. It must NOT be `pool`: `_fetch` runs IN `pool` and
     # waits on these futures, and a pool that waits on itself deadlocks the moment both are full.
-    pool = ThreadPoolExecutor(max_workers=max(1, C)) if C > 1 else None
+    pool = ThreadPoolExecutor(max_workers=max(1, C))
     frame_pool = ThreadPoolExecutor(max_workers=min(16, max(1, batch)))
+
+    def _submit(start):
+        """The next batch's decode, started BEFORE the current one's forwards are run."""
+        if start >= T:
+            return None, None
+        fr = list(range(start, min(start + batch, T)))
+        return fr, [pool.submit(_fetch, (ci, cam, fr))
+                    for ci, cam in enumerate(session.cam_names)]
+
     try:
-        for start in range(0, T, batch):
-            frames = list(range(start, min(start + batch, T)))
-            todo = list(enumerate(session.cam_names))
-            fetched = list(map(_fetch, todo) if pool is None else pool.map(_fetch, todo))
+        # ONE BATCH OF LOOKAHEAD. Decode is ~100% of this loop's wall clock once the pack is fixed,
+        # but the ~120 ms per batch of forward + NMS + tracker is time the decoder threads spent
+        # idle: they had nothing queued until the main thread came back round. Submitting batch i+1
+        # first overlaps the two. It changes no pixels and no order -- `_submit` returns the futures
+        # in camera order and the forwards still run one camera at a time, in that order.
+        frames, pending = _submit(0)
+        while pending is not None:
+            fetched = [f.result() for f in pending]
+            nxt = _submit(frames[-1] + 1)
             per_cam = []
             for ci, x, metas, src in fetched:
                 obj, boxes = det(x.to(device))
@@ -199,10 +213,10 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
                         for c, box in g['boxes'].items():
                             out[a, t, c] = box.numpy()
                             sc[a, t, c] = float(per_cam[c][j][1][g['members'][c]])
+            frames, pending = nxt
     finally:
         frame_pool.shutdown()
-        if pool is not None:
-            pool.shutdown()
+        pool.shutdown()
     return link_rows(out, sc, max_move=max_move) if (link and tracker is None) else (out, sc)
 
 

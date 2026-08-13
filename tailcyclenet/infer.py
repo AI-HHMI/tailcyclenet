@@ -78,6 +78,11 @@ class InferConfig:
     # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
     # pixels and no scene encode can be shared). See `run_group`.
     refine: bool = False
+    # WHERE THE WINDOW'S CROP COMES FROM. 'boxes' unions the detector's per-frame boxes, which is
+    # what every recorded number uses. 'keypoints' runs THE CROP RULE on the detector's own
+    # keypoints over the window -- see the long comment at the union below for why that is the one
+    # thing boxes cannot reproduce. Needs a keypoint-trained detector; ignored without one.
+    crop_source: str = 'boxes'
     # How many finite (frame, camera) boxes a row needs before it gets a window crop at all. 1 is
     # what the loop always did, and it is the reason coverage can be FABRICATED: `3dpop_nogate.npz`
     # reports 0.000 of (row, frame) missing a pose while its box cache has 2.1-2.2% of (row, frame)
@@ -408,7 +413,27 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
                     x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
                     y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
-                    boxes.append(torch.tensor([x0, y0, x1, y1], dtype=torch.int32))
+                    box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
+                    # THE ONE THING THE UNION-OF-BOXES CANNOT DO, and the comment above says so:
+                    # "the per-frame extents that would have to be unioned BEFORE squaring are not
+                    # recoverable from the boxes". Detector KEYPOINTS are exactly those extents, so
+                    # with them the training crop rule can be applied once over the whole window --
+                    # union the points, then square once -- instead of squaring per frame and
+                    # unioning squares. That is why this is not the 08 §1.3 proposal that measured
+                    # +3.06 mm worse: that one re-squared an already-square union.
+                    if cfg.crop_source == 'keypoints' and det_kpts_stc is not None:
+                        kk = det_kpts_stc[a, frames, ci][..., :2].reshape(-1, 2)
+                        kk = kk[np.isfinite(kk).all(-1)]
+                        if len(kk):
+                            kb = cropmod.crop_box_for_points(
+                                torch.as_tensor(kk, dtype=torch.float32),
+                                torch.tensor([w, h], dtype=torch.float32), cfg.min_crop_dim)
+                            # THE SAME BOUND `--refine` CARRIES, for the same reason: the rule
+                            # squares the extent, so a wandering keypoint set lands somewhere else
+                            # entirely. Falling back to the union is the conservative direction.
+                            if kb is not None and _overlaps(kb, box):
+                                box = kb.to(torch.int32)
+                    boxes.append(box)
                     use.append(ci)
                 if not use:
                     outcome[a, wi] = OUTCOMES.index('no camera')

@@ -91,6 +91,14 @@ def main():
                          'score-ordered rows, and the union crop spanning several animals. Every 2D '
                          'number in reports 11 and 13 came from an explicit opt-in. '
                          '`--no-link-boxes` restores that memoryless pass.')
+    ap.add_argument('--crop-source', default='boxes', choices=('boxes', 'keypoints'),
+                    help="where the window's crop comes from. 'boxes' (default) unions the "
+                         "detector's per-frame boxes -- what every recorded number uses. "
+                         "'keypoints' runs THE CROP RULE on the detector's own keypoints over the "
+                         'window, which is the one thing a union of boxes cannot reproduce: the '
+                         'per-frame extents are unioned BEFORE squaring rather than after. Needs '
+                         'a keypoint-trained detector and is ignored without one. Bounded by the '
+                         'same overlap test `--refine` carries.')
     ap.add_argument('--max-move', type=float, default=1.0,
                     help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a '
                          'target-detection pair further apart than this is not the same animal and '
@@ -284,7 +292,8 @@ def main():
         kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
-        oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device)
+        oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device,
+        crop_source=args.crop_source)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

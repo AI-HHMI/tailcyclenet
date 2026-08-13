@@ -381,7 +381,14 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   Hungarian on that keypoint alone, and this gate is precisely what makes rows sparse. Re-run it with
   the guard on before quoting it again. An all-NaN-confidence row is no longer silently kept either
   (`NaN < thresh` was False, so the row the model said least about was the one the gate could not
-  touch).
+  touch). **AND ITS VALUE IS A FUNCTION OF HOW BAD THE THING IT GATES IS.** Re-measured on the 58-group
+  protocol with a correctly-read run, 6.0 is worth **+0.009** MOTA for 0.001 of coverage against a
+  rate-matched random control that *costs* 0.017 MOTA and 2.5 points of coverage — about a fifth of the
+  +0.049 report 11 measured on the mismatched run, where there was far more junk to remove. Re-measure it
+  after any fix upstream of it. Its operating point also depends on the BOX PATH: on a non-tracker 3dpop
+  arm at this run's logit scale, 6.0 drops nothing at all (0.0000 of rows below it) while the `--track`
+  arm has 2.9% below it, because the tracker keeps the marginal — and therefore low-confidence — animals
+  alive.
 - **`--n-frames` shorter is a trade, not a win.** 24 → 12 → 8 on 3dpop moves MOTA 0 → +0.106 → +0.130
   and pck@10 0.103 → 0.074 → 0.067, monotonically in both directions, with MPJPE inside its interval
   throughout. A shorter window shrinks the crop union AND cuts temporal context; the first buys

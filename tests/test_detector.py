@@ -569,3 +569,107 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
     assert "('track', str(args.track))" in src, \
         'track must be UNCONDITIONAL in the cache stamp now that its default has moved'
     assert 'BooleanOptionalAction' in src, '--no-track must exist to restore the old behaviour'
+
+
+def test_keypoint_head_is_off_by_default():
+    """`n_keypoints = 0` must be BYTE-identical to the head before the branch existed.
+
+    Not "built and ignored": the modules are not constructed at all, so the `state_dict` has no
+    new keys and every recorded detector checkpoint loads without a new flag.
+    """
+    import torch
+
+    from tailcyclenet.detector import YOLOXNano
+
+    plain, kp = YOLOXNano(), YOLOXNano(n_keypoints=17)
+    assert set(plain.state_dict()) == {k for k in kp.state_dict() if 'kpt' not in k}
+    assert not any('kpt' in k for k in plain.state_dict())
+    assert sum(p.numel() for p in plain.parameters()) \
+        < sum(p.numel() for p in kp.parameters())
+    obj, boxes, kpts = plain(torch.zeros(1, 3, 64, 64))
+    assert kpts is None, 'a keypoint-free model must return None, not zeros'
+
+
+def test_keypoint_decode_is_signed_and_bounded():
+    """A positive offset moves right/down, and no keypoint escapes 1.25 box half-widths.
+
+    Both are silent failures: `exp` on a signed offset folds every keypoint to one side of its
+    anchor, and an unbounded offset is how a keypoint lands on the NEIGHBOURING animal.
+    """
+    import torch
+
+    from tailcyclenet.detector import YOLOXNano
+
+    m = YOLOXNano(n_keypoints=3).eval()
+    with torch.no_grad():
+        for p in m.head.kpt_pred:
+            p.weight.zero_()
+            p.bias.zero_()
+            p.bias[0::3] = +4.0          # dx large positive -> saturates tanh
+            p.bias[1::3] = -4.0          # dy large negative
+        _, boxes, kpts = m(torch.zeros(1, 3, 64, 64))
+        anchors = m.anchor_points(64, 64, torch.device('cpu'))
+    cx, cy = anchors[:, 0], anchors[:, 1]
+    assert (kpts[0, :, 0, 0] > cx).all(), 'positive dx must move RIGHT (an exp decode cannot)'
+    assert (kpts[0, :, 0, 1] < cy).all(), 'negative dy must move UP'
+    half_x = (boxes[0, :, 2] - boxes[0, :, 0]) / 2
+    assert (((kpts[0, :, 0, 0] - cx).abs() - 1.25 * half_x) <= 1e-3).all(), 'offset unbounded'
+
+
+def test_keypoint_loss_nan_rule():
+    """Every part of the NaN rule fails QUIETLY, so each gets an assertion.
+
+    - an all-NaN instance is exactly 0 with finite gradients (not NaN, not a pull to the origin)
+    - a half-labelled instance costs the SAME per point as a fully labelled one with the same
+      errors (this is what catches normalising by K instead of by the finite count)
+    - perturbing a NaN-target keypoint changes the loss by exactly 0 (this is what catches
+      `nan_to_num` supervising it toward the top-left corner)
+    """
+    import torch
+
+    from tailcyclenet.detector.assign import keypoint_loss
+
+    box = torch.tensor([[0.0, 0.0, 10.0, 10.0]])
+    nan = float('nan')
+
+    all_nan = torch.full((1, 4, 3), nan)
+    pred = torch.zeros(1, 4, 3, requires_grad=True)
+    reg, sc, nk, nv = keypoint_loss(pred, all_nan, box)
+    assert float(reg) == 0.0 and float(sc) == 0.0 and nk == 0 and nv == 0
+    (reg + sc).backward()
+    assert torch.isfinite(pred.grad).all(), 'an all-NaN instance produced non-finite gradients'
+
+    # Same errors on the finite points; one instance labels 2 of 4, the other all 4.
+    full = torch.tensor([[[1.0, 0, 1], [1.0, 0, 1], [1.0, 0, 1], [1.0, 0, 1]]])
+    half = torch.tensor([[[1.0, 0, 1], [1.0, 0, 1], [nan, nan, nan], [nan, nan, nan]]])
+    p = torch.zeros(1, 4, 3)
+    r_full, _, n_full, _ = keypoint_loss(p, full, box)
+    r_half, _, n_half, _ = keypoint_loss(p, half, box)
+    assert n_full == 4 and n_half == 2
+    assert abs(float(r_full) - float(r_half)) < 1e-6, \
+        'per-point cost changed with label density -- normalised by K, not by the finite count'
+
+    # Moving a masked-out prediction must not move the loss at all.
+    p2 = torch.zeros(1, 4, 3)
+    p2[0, 3, :2] = 500.0
+    r_moved, _, _, _ = keypoint_loss(p2, half, box)
+    assert float(r_moved) == float(r_half), 'a NaN-target keypoint is being supervised'
+
+
+def test_keypoint_score_target_is_status_not_finiteness():
+    """`x, y` null on a VISIBLE row is legal, and that row must still train the score channel.
+
+    The format permits it when a `points3d` row exists for the same key -- allen-mouse ships a
+    real per-camera visibility with no per-camera 2D. So the coordinate mask and the score mask
+    cannot be the same tensor.
+    """
+    import torch
+
+    from tailcyclenet.detector.assign import keypoint_loss
+
+    box = torch.tensor([[0.0, 0.0, 10.0, 10.0]])
+    nan = float('nan')
+    t = torch.tensor([[[nan, nan, 1.0], [nan, nan, 0.0]]])     # positioned nowhere, assessed
+    reg, sc, n_kpt, n_vis = keypoint_loss(torch.zeros(1, 2, 3), t, box)
+    assert n_kpt == 0, 'no coordinate is finite, so nothing should be regressed'
+    assert n_vis == 2 and float(sc) > 0.0, 'the score channel must still be supervised'

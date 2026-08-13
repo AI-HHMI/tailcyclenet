@@ -403,7 +403,11 @@ term on the second — opposite conclusions from one undifferentiated `fp_rate` 
 
 **Do NOT put the window union box through `crop_box_for_points`.** 08 §1.3 asks for it on gotcha-8
 grounds and it is measured worse: 3dpop +3.06 mm MPJPE and −0.032 MOTA, both SIG, and rat-city −0.040
-MOTA. The union of per-frame crop-rule boxes is already near-square (aspect median 1.047) and
+MOTA. The union of per-frame crop-rule boxes is already near-square (aspect median 1.047; report 13
+re-measures p50 1.03-1.15 across every arm, and identifies that report's "+82% p90 area" as the
+`associate` + `link_rows` regime specifically -- under `--track` the same figure is +19%, because a union
+that follows ONE animal is already square. Equal-area squaring would move a side by <=1.09x at p90
+there, so there is nothing left to win and no squaring rule is needed) and
 squaring it again grows the p90 box AREA by 82%. A detector box is already a crop-rule box, so the
 union already satisfies the `min_crop_dim` floor; and the rule cannot be reproduced from boxes anyway,
 because the per-frame extents that would be unioned before squaring are not recoverable.

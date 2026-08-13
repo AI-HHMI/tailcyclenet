@@ -185,7 +185,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
             nxt = _submit(frames[-1] + 1)
             per_cam = []
             for ci, x, metas, src in fetched:
-                obj, boxes = det(x.to(device))
+                obj, boxes, _ = det(x.to(device))
                 cam_frames = []
                 for j in range(len(frames)):
                     b, s = decode(obj[j], boxes[j], top_k=S, score_thresh=score_thresh)

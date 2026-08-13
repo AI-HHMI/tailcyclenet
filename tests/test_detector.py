@@ -16,7 +16,7 @@ from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, 
 def test_forward_shapes_and_anchor_order():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 160)
-    obj, boxes = m(x)
+    obj, boxes, _ = m(x)
     anchors = m.anchor_points(128, 160, x.device)
     assert obj.shape[1] == boxes.shape[1] == anchors.shape[0], \
         'anchor_points must match forward()s flattening order exactly'
@@ -94,7 +94,7 @@ def test_assign_gives_each_anchor_one_box():
 def test_loss_is_finite_with_no_animal_anywhere():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 128)
-    obj, boxes = m(x)
+    obj, boxes, _ = m(x)
     anchors = m.anchor_points(128, 128, x.device)
     gt = torch.full((2, 1, 4), float('nan'))
     loss, parts = detector_loss(obj, boxes, anchors, gt)

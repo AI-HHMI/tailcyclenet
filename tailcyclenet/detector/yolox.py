@@ -118,10 +118,22 @@ class PAFPN(nn.Module):
 
 
 class Head(nn.Module):
-    """Decoupled head, objectness + ltrb. No classification branch (single class)."""
+    """Decoupled head, objectness + ltrb. No classification branch (single class).
 
-    def __init__(self, cin=96, n_levels=3):
+    `n_keypoints > 0` adds a KEYPOINT BRANCH: a second depthwise tower off the same stem, and a
+    1x1 emitting `(dx, dy, score)` per keypoint. At the default 0 nothing is constructed -- not
+    built and ignored -- so an existing checkpoint's `state_dict` is unchanged and every recorded
+    detector number reproduces without passing a new flag.
+
+    DECOUPLED, not shared, and that is a measured choice: at batch 128 on an H100 the second
+    tower costs 1.15x the whole network against 1.01x for a shared one, which is 0.036% of a real
+    run's wall clock (the forward is 0.9% of it -- dev/reports/14). Compute is not the constraint
+    here by three orders of magnitude; accuracy is.
+    """
+
+    def __init__(self, cin=96, n_levels=3, n_keypoints=0):
         super().__init__()
+        self.n_keypoints = int(n_keypoints)
         self.stems = nn.ModuleList([conv_bn_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
             [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3)) for _ in range(n_levels)])
@@ -129,33 +141,45 @@ class Head(nn.Module):
         self.obj_pred = nn.ModuleList([nn.Conv2d(cin, 1, 1) for _ in range(n_levels)])
         for m in self.obj_pred:                      # rare-positive prior, as in YOLOX
             nn.init.constant_(m.bias, -4.595)
+        if self.n_keypoints:
+            self.kpt_convs = nn.ModuleList(
+                [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3))
+                 for _ in range(n_levels)])
+            self.kpt_pred = nn.ModuleList(
+                [nn.Conv2d(cin, 3 * self.n_keypoints, 1) for _ in range(n_levels)])
 
     def forward(self, feats):
         outs = []
         for i, f in enumerate(feats):
-            x = self.reg_convs[i](self.stems[i](f))
-            outs.append((self.obj_pred[i](x), self.reg_pred[i](x)))
+            stem = self.stems[i](f)
+            x = self.reg_convs[i](stem)
+            kpt = self.kpt_pred[i](self.kpt_convs[i](stem)) if self.n_keypoints else None
+            outs.append((self.obj_pred[i](x), self.reg_pred[i](x), kpt))
         return outs
 
 
 class YOLOXNano(nn.Module):
     STRIDES = (8, 16, 32)
 
-    def __init__(self, width=96):
+    def __init__(self, width=96, n_keypoints=0):
         super().__init__()
+        self.n_keypoints = int(n_keypoints)
         self.backbone = CSPDarknetNano()
         self.neck = PAFPN(out=width)
-        self.head = Head(width)
+        self.head = Head(width, n_keypoints=self.n_keypoints)
 
     def forward(self, x):
         """x: (B,3,H,W) normalized to [0,1].
 
         Returns obj_logits (B, A) and boxes (B, A, 4) in xyxy INPUT-image pixels, where A is
-        the total number of anchor points across the three levels.
+        the total number of anchor points across the three levels. With `n_keypoints > 0` it
+        returns a third tensor, keypoints (B, A, K, 3) -- (x, y, score_logit), x/y also in input
+        pixels -- and `None` otherwise, so existing two-value callers must be updated but their
+        behaviour is unchanged.
         """
         outs = self.head(self.neck(self.backbone(x)))
-        obj_all, box_all = [], []
-        for (obj, reg), stride in zip(outs, self.STRIDES):
+        obj_all, box_all, kpt_all = [], [], []
+        for (obj, reg, kpt), stride in zip(outs, self.STRIDES):
             B, _, h, w = obj.shape
             gy, gx = torch.meshgrid(torch.arange(h, device=x.device),
                                     torch.arange(w, device=x.device), indexing='ij')
@@ -169,7 +193,26 @@ class YOLOXNano(nn.Module):
                                  cx[None] + ltrb[..., 2], cy[None] + ltrb[..., 3]], dim=-1)
             obj_all.append(obj.reshape(B, -1))
             box_all.append(boxes)
-        return torch.cat(obj_all, 1), torch.cat(box_all, 1)
+            if kpt is not None:
+                k = kpt.permute(0, 2, 3, 1).reshape(B, -1, self.n_keypoints, 3)
+                # NO `exp` HERE. ltrb distances are positive so the box decode exponentiates;
+                # keypoint offsets are SIGNED, and exponentiating them would fold every keypoint
+                # to one side of its anchor -- silently, with a healthy-looking loss curve.
+                #
+                # BOUNDED AT 1.25 BOX HALF-WIDTHS via tanh, borrowed from RTMO's bin range: a
+                # keypoint physically cannot land outside 1.25x its own box, which is the hard
+                # prior plain regression lacks and which directly attacks the failure that
+                # matters for identity -- a keypoint flying onto the NEIGHBOURING animal.
+                # `.detach()` on the box so the keypoint loss cannot perturb the box branch;
+                # every detector number in reports 10-13 rests on that branch.
+                half = torch.stack([(ltrb[..., 0] + ltrb[..., 2]) / 2,
+                                    (ltrb[..., 1] + ltrb[..., 3]) / 2], -1).detach()
+                ctr = torch.stack([cx, cy], -1)[None]                    # (1,A,2)
+                xy = ctr[:, :, None] + 1.25 * half[:, :, None] * torch.tanh(k[..., :2])
+                kpt_all.append(torch.cat([xy, k[..., 2:]], -1))
+        if not kpt_all:
+            return torch.cat(obj_all, 1), torch.cat(box_all, 1), None
+        return torch.cat(obj_all, 1), torch.cat(box_all, 1), torch.cat(kpt_all, 1)
 
     def anchor_points(self, h, w, device):
         """(A, 3) of (cx, cy, stride) matching forward()'s flattening order."""

@@ -203,7 +203,7 @@ def main():
             if it >= args.iters:
                 break
             x, gt = x.to(device), gt.to(device)
-            obj, boxes = model(x)
+            obj, boxes, kpt = model(x)
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt)
             opt.zero_grad(set_to_none=True)

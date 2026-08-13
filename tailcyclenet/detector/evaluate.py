@@ -126,7 +126,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     tracks = defaultdict(dict)                  # (key, ci) -> frame -> (pred (P,4), gt (S,4))
     sessions, n_want = {}, {}
     for bi, (x, gt) in enumerate(loader):
-        obj, pred_boxes = model(x.to(device))
+        obj, pred_boxes, _ = model(x.to(device))
         for j in range(x.shape[0]):
             sess, gid, f, ci = ds.index[order[bi * batch_size + j]]
             key = f'{sess.session_id}/{gid}'

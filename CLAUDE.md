@@ -515,7 +515,19 @@ detections may be born into an empty row; `last` expires after one window. **`LI
 `--det-cache` stamp** because the cache stores boxes that have already been linked, so changing this
 rule silently makes an old cache a different box set.
 
-**`--track` is the target state, and it is what deletes the above.** `detector/track.py`: ONE
+**`--track` IS A CAPABILITY, NOT A MEASURED ACCURACY WIN — off by default and keep it that way.** On
+3dpop's own 58-group protocol, one lever against `associate` + `link_rows` rev 2, **none of report 12 §5's
+pre-registered primary endpoints moves**: coverage −0.0011, MOTA +0.0345, miss −0.0157, `fp_none` −0.0107,
+all n.s. What survives is MPJPE −2.62 [−6.69, −0.11], `motion_ratio` −0.037 and `box_agree` −0.0065 — small.
+On two crowded 10-bird clips it reads −7.4 mm and +0.089 MOTA, both SIG, but those clips were selected FOR
+crowding and a stratification by animal count shows **no dose-response** (MOTA significant only in the
+2-group 10-animal band; MPJPE significant in the 1-2 and 3-5 bands and not the crowded ones). Report 12
+§2.1's 17.2% unclaimed-box headroom does not translate because **41 of the 58 test groups hold 1-2
+animals**, where a memoryless pairwise search has almost nothing to get wrong: the headroom is real and
+rare, and a coverage claim needs a crowded benchmark 3dpop's test split does not provide. Use it where the
+rig is wide or the animals are many. Never quote the hard-clip numbers without the protocol ones.
+
+**What it unambiguously buys is scale.** `detector/track.py`: ONE
 cross-view target set with one affinity and one Hungarian, replacing per-frame `associate` plus
 `link_rows`, which never exchanged anything with each other or with `carried`. Report 12 §2.1 measures
 the memoryless pass leaving **17.2% of offered boxes unclaimed** at 15 px jitter where target matching

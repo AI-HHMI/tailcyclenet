@@ -98,7 +98,7 @@ def test_jitter_stays_inside_the_image():
 # reading pixels
 # ----------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize('angle', [0.0, 20.0, -35.0])
+@pytest.mark.parametrize('angle', [0.0, 20.0, -35.0, 150.0, -170.0])
 def test_the_fused_warp_agrees_with_the_camera(angle):
     """The composed rotate->crop->resize affine must land pixels where the CAMERA says they go.
 
@@ -149,6 +149,48 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
     wgt = out[ys, xs, 0].astype(np.float64)
     got = np.array([(xs * wgt).sum() / wgt.sum(), (ys * wgt).sum() / wgt.sum()])
     assert np.allclose(got, np.asarray(want, np.float64), atol=1.0), f'{got} vs {want}'
+
+
+@pytest.mark.parametrize('angle', [17.0, 45.0, 90.0, 173.0, -128.0])
+def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
+    """`_rotate_2d` must lose NO label at any angle, and its 2x3 must match the camera it returns.
+
+    The library's `rotate_points_image_plane` crops to the border-free inscribed rectangle, which
+    keeps a mean 0.416 of a 4696x2048 frame. The pose loader crops around ONE animal afterwards, so
+    that step buys nothing and costs the animals outside it -- and costs them SILENTLY, because the
+    `< 2 finite` guard runs before the rotation and `crop_box_for_points` clamps instead of
+    refusing. Measured on rat-city-annotated: 61% of rotated items came back with no label at all.
+
+    Two properties, both of which the inscribed crop breaks: every source pixel is still inside the
+    canvas, and a label lands where the returned camera says it lands.
+    """
+    from aniposelib.cameras import CameraGroup
+
+    from tailcyclenet import format as fmt
+    from tailcyclenet.dataset import _rotate_2d
+
+    W, H = 4696, 2048
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': True})
+    cam = rig.posetail()[0]
+    # the four frame corners plus its centre -- if any of these leaves the canvas, an animal can
+    corners = torch.tensor([[[0.0, 0.0], [W, 0.0], [W, H], [0.0, H], [W / 2, H / 2]]])
+
+    out, moved, (M, size) = _rotate_2d(cam, corners, angle)
+
+    assert tuple(out['size'].tolist()) == tuple(size)
+    # TIGHT: the rotated frame's bounding box is the canvas EXACTLY -- nothing lost off an edge and
+    # nothing wasted. The inscribed crop fails the first half; a lazily oversized canvas the second.
+    box = moved[0, :4]
+    np.testing.assert_allclose(box.amin(0).numpy(), [0.0, 0.0], atol=0.51)
+    np.testing.assert_allclose(box.amax(0).numpy(), list(size), atol=1.01)
+    # The camera's principal point moved by the canvas expansion, which is what keeps the pixels
+    # `_crop_affine` produces agreed with the camera `apply_crop` hands downstream: the frame
+    # centre must still be the canvas centre.
+    centre = moved[0, 4].numpy()
+    np.testing.assert_allclose(centre, [size[0] / 2, size[1] / 2], atol=1.01)
+    shift = (out['mat'][:2, 2] - cam['mat'][:2, 2]).numpy()
+    np.testing.assert_allclose(centre - shift, [W / 2, H / 2], atol=1.01)
 
 
 def test_computed_frame_paths_match_the_listing(dataset_3d):

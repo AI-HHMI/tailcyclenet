@@ -84,6 +84,27 @@ def box_corners(boxes):
     four, so a two-corner version crops the animal. Shared by the loader (`dataset._crop_pts`,
     which rotates them) and by inference (`infer.run_group`, which unions them over a window), so
     the two cannot end up bounding different things.
+
+    ROTATING THESE FOUR CORNERS AND RE-BOUNDING THEM IS THE RIGHT RULE, AND THAT IS MEASURED
+    RATHER THAN ASSUMED -- see `scratch/rat-city/check_rotation.py`. The objection is real: the
+    axis-aligned hull of a rotated rectangle is up to sqrt(2) wider on the side, and where a
+    stored box is a crop-rule box it is ALREADY padded and ALREADY squared, so re-bounding it
+    rotates the pad and the squaring, neither of which is a property of the animal. The
+    alternative that follows from that -- hold the side, move the centre, since a SQUARED extent
+    is approximately rotation-invariant -- was built and REFUTED on rat-city-annotated: against
+    truth (the crop rule on the same animal's rotated keypoints, over 548 instances x 36 angles)
+    the corner rule reads |ratio - 1| median 0.084 and holding the side reads 0.111.
+
+    The reason is the premise: 96% of that root's stored boxes are NOT square (aspect long/short
+    median 1.737, p90 2.940). They are APT's tight animal boxes, not `crop_box_for_points` output --
+    report 14 records that they round-trip exactly from the `.lbl` -- and
+    for a tight elongated box the rotated corners track the rotated animal better than any
+    rotation-invariant square can. Holding the side is UNBIASED there (median ratio 1.000 against
+    the corner rule's 1.084) and more variable, which is the worse trade.
+
+    So the sqrt(2) inflation is only wrong for a box that IS a squared crop extent -- tracked
+    rat-city's, not this root's -- and nothing trains on those today. Do not "fix" this without
+    re-running that script on the root you mean to fix.
     """
     lib = torch if torch.is_tensor(boxes) else np
     b = boxes

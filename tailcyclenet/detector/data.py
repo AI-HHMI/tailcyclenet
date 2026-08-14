@@ -153,12 +153,29 @@ def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
     return out
 
 
-def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
-    """A random similarity about the image centre, source pixels in and out, as a 2x3.
+def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
+                  rotate_deg=0.0, centre=None):
+    """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
 
     Deliberately a similarity and not YOLOX's shear-and-perspective: the target is
     `crop_box_for_points`, an AXIS-ALIGNED extent, and a shear turns a box into a parallelogram
     whose extent is no longer the crop rule's box for anything.
+
+    `rotate_deg` IS THE REPLACEMENT FOR THE FLIP, and it is strictly easier than the flip was: a
+    mirror permutes left/right keypoint names and so needs a `flip_pairs` map, while a rotation
+    moves every keypoint through the same affine and permutes nothing. With `--keypoints` on
+    everywhere `hflip` is 0 everywhere, which left scale and translate as the whole of the
+    geometric augmentation.
+
+    `centre` IS WHY TILING AND ROTATION COMPOSE. `__getitem__` builds `tile @ warp @ decode`, so
+    the tile is cut AFTER this warp: about the frame centre, a scale of 0.8 moves an animal 2,000
+    px out by 400 -- already more than a 640 px tile -- and a large rotation moves it out of the
+    tile entirely, so every animal- and region-chosen tile would come back holding something else.
+    Passing the tile's own centre pins the tile's content and makes rotation FREE there, because a
+    tile interior to a 4696x2048 frame pulls real neighbouring pixels in at every angle. On whole
+    frames it is not free: the mean real-pixel fraction of a 2.29:1 frame is 0.92 at +-15, 0.79 at
+    +-45 and 0.644 (min 0.437) at BOTH +-90 and +-180 -- so the whole cost is paid by the first 90
+    degrees and nothing is saved by stopping short of a full circle.
 
     No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
     relabelling left to right is a permutation of that set and the extent is unchanged.
@@ -174,9 +191,63 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
     w, h = float(size[0]), float(size[1])
     s = rng.uniform(*scale)
     sx = -s if rng.random() < hflip else s
-    cx, cy = w / 2, h / 2
-    return np.array([[sx, 0.0, cx - sx * cx + rng.uniform(-translate, translate) * w],
-                     [0.0, s, cy - s * cy + rng.uniform(-translate, translate) * h]], np.float32)
+    cx, cy = (w / 2, h / 2) if centre is None else (float(centre[0]), float(centre[1]))
+    A = np.array([[sx, 0.0], [0.0, s]], np.float64)
+    # The draw is SKIPPED at rotate_deg 0, not drawn and multiplied by zero: that keeps both the
+    # matrix and the rng stream bit-identical to every detector arm recorded before this key.
+    if rotate_deg:
+        a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
+        A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
+    t = (np.array([cx, cy]) - A @ np.array([cx, cy])
+         + np.array([rng.uniform(-translate, translate) * w,
+                     rng.uniform(-translate, translate) * h]))
+    return np.concatenate([A, t[:, None]], 1).astype(np.float32)
+
+
+def _warp_region(rects, M):
+    """(M,4) certified rects through an in-plane similarity, ROUNDING DOWN. Returns (M,4).
+
+    A certified region is a CLAIM -- "everything in here is labelled" -- and a claim must shrink
+    under a transform that makes it approximate, never grow. Taking four corners through the warp
+    and then their extent grows it: the axis-aligned hull of a rotated rectangle claims area the
+    annotator never marked, which re-admits exactly the unlabelled animals `regions.pq` exists to
+    exclude (this root labels a median of 2 rats where the tracked one finds 11). So this inscribes
+    instead, the same largest-axis-aligned-rect-in-a-rotated-rect computation
+    `posetail_dataset._rotated_rect_max_inscribed` uses for the rotated image canvas.
+
+    Under every warp that existed before rotation -- translation, scale, flip -- an axis-aligned
+    rect stays axis-aligned, inscribed and circumscribed coincide, and this is a no-op against the
+    old code. `test_a_region_is_unchanged_by_a_scale_and_translate_warp` is what holds that.
+    """
+    A = np.asarray(M)[:, :2]
+    # The rotation angle of a similarity, reflection-safe: normalise the columns first so a scale
+    # or a flip cannot be read as an angle.
+    ang = float(np.arctan2(A[1, 0], A[0, 0]))
+    sin_a, cos_a = abs(np.sin(ang)), abs(np.cos(ang))
+    x0, y0, x1, y1 = rects.unbind(-1)
+    c = torch.stack([(x0 + x1) / 2, (y0 + y1) / 2], -1)
+    c = _apply_affine(c, (M, None))
+    s = float(np.sqrt(abs(np.linalg.det(A))))
+    w, h = (x1 - x0) * s, (y1 - y0) * s
+    if sin_a > 1e-9:
+        # Largest axis-aligned rect inside a w x h rect rotated by `ang`, the exact same branch
+        # structure as `_rotated_rect_max_inscribed` -- written on tensors so a whole (M,4) goes
+        # through at once.
+        long_, short = torch.maximum(w, h), torch.minimum(w, h)
+        degen = short <= 2 * sin_a * cos_a * long_
+        if abs(sin_a - cos_a) < 1e-10:      # exactly 45 degrees: the normal branch is singular
+            degen = torch.ones_like(degen)
+        x, wide = 0.5 * short, w >= h
+        cw_d = torch.where(wide, x / max(sin_a, 1e-12), x / max(cos_a, 1e-12))
+        ch_d = torch.where(wide, x / max(cos_a, 1e-12), x / max(sin_a, 1e-12))
+        denom = cos_a * cos_a - sin_a * sin_a
+        denom = denom if abs(denom) > 1e-12 else 1e-12
+        cw_n = (w * cos_a - h * sin_a) / denom
+        ch_n = (h * cos_a - w * sin_a) / denom
+        w = torch.clamp(torch.where(degen, cw_d, cw_n), min=0.0)
+        h = torch.clamp(torch.where(degen, ch_d, ch_n), min=0.0)
+    half = torch.stack([w, h], -1) / 2
+    return torch.cat([c - half, c + half], -1)
 
 
 class BoxDataset(Dataset):
@@ -188,7 +259,7 @@ class BoxDataset(Dataset):
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
-                 augment=False, reduce=False, keypoints=False, hflip=None,
+                 augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
@@ -228,6 +299,10 @@ class BoxDataset(Dataset):
         # keypoint arm necessarily loses the flip, so a control that keeps it differs in two
         # levers and measures neither (eval rule 4).
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
+        # 0 is off and off is byte-identical: `random_affine` skips the draw entirely. See there
+        # for why this is free when tiling and not when not, and why a full circle costs no more
+        # than a half one.
+        self.rotate_deg = float(rotate_deg)
         # Off by default and requested explicitly, not inferred from the split: it is a key, and
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
@@ -298,6 +373,22 @@ class BoxDataset(Dataset):
     def _tile_extent(self):
         """The tile's extent in SOURCE pixels. `input_wh / tile_scale`, and nothing else."""
         return (self.tile_wh[0] / self.tile_scale, self.tile_wh[1] / self.tile_scale)
+
+    def _warp_centre(self, i):
+        """What `random_affine` turns and scales about: the TILE's centre, or None for the frame.
+
+        `__getitem__` composes `tile @ warp @ decode`, so the tile is cut after the warp. About the
+        frame centre a scale of 0.8 moves an animal 2,000 px out by 400 -- more than a 640 px tile
+        -- and a rotation moves it out entirely, so a tile chosen for a region or an animal comes
+        back holding something else and the tiled arms quietly degrade into background-only tiles.
+        The targets were always right (boxes and regions ride the same warp and are then dropped
+        outside the tile); what was wrong was which pixels the item contained.
+        """
+        if self.origins[i] is None:
+            return None
+        ox, oy = self.origins[i]
+        tw, th = self._tile_extent()
+        return (ox + tw / 2, oy + th / 2)
 
     def _region_rects(self, sess, gid, f, ci):
         """(M,4) certified rects in SOURCE px for one (frame, camera), or None if no regions.pq.
@@ -418,14 +509,7 @@ class BoxDataset(Dataset):
             return None
         out = torch.as_tensor(rects, dtype=torch.float32).reshape(-1, 4)
         if warp is not None and out.numel():
-            # FOUR corners through the warp, then the extent -- under a rotation or a flip the
-            # extent of the two diagonal corners is strictly inside the extent of all four, so a
-            # two-corner warp would certify less area than the annotator marked.
-            x0, y0, x1, y1 = out.unbind(-1)
-            c = torch.stack([torch.stack([x0, y0], -1), torch.stack([x1, y0], -1),
-                             torch.stack([x1, y1], -1), torch.stack([x0, y1], -1)], -2)
-            c = _apply_affine(c, (warp, None))
-            out = torch.cat([c.amin(-2), c.amax(-2)], -1)
+            out = _warp_region(out, warp)
         scale, pad = self._transform(i, sess.rig.size(sess.cam_names[ci]))
         out[:, 0::2] = out[:, 0::2] * scale + pad[0]
         out[:, 1::2] = out[:, 1::2] * scale + pad[1]
@@ -544,7 +628,9 @@ class BoxDataset(Dataset):
                 if torch.isfinite(b).all():
                     # FOUR corners, not two. Under a rotation or a flip the extent of the two
                     # diagonal corners is strictly inside the extent of all four, so a two-corner
-                    # warp crops the animal the box exists to enclose.
+                    # warp crops the animal the box exists to enclose. Re-bounding all four under
+                    # a ROTATION is also the measured-best rule -- see `crop.box_corners`, which
+                    # records the alternative that was built and refuted.
                     x0, y0, x1, y1 = b
                     src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
                                        torch.stack([x1, y1]), torch.stack([x0, y1])])
@@ -581,7 +667,8 @@ class BoxDataset(Dataset):
         # worker the same stream, and a shared one would make the draw depend on how the
         # DataLoader happened to interleave.
         rng = (np.random.default_rng([self.seed, i]) if self.augment and self.train else None)
-        warp = random_affine(size, rng, hflip=self.hflip) if rng is not None else None
+        warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
+                              centre=self._warp_centre(i)) if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
         regions = self.regions_for(i, warp)

@@ -151,6 +151,18 @@ def main():
                          'a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block '
                          '-- with a proper box filter. Stored in the checkpoint; inference '
                          'reads it back. No effect on a video root.')
+    ap.add_argument('--rotate-deg', type=float, default=0.0,
+                    help='in-plane rotation drawn from [-deg, +deg], on top of --augment. 0 is '
+                         'off and off is byte-identical (the draw is skipped, not zeroed). 180 is '
+                         'a full circle. IT IS THE REPLACEMENT FOR THE FLIP --keypoints COSTS, and '
+                         'strictly easier: a mirror permutes left/right names and needs a '
+                         'flip_pairs map, a rotation permutes nothing. FREE WHEN TILING, because '
+                         'the warp turns about the tile centre and a tile interior to the frame '
+                         'pulls real neighbouring pixels in at every angle. Not free on whole '
+                         'frames: on a 2.29:1 frame the mean real-pixel fraction is 0.92 at 15, '
+                         '0.79 at 45 and 0.644 (min 0.437) at BOTH 90 and 180 -- the whole cost '
+                         'is paid by the first 90 degrees, so stopping short of a circle saves '
+                         'nothing. Stored in the checkpoint.')
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--eval-batches', type=int, default=25,
                     help='batches per split at each checkpoint. TRAIN is scored too: the '
@@ -214,7 +226,7 @@ def main():
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
-                       hflip=0.0 if args.no_hflip else None, **tiling)
+                       hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg, **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
     # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
@@ -334,7 +346,7 @@ def main():
                         'use_regions': args.use_regions,
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
-                        'reduce': args.reduce,
+                        'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 torch.save(ckpt, args.out / 'detector.pth')

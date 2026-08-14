@@ -7,10 +7,11 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet.crop import crop_box_for_points
+from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
                                    box_iou, decode, detector_loss, giou_loss, letterbox,
                                    unletterbox_boxes)
+from tailcyclenet.detector.data import random_affine
 
 
 def test_forward_shapes_and_anchor_order():
@@ -263,6 +264,93 @@ def test_a_rotated_box_needs_four_corners_in_the_detector(tiny_root):
     e4, e2 = ext(f4), ext(f2)
     assert (e4[:2] <= e2[:2]).all() and (e4[2:] >= e2[2:]).all()
     assert not torch.allclose(e4, e2), 'two corners would crop the animal the box encloses'
+
+
+def test_rotation_off_is_byte_identical_and_on_turns_about_its_centre():
+    """`--rotate-deg 0` must reproduce the pre-rotation matrix EXACTLY, draw for draw.
+
+    Not "close": every detector arm on record was trained without this key, and `random_affine`
+    consumes the rng, so drawing an angle and multiplying it by zero would reseat every later draw
+    and silently make those arms unreproducible. The draw is skipped instead.
+    """
+    def before(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
+        w, h = float(size[0]), float(size[1])
+        s = rng.uniform(*scale)
+        sx = -s if rng.random() < hflip else s
+        cx, cy = w / 2, h / 2
+        return np.array([[sx, 0.0, cx - sx * cx + rng.uniform(-translate, translate) * w],
+                         [0.0, s, cy - s * cy + rng.uniform(-translate, translate) * h]],
+                        np.float32)
+
+    for seed in range(25):
+        a = before((4696, 2048), np.random.default_rng([0, seed]))
+        b = random_affine((4696, 2048), np.random.default_rng([0, seed]))
+        assert np.array_equal(a, b), f'seed {seed} moved'
+
+    # And the rotation is about `centre`, which is the whole reason tiling and rotation compose.
+    M = random_affine((1000, 1000), np.random.default_rng(1), scale=(1.0, 1.0), translate=0.0,
+                      hflip=0.0, rotate_deg=180.0, centre=(300.0, 700.0))
+    fixed = M @ np.array([300.0, 700.0, 1.0])
+    np.testing.assert_allclose(fixed, [300.0, 700.0], atol=1e-3)
+
+
+def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
+    """A tile is cut AFTER the warp, so the warp has to hold the tile or the tile holds nothing.
+
+    `__getitem__` composes `tile @ warp @ decode`. About the FRAME centre a rotation sweeps an
+    animal clean out of the 640-px window that was chosen for it -- measured on
+    rat-city-annotated at 0.075 of animal-bearing tiles still holding an animal, against 0.820
+    about the tile centre (`scratch/rat-city/check_rotation.py`). Here the check is structural:
+    the tile's own centre is a fixed point of its warp, and the frame's centre is not.
+    """
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(32, 32), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, rotate_deg=180.0,
+                    tile_wh=(32, 32), tile_scale=1.0)
+    i = next(j for j in range(len(ds)) if ds.origins[j] is not None)
+    ox, oy = ds.origins[i]
+    tw, th = ds._tile_extent()
+    assert ds._warp_centre(i) == (ox + tw / 2, oy + th / 2)
+
+    sess, _, _, ci = ds.index[i]
+    size = tuple(sess.rig.size(sess.cam_names[ci]))
+    M = random_affine(size, np.random.default_rng([ds.seed, i]), hflip=0.0, rotate_deg=180.0,
+                      translate=0.0, scale=(1.0, 1.0), centre=ds._warp_centre(i))
+    c = np.array([ox + tw / 2, oy + th / 2, 1.0])
+    np.testing.assert_allclose(M @ c, c[:2], atol=1e-3)
+
+
+def test_a_rotated_region_certifies_less_not_more(tiny_root):
+    """A certified area is a CLAIM, and under a rotation a claim must round DOWN.
+
+    Four corners then the extent -- right for a BOX, which must not crop its animal -- is exactly
+    backwards for a region: the axis-aligned hull of a rotated rectangle claims area the annotator
+    never marked, re-admitting the unlabelled animals `regions.pq` exists to exclude. That is the
+    one direction the mask cannot be wrong in, since this root labels a median of 2 rats per frame.
+    """
+    from tailcyclenet.detector.data import _warp_region
+
+    r = torch.tensor([[100.0, 200.0, 500.0, 900.0], [0.0, 0.0, 64.0, 64.0]])
+
+    # Every warp that existed before rotation keeps a rect axis-aligned, so inscribed and
+    # circumscribed coincide and this is a no-op against the old four-corner code.
+    for M in (np.array([[1.0, 0.0, 37.0], [0.0, 1.0, -12.0]], np.float32),
+              np.array([[0.83, 0.0, 5.0], [0.0, 0.83, 9.0]], np.float32),
+              np.array([[-1.1, 0.0, 900.0], [0.0, 1.1, 3.0]], np.float32)):
+        c = box_corners(r) @ torch.as_tensor(M[:, :2]).T + torch.as_tensor(M[:, 2])
+        want = torch.cat([c.amin(-2), c.amax(-2)], -1)
+        torch.testing.assert_close(_warp_region(r, M), want, atol=1e-3, rtol=0)
+
+    sq = torch.tensor([[0.0, 0.0, 400.0, 400.0]])
+    for deg in (15.0, 45.0, 137.0):
+        a = np.radians(deg)
+        M = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0]], np.float32)
+        hull = box_corners(sq) @ torch.as_tensor(M[:, :2]).T
+        out = _warp_region(sq, M)
+        assert float(out[0, 2] - out[0, 0]) < 400.0 < float((hull.amax(-2) - hull.amin(-2))[0, 0])
+    # 90 degrees maps a square onto itself exactly -- no shrink is owed and none is taken.
+    M90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0]], np.float32)
+    torch.testing.assert_close(_warp_region(sq, M90)[0, 2] - _warp_region(sq, M90)[0, 0],
+                               torch.tensor(400.0), atol=1e-3, rtol=0)
 
 
 def test_chunk_is_one_containers_worth_of_index(tiny_root):

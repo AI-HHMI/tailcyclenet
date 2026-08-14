@@ -35,8 +35,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from posetail.datasets.posetail_dataset import (custom_collate, rotate_camera_image_plane_3d,
-                                                rotate_points_image_plane)
+from posetail.datasets.posetail_dataset import custom_collate, rotate_camera_image_plane_3d
 from posetail.posetail.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
@@ -59,6 +58,18 @@ class LoaderConfig:
     prob_2d_only: float = 0.25         # rate at which a 3D session is shown a single camera
     balance_datasets: bool = True      # sample datasets uniformly, not proportionally
     aug_prob: float = 0.25             # in-plane rotation, per-camera appearance, cutout
+    # The in-plane rotation's magnitude and rate, split out of `aug_prob` because they are the two
+    # things a root actually wants to set. 180 is a FULL 360 draw, and on a wide frame it costs
+    # nothing over the historic 45: `_rotated_rect_max_inscribed` is 90-degree PERIODIC, so the
+    # border-free canvas [-45,45] lands on is the same one [-180,180] lands on (measured on
+    # rat-city's 2.29:1 frame: mean retained area 0.416 vs 0.417, min 0.218 both). What the wider
+    # draw buys is heading coverage -- the 2D rotation moves pixel coords directly with no Z-roll,
+    # so +-45 shows the model a quarter of the circle and +-180 all of it.
+    aug_rotation_deg: float = 45.0
+    # None means "follow aug_prob", which is what every run before this key did. Set it to dial
+    # rotation without moving appearance jitter and cutout with it: an overhead arena camera wants
+    # every item rotated and does NOT want every item blurred and cut out.
+    aug_rotation_prob: float | None = None
     per_image_aug_prob: float = 0.25   # per-FRAME appearance: motion blur, sensor noise
     grayscale_prob: float = 0.2        # rate at which a train item drops colour entirely
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
@@ -96,6 +107,62 @@ class LoaderConfig:
 # ----------------------------------------------------------------------------------------------
 # pixels
 # ----------------------------------------------------------------------------------------------
+
+def _rotate_2d(cam, coords, angle_deg):
+    """`rotate_points_image_plane` WITHOUT its border-free inscribed crop. Same return shape.
+
+    The library rotates the whole frame, expands the canvas so no pixel is lost, and then crops to
+    the largest axis-aligned rectangle containing no black border. That last step is right for a
+    consumer that uses the whole frame and catastrophic for one that crops around an animal: the
+    inscribed rectangle of a 4696x2048 frame keeps a MEAN 0.416 of its area (0.218 at the worst
+    angle), and an animal outside it is not skipped -- the `< 2 finite` guard runs BEFORE the
+    rotation and `crop_box_for_points` clamps rather than returning None, so the item comes back
+    with its labels silently NaN'd by the post-crop `_mask_outside`.
+
+    MEASURED on rat-city-annotated at `aug_rotation_prob = 1.0`: finite label coordinates per item
+    2.94 unrotated against 0.99 through the library, with 61% of rotated items carrying NO LABEL AT
+    ALL against 1.3%. At the historic `aug_prob = 0.25` that is ~16% of items quietly unsupervised
+    in every run on record; at the rotation rate an overhead arena camera wants it is two thirds.
+
+    Keeping the full expanded canvas costs nothing here. The crop that follows is a ~256 px window
+    around one animal, so it only meets the canvas edge for an animal that was at the frame edge,
+    and there `_crop_affine` already renders BORDER_CONSTANT zeros -- which its docstring calls out
+    as exactly what the old pad-safe crop buffer existed to produce. So this trades a black wedge
+    on the rare edge crop for the two thirds of items above.
+
+    THE 3D PATH IS DELIBERATELY LEFT ON THE LIBRARY HELPER. It has the same inscribed crop, but it
+    recomputes `vis_2d` through `is_point_visible` right after rotating (`_item`), so a point off
+    the canvas becomes INVISIBLE -- a label the loss handles -- instead of vanishing into NaN. The
+    failure is graceful there and silent here, which is the whole difference.
+    """
+    import cv2
+
+    w, h = cam['size'].tolist()
+    center_x = float(cam['mat'][0, 2].item()) - float(cam['offset'][0].item())
+    center_y = float(cam['mat'][1, 2].item()) - float(cam['offset'][1].item())
+    M = cv2.getRotationMatrix2D((center_x, center_y), angle_deg, 1.0)
+
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64)
+    rot = corners @ M[:, :2].T + M[:, 2]
+    tx, ty = -rot.min(axis=0)
+    M[0, 2] += tx
+    M[1, 2] += ty
+    cw = int(np.ceil(rot[:, 0].max() - rot[:, 0].min()))
+    ch = int(np.ceil(rot[:, 1].max() - rot[:, 1].min()))
+
+    out = dict(cam)
+    # Principal point tracks the canvas expansion only -- there is no crop offset to subtract now.
+    # ext/ext_inv/center stay untouched: the 2D coords ARE the target and moving them through the
+    # same affine as the pixels is the whole rule; a Z-roll would double-apply it.
+    out['mat'] = cam['mat'].clone()
+    out['mat'][0, 2] = cam['mat'][0, 2] + tx
+    out['mat'][1, 2] = cam['mat'][1, 2] + ty
+    out['offset'] = cam['offset'].clone()
+    out['size'] = torch.tensor([cw, ch], dtype=torch.int32, device=cam['size'].device)
+
+    Mt = torch.as_tensor(M, dtype=coords.dtype, device=coords.device)
+    return out, coords @ Mt[:, :2].T + Mt[:, 2], (M, (cw, ch))
+
 
 def _apply_affine(pts, rotation):
     """Move (...,2) pixel points through a rotation's own 2x3, or pass them through untouched.
@@ -849,14 +916,20 @@ class PoseDataset(Dataset):
             return None
 
         # -- geometry: rotate, crop, resize ----------------------------------------------
+        # One draw of the rate for the whole item. `aug_rotation_prob = None` reproduces the old
+        # expression exactly -- same value, same number of draws, same order -- so a run that does
+        # not set these two keys is bit-identical to every run recorded before they existed.
+        rot_p = (self.cfg.aug_prob if self.cfg.aug_rotation_prob is None
+                 else self.cfg.aug_rotation_prob)
+        rot_deg = self.cfg.aug_rotation_deg
         rotation_info = [None] * len(cgroup)
         if true_2d:
             cam = cgroup[0]
             coords = _mask_outside(coords, cam['size'])
             cp = None if crop_pts is None else crop_pts[:, 0]
-            if self.train and rng.random() < self.cfg.aug_prob:
-                cam, coords, rot = rotate_points_image_plane(cam, coords,
-                                                             float(rng.uniform(-45, 45)))
+            if self.train and rng.random() < rot_p:
+                cam, coords, rot = _rotate_2d(cam, coords,
+                                              float(rng.uniform(-rot_deg, rot_deg)))
                 rotation_info = [rot]
                 cp = _apply_affine(cp, rot)
             jit = self._jitter(rng)
@@ -876,9 +949,9 @@ class PoseDataset(Dataset):
             if self.train:
                 rotated = []
                 for cam in cgroup:
-                    if rng.random() < self.cfg.aug_prob:
-                        cam_r, rot = rotate_camera_image_plane_3d(cam,
-                                                                  float(rng.uniform(-45, 45)))
+                    if rng.random() < rot_p:
+                        cam_r, rot = rotate_camera_image_plane_3d(
+                            cam, float(rng.uniform(-rot_deg, rot_deg)))
                         rotated.append((cam_r, rot))
                     else:
                         rotated.append((cam, None))

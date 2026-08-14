@@ -311,10 +311,23 @@ Rows may overlap, and a frame may carry any number of them (including none). The
 key, so rule 9 does not apply. A rectangle with `x1 <= x0` or `y1 <= y0` is an error (rule 15),
 not an empty region — a certificate covering nothing is always a bug in the converter.
 
+**Membership is by CENTROID, not by overlap, and this is not a detail.** An animal is inside a
+region iff the mean of its keypoints is; one straddling the boundary with its centre outside is
+*not* required to be labelled. A consumer that instead tests pixel overlap will read that animal
+as an uncertified miss inside a certified area and conclude the certificate is unreliable. This
+was hit on the first render of `rat-city-annotated`: a Label Box that looked like it held an
+unlabelled rat, whose centre is in fact just outside the edge. It is also the source's own rule —
+APT tests `mask[round(nanmean(keypoints))]` (`APT_interface.py`, `labels_within_mask`).
+
 The source is APT's `labelsRoi` ("Label Box"), whose own help text describes it as marking
 "regions that are completely labeled… teaching the classifier what a negative label is". A frame
 with a Label Box but no rectangle covering the rest of the frame is asserting exactly that: the
-box is trustworthy and the rest of the frame is not.
+box is trustworthy and the rest of the frame is not. APT joins these to the per-target loss masks
+around each labelled animal (`rois = concatenate([rois, erois])`) and then samples its *negative*
+patches from inside the union, which is the polarity stated above, measured rather than inferred
+from the name. Note that its per-target mask is the keypoint extent padded by 1.5× with a 32 px
+floor, which is larger than the box `instances.pq` carries here — so reading the certified area as
+"regions ∪ instance boxes" understates it slightly, in the safe direction.
 
 ## 10. `extrinsics.pq` — moving cameras (optional)
 

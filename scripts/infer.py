@@ -299,13 +299,22 @@ def main():
               'instances.pq falls back to its keypoints')
 
     boxes = dict(np.load(args.boxes, allow_pickle=True)) if args.boxes else {}
-    det = det_wh = None
+    # `det_tile` is initialised HERE and not only inside the branch: it goes into the cache stamp
+    # unconditionally, and a NameError there would only fire on the box-source paths that have no
+    # detector at all.
+    det = det_wh = det_tile = None
     if args.detector:
         from tailcyclenet.detector import detect_group, load_detector
-        det, det_wh, det_ds, det_mcd, det_red, det_boxsrc = load_detector(
+        det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile = load_detector(
             args.detector, device, input_wh=args.det_input_wh)
-        print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}, trained on {det_ds!r}, '
-              f'boxes={det_boxsrc or "keypoints"})')
+        # A TILE-TRAINED DETECTOR IS DEPLOYED ON THE WHOLE FRAME AT ITS TRAINING SCALE, and
+        # `det_wh` is its TILE size. `detect_group` derives the per-camera input from `det_tile`
+        # (frame sizes vary WITHIN a root -- rat-city-annotated ships 4696x2048 beside 4500x2050),
+        # so `det_wh` is only a fallback here and is printed as the tile it is.
+        print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}'
+              + (f' TILE at scale {det_tile:g}, whole-frame input derived per camera'
+                 if det_tile else '')
+              + f', trained on {det_ds!r}, boxes={det_boxsrc or "keypoints"})')
         # The detector regresses THE CROP RULE'S box, so its floor has to be the pose model's
         # floor. Same shapes and same losses if they differ, so nothing else would say so.
         if det_mcd != cfg.min_crop_dim:
@@ -353,9 +362,17 @@ def main():
     # written while it was off carries no `track` entry, and under this line those caches are now
     # REFUSED rather than silently reused as if they had been tracked -- which is the whole point of
     # the stamp. Deleting them is correct; reproducing an untracked arm needs `--no-track`.
+    #
+    # `tile_scale` is UNCONDITIONAL for the FIFTH instance of the same trap, and this one is not
+    # about a moved default: it comes from the CHECKPOINT rather than the command line, so two runs
+    # can differ in it with identical arguments. A tile-trained detector is deployed at a different
+    # whole-frame input size than a letterbox-trained one, which is a different box set under an
+    # otherwise identical stamp. Every cache written before the key existed carries no entry and is
+    # now refused rather than reused as if the scales matched.
     from tailcyclenet.detector import LINK_REV
     stamp = repr(sorted([('det_score', str(args.det_score)), ('track', str(args.track)),
-                         ('link_boxes', str(args.link_boxes)), ('link_rev', str(LINK_REV))]
+                         ('link_boxes', str(args.link_boxes)), ('link_rev', str(LINK_REV)),
+                         ('tile_scale', str(det_tile))]
                         + [(k, str(getattr(args, k))) for k in
                            ('detector', 'max_animals', 'det_input_wh',
                             'max_frames', 'min_views', 'dup_res_px', 'max_move')
@@ -420,7 +437,7 @@ def main():
                         score_thresh=args.det_score, link=args.link_boxes,
                         reduce=det_red, max_frames=args.max_frames,
                         min_views=args.min_views, dup_res_px=args.dup_res_px,
-                        track=args.track, max_move=args.max_move)
+                        track=args.track, max_move=args.max_move, tile_scale=det_tile)
                     # A keypoint-trained detector returns a third array, cached under its own key.
                     # This does NOT change what an old cache is allowed to satisfy: a box-only arm
                     # never looks at it, and a keypoint-crop arm is refused above rather than served

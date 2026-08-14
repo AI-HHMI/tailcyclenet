@@ -767,3 +767,155 @@ def test_a_batchnorm_checkpoint_is_refused_by_name(tmp_path):
     torch.save({'model_state': {}, 'input_wh': [128, 128]}, p)
     with pytest.raises(ValueError, match='bn normalisation'):
         load_detector(p)
+
+
+# ----------------------------------------------------------------------------------------------
+# tiling and the regions.pq certified mask
+# ----------------------------------------------------------------------------------------------
+
+def _root_with_regions(tmp_path, rect=(4.0, 4.0, 44.0, 34.0)):
+    """A copy of the 2D fixture carrying one certified region on frame 1, camera 0."""
+    from tailcyclenet import format as fmt
+    from .conftest import _session_2d
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    lab.regions = np.array([[1.0, 0.0, *rect]])
+    fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
+                      names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},
+                      flip_pairs=sess.flip_pairs, provenance=sess.provenance)
+    return tmp_path / 'ds'
+
+
+def test_tile_transform_is_the_letterbox_form():
+    from tailcyclenet.detector.data import tile_transform
+    scale, pad = tile_transform((100, 50), 0.5)
+    # a source point at the tile's origin lands at the input origin
+    assert scale == 0.5 and pad == (-50.0, -25.0)
+    assert 100 * scale + pad[0] == 0.0 and 50 * scale + pad[1] == 0.0
+
+
+def test_tiled_targets_are_still_the_crop_rule(tiny_root):
+    """gotcha 8 under tiling: the box is RE-DERIVED in source px, never scaled by tile_scale.
+
+    If this fails every tiled detector number is invalid, exactly as for the whole-frame version.
+    """
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2,
+                    tile_wh=(32, 32), tile_scale=1.0)
+    from tailcyclenet.detector.data import tile_transform
+    for i in range(min(6, len(ds))):
+        sess, gid, f, ci = ds.index[i]
+        boxes = ds.boxes_for(i)
+        lab = sess.labels(gid)
+        cam = sess.rig.posetail()[ci]
+        ox, oy = ds.origins[i]
+        tw, th = ds._tile_extent()
+        for s in range(boxes.shape[0]):
+            pts = torch.as_tensor(lab.points2d[s, f, :, ci], dtype=torch.float32)
+            keep = ((pts[:, 0] >= ox) & (pts[:, 0] <= ox + tw) &
+                    (pts[:, 1] >= oy) & (pts[:, 1] <= oy + th))
+            want = crop_box_for_points(torch.where(keep[:, None], pts, torch.nan),
+                                       cam['size'], ds.min_crop_dim)
+            if want is None:
+                assert torch.isnan(boxes[s]).all()
+                continue
+            scale, pad = tile_transform((ox, oy), ds.tile_scale)
+            back = unletterbox_boxes(boxes[s][None], scale, pad)[0]
+            torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
+
+
+def test_a_point_outside_the_tile_is_dropped(tiny_root):
+    """Out-of-tile behaves exactly like out-of-frame: shrink the box, or emit no box at all."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
+                    tile_wh=(16, 16), tile_scale=1.0)
+    # a tile far from every animal: the 64x48 fixture has its points in [5, 43]
+    ds.origins[0] = (1000.0, 1000.0)
+    assert torch.isnan(ds.boxes_for(0)).all()
+
+
+def test_an_off_frame_tile_is_grey_not_wrapped(tiny_root):
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
+                    tile_wh=(16, 16), tile_scale=1.0)
+    ds.origins[0] = (-16.0, -16.0)          # wholly outside, up and left
+    x = ds[0][0]
+    assert x.shape == (3, 16, 16)
+    torch.testing.assert_close(x, torch.full_like(x, 114 / 255.0))
+
+
+def test_regions_none_and_empty_are_different_in_the_loader(tmp_path, tiny_root):
+    """`None` claims exhaustive labelling; `(0,4)` certifies nothing. Both reach the loader."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1)
+    assert ds.regions_for(0) is None                     # the fixture has no regions.pq
+
+    root = _root_with_regions(tmp_path)
+    d2 = BoxDataset(root, 'train', input_wh=(64, 48), max_frames_per_group=4)
+    got = {int(d2.index[i][2]): d2.regions_for(i) for i in range(len(d2))}
+    assert got[1] is not None and got[1].shape == (1, 4)  # frame 1 carries the region
+    assert got[0] is not None and got[0].shape == (0, 4)  # frame 0 certifies nothing
+
+
+def test_regions_ride_the_same_transform_as_the_boxes(tmp_path):
+    """A region letterboxed by a different rule than its own boxes is invisible in the loss."""
+    root = _root_with_regions(tmp_path, rect=(4.0, 4.0, 44.0, 34.0))
+    ds = BoxDataset(root, 'train', input_wh=(128, 96), max_frames_per_group=4)
+    i = next(i for i in range(len(ds)) if int(ds.index[i][2]) == 1)
+    scale, pad = ds._transform(i, (64, 48))
+    r = ds.regions_for(i)[0]
+    torch.testing.assert_close(r, torch.tensor([4.0 * scale + pad[0], 4.0 * scale + pad[1],
+                                                44.0 * scale + pad[0], 34.0 * scale + pad[1]]))
+
+
+def test_use_regions_emits_a_full_frame_rect_when_the_session_has_none(tiny_root):
+    """No regions.pq = exhaustively labelled = every anchor supervised, encoded as one big rect."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
+                    use_regions=True)
+    item = ds[0]
+    assert len(item) == 3
+    torch.testing.assert_close(item[2], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
+
+
+def test_certified_anchors_unions_the_boxes_in():
+    from tailcyclenet.detector import certified_anchors
+    anchors = torch.tensor([[5.0, 5.0, 8.0], [50.0, 50.0, 8.0], [95.0, 95.0, 8.0]])
+    regions = torch.tensor([[0.0, 0.0, 10.0, 10.0]])
+    boxes = torch.tensor([[40.0, 40.0, 60.0, 60.0], [float('nan')] * 4])
+    got = certified_anchors(anchors, regions, boxes)
+    assert got.tolist() == [True, True, False]           # region, GT box, neither
+    # a NaN-padded rect certifies nothing rather than certifying the origin
+    assert not certified_anchors(anchors, torch.full((1, 4), float('nan')),
+                                 torch.full((1, 4), float('nan'))).any()
+
+
+def test_split_batch_tells_keypoints_from_regions_by_rank():
+    from tailcyclenet.detector import split_batch
+    x, b = torch.zeros(2, 3, 8, 8), torch.zeros(2, 1, 4)
+    k, r = torch.zeros(2, 1, 5, 3), torch.zeros(2, 3, 4)
+    assert split_batch((x, b)) == (x, b, None, None)
+    assert split_batch((x, b, k))[2] is k and split_batch((x, b, k))[3] is None
+    assert split_batch((x, b, r))[2] is None and split_batch((x, b, r))[3] is r
+    got = split_batch((x, b, k, r))
+    assert got[2] is k and got[3] is r
+
+
+def test_detector_loss_without_regions_is_unchanged():
+    """THE BACKWARD-COMPATIBILITY PROOF. Reports 10-15's numbers depend on this equality."""
+    torch.manual_seed(0)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 64
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    base, bp = detector_loss(obj, boxes, anchors, gt)
+    same, sp = detector_loss(obj, boxes, anchors, gt, regions=None)
+    assert float(base) == float(same) and 'certified' not in bp and 'certified' not in sp
+
+    # a mask that certifies everything is the same loss; one that certifies nothing keeps only
+    # the positives, which are forced in because an unsupervised positive is an animal trained
+    # as nothing.
+    everything = torch.tensor([[[0.0, 0.0, 64.0, 64.0]]] * 2)
+    allm, ap = detector_loss(obj, boxes, anchors, gt, regions=everything)
+    torch.testing.assert_close(allm, base)
+    assert ap['certified'] == 1.0
+    nothing = torch.full((2, 1, 4), float('nan'))
+    _, np_ = detector_loss(obj, boxes, anchors, gt, regions=nothing)
+    assert 0.0 < np_['certified'] < 1.0

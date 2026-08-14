@@ -88,6 +88,35 @@ def assign(anchors, gt_boxes):
     return pos, gt_ix[best[pos]]
 
 
+def certified_anchors(anchors, regions, gt_boxes):
+    """(A,) bool: which anchors sit in area an annotator certified as completely labelled.
+
+    An anchor is certified when its centre is inside any `regions.pq` rectangle OR inside any
+    finite GT box. The union with the boxes is APT's own rule -- `APT_interface.py:331` concatenates
+    `extra_roi` with the per-target loss masks and treats the union as the labelled area -- and
+    without it an animal's own anchors would be unsupervised wherever the annotator drew no Label
+    Box, which is most frames.
+
+    Non-finite rows in either input are dropped, so `box_collate`'s NaN padding certifies nothing
+    rather than certifying the origin.
+
+    OUTSIDE this set the objectness target is UNKNOWN, not negative. That is the whole point: on
+    `rat-city-annotated` a labelled frame names a median of 2 rats where the tracker finds 11, so
+    training the other ~9 as background is a false negative per rat per frame.
+    """
+    cx, cy = anchors[:, 0], anchors[:, 1]
+    ok = torch.zeros(cx.shape, dtype=torch.bool, device=anchors.device)
+    for r in (regions, gt_boxes):
+        if r is None or r.numel() == 0:
+            continue
+        r = r[torch.isfinite(r).all(-1)]
+        if r.numel() == 0:
+            continue
+        ok |= ((cx[:, None] > r[None, :, 0]) & (cx[:, None] < r[None, :, 2]) &
+               (cy[:, None] > r[None, :, 1]) & (cy[:, None] < r[None, :, 3])).any(1)
+    return ok
+
+
 def keypoint_loss(pred, target, gt_boxes):
     """L1 over box sides + BCE on the score channel, both masked by the LABEL, not by K.
 
@@ -137,7 +166,8 @@ def keypoint_loss(pred, target, gt_boxes):
 
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
-                  kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0):
+                  kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
+                  regions=None):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -147,14 +177,29 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     -- the centre-prior assignment already selects them, and reusing it is what keeps the two
     branches trained on the same notion of "this anchor owns this animal". Absent, nothing about
     this function changes.
+
+    `regions` (B,M,4) restricts the objectness BCE to anchors inside the CERTIFIED area (see
+    `certified_anchors`). Absent, this function is bit-identical to what every recorded detector
+    trained on -- which `tests/test_detector.py` asserts, because that equality is the only thing
+    keeping reports 10-15's numbers comparable.
+
+    **THE NORMALISER IS DELIBERATELY UNCHANGED**, `/ max(n_pos, B)`. Masking shrinks the objectness
+    SUM without shrinking its divisor, so it silently reweights `obj` against `box_weight` -- by
+    ~100x on a full frame (104 certified of 7,056) and ~10x on a good tile. That is a real effect
+    and the alternative (normalising by the certified count) would have made the masked and
+    unmasked arms differ in two things at once. So the shift is left in and `parts['certified']`
+    REPORTS it, because a silent reweighting is exactly what an arm would misattribute to the mask.
     """
     device = obj_logits.device
     B = obj_logits.shape[0]
     target = torch.zeros_like(obj_logits)
+    weight = None if regions is None else torch.zeros_like(obj_logits)
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
         pos, gix = assign(anchors, gt_boxes[b])
+        if weight is not None:
+            weight[b] = certified_anchors(anchors, regions[b], gt_boxes[b]).to(weight.dtype)
         if pos.numel():
             target[b, pos] = 1.0
             losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
@@ -168,12 +213,23 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     # Divide by the image count, never by 1, when a batch has no positive at all: every animal
     # absent from every view is real on a multi-camera dataset, and a `sum` over 16 x 3780 anchors
     # over 1 is a loss of order 600 and one enormous gradient step.
-    obj = (F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
-           / max(n_pos, B))
+    if weight is None:
+        obj_all = F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
+    else:
+        # A POSITIVE IS CERTIFIED BY CONSTRUCTION -- `assign` only fires inside a GT box and
+        # `certified_anchors` unions those boxes in -- but it is forced here rather than assumed,
+        # because a positive dropped from the objectness term would be an animal trained as
+        # nothing, and no loss curve would show it.
+        weight = torch.maximum(weight, target)
+        obj_all = (F.binary_cross_entropy_with_logits(obj_logits, target, reduction='none')
+                   * weight).sum()
+    obj = obj_all / max(n_pos, B)
     box = (torch.cat(losses_box).sum() / max(n_pos, 1) if losses_box
            else torch.zeros((), device=device))
     total = obj + box_weight * box
     parts = {'obj': float(obj.detach()), 'box': float(box.detach()), 'n_pos': n_pos}
+    if weight is not None:
+        parts['certified'] = float(weight.mean().detach())
     if kpts is not None and gt_kpts is not None:
         # Mean over the IMAGES that had a positive, matching how `box` is normalised. Both lists
         # are empty when nothing was assigned, and then these are exact zeros with no gradient.

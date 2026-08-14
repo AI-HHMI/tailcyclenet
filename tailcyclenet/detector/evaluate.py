@@ -20,10 +20,9 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from ..format import INST_PRESENT
 from ..metrics import mota
 from .assign import box_iou, decode
-from .data import ChunkShuffle, box_collate, letterbox_transform
+from .data import ChunkShuffle, box_collate
 
 
 def greedy_match(gt, pred):
@@ -57,38 +56,36 @@ def _corners(boxes):
     return np.asarray(boxes, float).reshape(-1, 2, 2)
 
 
-def box_mota(sess, gid, ci, store, input_wh):
-    """Box-only MOTA over this group's sampled frames in one camera view.
+def box_mota(store):
+    """Box-only MOTA over one camera view's sampled VIEWS.
 
     `idsw` here is NOT a tracking number: frames are subsampled per group, so consecutive rows
     are not consecutive in time. It is comparable between arms and nothing more.
+
+    `store` maps a per-VIEW key to `(pred (P,4), gt (S,4), ig (S,) | None, ig_boxes (S,4) | None)`,
+    everything already in the same input pixels. The key is the loader's ITEM INDEX and not the
+    frame number, because under tiling one frame yields SEVERAL views and keying by frame silently
+    kept only the last tile of each. The ignore rows arrive pre-transformed from
+    `BoxDataset.ignore_for` for the same reason -- their transform is per item.
     """
-    lab = sess.labels(gid)
-    frames = sorted(store)
-    T = len(frames)
+    keys = sorted(store)
+    T = len(keys)
     P = max(1, max(v[0].shape[0] for v in store.values()))
     S = max(1, max(v[1].shape[0] for v in store.values()))
     pred = np.full((P, T, 2, 2), np.nan)
     true = np.full((S, T, 2, 2), np.nan)
-    for t, f in enumerate(frames):
-        p, g = store[f]
+    have_ig = any(v[2] is not None for v in store.values())
+    have_igb = any(v[3] is not None for v in store.values())
+    ig = np.zeros((S, T), bool) if have_ig else None
+    ig_boxes = np.full((S, T, 4), np.nan) if have_igb else None
+    for t, k in enumerate(keys):
+        p, g, gi, gb = store[k]
         pred[:p.shape[0], t] = _corners(p)
         true[:g.shape[0], t] = _corners(g)
-
-    # Present-but-unannotated animals: rat-city ships 26,021 of these since `43ff495`, and
-    # counting them as false positives is measuring the annotator, not the detector.
-    ig = ig_boxes = None
-    if lab.instance is not None:
-        scale, pad = letterbox_transform(sess.rig.size(sess.cam_names[ci]), input_wh)
-        n = min(S, lab.instance.shape[0])
-        ig = np.zeros((S, T), bool)
-        ig[:n] = lab.instance[:n][:, frames, ci] == INST_PRESENT
-        if lab.boxes is not None:
-            ig_boxes = np.full((S, T, 4), np.nan)
-            b = lab.boxes[:n][:, frames, ci].astype(float)
-            b[..., 0::2] = b[..., 0::2] * scale + pad[0]
-            b[..., 1::2] = b[..., 1::2] * scale + pad[1]
-            ig_boxes[:n] = b
+        if ig is not None and gi is not None:
+            ig[:min(S, len(gi)), t] = gi[:S]
+        if ig_boxes is not None and gb is not None:
+            ig_boxes[:min(S, len(gb)), t] = gb[:S]
 
     with np.errstate(all='ignore'):
         diag = np.nanmedian(np.linalg.norm(true[:, :, 1] - true[:, :, 0], axis=-1))
@@ -133,7 +130,8 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
         x, gt = batch[0], batch[1]
         obj, pred_boxes, _ = model(x.to(device))
         for j in range(x.shape[0]):
-            sess, gid, f, ci = ds.index[order[bi * batch_size + j]]
+            item = order[bi * batch_size + j]
+            sess, gid, f, ci = ds.index[item]
             key = f'{sess.session_id}/{gid}'
             if key not in n_want:
                 sessions[key] = sess
@@ -142,7 +140,9 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
             g_all = gt[j]
             g = g_all[torch.isfinite(g_all).all(-1)]
             p = p.cpu()
-            tracks[(key, ci)][f] = (p.numpy(), g_all.numpy())
+            # Keyed by the ITEM index, not by `f`: with tiling one frame yields several views
+            # and keying by frame dropped all but the last of them from MOTA.
+            tracks[(key, ci)][item] = (p.numpy(), g_all.numpy(), *ds.ignore_for(item))
             if not g.numel():
                 per_group[key]['fp'] += p.shape[0]
                 continue
@@ -155,8 +155,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
             s['fp'] += n_fp
 
     for (key, ci), store in tracks.items():
-        per_group[key].setdefault('mota', []).append(
-            box_mota(sessions[key], key.split('/', 1)[1], ci, store, ds.input_wh))
+        per_group[key].setdefault('mota', []).append(box_mota(store))
     if was_training:
         model.train()
     return {g: _summarise(s) for g, s in per_group.items()}

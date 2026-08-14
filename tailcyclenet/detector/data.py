@@ -26,7 +26,7 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
-from ..format import PROJECTED, UNLABELED, VISIBLE, load_datasets
+from ..format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
 
 
 def reduce_factor(size, out_wh):
@@ -83,6 +83,22 @@ def letterbox_transform(size, out_wh):
     s = min(out_wh[0] / w, out_wh[1] / h)
     nw, nh = int(round(w * s)), int(round(h * s))
     return s, ((out_wh[0] - nw) // 2, (out_wh[1] - nh) // 2)
+
+
+def tile_transform(origin, scale):
+    """The `(scale, (padx, pady))` that renders a source-pixel tile at `origin` into the input.
+
+    Deliberately the SAME two-number form `letterbox_transform` returns, and that is the whole
+    reason tiling is not a second data path in this file: every geometry line here applies a
+    transform as `x * scale + pad`, and a tile whose top-left source pixel is `(ox, oy)`, rendered
+    at scale `s`, is exactly `(s, (-ox*s, -oy*s))`. So `boxes_for`, `regions_for` and
+    `__getitem__`'s single `warpAffine` all tile by substituting this for the letterbox.
+
+    There is no padding term to compute because the tile's source extent is `input_wh / scale` by
+    construction, so its aspect ratio already matches the input and a letterbox would be a no-op.
+    """
+    s = float(scale)
+    return s, (-float(origin[0]) * s, -float(origin[1]) * s)
 
 
 def unletterbox_boxes(boxes, scale, pad, src_wh=None):
@@ -172,10 +188,38 @@ class BoxDataset(Dataset):
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
-                 augment=False, reduce=False, keypoints=False, hflip=None):
+                 augment=False, reduce=False, keypoints=False, hflip=None,
+                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
+        # TILING, off by default and off means the whole frame -- with `tile_wh=None` every
+        # geometry path below takes the letterbox branch and this loader is byte-identical to what
+        # every recorded detector was trained on, the same discipline `keypoints` follows.
+        #
+        # `tile_wh` is the tile in INPUT pixels, i.e. the model's input size, so it REPLACES
+        # `input_wh`. `tile_scale` is the source -> input scale and is the only scale there is:
+        # the tile's source extent is `tile_wh / tile_scale`. DO NOT ADD A SECOND RESIZE. Tiling
+        # and then downscaling the tiles is the number-one reported failure of this pattern (one
+        # practitioner reported zero precision at full-size inference from exactly that), because
+        # it breaks the invariant the whole scheme rests on -- the animal's size in INPUT pixels
+        # must be the same at train and at deployment.
+        self.tile_wh = None if tile_wh is None else tuple(int(v) for v in tile_wh)
+        self.tile_scale = float(tile_scale)
+        self.tile_bg_per_frame = int(tile_bg_per_frame)
+        if self.tile_wh is not None and self.tile_scale <= 0:
+            raise ValueError(f'tile_scale must be > 0, got {tile_scale}')
+        # Mask the objectness loss to the area an annotator certified as completely labelled
+        # (`regions.pq`, spec §9b). ORTHOGONAL to tiling and off by default, so an arm can move one
+        # lever at a time (eval rule 4) -- but MEASURED DEAD on full-frame input: at 896x384's
+        # 7,056 anchors a labelled rat-city frame carries a median of 104 certified anchors of
+        # which 48 are positive, a ~69% positive rate against 0.68% unmasked, and 17% of frames
+        # have no certified negative at all. Tiling is what fixes that: at 640x640 tiles rendered
+        # at scale 1.0 the same measurement reads 5.2% positive with 0% of tiles lacking a
+        # certified negative (`scratch/tile_certified_rate.py`). The rate is set by how many
+        # stride-8 CELLS the certified region spans, not by its area, because `CENTER_RADIUS` is
+        # 2.5 cells -- so it is a resolution knob and `tile_scale` is what sets it.
+        self.use_regions = bool(use_regions)
         # Opt-in, default off: with it absent this loader is byte-identical to what every recorded
         # detector was trained on. See `random_affine` for why it also kills the horizontal flip.
         self.keypoints = bool(keypoints)
@@ -201,11 +245,19 @@ class BoxDataset(Dataset):
                 f'{path}: the detector is trained per dataset (input size and box statistics are '
                 f'dataset-specific); found {len(self.datasets)} dataset roots')
         self.ds = self.datasets[0]
-        self.input_wh = tuple(input_wh)
+        # The tile IS the input when tiling; `input_wh` is then the tile size and the deployment
+        # input size is a DIFFERENT number (`frame_wh * tile_scale`). See `train_detector.py`, which
+        # records `tile_scale` in the checkpoint for exactly that reason.
+        self.input_wh = tuple(input_wh) if self.tile_wh is None else self.tile_wh
         self.min_crop_dim = min_crop_dim
         self.train = split == 'train'
         rng = np.random.default_rng(seed)
 
+        # Parallel to `self.index`, one entry per item: the tile's source-pixel origin, or None for
+        # the whole frame. A parallel list rather than a fifth tuple element because `index` is
+        # unpacked as a 4-tuple in `evaluate.py` and `scripts/diag_assign.py` too, and widening it
+        # would break those silently at the call site rather than loudly here.
+        self.origins: list = []
         self.index = []
         for sess in self.ds.sessions.get(split, []):
             sess.preload()
@@ -220,7 +272,11 @@ class BoxDataset(Dataset):
                     frames = rng.choice(frames, max_frames_per_group, replace=False)
                 for f in sorted(frames):
                     for ci in range(len(sess.rig)):
-                        self.index.append((sess, gid, int(f), ci))
+                        origins = ([None] if self.tile_wh is None
+                                   else self._tile_origins(sess, gid, int(f), ci, rng))
+                        for o in origins:
+                            self.index.append((sess, gid, int(f), ci))
+                            self.origins.append(o)
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
         # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
@@ -234,6 +290,172 @@ class BoxDataset(Dataset):
 
     def __len__(self):
         return len(self.index)
+
+    # ------------------------------------------------------------------------------------------
+    # tiling
+    # ------------------------------------------------------------------------------------------
+
+    def _tile_extent(self):
+        """The tile's extent in SOURCE pixels. `input_wh / tile_scale`, and nothing else."""
+        return (self.tile_wh[0] / self.tile_scale, self.tile_wh[1] / self.tile_scale)
+
+    def _region_rects(self, sess, gid, f, ci):
+        """(M,4) certified rects in SOURCE px for one (frame, camera), or None if no regions.pq.
+
+        `None` and an empty `(0,4)` are DIFFERENT ANSWERS and both are returned faithfully: None is
+        "the session carries no regions.pq, so it claims exhaustive labelling and every pixel is
+        certified", `(0,4)` is "the file exists and certifies nothing here". Collapsing them
+        inverts the claim the table exists to make (spec §9b).
+        """
+        r = sess.labels(gid).regions
+        if r is None:
+            return None
+        if not len(r):
+            return np.zeros((0, 4), np.float64)
+        sel = (r[:, 0].astype(int) == f) & (r[:, 1].astype(int) == ci)
+        return np.asarray(r[sel][:, 2:], np.float64)
+
+    def _tile_origins(self, sess, gid, f, ci, rng):
+        """Source-pixel tile origins for one (frame, camera).
+
+        One tile per certified region, one per animal, plus `tile_bg_per_frame` background tiles.
+        Origins are JITTERED by up to a quarter of the tile: a detector trained only on animals at
+        dead centre has never seen one near a border, and `assign`'s centre prior would then be
+        learned as a centre-of-image prior.
+
+        The background tiles are the population the mask exists to supply, and where they may be
+        drawn from is exactly the None/empty distinction:
+
+        - `regions is None` -- the session claims exhaustive labelling, so anywhere in the frame is
+          certified background and the centre is uniform over the frame.
+        - `regions` non-empty -- only inside a certified rect. Anywhere else is UNKNOWN, not
+          background, and sampling it would reintroduce the unlabelled animals this table exists
+          to exclude.
+        - `regions` empty `(0,4)` -- nothing here is certified, so there is no certified background
+          and none is drawn.
+        """
+        W, H = (float(v) for v in sess.rig.size(sess.cam_names[ci]))
+        tw, th = self._tile_extent()
+        regions = self._region_rects(sess, gid, f, ci)
+        out = []
+
+        def push(cx, cy):
+            jx, jy = rng.uniform(-0.25, 0.25, 2) * np.array([tw, th])
+            # Clamped so a tile always overlaps the frame, but NOT forced inside it: a tile at the
+            # frame edge is a real thing to train on and `warpAffine`'s grey border is what a
+            # detector sees there.
+            out.append((float(np.clip(cx - tw / 2 + jx, -tw / 4, max(0.0, W - 3 * tw / 4))),
+                        float(np.clip(cy - th / 2 + jy, -th / 4, max(0.0, H - 3 * th / 4)))))
+
+        if regions is not None:
+            for r in regions.reshape(-1, 4):
+                push((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)
+        for c in self._animal_centres(sess, gid, f, ci):
+            push(c[0], c[1])
+        for _ in range(self.tile_bg_per_frame):
+            if regions is None:
+                push(rng.uniform(0, W), rng.uniform(0, H))
+            elif len(regions):
+                r = regions[rng.integers(len(regions))]
+                push(rng.uniform(r[0], r[2]), rng.uniform(r[1], r[3]))
+        # A frame with no animal, no region and no certified background still yields ONE tile:
+        # objectness has to learn "nothing here", and dropping the frame would train a detector
+        # that has never seen an empty image (the same reason a NaN box is emitted rather than the
+        # frame skipped).
+        return out or [(max(0.0, (W - tw) / 2), max(0.0, (H - th) / 2))]
+
+    def _animal_centres(self, sess, gid, f, ci):
+        """(n,2) source-pixel centroids of the animals labelled in this view.
+
+        The centroid, not the crop box: an origin only needs to be approximately on an animal, and
+        running the crop rule for every animal of every frame at index-build time would pay for
+        precision nothing here uses.
+        """
+        p2d = self._points_2d(sess, gid, f, ci).numpy()
+        out = []
+        for s in range(p2d.shape[0]):
+            ok = np.isfinite(p2d[s]).all(-1)
+            if ok.any():
+                out.append(p2d[s][ok].mean(0))
+        return out
+
+    def _points_2d(self, sess, gid, f, ci):
+        """(S,K,2) source-pixel points for one (frame, camera). 3D sessions project.
+
+        Shared by `boxes_for` and the tile-origin sampler so there is one copy of the
+        "2D reads the table, 3D projects" branch.
+        """
+        lab = sess.labels(gid)
+        if sess.mode == '3d':
+            # Frame-indexed, not whole-group: axis -3 of `pts` is the ANIMAL, so a moving camera's
+            # (T,4,4) extrinsic would project animal `i` through frame `i`'s pose.
+            cam = sess.cgroup(gid, f)[ci]
+            pts = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)
+            return project_points_torch([cam], pts)[0]
+        return torch.as_tensor(lab.points2d[:, f, :, ci], dtype=torch.float32)
+
+    def _transform(self, i, size):
+        """The `(scale, (padx, pady))` for item `i`: its tile's, or the whole-frame letterbox.
+
+        THE one place that choice is made. `boxes_for` and `regions_for` both come here, because a
+        region transformed by a different rule than its own boxes is invisible in a loss curve --
+        the same failure `unletterbox_keypoints` is placed beside `unletterbox_boxes` to avoid.
+        """
+        if self.origins[i] is None:
+            return letterbox_transform(size, self.input_wh)
+        return tile_transform(self.origins[i], self.tile_scale)
+
+    def regions_for(self, i, warp=None):
+        """Certified rectangles for item `i` in INPUT pixels, `(M,4)`, or None.
+
+        None means the session carries no `regions.pq` and therefore claims to be exhaustively
+        labelled -- every anchor is supervised. An empty `(0,4)` means the file exists and this
+        view certifies nothing, so nothing is supervised. See `_region_rects`.
+        """
+        sess, gid, f, ci = self.index[i]
+        rects = self._region_rects(sess, gid, f, ci)
+        if rects is None:
+            return None
+        out = torch.as_tensor(rects, dtype=torch.float32).reshape(-1, 4)
+        if warp is not None and out.numel():
+            # FOUR corners through the warp, then the extent -- under a rotation or a flip the
+            # extent of the two diagonal corners is strictly inside the extent of all four, so a
+            # two-corner warp would certify less area than the annotator marked.
+            x0, y0, x1, y1 = out.unbind(-1)
+            c = torch.stack([torch.stack([x0, y0], -1), torch.stack([x1, y0], -1),
+                             torch.stack([x1, y1], -1), torch.stack([x0, y1], -1)], -2)
+            c = _apply_affine(c, (warp, None))
+            out = torch.cat([c.amin(-2), c.amax(-2)], -1)
+        scale, pad = self._transform(i, sess.rig.size(sess.cam_names[ci]))
+        out[:, 0::2] = out[:, 0::2] * scale + pad[0]
+        out[:, 1::2] = out[:, 1::2] * scale + pad[1]
+        return out
+
+    def ignore_for(self, i):
+        """`(ig (S,) bool, ig_boxes (S,4))` for item `i`, in INPUT pixels. Or `(None, None)`.
+
+        The `instances.pq` PRESENT rows -- an animal that is in this view and was not annotated, so
+        a prediction on it is neither a true nor a false positive. rat-city ships 26,021 of them
+        and scoring them as false positives measures the annotator.
+
+        HERE rather than in `evaluate.py` because it needs item `i`'s own transform, which under
+        tiling is the tile's and not the frame letterbox. `evaluate.py` used to call
+        `letterbox_transform` itself, which is right for a whole frame and silently wrong for a
+        tile -- and it is the ignore mask, so being wrong makes real animals into false positives.
+        """
+        sess, gid, f, ci = self.index[i]
+        lab = sess.labels(gid)
+        if lab.instance is None:
+            return None, None
+        ig = lab.instance[:, f, ci] == INST_PRESENT
+        boxes = None
+        if lab.boxes is not None:
+            scale, pad = self._transform(i, sess.rig.size(sess.cam_names[ci]))
+            b = np.asarray(lab.boxes[:, f, ci], np.float64).copy()
+            b[..., 0::2] = b[..., 0::2] * scale + pad[0]
+            b[..., 1::2] = b[..., 1::2] * scale + pad[1]
+            boxes = b
+        return ig, boxes
 
     def boxes_for(self, i, warp=None, with_keypoints=False):
         """The letterboxed target boxes for item `i`, without decoding its image.
@@ -265,14 +487,29 @@ class BoxDataset(Dataset):
         # Frame-indexed, not whole-group: `pts` below is (S,K,3) whose axis -3 is the ANIMAL, so a
         # moving camera's (T,4,4) extrinsic would project animal `i` through frame `i`'s pose.
         cam = sess.cgroup(gid, f)[ci]
-
+        p2d = self._points_2d(sess, gid, f, ci)
         if sess.mode == '3d':
-            pts = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)      # (S,K,3)
-            p2d = project_points_torch([cam], pts)[0]                            # (S,K,2)
             vis = None if lab.vis3d is None else lab.vis3d[:, f]                 # (S,K)
         else:
-            p2d = torch.as_tensor(lab.points2d[:, f, :, ci], dtype=torch.float32)
             vis = None if lab.vis2d is None else lab.vis2d[:, f, :, ci]
+
+        # A point outside the TILE is not in this image, so it is dropped exactly as an
+        # out-of-frame point is: the box shrinks to the visible part, which is what a crop of a
+        # half-out animal looks like, and if every point goes `crop_box_for_points` returns None
+        # and the animal is correctly "not here". In SOURCE pixels and applied AFTER the warp,
+        # because the tile is defined in post-warp coordinates -- `__getitem__` composes
+        # `tile @ warp @ decode`, in that order.
+        tile_box = None
+        if self.origins[i] is not None:
+            ox, oy = self.origins[i]
+            tw, th = self._tile_extent()
+            tile_box = (ox, oy, ox + tw, oy + th)
+
+        def drop_outside(x, bounds):
+            lo_x, lo_y, hi_x, hi_y = bounds
+            out = ((x[..., 0] < lo_x) | (x[..., 0] > hi_x) |
+                   (x[..., 1] < lo_y) | (x[..., 1] > hi_y))
+            return torch.where(out[..., None], torch.nan, x)
 
         # The keypoint target rides the SAME warp and the SAME letterbox as the boxes below, and
         # is derived here so there is exactly one copy of that transform.
@@ -281,9 +518,9 @@ class BoxDataset(Dataset):
             k = p2d.clone()
             if warp is not None:
                 k = _apply_affine(k, (warp, None))
-                w, h = float(cam['size'][0]), float(cam['size'][1])
-                out = (k[..., 0] < 0) | (k[..., 0] > w) | (k[..., 1] < 0) | (k[..., 1] > h)
-                k = torch.where(out[..., None], torch.nan, k)
+                k = drop_outside(k, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
+            if tile_box is not None:
+                k = drop_outside(k, tile_box)
             # COORDINATES LIVE ON `VISIBLE` *OR* `PROJECTED` (fmt.POSITIONED), but only VISIBLE is
             # a visibility CLAIM -- `projected` is a position from a source that never recorded
             # occlusion. So a projected point keeps its coordinates and gets NO score target.
@@ -317,13 +554,16 @@ class BoxDataset(Dataset):
                 # A point warped off the frame is not a point. Dropping it shrinks the box to the
                 # visible part, which is what a real crop of a half-out animal looks like; drop
                 # them all and `crop_box_for_points` returns None, i.e. "no animal here".
-                w, h = float(cam['size'][0]), float(cam['size'][1])
-                out = (src[..., 0] < 0) | (src[..., 0] > w) | (src[..., 1] < 0) | (src[..., 1] > h)
-                src = torch.where(out[..., None], torch.nan, src)
+                src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
+            if tile_box is not None:
+                src = drop_outside(src, tile_box)
+            # `min_crop_dim` and the pad stay in SOURCE units and the box is RE-DERIVED here, never
+            # scaled -- the pad would scale with the tile but the floor would not, so a floored box
+            # scaled by `tile_scale` is a box the rule can never emit (gotcha 8).
             box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
-        scale, pad = letterbox_transform(cam['size'], self.input_wh)
+        scale, pad = self._transform(i, cam['size'])
         boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
         boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
         if kpts is None:
@@ -344,6 +584,7 @@ class BoxDataset(Dataset):
         warp = random_affine(size, rng, hflip=self.hflip) if rng is not None else None
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
+        regions = self.regions_for(i, warp)
 
         r = reduce_factor(size, self.input_wh) if self.reduce else 1
         img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
@@ -359,20 +600,38 @@ class BoxDataset(Dataset):
             f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
             f'or {size} unreduced'
         d = size[0] / dec[0]                     # decoded pixels -> source pixels, 1.0 for video
-        if warp is None:
+        if warp is None and self.origins[i] is None:
             img, _, _ = letterbox(img, self.input_wh, src_wh=size)
         else:
-            # ONE warpAffine for the decode scale, the augmentation AND the letterbox. Three would
-            # resample rat-city's frame three times, and the loader is the expensive half of an
-            # iteration.
-            scale, pad = letterbox_transform(size, self.input_wh)
+            # ONE warpAffine for the decode scale, the augmentation AND the letterbox-or-tile.
+            # Three would resample rat-city's frame three times, and the loader is the expensive
+            # half of an iteration. `L` is whichever transform `_transform` chose, which is what
+            # makes a tile cost no extra resample and no extra code -- and `borderValue` is already
+            # what a tile hanging off the frame edge should see.
+            scale, pad = self._transform(i, size)
             L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
             D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
-            M = (L @ np.vstack([warp, [0, 0, 1]]) @ D)[:2]
+            W = np.vstack([warp, [0, 0, 1]]) if warp is not None else np.eye(3, dtype=np.float32)
+            M = (L @ W @ D)[:2]
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
-            img = np.clip(img * rng.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
+            if warp is not None:
+                img = np.clip(img * rng.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        return (x, boxes) if kpts is None else (x, boxes, kpts)
+        # `regions` rides along as its own element rather than being folded into `boxes`: a region
+        # is not an animal and must never reach `assign`. Appended only under `use_regions`, so
+        # without it the item shape is exactly what every recorded detector trained on.
+        #
+        # `regions_for` returning None means the session claims exhaustive labelling, and the
+        # faithful encoding of that HERE is one rect covering the whole input -- then "certified"
+        # is all-True and the masked loss equals the unmasked one, with no special case anywhere
+        # downstream. The None/empty distinction stays intact in `regions_for`, which is where a
+        # consumer that needs it can see it.
+        out = (x, boxes) if kpts is None else (x, boxes, kpts)
+        if not self.use_regions:
+            return out
+        if regions is None:
+            regions = torch.tensor([[0.0, 0.0, float(self.input_wh[0]), float(self.input_wh[1])]])
+        return (*out, regions)
 
 
 class ChunkShuffle(torch.utils.data.Sampler):
@@ -420,16 +679,48 @@ def box_collate(batch):
     NaN, not zero, and that carries all the way to the loss: a padded row is "no animal", which is
     the same signal a real animal with no finite point in this view sends. Keypoints pad the same
     way, so a padded (S,K,3) slice is non-finite in every channel and every mask drops it.
+
+    An item is `(x, boxes[, kpts][, regions])` and the optional tails are told apart BY RANK --
+    keypoints are (S,K,3) and regions (M,4). Dispatching on tuple length alone is ambiguous at
+    three elements, which is the kind of thing that silently feeds regions to the keypoint loss.
     """
     xs = torch.stack([b[0] for b in batch])
     n = max(b[1].shape[0] for b in batch)
     boxes = torch.full((len(batch), n, 4), float('nan'))
     for i, b in enumerate(batch):
         boxes[i, :b[1].shape[0]] = b[1]
-    if len(batch[0]) < 3:
-        return xs, boxes
-    K = batch[0][2].shape[1]
-    kpts = torch.full((len(batch), n, K, 3), float('nan'))
-    for i, b in enumerate(batch):
-        kpts[i, :b[2].shape[0]] = b[2]
-    return xs, boxes, kpts
+    tails = [t for t in batch[0][2:]]
+    out = [xs, boxes]
+
+    if any(t.dim() == 3 for t in tails):
+        K = next(t for t in tails if t.dim() == 3).shape[1]
+        kpts = torch.full((len(batch), n, K, 3), float('nan'))
+        for i, b in enumerate(batch):
+            k = next(t for t in b[2:] if t.dim() == 3)
+            kpts[i, :k.shape[0]] = k
+        out.append(kpts)
+
+    if any(t.dim() == 2 for t in tails):
+        # NaN-padded like the boxes, and for the same reason: `certified_anchors` drops a
+        # non-finite rect, so a padded row certifies nothing rather than certifying the origin.
+        rs = [next(t for t in b[2:] if t.dim() == 2) for b in batch]
+        m = max(1, max(r.shape[0] for r in rs))
+        regions = torch.full((len(batch), m, 4), float('nan'))
+        for i, r in enumerate(rs):
+            regions[i, :r.shape[0]] = r
+        out.append(regions)
+    return tuple(out)
+
+
+def split_batch(batch):
+    """A collated batch -> `(x, boxes, kpts_or_None, regions_or_None)`.
+
+    THE one place the optional tails are told apart, by RANK: keypoints are (B,S,K,3) and regions
+    (B,M,4). `len(batch) > 2` cannot do it -- with keypoints off and regions on, a three-element
+    batch's third element is regions, and reading it as `gt_kpts` would feed rectangles to the
+    keypoint loss and train the branch against them.
+    """
+    x, boxes = batch[0], batch[1]
+    kpts = next((t for t in batch[2:] if t.dim() == 4), None)
+    regions = next((t for t in batch[2:] if t.dim() == 3), None)
+    return x, boxes, kpts, regions

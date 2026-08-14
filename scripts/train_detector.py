@@ -41,7 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.format import load_datasets
-from tailcyclenet.detector import BoxDataset, ChunkShuffle, YOLOXNano, box_collate, detector_loss
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate,
+                                  detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.evaluate import overall, score_dataset
 
 
@@ -167,6 +168,30 @@ def main():
                     help='drop the horizontal flip from the augmentation. `--keypoints` already '
                          'does this implicitly, so this exists for the box-only CONTROL arm that '
                          'has to match it -- otherwise the control differs in two levers.')
+    ap.add_argument('--tile-wh', type=int, nargs=2, default=None,
+                    help='train on TILES of this size in INPUT pixels instead of whole frames. '
+                         'Off by default and off means whole frames, byte-identical to every '
+                         'recorded detector. This is the model\'s input size; the tile\'s SOURCE '
+                         'extent is --tile-wh / --tile-scale. Inference is unchanged -- one '
+                         'whole-frame forward at --tile-scale, derived per camera. Its ONE '
+                         'justification is --use-regions (report 16 §5.3b refuted the other).')
+    ap.add_argument('--tile-scale', type=float, default=1.0,
+                    help='source -> input scale for --tile-wh. 1.0 = native. DO NOT ALSO RESIZE '
+                         'THE TILE: the invariant is the animal\'s size in INPUT pixels, and '
+                         'tiling-then-downscaling is the number-one reported failure of this '
+                         'pattern. MEASURED on rat-city-annotated: this is what sets the mask\'s '
+                         'positive rate (5.2% at 1.0, 10.2% at 0.7, 17.5% at 0.5, 48% at 0.25) '
+                         'because CENTER_RADIUS is 2.5 CELLS, so the certified region has to span '
+                         'many cells, not much area.')
+    ap.add_argument('--tile-bg-per-frame', type=int, default=1,
+                    help='background tiles per frame, centres inside the certified area')
+    ap.add_argument('--use-regions', action='store_true',
+                    help='mask the objectness loss to the area regions.pq certifies as completely '
+                         'labelled. ORTHOGONAL to --tile-wh so an arm can move one lever. MEASURED '
+                         'DEAD on whole frames: 69%% of supervised anchors are positive against '
+                         '0.68%% unmasked and 17%% of frames have no certified negative at all. '
+                         'Use it WITH tiles. A session with no regions.pq claims exhaustive '
+                         'labelling and is unmasked.')
     ap.add_argument('--kpt-weight', type=float, default=1.0)
     ap.add_argument('--kpt-score-weight', type=float, default=1.0)
     ap.add_argument('--device', default='cuda:0')
@@ -184,10 +209,23 @@ def main():
                             args.max_input_px))
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
+    tiling = dict(tile_wh=args.tile_wh, tile_scale=args.tile_scale,
+                  tile_bg_per_frame=args.tile_bg_per_frame, use_regions=args.use_regions)
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
-                       hflip=0.0 if args.no_hflip else None)
+                       hflip=0.0 if args.no_hflip else None, **tiling)
+    # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
+    # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
+    # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
+    wh = train.input_wh
+    if args.tile_wh:
+        ext = train._tile_extent()
+        print(f'tiling: {args.tile_wh[0]}x{args.tile_wh[1]} input px at scale '
+              f'{args.tile_scale:g} = {ext[0]:.0f}x{ext[1]:.0f} SOURCE px, '
+              f'{args.tile_bg_per_frame} background tile(s)/frame')
+        print(f'  DEPLOYMENT INPUT is the whole frame at this scale, NOT the tile size: '
+              f'{tiled_input_wh(probe_sess.rig.size(probe_sess.cam_names[0]), args.tile_scale)}')
     print(f'train: {len(train)} views')
     # DERIVED from the registry, never configured -- the same rule `n_keypoints` follows on the
     # pose side. A configured K that disagreed with the data would mis-index every target.
@@ -221,7 +259,7 @@ def main():
         val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim, reduce=args.reduce,
                          max_frames_per_group=args.val_frames_per_group,
-                         keypoints=args.keypoints)
+                         keypoints=args.keypoints, **tiling)
         print(f'val:   {len(val)} views')
     except ValueError as e:
         print(f'val:   none ({e})')
@@ -240,13 +278,19 @@ def main():
         for batch in loader:
             if it >= args.iters:
                 break
-            x, gt = batch[0].to(device), batch[1].to(device)
-            gt_kpts = batch[2].to(device) if len(batch) > 2 else None
+            # BY RANK, not by tuple length: with --keypoints off and --use-regions on, the
+            # third element is regions, and reading it as `gt_kpts` would train the keypoint
+            # branch against rectangles.
+            x, gt, gt_kpts, gt_regions = split_batch(batch)
+            x, gt = x.to(device), gt.to(device)
+            gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
+            gt_regions = None if gt_regions is None else gt_regions.to(device)
             obj, boxes, kpt = model(x)
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=args.kpt_weight,
-                                        kpt_score_weight=args.kpt_score_weight)
+                                        kpt_score_weight=args.kpt_score_weight,
+                                        regions=gt_regions)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -257,6 +301,10 @@ def main():
             if it % 50 == 0:
                 kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
                       if 'kpt' in parts else '')
+                # The certified FRACTION, printed because masking shrinks the objectness sum
+                # without shrinking its divisor -- it silently reweights obj against box_weight,
+                # and that has to be a number in the log rather than an inference from a curve.
+                kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
                 print(f'{it:7d}/{args.iters}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
@@ -279,6 +327,11 @@ def main():
                 # cost, one level down.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
                         'n_keypoints': n_kpts, 'norm': 'gn',
+                        # `input_wh` above is the TILE size when tiling, which is NOT the
+                        # deployment input size -- `load_detector` raises if this is missing so
+                        # nobody can run a tiled detector at its tile size on a whole frame.
+                        'tile_wh': args.tile_wh, 'tile_scale': args.tile_scale,
+                        'use_regions': args.use_regions,
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
                         'reduce': args.reduce,

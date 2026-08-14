@@ -1,14 +1,16 @@
 import torch
 
-from .assign import assign, box_iou, decode, detector_loss, giou_loss
+from .assign import (assign, box_iou, certified_anchors, decode, detector_loss,
+                     giou_loss)
 from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, box_collate, letterbox, letterbox_transform,
-                   reduce_factor, unletterbox_boxes, unletterbox_keypoints)
+                   reduce_factor, split_batch, tile_transform, unletterbox_boxes,
+                   unletterbox_keypoints)
 from .yolox import YOLOXNano
 
 __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
-           'letterbox_transform', 'reduce_factor', 'unletterbox_boxes', 'unletterbox_keypoints',
-           'assign', 'box_iou',
+           'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
+           'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
            'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV']
 
 # BUMP THIS WHENEVER `link_rows` CHANGES WHAT IT EMITS. `--det-cache` stores boxes that have already
@@ -19,7 +21,7 @@ LINK_REV = 2
 
 
 def load_detector(path, device='cpu', input_wh=None):
-    """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source) from a folder or a .pth.
+    """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source, tile_scale) from a folder.
 
     THE INPUT SIZE IS PART OF THE WEIGHTS, not a runtime choice: the letterbox the detector was
     trained under decides what an animal looks like to it, and a square 416 puts the median rat
@@ -40,6 +42,18 @@ def load_detector(path, device='cpu', input_wh=None):
     failure, because the best rat-city detector on record is `instances`-trained while every
     rat-city pose run is keypoint-trained, and running that pair is a legitimate arm as long as
     nobody reads its delta as detector quality.
+
+    `tile_scale` is the fourth instance of the same theme and the most dangerous one. A TILE-TRAINED
+    detector's `input_wh` is its TILE size, which is NOT its deployment input size: the invariant
+    that makes train-on-tiles / infer-on-whole-frame work is the animal's size in INPUT pixels, so
+    deployment must letterbox the whole frame at the same source->input scale, i.e. at
+    `round(frame_wh * tile_scale)` -- per camera, because `rat-city-annotated` ships 4696x2048
+    beside 4500x2050. Feeding a tile-trained detector its tile size on a whole frame is a 1/scale
+    scale shift and is reported in the literature as producing near-zero precision.
+
+    `None` means "not tile-trained, use `input_wh` as-is". A tiled run therefore has to record it,
+    and `detect_group` derives the size from it. This is gotcha 12's shape: two values load the same
+    tensors, and the silently-wrong one cost +23.1 mm MPJPE for weeks.
     """
     import torch
     from pathlib import Path
@@ -65,15 +79,37 @@ def load_detector(path, device='cpu', input_wh=None):
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
     model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)))
     model.load_state_dict(ckpt['model_state'])
+    ts = ckpt.get('tile_scale')
+    if ckpt.get('tile_wh') is not None and ts is None:
+        raise ValueError(
+            f'{p}: trained on tiles ({ckpt["tile_wh"]}) but carries no `tile_scale`, so the '
+            'deployment input size cannot be derived. `input_wh` here is the TILE size, not the '
+            'whole-frame size -- running the frame at it is a scale shift, not a smaller input.')
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
             int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)),
-            str(ckpt.get('box_source', 'keypoints')))
+            str(ckpt.get('box_source', 'keypoints')),
+            None if ts is None else float(ts))
+
+
+def tiled_input_wh(src_wh, tile_scale):
+    """The whole-frame input size a tile-trained detector must be deployed at.
+
+    The invariant is the ANIMAL'S SIZE IN INPUT PIXELS, not the image size: a convnet is
+    translation-equivariant, not scale-invariant. So a detector trained on native-scale tiles must
+    see the whole frame at native scale too -- feeding it the tile size instead is a 1/scale shift
+    and is reported in the literature as costing essentially all precision.
+
+    Rounded to a multiple of 32, the coarsest stride, exactly as `train_detector.input_wh_for`
+    rounds. That perturbs the scale by under one part in `src/32` (0.7% on rat-city's 4696) which is
+    far inside the augmentation's own +-25%, and it keeps every feature map an integer size.
+    """
+    return tuple(max(64, int(round(float(v) * float(tile_scale) / 32) * 32)) for v in src_wh)
 
 
 @torch.no_grad()
 def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
                  score_thresh=0.99, link=False, reduce=False, max_frames=0, min_views=2,
-                 dup_res_px=None, track=True, max_move=1.0):
+                 dup_res_px=None, track=True, max_move=1.0, tile_scale=None):
     """Run the detector over every frame and camera of a group -> (boxes, scores).
 
     boxes (S,T,C,4), scores (S,T,C). The score is the objectness the box survived NMS on, and it
@@ -155,11 +191,16 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
         # pixels at deployment is being run off its own training distribution -- silently,
         # since nothing about the shapes or the scores would say so.
         src = session.rig.size(cam_name)
-        r = reduce_factor(src, input_wh) if reduce else 1
+        # PER CAMERA, because a tile-trained detector's input size is a function of the FRAME size
+        # and frame sizes vary within a root (rat-city-annotated: 4696x2048 beside 4500x2050). This
+        # is the whole of "train on tiles, infer on the whole frame": one forward, no cross-tile
+        # NMS, no seam handling -- only a different input size, derived rather than configured.
+        wh = input_wh if tile_scale is None else tiled_input_wh(src, tile_scale)
+        r = reduce_factor(src, wh) if reduce else 1
         imgs = read_frames(group, cam_name, frames, reduce=r, pool=frame_pool)
         lbs, metas = [], []
         for im in imgs:
-            lb, scale, pad = letterbox(im, input_wh, src_wh=src)
+            lb, scale, pad = letterbox(im, wh, src_wh=src)
             lbs.append(lb)
             metas.append((scale, pad))
         # ONE numpy CONVERSION FOR THE WHOLE BATCH, NOT ONE torch OP PER FRAME. Bit-identical --

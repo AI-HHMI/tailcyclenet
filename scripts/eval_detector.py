@@ -71,7 +71,7 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, wh, _, mcd, red, trained_on = load_detector(args.run, device=device)
+    model, wh, _, mcd, red, trained_on, tile_scale = load_detector(args.run, device=device)
     if trained_on != args.boxes:
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy '
@@ -100,7 +100,8 @@ def main():
         print(f'{name:>5s} {b["mean"]:7.3f}  {ci}')
 
     if args.compare:
-        m2, wh2, _, mcd2, red2, trained_on2 = load_detector(args.compare, device=device)
+        m2, wh2, _, mcd2, red2, trained_on2, tile2 = load_detector(args.compare,
+                                                          device=device)
         if trained_on2 != trained_on:
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
                   f'{trained_on2!r}. The paired delta below moves TWO keys (eval rule 4).')

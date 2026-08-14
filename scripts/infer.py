@@ -225,6 +225,11 @@ def main():
                          '"triangulated"; loading them as "query" infers `world = prior + '
                          'residual` from a head that learned `world = tri_t + residual_t`. Not a '
                          'sweep knob: on a run whose config names the key this must agree with it.')
+    ap.add_argument('--dataset-name', default=None,
+                    help='the registry entry to read this data\'s keypoints as, when the folder '
+                         'name is not it. `rat-city` served by a `rat-city-annotated` run: same '
+                         'names, same ids, different directory. Checked against the session\'s '
+                         'own names, so a wrong value raises rather than relabelling.')
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
     args = ap.parse_args()
@@ -332,6 +337,16 @@ def main():
                   f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '
                   'a delta against a run whose detector matched as a detector-quality result.')
     ds_name, sessions = sessions_for(args.data, args.split)
+    # A registry is keyed by DATASET NAME, so deploying a run on a root it was not trained on --
+    # the whole point of a shared keypoint vocabulary -- otherwise dies on the folder name alone.
+    # `rat-city` and `rat-city-annotated` are the shipped instance: identical `names`, therefore
+    # identical registry ids and the same embedding rows, and different directories. This is safe
+    # to override because it is CHECKED rather than assumed: `Registry.ids_for` aligns to the
+    # session's own `names` and raises on any name the registry does not hold, which is gotcha 4's
+    # guard and the reason a per-dataset id vector is never applied positionally.
+    if args.dataset_name:
+        print(f'registry: reading session keypoints as {args.dataset_name!r}, not {ds_name!r}')
+        ds_name = args.dataset_name
     want = set(args.groups.split(',')) if args.groups else None
     render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
 

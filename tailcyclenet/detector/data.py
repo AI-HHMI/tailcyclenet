@@ -382,8 +382,10 @@ class ChunkShuffle(torch.utils.data.Sampler):
     inside one video. A plain `shuffle=True` therefore sends every item to a different container:
     on calms21's 63 one-mp4 sessions that thrashes `dataset._reader`'s cache and costs 486 ms per
     batch of 16, against a 16 ms GPU step. Shuffling BLOCKS instead, and pooling `mix` of them so
-    a batch still spans several sessions, costs 40 ms -- 12x faster, and 7 sessions per batch so
-    BatchNorm does not end up normalising one animal's lighting.
+    a batch still spans several sessions, costs 40 ms -- 12x faster, and 7 sessions per batch.
+    (That diversity was originally about BatchNorm not normalising one animal's lighting;
+    normalisation is GroupNorm now and does not care, but a batch drawn from one video is still a
+    correlated gradient step, and the 12x is the reason this class exists either way.)
 
     PASS `chunk=dataset.chunk`. The default 512 was set against rat-city, whose whole split is one
     group; a dataset with 40 index positions per video gets 13 videos to a block and 52 to a pool,

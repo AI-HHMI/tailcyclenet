@@ -11,31 +11,61 @@ One class, so YOLOX simplifies hard:
 (`tailcyclenet.crop.crop_box_for_points`), so the detector reproduces the crop the pose model
 was trained on rather than some other box. `tests/test_dataset.py` is what keeps that true.
 
-Lifted from posetail-pose unchanged: it is a clean YOLOX-Nano with no exploration in it.
+Lifted from posetail-pose with ONE change: normalisation is GroupNorm, not BatchNorm. See
+`conv_norm_act`. Every detector number in dev/reports 10-13 and 15 is a BatchNorm number and stops
+being a comparable baseline against a checkpoint trained after that.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def conv_bn_act(cin, cout, k=3, s=1, groups=1):
+CH_PER_GROUP = 8
+
+
+def norm_groups(c, per_group=CH_PER_GROUP):
+    """A group count that DIVIDES `c`, at about `per_group` channels each.
+
+    The usual `G = 32` is unusable at these widths -- the backbone is (24, 48, 96, 192) with the
+    neck and head at 96, depthwise layers at those same counts, and bottlenecks at roughly half --
+    so the count is derived and then walked down to a divisor. 8 channels per group gives
+    24 -> 3, 48 -> 6, 96 -> 12, 192 -> 24, all exactly 8, and sits inside the band Wu & He sweep,
+    over which GN is insensitive to G.
+    """
+    g = max(1, c // per_group)
+    while c % g:
+        g -= 1
+    return g
+
+
+def conv_norm_act(cin, cout, k=3, s=1, groups=1):
+    """THE normalisation chokepoint: every conv in this net goes through here.
+
+    GroupNorm, not BatchNorm, for two reasons that are one change. It has NO RUNNING STATISTICS,
+    so train and inference are the same computation -- which is what makes training on crops and
+    inferring on a whole frame safe (Wu & He: GN/LN "do not require different training and
+    inference networks"), where BN's statistics would be collected on animal-rich crops and
+    applied to a mostly-empty arena. And it is batch-independent, so a high-resolution arm that
+    can only hold a small batch is merely slower to optimise rather than a differently-normalised
+    model -- otherwise a resolution sweep confounds resolution with batch size (MegDet).
+    """
     return nn.Sequential(
         nn.Conv2d(cin, cout, k, s, k // 2, groups=groups, bias=False),
-        nn.BatchNorm2d(cout),
+        nn.GroupNorm(norm_groups(cout), cout),
         nn.SiLU(inplace=True))
 
 
 def dw_conv(cin, cout, k=3, s=1):
     """Depthwise-separable conv (the YOLOX-Nano building block)."""
-    return nn.Sequential(conv_bn_act(cin, cin, k, s, groups=cin),
-                         conv_bn_act(cin, cout, 1, 1))
+    return nn.Sequential(conv_norm_act(cin, cin, k, s, groups=cin),
+                         conv_norm_act(cin, cout, 1, 1))
 
 
 class Bottleneck(nn.Module):
     def __init__(self, cin, cout, shortcut=True):
         super().__init__()
         hidden = cout // 2
-        self.conv1 = conv_bn_act(cin, hidden, 1)
+        self.conv1 = conv_norm_act(cin, hidden, 1)
         self.conv2 = dw_conv(hidden, cout, 3)
         self.add = shortcut and cin == cout
 
@@ -48,9 +78,9 @@ class CSPLayer(nn.Module):
     def __init__(self, cin, cout, n=1, shortcut=True):
         super().__init__()
         hidden = cout // 2
-        self.conv1 = conv_bn_act(cin, hidden, 1)
-        self.conv2 = conv_bn_act(cin, hidden, 1)
-        self.conv3 = conv_bn_act(2 * hidden, cout, 1)
+        self.conv1 = conv_norm_act(cin, hidden, 1)
+        self.conv2 = conv_norm_act(cin, hidden, 1)
+        self.conv3 = conv_norm_act(2 * hidden, cout, 1)
         self.m = nn.Sequential(*[Bottleneck(hidden, hidden, shortcut) for _ in range(n)])
 
     def forward(self, x):
@@ -61,9 +91,9 @@ class SPPBottleneck(nn.Module):
     def __init__(self, cin, cout, sizes=(5, 9, 13)):
         super().__init__()
         hidden = cin // 2
-        self.conv1 = conv_bn_act(cin, hidden, 1)
+        self.conv1 = conv_norm_act(cin, hidden, 1)
         self.pools = nn.ModuleList([nn.MaxPool2d(s, 1, s // 2) for s in sizes])
-        self.conv2 = conv_bn_act(hidden * (len(sizes) + 1), cout, 1)
+        self.conv2 = conv_norm_act(hidden * (len(sizes) + 1), cout, 1)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -76,7 +106,7 @@ class CSPDarknetNano(nn.Module):
     def __init__(self, w=(24, 48, 96, 192)):
         super().__init__()
         c1, c2, c3, c4 = w
-        self.stem = conv_bn_act(3, c1, 3, 2)                 # /2
+        self.stem = conv_norm_act(3, c1, 3, 2)                 # /2
         self.dark2 = nn.Sequential(dw_conv(c1, c2, 3, 2), CSPLayer(c2, c2, 1))     # /4
         self.dark3 = nn.Sequential(dw_conv(c2, c3, 3, 2), CSPLayer(c3, c3, 3))     # /8
         self.dark4 = nn.Sequential(dw_conv(c3, c4, 3, 2), CSPLayer(c4, c4, 3))     # /16
@@ -95,9 +125,9 @@ class PAFPN(nn.Module):
     def __init__(self, chans=(96, 192, 192), out=96):
         super().__init__()
         c3, c4, c5 = chans
-        self.lat5 = conv_bn_act(c5, out, 1)
-        self.lat4 = conv_bn_act(c4, out, 1)
-        self.lat3 = conv_bn_act(c3, out, 1)
+        self.lat5 = conv_norm_act(c5, out, 1)
+        self.lat4 = conv_norm_act(c4, out, 1)
+        self.lat3 = conv_norm_act(c3, out, 1)
         self.mrg4 = CSPLayer(2 * out, out, 1, shortcut=False)
         self.mrg3 = CSPLayer(2 * out, out, 1, shortcut=False)
         self.down3 = dw_conv(out, out, 3, 2)
@@ -134,7 +164,7 @@ class Head(nn.Module):
     def __init__(self, cin=96, n_levels=3, n_keypoints=0):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
-        self.stems = nn.ModuleList([conv_bn_act(cin, cin, 1) for _ in range(n_levels)])
+        self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
             [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3)) for _ in range(n_levels)])
         self.reg_pred = nn.ModuleList([nn.Conv2d(cin, 4, 1) for _ in range(n_levels)])

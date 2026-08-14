@@ -278,7 +278,7 @@ def main():
                 # how weights nobody recorded were trained. That distinction is what gotcha 12
                 # cost, one level down.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
-                        'n_keypoints': n_kpts,
+                        'n_keypoints': n_kpts, 'norm': 'gn',
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
                         'reduce': args.reduce,

@@ -709,3 +709,61 @@ def test_keypoint_score_target_is_status_not_finiteness():
     reg, sc, n_kpt, n_vis = keypoint_loss(torch.zeros(1, 2, 3), t, box)
     assert n_kpt == 0, 'no coordinate is finite, so nothing should be regressed'
     assert n_vis == 2 and float(sc) > 0.0, 'the score channel must still be supervised'
+
+
+# ----------------------------------------------------------------------------------------------
+# normalisation -- GroupNorm, and the two properties the switch was made for
+# ----------------------------------------------------------------------------------------------
+
+def test_norm_groups_always_divides_the_channel_count():
+    """A GroupNorm whose count does not divide its channels is a constructor error."""
+    from tailcyclenet.detector.yolox import norm_groups
+    for c in list(range(1, 200)) + [24, 48, 96, 192]:
+        g = norm_groups(c)
+        assert 1 <= g <= c and c % g == 0
+
+
+def test_there_are_no_running_statistics():
+    """The whole point: train and inference are the SAME computation.
+
+    BatchNorm collects statistics on the training distribution and applies them at inference.
+    Train on animal-rich crops and infer on a mostly-empty arena and those disagree -- which is
+    the train-test resolution discrepancy, and it is what would make train-on-tiles /
+    infer-on-whole-frame unsafe. GroupNorm has no buffers, so there is nothing to drift.
+    """
+    m = YOLOXNano(n_keypoints=3)
+    assert list(m.named_buffers()) == []
+    assert not any(isinstance(x, torch.nn.BatchNorm2d) for x in m.modules())
+
+    x = torch.rand(2, 3, 128, 192)
+    m.train()
+    a = m(x)[0]
+    m.eval()
+    with torch.no_grad():
+        b = m(x)[0]
+    torch.testing.assert_close(a, b)
+
+
+def test_the_forward_does_not_depend_on_the_rest_of_the_batch():
+    """Batch independence, which is what lets a high-resolution arm hold a smaller batch.
+
+    Without it, holding the batch equal across a resolution sweep is a hard constraint rather
+    than merely good practice (eval rule 4) -- an arm that had to drop its batch would be a
+    differently-normalised model, and the sweep would measure that instead of resolution.
+    """
+    torch.manual_seed(0)
+    m = YOLOXNano().eval()
+    x = torch.rand(4, 3, 96, 128)
+    with torch.no_grad():
+        alone = m(x[1:2])[0]
+        together = m(x)[0][1:2]
+    torch.testing.assert_close(alone, together, rtol=1e-4, atol=1e-5)
+
+
+def test_a_batchnorm_checkpoint_is_refused_by_name(tmp_path):
+    """It would fail on the key names anyway; this says WHY in one sentence."""
+    from tailcyclenet.detector import load_detector
+    p = tmp_path / 'detector.pth'
+    torch.save({'model_state': {}, 'input_wh': [128, 128]}, p)
+    with pytest.raises(ValueError, match='bn normalisation'):
+        load_detector(p)

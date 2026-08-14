@@ -161,13 +161,51 @@ Four things a consumer must know, each of which inverts a reading if missed:
 - **A region is kept only on the group whose OWN labelled frame it sits on.** A group is 65 frames
   around one labelled frame, so certifying a context frame would assert an area empty whose animals
   were converted into a different group. That drops **140 of 636**, printed by the converter.
-- **A hard anchor mask on FULL-FRAME input is measured dead**: at 896x384's 7,056 anchors a
-  labelled frame has a median of 62 certified, 33 positive and **10 certified negatives** — an 83%
-  positive rate against 0.65% today, with 212 of 1,087 frames having none at all. The mask needs
-  crops, which is what makes tiling its real justification rather than the keypoint branch's.
+- **A hard anchor mask on FULL-FRAME input is measured dead**: at 896x384 a labelled frame has a
+  median of 104 certified anchors of 7,056, 48 of them positive — a **69% positive rate** among
+  supervised anchors against 0.68% unmasked, with 17% of frames carrying no certified negative at
+  all. The mask needs crops, and `--tile-wh` is what supplies them.
 
 `--labels-only` rewrites the tables against the frames already on disk, so a table change costs
 30 s rather than 80 minutes of ffmpeg over 70,655 lossless-copied frames.
+
+### `--tile-wh` / `--use-regions`: training on tiles, and the mask that needs them
+
+**`--use-regions` masks the objectness loss to the certified area; `--tile-wh` is what makes that
+viable.** Both default off and they are ORTHOGONAL, so an arm moves one lever and the untiled,
+unmasked path is byte-identical — asserted, not assumed (`detector_loss(regions=None)` is tested
+exactly equal, and a mask certifying everything reproduces it).
+
+**A TILE IS JUST A TRANSFORM.** `letterbox_transform` returns `(scale, (padx, pady))` and every
+geometry line in `data.py` applies it as `x * scale + pad`; a tile at source origin `(ox, oy)` at
+scale `s` is exactly `(s, (-ox*s, -oy*s))`. So `tile_transform` is a drop-in, `_transform(i)` is the
+one place the choice is made, and boxes, regions and the single `warpAffine` all tile by
+substituting it. **Inference is one whole-frame forward as before** — no cross-tile NMS, no seam
+handling, no tiled inference path.
+
+**`--tile-scale` IS THE KNOB, AND IT IS A RESOLUTION KNOB, WHICH IS NOT OBVIOUS.** Measured on
+rat-city-annotated (`scratch/tile_certified_rate.py`), positive rate among supervised anchors:
+**48.3% at scale 0.25, 17.5% at 0.5, 10.2% at 0.7, 5.2% at 1.0**, against the full frame's 69%.
+Certified *area* is scale-INVARIANT at fixed source extent (29.4-30.0% across all four) while the
+rate moves 9x, because `assign`'s `CENTER_RADIUS` is 2.5 **cells** — the positive window is fixed in
+cells while the certified region shrinks in cells as the scale drops. Tile SIZE barely matters
+(640x640, 896x896 and 1024x512 at scale 0.5 all read ~17.4%). Ship it at scale 1.0.
+
+**DO NOT ALSO RESIZE THE TILE.** The invariant the whole scheme rests on is the animal's size in
+INPUT pixels; `tile_scale` is the only scale and the tile's source extent is `tile_wh / tile_scale`.
+Tiling-then-downscaling is the number-one reported failure of this pattern.
+
+**A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE.** Gotcha 12's
+shape. Deployment letterboxes the whole frame at the same scale, so `tile_scale` rides in the
+checkpoint, `load_detector` **raises** if a tiled checkpoint lacks it, and `detect_group` derives the
+size **per camera** — `rat-city-annotated` ships 4696x2048 beside 4500x2050. It is unconditional in
+the `--det-cache` stamp, the fifth instance of that trap and the first that comes from the
+CHECKPOINT rather than the command line, so two runs can differ in it with identical arguments.
+
+**No accuracy claim yet.** The `base` / `tile` / `tile+mask` arms have not been run; everything above
+is a gate and correctness result. Masking also reweights `obj` against `box_weight`, because the
+normaliser is deliberately left at `/ max(n_pos, B)` — `parts['certified']` prints the fraction so
+that shift is visible rather than inferred.
 
 ---
 

@@ -136,9 +136,38 @@ outside the frame against 0.01%**, and it smears the otherwise-perfect agreement
 
 Two more things it will not tell you unless you look. Its five `original/merged_video_all_keyframes*`
 sessions are **4500x2050** where the 45 cohort sessions are 4696x2048, which is why the converter
-buckets one session per movie — calibration is a session property. And a labelled frame labels only
-*some* of the rats in it: APT's `labelsRoi` marks where labelling was complete and is NOT converted,
-so an unlabelled rat reads as background to the detector.
+buckets one session per movie — calibration is a session property. And **a labelled frame labels
+only *some* of the rats in it** — a median of **2** where the tracked root finds a median of **11**
+— which is what `regions.pq` (§9b) now records.
+
+### `regions.pq`: the labelling here is PARTIAL, and the file says where it is not
+
+APT's `labelsRoi` ("Label Box") is converted, 496 rows across the root. It is **not an animal box**
+and could not be: `LabelROI` has no target index field. It marks an area the annotator certified as
+completely labelled, and the polarity is measured rather than inferred from the name — APT
+concatenates `extra_roi` with the per-target loss masks (`APT_interface.py:331`) and samples its
+*negative* patches from inside the union (`multi_background_sample_ratio`).
+
+Four things a consumer must know, each of which inverts a reading if missed:
+
+- **The file's ABSENCE is the claim of exhaustive labelling**, so every session here writes one,
+  and the two `test/` sessions write an **empty** one — APT's GT mode records no ROIs
+  (`aggregateLabelsAddRoi.m` uses `LabelROI.new()` when `isgt`), and a missing file there would
+  certify all 20 frames. `Labels.regions is None` and `(0,6)` are different answers.
+- **Membership is by CENTROID, not overlap** (`labels_within_mask`). The first render of this root
+  showed a Label Box apparently holding an unlabelled rat; its centre is just outside the edge. A
+  consumer testing pixel overlap reads that as an uncertified miss and concludes the certificates
+  are unreliable.
+- **A region is kept only on the group whose OWN labelled frame it sits on.** A group is 65 frames
+  around one labelled frame, so certifying a context frame would assert an area empty whose animals
+  were converted into a different group. That drops **140 of 636**, printed by the converter.
+- **A hard anchor mask on FULL-FRAME input is measured dead**: at 896x384's 7,056 anchors a
+  labelled frame has a median of 62 certified, 33 positive and **10 certified negatives** — an 83%
+  positive rate against 0.65% today, with 212 of 1,087 frames having none at all. The mask needs
+  crops, which is what makes tiling its real justification rather than the keypoint branch's.
+
+`--labels-only` rewrites the tables against the frames already on disk, so a table change costs
+30 s rather than 80 minutes of ffmpeg over 70,655 lossless-copied frames.
 
 ---
 

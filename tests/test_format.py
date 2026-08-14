@@ -329,3 +329,73 @@ def test_label_source_does_not_shadow_the_labels_method(tiny_root):
     sess = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
     assert sess.label_source in fmt.LABEL_SOURCES
     assert sess.labels('g000').n_animals == 2
+
+
+# ----------------------------------------------------------------------------------------------
+# regions.pq -- §9b. The file's ABSENCE is a claim, so None and empty are different answers.
+# ----------------------------------------------------------------------------------------------
+
+def _rewrite_with_regions(path, regions):
+    """Re-emit a session written by `_session_2d`, this time carrying `regions`."""
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    lab.regions = regions
+    fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
+                      names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},
+                      flip_pairs=sess.flip_pairs, provenance=sess.provenance)
+    return fmt.Session.load(path)
+
+
+def test_regions_absent_means_exhaustively_labelled(tmp_path):
+    """Every session written before regions.pq existed keeps reading as fully labelled."""
+    _session_2d(tmp_path / 'ds' / 'train' / 'a')
+    sess = fmt.Session.load(tmp_path / 'ds' / 'train' / 'a')
+    assert not (sess.path / 'regions.pq').exists()
+    assert sess.labels('g000').regions is None
+
+
+def test_regions_roundtrip(tmp_path):
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    want = np.array([[0, 0, 1.0, 2.0, 30.0, 20.0],
+                     [0, 0, 5.0, 5.0, 15.0, 15.0],      # two rects on one frame, overlapping
+                     [2, 0, 8.0, 9.0, 40.0, 30.0]])
+    got = _rewrite_with_regions(path, want).labels('g000').regions
+    np.testing.assert_allclose(got, want)
+    assert not fmt.validate_session(fmt.Session.load(path), check_images=False)
+
+
+def test_regions_empty_is_not_the_same_as_absent(tmp_path):
+    """The whole semantic: a certified-nothing group must not read as fully labelled.
+
+    This is the rat-city-annotated `test/` split, where APT's GT mode records no ROIs at all --
+    a MISSING regions.pq there would claim those frames are exhaustive, which they are not.
+    """
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    sess = _rewrite_with_regions(path, np.zeros((0, 6)))
+    assert (path / 'regions.pq').exists()
+    regions = sess.labels('g000').regions
+    assert regions is not None and regions.shape == (0, 6)
+
+
+def test_rule_15_rejects_an_empty_rectangle(tmp_path):
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    sess = _rewrite_with_regions(path, np.array([[0, 0, 30.0, 20.0, 30.0, 25.0]]))   # x1 == x0
+    assert _rule(fmt.validate_session(sess, check_images=False), 15)
+
+
+def test_rule_15_rejects_an_unknown_status(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    _rewrite_with_regions(path, np.array([[0, 0, 1.0, 2.0, 30.0, 20.0]]))
+    t = pq.read_table(path / 'regions.pq')
+    i = t.column_names.index('status')
+    pq.write_table(t.set_column(i, 'status', pa.array(['present']).dictionary_encode()),
+                   path / 'regions.pq')
+    errs = fmt.validate_session(fmt.Session.load(path), check_images=False)
+    assert _rule(errs, 15) and 'present' in _rule(errs, 15)[0]

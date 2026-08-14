@@ -69,6 +69,7 @@ the distinction from row counts in every consumer is guesswork the producer can 
       keypoints.pq                    # per-camera 2D + per-camera visibility   (optional)
       points3d.pq                     # 3D                                      (optional)
       instances.pq                    # boxes / present / absent                (optional)
+      regions.pq                      # areas certified completely labelled     (optional)
       extrinsics.pq                   # per-frame extrinsics, moving cameras    (optional)
       groups/
         <group_id>/
@@ -281,6 +282,40 @@ animal. That is what makes triangulation possible without a separate association
 checkable — a validator reprojects a triangulated instance and flags ids whose median residual
 exceeds `assoc_res_max_px` (rule 12).
 
+## 9b. `regions.pq` — areas certified completely labelled (optional)
+
+One row per rectangle an annotator has certified as **exhaustively labelled**: inside it, every
+animal that is there carries a row, so an area with no label is a genuine negative.
+
+| column | type | req | meaning |
+|---|---|---|---|
+| `group_id`, `camera` | dictionary\<int32,str\> | ✓ | the key, with `frame` |
+| `frame` | int32 | ✓ | 0-based index into the group |
+| `x0,y0,x1,y1` | float32 | ✓ | stored-image px, `[x0,x1) × [y0,y1)` as in §9 |
+| `status` | dictionary\<int8,str\> | ✓ | `labelled_complete` |
+
+**The file's absence is a claim, not a gap.** No `regions.pq` means the session is exhaustively
+labelled everywhere — the reading every dataset in this format already assumed, so nothing changes
+for a session that does not carry one. When the file *is* present the claim inverts: only the
+listed rectangles, together with that frame's own `instances.pq` boxes, are certified, and
+everything outside them is unknown. A consumer training a detector must then supervise only the
+certified area, or it teaches the unlabelled animals elsewhere in the frame to be background.
+
+**This cannot ride in `instances.pq`, and the reason is polarity.** That table is keyed by
+`animal_id` and its `present` status is an *ignore* region — "an animal is here, do not score it".
+A region is the opposite: a statement about pixels, with no animal attached, asserting that absence
+of a label here *is* evidence of absence. There is no `animal_id` to give it, and the two would be
+read with opposite signs by the same consumer.
+
+Rows may overlap, and a frame may carry any number of them (including none). There is no unique
+key, so rule 9 does not apply. A rectangle with `x1 <= x0` or `y1 <= y0` is an error (rule 15),
+not an empty region — a certificate covering nothing is always a bug in the converter.
+
+The source is APT's `labelsRoi` ("Label Box"), whose own help text describes it as marking
+"regions that are completely labeled… teaching the classifier what a negative label is". A frame
+with a Label Box but no rectangle covering the rest of the frame is asserting exactly that: the
+box is trustworthy and the rest of the frame is not.
+
 ## 10. `extrinsics.pq` — moving cameras (optional)
 
 Absent ⇒ every camera is static and its extrinsic comes from `calibration.toml`.
@@ -341,6 +376,12 @@ Checkable rules, so a validator can be written without re-deriving them.
     only in `[provenance] annotator` are the carve-out — they share sessions by design. A dataset
     whose splits are frame ranges of one recording violates the spirit of this by construction; a
     validator should **warn rather than fail**, because the alternative is discarding the dataset.
+15. If `regions.pq` exists, every row has `status = labelled_complete`, a `camera` in
+    `calibration.toml`, a `frame` in `[0, n_frames)`, and a non-empty rectangle (`x1 > x0` and
+    `y1 > y0`). An empty rectangle is an error, not a no-op. A group with no rows is legal and
+    means nothing in that group is certified — which is why an **empty** `regions.pq` differs from
+    an **absent** one, and a converter that has no regions for a session must decide which it
+    means rather than defaulting.
 
 ## 12. What a consumer reads
 
@@ -356,7 +397,15 @@ vis2d       (S, T, K, C)    int8       same codes, plus 2 projected (position, n
 boxes       (S, T, C, 4)    float32    NaN where no box
 instance    (S, T, C)       int8       -1 none, 0 absent, 1 present(ignore), 2 labeled
 ext         (C, T, 4, 4)    float64    only when a camera is moving
+regions     (M, 6)          float64    [frame, camera, x0, y0, x1, y1]; None iff no regions.pq
 ```
+
+`regions` has no animal axis, so it is a flat list rather than a dense array — the rows of one
+group's `regions.pq`, in file order. **`None` and an empty `(0,6)` are different answers** and a
+consumer must not conflate them: `None` means the file is absent and the session claims to be
+exhaustively labelled, while `(0,6)` means the file exists and certifies nothing in this group.
+Collapsing them to "no regions" reads a group with zero certified area as fully labelled, which is
+the exact inversion the table exists to prevent.
 
 `K` is the length of `names`; `C` the number of cameras; `S` the number of distinct `animal_id`s
 in the group; `T` the group's `n_frames`.
@@ -402,6 +451,13 @@ The mechanical parts are easy; these are the parts that bite.
   consumer rejects, for reasons no one can see from the files.
 - **Calibration that differs between clips means they are different sessions.** Calibration is a
   session property in this format; clips that disagree about it cannot share a session.
+- **Decide whether the source labels every animal, and say so.** Omitting `regions.pq` asserts
+  that it does. Many hand-annotation projects label a few animals per frame in a crowded scene and
+  record the completely-labelled area separately (APT's `labelsRoi`); converting the keypoints and
+  dropping that area teaches every unlabelled animal to a detector as background. Measured on one
+  such project: a labelled frame names a median of **2** rats where a tracker finds a median of
+  **11**. If the source records completeness, convert it; if it records nothing, and you know the
+  labelling is partial, write an **empty** `regions.pq` rather than none.
 
 ### From isolated labelled frames
 

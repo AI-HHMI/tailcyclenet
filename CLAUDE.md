@@ -41,6 +41,10 @@ tests/
 that should outlive the session belongs in this file or `docs/`. `docs/` is the human's — ask first.
 `../posetail-pose` and `../../posetail/posetail-next` are read-only reference.
 
+**Commit messages are ONE LINE.** No body, no bullet list, no `Co-Authored-By`, and no mention of
+Claude or any other assistant. What a change means belongs in this file or in `dev/reports/`, where
+it is findable; a paragraph in a commit message is findable only by whoever already knows the hash.
+
 ---
 
 ## Environment

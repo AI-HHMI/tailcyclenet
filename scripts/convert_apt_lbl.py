@@ -29,7 +29,7 @@ FACTS ABOUT THE SOURCE THAT THE CODE DEPENDS ON, all measured rather than assume
   5.0-7.4 at +1000. `_contiguity_ok` re-checks it per movie rather than trusting this note,
   because a scene cut inside a context window is corrupt data that nothing downstream reveals.
 
-THREE CONVERSION DECISIONS, each recorded in `[provenance]` on disk:
+FOUR CONVERSION DECISIONS, each recorded in `[provenance]` on disk:
 
 1. `occ == 1` (occluded, but the annotator placed the point) is written **`visible`, with its
    coordinates** -- 2,500 of 11,388 point-slots, 22.0%, which is 22.7% of the visible rows. That
@@ -42,7 +42,15 @@ THREE CONVERSION DECISIONS, each recorded in `[provenance]` on disk:
 2. APT's `tail` is renamed **`tail_base`** to match the tracked `rat-city` root, so the two share
    registry ids -- and therefore keypoint embedding rows -- instead of splitting the keypoint in
    two.
-3. One group per labelled frame, `--context` frames wide, **label centered**, which is
+3. APT's `labelsRoi` ("Label Box") becomes **`regions.pq`**, and every session writes one even
+   when it has none. A Label Box marks an area the annotator certified as COMPLETELY LABELLED,
+   which is the only thing standing between this root and teaching ~9 rats per frame to a
+   detector as background: a labelled frame here names a median of 2 rats where the tracked root
+   finds a median of 11. An ROI is kept only on the group whose OWN labelled frame it sits on
+   (`group_regions` says why), so the 140 of 636 that sit elsewhere are dropped and counted. The
+   `test/` sessions get an EMPTY regions.pq -- APT's GT mode records no ROIs -- which certifies
+   nothing, where a missing file would certify everything.
+4. One group per labelled frame, `--context` frames wide, **label centered**, which is
    allen-mouse's annotated shape. One labelled frame per group is also what makes APT's `tgt`
    safe to use as `animal_id`: `tgt` is a per-frame slot, not a tracked identity, and a group
    holding a single labelled frame asserts no identity across frames.
@@ -105,8 +113,9 @@ def read_lbl(path: Path, tmp: Path) -> dict:
             member = tf.getmember(LBL_MEMBER)
             tf.extract(member, tmp, filter='data')
         src = tmp / LBL_MEMBER
-    want = ['labels', 'labelsGT', 'movieFilesAll', 'movieFilesAllGT', 'movieInfoAll',
-            'movieInfoAllGT', 'skelNames', 'skeletonEdges', 'cfg', 'projname', 'VERSION']
+    want = ['labels', 'labelsGT', 'labelsRoi', 'labelsRoiGT', 'movieFilesAll', 'movieFilesAllGT',
+            'movieInfoAll', 'movieInfoAllGT', 'skelNames', 'skeletonEdges', 'cfg', 'projname',
+            'VERSION']
     return sio.loadmat(str(src), variable_names=want, struct_as_record=False, squeeze_me=True)
 
 
@@ -151,6 +160,34 @@ def movie_labels(entry) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     # reading puts 28.25% of points outside the frame against 0.01% for this one.
     xy = np.asarray(entry.p, float).reshape(2, npts, frm.size) - 1.0
     return frm, tgt, np.transpose(xy, (2, 1, 0))
+
+
+def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
+    """One `labelsRoi{i}` cell -> (frames, (n,4) [x0,y0,x1,y1]), both 0-based.
+
+    APT's "Label Box": a rectangle the annotator marked as COMPLETELY LABELLED, which its own
+    GUI help describes as "teaching the classifier what a negative label is". It is not an animal
+    box and could not be one -- `LabelROI` has no target index field at all.
+
+    `verts` is (4,2,n) -- four corners, (x,y), per ROI -- and `squeeze_me` flattens it to (4,2)
+    when a movie has exactly one. Every ROI in this project is axis-aligned; that is ASSERTED
+    rather than assumed, because a rotated one would silently become its bounding box, and a
+    bounding box certifies area the annotator did not.
+    """
+    v = getattr(entry, 'verts', None)
+    if v is None or np.size(v) == 0:
+        return np.zeros(0, int), np.zeros((0, 4))
+    v = np.asarray(v, float)
+    if v.ndim == 2:
+        v = v[:, :, None]
+    v = v - 1.0                                  # 1-based, like `p` and `frm`
+    f = np.ravel(entry.f).astype(int) - 1
+    lo, hi = v.min(0), v.max(0)                  # (2,n) each
+    corner_on_edge = (np.isclose(v, lo[None]) | np.isclose(v, hi[None])).all()
+    if not corner_on_edge:
+        raise SystemExit('labelsRoi holds a rotated rectangle; the format stores axis-aligned '
+                         'regions and squaring it would certify area nobody marked')
+    return f, np.stack([lo[0], lo[1], hi[0], hi[1]], -1)
 
 
 # --------------------------------------------------------------------------------------------
@@ -199,6 +236,8 @@ class Job:
     frm: np.ndarray
     tgt: np.ndarray
     xy: np.ndarray
+    roi_f: np.ndarray = field(default_factory=lambda: np.zeros(0, int))
+    roi_rect: np.ndarray = field(default_factory=lambda: np.zeros((0, 4)))
     frames: list[int] = field(default_factory=list)
 
 
@@ -208,17 +247,21 @@ def build_jobs(d: dict) -> list[Job]:
         movies = _strs(d['movieFilesAllGT' if is_gt else 'movieFilesAll'])
         labels = np.ravel(d['labelsGT' if is_gt else 'labels'])
         info = np.ravel(d['movieInfoAllGT' if is_gt else 'movieInfoAll'])
+        rois = np.ravel(d['labelsRoiGT' if is_gt else 'labelsRoi'])
         for i, (movie, entry) in enumerate(zip(movies, labels)):
             frm, tgt, xy = movie_labels(entry)
             if frm.size == 0:
                 continue
             nfo = info[i].info
+            roi_f, roi_rect = movie_regions(rois[i]) if i < rois.size else \
+                (np.zeros(0, int), np.zeros((0, 4)))
             jobs.append(Job(
                 split=split_of(movie, is_gt), session=session_id(movie), movie=movie,
                 wh=(int(np.ravel(nfo.Width)[0]), int(np.ravel(nfo.Height)[0])),
                 fps=float(np.ravel(nfo.FrameRate)[0]),
                 n_source=int(np.ravel(info[i].nframes)[0]),
                 is_gt=is_gt, apt_index=i, frm=frm, tgt=tgt, xy=xy,
+                roi_f=roi_f, roi_rect=roi_rect,
                 frames=sorted(set(frm.tolist()))))
     seen: dict[str, str] = {}
     for j in jobs:
@@ -416,6 +459,26 @@ def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels
     return lab
 
 
+def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int]:
+    """Region rows for one group: the ROIs on ITS OWN labelled frame, and no others.
+
+    A Label Box certifies that one SOURCE frame is completely labelled, and that claim is only
+    sound in the group carrying that frame's LABELS. Every group here is 65 frames wide around a
+    single labelled frame, so a context frame's ROI would certify an area whose animals were
+    converted into a different group -- i.e. it would assert the area empty. This is why the ROIs
+    are keyed against `frame` rather than against the window.
+
+    Returns ((M,6) in `Labels.regions` layout, n_clipped_away).
+    """
+    r = job.roi_rect[np.flatnonzero(job.roi_f == frame)]
+    out = np.zeros((len(r), 6))
+    out[:, 0] = frame - start                    # group-local frame index
+    out[:, 1] = 0                                # the single camera
+    out[:, 2:] = np.clip(r, 0.0, np.tile(np.asarray(wh, float), 2))
+    keep = (out[:, 4] > out[:, 2]) & (out[:, 5] > out[:, 3])
+    return out[keep], int((~keep).sum())
+
+
 # --------------------------------------------------------------------------------------------
 # one movie -> one session
 # --------------------------------------------------------------------------------------------
@@ -426,11 +489,12 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     if dst.exists() and args.clean:
         shutil.rmtree(dst)
     stat = {'session': job.session, 'split': job.split, 'groups': 0, 'frames': 0,
-            'decode_fallback': 0, 'decode_movie': False, 'skipped': 0, 'warnings': []}
+            'decode_fallback': 0, 'decode_movie': False, 'skipped': 0, 'regions': 0,
+            'roi_off_label': int((~np.isin(job.roi_f, job.frames)).sum()), 'warnings': []}
 
     starts = {f: window_start(f, job.n_source, context) for f in job.frames}
 
-    if not args.dry_run:
+    if not args.dry_run and not args.labels_only:
         with tempfile.TemporaryDirectory() as td:
             err = check_seek(job.movie, starts[job.frames[0]][0], job.fps, Path(td))
         if err:
@@ -443,8 +507,27 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
         if err:
             stat['warnings'].append(err)
 
-    groups, labels = {}, {}
-    for f in job.frames:
+    groups, labels, extract = {}, {}, None
+    # `--labels-only`: the 70,655 extracted frames are lossless copies and already correct, so a
+    # change to the TABLES must not re-run 80 minutes of ffmpeg over them. The groups on disk are
+    # the authority for `n_frames` and `source_frame_start` -- re-deriving them would silently
+    # disagree with the pixels wherever a group was truncated or dropped at extraction time.
+    reuse = args.labels_only and not args.dry_run
+    if reuse:
+        if not (dst / 'session.toml').exists():
+            raise SystemExit(f'{dst}: --labels-only, but this session has not been converted yet')
+        old = fmt.Session.load(dst)
+        extract = old.provenance.get('extract')      # how the pixels on disk were really made
+        for gid, g in old.groups.items():
+            groups[gid] = fmt.Group(gid, g.n_frames, fps=g.fps, source_video=g.source_video,
+                                    source_frame_start=g.source_frame_start,
+                                    source_frame_step=g.source_frame_step, notes=g.notes)
+            labels[gid] = group_labels(job, int(gid[1:]), g.source_frame_start, g.n_frames,
+                                       len(names))
+            stat['groups'] += 1
+            stat['frames'] += g.n_frames
+
+    for f in ([] if reuse else job.frames):
         (start, n), gid = starts[f], f'f{f:06d}'
         if args.dry_run:
             groups[gid], stat['groups'], stat['frames'] = None, stat['groups'] + 1, stat['frames'] + n
@@ -469,6 +552,20 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
 
     if args.dry_run or not groups:
         return stat
+
+    # EVERY group gets a `regions` array, empty or not, so every session here writes a regions.pq.
+    # Its absence is the format's claim of exhaustive labelling (§9b), and this project is the
+    # opposite: a labelled frame names a median of 2 rats where the tracker finds 11. The GT
+    # sessions in `test/` carry no ROIs at all -- APT builds them with `LabelROI.new()` -- so they
+    # get an EMPTY regions.pq, which certifies nothing, rather than a missing one, which would
+    # certify everything.
+    clipped = 0
+    for gid, g in groups.items():
+        labels[gid].regions, n = group_regions(job, int(gid[1:]), g.source_frame_start, job.wh)
+        stat['regions'] += len(labels[gid].regions)
+        clipped += n
+    if clipped:
+        stat['warnings'].append(f'{clipped} Label Box(es) clipped away as empty')
 
     cam = fmt.nominal_camera(CAM, job.wh)
     from aniposelib.cameras import CameraGroup
@@ -499,8 +596,12 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
             'animal_id_source': 'APT per-frame target slot (tgt-1); one labelled frame per group, '
                                 'so no cross-frame identity is asserted',
             'context_frames': context,
-            'extract': 'ffmpeg -c:v copy -bsf:v mjpeg2jpeg (lossless)' if mode == 'copy'
-                       else 'decord decode + JPEG q95',
+            'extract': extract or ('ffmpeg -c:v copy -bsf:v mjpeg2jpeg (lossless)'
+                                   if mode == 'copy' else 'decord decode + JPEG q95'),
+            'regions_source': "APT labelsRoi (Label Box), axis-aligned, kept only on each group's "
+                              'own labelled frame -- a certificate is sound only where that '
+                              "frame's labels live. An empty regions.pq means nothing in the "
+                              'session is certified, which is NOT the same as no file at all.',
         })
     return stat
 
@@ -518,6 +619,10 @@ def main() -> int:
     ap.add_argument('--jobs', type=int, default=1, help='movies in parallel')
     ap.add_argument('--max-groups', type=int, default=0, help='0 = all')
     ap.add_argument('--only', default='', help='substring of the session id -- re-run one session')
+    ap.add_argument('--labels-only', action='store_true',
+                    help='rewrite the tables against the frames already on disk -- no ffmpeg. '
+                         'The existing groups.pq is the authority for n_frames and '
+                         'source_frame_start, so a truncated or dropped group stays as extracted.')
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--clean', action='store_true', help='remove each session dir first')
     ap.add_argument('--validate', action='store_true')
@@ -557,6 +662,7 @@ def main() -> int:
         mine = [j for j in jobs if j.split == split]
         print(f'  {split:5s} {len(mine):3d} movies  {sum(len(j.frames) for j in mine):5d} groups  '
               f'{sum(n_inst(j) for j in mine):5d} instances  '
+              f'{sum(j.roi_f.size for j in mine):4d} label boxes  '
               f'sizes {sorted({j.wh for j in mine})}')
 
     stats = []
@@ -568,6 +674,7 @@ def main() -> int:
                 print(f'  [warn] {stat["session"]}: {w}')
             print(f'  {stat["split"]:5s} {stat["session"]:42s} '
                   f'{stat["groups"]:4d} groups {stat["frames"]:6d} frames'
+                  + (f' {stat["regions"]:3d} regions' if stat['regions'] else '')
                   + (' RE-ENCODED' if stat['decode_movie'] else '')
                   + (f' {stat["decode_fallback"]} fallback' if stat['decode_fallback'] else '')
                   + (f' {stat["skipped"]} skipped' if stat['skipped'] else ''))
@@ -576,7 +683,12 @@ def main() -> int:
     # -- decord indexing is exact by construction -- but it is re-encoded rather than copied, and
     # counting only the per-group route would leave that invisible.
     reenc = [s for s in stats if s['decode_movie']]
-    print(f'\ntotal: {sum(s["groups"] for s in stats)} groups, '
+    # A Label Box on a frame that is no group's LABELLED frame is dropped -- see `group_regions`.
+    # Reported because it is a real loss of certified negative area, not a rounding detail.
+    off = sum(s['roi_off_label'] for s in stats)
+    print(f'\nregions: {sum(s["regions"] for s in stats)} written, '
+          f'{off} label boxes dropped (on a frame no group is centered on)')
+    print(f'total: {sum(s["groups"] for s in stats)} groups, '
           f'{sum(s["frames"] for s in stats)} frames, '
           f'{sum(s["decode_fallback"] for s in stats)} per-group decode fallbacks, '
           f'{len(reenc)} movies re-encoded ({sum(s["frames"] for s in reenc)} frames), '

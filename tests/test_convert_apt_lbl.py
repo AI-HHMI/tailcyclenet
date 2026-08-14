@@ -110,3 +110,61 @@ def test_split_and_session_id(cv):
         == 'cohort7_20251209_1659'
     assert cv.session_id(f'{root}/train/original/merged_video_all_keyframes_005.avi') \
         == 'merged_video_all_keyframes_005'
+
+
+# ----------------------------------------------------------------------------------------------
+# labelsRoi -> regions.pq
+# ----------------------------------------------------------------------------------------------
+
+def _roi(verts, f):
+    return SimpleNamespace(verts=np.asarray(verts, float), f=np.asarray(f))
+
+
+def test_regions_are_one_based_and_axis_aligned(cv):
+    """verts (4,2,n) -> [x0,y0,x1,y1], minus the MATLAB 1, corner order irrelevant."""
+    v = np.zeros((4, 2, 1))
+    v[:, :, 0] = [[11, 21], [11, 41], [31, 41], [31, 21]]
+    f, r = cv.movie_regions(_roi(v, [5]))
+    assert f.tolist() == [4]
+    np.testing.assert_allclose(r, [[10, 20, 30, 40]])
+
+
+def test_regions_squeezed_single_roi(cv):
+    """scipy's squeeze_me flattens (4,2,1) to (4,2); the shape must not decide the reading."""
+    f, r = cv.movie_regions(_roi([[11, 21], [11, 41], [31, 41], [31, 21]], [5]))
+    assert f.tolist() == [4] and r.shape == (1, 4)
+
+
+def test_regions_empty_movie(cv):
+    f, r = cv.movie_regions(SimpleNamespace(verts=np.zeros(0), f=np.zeros(0)))
+    assert f.size == 0 and r.shape == (0, 4)
+
+
+def test_a_rotated_roi_is_refused_not_squared(cv):
+    """A bounding box would certify area the annotator never marked."""
+    v = np.zeros((4, 2, 1))
+    v[:, :, 0] = [[11, 21], [21, 41], [41, 31], [31, 11]]
+    with pytest.raises(SystemExit, match='rotated'):
+        cv.movie_regions(_roi(v, [5]))
+
+
+def test_regions_stay_on_their_own_labelled_frame(cv):
+    """A context frame's ROI would certify an area whose animals live in a DIFFERENT group.
+
+    Group frame 100 covers source frames [68, 133); the ROI on source frame 120 belongs to the
+    group centered on 120, not to this one, because only that group carries frame 120's labels.
+    """
+    job = SimpleNamespace(roi_f=np.array([100, 120]),
+                          roi_rect=np.array([[1.0, 2.0, 30.0, 40.0], [0.0, 0.0, 9.0, 9.0]]))
+    r, clipped = cv.group_regions(job, frame=100, start=68, wh=(4696, 2048))
+    assert clipped == 0 and r.shape == (1, 6)
+    np.testing.assert_allclose(r[0], [32, 0, 1, 2, 30, 40])       # local frame 100-68, camera 0
+
+
+def test_regions_are_clipped_to_the_frame(cv):
+    job = SimpleNamespace(roi_f=np.array([0, 0]),
+                          roi_rect=np.array([[-5.0, -5.0, 50.0, 50.0],    # clipped, still real
+                                             [120.0, 10.0, 130.0, 20.0]]))  # wholly outside
+    r, clipped = cv.group_regions(job, frame=0, start=0, wh=(100, 80))
+    assert clipped == 1 and r.shape == (1, 6)
+    np.testing.assert_allclose(r[0, 2:], [0, 0, 50, 50])

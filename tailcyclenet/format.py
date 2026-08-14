@@ -33,9 +33,16 @@ POSITIONED = (VISIBLE, PROJECTED)
 # Instance codes. -1 doubles as "no row" == no determination.
 INST_NONE, INST_ABSENT, INST_PRESENT, INST_LABELED = -1, 0, 1, 2
 
+# Region codes, for the `regions.pq` table. A region is a statement about PIXELS, not about an
+# animal, which is why it cannot ride in `instances.pq`: that table is keyed by `animal_id`, and
+# its `present` status is an IGNORE region -- the opposite polarity to "this area is fully
+# labelled, so absence of a label here IS evidence of absence".
+REGION_COMPLETE = 0
+
 KPT_STATUS = {'unlabeled': UNLABELED, 'missing': MISSING, 'visible': VISIBLE,
               'projected': PROJECTED}
 INST_STATUS = {'absent': INST_ABSENT, 'present': INST_PRESENT, 'labeled': INST_LABELED}
+REGION_STATUS = {'labelled_complete': REGION_COMPLETE}
 IMAGE_EXTS = ('.png', '.jpg')
 VIDEO_EXTS = ('.mp4', '.avi')
 SPLITS = ('train', 'val', 'test')

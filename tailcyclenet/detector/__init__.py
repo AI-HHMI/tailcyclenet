@@ -85,10 +85,17 @@ def load_detector(path, device='cpu', input_wh=None):
             f'{p}: trained on tiles ({ckpt["tile_wh"]}) but carries no `tile_scale`, so the '
             'deployment input size cannot be derived. `input_wh` here is the TILE size, not the '
             'whole-frame size -- running the frame at it is a scale shift, not a smaller input.')
+    # AND `tile_scale` IS MEANINGLESS WITHOUT `tile_wh`, so it is dropped here rather than trusted.
+    # `train_detector.py` records the flag's default (1.0) on every run, tiled or not, so an
+    # UNTILED checkpoint carries `tile_scale = 1.0` and `detect_group` would read that as "derive
+    # the input size from the frame" and letterbox the whole frame at its native size -- the fly's
+    # 1024x1024 against the 416x416 it trained at. That is the same 1/scale shift this field exists
+    # to prevent, arriving through the branch that is supposed to be the safe one. Normalised at
+    # the READ, not at the write, because every checkpoint already on disk has it.
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
             int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)),
             str(ckpt.get('box_source', 'keypoints')),
-            None if ts is None else float(ts))
+            None if ts is None or ckpt.get('tile_wh') is None else float(ts))
 
 
 def tiled_input_wh(src_wh, tile_scale):

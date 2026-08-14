@@ -876,6 +876,23 @@ def _root_with_regions(tmp_path, rect=(4.0, 4.0, 44.0, 34.0)):
     return tmp_path / 'ds'
 
 
+def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
+    """`tile_scale` without `tile_wh` must not reach `detect_group`, or it derives the input size.
+
+    `train_detector.py` records the flag's DEFAULT on every run, so an untiled checkpoint carries
+    `tile_scale = 1.0` -- and `detect_group` reads any non-None value as "letterbox the whole frame
+    at `frame_wh * scale`", which for branson-fly is 1024x1024 against the 416x416 it trained at.
+    """
+    from tailcyclenet.detector import YOLOXNano, load_detector
+    p = tmp_path / 'detector.pth'
+    base = dict(model_state=YOLOXNano(n_keypoints=0).state_dict(), input_wh=[416, 416], norm='gn')
+    torch.save({**base, 'tile_wh': None, 'tile_scale': 1.0}, p)
+    assert load_detector(p)[-1] is None
+    # ...and a genuinely tiled one still keeps it, or the tiled path loses its whole point.
+    torch.save({**base, 'tile_wh': [640, 640], 'tile_scale': 0.5}, p)
+    assert load_detector(p)[-1] == 0.5
+
+
 def test_tile_transform_is_the_letterbox_form():
     from tailcyclenet.detector.data import tile_transform
     scale, pad = tile_transform((100, 50), 0.5)

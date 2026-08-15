@@ -101,7 +101,13 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
             with np.errstate(all='ignore'):
                 span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
                 extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
-            max_dist = extent if np.isfinite(extent) else np.inf
+            # ZERO IS NOT A RADIUS, AND IT IS FINITE. An instance-frame with exactly ONE finite
+            # labelled keypoint has a keypoint-box diagonal of 0, not NaN, so the median can be 0
+            # on a sparsely-labelled root -- rat-city labels 2.02 of 4 points per animal-frame,
+            # one draw away. `match_instances` then admits nothing, err/median come back NaN,
+            # coverage 0 and MOTA goes to -(1 + fp_rate): a catastrophic model failure that is
+            # entirely an artefact of the radius.
+            max_dist = extent if np.isfinite(extent) and extent > 0 else np.inf
             mm = matched_error(pred, true, max_dist=max_dist,
                                min_kpts_frac=min_kpts_frac)
             m['err_rowwise'] = m['err']
@@ -162,7 +168,14 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0):
     with np.errstate(all='ignore'):
         span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
         extent = np.nanmedian(np.linalg.norm(span, axis=-1))
-    radius = mota_dist or float(extent) * 0.5
+    # `is None`, not `or`: `--mota-dist 0` is falsy and was silently read as "unset". And the same
+    # degenerate-extent case as above -- a zero radius makes every instance a miss AND a false
+    # positive at once, which is the failure this line's own comment describes.
+    radius = float(mota_dist) if mota_dist is not None else float(extent) * 0.5
+    if not radius > 0:
+        radius = np.inf
+        print(f'  MOTA: the labelled extent is {extent}, so the match radius is degenerate -- '
+              'scoring without one. Too few labelled keypoints per instance-frame to size it.')
     # Present-but-unannotated animals, WITH their boxes where the format carries them: an unmatched
     # prediction is then excused only if it actually lands on one. Without boxes the fallback
     # excuses every unmatched prediction on such a frame, so `fp_ignored` is printed to show how
@@ -240,6 +253,15 @@ def main():
         n_match = sum(m['n_matched'] for m in block)
         print(f'\n[{mode}] MPJPE {boot["mean"]:.3f} {unit}  '
               f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% bootstrap over {boot["n"]} group(s)')
+        # NO LABELS IN THE SCORED PREFIX IS A DIAGNOSIS, NOT A ZeroDivisionError. `n_true` counts
+        # over `true[:, :T]` with `T = min(pred, true)`, so `infer.py --max-frames 24` on an
+        # annotated root -- 65-frame groups whose one labelled frame is at index 32 -- gives every
+        # group `n_true = 0`, and the script died on this line after printing a table of NaN.
+        if not n_true:
+            print(f'[{mode}] coverage n/a: no labelled points in the scored frames. The prediction '
+                  'is shorter than the labels (--max-frames?) and the labelled frames are past '
+                  'its end.')
+            continue
         print(f'[{mode}] coverage {n_match / n_true:.4f}  ({n_match} of {n_true} labelled '
               f'points{", matched" if any(m["S"] > 1 for m in block) else ""})')
         mr = [m['motion_ratio'] for m in block if m.get('motion_ratio') is not None]
@@ -314,8 +336,11 @@ def main():
             print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}{drop}')
             # THE SHARED SET IS THE HEADLINE, not a footnote. A delta over points only one arm
             # attempted measures which arm declined more.
+            # Same degenerate case as the coverage line above: no labelled point in the scored
+            # prefix makes this a ZeroDivisionError rather than a statement about the two arms.
+            frac = f'{shared / nlab:.4f}' if nlab else 'n/a, nothing labelled in the scored frames'
             print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '
-                  f'({shared / nlab:.4f}) in {len(block)} group(s)')
+                  f'({frac}) in {len(block)} group(s)')
 
             def paired(name, get):
                 got = [(get(a), get(b)) for a, b in block]

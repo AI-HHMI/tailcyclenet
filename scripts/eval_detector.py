@@ -38,6 +38,22 @@ from tailcyclenet.detector.evaluate import score_dataset
 from tailcyclenet.metrics import paired_bootstrap
 
 
+def _tiled(run, tile_scale):
+    """Refuse a tiled checkpoint rather than score it at the wrong scale.
+
+    Refusing rather than supporting: this script does ONE whole-frame forward per item, which is
+    also what deployment does, so the honest fix is to letterbox the frame at `tile_scale` -- and
+    that is `detect_group`'s job, per camera, because a root can ship two frame sizes
+    (rat-city-annotated is 4696x2048 beside 4500x2050). Scoring a tiled arm goes through
+    `scripts/infer.py`; this raises so that the choice is visible instead of silent.
+    """
+    if tile_scale:
+        raise SystemExit(
+            f'{run}: trained on tiles (tile_scale={tile_scale}), so its input_wh is a TILE size '
+            'and letterboxing whole frames into it would score the weights at the wrong scale. '
+            'Score it through scripts/infer.py, which derives the input size per camera.')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -72,6 +88,13 @@ def main():
 
     device = args.device if torch.cuda.is_available() else 'cpu'
     model, wh, _, mcd, red, trained_on, tile_scale = load_detector(args.run, device=device)
+    # A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE (gotcha 12's
+    # shape). `tile_scale` was unpacked here and never used, so `BoxDataset(input_wh=wh)`
+    # letterboxed the WHOLE FRAME into one tile -- the 1/scale shift `tiled_input_wh` and
+    # `detect_group` exist to prevent, which `scripts/infer.py` guards and this script did not.
+    # A tiled arm scored here reads near-zero recall for a reason that is nothing to do with its
+    # weights, and that is precisely the arm this script exists to compare.
+    _tiled(args.run, tile_scale)
     if trained_on != args.boxes:
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy '
@@ -102,6 +125,7 @@ def main():
     if args.compare:
         m2, wh2, _, mcd2, red2, trained_on2, tile2 = load_detector(args.compare,
                                                           device=device)
+        _tiled(args.compare, tile2)
         if trained_on2 != trained_on:
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
                   f'{trained_on2!r}. The paired delta below moves TWO keys (eval rule 4).')

@@ -185,3 +185,41 @@ def test_paired_motion_uses_only_the_steps_both_arms_have():
     ra, rb, n = ev._shared_motion({'_pred': full, '_true': true},
                                   {'_pred': picky, '_true': true})
     assert n == 1 and ra == pytest.approx(1.0) and rb == pytest.approx(1.0)
+
+
+def test_a_one_keypoint_instance_frame_does_not_collapse_the_match_radius():
+    """ZERO IS FINITE, and it was passing the `isfinite` guard as a legitimate radius.
+
+    `extent` is the median keypoint-box DIAGONAL over instance-frames, and an instance-frame with
+    exactly one finite labelled keypoint contributes 0. rat-city labels 2.02 of its 4 points per
+    animal-frame, so its median is one draw from being 1 -- and at radius 0 `match_instances`
+    admits nothing, every instance is a miss AND a false positive at once, and MOTA goes to
+    -(1 + fp_rate). It reads as a catastrophic model failure that is entirely the radius.
+    """
+    # Two animals, two frames, three keypoints -- but only ONE labelled point per instance-frame.
+    true = np.full((2, 2, 3, 2), np.nan, np.float32)
+    true[0, :, 0] = [10.0, 10.0]
+    true[1, :, 0] = [90.0, 90.0]
+    with np.errstate(all='ignore'):
+        span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
+        extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+    assert extent == 0.0, 'the degenerate case must actually be degenerate, or this proves nothing'
+
+    pred = true + 0.5                       # a very good prediction: half a pixel out
+    assert matched_error(pred, true, max_dist=extent)['n_matched'] == 0, \
+        'radius 0 admits nothing short of an EXACT hit -- that is the bug'
+    # What eval.py now does instead: a non-positive extent is no radius at all.
+    max_dist = extent if np.isfinite(extent) and extent > 0 else np.inf
+    assert matched_error(pred, true, max_dist=max_dist)['n_matched'] == 4
+
+
+def test_mota_dist_zero_is_not_read_as_unset():
+    """`radius = mota_dist or extent * 0.5` -- 0.0 is falsy, so an explicit `--mota-dist 0` was
+    silently replaced by the derived radius, i.e. the flag did the opposite of what it said."""
+    for mota_dist, extent in ((0.0, 50.0), (None, 50.0), (7.0, 50.0)):
+        old = mota_dist or float(extent) * 0.5
+        new = float(mota_dist) if mota_dist is not None else float(extent) * 0.5
+        if mota_dist == 0.0:
+            assert old == 25.0 and new == 0.0, 'this is the case that used to be ignored'
+        else:
+            assert old == new

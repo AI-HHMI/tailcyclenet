@@ -818,6 +818,16 @@ detections may be born into an empty row; `last` expires after one window. **`LI
 `--det-cache` stamp** because the cache stores boxes that have already been linked, so changing this
 rule silently makes an old cache a different box set.
 
+**`--track` MADE EVERY BIRTH-TIME LEVER IRRELEVANT, and that is not obvious from the flag.**
+`associate` now runs only on detections no existing target claimed, so births are **104 events in
+10,054 frames across 3dpop's five 10-pigeon clips -- 0.041% of all associations, one per 97 frames**
+(`scratch/p19/birth_rate.py`). Any rule that fires at birth therefore has a ceiling of a few
+hundredths of a percent of associations, against a MOTA seed floor of +-0.023. Report 16 §9 ranked
+two proposals (a size veto at birth, a signed-mean epipolar residual) as items 3 and 6 while
+`associate` still ran every frame on every detection, where a birth-time test governed everything;
+the ranking was never re-derived after the default flipped. **Measure the POPULATION a lever governs
+before its selectivity** -- report 18 §2's "compute the ceiling first" in a different costume.
+
 **`--track` IS THE DEFAULT** (`--no-track` restores the memoryless pass). That is a judgement call taken
 against the protocol numbers below and in favour of the per-window ones: over 480 frames the memoryless pass
 grows +0.6 mm/window to 39.4 mm while the tracker holds 12-13 mm flat, the union crop widens 193 → 230 px

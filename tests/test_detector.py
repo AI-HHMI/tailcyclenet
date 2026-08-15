@@ -1024,3 +1024,59 @@ def test_detector_loss_without_regions_is_unchanged():
     nothing = torch.full((2, 1, 4), float('nan'))
     _, np_ = detector_loss(obj, boxes, anchors, gt, regions=nothing)
     assert 0.0 < np_['certified'] < 1.0
+
+
+def test_a_nan_box_is_skipped_by_both_cross_view_paths():
+    """The two halves of `unletterbox_boxes`' contract, joined. They never were.
+
+    That function returns NaN for a box the frame clamp left with no area, and the test above
+    asserts it. `associate`'s docstring said it skips a non-finite centre -- but `_triangulate`
+    ends in `torch.linalg.svd`, which RAISES on non-finite input, so the `isfinite(p3d)` guard
+    after it was unreachable. `CrossViewTracker` raised too, one step later: `clip(1 - nan)` is
+    NaN, `affinity.any()` is True for NaN, and `linear_sum_assignment` refuses the matrix.
+
+    Both were reachable from one anchor firing in the letterbox padding band, and both killed
+    `detect_group` mid-clip -- on rat-city's 57,594-frame test group, hours of decode in.
+    """
+    from aniposelib.cameras import Camera, CameraGroup
+
+    from tailcyclenet.detector.associate import associate
+    from tailcyclenet.detector.track import CrossViewTracker, _project
+    from tailcyclenet.format import Rig
+
+    cams = []
+    for i, ang in enumerate((-0.5, 0.0, 0.5)):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
+                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+             moving=dict.fromkeys(names, False),
+             calibrated=dict.fromkeys(names, True)).posetail()
+
+    world = np.array([[0.0, 0.0, 0.0]], np.float32)
+    nan_row = torch.full((1, 4), float('nan'))
+    per_cam, scores = [], []
+    for cam in cg:
+        uv = _project(cam, world)
+        good = torch.stack([uv[:, 0] - 20, uv[:, 1] - 20, uv[:, 0] + 20, uv[:, 1] + 20], -1)
+        per_cam.append(torch.cat([good, nan_row]))       # one real animal, one dead box
+        scores.append(torch.ones(2))
+
+    got = associate(cg, per_cam, max_res_px=20.0)
+    assert len(got) == 1, 'the real animal must still be found beside a NaN box'
+    assert bool(torch.isfinite(got[0]['point']).all())
+    # The NaN box is not silently adopted as a member of it.
+    assert all(j == 0 for j in got[0]['members'].values())
+
+    tr = CrossViewTracker(2, max_res_px=20.0)
+    boxes, _, _ = tr.step(cg, per_cam, scores)
+    assert np.isfinite(boxes[0]).all(), 'the tracked animal must come back with real boxes'
+
+    # And `min_views = 1` does not emit the dead box as a single-view instance.
+    solo = associate(cg, per_cam, max_res_px=20.0, min_views=1)
+    for g in solo:
+        for c, b in g['boxes'].items():
+            assert torch.isfinite(b).all(), f'camera {c} emitted a NaN box as an instance'

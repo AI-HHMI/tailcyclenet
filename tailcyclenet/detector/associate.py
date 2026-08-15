@@ -92,19 +92,29 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
     centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
     n_cams = len(cgroup)
 
+    # A NaN BOX IS "NO DETECTION HERE", AND IT USED TO RAISE. `unletterbox_boxes` returns NaN for
+    # a box the frame clamp left with no area (its docstring says this function skips a non-finite
+    # centre; it did not), and `_triangulate` ends in `torch.linalg.svd`, which RAISES on
+    # non-finite input -- so the `isfinite(p3d)` guard below was unreachable and `detect_group`
+    # died mid-clip, after hours of decode, on rat-city's 57k-frame group. `used` already means
+    # "this detection is not available", and both loops below honour it, so seeding it here is the
+    # one place that covers every consumer.
+    used = {(c, i) for c in range(n_cams)
+            for i in range(centres[c].shape[0]) if not bool(torch.isfinite(centres[c][i]).all())}
+
     # Every cross-camera pair, scored by its own reprojection residual.
     cands = []
     for ca, cb in itertools.combinations(range(n_cams), 2):
         for ia in range(centres[ca].shape[0]):
             for ib in range(centres[cb].shape[0]):
+                if (ca, ia) in used or (cb, ib) in used:
+                    continue
                 pts = torch.stack([centres[ca][ia], centres[cb][ib]])
                 p3d = _triangulate(cgroup, (ca, cb), pts)
                 if not torch.isfinite(p3d).all():
                     continue
                 cands.append((_residual(cgroup, (ca, cb), pts, p3d), (ca, ia), (cb, ib), p3d))
     cands.sort(key=lambda c: c[0])
-
-    used = set()
     out = []
     for res, a, b, p3d in cands:
         if a in used or b in used or res > max_res_px:
@@ -136,7 +146,11 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         # emitted anyway. Testing the number that was already here costs nothing and is the one
         # place in this function where the geometry can speak with more than two rays.
         res_fit = _residual(cgroup, cams, pts, refined)
-        if res_fit > max_res_px:
+        # NOT `res_fit > max_res_px`: that is False for NaN, so a degenerate refit passed the gate
+        # and planted an instance whose `point` is non-finite -- which `CrossViewTracker` then
+        # holds forever (a target with a non-finite point is filtered out of `slots`, so it is
+        # never matched, never aged and never retired, and its row goes dead for the clip).
+        if not res_fit <= max_res_px:
             continue
         out.append({'point': refined, 'residual': res_fit,
                     'boxes': {c: boxes_per_cam[c][members[c]] for c in cams},

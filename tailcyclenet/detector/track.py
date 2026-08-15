@@ -136,7 +136,11 @@ class CrossViewTracker:
             # animal, so it must be unavailable to Hungarian rather than merely expensive -- an
             # optimum over an all-bad cost matrix is an arbitrary permutation, which is exactly how
             # `link_rows` used to swap two animals that never touched.
-            affinity = np.clip(1.0 - gap, 0.0, None)
+            # A NaN BOX IS UNAVAILABLE, NOT UNRANKABLE. `unletterbox_boxes` returns NaN for a box
+            # with no area, which makes `gap` NaN, which `clip` leaves NaN -- and `affinity.any()`
+            # is True for NaN, so `linear_sum_assignment` raised `matrix contains invalid numeric
+            # entries` and killed the clip. Zero is what the gate already means: unavailable.
+            affinity = np.nan_to_num(np.clip(1.0 - gap, 0.0, None), nan=0.0)
             if not affinity.any():
                 continue
             ri, ci = linear_sum_assignment(-affinity)

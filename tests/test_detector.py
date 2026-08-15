@@ -1411,3 +1411,26 @@ def test_infer_help_renders():
     r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
     assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
     assert '--axis-veto' in r.stdout
+
+
+def test_the_target_keypoint_set_is_only_built_when_a_cue_reads_it():
+    """K triangulations per target per frame, and for most arms nobody looks at the result.
+
+    `_triangulate_kpts` runs PER KEYPOINT, so on 3dpop it is 10 targets x 17 keypoints x 2,680
+    frames = 455,600 triangulations per clip. It was gated on `kpts_per_cam is not None`, which is
+    true for every keypoint-trained detector -- so a plain `--max-animals` arm, reading none of it,
+    paid all of it, and the cost showed up as the whole pipeline being mysteriously slow rather than
+    as anything attributable.
+
+    `kpt_centre` is deliberately NOT in the guard: it reads each DETECTION's own 2D keypoints and
+    never the target's triangulated set.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    for kw, want in (({}, False),
+                     ({'kpt_centre': True}, False),
+                     ({'random_veto': 0.5}, False),
+                     ({'axis_veto_deg': 60.0}, True),
+                     ({'kpt_affinity': 0.5}, True)):
+        got = CrossViewTracker(3, **kw)._wants_kpts
+        assert got is want, f'{kw}: _wants_kpts is {got}, expected {want}'

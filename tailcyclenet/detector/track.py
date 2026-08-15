@@ -105,6 +105,10 @@ class CrossViewTracker:
         # a typical animal's per-keypoint error is ~58% independent, so a centroid over K averages
         # that part down, where a common-mode shift is what the box centre already carries.
         self.kpt_centre = bool(kpt_centre)
+        # WHICH CUES NEED THE TARGET'S TRIANGULATED KEYPOINT SET. Only these two reproject it; the
+        # rest read the detection's own 2D. Computing it regardless made every arm pay K
+        # triangulations per target per frame for nothing.
+        self._wants_kpts = self.axis_veto_deg is not None or self.kpt_affinity is not None
         self._rng = np.random.default_rng(seed)
         self.vetoed = {'axis': 0, 'kpt': 0, 'random': 0, 'eligible': 0}
         # slot -> {'point': (3,) float32 tensor, 'age': int, 'kpts': (K,3) tensor or None}
@@ -307,7 +311,13 @@ class CrossViewTracker:
                 # model), and a shape is a slower-changing quantity than a position, so a held set is
                 # a better prior than none. Only keypoints valid in EVERY claimed camera can be
                 # triangulated, which is why this is per keypoint rather than all-or-nothing.
-                if kpts_per_cam is not None:
+                # ONLY WHEN A CUE ACTUALLY READS IT. This is per keypoint over K, so it is K
+                # triangulations per target per frame -- 10 targets x 17 keypoints x 2,680 frames is
+                # 455,600 per 3dpop clip, and it ran on EVERY arm the moment the cache carried
+                # keypoints, including arms that read none of them. `kpt_centre` is deliberately not
+                # in this test: it uses each DETECTION's own 2D keypoints and never the target's
+                # triangulated set.
+                if self._wants_kpts and kpts_per_cam is not None:
                     kk = self._triangulate_kpts(cgroup, cams, got[s], kpts_per_cam)
                     if kk is not None:
                         self.targets[s]['kpts'] = kk
@@ -351,7 +361,7 @@ class CrossViewTracker:
                     # crowded clip births are frequent enough for that to be most of the cue's
                     # opportunities. `members` here indexes the LEFTOVER list, so it maps back
                     # through `keep` exactly as the boxes above do.
-                    if kpts_per_cam is not None and len(g['members']) >= 2:
+                    if self._wants_kpts and kpts_per_cam is not None and len(g['members']) >= 2:
                         cams = tuple(sorted(g['members']))
                         mem = {c: keep[c][g['members'][c]] for c in cams}
                         self.targets[s]['kpts'] = self._triangulate_kpts(

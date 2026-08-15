@@ -409,11 +409,33 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     # float or off-frame box produces a negative cam['offset'] and breaks
                     # project_cam far downstream.
                     w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
-                    x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
-                    y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
-                    x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
-                    y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
-                    box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
+                    if inst_boxes is not None:
+                        # STORED BOXES ARE NOT DETECTOR BOXES, AND TRAINING PUTS THEM THROUGH THE
+                        # RULE. Everything above is about a DETECTOR box, which is already a
+                        # crop-rule box. `instances.pq` is not: the loader routes it through
+                        # `_crop_source` -> `crop_box_for_points(..., pad=0)`, which SQUARES the
+                        # extent and applies the `min_crop_dim` floor -- and 96% of rat-city's
+                        # stored boxes are non-square (aspect p50 1.737). So an `instances`-trained
+                        # run was served a tight, unfloored, non-square crop here and a squared,
+                        # floored one in training, which after `_resize_camera` puts the animal at
+                        # a different scale on a different-aspect canvas than any crop it ever saw.
+                        #
+                        # This is the SAME arithmetic as training, not a second rule: training
+                        # unions the window's corners per camera and squares ONCE, which is what
+                        # `crop_box_for_points` over the union corners does. `pad=0` because the
+                        # stored extent is already padded -- see that function's own docstring.
+                        corners = torch.as_tensor(
+                            np.concatenate([v[:, :2], v[:, 2:]], 0), dtype=torch.float32)
+                        box = cropmod.crop_box_for_points(
+                            corners, torch.tensor([w, h]), cfg.min_crop_dim, pad=0)
+                        if box is None:
+                            continue
+                    else:
+                        x0 = int(np.clip(np.floor(v[:, 0].min()), 0, w - 1))
+                        y0 = int(np.clip(np.floor(v[:, 1].min()), 0, h - 1))
+                        x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
+                        y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
+                        box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
                     # THE ONE THING THE UNION-OF-BOXES CANNOT DO, and the comment above says so:
                     # "the per-frame extents that would have to be unioned BEFORE squaring are not
                     # recoverable from the boxes". Detector KEYPOINTS are exactly those extents, so

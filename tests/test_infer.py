@@ -519,3 +519,57 @@ def test_the_tracker_projects_correctly_on_a_moving_rig():
     for n in (1, 3):
         out = _project(per_frame[0], np.zeros((n, 3), np.float32))
         assert out.shape == (n, 2)
+
+
+def test_instances_boxes_get_the_training_crop_rule_at_inference(scene):
+    """`box_source = 'instances'` used two different crop rules on the two sides of the run.
+
+    The loader routes a stored box through `_crop_source` -> `crop_box_for_points(..., pad=0)`,
+    which SQUARES the extent and floors it at `min_crop_dim`. The window loop took the raw clamped
+    union instead -- no squaring, no floor -- on the grounds that "a detector box IS a crop-rule
+    box". True of a detector box, false of `instances.pq`: 96% of rat-city's stored boxes are
+    non-square (aspect p50 1.737). After `_resize_camera` that puts the animal at a different
+    scale on a different-aspect canvas than any crop the model was trained on -- gotcha 8's axis,
+    and invisible in every number the run reports.
+
+    The detector path must be UNCHANGED, because re-squaring an already-square union is measured
+    +3.06 mm worse on 3dpop.
+    """
+    from tailcyclenet import crop as cropmod
+
+    model, sess, registry, name = scene
+    w, h = sess.rig.size(sess.cam_names[0])
+    S, T, C = len(sess.labels('g000').animal_ids), 4, len(sess.rig)
+
+    # A deliberately NON-SQUARE stored extent, which is the case the two rules disagree on.
+    wide = np.tile(np.array([10.0, 10.0, 10.0 + 0.6 * w, 10.0 + 0.2 * h], np.float32),
+                   (S, T, C, 1))
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=wide)
+    det_box = out['crop'][0, 0, 0]
+
+    # The DETECTOR path keeps the raw union: it must NOT equal the squared rule here.
+    assert det_box[2] - det_box[0] != det_box[3] - det_box[1], \
+        'the detector union must stay non-square, or the measured +3.06 mm result is being undone'
+
+    # ...and the `instances` path DOES go through the rule. conftest's 2D session ships one stored
+    # box (animal 1, frame 1, 20x20 -- so `min_crop_dim` is what bites) and no others, which is
+    # also the per-animal keypoint fallback.
+    if sess.labels('g000').boxes is None:
+        pytest.skip('this fixture carries no instances.pq')
+    stored = sess.labels('g000').boxes
+    a, t = [(i, j) for i in range(stored.shape[0]) for j in range(stored.shape[1])
+            if np.isfinite(stored[i, j, 0]).all()][0]
+    cfg = _cfg(anchor='none', box_source='instances')
+    got = run_group(model, sess, 'g000', registry, name, cfg)
+
+    # THE ACTUAL CLAIM: the box the window loop uses is the box the LOADER would have used, which
+    # is `crop_box_for_points` over the stored corners at pad 0. Compared against the rule rather
+    # than asserted square, because the rule also clamps into the frame -- on this 64x48 fixture
+    # a squared box can come back non-square, and that is the rule's own behaviour, not a miss.
+    x0, y0, x1, y1 = stored[a, t, 0]
+    expect = cropmod.crop_box_for_points(
+        torch.tensor([[x0, y0], [x1, y1]]), torch.tensor([int(w), int(h)]),
+        cfg.min_crop_dim, pad=0)
+    # `crop` is indexed by WINDOW, not by frame; this group is one window, and `t` is its only
+    # finite stored frame, so the union over the window is that one box.
+    np.testing.assert_array_equal(got['crop'][a, 0, 0], np.asarray(expect, np.float32))

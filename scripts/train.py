@@ -352,6 +352,20 @@ def main():
     np.random.seed(int(train_cfg.get('seed', 0)))
 
     # -- data ------------------------------------------------------------------------------
+    # AN UNKNOWN [data] KEY IS A TYPO, NOT A COMMENT. The filter is needed -- `path` and
+    # `num_workers` live in this block and are not LoaderConfig fields -- but it also swallowed
+    # `prompt_offset` for `prompt_offset_px`, `frame_stride` for `frame_strides`, and any renamed
+    # key: the arm trained at the DEFAULT, `config.toml` in the run folder recorded the key nobody
+    # read, and nothing in the log said so. That is an arm silently reporting its own control
+    # (eval rule 4). `build_model` splats [model] and raises on an unknown key; this is the same
+    # guard for [data], which had none.
+    known = set(LoaderConfig.__dataclass_fields__) | {'path', 'num_workers'}
+    unknown = set(data_cfg) - known
+    if unknown:
+        raise SystemExit(
+            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
+            f'train at the defaults and report as the arm it is not. Known keys: '
+            f'{sorted(known)}')
     lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
                          if k in LoaderConfig.__dataclass_fields__})
     # Hoisted out of the call because `warm_start` needs it too: it is the evidence that the

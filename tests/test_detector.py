@@ -1106,3 +1106,43 @@ def test_reduce_under_tiling_matches_what_deployment_decodes():
     assert reduce_factor(size, (640, 288)) == reduce_factor(size, (640, 288))
     # At a genuine downscale the reduction comes back, on both sides alike.
     assert reduce_factor(size, (size[0] * 0.125, size[1] * 0.125)) > 1
+
+
+def test_every_box_affecting_option_reaches_the_det_cache_stamp():
+    """The stamp's whole safety property, which had NO test -- and shipped with a hole.
+
+    `--det-cache` shares one box set across arms so they are matched by construction. That is only
+    sound if two runs producing DIFFERENT boxes cannot produce the same stamp. `reduce` did:
+    `load_detector` reads it off the CHECKPOINT, `detect_group` uses it to choose the decode
+    resolution, and a different decode resolution is a different box set -- but it appeared in
+    neither the unconditional list nor the non-default one, so it was invisible to the stamp.
+
+    Table-driven against `detect_group`'s own signature, so the next parameter added to that
+    function fails here instead of being found in review.
+    """
+    import inspect
+    from pathlib import Path
+
+    from tailcyclenet.detector import detect_group
+
+    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    stamp = src[src.index('stamp = repr(sorted('):src.index('det_cache, cache_dirty')]
+
+    # Everything `detect_group` takes that can change the boxes. The rest are plumbing.
+    plumbing = {'det', 'session', 'gid', 'device', 'batch'}
+    params = set(inspect.signature(detect_group).parameters) - plumbing
+    # How each is spelled in the stamp, where the CLI name differs from the parameter name.
+    alias = {'score_thresh': 'det_score', 'link': 'link_boxes', 'input_wh': 'det_input_wh',
+             'max_instances': 'max_animals', 'max_frames': 'max_frames'}
+    missing = [p for p in sorted(params)
+               if f"'{alias.get(p, p)}'" not in stamp and f'({alias.get(p, p)}' not in stamp]
+    assert not missing, (
+        f'these change the boxes and are not in the --det-cache stamp: {missing}. A cache '
+        'written under one value would be reused under another, silently.')
+
+    # And the two CHECKPOINT-derived ones are UNCONDITIONAL, not "recorded only if non-default":
+    # they come from the checkpoint rather than the command line, so two runs can differ in them
+    # with identical arguments and would otherwise share a stamp.
+    head = stamp[:stamp.index('+ [(k, str(getattr(args, k)))')]
+    for k in ('tile_scale', 'reduce'):
+        assert f"'{k}'" in head, f'{k} is checkpoint-derived and must be stamped unconditionally'

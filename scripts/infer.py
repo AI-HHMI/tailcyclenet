@@ -304,10 +304,11 @@ def main():
               'instances.pq falls back to its keypoints')
 
     boxes = dict(np.load(args.boxes, allow_pickle=True)) if args.boxes else {}
-    # `det_tile` is initialised HERE and not only inside the branch: it goes into the cache stamp
-    # unconditionally, and a NameError there would only fire on the box-source paths that have no
-    # detector at all.
+    # `det_tile` and `det_red` are initialised HERE and not only inside the branch: both go into
+    # the cache stamp unconditionally, and a NameError there would only fire on the box-source
+    # paths that have no detector at all -- which is exactly how `det_kpts` shipped broken.
     det = det_wh = det_tile = None
+    det_red = False
     if args.detector:
         from tailcyclenet.detector import detect_group, load_detector
         det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile = load_detector(
@@ -384,10 +385,15 @@ def main():
     # whole-frame input size than a letterbox-trained one, which is a different box set under an
     # otherwise identical stamp. Every cache written before the key existed carries no entry and is
     # now refused rather than reused as if the scales matched.
+    #
+    # `reduce` is unconditional for the SAME reason, and it is the second checkpoint-derived one:
+    # `load_detector` reads it off the checkpoint, `detect_group` uses it to pick the decode
+    # resolution the detector sees, and a different decode resolution is a different box set. It
+    # was in neither list, so two detectors differing only in it shared a cache silently.
     from tailcyclenet.detector import LINK_REV
     stamp = repr(sorted([('det_score', str(args.det_score)), ('track', str(args.track)),
                          ('link_boxes', str(args.link_boxes)), ('link_rev', str(LINK_REV)),
-                         ('tile_scale', str(det_tile))]
+                         ('tile_scale', str(det_tile)), ('reduce', str(det_red))]
                         + [(k, str(getattr(args, k))) for k in
                            ('detector', 'max_animals', 'det_input_wh',
                             'max_frames', 'min_views', 'dup_res_px', 'max_move')

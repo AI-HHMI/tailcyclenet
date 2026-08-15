@@ -206,11 +206,21 @@ def test_carried_prior_is_bounds_masked_and_dated():
     assert qt.shape == (1, K)
     assert (qt == 3).all(), f'prompt frame 23 is index 3 of a window starting at 20, got {qt}'
 
-    # A prompt from just before the window -- inside the overlap, so the ordinary case -- cannot be
-    # expressed as a frame index and clamps into range rather than indexing off the front.
-    _, early = _build_prior(cfg, (pose, 17), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
-                            cgroup)
-    assert (early == 0).all()
+    # A PROMPT FROM BEFORE THE WINDOW IS RETIRED, not clamped. This used to assert the opposite
+    # ("inside the overlap, so the ordinary case") and that reading was wrong: `j = len(frames) -
+    # overlap` makes the carried frame the NEXT window's start exactly, so consecutive windows
+    # give qt == 0 and a NEGATIVE qt happens only when a window was skipped. Clamping it to 0
+    # presented a pose from a frame the model was never shown as this window's first frame, and in
+    # 3D the bounds mask cannot catch that -- a stale pose still visible to two cameras passes.
+    #
+    # The old guard spent a budget of `overlap` frames, which meant it only fired when
+    # `n_frames > 2 * overlap`: at the swept `--n-frames 24 --overlap 12` it never fired.
+    assert _build_prior(cfg, (pose, 17), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+                        cgroup) == (None, None)
+    # ...and the ordinary case -- the carried frame IS this window's first -- is still qt 0.
+    _, ordinary = _build_prior(cfg, (pose, 20), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+                               cgroup)
+    assert (ordinary == 0).all()
     _, late = _build_prior(cfg, (pose, 999), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                            cgroup)
     assert (late == len(frames) - 1).all()

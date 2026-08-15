@@ -905,7 +905,15 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
         # overlap that is the ordinary case (the carried frame IS in the previous window's tail);
         # beyond it the pose describes a frame the model was never shown, and in 3D the bounds mask
         # cannot catch it, because a pose that is stale but still visible to two cameras passes.
-        if -qt > cfg.overlap:
+        # `qt < 0`, NOT `-qt > overlap`. The invariant is exact: `j = len(frames) - overlap` makes
+        # the carried frame the NEXT window's start, so consecutive windows give qt == 0 and the
+        # last window (pulled back by `_window_starts`) gives qt > 0. A negative qt therefore
+        # happens if and only if a window was SKIPPED, in multiples of `n_frames - overlap`.
+        # Against `overlap` that test only fired when `n_frames > 2 * overlap` -- so at the swept
+        # `--n-frames 24 --overlap 12` it never fired at all, and a prior from before an animal was
+        # lost was presented as this window's first frame. There is no budget to spend: either the
+        # carried frame is inside this window or it predates it.
+        if qt < 0:
             return None, None
     if p.shape != (K, R):
         return None, None

@@ -140,6 +140,12 @@ def main():
                          'so they are fp_dup rather than new coverage. Default keeps them all, '
                          'which is the unconditional rule and carries the full FP risk.')
     ap.add_argument('--max-animals', type=int, default=0)
+    # DETECTION BUDGET, SEPARATE FROM THE ROW COUNT. `--max-animals` used to set both, so sweeping
+    # the row count also moved how many boxes the detector was allowed to emit and neither lever
+    # could be read alone (`link_rows`, spare rows). Default 0 = follow `--max-animals`, which is
+    # what the two did when they were one number.
+    ap.add_argument('--det-top-k', type=int, default=0,
+                    help='detections kept per frame-camera; 0 follows --max-animals')
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
                          '`carry` needs the frames contiguous.')
@@ -310,7 +316,7 @@ def main():
     det = det_wh = det_tile = None
     det_red = False
     if args.detector:
-        from tailcyclenet.detector import detect_group, load_detector
+        from tailcyclenet.detector import associate_group, detect_raw, load_detector
         det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile = load_detector(
             args.detector, device, input_wh=args.det_input_wh)
         # A TILE-TRAINED DETECTOR IS DEPLOYED ON THE WHOLE FRAME AT ITS TRAINING SCALE, and
@@ -390,13 +396,33 @@ def main():
     # `load_detector` reads it off the checkpoint, `detect_group` uses it to pick the decode
     # resolution the detector sees, and a different decode resolution is a different box set. It
     # was in neither list, so two detectors differing only in it shared a cache silently.
-    from tailcyclenet.detector import LINK_REV
-    stamp = repr(sorted([('det_score', str(args.det_score)), ('track', str(args.track)),
-                         ('link_boxes', str(args.link_boxes)), ('link_rev', str(LINK_REV)),
+    #
+    # **THE CACHE NOW HOLDS RAW DETECTIONS, SO THE ASSOCIATION OPTIONS LEAVE THIS STAMP.** `track`,
+    # `link_boxes`, `link_rev`, `max_animals`, `min_views`, `dup_res_px` and `max_move` change only
+    # what happens AFTER detection, and `associate_group` re-runs on every invocation -- microseconds
+    # per frame against 44 ms of 4K decode. So one cache now serves every identity arm, which makes
+    # those arms matched BY CONSTRUCTION rather than by trusting the detector to be deterministic
+    # (eval rule 4), and is the whole reason the split exists.
+    #
+    # `raw_rev` is UNCONDITIONAL and is the SIXTH instance of the `det_score` trap, and the sharpest:
+    # a raw cache and an associated one are the same shape, the same dtype and the same key names.
+    # An old cache read as raw would be associated a SECOND time, silently. There is no default to
+    # move here -- the meaning of the file changed -- so every cache written before the split is
+    # refused. That is correct and nearly free: `scratch/phase*` caches hold BatchNorm-detector boxes
+    # and are refused by `load_detector` already.
+    #
+    # `top_k` is what the raw depends on where `max_animals` used to be. It is one key rather than
+    # two because the dependency is genuinely one thing: `--det-top-k` when set, and the animal count
+    # `max_animals` implies when not. Conditional membership is what makes a stamp lie, so the key is
+    # always present and its VALUE says which rule produced it.
+    from tailcyclenet.detector import RAW_REV
+    top_k_stamp = (str(args.det_top_k) if args.det_top_k
+                   else f'from-max-animals:{args.max_animals}')
+    stamp = repr(sorted([('det_score', str(args.det_score)), ('raw_rev', str(RAW_REV)),
+                         ('top_k', top_k_stamp),
                          ('tile_scale', str(det_tile)), ('reduce', str(det_red))]
                         + [(k, str(getattr(args, k))) for k in
-                           ('detector', 'max_animals', 'det_input_wh',
-                            'max_frames', 'min_views', 'dup_res_px', 'max_move')
+                           ('detector', 'det_input_wh', 'max_frames')
                            if getattr(args, k) != ap.get_default(k)]))
     det_cache, cache_dirty = {}, False
     if args.det_cache and args.det_cache.exists():
@@ -428,21 +454,25 @@ def main():
             # after paying the checkpoint load. Same trap the comment above `det_tile` names.
             det_boxes = det_scores = det_kpts = None
             if det is not None:
-                # Default to what the session actually holds, not to 1. `detect_group` caps
-                # detections at this count, so a bare --detector run on a ten-animal dataset
+                # Default to what the session actually holds, not to 1. `associate_group` caps
+                # rows at this count, so a bare --detector run on a ten-animal dataset
                 # used to return one animal per frame and read as a catastrophic miss rate
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
+                # DETECT AT `top_k`, ASSOCIATE AT `n_want`. They were one number until the split,
+                # and welding them meant a sweep over the row count also moved the detection budget
+                # -- which is why `link_rows`' spare-rows finding could not be run end to end.
+                n_det = args.det_top_k or n_want
                 if key in det_cache:
-                    det_boxes, det_scores = det_cache[key], det_cache.get(f'{key}|score')
-                    det_kpts = det_cache.get(f'{key}|kpt')
+                    raw = (det_cache[key], det_cache.get(f'{key}|score'),
+                           det_cache.get(f'{key}|kpt'))
                     # A CACHE WITHOUT KEYPOINTS CANNOT SERVE `--crop-source keypoints`, and the
                     # failure would be SILENT: `run_group` takes `det_kpts_stc is not None` as the
                     # switch, so a None here does not error, it quietly crops from the boxes and
                     # reports the arm under the other arm's name. That is the `--boxes`-key trap
                     # below, one flag over. Refused rather than warned, because the whole purpose of
                     # a shared cache is that two arms differ in exactly one lever.
-                    if args.crop_source == 'keypoints' and det_kpts is None:
+                    if args.crop_source == 'keypoints' and raw[2] is None:
                         raise SystemExit(
                             f'{args.det_cache}: holds no keypoints for {key!r}, so --crop-source '
                             'keypoints would silently fall back to cropping from the boxes and '
@@ -451,30 +481,32 @@ def main():
                     # `flush` for the same reason the detecting branch has it: redirected to a log,
                     # stdout is block-buffered, so the CACHED path -- the fast one, which prints
                     # little else -- shows nothing for minutes and reads as a hung run.
-                    print(f'{key}: up to {n_want} animal(s), boxes from --det-cache', flush=True)
+                    print(f'{key}: up to {n_want} animal(s), raw boxes from --det-cache', flush=True)
                 else:
-                    print(f'{key}: detecting up to {n_want} animal(s)'
+                    print(f'{key}: detecting up to {n_det} per camera, {n_want} animal row(s)'
                           f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
                           flush=True)
-                    got = detect_group(
-                        det, det_wh, sess, gid, n_want, device=device,
-                        score_thresh=args.det_score, link=args.link_boxes,
-                        reduce=det_red, max_frames=args.max_frames,
-                        min_views=args.min_views, dup_res_px=args.dup_res_px,
-                        track=args.track, max_move=args.max_move, tile_scale=det_tile)
-                    # A keypoint-trained detector returns a third array, cached under its own key.
+                    raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
+                                     score_thresh=args.det_score, reduce=det_red,
+                                     max_frames=args.max_frames, tile_scale=det_tile)
+                    # A keypoint-trained detector fills a third array, cached under its own key.
                     # This does NOT change what an old cache is allowed to satisfy: a box-only arm
                     # never looks at it, and a keypoint-crop arm is refused above rather than served
                     # boxes under the wrong name. Storing it is what lets the two crop sources share
                     # ONE box set and so differ in exactly one lever (eval rule 4) -- report 15 §6
                     # had to match its item-3 arms by configuration for want of this.
-                    det_boxes, det_scores = got[0], got[1]
-                    det_kpts = got[2] if len(got) > 2 else None
-                    det_cache[key] = det_boxes
-                    det_cache[f'{key}|score'] = det_scores
-                    if det_kpts is not None:
-                        det_cache[f'{key}|kpt'] = det_kpts
+                    det_cache[key] = raw[0]
+                    det_cache[f'{key}|score'] = raw[1]
+                    if raw[2] is not None:
+                        det_cache[f'{key}|kpt'] = raw[2]
                     cache_dirty = True
+                # THE ASSOCIATION HALF RUNS EVERY TIME, cached or not. It is microseconds per frame
+                # against 44 ms of 4K decode, so recomputing it costs nothing measurable and buys
+                # the property the cache exists for: two identity arms differ in exactly one lever
+                # over byte-identical pixels.
+                det_boxes, det_scores, det_kpts = associate_group(
+                    raw, sess, gid, n_want, link=args.link_boxes, min_views=args.min_views,
+                    dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move)
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
                 # saturated on every detector shipped here; a detector whose scores are NOT
                 # saturated would lose most of its boxes to that, and this line is where that shows

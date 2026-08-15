@@ -639,23 +639,30 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
 def test_the_tracker_is_the_default_and_can_be_turned_off():
     """`--track` is ON by default (dev/reports/13), so `detect_group` must default to it too.
 
-    Pinned because the default is what every future arm inherits, and because the ONE thing that
-    makes flipping it safe is that `track` became unconditional in `--det-cache`'s stamp: a cache
-    written while it was off carries no `track` entry and must now be REFUSED rather than reused as
-    if it had been tracked. That is the same guard `det_score` needed when its default moved.
+    Pinned because the default is what every future arm inherits, and because flipping a default is
+    only safe if an old cache cannot be reused as if it had the new one. `track` USED to carry that
+    guard itself, as an unconditional stamp entry. It no longer needs to and no longer can: the
+    cache holds RAW detections and `associate_group` re-runs every invocation, so `track` does not
+    change the file at all. The guard moved to `raw_rev`, which refuses every pre-split cache
+    outright -- a strictly stronger statement than the one it replaced, since those caches hold
+    boxes that were already associated under whatever `track` was then.
     """
     import inspect
     from pathlib import Path
 
-    from tailcyclenet.detector import detect_group
+    from tailcyclenet.detector import associate_group, detect_group
 
-    sig = inspect.signature(detect_group)
-    assert sig.parameters['track'].default is True, 'the tracker is the default'
-    assert sig.parameters['link'].default is False, '--link-boxes is still opt-in'
+    for f in (detect_group, associate_group):
+        sig = inspect.signature(f)
+        assert sig.parameters['track'].default is True, f'{f.__name__}: the tracker is the default'
+        assert sig.parameters['link'].default is False, f'{f.__name__}: --link-boxes is opt-in'
 
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
-    assert "('track', str(args.track))" in src, \
-        'track must be UNCONDITIONAL in the cache stamp now that its default has moved'
+    assert "('raw_rev', str(RAW_REV))" in src, \
+        'raw_rev must be UNCONDITIONAL in the stamp: it is what refuses a pre-split cache'
+    assert "('track', str(args.track))" not in src, \
+        'track must NOT be stamped -- it does not change the cached raw detections, and stamping ' \
+        'it would refuse caches that hold exactly the right pixels'
     assert 'BooleanOptionalAction' in src, '--no-track must exist to restore the old behaviour'
 
 
@@ -688,9 +695,9 @@ def test_a_cache_without_keypoints_cannot_serve_the_keypoint_crop_source():
     from pathlib import Path
 
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
-    assert "det_cache[f'{key}|kpt'] = det_kpts" in src, \
+    assert "det_cache[f'{key}|kpt'] = raw[2]" in src, \
         'detector keypoints must be cached, or the two crop sources cannot share one box set'
-    assert "args.crop_source == 'keypoints' and det_kpts is None" in src, \
+    assert "args.crop_source == 'keypoints' and raw[2] is None" in src, \
         'a keypoint-free cache must be refused for --crop-source keypoints, not silently accepted'
     assert '"|score", "|kpt"' in src, 'the cached-group count must not count the keypoint entries'
 
@@ -1117,35 +1124,40 @@ def test_every_box_affecting_option_reaches_the_det_cache_stamp():
     resolution, and a different decode resolution is a different box set -- but it appeared in
     neither the unconditional list nor the non-default one, so it was invisible to the stamp.
 
-    Table-driven against `detect_group`'s own signature, so the next parameter added to that
-    function fails here instead of being found in review.
+    Table-driven against `detect_raw`'s own signature, so the next parameter added to that
+    function fails here instead of being found in review. It is `detect_raw` and no longer
+    `detect_group` because THE CACHE HOLDS RAW DETECTIONS: the association options change only what
+    happens after the cached array, and `associate_group` re-runs on every invocation, so stamping
+    them would refuse caches that are in fact exactly the right pixels. The stamp must cover what
+    the FILE depends on, which is precisely `detect_raw`'s inputs.
     """
     import inspect
     from pathlib import Path
 
-    from tailcyclenet.detector import detect_group
+    from tailcyclenet.detector import detect_raw
 
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
     stamp = src[src.index('stamp = repr(sorted('):src.index('det_cache, cache_dirty')]
 
-    # Everything `detect_group` takes that can change the boxes. The rest are plumbing.
+    # Everything `detect_raw` takes that can change the detections. The rest are plumbing.
     plumbing = {'det', 'session', 'gid', 'device', 'batch'}
-    params = set(inspect.signature(detect_group).parameters) - plumbing
+    params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the stamp, where the CLI name differs from the parameter name.
-    alias = {'score_thresh': 'det_score', 'link': 'link_boxes', 'input_wh': 'det_input_wh',
-             'max_instances': 'max_animals', 'max_frames': 'max_frames'}
+    alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'max_frames': 'max_frames'}
     missing = [p for p in sorted(params)
                if f"'{alias.get(p, p)}'" not in stamp and f'({alias.get(p, p)}' not in stamp]
     assert not missing, (
-        f'these change the boxes and are not in the --det-cache stamp: {missing}. A cache '
+        f'these change the detections and are not in the --det-cache stamp: {missing}. A cache '
         'written under one value would be reused under another, silently.')
 
-    # And the two CHECKPOINT-derived ones are UNCONDITIONAL, not "recorded only if non-default":
-    # they come from the checkpoint rather than the command line, so two runs can differ in them
-    # with identical arguments and would otherwise share a stamp.
+    # And the CHECKPOINT-derived ones are UNCONDITIONAL, not "recorded only if non-default": they
+    # come from the checkpoint rather than the command line, so two runs can differ in them with
+    # identical arguments and would otherwise share a stamp. `raw_rev` is unconditional for a
+    # sharper reason -- a raw cache and a pre-split associated one are the same shape and dtype
+    # under an otherwise identical stamp, so reading one as the other associates it twice.
     head = stamp[:stamp.index('+ [(k, str(getattr(args, k)))')]
-    for k in ('tile_scale', 'reduce'):
-        assert f"'{k}'" in head, f'{k} is checkpoint-derived and must be stamped unconditionally'
+    for k in ('tile_scale', 'reduce', 'raw_rev', 'top_k'):
+        assert f"'{k}'" in head, f'{k} must be stamped unconditionally'
 
 
 def test_score_dataset_scores_unaugmented_and_restores_the_flag():
@@ -1258,3 +1270,51 @@ def test_birth_age_off_is_the_rule_it_replaced():
     # And the knob is genuinely a no-op at None: same array as an explicit huge threshold.
     huge = link_rows(boxes.copy(), birth_age=10_000)
     np.testing.assert_array_equal(np.isfinite(off), np.isfinite(huge))
+
+
+def test_detection_and_association_split_composes_bit_identically(tmp_path):
+    """`detect_group` IS `detect_raw` + `associate_group`, to the last bit, on every path.
+
+    The split exists so that every identity arm shares ONE detection pass -- detection is the
+    expensive half of a run (report 14: 44 ms of 4K decode against a 0.86 ms forward) and every
+    lever in the identity family changes only what happens after it. That is worth nothing if the
+    composition is not exactly the function it replaced, because then every arm is matched to a
+    baseline that no longer exists.
+
+    Run on a MULTIVIEW root and on both association rules, since they are three different code
+    paths through `associate_group`: the tracker, the memoryless `associate`, and `link_rows` on
+    top of the latter.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    from tailcyclenet.detector import associate_group, detect_group, detect_raw
+    from tailcyclenet.format import Session
+
+    cf._session_3d(tmp_path / 'ds' / 'test' / 's')
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    torch.manual_seed(0)
+    det = YOLOXNano(n_keypoints=3).eval()
+    S, wh = 2, (64, 64)
+
+    for kw in ({'track': True}, {'track': False}, {'track': False, 'link': True}):
+        got = detect_group(det, wh, sess, 'g000', S, score_thresh=0.0, **kw)
+        raw = detect_raw(det, wh, sess, 'g000', S, score_thresh=0.0)
+        want = associate_group(raw, sess, 'g000', S, **kw)
+        for a, b in zip(got, want):
+            np.testing.assert_array_equal(a, b, err_msg=f'{kw} differs after the split')
+
+    # AND THE POINT OF THE SPLIT: raw detected at a LARGER top_k, then associated at S, gives the
+    # same rows as detecting at S -- as long as the detector offered no more than S per camera, so
+    # the extra capacity went unused. This is what licenses sweeping `S` over ONE cache, which is
+    # what separates the row count from the detection budget (`link_rows`, spare rows).
+    wide = detect_raw(det, wh, sess, 'g000', S + 6, score_thresh=0.0)
+    n_per = np.isfinite(wide[1]).sum(0)
+    if n_per.max() <= S:
+        got = detect_group(det, wh, sess, 'g000', S, score_thresh=0.0)
+        want = associate_group((wide[0][:S], wide[1][:S], wide[2][:S]), sess, 'g000', S)
+        for a, b in zip(got, want):
+            np.testing.assert_array_equal(a, b, err_msg='top_k must not change what S rows hold')

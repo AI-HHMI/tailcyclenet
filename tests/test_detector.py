@@ -1318,3 +1318,68 @@ def test_detection_and_association_split_composes_bit_identically(tmp_path):
         want = associate_group((wide[0][:S], wide[1][:S], wide[2][:S]), sess, 'g000', S)
         for a, b in zip(got, want):
             np.testing.assert_array_equal(a, b, err_msg='top_k must not change what S rows hold')
+
+
+def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_path):
+    """The identity cues default off, and OFF must be byte-identical to before they existed.
+
+    This is the check that caught `--dup-res-px` being inert under `--track`, and the reason
+    CLAUDE.md can say six posetail-pose configs "declared an anchor, trained, and were reported as
+    anchored arms whose anchor was a literal no-op". An arm that moves a flag which does nothing
+    reports the control twice.
+
+    Both halves matter and the second is the one usually skipped: OFF is identical, and ON actually
+    CHANGES something. A cue wired to a threshold nothing ever crosses is the same failure with a
+    different shape.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    from tailcyclenet.detector import associate_group, detect_raw, link_rows
+    from tailcyclenet.format import Session
+
+    cf._session_3d(tmp_path / 'ds' / 'test' / 's')
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    torch.manual_seed(0)
+    det = YOLOXNano(n_keypoints=5).eval()
+    raw = detect_raw(det, (64, 64), sess, 'g000', 3, score_thresh=0.0)
+
+    for kw in ({'track': True}, {'track': False, 'link': True}):
+        base = associate_group(raw, sess, 'g000', 3, **kw)
+        # The INERT arm: the same code path with the mechanism unable to fire. Not "flag absent" --
+        # that would only prove the branch is skipped, not that the branch is faithful.
+        for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0}):
+            got = associate_group(raw, sess, 'g000', 3, **kw, **inert)
+            for a, b in zip(base, got):
+                np.testing.assert_array_equal(a, b, err_msg=f'{kw} {inert} is not inert')
+        # ...and a threshold that rejects everything must change the output, or the cue is dead
+        # wiring reported as an arm.
+        stats = {}
+        hard = associate_group(raw, sess, 'g000', 3, **kw, random_veto=1.0, stats=stats)
+        assert stats.get('random', 0) > 0, f'{kw}: the veto never fired -- it is not wired in'
+        assert any(not np.array_equal(np.isfinite(a), np.isfinite(b))
+                   for a, b in zip(base, hard) if a is not None), \
+            f'{kw}: vetoing every edge changed nothing, so the cue does not reach the matcher'
+
+    # `link_rows` on its own, which is the whole of 2D identity, with the keypoints it links.
+    rng = np.random.default_rng(0)
+    S, T = 3, 20
+    boxes = np.full((S, T, 1, 4), np.nan, np.float32)
+    kp = np.full((S, T, 1, 6, 3), np.nan, np.float32)
+    for s in range(S):
+        for t in range(T):
+            x, y = 100.0 + 300 * s + rng.normal(0, 2), 100.0
+            boxes[s, t, 0] = (x, y, x + 60, y + 60)
+            # An animal lying along x, so its axis is well defined and the cue can abstain or not.
+            kp[s, t, 0, :, 0] = np.linspace(x, x + 60, 6)
+            kp[s, t, 0, :, 1] = y + 30
+    off = link_rows(boxes.copy(), extra=kp.copy())
+    for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0}):
+        np.testing.assert_array_equal(off, link_rows(boxes.copy(), extra=kp.copy(), **inert),
+                                      err_msg=f'link_rows {inert} is not inert')
+    # AND WITHOUT KEYPOINTS EVERY CUE ABSTAINS rather than rejecting everything -- the property
+    # that keeps a box-only detector on the old path instead of silently losing all its matches.
+    np.testing.assert_array_equal(off, link_rows(boxes.copy(), axis_veto_deg=1.0))

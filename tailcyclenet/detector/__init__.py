@@ -266,7 +266,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2, dup_res_px=None,
-                    track=True, max_move=1.0):
+                    track=True, max_move=1.0, axis_veto_deg=None, kpt_affinity=None,
+                    random_veto=None, seed=0, stats=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     `raw` is `detect_raw`'s `(boxes, scores, kpts)`. Returns the same triple re-indexed so row `a`
@@ -288,6 +289,13 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
     clip, and `link_rows` is not run on top of it. `track=False` restores the memoryless per-frame
     `associate`, whose rows are one animal within a frame and untracked across them; that is the
     arm every number before dev/reports/13 was measured on, so reproducing one needs it.
+
+    `axis_veto_deg` / `kpt_affinity` / `random_veto` are the keypoint identity cues, all default-off
+    and all VETOES over an unchanged centroid cost -- see `identity`. They need a keypoint-trained
+    detector; without one every cue abstains and this is byte-identical to the centroid-only path.
+    `stats` is an optional dict that collects each cue's fire count, because a veto's rate is what
+    its rate-matched random control has to be matched TO, and recomputing it afterwards from the
+    output is not possible -- a vetoed edge leaves no trace in the boxes.
     """
     import numpy as np
     import torch
@@ -309,7 +317,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
         from .track import CrossViewTracker
         tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
                                    min_views=min_views, dup_res_px=dup_res_px,
-                                   max_move=max_move)
+                                   max_move=max_move, axis_veto_deg=axis_veto_deg,
+                                   kpt_affinity=kpt_affinity, random_veto=random_veto, seed=seed)
 
     def _cam(t, c):
         """This frame-camera's decoded detections as torch, plus their raw indices.
@@ -336,8 +345,12 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
             continue
         cams = session.cgroup(gid, t) if moving else cgroup
         if tracker is not None:
+            # The detector's keypoints for THIS frame's live detections, in the same order the
+            # boxes are in, so `claimed` indexes both identically.
+            tk = (None if r_kp is None
+                  else [r_kp[per_cam[c][2], t, c] for c in range(C)])
             out[:, t], sc[:, t], claimed = tracker.step(
-                cams, [p[0] for p in per_cam], [p[1] for p in per_cam])
+                cams, [p[0] for p in per_cam], [p[1] for p in per_cam], kpts_per_cam=tk)
             if kp is not None:
                 # `claimed[a, c]` is the DETECTION index that slot a took in camera c, or -1.
                 # Gathering by it is the only way the keypoints follow the same row assignment
@@ -359,7 +372,11 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
                 if kp is not None:
                     kp[a, t, c] = r_kp[per_cam[c][2][d], t, c]
     if link and tracker is None:
-        out, sc = link_rows(out, sc, max_move=max_move, extra=kp)
+        out, sc = link_rows(out, sc, max_move=max_move, extra=kp, axis_veto_deg=axis_veto_deg,
+                            kpt_affinity=kpt_affinity, random_veto=random_veto, seed=seed,
+                            stats=stats)
+    elif stats is not None and tracker is not None:
+        stats.update(tracker.vetoed)
     return out, sc, kp
 
 
@@ -415,7 +432,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     return (out, sc) if kp is None else (out, sc, kp)
 
 
-def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None):
+def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None,
+              axis_veto_deg=None, kpt_affinity=None, random_veto=None, seed=0, stats=None):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
@@ -503,9 +521,24 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
+    from . import identity as idy
+
     S, T, C, _ = boxes.shape
     last = boxes[:, 0].copy()                     # (S,C,4), each row's most recent known box
     age = np.zeros(S, int)                        # frames since this row was last seen
+    # THE KEYPOINT CUES READ `extra`, which is the (S,T,C,K,3) detector keypoint array the one
+    # caller already passes so the keypoints follow the row permutation. They are VETOES over an
+    # unchanged centroid cost -- see `identity` -- so each may only zero an entry the centre gate
+    # already accepted, and `max_move`'s calibration in box sides is untouched. Without keypoints
+    # every cue abstains and this is byte-identical to the centroid-only rule.
+    cues = axis_veto_deg is not None or kpt_affinity is not None or random_veto
+    kp = extra if (cues and extra is not None and np.asarray(extra).ndim == 5) else None
+    # A ROW'S LAST KNOWN KEYPOINTS, carried exactly as `last` carries its box: a shape is slower
+    # changing than a position, so a held set is a better prior than none, and a one-frame miss
+    # must not blind the cue any more than it breaks the box chain.
+    last_kp = None if kp is None else kp[:, 0].copy()
+    rng = np.random.default_rng(seed)
+    fired = {'axis': 0, 'kpt': 0, 'random': 0, 'eligible': 0}
     for t in range(1, T):
         cur = boxes[:, t]
         cost = np.zeros((S, S), np.float32)
@@ -525,6 +558,30 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
             # branson's flies ~30, so one pixel gate cannot serve both.
             gap = np.where(side > 0, d / (max_move * np.maximum(side, 1e-6)), np.inf)
             cost[np.ix_(ok_p, ok_c)] += np.clip(1.0 - gap, 0.0, None)
+        if kp is not None:
+            # APPLIED TO THE SUMMED COST, AFTER EVERY CAMERA, because in 2D there is one camera and
+            # in multi-camera this path only runs with `--no-track`, where a row is an animal
+            # ACROSS cameras -- so a per-camera veto would reject a pair on one view's opinion.
+            pi, pj = np.nonzero(cost > 0)
+            fired['eligible'] += len(pi)
+            for i, j in zip(pi, pj):
+                a, b = last_kp[i, 0], kp[j, t, 0]
+                if axis_veto_deg is not None:
+                    g = idy.angle_gap(idy.body_axis(a), idy.body_axis(b))
+                    # NaN IS AN ABSTENTION: `g > thresh` is False for NaN, which is what is wanted.
+                    if np.isfinite(g) and g > axis_veto_deg:
+                        cost[i, j] = 0.0
+                        fired['axis'] += 1
+                        continue
+                if kpt_affinity is not None:
+                    f = idy.kpt_in_box_frac(a, cur[j, 0])
+                    if np.isfinite(f) and f < kpt_affinity:
+                        cost[i, j] = 0.0
+                        fired['kpt'] += 1
+                        continue
+                if random_veto and rng.random() < random_veto:
+                    cost[i, j] = 0.0
+                    fired['random'] += 1
         rows, cols = linear_sum_assignment(-cost)
         taken = {int(r): int(c) for r, c in zip(rows, cols) if cost[r, c] > 0}
         # A BIRTH, and only into a slot no live animal is using.
@@ -565,8 +622,17 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
             scores[:, t] = sc
         seen = np.isfinite(boxes[:, t]).all(-1)
         last = np.where(seen[..., None], boxes[:, t], last)
+        if last_kp is not None:
+            # THE SAME CARRY RULE THE BOX FOLLOWS, off the SAME `seen` mask, so a row's held
+            # keypoints and its held box always describe the same observation. Updating them on
+            # different conditions is how the two would come to describe different frames.
+            last_kp = np.where(seen[:, :, None, None], kp[:, t], last_kp)
         age = np.where(seen.any(-1), 0, age + 1)
         # EXPIRY IS A FORGET, not just a flag: a stale centre that stays in the cost matrix keeps
         # competing for the detection that belongs to whoever is there now.
         last[age > max_age] = np.nan
+        if last_kp is not None:
+            last_kp[age > max_age] = np.nan
+    if stats is not None:
+        stats.update(fired)
     return boxes if scores is None else (boxes, scores)

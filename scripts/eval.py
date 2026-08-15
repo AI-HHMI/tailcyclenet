@@ -65,6 +65,67 @@ def label_lookup(data: Path, split: str):
     return out
 
 
+def chunk_frames(preds, labels, n):
+    """Split every group into `n`-frame pieces, each its own scoring unit. -> (preds, labels).
+
+    **THE BOOTSTRAP RESAMPLES GROUPS, AND A LONG CLIP IS ONE GROUP.** rat-city's whole test split is
+    a single 500-frame group, so every delta measured on it comes back `DEGENERATE (one group -- no
+    interval exists)` -- and the roots this repo most wants long-clip numbers from are exactly the
+    ones with the fewest groups. The protocol and the statistic disagreed about what a sample is.
+
+    A chunk is the right resampling unit for a clip: consecutive frames are correlated, whole clips
+    are too few, and a chunk of a few seconds is long enough to contain the episodic failures that
+    matter (report 19 §1: bad windows come in contiguous bursts) and short enough to give a usable n.
+
+    It is NOT free of assumptions and the direction is knowable: chunks from one clip are more alike
+    than independent clips would be, so an interval from this is OPTIMISTIC. Quote it as within-clip
+    uncertainty, never as though the clip were a sample of clips.
+    """
+    import dataclasses
+
+    out_p, out_l = {}, {}
+    for key, out in preds.items():
+        if key not in labels:
+            out_p[key] = out
+            continue
+        lab, sess = labels[key]
+        T = int(np.asarray(out['pred']).shape[1])
+        # THE MATCH RADIUS MUST COME FROM THE WHOLE GROUP, NOT THE CHUNK. `score` derives it as the
+        # median animal extent over whatever it is given, so per-chunk it varies with the sample --
+        # measured on this clip at 27.6 to 101.9 px across ten 50-frame chunks, a 3.7x swing. That
+        # would make chunking change the METRIC rather than only the resampling unit, and chunks
+        # scored under different radii are not exchangeable, which is the one thing a bootstrap
+        # needs them to be. Computed once here and carried in.
+        full = lab.points3d if str(out['mode']) == '3d' else lab.points2d[..., 0, :]
+        with np.errstate(all='ignore'):
+            span = np.nanmax(full, axis=2) - np.nanmin(full, axis=2)
+            extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+        for t0 in range(0, T, n):
+            t1 = min(t0 + n, T)
+            if t1 - t0 < 2:                       # gotcha 1: T = 1 is not a usable window
+                continue
+            sub = {}
+            for k, v in out.items():
+                a = np.asarray(v)
+                # AXIS 1 IS TIME, but only for the arrays that are frame-indexed. `outcome` and
+                # `crop` are WINDOW-indexed on the same axis, so they are left whole rather than
+                # sliced by a frame range that means nothing to them.
+                sub[k] = a[:, t0:t1] if (a.ndim >= 2 and a.shape[1] == T) else v
+            fields = {f.name: getattr(lab, f.name) for f in dataclasses.fields(lab)}
+            for k, v in fields.items():
+                if isinstance(v, np.ndarray) and v.ndim >= 2 and k != 'regions':
+                    # `ext` is (C,T,4,4) -- time on axis 1 as well, so the same rule covers it.
+                    if v.shape[1] == T:
+                        fields[k] = v[:, t0:t1]
+            if isinstance(fields.get('regions'), np.ndarray) and fields['regions'].size:
+                r = fields['regions']
+                fields['regions'] = r[(r[:, 0] >= t0) & (r[:, 0] < t1)]
+            sub['__extent__'] = np.float64(extent)
+            out_p[f'{key}#{t0}'] = sub
+            out_l[f'{key}#{t0}'] = (dataclasses.replace(lab, **fields), sess)
+    return out_p, out_l
+
+
 def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
     """One row per group: the error, the coverage behind it, and MOTA where there are instances.
 
@@ -98,9 +159,12 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
             # Row index is not identity once boxes come from a detector. Match, then measure --
             # and take the matched COUNTS too, so the coverage quoted below describes the same
             # points as the error above it.
-            with np.errstate(all='ignore'):
-                span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-                extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+            if '__extent__' in out:
+                extent = float(out['__extent__'])      # the WHOLE group's, carried by --chunk
+            else:
+                with np.errstate(all='ignore'):
+                    span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
+                    extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
             # ZERO IS NOT A RADIUS, AND IT IS FINITE. An instance-frame with exactly ONE finite
             # labelled keypoint has a keypoint-box diagonal of 0, not NaN, so the median can be 0
             # on a sparsely-labelled root -- rat-city labels 2.02 of 4 points per animal-frame,
@@ -152,22 +216,32 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
             m['box_agree'] = float(np.median(ba)) if ba.size else None
             m['box_agree_p99'] = float(np.quantile(ba, 0.99)) if ba.size else None
         if S > 1:
-            m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac)
+            m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
+                                               extent_override=out.get('__extent__'))
         rows.append(m)
     return rows
 
 
-def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0):
-    """(radius, mota dict) for one group. The ignore region is built here, from the labels."""
+def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None):
+    """(radius, mota dict) for one group. The ignore region is built here, from the labels.
+
+    `extent_override` is the WHOLE group's animal extent, supplied by `--chunk`. Without it each
+    chunk sizes its own radius from its own sample and the radius swings 3.7x across ten chunks of
+    one clip -- which makes chunks scored under different radii non-exchangeable, and exchangeable
+    is exactly what a bootstrap needs them to be.
+    """
     pred, true = m['_pred'], m['_true']
     St, T = true.shape[0], true.shape[1]
     # Match radius scaled to the animal's own size: the DIAGONAL of its keypoint bounding box, not
     # a per-axis span. Taking the per-axis span and median-ing it across axes gave 1.6 px on
     # rat-city -- tighter than the labelling noise, so every instance read as a miss AND a false
     # positive and MOTA went negative.
-    with np.errstate(all='ignore'):
-        span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
-        extent = np.nanmedian(np.linalg.norm(span, axis=-1))
+    if extent_override is not None:
+        extent = float(extent_override)
+    else:
+        with np.errstate(all='ignore'):
+            span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
+            extent = np.nanmedian(np.linalg.norm(span, axis=-1))
     # `is None`, not `or`: `--mota-dist 0` is falsy and was silently read as "unset". And the same
     # degenerate-extent case as above -- a zero radius makes every instance a miss AND a false
     # positive at once, which is the failure this line's own comment describes.
@@ -217,11 +291,22 @@ def main():
                          'inflates coverage and MOTA for whatever made the rows sparse, '
                          '`--vis-thresh` being exactly such a thing. A fraction and not a count: K '
                          'is 4 on rat-city and 47 on allen.')
+    ap.add_argument('--chunk', type=int, default=0,
+                    help='split each group into N-frame pieces, each its own scoring unit, so the '
+                         'bootstrap has something to resample. THE BOOTSTRAP RESAMPLES GROUPS and a '
+                         'long clip is ONE group -- rat-city\'s whole test split is a single '
+                         '500-frame group, so every delta on it reads DEGENERATE. An interval from '
+                         'chunks of one clip is WITHIN-CLIP uncertainty and is optimistic against '
+                         'the between-clip kind; say which one a number is (eval rule 1).')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
     preds, meta = load_predictions(args.predictions)
     labels = label_lookup(args.data, args.split)
+    if args.chunk:
+        preds, labels = chunk_frames(preds, labels, args.chunk)
+        print(f'--chunk {args.chunk}: {len(preds)} scoring unit(s) -- WITHIN-clip uncertainty, '
+              'not between-clip')
     print(f'run={meta["run"]}  anchor={meta["anchor"]}  boxes={meta["boxes"]}'
           + (f'  box_source={meta["box_source"]}' if meta.get('box_source') else ''))
     if meta['anchor'] == 'labels':
@@ -305,6 +390,12 @@ def main():
 
     if args.vs:
         other, ometa = load_predictions(args.vs)
+        # THE SECOND FILE MUST BE CHUNKED THE SAME WAY, or the two sides key on different names and
+        # the pairing silently finds nothing in common -- which prints `no shared groups` and is
+        # easy to read as "these arms scored different clips". `labels` here is ALREADY the chunked
+        # lookup, so this reuses it rather than rebuilding one that could differ.
+        if args.chunk:
+            other, _ = chunk_frames(other, label_lookup(args.data, args.split), args.chunk)
         print(f'\nPAIRED: {args.predictions} minus {args.vs}')
         print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
         by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,

@@ -223,3 +223,51 @@ def test_mota_dist_zero_is_not_read_as_unset():
             assert old == 25.0 and new == 0.0, 'this is the case that used to be ignored'
         else:
             assert old == new
+
+
+def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path):
+    """`--chunk` gives a one-group clip something for the bootstrap to resample.
+
+    The bootstrap resamples GROUPS, and rat-city's whole test split is a single 500-frame group, so
+    every delta on it came back `DEGENERATE (one group -- no interval exists)`. The roots this repo
+    most wants long-clip numbers from are exactly the ones with the fewest groups.
+
+    Two properties, and the second is the one that makes it a resampling change rather than a METRIC
+    change: the chunks PARTITION the frames (nothing scored twice, nothing dropped), and the match
+    radius is the whole group's, not each chunk's. Sized per chunk it swung 27.6 to 101.9 px across
+    ten chunks of one clip -- a 3.7x swing that would leave chunks non-exchangeable, which is the
+    one thing a bootstrap needs them to be.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    from tailcyclenet.format import Session
+
+    ev = _eval_module()
+    cf._session_2d(tmp_path / 'ds' / 'test' / 's', T=20)
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    labels = {f's/{gid}': (sess.labels(gid), sess) for gid in sess.groups}
+    gid = next(iter(sess.groups))
+    true = labels[f's/{gid}'][0].points2d[..., 0, :]
+    preds = {f's/{gid}': {'pred': true.copy(), 'mode': np.array('2d')}}
+
+    chunked_p, chunked_l = ev.chunk_frames(preds, labels, 5)
+    assert len(chunked_p) == 4, f'20 frames in 5s is 4 chunks, got {sorted(chunked_p)}'
+    # A PARTITION: every frame in exactly one chunk, and the concatenation is the original.
+    rebuilt = np.concatenate([chunked_p[f's/{gid}#{t0}']['pred'] for t0 in (0, 5, 10, 15)], axis=1)
+    np.testing.assert_array_equal(rebuilt, true)
+    for t0 in (0, 5, 10, 15):
+        assert chunked_p[f's/{gid}#{t0}']['pred'].shape[1] == 5
+        # The labels are sliced to match, or a chunk scores its prediction against another's labels.
+        np.testing.assert_array_equal(
+            chunked_l[f's/{gid}#{t0}'][0].points2d[..., 0, :], true[:, t0:t0 + 5])
+
+    # THE RADIUS IS THE WHOLE GROUP'S. Every chunk carries the same one, and it is what an unchunked
+    # score would have used -- so chunking cannot move the number, only its uncertainty.
+    ext = {float(chunked_p[f's/{gid}#{t0}']['__extent__']) for t0 in (0, 5, 10, 15)}
+    assert len(ext) == 1, f'chunks must share one match radius, got {ext}'
+    rows = ev.score(preds, labels, quiet=True)
+    assert abs(ext.pop() - rows[0]['mpjpe_r']) < 1e-6, \
+        'the shared radius must be the one the unchunked scoring used'

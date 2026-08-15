@@ -160,6 +160,16 @@ def main():
                     help="reject a match where fewer than FRAC of the target's keypoints fall inside "
                          "the detection's box. Report 12's R5 term, never built until now: it counts "
                          'inside/outside over K, so per-keypoint noise averages away.')
+    ap.add_argument('--swap-repair', type=float, default=None, metavar='GAIN',
+                    help='report 16 §9.2 item 5, and the only one of the six still standing after '
+                         'report 19. Offline O(T x S^2) pass that EXCHANGES two rows\' suffixes '
+                         'where a swap is indicated -- it re-seats rather than rejecting, so it '
+                         'conserves every edge, which is the property a starved matcher needs. GAIN '
+                         'is the margin in degrees (two rows are always exchangeable, so with no '
+                         'margin it fires on noise everywhere); 30 is a starting value, not a '
+                         'calibrated one. IT FIRES ON THE SAME DISCONTINUITY the label-free '
+                         'statistic is built from, so score it on idsw/MOTA against labels and '
+                         'NEVER on that proxy.')
     ap.add_argument('--kpt-centre', action='store_true',
                     help="use the keypoint CENTROID as the affinity's point instead of the box "
                          'centre (report 16 §9.2 item 4). NOT a veto -- it moves the point and '
@@ -541,7 +551,7 @@ def main():
                     dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move,
                     axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
                     random_veto=args.random_veto, seed=args.seed, stats=veto_stats,
-                    kpt_centre=args.kpt_centre)
+                    kpt_centre=args.kpt_centre, swap_repair=args.swap_repair)
                 # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
                 # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
                 # whenever any cue is on, so an arm that silently never fired is visible as such

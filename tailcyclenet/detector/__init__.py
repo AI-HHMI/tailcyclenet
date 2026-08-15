@@ -267,7 +267,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2, dup_res_px=None,
                     track=True, max_move=1.0, axis_veto_deg=None, kpt_affinity=None,
-                    random_veto=None, seed=0, stats=None, kpt_centre=False):
+                    random_veto=None, seed=0, stats=None, kpt_centre=False, swap_repair=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     `raw` is `detect_raw`'s `(boxes, scores, kpts)`. Returns the same triple re-indexed so row `a`
@@ -299,6 +299,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
     """
     import numpy as np
     import torch
+
+    from . import identity as idy
 
     r_box, r_sc, r_kp = raw
     D, T, C = r_sc.shape
@@ -378,6 +380,13 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
                             stats=stats, kpt_centre=kpt_centre)
     elif stats is not None and tracker is not None:
         stats.update(tracker.vetoed)
+    # ITEM 5, AFTER EVERYTHING ELSE AND OFFLINE. It re-seats rows rather than rejecting edges, so it
+    # runs on the finished assignment and conserves every detection -- the property §4 identifies as
+    # necessary. It NEEDS keypoints; without them it is a no-op rather than a silent identity pass.
+    if swap_repair is not None and kp is not None:
+        n = idy.swap_repair(out, kp, scores=sc, min_gain=float(swap_repair))
+        if stats is not None:
+            stats['swaps'] = n
     return out, sc, kp
 
 

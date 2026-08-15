@@ -1434,3 +1434,36 @@ def test_the_target_keypoint_set_is_only_built_when_a_cue_reads_it():
                      ({'kpt_affinity': 0.5}, True)):
         got = CrossViewTracker(3, **kw)._wants_kpts
         assert got is want, f'{kw}: _wants_kpts is {got}, expected {want}'
+
+
+def test_swap_repair_conserves_every_detection():
+    """Item 5 re-seats rows; it must never DROP one. That is the whole reason it is still standing.
+
+    Report 19 §4 measured the veto family as a net loss because it removes edges from a matcher
+    already starved of them (§3), and §11 found edge-conserving is necessary though not sufficient.
+    A repair that quietly lost a detection would be a veto wearing a different name, so the
+    invariant is checked directly: the multiset of boxes is unchanged, only its row assignment moves.
+    """
+    from tailcyclenet.detector.identity import swap_repair
+
+    rng = np.random.default_rng(0)
+    S, T, K = 3, 30, 8
+    u = np.linspace(-40, 40, K)
+    kp = np.zeros((S, T, 1, K, 2))
+    for s in range(S):
+        ang = s * np.pi / 3
+        for t in range(T):
+            kp[s, t, 0] = np.stack([500 * s + 300 + u * np.cos(ang),
+                                    200 + u * np.sin(ang)], -1) + rng.normal(0, 1, (K, 2))
+    box = np.zeros((S, T, 1, 4))
+    for s in range(S):
+        for t in range(T):
+            p = kp[s, t, 0]
+            box[s, t, 0] = [p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max()]
+    kp[[0, 1], 15:] = kp[[1, 0], 15:]
+    box[[0, 1], 15:] = box[[1, 0], 15:]
+
+    before = np.sort(box.reshape(-1, 4), axis=0)
+    swap_repair(box, kp)
+    after = np.sort(box.reshape(-1, 4), axis=0)
+    np.testing.assert_allclose(before, after, err_msg='a repair must not create or destroy a box')

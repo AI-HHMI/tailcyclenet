@@ -214,6 +214,70 @@ def epipolar(res, signed=False):
     return float(np.mean(r)) if signed else float(np.median(np.abs(r)))
 
 
+def step_cost(prev_k, cur_k):
+    """How surprising is it that `cur_k` is the same animal as `prev_k` one frame later?
+
+    Axis turn in degrees plus the RELATIVE length change scaled to degrees, so the two are summed in
+    one unit rather than with a weight nobody calibrated. 90 deg is the scale factor because that is
+    the axis measure's full range (it is undirected), so a doubling in length costs the same as a
+    right-angle turn. NaN where either cue abstains -- the caller must treat that as "no opinion",
+    never as zero.
+
+    This is the SAME definition report 19 §6 measured as a label-free swap proxy, and that
+    circularity is the point and the trap: a repair that fires on this must NOT be scored on it.
+    Score it on `idsw`/MOTA against labels (§6's `axis-veto 60` has the best median axis turn of any
+    arm and 2.6x the baseline's idsw).
+    """
+    va, vb = body_axis(prev_k), body_axis(cur_k)
+    la, lb = body_length(prev_k), body_length(cur_k)
+    ang = angle_gap(va, vb)
+    if not np.isfinite(ang) or not (np.isfinite(la) and np.isfinite(lb)) or min(la, lb) <= 1e-9:
+        return np.nan
+    return float(ang + 90.0 * abs(la - lb) / min(la, lb))
+
+
+def swap_repair(boxes, kpts, scores=None, min_gain=30.0):
+    """Report 16 §9.2 item 5: exchange two rows' SUFFIXES where a swap is indicated. In place.
+
+    **THE ONLY PROPOSAL OF THE SIX STILL STANDING** after report 19: items 3 and 6 are dead on
+    population size (§9), 1 and 2 are net losses in their veto form (§4), 4 is refuted on both roots
+    (§11). This is the one that RE-SEATS rather than rejects -- it conserves every edge, which §4
+    identifies as necessary on a matcher that is starved of candidates, and it uses the cue signal §4
+    measured as real (both cues beat their rate-matched controls on idsw).
+
+    A swap is a PERSISTENT event, so the repair is persistent: if rows a and b exchanged animals at
+    frame t, then a holds b's animal for the rest of the clip, and the fix is to swap `[t:]` of both.
+    Swapping a single frame would repair the discontinuity at t and create a second one at t+1.
+
+    `min_gain` is in the units of `step_cost` (degrees), and it exists because two rows are ALWAYS
+    exchangeable: with no margin this fires on noise everywhere and reorders the whole clip. 30 deg
+    is a starting value, not a calibrated one -- sweep it and report the fire rate, per §4.
+
+    O(T x S^2) over arrays that already exist, no model, no labels.
+    """
+    b = np.asarray(boxes)
+    k = np.asarray(kpts)
+    S, T = b.shape[0], b.shape[1]
+    swaps = 0
+    for t in range(1, T):
+        for i in range(S):
+            for j in range(i + 1, S):
+                # Camera 0 decides. A row is ONE animal across cameras by construction here, so a
+                # swap is a property of the row pair rather than of a view, and testing every camera
+                # would weight the decision by how many cameras happened to see them.
+                ci, cj = step_cost(k[i, t - 1, 0], k[i, t, 0]), step_cost(k[j, t - 1, 0], k[j, t, 0])
+                si, sj = step_cost(k[i, t - 1, 0], k[j, t, 0]), step_cost(k[j, t - 1, 0], k[i, t, 0])
+                if not np.isfinite([ci, cj, si, sj]).all():
+                    continue                      # an abstention is not evidence for a swap
+                if (ci + cj) - (si + sj) > min_gain:
+                    for arr in (b, k) + ((np.asarray(scores),) if scores is not None else ()):
+                        tmp = arr[i, t:].copy()
+                        arr[i, t:] = arr[j, t:]
+                        arr[j, t:] = tmp
+                    swaps += 1
+    return swaps
+
+
 def demo():
     """assert-based, dependency-free:  pixi run python -m tailcyclenet.detector.identity"""
     rng = np.random.default_rng(0)
@@ -293,6 +357,33 @@ def demo():
     assert abs(epipolar(straddle, signed=True)) < abs(epipolar(one_side, signed=True)), \
         'the signed mean must separate a straddling residual from a displaced one'
     assert epipolar(straddle) > 0, 'the median-of-norms is positive even for a correct pairing'
+
+    # SWAP REPAIR. Two animals at right angles to each other, whose rows swap at frame 10 -- the
+    # exact event the repair exists to undo. Build it as ground truth, corrupt it, and check the
+    # repair restores the original rather than merely reducing some cost.
+    T, K = 20, 8
+    u = np.linspace(-40, 40, K)
+    true_k = np.zeros((2, T, 1, K, 2))
+    for t in range(T):
+        true_k[0, t, 0] = np.stack([300 + u, 200 + 0 * u], -1)          # along x
+        true_k[1, t, 0] = np.stack([700 + 0 * u, 600 + u], -1)          # along y
+    true_b = np.zeros((2, T, 1, 4))
+    for s in range(2):
+        for t in range(T):
+            p = true_k[s, t, 0]
+            true_b[s, t, 0] = [p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max()]
+    bad_k, bad_b = true_k.copy(), true_b.copy()
+    bad_k[[0, 1], 10:] = bad_k[[1, 0], 10:]
+    bad_b[[0, 1], 10:] = bad_b[[1, 0], 10:]
+    n = swap_repair(bad_b, bad_k)
+    assert n == 1, f'exactly one swap should be found, got {n}'
+    assert np.allclose(bad_k, true_k), 'the repair must RESTORE the rows, not just reduce a cost'
+
+    # AND IT MUST NOT FIRE ON CLEAN DATA. A repair that reorders a correct clip is worse than none,
+    # and with no margin two rows are always exchangeable -- which is what `min_gain` is for.
+    clean_b, clean_k = true_b.copy(), true_k.copy()
+    assert swap_repair(clean_b, clean_k) == 0, 'must not fire on a clip with no swap'
+    assert np.allclose(clean_k, true_k)
     print('identity: ok')
 
 

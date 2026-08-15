@@ -578,6 +578,22 @@ class PoseDataset(Dataset):
                     self.registry.ids_for(ds.name, sess.names), dtype=torch.long)
                 for gid, group in sess.groups.items():
                     lab = sess.labels(gid)
+                    # THE TABLE `_item` WILL DEREFERENCE, CHECKED WHERE THE SESSION HAS A NAME.
+                    # `_item` picks its target table off `sess.mode` alone, but the window is
+                    # admitted below off whichever visibility table exists -- and the spec allows
+                    # a `mode = "3d"` session carrying only `keypoints.pq` (§8, validation rule
+                    # 12; rule 6 requires only ONE of the two tables). That combination reached
+                    # `lab.points3d[a]` as `TypeError: 'NoneType' object is not subscriptable`,
+                    # mid-epoch, uncaught -- only a `None` return is retried. Refused here
+                    # instead, naming the session and the table, because the loader genuinely
+                    # cannot build 3D targets out of 2D labels.
+                    need = 'points3d' if sess.mode == '3d' else 'points2d'
+                    if getattr(lab, need) is None:
+                        raise ValueError(
+                            f'{sess.path}: mode is {sess.mode!r} so every window needs '
+                            f'{need}, and this session carries none. The format allows it '
+                            '(one label table is enough) but training on it does not: there is '
+                            'nothing to supervise the targets with.')
                     vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
                     if vis is None:
                         continue

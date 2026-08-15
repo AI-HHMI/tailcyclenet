@@ -1091,3 +1091,30 @@ def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
     assert cv2.warpAffine(src, aff, (256, 0)).shape == src.shape, \
         'if OpenCV ever raises on a zero dsize, the clamp above is belt-and-braces'
     assert cv2.warpAffine(src, aff, (256, 1)).shape == (1, 256, 3)
+
+
+def test_a_3d_session_with_no_points3d_is_refused_by_name(tmp_path):
+    """The format allows it; training on it does not. It used to CRASH mid-epoch instead.
+
+    Spec §8 and validation rule 12 admit a `mode = "3d"` session carrying only `keypoints.pq`
+    (rule 6 needs just one of the two tables), and the index builder admits its windows off
+    `vis2d`. But `_item` picks its target table off `sess.mode` alone, so it reached
+    `lab.points3d[a]` as `TypeError: 'NoneType' object is not subscriptable` -- uncaught, since
+    only a `None` return is retried, and with nothing in the message naming the session.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    root = tmp_path / 'ds'
+    cf._session_3d(root / 'train' / 's_3d')
+    (root / 'train' / 's_3d' / 'points3d.pq').unlink()
+
+    with pytest.raises(ValueError, match='points3d'):
+        PoseDataset(root, 'train', CFG, train=False)
+    # ...and the message names the session, which is the whole point of moving the check here.
+    try:
+        PoseDataset(root, 'train', CFG, train=False)
+    except ValueError as e:
+        assert 's_3d' in str(e)

@@ -176,10 +176,14 @@ class CrossViewTracker:
         dk = None if det_kpts is None else np.asarray(det_kpts, float)
         for i, j in live:
             tk = proj.get(int(i))
-            if tk is None or dk is None or int(j) >= dk.shape[0]:
-                continue
-            d = dk[int(j)]
-            if self.axis_veto_deg is not None:
+            # THE RANDOM CONTROL NEEDS NO KEYPOINTS, and must not be skipped when a keypoint cue
+            # would have abstained. It was: an early `continue` on `tk is None` guarded all three
+            # cues together, so once the target keypoint set stopped being built for control arms
+            # the control silently stopped firing -- a rate-matched control that rejects nothing is
+            # not a control, and every veto number quoted against it would have been meaningless.
+            have_kpts = tk is not None and dk is not None and int(j) < dk.shape[0]
+            d = dk[int(j)] if have_kpts else None
+            if self.axis_veto_deg is not None and have_kpts:
                 gap = idy.angle_gap(idy.body_axis(tk), idy.body_axis(d))
                 # NaN IS AN ABSTENTION, NOT A REJECTION. `gap > thresh` is False for NaN, which is
                 # the behaviour wanted -- but writing it as `not (gap <= thresh)` would invert that
@@ -188,7 +192,7 @@ class CrossViewTracker:
                     out[i, j] = 0.0
                     self._veto('axis')
                     continue
-            if self.kpt_affinity is not None:
+            if self.kpt_affinity is not None and have_kpts:
                 frac = idy.kpt_in_box_frac(tk, det_boxes[int(j)].numpy())
                 if np.isfinite(frac) and frac < self.kpt_affinity:
                     out[i, j] = 0.0

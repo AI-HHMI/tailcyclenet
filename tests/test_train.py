@@ -129,3 +129,47 @@ def test_stride_is_divided_out_of_the_smoothness_weight():
     # And it is idempotent -- re-derived from the configured weight each call, never compounded.
     mod._tune_smoothness(loss_fn, 4, 1)
     assert loss_fn.smoothness_loss_3d.weight == 0.5
+
+
+def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
+    """`optimizer_state` was written from day one and read by NOTHING.
+
+    So a relaunch into the same --out began again at iteration 0 and overwrote both ~5.6 GB files
+    -- `checkpoint_last.pth` at the first boundary, and `checkpoint_best.pth` as soon as any val
+    beat `saved_mpjpe = inf`. On a preemptible job that is the whole run.
+
+    Pins the part that can be silently wrong: that the schedule-free optimizer's own state (the
+    `z` iterate) survives the round trip, and that resuming takes the RAW weights rather than the
+    averaged eval ones. The `it = start_it` arithmetic is not what breaks.
+    """
+    from schedulefree import AdamWScheduleFree
+
+    from tailcyclenet.checkpoints import save_checkpoint
+
+    torch.manual_seed(0)
+    model = torch.nn.Linear(4, 4)
+    opt = AdamWScheduleFree(model.parameters(), lr=1e-3)
+    opt.train()
+    # SEVERAL steps: schedule-free's averaged iterate coincides with the raw one at step 1, so a
+    # single step cannot tell "resume from the raw weights" from "resume from the eval weights".
+    for _ in range(5):
+        opt.zero_grad()
+        model(torch.randn(2, 4)).sum().backward()
+        opt.step()
+    save_checkpoint(tmp_path / 'run', 1234, model, opt, {'model': {}})
+
+    ck = torch.load(tmp_path / 'run' / 'checkpoints' / 'checkpoint_last.pth',
+                    map_location='cpu', weights_only=False)
+    assert int(ck['iteration']) == 1234, 'the iteration is what a resume restarts at'
+    # The two iterates are genuinely different, or "resume from the raw one" is a distinction
+    # without a difference and this test would pass on the wrong weights.
+    assert not torch.equal(ck['model_state']['weight'], ck['model_state_eval']['weight'])
+
+    fresh = torch.nn.Linear(4, 4)
+    fresh_opt = AdamWScheduleFree(fresh.parameters(), lr=1e-3)
+    fresh.load_state_dict(ck['model_state'])
+    fresh_opt.load_state_dict(ck['optimizer_state'])
+    assert torch.equal(fresh.weight, ck['model_state']['weight'])
+    assert fresh_opt.state, 'no optimizer state came back, so the schedule-free z is lost'
+    assert any('z' in s for s in fresh_opt.state.values()), \
+        'the z iterate is the state that makes this a resume rather than a restart'

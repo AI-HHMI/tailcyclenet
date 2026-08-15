@@ -332,6 +332,8 @@ def main():
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--num-workers', type=int, default=None)
     ap.add_argument('--no-warm-start', action='store_true')
+    ap.add_argument('--no-resume', action='store_true',
+                    help='start from iteration 0 even if the run folder holds a checkpoint_last')
     ap.add_argument('--no-wandb', action='store_true', help='ignore the [wandb] config block')
     args = ap.parse_args()
 
@@ -455,6 +457,33 @@ def main():
     losses.setdefault('per_camera_cube_scale',
                       bool(config['model'].get('per_camera_cube_scale', False)))
     loss_fn = TotalLoss(**losses)
+
+    # RESUME, because the jobs are preemptible and re-running into the same --out is the
+    # documented way to restart one (`init_wandb`, above). This used to begin again at iteration 0
+    # AND destroy what the previous run had earned: `checkpoint_last.pth` is overwritten at the
+    # first boundary, and `saved_mpjpe = inf` replaces `checkpoint_best.pth` with whatever the
+    # fresh run reaches first. Both files are ~5.6 GB and a 60k run has no other copy.
+    # `optimizer_state` has been written since day one and read by nothing; this is that read.
+    #
+    # `model_state`, not `model_state_eval`: the raw iterate is what training continues from, and
+    # the averaged one is for evaluating. Warm start still runs above -- wasteful, but it is what
+    # fixes the `fresh` set and therefore the optimizer's parameter GROUPS, which the state below
+    # is keyed against by position.
+    #
+    # NOT restored: the sampler position. The sampler draws with replacement, so window order
+    # carries no contract, and a resumed run is simply not bit-identical to an uninterrupted one
+    # -- inside the ~0.041 mm run-to-run floor either way.
+    start_it, resumed = 0, run / 'checkpoints' / 'checkpoint_last.pth'
+    if resumed.exists() and not args.no_resume:
+        ck = torch.load(resumed, map_location=device, weights_only=False)
+        model.load_state_dict(ck['model_state'])
+        opt.load_state_dict(ck['optimizer_state'])
+        start_it = int(ck['iteration'])
+        print(f'resuming {resumed} at iteration {start_it} of {n_iter} '
+              '(--no-resume to start over, which OVERWRITES both checkpoints)')
+    elif resumed.exists():
+        print(f'--no-resume: {resumed} and any checkpoint_best.pth beside it WILL be overwritten')
+
     save_run_meta(run, config, registry)
     print(f'run folder: {run.resolve()}')
     wb = init_wandb(config, run, disabled=args.no_wandb)
@@ -485,13 +514,28 @@ def main():
               'written. Pick freqs that divide.')
     model.train()
     opt.train()
-    it, skipped, t0, running, clipped = 0, 0, time.time(), [], []
+    it, skipped, t0, running, clipped = start_it, 0, time.time(), [], []
     # best_mpjpe/best_iter: the best val at ANY val step -- a number, used for plateau detection.
     # saved_mpjpe: the metric of the file currently on disk as `checkpoint_best.pth`. The two are
     # different on purpose; only the second one costs a 3.15 GB write. `latest` is the most recent
     # val and the iteration it came from, so the checkpoint block can tell a fresh number from a
     # stale one.
-    best_mpjpe, best_iter, saved_mpjpe = float('inf'), 0, float('inf')
+    best_mpjpe, best_iter, saved_mpjpe = float('inf'), start_it, float('inf')
+    # ON RESUME, `saved_mpjpe` DESCRIBES A FILE THAT STILL EXISTS. Left at inf it would be beaten
+    # by the first val the resumed run produces, which is how a good `checkpoint_best.pth` gets
+    # replaced by a worse one. Read back from the log rather than from the checkpoint, because it
+    # is the metric of the `best` file and the `best` file does not record it.
+    if start_it and log_path.exists():
+        prev = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
+        marks = [r for r in prev if 'saved_mpjpe' in r]
+        if marks:
+            saved_mpjpe = float(marks[-1]['saved_mpjpe'])
+            best_mpjpe, best_iter = saved_mpjpe, int(marks[-1]['iter'])
+            print(f'resuming: checkpoint_best.pth holds mpjpe {saved_mpjpe:.4g} '
+                  f'from iteration {best_iter}; it is only replaced by something better')
+        else:
+            print('resuming: no saved_mpjpe in log.jsonl, so checkpoint_best.pth is unattributed '
+                  'and the first val of this run will replace it')
     latest = (float('inf'), -1)
     waited, evalled, ckpted = [0.0], [0.0], [0.0]
     while it < n_iter:
@@ -587,6 +631,10 @@ def main():
                     saved_mpjpe = latest[0]
                     save_checkpoint(run, it, model, opt, config, name='best')
                     print(f'  new best: mpjpe {saved_mpjpe:.4g} -> checkpoint_best.pth')
+                    # WHAT THE `best` FILE HOLDS, in the log, because the file itself does not
+                    # record it -- and a resumed run that cannot read this replaces a good `best`
+                    # with its own first val.
+                    record({'iter': it, 'saved_mpjpe': saved_mpjpe})
                 ckpted[0] += time.time() - t_ck
                 print(f'saved {p} ({time.time() - t_ck:.0f}s)')
     print(f'done: {it} iterations, {skipped} skipped')

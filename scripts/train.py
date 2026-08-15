@@ -354,8 +354,11 @@ def main():
     # -- data ------------------------------------------------------------------------------
     lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
                          if k in LoaderConfig.__dataclass_fields__})
-    train_ds = PoseDataset(data_cfg['path'], 'train', lc,
-                           registry_base=base_registry(run, train_cfg.get('checkpoint_path')))
+    # Hoisted out of the call because `warm_start` needs it too: it is the evidence that the
+    # checkpoint's keypoint table is a PREFIX of this run's, and therefore that its trained rows
+    # can be carried over instead of reset.
+    base_reg = base_registry(run, train_cfg.get('checkpoint_path'))
+    train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=base_reg)
     registry = train_ds.registry
     print(f'train: {len(train_ds)} windows across {len(train_ds.datasets)} dataset(s), '
           f'{registry.n_keypoints} keypoints')
@@ -437,7 +440,8 @@ def main():
     model = build_model(config['model'], n_keypoints=registry.n_keypoints)
     fresh: set[str] = set()
     if not args.no_warm_start and train_cfg.get('checkpoint_path'):
-        fresh = warm_start(model, resolve_checkpoint(Path(train_cfg['checkpoint_path'])))
+        fresh = warm_start(model, resolve_checkpoint(Path(train_cfg['checkpoint_path'])),
+                           base_names=base_reg.names if base_reg else None)
     if train_cfg.get('freeze_encoder', True):
         n = 0
         for name, p in model.named_parameters():

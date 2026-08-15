@@ -746,3 +746,39 @@ def test_the_triangulation_repair_leaves_the_forward_value_alone():
     guarded = torch.where(torch.isfinite(tri.detach()), tri.detach(), fallback)
     assert torch.equal(torch.nan_to_num(plain, nan=-1.0), torch.nan_to_num(guarded, nan=-1.0))
     assert callable(_rays_fallback)
+
+
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_a_grown_registry_keeps_its_trained_keypoint_rows(tmp_path, enc):
+    """The one workflow the registry file exists for, and it used to reset the whole table.
+
+    `Registry.build(base=)` APPENDS -- it raises rather than renumbering -- so a run that adds a
+    dataset gets `kpt_embed.weight` at (n0+k, d) where the checkpoint has (n0, d).
+    `_filter_shape_mismatch` drops a changed shape WHOLE, so every trained identity row went back
+    to noise and retrained at `kpt_lr`, while CLAUDE.md promised the opposite. It is camouflaged
+    because under `wide` most of `query_encoder.*` is expected to be dropped anyway.
+    """
+    from tailcyclenet.checkpoints import warm_start
+
+    base = build_model(small(enc), n_keypoints=3)
+    ckpt = tmp_path / f'base_{enc}.pth'
+    torch.save({'model_state': base.state_dict()}, ckpt)
+
+    model = build_model(small(enc), n_keypoints=5)
+    virgin = model.query_encoder.kpt_embed.weight.detach().clone()
+    src = base.query_encoder.kpt_embed.weight.detach()
+    assert not torch.allclose(virgin[:3], src), 'the fresh table must differ, or this proves nothing'
+
+    fresh = warm_start(model, ckpt, verbose=False, base_names=('a', 'b', 'c'))
+    got = model.query_encoder.kpt_embed.weight.detach()
+    torch.testing.assert_close(got[:3], src)               # the trained ids survived...
+    torch.testing.assert_close(got[3:], virgin[3:])        # ...and the new ones are still fresh
+    assert not any('kpt_embed' in n for n in fresh), \
+        'the table must no longer be reported as dropped or left fresh'
+
+    # NEGATIVE CONTROL: a base registry that does not match the checkpoint's row count is not that
+    # registry's table, and copying it would point each row at a different body part. Refused.
+    model2 = build_model(small(enc), n_keypoints=5)
+    virgin2 = model2.query_encoder.kpt_embed.weight.detach().clone()
+    warm_start(model2, ckpt, verbose=False, base_names=('a', 'b'))
+    torch.testing.assert_close(model2.query_encoder.kpt_embed.weight.detach(), virgin2)

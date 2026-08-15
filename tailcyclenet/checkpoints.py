@@ -178,7 +178,8 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu', eval_weight
     return model.to(device).eval(), config, registry, path
 
 
-def warm_start(model, checkpoint_path: Path, verbose: bool = True) -> set[str]:
+def warm_start(model, checkpoint_path: Path, verbose: bool = True,
+               base_names: tuple[str, ...] | None = None) -> set[str]:
     """Load the base tracker into a pose model. Returns the names of the params left fresh.
 
     Three things happen that a plain `load_state_dict` would get wrong:
@@ -220,6 +221,39 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True) -> set[str]:
     state, interpolated = _interp_res_params(state, model)
     if interpolated and verbose:
         print('warm start: resolution-coupled tensors checked; see any res-interp lines above')
+
+    # A GROWN REGISTRY KEEPS ITS ROWS. `Registry.build(base=)` only ever APPENDS -- it raises if
+    # any dataset's ids move -- so the checkpoint's (n0, d) keypoint identity table is exactly the
+    # first n0 rows of this model's (n, d) one. `_filter_shape_mismatch` below drops any tensor
+    # whose shape changed WHOLE, so adding one dataset sent every trained identity row back to
+    # `normal_(std=0.02)` and retrained it at `kpt_lr`. That is the one workflow the registry file
+    # exists for, and it is camouflaged: under `wide` most of `query_encoder.*` is EXPECTED to be
+    # dropped, so the report line looks normal.
+    #
+    # `base_names` is the registry this run appended to. If its length is not n0 then the table in
+    # front of us is not that registry's -- a checkpoint from somewhere else, or a registry the
+    # caller resolved differently -- and the copy is REFUSED rather than guessed, because a
+    # mis-applied row copy points each embedding row at a different body part, which is worse than
+    # the reset it is fixing.
+    msd = model.state_dict()
+    for k, v in list(state.items()):
+        if not k.endswith('kpt_embed.weight') or k not in msd:
+            continue
+        n0, n = v.shape[0], msd[k].shape[0]
+        if not (n0 < n and v.shape[1:] == msd[k].shape[1:]):
+            continue
+        if base_names is not None and len(base_names) != n0:
+            if verbose:
+                print(f'warm start: {k} is {n0} rows but the base registry names '
+                      f'{len(base_names)}, so it is NOT that registry\'s table -- the rows are '
+                      'left fresh rather than copied onto the wrong keypoints')
+            continue
+        grown = msd[k].clone()
+        grown[:n0] = v
+        state[k] = grown
+        if verbose:
+            print(f'warm start: {k} widened {n0} -> {n} rows, {n0} preserved')
+
     state, dropped = _filter_shape_mismatch(state, model)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if verbose:

@@ -33,9 +33,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.format import INST_PRESENT, Session, load_dataset
-from tailcyclenet.metrics import (error_and_coverage, match_instances, matched_error, mota,
-                                  motion_ratio, paired_bootstrap, pck)
+from tailcyclenet.format import INST_PRESENT, UNLABELED, VISIBLE, Session, load_dataset
+from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, match_instances, matched_error,
+                                  mota, motion_ratio, paired_bootstrap, pck)
+
+_PCT_KEYS = tuple(f'p{p}' for p in ERR_PCTS)
 
 
 def load_predictions(path: Path):
@@ -126,7 +128,7 @@ def chunk_frames(preds, labels, n):
     return out_p, out_l
 
 
-def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
+def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_cost='mean'):
     """One row per group: the error, the coverage behind it, and MOTA where there are instances.
 
     Factored out of `main` so `--vs` scores the second file through the IDENTICAL path. A baseline
@@ -173,10 +175,11 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
             # entirely an artefact of the radius.
             max_dist = extent if np.isfinite(extent) and extent > 0 else np.inf
             mm = matched_error(pred, true, max_dist=max_dist,
-                               min_kpts_frac=min_kpts_frac)
+                               min_kpts_frac=min_kpts_frac, cost=match_cost)
             m['err_rowwise'] = m['err']
             m.update({k: v for k, v in mm.items()
-                      if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')})
+                      if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')
+                      or k in _PCT_KEYS})
             m['unmatched'] = mm.get('unmatched_true', 0)
             # AND PCK GETS THE SAME PAIRING. It reads `_pred` positionally, so on detector boxes
             # it was scoring animal i's prediction against animal j's label under a heading that
@@ -215,14 +218,67 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0):
             ba = ba[np.isfinite(ba)]
             m['box_agree'] = float(np.median(ba)) if ba.size else None
             m['box_agree_p99'] = float(np.quantile(ba, 0.99)) if ba.size else None
+        # `kpt_agree` IS THE 2D HALF OF THE SAME CHECK, and it was written and never read.
+        # `box_agree` is structurally bounded in 2D -- the pose is decoded inside its own crop, so
+        # its centroid can be at most about half a box side from the centre by construction, and
+        # every 2D arm measures p99 0.31-0.56 (branson-fly 0.153). The DETECTOR's keypoints are
+        # regressed in the full frame, so `kpt_agree` has no such ceiling and is the diagnostic
+        # `box_agree` can only be in 3D. Same units -- one box side -- so one threshold means the
+        # same thing on every root, which is exactly what `--vis-thresh`'s logit does not.
+        if 'kpt_agree' in out:
+            ka = np.asarray(out['kpt_agree'], float)
+            ka = ka[np.isfinite(ka)]
+            m['kpt_agree'] = float(np.median(ka)) if ka.size else None
+            m['kpt_agree_p99'] = float(np.quantile(ka, 0.99)) if ka.size else None
+        m.update(_vis_confusion(out, lab, mode, T))
         if S > 1:
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
-                                               extent_override=out.get('__extent__'))
+                                               extent_override=out.get('__extent__'),
+                                               match_cost=match_cost)
         rows.append(m)
     return rows
 
 
-def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None):
+def _vis_confusion(out, lab, mode, T, thresh=0.0):
+    """Score the DECISION to omit a keypoint, separately from where the kept ones landed.
+
+    SLEAP reports this as `vis.precision` / `vis.recall` and nothing here did. It matters because
+    `vis_pred` is read as a row gate by `--vis-thresh` and its TARGET is corrupted on two roots by
+    conversion decisions that are documented and therefore only caught by whoever read the docs:
+    calms21's converter writes every point `VISIBLE`, so the head trained against an all-true
+    target and reported `occlusion_acc = 1.0`; `rat-city-annotated` writes APT's occluded-but-placed
+    points (2,500 slots, 22.7% of its visible rows) as `visible` by decision, leaving 171 real
+    negatives in 11,168 rows.
+
+    Printed, both of those become a `base` near 1.000 with `recall` 1.000 and `precision` at the
+    base rate -- a number that says "this head has no negatives, do not gate on it" on ANY new root,
+    without anyone having to remember. It is a guard and not an accuracy figure: a clean confusion
+    matrix is still not a licence to gate, which is what the rate-matched random control is for.
+    """
+    # `conf` IS the per-keypoint `vis_pred` logit, (S,T,K) -- `run_group` writes it under that name.
+    # The label side is the status channel: `vis3d` in 3D, and the FIRST camera's `vis2d` in 2D,
+    # which is the same slice `true` was taken from above.
+    st = lab.vis3d if mode == '3d' else (None if lab.vis2d is None else lab.vis2d[..., 0])
+    if 'conf' not in out or st is None:
+        return {}
+    vp, st = np.asarray(out['conf'], float), np.asarray(st, int)
+    n, k = min(vp.shape[0], st.shape[0]), min(vp.shape[2], st.shape[2])
+    vp, st = vp[:n, :T, :k], st[:n, :T, :k]
+    if vp.shape != st.shape:
+        return {}
+    # UNLABELED is not a negative -- it is the absence of an assessment, and counting it as
+    # "not visible" would manufacture the very negatives these two roots do not have.
+    ok = np.isfinite(vp) & (st != UNLABELED)
+    if not ok.any():
+        return {}
+    yhat, y = vp[ok] > thresh, st[ok] == VISIBLE
+    tp, fp, fn = int((yhat & y).sum()), int((yhat & ~y).sum()), int((~yhat & y).sum())
+    return {'vis_precision': tp / (tp + fp) if tp + fp else float('nan'),
+            'vis_recall': tp / (tp + fn) if tp + fn else float('nan'),
+            'vis_base': float(y.mean()), 'vis_n': int(y.size)}
+
+
+def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_cost='mean'):
     """(radius, mota dict) for one group. The ignore region is built here, from the labels.
 
     `extent_override` is the WHOLE group's animal extent, supplied by `--chunk`. Without it each
@@ -265,7 +321,7 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None):
         if lab.boxes is not None and m['mode'] == '2d':
             ig_boxes = lab.boxes[:St, :T, 0]              # xyxy in the first camera
     return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes,
-                        min_kpts_frac=min_kpts_frac)
+                        min_kpts_frac=min_kpts_frac, cost=match_cost)
 
 
 def main():
@@ -298,6 +354,16 @@ def main():
                          '500-frame group, so every delta on it reads DEGENERATE. An interval from '
                          'chunks of one clip is WITHIN-CLIP uncertainty and is optimistic against '
                          'the between-clip kind; say which one a number is (eval rule 1).')
+    ap.add_argument('--match-cost', choices=('mean', 'penalised'), default='mean',
+                    help="how a candidate pair's per-keypoint distances become one number. "
+                         "'mean' (the default, and what every published number here used) divides "
+                         'by the SHARED count, so a row sharing ONE keypoint is scored on that '
+                         'keypoint and can out-bid a dense row. "penalised" is OKS\'s answer in '
+                         'distance units: every keypoint the LABEL has and the prediction declined '
+                         'is charged at the match radius and stays in the denominator. It buys '
+                         '--min-match-kpts\'s protection without its punitiveness at small K, '
+                         'because it degrades continuously instead of rejecting the pair. An arm, '
+                         'not a correction -- it moves every number in this repo.')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
@@ -312,7 +378,8 @@ def main():
     if meta['anchor'] == 'labels':
         print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
 
-    rows = score(preds, labels, args.mota_dist, min_kpts_frac=args.min_match_kpts)
+    rows = score(preds, labels, args.mota_dist, min_kpts_frac=args.min_match_kpts,
+                 match_cost=args.match_cost)
     if not rows:
         print('nothing scored')
         return
@@ -354,11 +421,38 @@ def main():
             print(f'[{mode}] motion_ratio {np.mean(mr):.3f}  (predicted path / label path over the '
                   f'steps both have, {len(mr)} group(s) -- UNPAIRED, a screen not a claim; '
                   '--vs pairs it)')
-        ba = [m['box_agree'] for m in block if m.get('box_agree') is not None]
-        if ba:
-            p99 = [m['box_agree_p99'] for m in block if m.get('box_agree_p99') is not None]
-            print(f'[{mode}] box_agree median {np.mean(ba):.3f} box-side(s), p99 '
-                  f'{np.mean(p99):.3f}  (pose centroid to its own crop box)')
+        # THE TAIL, because the mean above cannot show one. An arm that declines five sixths of the
+        # animals has a flattering mean and a p90 that says so (eval rule 6), and it is the one
+        # column comparable to the literature at all -- APT reports raw Euclidean percentiles and
+        # no OKS, and SLEAP reports p50..p99 beside an mAP whose sigma matches nobody's.
+        pcts = [k for k in _PCT_KEYS if any(np.isfinite(m.get(k, np.nan)) for m in block)]
+        if pcts:
+            cells = '  '.join(f'{k} {np.nanmean([m.get(k, np.nan) for m in block]):.3f}'
+                              for k in pcts)
+            print(f'[{mode}] err {cells} {unit}  (mean over {len(block)} group(s))')
+        for name, label in (('box_agree', 'pose centroid to its own crop box'),
+                            # UNBOUNDED IN 2D where `box_agree` is capped at ~half a box side by
+                            # construction: the detector's keypoints are regressed in the full
+                            # frame, the pose is decoded inside its crop.
+                            ('kpt_agree', 'pose to its own detector keypoints')):
+            vals = [m[name] for m in block if m.get(name) is not None]
+            if vals:
+                p99 = [m[f'{name}_p99'] for m in block if m.get(f'{name}_p99') is not None]
+                print(f'[{mode}] {name} median {np.mean(vals):.3f} box-side(s), p99 '
+                      f'{np.mean(p99):.3f}  ({label})')
+        # THE HEAD'S TARGET, NOT ITS OUTPUT. A `base` at 1.000 means the converter wrote every
+        # point VISIBLE and there is nothing for `--vis-thresh` to learn -- calms21 exactly, where
+        # the gate is worth -0.037 to -0.123 MOTA. Print it wherever `vis_pred` exists so the next
+        # root declares itself instead of being documented.
+        vb = [m for m in block if m.get('vis_base') is not None]
+        if vb:
+            def _mean(k):
+                v = [m[k] for m in vb if np.isfinite(m[k])]
+                return np.mean(v) if v else float('nan')
+            print(f'[{mode}] vis precision {_mean("vis_precision"):.4f}  recall '
+                  f'{_mean("vis_recall"):.4f}  base {_mean("vis_base"):.4f} '
+                  f'({sum(m["vis_n"] for m in vb)} assessed points, logit > 0). A base near 1.000 '
+                  'means the target has no negatives -- do not gate on this head.')
 
         thresholds = ([float(t) for t in args.pck.split(',')] if args.pck
                       else ([2.0, 5.0, 10.0] if unit == 'mm' else [5.0, 10.0, 20.0]))
@@ -399,7 +493,8 @@ def main():
         print(f'\nPAIRED: {args.predictions} minus {args.vs}')
         print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
         by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,
-                                              min_kpts_frac=args.min_match_kpts)}
+                                              min_kpts_frac=args.min_match_kpts,
+                                              match_cost=args.match_cost)}
         pairs = [(m, by_key[m['group']]) for m in rows if m['group'] in by_key]
         if not pairs:
             print('  no shared groups')
@@ -461,6 +556,9 @@ def main():
                              + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
                 print(f'[{mode}] {"motion_ratio":>13s} {dm["mean"]:+.4f}  {tail}')
             paired('box_agree', lambda m: m.get('box_agree'))
+            paired('kpt_agree', lambda m: m.get('kpt_agree'))
+            for _k in _PCT_KEYS:
+                paired(f'err {_k}', (lambda k: lambda m: m.get(k))(_k))
             # And the FP term SPLIT, not just its total: `dup` is what arbitration could remove and
             # `none` is what a detector threshold could, so a paired `fp_rate` alone cannot say
             # which of the two an arm moved.

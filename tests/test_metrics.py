@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
-from tailcyclenet.metrics import (_dist, match_instances, matched_error, mota, motion_ratio,
-                                  path_length)
+from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, match_instances,
+                                  matched_error, mota, motion_ratio, path_length)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -271,3 +271,76 @@ def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path
     rows = ev.score(preds, labels, quiet=True)
     assert abs(ext.pop() - rows[0]['mpjpe_r']) < 1e-6, \
         'the shared radius must be the one the unchunked scoring used'
+
+
+def test_err_percentiles_describe_the_tail_the_mean_hides():
+    """p75..p99 come from the same matched vector as `err`, and outlast a flattering mean.
+
+    A MEAN CANNOT SHOW A TAIL. branson-fly reads MPJPE 0.599 px with p99 3.952 -- 6.6x the mean --
+    and every localisation failure this repo has found (the 182 mm seam p90 against a 2.4 interior,
+    the crop p90 566 -> 317) was found in a quantile and reported in one.
+    """
+    true = np.zeros((1, 1000, 1, 2))
+    pred = np.zeros((1, 1000, 1, 2))
+    pred[0, 980:, 0, 0] = 1000.0               # 2% of frames catastrophic, 98% exact
+    m = error_and_coverage(pred, true)
+    assert m['p75'] == 0.0 and m['p90'] == 0.0, 'the bulk is exact; only the tail moves'
+    assert m['p99'] == 1000.0, 'p99 must land ON the failures, not average them away'
+    assert m['err'] == pytest.approx(20.0), 'while the mean reports a 20 px model'
+
+    # And an all-NaN vector is NaN, not a crash and not a zero: no matched point is not "no error".
+    empty = error_and_coverage(np.full((1, 2, 1, 2), np.nan), true[:, :2])
+    assert all(np.isnan(empty[f'p{p}']) for p in ERR_PCTS)
+
+
+def test_penalised_cost_charges_the_keypoints_a_prediction_declined():
+    """OKS's rule in distance units: unshared LABEL keypoints cost `max_dist` and stay in `n`.
+
+    Under 'mean' a row sharing ONE keypoint is scored on that keypoint alone and can out-bid a
+    dense row (eval rule 9). Here the sparse row sits exactly on its target and the dense row is
+    0.5 px off, so 'mean' hands the GT to the one-point row -- and 'penalised' does not.
+    """
+    true = np.zeros((1, 1, 4, 2))
+    pred = np.full((2, 1, 4, 2), np.nan)
+    pred[0, 0, 0] = [0.0, 0.0]                 # ONE keypoint, perfect
+    pred[1, 0] = 0.5                           # all four, 0.5 px off in each axis
+
+    mean = match_instances(pred, true, max_dist=20.0, cost='mean')[0]
+    pen = match_instances(pred, true, max_dist=20.0, cost='penalised')[0]
+    assert mean[0][0] == 0, 'the one-point row wins on a mean over shared keypoints'
+    assert pen[0][0] == 1, 'and must lose once the three it declined are charged'
+    # The arithmetic, not just the ranking: (0 + 20*3)/4 = 15 against sqrt(0.5)*4/4.
+    assert pen[0][2] == pytest.approx(np.hypot(0.5, 0.5))
+
+    # A COMPLETE PREDICTION IS UNAFFECTED -- which is why this is a no-op on every arm on record.
+    # The pose decode emits every keypoint of every row it decodes (rat-city: 6,000 of 6,000
+    # instance-frames carry all K = 4), so `n_ok == n_labelled` and the penalty is identically 0.
+    dense = np.zeros((2, 1, 4, 2)) + 0.5
+    a = match_instances(dense, true, max_dist=20.0, cost='mean')[0]
+    b = match_instances(dense, true, max_dist=20.0, cost='penalised')[0]
+    assert a == b
+
+    # An infinite radius has no finite charge to levy, so it falls back rather than returning inf.
+    assert (match_instances(pred, true, cost='penalised')[0]
+            == match_instances(pred, true, cost='mean')[0])
+    with pytest.raises(ValueError):
+        match_instances(pred, true, cost='oks')
+
+
+def test_match_cost_default_reproduces_every_published_number():
+    """`cost='mean'` is the default and must be byte-identical to the pre-flag behaviour.
+
+    The flag is an ARM, not a silent correction -- the same discipline `min_kpts_frac = 0.0`
+    follows. If this drifts, every number in reports 10-19 becomes unreproducible.
+    """
+    rng = np.random.default_rng(0)
+    true = rng.normal(size=(3, 20, 5, 2)) * 10
+    pred = true + rng.normal(size=true.shape)
+    pred[np.asarray(rng.random(pred.shape[:3]) < 0.2)[..., None].repeat(2, -1)] = np.nan
+    for kw in ({}, {'cost': 'mean'}):
+        assert (match_instances(pred, true, max_dist=8.0, **kw)
+                == match_instances(pred, true, max_dist=8.0))
+    assert (mota(pred, true, 8.0)['mota']
+            == mota(pred, true, 8.0, cost='mean')['mota'])
+    assert (matched_error(pred, true, max_dist=8.0)['err']
+            == matched_error(pred, true, max_dist=8.0, cost='mean')['err'])

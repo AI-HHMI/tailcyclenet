@@ -132,10 +132,17 @@ def main():
     ap.add_argument('--min-crop-dim', type=int, default=64,
                     help='MUST equal the pose run\'s [data].min_crop_dim -- it is the same crop '
                          'rule. Stored in the checkpoint, and scripts/infer.py refuses a mismatch.')
-    ap.add_argument('--boxes', default='keypoints', choices=BOX_SOURCES,
-                    help='what the regression target bounds. `instances` needs a dataset whose '
-                         'instances.pq boxes ARE crop extents -- rat-city\'s are; johnson-mouse '
-                         'ships COCO boxes and calms21 MARS ones, which are not.')
+    ap.add_argument('--boxes', default='instances', choices=BOX_SOURCES,
+                    help='what the regression target bounds. DEFAULTS TO `instances`, matching '
+                         '`dataset.LoaderConfig.box_source` so the detector reproduces the crop '
+                         'the pose model is trained on -- the two must agree or the detector '
+                         'serves a different crop rule, silently. Inert where a root ships no '
+                         'instances.pq (3dpop, allen, branson-fly: falls back per view); an exact '
+                         'no-op on rat-city-annotated; worth 3.7% of animal-frames on '
+                         'rat-city-tracked, whose keypoint box is ~2.4 of 4 points. It DOES '
+                         'retarget calms21 (MARS) and johnson-mouse (COCO), whose boxes agree with '
+                         'the crop rule on 0.000 of instances -- pass `keypoints` there to '
+                         'reproduce reports 10-13. See dataset.LoaderConfig.box_source.')
     ap.add_argument('--val-frames-per-group', type=int, default=8,
                     help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
                          'branson-fly each hold a single val group, so the default 8 makes the '

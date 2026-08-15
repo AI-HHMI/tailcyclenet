@@ -78,11 +78,35 @@ class LoaderConfig:
     # What the crop rule bounds. `keypoints` is the labels themselves. `instances` bounds the
     # `instances.pq` box instead, for a root whose stored keypoints are too sparse to enclose the
     # animal: rat-city's converter dropped noisy points, leaving 26k train instances with NO
-    # finite point. OPT-IN rather than "use the table when it exists" -- an instances box is not a
-    # crop box in general (spec §9), johnson-mouse ships COCO boxes and calms21 MARS ones, and
-    # defaulting to them would silently retarget those crops. A view whose box is absent falls
-    # back to its keypoints (`crop._crop_source`), so one setting serves a multi-root run.
-    box_source: str = 'keypoints'
+    # finite point.
+    # THE DEFAULT, changed deliberately: an `instances.pq` box is an ANNOTATED animal extent and a
+    # keypoint crop is a box around the points that happen to be labelled, which on a sparse root
+    # is not the animal. Measured (`scratch/phase11/probe_boxsource.py`, train splits, box vs the
+    # keypoint crop box re-entered at pad 0):
+    #
+    #   root                    has instances   box-only   identical   IoU p50
+    #   3dpop                   NO              --         --          --
+    #   allen-mouse-combined    NO              0.0%       --          --
+    #   branson-fly             NO              0.0%       --          --
+    #   rat-city-annotated      yes             0.0%       1.000       1.000
+    #   rat-city-tracked        yes             3.7%       0.414       0.871
+    #   calms21                 yes (MARS)      0.0%       0.000       0.508
+    #   johnson-mouse-combined  yes (COCO)      0.0%       0.000       0.772
+    #
+    # So this is INERT on three of the seven roots (no table -- a view whose box is absent falls
+    # back to its keypoints per view, `crop._crop_source`), an exact no-op on rat-city-annotated,
+    # and the point of the exercise on rat-city-tracked, whose converter dropped noisy points: its
+    # keypoint box is built from ~2.4 of 4 points and floors at `min_crop_dim` against a ~235 px
+    # rat, and 3.7% of animal-frames have a box and NO keypoint at all and were being trained as
+    # background.
+    #
+    # IT RETARGETS calms21 AND johnson-mouse, AND THAT IS THE COST. Their tables hold MARS and COCO
+    # boxes, which agree with the crop rule on 0.000 of instances (IoU p50 0.508 and 0.772). Those
+    # are still annotated animal extents -- which is the argument for this default -- but they are a
+    # DIFFERENT extent from the one every run before this trained on, so a sweep3 number on those
+    # two roots is not comparable to reports 10-13 and `box_source = "keypoints"` is how to get the
+    # old behaviour back. It rides in the run folder's config.toml either way.
+    box_source: str = 'instances'
     prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
     prompt_noise_px: float = 0.0       # sigma on the prior, in PIXELS (3D scales by cube_scale)
     # The two corruptions that have the SHAPE of a deployment failure, where the jitter above does

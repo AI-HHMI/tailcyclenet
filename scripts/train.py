@@ -502,6 +502,12 @@ def main():
     elif resumed.exists():
         print(f'--no-resume: {resumed} and any checkpoint_best.pth beside it WILL be overwritten')
 
+    # RECORD THE RESOLVED `box_source`, not just the one the toml happened to name. Its default
+    # moved from 'keypoints' to 'instances', and `scripts/infer.py` reads the run config with
+    # `.get('box_source', 'keypoints')` -- which is RIGHT for every run trained before the move and
+    # WRONG for a run that takes the new default silently. Writing it makes the run folder say what
+    # it trained as, which is the whole job of a run folder; gotcha 12 is what the alternative cost.
+    config.setdefault('data', {})['box_source'] = train_ds.cfg.box_source
     save_run_meta(run, config, registry)
     print(f'run folder: {run.resolve()}')
     wb = init_wandb(config, run, disabled=args.no_wandb)

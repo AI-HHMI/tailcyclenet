@@ -329,6 +329,35 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                          np.nan, np.float32))
     crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
 
+    # THE COMPANION COLUMNS BLEND TOO, and they used not to. `pred` became the nan-aware mean of
+    # every window that decoded a frame while `conf`, `box_agree`, `kpt_agree` and `pred_tri`
+    # stayed plain assignments -- so they described the LAST window's decode of a frame whose
+    # reported pose is an average of several. `--vis-thresh` made it worse: it NaNs `conf` and
+    # `box_agree` for frames it dropped in this window while the blend still carries an earlier,
+    # ungated window's contribution to `pred`, so a frame could have a finite blended pose and a
+    # NaN confidence. `eval.py` reads `box_agree` per group and quotes `--vis-thresh` off `conf`,
+    # so the two blend arms were reporting mismatched columns.
+    #
+    # All four are per-FRAME quantities like `pred`, so they take the same sum/count treatment.
+    aux = ({k: [np.zeros(v.shape, np.float64), np.zeros(v.shape, np.int32)]
+            for k, v in (('conf', conf), ('box_agree', box_agree),
+                         ('pred_tri', pred_tri), ('kpt_agree', kpt_agree)) if v is not None}
+           if cfg.seam == 'blend' else None)
+
+    scratch = ({k: np.full_like(v, np.nan) for k, v in
+                (('box_agree', box_agree), ('kpt_agree', kpt_agree)) if v is not None}
+               if cfg.seam == 'blend' else None)
+
+    def record(key, idx, value):
+        """Write `value` at `idx`, or accumulate it when blending. Nan-aware either way."""
+        if aux is None or key not in aux:
+            return False
+        v = np.asarray(value, np.float64)
+        fin = np.isfinite(v)
+        np.add.at(aux[key][0], idx, np.where(fin, np.nan_to_num(v), 0.0))
+        np.add.at(aux[key][1], idx, fin)
+        return True
+
     for wi, start in enumerate(starts):
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
@@ -648,21 +677,35 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             p, q, out = got
             outcome[a, wi] = OUTCOMES.index('ok')
             if pred_tri is not None and out.get('3d_pred_triangulate') is not None:
-                pred_tri[a, frames] = out['3d_pred_triangulate'][0].detach().cpu().numpy()
+                tri_now = out['3d_pred_triangulate'][0].detach().cpu().numpy()
+                if not record('pred_tri', (a, frames), tri_now):
+                    pred_tri[a, frames] = tri_now
                 if out.get('tri_degenerate') is not None:
                     # A DEGENERATE SOLVE IS REPAIRED FROM THE RAYS, and `carry` now seeds the next
                     # window from this tensor -- so how often that happened has to be visible rather
                     # than absorbed into one silently-substituted array.
                     tri_bad[a, frames] = out['tri_degenerate'][0].detach().cpu().numpy()
-            _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
+            # The two `_fill_*` helpers write in place, so under blend they fill a scratch array
+            # and its window slice is accumulated -- same rule as `pred`, and the scratch is
+            # allocated once above rather than per window.
+            ba_dst = box_agree if aux is None else scratch['box_agree']
+            _fill_box_agreement(ba_dst, a, frames, use, boxes, p, mode, window_cams)
+            if aux is not None:
+                record('box_agree', (a, frames), ba_dst[a, frames])
+                ba_dst[a, frames] = np.nan
             if kpt_agree is not None:
-                _fill_kpt_agreement(kpt_agree, a, frames, use,
+                ka_dst = kpt_agree if aux is None else scratch['kpt_agree']
+                _fill_kpt_agreement(ka_dst, a, frames, use,
                                     [det_kpts_stc[a, frames, ci] for ci in use],
                                     p, mode, window_cams)
+                if aux is not None:
+                    record('kpt_agree', (a, frames), ka_dst[a, frames])
+                    ka_dst[a, frames] = np.nan
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
-                conf[a, frames] = v
+                if not record('conf', (a, frames), v):
+                    conf[a, frames] = v
                 vlogit = v
             # The pose the NEXT window opens on. Clamped from the front: a group shorter than
             # `overlap` gives a window with fewer frames than the step, and a plain negative
@@ -688,8 +731,16 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # two levers in one flag would be one too many (eval rule 4).
                 p = p.copy()
                 p[drop] = np.nan
-                conf[a, frames[drop]] = np.nan
-                box_agree[a, frames[drop]] = np.nan
+                # Under blend the gated frames were already accumulated above, so they are removed
+                # from the accumulator rather than from the finished array -- same rule as `p`:
+                # left OUT of the mean, not blanked and then averaged back in.
+                if aux is None:
+                    conf[a, frames[drop]] = np.nan
+                    box_agree[a, frames[drop]] = np.nan
+                else:
+                    for key, arr in (('conf', conf), ('box_agree', box_agree)):
+                        aux[key][0][a, frames[drop]] = 0.0
+                        aux[key][1][a, frames[drop]] = 0
             if blend is None:
                 pred[a, frames] = p
             else:
@@ -709,6 +760,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         n = blend[1][..., None]
         with np.errstate(invalid='ignore', divide='ignore'):
             pred = np.where(n > 0, blend[0] / np.maximum(n, 1), np.nan).astype(np.float32)
+        for key, (tot, cnt) in aux.items():
+            avg = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan).astype(np.float32)
+            {'conf': conf, 'box_agree': box_agree,
+             'pred_tri': pred_tri, 'kpt_agree': kpt_agree}[key][...] = avg
 
     out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
                'outcome': outcome, 'crop': crop, 'box_agree': box_agree,

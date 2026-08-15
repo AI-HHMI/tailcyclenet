@@ -623,3 +623,39 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
     cams = sess.cgroup('g000', frames)
     want = project_points_torch([cams[0]], torch.as_tensor(pred[0], dtype=torch.float32))[0]
     np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)
+
+
+def test_seam_blend_blends_the_companion_columns_too(scene):
+    """`pred` was averaged and every column beside it was last-write-wins.
+
+    So `conf`, `box_agree`, `kpt_agree` and `pred_tri` described the LAST window's decode of a
+    frame whose reported pose is the mean of several. `--vis-thresh` sharpened it: it NaNs `conf`
+    and `box_agree` for the frames it dropped in THIS window, while the blend still carries an
+    earlier ungated window's contribution to `pred` -- so a frame could have a finite blended pose
+    and a NaN confidence. `eval.py` reads `box_agree` per group and quotes `--vis-thresh` off
+    `conf`, so the two blend arms in the overlap-12 comparison reported mismatched columns.
+    """
+    model, sess, registry, name = scene
+    # n_frames=2, overlap=1 for the reason the test above spells out: the fixture groups are 4
+    # frames, so `_cfg`'s n_frames=4 gives ONE window and there is no overlap to blend.
+    kw = dict(anchor='none', n_frames=2, overlap=1, image_size=64, min_crop_dim=16, device='cpu')
+    last = run_group(model, sess, 'g000', registry, name, InferConfig(seam='last', **kw))
+    blend = run_group(model, sess, 'g000', registry, name, InferConfig(seam='blend', **kw))
+
+    for key in ('conf', 'box_agree', 'pred_tri'):
+        if blend.get(key) is None:
+            continue
+        a, b = np.asarray(blend[key]), np.asarray(last[key])
+        ok = np.isfinite(a) & np.isfinite(b)
+        if not ok.any():
+            continue
+        # WHEREVER THE POSE MOVED, the companion must have moved too -- otherwise it is still
+        # describing one window while the pose describes several.
+        assert not np.allclose(a[ok], b[ok]), \
+            f'{key} is identical under blend and last, so it is not being blended'
+
+    # A frame with a finite blended pose must not carry an all-NaN confidence it never earned.
+    fin_pred = np.isfinite(blend['pred']).all(-1)
+    fin_conf = np.isfinite(blend['conf'])
+    assert (fin_pred == fin_conf).all() or not fin_pred.any(), \
+        'pose and confidence must agree about which frames were decoded'

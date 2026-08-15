@@ -416,14 +416,17 @@ def main():
             if want and gid not in want:
                 continue
             key = f'{sess.session_id}/{gid}'
-            det_boxes = det_scores = None
+            # ALL THREE INITIALISED TOGETHER, OUTSIDE THE BRANCH. `det_kpts` used to be bound
+            # inside it, so every box source that is NOT a detector -- the GT-crop upper bound and
+            # the whole `--boxes` path -- raised `UnboundLocalError` at the `run_group` call below,
+            # after paying the checkpoint load. Same trap the comment above `det_tile` names.
+            det_boxes = det_scores = det_kpts = None
             if det is not None:
                 # Default to what the session actually holds, not to 1. `detect_group` caps
                 # detections at this count, so a bare --detector run on a ten-animal dataset
                 # used to return one animal per frame and read as a catastrophic miss rate
                 # rather than as a missing flag.
                 n_want = args.max_animals or max(1, len(sess.labels(gid).animal_ids))
-                det_kpts = None
                 if key in det_cache:
                     det_boxes, det_scores = det_cache[key], det_cache.get(f'{key}|score')
                     det_kpts = det_cache.get(f'{key}|kpt')

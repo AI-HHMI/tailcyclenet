@@ -406,6 +406,41 @@ def test_seam_blend_averages_the_overlap_and_changes_only_the_overlap(scene):
     assert not np.allclose(blend['pred'][:, over][ok], last['pred'][:, over][ok])
 
 
+def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
+    """THE DEFAULT BOX PATH, THROUGH `main()`. Every other CLI test SystemExits inside argparse.
+
+    That gap is not theoretical: `det_kpts` was initialised inside `if det is not None:` while its
+    two siblings were initialised outside it, so every box source that is NOT a detector -- the
+    GT-crop upper bound and the whole `--boxes` path -- raised `UnboundLocalError` at the
+    `run_group` call, after paying the checkpoint load. Six CLI tests passed throughout.
+
+    Asserts almost nothing about the numbers on purpose. What it pins is that every name in the
+    group loop is bound on the path with no detector, which is the class of failure that shipped.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL,
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4, 'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out = tmp_path / 'pred.npz'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(root),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--out', str(out)])
+    cli.main()
+    assert out.exists()
+    got = dict(np.load(out, allow_pickle=True))
+    assert 's/g000|pred' in got, f'no prediction written; keys: {sorted(got)}'
+
+
 @pytest.mark.parametrize('argv,expect', [
     (['--anchor', 'labels', '--detector', 'nope'], 'not label rows'),
     (['--anchor', 'labels', '--boxes', 'nope.npz'], 'not label rows'),

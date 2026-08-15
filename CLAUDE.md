@@ -1051,7 +1051,20 @@ These are not style preferences; each one was learned by publishing a wrong numb
 10. **Pairing is complete-case, which flatters the arm that failed more.** A group where either side
    is non-finite leaves the comparison, so `paired_bootstrap` returns `n_dropped` and `eval.py --vs`
    prints it. A delta over 9 of 17 groups is not a delta over 17.
-11. **There is now a temporal statistic, and there was not before.** `motion_ratio` / `path_length`,
+11. **A LABEL-FREE IDENTITY STATISTIC IS A SMOKE ALARM, NOT A METRIC, and a SELF-NORMALISED one
+   ranks arms BACKWARDS.** Report 16 §9.1's proposal -- per row, the joint discontinuity where the
+   axis turn and the length change both exceed that ROW'S OWN p99 -- fails its own validation gate
+   with correlation **-0.621** against true `idsw`: a row swapping on every step has an enormous p99
+   so almost nothing exceeds it, and the memoryless box path scores BEST of six arms. Any
+   per-unit-normalised discontinuity measure inherits this. The ABSOLUTE form (median per-step axis
+   turn in degrees, no normalisation) passes the gate at **+0.982** -- the memoryless arm reads
+   41.56 deg against 21.64, because two unrelated animals differ by a uniform angle with median 45 --
+   but **excluding that one broken arm the correlation is -0.558 over five working arms.** So it
+   detects a box path that is BROKEN, with no labels and an enormous margin, and cannot rank two that
+   both WORK. Never score a lever on it. **And never score a cue on the statistic it optimises**:
+   `--axis-veto 60` has the lowest median axis turn of any arm by construction and 2.6x the
+   baseline's `idsw`.
+12. **There is now a temporal statistic, and there was not before.** `motion_ratio` / `path_length`,
    paired over the steps both arms attempted. Every consistency number this repo had — jerk, bone CV —
    *rewards* a prediction that stopped moving, which is how RC1 stayed invisible. And `box_agree` is
    the pose-against-its-own-box check, in animal-size units.

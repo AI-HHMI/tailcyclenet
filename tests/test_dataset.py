@@ -1066,3 +1066,28 @@ def test_a_stale_prior_is_a_wrong_position_not_a_withdrawn_one(tiny_root):
         assert (b.prompt_t == base.prompt_t).all()
         moved |= not torch.allclose(b.kpt_prior, base.kpt_prior, equal_nan=True)
     assert moved, 'prompt_stale_frames=3 never moved the prior in 20 draws'
+
+
+def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
+    """`cv2.warpAffine` with a 0 in `dsize` returns the FULL SOURCE FRAME, and does not raise.
+
+    So a camera rounded to [256, 0] handed the model a 4696x2048 image while its own dict said
+    256x0 -- silent garbage instead of a clean failure. Reachable from `run_group`'s per-camera
+    union box, which only guarantees `x1 >= x0 + 1`, i.e. one detector box clipped to a sliver
+    against a frame edge is enough.
+    """
+    import cv2
+
+    from tailcyclenet.dataset import _resize_camera
+
+    cam = {'size': torch.tensor([2000, 1], dtype=torch.int32),
+           'mat': torch.eye(3), 'offset': torch.zeros(2)}
+    out, _ = _resize_camera(cam, 256)
+    assert out['size'].tolist() == [256, 1], f'a zero side survived: {out["size"].tolist()}'
+
+    # The reason it matters, pinned on OpenCV itself so it stays true if the behaviour ever moves.
+    src = np.zeros((480, 640, 3), np.uint8)
+    aff = np.array([[1.0, 0, 0], [0, 1.0, 0]], np.float32)
+    assert cv2.warpAffine(src, aff, (256, 0)).shape == src.shape, \
+        'if OpenCV ever raises on a zero dsize, the clamp above is belt-and-braces'
+    assert cv2.warpAffine(src, aff, (256, 1)).shape == (1, 256, 3)

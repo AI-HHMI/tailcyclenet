@@ -258,7 +258,13 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5, return
         empty = (boxes.new_zeros((0, 4)), scores.new_zeros((0,)))
         return (*empty, torch.zeros(0, dtype=torch.long, device=boxes.device)) \
             if return_index else empty
-    order = scores[keep].argsort(descending=True)
+    # STABLE, because these scores are SATURATED: 98.5% of rat-city's objectness and 99.98% of
+    # 3dpop's sit at exactly 1.0, so almost every comparison in this sort is a tie and an unstable
+    # tie-break decides which of two overlapping boxes survives greedy NMS -- and in what row
+    # order the survivors leave, which is the order `associate` and `CrossViewTracker` birth into.
+    # Without this the box set is reproducible only for a fixed torch version and device, which is
+    # exactly the property `--det-cache` exists to guarantee across two arms.
+    order = scores[keep].argsort(descending=True, stable=True)
     b, s = boxes[keep][order], scores[keep][order]
     ix = keep.nonzero().flatten()[order]
 

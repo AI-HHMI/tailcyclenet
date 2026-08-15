@@ -68,7 +68,15 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     files = sorted(folder.glob('checkpoint_*.pth'))
     if not files:
         raise FileNotFoundError(f'{folder}: no checkpoint_*.pth')
-    return files[-1]
+    # HIGHEST ITERATION, NOT LAST BY NAME. `'b' > '0'`, so a folder holding
+    # `checkpoint_00060000.pth` beside `checkpoint_best.pth` returned `best` -- a warm start from a
+    # checkpoint other than the one the log line implies, which is gotcha 12's class. Numeric
+    # names win; a folder of only named ones falls back to the old order, and says which it took.
+    numbered = sorted((int(p.stem.split('_')[-1]), p) for p in files if p.stem.split('_')[-1].isdigit())
+    got = numbered[-1][1] if numbered else files[-1]
+    print(f'{folder}: no checkpoint_last.pth, using {got.name} of '
+          f'{[p.name for p in files]}')
+    return got
 
 
 def provenance() -> dict:

@@ -1133,7 +1133,12 @@ def _resize_camera(cam, target_res):
     cam = dict(cam)
     size = cam['size']
     scale = float(target_res) / float(max(size))
-    cam['size'] = torch.round(size * scale).to(torch.int32)
+    # A ZERO SIDE IS NOT A SMALL CROP, IT IS THE WHOLE FRAME. An extreme-aspect box -- one
+    # detector box clipped to a sliver against a frame edge, which `run_group`'s per-camera union
+    # allows (it only guarantees x1 >= x0+1) -- rounds to e.g. [256, 0], and `cv2.warpAffine`
+    # treats a 0 in `dsize` as "use the source size": it returns the FULL 4696x2048 frame, with no
+    # exception, while the camera dict claims [256, 0]. Silent garbage rather than a clean failure.
+    cam['size'] = torch.round(size * scale).to(torch.int32).clamp_min(1)
     cam['mat'] = cam['mat'] * scale
     cam['mat'][2, 2] = 1
     cam['offset'] = cam['offset'] * scale

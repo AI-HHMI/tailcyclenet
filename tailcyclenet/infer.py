@@ -872,7 +872,11 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
         # purpose it was built for -- so off is the default here too.
         vis = carried[2] if len(carried) > 2 else None
         if cfg.prior_vis_thresh is not None and vis is not None and vis.shape == p.shape[:1]:
-            p[vis < cfg.prior_vis_thresh] = float('nan')
+            # NOT `vis < thresh`: that is False for NaN, so the keypoint the model said LEAST
+            # about was the one this gate could not touch, and it came back as a confident prior.
+            # Same trap, same fix, as the row gate 200 lines up ("AN UNSCORABLE ROW IS NOT A
+            # PASSING ROW").
+            p[~(vis >= cfg.prior_vis_thresh)] = float('nan')
         # A STALE PRIOR IS NOT A PRIOR. `carried` is only written on a window that predicted, so an
         # animal the box source lost for a few windows keeps handing back a pose from before this
         # one -- and `qt` clamps to 0 below, presenting it as this window's first frame. Within the

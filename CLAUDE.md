@@ -247,11 +247,30 @@ unions the tables, so `S` grows by one or two on five groups; checked safe both 
 `dataset._starts` returns `[]` for an animal with no labelled frame, and `mota`'s `true_present`
 is False for its all-NaN row, so it adds no training window and no GT.
 
-**`rat-city/val/instances.pq` ON DISK IS STALE and this did not touch it.** It was written by
-`042846a`, before `abef250` fixed the status lookup to index by `animal_id`, and never
-regenerated: 169 of its 745 rows carry the wrong status (633 `labeled` against the correct 656).
-A `labeled` written `present` is an eval ignore region. Re-running the script for rat-city fixes
-it and reproduces `train` and `test` byte-for-byte.
+**EVERY `instances.pq` IN `tailcycle-datasets` HAS NOW BEEN RE-DERIVED AND DIFFED, and one was
+stale.** `rat-city/val` was written by `042846a`, before `abef250` fixed the status lookup to index
+by `animal_id`, and never regenerated — **169 of its 745 rows carried the wrong status** (633
+`labeled` against the correct 656), and a `labeled` written `present` is an eval ignore region.
+Now regenerated; `train` and `test` came back byte-for-byte, so `abef250`'s fix only ever changed
+`val`. The other four roots regenerate identical: `rat-city-annotated` 50/50, `allen-mouse-annotated`
+80/80, `calms21` 89/89, `johnson-mouse-annotated` 42/42.
+
+**AND A ROOT'S FILE DATE CANNOT SETTLE THIS — regenerate and diff.** Four of the five roots carry a
+commit touching their converter *after* the root was written, and `scripts/convert_calms21.py` was
+`--diff-filter=A` **created** two hours after the calms21 data it produced. A converter is typically
+run, then committed, so "the script is newer than the data" is the normal case and not evidence of
+anything. All four turned out current; the one that was actually stale (`rat-city/val`) would have
+looked *fine* on dates, since `abef250` predates it.
+
+**`rat-city` IS A SYMLINK TO `rat-city-tracked`,** and the `*-combined` roots are symlink farms onto
+the `-annotated` / `-tracked` pairs, so a fix in one place lands in up to three roots and `find`
+without `-L` undercounts them (it reports `rat-city-combined` as 0 sessions). Coverage, following
+symlinks: 3dpop 118/118, allen-mouse-annotated 80/80, allen-mouse-combined 80/82, calms21 89/89,
+johnson-mouse-annotated 42/42, johnson-mouse-combined 42/44, rat-city 3/3, rat-city-annotated 50/50,
+rat-city-combined 53/53, rat-city-tracked 3/3. **Still carrying none: `allen-mouse-tracked` (3),
+`johnson-mouse-tracked` (3), `branson-fly` (10)** — the three `combined` shortfalls are exactly the
+tracked sessions. Each has a v3 counterpart and could be backfilled the same way, at the same
+`box_source` cost as 3dpop; none has been.
 
 ---
 

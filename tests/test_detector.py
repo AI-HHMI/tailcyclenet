@@ -1272,6 +1272,41 @@ def test_optimiser_levers_off_are_the_shipped_recipe_exactly():
     assert warm[1] > warm[0] and plain[1] < plain[0], 'warmup rises where the cosine falls'
 
 
+def test_ema_off_builds_nothing_and_on_tracks_the_weights_it_averages():
+    """`--ema-decay 0` must not construct an averaged model; on, it must actually average.
+
+    EMA is the one optimiser lever here that yields BOTH arms from a single run -- the raw and
+    averaged weights are scored on the same windows in the same iteration -- so the arms are paired
+    by construction rather than differing by seed noise as two runs would. That is only true if the
+    off path is untouched and the on path is a real average rather than a copy.
+    """
+    from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+
+    model = YOLOXNano(n_keypoints=0)
+    decay = 0.9
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay))
+
+    p = next(model.parameters())
+
+    # THE FIRST `update_parameters` IS A COPY, NOT AN AVERAGE. `AveragedModel` starts with
+    # `n_averaged = 0` and seeds itself from the model on the first call; only from the second does
+    # `avg_fn` run. Worth pinning, because a test that changed the weights and updated ONCE would
+    # see a perfect copy and read it as "the EMA is not averaging".
+    ema.update_parameters(model)
+    seeded = next(ema.module.parameters()).detach().clone()
+    torch.testing.assert_close(seeded, p.detach())
+
+    # From the second update it is a real average: a +1.0 jump moves it by exactly (1 - decay).
+    with torch.no_grad():
+        p.add_(1.0)
+    ema.update_parameters(model)
+    e1 = next(ema.module.parameters()).detach().clone()
+
+    assert not torch.allclose(e1, seeded), 'the EMA never moved -- it is not tracking the weights'
+    assert not torch.allclose(e1, p.detach()), 'the EMA copied the weights instead of averaging'
+    torch.testing.assert_close(e1, seeded + (1.0 - decay), rtol=1e-4, atol=1e-6)
+
+
 def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
     """The run measured its own peak and then overwrote it -- worth up to -28% recall.
 

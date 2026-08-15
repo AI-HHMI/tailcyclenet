@@ -160,6 +160,18 @@ def main():
                          'than cosmetic: decaying a norm\'s scale toward zero fights the '
                          'normalisation it exists to provide. None of the three reference systems '
                          'decays norm parameters either.')
+    ap.add_argument('--ema-decay', type=float, default=0.0, metavar='D',
+                    help='keep an exponential moving average of the weights at decay D and score '
+                         'and checkpoint it ALONGSIDE the raw weights. 0 (the default) is off and '
+                         'byte-identical -- the averaged model is never built, so the raw path is '
+                         'untouched arithmetic. 0.9998 is YOLOX\'s value. EMA is YOLOX\'s signature '
+                         'and we inherited everything but it; it is also the standard treatment '
+                         'for the one pathology on record here, whole-frame dense recall peaking '
+                         'at 4-8k of 20k and falling monotonically, which best-on-val selection '
+                         'currently works around rather than fixes. THE POINT OF SCORING BOTH IN '
+                         'ONE RUN is that the arms are then PAIRED BY CONSTRUCTION -- same data '
+                         'order, same augmentation draws, same seed -- at no extra training cost, '
+                         'where two separate runs would differ by seed noise as well as by EMA.')
     ap.add_argument('--num-workers', type=int, default=8)
     ap.add_argument('--frames-per-group', type=int, default=40)
     ap.add_argument('--min-crop-dim', type=int, default=64,
@@ -334,8 +346,22 @@ def main():
     else:
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
 
+    # THE AVERAGED MODEL IS NOT BUILT AT ALL WHEN OFF. `AveragedModel` deep-copies the module, so
+    # constructing it unconditionally would allocate a second network and change nothing else --
+    # harmless, but it would also make "off" a different code path from the one every recorded
+    # detector number came from, which is the thing every flag in this file is careful not to do.
+    ema = None
+    if args.ema_decay:
+        from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+        ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay))
+        print(f'EMA: decay {args.ema_decay}, scored and checkpointed beside the raw weights')
+
     args.out.mkdir(parents=True, exist_ok=True)
     history = []
+    # A SECOND best-tracker, because the two arms peak at different iterations -- that is most of
+    # what EMA is for, and sharing one `best_score` would let whichever arm happened to be ahead
+    # decide which checkpoint the OTHER arm ships.
+    best_ema = -float('inf')
     # `detector.pth` IS THE BEST CHECKPOINT, NOT THE LAST ONE. It used to be the last: the file was
     # rewritten at every evaluation and `best` was computed after the loop and only PRINTED, so a
     # run measured its own peak and then threw it away. That is not a tie-break -- on
@@ -368,6 +394,10 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             opt.step()
+            # AFTER `opt.step()`, so the average is over the weights the optimiser actually
+            # produced. Before it, every update would average in the PREVIOUS step twice.
+            if ema is not None:
+                ema.update_parameters(model)
             sched.step()
             running.append(float(loss.detach()))
             it += 1
@@ -412,6 +442,7 @@ def main():
                         # shape, so a checkpoint trained under one schedule and compared against
                         # another is indistinguishable from the file alone. Gotcha 12's shape.
                         'warmup_frac': args.warmup_frac, 'no_decay_norm': args.no_decay_norm,
+                        'ema_decay': args.ema_decay, 'ema': False,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the
@@ -421,8 +452,32 @@ def main():
                 if sel >= best_score:
                     best_score = sel
                     torch.save(ckpt, args.out / 'detector.pth')
-                history.append({'iteration': it, **{f'{k}_{m}': v[m] for k, v in scores.items()
-                                                    for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
+                # THE EMA ARM, scored through the IDENTICAL path on the IDENTICAL windows. The
+                # averaged weights live inside `ema.module`, so `score_dataset` never learns there
+                # is an EMA at all and the two arms cannot diverge through their evaluator.
+                escores = {}
+                if ema is not None:
+                    for name, ds in (('train', train), ('val', val)):
+                        if ds is None:
+                            continue
+                        escores[name] = overall(score_dataset(
+                            ema.module, ds, device, batch_size=args.batch_size,
+                            batches=args.eval_batches, num_workers=2))
+                    eck = dict(ckpt, model_state=ema.module.state_dict(), eval=escores, ema=True)
+                    torch.save(eck, args.out / f'detector_ema_it{it:06d}.pth')
+                    esel = escores.get('val', escores.get('train', {})).get('r50', -float('inf'))
+                    if esel >= best_ema:
+                        best_ema = esel
+                        torch.save(eck, args.out / 'detector_ema.pth')
+                    for name, s in escores.items():
+                        print(f'   ema {name:3s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
+                              f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
+                              flush=True)
+                history.append({'iteration': it,
+                                **{f'{k}_{m}': v[m] for k, v in scores.items()
+                                   for m in ('r50', 'r75', 'iou', 'fp', 'mota')},
+                                **{f'ema_{k}_{m}': v[m] for k, v in escores.items()
+                                   for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
                 (args.out / 'metrics.json').write_text(json.dumps(history, indent=1))
                 for name, s in scores.items():
                     print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '

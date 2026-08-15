@@ -267,7 +267,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2, dup_res_px=None,
                     track=True, max_move=1.0, axis_veto_deg=None, kpt_affinity=None,
-                    random_veto=None, seed=0, stats=None):
+                    random_veto=None, seed=0, stats=None, kpt_centre=False):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     `raw` is `detect_raw`'s `(boxes, scores, kpts)`. Returns the same triple re-indexed so row `a`
@@ -318,7 +318,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
         tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
                                    min_views=min_views, dup_res_px=dup_res_px,
                                    max_move=max_move, axis_veto_deg=axis_veto_deg,
-                                   kpt_affinity=kpt_affinity, random_veto=random_veto, seed=seed)
+                                   kpt_affinity=kpt_affinity, random_veto=random_veto, seed=seed,
+                                   kpt_centre=kpt_centre)
 
     def _cam(t, c):
         """This frame-camera's decoded detections as torch, plus their raw indices.
@@ -374,7 +375,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
     if link and tracker is None:
         out, sc = link_rows(out, sc, max_move=max_move, extra=kp, axis_veto_deg=axis_veto_deg,
                             kpt_affinity=kpt_affinity, random_veto=random_veto, seed=seed,
-                            stats=stats)
+                            stats=stats, kpt_centre=kpt_centre)
     elif stats is not None and tracker is not None:
         stats.update(tracker.vetoed)
     return out, sc, kp
@@ -433,7 +434,8 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
 
 
 def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None,
-              axis_veto_deg=None, kpt_affinity=None, random_veto=None, seed=0, stats=None):
+              axis_veto_deg=None, kpt_affinity=None, random_veto=None, seed=0, stats=None,
+              kpt_centre=False):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
@@ -531,7 +533,8 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     # unchanged centroid cost -- see `identity` -- so each may only zero an entry the centre gate
     # already accepted, and `max_move`'s calibration in box sides is untouched. Without keypoints
     # every cue abstains and this is byte-identical to the centroid-only rule.
-    cues = axis_veto_deg is not None or kpt_affinity is not None or random_veto
+    cues = (axis_veto_deg is not None or kpt_affinity is not None or random_veto
+            or kpt_centre)
     kp = extra if (cues and extra is not None and np.asarray(extra).ndim == 5) else None
     # A ROW'S LAST KNOWN KEYPOINTS, carried exactly as `last` carries its box: a shape is slower
     # changing than a position, so a held set is a better prior than none, and a one-frame miss
@@ -550,6 +553,14 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
             a, b = last[ok_p, c], cur[ok_c, c]
             ca = np.stack([(a[:, 0] + a[:, 2]) / 2, (a[:, 1] + a[:, 3]) / 2], -1)
             cb = np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], -1)
+            # ITEM 4: the POINT moves to the keypoint centroid, the gate and the pair set do not.
+            # `side` below stays the BOX side because `max_move` is calibrated in box sides, and a
+            # keypoint-extent denominator would be a second uncalibrated lever (eval rule 4).
+            if kpt_centre and kp is not None:
+                ca = np.stack([idy.centroid(k, box=bx) for k, bx
+                               in zip(last_kp[ok_p, c], a)])
+                cb = np.stack([idy.centroid(k, box=bx) for k, bx
+                               in zip(kp[ok_c, t, c], b)])
             d = np.linalg.norm(ca[:, None] - cb[None], axis=-1)
             sa = 0.5 * ((a[:, 2] - a[:, 0]) + (a[:, 3] - a[:, 1]))
             sb = 0.5 * ((b[:, 2] - b[:, 0]) + (b[:, 3] - b[:, 1]))

@@ -167,6 +167,34 @@ def kpt_in_box_frac(kpts, box):
     return float(inside.mean())
 
 
+def centroid(kpts, box=None, min_pts=MIN_PTS):
+    """(K,2+) -> (2,) keypoint centroid, falling back to the box centre. Report 16 §9.2 item 4.
+
+    **THE ONLY EDGE-CONSERVING CUE IN THE FAMILY.** Every other function here feeds a VETO, which
+    removes a candidate pair; this one moves the affinity's POINT and leaves the pair set untouched.
+    Report 19 §3 measured the matcher as starved of candidates and §4 measured the veto family as a
+    net loss on exactly that ground, so the distinction is the whole reason this is worth building.
+
+    It can only help by the part of the per-keypoint error that AVERAGES DOWN -- a whole-animal shift
+    is common to every keypoint and is exactly what the box centre already carries. Report 19 §7
+    measures that split on 3dpop: median per-animal common fraction **0.42**, middle half 0.20-0.75,
+    so most of a typical animal's error IS independent and a centroid over K = 17 does average it
+    down. (Read the robust split there, not the mean: mis-assigned boxes displace every keypoint
+    together, which is perfect common mode, and they dominate a squared mean.)
+
+    FALLS BACK RATHER THAN ABSTAINS, and that is the difference from the vetoes. A veto with no
+    opinion must not fire; an affinity point must exist for every detection or the pair vanishes,
+    which would make this a veto by the back door. Too few keypoints -> the box centre, unchanged.
+    """
+    p = _valid(kpts)
+    if p.shape[0] < min_pts:
+        if box is None:
+            return np.full(2, np.nan)
+        b = np.asarray(box, float)
+        return np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2])
+    return p.mean(0)
+
+
 def epipolar(res, signed=False):
     """Reduce a set of per-keypoint epipolar residuals to ONE number. NaN if there are none.
 
@@ -242,6 +270,20 @@ def demo():
     assert abs(size_ratio(animal, animal) - 1.0) < 1e-9
     assert size_ratio(animal, 500 + (animal - 500) * 0.5) > 1.5, 'half-size must read as a ratio'
     assert abs(angle_gap(body_axis(turned), v) - 90) < 1e-6
+
+    # The centroid FALLS BACK rather than abstaining -- an affinity point must exist for every
+    # detection, or moving the point would silently become a veto.
+    assert np.allclose(centroid(animal), [500, 300])
+    assert np.allclose(centroid(animal[:1], box=[0, 0, 10, 20]), [5, 10]), 'must fall back'
+    assert not np.isfinite(centroid(animal[:1])).any(), 'no box and no points -> NaN, not a guess'
+    # AND IT AVERAGES INDEPENDENT NOISE DOWN, which is the entire case for item 4: at K points the
+    # centroid's error is 1/sqrt(K) of one keypoint's. A common-mode shift is NOT reduced -- that is
+    # the null this is measured against in report 19 §7.
+    ind = np.mean([np.linalg.norm(centroid(animal + rng.normal(0, 10.7, animal.shape)) - [500, 300])
+                   for _ in range(400)])
+    assert ind < 10.7 / 2, f'independent noise must average down over K=10, got {ind:.2f} px'
+    shifted = [centroid(animal + np.array([8.0, 0.0])) for _ in range(5)]
+    assert abs(shifted[0][0] - 508) < 1e-6, 'a common-mode shift must pass straight through'
 
     # in-box fraction, and the sign convention of the epipolar reduction.
     assert kpt_in_box_frac(animal, [440, 240, 560, 360]) == 1.0

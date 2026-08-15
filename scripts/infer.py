@@ -160,6 +160,14 @@ def main():
                     help="reject a match where fewer than FRAC of the target's keypoints fall inside "
                          "the detection's box. Report 12's R5 term, never built until now: it counts "
                          'inside/outside over K, so per-keypoint noise averages away.')
+    ap.add_argument('--kpt-centre', action='store_true',
+                    help="use the keypoint CENTROID as the affinity's point instead of the box "
+                         'centre (report 16 §9.2 item 4). NOT a veto -- it moves the point and '
+                         'leaves the candidate pair set untouched, which is the one shape that can '
+                         'win on a matcher starved of candidates. Gated on report 19 §7: a typical '
+                         "animal's per-keypoint error is ~58%% independent, so a centroid over K "
+                         'averages that part down. Falls back to the box centre per detection '
+                         'wherever there are too few keypoints, so no pair can disappear.')
     ap.add_argument('--seed', type=int, default=0,
                     help='seed for --random-veto. The control needs to be repeatable and needs to '
                          'be runnable at several seeds, since one draw of a random rejection is one '
@@ -532,7 +540,8 @@ def main():
                     raw, sess, gid, n_want, link=args.link_boxes, min_views=args.min_views,
                     dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move,
                     axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
-                    random_veto=args.random_veto, seed=args.seed, stats=veto_stats)
+                    random_veto=args.random_veto, seed=args.seed, stats=veto_stats,
+                    kpt_centre=args.kpt_centre)
                 # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
                 # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
                 # whenever any cue is on, so an arm that silently never fired is visible as such

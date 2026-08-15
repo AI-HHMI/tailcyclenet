@@ -82,7 +82,7 @@ class CrossViewTracker:
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.0, max_age=24, min_views=2,
                  dup_res_px=None, axis_veto_deg=None, kpt_affinity=None, random_veto=None,
-                 seed=0):
+                 seed=0, kpt_centre=False):
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
@@ -99,6 +99,12 @@ class CrossViewTracker:
         # flatters a mean over matched points, so a veto's number means nothing without the same
         # number of edges removed at random (`--vis-thresh`'s lesson, CLAUDE.md).
         self.random_veto = None if random_veto is None else float(random_veto)
+        # ITEM 4, AND IT IS NOT A VETO. It moves the affinity's POINT from the box centre to the
+        # keypoint centroid and leaves the candidate pair set exactly as it was -- the one shape
+        # report 19 §4 says can win on a matcher §3 measured as starved of candidates. Gated on §7:
+        # a typical animal's per-keypoint error is ~58% independent, so a centroid over K averages
+        # that part down, where a common-mode shift is what the box centre already carries.
+        self.kpt_centre = bool(kpt_centre)
         self._rng = np.random.default_rng(seed)
         self.vetoed = {'axis': 0, 'kpt': 0, 'random': 0, 'eligible': 0}
         # slot -> {'point': (3,) float32 tensor, 'age': int, 'kpts': (K,3) tensor or None}
@@ -213,6 +219,20 @@ class CrossViewTracker:
         claimed_ix = np.full((self.n, C), -1, np.int32)
         centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
         sides = [_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
+        # THE POINT MOVES; THE GATE, THE SIDES AND THE PAIR SET DO NOT. `sides` stays the BOX side,
+        # because `max_move` is calibrated in box sides and a keypoint-extent denominator would be a
+        # second, uncalibrated lever riding along (eval rule 4). Per detection, and it falls back to
+        # the box centre wherever there are too few keypoints, so no pair can disappear.
+        if self.kpt_centre and kpts_per_cam is not None:
+            from . import identity as idy
+            for c, kk in enumerate(kpts_per_cam):
+                if kk is None or not centres[c].numel():
+                    continue
+                k = np.asarray(kk, float)
+                pts = np.stack([idy.centroid(k[i], box=boxes_per_cam[c][i].numpy())
+                                for i in range(min(len(k), centres[c].shape[0]))])
+                ok = np.isfinite(pts).all(-1)
+                centres[c][:len(pts)][ok] = torch.as_tensor(pts[ok], dtype=centres[c].dtype)
 
         slots = [s for s, t in sorted(self.targets.items())
                  if bool(torch.isfinite(t['point']).all())]

@@ -1351,7 +1351,8 @@ def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_pa
         base = associate_group(raw, sess, 'g000', 3, **kw)
         # The INERT arm: the same code path with the mechanism unable to fire. Not "flag absent" --
         # that would only prove the branch is skipped, not that the branch is faithful.
-        for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0}):
+        for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0},
+                      {'kpt_centre': False}):
             got = associate_group(raw, sess, 'g000', 3, **kw, **inert)
             for a, b in zip(base, got):
                 np.testing.assert_array_equal(a, b, err_msg=f'{kw} {inert} is not inert')
@@ -1383,6 +1384,14 @@ def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_pa
     # AND WITHOUT KEYPOINTS EVERY CUE ABSTAINS rather than rejecting everything -- the property
     # that keeps a box-only detector on the old path instead of silently losing all its matches.
     np.testing.assert_array_equal(off, link_rows(boxes.copy(), axis_veto_deg=1.0))
+    np.testing.assert_array_equal(off, link_rows(boxes.copy(), kpt_centre=True))
+
+    # `--kpt-centre` IS NOT A VETO: it moves the affinity's point and must leave the candidate pair
+    # set alone, so it can never make a row EMPTY that was filled without it. That is the property
+    # separating it from the veto family (report 19 §4), and it is the one worth pinning.
+    moved = link_rows(boxes.copy(), extra=kp.copy(), kpt_centre=True)
+    assert np.isfinite(moved).all(-1).sum() >= np.isfinite(off).all(-1).sum(), \
+        'moving the affinity point must not drop rows -- that would make it a veto by the back door'
 
 
 def test_infer_help_renders():

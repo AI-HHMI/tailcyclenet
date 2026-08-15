@@ -1272,6 +1272,59 @@ def test_optimiser_levers_off_are_the_shipped_recipe_exactly():
     assert warm[1] > warm[0] and plain[1] < plain[0], 'warmup rises where the cosine falls'
 
 
+def test_the_ignore_band_is_off_by_default_and_is_a_no_op_on_a_small_animal():
+    """`--ignore-band` withdraws the anchors that sit on an animal without being positive for it.
+
+    Today `detector_loss` starts from a zeros target and sets only the positives, so every anchor
+    INSIDE a GT box but outside the centre radius is supervised as "no animal here" while sitting
+    on one. Screened at the shipped geometry that is 43.5% of every anchor on rat-city's 640x640
+    tiles at scale 1.0, 13.5x the positive count.
+
+    THE INERTNESS CONTROL IS GEOMETRIC, NOT A THRESHOLD: an animal smaller than the centre radius
+    at every stride has `inside` a subset of `near`, so the band is EMPTY and the flag provably
+    cannot do anything. branson-fly's 30 px fly is that case, which is why it must come back
+    bit-identical when the arm runs -- and it is the root already at MOTA 1.000.
+    """
+    from tailcyclenet.detector.assign import assign, detector_loss
+
+    torch.manual_seed(0)
+    A, stride = 8 * 8, 8.0
+    ys, xs = torch.meshgrid(torch.arange(8.0), torch.arange(8.0), indexing='ij')
+    anchors = torch.stack([xs.reshape(-1) * stride + stride / 2,
+                           ys.reshape(-1) * stride + stride / 2,
+                           torch.full((A,), stride)], -1)
+
+    # A BIG box: many anchors inside it, only those within 2.5 cells of the centre are positive.
+    big = torch.tensor([[4.0, 4.0, 60.0, 60.0]])
+    pos, _, band = assign(anchors, big, return_band=True)
+    assert band.any(), 'a box much larger than the centre radius must produce a band'
+    # The band and the positives are disjoint by construction -- a positive is never ignored.
+    assert not band[pos].any(), 'a POSITIVE anchor must never land in the ignore band'
+
+    # A SMALL box, smaller than the centre radius at this stride: `inside` is a subset of `near`,
+    # so there is nothing to ignore. This is branson-fly's geometry.
+    small = torch.tensor([[30.0, 30.0, 34.0, 34.0]])
+    _, _, tiny_band = assign(anchors, small, return_band=True)
+    assert not tiny_band.any(), 'a sub-radius animal must produce an EMPTY band'
+
+    # OFF is byte-identical, and on a sub-radius animal ON is too -- the geometric inertness above
+    # expressed at the loss, which is what the branson-fly control asserts end to end.
+    obj = torch.randn(1, A)
+    boxes = torch.rand(1, A, 4) * 60
+    boxes[..., 2:] += boxes[..., :2]
+    for gt, same in ((big[None], False), (small[None], True)):
+        off = float(detector_loss(obj, boxes, anchors, gt)[0])
+        on = float(detector_loss(obj, boxes, anchors, gt, ignore_band=True)[0])
+        if same:
+            assert on == pytest.approx(off), 'a sub-radius animal must leave the loss untouched'
+        else:
+            assert on != pytest.approx(off), 'a real band must change the objectness loss'
+    # And the fraction is reported, for the same reason `certified` is: masking shrinks the sum
+    # without shrinking the `/ max(n_pos, B)` divisor, which silently reweights obj vs box_weight.
+    _, parts = detector_loss(obj, boxes, anchors, big[None], ignore_band=True)
+    assert 0.0 < parts['ignored'] < 1.0, 'the band fraction must be printed, not inferred'
+
+
 def test_ema_off_builds_nothing_and_on_tracks_the_weights_it_averages():
     """`--ema-decay 0` must not construct an averaged model; on, it must actually average.
 

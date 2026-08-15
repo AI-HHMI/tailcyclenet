@@ -160,6 +160,25 @@ def main():
                          'than cosmetic: decaying a norm\'s scale toward zero fights the '
                          'normalisation it exists to provide. None of the three reference systems '
                          'decays norm parameters either.')
+    ap.add_argument('--ignore-band', action='store_true',
+                    help='stop supervising objectness on anchors that sit INSIDE a GT box but are '
+                         'positive for none. Off by default and byte-identical. Today those are '
+                         'trained as "no animal here" WHILE SITTING ON ONE: `assign` returns '
+                         '`inside & near` and `detector_loss` starts from a zeros target, so every '
+                         'other anchor over the animal gets objectness target 0. Screened at each '
+                         "root's shipped geometry the band is 43.5%% of every anchor on rat-city's "
+                         '640x640 tiles at scale 1.0 (13.5x the positive count), 30.2%% on '
+                         'calms21, 6.8%% on 3dpop, 1.2%% on rat-city whole-frame and PROVABLY '
+                         '0.00%% on branson-fly, where a 30 px fly is smaller than the centre '
+                         'radius at every stride -- which makes branson-fly a free inertness '
+                         'control that must come back bit-identical. APT does exactly this: its '
+                         'assigner has three bands and ignores this one deliberately. NAMED '
+                         'FAILURE MODE: an animal is not solid, so ignoring every anchor inside a '
+                         'SQUARED crop-rule box also stops supervising the background between the '
+                         'legs, which on a thin animal is most of it. That is why this is an arm '
+                         'and not a fix. Report `ign` beside it: masking shrinks the objectness '
+                         'sum without shrinking its /max(n_pos,B) divisor, a ~2x reweight of obj '
+                         'against box_weight at 43.5%% that an arm would otherwise misattribute.')
     ap.add_argument('--ema-decay', type=float, default=0.0, metavar='D',
                     help='keep an exponential moving average of the weights at decay D and score '
                          'and checkpoint it ALONGSIDE the raw weights. 0 (the default) is off and '
@@ -389,7 +408,7 @@ def main():
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=args.kpt_weight,
                                         kpt_score_weight=args.kpt_score_weight,
-                                        regions=gt_regions)
+                                        regions=gt_regions, ignore_band=args.ignore_band)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -408,6 +427,7 @@ def main():
                 # without shrinking its divisor -- it silently reweights obj against box_weight,
                 # and that has to be a number in the log rather than an inference from a curve.
                 kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
+                kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
                 print(f'{it:7d}/{args.iters}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
@@ -443,6 +463,7 @@ def main():
                         # another is indistinguishable from the file alone. Gotcha 12's shape.
                         'warmup_frac': args.warmup_frac, 'no_decay_norm': args.no_decay_norm,
                         'ema_decay': args.ema_decay, 'ema': False,
+                        'ignore_band': args.ignore_band,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the

@@ -284,6 +284,15 @@ def main():
 
     args.out.mkdir(parents=True, exist_ok=True)
     history = []
+    # `detector.pth` IS THE BEST CHECKPOINT, NOT THE LAST ONE. It used to be the last: the file was
+    # rewritten at every evaluation and `best` was computed after the loop and only PRINTED, so a
+    # run measured its own peak and then threw it away. That is not a tie-break -- on
+    # rat-city-annotated recall PEAKS AT 4-8k AND FALLS MONOTONICALLY to 20k (whole-frame dense
+    # r@.5: tile 0.387 -> 0.278, tilemask 0.350 -> 0.288, tilemask-rot 0.407 -> 0.372), because a
+    # root whose labelled frame names 2 of ~10 rats spends 20,000 iterations teaching the objectness
+    # head that most rats are background. Every `detector_it*.pth` is still written, so a run that
+    # wants the last one still has it.
+    best_score = -float('inf')
     it, t0, running = 0, time.time(), []
     model.train()
     while it < args.iters:
@@ -349,7 +358,13 @@ def main():
                         'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
-                torch.save(ckpt, args.out / 'detector.pth')
+                # Selected on `val` where there is one, `train` otherwise -- the same key the
+                # end-of-run `best` line reports, so the printed winner and the shipped file are
+                # now the same checkpoint instead of two different ones.
+                sel = scores.get('val', scores.get('train', {})).get('r50', -float('inf'))
+                if sel >= best_score:
+                    best_score = sel
+                    torch.save(ckpt, args.out / 'detector.pth')
                 history.append({'iteration': it, **{f'{k}_{m}': v[m] for k, v in scores.items()
                                                     for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
                 (args.out / 'metrics.json').write_text(json.dumps(history, indent=1))
@@ -361,7 +376,7 @@ def main():
     best = max(history, key=lambda h: h.get('val_r50', h['train_r50'])) if history else None
     print(f'done: {it} iterations -> {args.out}')
     if best:
-        print(f'best: it {best["iteration"]}  ' +
+        print(f'best: it {best["iteration"]} (this is what detector.pth holds)  ' +
               '  '.join(f'{k} {v:.4f}' for k, v in best.items() if k != 'iteration'))
 
 

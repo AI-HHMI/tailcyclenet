@@ -1202,3 +1202,31 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
     tr2.targets[0] = {'point': torch.zeros(3), 'age': 0}
     tr2.step([], [], [])
     assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'
+
+
+def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
+    """The run measured its own peak and then overwrote it -- worth up to -28% recall.
+
+    On rat-city-annotated recall PEAKS at 4-8k and falls to 20k, because a root whose labelled
+    frame names 2 of ~10 rats spends the rest of training learning that most rats are background.
+    So "last" is not a tie-break with "best" here, it is systematically the wrong end.
+    """
+    from pathlib import Path
+
+    # The selection rule, exercised the way the loop runs it: r50 rises then falls.
+    history = [{'iteration': 2000, 'val_r50': 0.32}, {'iteration': 8000, 'val_r50': 0.39},
+               {'iteration': 20000, 'val_r50': 0.28}]
+    best_score, kept = -float('inf'), None
+    for h in history:
+        sel = h['val_r50']
+        if sel >= best_score:
+            best_score, kept = sel, h['iteration']
+    assert kept == 8000, 'detector.pth must hold the peak, not the last evaluation'
+
+    # ...and the end-of-run `best` line must name the SAME checkpoint, or the print lies.
+    best = max(history, key=lambda h: h.get('val_r50', h.get('train_r50')))
+    assert best['iteration'] == kept
+
+    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py').read_text()
+    assert "torch.save(ckpt, args.out / 'detector.pth')" in src
+    assert 'if sel >= best_score:' in src, 'the unconditional overwrite is back'

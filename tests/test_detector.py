@@ -1383,3 +1383,22 @@ def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_pa
     # AND WITHOUT KEYPOINTS EVERY CUE ABSTAINS rather than rejecting everything -- the property
     # that keeps a box-only detector on the old path instead of silently losing all its matches.
     np.testing.assert_array_equal(off, link_rows(boxes.copy(), axis_veto_deg=1.0))
+
+
+def test_infer_help_renders():
+    """`--help` must actually print. It did not, and nothing noticed for months.
+
+    argparse expands every `help=` string as `help % params`, so a BARE `%` in one is a format spec:
+    `80% of frames` reads as `%o` and `--help` dies with `TypeError: %o format: an integer is
+    required, not dict`. Three help strings carried one. Nothing else in the suite runs `--help`,
+    and `--help` is how anybody discovers a flag -- so a broken one silently hides every option this
+    script has.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py'
+    r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
+    assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
+    assert '--axis-veto' in r.stdout

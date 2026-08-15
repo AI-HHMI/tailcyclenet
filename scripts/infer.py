@@ -146,6 +146,29 @@ def main():
     # what the two did when they were one number.
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')
+    # THE KEYPOINT IDENTITY CUES (dev/reports/16 §9, 19 §4). All default-off, all VETOES over an
+    # unchanged centroid cost -- each may only remove an edge the centre gate already accepted, so
+    # `--max-move`'s calibration in box sides is untouched and a wrong cue costs a missed match
+    # rather than a wrong one. A detection with too few keypoints ABSTAINS; it never vetoes.
+    ap.add_argument('--axis-veto', type=float, default=None, metavar='DEG',
+                    help='reject a match whose body axes differ by more than DEG. The axis is PCA-1 '
+                         'over all K keypoints, not a two-point one (noise ~7 deg against ~11), and '
+                         'it is UNDIRECTED. Abstains on a round animal, by a K-AWARE isotropy test '
+                         '-- see detector/identity.iso_null, and note that at K = 4 it barely '
+                         'separates, which bounds this cue on rat-city.')
+    ap.add_argument('--kpt-affinity', type=float, default=None, metavar='FRAC',
+                    help="reject a match where fewer than FRAC of the target's keypoints fall inside "
+                         "the detection's box. Report 12's R5 term, never built until now: it counts "
+                         'inside/outside over K, so per-keypoint noise averages away.')
+    ap.add_argument('--seed', type=int, default=0,
+                    help='seed for --random-veto. The control needs to be repeatable and needs to '
+                         'be runnable at several seeds, since one draw of a random rejection is one '
+                         'sample of the control, not the control.')
+    ap.add_argument('--random-veto', type=float, default=None, metavar='RATE',
+                    help='THE RATE-MATCHED CONTROL, and it is not optional when a veto is quoted. '
+                         'Rejects RATE of the eligible edges at random. Any rejection flatters a '
+                         'mean over matched points, so a veto number without this control means '
+                         'nothing -- the `--vis-thresh` lesson.')
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
                          '`carry` needs the frames contiguous.')
@@ -170,8 +193,8 @@ def main():
                     help='withhold an (animal, frame) row whose MEDIAN `vis_pred` logit across '
                          'keypoints is below this. Measured against a rate-matched random rejection '
                          '-- the only honest control, since any rejection flatters a mean over '
-                         'matched points -- it is worth MOTA +0.049 SIG on 3dpop at 7.3% of rows '
-                         'and 0.601 -> 0.628 on rat-city at 14%, where the control gains nothing. '
+                         'matched points -- it is worth MOTA +0.049 SIG on 3dpop at 7.3%% of rows '
+                         'and 0.601 -> 0.628 on rat-city at 14%%, where the control gains nothing. '
                          'A LOGIT, and NOT PORTABLE: rat-city sits at a median of +2.7 and 3dpop at '
                          '+15.4, so pick it per dataset from the run\'s own `conf` field. Applies '
                          'to what is reported, never to the carried prompt.')
@@ -211,7 +234,7 @@ def main():
                          '"blend" reports the mean of every window that decoded the frame, and is '
                          'MEASURED NOT TO HELP: on 3dpop\'s 58 groups it leaves MPJPE unchanged and costs '
                          'MOTA -0.0014 (SIG) at overlap 4, and the harm scales with the blended fraction '
-                         '(-0.0020 at overlap 12, 80% of frames). A seam is partly an IDENTITY '
+                         '(-0.0020 at overlap 12, 80%% of frames). A seam is partly an IDENTITY '
                          'discontinuity and averaging two identities is worse than picking one. Kept so the '
                          'measurement is reproducible; it does move `motion_ratio` toward 1, which is why '
                          'that statistic is not sufficient on its own.')
@@ -504,9 +527,21 @@ def main():
                 # against 44 ms of 4K decode, so recomputing it costs nothing measurable and buys
                 # the property the cache exists for: two identity arms differ in exactly one lever
                 # over byte-identical pixels.
+                veto_stats = {}
                 det_boxes, det_scores, det_kpts = associate_group(
                     raw, sess, gid, n_want, link=args.link_boxes, min_views=args.min_views,
-                    dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move)
+                    dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move,
+                    axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
+                    random_veto=args.random_veto, seed=args.seed, stats=veto_stats)
+                # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
+                # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
+                # whenever any cue is on, so an arm that silently never fired is visible as such
+                # rather than being reported as a null result for the cue.
+                if veto_stats.get('eligible'):
+                    e = veto_stats['eligible']
+                    print(f'{key}: veto rates over {e} eligible edge(s) -- '
+                          + '  '.join(f'{k} {veto_stats.get(k, 0) / e:.4f}'
+                                      for k in ('axis', 'kpt', 'random')), flush=True)
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
                 # saturated on every detector shipped here; a detector whose scores are NOT
                 # saturated would lose most of its boxes to that, and this line is where that shows

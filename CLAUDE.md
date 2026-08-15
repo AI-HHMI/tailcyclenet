@@ -484,6 +484,21 @@ keypoint per frame is exactly the property that would free the motion the carry 
 why the prior stops paying for itself. **You cannot get per-frame freedom and a load-bearing prior from
 this one key** — fixing the motion lock needs a mechanism that decouples them.
 
+**KEYPOINT-BASED IDENTITY: THE CUES ARE REAL AND EVERY MECHANISM PROPOSED TO SPEND THEM IS
+REFUTED** (report 19). Report 16 §9 ranked six coarse aggregate cues; all six are now measured.
+Items 1 (`--axis-veto`) and 2 (`--kpt-affinity`) beat their RATE-MATCHED RANDOM controls on `idsw`
+(-0.020 and -0.033, both SIG) and item 2 on `fp_dup` (-0.068) -- the first positive measurement of
+§9's central claim -- and both still LOSE against no veto at all (MOTA -0.257, -0.142), because
+rejection is the wrong currency on a matcher report 18 §5 measured as starved of candidates. Items 3
+and 6 are dead on population size (one birth per 97 frames under `--track`). Item 4 (`--kpt-centre`)
+is refuted on both roots: a keypoint centroid moves with POSE and a box centre does not, and
+articulation is not detector noise so it does not average down with K. Item 5 (`--swap-repair`)
+conserves every edge exactly as designed and makes `idsw` monotonically worse in its margin, because
+it triggers on the statistic §6 measured as a smoke alarm rather than a metric. **A statistic too
+coarse to rank arms is too coarse to trigger a per-frame action.** All five flags ship default-off
+with their fire rates printed; the next form worth trying is a COST TERM inside the Hungarian, which
+§9.2 never proposed.
+
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
 is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:

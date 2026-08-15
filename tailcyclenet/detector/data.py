@@ -663,17 +663,36 @@ class BoxDataset(Dataset):
 
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
-        # Per item and per epoch, off the item index -- a worker-local RNG would hand every
-        # worker the same stream, and a shared one would make the draw depend on how the
-        # DataLoader happened to interleave.
-        rng = (np.random.default_rng([self.seed, i]) if self.augment and self.train else None)
+        # FRESH ENTROPY PER VISIT ON TRAIN, seeded by index on eval. `default_rng([self.seed, i])`
+        # claimed to be "per item and per epoch" and was only per item: nothing supplies an epoch
+        # (`ChunkShuffle.epoch` only permutes the ORDER, and `persistent_workers=True` would keep
+        # a forked copy stale anyway). So item `i` got the identical `random_affine` and the
+        # identical brightness on every one of its ~300 revisits, i.e. `--augment` and
+        # `--rotate-deg` delivered ONE frozen pre-augmented copy of the dataset instead of a fresh
+        # draw -- which understates what both levers are worth.
+        #
+        # `default_rng(None)` draws from OS entropy per call, so there is no shared stream for the
+        # workers to share and no dependence on how the DataLoader interleaved them -- the two
+        # things the old seeding was defending against. This is what the pose loader already does
+        # (`dataset.py:769`), for the same reason. Eval still gets NO augmentation at all.
+        rng = (np.random.default_rng(None) if self.augment and self.train else None)
         warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
                               centre=self._warp_centre(i)) if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
         regions = self.regions_for(i, warp)
 
-        r = reduce_factor(size, self.input_wh) if self.reduce else 1
+        # WHAT THE PIXELS ARE HEADED FOR, WHICH UNDER TILING IS NOT `input_wh`. Tiled,
+        # `self.input_wh` IS the tile size, so comparing the whole 4696x2048 frame against it gave
+        # r = 2 for a 640x640 tile and r = 4 for 640x288 -- and `M = L @ W @ D` below multiplies
+        # the decode scale back up, so the tile became a 2-4x UPSAMPLE of a decimated frame.
+        # Deployment does the opposite: `detect_group` letterboxes the whole frame to
+        # `tiled_input_wh(src, tile_scale)`, where `reduce_factor` returns 1 and the detector sees
+        # native pixels. That is exactly the train/deploy sampling skew `reduce` is stamped into
+        # the checkpoint to PREVENT. The deployment-equivalent target is the frame at `tile_scale`.
+        out_wh = (self.input_wh if self.tile_wh is None
+                  else (size[0] * self.tile_scale, size[1] * self.tile_scale))
+        r = reduce_factor(size, out_wh) if self.reduce else 1
         img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
         if img is None:
             raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')

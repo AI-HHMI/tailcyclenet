@@ -1080,3 +1080,29 @@ def test_a_nan_box_is_skipped_by_both_cross_view_paths():
     for g in solo:
         for c, b in g['boxes'].items():
             assert torch.isfinite(b).all(), f'camera {c} emitted a NaN box as an instance'
+
+
+def test_reduce_under_tiling_matches_what_deployment_decodes():
+    """`--reduce` compared the whole frame against the TILE size, which is not where it is headed.
+
+    Tiled, `input_wh` is the tile, so rat-city's 4696x2048 against a 640x640 tile gave r = 2 and
+    against 640x288 gave r = 4 -- and the warp multiplies the decode scale back up, so the tile
+    came out a 2-4x UPSAMPLE of a decimated frame. Deployment letterboxes the whole frame to
+    `tiled_input_wh(src, tile_scale)` instead, where the same function returns 1 and the detector
+    sees native pixels. That is the train/deploy sampling skew `reduce` is stamped into the
+    checkpoint to prevent.
+    """
+    from tailcyclenet.detector.data import reduce_factor
+
+    size = (4696, 2048)                                   # rat-city
+    for tile, scale in (((640, 640), 1.0), ((640, 288), 1.0), ((896, 896), 1.0)):
+        assert reduce_factor(size, tile) > 1, \
+            f'{tile}: the old comparison must actually decimate, or this proves nothing'
+        deployed = (size[0] * scale, size[1] * scale)
+        assert reduce_factor(size, deployed) == 1, \
+            'at tile_scale 1.0 deployment decodes natively, so training must too'
+
+    # And the untiled path is untouched: there `input_wh` IS what the frame is headed for.
+    assert reduce_factor(size, (640, 288)) == reduce_factor(size, (640, 288))
+    # At a genuine downscale the reduction comes back, on both sides alike.
+    assert reduce_factor(size, (size[0] * 0.125, size[1] * 0.125)) > 1

@@ -17,6 +17,8 @@ __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox'
 # been linked, so a cache written under an older rule is a different box set under an identical
 # stamp -- exactly the silent mismatch the stamp exists to catch (`scripts/infer.py`). Rev 2 is the
 # gated centre-distance matcher with births and expiry; rev 1 was ungated IoU with `free.pop(0)`.
+# `birth_age` did NOT bump this: it defaults to None, which is byte-identical to rev 2, and it is
+# unreachable from the CLI precisely because the sweep in `link_rows` refutes turning it on.
 LINK_REV = 2
 
 
@@ -308,7 +310,7 @@ def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch
     return (out, sc) if kp is None else (out, sc, kp)
 
 
-def link_rows(boxes, scores=None, max_move=1.0, max_age=24, extra=None):
+def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
@@ -351,6 +353,42 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, extra=None):
     which is a birth, not a swap. Beyond that it is dropped: there is no row for it, and inventing
     one on top of a live animal is `fp_dup`.
 
+    **THIS FUNCTION DROPS A THIRD OF rat-city's DETECTIONS AND `birth_age` IS THE FIX THAT DOES NOT
+    WORK. THE FIX IS SPARE ROWS.** Both halves are measured, and the second is the useful one.
+
+    The symptom, on rat-city's 500-frame clip where the detector fills 0.993 of slots
+    (`scratch/phase11/probe_link.py`): 5,946 detections offered, 3,891 matched, **7 born, 2,048
+    (34.4%) DROPPED** -- and 29% of the dropped were INSIDE the gate, so `max_move` is not what
+    rejected them. They lost the Hungarian and had nowhere to go.
+
+    The obvious reading is that eligibility is too strict: a row is open only when `last` is
+    entirely non-finite, which needs `max_age = 24` frames of absence, one whole window. `birth_age`
+    relaxes that -- a row unseen for that many frames is free even though `last` is kept for
+    MATCHING. It is measured and it is REFUTED (`scratch/phase11/probe_birth_age.py`), because
+    `run_group` crops a window to the UNION of a row's boxes and a row that changes animal
+    mid-window spans both:
+
+        birth_age   999(off)   8      4      2      1      0
+        fill          0.652  0.716  0.730  0.764  0.816  0.993
+        union p99       590   3044   3804   4090   4200   4367     px, against a 244 px rat
+
+    Coverage is bought at exactly the price the strict rule exists to prevent, and `birth_age = 0`
+    is `--no-link-boxes` (78.9 px at coverage 0.131 end to end). So it DEFAULTS TO None -- off,
+    byte-identical to the rule before it existed -- and is kept only because the sweep above is
+    worth more than the knob.
+
+    **What actually works is giving births somewhere to go.** `--max-animals` sets the row count `S`
+    from the LABEL count, so 12 rats get 12 rows and an unmatched detection can only be seated by
+    evicting a live animal. With spare rows the STRICT rule seats nearly everything and the union
+    gets TIGHTER, because no row has to hold two animals (`probe_spare_rows.py`):
+
+        rows      12     18     24        (birth_age off throughout)
+        fill/GT  0.652  0.914  1.042
+        union p99  590    564    525      px
+
+    Not the row count's fault either, strictly: it is that `S` is derived from how many animals the
+    LABELS name, which is a statement about annotation and not about how many boxes a tracker needs.
+
     ponytail: still per-frame Hungarian on geometry alone. No appearance model, no velocity (report
     12 R2 measured that as not worth it), no re-identification after a long occlusion. `dev/reports/
     12_crossview_tracking.md` R1 is the target state -- ONE cross-view target set with one affinity,
@@ -388,8 +426,19 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, extra=None):
         claimed = set(taken.values())
         free_dets = [c for c in range(S)
                      if c not in claimed and np.isfinite(cur[c]).all(-1).any()]
+        # `birth_age is None` is the shipped path and is byte-identical to the rule before the knob
+        # existed -- open means `last` has expired to all-NaN, and rows are paired in index order.
+        # The `sorted` branch only runs when a caller opts in, so the default cannot drift.
         open_rows = [r for r in range(S)
                      if r not in taken and not np.isfinite(last[r]).all(-1).any()]
+        if birth_age is not None:
+            # OCCUPIED is `age`, not `last`: `last` is retained for MATCHING. Oldest first, because
+            # `free_dets` pairs by position and the longest-unseen row is the likeliest to be free
+            # rather than mid-blink.
+            open_rows = sorted((r for r in range(S)
+                                if r not in taken and (not np.isfinite(last[r]).all(-1).any()
+                                                       or age[r] >= birth_age)),
+                               key=lambda r: -age[r])
         for r, c in zip(open_rows, free_dets):
             taken[r] = c
         out = np.full_like(cur, np.nan)

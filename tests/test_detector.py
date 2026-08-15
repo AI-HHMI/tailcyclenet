@@ -1230,3 +1230,31 @@ def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py').read_text()
     assert "torch.save(ckpt, args.out / 'detector.pth')" in src
     assert 'if sel >= best_score:' in src, 'the unconditional overwrite is back'
+
+
+def test_birth_age_off_is_the_rule_it_replaced():
+    """`birth_age=None` must be byte-identical to the pre-knob rule, because it is the default.
+
+    Loosening the birth rule is REFUTED: it buys coverage by letting one row hold two animals, and
+    `run_group` unions a row's boxes over a window, so rat-city's union p99 goes 590 -> 3804 px
+    against a 244 px rat. The knob ships off; the fix for the 34% drop is spare rows.
+    """
+    from tailcyclenet.detector import link_rows
+    rng = np.random.default_rng(0)
+    S, T = 4, 40
+    boxes = np.full((S, T, 1, 4), np.nan, np.float32)
+    for s in range(S):
+        x, y = 100.0 + 300 * s, 100.0
+        for t in range(T):
+            if 12 <= t < 30 and s == 1:          # row 1 disappears for 18 frames, under max_age
+                continue
+            x += rng.normal(0, 2)
+            boxes[s, t, 0] = (x, y, x + 60, y + 60)
+
+    off = link_rows(boxes.copy())
+    # A row that vanishes for 18 frames stays ITS OWN under the shipped rule -- nothing is reseated.
+    assert np.isfinite(off[1, 5, 0]).all() and np.isfinite(off[1, 35, 0]).all()
+    assert not np.isfinite(off[1, 20, 0]).any(), 'the gap must stay empty, not be filled'
+    # And the knob is genuinely a no-op at None: same array as an explicit huge threshold.
+    huge = link_rows(boxes.copy(), birth_age=10_000)
+    np.testing.assert_array_equal(np.isfinite(off), np.isfinite(huge))

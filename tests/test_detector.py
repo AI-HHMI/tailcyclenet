@@ -1170,3 +1170,35 @@ def test_score_dataset_scores_unaugmented_and_restores_the_flag():
     src = inspect.getsource(score_dataset)
     assert 'ds.augment = False' in src, 'scoring must not run through the augmentation'
     assert 'ds.augment = aug_was' in src, 'and it must put the flag back, or training loses it'
+
+
+def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
+    """`--min-views 1` births a target whose 3D point is all-NaN BY DESIGN (`associate`).
+
+    Such a target is filtered out of `slots`, so the update loop never touches its `age`, `retire`
+    never fires, and `free` excludes it because it is still in `self.targets`. One single-view
+    birth on frame 0 therefore cost a row for the rest of the clip -- on rat-city's 57,594-frame
+    test group, permanently.
+
+    This is NOT the documented immortal ONE-CAMERA target, which has a finite point, stays in
+    `slots`, and whose retirement was tried and measured worse (+2.72 mm MPJPE). This one is
+    invisible to the matcher altogether.
+    """
+    import torch
+
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    tr = CrossViewTracker(2, max_age=3)
+    tr.targets[0] = {'point': torch.full((3,), float('nan')), 'age': 0}
+    assert 0 in tr.targets
+
+    # No detections at all: the pointless target must still age out, freeing its slot.
+    for _ in range(tr.max_age + 1):
+        tr.step([], [], [])
+    assert 0 not in tr.targets, 'a target the matcher can never see must still be able to expire'
+
+    # A target WITH a point is unaffected by this path -- it ages through the normal loop.
+    tr2 = CrossViewTracker(2, max_age=3)
+    tr2.targets[0] = {'point': torch.zeros(3), 'age': 0}
+    tr2.step([], [], [])
+    assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'

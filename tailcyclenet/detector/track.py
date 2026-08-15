@@ -113,6 +113,19 @@ class CrossViewTracker:
 
         slots = [s for s, t in sorted(self.targets.items())
                  if bool(torch.isfinite(t['point']).all())]
+        # A TARGET WITH NO 3D POINT CANNOT BE MATCHED, SO IT MUST STILL BE ABLE TO EXPIRE. It is
+        # filtered out of `slots` above, so the update loop never touches its `age`, `retire` never
+        # fires, and `free` below excludes it because it is still in `self.targets` -- the slot is
+        # dead for the rest of the clip. `--min-views 1` creates exactly this: a single-view
+        # instance's `point` is all-NaN by design (`associate`), and one such birth on frame 0
+        # permanently costs a row.
+        #
+        # This is NOT the documented immortal one-camera target. That one HAS a finite point, is
+        # in `slots`, and its age is maintained; retiring it was tried and measured worse
+        # (+2.72 mm MPJPE). This one is invisible to the matcher entirely.
+        for s, t in self.targets.items():
+            if s not in slots:
+                t['age'] += 1
         pts = (torch.stack([self.targets[s]['point'] for s in slots]) if slots else None)
         claimed = {c: set() for c in range(C)}
         got = {s: {} for s in slots}                    # slot -> {cam: det index}

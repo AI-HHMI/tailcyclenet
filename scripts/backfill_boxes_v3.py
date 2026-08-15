@@ -174,8 +174,18 @@ def convert_session(dst: Path, src: Path, args) -> dict:
         annotated = np.zeros(len(s), bool)
         if lab_mask is not None:
             m = lab_mask[..., 0] if lab_mask.ndim == 3 else lab_mask
-            ok = s < m.shape[0]
-            annotated[ok] = m[s[ok], t[ok]]
+            # BY animal_id, NOT BY ROW POSITION. `s` indexes v3 rows (named `a{i:02d}` above),
+            # while `m` is indexed by the session's OWN animal axis -- from which
+            # `convert_v4.build_labels` has already dropped every all-NaN animal (its docstring
+            # names `a04` in rat-city val). Positional indexing therefore read the NEXT animal's
+            # labelled-ness for every row at or past the dropped id, and the last row fell off the
+            # `s < m.shape[0]` guard and was forced to `present`. A labelled instance written
+            # `present` becomes an IGNORE REGION in `scripts/eval.py` -- its false positives are
+            # excused (spec §9) -- and a `present` written `labeled` violates validation rule 11.
+            pos = {aid: i for i, aid in enumerate(sess.labels(gid).animal_ids)}
+            row = np.array([pos.get(aids[i], -1) for i in s], np.int64)
+            ok = row >= 0
+            annotated[ok] = m[row[ok], t[ok]]
 
         cols['group_id'].extend([gid] * len(s))
         cols['frame'].extend(t.astype(np.int32))

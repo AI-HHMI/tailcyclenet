@@ -544,7 +544,9 @@ rising curve. That also settles what the johnson divergence below was: error, no
 grows without plateauing on two of johnson-mouse's three 600-frame clips — 1.5-2.0 mm over the first
 five windows rising to 23 mm and 62 mm by the last, slopes of +6.1 and +2.1 mm/window over the second
 half, against a mouse whose longest bone is 33 mm. The de-loop reduces that growth by 0-31% and does not
-remove it. rat-city's one test group is 57,594 frames, 96x these clips. So for a long deployment run
+remove it. rat-city's TRAIN group is 57,594 frames, 96x these clips (its *test* group is 500 -- the
+split is by frame range over one recording, and the 57k figure is a format fact, not a test-clip
+length). So for a long deployment run
 prefer `--anchor none` until the architectural question above is settled, and say how short a clip any
 `carry` number came from. The only brake is the bounds mask, which fires at about one crop width and
 shows up in the trace as occasional windows of exactly 0.00 divergence.
@@ -619,7 +621,19 @@ head trained against an all-true target, and the gate is worth −0.037 to −0.
 and the rate-matched control is mandatory for both.
 
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
-bootstrap), PCK, coverage, MOTA/miss/FP/idsw. Multi-animal rows report **matched** MPJPE: row
+bootstrap), PCK, coverage, MOTA/miss/FP/idsw.
+
+**THE BOOTSTRAP RESAMPLES GROUPS, AND A LONG CLIP IS ONE GROUP** — so rat-city's whole test split,
+a single 500-frame group, returned `DEGENERATE (one group -- no interval exists)` on every delta ever
+measured there, and the roots this repo most wants long-clip numbers from are exactly the ones with
+the fewest groups. `--chunk N` splits each group into N-frame scoring units. Two things make it a
+resampling change rather than a metric change, and the second is not obvious: the chunks PARTITION
+the frames, and **the match radius is the whole group's** — sized per chunk it swung 27.6 to 101.9 px
+across ten chunks of one clip (3.7x), and chunks scored under different radii are not exchangeable,
+which is the one thing a bootstrap needs them to be. `--vs` chunks the second file too, or the two
+sides key on different names and the pairing reports `no shared groups`. Chunks of one clip are more
+alike than independent clips, so this is **within-clip** uncertainty and optimistic against the
+between-clip kind — say which one a number is (eval rule 1). Multi-animal rows report **matched** MPJPE: row
 index is not identity once boxes come from a detector, and scoring row-to-row measured 385 px on
 flies that are 30 px across. `--vs other.npz` pairs two prediction files over the groups both scored
 and the points **both matched** — including coverage and the FP split, because a delta over points
@@ -808,7 +822,8 @@ rule silently makes an old cache a different box set.
 against the protocol numbers below and in favour of the per-window ones: over 480 frames the memoryless pass
 grows +0.6 mm/window to 39.4 mm while the tracker holds 12-13 mm flat, the union crop widens 193 → 230 px
 against 187, the worst crop halves (p99 750 → 376), box slots filled rise 0.866 → 0.888, and it is 5-8x
-faster. Deployment clips are long — rat-city's test group is 57,594 frames, 480x the benchmark — so the
+faster. Deployment clips are long — rat-city's *train* group is 57,594 frames, 480x the benchmark; its
+test group is 500 — so the
 per-window behaviour is the one that governs. **`track` is UNCONDITIONAL in the `--det-cache` stamp** for the
 third instance of the `det_score` reason: its default moved, so every cache written while it was off carries
 no `track` entry and is now REFUSED rather than reused as if it had been tracked. Reproducing any arm from
@@ -832,8 +847,8 @@ non-tracker arms and **190 → 187 (−0.19/window)** under the tracker, while `
 union is WIDENING rather than sliding off. (19% of crop growth does not by itself explain 133% of error
 growth; progressive identity drift is the likely remainder, and it is the same failure.) Report 11 §2's
 protocol is only **120 frames = 6 windows**, deliberately short, which is why the tracker reads insignificant
-there: the benchmark is too short to show the effect it fixes. rat-city's test group is 57,594 frames, 480×
-that. Quote it per window, not per arm.
+there: the benchmark is too short to show the effect it fixes. rat-city's *train* group is 57,594 frames,
+480x that; the test group is 500 frames, which report 19 §2 is about. Quote it per window, not per arm.
 **What it DOES buy is crop discipline**: box slots filled 0.866 → 0.888 mean and 0.653 → 0.732 at p10 (so
 §2.1 was right about the BOXES), which does not convert to pose coverage because the union crop already
 rescued those rows from a single box — instead it halves the worst crop again (p99 750 → 376 px, max
@@ -850,6 +865,24 @@ BIRTHS, which is the one place a memoryless pairwise search is right. The affini
 distance of the target's held 3D point over the detection's box side — the same test as report 12's
 eq 4 point-to-ray, in the same units and with the same gate as `--link-boxes`, and with no `alpha_3d`
 constant to calibrate. Off by default until measured on 3dpop.
+
+**DETECTION AND ASSOCIATION ARE SPLIT, AND `--det-cache` NOW HOLDS RAW DETECTIONS.** `detect_raw`
+is pixels -> per-camera detections ranked by score; `associate_group` is the tracker / `associate` /
+`link_rows` half, microseconds per frame; `detect_group` is the composition and a test pins it
+byte-identical on every path. So every identity arm shares ONE detection pass and is matched BY
+CONSTRUCTION rather than by trusting the detector to be deterministic (eval rule 4), and `track`,
+`link_boxes`, `link_rev`, `max_animals`, `min_views`, `dup_res_px` and `max_move` all LEAVE the cache
+stamp -- they change nothing in the file. `raw_rev` is unconditional in their place and is the
+sharpest instance of the `det_score` trap yet: a raw cache and a pre-split associated one are the
+same shape, dtype and key names, so an old one read as raw would be associated a SECOND time,
+silently. Every pre-split cache is refused.
+
+**It also separates two levers `--max-animals` welded together** -- `decode`'s `top_k` and the row
+count `S`. `--det-top-k` sets the first alone, so `S` can be swept over one cache; that is what made
+report 18 §5's spare-rows result runnable end to end, and **`S` = animal count + 2 is measured a
+strict win on rat-city** (MOTA +0.112, coverage +0.205, idsw -0.011, `fp_dup` flat; report 19 §3).
+The curve is NOT monotonic -- S = 16 is worse than both 14 and 18 -- so sweep it, do not reason
+about it.
 
 **Every detector box is bounded in `unletterbox_boxes`.** `yolox.py:167` decodes a side as
 `exp(clamp(-6,6)) * stride` — up to ~12,910 px, ~137,000 source px after a 1/7 letterbox — and IoU-only

@@ -1216,6 +1216,62 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
     assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'
 
 
+def test_optimiser_levers_off_are_the_shipped_recipe_exactly():
+    """`--warmup-frac 0` and no `--no-decay-norm` must reproduce reports 10-21's optimiser.
+
+    Both flags move every number in a run, so the ONLY thing standing between them and every
+    detector figure on record is that their off-state is the old code path rather than a
+    reimplementation of it. Asserted on the two objects that carry the recipe -- the parameter
+    groups AdamW is handed, and the lr the schedule actually produces at each step.
+    """
+    import importlib.util
+    import pathlib
+    spec = importlib.util.spec_from_file_location(
+        'train_detector',
+        pathlib.Path(__file__).resolve().parents[1] / 'scripts' / 'train_detector.py')
+    td = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(td)
+
+    model = YOLOXNano(n_keypoints=0)
+
+    # OFF: exactly `model.parameters()`, not a one-group list that merely behaves like it.
+    off = td.param_groups(model, False)
+    assert list(off) == list(model.parameters()), 'flag off must hand AdamW the bare iterator'
+
+    # ON: rank splits the two groups and nothing is lost or duplicated between them.
+    on = td.param_groups(model, True)
+    assert len(on) == 2 and on[1]['weight_decay'] == 0.0
+    assert all(p.ndim > 1 for p in on[0]['params'])
+    assert all(p.ndim <= 1 for p in on[1]['params'])
+    assert len(on[0]['params']) + len(on[1]['params']) == len(list(model.parameters()))
+    assert on[1]['params'], 'GroupNorm affines and head biases are rank <= 1 and must be found'
+
+    # The schedule, stepped for real. Off is a plain cosine; the warmup arm starts at 1% of lr,
+    # reaches lr at the milestone, and only then begins descending.
+    iters, lr = 100, 1e-3
+    o1 = torch.optim.AdamW(model.parameters(), lr=lr)
+    s1 = torch.optim.lr_scheduler.CosineAnnealingLR(o1, T_max=iters)
+    plain = []
+    for _ in range(iters):
+        plain.append(o1.param_groups[0]['lr'])
+        s1.step()
+
+    o2 = torch.optim.AdamW(model.parameters(), lr=lr)
+    w = 5
+    s2 = torch.optim.lr_scheduler.SequentialLR(
+        o2, [torch.optim.lr_scheduler.LinearLR(o2, start_factor=0.01, total_iters=w),
+             torch.optim.lr_scheduler.CosineAnnealingLR(o2, T_max=iters - w)], milestones=[w])
+    warm = []
+    for _ in range(iters):
+        warm.append(o2.param_groups[0]['lr'])
+        s2.step()
+
+    assert plain[0] == pytest.approx(lr), 'the shipped schedule starts AT --lr'
+    assert warm[0] == pytest.approx(lr * 0.01), 'the warmup arm starts at 1% of --lr'
+    assert warm[w] == pytest.approx(lr), 'and reaches --lr exactly at the milestone'
+    assert warm[1] > warm[0] and plain[1] < plain[0], 'warmup rises where the cosine falls'
+
+
 def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
     """The run measured its own peak and then overwrote it -- worth up to -28% recall.
 

@@ -46,6 +46,21 @@ from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_coll
 from tailcyclenet.detector.evaluate import overall, score_dataset
 
 
+def param_groups(model, no_decay_norm):
+    """What AdamW is handed. `model.parameters()` unless `--no-decay-norm`, and then two groups.
+
+    RANK IS THE TEST, not the parameter's name. Every conv weight in YOLOX-Nano is rank 4 and
+    every GroupNorm affine and every head bias is rank 1, so `p.ndim <= 1` separates them without
+    matching on strings that a refactor would silently break. Returned as a plain iterator when the
+    flag is off so the optimizer sees exactly what it always saw.
+    """
+    if not no_decay_norm:
+        return model.parameters()
+    decay = [p for p in model.parameters() if p.requires_grad and p.ndim > 1]
+    plain = [p for p in model.parameters() if p.requires_grad and p.ndim <= 1]
+    return [{'params': decay}, {'params': plain, 'weight_decay': 0.0}]
+
+
 def default_input_wh(dataset, target_px=416 * 416):
     """An input size matched to the frame's aspect ratio, at roughly a square-416 pixel budget."""
     sess = next(iter(next(iter(dataset.sessions.values()))))
@@ -127,6 +142,24 @@ def main():
     ap.add_argument('--iters', type=int, default=20000)
     ap.add_argument('--batch-size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--warmup-frac', type=float, default=0.0,
+                    help='fraction of --iters spent on a LinearLR warmup from 1%% of --lr before '
+                         'the cosine takes over. 0 (the default) is the shipped schedule, byte-'
+                         'identical. WHY IT IS AN ARM: we run AdamW at 1e-3 from RANDOM INIT with '
+                         'no warmup, where DeepLabCut, SLEAP and APT are all at 1e-4. APT '
+                         'documents the failure by name -- "RTMDet needs its LinearLR warmup, '
+                         'since AdamW at the nominal lr of 4e-3 can diverge on a freshly '
+                         'initialized head" -- and caps its own warmup at dl_steps // 10. Random '
+                         'init is precisely the case warmup protects, and the one pathology on '
+                         'record here (whole-frame dense recall peaking at 4-8k of 20k and falling '
+                         'monotonically) is an early-training shape. 0.05 is APT\'s ratio.')
+    ap.add_argument('--no-decay-norm', action='store_true',
+                    help='exclude GroupNorm affines and biases (every parameter of rank <= 1) from '
+                         'weight decay. Off by default, which is byte-identical. AdamW currently '
+                         'decays them along with the conv weights, and with GroupNorm that is more '
+                         'than cosmetic: decaying a norm\'s scale toward zero fights the '
+                         'normalisation it exists to provide. None of the three reference systems '
+                         'decays norm parameters either.')
     ap.add_argument('--num-workers', type=int, default=8)
     ap.add_argument('--frames-per-group', type=int, default=40)
     ap.add_argument('--min-crop-dim', type=int, default=64,
@@ -286,8 +319,20 @@ def main():
     model = YOLOXNano(n_keypoints=n_kpts).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX-Nano: {n / 1e6:.2f}M params')
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
+    opt = torch.optim.AdamW(param_groups(model, args.no_decay_norm), lr=args.lr, weight_decay=5e-4)
+    # THE SCHEDULE IS BUILT IN ONE BRANCH OR THE OTHER, NEVER BOTH. Constructing a
+    # CosineAnnealingLR sets the optimizer's lr as a side effect at __init__, so building a spare
+    # one to hand to SequentialLR and then discarding it would leave the warmup starting from a
+    # perturbed lr -- and `--warmup-frac 0` would stop being the shipped schedule.
+    if args.warmup_frac > 0:
+        w = max(1, int(round(args.iters * args.warmup_frac)))
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt, [torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=w),
+                  torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.iters - w))],
+            milestones=[w])
+        print(f'schedule: LinearLR 0.01 -> 1.0 over {w} iters, then cosine over {args.iters - w}')
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
 
     args.out.mkdir(parents=True, exist_ok=True)
     history = []
@@ -363,6 +408,10 @@ def main():
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
                         'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
+                        # Recorded for the same reason `rotate_deg` is: neither changes a tensor's
+                        # shape, so a checkpoint trained under one schedule and compared against
+                        # another is indistinguishable from the file alone. Gotcha 12's shape.
+                        'warmup_frac': args.warmup_frac, 'no_decay_norm': args.no_decay_norm,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the

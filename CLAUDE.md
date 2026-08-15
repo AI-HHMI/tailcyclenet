@@ -60,6 +60,27 @@ pixi run test
 it. (posetail-pose's `path = "../posetail-next"` dep is how it ended up importing nothing after a
 directory move.)
 
+**`tailcyclenet/patches.py` MONKEYPATCHES THE PINNED LIBRARY, AND EVERY ENTRY IN IT IS A BUG THAT
+SHOULD BE FIXED UPSTREAM.** It is applied from `tailcyclenet/__init__.py` — importing anything from
+this package applies it — because `posetail`'s own modules bind the patched names by VALUE at their
+import time, so a later patch would reach some call sites and not others. **When the `posetail` pin
+moves, read that file and delete whatever landed upstream** rather than discovering a
+double-applied fix.
+
+Currently one entry. `cube.project_cam` does `p2d = p2d - offset[None, :]`, which prepends exactly
+one axis and so cannot express a PER-FRAME camera offset — the thing a moving crop
+(`crop.moving_boxes`) is, and the only thing it is: `apply_crop` writes only `offset` and `size`,
+and the rule holds the side constant, so `mat`, `ext` and `dist` never change. The library already
+carries a time axis on `ext` (`(T,4,4)`, indexed per frame at `encoder_decoder.py:59`); `offset` was
+never given the same treatment. **Upstream fix: right-align the subtraction** so `(T,2)` meets the
+time axis `project_cam`'s own comment already documents for `ext`. Without it a `(T,1,2)` offset
+gives correct VALUES at every call site and the wrong RANK wherever `p3d` is rank 3 — `(1,T,K,2)`
+in the loader against `(B,T,K,2)` in `losses.py` — so no single shape works and it fails as a silent
+shape bug. The patch WRAPS rather than reimplements (calls the original with `offset` withheld, then
+subtracts), so distortion, the depth clamp and any future upstream change are inherited; a 1-D
+offset takes the original path untouched and is bit-identical. `tests/test_patches.py` pins both
+halves and the end-to-end geometry.
+
 The `LD_LIBRARY_PATH` prepend in `[tool.pixi.activation.env]` is load-bearing: the env ships
 `libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it `import
 scipy.optimize` dies inside `_highspy` with an error that names only CXXABI.

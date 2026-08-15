@@ -166,6 +166,143 @@ def crop_to_points_2d(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None):
     return apply_crop(cam, box), box, shifted
 
 
+def moving_boxes(extents, size, min_crop_dim=64, scale=1.0, shift=(0.0, 0.0)):
+    """(T,4) int32 crops of ONE CONSTANT SIDE that FOLLOW the animal, or None.
+
+    THE ONE MOVING-CROP RULE, shared by the training loader (`crop_to_points_2d_moving`) and
+    inference (`infer.run_group`) for the same reason `crop_box_for_points` is shared: the pose
+    model must meet the same geometry in both places, and two copies of this arithmetic would
+    drift the way gotcha 8 describes.
+
+    A window crop is a union over the window's frames, so it is inflated by however far the animal
+    walked while the box stood still -- measured on rat-city, union side p50 1.23x and p90 1.92x
+    the median per-frame side. These boxes translate instead.
+
+    THE SIDE IS CONSTANT ACROSS THE WINDOW AND ONLY THE ORIGIN MOVES, which is what keeps this
+    expressible at all: `apply_crop` folds the crop into the camera as a per-camera `offset` and
+    `size`, one value for the whole window, so a per-frame SIZE would be a per-frame intrinsic and
+    would have to be taught to `project_points_torch`, the triangulation and both camera
+    embeddings. A per-frame ORIGIN is just a translation, and in 2D it is absorbed by shifting the
+    coordinates per frame. This is also why the gain is bounded: sizing one box for the window's
+    LARGEST frame leaves most of the union's inflation in place (measured 9% off the median side,
+    not the ~20% the p50 ratio suggests).
+
+    `extents` is one `[x1,y1,x2,y2]` per frame, or None where that frame had nothing finite. The
+    centre is carried through the Nones by interpolation, so a frame the detector missed does not
+    snap the crop to the image corner and take the animal out of shot.
+
+    `scale` and `shift` are ONE crop jitter for the whole window -- see `jitter_params`. They must
+    be one draw rather than one per frame: a per-frame scale is the per-frame size this rule exists
+    to avoid, and a per-frame shift would add a random walk to the crop the labels do not follow.
+
+    THE CENTRE IS WHAT GETS CLAMPED, not the corners. Clamping corners shrinks the box at the
+    arena edge, which is a per-frame scale change by the back door.
+    """
+    T = len(extents)
+    c = np.full((T, 2), np.nan, np.float64)
+    sides = np.full(T, np.nan, np.float64)
+    for t, e in enumerate(extents):
+        if e is None:
+            continue
+        x0, y0, x1, y1 = (float(q) for q in e)
+        c[t] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        sides[t] = max(x1 - x0, y1 - y0)
+    ok = np.isfinite(c).all(1)
+    if not ok.any():
+        return None
+    W, H = int(size[0]), int(size[1])
+    side = max(float(np.nanmax(sides)) * float(scale), float(min_crop_dim))
+    side = min(int(np.ceil(side)), W, H)
+    t = np.arange(T)
+    for i in range(2):
+        c[:, i] = np.interp(t, t[ok], c[ok, i])
+    cx = np.clip(c[:, 0] + side * float(shift[0]), side / 2.0, W - side / 2.0)
+    cy = np.clip(c[:, 1] + side * float(shift[1]), side / 2.0, H - side / 2.0)
+    x0 = np.clip(np.round(cx - side / 2.0), 0, W - side).astype(np.int32)
+    y0 = np.clip(np.round(cy - side / 2.0), 0, H - side).astype(np.int32)
+    return np.stack([x0, y0, x0 + side, y0 + side], 1).astype(np.int32)
+
+
+def crop_to_points_2d_moving(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None):
+    """`crop_to_points_2d`'s moving twin. Returns (cam, boxes (T,4), coords shifted per frame).
+
+    Same crop rule, same `_crop_source` fallback, same floor -- the box translates per frame
+    instead of standing still, and the returned `cam` carries the CONSTANT side as its `size` and
+    frame 0's origin as its `offset`. The per-frame origin is not in the camera and cannot be: it
+    is applied to the coordinates here and to the pixels by `read_frames`.
+
+    2D ONLY. In 3D the points are world-metric and `p2d` comes from `project_points_torch(cgroup,
+    coords)`, so a per-frame origin would need a per-frame camera -- the change this rule is
+    written to avoid.
+    """
+    src, pad = _crop_source(coords, crop_pts)
+    per = [crop_box_for_points(src[t], cam['size'], min_crop_dim, pad) for t in range(len(src))]
+    s, dx, dy = jitter if jitter is not None else (1.0, 0.0, 0.0)
+    boxes = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=(dx, dy))
+    if boxes is None:
+        return None, None, None
+    origin = torch.as_tensor(boxes[:, :2].astype(np.float32))       # (T,2)
+    # `coords` is (T,K,2); the origin broadcasts per frame, which is the whole 2D change.
+    shifted = coords - origin[:, None, :].to(coords.dtype)
+    return apply_crop(cam, boxes[0]), boxes, shifted
+
+
+def apply_crop_moving(cam, boxes):
+    """`apply_crop` for a crop that TRANSLATES: `offset` gains a time axis, `size` does not.
+
+    This is the whole of the camera change a moving crop needs, in 2D and in 3D alike. `apply_crop`
+    only ever wrote `offset` and `size`, and `moving_boxes` holds the side constant -- so `mat`,
+    `ext` and `dist` are untouched and no per-frame INTRINSIC is involved. A `(T,2)` offset is
+    exactly what `tailcyclenet.patches` teaches `project_cam` to right-align, and it is the same
+    shape convention the library already uses for a moving camera's `(T,4,4)` `ext`.
+    """
+    out = dict(cam)
+    off = torch.as_tensor(boxes[:, :2].astype(np.int32), dtype=cam['offset'].dtype)
+    out['offset'] = cam['offset'][None, :] + off                    # (T,2)
+    out['size'] = torch.tensor([int(boxes[0, 2] - boxes[0, 0]), int(boxes[0, 3] - boxes[0, 1])],
+                               dtype=torch.int32)
+    return out
+
+
+def crop_to_points_3d_moving(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None):
+    """`crop_to_points_3d`'s moving twin. Returns (cgroup, boxes) with boxes[c] of shape (T,4).
+
+    Same rule, same `_crop_source` fallback, same per-camera independence -- each camera follows
+    the animal in ITS OWN view, which is the point: the union crop is per camera too, so an animal
+    that stays put in one view and crosses another inflates only the second. Measured on 3dpop, the
+    moving side is p50 0.918 and p10 0.584 of the union side, a LARGER inflation than any 2D root.
+
+    In 3D the coordinates are world-metric and are NOT shifted here -- there is nothing to shift.
+    The crop enters the geometry through the camera's `offset` alone, so `project_points_torch`
+    lands points in moving-crop pixels by itself. That is why this needs `tailcyclenet.patches`
+    and the 2D twin does not: 2D absorbs the origin into the coordinates, 3D cannot.
+    """
+    p2d = project_points_torch(cgroup, coords)
+    out, boxes = [], []
+    s, dx, dy = jitter if jitter is not None else (1.0, 0.0, 0.0)
+    for cnum, cam in enumerate(cgroup):
+        src, pad = _crop_source(p2d[cnum], None if crop_pts is None else crop_pts[cnum])
+        per = [crop_box_for_points(src[t], cam['size'], min_crop_dim, pad)
+               for t in range(len(src))]
+        mb = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=(dx, dy))
+        if mb is None:
+            return None, None
+        out.append(apply_crop_moving(cam, mb))
+        boxes.append(mb)
+    return out, boxes
+
+
+def jitter_params(rng, shift_frac, scale_frac):
+    """The three numbers `jitter_box` draws, for a caller that must apply ONE draw to MANY boxes.
+
+    Same draws in the same order as `jitter_box`, so a moving-crop item consumes the rng
+    identically to a static one and the two arms stay comparable draw for draw.
+    """
+    return (1.0 + float(rng.uniform(-scale_frac, scale_frac)),
+            float(rng.uniform(-shift_frac, shift_frac)),
+            float(rng.uniform(-shift_frac, shift_frac)))
+
+
 def jitter_box(rng, shift_frac, scale_frac):
     """A crop-box jitterer. 0.3/0.3 measurably beat a tight box in posetail-pose.
 

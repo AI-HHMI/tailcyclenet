@@ -83,6 +83,14 @@ class InferConfig:
     # keypoints over the window -- see the long comment at the union below for why that is the one
     # thing boxes cannot reproduce. Needs a keypoint-trained detector; ignored without one.
     crop_source: str = 'boxes'
+    # CROP PER FRAME INSTEAD OF PER WINDOW -- one constant side that translates to follow the
+    # animal. See `crop.moving_boxes` for what it does and, more importantly, for what it does NOT do:
+    # the side is fixed across the window because a per-frame size is a per-frame intrinsic and
+    # `apply_crop` cannot express one. 2D ONLY, and it composes with `crop_source` (each frame's
+    # own box, or the crop rule on each frame's own detector keypoints). Off by default: the model
+    # was trained on static window crops, so this is a distribution shift and has to be measured
+    # against a matched fixed-crop arm rather than assumed to help.
+    moving_crop: bool = False
     # How many finite (frame, camera) boxes a row needs before it gets a window crop at all. 1 is
     # what the loop always did, and it is the reason coverage can be FABRICATED: `3dpop_nogate.npz`
     # reports 0.000 of (row, frame) missing a pose while its box cache has 2.1-2.2% of (row, frame)
@@ -163,13 +171,28 @@ def _crop_views(imgs, box, target_size):
     doing both inside the animal loop paid the full-frame decode once per animal: rat-city's
     twelve rats over a 24-frame window decoded the same 24 images twelve times. The warp itself
     is ~0.2 ms against ~27 ms for the decode it no longer repeats.
+
+    `box` is either ONE `[x1,y1,x2,y2]` for the whole window, or a (T,4) of per-frame boxes under
+    `--moving-crop`. The one-box path is kept as a single affine computed once, so the flag off is
+    the same arithmetic it always was.
     """
     import cv2
 
-    aff = _crop_affine((imgs[0].shape[1], imgs[0].shape[0]), box, target_size, None)
-    out = [im if aff is None else cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR)
-           for im in imgs]
+    b = np.asarray(box)
+    src_wh = (imgs[0].shape[1], imgs[0].shape[0])
+    if b.ndim == 1:
+        aff = _crop_affine(src_wh, box, target_size, None)
+        out = [im if aff is None else cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR)
+               for im in imgs]
+    else:
+        out = []
+        for t, im in enumerate(imgs):
+            aff = _crop_affine(src_wh, b[min(t, len(b) - 1)], target_size, None)
+            out.append(im if aff is None else
+                       cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
     return torch.from_numpy(np.asarray(out))[None]
+
+
 
 
 def prior_out_of_bounds(p, mode, cgroup):
@@ -328,6 +351,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                  np.full((S, T_total, len(session.rig), det_kpts_stc.shape[3]),
                          np.nan, np.float32))
     crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
+    # PER FRAME, so it cannot share `crop`'s per-window shape. `crop` stays the record of what the
+    # box source OFFERED for the window; this is what the pixels were actually cut to.
+    crop_mv = (np.full((S, T_total, len(session.rig), 4), np.nan, np.float32)
+               if cfg.moving_crop else None)
 
     # THE COMPANION COLUMNS BLEND TOO, and they used not to. `pred` became the nan-aware mean of
     # every window that decoded a frame while `conf`, `box_agree`, `kpt_agree` and `pred_tri`
@@ -399,7 +426,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # config like w9's, a one-camera window is an untrained input shape rather than a
                 # supported one. Predicting it beats dropping it either way, but do not read a
                 # single-view arm without checking the run's own `[data].prob_2d_only`.
-                use, boxes = [], []
+                use, boxes, mboxes = [], [], ([] if cfg.moving_crop else None)
                 for i, ci in enumerate(cam_ix):
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
                     if not len(v):
@@ -486,16 +513,67 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                                 box = kb.to(torch.int32)
                     boxes.append(box)
                     use.append(ci)
+                    if mboxes is not None:
+                        # PER FRAME, FROM THE SAME SOURCE `crop_source` NAMES, so the two flags
+                        # compose instead of one silently overriding the other: 'boxes' takes that
+                        # frame's own detector box, 'keypoints' runs the crop rule on that frame's
+                        # own detector keypoints. The window box above is still what positions
+                        # `cgroup` and is still what `crop` records -- it remains the record of what
+                        # the box source offered, which is the one thing `crop_moving` is not.
+                        if cfg.crop_source == 'keypoints' and det_kpts_stc is not None:
+                            kk = det_kpts_stc[a, frames, ci][..., :2]        # (T, K, 2)
+                            ext = []
+                            for kt in kk:
+                                q = kt[np.isfinite(kt).all(-1)]
+                                kb = (cropmod.crop_box_for_points(
+                                          torch.as_tensor(q, dtype=torch.float32),
+                                          torch.tensor([w, h], dtype=torch.float32),
+                                          cfg.min_crop_dim) if len(q) else None)
+                                ext.append(None if kb is None else kb.numpy())
+                        else:
+                            ext = [r if np.isfinite(r).all() else None for r in bb[:, i]]
+                        mboxes.append(cropmod.moving_boxes(ext, (w, h), cfg.min_crop_dim))
                 if not use:
                     outcome[a, wi] = OUTCOMES.index('no camera')
                     continue
-                cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
+                # THE CAMERA MUST DESCRIBE THE BOX THE PIXELS WERE ACTUALLY CUT WITH, and under
+                # `--moving-crop` that is the moving box, not the window union. `apply_crop` sets
+                # `size`, `_resize_camera` turns it into `scales`, and `forward` divides by that --
+                # so leaving the union box here scales the decode by union_side/moving_side (p50
+                # 1.23 on this root) and lands every keypoint short of where it belongs. It cost
+                # pck@10 0.841 -> 0.383 at unchanged coverage, which is the signature: the rows are
+                # all there and every one of them is in the wrong place.
+                #
+                # Frame 0's moving box is the right representative because the SIDE is constant
+                # across the window by construction -- only the origin moves, and the origin is
+                # handled per frame in `forward` and `_build_prior` instead.
+                # 2D AND 3D PUT THE MOVING ORIGIN IN DIFFERENT PLACES, and using one rule for both
+                # is silently wrong in 3D. In 2D the decode is crop-local absolute pixel bins, so
+                # the camera keeps frame 0's origin and `forward` adds the per-frame one back
+                # explicitly. In 3D the output is world-metric and every projection goes THROUGH
+                # the camera, so the origin has to live there -- `apply_crop_moving` gives it the
+                # (T,2) offset that `tailcyclenet.patches` teaches `project_cam` to right-align.
+                # Frame 0's offset in 3D would reproject all T frames through the first frame's
+                # crop, which is a whole-window lag with no symptom but a rising loss.
+                if mboxes is not None and mode != '2d':
+                    cgroup = [cropmod.apply_crop_moving(window_cams[ci], mb)
+                              if mb is not None else cropmod.apply_crop(window_cams[ci], b)
+                              for ci, b, mb in zip(use, boxes, mboxes)]
+                else:
+                    cbox = [(mboxes[i][0] if mboxes is not None and mboxes[i] is not None else b)
+                            for i, b in enumerate(boxes)]
+                    cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, cbox)]
             else:
                 pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
                 if not torch.isfinite(pts).all(-1).any():
                     outcome[a, wi] = OUTCOMES.index('no points')
                     continue
                 use = cam_ix
+                # NO MOVING CROP ON THE LABEL PATH. This branch is the GT-crop upper bound, whose
+                # whole point is to be the box the training loader would have produced -- a
+                # per-frame one is a different rule and would stop it being an upper bound on
+                # anything the trained model saw.
+                mboxes = None
                 cgroup, boxes = boxes_from_points(pts, [window_cams[i] for i in cam_ix],
                                                   cfg.min_crop_dim, mode)
                 if cgroup is None:
@@ -508,8 +586,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # The box BEFORE the pixels, so a decode failure still shows what it was reaching for.
             for i, ci in enumerate(use):
                 crop[a, wi, ci] = np.asarray(boxes[i], np.float32)
+                if crop_mv is not None and mboxes is not None and mboxes[i] is not None:
+                    # Per FRAME, and the windows overlap, so this is last-write-wins -- the same
+                    # `--seam last` rule the predictions themselves are recorded under.
+                    crop_mv[a, frames, ci] = mboxes[i].astype(np.float32)
             outcome[a, wi] = OUTCOMES.index('decode failed')
-            plans.append((a, use, boxes, cgroup, scales))
+            plans.append((a, use, boxes, cgroup, scales, mboxes))
 
         # ONE DECODE PER (CAMERA, FRAME) PER WINDOW, shared by every animal in it.
         #
@@ -540,10 +622,14 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # it takes out every animal that wanted this camera -- which is what the
                 # per-animal decode did too, one animal at a time.
                 ok = not any(im is None for im in imgs)
-                for a, use, boxes, cgroup, _ in plans:
+                for a, use, boxes, cgroup, _, mboxes in plans:
                     if ci in use:
                         i = use.index(ci)
-                        crops[a, ci] = (_crop_views(imgs, boxes[i], cgroup[i]['size'].tolist())
+                        # Fall back to the window box wherever `crop.moving_boxes` found nothing finite
+                        # to follow, so the flag can never cost a crop outright.
+                        bx = (mboxes[i] if mboxes is not None and mboxes[i] is not None
+                              else boxes[i])
+                        crops[a, ci] = (_crop_views(imgs, bx, cgroup[i]['size'].tolist())
                                         if ok else None)
                 del imgs
 
@@ -559,13 +645,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
         def forward(plan, crops):
             """One animal, one window -> its prediction in the SOURCE frame, or None."""
-            a, use, boxes, cgroup, scales = plan
+            a, use, boxes, cgroup, scales, mboxes = plan
             # uint8; the model divides on device. Same contract as the training loader.
             views = [crops[a, ci] for ci in use]
             if any(v is None for v in views):
                 return None                     # already marked 'decode failed' above
             prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
-                                           scales, mode, K, R, cgroup)
+                                           scales, mode, K, R, cgroup, mboxes)
             dev = cfg.device
             chunk = cfg.kpt_chunk or None
             views = [v.to(dev) for v in views]
@@ -602,7 +688,15 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             q = None
             if mode == '2d':
                 # crop pixels -> source pixels: undo the resize, then the crop origin
-                p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
+                # Under `--moving-crop` the origin is per FRAME, so the shift back into source
+                # pixels is too: `p` is (t,K,2) and the offset broadcasts as (t,1,2). This is the
+                # whole of the 2D geometry change -- the decode is crop-local absolute pixel bins,
+                # so a translating crop needs a translating offset and nothing else.
+                if mboxes is not None and mboxes[0] is not None:
+                    off = np.asarray(mboxes[0][:len(p), :2], np.float32)[:, None, :]
+                else:
+                    off = np.asarray(boxes[0][:2], np.float32)
+                p = p / scales[0] + off
                 # THE SAME TENSOR, deliberately: at one camera there is nothing to triangulate and
                 # the 2D grid head decodes ABSOLUTE pixel bins, so no anchor is being fed its own
                 # output. Every 2D root is therefore bit-identical under either `carry_source`,
@@ -635,7 +729,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # dropped: a bad prediction must not cost coverage a loose box already had.
             refined = []
             for plan in plans:
-                a, use, boxes, cgroup, scales = plan
+                a, use, boxes, cgroup, scales, mboxes = plan
                 got = forward(plan, crops)
                 if got is None:
                     refined.append(plan)
@@ -665,12 +759,14 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # number in reports 08 and 11 is computed from.
                 for i, ci in enumerate(use):
                     crop_refined[a, wi, ci] = np.asarray(b2[i], np.float32)
-                refined.append((a, use, b2, cg2, sc2))
+                # `--moving-crop` is refused alongside `--refine` in scripts/infer.py, so this is
+                # always None rather than a dropped moving box.
+                refined.append((a, use, b2, cg2, sc2, None))
             plans = refined
             crops = decode_crops(plans)
 
         for plan in plans:
-            a, use, boxes, cgroup, scales = plan
+            a, use, boxes, cgroup, scales, mboxes = plan
             got = forward(plan, crops)
             if got is None:
                 continue                        # already marked 'decode failed' above
@@ -781,6 +877,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         out_npz['tri_degenerate'] = tri_bad
     if crop_refined is not None:
         out_npz['crop_refined'] = crop_refined
+    if crop_mv is not None:
+        out_npz['crop_moving'] = crop_mv
     return out_npz
 
 
@@ -911,7 +1009,8 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup):
     return p + torch.as_tensor(float(amt) * width * v, dtype=p.dtype), 0
 
 
-def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup):
+def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup,
+                 mboxes=None):
     """The per-keypoint prior for this window, in the model's coordinate frame.
 
     Two things the prompt has to get right, both of which were wrong here and both silent:
@@ -974,7 +1073,15 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
         return None, None
     if mode == '2d':
         # the carried/labelled pose is in SOURCE pixels; the model works in crop pixels
-        p = (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
+        #
+        # THE PRIOR DESCRIBES FRAME `qt`, NOT FRAME 0, so under `--moving-crop` it has to be
+        # shifted by THAT frame's origin. Using frame 0's would place the prompt off by however far
+        # the crop had travelled by then -- which is exactly the whole-body lag the offset-prompt
+        # work is about, injected by the geometry rather than by the model.
+        b0 = boxes[0][:2]
+        if mboxes is not None and mboxes[0] is not None:
+            b0 = mboxes[0][min(max(qt, 0), len(frames) - 1)][:2]
+        p = (p - torch.as_tensor(np.asarray(b0, np.float32))) * scales[0]
     p = p.clone()
     p[prior_out_of_bounds(p, mode, cgroup)] = float('nan')
     qt = min(max(qt, 0), len(frames) - 1)

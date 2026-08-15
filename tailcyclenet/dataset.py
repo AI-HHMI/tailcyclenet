@@ -74,6 +74,22 @@ class LoaderConfig:
     grayscale_prob: float = 0.2        # rate at which a train item drops colour entirely
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
     crop_jitter_scale: float = 0.3     # box scale jitter
+    # CROP PER FRAME INSTEAD OF PER WINDOW -- one constant side that translates to follow the
+    # animal (`crop.moving_boxes`, the same rule `infer.py --moving-crop` uses). 2D ONLY; the 3D
+    # path needs a per-frame camera and is left per window.
+    #
+    # WHY THE KEY EXISTS. Every crop this loader has ever produced is a union over the window, so
+    # it is inflated by however far the animal walked while the box stood still -- measured on
+    # rat-city, union side p50 1.23x and p90 1.92x the median per-frame side. `--moving-crop` at
+    # INFERENCE removes part of that and measures 3.90 px MPJPE WORSE [-6.05, -2.07] against its
+    # matched control, which is unsurprising and uninformative on its own: nothing in training
+    # produces a moving background, so that arm confounds "moving crops are bad" with "this model
+    # never saw one". THIS KEY IS THE ARM THAT SEPARATES THEM. Train with it on, infer with
+    # `--moving-crop`, and the comparison is finally matched.
+    #
+    # It is a geometry choice and NOT an augmentation, so it applies to val as well as train --
+    # a val crop that differs from the deployment crop measures the wrong thing.
+    moving_crop: bool = False
     min_crop_dim: int = 64
     # What the crop rule bounds. `keypoints` is the labels themselves. `instances` bounds the
     # `instances.pq` box instead, for a root whose stored keypoints are too sparse to enclose the
@@ -414,7 +430,18 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     key = str(path)
     with _read_lock_for(key):
         imgs = _reader(key, group, cam).get_batch(list(frames)).asnumpy()  # decord gives RGB
-    aff = _crop_affine((imgs.shape[2], imgs.shape[1]), crop_coords, target_size, rotation)
+    src_wh = (imgs.shape[2], imgs.shape[1])
+    # A (T,4) `crop_coords` is a MOVING crop -- one affine per frame rather than one for the
+    # window. Same count of `warpAffine` calls either way; only the matrix differs per frame.
+    cc = None if crop_coords is None else np.asarray(crop_coords)
+    if cc is not None and cc.ndim == 2:
+        out = []
+        for t, im in enumerate(imgs):
+            aff = _crop_affine(src_wh, cc[min(t, len(cc) - 1)], target_size, rotation)
+            out.append(im if aff is None else
+                       cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
+        return out
+    aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
     if aff is None:
         return list(imgs)
     return [cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR) for im in imgs]
@@ -441,21 +468,32 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     # that window decodes 24 copies of one image per camera (384 decodes for 16 distinct frames).
     want = [int(i) for i in frames]
     path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
+    # PER-FRAME CROPS MOVE THE DEDUPE KEY. Under `moving_crop` the box is a function of the
+    # POSITION in the window, not of the source index -- and `_frames` clamp-pads a short window,
+    # so one index can occupy several positions. Keying on the index alone would then serve every
+    # repeat the first position's crop. The key becomes (index, box); with one box for the whole
+    # window the box half is constant and this is the old behaviour exactly.
+    cc = None if crop_coords is None else np.asarray(crop_coords)
+    per_frame = cc is not None and cc.ndim == 2
+    keys = [(w, tuple(int(v) for v in cc[min(t, len(cc) - 1)]) if per_frame else None)
+            for t, w in enumerate(want)]
+    box_for = (lambda k: list(k[1])) if per_frame else (lambda k: crop_coords)
+    uniq = list(dict.fromkeys(keys))
     if pool is None:
-        got = {i: load_image(path(i), crop_coords, target_size, rotation, reduce)
-               for i in set(want)}
+        got = {k: load_image(path(k[0]), box_for(k), target_size, rotation, reduce)
+               for k in uniq}
     else:
-        fs = {i: pool.submit(load_image, path(i), crop_coords, target_size, rotation, reduce)
-              for i in set(want)}
-        got = {i: f.result() for i, f in fs.items()}
+        fs = {k: pool.submit(load_image, path(k[0]), box_for(k), target_size, rotation, reduce)
+              for k in uniq}
+        got = {k: f.result() for k, f in fs.items()}
     if any(v is None for v in got.values()):
-        return [got[i] for i in want]          # the caller checks for None and drops the item
+        return [got[k] for k in keys]          # the caller checks for None and drops the item
     # A repeat gets a COPY, not the same array object. `_augment`'s cutout writes in place, so an
     # aliased list would have every repeat sharing one buffer. That is harmless today (imgaug
     # returns fresh arrays, and painting a constant rect twice is idempotent) but it is a trap not
     # worth leaving: the copy is ~20 us against the 27 ms decode it replaces.
     seen, out = set(), []
-    for i in want:
+    for i in keys:
         out.append(got[i].copy() if i in seen else got[i])
         seen.add(i)
     return out
@@ -647,6 +685,24 @@ class PoseDataset(Dataset):
             print(f'{split}: box_source=instances  ' + '  '.join(
                 f'{n}/{t} {name}' + ('' if n == t else ' (keypoint fallback)')
                 for name, n, t in boxed))
+        if cfg.moving_crop:
+            # BOTH PATHS ARE SUPPORTED -- 2D absorbs the moving origin into the coordinates, 3D
+            # into the camera's `(T,2)` offset (`crop.apply_crop_moving` + `tailcyclenet.patches`).
+            # So this line is a provenance record rather than a reachability check.
+            #
+            # WHAT IT DOES NOT CATCH, and this is the one that will cost an experiment: the key is
+            # INERT ON SPARSE LABELS. The crop follows each frame's OWN points, and the derived-T
+            # rule (gotcha 1) gives an annotated group -- one labelled frame per group -- a T = 2
+            # window with one labelled frame. Nothing to follow, the centre interpolates to a
+            # constant, and the box is exactly the static one. Measured at annot_frac = 0.4, the
+            # fraction of windows whose crop actually MOVES: 3dpop 0.99, calms21 0.97,
+            # branson-fly 0.95, johnson 0.76, allen 0.60, rat-city-combined 0.55.
+            # `scratch/rat-city-3way/probe_moving.py` is how that is re-measured on a new root.
+            n2d = sum(1 for d in self.datasets for s in d.sessions.get(split, [])
+                      if getattr(s, 'mode', None) == '2d')
+            ntot = sum(len(d.sessions.get(split, [])) for d in self.datasets)
+            print(f'{split}: moving_crop=true  {ntot} session(s), {n2d} 2D / {ntot - n2d} 3D'
+                  '   (inert on any window with one labelled frame -- see probe_moving.py)')
 
         # Sampling pools. A pool is a set of index positions plus an optional cumulative weight
         # array; `_pick` draws a pool, then an entry inside it. Balancing across datasets is the
@@ -980,9 +1036,16 @@ class PoseDataset(Dataset):
                                               float(rng.uniform(-rot_deg, rot_deg)))
                 rotation_info = [rot]
                 cp = _apply_affine(cp, rot)
-            jit = self._jitter(rng)
-            cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim, jit,
-                                                         crop_pts=cp)
+            if self.cfg.moving_crop:
+                # ONE jitter draw for the whole window, applied to every frame's box identically.
+                # A per-frame draw would be a per-frame SIZE (which the rule cannot express) plus a
+                # random walk of the crop centre that the labels do not follow.
+                cam, box, coords = cropmod.crop_to_points_2d_moving(
+                    cam, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp)
+            else:
+                jit = self._jitter(rng)
+                cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
+                                                             jit, crop_pts=cp)
             if cam is None:
                 return None
             cam, scale = _resize_camera(cam, self.cfg.image_size)
@@ -1032,9 +1095,18 @@ class PoseDataset(Dataset):
             # rotation -- the same affine `rotate_camera_image_plane_3d` hands back for the warp.
             cp3 = None if crop_pts is None else [
                 _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
-            jit = self._jitter(rng)
-            cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim, jit,
-                                                      crop_pts=cp3)
+            if self.cfg.moving_crop:
+                # 3D DIFFERS FROM 2D IN WHERE THE ORIGIN GOES, not in the rule. 2D subtracts the
+                # per-frame origin from the coordinates; here the coordinates are world-metric and
+                # the origin lives in the camera's `offset`, which gains a time axis. That is what
+                # `tailcyclenet.patches` teaches `project_cam` to read -- without it the offset
+                # subtraction prepends exactly one axis and lands a rank-3 projection at rank 4.
+                cgroup, boxes = cropmod.crop_to_points_3d_moving(
+                    cgroup, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp3)
+            else:
+                jit = self._jitter(rng)
+                cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
+                                                          jit, crop_pts=cp3)
             if cgroup is None:
                 return None
             cgroup = [_resize_camera(c, self.cfg.image_size)[0] for c in cgroup]
@@ -1199,6 +1271,16 @@ class PoseDataset(Dataset):
         if not self.train or self.cfg.crop_jitter <= 0:
             return None
         return cropmod.jitter_box(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
+
+    def _jitter_params(self, rng):
+        """`_jitter`'s moving-crop twin: the DRAW rather than the closure.
+
+        Same gate and the same three draws in the same order, so a moving-crop item consumes the
+        rng exactly as a static one does and the two arms differ in geometry alone.
+        """
+        if not self.train or self.cfg.crop_jitter <= 0:
+            return None
+        return cropmod.jitter_params(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
 
 
 def _mask_outside(coords, size):

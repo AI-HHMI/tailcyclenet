@@ -137,3 +137,42 @@ def test_the_moving_crop_holds_the_animal_still_and_the_static_one_does_not():
         return float((c - c.mean(0)).abs().max())
 
     assert wander(mv) < wander(st) / 2, 'a moving crop must hold the animal roughly still'
+
+
+def test_the_patch_must_be_applied_at_PACKAGE_import(monkeypatch):
+    """WHY `__init__.py` and not a lazier hook, pinned so nobody "tidies" it into one.
+
+    `tailcyclenet.query_encoder` does `from posetail.posetail.cube import project_points_torch` at
+    module level -- it binds BY VALUE, exactly as `posetail`'s own modules do. Applying the patch
+    from, say, `format.py` or `crop.py` would leave query_encoder holding the ORIGINAL function,
+    because it imports neither of them. Importing the package first is what makes the bound name
+    the patched one.
+
+    The cost of that choice is that `import tailcyclenet` requires torch, which is why the sweep
+    scripts' pre-warm imports `posetail` alone -- a login node cannot mmap `libtorch_cpu.so` and
+    the whole submission died on it once.
+    """
+    import tailcyclenet.query_encoder as qe
+
+    assert getattr(qe.project_points_torch, '_tailcyclenet_patched', False), \
+        'query_encoder bound the projector by value before the patch was applied'
+
+
+def test_applying_twice_does_not_stack():
+    """`apply_all` is called from package import and is idempotent; a double wrap would subtract
+    the offset twice and be invisible except as a constant pose shift."""
+    import torch
+
+    from posetail.posetail import cube
+    from tailcyclenet import patches
+
+    before = cube.project_cam
+    patches._APPLIED = False          # force a re-entry, as a second import would
+    patches.apply_all()
+    assert cube.project_cam is before, 'apply_all re-wrapped an already-patched function'
+
+    cam = _cam(offset=torch.arange(10, dtype=torch.float64).reshape(5, 2))
+    p3d = _points(5, 4, 3)
+    bare = {k: v for k, v in cam.items() if k != 'offset'}
+    torch.testing.assert_close(cube.project_cam(cam, p3d),
+                               cube.project_cam(bare, p3d) - cam['offset'].reshape(5, 1, 2))

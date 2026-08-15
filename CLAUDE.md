@@ -894,6 +894,16 @@ strict win on rat-city** (MOTA +0.112, coverage +0.205, idsw -0.011, `fp_dup` fl
 The curve is NOT monotonic -- S = 16 is worse than both 14 and 18 -- so sweep it, do not reason
 about it.
 
+**AND IT IS A SINGLE-CAMERA RESULT THAT DOES NOT REPLICATE UNDER `--track`.** Report 19 §11: on
+3dpop's five 10-pigeon clips, paired BETWEEN clips, spare rows buy MPJPE -0.57 mm and cost `fp_dup`,
+`fp_none` and `idsw` all SIG with MOTA a null -- and **S = 14 and S = 16 come out identical to four
+decimals**, because the row count saturates once the tracker has claimed what it needs. The
+difference is the box path, not the root. rat-city is ONE camera, where `link_rows` is the whole of
+identity and drops 34% of the detections it is offered; spare rows feed a starved matcher. 3dpop is
+four cameras under `--track`, where nothing is starved and an extra row fills with a false positive.
+So **measure the drop rate before porting the row count** (`scratch/phase11/probe_link.py`, seconds):
+spare rows help exactly where the matcher cannot seat detections it was offered, and nowhere else.
+
 **Every detector box is bounded in `unletterbox_boxes`.** `yolox.py:167` decodes a side as
 `exp(clamp(-6,6)) * stride` — up to ~12,910 px, ~137,000 source px after a 1/7 letterbox — and IoU-only
 NMS cannot suppress it (its IoU with the real box it swallows is ~0). Clamped into the frame; a box

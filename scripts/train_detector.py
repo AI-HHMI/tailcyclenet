@@ -160,6 +160,24 @@ def main():
                          'than cosmetic: decaying a norm\'s scale toward zero fights the '
                          'normalisation it exists to provide. None of the three reference systems '
                          'decays norm parameters either.')
+    ap.add_argument('--augment-photometric', action='store_true',
+                    help="extend --augment's appearance half from a single multiplicative gain to "
+                         "DLC's ranges: additive brightness +-0.2*255 and per-channel Gaussian "
+                         'noise at sigma ~ U(0, 12.75), each at p = 0.5, composed with the gain. '
+                         'Off by default and byte-identical -- the extra draws happen only under '
+                         'the flag, so the off path consumes the same rng stream it always did. '
+                         'WHY: `img * U(0.7, 1.3)` cannot express sensor noise, an exposure OFFSET '
+                         '(a gain maps black to black, a bias does not) or blur, and every '
+                         'reference system ships more -- DLC has GaussNoise + MotionBlur ON BY '
+                         'DEFAULT, APT has additive brightness and contrast, SLEAP has gamma and '
+                         'noise available. maDLC measured -0.25 mAP OUT-OF-DOMAIN on marmosets '
+                         'from new cages, the largest generalization number in either Nature '
+                         'Methods paper, and noise is what they ship against it. MOTION BLUR IS '
+                         'NOT IN THIS FLAG: it is a cv2.filter2D with its own kernel-length '
+                         'parameter, i.e. a second lever, and bundling it would make the arm '
+                         'unreadable (eval rule 4). ENTANGLEMENT TO DECLARE: --rotate-deg only '
+                         'fires when --augment is on, so every rotation arm already carries the '
+                         'gain and this changes what those arms would see.')
     ap.add_argument('--ignore-band', action='store_true',
                     help='stop supervising objectness on anchors that sit INSIDE a GT box but are '
                          'positive for none. Off by default and byte-identical. Today those are '
@@ -297,7 +315,8 @@ def main():
     train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
-                       hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg, **tiling)
+                       hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg,
+                       photometric=args.augment_photometric, **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
     # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
@@ -464,6 +483,7 @@ def main():
                         'warmup_frac': args.warmup_frac, 'no_decay_norm': args.no_decay_norm,
                         'ema_decay': args.ema_decay, 'ema': False,
                         'ignore_band': args.ignore_band,
+                        'photometric': args.augment_photometric,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the

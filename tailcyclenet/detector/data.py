@@ -153,6 +153,43 @@ def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
     return out
 
 
+def _photometric(img, rng, extended):
+    """The appearance half of `--augment`. `extended=False` is the shipped one-liner, exactly.
+
+    SHIPPED: a single MULTIPLICATIVE gain, `img * U(0.7, 1.3)`. That is the whole of it, and it
+    cannot express three things a real camera does -- sensor noise, an exposure OFFSET (a gain
+    scales black to black; a bias does not), or motion blur. Every reference system ships more:
+
+        DLC detector   GaussNoise(var_limit=(0, 12.75**2), per_channel=True, p=0.5)
+                       + MotionBlur(p=0.5) + hflip, and it is ON BY DEFAULT
+        APT            brightness +-0.2*255 ADDITIVE, contrast U(0.7,1.3) about the group mean
+        SLEAP          gamma, brightness, uniform + gaussian noise; available, off
+        us             img * U(0.7, 1.3), opt-in
+
+    maDLC measured **-0.25 mAP out-of-domain** on marmosets from new cages -- the largest
+    generalization number in either Nature Methods paper -- and noise plus blur is what they ship
+    against it.
+
+    EXTENDED adds DLC's two ranges and nothing else: an additive brightness offset and per-channel
+    Gaussian noise, each at p = 0.5, composed with the gain that was always there. MOTION BLUR IS
+    DELIBERATELY NOT HERE: it is a `cv2.filter2D` with its own kernel-length parameter, i.e. a
+    second lever, and bundling it would make the arm unreadable (eval rule 4).
+
+    The draws are ORDERED so that `extended=False` consumes exactly the stream it always did -- the
+    gain is drawn first and the two new draws happen only under the flag, so the off path is
+    byte-identical rather than merely equivalent in distribution.
+    """
+    out = img * rng.uniform(0.7, 1.3)
+    if extended:
+        if rng.random() < 0.5:
+            out = out + rng.uniform(-0.2, 0.2) * 255.0
+        if rng.random() < 0.5:
+            # `var_limit` is a VARIANCE range in DLC; the sigma is its square root, so 12.75 is the
+            # top of the sigma range (5% of the 0-255 scale). Per channel, as DLC has it.
+            out = out + rng.normal(0.0, rng.uniform(0.0, 12.75), size=out.shape)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
                   rotate_deg=0.0, centre=None):
     """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
@@ -260,6 +297,7 @@ class BoxDataset(Dataset):
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
+                 photometric=False,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
@@ -303,6 +341,9 @@ class BoxDataset(Dataset):
         # for why this is free when tiling and not when not, and why a full circle costs no more
         # than a half one.
         self.rotate_deg = float(rotate_deg)
+        # The APPEARANCE half of --augment. False is the shipped single gain and is
+        # byte-identical; True adds DLC's additive brightness and gaussian noise.
+        self.photometric = bool(photometric)
         # Off by default and requested explicitly, not inferred from the split: it is a key, and
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
@@ -721,7 +762,7 @@ class BoxDataset(Dataset):
             M = (L @ W @ D)[:2]
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
             if warp is not None:
-                img = np.clip(img * rng.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
+                img = _photometric(img, rng, self.photometric)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         # `regions` rides along as its own element rather than being folded into `boxes`: a region
         # is not an animal and must never reach `assign`. Appended only under `use_regions`, so

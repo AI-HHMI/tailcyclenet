@@ -1272,6 +1272,46 @@ def test_optimiser_levers_off_are_the_shipped_recipe_exactly():
     assert warm[1] > warm[0] and plain[1] < plain[0], 'warmup rises where the cosine falls'
 
 
+def test_photometric_off_consumes_the_same_rng_stream_and_on_adds_noise_and_offset():
+    """`--augment-photometric` off must be the shipped one-liner, DRAW FOR DRAW.
+
+    Not merely "the same distribution": `random_affine` and the photometric term share one `rng`,
+    so an extra draw taken while the flag is OFF would reseat every later draw in the item and
+    silently make every recorded detector arm unreproducible. That is the exact hazard
+    `--rotate-deg` is written around -- it SKIPS the angle draw at 0 rather than drawing one and
+    multiplying by zero -- and it is asserted here for the same reason.
+    """
+    from tailcyclenet.detector.data import _photometric
+
+    img = np.full((8, 8, 3), 128, np.uint8)
+
+    # OFF is exactly `clip(img * U(0.7, 1.3))`, and it consumes exactly one draw.
+    for seed in range(5):
+        a = _photometric(img, np.random.default_rng(seed), False)
+        r = np.random.default_rng(seed)
+        want = np.clip(img * r.uniform(0.7, 1.3), 0, 255).astype(np.uint8)
+        np.testing.assert_array_equal(a, want, err_msg='off is not the shipped one-liner')
+        # ...and the stream is left where the old code left it: one uniform consumed, no more.
+        after_flag = np.random.default_rng(seed)
+        after_flag.uniform(0.7, 1.3)
+        _photometric(img, (r2 := np.random.default_rng(seed)), False)
+        assert r2.random() == after_flag.random(), 'off consumed a different number of draws'
+
+    # ON must actually change the pixels, and must be able to move them BOTH ways -- a gain alone
+    # can only scale toward black, so an image at 128 that never brightens is a bias-free bug.
+    seen_up = seen_down = False
+    for seed in range(40):
+        b = _photometric(img, np.random.default_rng(seed), True)
+        m = float(b.mean())
+        seen_up |= m > 130.0
+        seen_down |= m < 126.0
+    assert seen_up and seen_down, 'extended photometric must shift brightness in both directions'
+
+    # And it must add per-pixel VARIATION, which a gain and a bias together cannot.
+    spreads = [float(_photometric(img, np.random.default_rng(s), True).std()) for s in range(40)]
+    assert max(spreads) > 1.0, 'extended photometric never added noise -- only gain and offset'
+
+
 def test_the_ignore_band_is_off_by_default_and_is_a_no_op_on_a_small_animal():
     """`--ignore-band` withdraws the anchors that sit on an animal without being positive for it.
 

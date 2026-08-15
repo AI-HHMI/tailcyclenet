@@ -178,6 +178,23 @@ def main():
                          "animal's per-keypoint error is ~58%% independent, so a centroid over K "
                          'averages that part down. Falls back to the box centre per detection '
                          'wherever there are too few keypoints, so no pair can disappear.')
+    ap.add_argument('--axis-cost', type=float, default=None, metavar='W',
+                    help='spend the body-axis cue as a Hungarian COST TERM rather than a veto: the '
+                         "affinity of an eligible edge is multiplied by `1 - W*(1 - cos(2*dtheta))/2`, "
+                         'maDLC\'s ellipse-tracker shape (0.8 + 0.2*|cos dtheta| is W = 0.2). THE '
+                         'ONE FORM REPORT 16 §9.2 NEVER PROPOSED, and the form report 19 §14 '
+                         'concluded both surviving cues want: §4 measured the axis and '
+                         'keypoint-in-box cues as REAL -- each beats its rate-matched random '
+                         'control on idsw -- and both as net LOSSES as vetoes, because rejection '
+                         'is the wrong currency on a matcher report 18 §5 measured as starved '
+                         '(34.4%% of offered detections dropped, 29 points of them INSIDE the '
+                         'gate). A cost shifts a ranking where a veto deletes a candidate, so the '
+                         'edge count is conserved exactly. The multiplier cannot reach 0, so no '
+                         'pair is ever removed; it is applied AFTER every veto, so a zeroed edge '
+                         'stays zeroed; and W = 0 is a literal no-op, which is the inertness '
+                         'control by construction rather than by a threshold that happens not to '
+                         'fire. Default off. Report its fire rate beside any number, and pair it '
+                         'against W = 0 -- NOT against a veto arm.')
     ap.add_argument('--seed', type=int, default=0,
                     help='seed for --random-veto. The control needs to be repeatable and needs to '
                          'be runnable at several seeds, since one draw of a random rejection is one '
@@ -200,6 +217,21 @@ def main():
                     help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
                          'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
                          'unreadable. A view only -- it changes nothing that was predicted.')
+    ap.add_argument('--moving-crop', action='store_true',
+                    help='crop PER FRAME instead of per window: one constant side that translates '
+                         'to follow the animal. The window crop is a union over the window, so it '
+                         'is inflated by however far the animal walked -- measured on rat-city, '
+                         'union side p50 1.23x and p90 1.92x the median per-frame side, which at '
+                         'image_size 256 renders a 242 px rat into 214 px and half that in the '
+                         'tail. This is the one lever that shrinks the crop WITHOUT shortening the '
+                         'window, which is what `--n-frames 8` pays for it in lost temporal '
+                         'context (pck@10 0.103 -> 0.067). 2D ONLY, and it composes with '
+                         '--crop-source. THE SIDE IS CONSTANT and only the origin moves, which is '
+                         'why this needs no retrain: a per-frame SIZE is a per-frame intrinsic and '
+                         "`apply_crop`'s offset/size are per-camera scalars. IT IS STILL A "
+                         'DISTRIBUTION SHIFT -- training crops hold the box still and let the '
+                         'animal drift, these hold the animal still and let the background slide '
+                         '-- so read it only against a matched fixed-crop arm.')
     ap.add_argument('--refine', action='store_true',
                     help='re-crop each window to the first pass\'s OWN prediction and predict '
                          'again, label-free. The prediction re-enters the crop rule as if it were '
@@ -345,7 +377,16 @@ def main():
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device,
-        crop_source=args.crop_source)
+        crop_source=args.crop_source, moving_crop=args.moving_crop)
+    # BOTH SHRINK THE CROP, so running them together measures neither (eval rule 4) -- and the
+    # refine pass rebuilds its plan from `boxes_from_points`, which is a per-WINDOW rule with no
+    # moving equivalent. Refused rather than silently ignored on one of the two.
+    if args.moving_crop and args.refine:
+        raise SystemExit('--moving-crop and --refine both shrink the crop; run them as separate '
+                         'arms or the delta measures neither.')
+    if args.moving_crop and args.detector is None and args.boxes is None:
+        raise SystemExit('--moving-crop needs per-frame boxes, so it needs --detector or --boxes. '
+                         'The label-crop path is the GT-crop upper bound and is left per window.')
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')
@@ -551,7 +592,8 @@ def main():
                     dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move,
                     axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
                     random_veto=args.random_veto, seed=args.seed, stats=veto_stats,
-                    kpt_centre=args.kpt_centre, swap_repair=args.swap_repair)
+                    kpt_centre=args.kpt_centre, swap_repair=args.swap_repair,
+                    axis_cost=args.axis_cost)
                 # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
                 # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
                 # whenever any cue is on, so an arm that silently never fired is visible as such
@@ -560,7 +602,7 @@ def main():
                     e = veto_stats['eligible']
                     print(f'{key}: veto rates over {e} eligible edge(s) -- '
                           + '  '.join(f'{k} {veto_stats.get(k, 0) / e:.4f}'
-                                      for k in ('axis', 'kpt', 'random')), flush=True)
+                                      for k in ('axis', 'kpt', 'random', 'axis_cost')), flush=True)
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
                 # saturated on every detector shipped here; a detector whose scores are NOT
                 # saturated would lose most of its boxes to that, and this line is where that shows

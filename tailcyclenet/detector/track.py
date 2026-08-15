@@ -82,19 +82,22 @@ class CrossViewTracker:
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.0, max_age=24, min_views=2,
                  dup_res_px=None, axis_veto_deg=None, kpt_affinity=None, random_veto=None,
-                 seed=0, kpt_centre=False):
+                 seed=0, kpt_centre=False, axis_cost=None):
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)
         self.dup_res_px = dup_res_px
-        # THE KEYPOINT CUES, ALL DEFAULT-OFF AND ALL VETOES. Each may only REMOVE an edge the centre
-        # gate already accepted; none touches the affinity's value, so `max_move`'s calibration in
-        # box sides stands untouched and a wrong cue costs a missed match rather than a wrong one.
-        # A target or detection with no usable keypoints ABSTAINS -- see `identity`.
+        # THE KEYPOINT CUES, ALL DEFAULT-OFF. The first two are VETOES: each may only REMOVE an edge
+        # the centre gate already accepted, so `max_move`'s calibration in box sides stands untouched
+        # and a wrong cue costs a missed match rather than a wrong one. `axis_cost` is the THIRD
+        # shape and the one report 19 §14 asks for -- it reweights an edge instead of deleting it,
+        # because report 19 measured both cues as real and both vetoes as net losses on a matcher
+        # already starved of candidates. A target or detection with no usable keypoints ABSTAINS.
         self.axis_veto_deg = None if axis_veto_deg is None else float(axis_veto_deg)
         self.kpt_affinity = None if kpt_affinity is None else float(kpt_affinity)
+        self.axis_cost = None if axis_cost is None else float(axis_cost)
         # THE RATE-MATCHED CONTROL, and it is not optional when a veto is quoted. Any rejection
         # flatters a mean over matched points, so a veto's number means nothing without the same
         # number of edges removed at random (`--vis-thresh`'s lesson, CLAUDE.md).
@@ -108,9 +111,13 @@ class CrossViewTracker:
         # WHICH CUES NEED THE TARGET'S TRIANGULATED KEYPOINT SET. Only these two reproject it; the
         # rest read the detection's own 2D. Computing it regardless made every arm pay K
         # triangulations per target per frame for nothing.
-        self._wants_kpts = self.axis_veto_deg is not None or self.kpt_affinity is not None
+        self._wants_kpts = (self.axis_veto_deg is not None
+                            or self.kpt_affinity is not None
+                            # A COST NEEDS THE KEYPOINTS TOO. Left out, the term is
+                            # wired, fires zero times and reports as a null result.
+                            or bool(self.axis_cost))
         self._rng = np.random.default_rng(seed)
-        self.vetoed = {'axis': 0, 'kpt': 0, 'random': 0, 'eligible': 0}
+        self.vetoed = {'axis': 0, 'kpt': 0, 'random': 0, 'axis_cost': 0, 'eligible': 0}
         # slot -> {'point': (3,) float32 tensor, 'age': int, 'kpts': (K,3) tensor or None}
         self.targets = {}
 
@@ -201,6 +208,22 @@ class CrossViewTracker:
             if self.random_veto and self._rng.random() < self.random_veto:
                 out[i, j] = 0.0
                 self._veto('random')
+                continue
+            # THE COST TERM (report 19 §14), the same multiplier `link_rows` applies and for the
+            # same reason: both surviving cues are measured REAL and both lose as vetoes, because
+            # rejection is the wrong currency. Implemented HERE as well as in `link_rows` because
+            # `--track` is the default, and a flag that is a silent no-op on the default path is
+            # the failure this repo keeps recording -- six posetail-pose configs declared an anchor
+            # that was a literal no-op and were reported as anchored arms.
+            #
+            # It can never reach 0, so no candidate is deleted; it runs AFTER every veto, so a
+            # zeroed entry stays zeroed; `axis_cost = 0` is identically 1, the inertness control.
+            if self.axis_cost and have_kpts:
+                gap = idy.angle_gap(idy.body_axis(tk), idy.body_axis(d))
+                if np.isfinite(gap):
+                    out[i, j] *= 1.0 - self.axis_cost * (
+                        1.0 - np.cos(np.radians(2.0 * gap))) / 2.0
+                    self._veto('axis_cost')
         return out
 
     # -- one frame ------------------------------------------------------------------------

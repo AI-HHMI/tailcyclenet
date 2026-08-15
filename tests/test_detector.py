@@ -1328,6 +1328,61 @@ def test_birth_age_off_is_the_rule_it_replaced():
     np.testing.assert_array_equal(np.isfinite(off), np.isfinite(huge))
 
 
+def test_the_axis_cost_reweights_the_hungarian_without_deleting_a_candidate():
+    """Report 19 §14's cost term: it must CHANGE the assignment and CONSERVE every edge.
+
+    Report 19 measured both keypoint cues as real (each beats its rate-matched random control on
+    `idsw`) and both as net losses in VETO form, because rejection is the wrong currency on a
+    matcher report 18 §5 measured as starved -- 34.4% of offered detections dropped, 29 points of
+    them inside the gate. §14: spend the cue "as a cost term inside the Hungarian, where a wrong
+    cue shifts a ranking rather than deleting a candidate". That is a different contract from every
+    other cue in this module and it is asserted here rather than assumed.
+
+    Built on geometry that makes the axis measurable, because `body_axis` ABSTAINS on a round
+    keypoint cloud -- which is correct, and is why the shared cue test cannot check firing.
+    """
+    from tailcyclenet.detector import link_rows
+
+    # Two rows, two frames. At frame 1 the two detections are NEARLY EQUIDISTANT from row 0's last
+    # box, so the centre affinity alone is close to a tie and the axis is what breaks it.
+    boxes = np.full((2, 2, 1, 4), np.nan, np.float32)
+    boxes[0, 0, 0] = [100, 100, 200, 200]
+    boxes[1, 0, 0] = [400, 100, 500, 200]
+    boxes[0, 1, 0] = [150, 100, 250, 200]
+    boxes[1, 1, 0] = [350, 100, 450, 200]
+
+    # Elongated keypoint sets: row 0 HORIZONTAL at both frames, row 1 VERTICAL at both. Under the
+    # cost term the aligned pairing is cheaper; the perpendicular one is penalised but survives.
+    def horiz(cx, cy):
+        return np.array([[cx - 40, cy], [cx, cy], [cx + 40, cy], [cx + 20, cy]], np.float32)
+
+    def vert(cx, cy):
+        return np.array([[cx, cy - 40], [cx, cy], [cx, cy + 40], [cx, cy + 20]], np.float32)
+
+    kp = np.full((2, 2, 1, 4, 2), np.nan, np.float32)
+    kp[0, 0, 0], kp[1, 0, 0] = horiz(150, 150), vert(450, 150)
+    kp[0, 1, 0], kp[1, 1, 0] = horiz(200, 150), vert(400, 150)
+
+    stats_off, stats_on = {}, {}
+    off, _ = link_rows(boxes.copy(), extra=kp.copy(), stats=stats_off)
+    on, _ = link_rows(boxes.copy(), extra=kp.copy(), axis_cost=1.0, stats=stats_on)
+
+    assert stats_on.get('axis_cost', 0) > 0, 'the cost term never fired -- it is not wired in'
+    assert stats_off.get('axis_cost', 0) == 0, 'off must not fire'
+    # EDGE CONSERVATION, the whole point: the same slots are filled either way.
+    np.testing.assert_array_equal(np.isfinite(off), np.isfinite(on),
+                                  err_msg='a cost deleted a candidate; it must only reweight')
+
+    # And the multiplier itself, at the two ends of its range. `angle_gap` folds to [0, 90], so
+    # cos(2g) runs +1 (aligned, no penalty) to -1 (perpendicular, the full weight).
+    for gap_deg, expect in ((0.0, 1.0), (90.0, 0.0)):
+        m = 1.0 - 1.0 * (1.0 - np.cos(np.radians(2.0 * gap_deg))) / 2.0
+        assert m == pytest.approx(expect), 'the multiplier must span [1-W, 1] over [0, 90] degrees'
+    # It can never reach zero at W = 1, which is what keeps a cost from becoming a veto.
+    assert min(1.0 - 1.0 * (1.0 - np.cos(np.radians(2.0 * g))) / 2.0
+               for g in np.linspace(0, 90, 91)) >= 0.0
+
+
 def test_detection_and_association_split_composes_bit_identically(tmp_path):
     """`detect_group` IS `detect_raw` + `associate_group`, to the last bit, on every path.
 
@@ -1408,7 +1463,7 @@ def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_pa
         # The INERT arm: the same code path with the mechanism unable to fire. Not "flag absent" --
         # that would only prove the branch is skipped, not that the branch is faithful.
         for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0},
-                      {'kpt_centre': False}):
+                      {'kpt_centre': False}, {'axis_cost': 0.0}):
             got = associate_group(raw, sess, 'g000', 3, **kw, **inert)
             for a, b in zip(base, got):
                 np.testing.assert_array_equal(a, b, err_msg=f'{kw} {inert} is not inert')
@@ -1420,6 +1475,19 @@ def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_pa
         assert any(not np.array_equal(np.isfinite(a), np.isfinite(b))
                    for a, b in zip(base, hard) if a is not None), \
             f'{kw}: vetoing every edge changed nothing, so the cue does not reach the matcher'
+
+        # THE COST TERM IS A DIFFERENT KIND OF LEVER AND NEEDS A DIFFERENT ASSERTION. A veto is
+        # checked by "it removed something"; a cost must be checked by "it removed NOTHING", which
+        # is the property that distinguishes it from the veto form report 19 refuted. That it
+        # FIRES is checked separately, on geometry built to make the axis measurable -- these
+        # synthetic keypoints are near-isotropic, so `body_axis` abstains and abstention is correct.
+        costed = associate_group(raw, sess, 'g000', 3, **kw, axis_cost=1.0)
+        for a, b in zip(base, costed):
+            if a is None:
+                continue
+            np.testing.assert_array_equal(
+                np.isfinite(a), np.isfinite(b),
+                err_msg=f'{kw}: a COST deleted a candidate -- it must only reweight')
 
     # `link_rows` on its own, which is the whole of 2D identity, with the keypoints it links.
     rng = np.random.default_rng(0)

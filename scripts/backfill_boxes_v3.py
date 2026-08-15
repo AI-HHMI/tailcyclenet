@@ -3,6 +3,7 @@
 
     pixi run python scripts/backfill_boxes_v3.py --dataset rat-city --dry-run
     pixi run python scripts/backfill_boxes_v3.py --dataset rat-city
+    pixi run python scripts/backfill_boxes_v3.py --dataset 3dpop --validate
 
 `convert_v4.py` reads `posetail-finetuning-v4`, whose score-cleaning NaNs out individual noisy
 keypoints. That cleaning is wanted for pose supervision and ruinous for anything that BOUNDS the
@@ -28,17 +29,35 @@ the ORIGINAL npz row index, so v3 row i is `a{i:02d}` even where v4's all-NaN fi
 row (it dropped `a04` from rat-city val). Such an animal comes back here as a `present` row --
 an ignore region with a box and no keypoints, which is what §9 is for and what
 `scripts/eval.py:186` already reads for MOTA.
+
+A 3D ROOT HAS NO STORED 2D, SO THE BOXES ARE PROJECTED -- once per group through
+`Session.cgroup`, then bounded per camera. 3dpop is the case: 118 sessions, no `instances.pq`,
+and v4's cleaning left a finite 3D point on ~55% of (animal, frame) slots against v3's 86.6%. It
+deleted six pigeons outright (`convert_v4.py:234` drops an all-NaN animal), five of which v3
+still holds in full -- birds that are physically in the frame with no row anywhere, so every
+prediction on one scores as a false positive. That is exactly the ignore region §9 exists for.
+
+TWO CONSEQUENCES OF WRITING THIS FILE FOR A ROOT THAT HAD NONE, neither of them local:
+`box_source` defaults to `instances` on BOTH models and falls back to keypoints silently where a
+root ships no table, so this flips 3dpop's crop rule from the v4-cleaned keypoint extent to the
+v3 stored extent with no config change -- the repair, but it un-compares every 3dpop number in
+reports 10-14. And in 3D `eval.py` withholds `ig_boxes` (a 3D centroid is world mm, the boxes are
+pixels), so a `present` row blanket-excuses EVERY unmatched prediction on its frame -- 24.6% of
+3dpop's frames carry one. Read `fp_ignored` beside any MOTA quoted off this.
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from posetail.posetail.cube import project_points_torch
 
 from tailcyclenet import format as fmt
 from tailcyclenet.crop import crop_box_for_points
@@ -62,12 +81,10 @@ def padded_extent(pose, size):
     wh = np.asarray(size, np.float32)
     # An instance with no finite point is all-NaN through nanmin and garbage through the int32
     # cast; both are overwritten below. Warnings off so a real one would still be visible.
-    with np.errstate(invalid='ignore'):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            lo = np.clip(np.nanmin(p, axis=2) - PAD, 0, wh)
-            hi = np.clip(np.nanmax(p, axis=2) + PAD, 0, wh)
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        lo = np.clip(np.nanmin(p, axis=2) - PAD, 0, wh)
+        hi = np.clip(np.nanmax(p, axis=2) + PAD, 0, wh)
         # int32 truncation, exactly as the rule does it, so a consumer reading the float back and
         # truncating again is a no-op rather than a second, different rounding.
         box = np.concatenate([lo, hi], -1).astype(np.int32).astype(np.float32)
@@ -93,11 +110,9 @@ def suppress_duplicates(box, pose, iou_thresh, kpt_frac):
     # Size from the RAW keypoint extent, not the stored box: the box carries 2 x PAD on each
     # axis, which on a 206x173 rat inflates the diagonal by 26% and quietly loosens the gate by
     # the same factor. "0.15 body diagonals" has to mean the body.
-    with np.errstate(invalid='ignore'):
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            diag = np.linalg.norm(np.nanmax(pose, 2) - np.nanmin(pose, 2), axis=-1)
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        diag = np.linalg.norm(np.nanmax(pose, 2) - np.nanmin(pose, 2), axis=-1)
     n = 0
     for i in range(S):
         for j in range(i + 1, S):
@@ -109,7 +124,10 @@ def suppress_duplicates(box, pose, iou_thresh, kpt_frac):
             inter = np.prod(np.clip(hi - lo, 0, None), -1)
             iou = inter / np.maximum(area[i, m] + area[j, m] - inter, 1e-6)
             d = np.linalg.norm(pose[i, m] - pose[j, m], axis=-1)
-            with np.errstate(invalid='ignore'):
+            # A pair with no keypoint finite in BOTH rows is an empty slice, not a warning: it is
+            # simply not a duplicate, and `nan_to_num` below already says so.
+            with np.errstate(invalid='ignore'), warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
                 same = np.nanmean(d, -1) < kpt_frac * np.minimum(diag[i, m], diag[j, m])
             hit = m[(iou > iou_thresh) & np.nan_to_num(same, nan=False).astype(bool)]
             if not hit.size:
@@ -134,77 +152,121 @@ def labelled_keys(sess, gid):
     return (vis != fmt.UNLABELED).any(2)                                  # (S,T,C)
 
 
+def v3_views(sess, src: Path, gid: str, T: int):
+    """The v3 pose for one group as (C,S,T,K,2) source px, plus its animal ids.
+
+    A 2D root stores the pixels already and has one camera. A 3D root stores no 2D at all -- 3dpop
+    ships `points3d.pq` alone -- so the views are PROJECTED, once per group through
+    `Session.cgroup`, which is the one place in this repo a camera group is built and the only one
+    that gets `moving_ext` right. Passing the whole group (not a frame index) is safe because a
+    static rig short-circuits to `(4,4)` extrinsics that broadcast over `(S,T,K,3)`; a moving one
+    would align its `(T,4,4)` against axis -3, which is the KEYPOINT axis here, so this refuses.
+    """
+    mode3d = sess.mode == '3d'
+    npz = src / gid / ('pose3d.npz' if mode3d else 'pose2d.npz')
+    if not npz.exists():
+        raise SystemExit(f'{npz}: no v3 pose for group {gid!r}')
+    d = np.load(npz, allow_pickle=True)
+    pose = d['pose'].astype(np.float32)                                   # (S,T,K,2 or 3)
+    if pose.shape[1] < T:
+        raise SystemExit(f'{npz}: {pose.shape[1]} frames, session says {T}')
+    pose = pose[:, :T]
+    if pose.shape[2] != len(sess.names):
+        raise SystemExit(f'{npz}: {pose.shape[2]} keypoints, session says {len(sess.names)}')
+
+    # `ids` is v4's own animal_id_source, recorded in `session.toml` provenance and tested here the
+    # same way `convert_v4.py:335` tests it. rat-city's v3 npz has none, so it keeps `a{i:02d}` --
+    # the v4 converter's row-index scheme, and the only thing that makes v3 row i and this
+    # session's animal i the same rat. Either way the ids are read from V3, never from
+    # `lab.animal_ids`: that list is missing exactly the rows v4 dropped, which are the rows this
+    # table exists to restore.
+    aids = (d['ids'].astype(str).tolist() if 'ids' in d
+            else [f'a{i:02d}' for i in range(pose.shape[0])])
+
+    if not mode3d:
+        if len(sess.rig) != 1:
+            raise SystemExit(f'{sess.path}: a 2D session with {len(sess.rig)} cameras has no '
+                             'stored view to bound; only 3D can be projected')
+        return pose[None], aids
+    if any(sess.rig.moving.values()):
+        raise SystemExit(f'{sess.path}: moving cameras -- `cgroup(gid)` would align its (T,4,4) '
+                         'extrinsic against the keypoint axis. Project per frame first.')
+    p2d = project_points_torch(sess.cgroup(gid), torch.as_tensor(pose))   # (C,S,T,K,2)
+    return p2d.numpy().astype(np.float32), aids
+
+
 def convert_session(dst: Path, src: Path, args) -> dict:
     sess = fmt.Session.load(dst)
-    if len(sess.rig) != 1:
-        raise SystemExit(f'{dst}: this backfill assumes one camera, found {len(sess.rig)}')
-    cam = sess.cam_names[0]
-    size = tuple(int(x) for x in sess.rig.size(cam))
     cols = {c: [] for c in ('group_id', 'frame', 'animal_id', 'camera',
                             'x0', 'y0', 'x1', 'y1', 'status')}
     stats = {'rows': 0, 'labeled': 0, 'present': 0, 'suppressed': 0, 'new_animals': set()}
 
     for gid, group in sess.groups.items():
-        npz = src / gid / 'pose2d.npz'
-        if not npz.exists():
-            raise SystemExit(f'{npz}: no v3 pose for group {gid!r}')
-        pose = np.load(npz)['pose'].astype(np.float32)                    # (S,T,K,2)
         T = group.n_frames
-        if pose.shape[1] < T:
-            raise SystemExit(f'{npz}: {pose.shape[1]} frames, session says {T}')
-        pose = pose[:, :T]
-        if pose.shape[2] != len(sess.names):
-            raise SystemExit(f'{npz}: {pose.shape[2]} keypoints, session says {len(sess.names)}')
-
-        box = padded_extent(pose, size)                                   # (S,T,4)
-        keep, n_sup = suppress_duplicates(box, pose, args.nms_iou, args.nms_kpt_frac)
-        check_round_trip(pose, box, size, args.check, gid)
-
-        # `a{row:02d}` is the v4 converter's own id scheme, and the only thing that makes v3 row i
-        # and this session's animal i the same rat. Reproducing it here rather than reading
-        # `lab.animal_ids` is deliberate: that list is missing exactly the rows v4 dropped, which
-        # are the rows this table exists to restore.
-        aids = [f'a{i:02d}' for i in range(pose.shape[0])]
+        views, aids = v3_views(sess, src, gid, T)                         # (C,S,T,K,2)
         known = set(sess.labels(gid).animal_ids)
         stats['new_animals'] |= {a for a in aids if a not in known}
-
         lab_mask = labelled_keys(sess, gid)                               # (S,T[,C]) or None
-        s, t = np.nonzero(keep)
-        b = box[s, t]
-        annotated = np.zeros(len(s), bool)
-        if lab_mask is not None:
-            m = lab_mask[..., 0] if lab_mask.ndim == 3 else lab_mask
-            # BY animal_id, NOT BY ROW POSITION. `s` indexes v3 rows (named `a{i:02d}` above),
-            # while `m` is indexed by the session's OWN animal axis -- from which
-            # `convert_v4.build_labels` has already dropped every all-NaN animal (its docstring
-            # names `a04` in rat-city val). Positional indexing therefore read the NEXT animal's
-            # labelled-ness for every row at or past the dropped id, and the last row fell off the
-            # `s < m.shape[0]` guard and was forced to `present`. A labelled instance written
-            # `present` becomes an IGNORE REGION in `scripts/eval.py` -- its false positives are
-            # excused (spec §9) -- and a `present` written `labeled` violates validation rule 11.
-            pos = {aid: i for i, aid in enumerate(sess.labels(gid).animal_ids)}
-            row = np.array([pos.get(aids[i], -1) for i in s], np.int64)
-            ok = row >= 0
-            annotated[ok] = m[row[ok], t[ok]]
+        # BY animal_id, NOT BY ROW POSITION. `s` indexes v3 rows, while `lab_mask` is indexed by
+        # the session's OWN animal axis -- from which `convert_v4.build_labels` has already dropped
+        # every all-NaN animal (its docstring names `a04` in rat-city val, and v4 deleted five
+        # pigeons from 3dpop the same way). Positional indexing therefore read the NEXT animal's
+        # labelled-ness for every row at or past the dropped id, and the last row fell off the
+        # `s < m.shape[0]` guard and was forced to `present`. A labelled instance written `present`
+        # becomes an IGNORE REGION in `scripts/eval.py` -- its false positives are excused
+        # (spec §9) -- and a `present` written `labeled` violates validation rule 11.
+        pos = {aid: i for i, aid in enumerate(sess.labels(gid).animal_ids)}
+        row_of = np.array([pos.get(a, -1) for a in aids], np.int64)
 
-        cols['group_id'].extend([gid] * len(s))
-        cols['frame'].extend(t.astype(np.int32))
-        cols['animal_id'].extend(np.asarray(aids, dtype=object)[s])
-        cols['camera'].extend([cam] * len(s))
-        for i, q in enumerate(('x0', 'y0', 'x1', 'y1')):
-            cols[q].extend(b[:, i])
-        cols['status'].extend(np.where(annotated, 'labeled', 'present'))
+        n_rows = n_lab = n_sup = 0
+        for ci, cam in enumerate(sess.cam_names):
+            size = tuple(int(x) for x in sess.rig.size(cam))
+            pose = views[ci]                                              # (S,T,K,2)
+            box = padded_extent(pose, size)                               # (S,T,4)
+            keep, sup = suppress_duplicates(box, pose, args.nms_iou, args.nms_kpt_frac)
+            check_round_trip(pose, box, size, args.check, f'{gid}/{cam}')
 
-        wh = b[:, 2:] - b[:, :2]
-        huge = int((wh[:, 0] > size[0] / 2).sum())
-        stats['rows'] += len(s)
-        stats['labeled'] += int(annotated.sum())
-        stats['present'] += int((~annotated).sum())
+            s, t = np.nonzero(keep)
+            b = box[s, t]
+            annotated = np.zeros(len(s), bool)
+            if lab_mask is not None:
+                # (S,T,C) on a root with real per-camera 2D; (S,T) on a 3D-only one, where a label
+                # is a claim about the ANIMAL and every view inherits it.
+                m = lab_mask[..., ci] if lab_mask.ndim == 3 else lab_mask
+                r = row_of[s]
+                ok = r >= 0
+                annotated[ok] = m[r[ok], t[ok]]
+
+            cols['group_id'].extend([gid] * len(s))
+            cols['frame'].extend(t.astype(np.int32))
+            cols['animal_id'].extend(np.asarray(aids, dtype=object)[s])
+            cols['camera'].extend([cam] * len(s))
+            for i, q in enumerate(('x0', 'y0', 'x1', 'y1')):
+                cols[q].extend(b[:, i])
+            cols['status'].extend(np.where(annotated, 'labeled', 'present'))
+
+            wh = b[:, 2:] - b[:, :2]
+            huge = int((wh[:, 0] > size[0] / 2).sum())
+            n_rows += len(s)
+            n_lab += int(annotated.sum())
+            n_sup += sup
+            if len(sess.cam_names) > 1:
+                print(f'      {cam}: {len(s)} rows  labeled={int(annotated.sum())}  '
+                      f'median box {np.median(wh[:, 0]):.0f}x{np.median(wh[:, 1]):.0f}px  '
+                      f'wider-than-half-frame={huge}')
+            else:
+                print(f'    {gid}: {len(s)} rows  labeled={int(annotated.sum())} '
+                      f'present={len(s) - int(annotated.sum())}  suppressed={sup}  '
+                      f'median box {np.median(wh[:, 0]):.0f}x{np.median(wh[:, 1]):.0f}px  '
+                      f'wider-than-half-frame={huge}')
+
+        if len(sess.cam_names) > 1:
+            print(f'    {gid}: {n_rows} rows over {len(sess.cam_names)} cam(s)  '
+                  f'labeled={n_lab} present={n_rows - n_lab}  suppressed={n_sup}')
+        stats['rows'] += n_rows
+        stats['labeled'] += n_lab
+        stats['present'] += n_rows - n_lab
         stats['suppressed'] += n_sup
-        print(f'    {gid}: {len(s)} rows  labeled={int(annotated.sum())} '
-              f'present={int((~annotated).sum())}  suppressed={n_sup}  '
-              f'median box {np.median(wh[:, 0]):.0f}x{np.median(wh[:, 1]):.0f}px  '
-              f'wider-than-half-frame={huge}')
 
     if not args.dry_run:
         out = {k: (np.asarray(v, np.float32) if k in ('x0', 'y0', 'x1', 'y1')
@@ -262,7 +324,12 @@ def main() -> int:
         if not d.is_dir():
             continue
         for dst in sorted(p for p in d.iterdir() if p.is_dir()):
-            src = args.src / args.dataset / split / dst.name
+            # THE SESSION ID IS NOT ALWAYS THE SOURCE FOLDER NAME. `convert_v4.py:282` splits one
+            # v4 session into `{session}__{trial}` per trial when the trials' calibration
+            # disagrees, which is every 3dpop session but the val one. `provenance.source` is what
+            # that converter wrote down; for rat-city, whose name is unsplit, it is the same string.
+            src = args.src / args.dataset / split / Path(
+                fmt.Session.load(dst).provenance.get('source', dst.name)).name
             if not src.is_dir():
                 raise SystemExit(f'{src}: no matching v3 session for {split}/{dst.name}')
             print(f'  {split}/{dst.name}')

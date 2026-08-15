@@ -211,6 +211,48 @@ is a gate and correctness result. Masking also reweights `obj` against `box_weig
 normaliser is deliberately left at `/ max(n_pos, B)` — `parts['certified']` prints the fraction so
 that shift is visible rather than inferred.
 
+### `3dpop` now ships an `instances.pq`, and writing it changed two things it does not name
+
+`scripts/backfill_boxes_v3.py` wrote all 118 sessions from `posetail-finetuning-v3`: **1,469,421
+rows** over 4 cameras, 86.6% `labeled` / 13.4% `present`, 19 duplicates suppressed. It is the same
+script and the same `labeled`/`present` rule that produced rat-city's, generalised to project
+`points3d` per camera — a 3D root stores no 2D, so its boxes come out of `Session.cgroup` +
+`project_points_torch` rather than off disk. rat-city's output is byte-identical.
+
+Why it was needed, in two independent registers. **v4's score-cleaning deleted six pigeons
+outright** (`convert_v4.py:234` drops an all-NaN animal); five of them v3 still holds in full —
+`706`, `483`, `485`, `54` and `706` again, up to 1,586 finite frames each. They are birds
+physically in the frame with no row anywhere, so every prediction on one scored as a false
+positive. They are back as pure `present` rows with boxes and zero labels, which is what §9 is
+for. **And the surviving boxes were damaged**: v3 has a finite 3D point on 86.6% of (animal,
+frame) slots against v4's ~55%, and a box is a min/max over whatever survived.
+
+Two consequences that are NOT local to this file:
+
+- **It flips 3dpop's `box_source = 'instances'` from inert to live.** Both `LoaderConfig` and
+  `train_detector.py --boxes` already default to `instances` and fall back to keypoints *silently*
+  where a root ships no table. So every future 3dpop pose and detector run crops from the v3
+  stored extent with no config change, and **no new 3dpop number is comparable to reports 10-14
+  without `box_source = "keypoints"`**. That is the repair, not a regression — but it is a
+  fifth instance of a default moving underneath a cached artefact.
+- **In 3D a `present` row has no box to localise against, so it excuses MORE than it should.**
+  `eval.py:191` withholds `ig_boxes` unless `mode == '2d'` (a 3D centroid is world mm, the boxes
+  are pixels), and `_in_ignore` then falls back to excusing EVERY unmatched prediction on any
+  frame carrying a present row — **24.6% of 3dpop's frames**, of which only 3.8% come from the
+  deleted birds; the rest are score-cleaned frames of kept birds. MOTA on 3dpop will rise for this
+  reason as well as for the real one. **Quote `fp_ignored` beside it or the number is unreadable.**
+
+Four animal ids (`483`, `485`, `54`, `706`) now appear only in `instances.pq`. `_animal_vocab`
+unions the tables, so `S` grows by one or two on five groups; checked safe both ways —
+`dataset._starts` returns `[]` for an animal with no labelled frame, and `mota`'s `true_present`
+is False for its all-NaN row, so it adds no training window and no GT.
+
+**`rat-city/val/instances.pq` ON DISK IS STALE and this did not touch it.** It was written by
+`042846a`, before `abef250` fixed the status lookup to index by `animal_id`, and never
+regenerated: 169 of its 745 rows carry the wrong status (633 `labeled` against the correct 656).
+A `labeled` written `present` is an eval ignore region. Re-running the script for rat-city fixes
+it and reproduces `train` and `test` byte-for-byte.
+
 ---
 
 ## Training

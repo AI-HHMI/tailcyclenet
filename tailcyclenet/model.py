@@ -387,6 +387,18 @@ def _query_anchored(out, query_ok):
         # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
         # numerator, full denominator), which is exactly how a wrong comparison gets published.
         bad = ~torch.isfinite(tri).all(-1)
+        # A NON-FINITE ENTRY POISONS THE SOLVE'S BACKWARD EVEN AT ZERO GRADIENT, and `torch.where`
+        # cannot stop it. The `where` below routes 0 into the bad entries, but
+        # `triangulate_simple_batch_reg`'s `torch.linalg.solve` (cube.py:299) then solves against
+        # its own NaN factorisation and RETURNS NaN -- which reaches every upstream parameter and
+        # gets the whole step thrown away by the grad-norm guard in `train.py`, counted as an
+        # unattributed `skipped`. `nan_to_num` here does NOT help: the NaN is created in the
+        # backward, downstream of anything applied to the forward value. Per-entry detach cannot
+        # help either -- the graph node is the whole batched solve. So on the rare degenerate step
+        # the window's triangulation supervision goes gradient-free and every other term keeps
+        # training. The forward value is unchanged in every case.
+        if not torch.isfinite(tri).all():
+            tri = tri.detach()
         sub = torch.where(torch.isfinite(tri), tri, _rays_fallback(out))
         # NOT written back on the single-view path: this key drives `coords_loss_triangulate_reproj`
         # at weight 2.0, so pointing it at the rays would reweight the rays supervision by 40x.
@@ -439,6 +451,8 @@ def _reanchor_per_frame(out, anchor):
     # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
     # numerator, full denominator), which is exactly how a wrong comparison gets published.
     bad = ~torch.isfinite(src).all(-1)
+    if not torch.isfinite(src).all():
+        src = src.detach()                    # see `_query_anchored`: the solve's backward NaNs
     src = torch.where(torch.isfinite(src), src, _rays_fallback(out))
     out = dict(out)
     out['tri_degenerate'] = bad                    # see `_query_anchored`

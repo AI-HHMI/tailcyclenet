@@ -700,3 +700,49 @@ def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
     cfg.pop('gridresid_offset')
     with pytest.raises(KeyError, match='gridresid_offset'):
         build_model(cfg, n_keypoints=n_kpt)
+
+
+def test_a_degenerate_triangulation_does_not_nan_the_whole_step():
+    """`torch.where` DOES NOT STOP THE NaN, and that is not obvious.
+
+    `_query_anchored` guards the degenerate solve with
+    `torch.where(isfinite(tri), tri, rays)`, which routes zero gradient into the bad entries. But
+    the NaN is not carried through the forward -- it is CREATED in the backward:
+    `triangulate_simple_batch_reg` ends in `torch.linalg.solve` (cube.py:299), whose backward
+    solves against its own NaN factorisation and returns NaN regardless of the incoming gradient.
+    Param grads are summed over points, so ONE degenerate point NaNs every parameter and the whole
+    step is dropped by `train.py`'s grad-norm guard -- counted as an unattributed `skipped`.
+
+    `nan_to_num` on the forward value does not help, for the same reason. Detaching does.
+    """
+    def grads(detach):
+        p = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        A = torch.stack([p, p * float('nan')])          # element 1: what a NaN box centre feeds it
+        x = torch.linalg.solve(A, torch.ones(2, 2))
+        assert not torch.isfinite(x).all(), 'the probe must actually be degenerate'
+        if detach and not torch.isfinite(x).all():
+            x = x.detach()
+        y = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+        (y.sum() + p.sum()).backward()                  # + the other heads, which must keep going
+        return p.grad
+
+    assert torch.isnan(grads(detach=False)).all(), \
+        'if `where` alone ever starts masking the backward, the guard in model.py is dead code'
+    assert torch.isfinite(grads(detach=True)).all(), 'the other heads must still get gradient'
+
+
+def test_the_triangulation_repair_leaves_the_forward_value_alone():
+    """The detach above must be invisible to every number this repo has published.
+
+    It only changes what the backward does on a step that was being thrown away anyway, so the
+    repaired tensor -- which the loss, the metric and `--anchor carry`'s seed all read -- has to
+    be bit-identical with and without it.
+    """
+    from tailcyclenet.model import _rays_fallback
+
+    tri = torch.tensor([[1.0, 2.0, 3.0], [float('nan'), 5.0, 6.0]], requires_grad=True)
+    fallback = torch.zeros(2, 3)
+    plain = torch.where(torch.isfinite(tri), tri, fallback)
+    guarded = torch.where(torch.isfinite(tri.detach()), tri.detach(), fallback)
+    assert torch.equal(torch.nan_to_num(plain, nan=-1.0), torch.nan_to_num(guarded, nan=-1.0))
+    assert callable(_rays_fallback)

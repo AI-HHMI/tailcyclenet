@@ -115,6 +115,19 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     was_training = model.training
     model.eval()
     order = list(iter(ChunkShuffle(len(ds), chunk=ds.chunk, seed=seed)))[:batches * batch_size]
+
+    # SCORED WITHOUT AUGMENTATION, and that is a correctness fix rather than a preference.
+    # `ignore_for` takes no `warp` -- unlike its two siblings `boxes_for` and `regions_for` -- so
+    # under `--augment` the predictions and the GT came back warped while the `instances.pq`
+    # PRESENT boxes did not. rat-city ships 26,021 of those, so `fp_ignored` and `mota` on the
+    # train split were excusing the wrong pixels: most of the train-side FP readout, i.e. the very
+    # number the train/val gap is read from. The warp is also no longer recoverable from the item
+    # index (it is drawn fresh per visit now), so re-deriving it here is not available.
+    #
+    # Turning it off is the right answer anyway: this measures the model on the data, and the
+    # train split's number is only comparable to the val split's if both are unaugmented.
+    aug_was = ds.augment
+    ds.augment = False                      # restored at the end, like `was_training` below
     loader = torch.utils.data.DataLoader(
         ds, batch_size=batch_size, sampler=order, num_workers=num_workers,
         collate_fn=box_collate)
@@ -156,6 +169,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
 
     for (key, ci), store in tracks.items():
         per_group[key].setdefault('mota', []).append(box_mota(store))
+    ds.augment = aug_was
     if was_training:
         model.train()
     return {g: _summarise(s) for g, s in per_group.items()}

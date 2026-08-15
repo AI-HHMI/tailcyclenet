@@ -44,7 +44,7 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, show
     return img
 
 
-def project(session, pred, cam):
+def project(session, pred, cam, gid=None, frames=None):
     """(S,T,K,3) world points -> (S,T,K,2) pixels in camera `cam`'s stored image.
 
     aniposelib owns the projection, including distortion; `offset` is the one thing it does not
@@ -53,10 +53,32 @@ def project(session, pred, cam):
 
     NaN passes through: `project_points` is elementwise, so an unpredicted keypoint stays NaN and
     `draw_instance` skips it.
+
+    ON A MOVING RIG THIS NEEDS `gid`, and without it it drew the skeleton off the animal.
+    `Rig.by_name` hands back the camera carrying `calibration.toml`'s single NOMINAL extrinsic;
+    the per-frame ones exist only through `Session.cgroup(gid, frames)`. That is gotcha 9's class
+    and this was the fifth builder to drop `moving_ext` -- and the symptom, a pose that does not
+    sit on the animal, reads as a model failure rather than as a render bug. The static path is
+    left exactly as it was, so every 2D and static-rig render is unchanged.
     """
     import torch
 
     name = session.cam_names[cam]
+    if gid is not None and session.rig.moving.get(name):
+        from posetail.posetail.cube import project_points_torch
+
+        # `format_camera` folds `offset` into the dict, so this comes back in image pixels
+        # already -- the same call `infer._fill_box_agreement` makes, for the same reason.
+        cams = session.cgroup(gid, frames)
+        S = pred.shape[0]
+        # PER ANIMAL, because `project_points_torch` aligns the (T,4,4) extrinsic against axis -3.
+        # Flattening (S,T) into one axis there would silently project animal i through frame i's
+        # camera pose -- the same alignment trap `test_the_tracker_projects_correctly_on_a_moving_rig`
+        # pins one module over.
+        with torch.no_grad():
+            p = torch.as_tensor(np.asarray(pred), dtype=torch.float32)
+            xy = [project_points_torch([cams[cam]], p[s])[0].cpu().numpy() for s in range(S)]
+        return np.stack(xy).astype(np.float32)
     obj = session.rig.by_name(name)
     with torch.no_grad():
         p = torch.as_tensor(np.asarray(pred).reshape(-1, 3),
@@ -123,14 +145,15 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
 
     assert pred.ndim == 4 and pred.shape[-1] in (2, 3), f'bad prediction shape {pred.shape}'
     if pred.shape[-1] == 3:
-        pred = project(session, pred, cam)
+        pred = project(session, pred, cam, gid, frames)
     group = session.groups[gid]
     cam_name = session.cam_names[cam]
     W, H = (int(x) for x in session.rig.size(cam_name))
     zoom = min(int(zoom), W, H)
     scale = min(1.0, max_side / max(W, H))
     src = pred if follow_from is None else (
-        project(session, follow_from, cam) if follow_from.shape[-1] == 3 else follow_from)
+        project(session, follow_from, cam, gid, frames) if follow_from.shape[-1] == 3
+        else follow_from)
     corners = follow(src, zoom, W, H) if zoom else None
     size = ((2 * zoom, 2 * zoom) if zoom else
             (int(round(W * scale)), int(round(H * scale))))

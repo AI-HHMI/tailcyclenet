@@ -1146,3 +1146,27 @@ def test_every_box_affecting_option_reaches_the_det_cache_stamp():
     head = stamp[:stamp.index('+ [(k, str(getattr(args, k)))')]
     for k in ('tile_scale', 'reduce'):
         assert f"'{k}'" in head, f'{k} is checkpoint-derived and must be stamped unconditionally'
+
+
+def test_score_dataset_scores_unaugmented_and_restores_the_flag():
+    """`ignore_for` takes no `warp`, unlike `boxes_for` and `regions_for` beside it.
+
+    So under `--augment` the predictions and the GT were warped while the `instances.pq` PRESENT
+    boxes were not, and the ignore mask excused the wrong pixels. rat-city ships 26,021 of those
+    rows, so that is most of the train-side FP readout -- the number the train/val gap is read
+    from. It is also the split that is supposed to be comparable to val, which is never augmented.
+    """
+    import inspect
+
+    from tailcyclenet.detector import data as ddata
+    from tailcyclenet.detector.evaluate import score_dataset
+
+    # The asymmetry that caused it, pinned so a future `warp` on `ignore_for` is noticed.
+    assert 'warp' in inspect.signature(ddata.BoxDataset.boxes_for).parameters
+    assert 'warp' in inspect.signature(ddata.BoxDataset.regions_for).parameters
+    assert 'warp' not in inspect.signature(ddata.BoxDataset.ignore_for).parameters, \
+        'ignore_for now takes a warp -- score_dataset can stop disabling augmentation'
+
+    src = inspect.getsource(score_dataset)
+    assert 'ds.augment = False' in src, 'scoring must not run through the augmentation'
+    assert 'ds.augment = aug_was' in src, 'and it must put the flag back, or training loses it'

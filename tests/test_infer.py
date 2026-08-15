@@ -583,3 +583,43 @@ def test_instances_boxes_get_the_training_crop_rule_at_inference(scene):
     # `crop` is indexed by WINDOW, not by frame; this group is one window, and `t` is its only
     # finite stored frame, so the union over the window is that one box.
     np.testing.assert_array_equal(got['crop'][a, 0, 0], np.asarray(expect, np.float32))
+
+
+def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
+    """Gotcha 9's class, and the FIFTH camera-group builder to drop `moving_ext`.
+
+    `render.project` took `Rig.by_name`, which carries `calibration.toml`'s single NOMINAL
+    extrinsic; the per-frame ones exist only through `Session.cgroup(gid, frames)`. So `--render`
+    on johnson-mouse -- or any `moving = true` session -- drew the skeleton somewhere the animal
+    is not, which reads as a pose failure rather than as a render bug. `_fill_box_agreement` in
+    the same package already did this correctly, so the two disagreed.
+
+    `test_render_writes_every_predicted_frame` skips 3D entirely, and the `mv` fixture has been
+    the moving one all along, so nothing here had ever executed this path.
+    """
+    from tailcyclenet.render import project
+
+    model, sess, registry, name = scene
+    if sess.mode != '3d':
+        pytest.skip('needs the moving 3D rig')
+    cam_name = sess.cam_names[0]
+    assert sess.rig.moving.get(cam_name), 'the fixture must actually be moving'
+
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
+    pred = out['pred']
+    frames = np.arange(pred.shape[1])
+
+    per_frame = project(sess, pred, 0, 'g000', frames)
+    nominal = project(sess, pred, 0)                  # what it used to do
+    assert per_frame.shape == pred.shape[:-1] + (2,)
+
+    ok = np.isfinite(per_frame) & np.isfinite(nominal)
+    assert ok.any(), 'need a finite projection to compare'
+    assert not np.allclose(per_frame[ok], nominal[ok]), \
+        'the two must differ on a moving rig, or the per-frame extrinsic is not being used'
+
+    # AND IT MATCHES THE PROJECTION THE PIPELINE ALREADY TRUSTS -- `infer`'s own, per frame.
+    from posetail.posetail.cube import project_points_torch
+    cams = sess.cgroup('g000', frames)
+    want = project_points_torch([cams[0]], torch.as_tensor(pred[0], dtype=torch.float32))[0]
+    np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)

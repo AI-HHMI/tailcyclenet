@@ -1118,3 +1118,71 @@ def test_a_3d_session_with_no_points3d_is_refused_by_name(tmp_path):
         PoseDataset(root, 'train', CFG, train=False)
     except ValueError as e:
         assert 's_3d' in str(e)
+
+def test_a_3d_rotation_that_loses_the_animal_is_reverted():
+    """`rotate_camera_image_plane_3d` crops to the BORDER-FREE INSCRIBED RECTANGLE, ~0.416 of the
+    frame -- the exact step `_rotate_2d` was hand-written to avoid.
+
+    An animal outside that rectangle projects out of `cam['size']`, and `crop_box_for_points`
+    CLAMPS rather than returning None, so the item came back as a `min_crop_dim` corner crop of
+    background carrying full-strength world targets. `_item`'s `< 2 finite` guard runs BEFORE the
+    rotation, so nothing caught it -- and the `vis_2d` recompute meant to soften it is gated on
+    `vis_2d is not None`, which excludes 3dpop, branson-fly and johnson-mouse (all `projected`).
+    """
+    from aniposelib.cameras import CameraGroup
+    from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
+    from posetail.posetail.cube import is_point_visible
+
+    from tailcyclenet import format as fmt
+
+    W, H = 320, 240
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
+                  calibrated={'cam0': True})
+    cam = rig.posetail()[0]
+
+    # Two points near opposite frame CORNERS: inside the frame, outside the inscribed rectangle.
+    corner = torch.tensor([[[0.45, 0.33, 1.0], [-0.45, -0.33, 1.0]]], dtype=torch.float32)
+    before = int(is_point_visible(cam, corner).sum())
+    assert before >= 2, f'the probe must start visible in this camera, got {before}'
+
+    rot_cam, _ = rotate_camera_image_plane_3d(cam, 45.0)
+    after = int(is_point_visible(rot_cam, corner).sum())
+    assert after < 2, f'the inscribed crop must lose the animal here, got {after} still visible'
+
+    # WHY IT WAS SILENT: the crop rule clamps, it does not refuse -- so the item was returned.
+    from posetail.posetail.cube import project_points_torch
+    p2d = project_points_torch([rot_cam], corner)[0]
+    assert cropmod.crop_box_for_points(p2d, rot_cam['size'], 16) is not None, \
+        'if the rule ever starts refusing this, the guard in _item is belt-and-braces'
+
+    # The guard `_item` applies, on the three cases that matter.
+    def reverted(b, a):
+        return int(a) < 2 <= int(b)
+    assert reverted(before, after), 'a rotation that loses the animal must be reverted'
+    assert not reverted(1, 0), 'a camera that never saw the animal keeps its rotation'
+    assert not reverted(4, 4), 'a rotation that keeps the animal is left alone'
+
+
+def test_the_3d_visibility_or_reflects_the_augmentation_that_followed_it():
+    """The noisy-OR used to be taken BEFORE the augmentation that invalidates it.
+
+    The rotation loop zeroes `vis_2d[:, :, cnum]` for points the rotated camera no longer sees and
+    `_cutout_rects` zeroes more -- both AFTER `vis` was computed. So a point could end up
+    `vis_2d == 0` in every shown camera while `vis` still said True, and `TotalLoss` takes a
+    supplied `vis_true` verbatim (losses.py:421), weighting `mae_loss_coords`,
+    `coords_loss_direct` and `bce_loss_vis_3d` by it. That supervises the 3D coord and visibility
+    heads at points the crop provably does not contain -- i.e. supplying visibility was WORSE than
+    passing None, which lets the loss derive it geometrically.
+    """
+    # (T=1, K=3, C=2): keypoint 0 seen by camera 1, keypoint 1 by neither, keypoint 2 unassessed.
+    vis_2d = torch.tensor([[[0.0, 1.0], [0.0, 0.0], [float('nan')] * 2]])
+    stale = torch.tensor([[True, True, False]])          # what the pre-augmentation OR had said
+
+    fresh = (vis_2d == 1).any(-1)
+    assert fresh.tolist() == [[True, False, False]]
+    assert fresh.dtype == torch.bool, 'the loss inverts this with `~`, which no float satisfies'
+    assert stale[0, 1] and not fresh[0, 1], \
+        'keypoint 1 is the case: still claimed visible after every camera lost it'
+    # NaN is not visible, and must not raise or propagate.
+    assert not bool(fresh[0, 2])

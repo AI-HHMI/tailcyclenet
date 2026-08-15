@@ -274,6 +274,23 @@ class PoseTrackerEncoder(TrackerEncoder):
             T_win = int(views[0].shape[1])
             qt = prompt_time.to(device).round().long().clamp_(0, T_win - 1).to(torch.int32)
             assert qt.shape == (B, K), f'prompt_time {tuple(qt.shape)} != {(B, K)}'
+            # A KEYPOINT WITH NO PRIOR HAS NO QUERY TIME. `embed_query_time` and `embed_gap` are
+            # UNCONDITIONAL terms in both encoders -- unlike `patch`/`qpos`/`pos`/`vis`/`depth`
+            # they carry no learned no-query token -- so an unprompted keypoint that still reports
+            # a frame index trains a forward NO deployment path produces: query-free, `val`,
+            # `self_prompt` and `run_group` all pass `prompt_time=None`, which is 0 everywhere.
+            #
+            # `prompt_dropout` NaNs `kpt_prior` and leaves `prompt_t` at each keypoint's first
+            # labelled frame (>0 on 19.5% of rat-city windows), so at `prompt_dropout = 0.4` some
+            # 40% of steps were training a "query-free" forward that differed from the real one in
+            # two of `wide`'s six fusion terms. It is also eval rule 7's shape: WHEN a keypoint was
+            # first labelled is GT-derived, and it was reaching the model at a point with no prior.
+            #
+            # Here rather than in the loader because this is the seam every caller routes through,
+            # and because it fixes the PARTIALLY prompted window too -- which is the case inference
+            # actually produces, since the bounds mask and `--prior-vis-thresh` withdraw individual
+            # keypoints from a prior that `_build_prior` dates with one scalar.
+            qt = torch.where(query_ok, qt, torch.zeros_like(qt))
 
         try:
             out = super().forward(views, coords_q, camera_group, query_times=qt,

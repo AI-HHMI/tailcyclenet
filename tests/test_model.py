@@ -782,3 +782,39 @@ def test_a_grown_registry_keeps_its_trained_keypoint_rows(tmp_path, enc):
     virgin2 = model2.query_encoder.kpt_embed.weight.detach().clone()
     warm_start(model2, ckpt, verbose=False, base_names=('a', 'b'))
     torch.testing.assert_close(model2.query_encoder.kpt_embed.weight.detach(), virgin2)
+
+
+@pytest.mark.parametrize('enc', ENCODERS)
+def test_an_unprompted_keypoint_carries_no_query_time(moving_batch, enc):
+    """A "query-free" TRAINING step must be the same forward as the query-free DEPLOYMENT step.
+
+    It was not. `prompt_dropout` NaNs `kpt_prior` and leaves `prompt_t` at each keypoint's first
+    labelled frame (>0 on 19.5% of rat-city windows), while `val`, `self_prompt` and `run_group`
+    all pass `prompt_time=None`, which zeroes it. `embed_query_time` and `embed_gap` are
+    UNCONDITIONAL fusion terms -- unlike `patch`/`qpos` they carry no learned no-query token -- so
+    at `prompt_dropout = 0.4` roughly 40% of steps trained a forward no deployment path produces.
+
+    It is also eval rule 7's shape: WHEN a keypoint was first labelled is GT-derived, and it was
+    reaching the model at a keypoint with no prior at all.
+    """
+    b = moving_batch
+    model = build_model(small(enc, query='prior'), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    K = b.kpt_ids.shape[1]
+    dropped = torch.full_like(b.kpt_prior, float('nan'))
+
+    with torch.no_grad():
+        deployed = model(b.views, b.kpt_ids, b.cgroup, mode='3d')['coords_pred']
+        # What a dropout step used to send: no prior, but a real per-keypoint query time.
+        late = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=dropped,
+                     prompt_time=torch.full((1, K), 1, dtype=torch.int32))['coords_pred']
+    torch.testing.assert_close(late, deployed)
+
+    # POSITIVE CONTROL: with a REAL prior the query time must still matter, or the assertion above
+    # passes vacuously on a tiny model whose time terms happen to be inert.
+    assert torch.isfinite(b.kpt_prior).any(), 'the fixture must carry a real prior'
+    with torch.no_grad():
+        at0 = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=b.kpt_prior,
+                    prompt_time=torch.zeros((1, K), dtype=torch.int32))['coords_pred']
+        at1 = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=b.kpt_prior,
+                    prompt_time=torch.ones((1, K), dtype=torch.int32))['coords_pred']
+    assert not torch.allclose(at0, at1), 'query_time is inert here, so this test proves nothing'

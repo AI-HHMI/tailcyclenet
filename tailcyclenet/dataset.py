@@ -968,6 +968,25 @@ class PoseDataset(Dataset):
                     if rng.random() < rot_p:
                         cam_r, rot = rotate_camera_image_plane_3d(
                             cam, float(rng.uniform(-rot_deg, rot_deg)))
+                        # THE INSCRIBED CROP CAN TAKE THE ANIMAL WITH IT. The library helper crops
+                        # to the border-free rectangle -- ~0.416 of the frame -- which is the exact
+                        # step `_rotate_2d` was hand-written to avoid. An animal outside it
+                        # projects out of `cam['size']`, and `crop_box_for_points` CLAMPS rather
+                        # than refusing, so the item came back as a `min_crop_dim` corner crop of
+                        # BACKGROUND carrying full-strength world targets. The `< 2 finite` guard
+                        # at the top of `_item` runs before this, so nothing caught it.
+                        #
+                        # Reverted rather than retried: a retry re-draws `idx` and perturbs the
+                        # whole subsequent sampling stream, where reverting consumes the identical
+                        # draws and changes only the item at hand.
+                        #
+                        # The `2 <=` half is load-bearing. A camera that never saw the animal --
+                        # ordinary on a 16-camera rig -- keeps today's behaviour instead of having
+                        # its augmentation suppressed for a reason that is nothing to do with the
+                        # rotation.
+                        if int(is_point_visible(cam_r, coords).sum()) < 2 <= int(
+                                is_point_visible(cam, coords).sum()):
+                            cam_r, rot = cam, None
                         rotated.append((cam_r, rot))
                     else:
                         rotated.append((cam, None))
@@ -1103,6 +1122,22 @@ class PoseDataset(Dataset):
         # frames[0]`: a window clipped at a group edge (`_frames`, np.clip) repeats its last frame,
         # and those zero gaps must not be read as stride 1.
         stride = max(1, int(np.median(np.diff(frames)))) if len(frames) > 1 else 1
+
+        # THE 3D NOISY-OR IS TAKEN OVER THE *FINAL* vis_2d, and it used not to be. It was computed
+        # from the raw statuses before any augmentation, while the rotation loop zeroes
+        # `vis_2d[:, :, cnum]` for points the rotated camera no longer sees and `_cutout_rects`
+        # zeroes more -- so a point could end up `vis_2d == 0` in EVERY shown camera while `vis`
+        # still claimed True. `TotalLoss` takes a supplied `vis_true` verbatim (losses.py:421) and
+        # weights `mae_loss_coords`, `coords_loss_direct` and `bce_loss_vis_3d` by it, so the 3D
+        # coord and visibility heads were supervised at points the crop provably does not contain.
+        # With `vis=None` the loss derives this geometrically and masks correctly -- i.e. supplying
+        # visibility was WORSE than withholding it, which is the opposite of the intent.
+        #
+        # `== 1` is NaN-safe (NaN == 1 is False), and the result stays bool, which the loss
+        # requires: it inverts this with `~` to build the occluded-point target.
+        if vis is not None and vis_2d is not None:
+            vis = (vis_2d == 1).any(-1)
+
         row = {'dataset': self.datasets[item.ds].name, 'session': sess.session_id,
                'group': item.gid, 'animal': lab.animal_ids[a], 'mode': '2d' if R == 2 else '3d',
                'single_view': single_view, 'start': int(frames[0]), 'cameras': cam_names,

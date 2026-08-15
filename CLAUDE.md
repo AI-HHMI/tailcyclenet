@@ -227,7 +227,13 @@ table is what makes this work.
 `n_keypoints` is **derived** from the registry, never configured. The registry is written to the
 run folder as `keypoint_registry.toml` and read back at inference. Given an existing registry, a
 later run **appends** new names so old ids — and the embedding rows behind them — survive warm
-start.
+start. **That second half was false until `abef250`**: `_filter_shape_mismatch` drops a tensor
+whose shape changed *whole*, so growing the registry reset every trained row of
+`query_encoder.kpt_embed.weight` to noise and retrained it at `kpt_lr`. It was camouflaged because
+under `wide` most of `query_encoder.*` is expected to be dropped. `warm_start` now copies the
+base rows into the grown table, keyed on the base registry's own length — if that does not match
+the checkpoint's row count the table is not that registry's and the copy is **refused rather than
+guessed**, because a mis-applied row copy points each embedding row at a different body part.
 
 A run folder also carries **`provenance.toml`** — the commit and a dirty flag at save time. It is
 there because a config is not a provenance record and gotcha 12 is what that cost.
@@ -483,7 +489,18 @@ prefer `--anchor none` until the architectural question above is settled, and sa
 shows up in the trace as occasional windows of exactly 0.00 divergence.
 
 Nothing in training or val exercises `carry`: the training prior is GT ± i.i.d. jitter or absent, and
-val runs `none` then `self` (one window, same pixels, qt = 0). `--oracle-corrupt` (with
+val runs `none` then `self` (one window, same pixels, qt = 0). **And until `1ba887b` "absent" was
+not the same forward as deployment's absent**: `prompt_dropout` NaNs `kpt_prior` but left
+`prompt_t` at each keypoint's first labelled frame (>0 on 19.5% of rat-city windows), while
+`embed_query_time` and `embed_gap` are UNCONDITIONAL fusion terms — unlike `patch`/`qpos` they
+carry no no-query token. So ~40% of a `prompt_dropout = 0.4` arm's steps trained a query-free
+forward that no deployment path produces, on a GT-derived input (eval rule 7). `model.py` now
+zeroes `qt` where the prior is absent, per keypoint, which also fixes the PARTIALLY prompted
+window that the bounds mask and `--prior-vis-thresh` actually produce. **Every prompted arm on
+record was trained under the old behaviour and is not paired with a new one** — the
+`prompt_offset_px` bar (`prior_self` ≤ ~2.48 mm) needs re-establishing with a paired re-run of
+`control` before anything is compared to 2.3275. Query-free arms and all `-none` siblings are
+bit-identical. `--oracle-corrupt` (with
 `--anchor labels`, diagnostic only) is how the echo coefficient is measured without a training run —
 a whole-body offset in **crop widths**, a stale-frame prior, or the neighbouring animal's.
 
@@ -604,8 +621,15 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   `--n-frames`** below, so do not sweep the two together.
   **Overlap 2 and 4 give the SAME window count** (6 each over 120 frames -- `_window_starts` pulls the last
   window back), so overlap 2's +0.460 mm and −0.011 MOTA cost the same compute and cannot be a context
-  effect: only the STALENESS BUDGET (`_build_prior` retires a prior staler than `overlap`) and the carried
-  frame index differ. That is the mechanism, at identical cost.
+  effect: only the carried frame index and the left-context differ. That is the mechanism, at identical
+  cost. **This used to credit a "staleness budget", and that reading was wrong twice over.** The guard
+  (`infer.py:_build_prior`) spent a budget of `overlap` frames, so it fired identically at overlap 2 and
+  4 and cannot explain any difference between them — and worse, `-qt > overlap` only fires at all when
+  `n_frames > 2 * overlap`, so at the swept `--n-frames 24 --overlap 12` it never fired. `a13ab03`
+  replaces it with the invariant: `j = len(frames) - overlap` makes the carried frame the NEXT window's
+  start exactly, so consecutive windows give `qt == 0` and a NEGATIVE `qt` happens if and only if a
+  window was skipped. There is no budget — either the carried frame is inside this window or it predates
+  it. Overlap 2/4/8 are bit-identical under the fix; **the overlap-12 arms can move.**
   **The optimum is the SEAM COUNT against the SEAM SIZE**: each seam shrinks with overlap (p50 3.95 → 3.24
   mm, ratio 2.95 → 2.49) while the fraction of steps that ARE seams grows (0.042 → 0.067), and their product
   bottoms out near 8. So `--seam blend`, which removes the per-seam jump, should move the optimum higher —

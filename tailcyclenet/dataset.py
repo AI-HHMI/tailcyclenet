@@ -132,8 +132,16 @@ def _rotate_2d(cam, coords, angle_deg):
 
     THE 3D PATH IS DELIBERATELY LEFT ON THE LIBRARY HELPER. It has the same inscribed crop, but it
     recomputes `vis_2d` through `is_point_visible` right after rotating (`_item`), so a point off
-    the canvas becomes INVISIBLE -- a label the loss handles -- instead of vanishing into NaN. The
-    failure is graceful there and silent here, which is the whole difference.
+    the canvas becomes INVISIBLE -- a label the loss handles -- instead of vanishing into NaN.
+
+    THAT MITIGATION IS NARROWER THAN IT READS, and this docstring used to overstate it. It is
+    gated on `vis_2d is not None`, so it never runs for 3dpop, branson-fly or johnson-mouse, whose
+    rows are all `projected` and whose visibility is therefore withheld; and it never recomputed
+    the 3D noisy-OR at all. An animal outside the inscribed rectangle then projected out of
+    `cam['size']`, where `crop_box_for_points` CLAMPS rather than refusing -- so the item came back
+    as a `min_crop_dim` corner crop of background carrying full-strength world targets, with
+    `_item`'s `< 2 finite` guard already behind it. `_item` now REVERTS a rotation that costs a
+    camera the animal, and takes the noisy-OR after the augmentation rather than before it.
     """
     import cv2
 

@@ -1089,7 +1089,13 @@ These are not style preferences; each one was learned by publishing a wrong numb
 10. **Pairing is complete-case, which flatters the arm that failed more.** A group where either side
    is non-finite leaves the comparison, so `paired_bootstrap` returns `n_dropped` and `eval.py --vs`
    prints it. A delta over 9 of 17 groups is not a delta over 17.
-11. **A LABEL-FREE IDENTITY STATISTIC IS A SMOKE ALARM, NOT A METRIC, and a SELF-NORMALISED one
+11. **A PER-WINDOW STATISTIC MUST USE THE SEAM RULE'S OWN FRAME->WINDOW ASSIGNMENT.** Under
+   `--seam last` a frame in an overlap belongs to the LAST window containing it, and any per-window
+   number must bin frames that way. Slicing `[start : start + n_frames]` instead hands every window
+   its neighbours' frames too, which SMOOTHS the per-window error: at `--overlap 8` it reported ZERO
+   burst windows on every 3dpop clip where the correct binning finds up to seven, at identical
+   indices. It reads as "the effect does not reproduce" rather than as a binning bug.
+12. **A LABEL-FREE IDENTITY STATISTIC IS A SMOKE ALARM, NOT A METRIC, and a SELF-NORMALISED one
    ranks arms BACKWARDS.** Report 16 §9.1's proposal -- per row, the joint discontinuity where the
    axis turn and the length change both exceed that ROW'S OWN p99 -- fails its own validation gate
    with correlation **-0.621** against true `idsw`: a row swapping on every step has an enormous p99
@@ -1102,7 +1108,7 @@ These are not style preferences; each one was learned by publishing a wrong numb
    both WORK. Never score a lever on it. **And never score a cue on the statistic it optimises**:
    `--axis-veto 60` has the lowest median axis turn of any arm by construction and 2.6x the
    baseline's `idsw`.
-12. **There is now a temporal statistic, and there was not before.** `motion_ratio` / `path_length`,
+13. **There is now a temporal statistic, and there was not before.** `motion_ratio` / `path_length`,
    paired over the steps both arms attempted. Every consistency number this repo had — jerk, bone CV —
    *rewards* a prediction that stopped moving, which is how RC1 stayed invisible. And `box_agree` is
    the pose-against-its-own-box check, in animal-size units.

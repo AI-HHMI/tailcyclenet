@@ -489,7 +489,10 @@ REFUTED** (report 19). Report 16 §9 ranked six coarse aggregate cues; all six a
 Items 1 (`--axis-veto`) and 2 (`--kpt-affinity`) beat their RATE-MATCHED RANDOM controls on `idsw`
 (-0.020 and -0.033, both SIG) and item 2 on `fp_dup` (-0.068) -- the first positive measurement of
 §9's central claim -- and both still LOSE against no veto at all (MOTA -0.257, -0.142), because
-rejection is the wrong currency on a matcher report 18 §5 measured as starved of candidates. Items 3
+rejection is the wrong currency on a matcher report 18 §5 measured as starved of candidates.
+**That cue-vs-control pair is measured on rat-city only**; 3dpop is where the cue is 3.4x more
+surgical (5.98% of edges against 20.6%) AND the matcher is not starved, so it is the arm most likely
+to overturn the veto verdict, and it was still running when report 19 was written. Items 3
 and 6 are dead on population size (one birth per 97 frames under `--track`). Item 4 (`--kpt-centre`)
 is refuted on both roots: a keypoint centroid moves with POSE and a box centre does not, and
 articulation is not detector noise so it does not average down with K. Item 5 (`--swap-repair`)

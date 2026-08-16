@@ -176,7 +176,6 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             max_dist = extent if np.isfinite(extent) and extent > 0 else np.inf
             mm = matched_error(pred, true, max_dist=max_dist,
                                min_kpts_frac=min_kpts_frac, cost=match_cost)
-            m['err_rowwise'] = m['err']
             m.update({k: v for k, v in mm.items()
                       if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')
                       or k in _PCT_KEYS})

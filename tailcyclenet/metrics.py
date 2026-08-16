@@ -118,31 +118,6 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
             'n_dropped': dropped}
 
 
-# ----------------------------------------------------------------------------------------------
-# temporal
-# ----------------------------------------------------------------------------------------------
-
-def path_length(pred) -> dict:
-    """Total distance travelled, summed over keypoints, and the step count behind it.
-
-    THE ONLY TEMPORAL STATISTIC IN THIS FILE, and it is here because there was none. A prompt loop
-    that feeds each window its own previous output low-passes the prediction, and every consistency
-    number this repo already had REWARDED that: on johnson-mouse `--anchor carry` scored the best
-    jerk (0.392 vs 0.507) and the best bone CV (0.148 vs 0.251) of any arm while moving the median
-    per-keypoint speed from 1.182 to 0.796 mm/frame against the same run prior-free -- 30% of the
-    animal's motion, invisible to everything that was measured.
-
-    Steps with a missing end are SKIPPED, not bridged. Bridging would charge the whole excursion
-    across a gap to one step and read as more motion, so a method that predicts less would look
-    livelier the more it declined.
-    """
-    p = np.asarray(pred, float)
-    d = np.linalg.norm(np.diff(p, axis=-3), axis=-1)          # (..., T-1, K)
-    ok = np.isfinite(d)
-    return {'path': float(d[ok].sum()), 'n_steps': int(ok.sum()),
-            'speed': float(np.median(d[ok])) if ok.any() else float('nan')}
-
-
 def motion_ratio(pred, ref) -> dict:
     """Predicted path length over a reference's, over the steps BOTH sides have.
 

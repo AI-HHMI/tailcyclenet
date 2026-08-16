@@ -626,7 +626,7 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
 
 
 def test_the_tracker_is_the_default_and_can_be_turned_off():
-    """`--track` is ON by default (dev/reports/13), so `detect_group` must default to it too.
+    """`--track` is ON by default (dev/reports/13).
 
     Pinned because the default is what every future arm inherits, and because flipping a default is
     only safe if an old cache cannot be reused as if it had the new one. `track` USED to carry that
@@ -639,12 +639,11 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
     import inspect
     from pathlib import Path
 
-    from tailcyclenet.detector import associate_group, detect_group
+    from tailcyclenet.detector import associate_group
 
-    for f in (detect_group, associate_group):
-        sig = inspect.signature(f)
-        assert sig.parameters['track'].default is True, f'{f.__name__}: the tracker is the default'
-        assert sig.parameters['link'].default is False, f'{f.__name__}: --link-boxes is opt-in'
+    sig = inspect.signature(associate_group)
+    assert sig.parameters['track'].default is True, 'the tracker is the default'
+    assert sig.parameters['link'].default is False, '--link-boxes is opt-in'
 
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
     assert "('raw_rev', str(RAW_REV))" in src, \
@@ -1296,52 +1295,6 @@ def test_birth_age_off_is_the_rule_it_replaced():
     np.testing.assert_array_equal(np.isfinite(off), np.isfinite(huge))
 
 
-def test_detection_and_association_split_composes_bit_identically(tmp_path):
-    """`detect_group` IS `detect_raw` + `associate_group`, to the last bit, on every path.
-
-    The split exists so that every identity arm shares ONE detection pass -- detection is the
-    expensive half of a run (report 14: 44 ms of 4K decode against a 0.86 ms forward) and every
-    lever in the identity family changes only what happens after it. That is worth nothing if the
-    composition is not exactly the function it replaced, because then every arm is matched to a
-    baseline that no longer exists.
-
-    Run on a MULTIVIEW root and on both association rules, since they are three different code
-    paths through `associate_group`: the tracker, the memoryless `associate`, and `link_rows` on
-    top of the latter.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    from tailcyclenet.detector import associate_group, detect_group, detect_raw
-    from tailcyclenet.format import Session
-
-    cf._session_3d(tmp_path / 'ds' / 'test' / 's')
-    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
-    sess.preload()
-    torch.manual_seed(0)
-    det = YOLOXNano(n_keypoints=3).eval()
-    S, wh = 2, (64, 64)
-
-    for kw in ({'track': True}, {'track': False}, {'track': False, 'link': True}):
-        got = detect_group(det, wh, sess, 'g000', S, score_thresh=0.0, **kw)
-        raw = detect_raw(det, wh, sess, 'g000', S, score_thresh=0.0)
-        want = associate_group(raw, sess, 'g000', S, **kw)
-        for a, b in zip(got, want):
-            np.testing.assert_array_equal(a, b, err_msg=f'{kw} differs after the split')
-
-    # AND THE POINT OF THE SPLIT: raw detected at a LARGER top_k, then associated at S, gives the
-    # same rows as detecting at S -- as long as the detector offered no more than S per camera, so
-    # the extra capacity went unused. This is what licenses sweeping `S` over ONE cache, which is
-    # what separates the row count from the detection budget (`link_rows`, spare rows).
-    wide = detect_raw(det, wh, sess, 'g000', S + 6, score_thresh=0.0)
-    n_per = np.isfinite(wide[1]).sum(0)
-    if n_per.max() <= S:
-        got = detect_group(det, wh, sess, 'g000', S, score_thresh=0.0)
-        want = associate_group((wide[0][:S], wide[1][:S], wide[2][:S]), sess, 'g000', S)
-        for a, b in zip(got, want):
-            np.testing.assert_array_equal(a, b, err_msg='top_k must not change what S rows hold')
 
 
 def test_infer_help_renders():

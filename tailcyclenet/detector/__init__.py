@@ -12,7 +12,7 @@ __all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox'
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
            'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV', 'RAW_REV',
-           'detect_raw', 'associate_group', 'detect_group', 'link_rows']
+           'detect_raw', 'associate_group', 'link_rows']
 
 # BUMP THIS WHENEVER `link_rows` CHANGES WHAT IT EMITS. `--det-cache` stores boxes that have already
 # been linked, so a cache written under an older rule is a different box set under an identical
@@ -382,58 +382,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         idy.pose_nms(out, kp, scores=sc, thresh=pose_nms, stats=stats)
 
     return out, sc, kp
-
-
-@torch.no_grad()
-def detect_group(det, input_wh, session, gid, max_instances, device='cpu', batch=16,
-                 score_thresh=0.99, link=False, reduce=False, max_frames=0, min_views=2,
-                 track=True, max_move=1.0, tile_scale=None, top_k=None):
-    """Run the detector over every frame and camera of a group -> (boxes, scores).
-
-    boxes (S,T,C,4), scores (S,T,C). The score is the objectness the box survived NMS on, and it
-    is returned rather than dropped because `--det-score` is otherwise a re-detection per
-    threshold: detection is the expensive half of a run, and a sweep over a threshold that only
-    ever *removes* boxes can be done offline from what one pass already computed.
-
-    THE COMPOSITION OF `detect_raw` AND `associate_group`, and nothing else. It is kept so no caller
-    changed when the two were split, and a test pins the composition byte-identical. `top_k`
-    defaults to `max_instances`, which is what this function did when the two were one.
-
-    `score_thresh` DEFAULTS TO 0.99, not to `decode`'s 0.05. The objectness is saturated -- 98.5% of
-    rat-city's boxes and 99.98% of 3dpop's sit at exactly 1.0 -- so 0.05 through 0.5 are the same
-    threshold in practice and the live range starts at 0.99, where dropping the bottom few percent is
-    worth MOTA +0.074 [+0.009, +0.154] on 3dpop and +0.073 on rat-city, entirely out of `fp_none`.
-    `decode` keeps 0.05 deliberately: it is also the training-time and detector-scoring primitive,
-    and `eval_detector.py`'s numbers in dev/reports/10 are all at 0.05.
-
-    `max_frames` is the same PREFIX `infer.run_group` takes, and it has to be honoured here or the
-    two disagree about the clip: rat-city's one test group is 57,594 frames and the protocol is its
-    first 480, so detecting the whole group threw away 99.2% of the detection -- which is the
-    expensive half of a run.
-
-    2D / single camera: instances are the NMS survivors, ordered by score, and the row index is
-    the only identity there is -- it is NOT tracked, so row `a` at frame t and frame t+1 need not
-    be the same animal. Feeding these straight to the pose model is the honest deployment
-    baseline for a single window and nothing more; a tracker belongs on top.
-
-    `link=True` puts the smallest possible one there -- see `link_rows`. `scripts/infer.py` passes
-    it ON by default; it stays off HERE because this function's contract is the honest untracked
-    baseline and callers that want a tracker should say so. Note the two levers do not overlap:
-    the tracker is built when `track and C > 1`, and `link_rows` runs only when it was not, so in
-    2D single-view `link` is the whole of cross-frame identity.
-
-    3D multiview: `track=True` (the DEFAULT) runs `track.CrossViewTracker` -- one cross-view target
-    set carried across frames, so a row is one physical animal both within a frame and along the
-    clip, and `link_rows` is not run on top of it. `track=False` restores the memoryless per-frame
-    `associate`, whose rows are one animal within a frame and untracked across them; that is the
-    arm every number before dev/reports/13 was measured on, so reproducing one needs it.
-    """
-    raw = detect_raw(det, input_wh, session, gid, top_k or max_instances or 1, device=device,
-                     batch=batch, score_thresh=score_thresh, reduce=reduce, max_frames=max_frames,
-                     tile_scale=tile_scale)
-    out, sc, kp = associate_group(raw, session, gid, max_instances, link=link, min_views=min_views,
-                                  track=track, max_move=max_move)
-    return (out, sc) if kp is None else (out, sc, kp)
 
 
 def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None):

@@ -11,7 +11,7 @@ import pytest
 from scipy.optimize import linear_sum_assignment
 
 from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, match_instances,
-                                  matched_error, mota, motion_ratio, path_length)
+                                  matched_error, mota, motion_ratio)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -153,16 +153,12 @@ def test_a_frozen_prediction_reads_as_less_motion_than_a_moving_one():
     moving = true.copy()
     frozen = np.zeros_like(true)                               # predicts the same pose every frame
 
-    assert path_length(moving)['path'] == pytest.approx(8.0)   # 2 keypoints x 4 unit steps
-    assert path_length(frozen)['path'] == 0.0
     assert motion_ratio(moving, true)['ratio'] == pytest.approx(1.0)
     assert motion_ratio(frozen, true)['ratio'] == 0.0
     # A step with a missing end is SKIPPED, not bridged -- bridging would charge the whole
     # excursion across the gap to one step and read as MORE motion than the continuous arm.
     gappy = moving.copy()
     gappy[0, 2] = np.nan
-    assert path_length(gappy)['n_steps'] == 4                  # 2 kpts x 2 surviving steps
-    assert path_length(gappy)['path'] == pytest.approx(4.0)
 
 
 def test_motion_ratio_takes_a_centroid_reference():

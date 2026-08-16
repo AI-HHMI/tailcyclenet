@@ -319,8 +319,28 @@ tracked sessions. Each has a v3 counterpart and could be backfilled the same way
 ## Training
 
 ```bash
-pixi run python scripts/train.py --config configs/w9.toml
+pixi run python scripts/train.py --config configs/3d.toml --data <root>   # or configs/2d.toml
 ```
+
+**THE TWO CONFIGS DIFFER IN THREE KEYS AND THAT IS THE POINT.** `configs/base.toml` holds
+everything shared; `2d.toml` and `3d.toml` `extends` it and add only what the setting genuinely
+requires — `cams_to_sample`, `val_cams_to_sample` and `prob_2d_only`, all three of them camera-count
+questions a one-camera root cannot ask. `2d.toml` adds NO `[data]` key at all. Resolution is one
+level deep by design (`checkpoints.load_config`): a chain of overlays would put the difference back
+out of sight, which is the thing the split exists to show.
+
+**The inference recipe is not config**, and it is where the two really differ:
+`--crop-source keypoints` (3D) against `boxes` (2D), with a detector trained `--keypoints` for the
+first. `--anchor carry` and `--overlap 8` are SHARED BY DECISION and neither is 2D's optimum — see
+`configs/2d.toml`, which records what that costs.
+
+**`[training.losses]` HAS FIVE KEYS THAT FIRE ON A 2D SESSION AND THE REST ARE 3D-ONLY.**
+`TotalLoss.forward` branches on `coords_true.shape[-1]`; the `R == 2` block computes
+`coords_loss_2d`, `coords_softmax_2d`, `smoothness_loss_2d` and the two smoothness shape keys, and
+everything else is NaN'd and dropped. **So NOTHING SUPERVISES VISIBILITY ON A 2D-ONLY RUN** — both
+vis terms live in the 3D `else`, and `vis_loss_weight = 5.0`, the largest weight in the block, gets
+no gradient there. That, and not "the converter wrote every point VISIBLE", is why `--vis-thresh`
+cannot work on a 2D root: the head it gates on was never trained.
 
 `[data].path` is either a dataset root (has `train/`, optionally `val/` and `test/`) or a folder
 whose children are dataset roots. In the second case keypoint names are prefixed with the dataset
@@ -850,7 +870,19 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
 
 ### The three inference levers that are measured (dev/reports/11_inference_verified.md)
 
-- **`--det-score`, and it is now the DEFAULT at 0.99** (was 0.05, which was never a considered value
+- **`--det-score` DEFAULTS TO 0.99 AND THAT IS WRONG FOR THE CURRENT DETECTOR GENERATION.** The
+  premise below — "the objectness is saturated" — was TRUE of the detectors it was measured on and
+  is FALSE of the tiled/masked ones trained since: report 21 §0b measures q01 at **0.452–0.843**,
+  so 0.99 cuts through the middle of the bulk and keeps **26–33% of detections**. On the 500-frame
+  rat-city clip that reads coverage **0.703 at 0.99 against 0.986 at 0.50**, and MOTA 0.622 against
+  **0.723 at 0.97**. A 0.10 MOTA and 0.20 coverage gap against the shipped default.
+  **WHETHER A DETECTOR IS SATURATED IS A PROPERTY OF THE CHECKPOINT, NOT OF THE DATASET** — report
+  21 §7a shows `--ignore-band` re-saturating it — so there is no default that is right for both
+  generations and the number cannot simply be moved. Sweep it per checkpoint; `scripts/infer.py`
+  prints per-group box coverage, and a figure near 0.25 is this. The original measurement, still
+  true of its own generation, follows.
+
+  (was 0.05, which was never a considered value
   — it is `decode`'s primitive floor inherited by the deployment path). The objectness is saturated —
   98.5% of rat-city's boxes and 99.98% of 3dpop's sit at exactly 1.0 — so a sweep over 0.05–0.5 moves
   1–3% of boxes and does nothing. At 0.99: MOTA **+0.074** [+0.009, +0.154] on 3dpop with MPJPE
@@ -1342,3 +1374,29 @@ that root yields a seen-animal number (reference: `prior_self` 2.484, `prior_non
 on that axis is 2.274). 3.394 is a genuinely cross-animal figure and needs a split that holds an animal out.
 Report 13 corrected step 6's bar for exactly this: scoring a seen-animal arm against 3.394 compares two axes
 and reads the ~0.9 mm difference in axis as a result (eval rule 1).
+
+---
+
+## The deleted levers, in one line each
+
+Every one below was measured, refuted, and REMOVED on the `cleanup` branch (dev/reports/24). They
+are listed so nobody re-proposes one, and NOT described further — the measurement is in the report
+and the reason is at the deletion site.
+
+**Inference:** `--axis-veto`, `--kpt-affinity`, `--kpt-centre`, `--axis-cost`, `--swap-repair`,
+`--random-veto` (their rate-matched control), `--stitch`, `--dup-res-px`, `--prior-vis-thresh`,
+`--seam blend`, `--moving-crop`.
+**Detector training:** `--ignore-band`, `--ema-decay`, `--warmup-frac`, `--augment-photometric`,
+`--identity` / `--id-weight` (and the YOLOX identity head behind them).
+**Config:** `moving_crop`; the dead loss weights `gamma`, `feature_loss_weight`, `pixel_thresh`;
+the inert model keys `corr_radius`, `use_volume_embedding`, `occlusion_embedding`, `mode_3d`,
+`cross_attn_dim`; and six `configs/datasets/*.toml` keys nothing ever read.
+
+**THE CUE IS REAL AND EVERY MECHANISM THAT SPENDS IT IS REFUTED — all three forms are now tried.**
+A veto, a permutation and a Hungarian cost term were each built, measured on BOTH roots and lost.
+Do not propose a fourth without first raising the cue's quality.
+
+**`--pose-nms` is the one identity lever that works**, `--rotate-deg` survives with its 180-degree
+setting refuted, and `synth_motion_*` survives unmeasured — and is now the sole consumer of the
+moving-crop geometry, which is why `crop.moving_boxes`, `apply_crop_moving` and `patches.py` are
+still here.

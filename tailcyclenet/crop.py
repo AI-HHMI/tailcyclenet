@@ -191,8 +191,8 @@ def moving_boxes(extents, size, min_crop_dim=64, scale=1.0, shift=(0.0, 0.0)):
     centre is carried through the Nones by interpolation, so a frame the detector missed does not
     snap the crop to the image corner and take the animal out of shot.
 
-    `scale` and `shift` are ONE crop jitter for the whole window -- see `jitter_params`. They must
-    be one draw rather than one per frame: a per-frame scale is the per-frame size this rule exists
+    `scale` and `shift` are ONE crop jitter for the whole window (one per CAMERA -- see
+    `crop_to_points_3d_moving`). They must be one draw per window rather than one per frame: a per-frame scale is the per-frame size this rule exists
     to avoid, and a per-frame shift would add a random walk to the crop the labels do not follow.
 
     THE CENTRE IS WHAT GETS CLAMPED, not the corners. Clamping corners shrinks the box at the
@@ -237,7 +237,7 @@ def crop_to_points_2d_moving(cam, coords, min_crop_dim=64, jitter=None, crop_pts
     """
     src, pad = _crop_source(coords, crop_pts)
     per = [crop_box_for_points(src[t], cam['size'], min_crop_dim, pad) for t in range(len(src))]
-    s, dx, dy = jitter if jitter is not None else (1.0, 0.0, 0.0)
+    s, dx, dy = jitter() if jitter is not None else (1.0, 0.0, 0.0)
     boxes = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=(dx, dy))
     if boxes is None:
         return None, None, None
@@ -280,10 +280,28 @@ def apply_crop_moving(cam, boxes):
     shape convention the library already uses for a moving camera's `(T,4,4)` `ext`.
     """
     out = dict(cam)
+    T = len(boxes)
     off = torch.as_tensor(boxes[:, :2].astype(np.int32), dtype=cam['offset'].dtype)
     out['offset'] = cam['offset'][None, :] + off                    # (T,2)
     out['size'] = torch.tensor([int(boxes[0, 2] - boxes[0, 0]), int(boxes[0, 3] - boxes[0, 1])],
                                dtype=torch.int32)
+    # A MOVING CROP IS A PER-FRAME CAMERA, SO SAY SO IN THE FIELD THE LIBRARY ALREADY BRANCHES ON.
+    # `ext` is expanded to a constant `(T,4,4)` -- the rig genuinely does not move, and these are
+    # T copies of one matrix -- purely so `cam['ext'].ndim == 3` is TRUE. That single test is how
+    # posetail decides, in half a dozen places, whether a camera differs per frame: `losses.py:408`
+    # keeps the visibility target as `(b,t,n)` instead of flattening it, `tracker_encoder.py:493`
+    # expands the extrinsic over the `(t n)` ray order, and `:664` pins its ray-local gauge frame
+    # to frame 0. Every one of those is what a moving crop needs, for the reason the library
+    # already implements them.
+    #
+    # This is a statement about the CAMERA, not a lie about the RIG: what differs per frame is the
+    # mapping from world to crop pixels, which is precisely what those branches exist for. Setting
+    # it here rather than patching each site is why `patches.py` stays at four entries instead of
+    # tracking every place the library flattens time.
+    if out['ext'].ndim == 2:
+        out['ext'] = out['ext'][None].expand(T, 4, 4).contiguous()
+    if 'center' in out and out['center'].ndim == 1:
+        out['center'] = out['center'][None].expand(T, out['center'].shape[-1]).contiguous()
     return out
 
 
@@ -302,8 +320,15 @@ def crop_to_points_3d_moving(cgroup, coords, min_crop_dim=64, jitter=None, crop_
     """
     p2d = project_points_torch(cgroup, coords)
     out, boxes = [], []
-    s, dx, dy = jitter if jitter is not None else (1.0, 0.0, 0.0)
     for cnum, cam in enumerate(cgroup):
+        # ONE DRAW PER CAMERA, matching exactly when `jitter_box`'s closure draws on the static
+        # path -- it is applied inside this same loop, so each camera gets its own jitter. Drawing
+        # once for the whole rig would both weaken the augmentation and consume the rng
+        # differently, which desynchronises every window drawn afterwards: the moving arm would
+        # then differ from its control in the augmentation AND the sampled data, not just the crop
+        # (eval rule 4). Measured before this fix as allen skipping 2 of 12 steps where its static
+        # control skipped 0.
+        s, dx, dy = jitter() if jitter is not None else (1.0, 0.0, 0.0)
         src, pad = _crop_source(p2d[cnum], None if crop_pts is None else crop_pts[cnum])
         per = [crop_box_for_points(src[t], cam['size'], min_crop_dim, pad)
                for t in range(len(src))]

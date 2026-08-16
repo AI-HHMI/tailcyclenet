@@ -83,16 +83,24 @@ halves and the end-to-end geometry. `get_camera_scale` and `undistort_points` ar
 same reason (a Jacobian, so collapsing the offset is exact; and two different point layouts reach
 the undistort).
 
-**A MOVING CROP IS THEREFORE 2D-ONLY, AND THAT IS A DECODE LIMIT RATHER THAN A DATA ONE.** The crop
-side is ready in both — `crop.crop_to_points_3d_moving` is verified against a projection computed
-the other way round — but the library's decode assumes a static offset in at least six places, and
-two are still open: `tracker_encoder.py:664`'s ray-local GAUGE FRAME (the library anchors a moving
-rig at frame 0 there and a moving crop needs the same choice, but the offset is not reachable from
-the call) and `encoder_decoder.py:394`'s own principal-point term. Each is a judgement about a
-PRETRAINED decode where a wrong answer trains to a plausible number instead of failing, which is
-gotcha 12's shape. **It fails loudly if attempted** — `project_cam`'s guard raises on a time-less
-point set rather than broadcasting a spurious time axis — so `moving_crop = true` on a 3D root
-stops the job in its first iteration instead of producing a quietly wrong run.
+**A MOVING CROP WORKS IN 2D AND 3D, AND THE 3D ROUTE IS NOT THE OBVIOUS ONE.** The crop is a
+per-frame camera `offset` and nothing else — but the library flattens the time axis away in half a
+dozen places, and patching each meant a separate judgement about a PRETRAINED decode where a wrong
+answer trains to a plausible number instead of failing. So `crop.apply_crop_moving` instead expands
+`ext` to a constant `(T,4,4)`: not a lie about the rig (it really is static; these are T copies of
+one matrix) but a way to make `cam['ext'].ndim == 3` true, which is the single test posetail already
+uses everywhere to mean "this camera differs per frame" — `losses.py:408` then keeps the visibility
+target as `(b,t,n)` instead of flattening it, `tracker_encoder.py:493` expands the extrinsic over
+the `(t n)` ray order, and `:664` pins its gauge frame to frame 0. All three are what a moving crop
+needs. `patches.py` handles only the remainder.
+
+**AND THE JITTER MUST BE DRAWN PER CAMERA.** `jitter_box` returns a CLOSURE that the static 3D path
+applies inside its per-camera loop, so each camera draws its own and the rng advances three numbers
+per camera. A single draw for the whole rig both weakens the augmentation and leaves the rng in a
+different state, desynchronising every window sampled afterwards — the arm would then differ from
+its control in the augmentation and the data as well as the crop. Measured before the fix as allen
+skipping 2 of 12 steps where its static control skipped 0. `_jitter_params` therefore returns a
+factory, matching `_jitter`.
 
 The `LD_LIBRARY_PATH` prepend in `[tool.pixi.activation.env]` is load-bearing: the env ships
 `libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it `import

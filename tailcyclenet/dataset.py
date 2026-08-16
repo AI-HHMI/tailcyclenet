@@ -1279,12 +1279,16 @@ class PoseDataset(Dataset):
     def _jitter_params(self, rng):
         """`_jitter`'s moving-crop twin: the DRAW rather than the closure.
 
-        Same gate and the same three draws in the same order, so a moving-crop item consumes the
-        rng exactly as a static one does and the two arms differ in geometry alone.
+        A FACTORY, not a draw, for the same reason `_jitter` returns a closure: the static 3D path
+        applies that closure once per CAMERA inside `crop_to_points_3d`'s loop, so each camera gets
+        its own jitter and the rng advances three numbers per camera. Returning a single drawn
+        triple here would jitter the whole rig identically AND leave the rng in a different state,
+        desynchronising every window sampled afterwards -- so the moving arm would differ from its
+        control in the augmentation and the data as well as the crop (eval rule 4).
         """
         if not self.train or self.cfg.crop_jitter <= 0:
             return None
-        return cropmod.jitter_params(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
+        return lambda: cropmod.jitter_params(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
 
 
 def _mask_outside(coords, size):

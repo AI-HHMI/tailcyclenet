@@ -62,6 +62,32 @@ import torch
 _APPLIED = False
 
 
+def _align_offset(off, points):
+    """Broadcast a per-frame `(T,2)` offset onto `points`, in whichever layout reached us.
+
+    Three layouts carry a time axis through the library, and they are not interchangeable:
+
+      (..., T, N, 2)  time at axis -3 -- the convention `project_cam` documents for `ext`, and
+                      what `tracker_encoder.py:614` passes (the 2D head's own prediction).
+      (T*N, 2)        flattened in `(t n)` order -- `points_to_rays` via `tracker_encoder.py:500`,
+                      the order that file's comment states and that it already uses to expand a
+                      moving rig's extrinsic over rays.
+      (B, 2)          one row per ray with the offset already resolved per ray by
+                      `points_to_rays` below.
+
+    Assuming any one of them alone is wrong, and wrong SILENTLY: an earlier version took the
+    flattened reading only and rejected a `(B,T,N,2)` tensor as "1 point against 24 frames".
+    """
+    T = off.shape[0]
+    if points.ndim >= 3 and points.shape[-3] == T:
+        return off.reshape(*(1,) * (points.ndim - 3), T, 1, 2)
+    if points.ndim == 2 and points.shape[0] % T == 0:
+        return off.repeat_interleave(points.shape[0] // T, dim=0)
+    raise ValueError(
+        f'a per-frame camera offset of {T} frames does not line up with points of '
+        f'{tuple(points.shape)}: expected time at axis -3, or a flat (T*N, 2) in (t n) order.')
+
+
 def _patch_project_cam():
     """Right-align `project_cam`'s offset subtraction so a per-frame `(T,2)` offset works."""
     from posetail.posetail import cube
@@ -204,24 +230,15 @@ def _patch_undistort_points():
         off = cam.get('offset')
         if off is None or off.ndim <= 1:
             return original(cam, points, *args, **kwargs)
-        T = off.shape[0]
-        one = lambda t, p: original(dict(cam, offset=off[t]), p, *args, **kwargs)  # noqa: E731
-        # TWO LAYOUTS REACH THIS FUNCTION and they are not interchangeable.
-        #   (..., T, N, 2)  -- `tracker_encoder.py:614`, the 2D head's own prediction. Time sits at
-        #                      axis -3, the same convention `project_cam` documents for `ext`.
-        #   (T*N, 2)        -- `points_to_rays` via `tracker_encoder.py:500`, flattened in the
-        #                      `(t n)` order that file's own comment states and that it already
-        #                      uses to expand a moving rig's extrinsic.
-        # Assuming either one alone is wrong: the first version of this patch took the flattened
-        # reading and rejected a (B,T,N,2) tensor as "1 point against 24 frames".
-        if points.ndim >= 3 and points.shape[-3] == T:
-            return torch.stack([one(t, points[..., t, :, :]) for t in range(T)], dim=-3)
-        if points.ndim == 2 and points.shape[0] % T == 0:
-            per = points.reshape(T, -1, points.shape[-1])
-            return torch.cat([one(t, per[t]) for t in range(T)], dim=0)
-        raise ValueError(
-            f'undistort_points got points of {tuple(points.shape)} against a per-frame offset of '
-            f'{T} frames: expected time at axis -3, or a flat (T*N, 2) in (t n) order.')
+        # THE OFFSET ENTERS AS A PURE PRE-ADD -- `points[:, i] + offset[i]`, before the distortion
+        # iteration and before anything else (`cube.py:317`) -- so folding it into the POINTS and
+        # zeroing it is EXACT, inherits the distortion model untouched, and stays vectorised. The
+        # first version of this patch looped one call per frame, which is up to 408 python-level
+        # calls per camera per forward.
+        aligned = _align_offset(off, points)
+        zero = torch.zeros(2, device=off.device, dtype=off.dtype)
+        return original(dict(cam, offset=zero), points + aligned.to(points.dtype),
+                        *args, **kwargs)
 
     undistort_points._tailcyclenet_patched = True
     undistort_points._tailcyclenet_original = original
@@ -238,6 +255,57 @@ def _patch_undistort_points():
             m.undistort_points = undistort_points
 
 
+def _patch_points_to_rays():
+    """Align the camera OFFSET with the `ext` the caller pinned -- the library's own rule.
+
+    UPSTREAM FIX: in `posetail/posetail/cube.py::points_to_rays`, treat `offset` exactly as `ext`
+    is already treated. Its docstring says `ext` "may be (4,4) [shared across rays, broadcast] or
+    (B,4,4) [one per ray] for moving cameras"; the offset needs the same two cases and currently
+    has neither.
+
+    THE ONE CASE THAT CANNOT BE INFERRED FURTHER DOWN is the ray-local GAUGE FRAME.
+    `tracker_encoder.py:664` calls this with a single crop-centre point and an explicitly pinned
+    `ext=cam['ext'][0]`, commented "ray-local gauge frame: anchor at frame 0 for moving cams (a
+    stable per-clip frame)". A moving crop must make the SAME choice for the same reason -- the
+    gauge has to be one stable frame for the clip, not a different one per ray -- and by the time
+    `undistort_points` sees a `(1,2)` point against a 24-frame offset there is nothing left to
+    decide it by. Resolving it here, from the `ext` argument, is what makes it a rule rather than
+    a guess.
+    """
+    from posetail.posetail import cube
+
+    original = cube.points_to_rays
+    if getattr(original, '_tailcyclenet_patched', False):
+        return
+
+    def points_to_rays(cam, p2d, *args, **kwargs):
+        off = cam.get('offset')
+        if off is not None and off.ndim > 1:
+            ext = kwargs.get('ext', args[3] if len(args) > 3 else None)
+            # SHARED-ACROSS-RAYS, BY EITHER SIGN. An explicitly pinned (4,4) extrinsic says so
+            # outright -- but a moving CROP leaves the rig static, so `tracker_encoder.py:664`'s
+            # `cam['ext'][0] if cam['ext'].ndim == 3 else None` passes None there and the first
+            # version of this check missed it entirely. The general statement is arithmetic: rays
+            # that do not divide by frames cannot be one-per-frame, so they are one shared ray,
+            # and frame 0 is the anchor the library picked for its own gauge frame.
+            if (ext is not None and ext.ndim == 2) or p2d.shape[0] % off.shape[0]:
+                cam = dict(cam, offset=off[0])
+        return original(cam, p2d, *args, **kwargs)
+
+    points_to_rays._tailcyclenet_patched = True
+    points_to_rays._tailcyclenet_original = original
+    cube.points_to_rays = points_to_rays
+    for mod in ('posetail.posetail.tracker_encoder', 'posetail.posetail.encoder_decoder'):
+        try:
+            import importlib
+            m = importlib.import_module(mod)
+        except Exception:
+            continue
+        if hasattr(m, 'points_to_rays') and not getattr(
+                m.points_to_rays, '_tailcyclenet_patched', False):
+            m.points_to_rays = points_to_rays
+
+
 def apply_all():
     """Idempotent. Called once from `tailcyclenet/__init__.py`."""
     global _APPLIED
@@ -246,4 +314,5 @@ def apply_all():
     _patch_project_cam()
     _patch_get_camera_scale()
     _patch_undistort_points()
+    _patch_points_to_rays()
     _APPLIED = True

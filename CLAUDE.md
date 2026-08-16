@@ -67,7 +67,7 @@ import time, so a later patch would reach some call sites and not others. **When
 moves, read that file and delete whatever landed upstream** rather than discovering a
 double-applied fix.
 
-Currently one entry. `cube.project_cam` does `p2d = p2d - offset[None, :]`, which prepends exactly
+Three entries, all one bug: the library assumes a camera `offset` is static. `cube.project_cam` does `p2d = p2d - offset[None, :]`, which prepends exactly
 one axis and so cannot express a PER-FRAME camera offset — the thing a moving crop
 (`crop.moving_boxes`) is, and the only thing it is: `apply_crop` writes only `offset` and `size`,
 and the rule holds the side constant, so `mat`, `ext` and `dist` never change. The library already
@@ -79,7 +79,20 @@ in the loader against `(B,T,K,2)` in `losses.py` — so no single shape works an
 shape bug. The patch WRAPS rather than reimplements (calls the original with `offset` withheld, then
 subtracts), so distortion, the depth clamp and any future upstream change are inherited; a 1-D
 offset takes the original path untouched and is bit-identical. `tests/test_patches.py` pins both
-halves and the end-to-end geometry.
+halves and the end-to-end geometry. `get_camera_scale` and `undistort_points` are patched for the
+same reason (a Jacobian, so collapsing the offset is exact; and two different point layouts reach
+the undistort).
+
+**A MOVING CROP IS THEREFORE 2D-ONLY, AND THAT IS A DECODE LIMIT RATHER THAN A DATA ONE.** The crop
+side is ready in both — `crop.crop_to_points_3d_moving` is verified against a projection computed
+the other way round — but the library's decode assumes a static offset in at least six places, and
+two are still open: `tracker_encoder.py:664`'s ray-local GAUGE FRAME (the library anchors a moving
+rig at frame 0 there and a moving crop needs the same choice, but the offset is not reachable from
+the call) and `encoder_decoder.py:394`'s own principal-point term. Each is a judgement about a
+PRETRAINED decode where a wrong answer trains to a plausible number instead of failing, which is
+gotcha 12's shape. **It fails loudly if attempted** — `project_cam`'s guard raises on a time-less
+point set rather than broadcasting a spurious time axis — so `moving_crop = true` on a 3D root
+stops the job in its first iteration instead of producing a quietly wrong run.
 
 The `LD_LIBRARY_PATH` prepend in `[tool.pixi.activation.env]` is load-bearing: the env ships
 `libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it `import

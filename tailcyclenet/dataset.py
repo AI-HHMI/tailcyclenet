@@ -1192,7 +1192,11 @@ class PoseDataset(Dataset):
         if R == 3 and (self.cfg.prompt_noise_px > 0 or self.cfg.prompt_offset_px > 0) \
                 and bool(torch.isfinite(kpt_prior).any()):
             pts = kpt_prior[torch.isfinite(kpt_prior).all(-1)][None]     # (1,n,3)
-            px = float(torch.nanmedian(get_camera_scale(cgroup, pts)))
+            # A PROJECTION JACOBIAN IS OFFSET-INVARIANT -- a constant image-plane translation
+            # has zero derivative -- and `pts` is one mean pose with no time axis, so a moving
+            # crop's (T,2) offset must be collapsed here. Exact, not an approximation.
+            px = float(torch.nanmedian(get_camera_scale(
+                [cropmod.with_static_offset(c) for c in cgroup], pts)))
             if not np.isfinite(px):
                 px = 1.0
         # STALE: the pose from a DIFFERENT frame than `prompt_t` claims. What `carried` degrades into

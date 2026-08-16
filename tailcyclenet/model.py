@@ -81,14 +81,23 @@ def scene_center(camera_group):
     origins, dirs = [], []
     for cam in camera_group:
         px = (cam['size'].to(torch.float64) / 2.0).reshape(1, 2)
-        und = undistort_points(cam, px)
-        ray_cam = torch.cat([und[0], und.new_ones(1)])
+        # A MOVING CROP GIVES EVERY FRAME ITS OWN RAY, for the same reason a moving rig does. The
+        # crop centre is a different SOURCE pixel each frame -- that is what following the animal
+        # means -- so it looks in a different direction, and `undistort_points` adds the offset
+        # back to reach source pixels. This is the one place a per-frame offset must NOT be
+        # collapsed: doing so would anchor the scene where the crop STARTED rather than where it
+        # followed the animal to, which is exactly the error the moving-rig note below describes.
+        off = cam['offset']
+        und = [undistort_points(dict(cam, offset=o), px)
+               for o in (off if off.ndim == 2 else off[None])]
         ext = cam['ext'] if cam['ext'].ndim == 3 else cam['ext'][None]
         centre = cam['center'] if cam['center'].ndim == 2 else cam['center'][None]
-        for t in range(ext.shape[0]):
-            d = ext[t, :3, :3].to(torch.float64).t() @ ray_cam
+        for t in range(max(ext.shape[0], len(und))):
+            u = und[min(t, len(und) - 1)]
+            ray_cam = torch.cat([u[0], u.new_ones(1)])
+            d = ext[min(t, ext.shape[0] - 1), :3, :3].to(torch.float64).t() @ ray_cam
             dirs.append(d / d.norm())
-            origins.append(centre[t].to(torch.float64))
+            origins.append(centre[min(t, centre.shape[0] - 1)].to(torch.float64))
     origins, dirs = torch.stack(origins), torch.stack(dirs)
 
     # Least-squares point minimising distance to a set of lines:

@@ -31,6 +31,8 @@ import torch.nn as nn
 from einops import rearrange, repeat
 
 from posetail.posetail.cube import is_point_visible, project_points_torch
+
+from . import crop as cropmod
 from posetail.posetail.encoder_decoder import PatchProcessor, QueryEncoder, sample_patches
 from posetail.posetail.utils import get_fourier_encoding
 
@@ -73,18 +75,6 @@ def _sub_unprompted(owner, term, token):
     return m * term + (1.0 - m) * token.view(1, 1, 1, -1)
 
 
-
-def _static_offset(cam):
-    """`cam['offset']` as a `(2,)`, collapsing the time axis a MOVING CROP puts there.
-
-    Under `--moving-crop` the crop origin -- and therefore the principal point -- genuinely moves
-    per frame, and `offset` is `(T,2)`. This term is a per-camera RIG DESCRIPTOR fed to the fusion
-    as one vector per camera, so it takes the window mean rather than growing a time axis: making
-    it time-varying is a model change with its own consequences and is not what the moving crop is
-    testing. The mean is exact for a static offset, so every non-moving run is unaffected.
-    """
-    off = cam['offset']
-    return off if off.ndim == 1 else off.to(torch.float32).mean(dim=tuple(range(off.ndim - 1)))
 
 
 class PoseQueryEncoder(QueryEncoder):
@@ -209,7 +199,11 @@ class PoseQueryEncoder(QueryEncoder):
         # Both this and the visibility branch below exist in the stock QueryEncoder and were lost
         # in the port (posetail-pose's kpt_query_encoder.py:361,392 dropped them too; it never
         # ran a moving rig through its own encoder).
-        moving = not is_2d and any(c['ext'].ndim == 3 for c in camera_group)
+        # A PER-FRAME OFFSET IS A MOVING CAMERA TOO. `--moving-crop` leaves `ext` static and varies
+        # `offset`, but every branch this flag guards -- the (b,t,n) reshape before projecting, and
+        # the per-frame visibility -- is needed for exactly the same reason.
+        moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
+                                   for c in camera_group)
         T_clip = preprocessed_views[0].shape[1]
 
         # When every keypoint shares one query -- the unprompted case, where they all sit at the
@@ -274,7 +268,8 @@ class PoseQueryEncoder(QueryEncoder):
 
         embed_pp = embed_intrinsic = None
         if self.principal_point_embedding:
-            ppt = torch.stack([(c['mat'][:2, 2] - _static_offset(c)).to(query_coords.dtype)
+            ppt = torch.stack([(c["mat"][:2, 2] - cropmod.static_offset(c["offset"])
+                                ).to(query_coords.dtype)
                                for c in camera_group])
             ppn = repeat(ppt / sizes * 2.0 - 1.0, 'cams r -> b t cams r', b=B, t=Tq)
             embed_pp = self.linear_pp(torch.cat(
@@ -557,7 +552,11 @@ class WideQueryEncoder(nn.Module):
         # and recomputes a constant term at full width on every query-free step.
         qpix, uniform = None, False
         if self.query_pos_embedding or self.query_patch_embedding:
-            moving = not is_2d and any(c['ext'].ndim == 3 for c in camera_group)
+            # A PER-FRAME OFFSET IS A MOVING CAMERA TOO. `--moving-crop` leaves `ext` static and varies
+            # `offset`, but every branch this flag guards -- the (b,t,n) reshape before projecting, and
+            # the per-frame visibility -- is needed for exactly the same reason.
+            moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
+                                       for c in camera_group)
             T_clip = preprocessed_views[0].shape[1]
             uniform = (not moving and bool(torch.equal(
                 query_coords, query_coords[:, :1].expand_as(query_coords))))
@@ -601,7 +600,8 @@ class WideQueryEncoder(nn.Module):
 
         # -- rig ---------------------------------------------------------------------------
         if self.principal_point_embedding:
-            ppt = torch.stack([(c['mat'][:2, 2] - _static_offset(c)).to(query_coords.dtype)
+            ppt = torch.stack([(c["mat"][:2, 2] - cropmod.static_offset(c["offset"])
+                                ).to(query_coords.dtype)
                                for c in camera_group])
             ppn = repeat(ppt / sizes * 2.0 - 1.0, 'cams r -> b t cams r', b=B, t=T_query)
             terms.append(self.linear_pp(torch.cat(

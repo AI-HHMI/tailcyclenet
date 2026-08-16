@@ -247,6 +247,29 @@ def crop_to_points_2d_moving(cam, coords, min_crop_dim=64, jitter=None, crop_pts
     return apply_crop(cam, boxes[0]), boxes, shifted
 
 
+def static_offset(off):
+    """A camera offset as a `(2,)`, collapsing the time axis a MOVING CROP puts there.
+
+    Not every consumer of a camera is a per-frame one, and the ones that are not need a single
+    origin. Two kinds, and they want this for different reasons:
+
+    - OFFSET-INVARIANT quantities. `get_camera_scale` is a projection Jacobian and a constant
+      image-plane translation has zero derivative, so collapsing is EXACT there, not an
+      approximation.
+    - PER-CAMERA DESCRIPTORS fed to the fusion, i.e. the principal-point term. Under a moving crop
+      the principal point genuinely moves per frame; giving that term a time axis is a model change
+      with its own consequences and is not what the moving crop is testing, so it takes the mean.
+
+    Exact for a static offset, so nothing without a moving crop is affected.
+    """
+    return off if off.ndim == 1 else off.to(torch.float32).mean(dim=tuple(range(off.ndim - 1)))
+
+
+def with_static_offset(cam):
+    """`cam` with its offset collapsed by `static_offset`. See there for when that is legitimate."""
+    return cam if cam['offset'].ndim == 1 else dict(cam, offset=static_offset(cam['offset']))
+
+
 def apply_crop_moving(cam, boxes):
     """`apply_crop` for a crop that TRANSLATES: `offset` gains a time axis, `size` does not.
 

@@ -999,7 +999,10 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup):
         fin = p[torch.isfinite(p).all(-1)]
         if not len(fin):
             return p, 0
-        scale = torch.nanmedian(get_camera_scale(cgroup, fin[None]))
+        # Offset-invariant (a Jacobian) and `fin[None]` carries no time axis -- same reason as
+        # dataset.py's camera-scale probe, and the same collapse.
+        scale = torch.nanmedian(get_camera_scale(
+            [cropmod.with_static_offset(c) for c in cgroup], fin[None]))
         if not torch.isfinite(scale):
             return p, 0
         width = float(scale) * cfg.image_size

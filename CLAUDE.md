@@ -547,6 +547,37 @@ coarse to rank arms is too coarse to trigger a per-frame action.** All five flag
 with their fire rates printed; the next form worth trying is a COST TERM inside the Hungarian, which
 §9.2 never proposed.
 
+**SYNTHETIC CAMERA MOTION MAKES A ONE-LABEL WINDOW INTO A LABELLED VIDEO** (`synth_motion_prob`,
+`synth_motion_amp`, `synth_motion_deg`, `synth_motion_frames`; report 22). An annotated group carries
+ONE labelled frame in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus
+trains NO temporal machinery: `SmoothnessLoss` returns 0 (its stencil needs k+1 labelled frames),
+temporal attention sees two frames one of which has no target, and `moving_crop` is inert. These keys
+emit T copies of the labelled frame and move the CAMERA over them — a smooth pan into `moving_boxes`'
+per-frame `shift`, a smooth roll into `ext` (3D) or into the coordinates (2D). Every frame is a real
+crop of a real image and every label is exact, because a per-frame crop is a per-frame `offset` and
+that geometry was already built for `moving_crop`. **The point is not the label count, it is the CARRY
+shape**: every frame labelled makes `prompt_t = 0` fall out of the existing `finite.argmax(0)`, so
+frames 1..T-1 are supervised at a DISPLACED target — the first training signal here shaped like what
+`--anchor carry` produces. Look for the effect in `prior_self`, not in the query-free pass.
+
+**THE SMOOTHNESS TERM MUST BE OFF ON THOSE WINDOWS AND `_tune_smoothness` DOES IT.** In 3D a synthetic
+camera motion CANNOT move a world point, so `coords` is constant across the window by construction,
+`d_true` is identically 0, and the hinge threshold `1.5*|d_true|` is 0 — at weight 0.5 that penalises
+ANY predicted 3D motion, i.e. RC1's motion lock trained in on purpose. It is also the first time the
+term fires on annotated data at all. Turning it back on needs a FLOOR on the hinge first; that is the
+follow-up arm, not a leftover. **And a synth window forces the moving-crop path regardless of
+`moving_crop`** — a static crop has nowhere to put a trajectory — so `moving_crop = false` beside these
+keys means "non-synth windows keep the static per-window crop".
+
+**`synth_motion_amp` IS IN BOX SIDES AND 0.35 IS MEASURED TOO HOT.** At 0.35 the pan walks the animal
+clean OUT of the crop on 34.8% of allen camera-windows and 22.8% of rat-city-annotated's, against a
+5.8%/0.0% baseline at 0 — the labels still follow the pixels exactly, but a frame of empty bedding
+carrying full-strength targets is the detector-failure case, not the camera-pan case. 0.15 costs ~4
+points over that baseline for 0.21 sides of motion (`scratch/synthmotion/sweep_amp.py`). **The RENDERS
+caught it and the centroid probe did not** — `motion/side` read a healthy 0.44 and said nothing about
+the animal leaving. Cost scales with T, so `synth_motion_frames` exists: allen's 40% annotated share is
+~1.6x, a 100%-annotated root at T = 24 would be 12x. Match arms on ITERATIONS.
+
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
 is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:

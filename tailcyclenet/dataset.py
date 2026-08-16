@@ -142,6 +142,33 @@ class LoaderConfig:
     # is what every run before this change did. See `_pool_weights` for why this is load-bearing.
     annot_frac: float | None = None    # P(a step comes from an `annotated` session)
     mode_3d_frac: float | None = None  # P(3d | source), i.e. applied WITHIN each source
+    # SYNTHETIC CAMERA MOTION, i.e. a labelled video built from ONE labelled frame.
+    #
+    # An annotated group carries one labelled frame in 65, so the derived-T rule gives it a T = 2
+    # window -- the label plus one unsupervised partner, because `_even_span` floors at 2. That is
+    # the cheapest correct thing to do and it means the annotated half of the corpus trains NO
+    # temporal machinery: `SmoothnessLoss` returns 0 (its stencil needs k+1 labelled frames),
+    # temporal self-attention sees two frames one of which has no target, and `moving_crop` is
+    # inert (nothing to follow). It also means nothing in training has the shape `--anchor carry`
+    # deploys with -- a prior at frame 0 and a DISPLACED target after it.
+    #
+    # These keys emit a T-frame window instead, holding the scene frozen and moving the CAMERA:
+    # a smooth pan (`_synth_path`) fed to `moving_boxes`' per-frame `shift`, plus a smooth in-plane
+    # roll written into `ext` (3D) or into the coordinates (2D). Every frame is a real crop of a
+    # real image and every label is exact, because a per-frame crop is a per-frame `offset` and
+    # that geometry is already built and tested (`crop.apply_crop_moving`, `patches.py`).
+    #
+    # WHAT IT DOES NOT DO, so nobody has to discover it: the animal is FROZEN. No articulation, no
+    # change of self-occlusion, no motion blur. This teaches equivariance to camera motion, not
+    # animal motion. And in 3D the world target is CONSTANT across the window by construction --
+    # a synthetic camera move cannot move a world point -- so 3D gains temporal context and
+    # multiview consistency under crop motion while 2D, whose target IS crop pixels, also gains a
+    # moving target. That constant 3D target is why `train._tune_smoothness` switches the
+    # smoothness term OFF on these windows; see there.
+    synth_motion_prob: float = 0.0     # P(a single-label TRAIN window is expanded)
+    synth_motion_amp: float = 0.0      # peak pan, in BOX SIDES -- scale-free across roots
+    synth_motion_deg: float = 0.0      # peak roll, degrees
+    synth_motion_frames: int = 0       # T for a synth window; 0 means cfg.n_frames
 
 
 # ----------------------------------------------------------------------------------------------
@@ -218,9 +245,16 @@ def _apply_affine(pts, rotation):
     Both rotation helpers return `(M_2x3, (w, h))` (`posetail_dataset.py:104,175`), and this is
     the same line `rotate_points_image_plane` applies to the coords -- shared so a stored box and
     the labels can never end up in different frames.
+
+    A LIST of those is a PER-FRAME rotation (`_synth_roll`), and then `pts` is indexed on its
+    leading axis, which is time in every caller: `(T,K,2)` labels and `(T,4,2)` stored box corners
+    alike. Same requirement as the single form -- whatever moves the pixels must move the points.
     """
     if pts is None or rotation is None:
         return pts
+    if isinstance(rotation, list):
+        return torch.stack([_apply_affine(pts[t], rotation[min(t, len(rotation) - 1)])
+                            for t in range(pts.shape[0])])
     M = torch.as_tensor(rotation[0], dtype=pts.dtype)
     return pts @ M[:, :2].T + M[:, 2]
 
@@ -265,11 +299,20 @@ def _crop_affine(src_wh, crop_coords, target_size, rotation):
     return (A @ M).astype(np.float32), (tw, th)
 
 
-def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1):
-    """One decode and one affine -> (H,W,3) uint8 RGB. None if the file will not decode.
+def load_warps(path, specs, target_size=None, reduce=1):
+    """ONE decode, N affines -> list of (H,W,3) uint8 RGB. All None if the file will not decode.
 
-    Replaces the library's `load_image`, which did the rotation, the crop and the resize as three
-    separate full-size buffers. BGR->RGB runs on the OUTPUT, which is the small one.
+    `specs` is one `(crop_coords, rotation)` per output frame.
+
+    DECODE COST IS PER FILE AND WARP COST IS PER OUTPUT, and fusing the two -- which is what one
+    `load_image` call per output frame does -- charges the first at the rate of the second. That
+    is invisible until a caller wants several DIFFERENT crops of the SAME frame: a
+    synthetic-motion window is exactly one source frame under T crops, so the fused form pays 24
+    full decodes for one picture, 24 x 27 ms on a 4696x2048 jpeg, dominating the item. It is the
+    same waste `read_frames`' dedupe was written to prevent, arriving from the other side.
+
+    BGR IS KEPT UNTIL AFTER THE WARP so the colour convert still runs on the SMALL output, which
+    is the property the fused version had and the reason not to just decode-then-call-load_image.
 
     `reduce` in {1,2,4,8} decodes at 1/N via libjpeg's DCT-domain decimation -- a proper box
     filter, and cheaper than decoding full size. It is only valid when the caller wants the WHOLE
@@ -282,17 +325,31 @@ def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1
     if reduce == 1:
         img = cv2.imread(path)
     else:
-        assert crop_coords is None and rotation is None, \
+        assert all(c is None and r is None for c, r in specs), \
             'reduce decodes at 1/N, so source-pixel crop_coords/rotation would be misplaced'
         flag = {2: cv2.IMREAD_REDUCED_COLOR_2, 4: cv2.IMREAD_REDUCED_COLOR_4,
                 8: cv2.IMREAD_REDUCED_COLOR_8}[reduce]
         img = cv2.imread(path, flag)
     if img is None:
-        return None
-    aff = _crop_affine((img.shape[1], img.shape[0]), crop_coords, target_size, rotation)
-    if aff is not None:
-        img = cv2.warpAffine(img, aff[0], aff[1], flags=cv2.INTER_LINEAR)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return [None] * len(specs)
+    src_wh = (img.shape[1], img.shape[0])
+    out = []
+    for crop_coords, rotation in specs:
+        aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
+        warped = (img if aff is None
+                  else cv2.warpAffine(img, aff[0], aff[1], flags=cv2.INTER_LINEAR))
+        out.append(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+    return out
+
+
+def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1):
+    """One decode and one affine -> (H,W,3) uint8 RGB. None if the file will not decode.
+
+    Replaces the library's `load_image`, which did the rotation, the crop and the resize as three
+    separate full-size buffers. The single-spec case of `load_warps`, which is where the
+    behaviour lives; kept as its own name because the detector wants exactly this.
+    """
+    return load_warps(path, [(crop_coords, rotation)], target_size, reduce)[0]
 
 
 # AN OPEN DECORD READER COSTS ABOUT A GIGABYTE, SO THE CACHE SIZE IS A MEMORY BUDGET, NOT A HINT.
@@ -428,23 +485,36 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     import cv2
 
     key = str(path)
+    # DECODE EACH DISTINCT INDEX ONCE, for the reason the image-directory path below decodes once:
+    # a clamp-padded window repeats its last frame, and a synthetic-motion window is ONE index T
+    # times under T different crops. Handing `get_batch` the repeats decodes them.
+    want = [int(i) for i in frames]
+    uniq = list(dict.fromkeys(want))
     with _read_lock_for(key):
-        imgs = _reader(key, group, cam).get_batch(list(frames)).asnumpy()  # decord gives RGB
-    src_wh = (imgs.shape[2], imgs.shape[1])
-    # A (T,4) `crop_coords` is a MOVING crop -- one affine per frame rather than one for the
-    # window. Same count of `warpAffine` calls either way; only the matrix differs per frame.
+        dec = _reader(key, group, cam).get_batch(uniq).asnumpy()          # decord gives RGB
+    at = {i: dec[n] for n, i in enumerate(uniq)}
+    src_wh = (dec.shape[2], dec.shape[1])
+    # A (T,4) `crop_coords` -- or a list of rotations -- is a MOVING crop: one affine per frame
+    # rather than one for the window. Same count of `warpAffine` calls either way; only the matrix
+    # differs per frame.
     cc = None if crop_coords is None else np.asarray(crop_coords)
-    if cc is not None and cc.ndim == 2:
-        out = []
-        for t, im in enumerate(imgs):
-            aff = _crop_affine(src_wh, cc[min(t, len(cc) - 1)], target_size, rotation)
-            out.append(im if aff is None else
-                       cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
-        return out
-    aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
-    if aff is None:
-        return list(imgs)
-    return [cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR) for im in imgs]
+    per_box = cc is not None and cc.ndim == 2
+    per_rot = isinstance(rotation, list)
+    out, seen = [], set()
+    for t, i in enumerate(want):
+        aff = _crop_affine(src_wh,
+                           cc[min(t, len(cc) - 1)] if per_box else crop_coords,
+                           target_size,
+                           rotation[min(t, len(rotation) - 1)] if per_rot else rotation)
+        im = at[i]
+        if aff is not None:
+            out.append(cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
+        else:
+            # A repeat gets a COPY: `_augment`'s cutout writes in place, and now that the decode
+            # is deduped the repeats would otherwise share one buffer. Same rule as `read_frames`.
+            out.append(im.copy() if i in seen else im)
+        seen.add(i)
+    return out
 
 
 def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation=None,
@@ -471,21 +541,34 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     # PER-FRAME CROPS MOVE THE DEDUPE KEY. Under `moving_crop` the box is a function of the
     # POSITION in the window, not of the source index -- and `_frames` clamp-pads a short window,
     # so one index can occupy several positions. Keying on the index alone would then serve every
-    # repeat the first position's crop. The key becomes (index, box); with one box for the whole
-    # window the box half is constant and this is the old behaviour exactly.
+    # repeat the first position's crop. The key becomes (index, box, rotation slot); with one box
+    # and one rotation for the whole window those halves are constant and this is the old
+    # behaviour exactly.
     cc = None if crop_coords is None else np.asarray(crop_coords)
-    per_frame = cc is not None and cc.ndim == 2
-    keys = [(w, tuple(int(v) for v in cc[min(t, len(cc) - 1)]) if per_frame else None)
+    per_box = cc is not None and cc.ndim == 2
+    per_rot = isinstance(rotation, list)
+    keys = [(w, tuple(int(v) for v in cc[min(t, len(cc) - 1)]) if per_box else None,
+             min(t, len(rotation) - 1) if per_rot else None)
             for t, w in enumerate(want)]
-    box_for = (lambda k: list(k[1])) if per_frame else (lambda k: crop_coords)
     uniq = list(dict.fromkeys(keys))
+    # BUT THE DEDUPE KEY IS NOT THE DECODE KEY, and conflating them is what made a synthetic-motion
+    # window unaffordable: it is ONE source index under T distinct crops, so every key differs and
+    # a fused decode-and-warp per key pays T full decodes for one picture. Group the keys by source
+    # index and hand each group to `load_warps`, which decodes once and warps per output. With one
+    # box for the window each index has exactly one key and this is a single fused call, as before.
+    by_index = {}
+    for k in uniq:
+        by_index.setdefault(k[0], []).append(k)
+    spec = lambda k: (list(k[1]) if per_box else crop_coords,          # noqa: E731
+                      rotation[k[2]] if per_rot else rotation)
+    batch = lambda i, ks: load_warps(path(i), [spec(k) for k in ks],   # noqa: E731
+                                     target_size, reduce)
     if pool is None:
-        got = {k: load_image(path(k[0]), box_for(k), target_size, rotation, reduce)
-               for k in uniq}
+        res = {i: batch(i, ks) for i, ks in by_index.items()}
     else:
-        fs = {k: pool.submit(load_image, path(k[0]), box_for(k), target_size, rotation, reduce)
-              for k in uniq}
-        got = {k: f.result() for k, f in fs.items()}
+        fs = {i: pool.submit(batch, i, ks) for i, ks in by_index.items()}
+        res = {i: f.result() for i, f in fs.items()}
+    got = {k: im for i, ks in by_index.items() for k, im in zip(ks, res[i])}
     if any(v is None for v in got.values()):
         return [got[k] for k in keys]          # the caller checks for None and drops the item
     # A repeat gets a COPY, not the same array object. `_augment`'s cutout writes in place, so an
@@ -527,6 +610,99 @@ def _even_span(span, ceiling):
     """
     hi = max(2, int(ceiling) - int(ceiling) % 2)
     return min(max(2, int(span) + int(span) % 2), hi)
+
+
+def _synth_path(rng, T, amp, deg):
+    """A smooth synthetic camera path: ((T,2) pan in BOX SIDES, (T,) roll in degrees).
+
+    SINUSOIDAL rather than linear, and that is not decoration. `SmoothnessLoss` differences to
+    order 4 and hinges the prediction against `1.5 * |k-th difference of the TARGET|`, so a linear
+    pan -- whose 4th difference is identically zero -- hands it a zero threshold. A sinusoid has
+    nonzero derivatives at every order. (The term is switched off on these windows anyway, for a
+    stronger reason: `train._tune_smoothness`. This keeps the path honest for the arm that
+    switches it back on.)
+
+    THE PAN IS IN BOX SIDES so one setting means the same visual displacement on a 30 px fly and a
+    4696 px arena, the same reason `prompt_noise_px` is in pixels and `box_agree` is in box sides.
+
+    ANCHORED AT FRAME 0 (`y - y[0]`), so amp = deg = 0 degenerates EXACTLY to the static crop
+    repeated T times, and frame 0 is always the crop the un-synthesised window would have had.
+    That is what makes the inertness control exact, and it keeps the prior at `prompt_t = 0`
+    describing an ordinary crop rather than an already-displaced one.
+
+    Nine draws, always the same nine whatever the amplitudes are, so the rng stream does not
+    depend on how far the camera is asked to move.
+    """
+    t = np.arange(T) / max(T - 1, 1)
+
+    def path(a):
+        y = (float(a) * rng.uniform(0.3, 1.0)
+             * np.sin(2 * np.pi * rng.uniform(0.5, 1.5) * t + rng.uniform(0.0, 2 * np.pi)))
+        return y - y[0]
+
+    return np.stack([path(amp), path(amp)], 1), path(deg)
+
+
+def _synth_roll(cam, angles_deg, base=None):
+    """A PER-FRAME in-plane roll: the (T,4,4) Z-roll for `ext`, and one source affine per frame.
+
+    NO CANVAS EXPANSION AND NO `mat` CHANGE, which is the whole reason this can be per frame.
+    `_rotate_2d` and the library's `rotate_camera_image_plane_3d` both expand the canvas and move
+    the principal point to track it -- and a per-frame principal point is a per-frame INTRINSIC,
+    the one thing `crop.moving_boxes`' docstring records as unrepresentable (it would have to be
+    taught to `project_points_torch`, the triangulation and both camera embeddings). A roll about
+    the principal point with the canvas held still needs none of that: `mat`, `size` and `offset`
+    are untouched and the rotation lives entirely in `ext` -- exactly where `apply_crop_moving`
+    already puts a time axis.
+
+    The crop then follows the rotated animal by itself, because `crop_to_points_{2d,3d}_moving`
+    boxes each frame's OWN points. So the black wedges a held canvas rotates in are only sampled
+    for an animal near the frame edge, and `_item` reverts the roll outright when it costs a
+    camera the animal -- the same guard, for the same reason, as the window rotation's.
+
+    ASSUMES fx == fy, as the library's helper does: a Z-roll is an in-plane IMAGE rotation only
+    for square pixels, and is a rotation plus an anisotropic scale otherwise.
+
+    `base` is the window rotation this camera already carries, `(M_2x3, (w, h))` or None. The roll
+    composes ON TOP of it, so the returned affines map SOURCE pixels straight to the final canvas
+    -- which is the one thing `_crop_affine` can consume.
+    """
+    import cv2
+
+    cx = float(cam['mat'][0, 2].item()) - float(cam['offset'][0].item())
+    cy = float(cam['mat'][1, 2].item()) - float(cam['offset'][1].item())
+    w, h = (int(v) for v in cam['size'].tolist())
+    mats, rolls = [], []
+    for a in angles_deg:
+        M = cv2.getRotationMatrix2D((cx, cy), float(a), 1.0)
+        if base is not None:
+            B, R = np.eye(3), np.eye(3)
+            B[:2], R[:2] = base[0], M
+            M = (R @ B)[:2]
+        mats.append((M.astype(np.float64), (w, h)))
+        r = np.radians(float(a))
+        # OpenCV y-down sign convention, copied from `rotate_camera_image_plane_3d` rather than
+        # rederived: [[c, s], [-s, c]] is what makes the Z-roll agree with getRotationMatrix2D.
+        rolls.append([[np.cos(r), np.sin(r)], [-np.sin(r), np.cos(r)]])
+    R4 = torch.eye(4, dtype=cam['ext'].dtype).repeat(len(mats), 1, 1)
+    R4[:, :2, :2] = torch.as_tensor(np.asarray(rolls), dtype=cam['ext'].dtype)
+    return R4, mats
+
+
+def _roll_camera_3d(cam, R4):
+    """`cam` with a per-frame Z-roll folded into its extrinsic. `mat`/`size`/`offset` untouched.
+
+    Same three fields the library's helper updates, in the same way, but with a TIME AXIS: `R4 @
+    ext` broadcasts a `(T,4,4)` roll against a static `(4,4)` or an already-moving `(T,4,4)` rig.
+    `apply_crop_moving` then finds `ext.ndim == 3` and `center.ndim == 2` already true and leaves
+    both alone, which is the behaviour its guards were written for.
+    """
+    out = dict(cam)
+    out['ext'] = R4 @ cam['ext']
+    out['ext_inv'] = torch.linalg.inv(out['ext'])
+    out['center'] = -torch.einsum('...ji,...j->...i',
+                                  out['ext'][..., :3, :3], out['ext'][..., :3, 3])
+    return out
 
 
 def _build_augmenters(cfg):
@@ -863,7 +1039,7 @@ class PoseDataset(Dataset):
         raise RuntimeError(f'{self.split}: 8 consecutive items failed to build')
 
     def _frames(self, item, lab, group, rng):
-        """T frame indices, clamp-padded so a short group still yields T >= 2.
+        """(T frame indices, is this a SYNTHETIC-MOTION window), clamp-padded so T >= 2.
 
         ON TRAIN, T IS DERIVED FROM THE LABELS, and `cfg.n_frames` is only its ceiling. The
         annotated sessions carry ONE labelled frame per 65-frame group, so a fixed T = 24 encodes
@@ -884,15 +1060,22 @@ class PoseDataset(Dataset):
         can only reach labels congruent to it mod s, so the span is measured in lattice steps and
         the start is snapped onto the lattice.
 
+        A WINDOW THAT REACHES EXACTLY ONE LABEL MAY INSTEAD BE SYNTHESISED, which is the second
+        return value. That is the case this docstring calls "one label still carries an
+        unsupervised partner", and `synth_motion_prob` is the rate at which it is turned into T
+        copies of the labelled frame for a synthetic camera to move over instead. It fires on the
+        WINDOW rather than on the session -- an annotated group can only ever produce one, and a
+        densely tracked one never does -- so no flag has to be plumbed to find it.
+
         VAL AND TEST ARE UNTOUCHED -- `_starts` enumerates fixed `cfg.n_frames` windows there at
         stride 1, and a metric whose window geometry moved would not be comparable across
-        checkpoints.
+        checkpoints. Synthesis is train-only for the same reason.
         """
         T = self.cfg.n_frames
         vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
         labelled = self._labelled_frames(vis, item.animal)
         if labelled.size == 0:
-            return None
+            return None, False
         s = 1
         if item.start >= 0:
             start = item.start
@@ -923,6 +1106,21 @@ class PoseDataset(Dataset):
                 # The span is wider than the ceiling allows; no placement covers it, so fall back
                 # to the anchor and let the draw pick which end of the span it lands on.
                 first = last = anchor
+            # SYNTHETIC CAMERA MOTION. This window reaches exactly ONE label, so the derived-T rule
+            # is about to spend a T = 2 window supervising a single frame. Emit T copies of that
+            # frame instead and let `_item` move the CAMERA over them: the scene is frozen, so
+            # every frame is a real crop of a real image and every label is exact.
+            #
+            # THE `> 0` GUARD IS WHAT MAKES THE CONTROL A CONTROL. With the key off, no draw is
+            # taken and the rng stream is the one every run on record consumed, so a
+            # `synth_motion_prob = 0` arm is bit-identical to a run predating these keys -- the
+            # same preservation `aug_rotation_prob is None` makes below and `rotate_deg = 0` makes
+            # in `detector/data.py`.
+            if first == last and self.cfg.synth_motion_prob > 0 \
+                    and rng.random() < self.cfg.synth_motion_prob:
+                T = _even_span(self.cfg.synth_motion_frames or self.cfg.n_frames,
+                               self.cfg.n_frames)
+                return np.full(T, anchor, dtype=np.int64), True
             # Bounds that COVER first..last rather than merely containing the anchor -- sizing T
             # to a span and then placing the window off it would pay for frames it never reads.
             span = (T - 1) * s
@@ -931,7 +1129,7 @@ class PoseDataset(Dataset):
             lo += (anchor - lo) % s                 # snap up onto the anchor's lattice
             start = int(lo + s * rng.integers(0, (hi - lo) // s + 1)) if hi > lo else lo
         f = np.clip(np.arange(start, start + T * s, s), 0, group.n_frames - 1)
-        return f
+        return f, False
 
     def _crop_pts(self, lab, a, frames, cam_ix):
         """One animal's stored boxes over a window, as points the crop rule can bound.
@@ -952,7 +1150,7 @@ class PoseDataset(Dataset):
         item = self._pick(idx, rng)
         sess, group = item.session, item.session.groups[item.gid]
         lab = sess.labels(item.gid)
-        frames = self._frames(item, lab, group, rng)
+        frames, synth = self._frames(item, lab, group, rng)
         if frames is None:
             return None
         a, T = item.animal, len(frames)
@@ -1036,12 +1234,37 @@ class PoseDataset(Dataset):
                                               float(rng.uniform(-rot_deg, rot_deg)))
                 rotation_info = [rot]
                 cp = _apply_affine(cp, rot)
-            if self.cfg.moving_crop:
+            synth_path = None
+            if synth:
+                # 2D ROLLS THE COORDINATES, NOT THE EXTRINSIC. The 2D coords ARE the target, so
+                # the affine that moves the pixels must move them too and a Z-roll on top would
+                # double-apply the rotation -- `rotate_points_image_plane`'s own reason for
+                # leaving `ext` alone. `mat` is not touched either; see `_synth_roll`.
+                synth_path, angles = _synth_path(rng, T, self.cfg.synth_motion_amp,
+                                                 self.cfg.synth_motion_deg)
+                if self.cfg.synth_motion_deg > 0:
+                    _, mats = _synth_roll(cam, angles, rotation_info[0])
+                    rolled = _mask_outside(_apply_affine(coords, mats), cam['size'])
+                    # REVERTED, NOT RETRIED, exactly as the 3D window rotation is: the canvas is
+                    # held still so a roll really can carry the animal off it, and a retry would
+                    # re-draw `idx` and perturb the whole subsequent sampling stream where a
+                    # revert consumes the identical draws and changes only the item at hand.
+                    if int(torch.isfinite(rolled).all(-1).sum(-1).min()) >= 2:
+                        coords, rotation_info = rolled, [mats]
+                        cp = _apply_affine(cp, mats)
+            if self.cfg.moving_crop or synth:
                 # ONE jitter draw for the whole window, applied to every frame's box identically.
                 # A per-frame draw would be a per-frame SIZE (which the rule cannot express) plus a
-                # random walk of the crop centre that the labels do not follow.
+                # random walk of the crop centre that the labels do not follow. `path` is the one
+                # per-frame shift that IS legal -- a smooth synthetic camera pan, which the labels
+                # do follow because the origin is subtracted from them frame by frame.
+                #
+                # A SYNTH WINDOW FORCES THIS PATH whatever `moving_crop` says: a static crop has
+                # nowhere to put a trajectory. With `synth_motion_amp = 0` the path is all zeros
+                # and this reduces to the moving crop of a frozen animal, i.e. the static box.
                 cam, box, coords = cropmod.crop_to_points_2d_moving(
-                    cam, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp)
+                    cam, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp,
+                    path=synth_path)
             else:
                 jit = self._jitter(rng)
                 cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
@@ -1091,18 +1314,53 @@ class PoseDataset(Dataset):
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
                             vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
+            synth_paths = None
+            if synth:
+                # 3D PUTS THE ROLL IN `ext`, WHERE A TIME AXIS IS ALREADY LEGAL. The world coords
+                # are the target and must not move (a synthetic CAMERA motion cannot move a world
+                # point), so the rotation goes into the camera -- and `apply_crop_moving` already
+                # expands `ext` to `(T,4,4)` for the moving crop, so a per-frame roll costs no new
+                # representation. `project_points_torch` then returns per-frame rotated
+                # projections and the crop follows the rotated animal by itself.
+                #
+                # ONE DRAW PER CAMERA, matching `_jitter_params`' rule and for the same reason:
+                # each camera follows the animal in its own view, so its pan and roll are its own.
+                synth_paths, cams, infos = [], [], []
+                for cnum, cam in enumerate(cgroup):
+                    p, angles = _synth_path(rng, T, self.cfg.synth_motion_amp,
+                                            self.cfg.synth_motion_deg)
+                    synth_paths.append(p)
+                    cam_r, info = cam, rotation_info[cnum]
+                    if self.cfg.synth_motion_deg > 0:
+                        R4, mats = _synth_roll(cam, angles, rotation_info[cnum])
+                        rolled = _roll_camera_3d(cam, R4)
+                        # THE ROLL CAN TAKE THE ANIMAL OUT OF A CAMERA and the canvas is held
+                        # still, so there is no expansion to catch it. Same guard as the window
+                        # rotation's, PER FRAME because the roll differs per frame -- and with the
+                        # same `2 <=` half, so a camera that never saw the animal keeps its roll
+                        # instead of having it suppressed for an unrelated reason.
+                        if int(is_point_visible(rolled, coords).sum(-1).min()) >= 2 \
+                                or int(is_point_visible(cam, coords).sum(-1).min()) < 2:
+                            cam_r, info = rolled, mats
+                            if vis_2d is not None:
+                                vis_2d[:, :, cnum][~is_point_visible(cam_r, coords)] = 0
+                    cams.append(cam_r)
+                    infos.append(info)
+                cgroup, rotation_info = cams, infos
             # A stored box lives in SOURCE pixels, so it follows each camera's own in-plane
-            # rotation -- the same affine `rotate_camera_image_plane_3d` hands back for the warp.
+            # rotation -- the same affine `rotate_camera_image_plane_3d` hands back for the warp,
+            # or one per frame under a synthetic roll.
             cp3 = None if crop_pts is None else [
                 _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
-            if self.cfg.moving_crop:
+            if self.cfg.moving_crop or synth:
                 # 3D DIFFERS FROM 2D IN WHERE THE ORIGIN GOES, not in the rule. 2D subtracts the
                 # per-frame origin from the coordinates; here the coordinates are world-metric and
                 # the origin lives in the camera's `offset`, which gains a time axis. That is what
                 # `tailcyclenet.patches` teaches `project_cam` to read -- without it the offset
                 # subtraction prepends exactly one axis and lands a rank-3 projection at rank 4.
                 cgroup, boxes = cropmod.crop_to_points_3d_moving(
-                    cgroup, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp3)
+                    cgroup, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp3,
+                    paths=synth_paths)
             else:
                 jit = self._jitter(rng)
                 cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
@@ -1249,7 +1507,7 @@ class PoseDataset(Dataset):
         row = {'dataset': self.datasets[item.ds].name, 'session': sess.session_id,
                'group': item.gid, 'animal': lab.animal_ids[a], 'mode': '2d' if R == 2 else '3d',
                'single_view': single_view, 'start': int(frames[0]), 'cameras': cam_names,
-               'stride': stride}
+               'stride': stride, 'synth': bool(synth)}
 
         return (views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
                 vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t)

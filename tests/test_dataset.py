@@ -227,25 +227,58 @@ def test_repeated_frames_are_decoded_once(dataset_3d, monkeypatch):
     `_frames` pads a group shorter than `n_frames` by repeating its last frame, and 251 of
     johnson-mouse's 624 train windows come from `n_frames = 1` groups -- 24 copies of frame 0 per
     camera, which was 384 decodes for 16 distinct images on a 16-camera session.
+
+    COUNTS `cv2.imread`, NOT A HELPER. The decode is the thing being conserved, and counting the
+    internal function that happens to wrap it means the test passes vacuously the moment that
+    function is renamed or bypassed -- which is exactly what happened when `read_frames` moved to
+    `load_warps`: it read `decoded 0 times` and the assertion was on the wrong side of zero to
+    notice.
     """
+    import cv2
+
     from tailcyclenet import dataset as dsmod
 
     sess = dataset_3d.sessions['train'][0]
     group = sess.groups['g000']
-    calls, real = [], dsmod.load_image
+    calls, real = [], cv2.imread
 
     def counted(p, *a, **k):
         calls.append(p)
         return real(p, *a, **k)
 
-    # read_frames resolves `load_image` as a module global per call, so patching it here is enough
-    monkeypatch.setattr(dsmod, 'load_image', counted)
+    monkeypatch.setattr(cv2, 'imread', counted)
 
     out = dsmod.read_frames(group, sess.cam_names[0], [0] * 24)
     assert len(out) == 24
     assert len(calls) == 1, f'decoded {len(calls)} times for one distinct frame'
     for im in out:
         np.testing.assert_array_equal(im, out[0])
+
+
+def test_one_frame_under_many_crops_decodes_once(dataset_3d, monkeypatch):
+    """THE synthetic-motion cost guard: one source index, T DIFFERENT boxes, one decode.
+
+    This is the case the `(index, box)` dedupe key cannot catch -- every key differs, so a fused
+    decode-and-warp per key pays T full decodes for one picture (24 x 27 ms on a 4696x2048 jpeg,
+    dominating the item). `load_warps` splits the decode from the warp; this pins that it stays
+    split, and that the T outputs are genuinely different crops rather than one crop repeated.
+    """
+    import cv2
+
+    from tailcyclenet import dataset as dsmod
+
+    sess = dataset_3d.sessions['train'][0]
+    group = sess.groups['g000']
+    calls, real = [], cv2.imread
+    monkeypatch.setattr(cv2, 'imread', lambda p, *a, **k: (calls.append(p), real(p, *a, **k))[1])
+
+    boxes = np.stack([np.array([i, i, i + 16, i + 16], np.int32) for i in range(8)])
+    out = dsmod.read_frames(group, sess.cam_names[0], [0] * 8, crop_coords=boxes,
+                            target_size=[16, 16])
+    assert len(calls) == 1, f'decoded {len(calls)} times for one distinct frame'
+    assert [im.shape for im in out] == [(16, 16, 3)] * 8
+    # ... and they are not all the same picture, or the dedupe collapsed the crops instead.
+    assert any(not np.array_equal(out[0], im) for im in out[1:])
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1265,28 +1298,250 @@ def test_moving_crop_keeps_per_frame_boxes_distinct_in_read_frames(dataset_3d, m
 
     The mirror of `test_repeated_frames_are_decoded_once`: the same three positions with ONE box
     must still collapse to one decode, or the fix has cost that optimisation.
+
+    ASSERTS ON THE WARPS, NOT ON THE DECODES. It used to require "2 distinct boxes -> 2 decodes",
+    which conflated the two halves: since `load_warps` split them, 2 distinct boxes on ONE source
+    index is 1 decode and 2 warps, and that is the improvement rather than a regression. What has
+    to hold is that the boxes are not COLLAPSED, which is a statement about the returned pixels.
     """
+    import cv2
+
     from tailcyclenet import dataset as dsmod
 
     sess = dataset_3d.sessions['train'][0]
     group, cam = sess.groups['g000'], sess.cam_names[0]
-    calls, real = [], dsmod.load_image
-
-    def spy(path, crop_coords=None, *a, **k):
-        calls.append(None if crop_coords is None else tuple(int(v) for v in crop_coords))
-        return real(path, crop_coords, *a, **k)
-
-    monkeypatch.setattr(dsmod, 'load_image', spy)
+    decodes, warps = [], []
+    real_read, real_warp = cv2.imread, cv2.warpAffine
+    monkeypatch.setattr(cv2, 'imread',
+                        lambda p, *a, **k: (decodes.append(p), real_read(p, *a, **k))[1])
+    monkeypatch.setattr(cv2, 'warpAffine',
+                        lambda i, m, d, **k: (warps.append(m), real_warp(i, m, d, **k))[1])
 
     moving = np.array([[0, 0, 20, 20], [5, 5, 25, 25], [0, 0, 20, 20]], np.int32)
     out = dsmod.read_frames(group, cam, [0, 0, 0], crop_coords=moving, target_size=[8, 8])
     assert len(out) == 3
-    assert len(set(calls)) == 2, f'2 distinct boxes should be 2 decodes, got {calls}'
+    assert len(decodes) == 1, f'one source frame is one decode, got {len(decodes)}'
+    assert len(warps) == 2, f'2 distinct boxes are 2 warps, got {len(warps)}'
     # position 0 and position 2 share a box, so they must share pixels; position 1 must not.
     np.testing.assert_array_equal(out[0], out[2])
     assert not np.array_equal(out[0], out[1]), 'a moved crop must produce different pixels'
 
-    calls.clear()
+    decodes.clear(), warps.clear()
     out = dsmod.read_frames(group, cam, [0, 0, 0], crop_coords=[0, 0, 20, 20], target_size=[8, 8])
-    assert len(calls) == 1, f'one box over three positions is still one decode, got {calls}'
+    assert len(decodes) == 1, f'one box over three positions is still one decode, got {decodes}'
+    assert len(warps) == 1, f'one box over three positions is one warp, got {len(warps)}'
     assert len(out) == 3
+
+
+# ----------------------------------------------------------------------------------------------
+# synthetic camera motion
+# ----------------------------------------------------------------------------------------------
+
+def _marker_centroid(img):
+    """Where a painted single-pixel marker ended up, to sub-pixel. None if it left the crop."""
+    ys, xs = np.nonzero(img[..., 0])
+    if not xs.size:
+        return None
+    w = img[ys, xs, 0].astype(np.float64)
+    return np.array([(xs * w).sum() / w.sum(), (ys * w).sum() / w.sum()])
+
+
+@pytest.mark.parametrize('deg', [0.0, 12.0, -25.0])
+def test_synth_motion_3d_labels_follow_the_pixels(deg):
+    """THE synthetic-motion test: for EVERY frame, the label lands where the pixels put it.
+
+    A synth window is one real frame under a per-frame roll and a per-frame pan, so its geometry
+    is split across four places that have to agree: the roll goes into `ext` (`_roll_camera_3d`),
+    the pan into the crop box (`moving_boxes`' per-frame shift), the box into the camera's
+    `offset` (`apply_crop_moving`), and all of it into ONE source->crop affine per frame
+    (`_synth_roll`'s mats, composed by `_crop_affine`). A sign error in the Z-roll, a rotation
+    about the wrong centre, or a box paired with the wrong frame each produce a plausible-looking
+    crop with the labels quietly displaced -- which trains to a number instead of failing.
+
+    So paint a marker at the point's projection, push the image through the pixel half and the
+    camera through the geometry half, and require they still agree at every t. `deg = 0` is the
+    translation-only arm, i.e. the inertness control for the roll.
+    """
+    import cv2
+    from aniposelib.cameras import CameraGroup
+    from posetail.posetail.cube import project_points_torch
+
+    from tailcyclenet import format as fmt
+    from tailcyclenet.dataset import (_crop_affine, _resize_camera, _roll_camera_3d, _synth_roll)
+
+    W, H, T = 320, 240, 6
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': True})
+    cam = rig.posetail()[0]
+
+    # ONE frozen 3D point, repeated over T -- a synthetic camera motion cannot move a world point,
+    # and this test would not notice if it did.
+    pt = torch.tensor([[0.4, 0.2, 4.0]]).repeat(T, 1, 1)              # (T, K=1, 3)
+    src = project_points_torch([cam], pt)[0][0, 0]
+    img = np.zeros((H, W, 3), np.uint8)
+    img[int(round(float(src[1]))), int(round(float(src[0])))] = 255
+
+    angles = np.linspace(-deg, deg, T)
+    path = np.stack([np.linspace(0, 0.25, T), np.linspace(0, -0.15, T)], 1)
+    R4, mats = _synth_roll(cam, angles, None)
+    rolled = _roll_camera_3d(cam, R4)
+    cgroup, boxes = cropmod.crop_to_points_3d_moving(
+        [rolled], pt, min_crop_dim=96, jitter=None, paths=[path])
+    cgroup = [_resize_camera(c, 64)[0] for c in cgroup]
+
+    want = project_points_torch(cgroup, pt)[0]                        # (T, K, 2)
+    for t in range(T):
+        M, size = _crop_affine((W, H), boxes[0][t], cgroup[0]['size'].tolist(), mats[t])
+        got = _marker_centroid(cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR))
+        assert got is not None, f'frame {t}: the marker left the crop'
+        assert np.allclose(got, np.asarray(want[t, 0], np.float64), atol=1.0), \
+            f'frame {t}: pixels say {got}, camera says {want[t, 0]}'
+
+    # ... and the window really moved, or the assertion above is satisfied by a static crop.
+    assert len(set(tuple(b) for b in boxes[0].tolist())) > 1, 'the synthetic pan did nothing'
+
+
+@pytest.mark.parametrize('deg', [0.0, 20.0])
+def test_synth_motion_2d_labels_follow_the_pixels(deg):
+    """The 2D twin. Here the COORDS are the target, so they carry the roll and the origin.
+
+    2D differs from 3D in where the motion goes, not in the rule: the roll is applied to the
+    points (a Z-roll would double-apply it) and the per-frame crop origin is subtracted from them
+    by `crop_to_points_2d_moving`, where 3D leaves the world points alone and puts both in the
+    camera. Both must land the label on the same pixel.
+    """
+    import cv2
+    from aniposelib.cameras import CameraGroup
+
+    from tailcyclenet import format as fmt
+    from tailcyclenet.dataset import _apply_affine, _crop_affine, _resize_camera, _synth_roll
+
+    W, H, T = 320, 240, 6
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': True})
+    cam = rig.posetail()[0]
+
+    src = np.array([176.0, 132.0])
+    coords = torch.as_tensor(src, dtype=torch.float32).reshape(1, 1, 2).repeat(T, 1, 1)
+    img = np.zeros((H, W, 3), np.uint8)
+    img[int(src[1]), int(src[0])] = 255
+
+    angles = np.linspace(-deg, deg, T)
+    path = np.stack([np.linspace(0, -0.2, T), np.linspace(0, 0.3, T)], 1)
+    _, mats = _synth_roll(cam, angles, None)
+    coords = _apply_affine(coords, mats)
+    cam, boxes, coords = cropmod.crop_to_points_2d_moving(
+        cam, coords, min_crop_dim=96, jitter=None, path=path)
+    cam, scale = _resize_camera(cam, 64)
+    coords = coords * scale
+
+    for t in range(T):
+        M, size = _crop_affine((W, H), boxes[t], cam['size'].tolist(), mats[t])
+        got = _marker_centroid(cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR))
+        assert got is not None, f'frame {t}: the marker left the crop'
+        assert np.allclose(got, np.asarray(coords[t, 0], np.float64), atol=1.0), \
+            f'frame {t}: pixels say {got}, labels say {coords[t, 0]}'
+    assert len(set(tuple(b) for b in boxes.tolist())) > 1, 'the synthetic pan did nothing'
+
+
+def test_moving_boxes_accepts_a_per_frame_shift():
+    """A `(T,)` shift must broadcast, and a constant one must reproduce the scalar form exactly.
+
+    The scalar equality is the load-bearing half: `moving_boxes` is shared with inference through
+    `--moving-crop`, so a change to its arithmetic would move every box in a shipped path. The
+    per-frame equality against an explicit loop is what says the broadcast is the loop.
+    """
+    extents = [[10, 20, 60, 70], [12, 22, 62, 72], [14, 24, 64, 74], [16, 26, 66, 76]]
+    size = torch.tensor([320, 240], dtype=torch.int32)
+
+    base = cropmod.moving_boxes(extents, size, 64, shift=(0.1, -0.2))
+    same = cropmod.moving_boxes(extents, size, 64, shift=(np.full(4, 0.1), np.full(4, -0.2)))
+    np.testing.assert_array_equal(base, same)
+
+    dx, dy = np.array([0.0, 0.1, 0.2, 0.3]), np.array([0.0, -0.1, -0.2, -0.3])
+    got = cropmod.moving_boxes(extents, size, 64, shift=(dx, dy))
+    loop = np.stack([cropmod.moving_boxes(extents, size, 64,
+                                          shift=(float(dx[t]), float(dy[t])))[t]
+                     for t in range(4)])
+    np.testing.assert_array_equal(got, loop)
+
+
+def test_synth_motion_off_is_bit_identical(tiny_root):
+    """`synth_motion_prob = 0` must reproduce the loader exactly -- items AND rng consumption.
+
+    This is what licenses reading a synth arm against a control trained before these keys existed
+    (eval rule 4). It is not enough that the items match on one draw: the keys must consume NO rng
+    when off, or every window sampled afterwards differs and the arm moves the data as well as the
+    lever. Both are covered here, because a diverged stream shows up as a different ITEM a few
+    draws later.
+    """
+    import imgaug
+
+    off = LoaderConfig(n_frames=8)
+    on = LoaderConfig(n_frames=8, synth_motion_prob=0.0, synth_motion_amp=0.4,
+                      synth_motion_deg=20.0, synth_motion_frames=16)
+    for name in ('ratlike', 'mouselike'):
+        a = PoseDataset(tiny_root / name, 'train', off)
+        b = PoseDataset(tiny_root / name, 'train', on)
+        # `_item` directly, with a controlled rng: train items are entropy-seeded on purpose
+        # (`__getitem__`), so this is the only way to compare them at all -- and it is the
+        # stronger test anyway, because the shared rng object exposes the DRAWS as well as the
+        # result.
+        for i in range(len(a)):
+            ra, rb = np.random.default_rng((11, i)), np.random.default_rng((11, i))
+            # THREE GLOBAL RNGS ARE IN PLAY BESIDES `rng`, and none is this change's doing:
+            # imgaug's (which is why `worker_init` reseeds it) drives the appearance pipeline,
+            # and the library's `rotate_camera_group` draws its world rotation from numpy's
+            # LEGACY global (`np.random.uniform`, `posetail_dataset.py`) rather than from the
+            # generator the loader threads everywhere else. So a 3D train item is not a function
+            # of `rng` at all, and `a._item(i, r)` twice over does not even agree with ITSELF
+            # without this. Pin them, or the second call differs for reasons unrelated to the
+            # keys under test.
+            def pinned(ds, rg):
+                imgaug.random.seed(1234)
+                torch.manual_seed(1234)
+                np.random.seed(1234)
+                return ds._item(i, rg)
+
+            x, y = pinned(a, ra), pinned(b, rb)
+            assert (x is None) == (y is None)
+            if x is None:
+                continue
+            for va, vb in zip(x[0], y[0]):
+                torch.testing.assert_close(va, vb, rtol=0, atol=0)          # pixels
+            # equal_nan: the fixtures carry deliberate NaN labels (a MISSING point and a never
+            # assessed one), and NaN != NaN would read as a difference the loader did not make.
+            torch.testing.assert_close(x[1], y[1], rtol=0, atol=0, equal_nan=True)   # coords
+            torch.testing.assert_close(x[11], y[11], rtol=0, atol=0, equal_nan=True)  # kpt_prior
+            np.testing.assert_array_equal(np.asarray(x[3]), np.asarray(y[3]))   # frame indices
+            assert x[5]['synth'] is False and y[5]['synth'] is False
+            assert ra.random() == rb.random(), \
+                f'{name}: the keys consumed rng while switched off, desynchronising the stream'
+
+
+def test_synth_motion_expands_a_single_label_window(single_label_root):
+    """A window reaching ONE label becomes T synthetic frames of that one frame, and moves.
+
+    Four things at once, because they are the claim: the window is `synth_motion_frames` long
+    rather than the derived T = 2, every index in it is the SAME source frame, the crop actually
+    translates across it, and `sample_info` says so -- which is what `train._tune_smoothness`
+    reads to switch the smoothness term off.
+    """
+    cfg = LoaderConfig(n_frames=24, aug_prob=0.0, prompt_dropout=0.0, crop_jitter=0.0,
+                       crop_jitter_scale=0.0, synth_motion_prob=1.0, synth_motion_amp=0.4,
+                       synth_motion_deg=15.0, synth_motion_frames=8)
+    ds = PoseDataset(single_label_root, 'train', cfg)
+    seen = 0
+    for i in range(len(ds)):
+        item = ds._item(i, np.random.default_rng((5, i)))
+        if item is None or not item[5]['synth']:
+            continue
+        seen += 1
+        frames = np.asarray(item[3])
+        assert len(frames) == 8, f'want the synth window length, got {len(frames)}'
+        assert len(set(frames.tolist())) == 1, 'a synth window is ONE source frame repeated'
+        assert item[0][0].shape[0] == 8
+        # the pixels must differ across the window, or the camera did not actually move
+        v = item[0][0]
+        assert any(not torch.equal(v[0], v[t]) for t in range(1, 8)), 'the crop never moved'
+    assert seen, 'no synth window was produced -- the fixture has no single-label window'

@@ -162,8 +162,9 @@ def to_device(batch, device):
     return views, cgroup
 
 
-def _tune_smoothness(loss_fn, T, stride=1):
-    """Hold the smoothness order below the window length, and undo the stride. Mutates in place.
+def _tune_smoothness(loss_fn, T, stride=1, synth=False):
+    """Hold the smoothness order below the window length, undo the stride, and switch the term off
+    on a synthetic-motion window. Mutates in place.
 
     `SmoothnessLoss.forward` builds its stencil mask with `valid.narrow(time_dim, 0, T - k)`
     (`posetail/losses.py:1146`), so a window shorter than `k + 1` frames RAISES on a negative
@@ -192,6 +193,24 @@ def _tune_smoothness(loss_fn, T, stride=1):
     normalise away; declare it when reporting a `frame_strides` arm. (CLAUDE.md used to state the
     effective weight RISES with stride. It is the magnitude that rose; the hinge got looser.)
 
+    SYNTH. A synthetic-motion window (`LoaderConfig.synth_motion_*`) freezes the scene and moves
+    the camera, and this term must be OFF there. In 3D that is not a preference: a synthetic
+    camera motion CANNOT move a world point, so `coords` is constant across the window by
+    construction, `d_true` is identically zero, and the hinge threshold `1.5 * |d_true|` is zero
+    -- at weight 0.5 that penalises ANY predicted 3D motion, which is report 13 RC1's motion lock
+    trained in on purpose. In 2D the crop-pixel target does move, but a smooth pan's k-th
+    difference is ~`A*w^k` and sub-pixel at these frequencies, so the hinge is nearly as tight.
+
+    It is also the first time the term would fire on annotated data at all -- the stencil needs
+    all k+1 frames labelled, which a one-label window never had and a synth window always has --
+    so this is a new term switching itself on at full strength with a degenerate threshold, not an
+    existing one changing slightly.
+
+    TURNING IT BACK ON IS THE FIRST FOLLOW-UP ARM, not a leftover. "The pose does not wobble when
+    the camera pans" is a real equivariance signal and this is the only place in the corpus that
+    could teach it; what it needs first is a FLOOR on the hinge so a zero `d_true` does not mean a
+    zero tolerance. One line, here.
+
     `# ponytail:` mutating the loss module's order and weight per batch is the small diff; a second
     `TotalLoss` built for short windows is the upgrade path if the two ever need to differ by
     more than this.
@@ -207,7 +226,8 @@ def _tune_smoothness(loss_fn, T, stride=1):
         if not hasattr(sl, '_configured_order'):
             sl._configured_order, sl._configured_weight = sl.order, sl.weight
         sl.order = min(sl._configured_order, max(1, T - 1))
-        sl.weight = sl._configured_weight / float(stride) ** sl.order
+        sl.weight = (0.0 if synth
+                     else sl._configured_weight / float(stride) ** sl.order)
 
 
 def run_batch(model, loss_fn, batch, device):
@@ -230,7 +250,8 @@ def run_batch(model, loss_fn, batch, device):
     """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
-    _tune_smoothness(loss_fn, int(views[0].shape[1]), batch.sample_info.get('stride', 1))
+    _tune_smoothness(loss_fn, int(views[0].shape[1]), batch.sample_info.get('stride', 1),
+                     bool(batch.sample_info.get('synth', False)))
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device))
     coords_true = batch.coords.to(device)

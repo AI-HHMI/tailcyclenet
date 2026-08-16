@@ -191,9 +191,23 @@ def moving_boxes(extents, size, min_crop_dim=64, scale=1.0, shift=(0.0, 0.0)):
     centre is carried through the Nones by interpolation, so a frame the detector missed does not
     snap the crop to the image corner and take the animal out of shot.
 
-    `scale` and `shift` are ONE crop jitter for the whole window (one per CAMERA -- see
-    `crop_to_points_3d_moving`). They must be one draw per window rather than one per frame: a per-frame scale is the per-frame size this rule exists
-    to avoid, and a per-frame shift would add a random walk to the crop the labels do not follow.
+    `scale` is ONE crop jitter for the whole window (one per CAMERA -- see
+    `crop_to_points_3d_moving`) and MUST stay that way: a per-frame scale is the per-frame size
+    this rule exists to avoid.
+
+    `shift` IS ALLOWED TO VARY PER FRAME, and each of its two entries may be a scalar or a `(T,)`.
+    That is not a licence to jitter per frame -- a per-frame JITTER draw is an i.i.d. random walk
+    of the crop centre, which is still wrong for the reason it always was. What a `(T,)` shift is
+    for is a SMOOTH synthetic camera path (`dataset._synth_path`): the origin it produces lands in
+    the camera's `offset` (3D) or is subtracted from the coordinates (2D) frame by frame, so the
+    labels follow it exactly, which is precisely what a random walk does not do. The arithmetic
+    below already broadcasts and the clamp is already elementwise; only the `float()` casts had to
+    go.
+
+    THE CLAMP IS THE CEILING ON THAT PATH. The CENTRE is held inside `[side/2, W - side/2]`, so a
+    trajectory that would walk the box off the frame is silently flattened rather than refused --
+    an animal near an arena edge gets less synthetic motion than one in the middle.
+    `scratch/synthmotion/probe.py` prints the realised fraction for that reason.
 
     THE CENTRE IS WHAT GETS CLAMPED, not the corners. Clamping corners shrinks the box at the
     arena edge, which is a per-frame scale change by the back door.
@@ -216,14 +230,29 @@ def moving_boxes(extents, size, min_crop_dim=64, scale=1.0, shift=(0.0, 0.0)):
     t = np.arange(T)
     for i in range(2):
         c[:, i] = np.interp(t, t[ok], c[ok, i])
-    cx = np.clip(c[:, 0] + side * float(shift[0]), side / 2.0, W - side / 2.0)
-    cy = np.clip(c[:, 1] + side * float(shift[1]), side / 2.0, H - side / 2.0)
+    # np.asarray, not float(): a `(T,)` entry broadcasts against `c[:, i]` and the clip is already
+    # elementwise, so a per-frame shift needs no other change. See the docstring.
+    cx = np.clip(c[:, 0] + side * np.asarray(shift[0], np.float64), side / 2.0, W - side / 2.0)
+    cy = np.clip(c[:, 1] + side * np.asarray(shift[1], np.float64), side / 2.0, H - side / 2.0)
     x0 = np.clip(np.round(cx - side / 2.0), 0, W - side).astype(np.int32)
     y0 = np.clip(np.round(cy - side / 2.0), 0, H - side).astype(np.int32)
     return np.stack([x0, y0, x0 + side, y0 + side], 1).astype(np.int32)
 
 
-def crop_to_points_2d_moving(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None):
+def _with_path(jit, path):
+    """(scale, shift) for `moving_boxes`: the window's jitter plus an optional synthetic path.
+
+    The jitter is ONE draw applied to every frame and the path is per frame; they ADD, so a synth
+    window keeps the crop augmentation it would have had and pans on top of it.
+    """
+    s, dx, dy = jit if jit is not None else (1.0, 0.0, 0.0)
+    if path is None:
+        return s, (dx, dy)
+    p = np.asarray(path, np.float64)
+    return s, (dx + p[:, 0], dy + p[:, 1])
+
+
+def crop_to_points_2d_moving(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None, path=None):
     """`crop_to_points_2d`'s moving twin. Returns (cam, boxes (T,4), coords shifted per frame).
 
     Same crop rule, same `_crop_source` fallback, same floor -- the box translates per frame
@@ -237,8 +266,8 @@ def crop_to_points_2d_moving(cam, coords, min_crop_dim=64, jitter=None, crop_pts
     """
     src, pad = _crop_source(coords, crop_pts)
     per = [crop_box_for_points(src[t], cam['size'], min_crop_dim, pad) for t in range(len(src))]
-    s, dx, dy = jitter() if jitter is not None else (1.0, 0.0, 0.0)
-    boxes = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=(dx, dy))
+    s, shift = _with_path(jitter() if jitter is not None else None, path)
+    boxes = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=shift)
     if boxes is None:
         return None, None, None
     origin = torch.as_tensor(boxes[:, :2].astype(np.float32))       # (T,2)
@@ -305,7 +334,8 @@ def apply_crop_moving(cam, boxes):
     return out
 
 
-def crop_to_points_3d_moving(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None):
+def crop_to_points_3d_moving(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None,
+                             paths=None):
     """`crop_to_points_3d`'s moving twin. Returns (cgroup, boxes) with boxes[c] of shape (T,4).
 
     Same rule, same `_crop_source` fallback, same per-camera independence -- each camera follows
@@ -328,11 +358,15 @@ def crop_to_points_3d_moving(cgroup, coords, min_crop_dim=64, jitter=None, crop_
         # then differ from its control in the augmentation AND the sampled data, not just the crop
         # (eval rule 4). Measured before this fix as allen skipping 2 of 12 steps where its static
         # control skipped 0.
-        s, dx, dy = jitter() if jitter is not None else (1.0, 0.0, 0.0)
+        # `paths` is PER CAMERA for the same reason the jitter is: each camera follows the animal
+        # in its own view, so a synthetic pan is a per-camera quantity too. The draw itself happens
+        # in the loader, before the roll it has to be consistent with.
+        s, shift = _with_path(jitter() if jitter is not None else None,
+                              None if paths is None else paths[cnum])
         src, pad = _crop_source(p2d[cnum], None if crop_pts is None else crop_pts[cnum])
         per = [crop_box_for_points(src[t], cam['size'], min_crop_dim, pad)
                for t in range(len(src))]
-        mb = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=(dx, dy))
+        mb = moving_boxes(per, cam['size'], min_crop_dim, scale=s, shift=shift)
         if mb is None:
             return None, None
         out.append(apply_crop_moving(cam, mb))

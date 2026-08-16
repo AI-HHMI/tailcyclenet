@@ -224,6 +224,16 @@ def centred_root(tmp_path_factory):
 
 
 @pytest.fixture(scope='session')
+def single_label_root(tmp_path_factory):
+    """ONE labelled frame in a 24-frame group -- the annotated roots' shape, and the only shape
+    `synth_motion_*` fires on. allen's and rat-city-annotated's groups are 65 frames carrying a
+    single hand-annotated still; this is that, small."""
+    root = tmp_path_factory.mktemp('single')
+    _session_centred_labels(root / 'one' / 'train' / 's', T=24, labelled=(12,))
+    return root / 'one'
+
+
+@pytest.fixture(scope='session')
 def dense_root(tmp_path_factory):
     """A fully-labelled 32-frame group -- long enough for a strided window to have room."""
     root = tmp_path_factory.mktemp('dense')

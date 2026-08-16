@@ -74,22 +74,20 @@ class LoaderConfig:
     grayscale_prob: float = 0.2        # rate at which a train item drops colour entirely
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
     crop_jitter_scale: float = 0.3     # box scale jitter
-    # CROP PER FRAME INSTEAD OF PER WINDOW -- one constant side that translates to follow the
-    # animal (`crop.moving_boxes`, the same rule `infer.py --moving-crop` uses). 2D ONLY; the 3D
-    # path needs a per-frame camera and is left per window.
+    # `moving_crop` WAS HERE AND IS DELETED -- a per-frame crop as a DEPLOYMENT choice is refuted.
+    # Six one-key arms against their own controls, paired, one detection pass shared per root:
+    # zero of six roots improve on MPJPE (rat-city +4.685 px [+1.97, +7.52] SIG worse, 3dpop
+    # +2.629 SIG worse, three nulls, calms21 unreadable), and coverage / MOTA / miss / fp / idsw
+    # are null on every root. The one thing it moved was `motion_ratio`, by adding a roughly
+    # constant amount of path length -- which lands the two roots that UNDERSHOOT nearer 1.0 and
+    # pushes the rest further past it. Motion back, accuracy nowhere: the `--seam blend` result
+    # again, and the second instance of "motion_ratio near 1 is necessary but not sufficient".
+    # Full numbers in dev/reports/23_moving_crop_sweep.md.
     #
-    # WHY THE KEY EXISTS. Every crop this loader has ever produced is a union over the window, so
-    # it is inflated by however far the animal walked while the box stood still -- measured on
-    # rat-city, union side p50 1.23x and p90 1.92x the median per-frame side. `--moving-crop` at
-    # INFERENCE removes part of that and measures 3.90 px MPJPE WORSE [-6.05, -2.07] against its
-    # matched control, which is unsurprising and uninformative on its own: nothing in training
-    # produces a moving background, so that arm confounds "moving crops are bad" with "this model
-    # never saw one". THIS KEY IS THE ARM THAT SEPARATES THEM. Train with it on, infer with
-    # `--moving-crop`, and the comparison is finally matched.
-    #
-    # It is a geometry choice and NOT an augmentation, so it applies to val as well as train --
-    # a val crop that differs from the deployment crop measures the wrong thing.
-    moving_crop: bool = False
+    # THE GEOMETRY IT USED SURVIVES AND IS NOT DEAD CODE. `crop.crop_to_points_{2d,3d}_moving`,
+    # `crop.moving_boxes`, `crop.apply_crop_moving` and all of `tailcyclenet/patches.py` are now
+    # reached solely by `synth_motion_*` below, which is their only consumer. Retiring those keys
+    # too is what would make that whole stack deletable.
     min_crop_dim: int = 64
     # What the crop rule bounds. `keypoints` is the labels themselves. `instances` bounds the
     # `instances.pq` box instead, for a root whose stored keypoints are too sparse to enclose the
@@ -148,8 +146,9 @@ class LoaderConfig:
     # window -- the label plus one unsupervised partner, because `_even_span` floors at 2. That is
     # the cheapest correct thing to do and it means the annotated half of the corpus trains NO
     # temporal machinery: `SmoothnessLoss` returns 0 (its stencil needs k+1 labelled frames),
-    # temporal self-attention sees two frames one of which has no target, and `moving_crop` is
-    # inert (nothing to follow). It also means nothing in training has the shape `--anchor carry`
+    # temporal self-attention sees two frames one of which has no target, and a per-frame crop
+    # would be inert (nothing to follow). It also means nothing in training has the shape
+    # `--anchor carry`
     # deploys with -- a prior at frame 0 and a DISPLACED target after it.
     #
     # These keys emit a T-frame window instead, holding the scene frozen and moving the CAMERA:
@@ -538,7 +537,7 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     # that window decodes 24 copies of one image per camera (384 decodes for 16 distinct frames).
     want = [int(i) for i in frames]
     path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
-    # PER-FRAME CROPS MOVE THE DEDUPE KEY. Under `moving_crop` the box is a function of the
+    # PER-FRAME CROPS MOVE THE DEDUPE KEY. Under a synth window the box is a function of the
     # POSITION in the window, not of the source index -- and `_frames` clamp-pads a short window,
     # so one index can occupy several positions. Keying on the index alone would then serve every
     # repeat the first position's crop. The key becomes (index, box, rotation slot); with one box
@@ -861,25 +860,6 @@ class PoseDataset(Dataset):
             print(f'{split}: box_source=instances  ' + '  '.join(
                 f'{n}/{t} {name}' + ('' if n == t else ' (keypoint fallback)')
                 for name, n, t in boxed))
-        if cfg.moving_crop:
-            # BOTH PATHS ARE SUPPORTED -- 2D absorbs the moving origin into the coordinates, 3D
-            # into the camera's `(T,2)` offset (`crop.apply_crop_moving` + `tailcyclenet.patches`).
-            # So this line is a provenance record rather than a reachability check.
-            #
-            # WHAT IT DOES NOT CATCH, and this is the one that will cost an experiment: the key is
-            # INERT ON SPARSE LABELS. The crop follows each frame's OWN points, and the derived-T
-            # rule (gotcha 1) gives an annotated group -- one labelled frame per group -- a T = 2
-            # window with one labelled frame. Nothing to follow, the centre interpolates to a
-            # constant, and the box is exactly the static one. Measured at annot_frac = 0.4, the
-            # fraction of windows whose crop actually MOVES: 3dpop 0.99, calms21 0.97,
-            # branson-fly 0.95, johnson 0.76, allen 0.60, rat-city-combined 0.55.
-            # `scratch/rat-city-3way/probe_moving.py` is how that is re-measured on a new root.
-            n2d = sum(1 for d in self.datasets for s in d.sessions.get(split, [])
-                      if getattr(s, 'mode', None) == '2d')
-            ntot = sum(len(d.sessions.get(split, [])) for d in self.datasets)
-            print(f'{split}: moving_crop=true  {ntot} session(s), {n2d} 2D / {ntot - n2d} 3D'
-                  '   (inert on any window with one labelled frame -- see probe_moving.py)')
-
         # Sampling pools. A pool is a set of index positions plus an optional cumulative weight
         # array; `_pick` draws a pool, then an entry inside it. Balancing across datasets is the
         # only thing that makes more than one pool, and it is train-only -- val and test address
@@ -1261,16 +1241,17 @@ class PoseDataset(Dataset):
                     if int(torch.isfinite(rolled).all(-1).sum(-1).min()) >= 2:
                         coords, rotation_info = rolled, [mats]
                         cp = _apply_affine(cp, mats)
-            if self.cfg.moving_crop or synth:
+            if synth:
                 # ONE jitter draw for the whole window, applied to every frame's box identically.
                 # A per-frame draw would be a per-frame SIZE (which the rule cannot express) plus a
                 # random walk of the crop centre that the labels do not follow. `path` is the one
                 # per-frame shift that IS legal -- a smooth synthetic camera pan, which the labels
                 # do follow because the origin is subtracted from them frame by frame.
                 #
-                # A SYNTH WINDOW FORCES THIS PATH whatever `moving_crop` says: a static crop has
-                # nowhere to put a trajectory. With `synth_motion_amp = 0` the path is all zeros
-                # and this reduces to the moving crop of a frozen animal, i.e. the static box.
+                # A SYNTH WINDOW IS THE ONLY THING THAT REACHES THIS PATH now that `moving_crop`
+                # is deleted: a static crop has nowhere to put a trajectory. With
+                # `synth_motion_amp = 0` the path is all zeros and this reduces to the moving crop
+                # of a frozen animal, i.e. the static box.
                 cam, box, coords = cropmod.crop_to_points_2d_moving(
                     cam, coords, self.cfg.min_crop_dim, self._jitter_params(rng), crop_pts=cp,
                     path=synth_path)
@@ -1361,7 +1342,7 @@ class PoseDataset(Dataset):
             # or one per frame under a synthetic roll.
             cp3 = None if crop_pts is None else [
                 _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
-            if self.cfg.moving_crop or synth:
+            if synth:
                 # 3D DIFFERS FROM 2D IN WHERE THE ORIGIN GOES, not in the rule. 2D subtracts the
                 # per-frame origin from the coordinates; here the coordinates are world-metric and
                 # the origin lives in the camera's `offset`, which gains a time axis. That is what

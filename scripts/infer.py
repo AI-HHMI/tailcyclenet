@@ -243,21 +243,6 @@ def main():
                     help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
                          'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
                          'unreadable. A view only -- it changes nothing that was predicted.')
-    ap.add_argument('--moving-crop', action='store_true',
-                    help='crop PER FRAME instead of per window: one constant side that translates '
-                         'to follow the animal. The window crop is a union over the window, so it '
-                         'is inflated by however far the animal walked -- measured on rat-city, '
-                         'union side p50 1.23x and p90 1.92x the median per-frame side, which at '
-                         'image_size 256 renders a 242 px rat into 214 px and half that in the '
-                         'tail. This is the one lever that shrinks the crop WITHOUT shortening the '
-                         'window, which is what `--n-frames 8` pays for it in lost temporal '
-                         'context (pck@10 0.103 -> 0.067). 2D ONLY, and it composes with '
-                         '--crop-source. THE SIDE IS CONSTANT and only the origin moves, which is '
-                         'why this needs no retrain: a per-frame SIZE is a per-frame intrinsic and '
-                         "`apply_crop`'s offset/size are per-camera scalars. IT IS STILL A "
-                         'DISTRIBUTION SHIFT -- training crops hold the box still and let the '
-                         'animal drift, these hold the animal still and let the background slide '
-                         '-- so read it only against a matched fixed-crop arm.')
     ap.add_argument('--refine', action='store_true',
                     help='re-crop each window to the first pass\'s OWN prediction and predict '
                          'again, label-free. The prediction re-enters the crop rule as if it were '
@@ -403,16 +388,7 @@ def main():
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device,
-        crop_source=args.crop_source, moving_crop=args.moving_crop)
-    # BOTH SHRINK THE CROP, so running them together measures neither (eval rule 4) -- and the
-    # refine pass rebuilds its plan from `boxes_from_points`, which is a per-WINDOW rule with no
-    # moving equivalent. Refused rather than silently ignored on one of the two.
-    if args.moving_crop and args.refine:
-        raise SystemExit('--moving-crop and --refine both shrink the crop; run them as separate '
-                         'arms or the delta measures neither.')
-    if args.moving_crop and args.detector is None and args.boxes is None:
-        raise SystemExit('--moving-crop needs per-frame boxes, so it needs --detector or --boxes. '
-                         'The label-crop path is the GT-crop upper bound and is left per window.')
+        crop_source=args.crop_source)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

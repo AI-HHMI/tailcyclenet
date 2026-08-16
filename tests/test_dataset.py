@@ -1222,43 +1222,20 @@ def test_the_3d_visibility_or_reflects_the_augmentation_that_followed_it():
 
 
 # ----------------------------------------------------------------------------------------------
-# the moving crop
+# the per-frame crop geometry
+#
+# `moving_crop` -- a per-frame crop as a DEPLOYMENT choice -- is deleted, refuted on six roots
+# (dev/reports/23). What these cover is the GEOMETRY, whose only remaining consumer is
+# `synth_motion_*` below: a synthetic camera pan is a per-frame crop origin and nothing else.
 # ----------------------------------------------------------------------------------------------
 
-def test_moving_crop_off_is_the_static_loader_exactly():
-    """The default must be the loader that produced every recorded number.
-
-    `moving_crop` reroutes the 2D crop AND changes `read_frames`' dedupe key, so "off is unchanged"
-    is two claims, not one. This asserts the field defaults off; `test_2d_item_is_unchanged_...`
-    below asserts the pixels and coordinates agree item for item.
-    """
-    assert LoaderConfig().moving_crop is False
-
-
-def test_2d_item_is_unchanged_when_moving_crop_is_off(tiny_root):
-    ds_a = PoseDataset(tiny_root / 'ratlike', 'train', CFG)
-    ds_b = PoseDataset(tiny_root / 'ratlike', 'train',
-                       LoaderConfig(**{**CFG.__dict__, 'moving_crop': False}))
-    for i in range(len(ds_a)):
-        a, b = pose_collate([ds_a[i]]), pose_collate([ds_b[i]])
-        assert torch.equal(a.views[0], b.views[0])
-        assert torch.equal(torch.nan_to_num(a.coords, nan=-1.0),
-                           torch.nan_to_num(b.coords, nan=-1.0))
-
-
-def test_moving_crop_produces_one_box_per_frame_of_one_constant_side(tiny_root):
+def test_moving_boxes_produce_one_box_per_frame_of_one_constant_side():
     """The two properties the whole rule rests on: per frame, and ONE side.
 
     A varying side would be a per-frame INTRINSIC, which `apply_crop` cannot express -- its
     `offset`/`size` are per-camera scalars -- so it would silently mis-scale the decode. That is
     exactly the bug the inference arm hit (pck@10 0.841 -> 0.383 at unchanged coverage).
     """
-    cfg = LoaderConfig(**{**CFG.__dict__, 'moving_crop': True})
-    ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg)
-    b = pose_collate([ds[0]])
-    assert b.views[0].shape[:2] == (1, cfg.n_frames)
-    assert b.coords.shape == (1, cfg.n_frames, 4, 2)
-
     cam = {'size': torch.tensor([200, 100], dtype=torch.int32),
            'offset': torch.zeros(2, dtype=torch.int32)}
     coords = torch.tensor([[[10.0, 10.0], [30.0, 30.0]],
@@ -1275,21 +1252,7 @@ def test_moving_crop_produces_one_box_per_frame_of_one_constant_side(tiny_root):
     assert float((ctr - ctr.mean(0)).abs().max()) < float(sides[0]) * 0.25
 
 
-def test_the_moving_rule_is_shared_with_inference(tiny_root):
-    """ONE rule, imported by both, for `crop_box_for_points`' reason.
-
-    `infer.run_group` and the loader must crop identically or the model meets a different geometry
-    at deployment than in training -- gotcha 8, in the one place a second copy would be easiest.
-    """
-    import inspect
-
-    from tailcyclenet import infer as infermod
-
-    assert 'cropmod.moving_boxes' in inspect.getsource(infermod.run_group)
-    assert not hasattr(infermod, '_moving_boxes'), 'infer.py must not keep its own copy'
-
-
-def test_moving_crop_keeps_per_frame_boxes_distinct_in_read_frames(dataset_3d, monkeypatch):
+def test_per_frame_boxes_stay_distinct_in_read_frames(dataset_3d, monkeypatch):
     """The dedupe key has to include the BOX, not just the source index.
 
     `_frames` clamp-pads a short window, so one index occupies several positions -- and under a

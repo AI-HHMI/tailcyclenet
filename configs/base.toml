@@ -1,0 +1,167 @@
+# Everything 2D and 3D agree on. Not runnable alone -- `configs/2d.toml` and `configs/3d.toml`
+# each `extends` this and add the few keys that genuinely differ.
+#
+# THE POINT OF THE SPLIT IS THAT THE OVERLAY IS THE WHOLE DIFFERENCE. If a key belongs here and is
+# repeated in an overlay, the overlay stops being readable as "what 3D needs that 2D does not",
+# which is the one question this layout exists to answer. Three keys differ. See the overlays.
+#
+# [model] below the `query` line is the ukt14i7c base recipe -- it is splatted into posetail's
+# TrackerEncoder and the warm start expects the same architecture it was trained with.
+# `n_keypoints` is NOT here: it is derived from the keypoint registry, which is derived from data.
+
+[data]
+n_frames = 24               # a CEILING: a train window is sized to the labelled span it covers
+image_size = 256
+balance_datasets = true
+aug_prob = 0.25
+crop_jitter = 0.3           # 0.3/0.3 cut the cost of detector crops from +0.545 to +0.115 mm
+crop_jitter_scale = 0.3     # AND improved base accuracy -- a tight box teaches the model that
+min_crop_dim = 64           # the animal always fills the frame, which no detector delivers
+prompt_dropout = 0.5        # fraction of STEPS run fully query-free -> no-query tokens
+prompt_noise_px = 2.5       # sigma on the prior, in PIXELS. 3D converts via cube_scale (world
+                            # units per pixel), so ONE setting means the same visual displacement
+                            # on a 30 px fly and on allen's mm-space rig. Ships WITH the dropout --
+                            # dropout alone is retired at +0.146 SIG worse on fly.
+# A WHOLE-BODY offset, the corruption with the shape of a deployment failure (i.i.d. jitter
+# averages to zero over the keypoint set and so teaches the model to trust the prior's centroid
+# exactly -- the one quantity a whole-body lag gets wrong).
+#
+# 5.0 IS A CONSISTENCY CHOICE, NOT A MEASURED OPTIMUM. The measured value is 8.0, on allen, 3D
+# (`prior_self` 2.3275 against 2.5254, -0.277 mm [-0.395, -0.171] paired; report 13 step 6). 2D was
+# proposed at 0.0 only because the key acts through `scene_center` and `cube_scale`, which are
+# 3D-derived, so report 17 section 7 argues it is UNMEASURABLE in 2D -- not that it is harmful
+# there. 5 buys one fewer knob that differs between the two files. The cost: a new 3D arm is no
+# longer paired with the `offset8` result on record, so say so when reporting one.
+prompt_offset_px = 5.0
+num_workers = 12
+
+[model]
+query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
+query_encoder = "wide"      # "wide" (512-dim, identity + time + the two query terms,
+                            # which are built iff query = "prior") | "pose" (256-dim, ten)
+# What the 3D residual is an offset FROM. NO DEFAULT -- the two values load the same tensors, so a
+# checkpoint trained under one and built under the other produces numbers instead of an exception
+# (+23.1 mm MPJPE, -0.18 MOTA on 3dpop; gotcha 12). Inert in 2D, where `model.py` returns before
+# both offset paths -- but still required, because the key is about the WEIGHTS, not the run.
+# "triangulated" is REFUTED when paired with query = "prior": +0.289 mm [+0.115, +0.473] worse.
+gridresid_offset = "query"
+
+video_encoder_version = "large"
+video_encoder_requires_grad = false
+video_encoder_hierarchical = true
+soft_argmax_temperature_learnable = true
+stride_length = 24
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+max_freq = 10
+embedding_dim = 256
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+scene_encoder_proj = true
+scene_proj_dim = 512
+scene_proj_prenorm = false
+scene_proj_mlp = false
+scene_pos_embed_mode = "ropepos"
+rope_base = 100.0
+time_embed_mode = "fourier_rel"
+output_mode = "gridresid"
+head_3d_grid_size = 1024
+head_3d_grid_radius = 1.8
+log_3d_output = true
+log_3d_eps = 0.1
+# LOAD-BEARING, do not widen. `_grid_softmax` masks to |argmax - index| <= 60 of 1024 bins. Swept
+# against labels: 10/20/30/45/60/120/inf read 8.114/8.032/7.991/7.981/7.976/8.374/11.032 mm --
+# removing the truncation costs +3.06 mm (38%). It suppresses spurious far modes; it is not a bias.
+soft_argmax_threshold = 60
+# "head" averages convex-spaced bin centres directly and overshoots through the warp at large
+# motion; "warped" averages in the uniform space first. The library defaults to the wrong one.
+grid_decode_space = "warped"
+enable_subpixel_refinement = false
+depth_log_min = -2.5
+depth_log_max = 2.5
+
+# Five keys that used to be here and reach nothing, removed rather than left reading as knobs:
+#   corr_radius, use_volume_embedding, occlusion_embedding -- consumed only by the stock
+#     QueryEncoder, which model.py builds and DISCARDS under query_encoder = "wide"
+#   mode_3d      -- "stored and never read" (build_model only asserts it)
+#   cross_attn_dim -- restated latent_dim, which is also what None defaults to
+# `scratch/regress/probe_model_shapes.py` asserts the parameter set is identical without them.
+
+[training]
+n_iterations = 60000
+seed = 0
+# The base tracker this finetunes from. Moving-camera support added ZERO parameters, so a
+# checkpoint from before that merge loads cleanly; the unexpected-keys list is printed anyway.
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260727_113457-ukt14i7c/files/checkpoints"
+max_grad_norm = 10.0
+checkpoint_freq = 1000
+val_freq = 200
+val_batches = 20
+print_freq = 20
+freeze_encoder = true       # a DEPLOYMENT decision: one frozen encoder forward feeds both models
+
+[training.optimizer]
+learning_rate = 1e-4        # what every hop of the golden chain actually ran
+kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
+encoder_lr_scale = 0.1      # inert while freeze_encoder = true: the encoder group is then empty
+weight_decay = 0.002
+warmup_steps = 500
+beta1 = 0.9
+beta2 = 0.95
+
+[training.losses]
+# `delta` and `use_huber_loss` reach the 3D metric Hubers only -- the 2D and all four reprojection
+# losses hardcode delta = 16 and Huber on.
+delta = 6
+use_huber_loss = true
+# THE ONLY FIVE THAT FIRE ON A 2D SESSION. `TotalLoss.forward` branches on coords_true.shape[-1],
+# and the R == 2 block computes exactly these; everything else below is NaN'd and dropped. So a
+# 2D-only run trains NO visibility head at all -- see vis_loss_weight.
+coords_loss_2d_weight = 1.5
+coords_softmax_2d_weight = 0.6
+smoothness_loss_2d_weight = 0.5
+smoothness_loss_order = 4   # a CEILING: train.py clamps to min(order, T-1) per batch, and the
+smoothness_loss_tolerance = 1.5   # derived-T rule makes T = 2 common, i.e. order 1.
+# 3D-only from here down.
+#
+# NOTHING SUPERVISES VISIBILITY ON A 2D SESSION. Both vis terms live inside losses.py's 3D `else`
+# branch, so on a 2D-only root the vis_pred head gets no gradient -- and `--vis-thresh` there is
+# gating on an untrained head. That is the real reason the rat-city gate figure was withdrawn and
+# the calms21 one is negative, and it is why this weight looks larger than it acts.
+vis_loss_weight = 5.0
+vis_loss_3d_weight = 1.0
+conf_loss_weight = 0.0            # documented off-switches: the terms exist, the weights are 0
+conf_2d_loss_weight = 0.0
+coords_loss_rays_weight = 0.0     # supervises the unnormalised weighted SUM; see model.py:360
+occluded_coords_loss_weight = 0.1
+coords_loss_weight = 0.1
+coords_loss_direct_weight = 0.1   # applied TWICE (cams_direct and direct), so effectively 0.2
+coords_loss_triangulate_weight = 0.1
+coords_loss_depth_weight = 0.5
+coords_loss_direct_reproj_weight = 1.0
+coords_loss_rays_reproj_weight = 0.05
+coords_loss_triangulate_reproj_weight = 2.0
+coords_softmax_3d_weight = 0.4
+depth_softmax_weight = 1.5        # the largest CE term, and query-INDEPENDENT
+coords_3d_loss_scale = 50.0
+smoothness_loss_3d_weight = 0.5
+
+# Three keys that used to be here and reach nothing:
+#   gamma, feature_loss_weight -- both gate on outputs TrackerEncoder never emits
+#     (`coords_pred_iters` survives only as a comment at tracker_encoder.py:830;
+#      `feature_planes_levels` does not appear in that file at all)
+#   pixel_thresh -- feeds only the two conf losses, which are weighted 0
+
+[wandb]
+project_name = "tailcyclenet"
+path = "/groups/karashchuk/home/karashchukl/results/tailcyclenet"
+mode = "offline"

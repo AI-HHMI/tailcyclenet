@@ -3,10 +3,15 @@
 Finetune a [posetail](https://pypi.org/project/posetail/) point tracker into an animal pose
 estimator. Three settings, one model: **3D multiview**, **3D single-view**, **2D single-view**.
 
-This is a clean rebuild of `../posetail-pose` (~30,000 lines, 86 generated arm configs, ~20
-architecture switches, ~20 partly-redundant eval scripts). Everything that was an *experiment*
-there is deleted here. What survives is the one architecture that won, the one crop rule, the one
-window loop, and a data format that serves both hand annotation and bulk training.
+This is a clean rebuild of `../posetail-pose`. Everything that was an *experiment* there is
+deleted here; what survives is the one architecture that won, the one crop rule, the one window
+loop, and a data format that serves both hand annotation and bulk training.
+
+**THIS FILE IS THE CURRENT STATE, NOT THE TRAIL.** Every measurement, refutation and retraction
+lives in `dev/reports/`, indexed and dated. What is here is what a reader must know to avoid
+breaking something: the defaults, the invariants, the gotchas, the eval rules — with the report
+number beside anything that needs a *why*. **Do not grow this file with narrative**; that is what
+put it at 108 KB, and `dev/reports/24_lever_audit_and_cleanup.md` is the cut that brought it back.
 
 ---
 
@@ -27,23 +32,24 @@ tailcyclenet/
   crop.py             crop_box_for_points -- THE crop rule, int32-exact
   model.py            PoseTrackerEncoder + build_model + the query-free scene centre
   query_encoder.py    PoseQueryEncoder with missing-query tokens
-  checkpoints.py      run folders, save/load, warm start
+  checkpoints.py      run folders, save/load, warm start, config `extends`
+  patches.py          MONKEYPATCHES THE PINNED LIBRARY -- see Environment
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
   infer.py            THE inference path: one window loop
   detector/           YOLOX-Nano box predictor + cross-view association
     track.py            ONE cross-view target set. `--track`; replaces associate+link_rows
+    identity.py         pose_nms, the one keypoint identity lever that works
 scripts/              convert_v4.py  train.py  train_detector.py  infer.py  eval.py
-configs/              example configs, hand-written. NOT generated, NOT one per experiment.
+configs/              base.toml + 2d.toml + 3d.toml. Hand-written, NOT one per experiment.
 tests/
 ```
 
 **Who may write where.** `dev/` and `scratch/` are yours, and both are gitignored — a conclusion
-that should outlive the session belongs in this file or `docs/`. `docs/` is the human's — ask first.
-`../posetail-pose` and `../../posetail/posetail-next` are read-only reference.
+that should outlive the session belongs in this file or `docs/`. `docs/` is the human's — ask
+first. `../posetail-pose` and `../../posetail/posetail-next` are read-only reference.
 
 **Commit messages are ONE LINE.** No body, no bullet list, no `Co-Authored-By`, and no mention of
-Claude or any other assistant. What a change means belongs in this file or in `dev/reports/`, where
-it is findable; a paragraph in a commit message is findable only by whoever already knows the hash.
+Claude or any other assistant. What a change means belongs in this file or in `dev/reports/`.
 
 ---
 
@@ -63,48 +69,26 @@ directory move.)
 **`tailcyclenet/patches.py` MONKEYPATCHES THE PINNED LIBRARY, AND EVERY ENTRY IN IT IS A BUG THAT
 SHOULD BE FIXED UPSTREAM.** It is applied from `tailcyclenet/__init__.py` — importing anything from
 this package applies it — because `posetail`'s own modules bind the patched names by VALUE at their
-import time, so a later patch would reach some call sites and not others. **When the `posetail` pin
-moves, read that file and delete whatever landed upstream** rather than discovering a
-double-applied fix.
+import time, so a later patch would reach some call sites and not others. **When the pin moves,
+read that file and delete whatever landed upstream** rather than discovering a double-applied fix.
 
-Three entries, all one bug: the library assumes a camera `offset` is static. `cube.project_cam` does `p2d = p2d - offset[None, :]`, which prepends exactly
-one axis and so cannot express a PER-FRAME camera offset — the thing a moving crop
-(`crop.moving_boxes`) is, and the only thing it is: `apply_crop` writes only `offset` and `size`,
-and the rule holds the side constant, so `mat`, `ext` and `dist` never change. The library already
-carries a time axis on `ext` (`(T,4,4)`, indexed per frame at `encoder_decoder.py:59`); `offset` was
-never given the same treatment. **Upstream fix: right-align the subtraction** so `(T,2)` meets the
-time axis `project_cam`'s own comment already documents for `ext`. Without it a `(T,1,2)` offset
-gives correct VALUES at every call site and the wrong RANK wherever `p3d` is rank 3 — `(1,T,K,2)`
-in the loader against `(B,T,K,2)` in `losses.py` — so no single shape works and it fails as a silent
-shape bug. The patch WRAPS rather than reimplements (calls the original with `offset` withheld, then
-subtracts), so distortion, the depth clamp and any future upstream change are inherited; a 1-D
-offset takes the original path untouched and is bit-identical. `tests/test_patches.py` pins both
-halves and the end-to-end geometry. `get_camera_scale` and `undistort_points` are patched for the
-same reason (a Jacobian, so collapsing the offset is exact; and two different point layouts reach
-the undistort).
+Four entries, all one bug: the library assumes a camera `offset` is static. `cube.project_cam` does
+`p2d = p2d - offset[None, :]`, which prepends exactly one axis and so cannot express a PER-FRAME
+camera offset. The library already carries a time axis on `ext` (`(T,4,4)`); `offset` was never
+given the same treatment. **Upstream fix: right-align the subtraction.** The patch WRAPS rather
+than reimplements (it calls the original with `offset` withheld, then subtracts), so distortion,
+the depth clamp and any future upstream change are inherited; a 1-D offset takes the original path
+and is bit-identical. `tests/test_patches.py` pins both halves and the end-to-end geometry.
 
-**A MOVING CROP WORKS IN 2D AND 3D, AND THE 3D ROUTE IS NOT THE OBVIOUS ONE.** The crop is a
-per-frame camera `offset` and nothing else — but the library flattens the time axis away in half a
-dozen places, and patching each meant a separate judgement about a PRETRAINED decode where a wrong
-answer trains to a plausible number instead of failing. So `crop.apply_crop_moving` instead expands
-`ext` to a constant `(T,4,4)`: not a lie about the rig (it really is static; these are T copies of
-one matrix) but a way to make `cam['ext'].ndim == 3` true, which is the single test posetail already
-uses everywhere to mean "this camera differs per frame" — `losses.py:408` then keeps the visibility
-target as `(b,t,n)` instead of flattening it, `tracker_encoder.py:493` expands the extrinsic over
-the `(t n)` ray order, and `:664` pins its gauge frame to frame 0. All three are what a moving crop
-needs. `patches.py` handles only the remainder.
-
-**AND THE JITTER MUST BE DRAWN PER CAMERA.** `jitter_box` returns a CLOSURE that the static 3D path
-applies inside its per-camera loop, so each camera draws its own and the rng advances three numbers
-per camera. A single draw for the whole rig both weakens the augmentation and leaves the rng in a
-different state, desynchronising every window sampled afterwards — the arm would then differ from
-its control in the augmentation and the data as well as the crop. Measured before the fix as allen
-skipping 2 of 12 steps where its static control skipped 0. `_jitter_params` therefore returns a
-factory, matching `_jitter`.
+**THE ONLY THING THAT REACHES THE PATCHED PATH IS `synth_motion_*`.** A per-frame crop as a
+*deployment* choice (`moving_crop`) was measured on six roots and deleted (report 23), so the
+moving-crop geometry — `crop.moving_boxes`, `crop_to_points_{2d,3d}_moving`, `apply_crop_moving` —
+now has exactly one consumer: the synthetic camera motion below. Retiring that key too is what
+would make this whole stack, `patches.py` included, deletable.
 
 The `LD_LIBRARY_PATH` prepend in `[tool.pixi.activation.env]` is load-bearing: the env ships
-`libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it `import
-scipy.optimize` dies inside `_highspy` with an error that names only CXXABI.
+`libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it
+`import scipy.optimize` dies inside `_highspy` with an error that names only CXXABI.
 
 ---
 
@@ -120,7 +104,7 @@ Spec: `docs/annotation_format.md`. Summary of the shape:
     keypoints.pq       per-camera 2D + per-camera visibility
     points3d.pq        3D -- first-class, not derived from 2D
     instances.pq       boxes / present / absent          (optional)
-    extrinsics.pq      per-frame extrinsics, moving cams (optional)
+    extrinsics.pq      per-frame extrinsics, moving cams (optional; NO shipped root has one)
     groups/<gid>/<cam>/000000.jpg …   or   groups/<gid>/<cam>.mp4   (symlinks fine)
 ```
 
@@ -129,190 +113,74 @@ Five things that are easy to get wrong:
 - **Split is a directory, not a column.** None of the four shipped datasets split cleanly by
   session — rat-city's train/val/test are one recording — so a session-level field could not
   express them.
-- **`mode` is per-session.** One `train/` may hold 2D and 3D sessions; the model trains on both
-  and both head-bank slots (`mode_idx` 0 and 1) get gradient. Sessions need not agree on `names`
-  either: `Dataset.names` is the **union** over the root's sessions and `Registry.ids_for` remaps
-  each session's own axis onto it **by name**, so a session may reorder the keypoints or carry a
-  subset of them. `allen-mouse-combined` is exactly this — 80 hand-annotated sessions in
+- **`mode` is per-session.** One `train/` may hold 2D and 3D sessions; both head-bank slots get
+  gradient. Sessions need not agree on `names` either: `Dataset.names` is the **union** and
+  `Registry.ids_for` remaps each session's own axis onto it **by name**, so a session may reorder
+  or subset the keypoints. `allen-mouse-combined` is exactly this — 80 hand-annotated sessions in
   anatomical order beside a tracked one in name-sorted order.
 - **A group is a contiguous clip**, `n_frames` unbounded. rat-city's 57,594 frames are ONE group
-  whose `cam0` is a single symlink. ~900 symlinks across all four datasets, not 550k.
-  **A group's length is not its label count.** allen's annotated groups are 65 frames carrying
-  exactly ONE labelled frame — context around a single hand-annotated still — while a tracked
-  group is labelled throughout. This is why a train window's T is derived from the labels rather
-  than configured (gotcha 1), and why an index entry is a poor sampling weight (`_pool_weights`).
-- **`status` is the visibility channel**, in both label tables. Dictionary-encoded in parquet, so
+  whose `cam0` is a single symlink (~900 symlinks across all four datasets, not 550k).
+  **A group's length is not its label count**: allen's annotated groups are 65 frames carrying
+  exactly ONE labelled frame. This is why a train window's T is derived rather than configured
+  (gotcha 1), and why an index entry is a poor sampling weight.
+- **`status` is the visibility channel**, in both label tables, dictionary-encoded so
   `vis = codes == VISIBLE` is a vectorized int8 compare. But **coordinates live on `VISIBLE` *or*
   `PROJECTED`** (`fmt.POSITIONED`): `projected` is a position with no visibility claim, for a
-  source that had its annotators place every keypoint in every view and never recorded occlusion
+  source whose annotators placed every keypoint in every view and never recorded occlusion
   (johnson-mouse: 1,235,334 "visible" vs 18 "not"). It must never reach a visibility target —
   `dataset.py` NaNs it out, and withholds `vis`/`vis_2d` entirely when a window has no assessment
   at all, because the noisy-OR would otherwise assert that nothing is reconstructible in 3D.
 - **`keypoints.pq` `x,y` may be null on a `visible` row** iff a `points3d` row exists for the same
-  key. That row is a *visibility observation* — allen-mouse ships a real per-camera
-  `vis (S,T,K,7)` with no per-camera 2D, and this is how it is kept without inventing positions.
+  key. That row is a *visibility observation* — allen-mouse ships a real per-camera `vis (S,T,K,7)`
+  with no per-camera 2D, and this is how it is kept without inventing positions.
 
-### `rat-city-annotated` — the hand-annotated sibling, and its one trap
+### Per-root traps
 
-`scripts/convert_apt_lbl.py` converts an APT (Animal Part Tracker) `.lbl` project. Shipped from
-`ratCity_round13_mjpegqv5_bounded.lbl`: 2D single-view, `labels = "annotated"`, **1,087 groups of
-65 frames each with ONE labelled frame centered at index 32** — allen-mouse's annotated shape,
-which is why the derived-T rule (gotcha 1) matters as much here. 2,847 instances, 11,168 keypoint
-rows (10,997 `visible` + 171 `missing`), K = 4 with names identical to the tracked `rat-city` so
-both roots share registry ids and therefore embedding rows. Split is **cross-cohort**: cohort5 is
-val, APT's own GT set is test. Round-tripped against the `.lbl`: every row, status, coordinate and
-box exact.
+- **`rat-city-annotated`** (APT `.lbl`, `scripts/convert_apt_lbl.py`): 1,087 groups of 65 frames
+  with ONE labelled frame at index 32, K = 4, names identical to the tracked root so both share
+  registry ids and embedding rows. **Its per-camera visibility is the calms21 failure mode by
+  decision** — APT records an occluded-but-placed point (`occ == 1`, 22.0% of slots) and the format
+  has no such status, so those are written `visible` with their coordinates. Never use this root's
+  vis head as a row gate without the rate-matched random control. **And its `p` column is
+  x-block-then-y-block**: `labels{i}.p` is `(2K,n)` and decodes as `reshape(2,K,n)`. Both readings
+  look plausible on a 4696x2048 frame; the interleaved one puts 28.25% of points outside the frame
+  against 0.01%. Asserted on VALUES in `tests/test_convert_apt_lbl.py`, not on shapes. A labelled
+  frame also labels only *some* of the rats in it — a median of 2 where the tracked root finds 11.
+- **`regions.pq`** is APT's "Label Box": an area the annotator certified as completely labelled.
+  Polarity is measured, not inferred from the name. **The file's ABSENCE is the claim of exhaustive
+  labelling**, so the two `test/` sessions write an **empty** one rather than none — `None` and
+  `(0,6)` are different answers. Membership is by **CENTROID, not overlap**. A region is kept only
+  on the group whose own labelled frame it sits on (drops 140 of 636, printed by the converter).
+- **`3dpop` ships an `instances.pq`** written from v3 (1,469,421 rows), which restores five pigeons
+  v4's score-cleaning deleted outright — birds physically in frame with no row anywhere, so every
+  prediction on one scored as a false positive. It flips `box_source = 'instances'` from inert to
+  live, so **no new 3dpop number is comparable to reports 10-14 without `box_source = "keypoints"`**.
+  And in 3D a `present` row has no box to localise against, so `_in_ignore` excuses every unmatched
+  prediction on a frame carrying one — 24.6% of 3dpop's frames. **Quote `fp_ignored` beside MOTA
+  or the number is unreadable.**
+- **`rat-city` IS A SYMLINK to `rat-city-tracked`**, and the `*-combined` roots are symlink farms,
+  so a fix in one place lands in up to three roots and `find` without `-L` undercounts them.
+- **A root's file date cannot settle whether its tables are current — regenerate and diff.** Four
+  of five roots carry a converter commit *after* the root was written, and one converter was
+  created two hours after the data it produced. All were current; the one that was actually stale
+  (`rat-city/val`, 169 of 745 rows with the wrong status) would have looked *fine* on dates.
 
-**ITS PER-CAMERA VISIBILITY CHANNEL IS THE calms21 FAILURE MODE, BY DECISION.** APT records an
-occluded point the annotator still placed (`occ == 1`, 2,500 slots — 22.0% of all, 22.7% of the
-`visible` rows) and the format has no
-"occluded but positioned" status, so those are written **`visible` with their coordinates** —
-label density bought at the price of the visibility target. A `vis_pred` head trained on this root
-learns against a target that calls occluded points visible, exactly as calms21's all-`VISIBLE`
-converter did, and `--vis-thresh` is worth −0.037 to −0.123 MOTA there. Never use this root's vis
-head as a row gate without the rate-matched random control. `Inf` still becomes `missing` and
-`NaN` still becomes no row, so the negatives that exist are real — there are just only 171 of them.
+### Which roots can carry a benchmark
 
-**AND ITS `p` COLUMN IS x-BLOCK-THEN-y-BLOCK, WHICH IS THE ONE THING THAT WOULD HAVE BEEN SILENT.**
-`labels{i}.p` is `(2K, n)` and decodes as `reshape(2, K, n)`, not `reshape(K, 2, n)`. Both readings
-give plausible-looking coordinates on a 4696x2048 frame, which is why this is asserted on values in
-`tests/test_convert_apt_lbl.py` and not on shapes: the interleaved reading puts **28.25% of points
-outside the frame against 0.01%**, and it smears the otherwise-perfect agreement between APT's
-`Inf`/`NaN` sentinels and its `occ` tag. Gotcha 10 in a new source.
+| root | test groups | frames/group (min/med/max) | usable? |
+|---|---|---|---|
+| **3dpop** | 58 | 755 / 908 / 2,680 | **yes — the best split in the repo** |
+| **calms21** | 19 | 4,881 / 17,483 / 23,810 | **yes, and long** |
+| rat-city (= `-tracked`) | 1 | 500 | **no — this is the DEGENERATE one** |
+| rat-city-combined | 21 | 20x65 + 1x500 | marginal |
+| allen / johnson `-tracked` | 1 | 500 / 950 | no |
+| allen / johnson `-annotated`, `-combined` | — | — | **NO `test/` SPLIT AT ALL** — every number on those roots is a `val` number |
+| branson-fly | 1 | 500 | no |
 
-Two more things it will not tell you unless you look. Its five `original/merged_video_all_keyframes*`
-sessions are **4500x2050** where the 45 cohort sessions are 4696x2048, which is why the converter
-buckets one session per movie — calibration is a session property. And **a labelled frame labels
-only *some* of the rats in it** — a median of **2** where the tracked root finds a median of **11**
-— which is what `regions.pq` (§9b) now records.
-
-### `regions.pq`: the labelling here is PARTIAL, and the file says where it is not
-
-APT's `labelsRoi` ("Label Box") is converted, 496 rows across the root. It is **not an animal box**
-and could not be: `LabelROI` has no target index field. It marks an area the annotator certified as
-completely labelled, and the polarity is measured rather than inferred from the name — APT
-concatenates `extra_roi` with the per-target loss masks (`APT_interface.py:331`) and samples its
-*negative* patches from inside the union (`multi_background_sample_ratio`).
-
-Four things a consumer must know, each of which inverts a reading if missed:
-
-- **The file's ABSENCE is the claim of exhaustive labelling**, so every session here writes one,
-  and the two `test/` sessions write an **empty** one — APT's GT mode records no ROIs
-  (`aggregateLabelsAddRoi.m` uses `LabelROI.new()` when `isgt`), and a missing file there would
-  certify all 20 frames. `Labels.regions is None` and `(0,6)` are different answers.
-- **Membership is by CENTROID, not overlap** (`labels_within_mask`). The first render of this root
-  showed a Label Box apparently holding an unlabelled rat; its centre is just outside the edge. A
-  consumer testing pixel overlap reads that as an uncertified miss and concludes the certificates
-  are unreliable.
-- **A region is kept only on the group whose OWN labelled frame it sits on.** A group is 65 frames
-  around one labelled frame, so certifying a context frame would assert an area empty whose animals
-  were converted into a different group. That drops **140 of 636**, printed by the converter.
-- **A hard anchor mask on FULL-FRAME input is measured dead**: at 896x384 a labelled frame has a
-  median of 104 certified anchors of 7,056, 48 of them positive — a **69% positive rate** among
-  supervised anchors against 0.68% unmasked, with 17% of frames carrying no certified negative at
-  all. The mask needs crops, and `--tile-wh` is what supplies them.
-
-`--labels-only` rewrites the tables against the frames already on disk, so a table change costs
-30 s rather than 80 minutes of ffmpeg over 70,655 lossless-copied frames.
-
-### `--tile-wh` / `--use-regions`: training on tiles, and the mask that needs them
-
-**`--use-regions` masks the objectness loss to the certified area; `--tile-wh` is what makes that
-viable.** Both default off and they are ORTHOGONAL, so an arm moves one lever and the untiled,
-unmasked path is byte-identical — asserted, not assumed (`detector_loss(regions=None)` is tested
-exactly equal, and a mask certifying everything reproduces it).
-
-**A TILE IS JUST A TRANSFORM.** `letterbox_transform` returns `(scale, (padx, pady))` and every
-geometry line in `data.py` applies it as `x * scale + pad`; a tile at source origin `(ox, oy)` at
-scale `s` is exactly `(s, (-ox*s, -oy*s))`. So `tile_transform` is a drop-in, `_transform(i)` is the
-one place the choice is made, and boxes, regions and the single `warpAffine` all tile by
-substituting it. **Inference is one whole-frame forward as before** — no cross-tile NMS, no seam
-handling, no tiled inference path.
-
-**`--tile-scale` IS THE KNOB, AND IT IS A RESOLUTION KNOB, WHICH IS NOT OBVIOUS.** Measured on
-rat-city-annotated (`scratch/tile_certified_rate.py`), positive rate among supervised anchors:
-**48.3% at scale 0.25, 17.5% at 0.5, 10.2% at 0.7, 5.2% at 1.0**, against the full frame's 69%.
-Certified *area* is scale-INVARIANT at fixed source extent (29.4-30.0% across all four) while the
-rate moves 9x, because `assign`'s `CENTER_RADIUS` is 2.5 **cells** — the positive window is fixed in
-cells while the certified region shrinks in cells as the scale drops. Tile SIZE barely matters
-(640x640, 896x896 and 1024x512 at scale 0.5 all read ~17.4%). Ship it at scale 1.0.
-
-**DO NOT ALSO RESIZE THE TILE.** The invariant the whole scheme rests on is the animal's size in
-INPUT pixels; `tile_scale` is the only scale and the tile's source extent is `tile_wh / tile_scale`.
-Tiling-then-downscaling is the number-one reported failure of this pattern.
-
-**A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE.** Gotcha 12's
-shape. Deployment letterboxes the whole frame at the same scale, so `tile_scale` rides in the
-checkpoint, `load_detector` **raises** if a tiled checkpoint lacks it, and `detect_group` derives the
-size **per camera** — `rat-city-annotated` ships 4696x2048 beside 4500x2050. It is unconditional in
-the `--det-cache` stamp, the fifth instance of that trap and the first that comes from the
-CHECKPOINT rather than the command line, so two runs can differ in it with identical arguments.
-
-**No accuracy claim yet.** The `base` / `tile` / `tile+mask` arms have not been run; everything above
-is a gate and correctness result. Masking also reweights `obj` against `box_weight`, because the
-normaliser is deliberately left at `/ max(n_pos, B)` — `parts['certified']` prints the fraction so
-that shift is visible rather than inferred.
-
-### `3dpop` now ships an `instances.pq`, and writing it changed two things it does not name
-
-`scripts/backfill_boxes_v3.py` wrote all 118 sessions from `posetail-finetuning-v3`: **1,469,421
-rows** over 4 cameras, 86.6% `labeled` / 13.4% `present`, 19 duplicates suppressed. It is the same
-script and the same `labeled`/`present` rule that produced rat-city's, generalised to project
-`points3d` per camera — a 3D root stores no 2D, so its boxes come out of `Session.cgroup` +
-`project_points_torch` rather than off disk. rat-city's output is byte-identical.
-
-Why it was needed, in two independent registers. **v4's score-cleaning deleted six pigeons
-outright** (`convert_v4.py:234` drops an all-NaN animal); five of them v3 still holds in full —
-`706`, `483`, `485`, `54` and `706` again, up to 1,586 finite frames each. They are birds
-physically in the frame with no row anywhere, so every prediction on one scored as a false
-positive. They are back as pure `present` rows with boxes and zero labels, which is what §9 is
-for. **And the surviving boxes were damaged**: v3 has a finite 3D point on 86.6% of (animal,
-frame) slots against v4's ~55%, and a box is a min/max over whatever survived.
-
-Two consequences that are NOT local to this file:
-
-- **It flips 3dpop's `box_source = 'instances'` from inert to live.** Both `LoaderConfig` and
-  `train_detector.py --boxes` already default to `instances` and fall back to keypoints *silently*
-  where a root ships no table. So every future 3dpop pose and detector run crops from the v3
-  stored extent with no config change, and **no new 3dpop number is comparable to reports 10-14
-  without `box_source = "keypoints"`**. That is the repair, not a regression — but it is a
-  fifth instance of a default moving underneath a cached artefact.
-- **In 3D a `present` row has no box to localise against, so it excuses MORE than it should.**
-  `eval.py:191` withholds `ig_boxes` unless `mode == '2d'` (a 3D centroid is world mm, the boxes
-  are pixels), and `_in_ignore` then falls back to excusing EVERY unmatched prediction on any
-  frame carrying a present row — **24.6% of 3dpop's frames**, of which only 3.8% come from the
-  deleted birds; the rest are score-cleaned frames of kept birds. MOTA on 3dpop will rise for this
-  reason as well as for the real one. **Quote `fp_ignored` beside it or the number is unreadable.**
-
-Four animal ids (`483`, `485`, `54`, `706`) now appear only in `instances.pq`. `_animal_vocab`
-unions the tables, so `S` grows by one or two on five groups; checked safe both ways —
-`dataset._starts` returns `[]` for an animal with no labelled frame, and `mota`'s `true_present`
-is False for its all-NaN row, so it adds no training window and no GT.
-
-**EVERY `instances.pq` IN `tailcycle-datasets` HAS NOW BEEN RE-DERIVED AND DIFFED, and one was
-stale.** `rat-city/val` was written by `042846a`, before `abef250` fixed the status lookup to index
-by `animal_id`, and never regenerated — **169 of its 745 rows carried the wrong status** (633
-`labeled` against the correct 656), and a `labeled` written `present` is an eval ignore region.
-Now regenerated; `train` and `test` came back byte-for-byte, so `abef250`'s fix only ever changed
-`val`. The other four roots regenerate identical: `rat-city-annotated` 50/50, `allen-mouse-annotated`
-80/80, `calms21` 89/89, `johnson-mouse-annotated` 42/42.
-
-**AND A ROOT'S FILE DATE CANNOT SETTLE THIS — regenerate and diff.** Four of the five roots carry a
-commit touching their converter *after* the root was written, and `scripts/convert_calms21.py` was
-`--diff-filter=A` **created** two hours after the calms21 data it produced. A converter is typically
-run, then committed, so "the script is newer than the data" is the normal case and not evidence of
-anything. All four turned out current; the one that was actually stale (`rat-city/val`) would have
-looked *fine* on dates, since `abef250` predates it.
-
-**`rat-city` IS A SYMLINK TO `rat-city-tracked`,** and the `*-combined` roots are symlink farms onto
-the `-annotated` / `-tracked` pairs, so a fix in one place lands in up to three roots and `find`
-without `-L` undercounts them (it reports `rat-city-combined` as 0 sessions). Coverage, following
-symlinks: 3dpop 118/118, allen-mouse-annotated 80/80, allen-mouse-combined 80/82, calms21 89/89,
-johnson-mouse-annotated 42/42, johnson-mouse-combined 42/44, rat-city 3/3, rat-city-annotated 50/50,
-rat-city-combined 53/53, rat-city-tracked 3/3. **Still carrying none: `allen-mouse-tracked` (3),
-`johnson-mouse-tracked` (3), `branson-fly` (10)** — the three `combined` shortfalls are exactly the
-tracked sessions. Each has a v3 counterpart and could be backfilled the same way, at the same
-`box_source` cost as 3dpop; none has been.
+**The long-clip protocol this repo keeps asking for already exists as data** (report 24 §1.3):
+3dpop's 120-frame truncation discards 88% of its split, and calms21's 262,107 test frames are
+entirely unused. Both at `--chunk 500` are chunks of MANY independent clips, so the within-clip
+caveat is far weaker there than on rat-city's single group.
 
 ---
 
@@ -324,375 +192,176 @@ pixi run python scripts/train.py --config configs/3d.toml --data <root>   # or c
 
 **THE TWO CONFIGS DIFFER IN THREE KEYS AND THAT IS THE POINT.** `configs/base.toml` holds
 everything shared; `2d.toml` and `3d.toml` `extends` it and add only what the setting genuinely
-requires — `cams_to_sample`, `val_cams_to_sample` and `prob_2d_only`, all three of them camera-count
-questions a one-camera root cannot ask. `2d.toml` adds NO `[data]` key at all. Resolution is one
-level deep by design (`checkpoints.load_config`): a chain of overlays would put the difference back
-out of sight, which is the thing the split exists to show.
-
-**The inference recipe is not config**, and it is where the two really differ:
-`--crop-source keypoints` (3D) against `boxes` (2D), with a detector trained `--keypoints` for the
-first. `--anchor carry` and `--overlap 8` are SHARED BY DECISION and neither is 2D's optimum — see
-`configs/2d.toml`, which records what that costs.
-
-**`[training.losses]` HAS FIVE KEYS THAT FIRE ON A 2D SESSION AND THE REST ARE 3D-ONLY.**
-`TotalLoss.forward` branches on `coords_true.shape[-1]`; the `R == 2` block computes
-`coords_loss_2d`, `coords_softmax_2d`, `smoothness_loss_2d` and the two smoothness shape keys, and
-everything else is NaN'd and dropped. **So NOTHING SUPERVISES VISIBILITY ON A 2D-ONLY RUN** — both
-vis terms live in the 3D `else`, and `vis_loss_weight = 5.0`, the largest weight in the block, gets
-no gradient there. That, and not "the converter wrote every point VISIBLE", is why `--vis-thresh`
-cannot work on a 2D root: the head it gates on was never trained.
+requires — `cams_to_sample`, `val_cams_to_sample`, `prob_2d_only`, all three camera-count questions
+a one-camera root cannot ask. `2d.toml` adds NO `[data]` key at all. Resolution is **one level deep
+by design** (`checkpoints.load_config`): a chain of overlays would put the difference back out of
+sight, which is the thing the split exists to show.
 
 `[data].path` is either a dataset root (has `train/`, optionally `val/` and `test/`) or a folder
 whose children are dataset roots. In the second case keypoint names are prefixed with the dataset
-folder name (`rat-city-nose`) and one estimator trains across all of them; the keypoint embedding
-table is what makes this work.
+folder name and one estimator trains across all of them; the keypoint embedding table is what makes
+this work.
 
 `n_keypoints` is **derived** from the registry, never configured. The registry is written to the
-run folder as `keypoint_registry.toml` and read back at inference. Given an existing registry, a
-later run **appends** new names so old ids — and the embedding rows behind them — survive warm
-start. **That second half was false until `abef250`**: `_filter_shape_mismatch` drops a tensor
-whose shape changed *whole*, so growing the registry reset every trained row of
-`query_encoder.kpt_embed.weight` to noise and retrained it at `kpt_lr`. It was camouflaged because
-under `wide` most of `query_encoder.*` is expected to be dropped. `warm_start` now copies the
-base rows into the grown table, keyed on the base registry's own length — if that does not match
-the checkpoint's row count the table is not that registry's and the copy is **refused rather than
-guessed**, because a mis-applied row copy points each embedding row at a different body part.
+run folder as `keypoint_registry.toml` and read back at inference. A later run **appends** new
+names so old ids — and the embedding rows behind them — survive warm start. `warm_start` copies the
+base rows into the grown table keyed on the base registry's own length; if that does not match the
+checkpoint's row count the copy is **refused rather than guessed**, because a mis-applied row copy
+points each embedding row at a different body part. (`_filter_shape_mismatch` drops a tensor whose
+shape changed *whole*, so before this, growing the registry reset every trained row to noise.)
 
-A run folder also carries **`provenance.toml`** — the commit and a dirty flag at save time. It is
-there because a config is not a provenance record and gotcha 12 is what that cost.
+A run folder also carries **`provenance.toml`** — the commit and a dirty flag at save time. A
+config is not a provenance record, and gotcha 12 is what that cost.
 
 ### The architecture: two switches
 
 ```toml
 [model]
-query = "prior"           # per-keypoint prior + missing-query tokens (posetail-pose w9_honest)
+query = "prior"           # per-keypoint prior + missing-query tokens
 # query = "none"          # query-free: no prior at all
 query_encoder = "wide"    # 512-dim, identity + time, + two query terms iff query = "prior"
-# query_encoder = "pose"  # 256-dim, ten terms, 27 of 30 tensors inherited
+# query_encoder = "pose"  # 256-dim, ten terms
 ```
 
-They are **orthogonal**: `query` decides whether a prior is supplied, `query_encoder` decides
-which module consumes it. `wide`'s two query terms (`qpos`, `patch`) **default to** `query`,
-because under `query = "none"` the prior is never read, so `_query_ok` is all-False for the whole
-run and both terms collapse to constant no-query tokens feeding dead gate inputs. So `wide` +
-`none` is a 6-term encoder and `wide` + `prior` an 8-term one, and `wide` + `none` **is**
-golden's `j3`.
+They are **orthogonal**: `query` decides whether a prior is supplied, `query_encoder` decides which
+module consumes it. `wide`'s two query terms (`qpos`, `patch`) **default to** `query`, because under
+`query = "none"` the prior is never read and both terms would collapse to constant no-query tokens
+feeding dead gate inputs. So `wide` + `none` is a 6-term encoder and **is** golden's `j3`.
 
-Either term may be **overridden** — `query_pos_embedding = true, query_patch_embedding = false`
-is the 7-term `j4_prior` recipe, 3.317 mm allen cross-animal with the anchor gated off and the
-only non-anchor arm on record to beat golden j3's 3.394. Two combinations stay unbuildable, and
-`build_model` says which key is wrong: both terms off under `query = "prior"` (the prior would
-have no route into the encoder), and either term on under `query = "none"` (constant all run).
-They only apply to `wide`; naming one beside `pose` asserts rather than silently doing nothing.
+Either term may be **overridden** — `query_pos_embedding = true, query_patch_embedding = false` is
+the 7-term `j4_prior` recipe (3.317 mm allen cross-animal, the only non-anchor arm on record to beat
+golden j3's 3.394). Two combinations stay unbuildable and `build_model` says which key is wrong.
+They only apply to `wide`; naming one beside `pose` asserts rather than silently doing nothing —
+which is how six posetail-pose configs declared an anchor, trained, and were reported as anchored
+arms whose anchor was a literal no-op.
 
-`query = "prior"` carries a per-keypoint prior `kpt_prior (B,K,R)` plus `prompt_time (B,K)`.
-Every position-derived fusion term — `pos`, `patch`, `vis`, and `depth` in 3D on `pose`; `qpos`
-and `patch` on `wide` — carries a **learned no-query token** where a keypoint has no prior,
-instead of a value computed from the crop centre and presented as real. `prompt_dropout` is the
-fraction of **steps** that run fully query-free, drawn per item as the reference draws it, and
-`prompt_noise_px` is the jitter on the priors it keeps — **in pixels**, converted for 3D by
-`cube_scale` (world units per pixel), the same normalisation the metric losses use to enter the
-Huber in pixels. One scalar in each session's own units could not work: `allen-mouse-combined`
-alone holds 63 px sessions beside 14 mm ones. Ship it WITH the dropout — dropout alone is retired
-at +0.146 SIG worse on fly. The
-decode itself is per-keypoint independent — there is no attention across the query axis — but
-`scene_center`, `scene_radius` and `cube_scale` are derived from the WHOLE `coords_q` set
-(`tracker_encoder.py:318,356`) and scale the depth and 3D outputs. Measured on allen: a
-per-keypoint draw at p = 0.5 puts `scene_center` 13.6 mm from its deployment value (0 of 200 draws
-within 1 mm), where a per-item drop puts it at exactly 0. Per keypoint, the geometry the model
-meets at deployment is never trained. The instance-anchor
-machinery (`instance_anchor`, `anchor_mode`, `anchor_fallback`, `anchor_attn_bias`) is **deleted**,
-not defaulted off — including `j7`, the best row on record (3.140 allen cross-animal).
+`query = "prior"` carries a per-keypoint prior plus `prompt_time`. Every position-derived fusion
+term carries a **learned no-query token** where a keypoint has no prior, instead of a value computed
+from the crop centre and presented as real. `prompt_dropout` is the fraction of **steps** that run
+fully query-free; `prompt_noise_px` is the jitter on the priors it keeps — **in pixels**, converted
+for 3D by `cube_scale`, the same normalisation the metric losses use. One scalar in each session's
+own units could not work: `allen-mouse-combined` holds 63 px sessions beside 14 mm ones. Ship it
+WITH the dropout — dropout alone is retired at +0.146 SIG worse on fly.
 
-`wide` is the pre-port encoder, and the record says it wins **whenever no prior is supplied**:
-query-free, `pose`'s four distinguishing terms are computed from the same derived scene point for
-every keypoint, so they are constants and `pose` is a lower-capacity `wide`. Defaulting its two
-query terms to `query` also keeps the old wiring trap unrepresentable — `wide` with both terms off
-ignores `query_coords` entirely, which is how six posetail-pose configs declared an anchor,
-trained, and were reported as anchored arms whose anchor was a literal no-op.
+The decode is per-keypoint independent, but `scene_center`, `scene_radius` and `cube_scale` are
+derived from the WHOLE `coords_q` set — which is why `prompt_dropout` is drawn per ITEM and not per
+keypoint. Measured on allen: a per-keypoint draw at p = 0.5 puts `scene_center` 13.6 mm from its
+deployment value (0 of 200 draws within 1 mm); per item it is exactly 0. **Per keypoint, the
+geometry the model meets at deployment is never trained.**
+
+**`prompt_offset_px` is a WHOLE-BODY offset and it is the corruption with the shape of a deployment
+failure.** i.i.d. jitter averages to zero over the keypoint set, so it teaches the model to trust
+the prior's *centroid* exactly — the one quantity a whole-body lag gets wrong. Per keypoint the two
+are indistinguishable (0.7086 vs 0.7084 mm at sigma 8 px); they differ ONLY through the scalars
+that read the whole prior set, where a whole-body offset moves the centroid by the full lag while
+i.i.d. draws cancel to sigma/sqrt(K) — **6.6x apart at allen's K = 44**. Measured at 8.0 on allen
+3D: `prior_self` −0.277 mm [−0.395, −0.171] paired, and the carried prior's distortion of the
+motion cut 29x. **`base.toml` ships 5.0 on BOTH 2D and 3D as a consistency choice, not a measured
+optimum** — the mechanism is 3D-derived, so report 17 §7 argues it is *unmeasurable* in 2D rather
+than harmful there. Say so when reporting a 3D arm: it is no longer paired with the `offset8` result.
+
+The instance-anchor machinery is **deleted**, not defaulted off — including `j7`, the best row on
+record (3.140 allen cross-animal).
 
 `query_patch_embedding` builds its `PatchProcessor` at the base checkpoint's `embed_dim` and
-projects to the fusion width, so all ~5.4M of the pretrained patch CNN load by name. Building it
-at 512 instead would inherit 93k of 5.5M and silently retrain the rest from noise.
+projects to the fusion width, so all ~5.4M of the pretrained patch CNN load by name. Building it at
+512 instead would inherit 93k of 5.5M and silently retrain the rest from noise.
 
 ### The 3D output: `gridresid_offset`
 
 `output_mode = "gridresid"` reconstructs `world = query + R @ residual` with ONE anchor for the
-whole window (`tracker_encoder.py:736`). What that anchor is is a switch:
+whole window. What that anchor is is a switch:
 
-- **`gridresid_offset = "query"`** — the native structure, kept **per keypoint** only where a real
-  prior anchored it; every other keypoint falls back to that frame's own **triangulation**. Under
-  `query = "none"` that is every point, so the prediction is the triangulation outright and the
-  `grid` CE target is dropped (`losses.py:680` gates on `'grid' in outputs`).
-  **A COROLLARY THAT COSTS AN EXPERIMENT IF YOU MISS IT: query-free, `out_3d` never reaches the
-  output**, so every `[model]` key that only affects it — `grid_decode_space`, `log_3d_output`,
-  `head_3d_grid_radius`, the subpixel 3D refinement — is INERT under `--anchor none`. A sweep over
-  one of them there returns bit-identical numbers, and that is not evidence the key does not
-  matter. Probe them with `--anchor labels` (oracle) or a prompted arm.
-- **`gridresid_offset = "triangulated"`** — recover the residual and re-add it to **each frame's**
-  own triangulation, for every keypoint. This is posetail-pose's `_reanchor_per_frame`, which it
-  applies unconditionally (`model.py:756`), measured 2.07 → 1.37 mm within-session.
+- **`"query"`** — the native structure, kept **per keypoint** only where a real prior anchored it;
+  every other keypoint falls back to that frame's own **triangulation**. Under `query = "none"` that
+  is every point, so the prediction is the triangulation outright and the `grid` CE target is
+  dropped. **A COROLLARY THAT COSTS AN EXPERIMENT: query-free, `out_3d` never reaches the output**,
+  so every `[model]` key that only affects it — `grid_decode_space`, `log_3d_output`,
+  `head_3d_grid_radius`, the subpixel refinement — is INERT under `--anchor none`. A sweep over one
+  of them there returns bit-identical numbers, and that is not evidence the key does not matter.
+  Probe with `--anchor labels` or a prompted arm.
+- **`"triangulated"`** — recover the residual and re-add it to **each frame's** own triangulation,
+  for every keypoint (posetail-pose's `_reanchor_per_frame`, 2.07 → 1.37 mm within-session).
 
-Pair them with `query`: a residual measured from the query point only means something when the
-query is a real prior, and per-frame re-anchoring exists specifically to rescue a scene-centre
-anchor. So `prior` → `"query"` and `none` → `"triangulated"`, which also makes `wide` + `none` +
-`"triangulated"` a faithful **golden j3** architecture.
+Pair them with `query`: `prior` → `"query"`, `none` → `"triangulated"`. **`query = "prior"` +
+`"triangulated"` is REFUTED** at **+0.289 mm [+0.115, +0.473] worse**, with the prompt doing the
+least accuracy work of any arm — per-frame re-anchoring frees the motion by leaving no static anchor
+to distort, and costs the accuracy by leaving the prior nothing to contribute. The same property
+both times. **You cannot get per-frame freedom and a load-bearing prior from this one key.**
 
 **`gridresid_offset` HAS NO DEFAULT and an absent key raises.** The two values load the same
 tensors, so a checkpoint trained under one and built under the other produces numbers instead of an
-exception — measured at **+23.1 mm MPJPE and −0.18 MOTA** on 3dpop (report 13 §0b). Gotcha 12.
-`load_run(model_overrides=…)` / `scripts/infer.py --gridresid-offset` state the value for a run
-folder written before the key existed; that is an assertion about weights nobody recorded, and it
-is echoed as one.
+exception — measured at **+23.1 mm MPJPE and −0.18 MOTA**. Gotcha 12. `load_run(model_overrides=)`
+/ `--gridresid-offset` state the value for a run folder written before the key existed; that is an
+assertion about weights nobody recorded, and it is echoed as one.
 
-The substitution uses the **detached** triangulation, and that is also the loss gate: the direct
-term is then constant at unprompted points, contributing exactly zero gradient, so
-`coords_loss_direct*` and `coords_softmax_3d` supervise query points only — without forking
-`TotalLoss`. In 3D single-view there is no triangulation, so the substituted anchor is the
-conf-weighted **mean** of the back-projected rays (`_rays_fallback`) — not the library's
-`3d_pred_rays`, which is a weighted *sum*: `conf_pred_2d` is an unnormalised sigmoid and
-`tracker_encoder.py:637` never divides by it, so at one camera it lands about half way from the
-world origin to the animal.
+The substitution uses the **detached** triangulation, which is also the loss gate: the direct term
+is then constant at unprompted points, so `coords_loss_direct*` and `coords_softmax_3d` supervise
+query points only without forking `TotalLoss`. In 3D single-view there is no triangulation, so the
+substituted anchor is the conf-weighted **mean** of the back-projected rays — not the library's
+`3d_pred_rays`, which is a weighted *sum* (`conf_pred_2d` is an unnormalised sigmoid and nothing
+divides by it, so at one camera it lands about half way from the world origin to the animal).
 
 **Turning off the 3D CE means NaN-ing `grid['anchor_local']`, never popping `grid`.**
-`losses.py:680` gates `depth_softmax` — weight 1.5, the largest CE term in `w9.toml`, and
-query-*independent* — on the same `'grid' in outputs`, and `losses.py:458` reads `f_eff` out of
-the same dict to normalise the depth Huber. Measured on one unprompted window: popping took the
-depth CE from 6.24 to off and the depth Huber from 0.617 to 39.49, a 64× renormalisation. A
-non-finite anchor is the library's own off switch — `grid_softmax_loss` (`losses.py:45-52`) drops
-non-finite targets and returns 0 when all are dropped.
+`depth_softmax` — weight 1.5, the largest CE term, and query-*independent* — gates on the same
+`'grid' in outputs`, and the depth Huber reads `f_eff` out of the same dict. Measured on one window:
+popping took the depth CE from 6.24 to off and the depth Huber from 0.617 to 39.49, a 64x
+renormalisation. A non-finite anchor is the library's own off switch.
 
-**The shipped sweep is therefore a TWO-LEVER comparison** — `prior` and `none` differ in `query`
-*and* `gridresid_offset`. That is deliberate (each arm gets the offset its query implies) but it
-means a `prior` − `none` delta cannot be attributed to the prior alone. Say so when reporting it;
-eval rule 4, and `improvement_leads.md` opens by retracting a claim of exactly this shape.
-Isolating either lever needs a third arm.
+### The losses: five keys fire in 2D and the rest are 3D-only
 
-**Prompt corruption is REOPENED and `prompt_offset_px = 8` is MEASURED TO WORK** (report 13, step 6: three
-matched 60k allen arms). It beats a matched control by **−0.277 mm [−0.395, −0.171] paired** on the deployable
-`prior_self` pass (2.3275 against 2.5254; `checkpoint_last` agrees at 2.3051), and it cuts the carried prior's
-distortion of the motion by 29x — carry/none path ratio 1.034 against the control's 1.657, |r−1| 0.983 → 0.034.
-The inertness control passes: its prompt does the MOST accuracy work of any arm (self−none −0.366), so the prior
-is live rather than ignored. `prompt_stale_frames` is built and untested (step 1 measured staleness as not the
-failure mode). The reason is that i.i.d. jitter is not the failure
-deployment produces: Gaussian noise averages to zero over the keypoint set, so it teaches the model
-to trust the prior's **centroid** exactly — the one quantity a whole-body lag gets wrong. The lag is
-real (report 13 RC1: `--anchor carry` cost 23-39% of johnson-mouse's motion).
-**PER KEYPOINT THE TWO CORRUPTIONS ARE INDISTINGUISHABLE** — the decode has no attention across the query axis,
-so each keypoint sees only its own displacement and the marginals are identical (measured: 0.7086 vs 0.7084 mm
-at sigma = 8 px). They differ ONLY through the scalars that read the WHOLE prior set: `scene_center =
-nanmean(coords_q, dim=1)` (`tracker_encoder.py:356`) and `cube_scale` (`:318`), where a whole-body offset moves
-the centroid by the full lag while i.i.d. draws cancel to sigma/sqrt(K) — **6.6x apart at allen's K = 44**.
-Matching the aggregate with jitter alone needs sigma = 8*sqrt(44) ~ 53 px, 21% of a 256 px crop, which destroys
-the per-keypoint marginal; one knob cannot set both channels. **NOT yet shown: that this channel is where the
-gain comes from.** A `prompt_noise_px = 10, prompt_offset_px = 0` arm has `offset8`'s per-keypoint marginal
-(10 vs 8.4 px) and 1/6.6 of its scene perturbation — if it matches, `prompt_offset_px` is redundant and goes.
-That arm is DEFERRED BY DECISION, so the key ships with its effect measured and its mechanism unresolved. Wrong-animal is *not* built, and that is
-now a measurement rather than a shrug: `--oracle-corrupt other` displaces the prior by 1.65 crop
-widths (a different bird) and moves the output by 0.008 — alpha 0.005, 61% of frames not moving at
-all — because the bounds mask withdraws a prior that far outside the crop. A row swap's damage is the
-wrong CROP, not a wrong prompt. The measured echo is alpha ~ 0.48-0.56 for offsets of a quarter to a
-half of a crop width, collapsing to 0.10 at a full one as the mask starts firing, so the whole
-dynamic range of the drift sits inside the gap the mask does not cover. Bar for keeping either: **`prior_self` not regressing beyond ~2.48 mm on
-`allen-mouse-combined/val`'s five sessions** (scored through `scratch/allen_eval3/rollup.py`, `checkpoint_best`
-not `last`) *and* the carry/no-anchor path ratio moving toward 1. Ships WITH
-`prompt_dropout`.
-**A `motion_ratio` THAT REACHES 1 NEEDS AN INERTNESS CONTROL.** "carry moves as much as none" has two
-opposite readings — the prior stopped distorting the motion, or the prior went inert so `carry` ≈ `none`
-trivially — and the ratio cannot separate them. The control is whether the prompt still does accuracy work,
-`prior_self` minus `prior_none` on the same checkpoint. Report it beside any ratio near 1 or the ratio means
-nothing.
+`TotalLoss.forward` branches on `coords_true.shape[-1]`. The `R == 2` block computes
+`coords_loss_2d`, `coords_softmax_2d`, `smoothness_loss_2d` and the two smoothness shape keys;
+everything else is `_nan()`'d and dropped.
 
-**`motion_ratio` IS NOT SINGLE-SIGNED — check which regime a root is in before setting a threshold on it.** It
-reads LOCK where the animal moves and JITTER where it does not: the same reference run gives johnson
-carry/none = **0.757** (24% of the path lost, 3.66 mm/step) and allen val **1.983** (twice the path, 0.331
-mm/step, an 11x slower animal). The two are not comparable and must never be pooled. An allen-trained arm also
-cannot be scored on johnson at all (47 keypoints against 24), so a motion bar has to be set on the root the arm
-was trained on, as |ratio − 1|.
-**NOT against 3.394 mm.** That is golden's CROSS-ANIMAL figure and `allen-mouse-combined/val` cannot produce
-one — all five of its sessions are a seen animal on an unseen session, since the other 769890 sessions live in
-`train/`. `allen_sweep3_60k.md` says so explicitly; scoring against 3.394 compares two axes and calls the
-difference a result (eval rule 1).
+**SO NOTHING SUPERVISES VISIBILITY ON A 2D-ONLY RUN.** Both vis terms live in the 3D `else`, and
+`vis_loss_weight = 5.0` — the largest weight in the block — gets no gradient there. That, and not
+"the converter wrote every point VISIBLE", is why `--vis-thresh` cannot work on a 2D root: **the
+head it gates on was never trained** (report 24 §1.2).
 
-**`checkpoint_best` IS SELECTED ON `val`, THE PRIOR-FREE PASS** (`train.py:567`), not on `val_self`. Their
-argmins differ by up to 13,600 iterations in practice, so on any run whose deployable regime is prompted,
-`best` is not the checkpoint you want — and it penalises exactly the arm that trades query-free accuracy for
-prompted accuracy, which is what `prompt_offset_px` does by design. Score `best` AND `last`, and know that
-neither may sit at `argmin val_self`; a run that wants the prompted optimum needs `train.py` to select on
-`ms['mpjpe']` instead, which is a one-line change and a config key nobody has added.
+`conf_loss_weight`, `conf_2d_loss_weight` and `coords_loss_rays_weight` ship at 0.0 as documented
+off-switches for terms that do exist. `gamma`, `feature_loss_weight` and `pixel_thresh` were
+DELETED: the first two gate on outputs `TrackerEncoder` never emits (`coords_pred_iters` survives
+only as a comment in that file; `feature_planes_levels` does not appear at all), and the third feeds
+only the two conf losses. `coords_loss_direct_weight` is applied **twice**, so its effective weight
+is double what the config says.
 
-**The training-time signature to watch is `val` against `val_self`, not `val` alone.** `val` is the
-query-free forward and `val_self` re-queries at the model's own frame-0 prediction, i.e. the
-deployment-shaped path. With `prompt_offset_px = 8` the prompted path is better at every matched
-iteration — allen val_self 3.593 against the control's 3.673 at 15.4k, best-so-far 3.513 against 3.593 —
-paid for on the query-free path (3.968 against 3.904). So the offset buys ~0.08-0.09 mm where deployment
-lives for ~0.06 mm where it does not, which is the shape α ≈ 0.5 predicts. **Do not read this before ~15k
-iterations**: at 7.6k the control's prompt appeared to HURT (4.105 against 4.253) and by 15.4k it helped by
-0.231 mm, so an early read gives the opposite conclusion. Eval rule 5, learned again.
+### Synthetic camera motion
 
-**`query = "prior"` + `gridresid_offset = "triangulated"` is REFUTED at 60k, with its reason.** It reaches the
-best motion ratio of any arm (**1.003**) and is the WORST on accuracy: `prior_self` 2.6595, **+0.289 [+0.115,
-+0.473] paired worse than the control**, prompt doing the least work (−0.141). Per-frame re-anchoring frees the
-motion by leaving no static anchor to distort, and costs the accuracy by leaving the prior nothing to contribute
-— the same property both times. Do not use this pairing.
+`synth_motion_prob` / `_amp` / `_deg` / `_frames` (report 22). An annotated group carries ONE
+labelled frame in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus
+trains NO temporal machinery: `SmoothnessLoss` returns 0, temporal attention sees two frames one of
+which has no target. These keys emit T copies of the labelled frame and move the CAMERA over them —
+a smooth pan into `moving_boxes`' per-frame `shift`, a smooth roll into `ext` (3D) or the
+coordinates (2D). Every frame is a real crop of a real image and every label is exact, because a
+per-frame crop is a per-frame `offset` and that geometry was already built and tested.
 
-**The run-to-run floor on that axis is ~0.041 mm**, measured by accident: `control` is a verbatim copy of the
-reference config and landed 2.5254 against its 2.4843 (different `best` iterations, 53,200 vs 55,000, and
-nondeterministic training). n = 2, so an estimate not a variance — but it is why a `vs bar` column partly
-measures seed noise and why an arm-vs-arm PAIRED comparison is the sound one.
+**The point is not the label count, it is the CARRY shape**: every frame labelled makes
+`prompt_t = 0` fall out of the existing `finite.argmax(0)`, so frames 1..T-1 are supervised at a
+DISPLACED target — the first training signal shaped like what `--anchor carry` produces. Look for
+the effect in `prior_self`, not in the query-free pass.
 
-**The earlier training-curve read of this pairing, for the trail:** Its two paths come out nearly equal (4.258 / 4.235) and both worst: re-anchoring every
-keypoint per frame is exactly the property that would free the motion the carry loop locks, and exactly
-why the prior stops paying for itself. **You cannot get per-frame freedom and a load-bearing prior from
-this one key** — fixing the motion lock needs a mechanism that decouples them.
+**THE SMOOTHNESS TERM MUST BE OFF ON THOSE WINDOWS AND `_tune_smoothness` DOES IT.** In 3D a
+synthetic camera motion CANNOT move a world point, so `coords` is constant by construction,
+`d_true` is identically 0, and the hinge threshold is 0 — at weight 0.5 that penalises ANY predicted
+3D motion, i.e. the motion lock trained in on purpose. Turning it back on needs a FLOOR on the
+hinge first; that is a follow-up arm, not a leftover.
 
-**KEYPOINT-BASED IDENTITY: THE CUES ARE REAL AND EVERY MECHANISM PROPOSED TO SPEND THEM IS
-REFUTED** (report 19). Report 16 §9 ranked six coarse aggregate cues; all six are now measured.
-Items 1 (`--axis-veto`) and 2 (`--kpt-affinity`) beat their RATE-MATCHED RANDOM controls on `idsw`
-(-0.020 and -0.033, both SIG) and item 2 on `fp_dup` (-0.068) -- the first positive measurement of
-§9's central claim -- and both still LOSE against no veto at all (MOTA -0.257, -0.142), because
-rejection is the wrong currency on a matcher report 18 §5 measured as starved of candidates.
-**The veto verdict is measured on BOTH roots.** 3dpop should have been the friendliest case -- the
-cue is 3.4x more surgical there (5.98% of edges against 20.6%) AND the matcher is not starved -- and
-`--axis-veto 60` is SIG worse there on MPJPE (+0.77 mm), MOTA (-0.008), miss AND `idsw` (+0.0024).
-So the veto form is refuted rather than mis-thresholded. `--axis-veto 90` fires on 0.00% of edges and
-reproduces the baseline to four decimals on every column, which is the inertness control that makes
-the rest of it readable. Items 3
-and 6 are dead on population size (one birth per 97 frames under `--track`). Item 4 (`--kpt-centre`)
-is refuted on both roots: a keypoint centroid moves with POSE and a box centre does not, and
-articulation is not detector noise so it does not average down with K. Item 5 (`--swap-repair`)
-conserves every edge exactly as designed and makes `idsw` monotonically worse in its margin, because
-it triggers on the statistic §6 measured as a smoke alarm rather than a metric. **A statistic too
-coarse to rank arms is too coarse to trigger a per-frame action.** All five flags ship default-off
-with their fire rates printed.
+**`synth_motion_amp` IS IN BOX SIDES AND 0.35 IS MEASURED TOO HOT** — the pan walks the animal clean
+OUT of the crop on 34.8% of allen camera-windows and 22.8% of rat-city-annotated's, against a
+5.8%/0.0% baseline. A frame of empty bedding carrying full-strength targets is the detector-failure
+case, not the camera-pan case. 0.15 costs ~4 points over baseline for 0.21 sides of motion. **The
+RENDERS caught this and the centroid probe did not** — `motion/side` read a healthy 0.44 and said
+nothing about the animal leaving. Cost scales with T, so `synth_motion_frames` exists; match arms on
+ITERATIONS.
 
-**THE COST TERM WAS THE RECOMMENDED NEXT FORM. IT IS NOW BUILT AND ALSO REFUTED** (`--axis-cost W`,
-report 21 §6/§6b). Report 19 §14 argued the two surviving cues wanted to be spent *inside* the
-Hungarian, "where a wrong cue shifts a ranking rather than deleting a candidate", and that is the one
-form report 16 §9.2 never proposed. Built as an elementwise multiply between the affinity
-accumulation and the Hungarian, unable to raise a zero entry (a zero is INELIGIBLE, not merely
-expensive). It **buys nothing at any weight on either root**, and is harmful at K = 4 and at W = 1.0
-on K = 17. `W = 0` reproduces the baseline to four decimals, which is the inertness control. So the
-cue's *form* is not what was wrong: veto, permutation and cost term have now all been measured, and
-the ranking a K = 4 body axis supplies is too noisy to spend in any of them. **Do not re-propose a
-fourth form without first raising the cue's quality.**
+**UNMEASURED: no arm has trained past 12 iterations.** It is kept on that basis, not on evidence,
+and it is why `patches.py` and the moving-crop geometry survive.
 
-**THREE MORE 2D IDENTITY MECHANISMS, MEASURED ON A 57,594-FRAME CLIP** (report 21 §9, n = 116
-scoring units via `eval.py --chunk 500` — that benchmark is the session's real product; rat-city's
-whole test split is ONE 500-frame group and returned `DEGENERATE` on every delta ever measured
-there):
-
-- **`--pose-nms FRAC` WORKS, and it is the only identity lever in this repo that does.** maDLC's
-  `Assembly.intersection_with`: intersect two rows' boxes, take `min(kpts of A in B / |A|,
-  kpts of B in A / |B|)`, drop the lower-scored row above the threshold. **Deliberately not IoU**,
-  for the reason `--link-boxes` abandoned it. On rat-city **MOTA +0.0223 at 3-of-4**, `fp_dup`
-  −0.0196, `idsw` −0.0017; it **beats its rate-matched random control by +0.058 MOTA**, and at an
-  identical 4.54% rejection budget it costs **0.24 points of coverage against random's 4.08 (17x)**
-  and removes **3.7x more duplicates**. **`--pose-nms` IS QUANTISED BY K**: the overlap can only take
-  `{0, .25, .5, .75, 1}` at K = 4, so the flag has FIVE settings and `0.6` and `0.7` are
-  byte-identical — quote it as a COUNT ("3 of 4"), the `--min-match-kpts` trap again. **Harmful on
-  calms21**, which is at ceiling (idsw 0.0000 on all 19 groups), so it is root-conditional and
-  default-off.
-- **`--stitch GAP` (fragment locally, bridge globally) is REFUTED** — every column worse and the
-  window union crop blows up 4.2x, exactly the failure `--birth-age` produced. It is the GATE, not
-  the gap: shortening the gap 6x does not rescue it.
-- **A LEARNED IDENTITY HEAD IS REFUTED ON POPULATION, NOT ON THE CUE.** SLEAP's `ClassVectorsHead`
-  ported onto the detector stem (decoder features have identity deliberately removed). Trained on
-  `rat-city-tracked` it reaches **36.1% argmax against 8.3% chance**, and **25.1% restricted to the
-  animals whose next-frame centroid is genuinely contested** — real signal in both. But the centroid
-  alone already settles **98.8%** of frame-to-frame decisions (median runner-up is **163x** further
-  than the nearest), so a perfect-precision identity cost could flip **≤0.31% of associations**
-  against a ±0.023 MOTA seed floor. The logits are **not plumbed through** `detect_raw` → cache →
-  `associate_group`, and this is why.
-
-**AND `--overlap` COMPOSES WITH `--pose-nms` BY PLAIN ADDITIVITY — check that before sweeping a
-grid.** `--pose-nms` runs per frame inside `associate_group`, upstream of the window loop, so its
-fire rate is **byte-identical at overlap 4, 8 and 12** (22,148 of 1,547,535 at 3-of-4, all three).
-Summing the two one-lever deltas predicts the measured pair on every column at three thresholds,
-several exact to four decimals. Two consequences: the pair needs **no joint sweep**, and **"arm A
-makes arm B viable" is an artefact whenever B's fire rate is unchanged** — 2-of-4's MPJPE cost
-appeared to go from SIG to null under overlap 8, but its own cost never moved off +0.171 px; a
-constant −0.235 was added and the SUM crossed zero. The fire rate is what exposes it.
-
-**`moving_crop` END TO END IS MEASURED AND IT DOES NOT PAY** (report 23). Six one-key arms
-(`scratch/sweep4`) against the controls they were derived from, paired, ONE detection pass shared per
-root: **zero of six roots improve on MPJPE.** Three nulls (branson-fly −0.026 px, allen +0.030 mm,
-johnson +0.009 mm), two significantly WORSE (**rat-city +4.685 px [+1.97, +7.52]**, 3dpop +2.629 mm),
-one unreadable (calms21, §below). Coverage, MOTA, miss, fp and idsw are null on every root. **The one
-thing it moves is `motion_ratio`, and that is not a win**: the paired delta is positive on all six and
-significant on five (+0.008 to +0.498), i.e. it adds a roughly constant amount of path length, which
-lands 3dpop (0.940 → 1.031) and johnson (0.955 → 1.030) NEARER 1.0 by undoing part of RC1's motion
-lock and pushes every other root further past it. Motion back, accuracy nowhere — the `--seam blend`
-result again, and the second instance of "`motion_ratio` near 1 is necessary but not sufficient".
-**Keep the key, do not default it**: it is the geometry `synth_motion_*` rides on, and a synth window
-forces the moving-crop path regardless of `moving_crop`, so report 22's arm is untouched by this.
-
-**AND `best_mpjpe` FROM `log.jsonl` SAYS THE OPPOSITE, INVALIDLY.** The log makes the arm look
-−1.43 mm better on calms21 and −1.43 px better on rat-city, where the eval says rat-city is +4.69 px
-WORSE. `moving_crop` is a geometry choice and not an augmentation, so **it applies to val as well as
-train** (`dataset.py:90-91`) — deliberately, since a val crop unlike the deployment crop measures the
-wrong thing. The consequence nobody wrote down: **the two sides' val windows are DIFFERENT PIXELS, so
-their val curves share no axis and the difference between them is not a result.** Eval rule 2 in a
-costume, pointing the wrong way by 6 px. Never compare `best_mpjpe` across a `moving_crop` pair.
-
-**THREE OF THE SIX ARMS WERE UNFINISHED AND THAT CANNOT BE REPAIRED RETROSPECTIVELY** — 3dpop, allen
-and johnson at 43600 / 39600 / 37200 of 60000 against controls all `done` at 60000, with only `last`
-and `best` saved, so there is no 60k arm and no 39k control. So 3dpop's +2.629 mm is NOT attributable
-to the crop, the allen and johnson nulls are generous to the arm, and the verdict rests on the three
-MATCHED roots. Re-run those three at 60000 before anyone reopens this.
-
-**calms21 HAS A LIVE IDENTITY COLLAPSE THAT IS LARGER THAN THIS REPORT AND IS NOT THE CARRY LOOP.**
-On 1000 frames of one test session BOTH arms read ~115-119 px on 220 px mice, coverage 0.47, MOTA
-−1.000 on six of ten chunks, degrading monotonically from a perfect chunk 0. `--anchor none` on the
-identical clip and cache reads 117.3 against carry's 115.7 (indistinguishable, so not the loop) and
-boxes fill 0.864 of slots with the prediction 0.984 finite on both sides (so not the detector). It is
-the row path losing two heavily-overlapping mice over a long clip — calms21's FP split is 90%
-`fp_dup`. Any calms21 delta measured on top of that is uninformative.
-
-**SYNTHETIC CAMERA MOTION MAKES A ONE-LABEL WINDOW INTO A LABELLED VIDEO** (`synth_motion_prob`,
-`synth_motion_amp`, `synth_motion_deg`, `synth_motion_frames`; report 22). An annotated group carries
-ONE labelled frame in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus
-trains NO temporal machinery: `SmoothnessLoss` returns 0 (its stencil needs k+1 labelled frames),
-temporal attention sees two frames one of which has no target, and `moving_crop` is inert. These keys
-emit T copies of the labelled frame and move the CAMERA over them — a smooth pan into `moving_boxes`'
-per-frame `shift`, a smooth roll into `ext` (3D) or into the coordinates (2D). Every frame is a real
-crop of a real image and every label is exact, because a per-frame crop is a per-frame `offset` and
-that geometry was already built for `moving_crop`. **The point is not the label count, it is the CARRY
-shape**: every frame labelled makes `prompt_t = 0` fall out of the existing `finite.argmax(0)`, so
-frames 1..T-1 are supervised at a DISPLACED target — the first training signal here shaped like what
-`--anchor carry` produces. Look for the effect in `prior_self`, not in the query-free pass.
-
-**THE SMOOTHNESS TERM MUST BE OFF ON THOSE WINDOWS AND `_tune_smoothness` DOES IT.** In 3D a synthetic
-camera motion CANNOT move a world point, so `coords` is constant across the window by construction,
-`d_true` is identically 0, and the hinge threshold `1.5*|d_true|` is 0 — at weight 0.5 that penalises
-ANY predicted 3D motion, i.e. RC1's motion lock trained in on purpose. It is also the first time the
-term fires on annotated data at all. Turning it back on needs a FLOOR on the hinge first; that is the
-follow-up arm, not a leftover. **And a synth window forces the moving-crop path regardless of
-`moving_crop`** — a static crop has nowhere to put a trajectory — so `moving_crop = false` beside these
-keys means "non-synth windows keep the static per-window crop".
-
-**IT FIRES ON A WINDOW REACHING ONE LABEL, AND `first == last` IS NOT THAT TEST.** The gate is
-`near.size == 1`. `first == last` looks like the same question and is the opposite one: the wide-span
-fallback sets it when a window reaches MORE labels than T can span, which is the normal case on a
-densely tracked group. Gating on it froze **173 of 175 sampled rat-city-combined TRACKED windows** —
-the scene held still on precisely the windows that already had real motion — while the probe reported
-a healthy-looking 99% synth rate. **A synth RATE cannot tell you WHICH windows synthesised**; check it
-against `annot_frac`, which is what it must equal, and instrument by `label_source` if it does not.
-
-**`synth_motion_amp` IS IN BOX SIDES AND 0.35 IS MEASURED TOO HOT.** Share of camera-windows losing
-more than a quarter of their frames (`scratch/synthmotion/sweep_amp.py`): at 0.35, **36.0% on allen and
-39.4% on rat-city-combined**, against a 6.4%/0.0% baseline at 0 — the labels still follow the pixels
-exactly, but a frame of empty bedding carrying full-strength targets is the detector-failure case, not
-the camera-pan case. 0.15 costs 12.0%/12.1% for 0.22-0.28 sides of motion. **The RENDERS caught it and
-the centroid probe did not** — `motion/side` read a healthy 0.44 and said nothing about the animal
-leaving. Cost scales with T, so `synth_motion_frames` exists: at `annot_frac = 0.4` a root pays ~1.6x,
-a 100%-annotated one at T = 24 would pay 12x. Match arms on ITERATIONS.
-
-Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,
-`crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
-is a **two-lever** comparison (`j2_jitter`: wide *and* crop jitter, 60k iters, vs `p3_package`:
-pose, no jitter, **12k**). The one-key figure from that ledger is **3.535 vs 4.021**, unpaired,
-one seed each, no CI, never re-run.
+Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, `crop_side_mode`,
+`curriculum`, and `moving_crop`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
+is a **two-lever** comparison; the one-key figure is **3.535 vs 4.021**, unpaired, one seed, no CI,
+never re-run.
 
 ---
 
@@ -702,328 +371,153 @@ one seed each, no CI, never re-run.
 pixi run python scripts/infer.py --data <dataset|session|video> --run runs/<x>/ --out pred.npz
 ```
 
-There is **one** window loop. posetail-pose had three, and all three got it wrong differently.
-Box sources are the annotation set, a detections npz, or a per-dataset detector. Prompt regimes:
-`none` (query-free), `carry` (previous window's own prediction — what deployment does, requires
-`overlap >= 1`), `self` (two passes per window). Rendering is a flag, not a separate script.
+There is **one** window loop. posetail-pose had three and all three got it wrong differently. Box
+sources are the annotation set, a detections npz, or a per-dataset detector. Prompt regimes: `none`
+(query-free), `carry` (previous window's own prediction — what deployment does, requires
+`overlap >= 1`), `self` (two passes), `labels` (ORACLE, gated off by default, because in the project
+this descends from, ungated GT-derived priors inflated *every* anchored number ever published).
+Rendering is a flag, not a separate script.
 
-**`carry` feeds back the ANCHOR-FREE estimate, not the reported prediction** (`--carry-source`,
-default `triangulate`). Under `gridresid_offset = "query"` the reported 3D output *is*
-`query + R @ residual` with one anchor per keypoint for the whole window, so writing it back closes a
-loop with gain: whatever the prior was wrong by is re-added and only the residual carries new
-information. `3d_pred_triangulate` is re-derived from each window's own pixels
-every frame and is supervised on every keypoint, so carrying it changes no reported output and breaks
-only the feedback path. Worth, on 3dpop's two 480-frame hard clips, MPJPE −0.50 mm / coverage +0.0025 /
-MOTA +0.0041, all SIG, at +0.0011 of idsw — **but on the 58-group 120-frame protocol the same lever is a NULL
-on every column** (MPJPE −0.106 [−0.349, +0.160], MOTA +0.0011, idsw +0.0000, all n.s.), because 120 frames is
-five carry hand-offs and too few for a loop effect to accumulate. It stays the default on the deployment case
-and the mechanism (α ≈ 0.5, brake only at animal-sized error, 2D bit-identical, and it is what makes report
-12's R3 safe to build) — **not** on the protocol number. Quote −0.50 mm only with "2 groups, 480 frames"
-attached.
+### The measured defaults
 
-**Steps 3 and 7 share this shape, and it is a statement about the BENCHMARK.** Both target error that
-accumulates over a clip; report 11 §2's protocol is 120 frames, chosen so 58 groups fit in a GPU-hour; neither
-is confirmable on it. What this repo needs next is a long-clip protocol, not another lever.
+| flag | default | 2D | 3D | report |
+|---|---|---|---|---|
+| `--anchor` | `carry` | **measured harmful; see below** | good | 21 §9i |
+| `--overlap` | 4 | 12 is better and still climbing | **8 is the optimum** | 21 §9l, 13 |
+| `--crop-source` | `boxes` | **`boxes`** | **`keypoints`** (−0.45 mm) | 21 §4 |
+| `--det-score` | 0.99 | **per-checkpoint** | per-checkpoint | 21 §0b |
+| `--track` | on | **INERT** (`C > 1` gate) | on | 20 §0a |
+| `--carry-source` | `triangulate` | **INERT** (bit-identical) | on | 13 RC1 |
+| `--pose-nms` | off | +0.0223 MOTA on rat-city, **harmful on calms21** | untested | 21 §9k |
+| `--vis-thresh` | off | **cannot work** (untrained head) | +0.049 on 3dpop | 24 §1.2 |
+| `--refine` | off | helps calms21 PCK | loses to `--crop-source keypoints` at 2x compute | 11, 15 |
+| `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | | |
 
-**IT IS NOT THE FIX FOR THE MOTION LOSS, and the mechanism there is worth stating exactly.** `--anchor
-carry` does lose **23-39% of johnson-mouse's motion** against the same run with no anchor — and every
-consistency statistic in this repo *rewarded* that (best jerk 0.392 vs 0.507, best bone CV 0.148 vs
-0.251), because a locked pose is a smooth one. But switching what is carried recovers only 0.5-9.1% of
-the path (measured, report 13). The cause is query-anchoring itself: with ANY prior the output is
-`prior + R @ residual` off one anchor for the whole window, so all its temporal variation comes from
-the residual head, where `--anchor none` substitutes the per-frame triangulation. Only removing the
-prior or re-anchoring the output per frame can touch that, which makes it a `prior` + `triangulated`
-TRAINING question — the pre-`bcbfbc1` pairing — and an open one. **2D is bit-identical either way** — one camera has nothing to triangulate and the grid head
-decodes absolute pixel bins — which is checked on calms21 and rat-city and pinned as a test, and is
-what confines the risk of this to the 3D roots. `--carry-source pred` restores the old behaviour so
-the comparison stays available.
+**`--anchor carry` IN 2D COSTS +52.42 px MPJPE [+50.77, +54.05] AND −0.4563 MOTA** on rat-city's
+57,594-frame clip, and −9.144 px even on a 500-frame one. **The loop SATURATES rather than
+diverging** — it starts at the prior-free value, climbs ~5x over roughly the first 300 windows, then
+plateaus for the remaining 2,500 (slope −0.0032 px/window, zero burst windows). An unbounded loop is
+a stability bug that worsens indefinitely; a saturating one has a fixed cost you measure once. The
+brake is the bounds mask, which fires at about one crop width. In 3D the per-frame triangulation
+de-loops the feedback and the sign flips. **Use `--anchor none` for a long 2D deployment run.**
+`idsw` is the one column `carry` wins, which is a locked pose being a consistent one.
 
-**AND THE ERROR GROWS WITH CLIP LENGTH — measured against LABELS on 3dpop's 58-group protocol.** Matched
-MPJPE per window index over 120 frames: the published `3dpop-and` arm runs **30.8 → 44.6 → 66.3 → 67.5 →
-71.2 → 76.7 mm, +8.9 mm per window**, while the fixed arms are flat (+0.29 and +0.14). So report 11's 3D
-figures are wrong in a way that GROWS with clip length, and their 120-frame means are averages over a
-rising curve. That also settles what the johnson divergence below was: error, not refinement.
+**`--det-score 0.99` IS WRONG FOR ANY DETECTOR WHOSE OBJECTNESS IS NOT SATURATED.** 0.99 was chosen
+against detectors with 98.5% of boxes at exactly 1.0; the tiled/masked generation reads q01
+0.45–0.84 and loses two thirds of its detections to the same number — coverage **0.703 against 0.986
+at 0.50**, MOTA 0.622 against **0.723 at 0.97**. **Saturation is a property of the RECIPE, not the
+dataset** (`--ignore-band` re-saturated it), so no constant is right for both generations.
+`train_detector.py` records the val objectness quantiles in the checkpoint and `infer.py` **warns
+when the chosen threshold is at or above the median**. Sweep per checkpoint: 0.50 maximises
+coverage, 0.97 maximises identity. `decode` and `eval_detector.py` stay at 0.05 — they are the
+training and detector-scoring paths.
 
-**ON A LONG CLIP THE LOOP SATURATES — IT IS NOT UNBOUNDED, AND THAT WORD WAS WRONG.** Per-window
-divergence from the same run with no anchor grows without plateauing on two of johnson-mouse's three
-600-frame clips — 1.5-2.0 mm over the first five windows rising to 23 mm and 62 mm by the last,
-slopes of +6.1 and +2.1 mm/window over the second half, against a mouse whose longest bone is 33 mm.
-**BUT 600 FRAMES IS ~25 WINDOWS AND THAT IS THE CLIMB, NOT THE CURVE.** Report 21 §9i ran `carry`
-against `none` over rat-city's 57,594-frame clip — **2,880 windows, 115x longer** — and the error
-starts at the prior-free value (w0 14.31 px, indistinguishable from `none`), climbs ~5x over roughly
-the first 300 windows, then **PLATEAUS for the remaining 2,500**: slope **-0.0032 px/window**, last
-fifth **0.915x** the first, zero burst windows. The brake named below is what does it: the prior
-cannot drift past about one crop width, so the damage tops out there. An unbounded loop is a
-stability bug that worsens indefinitely; a saturating one has a fixed cost you measure once, and on
-rat-city that cost is **+52.42 px MPJPE [+50.77, +54.05] and -0.4563 MOTA** with `motion_ratio`
-**-0.459** (the carried prior costs 46% of the animal's path). Note the scale of the length effect:
-report 18 §6 measured `none - carry` at **-9.144 px** on the 500-frame clip, which ends during the
-climb; the same lever on the full clip is **-52 px, 5.7x larger**. `idsw` is the one column `carry`
-wins (-0.0031), which is a locked pose being a consistent one, not identity working. The de-loop reduces that growth by 0-31% and does not
-remove it. rat-city's TRAIN group is 57,594 frames, 96x these clips (its *test* group is 500 -- the
-split is by frame range over one recording, and the 57k figure is a format fact, not a test-clip
-length). So for a long deployment run
-prefer `--anchor none` until the architectural question above is settled, and say how short a clip any
-`carry` number came from. The only brake is the bounds mask, which fires at about one crop width and
-shows up in the trace as occasional windows of exactly 0.00 divergence.
+**`carry` feeds back the ANCHOR-FREE estimate** (`--carry-source`, default `triangulate`). Under
+`gridresid_offset = "query"` the reported output *is* `query + R @ residual`, so writing it back
+closes a loop with gain: whatever the prior was wrong by is re-added and only the residual carries
+new information. `3d_pred_triangulate` is re-derived from each window's own pixels and supervised on
+every keypoint, so carrying it changes no reported output and breaks only the feedback path. Worth
+−0.50 mm on 3dpop's two 480-frame hard clips — **and a NULL on the 58-group 120-frame protocol**,
+because 120 frames is five hand-offs and too few for a loop effect to accumulate. Quote −0.50 only
+with "2 groups, 480 frames" attached. **2D is bit-identical either way** and pinned as a test.
 
-Nothing in training or val exercises `carry`: the training prior is GT ± i.i.d. jitter or absent, and
-val runs `none` then `self` (one window, same pixels, qt = 0). **And until `1ba887b` "absent" was
-not the same forward as deployment's absent**: `prompt_dropout` NaNs `kpt_prior` but left
-`prompt_t` at each keypoint's first labelled frame (>0 on 19.5% of rat-city windows), while
-`embed_query_time` and `embed_gap` are UNCONDITIONAL fusion terms — unlike `patch`/`qpos` they
-carry no no-query token. So ~40% of a `prompt_dropout = 0.4` arm's steps trained a query-free
-forward that no deployment path produces, on a GT-derived input (eval rule 7). `model.py` now
-zeroes `qt` where the prior is absent, per keypoint, which also fixes the PARTIALLY prompted
-window that the bounds mask and `--prior-vis-thresh` actually produce. **Every prompted arm on
-record was trained under the old behaviour and is not paired with a new one** — the
-`prompt_offset_px` bar (`prior_self` ≤ ~2.48 mm) needs re-establishing with a paired re-run of
-`control` before anything is compared to 2.3275. Query-free arms and all `-none` siblings are
-bit-identical. `--oracle-corrupt` (with
-`--anchor labels`, diagnostic only) is how the echo coefficient is measured without a training run —
-a whole-body offset in **crop widths**, a stale-frame prior, or the neighbouring animal's.
+**IT IS NOT THE FIX FOR THE MOTION LOSS.** `--anchor carry` loses 23-39% of johnson-mouse's motion,
+and every consistency statistic *rewarded* that (a locked pose is a smooth one — best jerk 0.392 vs
+0.507, best bone CV 0.148 vs 0.251). Switching what is carried recovers only 0.5-9.1% of the path.
+The cause is query-anchoring itself: with ANY prior the output is `prior + R @ residual` off one
+anchor for the whole window, so all its temporal variation comes from the residual head. Only
+removing the prior or re-anchoring per frame can touch it, which makes it a TRAINING question and an
+open one.
 
-**`--seam blend` averages the overlap; `last` is the default and it is a real discontinuity.** Under
-last-write-wins a frame in the overlap is reported from the window that saw it with the LEAST
-left-context, and the switch repeats every `n_frames - overlap` frames. Measured as the one-frame
-displacement AT the boundary against the same statistic in a window's interior: **3.46x on 3dpop**
-(2.42 mm vs 0.70), 4.49x without the tracker, 2.33x on johnson-mouse, 1.24-1.45x on the 2D roots —
-and on the mismatched phase3 3dpop arm the seam p90 is **182 mm against an interior p90 of 2.4**. At
-30 fps that is a ~1.5 Hz sawtooth, which is what a "low-frequency" wobble looks like. `blend` is
-nan-aware, so a frame only one window decoded is that window's value exactly and coverage cannot fall.
-The gate is applied to the window's own decode BEFORE it is recorded, so a gated frame is left out of
-the mean rather than blanked and then averaged back in.
+**`--overlap`'s SIGN transfers across dimensionality and its OPTIMUM does not.** 3dpop has an
+interior optimum at 8 (−0.355 mm [−0.751, −0.063] SIG; overlap 12 is no better than 4, and overlap 2
+costs +0.460 mm and −0.011 MOTA). 2D is still improving at 12 (−0.408 px against overlap 4, where 8
+buys −0.235), at a small monotone identity cost. The optimum is the SEAM COUNT against the SEAM
+SIZE, and both terms depend on the clip's motion and animal count. **Sweep it per root.** Overlap 2
+and 4 give the SAME window count, so overlap 2's cost cannot be a context effect — only the carried
+frame index and the left-context differ, at identical compute.
 
-**MEASURED, AND IT DOES NOT WORK.** At overlap 4 on the 58-group protocol, blending is a no-op on error
-(MPJPE −0.0026 mm, n.s.) and slightly WORSE on identity (MOTA −0.0014, miss +0.0007, both SIG). The sign is
-the informative part: **a seam discontinuity is partly an IDENTITY discontinuity, and averaging identities is
-worse than picking one** — where two windows disagree about which animal a row is, their mean belongs to
-neither and can fall outside a match radius either one would have satisfied. So the seam is real and
-averaging is the wrong instrument: the fix has to resolve the disagreement, not split it, which is what
-`--track` does (seam ratio 2.67 → 2.45 with no blending). **`--seam blend` stays default-off** — that
-sentence is about blending, not about `--track`, which is ON.
-**Confirmed on a 4x stronger test**: at overlap 12, 80% of frames are averaged instead of 20%, and the harm
-SCALES (MOTA −0.0014 → −0.0020, miss +0.0007 → +0.0011) while MPJPE still does not improve (+0.005). What
-blending does do is move `motion_ratio` −0.016 SIG toward 1, because averaging smooths — so **`motion_ratio`
-near 1 is necessary but not sufficient**, and must be read beside the error and identity columns exactly as
-`err` must be read beside coverage. That is RC1's trap in mirror image.
-**Confirmed on a 4x stronger test**: at overlap 12, 80% of frames are averaged instead of 20%, and the harm
-SCALES (MOTA −0.0014 → −0.0020, miss +0.0007 → +0.0011) while MPJPE still does not improve (+0.005). What
-blending does do is move `motion_ratio` −0.016 SIG toward 1, because averaging smooths — so **`motion_ratio`
-near 1 is necessary but not sufficient**, and must be read beside the error and identity columns exactly as
-`err` must be read beside coverage. That is RC1's trap in mirror image.
+**`--pose-nms` IS THE ONE IDENTITY LEVER THAT WORKS.** maDLC's `Assembly.intersection_with`:
+intersect two rows' boxes, take `min(kpts of A in B / |A|, kpts of B in A / |B|)`, drop the
+lower-scored row above the threshold. **Deliberately not IoU**, for the reason `--link-boxes`
+abandoned it. On rat-city MOTA **+0.0223 [+0.0179, +0.0267]** at 3-of-4, beating its rate-matched
+random control by **+0.058** — at an identical rejection budget it costs 0.24 points of coverage
+against random's 4.08 (17x) and removes 3.7x more duplicates. **QUANTISED BY K**: the overlap can
+only take `{0,.25,.5,.75,1}` at K = 4, so the flag has five settings and `0.6` and `0.7` are
+byte-identical. **Quote it as a COUNT ("3 of 4").** Harmful on calms21, which is at ceiling —
+root-conditional and default-off. The discriminator is whether `fp_dup` is a live term to attack.
 
-The npz also carries **`box_agree`** (S,T,C) — the predicted centroid's distance from the centre of
-the crop box that produced its pixels, in units of one box side, reprojected in 3D. The pipeline held
-two independent statements about where an animal is, the box and the pose, and nothing compared them.
-In animal-size units, so unlike `--vis-thresh`'s logit one value means the same thing on every root.
-And **`pred_tri`** / **`tri_degenerate`**, because every fix above rests on the triangulation and
-nothing had ever scored it.
+**`--pose-nms` COMPOSES WITH `--overlap` BY PLAIN ADDITIVITY.** It runs per frame inside
+`associate_group`, upstream of the window loop, so its fire rate is **byte-identical at overlap 4, 8
+and 12**. Summing the one-lever deltas predicts the measured pair on every column, several exact to
+four decimals. Two consequences: the pair needs **no joint sweep**, and **"arm A makes arm B viable"
+is an artefact whenever B's fire rate is unchanged** — 2-of-4's MPJPE cost appeared to go from SIG
+to null under overlap 8 while its own cost never moved; a constant was added and the SUM crossed
+zero. **Check additivity before sweeping a grid**; it turns an N×M grid into N+M.
 
-**`box_agree` IS A 3D DIAGNOSTIC. In 2D it is structurally bounded and says almost nothing** — the pose
-is decoded inside its own crop, so the centroid can be at most about half a box side from the centre by
-construction, and every 2D arm measures p99 0.31-0.56 with max 0.80. In 3D the pose is triangulated
-across cameras and its reprojection into any one camera can land anywhere, which is where values above
-one box side come from: 3dpop reads p99 0.451 with `--track` and **1.456** without, a significant paired
-delta. Report 13 retracts a pre-registered "rat-city p99 4.9 box-sides" that cannot occur in 2D.
+**`box_agree`** (S,T,C) is the predicted centroid's distance from its crop-box centre, in box sides,
+reprojected in 3D. The pipeline held two independent statements about where an animal is — the box
+and the pose — and nothing compared them. **It is a 3D DIAGNOSTIC**: in 2D the pose is decoded
+inside its own crop, so the centroid is at most about half a box side from the centre by
+construction (every 2D arm reads p99 0.31-0.56, max 0.80). In 3D the pose is triangulated and its
+reprojection into any one camera can land anywhere. As a row gate it works and is **portable where
+`--vis-thresh` is not** — no learned head, no per-dataset threshold — worth −0.29 mm and +0.007
+MOTA at 1.24% of rows on 3dpop, beating its rate-matched control at every threshold tried. Neither
+is a default and the rate-matched control is mandatory for both.
 
-**AS A ROW GATE IT WORKS, AND IT IS PORTABLE WHERE `--vis-thresh` IS NOT.** On the 58-group 3dpop protocol
-`box_agree > 0.5` drops 1.24% of rows for **−0.29 mm and +0.007 MOTA**, beating its rate-matched random
-control at every threshold tried (2.0 / 1.0 / 0.75 / 0.5). It is not strictly better than the incumbent —
-at comparable rates `vis_pred` wins on MOTA and `box_agree` on MPJPE — so they are complementary and
-combining them is the next arm. What it has that `vis_pred` cannot: no learned head and no per-dataset
-threshold, so it cannot fail the way calms21 does, where the converter writes every point `VISIBLE`, the
-head trained against an all-true target, and the gate is worth −0.037 to −0.123 MOTA. Neither is a default
-and the rate-matched control is mandatory for both.
+**A window that predicted nothing says why.** `run_group` writes an `outcome` per (animal, window) —
+`ok / no box / no camera / no points / crop failed / decode failed` — and the crop box it used. Five
+aborts wrote the same NaN before, so a coverage number could not be attributed to a cause. On the
+long 2D clip **100% of coverage loss is `no box`** (24.89%, 0.0000 for every other outcome), which
+is what makes the crop path the biggest lever in the repo. The FP term is split too: `fp_dup` is a
+second prediction on a claimed animal and `fp_none` landed on nothing; they want opposite fixes. On
+3dpop `fp_none` is ~10x `fp_dup` (4 cameras, low overlap) and on calms21 90% is `fp_dup` (two mice,
+heavy overlap) — **opposite conclusions from one undifferentiated `fp_rate`.**
+
+**`soft_argmax_threshold = 60` IS LOAD-BEARING — do not widen it.** It masks the softmax to
+`|argmax - index| <= 60` of the shipped 1024 bins. It reads like a bias that pulls extremities
+inward, and it does move them — but swept against the labels it is the OPTIMUM:
+10/20/30/45/**60**/120/∞ read 8.114/8.032/7.991/7.981/**7.976**/8.374/**11.032** mm. Removing the
+truncation costs +3.06 mm (38%): it suppresses spurious far modes rather than introducing a bias,
+and 256 and ∞ are identical so the posterior never spreads further. A plain attribute, not in any
+`state_dict`, so it is sweepable with no retrain — which is how this was settled, and it is settled.
+
+**`grid_decode_space = "warped"` is the RIGHT value and the library's default is not.** `"head"`
+averages the convex-spaced bin centres directly and overshoots through the warp at large motion;
+`"warped"` averages in the uniform space first and is overshoot-free. Reverting costs +0.19 mm
+(6.4%) at every quantile. Only measurable on a PROMPTED arm.
+
+**Do NOT put the window union box through `crop_box_for_points`.** 08 §1.3 asks for it on gotcha-8
+grounds and it is measured worse: 3dpop +3.06 mm and −0.032 MOTA, rat-city −0.040 MOTA. The union of
+per-frame crop-rule boxes is already near-square (aspect p50 1.03-1.15) and squaring it again grows
+the p90 box AREA by 82%. A detector box is already a crop-rule box, so the union already satisfies
+the `min_crop_dim` floor.
+
+**A GT crop is only an upper bound where the labels are dense.** rat-city labels 2.02 of its 4
+points per animal-frame, so its GT crop is built from one or two points and floors at 64 px — the
+detector arms beat it on MPJPE there. Everywhere labels are complete the GT crop wins wide:
++8.57 mm [+4.08, +14.02] on 3dpop and +14.93 px on calms21 — and calms21 is the control that settles
+it, being 2D, multi-animal and *heavier* overlap than rat-city. **The inversion is label sparsity
+and nothing else.** The "GT crop" row means different things on different roots; say which.
 
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw.
 
-**THE BOOTSTRAP RESAMPLES GROUPS, AND A LONG CLIP IS ONE GROUP** — so rat-city's whole test split,
-a single 500-frame group, returned `DEGENERATE (one group -- no interval exists)` on every delta ever
-measured there, and the roots this repo most wants long-clip numbers from are exactly the ones with
-the fewest groups. `--chunk N` splits each group into N-frame scoring units. Two things make it a
-resampling change rather than a metric change, and the second is not obvious: the chunks PARTITION
-the frames, and **the match radius is the whole group's** — sized per chunk it swung 27.6 to 101.9 px
-across ten chunks of one clip (3.7x), and chunks scored under different radii are not exchangeable,
-which is the one thing a bootstrap needs them to be. `--vs` chunks the second file too, or the two
-sides key on different names and the pairing reports `no shared groups`. Chunks of one clip are more
-alike than independent clips, so this is **within-clip** uncertainty and optimistic against the
-between-clip kind — say which one a number is (eval rule 1). Multi-animal rows report **matched** MPJPE: row
-index is not identity once boxes come from a detector, and scoring row-to-row measured 385 px on
-flies that are 30 px across. `--vs other.npz` pairs two prediction files over the groups both scored
-and the points **both matched** — including coverage and the FP split, because a delta over points
-only one arm attempted measures which arm declined more (eval rule 6).
+**THE BOOTSTRAP RESAMPLES GROUPS, AND A LONG CLIP IS ONE GROUP** — so rat-city's whole test split
+returns `DEGENERATE` on every delta ever measured there, and the roots this repo most wants
+long-clip numbers from have the fewest groups. `--chunk N` splits each group into N-frame scoring
+units. Two things make it a resampling change and not a metric change, and the second is not
+obvious: the chunks PARTITION the frames, and **the match radius is the whole group's** — sized per
+chunk it swung 27.6 to 101.9 px across ten chunks of one clip, and chunks scored under different
+radii are not exchangeable, which is the one thing a bootstrap needs. `--vs` chunks the second file
+too, or the two sides key on different names. Chunks of one clip are more alike than independent
+clips, so this is **within-clip** uncertainty and optimistic against the between-clip kind. Say
+which one a number is. Multi-animal rows report **matched** MPJPE: row index is not identity once
+boxes come from a detector, and scoring row-to-row measured 385 px on 30 px flies. `--vs` pairs two
+files over the groups both scored and the points **both matched** — including coverage and the FP
+split, because a delta over points only one arm attempted measures which arm declined more.
 
-**A window that predicted nothing says why.** `run_group` writes an `outcome` code per (animal,
-window) — `ok / no box / no camera / no points / crop failed / decode failed` — and the crop box it
-used. Five aborts wrote the same NaN before, so a coverage number could not be attributed to a cause.
-**This is what makes the row-matcher fix readable rather than alarming:** on the 58-group 3dpop protocol
-the fixed arm's `no box` RISES from 1.65% to 2.67% while its coverage rises 0.933 → 0.985 and MOTA by
-0.343, because an unmatched row is now left EMPTY where `free.pop(0)` used to fill it with an arbitrary
-other animal. Without the split, "refuses more windows" and "covers more points" are two unexplained
-numbers pointing opposite ways. The crop inflation behind it is a TAIL fix: median 200 → 190 px, p90 566 →
-317 (−44%), max 1912 → 1312.
-The FP term is split too: `fp_dup` is a second prediction on an animal something else already claimed
-and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `fp_none` is ~10×
-`fp_dup` on every arm, which is why cross-track arbitration is not worth building.
-
-### The three inference levers that are measured (dev/reports/11_inference_verified.md)
-
-- **`--det-score` DEFAULTS TO 0.99 AND THAT IS WRONG FOR THE CURRENT DETECTOR GENERATION.** The
-  premise below — "the objectness is saturated" — was TRUE of the detectors it was measured on and
-  is FALSE of the tiled/masked ones trained since: report 21 §0b measures q01 at **0.452–0.843**,
-  so 0.99 cuts through the middle of the bulk and keeps **26–33% of detections**. On the 500-frame
-  rat-city clip that reads coverage **0.703 at 0.99 against 0.986 at 0.50**, and MOTA 0.622 against
-  **0.723 at 0.97**. A 0.10 MOTA and 0.20 coverage gap against the shipped default.
-  **WHETHER A DETECTOR IS SATURATED IS A PROPERTY OF THE CHECKPOINT, NOT OF THE DATASET** — report
-  21 §7a shows `--ignore-band` re-saturating it — so there is no default that is right for both
-  generations and the number cannot simply be moved. Sweep it per checkpoint; `scripts/infer.py`
-  prints per-group box coverage, and a figure near 0.25 is this. The original measurement, still
-  true of its own generation, follows.
-
-  (was 0.05, which was never a considered value
-  — it is `decode`'s primitive floor inherited by the deployment path). The objectness is saturated —
-  98.5% of rat-city's boxes and 99.98% of 3dpop's sit at exactly 1.0 — so a sweep over 0.05–0.5 moves
-  1–3% of boxes and does nothing. At 0.99: MOTA **+0.074** [+0.009, +0.154] on 3dpop with MPJPE
-  −2.11 mm and coverage +0.010 also SIG, and +0.073 on rat-city, whose MOTA at the new default
-  (0.660) now beats its own GT-crop upper bound (0.635). **The size tracks how many boxes are
-  actually below the threshold** — 6–8% on those two, 0.9% on calms21, where it reads +0.012 n.s.
-  A detector whose scores are NOT saturated wants this lowered; `scripts/infer.py` prints per-group
-  box coverage so that shows up where it happens. `decode` and `eval_detector.py` stay at 0.05 —
-  they are the training and detector-scoring paths, and report 10's figures are all at 0.05.
-  `det_score` is unconditional in the box-cache stamp for exactly this reason: the stamp otherwise
-  records only non-defaults, so moving a default would let an old cache be reused silently.
-- **`--vis-thresh`. ITS rat-city NUMBER IS WITHDRAWN.** `vis_pred` was write-only. Read as a row
-  gate it is worth MOTA +0.049 [+0.011, +0.110] on 3dpop at 7.3% of rows — but the rat-city figure
-  below (0.601 → 0.628 at 14% of rows) **does not survive re-derivation and should not be quoted**.
-  Report 21 §5 re-ran it offline on a current run with the rate-matched random control mandatory at
-  every rate: **every gate costs MOTA**, the best of six is a wash (`kpt_agree > 0.5` at −0.027,
-  interval spanning zero), and `--vis-thresh` at a matched 14% reads **MOTA −0.126**. Two further
-  facts came with it: the logit is **not portable across RUNS, not merely across roots** — the value
-  6.0 quoted here drops **100% of rows** on a current run whose per-row median logit is −0.543 — and
-  the head does beat its rate-matched control on `idsw` and MPJPE, so it carries real signal and
-  still loses to keeping the rows. Retained below for the trail: 0.601 → 0.628 on rat-city at 14% —
-  and **−0.037 to −0.123 SIG on calms21**, whose converter writes every point `VISIBLE` so the head trained against
-  an all-true target (`occlusion_acc = 1.0`), and whose baseline coverage of 0.995 leaves almost
-  nothing junk to remove. So it is **dataset-conditional, not a default**, in two ways: the threshold
-  is a LOGIT with no portable value (medians +2.7 / +4.0 / +15.4 across the three roots), and the
-  lever itself can be negative. **Never quote it without the rate-matched random rejection of the
-  same number of rows** — any rejection flatters a mean over matched points, and the control is the
-  entire reason the number means anything. **Its measured justification is also not yet clean**: at
-  `eval.py --min-match-kpts 0` a predicted row that shares ONE keypoint with a GT row can win the
-  Hungarian on that keypoint alone, and this gate is precisely what makes rows sparse. Re-run it with
-  the guard on before quoting it again. An all-NaN-confidence row is no longer silently kept either
-  (`NaN < thresh` was False, so the row the model said least about was the one the gate could not
-  touch). **AND ITS VALUE IS A FUNCTION OF HOW BAD THE THING IT GATES IS.** Re-measured on the 58-group
-  protocol with a correctly-read run, 6.0 is worth **+0.009** MOTA for 0.001 of coverage against a
-  rate-matched random control that *costs* 0.017 MOTA and 2.5 points of coverage — about a fifth of the
-  +0.049 report 11 measured on the mismatched run, where there was far more junk to remove. Re-measure it
-  after any fix upstream of it. Its operating point also depends on the BOX PATH: on a non-tracker 3dpop
-  arm at this run's logit scale, 6.0 drops nothing at all (0.0000 of rows below it) while the `--track`
-  arm has 2.9% below it, because the tracker keeps the marginal — and therefore low-confidence — animals
-  alive.
-- **`--overlap`'s SIGN transfers across dimensionality and its OPTIMUM does not — 8 is 3dpop's
-  number, and porting it to a 2D root leaves most of the gain on the table.** On rat-city's
-  57,594-frame clip (report 21 §9l) overlap 12 is roughly DOUBLE overlap 8 on every column it moves:
-  MPJPE −0.408 against −0.235, coverage +0.0142 against +0.0068, `miss` −0.0144 against −0.0066, all
-  SIG — i.e. 2D is still improving where 3D has already turned over. It stays a localisation lever
-  bought at a small monotone identity cost (`fp_dup` +0.0036 → +0.0057, `idsw` +0.0004 → +0.0010).
-  That is consistent with CLAUDE.md's own mechanism for the 3D optimum — the SEAM COUNT against the
-  SEAM SIZE — since both terms depend on the clip's motion and animal count. **Sweep it per root.**
-  (`--overlap 16` is running to find where 2D turns over.) The 3dpop sweep, unchanged:
-- **`--overlap` has an interior OPTIMUM at 8 ON 3dpop, and it buys LOCALISATION not recall.** Swept on 3dpop's
-  58-group protocol (one shared cache, everything else held): MPJPE **12.985 / 12.841 / 12.507 / 12.825 mm**
-  at overlap 2 / 4 / **8** / 12. Paired against the default, overlap 2 costs +0.460 mm, −0.011 MOTA and
-  +0.006 miss (all SIG); **overlap 8 buys −0.355 mm [−0.751, −0.063] SIG** and no MOTA back; overlap 12 is
-  no better than 4 (−0.049, n.s.). Coverage rises monotonically but trivially (+0.0005 at 12). Cost is
-  windows: ~17% more forwards from 4 to 8, cheaper than `--refine`'s 100%. **The opposite trade from
-  `--n-frames`** below, so do not sweep the two together.
-  **Overlap 2 and 4 give the SAME window count** (6 each over 120 frames -- `_window_starts` pulls the last
-  window back), so overlap 2's +0.460 mm and −0.011 MOTA cost the same compute and cannot be a context
-  effect: only the carried frame index and the left-context differ. That is the mechanism, at identical
-  cost. **This used to credit a "staleness budget", and that reading was wrong twice over.** The guard
-  (`infer.py:_build_prior`) spent a budget of `overlap` frames, so it fired identically at overlap 2 and
-  4 and cannot explain any difference between them — and worse, `-qt > overlap` only fires at all when
-  `n_frames > 2 * overlap`, so at the swept `--n-frames 24 --overlap 12` it never fired. `a13ab03`
-  replaces it with the invariant: `j = len(frames) - overlap` makes the carried frame the NEXT window's
-  start exactly, so consecutive windows give `qt == 0` and a NEGATIVE `qt` happens if and only if a
-  window was skipped. There is no budget — either the carried frame is inside this window or it predates
-  it. Overlap 2/4/8 are bit-identical under the fix; **the overlap-12 arms can move.**
-  **The optimum is the SEAM COUNT against the SEAM SIZE**: each seam shrinks with overlap (p50 3.95 → 3.24
-  mm, ratio 2.95 → 2.49) while the fraction of steps that ARE seams grows (0.042 → 0.067), and their product
-  bottoms out near 8. So `--seam blend`, which removes the per-seam jump, should move the optimum higher —
-  untested.
-- **`--n-frames` shorter is a trade, not a win.** 24 → 12 → 8 on 3dpop moves MOTA 0 → +0.106 → +0.130
-  and pck@10 0.103 → 0.074 → 0.067, monotonically in both directions, with MPJPE inside its interval
-  throughout. A shorter window shrinks the crop union AND cuts temporal context; the first buys
-  instance recall, the second pays for it.
-- **`--refine`** re-crops each window to the first pass's own prediction, label-free, at 2× the pose
-  compute. It improves every PCK threshold on all three roots (calms21 +0.028/+0.031/+0.021) and
-  leaves MPJPE, coverage and MOTA inside their intervals on both interval-bearing datasets. This is
-  the arm that shrinks the crop union WITHOUT shortening the window. It is now **bounded**: a refined
-  box that does not overlap the box it came from is rejected, because `crop_box_for_points` SQUARES
-  the extent and a pose that wandered lands somewhere else entirely (the giant squares in
-  `rat-city_best.npz`). And `crop` keeps the FIRST-PASS box — the refined one goes in `crop_refined`,
-  since `crop` is the only record of what the box source offered and every coverage and
-  crop-inflation number in reports 08 and 11 is computed from it.
-- **`--min-box-frames`** (default 1 = unchanged). One finite box out of T × C used to position a crop
-  for all 24 frames and mark every one `ok`: 3dpop reports 0.000 of (row, frame) with no pose against
-  2.1–2.2% with no camera at all. Raising it LOWERS reported coverage, which is the point; it moves
-  the same number the row matcher moves, so the two need separate arms.
-
-On 3dpop the first two together beat a 7.7×-compute detector (MPJPE 56.17 vs 56.91, MOTA 0.613 vs
-0.572) with no retraining.
-
-**EVERY 3D FIGURE IN REPORT 11 §2 IS A MISMATCHED READ (gotcha 12) AND IS SUPERSEDED.** On its own
-58-group protocol, the same detector and the same flags on a consistently-trained run read
-**MPJPE 12.87 mm [9.92, 17.21] against the published 59.30**, coverage 0.985 against 0.933, pck@10 0.605
-against 0.105, MOTA +0.343 [+0.243, +0.448] — paired over 56 scoring groups. `motion_ratio` goes 0.634 to
-1.111, i.e. the published arms travelled 63% of the labels' path. That is a many-lever delta (the run, the
-carry source, the box path, the guards); report 13 measures each. Do not compare a new arm against report
-11's absolute 3D numbers — regenerate the baseline.
-
-**`grid_decode_space = "warped"` is the RIGHT value and the library's default is not.** `"head"`
-averages the convex-spaced bin centres directly and overshoots through the warp at large motion;
-`"warped"` averages in the uniform warped space first and is overshoot-free. Reverting costs +0.19 mm
-(6.4%) at every quantile on an oracle-prompted 3dpop probe. Also a plain attribute with no buffers, so
-it is a runtime knob — but only measurable on a PROMPTED arm, since query-free the tensor it touches
-never reaches the output (see `gridresid_offset`).
-
-**`soft_argmax_threshold = 60` IS LOAD-BEARING — do not widen it.** `_grid_softmax` masks the softmax
-to `|argmax - index| <= threshold` bins, and the shipped runs set `head_3d_grid_size = 1024` (not the 64
-of the test config), so 60 is a window of 121 of 1024 bins — 12% of the grid, ±0.21 of the ±1.8
-head-unit radius. It reads like a bias that pulls extremities inward, and it does move them a lot
-(3dpop p50 5.88 mm, `bp_tail` 14.09, `bp_topKeel` 12.75, against 3.2-4.1 for body points) — but swept
-against the labels it is the OPTIMUM: 10/20/30/45/**60**/120/∞ read
-8.114/8.032/7.991/7.981/**7.976**/8.374/**11.032** mm. Removing the truncation costs +3.06 mm, 38%: it
-suppresses spurious far modes rather than introducing a bias, and 256 and ∞ are identical so the
-posterior never spreads further than that. It is a plain attribute, not in any `state_dict`, so it is
-sweepable at inference with no retrain — which is how this was settled, and it is settled.
-
-**Read the FP split per dataset before choosing a fix.** The detector's FP rise over the GT crop is
-91% `fp_none` on 3dpop (4 cameras, low overlap) and 90% `fp_dup` on calms21 (two mice, heavy
-overlap). Cross-track arbitration is therefore worthless on the first and addresses nearly the whole
-term on the second — opposite conclusions from one undifferentiated `fp_rate` of +0.029 either way.
-
-**Do NOT put the window union box through `crop_box_for_points`.** 08 §1.3 asks for it on gotcha-8
-grounds and it is measured worse: 3dpop +3.06 mm MPJPE and −0.032 MOTA, both SIG, and rat-city −0.040
-MOTA. The union of per-frame crop-rule boxes is already near-square (aspect median 1.047; report 13
-re-measures p50 1.03-1.15 across every arm, and identifies that report's "+82% p90 area" as the
-`associate` + `link_rows` regime specifically -- under `--track` the same figure is +19%, because a union
-that follows ONE animal is already square. Equal-area squaring would move a side by <=1.09x at p90
-there, so there is nothing left to win and no squaring rule is needed) and
-squaring it again grows the p90 box AREA by 82%. A detector box is already a crop-rule box, so the
-union already satisfies the `min_crop_dim` floor; and the rule cannot be reproduced from boxes anyway,
-because the per-frame extents that would be unioned before squaring are not recoverable.
-
-**A GT crop is only an upper bound where the labels are dense.** The crop rule follows the *labelled*
-keypoints, and rat-city labels 2.02 of its 4 per animal-frame, so its GT crop is built from one or two
-points and floors at 64 px — the detector arms beat it on MPJPE there. Everywhere the labels are
-complete the GT crop wins by a wide margin: +8.57 mm [+4.08, +14.02] on 3dpop (17 of 17) and
-+14.93 px [+9.06, +21.21] on calms21 (7 of 7). calms21 is the control that settles it — 2D,
-multi-animal and *heavier* overlap than rat-city, so **the inversion is label sparsity and nothing
-else**. The "GT crop" row means different things on different roots; say which.
+---
 
 ## The detector
 
@@ -1033,279 +527,213 @@ pixi run python scripts/infer.py --run runs/w9 --data <dataset> --detector runs/
 ```
 
 **One detector per dataset**, and `--input-wh` defaults to an aspect-matched size rather than a
-square. This is not fussiness: rat-city's frames are 2.29:1, so a square 416 letterbox wastes 56%
-of the canvas and delivers the median rat at 15.8 x 12.5 px — about 2 x 1.6 cells at stride 8 and
-absent from strides 16 and 32, so two thirds of the FPN cannot represent it. Same detector on
+square. This is not fussiness: rat-city's frames are 2.29:1, so a square 416 letterbox wastes 56% of
+the canvas and delivers the median rat at 15.8 x 12.5 px — about 2 x 1.6 cells at stride 8 and
+absent from strides 16 and 32, so two thirds of the FPN cannot represent it. The same detector on
 square 1024x1024 fly frames reaches AP50 0.985 where rat-city sits near 0.50.
 
-The regression target is `crop.crop_box_for_points`, i.e. the detector reproduces *the crop the
-pose model was trained on*, not "a box around the animal". `tests/test_detector.py` asserts that
-against the crop rule directly.
+The regression target is `crop.crop_box_for_points`, i.e. the detector reproduces *the crop the pose
+model was trained on*, not "a box around the animal". `tests/test_detector.py` asserts that against
+the crop rule directly. `--boxes` is part of that rule and a mismatch across the two models is a
+warning, not a failure — the best rat-city detector on record is `instances`-trained while every
+rat-city pose run is keypoint-trained, so the mismatched pair is worth running.
 
-`--boxes` is part of that rule, and **nothing used to check it across the two models**: a detector
-trained on `instances.pq` boxes serves a keypoint-trained pose run a different crop rule, silently.
-`scripts/infer.py` now warns and records `__box_source__` in the npz — a warning and not a failure,
-because `scratch/phase1/rat-city-inst` is the best rat-city detector on record (recall 0.531 vs 0.429)
-while every rat-city pose run is keypoint-trained, so the mismatched pair is worth running. Its delta
-against a matched pair moves two keys and is not a detector-quality result.
+**A DETECTOR ARM NEEDS A SAME-RECIPE REPLICATE, NOT JUST A PAIRED INTERVAL.** Four same-recipe runs
+spread val r@.5 by **0.0122** and best-iteration by 8,000, and a replicate with NO lever moves
+coverage +0.0575, miss −0.0619 and `kpt_agree` +0.1124, all SIG. **ONE arm against ONE baseline
+establishes nothing here, on any column.** Only effects larger than a whole seed survive. **AND A
+FIXED `--det-score` MEASURES CALIBRATION** whenever a lever moves the objectness distribution, so
+every arm must be re-scored at a matched threshold; several "significant" results have evaporated to
+this. Inference arms off a shared `--det-cache` are subject to neither.
+
+**`--use-regions` is the one detector lever with a positive accuracy result**: MOTA **+0.0489
+[+0.0079, +0.1010]**, entirely via `fp_none` −0.0576, at an idsw +0.0074 cost. Default-off.
+`--tile-wh` is what makes the mask viable — a hard mask on FULL-FRAME input is measured dead (a 69%
+positive rate among certified anchors against 0.68% unmasked, with 17% of frames carrying no
+certified negative at all). Both default off and they are ORTHOGONAL, so the untiled unmasked path
+is byte-identical — asserted, not assumed. **A TILE IS JUST A TRANSFORM**: a tile at source origin
+`(ox, oy)` at scale `s` is exactly the letterbox `(s, (-ox*s, -oy*s))`, so boxes, regions and the
+single `warpAffine` all tile by substituting it, and **inference is one whole-frame forward as
+before**. **`--tile-scale` IS A RESOLUTION KNOB**: positive rate among supervised anchors is 48.3%
+at 0.25 and 5.2% at 1.0 while certified *area* is scale-invariant, because `CENTER_RADIUS` is 2.5
+**cells**. **Ship tiles at scale 1.0, and DO NOT ALSO RESIZE THE TILE** — the invariant is the
+animal's size in INPUT pixels, and tiling-then-downscaling is the number-one reported failure.
+
+**A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE.** Gotcha 12's
+shape. Deployment letterboxes the whole frame at the same scale, so `tile_scale` rides in the
+checkpoint, `load_detector` **raises** if a tiled checkpoint lacks it, and the input is derived **per
+camera** (rat-city-annotated ships 4696x2048 beside 4500x2050).
+
+**`--rotate-deg` ships default-off and its 180-degree setting is REFUTED** — +3.33 px on hand labels
+and +1.28 px on the tracker clip, idsw ×1.7, err p99 +29.9, two roots and two label sources in one
+direction. The knob survives because that refutes one SETTING on one root, and because
+`_rotated_rect_max_inscribed` is 90-degree PERIODIC, so a smaller amplitude retains no more area and
+is a different trade rather than obviously a safer one. **In-training val recall disagreed with the
+end-to-end result in both directions three times**, so score a detector end to end.
 
 **`--link-boxes` is a per-frame Hungarian on CENTRE DISTANCE over the box side, gated at one side.**
-It used to be ungated IoU with a force-assign, and all three parts were wrong. IoU ranks by shape
-agreement, which is not identity — replaying calms21 frame 301→302 from the box cache, IoU scored the
-WRONG mouse at 0.512 against the right one's 0.233 (two touching 220 px mice overlap almost equally)
-and the pose error jumped from 4–10 px to 60–82 px; IoU is also exactly zero under fast motion, where
-it cannot rank at all. The gate at one box side has 10–16× headroom over real motion (p90 centre
-displacement is 0.06–0.11 body lengths on every multi-animal root) and rejects the 3.4–3.9% of 3dpop
-row transitions that jump beyond a body length. And an unmatched row now stays EMPTY instead of taking
-`free.pop(0)`, an arbitrary leftover: that was rat-city row 9, whose normal-sized boxes teleported
-across the arena and whose window union came out **1924×1924 against a 244 px rat**. Unclaimed
-detections may be born into an empty row; `last` expires after one window. **`LINK_REV` is in the
-`--det-cache` stamp** because the cache stores boxes that have already been linked, so changing this
-rule silently makes an old cache a different box set.
+It used to be ungated IoU with a force-assign and all three parts were wrong: IoU ranks by shape
+agreement, which is not identity — replaying calms21 frame 301→302, IoU scored the WRONG mouse at
+0.512 against the right one's 0.233, and the pose error jumped from 4-10 px to 60-82 px — and IoU is
+exactly zero under fast motion, where it cannot rank at all. The gate has 10-16x headroom over real
+motion (p90 centre displacement is 0.06-0.11 body lengths on every multi-animal root). An unmatched
+row now stays EMPTY instead of taking an arbitrary leftover: that was rat-city row 9, whose window
+union came out **1924x1924 against a 244 px rat**. **`LINK_REV` is in the `--det-cache` stamp.**
+*It is default-on and its paired arm has never been run.*
 
-**EVERY SENTENCE IN THIS `--track` BLOCK IS A 3D MULTIVIEW STATEMENT. `--track` IS STRUCTURALLY
-INERT ON EVERY 2D ROOT** — `detector/__init__.py:326` builds `CrossViewTracker` only when
-`track and C > 1`, and rat-city, calms21 and branson-fly are all `C == 1`. `associate` never runs
-there either; it is a cross-view pairwise search. **In 2D `associate_group` reduces to a truncation
-of the score-ordered `decode` survivors followed by `link_rows`**, so on a 2D root `--track` and
-`--no-track` are the same pass and every number below is unreachable. This is not a caveat about
-effect size — the code path does not execute. Say "2D" or "3D" before any sentence about `--track`,
-and never quote a 2D identity result without naming the root (branson-fly and calms21 are at
-ceiling — idsw 0.0000 — so rat-city is the only 2D root with an identity problem at all, and its GT
-is another tracker's output).
+**EVERY SENTENCE IN THIS `--track` BLOCK IS A 3D MULTIVIEW STATEMENT.** `--track` is structurally
+inert on every 2D root — `detector/__init__.py` builds `CrossViewTracker` only when `track and
+C > 1`, and rat-city, calms21 and branson-fly are all `C == 1`. `associate` never runs there either;
+it is a cross-view pairwise search. **In 2D `associate_group` reduces to a truncation of the
+score-ordered `decode` survivors followed by `link_rows`.** This is not a caveat about effect size —
+the code path does not execute. Say "2D" or "3D" before any sentence about `--track`, and never
+quote a 2D identity result without naming the root (branson-fly and calms21 are at ceiling, so
+rat-city is the only 2D root with an identity problem at all, and its GT is another tracker's
+output).
 
-**`--track` MADE EVERY BIRTH-TIME LEVER IRRELEVANT, and that is not obvious from the flag.** (3D.)
-`associate` now runs only on detections no existing target claimed, so births are **104 events in
-10,054 frames across 3dpop's five 10-pigeon clips -- 0.041% of all associations, one per 97 frames**
-(`scratch/p19/birth_rate.py`) — **that rate is 3dpop's and is not portable**: rat-city sees 7 births
-in 500 frames, and for an unrelated reason (`link_rows` seats a birth only into a row whose `last`
-is *entirely* non-finite, which takes `max_age = 24` frames). Any rule that fires at birth therefore has a ceiling of a few
-hundredths of a percent of associations, against a MOTA seed floor of +-0.023. Report 16 §9 ranked
-two proposals (a size veto at birth, a signed-mean epipolar residual) as items 3 and 6 while
-`associate` still ran every frame on every detection, where a birth-time test governed everything;
-the ranking was never re-derived after the default flipped. **Measure the POPULATION a lever governs
-before its selectivity** -- report 18 §2's "compute the ceiling first" in a different costume.
+**`--track` IS THE DEFAULT** (`--no-track` restores the memoryless pass), and **it is for LONG
+CLIPS, not for crowding.** Over 480 frames the memoryless pass grows +0.6 mm/window to 39.4 mm while
+the tracker holds 12-13 mm flat and is 5-8x faster; the union crop widens 193 → 230 px against 187,
+the worst crop halves (p99 750 → 376), and box slots filled rise 0.866 → 0.888. **So the error
+growth over a clip is the CROP degrading, not the prompt** — shown directly, not inferred. On the
+58-group 120-frame protocol none of the pre-registered endpoints move, because that benchmark is
+6 windows and too short to show the effect it fixes; on two crowded clips it reads −7.4 mm and
++0.089 MOTA, but those clips were selected FOR crowding and a stratification by animal count shows
+**no dose-response**. What it unambiguously buys is scale: the memoryless pass leaves 17.2% of
+offered boxes unclaimed and runs at **4.1 s/frame at C = 16** against ~0.6 ms, so any multi-animal
+16-camera rig is otherwise unrunnable. `associate` stays for BIRTHS, the one place a memoryless
+pairwise search is right. **`track` is UNCONDITIONAL in the `--det-cache` stamp**, so every cache
+written while it was off is REFUSED rather than reused as if it had been tracked.
 
-**`--track` IS THE DEFAULT** (`--no-track` restores the memoryless pass). That is a judgement call taken
-against the protocol numbers below and in favour of the per-window ones: over 480 frames the memoryless pass
-grows +0.6 mm/window to 39.4 mm while the tracker holds 12-13 mm flat, the union crop widens 193 → 230 px
-against 187, the worst crop halves (p99 750 → 376), box slots filled rise 0.866 → 0.888, and it is 5-8x
-faster. Deployment clips are long — rat-city's *train* group is 57,594 frames, 480x the benchmark; its
-test group is 500 — so the
-per-window behaviour is the one that governs. **`track` is UNCONDITIONAL in the `--det-cache` stamp** for the
-third instance of the `det_score` reason: its default moved, so every cache written while it was off carries
-no `track` entry and is now REFUSED rather than reused as if it had been tracked. Reproducing any arm from
-reports 10-12 or from `scratch/phase{5,7,8}` needs `--no-track`, and those scripts now pass it.
+**`--track` MADE EVERY BIRTH-TIME LEVER IRRELEVANT.** Births are 104 events in 10,054 frames —
+0.041% of associations, one per 97 frames — so any rule firing at birth has a ceiling of a few
+hundredths of a percent against a ±0.023 MOTA seed floor. **That rate is 3dpop's and is not
+portable** (rat-city sees 7 births in 500 frames, for an unrelated reason). **Measure the POPULATION
+a lever governs before its selectivity.**
 
-**What it does NOT buy, unchanged by the default flip.** On
-3dpop's own 58-group protocol, one lever against `associate` + `link_rows` rev 2, **none of report 12 §5's
-pre-registered primary endpoints moves**: coverage −0.0011, MOTA +0.0345, miss −0.0157, `fp_none` −0.0107,
-all n.s. What survives is MPJPE −2.62 [−6.69, −0.11], `motion_ratio` −0.037 and `box_agree` −0.0065 — small.
-On two crowded 10-bird clips it reads −7.4 mm and +0.089 MOTA, both SIG, but those clips were selected FOR
-crowding and a stratification by animal count shows **no dose-response** (MOTA significant only in the
-2-group 10-animal band; MPJPE significant in the 1-2 and 3-5 bands and not the crowded ones). Report 12
-§2.1's 17.2% unclaimed-box headroom does not translate because **41 of the 58 test groups hold 1-2
-animals**, where a memoryless pairwise search has almost nothing to get wrong: the headroom is real and
-rare, and a coverage claim needs a crowded benchmark 3dpop's test split does not provide. **USE IT FOR LONG CLIPS — that, and not crowding, is what it fixes.** Matched MPJPE per window over 480
-frames (24 windows): `associate` + `link_rows` runs 16.9 → **39.4 mm** at +0.6 mm/window whether the carry
-source is `pred` or `triangulate`, while `--track` holds **12-13 mm flat** (−0.02 mm/window) and is 3× better
-by the last window. So the error growth over a clip is the CROP degrading, not the prompt — shown directly, not just
-inferred: over the same 24 windows the median crop side goes **193 → 230 px (+19%, +1.13 px/window)** on both
-non-tracker arms and **190 → 187 (−0.19/window)** under the tracker, while `box_agree` barely moves, so the
-union is WIDENING rather than sliding off. (19% of crop growth does not by itself explain 133% of error
-growth; progressive identity drift is the likely remainder, and it is the same failure.) Report 11 §2's
-protocol is only **120 frames = 6 windows**, deliberately short, which is why the tracker reads insignificant
-there: the benchmark is too short to show the effect it fixes. rat-city's *train* group is 57,594 frames,
-480x that; the test group is 500 frames, which report 19 §2 is about. Quote it per window, not per arm.
-**What it DOES buy is crop discipline**: box slots filled 0.866 → 0.888 mean and 0.653 → 0.732 at p10 (so
-§2.1 was right about the BOXES), which does not convert to pose coverage because the union crop already
-rescued those rows from a single box — instead it halves the worst crop again (p99 750 → 376 px, max
-1312 → 570), which is what the significant `box_agree` (p99 0.603 → 0.332) and `motion_ratio` deltas
-measure. It refuses more windows too (`no box` 2.67% → 3.19%).
+**`min_views = 2` was never a threshold — it is the algorithm.** Every instance is built from a
+cross-camera PAIR, so `len(members) >= 2` holds by construction and the check could not fire.
+`min_views = 1` is a different rule that emits each leftover box as a single-view instance; on 3dpop
+it halves the `no box` outcome rate and moves no metric, because `associate` stops at the session's
+animal count and with four cameras it already fills every row. Whether the pose model can *use* a
+one-camera 3D window is the run's own `[data].prob_2d_only`, which is **0** in the shipped configs.
 
-**What it unambiguously buys is scale.** `detector/track.py`: ONE
-cross-view target set with one affinity and one Hungarian, replacing per-frame `associate` plus
-`link_rows`, which never exchanged anything with each other or with `carried`. Report 12 §2.1 measures
-the memoryless pass leaving **17.2% of offered boxes unclaimed** at 15 px jitter where target matching
-claims all of them, and §2.2 measures it at **4.1 s/frame at C = 16** against ~0.6 ms — johnson-mouse
-is a 16-camera rig, so any multi-animal 16-camera rig is currently unrunnable. `associate` stays for
-BIRTHS, which is the one place a memoryless pairwise search is right. The affinity is the reprojection
-distance of the target's held 3D point over the detection's box side — the same test as report 12's
-eq 4 point-to-ray, in the same units and with the same gate as `--link-boxes`, and with no `alpha_3d`
-constant to calibrate. Off by default until measured on 3dpop.
+**`--max-animals` / `--det-top-k`: sweep per root, never reason.** "S = animal count + 2" was
+measured **+0.112 MOTA** on a 500-frame clip and **does not reproduce at 115x the length** — the sign
+REVERSES and the magnitude is **37x smaller** (+0.0030), with coverage 48x smaller. The mechanism is
+in `fill`: on the short clip the spare rows FILLED and those fills were false positives; on the long
+clip the same ~7.8 rows are occupied at every S. It is also a SINGLE-CAMERA result: under `--track`
+at four cameras, S = 14 and S = 16 come out identical to four decimals, because the row count
+saturates once the tracker has claimed what it needs. **Measure the drop rate before porting a row
+count** — spare rows help exactly where the matcher cannot seat detections it was offered.
 
-**DETECTION AND ASSOCIATION ARE SPLIT, AND `--det-cache` NOW HOLDS RAW DETECTIONS.** `detect_raw`
-is pixels -> per-camera detections ranked by score; `associate_group` is the tracker / `associate` /
-`link_rows` half, microseconds per frame; `detect_group` is the composition and a test pins it
-byte-identical on every path. So every identity arm shares ONE detection pass and is matched BY
-CONSTRUCTION rather than by trusting the detector to be deterministic (eval rule 4), and `track`,
-`link_boxes`, `link_rev`, `max_animals`, `min_views`, `dup_res_px` and `max_move` all LEAVE the cache
-stamp -- they change nothing in the file. `raw_rev` is unconditional in their place and is the
-sharpest instance of the `det_score` trap yet: a raw cache and a pre-split associated one are the
-same shape, dtype and key names, so an old one read as raw would be associated a SECOND time,
-silently. Every pre-split cache is refused.
+**DETECTION AND ASSOCIATION ARE SPLIT, AND `--det-cache` HOLDS RAW DETECTIONS.** `detect_raw` is
+pixels → per-camera detections ranked by score; `associate_group` is the tracker/`associate`/
+`link_rows` half, microseconds per frame. So every identity arm shares ONE detection pass and is
+matched BY CONSTRUCTION rather than by trusting the detector to be deterministic, and `track`,
+`link_boxes`, `max_animals`, `min_views` and `max_move` all LEAVE the stamp — they change nothing in
+the file. `raw_rev` is unconditional in their place and is the sharpest instance of the trap: a raw
+cache and a pre-split associated one are the same shape, dtype and key names, so an old one read as
+raw would be associated a SECOND time, silently. **Every pre-split cache is refused.**
 
-**It also separates two levers `--max-animals` welded together** -- `decode`'s `top_k` and the row
-count `S`. `--det-top-k` sets the first alone, so `S` can be swept over one cache; that is what made
-report 18 §5's spare-rows result runnable end to end. **`S` = animal count + 2 was measured a strict
-win on rat-city** (MOTA +0.112, coverage +0.205, idsw -0.011, `fp_dup` flat; report 19 §3) --
-**AND THAT IS A 500-FRAME WITHIN-CLIP RESULT THAT DOES NOT REPRODUCE ON THE SAME ROOT AT 115x THE
-LENGTH.** Report 21 §9g re-ran it on rat-city's 57,594-frame train group, one lever off one cache,
-116 scoring units, 1.46M matched points: S = 12 minus S = 14 reads MOTA **+0.0030** [+0.0010,
-+0.0052] -- the sign REVERSED and the magnitude **37x smaller** -- with coverage +0.0043 against the
-+0.205 on record (48x smaller). Every column is significant and every column is negligible.
-The mechanism is in `fill`: on the 500-frame clip the spare rows FILLED (0.392 x 36 = 14.1 occupied)
-and those fills were false positives; on the long clip the same ~7.8 rows are occupied at every S
-and the extras stay empty. So the row count barely matters on this root, the +0.112 belongs to that
-clip rather than to rat-city, and the curve's non-monotonicity (S = 16 worse than 14 and 18) is a
-500-frame artefact too. **Sweep it on the long clip, do not reason about it, and do not carry the
-+0.112.**
+The stamp is the set of box-affecting options that **differ from their defaults**, deliberately: a
+positional list of every value meant that adding one flag refused every cache on disk, which
+happened three times in one afternoon and twice mid-sweep. `det_score`, `raw_rev`, `top_k`,
+`tile_scale` and `reduce` are unconditional — because **moving a default would otherwise let an old
+cache be reused silently**, which has now happened five times.
 
-**AND IT IS A SINGLE-CAMERA RESULT THAT DOES NOT REPLICATE UNDER `--track`.** Report 19 §11: on
-3dpop's five 10-pigeon clips, paired BETWEEN clips, spare rows buy MPJPE -0.57 mm and cost `fp_dup`,
-`fp_none` and `idsw` all SIG with MOTA a null -- and **S = 14 and S = 16 come out identical to four
-decimals**, because the row count saturates once the tracker has claimed what it needs. The
-difference is the box path, not the root. rat-city is ONE camera, where `link_rows` is the whole of
-identity and drops 34% of the detections it is offered; spare rows feed a starved matcher. 3dpop is
-four cameras under `--track`, where nothing is starved and an extra row fills with a false positive.
-So **measure the drop rate before porting the row count** (`scratch/phase11/probe_link.py`, seconds):
-spare rows help exactly where the matcher cannot seat detections it was offered, and nowhere else.
+**Every detector box is bounded in `unletterbox_boxes`.** `yolox.py` decodes a side as
+`exp(clamp(-6,6)) * stride` — up to ~12,910 px, ~137,000 source px after a 1/7 letterbox — and
+IoU-only NMS cannot suppress it (its IoU with the real box it swallows is ~0). Clamped into the
+frame; a box with no positive area comes back NaN, which every consumer reads as "no box here".
 
-**Every detector box is bounded in `unletterbox_boxes`.** `yolox.py:167` decodes a side as
-`exp(clamp(-6,6)) * stride` — up to ~12,910 px, ~137,000 source px after a 1/7 letterbox — and IoU-only
-NMS cannot suppress it (its IoU with the real box it swallows is ~0). Clamped into the frame; a box
-with no positive area comes back NaN, which every consumer already reads as "no box here".
-
-**`min_views = 2` in `associate` was never a threshold — it is the algorithm.** Every instance is
-built from a cross-camera PAIR, so `len(members) >= 2` holds by construction and the check could not
-fire. `min_views = 1` is a different rule that emits each leftover box as a single-view instance;
-`--dup-res-px` gates one that reprojects onto an instance already accepted in that camera, which is
-`fp_dup` rather than coverage. Both ship default-off: on 3dpop `min_views = 1` halves the `no box`
-outcome rate (0.016 → 0.008) and moves no metric, because `associate` stops at the session's animal
-count and with four cameras it already fills every row. And whether the pose model can *use* a
-one-camera 3D window is the run's own `[data].prob_2d_only` — 0.25 in the shipped 3dpop and rat-city
-runs, **0** in `configs/w9.toml`, where it would be an untrained input shape.
-
-Detection is the expensive half of a run, so `--det-cache` exists to share one box set across arms —
-which makes them matched by construction instead of by trusting the detector to be deterministic. Its
-stamp is the set of box-affecting options that **differ from their defaults**, deliberately: a
-positional list of every value meant that adding one flag refused every cache on disk, which happened
-three times in one afternoon and twice mid-sweep.
-
-**AND ITS COST IS THE VIDEO DECODE, NOT THE GPU — measured, report 14.** The YOLOX-Nano forward is
-0.86 ms per frame-camera against a 44 ms decode of one 3840x2160 MPEG-4 frame, 50x, and detection
-runs at 0-3% GPU no matter what. Four things were wrong and all four are fixed bit-identically
-(8,370 finite box values, 0 differ, so **no `--det-cache` stamp entry** — this is the same box set):
-`detect_group` converted uint8 to float ONE 0.5 MP FRAME AT A TIME through torch, whose intraop pool
-is `nproc` wide, at **67 ms/frame against numpy's 1.0** and 62% of the whole pass; `_read_video` held
-ONE GLOBAL LOCK where the state is per container, so four cameras could not overlap (3.5x); the
-image-directory roots got no frame pool at all; and nothing was prefetched. 3dpop 136 s → 21 s
-quiet, **471 s → 38 s on a busy host** (the old path's cost RISES with contention), CPU 1451% → 411%,
-RSS 85 → 18 GB; rat-city 3.0x; `infer.py` end to end 1.61x with the same fix in `decode_crops`.
-**Do not chase NVDEC here**: 3dpop and calms21 are both MPEG-4 Part 2, and at 3840x2160 that is
-32,400 macroblocks against NVDEC's 8,192 cap for that codec — an H100 cannot decode these files at
-all. decord's PyPI build has no CUDA and torchcodec has no build for torch 2.11. The remaining lever
-is process count, which just got ~5x cheaper per process.
+**THE COST OF DETECTION IS THE VIDEO DECODE, NOT THE GPU.** The YOLOX-Nano forward is 0.86 ms per
+frame-camera against a 44 ms decode of one 3840x2160 MPEG-4 frame, 50x, and detection runs at 0-3%
+GPU no matter what. Four things were wrong and all four are fixed bit-identically: a per-frame
+uint8→float conversion through torch, whose intraop pool is `nproc` wide, at **67 ms/frame against
+numpy's 1.0** and 62% of the whole pass; ONE GLOBAL LOCK on `_read_video` where the state is per
+container, so four cameras could not overlap; no frame pool on the image-directory roots; and no
+prefetch. 3dpop 136 s → 21 s quiet, **471 s → 38 s on a busy host** (the old path's cost RISES with
+contention), CPU 1451% → 411%, RSS 85 → 18 GB. **Do not chase NVDEC**: 3dpop and calms21 are both
+MPEG-4 Part 2, and at 3840x2160 that is 32,400 macroblocks against NVDEC's 8,192 cap for that codec
+— an H100 cannot decode these files at all. The remaining lever is process count.
 
 ---
 
 ## Gotchas — every one of these has already cost someone a day
 
-1. **T = 1 is not usable.** `posetail/posetail/encoder_decoder.py:748` computes
-   `gT = T // tubelet_size` → 0, so the pos_embed is zero-length; `tracker_encoder.py:518` has the
-   same shape. The fix existed on the abandoned `memory` branch
-   (`gT = feat.shape[1] // (gH*gW)`) and was **lost in the moving-cams merge**. Never sample
-   fewer than 2 frames; single-frame groups are padded at ingest.
+1. **T = 1 is not usable.** `encoder_decoder.py:748` computes `gT = T // tubelet_size` → 0, so the
+   pos_embed is zero-length; `tracker_encoder.py:518` has the same shape. The fix existed on the
+   abandoned `memory` branch and was **lost in the moving-cams merge**. Never sample fewer than 2
+   frames; single-frame groups are padded at ingest.
 
    Relatedly, **a training window's T is derived, not configured.** `[data].n_frames` is only a
-   ceiling: `_frames` sizes each train window to the labelled span it covers, rounded up to an
-   even number (tubelet 2), floor 2. The annotated sessions carry ONE labelled frame per 65-frame
-   group, so a fixed T = 24 spent 24 encodes to supervise 1 — 40% of steps at `annot_frac = 0.4`.
-   Val and test still enumerate fixed `n_frames` windows, or the metric would not be comparable
-   across checkpoints. A train window may also be **strided**, by `[data].frame_strides` (default
-   `[1]`, i.e. off) — posetail's `interval`. The derived-T rule then runs on a lattice of spacing
-   s: only labels congruent to the anchor mod s are reachable, and T is capped by the room left on
-   *that* lattice, not the room from frame 0. `SmoothnessLoss` has no notion of dt — `torch.diff`
-   is an UNDIVIDED difference — so its k-th difference grows like `s^k` (256× at k = 4, s = 4) and
-   its magnitude would ride on a per-item draw. `_tune_smoothness` divides that out per batch,
-   reading the stride off `sample_info['stride']`. What it cannot fix, and what any
-   `frame_strides` arm must declare: the HINGE is scale-invariant, and striding genuinely loosens
-   it — the threshold tracks the trajectory's k-th derivative, which grows like `s^k`, while the
-   per-frame jitter it exists to catch is white and s-independent. **This used to be documented
-   backwards** ("effective weight rises with s"): the magnitude rose, the hinge got looser.
-   And **`SmoothnessLoss` raises below `smoothness_loss_order + 1` frames**
-   (`losses.py:1146` narrows by `T - k`), so `run_batch` clamps the order per batch; at T = 2 it
+   ceiling: `_frames` sizes each train window to the labelled span it covers, rounded up to an even
+   number (tubelet 2), floor 2. The annotated sessions carry ONE labelled frame per 65-frame group,
+   so a fixed T = 24 spent 24 encodes to supervise 1. Val and test still enumerate fixed `n_frames`
+   windows, or the metric would not be comparable across checkpoints. A train window may also be
+   **strided** by `[data].frame_strides` (default `[1]`); the derived-T rule then runs on a lattice
+   of spacing s, and T is capped by the room left on *that* lattice. `SmoothnessLoss` has no notion
+   of dt — `torch.diff` is an UNDIVIDED difference — so its k-th difference grows like `s^k` (256x
+   at k = 4, s = 4) and `_tune_smoothness` divides that out per batch. What it cannot fix, and what
+   any `frame_strides` arm must declare: the HINGE is scale-invariant, so **striding genuinely
+   loosens it** — the threshold tracks the trajectory's k-th derivative while the per-frame jitter
+   it exists to catch is white and s-independent. **This used to be documented backwards.** And
+   `SmoothnessLoss` raises below `order + 1` frames, so the order is clamped per batch; at T = 2 it
    degrades to a first difference rather than being disabled.
 2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x.**
    Encoder sharing for inference goes through `SceneRepresentation` directly, or the private
    `_forward_window` / `_decode_from_scene`.
-3. **`batch_size` is structurally 1.** `custom_collate` keeps only item 0's `cgroup`
-   (`posetail_dataset.py:398`) and the model takes one camera group per batch. This is why there
-   is no DDP. Known ceiling, not a bug to fix casually.
-4. **Keypoint identity ≠ array position.** The library drops keypoints with <2 valid frames, so
-   `N` shrinks and positions stop matching ids. The loader must never filter. This failure is
-   invisible in the loss curve.
+3. **`batch_size` is structurally 1.** `custom_collate` keeps only item 0's `cgroup` and the model
+   takes one camera group per batch. This is why there is no DDP. Known ceiling, not a bug to fix
+   casually.
+4. **Keypoint identity ≠ array position.** The library drops keypoints with <2 valid frames, so `N`
+   shrinks and positions stop matching ids. The loader must never filter. **This failure is
+   invisible in the loss curve.**
 5. **Keypoint ids ride in the occlusion channel**, and the stock `QueryEncoder` clamps
    `occlusion+1` into `[0,2]`. Never share that tensor between the two consumers.
 6. **`vis` and `vis_2d` are both-or-neither** — supplying one dies inside einops. And
    `get_eval_metrics` wants the trailing dim `(B,T,N,1)`.
 8. **The crop rule is exact, not approximate.** `crop.py` is lifted verbatim from posetail-pose's
-   verified copy (`crop_box_for_points` does not exist in 0.3.x — it was a `memory`-branch
-   method). A test asserts it is int32-exact against `crop_cgroup_to_points`. If that fails,
-   every detector number is invalid.
-9. **Moving-camera inference is not supported upstream.**
-   `inference_utils.load_camera_group_from_metadata` ignores `moving_cams` entirely; we build the
-   camera group ourselves via `format_camera_group(..., moving_ext={cam: (T,4,4)})`. Only
-   `TrackerEncoder` is moving-cam-safe — `ScorerEncoder` and `TrackerTapNext` shape-error on
-   `(T,3)` centres.
+   verified copy (`crop_box_for_points` does not exist in 0.3.x). A test asserts it is int32-exact
+   against `crop_cgroup_to_points`. If that fails, **every detector number is invalid.**
+9. **Moving-camera inference is not supported upstream.** `load_camera_group_from_metadata` ignores
+   `moving_cams` entirely; we build the camera group via `format_camera_group(..., moving_ext=)`.
+   Only `TrackerEncoder` is moving-cam-safe — `ScorerEncoder` and `TrackerTapNext` shape-error on
+   `(T,3)` centres. **No shipped root has a moving rig** — every `calibration.toml` reads
+   `moving = false` and no `extrinsics.pq` exists anywhere — so this path is exercised by nothing.
 10. **allen-mouse's npz is column-sorted.** `pose3d.npz['pose']` is ordered by
-   `sorted(f'{name}_{axis}')` while `keypoints` is name-sorted, which transposes all 8
-   `X` / `X-base` pairs — 16 of 47 keypoints. The converter applies the permutation once. Zipping
-   `pose` against `keypoints` silently mislabels them and nothing downstream notices.
-11. **Nothing in the parent process may decode video before the loader forks.** On a video-backed
-   root that initialises decord in the parent, and the forked workers then deadlock in a futex
-   while holding an open container: 0% GPU, ~0 worker CPU, no traceback, no timeout, forever.
-   `scripts/train.py` materialises its fixed val windows before the train loader's first `next()`
-   (`persistent_workers` forks there, not at construction), so it used to be the parent that
-   decoded; it now pulls them through a one-worker `DataLoader`, which is byte-identical because
-   `PoseDataset` seeds val items by index. Measured on calms21: hangs at every reader-cache size,
-   never hangs when the parent decodes nothing.
-   `scratch/calms21_loader_repro.py` isolates it in seconds, without the model.
-   **3dpop is video-backed too and survives it** — which is the only reason the five-dataset sweep
-   never hit this, and why "the sweep works" was not evidence that the pose loader was fork-safe.
-   Of the shipped roots only calms21 and 3dpop hold `.mp4`; the rest are image directories and
-   cannot trigger it — but **any** video-backed root can, including ones a converter makes later
-   (`scratch/johnson-mouse/.../johnson-mouse-combined` is 16 cameras of `.mp4`), so this is a
-   property of the pixels, not a list of four names.
+   `sorted(f'{name}_{axis}')` while `keypoints` is name-sorted, which transposes all 8 `X` /
+   `X-base` pairs — 16 of 47 keypoints. The converter applies the permutation once. Zipping `pose`
+   against `keypoints` silently mislabels them and nothing downstream notices.
+11. **Nothing in the parent process may decode video before the loader forks.** The forked workers
+   deadlock in a futex while holding an open container: 0% GPU, ~0 worker CPU, no traceback, no
+   timeout, forever. `scripts/train.py` materialises its fixed val windows before the train loader's
+   first `next()`, so it used to be the parent that decoded; it now pulls them through a one-worker
+   `DataLoader`, byte-identical because `PoseDataset` seeds val items by index.
+   `scratch/calms21_loader_repro.py` isolates it in seconds, without the model. **3dpop is
+   video-backed too and survives it** — which is the only reason the five-dataset sweep never hit
+   this, and why "the sweep works" was not evidence the pose loader was fork-safe. Any video-backed
+   root can trigger it, including ones a converter makes later: a property of the pixels, not a list
+   of names.
 
-   This is also why **the reader cache may never be sized by probing.** `_reader_cache_size`
-   (`dataset.py`) derives it from a camera count, a frame size and `get_worker_info()` — all
-   parsed-toml or in-process facts — because opening one `VideoReader` in the parent to measure
-   anything is the deadlock. A single process streaming windows gets `len(rig)`, a loader worker
-   gets 4, both clamped by half of physical RAM split across `num_workers`, and
-   `TAILCYCLENET_READER_CACHE` is an override rather than a per-dataset requirement. A cache below
-   the camera count misses on *every* call: a 16-camera rig at 4 ran detection 2.5× slower.
-
-   **DO NOT SET `TAILCYCLENET_READER_CACHE` BY HAND.** The sizing is automatic and it already
-   knows the two things that matter — the camera count and whether it is inside a loader worker.
-   Setting it on a command line is at best a no-op that repeats the derived value and at worst
-   silently overrides the per-worker clamp, which is the one thing standing between a 16-camera
-   rig and swapping. If a run needs a different cache the fix belongs in `_reader_cache_size`,
-   where it applies to every caller and is testable, not in one invocation's environment.
-
+   This is also why **the reader cache may never be sized by probing**: opening one `VideoReader` in
+   the parent to measure anything IS the deadlock. `_reader_cache_size` derives it from a camera
+   count, a frame size and `get_worker_info()` — all parsed-toml or in-process facts. **DO NOT SET
+   `TAILCYCLENET_READER_CACHE` BY HAND**: at best a no-op repeating the derived value, at worst it
+   overrides the per-worker clamp that stands between a 16-camera rig and swapping. A cache below
+   the camera count misses on *every* call (a 16-camera rig at 4 ran detection 2.5x slower). If a
+   run needs a different cache the fix belongs in `_reader_cache_size`, where it is testable.
 12. **A RUN FOLDER USED TO RECORD NO COMMIT, and one config key had a default it could not
    justify.** `runs/3dpop-prior` trained under unconditional per-frame re-anchoring, finished nine
-   hours before `bcbfbc1` replaced that with the query-anchored residual, and carries no
-   `gridresid_offset` — so `cfg.pop('gridresid_offset', 'query')` loaded it as the architecture it was
-   not trained as, for weeks, silently. It cost **+23.1 mm MPJPE [+22.3, +24.0] and −0.18 MOTA** on
-   3dpop against reading the same weights correctly, and the pose visibly lagged the animal until the
-   bounds mask dropped the prior and the fallback snapped it back to the triangulation it *was*
-   trained on. Both halves are now closed: `save_run_meta` writes `provenance.toml`, and the key
-   raises rather than defaulting. **The `-none` siblings are mismatched harder**: query-free,
-   `_query_anchored` substitutes the triangulation at every keypoint, so the residual head's output is
-   discarded outright. Keyless generations: `runs/*`, `runs/20260810/*`, `runs/20260810_1711/*`. 2D is
-   unaffected (`forward` returns at `model.py:300` before both offset paths), so rat-city and
-   branson-fly are keyless and harmless. Any 3D number published off those three needs re-checking.
+   hours before the commit that replaced it, and carries no `gridresid_offset` — so it loaded as the
+   architecture it was not trained as, for weeks, silently. **+23.1 mm MPJPE [+22.3, +24.0] and
+   −0.18 MOTA**, with the pose visibly lagging the animal until the bounds mask dropped the prior.
+   Both halves are now closed: `save_run_meta` writes `provenance.toml`, and the key raises rather
+   than defaulting. **The `-none` siblings are mismatched harder**: query-free, the triangulation is
+   substituted at every keypoint so the residual head's output is discarded outright. Keyless
+   generations: `runs/*`, `runs/20260810*`. 2D is unaffected (`forward` returns before both offset
+   paths). **Any 3D number published off those needs re-checking.**
 
 ---
 
@@ -1321,82 +749,118 @@ These are not style preferences; each one was learned by publishing a wrong numb
 4. **Match the controls.** An arm that differs in two keys measures neither.
 5. **A log statistic cannot tell you a run converged.** Use two pinned checkpoints on identical
    windows.
-6. **`err` is a mean over matched frames.** Decompose coverage before quoting any delta — a
-   method that predicts fewer, easier frames looks better and is not.
+6. **`err` is a mean over matched frames.** Decompose coverage before quoting any delta — a method
+   that predicts fewer, easier frames looks better and is not. *(Under a Hungarian row matcher this
+   INVERTS: deleting a good row leaves its GT to re-match against a worse one, so a rate-matched
+   random control costs +0.42 px MPJPE rather than gaining. Rejection is not free either way.)*
 7. **Anchor and prior inputs are GT-derived.** They must be gated off at eval by default. In
    posetail-pose their absence inflated *every* anchored number ever published there.
 8. Only MOTA replicates across seeds, and only above a ±0.023 seed floor.
 9. **The matcher itself can be fooled.** `match_instances`' cost is a mean over SHARED keypoints, so
    at `--min-match-kpts 0` a row sharing one keypoint is scored on that keypoint and can hijack a GT
-   row. It is a FRACTION of K, not a count — K is 4 on rat-city and 47 on allen. Default 0 keeps every
-   published number reproducible; any claim about a lever that changes row sparsity needs it on.
-   **But it is punitive at small K with sparse labels, so quote it with both.** rat-city has K = 4 and
-   labels 2.02 points per animal-frame, so 0.5 demands 2 shared points — nearly every labelled point —
-   and its absolute MOTA falls 0.587 → 0.092 while the *delta* between two arms barely moves
-   (+0.051 → +0.059). Use it for deltas, not for absolute MOTA, and never carry one value across roots
-   (0.25 rounds to 1 at K = 4, i.e. it is identical to 0 there).
+   row. It is a FRACTION of K, not a count — K is 4 on rat-city and 47 on allen. Default 0 keeps
+   every published number reproducible; any claim about a lever that changes row sparsity needs it
+   on. **But it is punitive at small K with sparse labels, so quote it with both**: rat-city's
+   absolute MOTA falls 0.587 → 0.092 at 0.5 while the *delta* between two arms barely moves
+   (+0.051 → +0.059). Use it for deltas, not absolutes, and never carry one value across roots
+   (0.25 rounds to 1 at K = 4, i.e. identical to 0 there).
 10. **Pairing is complete-case, which flatters the arm that failed more.** A group where either side
-   is non-finite leaves the comparison, so `paired_bootstrap` returns `n_dropped` and `eval.py --vs`
-   prints it. A delta over 9 of 17 groups is not a delta over 17.
-11. **A PER-WINDOW STATISTIC MUST USE THE SEAM RULE'S OWN FRAME->WINDOW ASSIGNMENT.** Under
-   `--seam last` a frame in an overlap belongs to the LAST window containing it, and any per-window
-   number must bin frames that way. Slicing `[start : start + n_frames]` instead hands every window
-   its neighbours' frames too, which SMOOTHS the per-window error: at `--overlap 8` it reported ZERO
-   burst windows on every 3dpop clip where the correct binning finds up to seven, at identical
+   is non-finite leaves the comparison, so `paired_bootstrap` returns `n_dropped` and `--vs` prints
+   it. A delta over 9 of 17 groups is not a delta over 17.
+11. **A PER-WINDOW STATISTIC MUST USE THE SEAM RULE'S OWN FRAME→WINDOW ASSIGNMENT.** A frame in an
+   overlap belongs to the LAST window containing it. Slicing `[start : start + n_frames]` instead
+   hands every window its neighbours' frames too, which SMOOTHS the per-window error: it reported
+   ZERO burst windows on every 3dpop clip where the correct binning finds up to seven, at identical
    indices. It reads as "the effect does not reproduce" rather than as a binning bug.
 12. **A LABEL-FREE IDENTITY STATISTIC IS A SMOKE ALARM, NOT A METRIC, and a SELF-NORMALISED one
-   ranks arms BACKWARDS.** Report 16 §9.1's proposal -- per row, the joint discontinuity where the
-   axis turn and the length change both exceed that ROW'S OWN p99 -- fails its own validation gate
-   with correlation **-0.621** against true `idsw`: a row swapping on every step has an enormous p99
-   so almost nothing exceeds it, and the memoryless box path scores BEST of six arms. Any
-   per-unit-normalised discontinuity measure inherits this. The ABSOLUTE form (median per-step axis
-   turn in degrees, no normalisation) passes the gate at **+0.982** -- the memoryless arm reads
-   41.56 deg against 21.64, because two unrelated animals differ by a uniform angle with median 45 --
-   but **excluding that one broken arm the correlation is -0.558 over five working arms.** So it
-   detects a box path that is BROKEN, with no labels and an enormous margin, and cannot rank two that
-   both WORK. Never score a lever on it. **And never score a cue on the statistic it optimises**:
-   `--axis-veto 60` has the lowest median axis turn of any arm by construction and 2.6x the
-   baseline's `idsw`.
-13. **There is now a temporal statistic, and there was not before.** `motion_ratio` / `path_length`,
-   paired over the steps both arms attempted. Every consistency number this repo had — jerk, bone CV —
-   *rewards* a prediction that stopped moving, which is how RC1 stayed invisible. And `box_agree` is
-   the pose-against-its-own-box check, in animal-size units.
+   ranks arms BACKWARDS** — correlation **−0.621** against true `idsw`, because a row swapping on
+   every step has an enormous p99 so almost nothing exceeds it, and the memoryless box path scores
+   BEST of six arms. Any per-unit-normalised discontinuity measure inherits this. The ABSOLUTE form
+   passes the gate at **+0.982** — but **excluding that one broken arm the correlation is −0.558
+   over five working arms**. So it detects a box path that is BROKEN, with no labels and an enormous
+   margin, and cannot rank two that both WORK. **And never score a cue on the statistic it
+   optimises.**
+13. **There is a temporal statistic and there was not before**: `motion_ratio`, paired over the steps
+   both arms attempted. Every consistency number this repo had — jerk, bone CV — *rewards* a
+   prediction that stopped moving, which is how the motion lock stayed invisible. **But
+   `motion_ratio` near 1 is necessary and NOT sufficient**: `--seam blend` moved it −0.016 toward 1
+   while making identity worse, and `moving_crop` moved it on all six roots while buying no accuracy
+   anywhere. Read it beside the error and identity columns, exactly as `err` must be read beside
+   coverage. **It is also not single-signed** — it reads LOCK where the animal moves (johnson 0.757)
+   and JITTER where it does not (allen 1.983, an 11x slower animal) — so set a bar as |ratio − 1| on
+   the root the arm was trained on, and never pool the two.
 
-Reproduction note: posetail-pose's `reports/golden_allen_j3.json` is an exact-reproduction
-contract for *that* pipeline. This repo will not match it bit-for-bit and should not claim to.
-The check here is a band: allen-mouse cross-animal MPJPE near 3.394 mm, human-vs-human baseline
-2.208 mm. A large gap is a port bug, and the first suspects are the allen column-sort permutation
-and the crop rule.
+Reproduction note: posetail-pose's `reports/golden_allen_j3.json` is an exact-reproduction contract
+for *that* pipeline. This repo will not match it bit-for-bit and should not claim to. The check is a
+band: allen-mouse cross-animal MPJPE near 3.394 mm, human-vs-human baseline 2.208 mm. A large gap is
+a port bug, and the first suspects are the allen column-sort permutation and the crop rule.
 
-**BUT NAME THE SPLIT WHEN YOU USE THAT BAND, because `allen-mouse-combined/val` CANNOT PRODUCE IT.** All five
-of its val sessions are a seen animal on an unseen session — the other 769890 sessions are in `train/` — so
-that root yields a seen-animal number (reference: `prior_self` 2.484, `prior_none` 2.642, `none` 2.786; golden
-on that axis is 2.274). 3.394 is a genuinely cross-animal figure and needs a split that holds an animal out.
-Report 13 corrected step 6's bar for exactly this: scoring a seen-animal arm against 3.394 compares two axes
-and reads the ~0.9 mm difference in axis as a result (eval rule 1).
+**BUT NAME THE SPLIT, because `allen-mouse-combined/val` CANNOT PRODUCE IT.** All five of its val
+sessions are a seen animal on an unseen session, so that root yields a seen-animal number
+(reference: `prior_self` 2.484, `prior_none` 2.642, `none` 2.786; golden on that axis is 2.274).
+3.394 is genuinely cross-animal and needs a split that holds an animal out. Scoring a seen-animal
+arm against 3.394 compares two axes and reads the ~0.9 mm difference in axis as a result.
+
+**`checkpoint_best` IS SELECTED ON `val`, THE PRIOR-FREE PASS**, not on `val_self`. Their argmins
+differ by up to 13,600 iterations in practice, so on any run whose deployable regime is prompted,
+`best` is not the checkpoint you want — and it penalises exactly the arm that trades query-free
+accuracy for prompted accuracy. Score `best` AND `last`.
 
 ---
 
 ## The deleted levers, in one line each
 
-Every one below was measured, refuted, and REMOVED on the `cleanup` branch (dev/reports/24). They
-are listed so nobody re-proposes one, and NOT described further — the measurement is in the report
-and the reason is at the deletion site.
+Every one below was measured, refuted, and REMOVED (`dev/reports/24_lever_audit_and_cleanup.md`).
+Listed so nobody re-proposes one; the measurement is in the report and the reason is at the deletion
+site.
 
 **Inference:** `--axis-veto`, `--kpt-affinity`, `--kpt-centre`, `--axis-cost`, `--swap-repair`,
 `--random-veto` (their rate-matched control), `--stitch`, `--dup-res-px`, `--prior-vis-thresh`,
 `--seam blend`, `--moving-crop`.
 **Detector training:** `--ignore-band`, `--ema-decay`, `--warmup-frac`, `--augment-photometric`,
 `--identity` / `--id-weight` (and the YOLOX identity head behind them).
-**Config:** `moving_crop`; the dead loss weights `gamma`, `feature_loss_weight`, `pixel_thresh`;
-the inert model keys `corr_radius`, `use_volume_embedding`, `occlusion_embedding`, `mode_3d`,
+**Config:** `moving_crop`; the dead loss weights `gamma`, `feature_loss_weight`, `pixel_thresh`; the
+inert model keys `corr_radius`, `use_volume_embedding`, `occlusion_embedding`, `mode_3d`,
 `cross_attn_dim`; and six `configs/datasets/*.toml` keys nothing ever read.
 
-**THE CUE IS REAL AND EVERY MECHANISM THAT SPENDS IT IS REFUTED — all three forms are now tried.**
-A veto, a permutation and a Hungarian cost term were each built, measured on BOTH roots and lost.
-Do not propose a fourth without first raising the cue's quality.
+**THE CUE IS REAL AND EVERY MECHANISM THAT SPENDS IT IS REFUTED — all three forms are now tried.** A
+veto, a permutation and a Hungarian cost term were each built, measured on BOTH roots and lost; the
+ranking a K = 4 body axis supplies is too noisy to spend in any of them. **Do not propose a fourth
+without first raising the cue's quality.** Two more are dead on POPULATION rather than on the cue: a
+learned identity head reaches 25.1% on genuinely contested decisions against 8.3% chance (39.6% at
+3x the training), but the centroid alone already settles 98.8%, so a perfect head could flip
+**≤0.31%** of associations; and SLEAP's `connect_single_track_breaks` fires **0 times in 57,593
+consecutive steps**. **When refuting a mechanism, refute it on the quantity a better model cannot
+change.**
 
-**`--pose-nms` is the one identity lever that works**, `--rotate-deg` survives with its 180-degree
-setting refuted, and `synth_motion_*` survives unmeasured — and is now the sole consumer of the
-moving-crop geometry, which is why `crop.moving_boxes`, `apply_crop_moving` and `patches.py` are
-still here.
+**`--pose-nms` is the one identity lever that works.** `--rotate-deg` survives with its 180-degree
+setting refuted. `synth_motion_*` survives **unmeasured**, and is the sole consumer of the
+moving-crop geometry.
+
+---
+
+## What is owed
+
+**Blocking.** Stand up the held-out long-clip protocol on `3dpop/test` and `calms21/test` — the data
+exists (see the format section) and this costs no lever, no dataset and no `eval.py` change. **calms21's "identity collapse" is an ARM, not the root** — report 24 §6 reaches **MOTA 1.000,
+coverage 1.0000, MPJPE 6.379 px** on two of its clips with `--anchor carry --link-boxes --track
+--refine`, reproduced end to end on current code. The collapsing arm (115 px, MOTA −1.0 on six of
+ten chunks) differs from it in FIVE levers — session, pose run, detector, `--refine`, clip length —
+so report 23 §2's "a delta measured on top of that is uninformative" is true of that arm and must
+not be generalised. What is owed is the one-lever test: `--refine` on the failing session, which
+shrinks exactly the crop §6c measures as wider than the two mice are apart.
+
+**Cheap, off artifacts already on disk.** `--pose-nms` on 3dpop K = 17 (~1 min CPU, and the only
+outstanding test of the `fp_dup`-must-be-live discriminator — **a rule that says in advance which
+roots a lever will help is worth more than the lever**); `--overlap 12 + --pose-nms 0.6`, predicted
+to displace the current recommendation; `--overlap 16`.
+
+**Larger.** `synth_motion_*` has never been trained. The pose loader's `aug_rotation_deg = 45` has
+no accuracy number in either dimension and is the one surviving unmeasured augmentation.
+`--link-boxes` is default-on and never measured. `link_rows`' `max_age = 24` and `birth_age` are
+pinned constants unreachable from any CLI that govern birth and expiry on a long clip.
+
+**THE BIGGEST LEVER IN THE REPO IS NOT A FLAG.** Pose on a GT crop is **19.3 px at coverage 1.000**
+against **44.7 px at 0.566** through the detector, and on the long clip 100% of coverage loss is
+`no box`. Every identity lever in reports 19-21 fought over ±0.02 MOTA while the box path costs
+25 px and 43% of coverage.

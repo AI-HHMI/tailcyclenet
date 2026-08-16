@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -568,9 +569,11 @@ def main():
                     print(f'{key}: detecting up to {n_det} per camera, {n_want} animal row(s)'
                           f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
                           flush=True)
+                    _t_det = time.time()
                     raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                                      score_thresh=args.det_score, reduce=det_red,
                                      max_frames=args.max_frames, tile_scale=det_tile)
+                    _det_secs = time.time() - _t_det
                     # A keypoint-trained detector fills a third array, cached under its own key.
                     # This does NOT change what an old cache is allowed to satisfy: a box-only arm
                     # never looks at it, and a keypoint-crop arm is refused above rather than served
@@ -582,6 +585,26 @@ def main():
                     if raw[2] is not None:
                         det_cache[f'{key}|kpt'] = raw[2]
                     cache_dirty = True
+                    # CHECKPOINT AN EXPENSIVE GROUP IMMEDIATELY, rather than only at the end of the
+                    # run. The end-of-run write below is still the one that matters for a short
+                    # protocol, but it held rat-city's 57,594-frame group -- 3h18m of decode, 62 GB
+                    # of JPEG -- in memory alone across a further ~3h pose pass, so any interruption
+                    # lost the entire detection. That cache IS the artifact the long-clip benchmark
+                    # exists to produce ("detect once, then every association arm is a CPU-minute"),
+                    # and it did not survive the run that creates it.
+                    #
+                    # GATED ON THE TIME THE DETECTION ACTUALLY TOOK, not on a frame count: 60 s is
+                    # "long enough that losing it would hurt", which is exactly the quantity in
+                    # question. A 58-group protocol detects each group in seconds and so writes
+                    # once, at the end, byte-identical to before; a single long group writes exactly
+                    # once, immediately. Only a root with many SLOW groups pays repeated
+                    # compression, and there it is buying back hours.
+                    if args.det_cache and _det_secs > 60.0:
+                        args.det_cache.parent.mkdir(parents=True, exist_ok=True)
+                        np.savez_compressed(args.det_cache, __stamp__=np.asarray(stamp),
+                                            **det_cache)
+                        print(f'{key}: detection took {_det_secs / 60:.1f} min -- checkpointed '
+                              f'{args.det_cache}', flush=True)
                 # THE ASSOCIATION HALF RUNS EVERY TIME, cached or not. It is microseconds per frame
                 # against 44 ms of 4K decode, so recomputing it costs nothing measurable and buys
                 # the property the cache exists for: two identity arms differ in exactly one lever

@@ -268,7 +268,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2, dup_res_px=None,
                     track=True, max_move=1.0, axis_veto_deg=None, kpt_affinity=None,
                     random_veto=None, seed=0, stats=None, kpt_centre=False, swap_repair=None,
-                    axis_cost=None):
+                    axis_cost=None, pose_nms=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     `raw` is `detect_raw`'s `(boxes, scores, kpts)`. Returns the same triple re-indexed so row `a`
@@ -381,6 +381,13 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2, d
                             stats=stats, kpt_centre=kpt_centre, axis_cost=axis_cost)
     elif stats is not None and tracker is not None:
         stats.update(tracker.vetoed)
+    # LEAD 1, AFTER ASSOCIATION: drop a row that is a duplicate of another row's animal, by
+    # maDLC's keypoint-containment overlap rather than by IoU. It runs here, on the finished
+    # assignment, because a duplicate is a property of the SEATED rows -- `decode`'s own NMS is
+    # per-box IoU before any row exists, and cannot see it.
+    if pose_nms is not None and kp is not None:
+        idy.pose_nms(out, kp, scores=sc, thresh=pose_nms, stats=stats)
+
     # ITEM 5, AFTER EVERYTHING ELSE AND OFFLINE. It re-seats rows rather than rejecting edges, so it
     # runs on the finished assignment and conserves every detection -- the property §4 identifies as
     # necessary. It NEEDS keypoints; without them it is a no-op rather than a silent identity pass.

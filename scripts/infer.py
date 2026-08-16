@@ -196,6 +196,15 @@ def main():
                          'control by construction rather than by a threshold that happens not to '
                          'fire. Default off. Report its fire rate beside any number, and pair it '
                          'against W = 0 -- NOT against a veto arm.')
+    ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
+                    help='INSTANCE-LEVEL NMS on the seated rows (report 20 lead 1, maDLC\'s '
+                         '`Assembly.intersection_with`). Drops the lower-scored of two rows whose '
+                         'keypoint-containment overlap `min(#kpts of A in B\'s box / |A|, ...)` '
+                         'exceeds FRAC; 0.8 is maDLC\'s value. NOT IoU -- two touching animals '
+                         'overlap almost equally by IoU and it is zero under fast motion. Aimed at '
+                         '`fp_dup`, which is 90%% of calms21\'s detector-minus-GT FP rise and ~10%% '
+                         'of 3dpop\'s, so expect it to matter on crowded-overlap roots and be a '
+                         'near-no-op elsewhere. Default off; its fire rate is printed.')
     ap.add_argument('--seed', type=int, default=0,
                     help='seed for --random-veto. The control needs to be repeatable and needs to '
                          'be runnable at several seeds, since one draw of a random rejection is one '
@@ -616,7 +625,7 @@ def main():
                     axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
                     random_veto=args.random_veto, seed=args.seed, stats=veto_stats,
                     kpt_centre=args.kpt_centre, swap_repair=args.swap_repair,
-                    axis_cost=args.axis_cost)
+                    axis_cost=args.axis_cost, pose_nms=args.pose_nms)
                 # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
                 # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
                 # whenever any cue is on, so an arm that silently never fired is visible as such

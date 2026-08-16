@@ -389,3 +389,67 @@ def demo():
 
 if __name__ == '__main__':
     demo()
+
+
+def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
+    """INSTANCE-LEVEL NMS on the pose rows. maDLC's rule, not IoU. Report 20 lead 1.
+
+    Per frame, for every pair of live rows, the overlap is
+
+        min(#kpts of A inside B's box / |A|,  #kpts of B inside A's box / |B|)
+
+    -- `Assembly.intersection_with` in DeepLabCut -- and above `thresh` the LOWER-SCORED row is
+    dropped. Modifies `boxes` (and `kpts`) in place; returns the number of rows dropped.
+
+    WHY NOT IoU, WHICH IS THE OBVIOUS CHOICE. The same reason `--link-boxes` abandoned it: two
+    touching animals overlap almost equally by IoU, and it is exactly zero under fast motion where
+    it cannot rank at all. Replaying calms21 frame 301->302, IoU scored the WRONG mouse at 0.512
+    against the right one's 0.233. A keypoint-containment fraction asks a different question -- "is
+    this row's animal the same animal as that row's" -- and degrades gracefully under occlusion,
+    where a box shrinks and IoU falls off a cliff.
+
+    WHAT IT IS FOR. `fp_dup` is a second prediction on an animal something else already claimed, and
+    nothing in this repo addresses duplicates at the INSTANCE level: the detector's own NMS is
+    per-box IoU inside `decode`, before any row assignment. On calms21 90% of the detector-minus-GT
+    FP rise is `fp_dup`, against ~10% on 3dpop -- the two roots want opposite fixes, so this is
+    aimed at the crowded-overlap case and should be a near-no-op on the sparse one.
+
+    ASYMMETRIC BY CONSTRUCTION, and the `min` is what makes it safe: a small animal wholly inside a
+    large animal's box scores 1.0 one way and a small fraction the other, so `min` keeps it -- two
+    animals, one occluding the other, are not duplicates. Only a genuine double-detection scores
+    high BOTH ways.
+    """
+    # NO dtype CONVERSION. `np.asarray(x, float)` on a float32 array returns a COPY, so every
+    # in-place drop below would land on a temporary and the caller would see nothing -- which is
+    # exactly what the first version did, and it looked like "the lever fires and changes nothing".
+    b, k = boxes, kpts
+    S, T = b.shape[0], b.shape[1]
+    sc = scores
+    dropped, pairs = 0, 0
+    if k is None:
+        return 0
+    for t in range(T):
+        live = [i for i in range(S) if np.isfinite(b[i, t, 0]).all()]
+        for ii, i in enumerate(live):
+            for j in live[ii + 1:]:
+                if not np.isfinite(b[i, t, 0]).all() or not np.isfinite(b[j, t, 0]).all():
+                    continue
+                a = kpt_in_box_frac(k[i, t, 0], b[j, t, 0])
+                c = kpt_in_box_frac(k[j, t, 0], b[i, t, 0])
+                if not (np.isfinite(a) and np.isfinite(c)):
+                    continue
+                ov = min(a, c)
+                pairs += 1
+                if ov <= thresh:
+                    continue
+                # Lower score loses; with no scores, the higher row index loses (stable).
+                si = -np.inf if sc is None else np.nanmax(sc[i, t])
+                sj = -np.inf if sc is None else np.nanmax(sc[j, t])
+                loser = j if (sj < si or (sj == si and j > i)) else i
+                b[loser, t] = np.nan
+                k[loser, t] = np.nan
+                dropped += 1
+    if stats is not None:
+        stats['nms_pairs'] = stats.get('nms_pairs', 0) + pairs
+        stats['nms_dropped'] = stats.get('nms_dropped', 0) + dropped
+    return dropped

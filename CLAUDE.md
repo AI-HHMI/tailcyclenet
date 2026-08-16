@@ -848,7 +848,16 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   arm at this run's logit scale, 6.0 drops nothing at all (0.0000 of rows below it) while the `--track`
   arm has 2.9% below it, because the tracker keeps the marginal — and therefore low-confidence — animals
   alive.
-- **`--overlap` has an interior OPTIMUM at 8, and it buys LOCALISATION not recall.** Swept on 3dpop's
+- **`--overlap`'s SIGN transfers across dimensionality and its OPTIMUM does not — 8 is 3dpop's
+  number, and porting it to a 2D root leaves most of the gain on the table.** On rat-city's
+  57,594-frame clip (report 21 §9l) overlap 12 is roughly DOUBLE overlap 8 on every column it moves:
+  MPJPE −0.408 against −0.235, coverage +0.0142 against +0.0068, `miss` −0.0144 against −0.0066, all
+  SIG — i.e. 2D is still improving where 3D has already turned over. It stays a localisation lever
+  bought at a small monotone identity cost (`fp_dup` +0.0036 → +0.0057, `idsw` +0.0004 → +0.0010).
+  That is consistent with CLAUDE.md's own mechanism for the 3D optimum — the SEAM COUNT against the
+  SEAM SIZE — since both terms depend on the clip's motion and animal count. **Sweep it per root.**
+  (`--overlap 16` is running to find where 2D turns over.) The 3dpop sweep, unchanged:
+- **`--overlap` has an interior OPTIMUM at 8 ON 3dpop, and it buys LOCALISATION not recall.** Swept on 3dpop's
   58-group protocol (one shared cache, everything else held): MPJPE **12.985 / 12.841 / 12.507 / 12.825 mm**
   at overlap 2 / 4 / **8** / 12. Paired against the default, overlap 2 costs +0.460 mm, −0.011 MOTA and
   +0.006 miss (all SIG); **overlap 8 buys −0.355 mm [−0.751, −0.063] SIG** and no MOTA back; overlap 12 is

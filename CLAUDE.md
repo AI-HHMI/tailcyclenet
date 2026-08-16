@@ -594,6 +594,41 @@ makes arm B viable" is an artefact whenever B's fire rate is unchanged** — 2-o
 appeared to go from SIG to null under overlap 8, but its own cost never moved off +0.171 px; a
 constant −0.235 was added and the SUM crossed zero. The fire rate is what exposes it.
 
+**`moving_crop` END TO END IS MEASURED AND IT DOES NOT PAY** (report 23). Six one-key arms
+(`scratch/sweep4`) against the controls they were derived from, paired, ONE detection pass shared per
+root: **zero of six roots improve on MPJPE.** Three nulls (branson-fly −0.026 px, allen +0.030 mm,
+johnson +0.009 mm), two significantly WORSE (**rat-city +4.685 px [+1.97, +7.52]**, 3dpop +2.629 mm),
+one unreadable (calms21, §below). Coverage, MOTA, miss, fp and idsw are null on every root. **The one
+thing it moves is `motion_ratio`, and that is not a win**: the paired delta is positive on all six and
+significant on five (+0.008 to +0.498), i.e. it adds a roughly constant amount of path length, which
+lands 3dpop (0.940 → 1.031) and johnson (0.955 → 1.030) NEARER 1.0 by undoing part of RC1's motion
+lock and pushes every other root further past it. Motion back, accuracy nowhere — the `--seam blend`
+result again, and the second instance of "`motion_ratio` near 1 is necessary but not sufficient".
+**Keep the key, do not default it**: it is the geometry `synth_motion_*` rides on, and a synth window
+forces the moving-crop path regardless of `moving_crop`, so report 22's arm is untouched by this.
+
+**AND `best_mpjpe` FROM `log.jsonl` SAYS THE OPPOSITE, INVALIDLY.** The log makes the arm look
+−1.43 mm better on calms21 and −1.43 px better on rat-city, where the eval says rat-city is +4.69 px
+WORSE. `moving_crop` is a geometry choice and not an augmentation, so **it applies to val as well as
+train** (`dataset.py:90-91`) — deliberately, since a val crop unlike the deployment crop measures the
+wrong thing. The consequence nobody wrote down: **the two sides' val windows are DIFFERENT PIXELS, so
+their val curves share no axis and the difference between them is not a result.** Eval rule 2 in a
+costume, pointing the wrong way by 6 px. Never compare `best_mpjpe` across a `moving_crop` pair.
+
+**THREE OF THE SIX ARMS WERE UNFINISHED AND THAT CANNOT BE REPAIRED RETROSPECTIVELY** — 3dpop, allen
+and johnson at 43600 / 39600 / 37200 of 60000 against controls all `done` at 60000, with only `last`
+and `best` saved, so there is no 60k arm and no 39k control. So 3dpop's +2.629 mm is NOT attributable
+to the crop, the allen and johnson nulls are generous to the arm, and the verdict rests on the three
+MATCHED roots. Re-run those three at 60000 before anyone reopens this.
+
+**calms21 HAS A LIVE IDENTITY COLLAPSE THAT IS LARGER THAN THIS REPORT AND IS NOT THE CARRY LOOP.**
+On 1000 frames of one test session BOTH arms read ~115-119 px on 220 px mice, coverage 0.47, MOTA
+−1.000 on six of ten chunks, degrading monotonically from a perfect chunk 0. `--anchor none` on the
+identical clip and cache reads 117.3 against carry's 115.7 (indistinguishable, so not the loop) and
+boxes fill 0.864 of slots with the prediction 0.984 finite on both sides (so not the detector). It is
+the row path losing two heavily-overlapping mice over a long clip — calms21's FP split is 90%
+`fp_dup`. Any calms21 delta measured on top of that is uninformative.
+
 **SYNTHETIC CAMERA MOTION MAKES A ONE-LABEL WINDOW INTO A LABELLED VIDEO** (`synth_motion_prob`,
 `synth_motion_amp`, `synth_motion_deg`, `synth_motion_frames`; report 22). An annotated group carries
 ONE labelled frame in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus
@@ -616,14 +651,22 @@ follow-up arm, not a leftover. **And a synth window forces the moving-crop path 
 `moving_crop`** — a static crop has nowhere to put a trajectory — so `moving_crop = false` beside these
 keys means "non-synth windows keep the static per-window crop".
 
-**`synth_motion_amp` IS IN BOX SIDES AND 0.35 IS MEASURED TOO HOT.** At 0.35 the pan walks the animal
-clean OUT of the crop on 34.8% of allen camera-windows and 22.8% of rat-city-annotated's, against a
-5.8%/0.0% baseline at 0 — the labels still follow the pixels exactly, but a frame of empty bedding
-carrying full-strength targets is the detector-failure case, not the camera-pan case. 0.15 costs ~4
-points over that baseline for 0.21 sides of motion (`scratch/synthmotion/sweep_amp.py`). **The RENDERS
-caught it and the centroid probe did not** — `motion/side` read a healthy 0.44 and said nothing about
-the animal leaving. Cost scales with T, so `synth_motion_frames` exists: allen's 40% annotated share is
-~1.6x, a 100%-annotated root at T = 24 would be 12x. Match arms on ITERATIONS.
+**IT FIRES ON A WINDOW REACHING ONE LABEL, AND `first == last` IS NOT THAT TEST.** The gate is
+`near.size == 1`. `first == last` looks like the same question and is the opposite one: the wide-span
+fallback sets it when a window reaches MORE labels than T can span, which is the normal case on a
+densely tracked group. Gating on it froze **173 of 175 sampled rat-city-combined TRACKED windows** —
+the scene held still on precisely the windows that already had real motion — while the probe reported
+a healthy-looking 99% synth rate. **A synth RATE cannot tell you WHICH windows synthesised**; check it
+against `annot_frac`, which is what it must equal, and instrument by `label_source` if it does not.
+
+**`synth_motion_amp` IS IN BOX SIDES AND 0.35 IS MEASURED TOO HOT.** Share of camera-windows losing
+more than a quarter of their frames (`scratch/synthmotion/sweep_amp.py`): at 0.35, **36.0% on allen and
+39.4% on rat-city-combined**, against a 6.4%/0.0% baseline at 0 — the labels still follow the pixels
+exactly, but a frame of empty bedding carrying full-strength targets is the detector-failure case, not
+the camera-pan case. 0.15 costs 12.0%/12.1% for 0.22-0.28 sides of motion. **The RENDERS caught it and
+the centroid probe did not** — `motion/side` read a healthy 0.44 and said nothing about the animal
+leaving. Cost scales with T, so `synth_motion_frames` exists: at `annot_frac = 0.4` a root pays ~1.6x,
+a 100%-annotated one at T = 24 would pay 12x. Match arms on ITERATIONS.
 
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops,
 `crop_side_mode`, `curriculum`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that

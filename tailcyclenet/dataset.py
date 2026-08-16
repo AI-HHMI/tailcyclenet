@@ -1101,26 +1101,35 @@ class PoseDataset(Dataset):
             near = labelled[(labelled > anchor - T * s) & (labelled < anchor + T * s)]
             near = near[(near - anchor) % s == 0]
             first, last = int(near[0]), int(near[-1])
-            T = _even_span((last - first) // s + 1, T)
-            if last - first > (T - 1) * s:
-                # The span is wider than the ceiling allows; no placement covers it, so fall back
-                # to the anchor and let the draw pick which end of the span it lands on.
-                first = last = anchor
             # SYNTHETIC CAMERA MOTION. This window reaches exactly ONE label, so the derived-T rule
             # is about to spend a T = 2 window supervising a single frame. Emit T copies of that
             # frame instead and let `_item` move the CAMERA over them: the scene is frozen, so
             # every frame is a real crop of a real image and every label is exact.
+            #
+            # THE TEST IS `near.size == 1`, AND `first == last` IS A DIFFERENT QUESTION THAT LOOKS
+            # LIKE THE SAME ONE. `first == last` is ALSO what the wide-span fallback below sets,
+            # and that fires when a window reaches MORE labels than T can span -- the opposite
+            # situation, and the normal one on a densely tracked group. Gating on it froze 173 of
+            # 175 sampled rat-city-combined TRACKED windows into synthetic ones, i.e. it destroyed
+            # the real motion on exactly the windows that had any, while the probe reported a
+            # healthy-looking 99% synth rate. Measured before the fix; `test_synth_motion_never_
+            # fires_on_a_densely_labelled_window` is what holds it.
             #
             # THE `> 0` GUARD IS WHAT MAKES THE CONTROL A CONTROL. With the key off, no draw is
             # taken and the rng stream is the one every run on record consumed, so a
             # `synth_motion_prob = 0` arm is bit-identical to a run predating these keys -- the
             # same preservation `aug_rotation_prob is None` makes below and `rotate_deg = 0` makes
             # in `detector/data.py`.
-            if first == last and self.cfg.synth_motion_prob > 0 \
+            if near.size == 1 and self.cfg.synth_motion_prob > 0 \
                     and rng.random() < self.cfg.synth_motion_prob:
                 T = _even_span(self.cfg.synth_motion_frames or self.cfg.n_frames,
                                self.cfg.n_frames)
                 return np.full(T, anchor, dtype=np.int64), True
+            T = _even_span((last - first) // s + 1, T)
+            if last - first > (T - 1) * s:
+                # The span is wider than the ceiling allows; no placement covers it, so fall back
+                # to the anchor and let the draw pick which end of the span it lands on.
+                first = last = anchor
             # Bounds that COVER first..last rather than merely containing the anchor -- sizing T
             # to a span and then placing the window off it would pay for frames it never reads.
             span = (T - 1) * s

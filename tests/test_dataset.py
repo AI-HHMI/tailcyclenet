@@ -1545,3 +1545,33 @@ def test_synth_motion_expands_a_single_label_window(single_label_root):
         v = item[0][0]
         assert any(not torch.equal(v[0], v[t]) for t in range(1, 8)), 'the crop never moved'
     assert seen, 'no synth window was produced -- the fixture has no single-label window'
+
+
+def test_synth_motion_never_fires_on_a_densely_labelled_window(dense_root):
+    """Synthesis must fire on a ONE-LABEL window and never on a densely-labelled one.
+
+    The condition is `near.size == 1`, and the near-miss that reads identically is `first == last`
+    -- which the WIDE-SPAN FALLBACK also sets, when a window reaches MORE labels than T can span.
+    That is the opposite situation and the normal one on a densely tracked group, so gating on it
+    inverts the feature: measured before the fix, 173 of 175 sampled rat-city-combined TRACKED
+    windows were frozen into synthetic ones, destroying the real motion on precisely the windows
+    that had any. The probe read a healthy-looking 99% synth rate throughout, because a synth rate
+    cannot tell you WHICH windows synthesised.
+
+    `dense_root` is 32 frames all labelled, so every window trips the fallback and none may
+    synthesise even at `synth_motion_prob = 1.0`.
+    """
+    cfg = LoaderConfig(n_frames=24, synth_motion_prob=1.0, synth_motion_amp=0.15,
+                       synth_motion_deg=15.0)
+    ds = PoseDataset(dense_root, 'train', cfg)
+    seen = 0
+    for i in range(len(ds)):
+        for r in range(6):
+            item = ds._item(i, np.random.default_rng((13, i, r)))
+            if item is None:
+                continue
+            seen += 1
+            assert item[5]['synth'] is False, \
+                'a densely-labelled window must never synthesise -- it already has real motion'
+            assert len(item[3]) > 2, 'and it must keep the multi-frame window it earned'
+    assert seen, 'the fixture produced no items'

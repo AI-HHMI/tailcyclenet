@@ -603,10 +603,22 @@ MPJPE per window index over 120 frames: the published `3dpop-and` arm runs **30.
 figures are wrong in a way that GROWS with clip length, and their 120-frame means are averages over a
 rising curve. That also settles what the johnson divergence below was: error, not refinement.
 
-**ON A LONG CLIP THE LOOP IS UNBOUNDED.** Per-window divergence from the same run with no anchor
-grows without plateauing on two of johnson-mouse's three 600-frame clips — 1.5-2.0 mm over the first
-five windows rising to 23 mm and 62 mm by the last, slopes of +6.1 and +2.1 mm/window over the second
-half, against a mouse whose longest bone is 33 mm. The de-loop reduces that growth by 0-31% and does not
+**ON A LONG CLIP THE LOOP SATURATES — IT IS NOT UNBOUNDED, AND THAT WORD WAS WRONG.** Per-window
+divergence from the same run with no anchor grows without plateauing on two of johnson-mouse's three
+600-frame clips — 1.5-2.0 mm over the first five windows rising to 23 mm and 62 mm by the last,
+slopes of +6.1 and +2.1 mm/window over the second half, against a mouse whose longest bone is 33 mm.
+**BUT 600 FRAMES IS ~25 WINDOWS AND THAT IS THE CLIMB, NOT THE CURVE.** Report 21 §9i ran `carry`
+against `none` over rat-city's 57,594-frame clip — **2,880 windows, 115x longer** — and the error
+starts at the prior-free value (w0 14.31 px, indistinguishable from `none`), climbs ~5x over roughly
+the first 300 windows, then **PLATEAUS for the remaining 2,500**: slope **-0.0032 px/window**, last
+fifth **0.915x** the first, zero burst windows. The brake named below is what does it: the prior
+cannot drift past about one crop width, so the damage tops out there. An unbounded loop is a
+stability bug that worsens indefinitely; a saturating one has a fixed cost you measure once, and on
+rat-city that cost is **+52.42 px MPJPE [+50.77, +54.05] and -0.4563 MOTA** with `motion_ratio`
+**-0.459** (the carried prior costs 46% of the animal's path). Note the scale of the length effect:
+report 18 §6 measured `none - carry` at **-9.144 px** on the 500-frame clip, which ends during the
+climb; the same lever on the full clip is **-52 px, 5.7x larger**. `idsw` is the one column `carry`
+wins (-0.0031), which is a locked pose being a consistent one, not identity working. The de-loop reduces that growth by 0-31% and does not
 remove it. rat-city's TRAIN group is 57,594 frames, 96x these clips (its *test* group is 500 -- the
 split is by frame range over one recording, and the 57k figure is a format fact, not a test-clip
 length). So for a long deployment run
@@ -729,9 +741,17 @@ and `fp_none` landed on nothing, which want opposite fixes. Measured on 3dpop, `
   they are the training and detector-scoring paths, and report 10's figures are all at 0.05.
   `det_score` is unconditional in the box-cache stamp for exactly this reason: the stamp otherwise
   records only non-defaults, so moving a default would let an old cache be reused silently.
-- **`--vis-thresh`.** `vis_pred` was write-only. Read as a row gate it is worth MOTA +0.049
-  [+0.011, +0.110] on 3dpop at 7.3% of rows and 0.601 → 0.628 on rat-city at 14% — and **−0.037 to
-  −0.123 SIG on calms21**, whose converter writes every point `VISIBLE` so the head trained against
+- **`--vis-thresh`. ITS rat-city NUMBER IS WITHDRAWN.** `vis_pred` was write-only. Read as a row
+  gate it is worth MOTA +0.049 [+0.011, +0.110] on 3dpop at 7.3% of rows — but the rat-city figure
+  below (0.601 → 0.628 at 14% of rows) **does not survive re-derivation and should not be quoted**.
+  Report 21 §5 re-ran it offline on a current run with the rate-matched random control mandatory at
+  every rate: **every gate costs MOTA**, the best of six is a wash (`kpt_agree > 0.5` at −0.027,
+  interval spanning zero), and `--vis-thresh` at a matched 14% reads **MOTA −0.126**. Two further
+  facts came with it: the logit is **not portable across RUNS, not merely across roots** — the value
+  6.0 quoted here drops **100% of rows** on a current run whose per-row median logit is −0.543 — and
+  the head does beat its rate-matched control on `idsw` and MPJPE, so it carries real signal and
+  still loses to keeping the rows. Retained below for the trail: 0.601 → 0.628 on rat-city at 14% —
+  and **−0.037 to −0.123 SIG on calms21**, whose converter writes every point `VISIBLE` so the head trained against
   an all-true target (`occlusion_acc = 1.0`), and whose baseline coverage of 0.995 leaves almost
   nothing junk to remove. So it is **dataset-conditional, not a default**, in two ways: the threshold
   is a LOGIT with no portable value (medians +2.7 / +4.0 / +15.4 across the three roots), and the
@@ -952,10 +972,19 @@ silently. Every pre-split cache is refused.
 
 **It also separates two levers `--max-animals` welded together** -- `decode`'s `top_k` and the row
 count `S`. `--det-top-k` sets the first alone, so `S` can be swept over one cache; that is what made
-report 18 §5's spare-rows result runnable end to end, and **`S` = animal count + 2 is measured a
-strict win on rat-city** (MOTA +0.112, coverage +0.205, idsw -0.011, `fp_dup` flat; report 19 §3).
-The curve is NOT monotonic -- S = 16 is worse than both 14 and 18 -- so sweep it, do not reason
-about it.
+report 18 §5's spare-rows result runnable end to end. **`S` = animal count + 2 was measured a strict
+win on rat-city** (MOTA +0.112, coverage +0.205, idsw -0.011, `fp_dup` flat; report 19 §3) --
+**AND THAT IS A 500-FRAME WITHIN-CLIP RESULT THAT DOES NOT REPRODUCE ON THE SAME ROOT AT 115x THE
+LENGTH.** Report 21 §9g re-ran it on rat-city's 57,594-frame train group, one lever off one cache,
+116 scoring units, 1.46M matched points: S = 12 minus S = 14 reads MOTA **+0.0030** [+0.0010,
++0.0052] -- the sign REVERSED and the magnitude **37x smaller** -- with coverage +0.0043 against the
++0.205 on record (48x smaller). Every column is significant and every column is negligible.
+The mechanism is in `fill`: on the 500-frame clip the spare rows FILLED (0.392 x 36 = 14.1 occupied)
+and those fills were false positives; on the long clip the same ~7.8 rows are occupied at every S
+and the extras stay empty. So the row count barely matters on this root, the +0.112 belongs to that
+clip rather than to rat-city, and the curve's non-monotonicity (S = 16 worse than 14 and 18) is a
+500-frame artefact too. **Sweep it on the long clip, do not reason about it, and do not carry the
++0.112.**
 
 **AND IT IS A SINGLE-CAMERA RESULT THAT DOES NOT REPLICATE UNDER `--track`.** Report 19 §11: on
 3dpop's five 10-pigeon clips, paired BETWEEN clips, spare rows buy MPJPE -0.57 mm and cost `fp_dup`,

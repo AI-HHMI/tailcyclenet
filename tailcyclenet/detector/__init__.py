@@ -88,11 +88,7 @@ def load_detector(path, device='cpu', input_wh=None):
             f'{p}: trained with {norm} normalisation; the model is GroupNorm now (there are no '
             'running statistics to load into). Retrain this detector -- see '
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
-    # `n_ids` RIDES IN THE CHECKPOINT for the same reason `n_keypoints` does: it is part of the
-    # WEIGHTS, not a runtime choice, and building without it makes every identity tensor an
-    # "unexpected key" -- which is how the first identity checkpoint failed to load at all.
-    model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
-                      n_ids=int(ckpt.get('n_ids', 0)))
+    model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

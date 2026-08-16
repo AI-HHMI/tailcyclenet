@@ -44,23 +44,6 @@ from tailcyclenet.format import load_datasets
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate,
                                   detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.evaluate import overall, score_dataset
-
-
-def param_groups(model, no_decay_norm):
-    """What AdamW is handed. `model.parameters()` unless `--no-decay-norm`, and then two groups.
-
-    RANK IS THE TEST, not the parameter's name. Every conv weight in YOLOX-Nano is rank 4 and
-    every GroupNorm affine and every head bias is rank 1, so `p.ndim <= 1` separates them without
-    matching on strings that a refactor would silently break. Returned as a plain iterator when the
-    flag is off so the optimizer sees exactly what it always saw.
-    """
-    if not no_decay_norm:
-        return model.parameters()
-    decay = [p for p in model.parameters() if p.requires_grad and p.ndim > 1]
-    plain = [p for p in model.parameters() if p.requires_grad and p.ndim <= 1]
-    return [{'params': decay}, {'params': plain, 'weight_decay': 0.0}]
-
-
 def default_input_wh(dataset, target_px=416 * 416):
     """An input size matched to the frame's aspect ratio, at roughly a square-416 pixel budget."""
     sess = next(iter(next(iter(dataset.sessions.values()))))
@@ -142,90 +125,6 @@ def main():
     ap.add_argument('--iters', type=int, default=20000)
     ap.add_argument('--batch-size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-3)
-    ap.add_argument('--warmup-frac', type=float, default=0.0,
-                    help='fraction of --iters spent on a LinearLR warmup from 1%% of --lr before '
-                         'the cosine takes over. 0 (the default) is the shipped schedule, byte-'
-                         'identical. WHY IT IS AN ARM: we run AdamW at 1e-3 from RANDOM INIT with '
-                         'no warmup, where DeepLabCut, SLEAP and APT are all at 1e-4. APT '
-                         'documents the failure by name -- "RTMDet needs its LinearLR warmup, '
-                         'since AdamW at the nominal lr of 4e-3 can diverge on a freshly '
-                         'initialized head" -- and caps its own warmup at dl_steps // 10. Random '
-                         'init is precisely the case warmup protects, and the one pathology on '
-                         'record here (whole-frame dense recall peaking at 4-8k of 20k and falling '
-                         'monotonically) is an early-training shape. 0.05 is APT\'s ratio.')
-    ap.add_argument('--no-decay-norm', action='store_true',
-                    help='exclude GroupNorm affines and biases (every parameter of rank <= 1) from '
-                         'weight decay. Off by default, which is byte-identical. AdamW currently '
-                         'decays them along with the conv weights, and with GroupNorm that is more '
-                         'than cosmetic: decaying a norm\'s scale toward zero fights the '
-                         'normalisation it exists to provide. None of the three reference systems '
-                         'decays norm parameters either.')
-    ap.add_argument('--augment-photometric', action='store_true',
-                    help="extend --augment's appearance half from a single multiplicative gain to "
-                         "DLC's ranges: additive brightness +-0.2*255 and per-channel Gaussian "
-                         'noise at sigma ~ U(0, 12.75), each at p = 0.5, composed with the gain. '
-                         'Off by default and byte-identical -- the extra draws happen only under '
-                         'the flag, so the off path consumes the same rng stream it always did. '
-                         'WHY: `img * U(0.7, 1.3)` cannot express sensor noise, an exposure OFFSET '
-                         '(a gain maps black to black, a bias does not) or blur, and every '
-                         'reference system ships more -- DLC has GaussNoise + MotionBlur ON BY '
-                         'DEFAULT, APT has additive brightness and contrast, SLEAP has gamma and '
-                         'noise available. maDLC measured -0.25 mAP OUT-OF-DOMAIN on marmosets '
-                         'from new cages, the largest generalization number in either Nature '
-                         'Methods paper, and noise is what they ship against it. MOTION BLUR IS '
-                         'NOT IN THIS FLAG: it is a cv2.filter2D with its own kernel-length '
-                         'parameter, i.e. a second lever, and bundling it would make the arm '
-                         'unreadable (eval rule 4). ENTANGLEMENT TO DECLARE: --rotate-deg only '
-                         'fires when --augment is on, so every rotation arm already carries the '
-                         'gain and this changes what those arms would see.')
-    ap.add_argument('--identity', action='store_true',
-                    help='train a CLOSED-SET identity head (report 20 lead 5, SLEAP\'s '
-                         '`ClassVectorsHead`). Adds a per-anchor softmax over the root\'s animal '
-                         'slots, supervised over the SAME positives the box term uses, with the '
-                         'target being the GT box ROW the anchor was assigned to -- on these roots '
-                         'a row IS an animal, so no new loader plumbing is needed. Gated in the '
-                         'plan on leads 1-3 failing, which they did, and two of those failures '
-                         'point here: the stitch gate cannot tell animals apart and the axis cue '
-                         'carries information the matcher cannot use. Off by default and '
-                         'byte-identical -- the branch is not constructed. NOTE THE SCOPE: a '
-                         'closed set is only meaningful where the animals are FIXED and identified '
-                         'consistently across the clip, which rat-city is (12 rats, one arena, '
-                         'tracker identity) and calms21 is not in the same sense.')
-    ap.add_argument('--id-weight', type=float, default=1.0,
-                    help='weight on the identity CE. SLEAP weights its class loss 1e-4 against a '
-                         'confmap MSE; our objectness is a BCE of a different scale, so 1.0 is a '
-                         'starting point and not a ported value -- sweep it before trusting it.')
-    ap.add_argument('--ignore-band', action='store_true',
-                    help='stop supervising objectness on anchors that sit INSIDE a GT box but are '
-                         'positive for none. Off by default and byte-identical. Today those are '
-                         'trained as "no animal here" WHILE SITTING ON ONE: `assign` returns '
-                         '`inside & near` and `detector_loss` starts from a zeros target, so every '
-                         'other anchor over the animal gets objectness target 0. Screened at each '
-                         "root's shipped geometry the band is 43.5%% of every anchor on rat-city's "
-                         '640x640 tiles at scale 1.0 (13.5x the positive count), 30.2%% on '
-                         'calms21, 6.8%% on 3dpop, 1.2%% on rat-city whole-frame and PROVABLY '
-                         '0.00%% on branson-fly, where a 30 px fly is smaller than the centre '
-                         'radius at every stride -- which makes branson-fly a free inertness '
-                         'control that must come back bit-identical. APT does exactly this: its '
-                         'assigner has three bands and ignores this one deliberately. NAMED '
-                         'FAILURE MODE: an animal is not solid, so ignoring every anchor inside a '
-                         'SQUARED crop-rule box also stops supervising the background between the '
-                         'legs, which on a thin animal is most of it. That is why this is an arm '
-                         'and not a fix. Report `ign` beside it: masking shrinks the objectness '
-                         'sum without shrinking its /max(n_pos,B) divisor, a ~2x reweight of obj '
-                         'against box_weight at 43.5%% that an arm would otherwise misattribute.')
-    ap.add_argument('--ema-decay', type=float, default=0.0, metavar='D',
-                    help='keep an exponential moving average of the weights at decay D and score '
-                         'and checkpoint it ALONGSIDE the raw weights. 0 (the default) is off and '
-                         'byte-identical -- the averaged model is never built, so the raw path is '
-                         'untouched arithmetic. 0.9998 is YOLOX\'s value. EMA is YOLOX\'s signature '
-                         'and we inherited everything but it; it is also the standard treatment '
-                         'for the one pathology on record here, whole-frame dense recall peaking '
-                         'at 4-8k of 20k and falling monotonically, which best-on-val selection '
-                         'currently works around rather than fixes. THE POINT OF SCORING BOTH IN '
-                         'ONE RUN is that the arms are then PAIRED BY CONSTRUCTION -- same data '
-                         'order, same augmentation draws, same seed -- at no extra training cost, '
-                         'where two separate runs would differ by seed noise as well as by EMA.')
     ap.add_argument('--num-workers', type=int, default=8)
     ap.add_argument('--frames-per-group', type=int, default=40)
     ap.add_argument('--min-crop-dim', type=int, default=64,
@@ -257,18 +156,17 @@ def main():
                          'a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block '
                          '-- with a proper box filter. Stored in the checkpoint; inference '
                          'reads it back. No effect on a video root.')
-    ap.add_argument('--rotate-deg', type=float, default=0.0,
-                    help='in-plane rotation drawn from [-deg, +deg], on top of --augment. 0 is '
-                         'off and off is byte-identical (the draw is skipped, not zeroed). 180 is '
-                         'a full circle. IT IS THE REPLACEMENT FOR THE FLIP --keypoints COSTS, and '
-                         'strictly easier: a mirror permutes left/right names and needs a '
-                         'flip_pairs map, a rotation permutes nothing. FREE WHEN TILING, because '
-                         'the warp turns about the tile centre and a tile interior to the frame '
-                         'pulls real neighbouring pixels in at every angle. Not free on whole '
-                         'frames: on a 2.29:1 frame the mean real-pixel fraction is 0.92 at 15, '
-                         '0.79 at 45 and 0.644 (min 0.437) at BOTH 90 and 180 -- the whole cost '
-                         'is paid by the first 90 degrees, so stopping short of a circle saves '
-                         'nothing. Stored in the checkpoint.')
+    ap.add_argument('--rotate-deg', type=float, default=0.0, metavar='DEG',
+                    help='random in-plane rotation, +-DEG, drawn per visit. Needs --augment; 0 is '
+                         'off and off is byte-identical (the draw is skipped, not multiplied by '
+                         'zero). DEFAULT-OFF ON EVIDENCE: at 180 on rat-city this is SIGNIFICANTLY '
+                         'WORSE on two roots and two label sources, one direction -- MPJPE '
+                         '+3.33 px hand / +1.28 px tracked, coverage -0.009, idsw x1.7, err p99 '
+                         '+29.9 (dev/reports/21 3a/3b). The knob is kept because that refutes one '
+                         'SETTING on one root, and because a full circle retains no less area than '
+                         'a quarter one, so a smaller amplitude is a different trade rather than '
+                         'obviously a safer one. Recorded in the checkpoint: it changes no tensor '
+                         'shape, so two arms are indistinguishable from the file alone.')
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--eval-batches', type=int, default=25,
                     help='batches per split at each checkpoint. TRAIN is scored too: the '
@@ -333,7 +231,7 @@ def main():
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
                        hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg,
-                       photometric=args.augment_photometric, **tiling)
+                       **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
     # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
@@ -383,48 +281,14 @@ def main():
     except ValueError as e:
         print(f'val:   none ({e})')
 
-    # THE ANIMAL SLOT COUNT IS THE ROOT'S, not a guess: `assign`'s `gix` indexes the GT box array,
-    # whose row count is what the loader emits per view.
-    n_ids = 0
-    if args.identity:
-        n_ids = int(max(len(sess.labels(g).animal_ids)
-                        for r in roots for sess in r.sessions.get('train', [])
-                        for g in sess.groups))
-        print(f'identity head: {n_ids} animal slot(s) (closed set)')
-    model = YOLOXNano(n_keypoints=n_kpts, n_ids=n_ids).to(device)
+    model = YOLOXNano(n_keypoints=n_kpts).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX-Nano: {n / 1e6:.2f}M params')
-    opt = torch.optim.AdamW(param_groups(model, args.no_decay_norm), lr=args.lr, weight_decay=5e-4)
-    # THE SCHEDULE IS BUILT IN ONE BRANCH OR THE OTHER, NEVER BOTH. Constructing a
-    # CosineAnnealingLR sets the optimizer's lr as a side effect at __init__, so building a spare
-    # one to hand to SequentialLR and then discarding it would leave the warmup starting from a
-    # perturbed lr -- and `--warmup-frac 0` would stop being the shipped schedule.
-    if args.warmup_frac > 0:
-        w = max(1, int(round(args.iters * args.warmup_frac)))
-        sched = torch.optim.lr_scheduler.SequentialLR(
-            opt, [torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=w),
-                  torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.iters - w))],
-            milestones=[w])
-        print(f'schedule: LinearLR 0.01 -> 1.0 over {w} iters, then cosine over {args.iters - w}')
-    else:
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
-
-    # THE AVERAGED MODEL IS NOT BUILT AT ALL WHEN OFF. `AveragedModel` deep-copies the module, so
-    # constructing it unconditionally would allocate a second network and change nothing else --
-    # harmless, but it would also make "off" a different code path from the one every recorded
-    # detector number came from, which is the thing every flag in this file is careful not to do.
-    ema = None
-    if args.ema_decay:
-        from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-        ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay))
-        print(f'EMA: decay {args.ema_decay}, scored and checkpointed beside the raw weights')
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
 
     args.out.mkdir(parents=True, exist_ok=True)
     history = []
-    # A SECOND best-tracker, because the two arms peak at different iterations -- that is most of
-    # what EMA is for, and sharing one `best_score` would let whichever arm happened to be ahead
-    # decide which checkpoint the OTHER arm ships.
-    best_ema = -float('inf')
     # `detector.pth` IS THE BEST CHECKPOINT, NOT THE LAST ONE. It used to be the last: the file was
     # rewritten at every evaluation and `best` was computed after the loop and only PRINTED, so a
     # run measured its own peak and then threw it away. That is not a tie-break -- on
@@ -449,21 +313,15 @@ def main():
             gt_regions = None if gt_regions is None else gt_regions.to(device)
             out = model(x)
             obj, boxes, kpt = out[0], out[1], out[2]
-            ident = out[3] if len(out) > 3 else None
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=args.kpt_weight,
                                         kpt_score_weight=args.kpt_score_weight,
-                                        regions=gt_regions, ignore_band=args.ignore_band,
-                                        ident=ident, id_weight=args.id_weight)
+                                        regions=gt_regions)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             opt.step()
-            # AFTER `opt.step()`, so the average is over the weights the optimiser actually
-            # produced. Before it, every update would average in the PREVIOUS step twice.
-            if ema is not None:
-                ema.update_parameters(model)
             sched.step()
             running.append(float(loss.detach()))
             it += 1
@@ -506,13 +364,6 @@ def main():
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
                         'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
-                        # Recorded for the same reason `rotate_deg` is: neither changes a tensor's
-                        # shape, so a checkpoint trained under one schedule and compared against
-                        # another is indistinguishable from the file alone. Gotcha 12's shape.
-                        'warmup_frac': args.warmup_frac, 'no_decay_norm': args.no_decay_norm,
-                        'ema_decay': args.ema_decay, 'ema': False,
-                        'ignore_band': args.ignore_band, 'n_ids': n_ids,
-                        'photometric': args.augment_photometric,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the
@@ -522,31 +373,8 @@ def main():
                 if sel >= best_score:
                     best_score = sel
                     torch.save(ckpt, args.out / 'detector.pth')
-                # THE EMA ARM, scored through the IDENTICAL path on the IDENTICAL windows. The
-                # averaged weights live inside `ema.module`, so `score_dataset` never learns there
-                # is an EMA at all and the two arms cannot diverge through their evaluator.
-                escores = {}
-                if ema is not None:
-                    for name, ds in (('train', train), ('val', val)):
-                        if ds is None:
-                            continue
-                        escores[name] = overall(score_dataset(
-                            ema.module, ds, device, batch_size=args.batch_size,
-                            batches=args.eval_batches, num_workers=2))
-                    eck = dict(ckpt, model_state=ema.module.state_dict(), eval=escores, ema=True)
-                    torch.save(eck, args.out / f'detector_ema_it{it:06d}.pth')
-                    esel = escores.get('val', escores.get('train', {})).get('r50', -float('inf'))
-                    if esel >= best_ema:
-                        best_ema = esel
-                        torch.save(eck, args.out / 'detector_ema.pth')
-                    for name, s in escores.items():
-                        print(f'   ema {name:3s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
-                              f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
-                              flush=True)
                 history.append({'iteration': it,
                                 **{f'{k}_{m}': v[m] for k, v in scores.items()
-                                   for m in ('r50', 'r75', 'iou', 'fp', 'mota')},
-                                **{f'ema_{k}_{m}': v[m] for k, v in escores.items()
                                    for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
                 (args.out / 'metrics.json').write_text(json.dumps(history, indent=1))
                 for name, s in scores.items():

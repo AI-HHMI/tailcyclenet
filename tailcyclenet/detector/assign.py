@@ -43,7 +43,7 @@ def giou_loss(pred, target, eps=1e-7):
     return 1.0 - (iou - (carea - union) / carea)
 
 
-def assign(anchors, gt_boxes, return_band=False):
+def assign(anchors, gt_boxes):
     """Positive anchors for each ground-truth box.
 
     Args:
@@ -51,18 +51,19 @@ def assign(anchors, gt_boxes, return_band=False):
         gt_boxes: (G,4) xyxy; rows with any non-finite value are skipped (an animal that is
             not croppable in this view -- the loader emits a NaN box rather than dropping the
             frame, so objectness still learns "no animal here").
-        return_band: also return an (A,) bool of the anchors that sit INSIDE some GT box but are
-            positive for none -- the band `--ignore-band` exists to stop supervising. Off by
+        (`return_band` and `--ignore-band` were here: withdrawing supervision from the anchors
+            that sit inside a GT box but are positive for none is REFUTED -- MOTA -0.258
+            [-0.402, -0.136] at a matched threshold, 12x the seed floor, because those anchors are
+            HARD NEGATIVES and removing them re-saturates the objectness. Off by
             default so the two-value return every caller already unpacks is unchanged.
 
-    Returns (pos_anchor_ix, pos_gt_ix), plus the band when `return_band`. Empty when there is no
+    Returns (pos_anchor_ix, pos_gt_ix). Empty when there is no
     finite box.
     """
     empty = (torch.zeros(0, dtype=torch.long, device=anchors.device),) * 2
-    no_band = torch.zeros(anchors.shape[0], dtype=torch.bool, device=anchors.device)
     keep = torch.isfinite(gt_boxes).all(-1)
     if not keep.any():
-        return (*empty, no_band) if return_band else empty
+        return empty
     gt = gt_boxes[keep]
     gt_ix = torch.nonzero(keep, as_tuple=True)[0]
 
@@ -89,9 +90,8 @@ def assign(anchors, gt_boxes, return_band=False):
     # provably 0.00% on branson-fly, where a 30 px fly is smaller than the centre radius at every
     # stride so `inside` is a subset of `near`. That makes branson-fly a free inertness control.
     # APT's assigner has the same three bands and ignores this one deliberately.
-    band = inside.any(-1) & ~ok.any(-1) if return_band else no_band
     if not ok.any():
-        return (*empty, band) if return_band else empty
+        return empty
 
     # An anchor can only serve one box: give it the one whose centre it is closest to, so two
     # overlapping animals do not both claim it and cancel.
@@ -100,7 +100,7 @@ def assign(anchors, gt_boxes, return_band=False):
     best = d.argmin(1)
     pos = torch.nonzero(torch.isfinite(d.min(1).values), as_tuple=True)[0]
     out = (pos, gt_ix[best[pos]])
-    return (*out, band) if return_band else out
+    return out
 
 
 def certified_anchors(anchors, regions, gt_boxes):
@@ -182,7 +182,7 @@ def keypoint_loss(pred, target, gt_boxes):
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
-                  regions=None, ignore_band=False, ident=None, id_weight=1.0):
+                  regions=None):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -208,42 +208,20 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     device = obj_logits.device
     B = obj_logits.shape[0]
     target = torch.zeros_like(obj_logits)
-    # ONE `weight` TENSOR SERVES BOTH MASKS. `--use-regions` certifies where objectness may be
-    # supervised at all; `--ignore-band` withdraws the anchors that sit on an animal without being
-    # positive for it. They compose by multiplication and either alone allocates it.
-    weight = None if (regions is None and not ignore_band) else torch.ones_like(obj_logits)
-    n_band, n_cert = 0, 0.0
+    # `--use-regions` certifies where objectness may be supervised at all.
+    weight = None if regions is None else torch.ones_like(obj_logits)
+    n_cert = 0.0
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
-    id_ce, n_id = [], 0
     for b in range(B):
-        if ignore_band:
-            pos, gix, band = assign(anchors, gt_boxes[b], return_band=True)
-        else:
-            pos, gix = assign(anchors, gt_boxes[b])
-            band = None
+        pos, gix = assign(anchors, gt_boxes[b])
         if regions is not None:
             weight[b] = certified_anchors(anchors, regions[b], gt_boxes[b]).to(weight.dtype)
             n_cert += float(weight[b].mean())
-        if band is not None:
-            # AFTER the certification, so the two masks INTERSECT: an anchor must be both
-            # certified and not-in-the-band to be supervised. `n_cert` is accumulated above rather
-            # than read off `weight` at the end, or `parts['certified']` would report the PRODUCT
-            # of the two masks under an arm running both and understate the certified area.
-            weight[b] = weight[b] * (~band).to(weight.dtype)
-            n_band += int(band.sum())
         if pos.numel():
             target[b, pos] = 1.0
             losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
             n_pos += pos.numel()
-            # THE IDENTITY TERM (report 20 lead 5). The target is `gix` -- the GT BOX INDEX the
-            # anchor was assigned to -- and on these roots a box row IS an animal, so the closed-set
-            # label needs no new loader plumbing at all. Supervised over the SAME positives the box
-            # and keypoint terms use, so all three branches share one notion of "this anchor owns
-            # this animal".
-            if ident is not None:
-                id_ce.append(F.cross_entropy(ident[b, pos], gix, reduction='sum'))
-                n_id += pos.numel()
             if kpts is not None and gt_kpts is not None:
                 r, s, nk, nv = keypoint_loss(kpts[b, pos], gt_kpts[b][gix], gt_boxes[b][gix])
                 kpt_reg.append(r)
@@ -266,20 +244,10 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     obj = obj_all / max(n_pos, B)
     box = (torch.cat(losses_box).sum() / max(n_pos, 1) if losses_box
            else torch.zeros((), device=device))
-    ident_loss = (torch.stack(id_ce).sum() / max(n_id, 1) if id_ce
-                  else torch.zeros((), device=device))
-    total = obj + box_weight * box + (id_weight * ident_loss if ident is not None else 0.0)
+    total = obj + box_weight * box
     parts = {'obj': float(obj.detach()), 'box': float(box.detach()), 'n_pos': n_pos}
-    if ident is not None:
-        parts['ident'] = float(ident_loss.detach())
     if regions is not None:
         parts['certified'] = n_cert / max(B, 1)
-    if ignore_band:
-        # THE BAND FRACTION, printed for the same reason `certified` is: masking shrinks the
-        # objectness sum without shrinking its `/ max(n_pos, B)` divisor, so it silently reweights
-        # `obj` against `box_weight`. At the screened 43.5% that is a ~2x shift an arm would
-        # otherwise misattribute to the band itself.
-        parts['ignored'] = n_band / max(obj_logits.numel(), 1)
     if kpts is not None and gt_kpts is not None:
         # Mean over the IMAGES that had a positive, matching how `box` is normalised. Both lists
         # are empty when nothing was assigned, and then these are exact zeros with no gradient.

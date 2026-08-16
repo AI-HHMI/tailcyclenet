@@ -153,31 +153,15 @@ def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
     return out
 
 
-def _photometric(img, rng, extended):
-    """The appearance half of `--augment`. `extended=False` is the shipped one-liner, exactly.
+def _photometric(img, rng):
+    """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
 
-    SHIPPED: a single MULTIPLICATIVE gain, `img * U(0.7, 1.3)`. That is the whole of it, and it
-    cannot express three things a real camera does -- sensor noise, an exposure OFFSET (a gain
-    scales black to black; a bias does not), or motion blur. Every reference system ships more:
-
-        DLC detector   GaussNoise(var_limit=(0, 12.75**2), per_channel=True, p=0.5)
-                       + MotionBlur(p=0.5) + hflip, and it is ON BY DEFAULT
-        APT            brightness +-0.2*255 ADDITIVE, contrast U(0.7,1.3) about the group mean
-        SLEAP          gamma, brightness, uniform + gaussian noise; available, off
-        us             img * U(0.7, 1.3), opt-in
-
-    maDLC measured **-0.25 mAP out-of-domain** on marmosets from new cages -- the largest
-    generalization number in either Nature Methods paper -- and noise plus blur is what they ship
-    against it.
-
-    EXTENDED adds DLC's two ranges and nothing else: an additive brightness offset and per-channel
-    Gaussian noise, each at p = 0.5, composed with the gain that was always there. MOTION BLUR IS
-    DELIBERATELY NOT HERE: it is a `cv2.filter2D` with its own kernel-length parameter, i.e. a
-    second lever, and bundling it would make the arm unreadable (eval rule 4).
-
-    The draws are ORDERED so that `extended=False` consumes exactly the stream it always did -- the
-    gain is drawn first and the two new draws happen only under the flag, so the off path is
-    byte-identical rather than merely equivalent in distribution.
+    DLC's extended form -- additive brightness plus per-channel gaussian noise -- was built,
+    measured and REFUTED here: MOTA -0.127 [-0.256, -0.016] and miss +0.064, both significant, on
+    rat-city in-domain. DLC buys it for an OUT-of-domain gain (-0.25 mAP on marmosets without it)
+    and neither rat-city split tests that, so the honest summary is that it costs accuracy in the
+    only regime this repo can measure. Re-add it with a root that has a genuinely different camera
+    or enclosure, not before.
     """
     out = img * rng.uniform(0.7, 1.3)
     if extended:
@@ -232,6 +216,14 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     A = np.array([[sx, 0.0], [0.0, s]], np.float64)
     # The draw is SKIPPED at rotate_deg 0, not drawn and multiplied by zero: that keeps both the
     # matrix and the rng stream bit-identical to every detector arm recorded before this key.
+    #
+    # DEFAULT-OFF ON EVIDENCE, not on caution. At +-180 on rat-city it is significantly WORSE on
+    # two roots and two label sources, one direction: MPJPE +3.33 px [+0.08, +7.06] on hand labels
+    # and +1.28 [+0.63, +1.88] on the tracker clip, coverage -0.009, idsw x1.7 (0.0189 -> 0.0328),
+    # err p99 +29.9. The knob is kept because the refutation is of that SETTING on that root, and
+    # because a full circle costs no more retained area than a quarter one
+    # (`_rotated_rect_max_inscribed` is 90-degree periodic), so a smaller amplitude is not
+    # obviously the same trade. dev/reports/21 sections 3a and 3b.
     if rotate_deg:
         a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
         A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
@@ -297,7 +289,6 @@ class BoxDataset(Dataset):
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
-                 photometric=False,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
@@ -337,13 +328,14 @@ class BoxDataset(Dataset):
         # keypoint arm necessarily loses the flip, so a control that keeps it differs in two
         # levers and measures neither (eval rule 4).
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
+        # 0 is off and off is byte-identical: `random_affine` skips the draw. See there for
+        # why the knob survives a refutation of its 180-degree setting.
+        self.rotate_deg = float(rotate_deg)
         # 0 is off and off is byte-identical: `random_affine` skips the draw entirely. See there
         # for why this is free when tiling and not when not, and why a full circle costs no more
         # than a half one.
-        self.rotate_deg = float(rotate_deg)
         # The APPEARANCE half of --augment. False is the shipped single gain and is
         # byte-identical; True adds DLC's additive brightness and gaussian noise.
-        self.photometric = bool(photometric)
         # Off by default and requested explicitly, not inferred from the split: it is a key, and
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
@@ -762,7 +754,7 @@ class BoxDataset(Dataset):
             M = (L @ W @ D)[:2]
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
             if warp is not None:
-                img = _photometric(img, rng, self.photometric)
+                img = _photometric(img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         # `regions` rides along as its own element rather than being folded into `boxes`: a region
         # is not an animal and must never reach `assign`. Appended only under `use_regions`, so

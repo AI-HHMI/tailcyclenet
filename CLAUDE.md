@@ -544,8 +544,55 @@ articulation is not detector noise so it does not average down with K. Item 5 (`
 conserves every edge exactly as designed and makes `idsw` monotonically worse in its margin, because
 it triggers on the statistic §6 measured as a smoke alarm rather than a metric. **A statistic too
 coarse to rank arms is too coarse to trigger a per-frame action.** All five flags ship default-off
-with their fire rates printed; the next form worth trying is a COST TERM inside the Hungarian, which
-§9.2 never proposed.
+with their fire rates printed.
+
+**THE COST TERM WAS THE RECOMMENDED NEXT FORM. IT IS NOW BUILT AND ALSO REFUTED** (`--axis-cost W`,
+report 21 §6/§6b). Report 19 §14 argued the two surviving cues wanted to be spent *inside* the
+Hungarian, "where a wrong cue shifts a ranking rather than deleting a candidate", and that is the one
+form report 16 §9.2 never proposed. Built as an elementwise multiply between the affinity
+accumulation and the Hungarian, unable to raise a zero entry (a zero is INELIGIBLE, not merely
+expensive). It **buys nothing at any weight on either root**, and is harmful at K = 4 and at W = 1.0
+on K = 17. `W = 0` reproduces the baseline to four decimals, which is the inertness control. So the
+cue's *form* is not what was wrong: veto, permutation and cost term have now all been measured, and
+the ranking a K = 4 body axis supplies is too noisy to spend in any of them. **Do not re-propose a
+fourth form without first raising the cue's quality.**
+
+**THREE MORE 2D IDENTITY MECHANISMS, MEASURED ON A 57,594-FRAME CLIP** (report 21 §9, n = 116
+scoring units via `eval.py --chunk 500` — that benchmark is the session's real product; rat-city's
+whole test split is ONE 500-frame group and returned `DEGENERATE` on every delta ever measured
+there):
+
+- **`--pose-nms FRAC` WORKS, and it is the only identity lever in this repo that does.** maDLC's
+  `Assembly.intersection_with`: intersect two rows' boxes, take `min(kpts of A in B / |A|,
+  kpts of B in A / |B|)`, drop the lower-scored row above the threshold. **Deliberately not IoU**,
+  for the reason `--link-boxes` abandoned it. On rat-city **MOTA +0.0223 at 3-of-4**, `fp_dup`
+  −0.0196, `idsw` −0.0017; it **beats its rate-matched random control by +0.058 MOTA**, and at an
+  identical 4.54% rejection budget it costs **0.24 points of coverage against random's 4.08 (17x)**
+  and removes **3.7x more duplicates**. **`--pose-nms` IS QUANTISED BY K**: the overlap can only take
+  `{0, .25, .5, .75, 1}` at K = 4, so the flag has FIVE settings and `0.6` and `0.7` are
+  byte-identical — quote it as a COUNT ("3 of 4"), the `--min-match-kpts` trap again. **Harmful on
+  calms21**, which is at ceiling (idsw 0.0000 on all 19 groups), so it is root-conditional and
+  default-off.
+- **`--stitch GAP` (fragment locally, bridge globally) is REFUTED** — every column worse and the
+  window union crop blows up 4.2x, exactly the failure `--birth-age` produced. It is the GATE, not
+  the gap: shortening the gap 6x does not rescue it.
+- **A LEARNED IDENTITY HEAD IS REFUTED ON POPULATION, NOT ON THE CUE.** SLEAP's `ClassVectorsHead`
+  ported onto the detector stem (decoder features have identity deliberately removed). Trained on
+  `rat-city-tracked` it reaches **36.1% argmax against 8.3% chance**, and **25.1% restricted to the
+  animals whose next-frame centroid is genuinely contested** — real signal in both. But the centroid
+  alone already settles **98.8%** of frame-to-frame decisions (median runner-up is **163x** further
+  than the nearest), so a perfect-precision identity cost could flip **≤0.31% of associations**
+  against a ±0.023 MOTA seed floor. The logits are **not plumbed through** `detect_raw` → cache →
+  `associate_group`, and this is why.
+
+**AND `--overlap` COMPOSES WITH `--pose-nms` BY PLAIN ADDITIVITY — check that before sweeping a
+grid.** `--pose-nms` runs per frame inside `associate_group`, upstream of the window loop, so its
+fire rate is **byte-identical at overlap 4, 8 and 12** (22,148 of 1,547,535 at 3-of-4, all three).
+Summing the two one-lever deltas predicts the measured pair on every column at three thresholds,
+several exact to four decimals. Two consequences: the pair needs **no joint sweep**, and **"arm A
+makes arm B viable" is an artefact whenever B's fire rate is unchanged** — 2-of-4's MPJPE cost
+appeared to go from SIG to null under overlap 8, but its own cost never moved off +0.171 px; a
+constant −0.235 was added and the SUM crossed zero. The fire rate is what exposes it.
 
 **SYNTHETIC CAMERA MOTION MAKES A ONE-LABEL WINDOW INTO A LABELLED VIDEO** (`synth_motion_prob`,
 `synth_motion_amp`, `synth_motion_deg`, `synth_motion_frames`; report 22). An annotated group carries

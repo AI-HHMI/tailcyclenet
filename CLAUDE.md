@@ -932,10 +932,23 @@ detections may be born into an empty row; `last` expires after one window. **`LI
 `--det-cache` stamp** because the cache stores boxes that have already been linked, so changing this
 rule silently makes an old cache a different box set.
 
-**`--track` MADE EVERY BIRTH-TIME LEVER IRRELEVANT, and that is not obvious from the flag.**
+**EVERY SENTENCE IN THIS `--track` BLOCK IS A 3D MULTIVIEW STATEMENT. `--track` IS STRUCTURALLY
+INERT ON EVERY 2D ROOT** — `detector/__init__.py:326` builds `CrossViewTracker` only when
+`track and C > 1`, and rat-city, calms21 and branson-fly are all `C == 1`. `associate` never runs
+there either; it is a cross-view pairwise search. **In 2D `associate_group` reduces to a truncation
+of the score-ordered `decode` survivors followed by `link_rows`**, so on a 2D root `--track` and
+`--no-track` are the same pass and every number below is unreachable. This is not a caveat about
+effect size — the code path does not execute. Say "2D" or "3D" before any sentence about `--track`,
+and never quote a 2D identity result without naming the root (branson-fly and calms21 are at
+ceiling — idsw 0.0000 — so rat-city is the only 2D root with an identity problem at all, and its GT
+is another tracker's output).
+
+**`--track` MADE EVERY BIRTH-TIME LEVER IRRELEVANT, and that is not obvious from the flag.** (3D.)
 `associate` now runs only on detections no existing target claimed, so births are **104 events in
 10,054 frames across 3dpop's five 10-pigeon clips -- 0.041% of all associations, one per 97 frames**
-(`scratch/p19/birth_rate.py`). Any rule that fires at birth therefore has a ceiling of a few
+(`scratch/p19/birth_rate.py`) — **that rate is 3dpop's and is not portable**: rat-city sees 7 births
+in 500 frames, and for an unrelated reason (`link_rows` seats a birth only into a row whose `last`
+is *entirely* non-finite, which takes `max_age = 24` frames). Any rule that fires at birth therefore has a ceiling of a few
 hundredths of a percent of associations, against a MOTA seed floor of +-0.023. Report 16 §9 ranked
 two proposals (a size veto at birth, a signed-mean epipolar residual) as items 3 and 6 while
 `associate` still ran every frame on every detection, where a birth-time test governed everything;

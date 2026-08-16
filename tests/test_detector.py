@@ -1769,3 +1769,29 @@ def test_identity_branch_is_off_by_default_and_learns_a_closed_animal_set():
             first = parts['ident']
         last = parts['ident']
     assert last < first * 0.5, f'identity CE did not learn: {first:.3f} -> {last:.3f}'
+
+
+def test_every_consumer_survives_the_head_growing_a_return_value():
+    """A fixed-arity unpack of `model(x)` breaks the moment an optional branch is added.
+
+    The identity branch (lead 5) made the head return four values, and `evaluate.score_dataset`
+    unpacked exactly three -- so the arm trained for 2,000 iterations and then died at its first
+    checkpoint eval, with the failure a long way from the change that caused it. Every consumer now
+    INDEXES what it needs. This test is what makes the next branch cheap.
+    """
+    import inspect
+    from tailcyclenet.detector import evaluate as ev
+    from tailcyclenet.detector import __init__ as di  # noqa: F401
+
+    for mod in (ev,):
+        src = inspect.getsource(mod)
+        assert 'obj, pred_boxes, _ = model(' not in src, 'evaluate.py unpacks a fixed arity'
+
+    # And the real thing: both arities run through the same consumer path.
+    torch.manual_seed(0)
+    for n_ids in (0, 5):
+        m = YOLOXNano(n_keypoints=2, n_ids=n_ids).eval()
+        out = m(torch.randn(1, 3, 64, 64))
+        assert len(out) == (4 if n_ids else 3)
+        obj, boxes = out[0], out[1]           # the indexed read every consumer now uses
+        assert obj.ndim == 2 and boxes.shape[-1] == 4

@@ -141,7 +141,12 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     # number in reports 10-13.
     for bi, batch in enumerate(loader):
         x, gt = batch[0], batch[1]
-        obj, pred_boxes, _ = model(x.to(device))
+        # INDEXED, NOT UNPACKED. The head grew a fourth return (identity logits) and a fixed-arity
+        # unpack here crashed the whole eval at the first checkpoint -- after 2,000 iterations of
+        # training had already happened. Any future branch adds another tail element; this reads
+        # the two it needs and ignores the rest.
+        _out = model(x.to(device))
+        obj, pred_boxes = _out[0], _out[1]
         for j in range(x.shape[0]):
             item = order[bi * batch_size + j]
             sess, gid, f, ci = ds.index[item]

@@ -244,7 +244,10 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             fetched = [f.result() for f in pending]
             nxt = _submit(frames[-1] + 1)
             for ci, x, metas, src in fetched:
-                obj, boxes, kpts = det(x.to(device))
+                # Indexed for the same reason `evaluate.py` is: the head's return arity grows
+                # with each optional branch, and `detect_raw` needs only the first three.
+                _o = det(x.to(device))
+                obj, boxes, kpts = _o[0], _o[1], _o[2]
                 for j, t in enumerate(frames):
                     b, s, ix = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
                                       return_index=True)

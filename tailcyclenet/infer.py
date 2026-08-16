@@ -40,7 +40,6 @@ from .model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 CARRY_SOURCES = ('triangulate', 'pred')
-SEAM_MODES = ('last', 'blend')
 
 # WHY AN (ANIMAL, WINDOW) PRODUCED NOTHING. Five separate aborts in the loop below wrote the same
 # NaN, so a coverage number could not be decomposed at all -- "the detector offered no box", "the
@@ -62,10 +61,6 @@ class InferConfig:
     max_animals: int = 0          # 0 -> every animal the box source offers
     max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
     kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
-    # None -> carry every keypoint the bounds mask keeps. A float drops the carried keypoints whose
-    # own `vis_pred` LOGIT is below it, per keypoint, before they become a prior. Not a row gate:
-    # this decides what the model is told, not what it reports.
-    prior_vis_thresh: float | None = None
     # None -> report every row predicted. A float withholds an (animal, frame) row whose MEDIAN
     # `vis_pred` logit across keypoints is below it. Measured against a rate-matched random
     # rejection, which is the only honest control (any rejection improves a mean over matched
@@ -96,16 +91,6 @@ class InferConfig:
     # 2D is identical either way: there is no triangulation at one camera and `coords_pred` is an
     # absolute pixel decode, so nothing is being fed its own anchor.
     carry_source: str = 'triangulate'
-    # HOW OVERLAPPING FRAMES ARE RESOLVED.
-    #   'last'  -- the later window wins outright, which is what the loop always did.
-    #   'blend' -- the mean of every window that decoded the frame.
-    # The seam is not a small effect: measured as the one-frame displacement AT the boundary against
-    # the same statistic in a window's interior, it is 3.46x on 3dpop (2.42 mm vs 0.70), 4.49x without
-    # the tracker, 2.33x on johnson-mouse and 1.24-1.45x on the 2D roots -- and on the mismatched
-    # phase3 3dpop arm the seam p90 is 182 mm against an interior p90 of 2.4. Under `last`, a frame in
-    # the overlap is reported from the window that saw it with the LEAST left-context, and the switch
-    # happens every `n_frames - overlap` frames, which at 30 fps is a ~1.5 Hz sawtooth.
-    seam: str = 'last'
     # DELIBERATELY BREAK THE ORACLE PRIOR, to measure how far the output follows it. `--anchor
     # labels` + this is the only cheap way to get the echo coefficient alpha = d(output)/d(prior)
     # without a training run, and alpha is what decides whether the prior needs retraining at all.
@@ -252,7 +237,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     assert cfg.carry_source in CARRY_SOURCES, \
         f'carry_source must be one of {CARRY_SOURCES}, got {cfg.carry_source!r}'
-    assert cfg.seam in SEAM_MODES, f'seam must be one of {SEAM_MODES}, got {cfg.seam!r}'
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
         raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
                          'overlap >= 1; got 0')
@@ -314,10 +298,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # the npz where `eval.py` can. Independent of `carry_source`, deliberately: it is a property of
     # the forward, not of what the loop chose to do with it.
     pred_tri = np.full((S, T_total, K, R), np.nan, np.float32) if mode == '3d' else None
-    # BLENDING NEEDS A SUM AND A COUNT, not a second write. Kept nan-aware so a frame only one window
-    # decoded is that window's value exactly, and a frame no window decoded stays NaN.
-    blend = (np.zeros((S, T_total, K, R), np.float64),
-             np.zeros((S, T_total, K), np.int32)) if cfg.seam == 'blend' else None
     tri_bad = np.zeros((S, T_total, K), bool) if mode == '3d' else None
     carried = [None] * S                      # per-animal prior for the next window
     # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
@@ -353,26 +333,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # NaN confidence. `eval.py` reads `box_agree` per group and quotes `--vis-thresh` off `conf`,
     # so the two blend arms were reporting mismatched columns.
     #
-    # All four are per-FRAME quantities like `pred`, so they take the same sum/count treatment.
-    aux = ({k: [np.zeros(v.shape, np.float64), np.zeros(v.shape, np.int32)]
-            for k, v in (('conf', conf), ('box_agree', box_agree),
-                         ('pred_tri', pred_tri), ('kpt_agree', kpt_agree)) if v is not None}
-           if cfg.seam == 'blend' else None)
-
-    scratch = ({k: np.full_like(v, np.nan) for k, v in
-                (('box_agree', box_agree), ('kpt_agree', kpt_agree)) if v is not None}
-               if cfg.seam == 'blend' else None)
-
-    def record(key, idx, value):
-        """Write `value` at `idx`, or accumulate it when blending. Nan-aware either way."""
-        if aux is None or key not in aux:
-            return False
-        v = np.asarray(value, np.float64)
-        fin = np.isfinite(v)
-        np.add.at(aux[key][0], idx, np.where(fin, np.nan_to_num(v), 0.0))
-        np.add.at(aux[key][1], idx, fin)
-        return True
-
     for wi, start in enumerate(starts):
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
@@ -700,35 +660,21 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             p, q, out = got
             outcome[a, wi] = OUTCOMES.index('ok')
             if pred_tri is not None and out.get('3d_pred_triangulate') is not None:
-                tri_now = out['3d_pred_triangulate'][0].detach().cpu().numpy()
-                if not record('pred_tri', (a, frames), tri_now):
-                    pred_tri[a, frames] = tri_now
+                pred_tri[a, frames] = out['3d_pred_triangulate'][0].detach().cpu().numpy()
                 if out.get('tri_degenerate') is not None:
                     # A DEGENERATE SOLVE IS REPAIRED FROM THE RAYS, and `carry` now seeds the next
                     # window from this tensor -- so how often that happened has to be visible rather
                     # than absorbed into one silently-substituted array.
                     tri_bad[a, frames] = out['tri_degenerate'][0].detach().cpu().numpy()
-            # The two `_fill_*` helpers write in place, so under blend they fill a scratch array
-            # and its window slice is accumulated -- same rule as `pred`, and the scratch is
-            # allocated once above rather than per window.
-            ba_dst = box_agree if aux is None else scratch['box_agree']
-            _fill_box_agreement(ba_dst, a, frames, use, boxes, p, mode, window_cams)
-            if aux is not None:
-                record('box_agree', (a, frames), ba_dst[a, frames])
-                ba_dst[a, frames] = np.nan
+            _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
             if kpt_agree is not None:
-                ka_dst = kpt_agree if aux is None else scratch['kpt_agree']
-                _fill_kpt_agreement(ka_dst, a, frames, use,
+                _fill_kpt_agreement(kpt_agree, a, frames, use,
                                     [det_kpts_stc[a, frames, ci] for ci in use],
                                     p, mode, window_cams)
-                if aux is not None:
-                    record('kpt_agree', (a, frames), ka_dst[a, frames])
-                    ka_dst[a, frames] = np.nan
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
-                if not record('conf', (a, frames), v):
-                    conf[a, frames] = v
+                conf[a, frames] = v
                 vlogit = v
             # The pose the NEXT window opens on. Clamped from the front: a group shorter than
             # `overlap` gives a window with fewer frames than the step, and a plain negative
@@ -748,7 +694,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # every keypoint confidence was NaN used to sail through the gate -- the one row the
                 # model said least about was the one the gate could not touch.
                 drop = ~(med >= cfg.vis_thresh)
-                # APPLIED TO `p` BEFORE IT IS RECORDED, not to `pred` after: under `seam = 'blend'` a
+                # APPLIED TO `p` BEFORE IT IS RECORDED, not to `pred` after: a
                 # gated frame must be left OUT of the mean rather than blanked once and then averaged
                 # back in by the next window. `q` is untouched, so the carried prompt is unaffected --
                 # two levers in one flag would be one too many (eval rule 4).
@@ -756,37 +702,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 p[drop] = np.nan
                 # Under blend the gated frames were already accumulated above, so they are removed
                 # from the accumulator rather than from the finished array -- same rule as `p`:
-                # left OUT of the mean, not blanked and then averaged back in.
-                if aux is None:
-                    conf[a, frames[drop]] = np.nan
-                    box_agree[a, frames[drop]] = np.nan
-                else:
-                    for key, arr in (('conf', conf), ('box_agree', box_agree)):
-                        aux[key][0][a, frames[drop]] = 0.0
-                        aux[key][1][a, frames[drop]] = 0
-            if blend is None:
-                pred[a, frames] = p
-            else:
-                # `np.add.at`, NOT `+=`. A single-frame group is padded to two frames by REPEATING
-                # its index (see `frames` above), and `arr[[0, 0]] += x` applies only the last write
-                # -- so a plain `+=` would silently drop a contribution and leave the count and the
-                # sum both short. Every other write in this loop is an assignment, where a repeat is
-                # harmless; this is the one accumulation.
-                fin = np.isfinite(p).all(-1)
-                np.add.at(blend[0], (a, frames), np.where(fin[..., None], np.nan_to_num(p), 0.0))
-                np.add.at(blend[1], (a, frames), fin)
+                conf[a, frames[drop]] = np.nan
+                box_agree[a, frames[drop]] = np.nan
+            pred[a, frames] = p
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
                               None if vlogit is None else torch.as_tensor(vlogit[j]))
-
-    if blend is not None:
-        n = blend[1][..., None]
-        with np.errstate(invalid='ignore', divide='ignore'):
-            pred = np.where(n > 0, blend[0] / np.maximum(n, 1), np.nan).astype(np.float32)
-        for key, (tot, cnt) in aux.items():
-            avg = np.where(cnt > 0, tot / np.maximum(cnt, 1), np.nan).astype(np.float32)
-            {'conf': conf, 'box_agree': box_agree,
-             'pred_tri': pred_tri, 'kpt_agree': kpt_agree}[key][...] = avg
 
     out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
                'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
@@ -795,7 +716,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                'outcome_names': np.asarray(OUTCOMES, object),
                'mode': mode, 'group_id': gid, 'session': session.session_id,
                'dataset': dataset_name, 'anchor': cfg.anchor,
-               'carry_source': cfg.carry_source, 'seam': cfg.seam, 'n_frames': T_total,
+               'carry_source': cfg.carry_source, 'n_frames': T_total,
                'boxes_from': 'detector' if boxes_stc is not None else
                              ('given points' if box_points is not None else
                               ('instances.pq' if inst_boxes is not None else 'labels'))}
@@ -967,19 +888,6 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
             return None, None
         p = carried[0].clone().float()
         qt = int(carried[1]) - int(frames[0])
-        # A KEYPOINT THE MODEL ITSELF DOUBTED IS NOT A PRIOR EITHER. The bounds mask below drops
-        # what left the crop; this drops what the previous window reported as not visible, in the
-        # same currency the no-query tokens already speak (NaN = "I was not told"). `vis_pred`, not
-        # `conf`: `conf_pred_2d` is an unnormalised sigmoid whose scale means nothing here.
-        # posetail-pose ships this default-off and byte-identical, and it was refuted for the
-        # purpose it was built for -- so off is the default here too.
-        vis = carried[2] if len(carried) > 2 else None
-        if cfg.prior_vis_thresh is not None and vis is not None and vis.shape == p.shape[:1]:
-            # NOT `vis < thresh`: that is False for NaN, so the keypoint the model said LEAST
-            # about was the one this gate could not touch, and it came back as a confident prior.
-            # Same trap, same fix, as the row gate 200 lines up ("AN UNSCORABLE ROW IS NOT A
-            # PASSING ROW").
-            p[~(vis >= cfg.prior_vis_thresh)] = float('nan')
         # A STALE PRIOR IS NOT A PRIOR. `carried` is only written on a window that predicted, so an
         # animal the box source lost for a few windows keeps handing back a pose from before this
         # one -- and `qt` clamps to 0 below, presenting it as this window's first frame. Within the

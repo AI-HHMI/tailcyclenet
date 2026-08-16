@@ -407,17 +407,6 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
     assert list(extra['boxes']) == [2] and torch.isnan(extra['point']).all(), \
         'a single ray has no triangulated point, and inventing a depth would be a lie'
 
-    # A SECOND DETECTION OF AN ANIMAL ALREADY IN THE OUTPUT IS NOT NEW COVERAGE. The same box
-    # again, in a camera that already contributed to the triangulated instance, reprojects on top of
-    # it -- `fp_dup`, not a found animal -- and `dup_res_px` is the gate on that.
-    dup_cam = [centre, centre, torch.cat([centre, centre])]
-    assert len(associate(cams, dup_cam, max_res_px=30.0, min_views=1)) == len(two) + 1
-    assert len(associate(cams, dup_cam, max_res_px=30.0, min_views=1,
-                         dup_res_px=30.0)) == len(two)
-    # ...and the gate must not swallow the corner box, which is a different place.
-    assert len(associate(cams, per_cam, max_res_px=30.0, min_views=1,
-                         dup_res_px=30.0)) == len(two) + 1
-
 
 def test_link_rows_follows_one_animal():
     """Unlinked rows are score-ordered, so the window-union crop spans several animals.
@@ -1456,61 +1445,6 @@ def test_birth_age_off_is_the_rule_it_replaced():
     np.testing.assert_array_equal(np.isfinite(off), np.isfinite(huge))
 
 
-def test_the_axis_cost_reweights_the_hungarian_without_deleting_a_candidate():
-    """Report 19 §14's cost term: it must CHANGE the assignment and CONSERVE every edge.
-
-    Report 19 measured both keypoint cues as real (each beats its rate-matched random control on
-    `idsw`) and both as net losses in VETO form, because rejection is the wrong currency on a
-    matcher report 18 §5 measured as starved -- 34.4% of offered detections dropped, 29 points of
-    them inside the gate. §14: spend the cue "as a cost term inside the Hungarian, where a wrong
-    cue shifts a ranking rather than deleting a candidate". That is a different contract from every
-    other cue in this module and it is asserted here rather than assumed.
-
-    Built on geometry that makes the axis measurable, because `body_axis` ABSTAINS on a round
-    keypoint cloud -- which is correct, and is why the shared cue test cannot check firing.
-    """
-    from tailcyclenet.detector import link_rows
-
-    # Two rows, two frames. At frame 1 the two detections are NEARLY EQUIDISTANT from row 0's last
-    # box, so the centre affinity alone is close to a tie and the axis is what breaks it.
-    boxes = np.full((2, 2, 1, 4), np.nan, np.float32)
-    boxes[0, 0, 0] = [100, 100, 200, 200]
-    boxes[1, 0, 0] = [400, 100, 500, 200]
-    boxes[0, 1, 0] = [150, 100, 250, 200]
-    boxes[1, 1, 0] = [350, 100, 450, 200]
-
-    # Elongated keypoint sets: row 0 HORIZONTAL at both frames, row 1 VERTICAL at both. Under the
-    # cost term the aligned pairing is cheaper; the perpendicular one is penalised but survives.
-    def horiz(cx, cy):
-        return np.array([[cx - 40, cy], [cx, cy], [cx + 40, cy], [cx + 20, cy]], np.float32)
-
-    def vert(cx, cy):
-        return np.array([[cx, cy - 40], [cx, cy], [cx, cy + 40], [cx, cy + 20]], np.float32)
-
-    kp = np.full((2, 2, 1, 4, 2), np.nan, np.float32)
-    kp[0, 0, 0], kp[1, 0, 0] = horiz(150, 150), vert(450, 150)
-    kp[0, 1, 0], kp[1, 1, 0] = horiz(200, 150), vert(400, 150)
-
-    stats_off, stats_on = {}, {}
-    off, _ = link_rows(boxes.copy(), extra=kp.copy(), stats=stats_off)
-    on, _ = link_rows(boxes.copy(), extra=kp.copy(), axis_cost=1.0, stats=stats_on)
-
-    assert stats_on.get('axis_cost', 0) > 0, 'the cost term never fired -- it is not wired in'
-    assert stats_off.get('axis_cost', 0) == 0, 'off must not fire'
-    # EDGE CONSERVATION, the whole point: the same slots are filled either way.
-    np.testing.assert_array_equal(np.isfinite(off), np.isfinite(on),
-                                  err_msg='a cost deleted a candidate; it must only reweight')
-
-    # And the multiplier itself, at the two ends of its range. `angle_gap` folds to [0, 90], so
-    # cos(2g) runs +1 (aligned, no penalty) to -1 (perpendicular, the full weight).
-    for gap_deg, expect in ((0.0, 1.0), (90.0, 0.0)):
-        m = 1.0 - 1.0 * (1.0 - np.cos(np.radians(2.0 * gap_deg))) / 2.0
-        assert m == pytest.approx(expect), 'the multiplier must span [1-W, 1] over [0, 90] degrees'
-    # It can never reach zero at W = 1, which is what keeps a cost from becoming a veto.
-    assert min(1.0 - 1.0 * (1.0 - np.cos(np.radians(2.0 * g))) / 2.0
-               for g in np.linspace(0, 90, 91)) >= 0.0
-
-
 def test_detection_and_association_split_composes_bit_identically(tmp_path):
     """`detect_group` IS `detect_raw` + `associate_group`, to the last bit, on every path.
 
@@ -1559,93 +1493,6 @@ def test_detection_and_association_split_composes_bit_identically(tmp_path):
             np.testing.assert_array_equal(a, b, err_msg='top_k must not change what S rows hold')
 
 
-def test_every_keypoint_cue_is_a_literal_no_op_when_off_and_fires_when_on(tmp_path):
-    """The identity cues default off, and OFF must be byte-identical to before they existed.
-
-    This is the check that caught `--dup-res-px` being inert under `--track`, and the reason
-    CLAUDE.md can say six posetail-pose configs "declared an anchor, trained, and were reported as
-    anchored arms whose anchor was a literal no-op". An arm that moves a flag which does nothing
-    reports the control twice.
-
-    Both halves matter and the second is the one usually skipped: OFF is identical, and ON actually
-    CHANGES something. A cue wired to a threshold nothing ever crosses is the same failure with a
-    different shape.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    from tailcyclenet.detector import associate_group, detect_raw, link_rows
-    from tailcyclenet.format import Session
-
-    cf._session_3d(tmp_path / 'ds' / 'test' / 's')
-    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
-    sess.preload()
-    torch.manual_seed(0)
-    det = YOLOXNano(n_keypoints=5).eval()
-    raw = detect_raw(det, (64, 64), sess, 'g000', 3, score_thresh=0.0)
-
-    for kw in ({'track': True}, {'track': False, 'link': True}):
-        base = associate_group(raw, sess, 'g000', 3, **kw)
-        # The INERT arm: the same code path with the mechanism unable to fire. Not "flag absent" --
-        # that would only prove the branch is skipped, not that the branch is faithful.
-        for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0},
-                      {'kpt_centre': False}, {'axis_cost': 0.0}):
-            got = associate_group(raw, sess, 'g000', 3, **kw, **inert)
-            for a, b in zip(base, got):
-                np.testing.assert_array_equal(a, b, err_msg=f'{kw} {inert} is not inert')
-        # ...and a threshold that rejects everything must change the output, or the cue is dead
-        # wiring reported as an arm.
-        stats = {}
-        hard = associate_group(raw, sess, 'g000', 3, **kw, random_veto=1.0, stats=stats)
-        assert stats.get('random', 0) > 0, f'{kw}: the veto never fired -- it is not wired in'
-        assert any(not np.array_equal(np.isfinite(a), np.isfinite(b))
-                   for a, b in zip(base, hard) if a is not None), \
-            f'{kw}: vetoing every edge changed nothing, so the cue does not reach the matcher'
-
-        # THE COST TERM IS A DIFFERENT KIND OF LEVER AND NEEDS A DIFFERENT ASSERTION. A veto is
-        # checked by "it removed something"; a cost must be checked by "it removed NOTHING", which
-        # is the property that distinguishes it from the veto form report 19 refuted. That it
-        # FIRES is checked separately, on geometry built to make the axis measurable -- these
-        # synthetic keypoints are near-isotropic, so `body_axis` abstains and abstention is correct.
-        costed = associate_group(raw, sess, 'g000', 3, **kw, axis_cost=1.0)
-        for a, b in zip(base, costed):
-            if a is None:
-                continue
-            np.testing.assert_array_equal(
-                np.isfinite(a), np.isfinite(b),
-                err_msg=f'{kw}: a COST deleted a candidate -- it must only reweight')
-
-    # `link_rows` on its own, which is the whole of 2D identity, with the keypoints it links.
-    rng = np.random.default_rng(0)
-    S, T = 3, 20
-    boxes = np.full((S, T, 1, 4), np.nan, np.float32)
-    kp = np.full((S, T, 1, 6, 3), np.nan, np.float32)
-    for s in range(S):
-        for t in range(T):
-            x, y = 100.0 + 300 * s + rng.normal(0, 2), 100.0
-            boxes[s, t, 0] = (x, y, x + 60, y + 60)
-            # An animal lying along x, so its axis is well defined and the cue can abstain or not.
-            kp[s, t, 0, :, 0] = np.linspace(x, x + 60, 6)
-            kp[s, t, 0, :, 1] = y + 30
-    off = link_rows(boxes.copy(), extra=kp.copy())
-    for inert in ({'axis_veto_deg': 180.0}, {'kpt_affinity': 0.0}, {'random_veto': 0.0}):
-        np.testing.assert_array_equal(off, link_rows(boxes.copy(), extra=kp.copy(), **inert),
-                                      err_msg=f'link_rows {inert} is not inert')
-    # AND WITHOUT KEYPOINTS EVERY CUE ABSTAINS rather than rejecting everything -- the property
-    # that keeps a box-only detector on the old path instead of silently losing all its matches.
-    np.testing.assert_array_equal(off, link_rows(boxes.copy(), axis_veto_deg=1.0))
-    np.testing.assert_array_equal(off, link_rows(boxes.copy(), kpt_centre=True))
-
-    # `--kpt-centre` IS NOT A VETO: it moves the affinity's point and must leave the candidate pair
-    # set alone, so it can never make a row EMPTY that was filled without it. That is the property
-    # separating it from the veto family (report 19 §4), and it is the one worth pinning.
-    moved = link_rows(boxes.copy(), extra=kp.copy(), kpt_centre=True)
-    assert np.isfinite(moved).all(-1).sum() >= np.isfinite(off).all(-1).sum(), \
-        'moving the affinity point must not drop rows -- that would make it a veto by the back door'
-
-
 def test_infer_help_renders():
     """`--help` must actually print. It did not, and nothing noticed for months.
 
@@ -1662,63 +1509,7 @@ def test_infer_help_renders():
     p = Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py'
     r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
     assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
-    assert '--axis-veto' in r.stdout
-
-
-def test_the_target_keypoint_set_is_only_built_when_a_cue_reads_it():
-    """K triangulations per target per frame, and for most arms nobody looks at the result.
-
-    `_triangulate_kpts` runs PER KEYPOINT, so on 3dpop it is 10 targets x 17 keypoints x 2,680
-    frames = 455,600 triangulations per clip. It was gated on `kpts_per_cam is not None`, which is
-    true for every keypoint-trained detector -- so a plain `--max-animals` arm, reading none of it,
-    paid all of it, and the cost showed up as the whole pipeline being mysteriously slow rather than
-    as anything attributable.
-
-    `kpt_centre` is deliberately NOT in the guard: it reads each DETECTION's own 2D keypoints and
-    never the target's triangulated set.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    for kw, want in (({}, False),
-                     ({'kpt_centre': True}, False),
-                     ({'random_veto': 0.5}, False),
-                     ({'axis_veto_deg': 60.0}, True),
-                     ({'kpt_affinity': 0.5}, True)):
-        got = CrossViewTracker(3, **kw)._wants_kpts
-        assert got is want, f'{kw}: _wants_kpts is {got}, expected {want}'
-
-
-def test_swap_repair_conserves_every_detection():
-    """Item 5 re-seats rows; it must never DROP one. That is the whole reason it is still standing.
-
-    Report 19 §4 measured the veto family as a net loss because it removes edges from a matcher
-    already starved of them (§3), and §11 found edge-conserving is necessary though not sufficient.
-    A repair that quietly lost a detection would be a veto wearing a different name, so the
-    invariant is checked directly: the multiset of boxes is unchanged, only its row assignment moves.
-    """
-    from tailcyclenet.detector.identity import swap_repair
-
-    rng = np.random.default_rng(0)
-    S, T, K = 3, 30, 8
-    u = np.linspace(-40, 40, K)
-    kp = np.zeros((S, T, 1, K, 2))
-    for s in range(S):
-        ang = s * np.pi / 3
-        for t in range(T):
-            kp[s, t, 0] = np.stack([500 * s + 300 + u * np.cos(ang),
-                                    200 + u * np.sin(ang)], -1) + rng.normal(0, 1, (K, 2))
-    box = np.zeros((S, T, 1, 4))
-    for s in range(S):
-        for t in range(T):
-            p = kp[s, t, 0]
-            box[s, t, 0] = [p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max()]
-    kp[[0, 1], 15:] = kp[[1, 0], 15:]
-    box[[0, 1], 15:] = box[[1, 0], 15:]
-
-    before = np.sort(box.reshape(-1, 4), axis=0)
-    swap_repair(box, kp)
-    after = np.sort(box.reshape(-1, 4), axis=0)
-    np.testing.assert_allclose(before, after, err_msg='a repair must not create or destroy a box')
+    assert '--pose-nms' in r.stdout
 
 
 def test_identity_branch_is_off_by_default_and_learns_a_closed_animal_set():

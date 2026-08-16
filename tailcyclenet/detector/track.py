@@ -80,154 +80,16 @@ class CrossViewTracker:
     side has 10-16x headroom and rejects essentially nothing legitimate.
     """
 
-    def __init__(self, n_slots, max_res_px=30.0, max_move=1.0, max_age=24, min_views=2,
-                 dup_res_px=None, axis_veto_deg=None, kpt_affinity=None, random_veto=None,
-                 seed=0, kpt_centre=False, axis_cost=None):
+    def __init__(self, n_slots, max_res_px=30.0, max_move=1.0, max_age=24, min_views=2):
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)
-        self.dup_res_px = dup_res_px
-        # THE KEYPOINT CUES, ALL DEFAULT-OFF. The first two are VETOES: each may only REMOVE an edge
-        # the centre gate already accepted, so `max_move`'s calibration in box sides stands untouched
-        # and a wrong cue costs a missed match rather than a wrong one. `axis_cost` is the THIRD
-        # shape and the one report 19 §14 asks for -- it reweights an edge instead of deleting it,
-        # because report 19 measured both cues as real and both vetoes as net losses on a matcher
-        # already starved of candidates. A target or detection with no usable keypoints ABSTAINS.
-        self.axis_veto_deg = None if axis_veto_deg is None else float(axis_veto_deg)
-        self.kpt_affinity = None if kpt_affinity is None else float(kpt_affinity)
-        self.axis_cost = None if axis_cost is None else float(axis_cost)
-        # THE RATE-MATCHED CONTROL, and it is not optional when a veto is quoted. Any rejection
-        # flatters a mean over matched points, so a veto's number means nothing without the same
-        # number of edges removed at random (`--vis-thresh`'s lesson, CLAUDE.md).
-        self.random_veto = None if random_veto is None else float(random_veto)
-        # ITEM 4, AND IT IS NOT A VETO. It moves the affinity's POINT from the box centre to the
-        # keypoint centroid and leaves the candidate pair set exactly as it was -- the one shape
-        # report 19 §4 says can win on a matcher §3 measured as starved of candidates. Gated on §7:
-        # a typical animal's per-keypoint error is ~58% independent, so a centroid over K averages
-        # that part down, where a common-mode shift is what the box centre already carries.
-        self.kpt_centre = bool(kpt_centre)
-        # WHICH CUES NEED THE TARGET'S TRIANGULATED KEYPOINT SET. Only these two reproject it; the
-        # rest read the detection's own 2D. Computing it regardless made every arm pay K
-        # triangulations per target per frame for nothing.
-        self._wants_kpts = (self.axis_veto_deg is not None
-                            or self.kpt_affinity is not None
-                            # A COST NEEDS THE KEYPOINTS TOO. Left out, the term is
-                            # wired, fires zero times and reports as a null result.
-                            or bool(self.axis_cost))
-        self._rng = np.random.default_rng(seed)
-        self.vetoed = {'axis': 0, 'kpt': 0, 'random': 0, 'axis_cost': 0, 'eligible': 0}
-        # slot -> {'point': (3,) float32 tensor, 'age': int, 'kpts': (K,3) tensor or None}
+        # slot -> {'point': (3,) float32 tensor, 'age': int}
         self.targets = {}
 
-    def _veto(self, kind, n=1):
-        self.vetoed[kind] += int(n)
-
-    @staticmethod
-    def _triangulate_kpts(cgroup, cams, members, kpts_per_cam):
-        """(K,3) from one target's claimed detections, per keypoint. None if nothing triangulated.
-
-        PER KEYPOINT, because a detector emits a confidence per keypoint and a bird's beak may be
-        visible in two cameras while its tail is visible in three. Requiring all K in all cameras
-        would throw the whole set away for one missing point, on the roots where occlusion is
-        exactly the problem being solved.
-        """
-        per_cam = [kpts_per_cam[c] for c in cams]
-        if any(k is None for k in per_cam):
-            return None
-        xy = torch.stack([torch.as_tensor(np.asarray(k[members[c]], np.float32))[:, :2]
-                          for c, k in zip(cams, per_cam)])                       # (n_cam, K, 2)
-        K = xy.shape[1]
-        out = torch.full((K, 3), float('nan'))
-        ok = torch.isfinite(xy).all(-1)                                          # (n_cam, K)
-        for k in range(K):
-            use = tuple(c for i, c in enumerate(cams) if bool(ok[i, k]))
-            if len(use) < 2:
-                continue
-            p = xy[[i for i, c in enumerate(cams) if c in use], k]
-            tri = _triangulate(cgroup, use, p)
-            if bool(torch.isfinite(tri).all()):
-                out[k] = tri
-        return out if bool(torch.isfinite(out).all(-1).any()) else None
-
-    def _apply_vetoes(self, affinity, cam, slots, det_kpts, det_boxes):
-        """Zero the entries the keypoint cues reject. Returns a NEW array; `affinity` is untouched.
-
-        Each cue reads the TARGET'S HELD KEYPOINT SET reprojected into this camera against the
-        DETECTION'S OWN keypoints, so both sides are measured in the same pixels and the comparison
-        needs no calibration constant. A target that has never claimed two cameras holds no keypoint
-        set and abstains, exactly as a detection with too few valid points does.
-        """
-        from . import identity as idy
-
-        out = affinity.copy()
-        live = np.argwhere(out > 0)
-        if live.size == 0:
-            return out
-        self._veto('eligible', len(live))
-
-        # Reproject each target's held (K,3) into this camera ONCE, not once per pair.
-        proj = {}
-        for i, s in enumerate(slots):
-            kp = self.targets[s].get('kpts')
-            if kp is None:
-                continue
-            ok = torch.isfinite(kp).all(-1)
-            if int(ok.sum()) < idy.MIN_PTS:
-                continue
-            xy = np.full((kp.shape[0], 2), np.nan, np.float32)
-            xy[ok.numpy()] = _project(cam, kp[ok]).numpy()
-            proj[i] = xy
-
-        dk = None if det_kpts is None else np.asarray(det_kpts, float)
-        for i, j in live:
-            tk = proj.get(int(i))
-            # THE RANDOM CONTROL NEEDS NO KEYPOINTS, and must not be skipped when a keypoint cue
-            # would have abstained. It was: an early `continue` on `tk is None` guarded all three
-            # cues together, so once the target keypoint set stopped being built for control arms
-            # the control silently stopped firing -- a rate-matched control that rejects nothing is
-            # not a control, and every veto number quoted against it would have been meaningless.
-            have_kpts = tk is not None and dk is not None and int(j) < dk.shape[0]
-            d = dk[int(j)] if have_kpts else None
-            if self.axis_veto_deg is not None and have_kpts:
-                gap = idy.angle_gap(idy.body_axis(tk), idy.body_axis(d))
-                # NaN IS AN ABSTENTION, NOT A REJECTION. `gap > thresh` is False for NaN, which is
-                # the behaviour wanted -- but writing it as `not (gap <= thresh)` would invert that
-                # silently, so it is spelled positively and this comment is why.
-                if np.isfinite(gap) and gap > self.axis_veto_deg:
-                    out[i, j] = 0.0
-                    self._veto('axis')
-                    continue
-            if self.kpt_affinity is not None and have_kpts:
-                frac = idy.kpt_in_box_frac(tk, det_boxes[int(j)].numpy())
-                if np.isfinite(frac) and frac < self.kpt_affinity:
-                    out[i, j] = 0.0
-                    self._veto('kpt')
-                    continue
-            if self.random_veto and self._rng.random() < self.random_veto:
-                out[i, j] = 0.0
-                self._veto('random')
-                continue
-            # THE COST TERM (report 19 §14), the same multiplier `link_rows` applies and for the
-            # same reason: both surviving cues are measured REAL and both lose as vetoes, because
-            # rejection is the wrong currency. Implemented HERE as well as in `link_rows` because
-            # `--track` is the default, and a flag that is a silent no-op on the default path is
-            # the failure this repo keeps recording -- six posetail-pose configs declared an anchor
-            # that was a literal no-op and were reported as anchored arms.
-            #
-            # It can never reach 0, so no candidate is deleted; it runs AFTER every veto, so a
-            # zeroed entry stays zeroed; `axis_cost = 0` is identically 1, the inertness control.
-            if self.axis_cost and have_kpts:
-                gap = idy.angle_gap(idy.body_axis(tk), idy.body_axis(d))
-                if np.isfinite(gap):
-                    out[i, j] *= 1.0 - self.axis_cost * (
-                        1.0 - np.cos(np.radians(2.0 * gap))) / 2.0
-                    self._veto('axis_cost')
-        return out
-
-    # -- one frame ------------------------------------------------------------------------
-    def step(self, cgroup, boxes_per_cam, scores_per_cam, kpts_per_cam=None):
+    def step(self, cgroup, boxes_per_cam, scores_per_cam):
         """Match, update, birth, retire. -> (boxes (S,C,4), scores (S,C), claimed (S,C)) numpy.
 
         `claimed[s, c]` is the DETECTION INDEX slot `s` took in camera `c`, or -1. It is returned
@@ -237,10 +99,6 @@ class CrossViewTracker:
 
         `boxes_per_cam` is a list of (n_c, 4) tensors in each camera's own pixels, and
         `scores_per_cam` the matching (n_c,) objectness -- the same pair `associate` takes.
-
-        `kpts_per_cam` is the optional matching list of (n_c, K, 3) detector keypoints in the same
-        pixels. Supplying it is what lets the cues above fire; without it every cue abstains and
-        this is byte-identical to the centroid-only tracker.
         """
         from scipy.optimize import linear_sum_assignment
 
@@ -250,21 +108,6 @@ class CrossViewTracker:
         claimed_ix = np.full((self.n, C), -1, np.int32)
         centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
         sides = [_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
-        # THE POINT MOVES; THE GATE, THE SIDES AND THE PAIR SET DO NOT. `sides` stays the BOX side,
-        # because `max_move` is calibrated in box sides and a keypoint-extent denominator would be a
-        # second, uncalibrated lever riding along (eval rule 4). Per detection, and it falls back to
-        # the box centre wherever there are too few keypoints, so no pair can disappear.
-        if self.kpt_centre and kpts_per_cam is not None:
-            from . import identity as idy
-            for c, kk in enumerate(kpts_per_cam):
-                if kk is None or not centres[c].numel():
-                    continue
-                k = np.asarray(kk, float)
-                pts = np.stack([idy.centroid(k[i], box=boxes_per_cam[c][i].numpy())
-                                for i in range(min(len(k), centres[c].shape[0]))])
-                ok = np.isfinite(pts).all(-1)
-                centres[c][:len(pts)][ok] = torch.as_tensor(pts[ok], dtype=centres[c].dtype)
-
         slots = [s for s, t in sorted(self.targets.items())
                  if bool(torch.isfinite(t['point']).all())]
         # A TARGET WITH NO 3D POINT CANNOT BE MATCHED, SO IT MUST STILL BE ABLE TO EXPIRE. It is
@@ -308,14 +151,6 @@ class CrossViewTracker:
             # is True for NaN, so `linear_sum_assignment` raised `matrix contains invalid numeric
             # entries` and killed the clip. Zero is what the gate already means: unavailable.
             affinity = np.nan_to_num(np.clip(1.0 - gap, 0.0, None), nan=0.0)
-            # THE VETOES, APPLIED TO THE AFFINITY BEFORE THE HUNGARIAN AND NEVER TO ITS VALUE.
-            # Zeroing an entry is what the gate already means -- unavailable -- so a veto is exactly
-            # a narrower gate and cannot reorder the pairs it leaves alone. Applied before matching
-            # rather than after, because rejecting a pair the Hungarian already chose leaves that
-            # detection unclaimed while a legal alternative went unconsidered.
-            if kpts_per_cam is not None and affinity.any():
-                affinity = self._apply_vetoes(affinity, cgroup[c], slots, kpts_per_cam[c],
-                                              boxes_per_cam[c])
             if not affinity.any():
                 continue
             ri, ci = linear_sum_assignment(-affinity)
@@ -338,16 +173,6 @@ class CrossViewTracker:
                 # model), and a shape is a slower-changing quantity than a position, so a held set is
                 # a better prior than none. Only keypoints valid in EVERY claimed camera can be
                 # triangulated, which is why this is per keypoint rather than all-or-nothing.
-                # ONLY WHEN A CUE ACTUALLY READS IT. This is per keypoint over K, so it is K
-                # triangulations per target per frame -- 10 targets x 17 keypoints x 2,680 frames is
-                # 455,600 per 3dpop clip, and it ran on EVERY arm the moment the cache carried
-                # keypoints, including arms that read none of them. `kpt_centre` is deliberately not
-                # in this test: it uses each DETECTION's own 2D keypoints and never the target's
-                # triangulated set.
-                if self._wants_kpts and kpts_per_cam is not None:
-                    kk = self._triangulate_kpts(cgroup, cams, got[s], kpts_per_cam)
-                    if kk is not None:
-                        self.targets[s]['kpts'] = kk
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
@@ -375,24 +200,14 @@ class CrossViewTracker:
                         else boxes_per_cam[c].new_zeros((0, 4)) for c in range(C)]
                 born = associate(cgroup, left, max_res_px=self.max_res_px,
                                  min_views=self.min_views, max_instances=len(free),
-                                 dup_res_px=self.dup_res_px)
+)
                 for s, g in zip(free, born):
-                    self.targets[s] = {'point': g['point'], 'age': 0, 'kpts': None}
+                    self.targets[s] = {'point': g['point'], 'age': 0}
                     for c, j in g['members'].items():
                         det = keep[c][j]
                         out[s, c] = boxes_per_cam[c][det].numpy()
                         sc[s, c] = float(scores_per_cam[c][det])
                         claimed_ix[s, c] = det
-                    # A NEWBORN GETS ITS KEYPOINT SET IMMEDIATELY where it claimed two cameras --
-                    # otherwise every target abstains on its first frame after birth, and on a
-                    # crowded clip births are frequent enough for that to be most of the cue's
-                    # opportunities. `members` here indexes the LEFTOVER list, so it maps back
-                    # through `keep` exactly as the boxes above do.
-                    if self._wants_kpts and kpts_per_cam is not None and len(g['members']) >= 2:
-                        cams = tuple(sorted(g['members']))
-                        mem = {c: keep[c][g['members'][c]] for c in cams}
-                        self.targets[s]['kpts'] = self._triangulate_kpts(
-                            cgroup, cams, mem, kpts_per_cam)
 
         # -- retire: a slot with no evidence for a window is free for whoever is there now ---
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:

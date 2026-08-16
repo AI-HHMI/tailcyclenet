@@ -225,18 +225,6 @@ def test_carried_prior_is_bounds_masked_and_dated():
                            cgroup)
     assert (late == len(frames) - 1).all()
 
-    # A KEYPOINT THE MODEL ITSELF DOUBTED, gated in the same currency (NaN = "I was not told").
-    gated = InferConfig(anchor='carry', prior_vis_thresh=0.0)
-    vis = torch.tensor([2.0, -1.0, 3.0, -5.0])
-    pri, _ = _build_prior(gated, (pose, 23, vis), None, 0, 0, frames, boxes, [1.0], '2d', K,
-                          2, cgroup)
-    assert torch.isfinite(pri[0, 0]).all(), 'a confident in-crop keypoint must survive'
-    assert torch.isnan(pri[0, 1]).all(), 'a keypoint below the logit threshold must be dropped'
-    # ...and the default keeps it, so an unconfigured run is byte-identical.
-    keep, _ = _build_prior(cfg, (pose, 23, vis), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
-                           cgroup)
-    assert torch.isfinite(keep[0, 1]).all()
-
     # STALER THAN THE OVERLAP IS NOT A PRIOR. `carried` is only written by a window that predicted,
     # so an animal the box source lost for a few windows keeps offering a pose from before this
     # one, and the clamp above would present it as this window's first frame.
@@ -375,47 +363,6 @@ def test_3d_carry_feeds_back_the_anchor_free_estimate(scene):
                               np.nan_to_num(out['pred'], nan=-9e9))
 
 
-def test_seam_blend_averages_the_overlap_and_changes_only_the_overlap(scene):
-    """The window seam is a discontinuity: measured at 3.46x the interior per-frame displacement on
-    3dpop and 2.33x on johnson-mouse, because `last` reports each overlap frame from the window that
-    saw it with the LEAST left-context.
-
-    `blend` must (a) leave frames only one window decoded exactly as they were, and (b) move the
-    overlap frames, or it is averaging nothing.
-    """
-    model, sess, registry, name = scene
-    # n_frames=2, overlap=1 -- NOT `_cfg`'s defaults. The fixture groups are 4 frames long, so at
-    # n_frames=4 `_window_starts` returns a SINGLE window and there is no overlap to blend: an earlier
-    # version of this test guarded that with `pytest.skip` and therefore never ran on either fixture.
-    # 2 is the floor (gotcha 1: T = 1 hits posetail's gT = T // tubelet = 0).
-    NF, OV = 2, 1
-    kw = dict(anchor='none', n_frames=NF, overlap=OV)
-    last = run_group(model, sess, 'g000', registry, name,
-                     InferConfig(image_size=64, min_crop_dim=16, device='cpu', seam='last', **kw))
-    blend = run_group(model, sess, 'g000', registry, name,
-                      InferConfig(image_size=64, min_crop_dim=16, device='cpu', seam='blend', **kw))
-    assert blend['pred'].shape == last['pred'].shape
-    # Coverage cannot fall: a frame one window decoded is that window's value, nan-aware.
-    assert (np.isfinite(blend['pred']).all(-1).sum()
-            >= np.isfinite(last['pred']).all(-1).sum())
-    starts = last['window_start']
-    assert len(starts) >= 2, f'the fixture must produce several windows, got {starts}'
-    T = last['pred'].shape[1]
-    covered = np.zeros(T, int)
-    for s0 in starts:
-        covered[s0:min(s0 + NF, T)] += 1
-    assert (covered > 1).any(), 'the fixture must actually overlap'
-    solo = covered == 1
-    if solo.any():
-        np.testing.assert_allclose(blend['pred'][:, solo], last['pred'][:, solo],
-                                   rtol=1e-5, atol=1e-5)
-    # ...and the overlap frames must actually MOVE, or nothing is being averaged.
-    over = covered > 1
-    ok = np.isfinite(blend['pred'][:, over]).all(-1) & np.isfinite(last['pred'][:, over]).all(-1)
-    assert ok.any(), 'need a finite overlap frame to compare'
-    assert not np.allclose(blend['pred'][:, over][ok], last['pred'][:, over][ok])
-
-
 def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     """THE DEFAULT BOX PATH, THROUGH `main()`. Every other CLI test SystemExits inside argparse.
 
@@ -457,7 +404,6 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     (['--oracle-corrupt', 'nonsense'], 'kind must be one of'),
     (['--oracle-corrupt', 'off'], 'needs an amount'),
     (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
-    (['--prior-vis-thresh', '1.0', '--anchor', 'none'], 'only means anything'),
 ])
 def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
                                                                         argv, expect):
@@ -480,31 +426,6 @@ def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, mo
     with pytest.raises(SystemExit) as e:
         cli.main()
     assert expect in str(e.value), f'wanted {expect!r}, got: {e.value}'
-
-
-def test_seam_blend_accumulates_a_repeated_frame_index():
-    """`arr[[0, 0]] += x` applies only the LAST write, and `run_group` produces a repeated frame index.
-
-    A group shorter than two frames is padded by repeating its index (`np.clip(np.arange(start,
-    start + 2), ...)`), because T = 1 hits posetail's `gT = T // tubelet = 0` bug. Every other write in
-    the loop is an assignment, where a repeat is harmless; the blend accumulator is the one place it is
-    not, and numpy's fancy-index `+=` fails silently there rather than raising.
-    """
-    sum_ = np.zeros((1, 3, 1, 2))
-    cnt = np.zeros((1, 3, 1), int)
-    frames = np.array([0, 0])                      # what a one-frame group produces
-    p = np.array([[[1.0, 1.0]], [[3.0, 3.0]]])     # two decodes of the same frame
-    fin = np.isfinite(p).all(-1)
-    np.add.at(sum_, (0, frames), np.where(fin[..., None], p, 0.0))
-    np.add.at(cnt, (0, frames), fin)
-    assert cnt[0, 0, 0] == 2, 'both decodes of the repeated frame must be counted'
-    assert sum_[0, 0, 0, 0] == 4.0
-    # The mean is then 2.0. A plain `+=` would have given count 1 and sum 3.0, i.e. it would have
-    # thrown one decode away and still produced a plausible-looking number.
-    naive_s = np.zeros_like(sum_); naive_c = np.zeros_like(cnt)
-    naive_s[0, frames] += np.where(fin[..., None], p, 0.0)
-    naive_c[0, frames] += fin
-    assert naive_c[0, 0, 0] == 1 and naive_s[0, 0, 0, 0] == 3.0
 
 
 def test_the_tracker_projects_correctly_on_a_moving_rig():
@@ -625,37 +546,3 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
     np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)
 
 
-def test_seam_blend_blends_the_companion_columns_too(scene):
-    """`pred` was averaged and every column beside it was last-write-wins.
-
-    So `conf`, `box_agree`, `kpt_agree` and `pred_tri` described the LAST window's decode of a
-    frame whose reported pose is the mean of several. `--vis-thresh` sharpened it: it NaNs `conf`
-    and `box_agree` for the frames it dropped in THIS window, while the blend still carries an
-    earlier ungated window's contribution to `pred` -- so a frame could have a finite blended pose
-    and a NaN confidence. `eval.py` reads `box_agree` per group and quotes `--vis-thresh` off
-    `conf`, so the two blend arms in the overlap-12 comparison reported mismatched columns.
-    """
-    model, sess, registry, name = scene
-    # n_frames=2, overlap=1 for the reason the test above spells out: the fixture groups are 4
-    # frames, so `_cfg`'s n_frames=4 gives ONE window and there is no overlap to blend.
-    kw = dict(anchor='none', n_frames=2, overlap=1, image_size=64, min_crop_dim=16, device='cpu')
-    last = run_group(model, sess, 'g000', registry, name, InferConfig(seam='last', **kw))
-    blend = run_group(model, sess, 'g000', registry, name, InferConfig(seam='blend', **kw))
-
-    for key in ('conf', 'box_agree', 'pred_tri'):
-        if blend.get(key) is None:
-            continue
-        a, b = np.asarray(blend[key]), np.asarray(last[key])
-        ok = np.isfinite(a) & np.isfinite(b)
-        if not ok.any():
-            continue
-        # WHEREVER THE POSE MOVED, the companion must have moved too -- otherwise it is still
-        # describing one window while the pose describes several.
-        assert not np.allclose(a[ok], b[ok]), \
-            f'{key} is identical under blend and last, so it is not being blended'
-
-    # A frame with a finite blended pose must not carry an all-NaN confidence it never earned.
-    fin_pred = np.isfinite(blend['pred']).all(-1)
-    fin_conf = np.isfinite(blend['conf'])
-    assert (fin_pred == fin_conf).all() or not fin_pred.any(), \
-        'pose and confidence must agree about which frames were decoded'

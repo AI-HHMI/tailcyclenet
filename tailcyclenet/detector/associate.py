@@ -54,8 +54,7 @@ def _residual(cgroup, cams, pts, p3d):
     return float(torch.linalg.norm(proj - pts, dim=-1).median())
 
 
-def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
-              dup_res_px=None):
+def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0):
     """Group boxes across cameras into 3D instances.
 
     Args:
@@ -77,12 +76,10 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             `[data].prob_2d_only` before reading anything into a `min_views = 1` arm.
 
             It cannot be free either: a leftover box is one the geometry never corroborated, so it
-            is also where a false positive lives. `dup_res_px` is the gate on that.
-        dup_res_px: only with `min_views = 1`. A leftover box whose centre reprojects within this
-            many pixels of an instance ALREADY accepted in that camera is a second detection of an
-            animal that is already in the output, so it is dropped instead of emitted. None keeps
-            every leftover, which is the unconditional version and the one that carries the full FP
-            risk above.
+            is also where a false positive lives.
+        `dup_res_px` WAS HERE and is deleted: under `--track` (the default) it produced a
+            byte-identical prediction file -- same md5 -- because the tracker claims the leftovers
+            this gate existed to police.
 
     Returns a list of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float}. A
     single-view instance has `point` all-NaN and `residual` inf: there is nothing to triangulate
@@ -164,22 +161,11 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
     if min_views == 1:
         # Whatever no pair claimed, in camera order then score order (the boxes arrive score-ordered
         # from `decode`). Deterministic, so two arms over one clip see the same rows.
-        accepted = [g['point'] for g in out if torch.isfinite(g['point']).all()]
         for c in range(n_cams):
             for i in range(centres[c].shape[0]):
                 if max_instances and len(out) >= max_instances:
                     return out
                 if (c, i) in used:
-                    continue
-                # A SECOND DETECTION OF AN ANIMAL ALREADY IN THE OUTPUT IS NOT NEW COVERAGE. The
-                # pairwise pass uses each box once, so an animal detected twice in one camera
-                # leaves the loser unclaimed -- and emitting it adds a duplicate instance on top of
-                # a triangulated one, which is `fp_dup` in `metrics.mota`, not a found animal.
-                # Tested where the geometry can speak: against the accepted points' reprojection
-                # into THIS camera.
-                if dup_res_px is not None and accepted and any(
-                        _residual(cgroup, (c,), centres[c][i].reshape(1, 2), p) <= dup_res_px
-                        for p in accepted):
                     continue
                 out.append({'point': torch.full((3,), float('nan')), 'residual': float('inf'),
                             'boxes': {c: boxes_per_cam[c][i]}, 'members': {c: i}})

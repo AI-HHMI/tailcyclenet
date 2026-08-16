@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.checkpoints import load_run
 from tailcyclenet.format import Session, load_dataset
-from tailcyclenet.infer import ANCHORS, CARRY_SOURCES, SEAM_MODES, InferConfig, run_group
+from tailcyclenet.infer import ANCHORS, CARRY_SOURCES, InferConfig, run_group
 
 
 def sessions_for(path: Path, split: str):
@@ -134,12 +134,6 @@ def main():
                          'one-camera 3D window is the run\'s own `[data].prob_2d_only`: the shipped '
                          '3dpop and rat-city runs set 0.25, configs/w9.toml sets 0, and under 0 it '
                          'is an untrained input shape. Measured on 3dpop: no metric moves.')
-    ap.add_argument('--dup-res-px', type=float, default=None,
-                    help='only with --min-views 1: drop a leftover single-view box that reprojects '
-                         'within this many pixels of an instance already accepted in that camera. '
-                         'Those are second detections of an animal that is already in the output, '
-                         'so they are fp_dup rather than new coverage. Default keeps them all, '
-                         'which is the unconditional rule and carries the full FP risk.')
     ap.add_argument('--max-animals', type=int, default=0)
     # DETECTION BUDGET, SEPARATE FROM THE ROW COUNT. `--max-animals` used to set both, so sweeping
     # the row count also moved how many boxes the detector was allowed to emit and neither lever
@@ -151,51 +145,6 @@ def main():
     # unchanged centroid cost -- each may only remove an edge the centre gate already accepted, so
     # `--max-move`'s calibration in box sides is untouched and a wrong cue costs a missed match
     # rather than a wrong one. A detection with too few keypoints ABSTAINS; it never vetoes.
-    ap.add_argument('--axis-veto', type=float, default=None, metavar='DEG',
-                    help='reject a match whose body axes differ by more than DEG. The axis is PCA-1 '
-                         'over all K keypoints, not a two-point one (noise ~7 deg against ~11), and '
-                         'it is UNDIRECTED. Abstains on a round animal, by a K-AWARE isotropy test '
-                         '-- see detector/identity.iso_null, and note that at K = 4 it barely '
-                         'separates, which bounds this cue on rat-city.')
-    ap.add_argument('--kpt-affinity', type=float, default=None, metavar='FRAC',
-                    help="reject a match where fewer than FRAC of the target's keypoints fall inside "
-                         "the detection's box. Report 12's R5 term, never built until now: it counts "
-                         'inside/outside over K, so per-keypoint noise averages away.')
-    ap.add_argument('--swap-repair', type=float, default=None, metavar='GAIN',
-                    help='report 16 §9.2 item 5, and the only one of the six still standing after '
-                         'report 19. Offline O(T x S^2) pass that EXCHANGES two rows\' suffixes '
-                         'where a swap is indicated -- it re-seats rather than rejecting, so it '
-                         'conserves every edge, which is the property a starved matcher needs. GAIN '
-                         'is the margin in degrees (two rows are always exchangeable, so with no '
-                         'margin it fires on noise everywhere); 30 is a starting value, not a '
-                         'calibrated one. IT FIRES ON THE SAME DISCONTINUITY the label-free '
-                         'statistic is built from, so score it on idsw/MOTA against labels and '
-                         'NEVER on that proxy.')
-    ap.add_argument('--kpt-centre', action='store_true',
-                    help="use the keypoint CENTROID as the affinity's point instead of the box "
-                         'centre (report 16 §9.2 item 4). NOT a veto -- it moves the point and '
-                         'leaves the candidate pair set untouched, which is the one shape that can '
-                         'win on a matcher starved of candidates. Gated on report 19 §7: a typical '
-                         "animal's per-keypoint error is ~58%% independent, so a centroid over K "
-                         'averages that part down. Falls back to the box centre per detection '
-                         'wherever there are too few keypoints, so no pair can disappear.')
-    ap.add_argument('--axis-cost', type=float, default=None, metavar='W',
-                    help='spend the body-axis cue as a Hungarian COST TERM rather than a veto: the '
-                         "affinity of an eligible edge is multiplied by `1 - W*(1 - cos(2*dtheta))/2`, "
-                         'maDLC\'s ellipse-tracker shape (0.8 + 0.2*|cos dtheta| is W = 0.2). THE '
-                         'ONE FORM REPORT 16 §9.2 NEVER PROPOSED, and the form report 19 §14 '
-                         'concluded both surviving cues want: §4 measured the axis and '
-                         'keypoint-in-box cues as REAL -- each beats its rate-matched random '
-                         'control on idsw -- and both as net LOSSES as vetoes, because rejection '
-                         'is the wrong currency on a matcher report 18 §5 measured as starved '
-                         '(34.4%% of offered detections dropped, 29 points of them INSIDE the '
-                         'gate). A cost shifts a ranking where a veto deletes a candidate, so the '
-                         'edge count is conserved exactly. The multiplier cannot reach 0, so no '
-                         'pair is ever removed; it is applied AFTER every veto, so a zeroed edge '
-                         'stays zeroed; and W = 0 is a literal no-op, which is the inertness '
-                         'control by construction rather than by a threshold that happens not to '
-                         'fire. Default off. Report its fire rate beside any number, and pair it '
-                         'against W = 0 -- NOT against a veto arm.')
     ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
                     help='INSTANCE-LEVEL NMS on the seated rows (report 20 lead 1, maDLC\'s '
                          '`Assembly.intersection_with`). Drops the lower-scored of two rows whose '
@@ -211,25 +160,6 @@ def main():
                          'it as a keypoint COUNT, not as a float, and note that maDLC\'s 0.8 means '
                          'something different at K = 17 than at K = 4. Same trap as '
                          '--min-match-kpts (eval rule 9).')
-    ap.add_argument('--stitch', type=int, default=None, metavar='GAP',
-                    help='merge two rows holding complementary fragments of one animal, when the '
-                         'temporal gap between them is <= GAP frames and the boxes either side of '
-                         'it are within --max-move (report 20 lead 2, APT\'s rung). `link_rows` '
-                         'only seats a birth into a row whose last box is ENTIRELY non-finite, '
-                         'which takes max_age = 24 frames, so a short disappearance splits one '
-                         'animal across two rows. NOT DLC\'s min-cost flow, which is a path COVER '
-                         'and forces junk fragments onto real animals -- the failure --birth-age '
-                         'already produced here (union crop p99 590 -> 3,804 px against a 244 px '
-                         'rat). Only merges rows whose live frames are DISJOINT. Default off.')
-    ap.add_argument('--seed', type=int, default=0,
-                    help='seed for --random-veto. The control needs to be repeatable and needs to '
-                         'be runnable at several seeds, since one draw of a random rejection is one '
-                         'sample of the control, not the control.')
-    ap.add_argument('--random-veto', type=float, default=None, metavar='RATE',
-                    help='THE RATE-MATCHED CONTROL, and it is not optional when a veto is quoted. '
-                         'Rejects RATE of the eligible edges at random. Any rejection flatters a '
-                         'mean over matched points, so a veto number without this control means '
-                         'nothing -- the `--vis-thresh` lesson.')
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
                          '`carry` needs the frames contiguous.')
@@ -259,11 +189,6 @@ def main():
                          'A LOGIT, and NOT PORTABLE: rat-city sits at a median of +2.7 and 3dpop at '
                          '+15.4, so pick it per dataset from the run\'s own `conf` field. Applies '
                          'to what is reported, never to the carried prompt.')
-    ap.add_argument('--prior-vis-thresh', type=float, default=None,
-                    help='drop a CARRIED keypoint from the prompt when the previous window\'s own '
-                         '`vis_pred` LOGIT for it is below this. A logit, not a probability: 0.0 is '
-                         'p = 0.5. Gates individual prompt keypoints, not rows -- it changes what '
-                         'the model is told, never what it reports. Off by default.')
     ap.add_argument('--kpt-chunk', type=int, default=0,
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
@@ -285,20 +210,6 @@ def main():
                          'every one is marked `ok` -- 3dpop reports 0.000 of (row, frame) with no '
                          'pose against 2.1-2.2%% of (row, frame) with no camera at all. Raising this '
                          'LOWERS reported coverage on purpose.')
-    ap.add_argument('--seam', default='last', choices=SEAM_MODES,
-                    help='how overlapping frames are resolved. "last" is what the loop always did: '
-                         'the later window wins outright, so a frame in the overlap is reported from '
-                         'the window that saw it with the LEAST left-context, and the switch repeats '
-                         'every `n_frames - overlap` frames. That seam is NOT small -- the one-frame '
-                         'displacement at the boundary is 3.46x the interior value on 3dpop '
-                         '(2.42 mm vs 0.70), 2.33x on johnson-mouse, 1.24-1.45x on the 2D roots. '
-                         '"blend" reports the mean of every window that decoded the frame, and is '
-                         'MEASURED NOT TO HELP: on 3dpop\'s 58 groups it leaves MPJPE unchanged and costs '
-                         'MOTA -0.0014 (SIG) at overlap 4, and the harm scales with the blended fraction '
-                         '(-0.0020 at overlap 12, 80%% of frames). A seam is partly an IDENTITY '
-                         'discontinuity and averaging two identities is worse than picking one. Kept so the '
-                         'measurement is reproducible; it does move `motion_ratio` toward 1, which is why '
-                         'that statistic is not sufficient on its own.')
     ap.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
                     help='3D only, and only under --anchor carry: what the next window is seeded '
                          'with. "triangulate" (default) hands back the ANCHOR-FREE estimate, '
@@ -357,10 +268,6 @@ def main():
               f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
               'prediction of anything. ***')
 
-    if args.prior_vis_thresh is not None and args.anchor != 'carry':
-        raise SystemExit('--prior-vis-thresh gates the CARRIED prompt, so it only means anything '
-                         f'under --anchor carry; got {args.anchor!r}.')
-
     device = args.device if torch.cuda.is_available() else 'cpu'
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
@@ -384,10 +291,10 @@ def main():
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
-        kpt_chunk=args.kpt_chunk, prior_vis_thresh=args.prior_vis_thresh,
+        kpt_chunk=args.kpt_chunk,
         vis_thresh=args.vis_thresh, refine=args.refine,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
-        oracle_corrupt=args.oracle_corrupt, seam=args.seam, device=device,
+        oracle_corrupt=args.oracle_corrupt, device=device,
         crop_source=args.crop_source)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
@@ -610,34 +517,17 @@ def main():
                 # against 44 ms of 4K decode, so recomputing it costs nothing measurable and buys
                 # the property the cache exists for: two identity arms differ in exactly one lever
                 # over byte-identical pixels.
-                veto_stats = {}
+                nms_stats = {}
                 det_boxes, det_scores, det_kpts = associate_group(
                     raw, sess, gid, n_want, link=args.link_boxes, min_views=args.min_views,
-                    dup_res_px=args.dup_res_px, track=args.track, max_move=args.max_move,
-                    axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
-                    random_veto=args.random_veto, seed=args.seed, stats=veto_stats,
-                    kpt_centre=args.kpt_centre, swap_repair=args.swap_repair,
-                    axis_cost=args.axis_cost, pose_nms=args.pose_nms,
-                    stitch=args.stitch)
-                # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
-                # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
-                # whenever any cue is on, so an arm that silently never fired is visible as such
-                # rather than being reported as a null result for the cue.
-                if veto_stats.get('eligible'):
-                    e = veto_stats['eligible']
-                    print(f'{key}: veto rates over {e} eligible edge(s) -- '
-                          + '  '.join(f'{k} {veto_stats.get(k, 0) / e:.4f}'
-                                      for k in ('axis', 'kpt', 'random', 'axis_cost')), flush=True)
-                # THE OTHER TWO LEVERS' RATES. `--pose-nms` and `--stitch` do not touch the
-                # candidate-edge counters above, so without this their fire rate had to be
-                # recovered from the npz after the fact -- and "report the fire rate before the
-                # metric" means printed, not recoverable.
+                    track=args.track, max_move=args.max_move, stats=nms_stats,
+                    pose_nms=args.pose_nms)
+                # THE FIRE RATE IS THE NUMBER A RATE-MATCHED RANDOM CONTROL MUST BE MATCHED TO, and
+                # it cannot be recovered afterwards from the npz -- a dropped row leaves no trace.
+                # "Report the fire rate before the metric" means printed, not recoverable.
                 if args.pose_nms is not None:
-                    print(f'{key}: pose-nms dropped {veto_stats.get("nms_dropped", 0)} row(s) of '
-                          f'{veto_stats["nms_pairs"]} overlapping pair(s)', flush=True)
-                if args.stitch is not None:
-                    print(f'{key}: stitch merged {veto_stats.get("stitch_merged", 0)} of '
-                          f'{veto_stats["stitch_candidates"]} candidate gap(s)', flush=True)
+                    print(f'{key}: pose-nms dropped {nms_stats.get("nms_dropped", 0)} row(s) of '
+                          f'{nms_stats["nms_pairs"]} overlapping pair(s)', flush=True)
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
                 # saturated on every detector shipped here; a detector whose scores are NOT
                 # saturated would lose most of its boxes to that, and this line is where that shows

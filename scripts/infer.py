@@ -204,7 +204,13 @@ def main():
                          'overlap almost equally by IoU and it is zero under fast motion. Aimed at '
                          '`fp_dup`, which is 90%% of calms21\'s detector-minus-GT FP rise and ~10%% '
                          'of 3dpop\'s, so expect it to matter on crowded-overlap roots and be a '
-                         'near-no-op elsewhere. Default off; its fire rate is printed.')
+                         'near-no-op elsewhere. Default off; its fire rate is printed. '
+                         'QUANTISED: the overlap is a fraction of K keypoints, so at K = 4 it takes '
+                         'only {0, .25, .5, .75, 1} and this flag has FIVE meaningful settings, not '
+                         'a continuum -- 0.6 and 0.7 are byte-identical (both mean "3 of 4"). Quote '
+                         'it as a keypoint COUNT, not as a float, and note that maDLC\'s 0.8 means '
+                         'something different at K = 17 than at K = 4. Same trap as '
+                         '--min-match-kpts (eval rule 9).')
     ap.add_argument('--stitch', type=int, default=None, metavar='GAP',
                     help='merge two rows holding complementary fragments of one animal, when the '
                          'temporal gap between them is <= GAP frames and the boxes either side of '

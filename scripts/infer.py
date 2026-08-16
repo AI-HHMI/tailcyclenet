@@ -650,10 +650,10 @@ def main():
                 # candidate-edge counters above, so without this their fire rate had to be
                 # recovered from the npz after the fact -- and "report the fire rate before the
                 # metric" means printed, not recoverable.
-                if veto_stats.get('nms_pairs'):
+                if args.pose_nms is not None:
                     print(f'{key}: pose-nms dropped {veto_stats.get("nms_dropped", 0)} row(s) of '
                           f'{veto_stats["nms_pairs"]} overlapping pair(s)', flush=True)
-                if veto_stats.get('stitch_candidates'):
+                if args.stitch is not None:
                     print(f'{key}: stitch merged {veto_stats.get("stitch_merged", 0)} of '
                           f'{veto_stats["stitch_candidates"]} candidate gap(s)', flush=True)
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is

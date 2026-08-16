@@ -205,6 +205,16 @@ def main():
                          '`fp_dup`, which is 90%% of calms21\'s detector-minus-GT FP rise and ~10%% '
                          'of 3dpop\'s, so expect it to matter on crowded-overlap roots and be a '
                          'near-no-op elsewhere. Default off; its fire rate is printed.')
+    ap.add_argument('--stitch', type=int, default=None, metavar='GAP',
+                    help='merge two rows holding complementary fragments of one animal, when the '
+                         'temporal gap between them is <= GAP frames and the boxes either side of '
+                         'it are within --max-move (report 20 lead 2, APT\'s rung). `link_rows` '
+                         'only seats a birth into a row whose last box is ENTIRELY non-finite, '
+                         'which takes max_age = 24 frames, so a short disappearance splits one '
+                         'animal across two rows. NOT DLC\'s min-cost flow, which is a path COVER '
+                         'and forces junk fragments onto real animals -- the failure --birth-age '
+                         'already produced here (union crop p99 590 -> 3,804 px against a 244 px '
+                         'rat). Only merges rows whose live frames are DISJOINT. Default off.')
     ap.add_argument('--seed', type=int, default=0,
                     help='seed for --random-veto. The control needs to be repeatable and needs to '
                          'be runnable at several seeds, since one draw of a random rejection is one '
@@ -625,7 +635,8 @@ def main():
                     axis_veto_deg=args.axis_veto, kpt_affinity=args.kpt_affinity,
                     random_veto=args.random_veto, seed=args.seed, stats=veto_stats,
                     kpt_centre=args.kpt_centre, swap_repair=args.swap_repair,
-                    axis_cost=args.axis_cost, pose_nms=args.pose_nms)
+                    axis_cost=args.axis_cost, pose_nms=args.pose_nms,
+                    stitch=args.stitch)
                 # THE FIRE RATE IS THE NUMBER THE RANDOM CONTROL MUST BE MATCHED TO, and it cannot
                 # be recovered afterwards -- a vetoed edge leaves no trace in the boxes. Printed
                 # whenever any cue is on, so an arm that silently never fired is visible as such

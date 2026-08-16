@@ -453,3 +453,83 @@ def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
         stats['nms_pairs'] = stats.get('nms_pairs', 0) + pairs
         stats['nms_dropped'] = stats.get('nms_dropped', 0) + dropped
     return dropped
+
+
+def stitch_rows(boxes, kpts=None, scores=None, max_gap=24, max_move=1.0, stats=None):
+    """Bridge a row's temporal GAPS to another row's fragment. Report 20 lead 2, APT's rung.
+
+    `link_rows` seats a birth only into a row whose `last` is ENTIRELY non-finite, which takes
+    `max_age = 24` frames of absence -- so an animal that vanishes for a few frames and comes back
+    is picked up by whatever row is free, and one animal ends up split across two rows with
+    complementary gaps. Report 18 §5 measured the other end of this: 34.4% of offered detections
+    dropped, **29 percentage points of them INSIDE the gate**, i.e. they lost the Hungarian and had
+    nowhere to go. Report 19 §3's S sweep is the same fact again -- coverage and MPJPE improve
+    monotonically from S = 12 to S = 36 while MOTA collapses through the FP term alone: the
+    information exists and the bookkeeping discards it.
+
+    THE RUNG, NOT THE LADDER. DeepLabCut solves this as a min-cost flow, which is a node-disjoint
+    path COVER -- every fragment is forced onto some animal, including junk. That is exactly the
+    failure `--birth-age` already produced here (union crop p99 590 -> 3,804 px against a 244 px
+    rat), so this takes APT's cheaper form: greedy, gap-bounded, and it only ever MERGES two rows
+    whose live frames do not overlap.
+
+    Merge rule, greedy over pairs sorted by gap length:
+      * the two rows must not both be live on any frame (disjoint supports);
+      * the gap between one's last live frame and the other's first must be <= `max_gap`;
+      * the box centres either side of the gap must be within `max_move` mean box sides, the SAME
+        gate `link_rows` uses, so a merge cannot do what a single link step would have refused.
+
+    Returns the number of merges. In place.
+    """
+    b = boxes
+    S, T = b.shape[0], b.shape[1]
+    live = [np.flatnonzero(np.isfinite(b[i, :, 0]).all(-1)) for i in range(S)]
+    merged = 0
+    cand = []
+    for i in range(S):
+        if live[i].size == 0:
+            continue
+        for j in range(S):
+            if i == j or live[j].size == 0:
+                continue
+            # j must start strictly after i ends, with a bounded gap.
+            gap = int(live[j][0]) - int(live[i][-1])
+            if gap <= 0 or gap > max_gap:
+                continue
+            if np.intersect1d(live[i], live[j]).size:
+                continue
+            cand.append((gap, i, j))
+    cand.sort()
+    dead = set()
+    for gap, i, j in cand:
+        if i in dead or j in dead or live[i].size == 0 or live[j].size == 0:
+            continue
+        ta, tb = int(live[i][-1]), int(live[j][0])
+        ba, bb = b[i, ta, 0], b[j, tb, 0]
+        if not (np.isfinite(ba).all() and np.isfinite(bb).all()):
+            continue
+        ca = np.array([(ba[0] + ba[2]) / 2, (ba[1] + ba[3]) / 2])
+        cb = np.array([(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2])
+        sa = 0.5 * ((ba[2] - ba[0]) + (ba[3] - ba[1]))
+        sb = 0.5 * ((bb[2] - bb[0]) + (bb[3] - bb[1]))
+        side = 0.5 * (sa + sb)
+        if side <= 0 or np.linalg.norm(ca - cb) > max_move * side:
+            continue
+        # Move j's frames into i, then retire j.
+        sel = live[j]
+        b[i, sel] = b[j, sel]
+        b[j, sel] = np.nan
+        if kpts is not None:
+            kpts[i, sel] = kpts[j, sel]
+            kpts[j, sel] = np.nan
+        if scores is not None:
+            scores[i, sel] = scores[j, sel]
+            scores[j, sel] = np.nan
+        live[i] = np.union1d(live[i], sel)
+        live[j] = np.array([], int)
+        dead.add(j)
+        merged += 1
+    if stats is not None:
+        stats['stitch_candidates'] = stats.get('stitch_candidates', 0) + len(cand)
+        stats['stitch_merged'] = stats.get('stitch_merged', 0) + merged
+    return merged

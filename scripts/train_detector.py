@@ -178,6 +178,23 @@ def main():
                          'unreadable (eval rule 4). ENTANGLEMENT TO DECLARE: --rotate-deg only '
                          'fires when --augment is on, so every rotation arm already carries the '
                          'gain and this changes what those arms would see.')
+    ap.add_argument('--identity', action='store_true',
+                    help='train a CLOSED-SET identity head (report 20 lead 5, SLEAP\'s '
+                         '`ClassVectorsHead`). Adds a per-anchor softmax over the root\'s animal '
+                         'slots, supervised over the SAME positives the box term uses, with the '
+                         'target being the GT box ROW the anchor was assigned to -- on these roots '
+                         'a row IS an animal, so no new loader plumbing is needed. Gated in the '
+                         'plan on leads 1-3 failing, which they did, and two of those failures '
+                         'point here: the stitch gate cannot tell animals apart and the axis cue '
+                         'carries information the matcher cannot use. Off by default and '
+                         'byte-identical -- the branch is not constructed. NOTE THE SCOPE: a '
+                         'closed set is only meaningful where the animals are FIXED and identified '
+                         'consistently across the clip, which rat-city is (12 rats, one arena, '
+                         'tracker identity) and calms21 is not in the same sense.')
+    ap.add_argument('--id-weight', type=float, default=1.0,
+                    help='weight on the identity CE. SLEAP weights its class loss 1e-4 against a '
+                         'confmap MSE; our objectness is a BCE of a different scale, so 1.0 is a '
+                         'starting point and not a ported value -- sweep it before trusting it.')
     ap.add_argument('--ignore-band', action='store_true',
                     help='stop supervising objectness on anchors that sit INSIDE a GT box but are '
                          'positive for none. Off by default and byte-identical. Today those are '
@@ -366,7 +383,15 @@ def main():
     except ValueError as e:
         print(f'val:   none ({e})')
 
-    model = YOLOXNano(n_keypoints=n_kpts).to(device)
+    # THE ANIMAL SLOT COUNT IS THE ROOT'S, not a guess: `assign`'s `gix` indexes the GT box array,
+    # whose row count is what the loader emits per view.
+    n_ids = 0
+    if args.identity:
+        n_ids = int(max(len(sess.labels(g).animal_ids)
+                        for r in roots for sess in r.sessions.get('train', [])
+                        for g in sess.groups))
+        print(f'identity head: {n_ids} animal slot(s) (closed set)')
+    model = YOLOXNano(n_keypoints=n_kpts, n_ids=n_ids).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX-Nano: {n / 1e6:.2f}M params')
     opt = torch.optim.AdamW(param_groups(model, args.no_decay_norm), lr=args.lr, weight_decay=5e-4)
@@ -422,12 +447,15 @@ def main():
             x, gt = x.to(device), gt.to(device)
             gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
             gt_regions = None if gt_regions is None else gt_regions.to(device)
-            obj, boxes, kpt = model(x)
+            out = model(x)
+            obj, boxes, kpt = out[0], out[1], out[2]
+            ident = out[3] if len(out) > 3 else None
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=args.kpt_weight,
                                         kpt_score_weight=args.kpt_score_weight,
-                                        regions=gt_regions, ignore_band=args.ignore_band)
+                                        regions=gt_regions, ignore_band=args.ignore_band,
+                                        ident=ident, id_weight=args.id_weight)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -447,6 +475,7 @@ def main():
                 # and that has to be a number in the log rather than an inference from a curve.
                 kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
                 kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
+                kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
                 print(f'{it:7d}/{args.iters}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
@@ -482,7 +511,7 @@ def main():
                         # another is indistinguishable from the file alone. Gotcha 12's shape.
                         'warmup_frac': args.warmup_frac, 'no_decay_norm': args.no_decay_norm,
                         'ema_decay': args.ema_decay, 'ema': False,
-                        'ignore_band': args.ignore_band,
+                        'ignore_band': args.ignore_band, 'n_ids': n_ids,
                         'photometric': args.augment_photometric,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')

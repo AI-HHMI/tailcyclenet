@@ -238,7 +238,7 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
     return rows
 
 
-def _vis_confusion(out, lab, mode, T, thresh=0.0):
+def _vis_confusion(out, lab, mode, T):
     """Score the DECISION to omit a keypoint, separately from where the kept ones landed.
 
     SLEAP reports this as `vis.precision` / `vis.recall` and nothing here did. It matters because
@@ -270,7 +270,7 @@ def _vis_confusion(out, lab, mode, T, thresh=0.0):
     ok = np.isfinite(vp) & (st != UNLABELED)
     if not ok.any():
         return {}
-    yhat, y = vp[ok] > thresh, st[ok] == VISIBLE
+    yhat, y = vp[ok] > 0.0, st[ok] == VISIBLE
     tp, fp, fn = int((yhat & y).sum()), int((yhat & ~y).sum()), int((~yhat & y).sum())
     return {'vis_precision': tp / (tp + fp) if tp + fp else float('nan'),
             'vis_recall': tp / (tp + fn) if tp + fn else float('nan'),

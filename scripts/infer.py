@@ -308,8 +308,22 @@ def main():
     det_red = False
     if args.detector:
         from tailcyclenet.detector import associate_group, detect_raw, load_detector
-        det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile = load_detector(
+        det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile, det_objq = load_detector(
             args.detector, device, input_wh=args.det_input_wh)
+        # `--det-score` IS NOT PORTABLE ACROSS DETECTOR GENERATIONS, and this is the only place
+        # that can tell. 0.99 was measured on detectors whose objectness is saturated; a
+        # tiled/masked one reads q01 0.45-0.84 and loses two thirds of its detections to the same
+        # number -- coverage 0.703 against 0.986 at 0.50 (dev/reports/21 0b). A warning and not a
+        # refusal, and no automatic threshold: which value is right depends on whether coverage or
+        # identity is the objective (0.50 maximises the first, 0.97 the second), and choosing on
+        # the caller's behalf would hide the trade.
+        if det_objq and args.det_score >= det_objq.get('q50', 0.0):
+            print(f'WARNING: --det-score {args.det_score} is at or above this detector\'s MEDIAN '
+                  f'objectness ({det_objq["q50"]:.4f}), so it discards at least half of the '
+                  f'detections it offers. q01 {det_objq.get("q01", float("nan")):.4f} '
+                  f'q10 {det_objq.get("q10", float("nan")):.4f} '
+                  f'q90 {det_objq.get("q90", float("nan")):.4f}. This detector is NOT saturated; '
+                  '0.99 was measured against ones that are.', flush=True)
         # A TILE-TRAINED DETECTOR IS DEPLOYED ON THE WHOLE FRAME AT ITS TRAINING SCALE, and
         # `det_wh` is its TILE size. `detect_group` derives the per-camera input from `det_tile`
         # (frame sizes vary WITHIN a root -- rat-city-annotated ships 4696x2048 beside 4500x2050),

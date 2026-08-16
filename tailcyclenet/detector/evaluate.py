@@ -106,11 +106,17 @@ def _summarise(s):
 
 @torch.no_grad()
 def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_thresh=0.05,
-                  num_workers=4, max_animals=None):
+                  num_workers=4, max_animals=None, out_scores=None):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
     Sampled with `ChunkShuffle` rather than read off the front of an unshuffled loader: the index
     is built session by session, so the first 800 views ARE the first session.
+
+    `out_scores`, when given a list, collects every DECODED objectness this pass saw. That is the
+    distribution `--det-score` cuts, and it has to be recorded at training time because it is a
+    property of the CHECKPOINT: the saturated detectors 0.99 was chosen against read q01 ~1.0,
+    while a tiled/masked one reads 0.45-0.84 and loses two thirds of its detections to the same
+    threshold. Optional so no existing caller changes.
     """
     was_training = model.training
     model.eval()
@@ -154,7 +160,9 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
             if key not in n_want:
                 sessions[key] = sess
                 n_want[key] = max_animals or max(1, len(sess.labels(gid).animal_ids))
-            p, _ = decode(obj[j], pred_boxes[j], top_k=n_want[key], score_thresh=score_thresh)
+            p, sc_j = decode(obj[j], pred_boxes[j], top_k=n_want[key], score_thresh=score_thresh)
+            if out_scores is not None and sc_j.numel():
+                out_scores.append(sc_j.detach().cpu().numpy())
             g_all = gt[j]
             g = g_all[torch.isfinite(g_all).all(-1)]
             p = p.cpu()

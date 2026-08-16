@@ -32,7 +32,7 @@ RAW_REV = 1
 
 
 def load_detector(path, device='cpu', input_wh=None):
-    """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source, tile_scale) from a folder.
+    """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source, tile_scale, obj_q).
 
     THE INPUT SIZE IS PART OF THE WEIGHTS, not a runtime choice: the letterbox the detector was
     trained under decides what an animal looks like to it, and a square 416 puts the median rat
@@ -106,7 +106,12 @@ def load_detector(path, device='cpu', input_wh=None):
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
             int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)),
             str(ckpt.get('box_source', 'keypoints')),
-            None if ts is None or ckpt.get('tile_wh') is None else float(ts))
+            None if ts is None or ckpt.get('tile_wh') is None else float(ts),
+            # THE OBJECTNESS DISTRIBUTION THIS CHECKPOINT PRODUCES, or {} for one trained before
+            # it was recorded. `--det-score` is not portable across detector GENERATIONS -- see
+            # `scripts/infer.py`, which warns rather than guessing a threshold on the caller's
+            # behalf, because the right value depends on whether coverage or identity is wanted.
+            dict(ckpt.get('obj_quantiles') or {}))
 
 
 def tiled_input_wh(src_wh, tile_scale):

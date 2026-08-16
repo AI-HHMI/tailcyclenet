@@ -87,7 +87,7 @@ def main():
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
-    model, wh, _, mcd, red, trained_on, tile_scale = load_detector(args.run, device=device)
+    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
     # A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE (gotcha 12's
     # shape). `tile_scale` was unpacked here and never used, so `BoxDataset(input_wh=wh)`
     # letterboxed the WHOLE FRAME into one tile -- the 1/scale shift `tiled_input_wh` and
@@ -123,7 +123,7 @@ def main():
         print(f'{name:>5s} {b["mean"]:7.3f}  {ci}')
 
     if args.compare:
-        m2, wh2, _, mcd2, red2, trained_on2, tile2 = load_detector(args.compare,
+        m2, wh2, _, mcd2, red2, trained_on2, tile2, _ = load_detector(args.compare,
                                                           device=device)
         _tiled(args.compare, tile2)
         if trained_on2 != trained_on:

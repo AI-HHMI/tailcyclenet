@@ -625,6 +625,31 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
             np.testing.assert_allclose(got[0, c], box.numpy(), atol=1e-4)
 
 
+def test_a_detector_records_its_objectness_and_load_detector_hands_it_back(tmp_path):
+    """`--det-score` is not portable across detector GENERATIONS, so the distribution must ride
+    in the checkpoint.
+
+    0.99 was measured against detectors whose objectness is saturated (98.5% of rat-city's boxes at
+    exactly 1.0). The tiled/masked generation reads q01 0.45-0.84 and loses two thirds of its
+    detections to the same number -- coverage 0.703 against 0.986 at 0.50 (dev/reports/21 0b). That
+    is a property of the RECIPE, not of the dataset, so no constant is right for both and the only
+    durable answer is to record what a checkpoint actually produces.
+
+    A checkpoint written before the field returns `{}` rather than a guess: "nobody measured this"
+    and "this one is saturated" are different answers, and gotcha 12 is what conflating them costs.
+    """
+    from tailcyclenet.detector import YOLOXNano, load_detector
+
+    p = tmp_path / 'detector.pth'
+    base = dict(model_state=YOLOXNano(n_keypoints=0).state_dict(), input_wh=[416, 416], norm='gn')
+    torch.save(base, p)
+    assert load_detector(p)[-1] == {}, 'an unrecorded distribution must not be invented'
+
+    q = {'q01': 0.452, 'q10': 0.601, 'q50': 0.883, 'q90': 0.981}
+    torch.save({**base, 'obj_quantiles': q}, p)
+    assert load_detector(p)[-1] == q
+
+
 def test_the_tracker_is_the_default_and_can_be_turned_off():
     """`--track` is ON by default (dev/reports/13).
 
@@ -882,10 +907,10 @@ def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
     p = tmp_path / 'detector.pth'
     base = dict(model_state=YOLOXNano(n_keypoints=0).state_dict(), input_wh=[416, 416], norm='gn')
     torch.save({**base, 'tile_wh': None, 'tile_scale': 1.0}, p)
-    assert load_detector(p)[-1] is None
+    assert load_detector(p)[-2] is None
     # ...and a genuinely tiled one still keeps it, or the tiled path loses its whole point.
     torch.save({**base, 'tile_wh': [640, 640], 'tile_scale': 0.5}, p)
-    assert load_detector(p)[-1] == 0.5
+    assert load_detector(p)[-2] == 0.5
 
 
 def test_tile_transform_is_the_letterbox_form():

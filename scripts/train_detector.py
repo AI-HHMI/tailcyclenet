@@ -342,13 +342,32 @@ def main():
                 # Both splits, EVERY checkpoint, and the score stored beside the weights. A
                 # rolling `detector.pth` with no score cannot be selected on: johnson peaked at
                 # val recall 0.871 and shipped 0.706, branson peaked 0.885 and shipped 0.833.
-                scores = {}
+                scores, obj_scores = {}, []
                 for name, ds in (('train', train), ('val', val)):
                     if ds is None:
                         continue
+                    # `obj_scores` is collected from the LAST split scored (val where there is
+                    # one), which is the distribution deployment meets.
+                    obj_scores.clear()
                     scores[name] = overall(score_dataset(
                         model, ds, device, batch_size=args.batch_size,
-                        batches=args.eval_batches, num_workers=2))
+                        batches=args.eval_batches, num_workers=2, out_scores=obj_scores))
+                # THE OBJECTNESS DISTRIBUTION, RECORDED BECAUSE `--det-score` CANNOT BE A CONSTANT.
+                # 0.99 was chosen against detectors whose objectness is saturated (98.5% of
+                # rat-city's boxes at exactly 1.0) and is wrong for the tiled/masked generation,
+                # which reads q01 0.45-0.84 and loses two thirds of its detections to it --
+                # coverage 0.703 against 0.986 at 0.50 (dev/reports/21 0b). Saturation is a
+                # property of the RECIPE, not the dataset, so the only durable fix is to record
+                # what this checkpoint actually produces and let `infer.py` warn.
+                obj_q = {}
+                if obj_scores:
+                    a = np.concatenate(obj_scores)
+                    obj_q = {f'q{int(q * 100):02d}': float(np.quantile(a, q))
+                             for q in (0.01, 0.10, 0.50, 0.90)}
+                    print(f'   objectness q01 {obj_q["q01"]:.4f}  q10 {obj_q["q10"]:.4f}  '
+                          f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}'
+                          + ('   <-- NOT saturated: --det-score 0.99 would drop most of these'
+                             if obj_q['q50'] < 0.99 else ''), flush=True)
                 # `n_keypoints` rides in the checkpoint beside `input_wh` for the same reason:
                 # it is part of the WEIGHTS, not a runtime choice, and absent reads as 0 -- which
                 # is a fact about the file ("no keypoint weights here"), not an assertion about
@@ -364,6 +383,7 @@ def main():
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
                         'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
+                        'obj_quantiles': obj_q,
                         'eval': scores}
                 torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the

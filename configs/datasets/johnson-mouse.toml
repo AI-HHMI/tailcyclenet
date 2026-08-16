@@ -15,8 +15,6 @@ name = "johnson-mouse"
 out_name = "johnson-mouse-tracked"
 mode = "3d"
 units = "mm"
-max_instances = 1
-
 names = [
   "AnkleL", "AnkleR", "EarL", "EarR",
   "ElbowL", "ElbowR", "FootL", "FootR",

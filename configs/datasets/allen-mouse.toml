@@ -11,11 +11,7 @@ name = "allen-mouse"
 out_name = "allen-mouse-tracked"
 mode = "3d"
 units = "mm"
-max_instances = 1
 npz_column_sorted = true
-holdout_sessions = ["769890"]
-min_crop_dim = 64
-
 names = [
   "L-ear", "LF-elbow", "LF-index", "LF-index-base",
   "LF-middle", "LF-pinkie", "LF-pinkie-base", "LF-ring",
@@ -108,5 +104,3 @@ flip_pairs = [
 ]
 
 # Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
-default_iterations = 60000
-iterations_is_floor = true

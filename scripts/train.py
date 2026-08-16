@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from posetail.posetail.losses import TotalLoss
 
-from tailcyclenet.checkpoints import (check_image_size, resolve_checkpoint, save_checkpoint,
+from tailcyclenet.checkpoints import (check_image_size, load_config, resolve_checkpoint, save_checkpoint,
                                       save_run_meta, warm_start)
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate, worker_init
 from tailcyclenet.format import Registry
@@ -358,8 +358,7 @@ def main():
     ap.add_argument('--no-wandb', action='store_true', help='ignore the [wandb] config block')
     args = ap.parse_args()
 
-    with open(args.config, 'rb') as f:
-        config = tomllib.load(f)
+    config = load_config(args.config)
     check_image_size(config)
     data_cfg, train_cfg = config['data'], config['training']
     if args.data:

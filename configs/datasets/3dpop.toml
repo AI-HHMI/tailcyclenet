@@ -10,9 +10,6 @@
 name = "3dpop"
 mode = "3d"
 units = "mm"
-max_instances = 10
-holdout_sessions = []
-min_crop_dim = 64
 # 3-POP frames are 3840 px wide, so the association gate is looser than a 256 px rig would need.
 assoc_res_max_px = 40.0
 
@@ -29,5 +26,3 @@ skeleton = []
 flip_pairs = []
 
 # Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
-default_iterations = 30000
-iterations_is_floor = false

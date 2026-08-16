@@ -23,6 +23,40 @@ from .format import Registry
 from .model import build_model
 
 
+def load_config(path) -> dict:
+    """A run config, with `extends = "<file>"` resolved once against the config's own directory.
+
+    ONE LEVEL, DELIBERATELY. `configs/2d.toml` and `configs/3d.toml` exist so that the DIFFERENCE
+    between the two settings is the whole content of each file -- three keys, all of them camera
+    counts a one-camera root cannot ask about. A chain of overlays would put that difference back
+    out of sight, which is the thing the split is for, so `extends` in a base raises rather than
+    recursing.
+
+    The merge is per BLOCK, not per file: an overlay's `[data]` updates the base's `[data]` key by
+    key rather than replacing the table. Replacing it would mean every overlay had to restate the
+    whole block, which is the duplication the base exists to remove.
+    """
+    import tomllib
+
+    path = Path(path)
+    with open(path, 'rb') as f:
+        cfg = tomllib.load(f)
+    base_name = cfg.pop('extends', None)
+    if base_name is None:
+        return cfg
+    with open(path.parent / base_name, 'rb') as f:
+        base = tomllib.load(f)
+    if 'extends' in base:
+        raise SystemExit(f'{base_name}: `extends` is one level deep; {path.name} extends it and '
+                         'it may not extend anything further.')
+    for block, over in cfg.items():
+        if isinstance(over, dict) and isinstance(base.get(block), dict):
+            base[block].update(over)
+        else:
+            base[block] = over
+    return base
+
+
 def check_image_size(config: dict) -> None:
     """`[model].image_size` and `[data].image_size` must agree. Nothing else notices if they do not.
 

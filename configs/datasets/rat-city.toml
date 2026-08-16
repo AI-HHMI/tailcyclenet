@@ -9,11 +9,7 @@
 name = "rat-city"
 mode = "2d"
 units = "px"
-max_instances = 12
 image_wh = [4696, 2048]
-holdout_sessions = []
-min_crop_dim = 64
-
 # THE ONLY DATASET THAT IS NOT A SQUARE 416 DETECTOR INPUT, because it is the only one whose frame
 # is nowhere near square (2.29:1).
 #
@@ -27,8 +23,6 @@ min_crop_dim = 64
 # 896x384 matches the aspect ratio to 1.7% padding for 1.99x the pixels of 416^2, and puts the
 # median rat at 33.4 x 26.4 px -- the regime the fly detector already works in. Kept out of `sha`:
 # it is a detector input size, not part of what the keypoint table means.
-det_input_wh = [896, 384]
-
 names = [
   "nose", "left_ear", "right_ear", "tail_base",
 ]
@@ -45,5 +39,3 @@ flip_pairs = [
 ]
 
 # Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
-default_iterations = 20000
-iterations_is_floor = false

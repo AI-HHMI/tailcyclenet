@@ -16,11 +16,7 @@ name = "branson-fly"
 mode = "2d"
 units = "px"
 names_provisional = true
-max_instances = 10
 image_wh = [1024, 1024]
-holdout_sessions = []
-min_crop_dim = 64
-
 names = [
   "kp00", "kp01", "kp02", "kp03", "kp04", "kp05", "kp06",
   "kp07", "kp08", "kp09", "kp10", "kp11", "kp12", "kp13",
@@ -31,5 +27,3 @@ skeleton = []
 flip_pairs = []
 
 # Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.
-default_iterations = 60000
-iterations_is_floor = true

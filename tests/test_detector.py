@@ -1795,3 +1795,29 @@ def test_every_consumer_survives_the_head_growing_a_return_value():
         assert len(out) == (4 if n_ids else 3)
         obj, boxes = out[0], out[1]           # the indexed read every consumer now uses
         assert obj.ndim == 2 and boxes.shape[-1] == 4
+
+
+def test_a_checkpoint_with_an_identity_head_loads_back(tmp_path):
+    """`load_detector` must build the architecture the checkpoint RECORDS, not a default one.
+
+    `n_keypoints` was already read back; `n_ids` was not, so the first identity checkpoint trained
+    for 20,000 iterations and then could not be loaded -- 42 unexpected keys. Same shape as the
+    evaluator's fixed-arity unpack: a local addition that every consumer has to learn about.
+    """
+    from tailcyclenet.detector import load_detector
+
+    m = YOLOXNano(n_keypoints=3, n_ids=7)
+    ckpt = {'model_state': m.state_dict(), 'input_wh': (64, 64), 'n_keypoints': 3,
+            'n_ids': 7, 'norm': 'gn'}
+    torch.save(ckpt, tmp_path / 'detector.pth')
+    det, wh, *_ = load_detector(tmp_path)
+    assert det.n_ids == 7 and det.head.n_ids == 7
+    out = det(torch.randn(1, 3, 64, 64))
+    assert len(out) == 4 and out[3].shape[-1] == 7
+
+    # And a checkpoint WITHOUT the field still loads as a no-identity model.
+    plain = YOLOXNano(n_keypoints=3)
+    torch.save({'model_state': plain.state_dict(), 'input_wh': (64, 64), 'n_keypoints': 3,
+                'norm': 'gn'}, tmp_path / 'plain.pth')
+    det2, *_ = load_detector(tmp_path / 'plain.pth')
+    assert det2.n_ids == 0 and len(det2(torch.randn(1, 3, 64, 64))) == 3

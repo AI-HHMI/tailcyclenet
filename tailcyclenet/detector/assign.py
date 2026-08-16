@@ -182,7 +182,7 @@ def keypoint_loss(pred, target, gt_boxes):
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
-                  regions=None, ignore_band=False):
+                  regions=None, ignore_band=False, ident=None, id_weight=1.0):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -215,6 +215,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     n_band, n_cert = 0, 0.0
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
+    id_ce, n_id = [], 0
     for b in range(B):
         if ignore_band:
             pos, gix, band = assign(anchors, gt_boxes[b], return_band=True)
@@ -235,6 +236,14 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             target[b, pos] = 1.0
             losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
             n_pos += pos.numel()
+            # THE IDENTITY TERM (report 20 lead 5). The target is `gix` -- the GT BOX INDEX the
+            # anchor was assigned to -- and on these roots a box row IS an animal, so the closed-set
+            # label needs no new loader plumbing at all. Supervised over the SAME positives the box
+            # and keypoint terms use, so all three branches share one notion of "this anchor owns
+            # this animal".
+            if ident is not None:
+                id_ce.append(F.cross_entropy(ident[b, pos], gix, reduction='sum'))
+                n_id += pos.numel()
             if kpts is not None and gt_kpts is not None:
                 r, s, nk, nv = keypoint_loss(kpts[b, pos], gt_kpts[b][gix], gt_boxes[b][gix])
                 kpt_reg.append(r)
@@ -257,8 +266,12 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     obj = obj_all / max(n_pos, B)
     box = (torch.cat(losses_box).sum() / max(n_pos, 1) if losses_box
            else torch.zeros((), device=device))
-    total = obj + box_weight * box
+    ident_loss = (torch.stack(id_ce).sum() / max(n_id, 1) if id_ce
+                  else torch.zeros((), device=device))
+    total = obj + box_weight * box + (id_weight * ident_loss if ident is not None else 0.0)
     parts = {'obj': float(obj.detach()), 'box': float(box.detach()), 'n_pos': n_pos}
+    if ident is not None:
+        parts['ident'] = float(ident_loss.detach())
     if regions is not None:
         parts['certified'] = n_cert / max(B, 1)
     if ignore_band:

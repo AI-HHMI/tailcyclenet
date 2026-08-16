@@ -161,9 +161,13 @@ class Head(nn.Module):
     here by three orders of magnitude; accuracy is.
     """
 
-    def __init__(self, cin=96, n_levels=3, n_keypoints=0):
+    def __init__(self, cin=96, n_levels=3, n_keypoints=0, n_ids=0):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
+        # THE IDENTITY BRANCH (report 20 lead 5, SLEAP's `ClassVectorsHead` in a single-shot head).
+        # A per-anchor softmax over a CLOSED animal set -- which is what rat-city is, 12 fixed rats
+        # in one arena. Built only when asked, so at n_ids = 0 the state_dict is unchanged.
+        self.n_ids = int(n_ids)
         self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
             [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3)) for _ in range(n_levels)])
@@ -171,6 +175,17 @@ class Head(nn.Module):
         self.obj_pred = nn.ModuleList([nn.Conv2d(cin, 1, 1) for _ in range(n_levels)])
         for m in self.obj_pred:                      # rare-positive prior, as in YOLOX
             nn.init.constant_(m.bias, -4.595)
+        if self.n_ids:
+            # SLEAP's one implementation detail worth more than the rest: identity features must
+            # come from the DEEPEST layer available. They tried the decoder and got "extreme
+            # training instability", because confidence maps are trained to be INVARIANT to
+            # individual appearance -- decoder features have had identity deliberately removed.
+            # Here the stem is the deepest shared point before the task towers, so the identity
+            # tower hangs off it directly rather than off `reg_convs`.
+            self.id_convs = nn.ModuleList(
+                [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3))
+                 for _ in range(n_levels)])
+            self.id_pred = nn.ModuleList([nn.Conv2d(cin, self.n_ids, 1) for _ in range(n_levels)])
         if self.n_keypoints:
             self.kpt_convs = nn.ModuleList(
                 [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3))
@@ -184,19 +199,21 @@ class Head(nn.Module):
             stem = self.stems[i](f)
             x = self.reg_convs[i](stem)
             kpt = self.kpt_pred[i](self.kpt_convs[i](stem)) if self.n_keypoints else None
-            outs.append((self.obj_pred[i](x), self.reg_pred[i](x), kpt))
+            ident = self.id_pred[i](self.id_convs[i](stem)) if self.n_ids else None
+            outs.append((self.obj_pred[i](x), self.reg_pred[i](x), kpt, ident))
         return outs
 
 
 class YOLOXNano(nn.Module):
     STRIDES = (8, 16, 32)
 
-    def __init__(self, width=96, n_keypoints=0):
+    def __init__(self, width=96, n_keypoints=0, n_ids=0):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
+        self.n_ids = int(n_ids)
         self.backbone = CSPDarknetNano()
         self.neck = PAFPN(out=width)
-        self.head = Head(width, n_keypoints=self.n_keypoints)
+        self.head = Head(width, n_keypoints=self.n_keypoints, n_ids=self.n_ids)
 
     def forward(self, x):
         """x: (B,3,H,W) normalized to [0,1].
@@ -208,8 +225,8 @@ class YOLOXNano(nn.Module):
         behaviour is unchanged.
         """
         outs = self.head(self.neck(self.backbone(x)))
-        obj_all, box_all, kpt_all = [], [], []
-        for (obj, reg, kpt), stride in zip(outs, self.STRIDES):
+        obj_all, box_all, kpt_all, id_all = [], [], [], []
+        for (obj, reg, kpt, ident), stride in zip(outs, self.STRIDES):
             B, _, h, w = obj.shape
             gy, gx = torch.meshgrid(torch.arange(h, device=x.device),
                                     torch.arange(w, device=x.device), indexing='ij')
@@ -223,6 +240,8 @@ class YOLOXNano(nn.Module):
                                  cx[None] + ltrb[..., 2], cy[None] + ltrb[..., 3]], dim=-1)
             obj_all.append(obj.reshape(B, -1))
             box_all.append(boxes)
+            if ident is not None:
+                id_all.append(ident.permute(0, 2, 3, 1).reshape(B, -1, self.n_ids))
             if kpt is not None:
                 k = kpt.permute(0, 2, 3, 1).reshape(B, -1, self.n_keypoints, 3)
                 # NO `exp` HERE. ltrb distances are positive so the box decode exponentiates;
@@ -240,9 +259,13 @@ class YOLOXNano(nn.Module):
                 ctr = torch.stack([cx, cy], -1)[None]                    # (1,A,2)
                 xy = ctr[:, :, None] + 1.25 * half[:, :, None] * torch.tanh(k[..., :2])
                 kpt_all.append(torch.cat([xy, k[..., 2:]], -1))
-        if not kpt_all:
-            return torch.cat(obj_all, 1), torch.cat(box_all, 1), None
-        return torch.cat(obj_all, 1), torch.cat(box_all, 1), torch.cat(kpt_all, 1)
+        k = torch.cat(kpt_all, 1) if kpt_all else None
+        # THE IDENTITY LOGITS RIDE AS A FOURTH RETURN, and only when the branch exists. Two-value
+        # and three-value callers are unaffected: at n_ids = 0 this is None, exactly as `kpt` is
+        # at n_keypoints = 0.
+        if not id_all:
+            return torch.cat(obj_all, 1), torch.cat(box_all, 1), k
+        return torch.cat(obj_all, 1), torch.cat(box_all, 1), k, torch.cat(id_all, 1)
 
     def anchor_points(self, h, w, device):
         """(A, 3) of (cx, cy, stride) matching forward()'s flattening order."""

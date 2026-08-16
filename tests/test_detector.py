@@ -1719,3 +1719,53 @@ def test_swap_repair_conserves_every_detection():
     swap_repair(box, kp)
     after = np.sort(box.reshape(-1, 4), axis=0)
     np.testing.assert_allclose(before, after, err_msg='a repair must not create or destroy a box')
+
+
+def test_identity_branch_is_off_by_default_and_learns_a_closed_animal_set():
+    """Report 20 lead 5: SLEAP's `ClassVectorsHead` idea in a single-shot head.
+
+    Gated on leads 1-3 failing, which they did -- and two of those failures point here: the stitch
+    gate cannot tell animals apart (§9j) and the axis cue carries information the matcher cannot
+    use (§6b). Both want an identity signal the geometry does not contain.
+
+    THE TARGET NEEDS NO NEW LOADER PLUMBING. `assign` already returns `gix`, the GT box index an
+    anchor was assigned to, and on these roots a box ROW IS AN ANIMAL -- so the closed-set label is
+    already in hand. rat-city is exactly SLEAP's use case: 12 fixed rats in one arena.
+
+    Off must be byte-identical, on must actually learn.
+    """
+    from tailcyclenet.detector.assign import detector_loss
+
+    torch.manual_seed(0)
+    # OFF: no parameters, no fourth return, state_dict unchanged.
+    plain, with_id = YOLOXNano(n_keypoints=4), YOLOXNano(n_keypoints=4, n_ids=12)
+    assert set(plain.state_dict()) == {k for k in with_id.state_dict()
+                                       if not k.startswith('head.id_')}
+    assert len(plain(torch.randn(1, 3, 64, 64))) == 3, 'off must not add a return value'
+    out = with_id(torch.randn(1, 3, 64, 64))
+    assert len(out) == 4 and out[3].shape[-1] == 12
+
+    # The loss term is ADDITIVE and absent when off, so every recorded number is untouched.
+    m = YOLOXNano(n_ids=3)
+    x = torch.randn(1, 3, 64, 64)
+    obj, boxes, _, ident = m(x)
+    anchors = m.anchor_points(64, 64, x.device)
+    gt = torch.tensor([[[8., 8., 40., 40.], [40., 40., 60., 60.]]])
+    l_off, p_off = detector_loss(obj, boxes, anchors, gt)
+    l_on, p_on = detector_loss(obj, boxes, anchors, gt, ident=ident)
+    assert 'ident' not in p_off and 'ident' in p_on
+    assert float(l_on) - float(l_off) == pytest.approx(p_on['ident'], abs=1e-4)
+
+    # AND IT LEARNS: overfit two fixed boxes for a few steps and the identity CE must fall.
+    opt = torch.optim.Adam(m.parameters(), lr=3e-3)
+    first = last = None
+    for step in range(25):
+        obj, boxes, _, ident = m(x)
+        loss, parts = detector_loss(obj, boxes, anchors, gt, ident=ident)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        if step == 0:
+            first = parts['ident']
+        last = parts['ident']
+    assert last < first * 0.5, f'identity CE did not learn: {first:.3f} -> {last:.3f}'

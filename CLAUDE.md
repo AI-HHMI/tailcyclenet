@@ -84,7 +84,7 @@ and is bit-identical. `tests/test_patches.py` pins both halves and the end-to-en
 A per-frame crop as a *deployment* choice (`moving_crop`) was measured on six roots and deleted
 (report 23), which left the moving-crop geometry — `crop.moving_boxes`,
 `crop_to_points_{2d,3d}_moving`, `apply_crop_moving` — with exactly one consumer, the synthetic
-camera motion. **The slide then stopped routing through it** (report 29 §0: the animal moves inside
+camera motion. **The slide then stopped routing through it** (report 30 §0: the animal moves inside
 a crop that stands still, so there is no per-frame camera), so the only callers left are
 `tests/test_patches.py` and two `tests/test_dataset.py` cases. **This is now a cleanup with no
 measurement blocking it** — the arm the geometry existed for is refuted (report 22) and its
@@ -382,14 +382,18 @@ a real rat's keypoint displacement over a window is non-rigid** (p50 0.144 at ga
 gap 1 is label noise). `_tune_smoothness` still zeroes the smoothness term on these windows, but
 the reason has lapsed — the target moves now — so re-enabling it is a real follow-up arm.
 
-**MEASURED AND IT IS A NULL (report 29).** rat-city at matched 60k reads a carry cost of **+1.12
+**MEASURED AND IT IS A NULL (report 30).** rat-city at matched 60k reads a carry cost of **+1.12
 against its control's +1.56 with both MPJPE deltas n.s.** — so the moving-camera version's +4.47 is
 gone and geometry genuinely was that failure's mechanism, but nothing replaces it with a gain. allen
 **cannot measure the endpoint at all**: the carry cost is ±0.01 mm on *both* arms, because in 3D the
-per-frame triangulation de-loops the feedback. johnson is unmeasured and its amp auto-tuned to 0.046
-box sides, the smallest of six roots, so it is predicted near-inert. **Stays default-off; do not tune
-`amp` chasing it** — the live suspect is the background-slides-with-the-animal ceiling, which is a
-compositing or pseudo-label fix and not a config key.
+per-frame triangulation de-loops the feedback — and johnson's carry cost is negative on both arms for
+the same reason, so **the endpoint is measurable on exactly one root in this repo**. johnson is the one
+root with a positive signal (+1.41 to +3.44 mm, 4 of 4 cells SIG) and **94% of that is two chunks whose
+mean is 112 mm against a median of 4** — both arms break on the same chunks, so the defensible size is
+the **~3% in the working regime**, on 6 of 6 chunks. **Stays default-off; do not tune `amp` chasing
+it** — the live suspect is the background-slides-with-the-animal ceiling, which is a compositing or
+pseudo-label fix and not a config key. **And amp did NOT predict where the arm would act**: johnson's
+auto-tuned to 0.046 box sides, the smallest of six roots, which predicted near-inert and was wrong.
 
 **AND THE `best`/`last` PAIR IS NOT A PROTOCOL ON ITS OWN — READ THE `iteration` OUT OF THE `.pth`.**
 On slide-ratcity `checkpoint_best` is 34,800 against its control's 60,000, and on slide-allen `best`
@@ -951,7 +955,7 @@ against — so it must never be quoted as a win for one.
 
 **`--pose-nms` is the one identity lever that works.** `--rotate-deg` survives with its 180-degree
 setting refuted. `synth_motion_*` survives **measured as a null on the one root that can measure it**
-(report 29), and no longer consumes the moving-crop geometry — which leaves that geometry and
+(report 30), and no longer consumes the moving-crop geometry — which leaves that geometry and
 `patches.py` with no in-package caller at all.
 
 ---
@@ -990,10 +994,13 @@ is that it is CENTRED, and widening destroys it. The rule is fitted on two roots
 shipping is a second 3D root (or 3dpop's other 57 test groups at `--chunk 500`) plus rat-city as the
 discriminator's test** — one group per root is not enough to license a flag here.
 
-**Larger.** `synth_motion_*` is measured and null on rat-city (report 29); what is left is **johnson**
-(unmeasured, predicted near-inert at amp 0.046), **allen re-run iteration-matched at 51,200**, and the
-one change that could plausibly rescue it — stopping the background from sliding with the animal, via
-compositing or real neighbouring frames. The pose loader's `aug_rotation_deg = 45` has
+**Larger.** `synth_motion_*` is measured: null on rat-city, unmeasurable on allen, **+3% in the working
+regime on johnson** (report 30). What is left is **johnson's other two clips** and **why two of its six
+chunks break on both arms** — a clip or box-path failure that is 94% of that root's headline delta and
+worth more than the lever — plus **allen re-run iteration-matched at 50,000** (both sides have that
+checkpoint) and the one change that could plausibly rescue the arm: stopping the background from
+sliding with the animal, via compositing or real neighbouring frames. The pose loader's
+`aug_rotation_deg = 45` has
 no accuracy number in either dimension and is the one surviving unmeasured augmentation.
 `--link-boxes` is default-on and never measured. `link_rows`' `max_age = 24` and `birth_age` are
 pinned constants unreachable from any CLI that govern birth and expiry on a long clip.

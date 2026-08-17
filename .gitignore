@@ -1,6 +1,7 @@
 # training artifacts -- large, regenerable, or not ours to version
 runs/
 .pixi/
+.pi/
 *.egg-info/
 __pycache__/
 *.pyc

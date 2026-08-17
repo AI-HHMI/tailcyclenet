@@ -245,6 +245,27 @@ def test_augmented_targets_are_still_the_crop_rule(tiny_root):
     torch.testing.assert_close(ds.boxes_for(0), plain.boxes_for(0))
 
 
+def test_augment_decodes_real_pixels_through_getitem(tiny_root):
+    """`augment=True` must survive an actual `__getitem__` call, not just `boxes_for`.
+
+    Every other augmentation test above calls `ds.boxes_for(...)`, which never reaches
+    `_photometric` -- that function is called from `__getitem__` alone. A cleanup commit
+    (`3dbb0a1`) deleted `_photometric`'s `extended` parameter and `BoxDataset`'s `photometric`
+    flag but left an `if extended:` block referencing the now-undefined name, a `NameError` on
+    EVERY item under `--augment`. It went undetected through this whole file and only surfaced
+    when real training jobs hit it. This test exists so that class of gap cannot reopen: it is
+    the one place in this file that actually decodes a pixel tensor under augmentation.
+    """
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True)
+    for i in range(min(3, len(ds))):
+        x, boxes = ds[i]
+        assert x.shape == (3, 48, 64)
+        assert torch.isfinite(x).all()
+        assert float(x.min()) >= 0.0 and float(x.max()) <= 1.0, \
+            'the photometric gain must still land in the normalised [0, 1] range'
+
+
 def test_a_rotated_box_needs_four_corners_in_the_detector(tiny_root):
     """Two diagonal corners are not a box under a flip: their extent is strictly inside all four.
 
@@ -875,6 +896,119 @@ def test_a_batchnorm_checkpoint_is_refused_by_name(tmp_path):
     torch.save({'model_state': {}, 'input_wh': [128, 128]}, p)
     with pytest.raises(ValueError, match='bn normalisation'):
         load_detector(p)
+
+
+# ----------------------------------------------------------------------------------------------
+# the YOLOX version switch -- capacity (nano/tiny/s/m/l/x) alongside `trimmed`
+# ----------------------------------------------------------------------------------------------
+
+def test_trimmed_is_the_default_and_is_unchanged():
+    """`version='trimmed'` must be indistinguishable from the model before this switch existed.
+
+    Every checkpoint on disk was trained under the old, switch-free `YOLOXNano()`. Pinning the
+    param count and the backbone type is what stands between that and a silent architecture
+    change the next time this file is edited.
+    """
+    from tailcyclenet.detector.yolox import CSPDarknetNano
+
+    m = YOLOXNano()
+    assert m.version == 'trimmed'
+    assert isinstance(m.backbone, CSPDarknetNano)
+    n = sum(p.numel() for p in m.parameters())
+    assert abs(n - 664_179) < 100, f'trimmed grew to {n} params -- is this still the old net?'
+
+
+def test_every_yolox_tier_builds_and_forwards():
+    """Every named tier in `YOLOX_TIERS`, plus `trimmed`, must construct and run end to end."""
+    from tailcyclenet.detector.yolox import YOLOX_TIERS
+
+    prev_params = 0
+    for v in sorted(YOLOX_TIERS, key=lambda k: YOLOX_TIERS[k][1]):     # by width_mul, ascending
+        m = YOLOXNano(n_keypoints=5, version=v)
+        x = torch.rand(1, 3, 96, 128)
+        obj, boxes, kpt = m(x)
+        anchors = m.anchor_points(96, 128, x.device)
+        assert obj.shape[1] == boxes.shape[1] == anchors.shape[0] == kpt.shape[1]
+        assert kpt.shape[2] == 5
+        n = sum(p.numel() for p in m.parameters())
+        assert n > prev_params, f'{v} must be larger than the previous (narrower) tier'
+        prev_params = n
+
+
+def test_yolox_tier_names_and_conv_type_match_megvii():
+    """Only `nano` (and `trimmed`) is depthwise-separable; tiny/s/m/l/x are full-convolution."""
+    from tailcyclenet.detector.yolox import YOLOX_TIERS
+
+    assert set(YOLOX_TIERS) == {'nano', 'tiny', 's', 'm', 'l', 'x'}
+    assert YOLOX_TIERS['nano'][2] is True
+    assert all(YOLOX_TIERS[v][2] is False for v in ('tiny', 's', 'm', 'l', 'x'))
+    order = ['nano', 'tiny', 's', 'm', 'l', 'x']
+    depths = [YOLOX_TIERS[v][0] for v in order]
+    widths = [YOLOX_TIERS[v][1] for v in order]
+    assert depths == sorted(depths) and widths == sorted(widths), \
+        'depth_mul and width_mul must both increase monotonically nano -> x'
+
+
+def test_an_unknown_yolox_version_raises():
+    with pytest.raises(ValueError, match='trimmed'):
+        YOLOXNano(version='medium')
+
+
+def test_width_only_applies_to_trimmed():
+    """A non-default `width` alongside a canonical tier is a mistake, not a silent no-op."""
+    with pytest.raises(ValueError, match='width only applies'):
+        YOLOXNano(width=128, version='nano')
+    YOLOXNano(width=96, version='nano')          # the sentinel default must not raise
+
+
+def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
+    """The fifth instance of gotcha 12's shape: absent means `trimmed`, never a guess."""
+    from tailcyclenet.detector import load_detector
+
+    p = tmp_path / 'detector.pth'
+    m = YOLOXNano(n_keypoints=0, version='s')
+    torch.save({'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
+               'yolox_version': 's'}, p)
+    loaded, *_ = load_detector(p)
+    assert loaded.version == 's'
+    torch.testing.assert_close(
+        loaded.state_dict()['head.obj_pred.0.bias'], m.state_dict()['head.obj_pred.0.bias'])
+
+    # absent -> 'trimmed', a fact about every checkpoint written before this switch existed
+    p2 = tmp_path / 'old.pth'
+    old = YOLOXNano()
+    torch.save({'model_state': old.state_dict(), 'input_wh': [416, 416], 'norm': 'gn'}, p2)
+    loaded2, *_ = load_detector(p2)
+    assert loaded2.version == 'trimmed'
+
+
+def test_norm_groups_divides_every_canonical_tier_channel_count():
+    """The channel counts a canonical tier actually produces, not just `trimmed`'s."""
+    from tailcyclenet.detector.yolox import YOLOX_TIERS, norm_groups, round8
+
+    for depth_mul, width_mul, _ in YOLOX_TIERS.values():
+        c = round8(64 * width_mul)
+        for ch in (c, c * 2, c * 4, c * 8, c * 16, round8(256 * width_mul)):
+            g = norm_groups(ch)
+            assert 1 <= g <= ch and ch % g == 0
+
+
+def test_train_detector_help_renders():
+    """The same failure mode `test_infer_help_renders` guards, one script over.
+
+    argparse expands every `help=` string as `help % params`, so a bare `%` is a format spec --
+    `3.7% of` reads as `% ` (a valid flag) then `o` (octal), and `--help` dies with
+    `TypeError: %o format`. Nothing had ever run this script's `--help` before the yolox/seed
+    flags were added, so two pre-existing bare `%`s were sitting undetected.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    p = Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py'
+    r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
+    assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
+    assert '--yolox' in r.stdout and '--seed' in r.stdout
 
 
 # ----------------------------------------------------------------------------------------------

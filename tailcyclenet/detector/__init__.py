@@ -6,9 +6,9 @@ from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, box_collate, letterbox, letterbox_transform,
                    reduce_factor, split_batch, tile_transform, unletterbox_boxes,
                    unletterbox_keypoints)
-from .yolox import YOLOXNano
+from .yolox import YOLOX_TIERS, YOLOXNano
 
-__all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
+__all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
            'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV', 'RAW_REV',
@@ -65,6 +65,13 @@ def load_detector(path, device='cpu', input_wh=None):
     `None` means "not tile-trained, use `input_wh` as-is". A tiled run therefore has to record it,
     and `detect_group` derives the size from it. This is gotcha 12's shape: two values load the same
     tensors, and the silently-wrong one cost +23.1 mm MPJPE for weeks.
+
+    `yolox_version` is the fifth instance of the same theme: it says which architecture the
+    weights were shaped for (`'trimmed'` -- the repo's bespoke net -- or a canonical tier name,
+    see `tailcyclenet.detector.yolox.YOLOX_TIERS`), and absent means `'trimmed'` -- a fact about
+    every checkpoint written before the capacity switch existed, not a guess about one that could
+    have been anything. The return signature here is UNCHANGED: this is used only to build the
+    right model internally, so no caller needs a new field to keep working.
     """
     import torch
     from pathlib import Path
@@ -88,7 +95,8 @@ def load_detector(path, device='cpu', input_wh=None):
             f'{p}: trained with {norm} normalisation; the model is GroupNorm now (there are no '
             'running statistics to load into). Retrain this detector -- see '
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
-    model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)))
+    model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
+                      version=str(ckpt.get('yolox_version', 'trimmed')))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

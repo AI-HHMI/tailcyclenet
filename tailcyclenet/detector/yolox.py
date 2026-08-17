@@ -1,19 +1,40 @@
-"""Compact YOLOX-style box predictor.
+"""Compact YOLOX-style box predictor, plus the canonical YOLOX tiers as an opt-in capacity switch.
 
 One class, so YOLOX simplifies hard:
-  * CSPDarknet-nano backbone (depthwise-separable) + PAFPN neck, strides 8/16/32
+  * CSPDarknet backbone (depthwise-separable, at the default tier) + PAFPN neck, strides 8/16/32
   * decoupled anchor-free head with the CLASSIFICATION branch dropped -- a single class
     means objectness alone carries all the information
   * centre-prior assignment instead of SimOTA (see assign.py)
   * BCE(objectness) + GIoU(box)
 
-~1M params. The regression target is the SAME crop box the pose pipeline uses
-(`tailcyclenet.crop.crop_box_for_points`), so the detector reproduces the crop the pose model
-was trained on rather than some other box. `tests/test_dataset.py` is what keeps that true.
+**`version='trimmed'` (the default) is the repo's bespoke ~0.66M-param net** -- a 4-effective-width
+backbone `(24,48,96,192)` (dark4 and dark5 share the last width) with a plain-conv stem, unchanged
+from before this switch existed and BYTE-IDENTICAL to it: every checkpoint trained under the old
+`YOLOXNano()` still loads, because the `trimmed` construction path is untouched code.
 
-Lifted from posetail-pose with ONE change: normalisation is GroupNorm, not BatchNorm. See
-`conv_norm_act`. Every detector number in dev/reports 10-13 and 15 is a BatchNorm number and stops
-being a comparable baseline against a checkpoint trained after that.
+**`version in {'nano','tiny','s','m','l','x'}` builds the CANONICAL YOLOX backbone** (Focus stem,
+5-stage CSPDarknet at `base_channels = 64`) at that tier's official `(depth_mul, width_mul,
+depthwise)` -- see `YOLOX_TIERS`. This exists to test whether the detector is CAPACITY-limited:
+report 16 §5.3b found the keypoint branch's error flat across a 26.7x resolution range and called
+it "capacity-limited" purely by elimination, never by actually scaling the model. This is that
+follow-on, and it is a model-SELECTION sweep, not a single-lever ablation -- each named tier
+differs from `trimmed` in several things at once (schedule, depth, conv type, stem) by
+construction.
+
+**NOT byte-identical to Megvii's release**, in two ways, both deliberate and both stated here so
+nobody mistakes a canonical-tier number for one comparable to a published YOLOX benchmark:
+  1. GroupNorm throughout, not BatchNorm -- see `conv_norm_act`. Every detector number in
+     dev/reports 10-13 and 15 is a BatchNorm number; every one from report 16 onward is GroupNorm.
+  2. The neck unifies all three pyramid levels to ONE output width (matching this file's single
+     shared `Head`), rather than Megvii's per-level neck width with three separate head stems
+     projecting down to a shared `cin`. The two are mathematically similar (a linear projection
+     either way) but are not the same parameter count. This mirrors how `trimmed` already works
+     here, just generalised to the canonical channel schedule.
+
+~1M params at `trimmed`. The regression target is the SAME crop box the pose pipeline uses
+(`tailcyclenet.crop.crop_box_for_points`), so the detector reproduces the crop the pose model
+was trained on rather than some other box, at every version. `tests/test_dataset.py` is what
+keeps that true.
 """
 import torch
 import torch.nn as nn
@@ -22,15 +43,35 @@ import torch.nn.functional as F
 
 CH_PER_GROUP = 8
 
+# (depth_mul, width_mul, depthwise), Megvii's own values. Only `nano` is depthwise-separable --
+# tiny/s/m/l/x are full-convolution. `base_channels = round8(64 * width_mul)` and
+# `base_depth = max(1, round(3 * depth_mul))` are applied in `CSPDarknet` below; at these six
+# points `64 * width_mul` already lands on a multiple of 8 (16/24/32/48/64/80), so `round8` is a
+# safety net for an arbitrary width_mul rather than a real rounding of the shipped tiers.
+YOLOX_TIERS = {
+    'nano': (0.33, 0.25, True),
+    'tiny': (0.33, 0.375, False),
+    's':    (0.33, 0.50, False),
+    'm':    (0.67, 0.75, False),
+    'l':    (1.00, 1.00, False),
+    'x':    (1.33, 1.25, False),
+}
+
+
+def round8(v):
+    """Round to the nearest multiple of 8 (floor 8) -- keeps `norm_groups` clean at any width."""
+    return max(8, int(round(v / 8)) * 8)
+
 
 def norm_groups(c, per_group=CH_PER_GROUP):
     """A group count that DIVIDES `c`, at about `per_group` channels each.
 
-    The usual `G = 32` is unusable at these widths -- the backbone is (24, 48, 96, 192) with the
-    neck and head at 96, depthwise layers at those same counts, and bottlenecks at roughly half --
-    so the count is derived and then walked down to a divisor. 8 channels per group gives
+    The usual `G = 32` is unusable at `trimmed`'s widths -- the backbone is (24, 48, 96, 192) with
+    the neck and head at 96, depthwise layers at those same counts, and bottlenecks at roughly
+    half -- so the count is derived and then walked down to a divisor. 8 channels per group gives
     24 -> 3, 48 -> 6, 96 -> 12, 192 -> 24, all exactly 8, and sits inside the band Wu & He sweep,
-    over which GN is insensitive to G.
+    over which GN is insensitive to G. The walk-down means this is correct for ANY channel count a
+    canonical tier produces too (128, 256, 384, 512, 768, 1024, 1280, ...), not just `trimmed`'s.
     """
     g = max(1, c // per_group)
     while c % g:
@@ -45,9 +86,10 @@ def conv_norm_act(cin, cout, k=3, s=1, groups=1):
     so train and inference are the same computation -- which is what makes training on crops and
     inferring on a whole frame safe (Wu & He: GN/LN "do not require different training and
     inference networks"), where BN's statistics would be collected on animal-rich crops and
-    applied to a mostly-empty arena. And it is batch-independent, so a high-resolution arm that
-    can only hold a small batch is merely slower to optimise rather than a differently-normalised
-    model -- otherwise a resolution sweep confounds resolution with batch size (MegDet).
+    applied to a mostly-empty arena. And it is batch-independent, so a high-resolution (or wider)
+    arm that can only hold a small batch is merely slower to optimise rather than a
+    differently-normalised model -- otherwise a capacity or resolution sweep confounds itself
+    with batch size (MegDet).
     """
     return nn.Sequential(
         nn.Conv2d(cin, cout, k, s, k // 2, groups=groups, bias=False),
@@ -61,12 +103,22 @@ def dw_conv(cin, cout, k=3, s=1):
                          conv_norm_act(cin, cout, 1, 1))
 
 
+def conv3(cin, cout, k=3, s=1, depthwise=True):
+    """The one 'kxk conv' building block used everywhere below, switched by `depthwise`.
+
+    Megvii's tiers differ on exactly this: `nano` (and this repo's `trimmed`) use the
+    depthwise-separable form: `tiny/s/m/l/x` use a single full convolution. Keeping one call site
+    for both is what makes `depthwise` a clean, single lever through the backbone, neck and head.
+    """
+    return dw_conv(cin, cout, k, s) if depthwise else conv_norm_act(cin, cout, k, s)
+
+
 class Bottleneck(nn.Module):
-    def __init__(self, cin, cout, shortcut=True):
+    def __init__(self, cin, cout, shortcut=True, depthwise=True):
         super().__init__()
         hidden = cout // 2
         self.conv1 = conv_norm_act(cin, hidden, 1)
-        self.conv2 = dw_conv(hidden, cout, 3)
+        self.conv2 = conv3(hidden, cout, 3, depthwise=depthwise)
         self.add = shortcut and cin == cout
 
     def forward(self, x):
@@ -75,13 +127,14 @@ class Bottleneck(nn.Module):
 
 
 class CSPLayer(nn.Module):
-    def __init__(self, cin, cout, n=1, shortcut=True):
+    def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True):
         super().__init__()
         hidden = cout // 2
         self.conv1 = conv_norm_act(cin, hidden, 1)
         self.conv2 = conv_norm_act(cin, hidden, 1)
         self.conv3 = conv_norm_act(2 * hidden, cout, 1)
-        self.m = nn.Sequential(*[Bottleneck(hidden, hidden, shortcut) for _ in range(n)])
+        self.m = nn.Sequential(
+            *[Bottleneck(hidden, hidden, shortcut, depthwise=depthwise) for _ in range(n)])
 
     def forward(self, x):
         return self.conv3(torch.cat([self.m(self.conv1(x)), self.conv2(x)], dim=1))
@@ -101,17 +154,74 @@ class SPPBottleneck(nn.Module):
 
 
 class CSPDarknetNano(nn.Module):
-    """Strides 8/16/32 feature maps."""
+    """`trimmed`'s backbone. Strides 8/16/32 feature maps. Unchanged from before this switch."""
 
     def __init__(self, w=(24, 48, 96, 192)):
         super().__init__()
         c1, c2, c3, c4 = w
         self.stem = conv_norm_act(3, c1, 3, 2)                 # /2
-        self.dark2 = nn.Sequential(dw_conv(c1, c2, 3, 2), CSPLayer(c2, c2, 1))     # /4
-        self.dark3 = nn.Sequential(dw_conv(c2, c3, 3, 2), CSPLayer(c3, c3, 3))     # /8
-        self.dark4 = nn.Sequential(dw_conv(c3, c4, 3, 2), CSPLayer(c4, c4, 3))     # /16
-        self.dark5 = nn.Sequential(dw_conv(c4, c4, 3, 2), SPPBottleneck(c4, c4),
-                                   CSPLayer(c4, c4, 1, shortcut=False))            # /32
+        self.dark2 = nn.Sequential(conv3(c1, c2, 3, 2), CSPLayer(c2, c2, 1))          # /4
+        self.dark3 = nn.Sequential(conv3(c2, c3, 3, 2), CSPLayer(c3, c3, 3))          # /8
+        self.dark4 = nn.Sequential(conv3(c3, c4, 3, 2), CSPLayer(c4, c4, 3))          # /16
+        self.dark5 = nn.Sequential(conv3(c4, c4, 3, 2), SPPBottleneck(c4, c4),
+                                   CSPLayer(c4, c4, 1, shortcut=False))               # /32
+        # p3, p4, p5 output widths -- dark4 and dark5 share `c4` in this 4-effective-width net,
+        # unlike the canonical 5-stage backbone below where all three differ.
+        self.out_channels = (c3, c4, c4)
+
+    def forward(self, x):
+        x = self.dark2(self.stem(x))
+        p3 = self.dark3(x)
+        p4 = self.dark4(p3)
+        p5 = self.dark5(p4)
+        return p3, p4, p5
+
+
+class Focus(nn.Module):
+    """Space-to-depth stride-2 stem, YOLOX's classic first layer.
+
+    Concatenates four 2x2-subsampled copies of the input on the channel axis -- a LOSSLESS
+    stride-2 reduction, unlike a strided conv -- then one k x k conv. Only `CSPDarknet` (the
+    canonical tiers) uses this; `trimmed`'s stem is a plain strided conv, kept as-is for
+    checkpoint back-compat.
+    """
+
+    def __init__(self, cin, cout, k=3, depthwise=False):
+        super().__init__()
+        self.conv = conv3(cin * 4, cout, k, 1, depthwise=depthwise)
+
+    def forward(self, x):
+        tl = x[..., ::2, ::2]
+        tr = x[..., ::2, 1::2]
+        bl = x[..., 1::2, ::2]
+        br = x[..., 1::2, 1::2]
+        return self.conv(torch.cat([tl, bl, tr, br], dim=1))
+
+
+class CSPDarknet(nn.Module):
+    """The CANONICAL 5-stage YOLOX backbone: Focus stem, `base_channels x {1,2,4,8,16}`.
+
+    Same contract as `CSPDarknetNano` (strides 8/16/32, returns p3/p4/p5), built at Megvii's
+    official `(depth_mul, width_mul, depthwise)` for the six named tiers in `YOLOX_TIERS`. See the
+    module docstring for the two deliberate deviations (GroupNorm, and the neck's unified width).
+    """
+
+    def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False):
+        super().__init__()
+        c = round8(64 * width_mul)
+        d = max(1, round(3 * depth_mul))
+        self.stem = Focus(3, c, 3, depthwise=depthwise)                                   # /2
+        self.dark2 = nn.Sequential(conv3(c, c * 2, 3, 2, depthwise=depthwise),
+                                   CSPLayer(c * 2, c * 2, d, depthwise=depthwise))         # /4
+        self.dark3 = nn.Sequential(conv3(c * 2, c * 4, 3, 2, depthwise=depthwise),
+                                   CSPLayer(c * 4, c * 4, d * 3, depthwise=depthwise))     # /8
+        self.dark4 = nn.Sequential(conv3(c * 4, c * 8, 3, 2, depthwise=depthwise),
+                                   CSPLayer(c * 8, c * 8, d * 3, depthwise=depthwise))     # /16
+        self.dark5 = nn.Sequential(
+            conv3(c * 8, c * 16, 3, 2, depthwise=depthwise),
+            SPPBottleneck(c * 16, c * 16),
+            CSPLayer(c * 16, c * 16, d, shortcut=False, depthwise=depthwise))              # /32
+        self.out_channels = (c * 4, c * 8, c * 16)          # p3, p4, p5 -- three DISTINCT widths
 
     def forward(self, x):
         x = self.dark2(self.stem(x))
@@ -122,18 +232,18 @@ class CSPDarknetNano(nn.Module):
 
 
 class PAFPN(nn.Module):
-    def __init__(self, chans=(96, 192, 192), out=96):
+    def __init__(self, chans=(96, 192, 192), out=96, depthwise=True):
         super().__init__()
         c3, c4, c5 = chans
         self.lat5 = conv_norm_act(c5, out, 1)
         self.lat4 = conv_norm_act(c4, out, 1)
         self.lat3 = conv_norm_act(c3, out, 1)
-        self.mrg4 = CSPLayer(2 * out, out, 1, shortcut=False)
-        self.mrg3 = CSPLayer(2 * out, out, 1, shortcut=False)
-        self.down3 = dw_conv(out, out, 3, 2)
-        self.down4 = dw_conv(out, out, 3, 2)
-        self.out4 = CSPLayer(2 * out, out, 1, shortcut=False)
-        self.out5 = CSPLayer(2 * out, out, 1, shortcut=False)
+        self.mrg4 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
+        self.mrg3 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
+        self.down3 = conv3(out, out, 3, 2, depthwise=depthwise)
+        self.down4 = conv3(out, out, 3, 2, depthwise=depthwise)
+        self.out4 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
+        self.out5 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
 
     def forward(self, feats):
         p3, p4, p5 = feats
@@ -150,32 +260,37 @@ class PAFPN(nn.Module):
 class Head(nn.Module):
     """Decoupled head, objectness + ltrb. No classification branch (single class).
 
-    `n_keypoints > 0` adds a KEYPOINT BRANCH: a second depthwise tower off the same stem, and a
-    1x1 emitting `(dx, dy, score)` per keypoint. At the default 0 nothing is constructed -- not
-    built and ignored -- so an existing checkpoint's `state_dict` is unchanged and every recorded
-    detector number reproduces without passing a new flag.
+    `n_keypoints > 0` adds a KEYPOINT BRANCH: a second tower off the same stem, and a 1x1 emitting
+    `(dx, dy, score)` per keypoint. At the default 0 nothing is constructed -- not built and
+    ignored -- so an existing checkpoint's `state_dict` is unchanged and every recorded detector
+    number reproduces without passing a new flag.
 
     DECOUPLED, not shared, and that is a measured choice: at batch 128 on an H100 the second
     tower costs 1.15x the whole network against 1.01x for a shared one, which is 0.036% of a real
     run's wall clock (the forward is 0.9% of it -- dev/reports/14). Compute is not the constraint
     here by three orders of magnitude; accuracy is.
+
+    `depthwise` matches the tier's own choice: `trimmed`/`nano` use depthwise-separable towers,
+    `tiny` and up use full convolutions, so the head is not a full-conv tier's odd one out.
     """
 
-    def __init__(self, cin=96, n_levels=3, n_keypoints=0):
+    def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         # THE IDENTITY BRANCH (report 20 lead 5, SLEAP's `ClassVectorsHead` in a single-shot head).
         # A per-anchor softmax over a CLOSED animal set -- which is what rat-city is, 12 fixed rats
         self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
-            [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3)) for _ in range(n_levels)])
+            [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
+                           conv3(cin, cin, 3, depthwise=depthwise)) for _ in range(n_levels)])
         self.reg_pred = nn.ModuleList([nn.Conv2d(cin, 4, 1) for _ in range(n_levels)])
         self.obj_pred = nn.ModuleList([nn.Conv2d(cin, 1, 1) for _ in range(n_levels)])
         for m in self.obj_pred:                      # rare-positive prior, as in YOLOX
             nn.init.constant_(m.bias, -4.595)
         if self.n_keypoints:
             self.kpt_convs = nn.ModuleList(
-                [nn.Sequential(dw_conv(cin, cin, 3), dw_conv(cin, cin, 3))
+                [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
+                               conv3(cin, cin, 3, depthwise=depthwise))
                  for _ in range(n_levels)])
             self.kpt_pred = nn.ModuleList(
                 [nn.Conv2d(cin, 3 * self.n_keypoints, 1) for _ in range(n_levels)])
@@ -191,14 +306,38 @@ class Head(nn.Module):
 
 
 class YOLOXNano(nn.Module):
+    """The box predictor. `version='trimmed'` (default) is byte-identical to the pre-switch net.
+
+    `version` in `{'nano','tiny','s','m','l','x'}` instead builds `CSPDarknet` at that tier's
+    official `(depth_mul, width_mul, depthwise)` (`YOLOX_TIERS`), with this file's GroupNorm,
+    single-class crop-rule head and optional keypoint branch unchanged. `width` only applies to
+    `version='trimmed'` -- for a canonical tier the neck/head width is DERIVED from `width_mul`
+    (`round8(256 * width_mul)`, matching Megvii's own `int(256 * width)` head-stem convention), and
+    passing a non-default `width` alongside a canonical `version` raises rather than silently
+    ignoring it.
+    """
     STRIDES = (8, 16, 32)
 
-    def __init__(self, width=96, n_keypoints=0):
+    def __init__(self, width=96, n_keypoints=0, version='trimmed'):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
-        self.backbone = CSPDarknetNano()
-        self.neck = PAFPN(out=width)
-        self.head = Head(width, n_keypoints=self.n_keypoints)
+        self.version = str(version)
+        if self.version == 'trimmed':
+            self.backbone = CSPDarknetNano()
+            neck_out, depthwise = width, True
+        else:
+            if self.version not in YOLOX_TIERS:
+                raise ValueError(f"yolox version {version!r}: must be 'trimmed' or one of "
+                                 f"{sorted(YOLOX_TIERS)}")
+            if width != 96:
+                raise ValueError(f"width={width} was passed alongside version={version!r}, but "
+                                 "width only applies to version='trimmed' -- a canonical tier "
+                                 "derives its neck/head width from width_mul.")
+            depth_mul, width_mul, depthwise = YOLOX_TIERS[self.version]
+            self.backbone = CSPDarknet(width_mul, depth_mul, depthwise=depthwise)
+            neck_out = round8(256 * width_mul)
+        self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise)
+        self.head = Head(neck_out, n_keypoints=self.n_keypoints, depthwise=depthwise)
 
     def forward(self, x):
         """x: (B,3,H,W) normalized to [0,1].

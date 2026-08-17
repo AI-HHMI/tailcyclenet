@@ -163,14 +163,14 @@ def _photometric(img, rng):
     only regime this repo can measure. Re-add it with a root that has a genuinely different camera
     or enclosure, not before.
     """
+    # THE `extended` BRANCH WAS DELETED, NOT DISABLED. The commit that pulled `--augment-
+    # photometric` (`3dbb0a1`) removed the `extended` parameter from this function's signature
+    # and from `BoxDataset.__init__`, but left an `if extended:` block referencing it -- a
+    # `NameError` on every call, live in every checkpoint trained with `--augment` since. Nothing
+    # in the test suite calls `BoxDataset.__getitem__` with `augment=True` through to a real pixel
+    # decode (the augmentation tests only exercise `boxes_for`, which never reaches this
+    # function), so it went undetected until a real training run hit it.
     out = img * rng.uniform(0.7, 1.3)
-    if extended:
-        if rng.random() < 0.5:
-            out = out + rng.uniform(-0.2, 0.2) * 255.0
-        if rng.random() < 0.5:
-            # `var_limit` is a VARIANCE range in DLC; the sigma is its square root, so 12.75 is the
-            # top of the sigma range (5% of the 0-255 scale). Per channel, as DLC has it.
-            out = out + rng.normal(0.0, rng.uniform(0.0, 12.75), size=out.shape)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 

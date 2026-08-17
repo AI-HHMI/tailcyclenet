@@ -18,6 +18,14 @@ detector across datasets is not offered: one letterbox cannot serve both.
 extent. rat-city wants it: its converter dropped noisy points, so 26k train instances carry no
 finite keypoint at all and would otherwise be trained as "no animal here".
 
+`--yolox {trimmed,nano,tiny,s,m,l,x}` is a MODEL-CAPACITY switch, default `trimmed` (the repo's
+bespoke ~0.66M-param net, byte-identical to every detector on record). The named tiers build the
+canonical YOLOX backbone at Megvii's own (depth_mul, width_mul, depthwise) -- see
+`tailcyclenet.detector.yolox.YOLOX_TIERS` -- to test whether the detector is capacity-limited
+rather than resolution-limited (dev/reports/16 §5.3b reached "capacity-limited" for the keypoint
+branch by elimination, never by scaling the model). It is recorded in the checkpoint and
+`load_detector` reconstructs the matching architecture; absent means `trimmed`.
+
 Every checkpoint is written as its own `detector_it<n>.pth` WITH its scores inside, plus a
 `metrics.json` of the whole history, and both splits are scored each time. A single rolling
 `detector.pth` carrying no score cannot be selected on -- johnson peaked at val recall 0.871 and
@@ -41,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.format import load_datasets
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate,
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOX_TIERS, YOLOXNano, box_collate,
                                   detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.evaluate import overall, score_dataset
 def default_input_wh(dataset, target_px=416 * 416):
@@ -136,7 +144,7 @@ def main():
                          'the pose model is trained on -- the two must agree or the detector '
                          'serves a different crop rule, silently. Inert where a root ships no '
                          'instances.pq (3dpop, allen, branson-fly: falls back per view); an exact '
-                         'no-op on rat-city-annotated; worth 3.7% of animal-frames on '
+                         'no-op on rat-city-annotated; worth 3.7%% of animal-frames on '
                          'rat-city-tracked, whose keypoint box is ~2.4 of 4 points. It DOES '
                          'retarget calms21 (MARS) and johnson-mouse (COCO), whose boxes agree with '
                          'the crop rule on 0.000 of instances -- pass `keypoints` there to '
@@ -196,7 +204,8 @@ def main():
                          'THE TILE: the invariant is the animal\'s size in INPUT pixels, and '
                          'tiling-then-downscaling is the number-one reported failure of this '
                          'pattern. MEASURED on rat-city-annotated: this is what sets the mask\'s '
-                         'positive rate (5.2% at 1.0, 10.2% at 0.7, 17.5% at 0.5, 48% at 0.25) '
+                         'positive rate (5.2%% at 1.0, 10.2%% at 0.7, 17.5%% at 0.5, 48%% at '
+                         '0.25) '
                          'because CENTER_RADIUS is 2.5 CELLS, so the certified region has to span '
                          'many cells, not much area.')
     ap.add_argument('--tile-bg-per-frame', type=int, default=1,
@@ -210,9 +219,36 @@ def main():
                          'labelling and is unmasked.')
     ap.add_argument('--kpt-weight', type=float, default=1.0)
     ap.add_argument('--kpt-score-weight', type=float, default=1.0)
+    ap.add_argument('--yolox', default='trimmed', choices=['trimmed', *sorted(YOLOX_TIERS)],
+                    help='the ARCHITECTURE, not a runtime choice -- it changes the state_dict and '
+                         'is recorded in the checkpoint (`load_detector` reads it back; absent '
+                         'means `trimmed`, i.e. every checkpoint from before this flag existed). '
+                         '`trimmed` (default) is the repo\'s bespoke ~0.66M-param net, BYTE-'
+                         'IDENTICAL to every detector on record. `nano/tiny/s/m/l/x` instead build '
+                         'the CANONICAL YOLOX backbone (Focus stem, 5-stage CSPDarknet) at that '
+                         'tier\'s official (depth_mul, width_mul, depthwise) -- see '
+                         '`tailcyclenet.detector.yolox.YOLOX_TIERS`. This exists to test whether '
+                         'the detector is CAPACITY-limited (report 16 §5.3b inferred "capacity-'
+                         'limited" for the keypoint branch by elimination -- 26.7x the resolution '
+                         'bought 2.8%% of its error -- never by scaling the model). NOT byte-'
+                         'identical to Megvii\'s release: GroupNorm throughout, and the neck '
+                         'unifies all three pyramid levels to one width rather than three '
+                         'per-level widths with per-level head stems. This is a MODEL-SELECTION '
+                         'sweep, not a single-lever ablation -- every named tier differs from '
+                         '`trimmed` in schedule, depth, conv type and stem all at once.')
     ap.add_argument('--device', default='cuda:0')
+    ap.add_argument('--seed', type=int, default=0,
+                    help='model init, augmentation draws and the train shuffle order. Does NOT '
+                         "move `input_wh_for`'s own median-animal probe, which stays pinned at "
+                         'seed 0 regardless -- that is a MEASUREMENT of the dataset, not training '
+                         'stochasticity, and letting it vary would make --input-wh depend on '
+                         '--seed. A SAME-RECIPE REPLICATE (same flags, different --seed) is not '
+                         'optional before trusting a detector arm: report 21 §7.0 measured '
+                         'coverage +0.0575 and kpt_agree +0.1124, both SIG, with NO lever at all.')
     args = ap.parse_args()
 
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     device = args.device if torch.cuda.is_available() else 'cpu'
     # Just the camera size, so just the discovery -- building a BoxDataset here scattered every
     # session's parquet into dense arrays to read two integers.
@@ -231,7 +267,7 @@ def main():
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
                        hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg,
-                       **tiling)
+                       seed=args.seed, **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
     # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
@@ -267,7 +303,8 @@ def main():
               f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
         print(f'  thinnest: {", ".join(thin)}', flush=True)
     loader = torch.utils.data.DataLoader(
-        train, batch_size=args.batch_size, sampler=ChunkShuffle(len(train), chunk=train.chunk),
+        train, batch_size=args.batch_size,
+        sampler=ChunkShuffle(len(train), chunk=train.chunk, seed=args.seed),
         num_workers=args.num_workers,
         collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0,
         worker_init_fn=worker_init)
@@ -276,14 +313,14 @@ def main():
         val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim, reduce=args.reduce,
                          max_frames_per_group=args.val_frames_per_group,
-                         keypoints=args.keypoints, **tiling)
+                         keypoints=args.keypoints, seed=args.seed, **tiling)
         print(f'val:   {len(val)} views')
     except ValueError as e:
         print(f'val:   none ({e})')
 
-    model = YOLOXNano(n_keypoints=n_kpts).to(device)
+    model = YOLOXNano(n_keypoints=n_kpts, version=args.yolox).to(device)
     n = sum(p.numel() for p in model.parameters())
-    print(f'YOLOX-Nano: {n / 1e6:.2f}M params')
+    print(f'YOLOX [{args.yolox}]: {n / 1e6:.2f}M params')
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
 
@@ -373,8 +410,12 @@ def main():
                 # is a fact about the file ("no keypoint weights here"), not an assertion about
                 # how weights nobody recorded were trained. That distinction is what gotcha 12
                 # cost, one level down.
+                # `yolox_version` is the fifth field of this shape (gotcha 12): the architecture
+                # is part of the WEIGHTS, and absent reads as 'trimmed' -- a fact about every
+                # checkpoint written before this switch existed, not a guess.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
-                        'n_keypoints': n_kpts, 'norm': 'gn',
+                        'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': args.yolox,
+                        'seed': args.seed,
                         # `input_wh` above is the TILE size when tiling, which is NOT the
                         # deployment input size -- `load_detector` raises if this is missing so
                         # nobody can run a tiled detector at its tile size on a whole frame.

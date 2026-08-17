@@ -573,8 +573,16 @@ def main():
                 # it cannot be recovered afterwards from the npz -- a dropped row leaves no trace.
                 # "Report the fire rate before the metric" means printed, not recoverable.
                 if args.pose_nms is not None:
+                    # `.get(..., 0)`, both keys: `identity.pose_nms` returns before writing EITHER
+                    # key when the detector has no keypoint branch (`kpts is None`) -- a correct
+                    # no-op, since the maDLC overlap it computes needs keypoints to exist at all.
+                    # A keypoint-less detector is the NORMAL case for a 2D root (rat-city's own
+                    # recipe omits --keypoints), so `nms_stats` being empty here is not a bug
+                    # signal, and asserting `nms_pairs` unconditionally raised on every such run.
                     print(f'{key}: pose-nms dropped {nms_stats.get("nms_dropped", 0)} row(s) of '
-                          f'{nms_stats["nms_pairs"]} overlapping pair(s)', flush=True)
+                          f'{nms_stats.get("nms_pairs", 0)} overlapping pair(s)'
+                          + (' (no keypoint branch -- pose-nms is a no-op)' if not nms_stats
+                             else ''), flush=True)
                 # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
                 # saturated on every detector shipped here; a detector whose scores are NOT
                 # saturated would lose most of its boxes to that, and this line is where that shows

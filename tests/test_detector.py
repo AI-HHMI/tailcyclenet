@@ -580,6 +580,63 @@ def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
     assert np.allclose(linked[1, 1, 0], wide)
 
 
+def test_pose_nms_drops_the_lower_scored_duplicate():
+    """Two rows whose keypoints sit almost entirely inside each other's box are one animal twice."""
+    from tailcyclenet.detector.identity import pose_nms
+
+    boxes = np.zeros((2, 1, 1, 4), np.float32)
+    boxes[0, 0, 0] = [0.0, 0.0, 100.0, 100.0]
+    boxes[1, 0, 0] = [5.0, 5.0, 105.0, 105.0]           # near-identical box: a duplicate detection
+    kpts = np.zeros((2, 1, 1, 3, 3), np.float32)
+    kpts[0, 0, 0] = [[10, 10, 1], [50, 50, 1], [90, 90, 1]]
+    kpts[1, 0, 0] = [[12, 12, 1], [52, 52, 1], [92, 92, 1]]     # inside row 0's box too
+    scores = np.array([[[0.9]], [[0.5]]], np.float32)
+
+    stats = {}
+    dropped = pose_nms(boxes, kpts, scores=scores, thresh=0.8, stats=stats)
+    assert dropped == 1 and stats == {'nms_pairs': 1, 'nms_dropped': 1}
+    assert not np.isfinite(boxes[1, 0, 0]).all(), 'the LOWER-scored row must be the one dropped'
+    assert np.isfinite(boxes[0, 0, 0]).all()
+
+
+def test_pose_nms_is_a_correct_noop_with_no_keypoints():
+    """`kpts=None` (a detector with no keypoint branch) must return 0 and leave `stats` EMPTY,
+    not populate it with zeros.
+
+    `scripts/infer.py` crashed on every `rat-city-combined` arm of the capacity sweep here:
+    `pose_nms` returns before writing `stats['nms_pairs']` in this branch (correctly -- the maDLC
+    overlap it computes needs keypoints to exist at all, and a 2D root's own recipe has no
+    `--keypoints`), but the caller read `nms_stats["nms_pairs"]` with a bare subscript instead of
+    `.get(..., 0)` like its neighbour on the same line. This is the empty-stats case that bug
+    needed to reproduce.
+    """
+    from tailcyclenet.detector.identity import pose_nms
+
+    boxes = np.zeros((2, 1, 1, 4), np.float32)
+    boxes[0, 0, 0] = [0.0, 0.0, 100.0, 100.0]
+    boxes[1, 0, 0] = [5.0, 5.0, 105.0, 105.0]
+    stats = {}
+    dropped = pose_nms(boxes, None, thresh=0.8, stats=stats)
+    assert dropped == 0
+    assert stats == {}, 'a keypoint-less no-op must not invent stats keys'
+    # the caller's own read must survive an empty dict
+    assert stats.get('nms_pairs', 0) == 0 and stats.get('nms_dropped', 0) == 0
+
+
+def test_infer_reads_pose_nms_stats_defensively():
+    """Source check: both stats keys must be `.get(..., 0)`, never a bare subscript.
+
+    `nms_stats["nms_pairs"]` raised `KeyError` on every keypoint-less detector -- the NORMAL case
+    for a 2D root -- and `--pose-nms` is a documented default for exactly one of them (rat-city).
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    assert 'nms_stats["nms_pairs"]' not in src, 'a bare subscript will KeyError with no keypoints'
+    assert 'nms_stats.get("nms_pairs", 0)' in src
+    assert 'nms_stats.get("nms_dropped", 0)' in src
+
+
 def test_unletterbox_clamps_a_runaway_box_into_the_frame():
     """`yolox.py:167` decodes a side as exp(clamp(-6,6))*stride -- up to ~12,910 px, ~137,000 after
     a 1/7 letterbox scale. IoU-only NMS cannot suppress it, and downstream it becomes the crop."""

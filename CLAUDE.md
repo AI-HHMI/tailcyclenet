@@ -841,8 +841,11 @@ moving-crop geometry.
 
 ## What is owed
 
-**Blocking.** Stand up the held-out long-clip protocol on `3dpop/test` and `calms21/test` — the data
-exists (see the format section) and this costs no lever, no dataset and no `eval.py` change. **calms21's "identity collapse" is an ARM, not the root** — report 24 §6 reaches **MOTA 1.000,
+**Blocking.** `3dpop/test` is DONE — all 58 groups untruncated at `--chunk 500` give **145 units,
+2.86M matched points, MPJPE 9.586 mm [8.548, 11.104]**, an interval **2.8x tighter** than the
+120-frame protocol's, and its units come from 58 DISTINCT sessions rather than one clip
+(`scratch/longclip/`, report 24 §7). `calms21/test` still wants the same treatment, and `eval.py`
+still resamples chunks rather than sessions — which is the honest interval on a 58-clip split. **calms21's "identity collapse" is an ARM, not the root** — report 24 §6 reaches **MOTA 1.000,
 coverage 1.0000, MPJPE 6.379 px** on two of its clips with `--anchor carry --link-boxes --track
 --refine`, reproduced end to end on current code. The collapsing arm (115 px, MOTA −1.0 on six of
 ten chunks) differs from it in FIVE levers — session, pose run, detector, `--refine`, clip length —

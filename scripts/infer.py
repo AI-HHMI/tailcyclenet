@@ -51,7 +51,14 @@ def main():
     ap.add_argument('--checkpoint', default=None)
     ap.add_argument('--anchor', default='carry', choices=ANCHORS,
                     help="'labels' is an ORACLE, not a deployment number")
-    ap.add_argument('--overlap', type=int, default=4)
+    ap.add_argument('--overlap', type=int, default=8,
+                    help='frames each window shares with its predecessor. 8, and it is the one '
+                         'number that suits both dimensions: 3dpop reads -0.626 mm against 4 over '
+                         '16 sessions (and -0.355 [-0.751, -0.063] SIG on the 120-frame protocol, '
+                         'where overlap 2 costs +0.460 and 12 is no better), while 2D still '
+                         'improves at 12 -- but only by +0.787 px [-0.111, +1.951] n.s. over 8 on '
+                         'rat-city, at a small monotone identity cost. It is the SEAM COUNT against '
+                         'the SEAM SIZE and both terms depend on the clip; sweep it per root.')
     ap.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
     ap.add_argument('--boxes', type=Path, default=None,
                     help='npz of crop points per group; default is to crop from the labels')
@@ -173,8 +180,19 @@ def main():
                     help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
                          'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
                          'unreadable. A view only -- it changes nothing that was predicted.')
-    ap.add_argument('--refine', action='store_true',
-                    help='re-crop each window to the first pass\'s OWN prediction and predict '
+    ap.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
+                    help='DEFAULT: ON IN 3D, OFF IN 2D -- derived from the session\'s own mode, '
+                         'because the two dimensions disagree and the code knows which it is in. '
+                         '3dpop over 16 sessions / 47 units, paired, one lever: MPJPE -0.962 mm '
+                         '[-2.104, -0.216] SIG, p75 -0.749 SIG, p95 -8.17 SIG, with coverage, MOTA '
+                         'and idsw all null -- a clean win, which retires report 11\'s "loses to '
+                         '--crop-source keypoints at 2x compute". In 2D it is a TRADE: bulk accuracy '
+                         'improves on both roots (rat-city p75 -0.744 SIG, coverage +0.008 SIG; '
+                         'calms21 p75 -4.14 SIG) while calms21 identity gets SIG worse (MOTA '
+                         '-0.0435, idsw +0.0085, coverage -0.0053) -- 2x the seed floor, so 2D does '
+                         'not get it by default. `--refine` / `--no-refine` overrides either way. '
+                         'What it does: '
+                         're-crop each window to the first pass\'s OWN prediction and predict '
                          'again, label-free. The prediction re-enters the crop rule as if it were '
                          'the labels, so the second pass sees the box a GT crop would have given -- '
                          'the only arm that beat every detector crop on 3dpop. Costs one extra '
@@ -278,9 +296,11 @@ def main():
               'prediction of anything. ***')
 
     if args.refine_px is not None:
-        if not args.refine:
-            raise SystemExit('--refine-px sets the resolution of --refine\'s FIRST pass; without '
-                             '--refine there is only one pass and it is the answer.')
+        # `--refine` is tri-state now (None = derive from the session mode), so only an EXPLICIT
+        # `--no-refine` is a contradiction. Leaving it unset is fine and means "wherever refine runs".
+        if args.refine is False:
+            raise SystemExit('--refine-px sets the resolution of --refine\'s FIRST pass, and '
+                             '--no-refine turns that pass off. Pick one.')
         # THE STRUCTURAL FLOOR, and it is the spatial analogue of gotcha 1. At `patch_size` 16 a
         # 16 px input gives a 1x1 token grid and the forward returns ALL-NaN with no exception,
         # while `run_group` still marks every window `ok` -- only `coverage 0.0000` reveals it.
@@ -658,9 +678,12 @@ def main():
     # identical in their own provenance, so report 15 §6's pair could be told apart only by
     # filename. `--refine` rides here too, being the other re-crop lever, so a three-way comparison
     # is legible from the files alone.
+    # `refine` is resolved per session from its mode, so read the RESOLVED flag off the results
+    # rather than off `cfg`, which may still hold the tri-state None.
+    did_refine = any(bool(r.get('refine')) for r in results.values())
     flat['__crop_source__'] = np.asarray(
-        f'{cfg.crop_source}{"+refine" if cfg.refine else ""}'
-        f'{f"@{cfg.refine_px}px" if cfg.refine and cfg.refine_px else ""}')
+        f'{cfg.crop_source}{"+refine" if did_refine else ""}'
+        f'{f"@{cfg.refine_px}px" if did_refine and cfg.refine_px else ""}')
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
 

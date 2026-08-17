@@ -403,21 +403,35 @@ Rendering is a flag, not a separate script.
 
 ### The measured defaults
 
+The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one lever off
+`--anchor carry --overlap 8`; the 2D column names its root because **the two 2D roots disagree**
+(rat-city 500 f / 5 units; calms21 6 sessions x 2000 f / 24 units). Report 24 §10.
+
 | flag | default | 2D | 3D | report |
 |---|---|---|---|---|
-| `--anchor` | `carry` | **measured harmful; see below** | good | 21 §9i |
-| `--overlap` | 4 | 12 is better and still climbing | **8 is the optimum** | 21 §9l, 13 |
-| `--crop-source` | `boxes` | **`boxes`** | **`keypoints`** (−0.45 mm) | 21 §4 |
+| `--anchor` | `carry` | **ROOT-CONDITIONAL**: rat-city +5.04 px SIG worse, calms21 MOTA +0.082 SIG better | mean NULL; carry wins the bulk | 24 §10 |
+| `--overlap` | **8** | 12 best, 8 within noise (+0.79 n.s.) | −0.626 mm vs 4 | 24 §10, 13 |
+| `--refine` | **on in 3D, off in 2D** | accuracy yes, identity no | **−0.962 mm [−2.104, −0.216] SIG** | 24 §10 |
+| `--crop-source` | `boxes` | **`boxes`** | **NULL** (+0.181 [−0.182, +0.546]) | 24 §10 |
 | `--det-score` | 0.99 | **per-checkpoint** | per-checkpoint | 21 §0b |
 | `--track` | on | **INERT** (`C > 1` gate) | on | 20 §0a |
 | `--carry-source` | `triangulate` | **INERT** (bit-identical) | on | 13 RC1 |
 | `--pose-nms` | off | +0.0223 MOTA on rat-city, **harmful on calms21** | untested | 21 §9k |
 | `--vis-thresh` | off | **cannot work** (untrained head) | +0.049 on 3dpop | 24 §1.2 |
-| `--refine` | off | helps calms21 PCK | loses to `--crop-source keypoints` at 2x compute | 11, 15 |
-| `--refine-px` | none | **96** (beats full-res refine) | 192 is a null; 96–128 trade mm for MOTA | 24 §9h, §9j |
+| `--refine-px` | none | **SWEEP IT**: 96 is best on calms21 and **+15.8 px / MOTA −0.238 SIG on rat-city** | 192 ≈ 256; 96–128 trade mm for MOTA | 24 §9h, §9j, §10 |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | | |
 
-**`--anchor carry` IN 2D COSTS +52.42 px MPJPE [+50.77, +54.05] AND −0.4563 MOTA** on rat-city's
+**`--anchor` IN 2D IS ROOT-CONDITIONAL, AND "HARMFUL IN 2D" WAS ONE ROOT GENERALISED** (report 24
+§10.2). On **calms21**, 6 sessions x 2000 frames, `carry` is significantly BETTER: **MOTA +0.0821
+[+0.0320, +0.1240]**, idsw −0.0024 SIG, err p99 −40.7 SIG, MPJPE −3.60 n.s. On **rat-city** it is
+significantly worse: +5.04 px [+2.10, +7.77] at 500 frames and +52.42 px at 57,594. **The
+discriminator is ANIMAL COUNT, not clip length** — rat-city loses at 500 frames too, and it has
+12 rats against calms21's 2, so a carried prior there is often the wrong animal's pose and a wrong
+prior is worse than none. `carry` also LOCKS the pose (motion_ratio −0.207 SIG on calms21), so read
+`motion_ratio` beside it. The default stays `carry`; use `--anchor none` on a crowded 2D root.
+
+The rat-city mechanism, unchanged and still the reason to distrust `carry` on a long 2D clip:
+**+52.42 px MPJPE [+50.77, +54.05] and −0.4563 MOTA** on rat-city's
 57,594-frame clip, and −9.144 px even on a 500-frame one. **The loop SATURATES rather than
 diverging** — it starts at the prior-free value, climbs ~5x over roughly the first 300 windows, then
 plateaus for the remaining 2,500 (slope −0.0032 px/window, zero burst windows). An unbounded loop is
@@ -553,6 +567,17 @@ and nothing else.** The "GT crop" row means different things on different roots;
 
 `scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw.
+
+**A METRIC THAT FAILS AT A CHUNK BOUNDARY IS A METRIC BUG UNTIL PROVEN OTHERWISE.** `chunk_frames`
+sliced the LABEL arrays only where `label.shape[1] == pred.shape[1]`, so a prediction that is a
+`--max-frames` PREFIX of its group failed that test on every field and each chunk got the whole
+group's labels — and `score` truncates to the shorter, so chunk 0 was right and **every later chunk
+scored its own frames against frames 0..n−1 again**. Measured on 6 calms21 sessions whose
+predictions are good to a median 8-11 px in EVERY chunk: coverage **0.4656 against 0.9891** fixed,
+MPJPE **98.6 against 26.5**, and per-chunk MOTA 0.76-0.95 on chunk 0 beside **−0.36 to −1.00 on
+chunks 1-3 of all six**. It survived because it looks exactly like a pipeline degrading over a clip,
+which this repo has a documented lever for. Fixed; report 24 §10.3. Real degradation does not respect
+the scoring unit's edges.
 
 **THE BOOTSTRAP RESAMPLES GROUPS, AND A LONG CLIP IS ONE GROUP** — so rat-city's whole test split
 returns `DEGENERATE` on every delta ever measured there, and the roots this repo most wants

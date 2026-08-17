@@ -26,7 +26,7 @@ from __future__ import annotations
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -72,7 +72,17 @@ class InferConfig:
     # Re-crop each window to the FIRST PASS's own prediction and predict again. Label-free, and it
     # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
     # pixels and no scene encode can be shared). See `run_group`.
-    refine: bool = False
+    # None -> DERIVED FROM THE SESSION'S MODE: on in 3D, off in 2D. The two dimensions disagree and
+    # the code knows which one it is in, so the default says so rather than picking a loser.
+    # 3dpop, 16 sessions / 47 chunk-500 units, paired, one lever: MPJPE **-0.962 mm
+    # [-2.104, -0.216] SIG**, p75 -0.749 SIG, p95 -8.17 SIG, coverage and MOTA and idsw all null.
+    # (This RETIRES report 11's "loses to `--crop-source keypoints` at 2x compute", which was one
+    # 120-frame protocol.) In 2D it is a TRADE, not a win: bulk accuracy improves on both roots
+    # (rat-city p75 -0.744 SIG and coverage +0.008 SIG; calms21 p75 -4.14 SIG, pck@10 +0.07) while
+    # calms21's identity gets significantly worse (MOTA -0.0435 [-0.0640, -0.0238], idsw +0.0085,
+    # coverage -0.0053, all SIG). A default must not cost 2x the seed floor of MOTA on a
+    # multi-animal root, so 2D keeps it off and `--refine` turns it on.
+    refine: bool | None = None
     # PASS 1'S INPUT RESOLUTION under `--refine`. None -> `image_size`, i.e. today's behaviour
     # exactly. Refine's gain is MAGNIFICATION, not coordinate frame (an ablation that re-centred
     # the crop at a fixed side recovered 42% of the mean gain, 3% of the median and 0.4% of
@@ -250,15 +260,20 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
         raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
                          'overlap >= 1; got 0')
-    # A reduced pass-1 resolution is only a thing when there IS a second pass. Without `--refine`,
-    # pass 1 is the only pass and its output is the answer.
-    pass1_res = cfg.refine_px if (cfg.refine and cfg.refine_px) else cfg.image_size
 
     group = session.groups[gid]
     lab: Labels = session.labels(gid)
     mode = session.mode
     K = session.n_keypoints
     R = 3 if mode == '3d' else 2
+    # `refine` DEFAULTS BY DIMENSIONALITY -- see `InferConfig.refine`. Resolved here, where `mode`
+    # is known, and folded back into `cfg` so every consumer downstream (and the recorded output)
+    # sees one concrete value instead of a tri-state nobody else should have to interpret.
+    if cfg.refine is None:
+        cfg = replace(cfg, refine=(mode == '3d'))
+    # A reduced pass-1 resolution is only a thing when there IS a second pass. Without `--refine`,
+    # pass 1 is the only pass and its output is the answer.
+    pass1_res = cfg.refine_px if (cfg.refine and cfg.refine_px) else cfg.image_size
     # A PREFIX of the group, not a sample of it: `carry` needs the frames contiguous, and
     # rat-city's posetail-pose protocol is frames 0-479 of its one test trial.
     T_total = min(group.n_frames, cfg.max_frames or group.n_frames)
@@ -751,6 +766,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                'mode': mode, 'group_id': gid, 'session': session.session_id,
                'dataset': dataset_name, 'anchor': cfg.anchor,
                'carry_source': cfg.carry_source, 'n_frames': T_total,
+               # THE RESOLVED VALUE, not the tri-state the caller passed. `refine` defaults by
+               # dimensionality, so the file has to say which way it went -- otherwise a 3D run and
+               # a `--no-refine` 3D run are indistinguishable in their own provenance.
+               'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
                'boxes_from': 'detector' if boxes_stc is not None else
                              ('given points' if box_points is not None else
                               ('instances.pq' if inst_boxes is not None else 'labels'))}

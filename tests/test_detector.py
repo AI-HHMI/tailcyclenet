@@ -769,7 +769,15 @@ def test_the_npz_records_which_crop_source_made_it():
 
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
     assert "flat['__crop_source__']" in src, 'the crop source must be in the npz, not the shell'
-    assert '"+refine" if cfg.refine' in src, '--refine is a crop change and belongs in that field'
+    assert '"+refine" if did_refine' in src, '--refine is a crop change and belongs in that field'
+    # AND IT MUST BE THE RESOLVED FLAG, NOT `cfg.refine`. `refine` defaults by dimensionality, so
+    # `cfg.refine` is `None` on any run that did not pass the flag -- which is now the normal 3D
+    # case. Reading `cfg` there would stamp every auto-refined 3D file as unrefined.
+    assert 'any(bool(r.get(\'refine\')) for r in results.values())' in src, \
+        'the stamp must read the per-session RESOLVED refine flag, not the tri-state config'
+    assert "'refine': bool(cfg.refine)" in (
+        Path(__file__).resolve().parent.parent / 'tailcyclenet' / 'infer.py').read_text(), \
+        'run_group must record the resolved refine flag for the stamp to read'
 
 
 def test_a_cache_without_keypoints_cannot_serve_the_keypoint_crop_source():

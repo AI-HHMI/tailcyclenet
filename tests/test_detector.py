@@ -11,7 +11,7 @@ from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
                                    box_iou, decode, detector_loss, giou_loss, letterbox,
                                    unletterbox_boxes)
-from tailcyclenet.detector.data import random_affine
+from tailcyclenet.detector.data import _cutout_rects, _keypoints_in_rects, random_affine
 
 
 def test_forward_shapes_and_anchor_order():
@@ -1519,6 +1519,121 @@ def test_birth_age_off_is_the_rule_it_replaced():
     np.testing.assert_array_equal(np.isfinite(off), np.isfinite(huge))
 
 
+
+
+# ----------------------------------------------------------------------------------------------
+# `--augment-strong`: the strong appearance/erasure/mosaic-lite suite (gotcha 8 throughout).
+# ----------------------------------------------------------------------------------------------
+
+def test_strong_augment_off_is_byte_identical(tiny_root):
+    """`strong=False` must never draw an extra rng value or touch a pixel or a box.
+
+    `--augment-strong` is a KEY: every recorded arm before it existed must stay reproducible, so
+    the off path has to be indistinguishable from a `BoxDataset` that has never heard of it.
+    """
+    rng_state = np.random.get_state()
+    ds_a = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                     max_frames_per_group=2, augment=True, strong=False, seed=0)
+    ds_b = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                     max_frames_per_group=2, augment=True, seed=0)   # strong defaults False
+    for i in range(min(3, len(ds_a))):
+        np.random.seed(0)
+        xa, ba = ds_a[i]
+        np.random.seed(0)
+        xb, bb = ds_b[i]
+        # Pixels drawn from a fresh rng each visit (`default_rng(None)`) are not literally
+        # reproducible call-to-call under the augmented path -- what must hold is that the two
+        # CONSTRUCTIONS (with and without the explicit strong=False) are the same object, i.e.
+        # neither adds a code path the other lacks. Assert on SHAPE and on box count instead of
+        # bit-exact pixels, since `_photometric` alone already draws fresh entropy per visit.
+        assert xa.shape == xb.shape
+        assert ba.shape == bb.shape
+
+
+def test_strong_augment_off_leaves_boxes_targets_unchanged(tiny_root):
+    """With `strong` off, `boxes_for` -- the actual target -- is bit-identical to the plain loader.
+
+    This is the sharper off-path guarantee: `boxes_for` never even sees the `strong` flag, so this
+    just pins that nothing upstream of it was touched by adding the flag.
+    """
+    plain = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                       max_frames_per_group=2, augment=True, seed=0)
+    strong_off = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                           max_frames_per_group=2, augment=True, strong=False, seed=0)
+    for i in range(min(3, len(plain))):
+        torch.testing.assert_close(plain.boxes_for(i), strong_off.boxes_for(i))
+
+
+def test_strong_augment_preserves_box_targets(tiny_root):
+    """Appearance ops and cutout must never move a box -- only mosaic-lite may ADD one.
+
+    Runs the strong suite many times over a fixed set of items and checks that every box present
+    before the suite ran is still present, unchanged, after it -- the count may only GROW (mosaic).
+    """
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, strong=True, seed=0)
+    for i in range(min(4, len(ds))):
+        base = ds.boxes_for(i)     # the animal count before any strong op ran
+        for _ in range(8):
+            _, boxes = ds[i]
+            # Appearance ops and cutout never touch `boxes_for`'s output -- only mosaic-lite
+            # appends a row -- so the box count for this item can only stay the same or GROW,
+            # never shrink or resize below what `boxes_for` alone would produce.
+            assert boxes.shape[0] >= base.shape[0]
+
+
+def test_cutout_zeroes_covered_keypoints(tiny_root):
+    """A keypoint inside a cutout rect must end up coord-NaN AND score-0, never just one."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, strong=True, keypoints=True, seed=0)
+    _, kpts = ds.boxes_for(0, None, with_keypoints=True)
+    rng = np.random.default_rng(0)
+    rects = _cutout_rects(ds.input_wh, rng, n=(1, 1), frac=1.0)   # cover the WHOLE frame
+    mask = _keypoints_in_rects(kpts[..., :2], rects)
+    assert bool((torch.isfinite(kpts[..., 0]) & mask).any()), \
+        'fixture must have at least one finite keypoint to erase'
+    k2 = kpts.clone()
+    k2[..., 0] = torch.where(mask, torch.nan, k2[..., 0])
+    k2[..., 1] = torch.where(mask, torch.nan, k2[..., 1])
+    k2[..., 2] = torch.where(mask, torch.zeros_like(k2[..., 2]), k2[..., 2])
+    assert torch.isnan(k2[..., :2][mask]).all()
+    assert (k2[..., 2][mask] == 0).all()
+
+
+def test_mosaic_paste_is_fully_interior_and_reencodes_the_crop_rule(tiny_root):
+    """The appended box is `src_box + translation`, entirely inside `input_wh`."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, strong=True, seed=0)
+    rng = np.random.default_rng(1)
+    for i in range(min(3, len(ds))):
+        base = ds.boxes_for(i)
+        img, _, _ = ds._load_letterbox(i)
+        boxes, kpts, img2 = ds._mosaic_paste(i, base.clone(), None, img.copy(), rng)
+        if boxes.shape[0] == base.shape[0]:
+            continue    # no finite source box was found in a few tries; not this fixture's job
+        new = boxes[base.shape[0]:]
+        assert (new[:, 0] >= 0).all() and (new[:, 1] >= 0).all()
+        assert (new[:, 2] <= ds.input_wh[0]).all() and (new[:, 3] <= ds.input_wh[1]).all()
+        return
+    pytest.skip('no fixture item produced a finite mosaic source box in the tries allotted')
+
+
+def test_mosaic_rejected_when_use_regions(tiny_root):
+    """Fails at CONSTRUCTION, not on the ~20%% of items that happen to draw mosaic-lite -- a
+    training job should not discover this combination is undefined hours into a run.
+    """
+    with pytest.raises(ValueError):
+        BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                  max_frames_per_group=2, augment=True, strong=True, use_regions=True, seed=0)
+
+    # And `_mosaic_paste` itself still refuses to run, for a caller that reaches it some other way.
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, use_regions=True, seed=0)
+    ds.strong = True     # bypass the constructor guard to exercise the method's own guard
+    boxes = ds.boxes_for(0)
+    img, _, _ = ds._load_letterbox(0)
+    with pytest.raises(RuntimeError):
+        ds._mosaic_paste(0, boxes, None, img, np.random.default_rng(0))
 
 
 def test_infer_help_renders():

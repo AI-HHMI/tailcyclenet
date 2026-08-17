@@ -174,6 +174,107 @@ def _photometric(img, rng):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+# ================================================================================================
+# THE STRONG SUITE -- `--augment-strong`. Layered AFTER `_photometric`, gated on
+# `self.strong and self.augment and self.train`, off by default and off means none of these draws
+# happen at all (byte-identical to every recorded detector). Every op here is APPEARANCE-ONLY or,
+# for cutout, an ERASURE -- neither moves a box target, which is the one invariant gotcha 8 exists
+# to protect. Mirrors posetail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`
+# (`posetail_dataset.py`), one lever (additive noise) of which was single-lever REFUTED here before
+# (report 21 §7: MOTA -0.127 SIG). This is a deliberate re-test of the whole mix together, on the
+# capacity ladder, against the train/val gap report 28 measured -- not a contradiction of that
+# result, which was a different arm on a different question.
+def _color_jitter(img, rng):
+    """Gamma contrast, then HSV saturation and hue shifts -- posetail's `aug_per_camera` triplet
+    (DefocusBlur is folded into `_motion_blur` below rather than duplicated).
+    """
+    import cv2
+    gamma = rng.uniform(0.6, 1.8)
+    lut = np.clip((np.arange(256, dtype=np.float64) / 255.0) ** gamma * 255.0, 0, 255)
+    out = cv2.LUT(img, lut.astype(np.uint8))
+    hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV).astype(np.int16)
+    hsv[..., 1] = np.clip(hsv[..., 1] + rng.uniform(-50, 30), 0, 255)
+    hsv[..., 0] = np.mod(hsv[..., 0] + rng.uniform(-10, 10), 180)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+
+def _additive_noise(img, rng, sigma_max=10.2):
+    """Per-channel gaussian noise, sigma ~ U(0, sigma_max). posetail's `AdditiveGaussianNoise`
+    (scale=(0, 0.04*255), i.e. sigma up to 10.2) -- the SAME lever report 21 §7 refuted alone, on
+    a detector with no capacity lever, scored on in-domain downstream MOTA. Re-tested here as part
+    of the mix, on a different question (the train/val box-screen gap).
+    """
+    sigma = rng.uniform(0.0, sigma_max)
+    noise = rng.normal(0.0, sigma, img.shape)
+    return np.clip(img.astype(np.float64) + noise, 0, 255).astype(np.uint8)
+
+
+def _salt_pepper(img, rng, frac=0.004):
+    """posetail's `SaltAndPepper(0.004)`: a fraction of pixels forced to black or white."""
+    out = img.copy()
+    h, w = img.shape[:2]
+    n = int(round(frac * h * w))
+    if n <= 0:
+        return out
+    ys = rng.integers(0, h, n)
+    xs = rng.integers(0, w, n)
+    salt = rng.random(n) < 0.5
+    out[ys[salt], xs[salt]] = 255
+    out[ys[~salt], xs[~salt]] = 0
+    return out
+
+
+def _motion_blur(img, rng, k=(3, 5)):
+    """Horizontal motion kernel, size drawn from `k`. posetail's `MotionBlur(k=(3,5))`."""
+    import cv2
+    ksize = int(rng.choice(k))
+    kernel = np.zeros((ksize, ksize), np.float32)
+    kernel[ksize // 2, :] = 1.0
+    kernel /= kernel.sum()
+    return cv2.filter2D(img, -1, kernel)
+
+
+def _cutout_rects(wh, rng, n=(1, 3), frac=0.15):
+    """1-3 rects of `frac` x `frac` of `wh` (INPUT pixels), random RGB fill.
+
+    posetail's `cutout_rects`: an erasure, not a geometric transform, so it never touches a box
+    target -- only the pixels under it, and (in `__getitem__`) the keypoints it covers.
+    """
+    w, h = int(wh[0]), int(wh[1])
+    rw, rh = max(1, int(w * frac)), max(1, int(h * frac))
+    out = []
+    for _ in range(int(rng.integers(n[0], n[1] + 1))):
+        rx = int(rng.integers(0, max(w - rw, 1)))
+        ry = int(rng.integers(0, max(h - rh, 1)))
+        fill = tuple(int(v) for v in rng.integers(0, 256, 3))
+        out.append((rx, ry, rx + rw, ry + rh, fill))
+    return out
+
+
+def _apply_cutout(img, rects):
+    """Fill each `(x0, y0, x1, y1, fill)` rect. Never touches a box target -- erasure only."""
+    out = img.copy()
+    for x0, y0, x1, y1, fill in rects:
+        out[y0:y1, x0:x1] = fill
+    return out
+
+
+def _keypoints_in_rects(kpts_xy, rects):
+    """(..., 2) input-pixel keypoints, `rects` from `_cutout_rects` -> (...) bool, covered or not.
+
+    Half-open like the rects themselves (`_apply_cutout`'s slice), so a keypoint exactly on the
+    far edge of a rect is not counted as erased -- it was not overwritten.
+    """
+    if not rects:
+        return torch.zeros(kpts_xy.shape[:-1], dtype=torch.bool)
+    x, y = kpts_xy[..., 0], kpts_xy[..., 1]
+    mask = torch.zeros_like(x, dtype=torch.bool)
+    for x0, y0, x1, y1, _ in rects:
+        mask = mask | ((x >= x0) & (x < x1) & (y >= y0) & (y < y1))
+    return mask
+# ================================================================================================
+
+
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
                   rotate_deg=0.0, centre=None):
     """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
@@ -289,7 +390,8 @@ class BoxDataset(Dataset):
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
-                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False):
+                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
+                 strong=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -335,11 +437,25 @@ class BoxDataset(Dataset):
         # for why this is free when tiling and not when not, and why a full circle costs no more
         # than a half one.
         # The APPEARANCE half of --augment. False is the shipped single gain and is
-        # byte-identical; True adds DLC's additive brightness and gaussian noise.
+        # byte-identical; True adds nothing extra by itself -- `--augment-strong` (below) is what
+        # layers the rest of the mix on top of it.
         # Off by default and requested explicitly, not inferred from the split: it is a key, and
         # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
         # or test loader built by a script that passes `augment=True` blindly stays deterministic.
         self.augment = augment
+        # THE STRONG SUITE. Off by default and off means byte-identical to every recorded
+        # detector -- every new draw below is gated on `self.strong and self.augment and
+        # self.train`, so `strong=True` with `augment=False` (or on eval) does nothing either.
+        # It is a SINGLE recipe (color jitter, additive noise, salt & pepper, motion blur, cutout,
+        # mosaic-lite), not five independently-swept levers: isolating one component is a
+        # follow-on, and the single-lever additive-noise refutation (report 21 §7) is exactly why
+        # this sweep asks about the mix rather than the piece.
+        self.strong = bool(strong)
+        if self.strong and self.use_regions:
+            # FAIL AT CONSTRUCTION, not on the ~20% of items that happen to draw mosaic-lite: a
+            # composite frame has no expressible certified-area mask, so this combination can
+            # never be trained correctly and a job should not discover that hours in.
+            raise ValueError('--augment-strong (mosaic-lite) is undefined under --use-regions')
         # Off by default, and it is a KEY rather than a loader detail: it changes which source
         # pixels reach the model, so every arm measured without it stays comparable only against
         # other arms without it. It rides in the checkpoint and `detect_group` reads it back,
@@ -691,6 +807,89 @@ class BoxDataset(Dataset):
         kpts[..., 1] = kpts[..., 1] * scale + pad[1]
         return boxes, kpts
 
+    def _load_letterbox(self, i, with_keypoints=False):
+        """Decode item `i` and letterbox (or tile) it with NO augmentation whatsoever.
+
+        `(img_uint8, boxes, kpts_or_None)`, all in INPUT pixels. Used only by mosaic-lite as a
+        source of another frame's pixels and its own crop-rule box -- it must not recurse into
+        `__getitem__`'s augmentation path, or a mosaic source could itself be mosaicked.
+        """
+        import cv2
+
+        sess, gid, f, ci = self.index[i]
+        size = tuple(sess.rig.size(sess.cam_names[ci]))
+        out_wh = (self.input_wh if self.tile_wh is None
+                  else (size[0] * self.tile_scale, size[1] * self.tile_scale))
+        r = reduce_factor(size, out_wh) if self.reduce else 1
+        img = read_frames(sess.groups[gid], sess.cam_names[ci], [f], reduce=r)[0]
+        if img is None:
+            raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
+        dec = (img.shape[1], img.shape[0])
+        d = size[0] / dec[0]
+        if self.origins[i] is None:
+            img, _, _ = letterbox(img, self.input_wh, src_wh=size)
+        else:
+            scale, pad = self._transform(i, size)
+            L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
+            D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
+            M = (L @ D)[:2]
+            img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
+        got = self.boxes_for(i, None, with_keypoints=with_keypoints)
+        boxes, kpts = got if with_keypoints else (got, None)
+        return img, boxes, kpts
+
+    def _mosaic_paste(self, i, boxes, kpts, img, rng):
+        """Copy-paste one WHOLE, untruncated crop-rule box from a DIFFERENT frame into empty
+        space of this item's rendered image, at a location fully interior to `input_wh`.
+
+        Deliberately copy-paste and not true YOLOX 4-quadrant mosaic: a quadrant clips whatever
+        animal sits on its seam, and a clipped extent is not `crop_box_for_points`'s box for
+        anything -- it would train the detector off a target it never emits (gotcha 8). A
+        relocated WHOLE box has exactly the crop rule's extent, translated -- the union of a
+        translation and the crop rule is the crop rule of the translated points.
+
+        Never clips: a placement that would not fit entirely inside `input_wh` is redrawn, up to
+        a few tries, and the item is returned unchanged if none fits.
+        """
+        if self.use_regions:
+            raise RuntimeError('mosaic-lite is undefined under --use-regions: a composite frame '
+                               'has no expressible certified-area mask')
+        if len(self) < 2:
+            return boxes, kpts, img
+        for _ in range(4):
+            j = int(rng.integers(len(self)))
+            if j == i:
+                continue
+            src_img, src_boxes, src_kpts = self._load_letterbox(j, with_keypoints=self.keypoints)
+            finite = torch.isfinite(src_boxes).all(-1)
+            if not bool(finite.any()):
+                continue
+            cand = torch.nonzero(finite).flatten().tolist()
+            s = int(rng.choice(cand))
+            b = src_boxes[s]
+            x0, y0, x1, y1 = (int(v) for v in b.round().tolist())
+            bw, bh = x1 - x0, y1 - y0
+            if bw <= 0 or bh <= 0 or bw > self.input_wh[0] or bh > self.input_wh[1]:
+                continue
+            dx = int(rng.integers(0, self.input_wh[0] - bw + 1))
+            dy = int(rng.integers(0, self.input_wh[1] - bh + 1))
+            img = img.copy()
+            img[dy:dy + bh, dx:dx + bw] = src_img[y0:y1, x0:x1]
+            offset = torch.tensor([dx - x0, dy - y0, dx - x0, dy - y0], dtype=boxes.dtype)
+            boxes = torch.cat([boxes, (b + offset).to(boxes.dtype)[None]], 0)
+            if self.keypoints and kpts is not None:
+                k = src_kpts[s].clone()
+                k[..., 0] += (dx - x0)
+                k[..., 1] += (dy - y0)
+                # A keypoint of the source instance that falls outside the PASTED box is not
+                # part of this composite's crop -- the same rule a point warped off-frame follows.
+                outside = ((k[..., 0] < dx) | (k[..., 0] >= dx + bw) |
+                          (k[..., 1] < dy) | (k[..., 1] >= dy + bh))
+                k[..., :2] = torch.where(outside[..., None], torch.nan, k[..., :2])
+                kpts = torch.cat([kpts, k[None]], 0)
+            break
+        return boxes, kpts, img
+
     def __getitem__(self, i):
         import cv2
 
@@ -755,6 +954,36 @@ class BoxDataset(Dataset):
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
             if warp is not None:
                 img = _photometric(img, rng)
+                # THE STRONG SUITE. Gated on `self.strong` alone here -- `rng is not None` already
+                # means `self.augment and self.train`, so nothing below runs off that path.
+                # FIXED ORDER, one independent per-op draw each: color jitter -> additive noise ->
+                # salt & pepper -> motion blur. Appearance-only, so no box or keypoint target
+                # moves through any of these four.
+                if self.strong:
+                    if rng.random() < 0.5:
+                        img = _color_jitter(img, rng)
+                    if rng.random() < 0.3:
+                        img = _additive_noise(img, rng)
+                    if rng.random() < 0.2:
+                        img = _salt_pepper(img, rng)
+                    if rng.random() < 0.2:
+                        img = _motion_blur(img, rng)
+        if self.strong and rng is not None:
+            # CUTOUT: an erasure, so it moves no box -- but a keypoint it covers must lose BOTH
+            # its coordinate (-> NaN) and its score target (-> 0), or either the coordinate loss
+            # or the visibility loss would still supervise a point the pixels no longer show.
+            if rng.random() < 0.5:
+                rects = _cutout_rects(self.input_wh, rng)
+                img = _apply_cutout(img, rects)
+                if kpts is not None:
+                    mask = _keypoints_in_rects(kpts[..., :2], rects)
+                    kpts[..., 0] = torch.where(mask, torch.nan, kpts[..., 0])
+                    kpts[..., 1] = torch.where(mask, torch.nan, kpts[..., 1])
+                    kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
+            # MOSAIC-LITE: copy-paste one whole crop-rule box from another frame into empty space.
+            # The only op here that adds a box -- appearance and cutout never do (gotcha 8).
+            if rng.random() < 0.2:
+                boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         # `regions` rides along as its own element rather than being folded into `boxes`: a region
         # is not an animal and must never reach `assign`. Appended only under `use_regions`, so

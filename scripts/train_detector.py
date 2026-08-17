@@ -157,6 +157,24 @@ def main():
                     help='random similarity + brightness on the TRAIN split. Helps where a '
                          'dataset fits its training data and lags on val; on one that fits '
                          'neither it is the wrong lever. Read the train/val gap first.')
+    ap.add_argument('--augment-strong', action='store_true',
+                    help='LAYERS a strong appearance/erasure/mosaic-lite suite on top of '
+                         '--augment (needs it; a no-op without it): color jitter (gamma, '
+                         'saturation, hue, p=0.5), additive gaussian noise (sigma up to 10.2, '
+                         'p=0.3), salt & pepper (0.004, p=0.2), motion blur (k in {3,5}, p=0.2), '
+                         'cutout (1-3 rects of 15%%x15%% of the input, random fill, p=0.5 -- a '
+                         'covered keypoint gets BOTH its coordinate NaN\'d and its score zeroed), '
+                         'and mosaic-lite (p=0.2 -- copy-paste one WHOLE crop-rule box from a '
+                         'different frame into empty space, never a 4-quadrant mosaic, which '
+                         'would clip a box and break gotcha 8; undefined under --use-regions). '
+                         'ONE recipe, not five swept levers: this is a deliberate RE-TEST of a '
+                         'mix that includes a lever (additive noise) refuted alone before '
+                         '(dev/reports/21 section 7: MOTA -0.127 SIG, on a detector with no '
+                         'capacity lever, scored on in-domain downstream MOTA) -- the question '
+                         'here is the train/val BOX-SCREEN gap the capacity ladder opened '
+                         '(dev/reports/28 section 2.2/2.3), on a bigger model, as a mix. Off by '
+                         'default and off means none of these draws happen at all -- byte-'
+                         'identical to every recorded detector. Recorded in the checkpoint.')
     ap.add_argument('--reduce', action='store_true',
                     help='decode JPEGs at 1/N via libjpeg where the frame is far above the '
                          'letterbox target. A KEY, not a loader detail: it changes which source '
@@ -267,7 +285,7 @@ def main():
                        min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
                        max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
                        hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg,
-                       seed=args.seed, **tiling)
+                       strong=args.augment_strong, seed=args.seed, **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
     # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
@@ -423,6 +441,7 @@ def main():
                         'use_regions': args.use_regions,
                         'dataset': train.ds.name, 'box_source': args.boxes,
                         'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
+                        'augment_strong': args.augment_strong,
                         'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
                         'obj_quantiles': obj_q,
                         'eval': scores}

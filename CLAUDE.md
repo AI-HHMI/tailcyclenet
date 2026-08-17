@@ -326,37 +326,60 @@ only as a comment in that file; `feature_planes_levels` does not appear at all),
 only the two conf losses. `coords_loss_direct_weight` is applied **twice**, so its effective weight
 is double what the config says.
 
-### Synthetic camera motion
+### Synthetic motion: SLIDE THE ANIMAL, hold the camera still
 
-`synth_motion_prob` / `_amp` / `_deg` / `_frames` (report 22). An annotated group carries ONE
-labelled frame in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus
-trains NO temporal machinery: `SmoothnessLoss` returns 0, temporal attention sees two frames one of
-which has no target. These keys emit T copies of the labelled frame and move the CAMERA over them —
-a smooth pan into `moving_boxes`' per-frame `shift`, a smooth roll into `ext` (3D) or the
-coordinates (2D). Every frame is a real crop of a real image and every label is exact, because a
-per-frame crop is a per-frame `offset` and that geometry was already built and tested.
+`synth_motion_prob` / `_amp` / `_frames` (report 22). An annotated group carries ONE labelled frame
+in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus trains NO temporal
+machinery: `SmoothnessLoss` returns 0, temporal attention sees two frames one of which has no
+target. These keys emit a T-frame window instead and **slide the animal through a crop that stands
+still** — in 2D the displacement is added to the coordinates, in 3D it moves the world point, sized
+through `get_camera_scale` so one `amp` means the same crop-width displacement on a px session and
+a mm one. The static crop rule then bounds the SLID points, which makes the box the UNION over the
+window: exactly the crop inference builds, inflated by exactly how far the animal walked.
 
-**The point is not the label count, it is the CARRY shape**: every frame labelled makes
-`prompt_t = 0` fall out of the existing `finite.argmax(0)`, so frames 1..T-1 are supervised at a
-DISPLACED target — the first training signal shaped like what `--anchor carry` produces. Look for
-the effect in `prior_self`, not in the query-free pass.
+**IT FIRES ON A WINDOW REACHING ONE LABEL, AND `first == last` IS NOT THAT TEST.** The gate is
+`near.size == 1`. `first == last` looks like the same question and is the opposite one: the
+wide-span fallback sets it when a window reaches MORE labels than T can span, the normal case on a
+densely tracked group. Gating on it froze **173 of 175 sampled rat-city-combined TRACKED windows**
+while the probe reported a healthy 99% synth rate. **A synth RATE cannot tell you WHICH windows
+synthesised** — check it equals `annot_frac`, and instrument by `label_source` if it does not.
 
-**THE SMOOTHNESS TERM MUST BE OFF ON THOSE WINDOWS AND `_tune_smoothness` DOES IT.** In 3D a
-synthetic camera motion CANNOT move a world point, so `coords` is constant by construction,
-`d_true` is identically 0, and the hinge threshold is 0 — at weight 0.5 that penalises ANY predicted
-3D motion, i.e. the motion lock trained in on purpose. Turning it back on needs a FLOOR on the
-hinge first; that is a follow-up arm, not a leftover.
+**THE FIRST VERSION MOVED THE CAMERA AND THAT IS WHY IT FAILED.** It gave the window a per-frame
+`offset`, `ext` at `(T,4,4)` and the library's `moving` flag, where deployment presents ONE STATIC
+camera per window. Measured at 60k on rat-city-combined (report 22 §8): prompted, all three arms
+are indistinguishable (`self` 7.990 / 8.021 / 7.901 px) and their **carry costs separate 7 px** —
++1.33 (ctrl), +4.47 (pan), +9.30 (pan+roll), monotone in the amount of synthetic motion. The arm
+existed to train the carry shape and carry was the one regime it degraded. The ROLL
+(`synth_motion_deg`) is refuted outright, −2.8 to −3.3 px with four of four cells significant, and
+the key is **deleted** so an old config fails loudly on an unknown key.
 
-**`synth_motion_amp` IS IN BOX SIDES AND 0.35 IS MEASURED TOO HOT** — the pan walks the animal clean
-OUT of the crop on 34.8% of allen camera-windows and 22.8% of rat-city-annotated's, against a
-5.8%/0.0% baseline. A frame of empty bedding carrying full-strength targets is the detector-failure
-case, not the camera-pan case. 0.15 costs ~4 points over baseline for 0.21 sides of motion. **The
-RENDERS caught this and the centroid probe did not** — `motion/side` read a healthy 0.44 and said
-nothing about the animal leaving. Cost scales with T, so `synth_motion_frames` exists; match arms on
-ITERATIONS.
+**IN 3D THE PIXELS ARE APPROXIMATE AND THE LABELS ARE NOT.** A world translation does not project
+to a pure 2D translation — each keypoint's displacement scales with its own depth — so each camera
+gets a per-frame **affine fitted to the true projected displacements** (`_fit_affine`), and the
+labels are the exact projection. Measured on 3dpop at amp 0.15, median residual against the true
+projection: **0.17 crop px for the affine against 0.53 for a translation**; a homography reaches
+0.14 for a nonlinear solve and is refused. The affine's advantage IS the depth ramp along an
+elongated body — on a random point cloud it has nothing to fit and reads slightly worse than a
+robust median shift, which is why `tests` uses a tilted-body fixture and not random points.
+This also retires the old design's worst property: the 3D world target now genuinely MOVES.
 
-**UNMEASURED: no arm has trained past 12 iterations.** It is kept on that basis, not on evidence,
-and it is why `patches.py` and the moving-crop geometry survive.
+**`synth_motion_amp = 0.25` IS CALIBRATED, NOT CHOSEN.** `scratch/slide/calibrate_amp.py` measures
+what a real rat does over a 24-frame window on the tracked sessions — displacement **p50 0.275 box
+sides**, union-crop inflation p50 1.141 against CLAUDE.md's own 1.23 — and `probe.py` measures what
+the loader realises: amp 0.25 → p50 0.294. Retention is no longer a tunable: the box is built to
+CONTAIN the slide, so `inside` reads 100% on 2D at every amp. (In 3D `inside` is not an invariant —
+a keypoint legitimately projects outside some cameras' views.)
+
+**WHAT IT STILL DOES NOT DO.** The animal is RIGID and **the background slides with it**, because
+one frame warped is all there is — so the model can still solve a synth window by tracking the
+background. Only real neighbouring frames (pseudo-labels) or compositing fix that. Rigid is a fair
+model of the whole-animal part: measured on rat-city's tracked clip by Umeyama fit, only **~14% of
+a real rat's keypoint displacement over a window is non-rigid** (p50 0.144 at gap 23; the 0.383 at
+gap 1 is label noise). `_tune_smoothness` still zeroes the smoothness term on these windows, but
+the reason has lapsed — the target moves now — so re-enabling it is a real follow-up arm.
+
+**UNMEASURED: the slide has trained 12 iterations.** The moving-camera version it replaces is
+measured and refuted; this one is not yet measured at all.
 
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, `crop_side_mode`,
 `curriculum`, and `moving_crop`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that

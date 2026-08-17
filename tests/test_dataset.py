@@ -1309,75 +1309,131 @@ def _marker_centroid(img):
     return np.array([(xs * w).sum() / w.sum(), (ys * w).sum() / w.sum()])
 
 
-@pytest.mark.parametrize('deg', [0.0, 12.0, -25.0])
-def test_synth_motion_3d_labels_follow_the_pixels(deg):
-    """THE synthetic-motion test: for EVERY frame, the label lands where the pixels put it.
+def _tilted_body(K=12, tilt=0.35, seed=1):
+    """An ELONGATED animal LEANING IN DEPTH -- the geometry that makes the affine fit worth having.
 
-    A synth window is one real frame under a per-frame roll and a per-frame pan, so its geometry
-    is split across four places that have to agree: the roll goes into `ext` (`_roll_camera_3d`),
-    the pan into the crop box (`moving_boxes`' per-frame shift), the box into the camera's
-    `offset` (`apply_crop_moving`), and all of it into ONE source->crop affine per frame
-    (`_synth_roll`'s mats, composed by `_crop_affine`). A sign error in the Z-roll, a rotation
-    about the wrong centre, or a box paired with the wrong frame each produce a plausible-looking
-    crop with the labels quietly displaced -- which trains to a number instead of failing.
+    Not decoration, and a random point cloud is the wrong fixture: a fronto-parallel translation
+    displaces a point by `f*d/Z`, which depends on depth alone, so an affine (linear in IMAGE
+    position) can only capture it where depth CORRELATES with image position. On random points it
+    cannot, reduces to a least-squares translation, and reads slightly WORSE than the robust
+    median shift -- which is what this fixture read before it was made realistic. A real animal is
+    long and usually oblique to the camera, so its depth ramps along its length and the affine has
+    exactly that to fit: measured here, the affine beats a translation 1.4x at zero tilt and 10.9x
+    at 0.35, and its relative residual (~0.0044) matches 3dpop's measured 0.0038.
+    """
+    g = torch.Generator().manual_seed(seed)
+    u = torch.linspace(-1, 1, K)[:, None]
+    axis = torch.tensor([0.30, 0.06, tilt])              # long axis, leaning away from the camera
+    return torch.tensor([0.4, 0.2, 4.0]) + u * axis + 0.02 * torch.randn(K, 3, generator=g)
 
-    So paint a marker at the point's projection, push the image through the pixel half and the
-    camera through the geometry half, and require they still agree at every t. `deg = 0` is the
-    translation-only arm, i.e. the inertness control for the roll.
+
+def test_synth_motion_3d_labels_follow_the_pixels():
+    """THE synthetic-motion test, 3D: for EVERY frame the label lands where the pixels put it.
+
+    A slide moves the ANIMAL through the world and leaves the cameras alone, so the geometry is
+    split across three places that must agree: the world displacement (`_slide_world`, sized by
+    `get_camera_scale`), the per-frame source affine fitted to the TRUE projections (`_fit_affine`),
+    and the one static union crop. A sign error, a frame paired with the wrong affine, or a
+    translation where an affine was needed each produce a plausible-looking crop with the labels
+    quietly displaced -- which trains to a number instead of failing.
+
+    It also pins the PARALLAX BOUND. A world translation does not project to a pure 2D translation,
+    so the pixels carry a residual the labels do not; measured on 3dpop at amp 0.15 it is 0.17 crop
+    px for an affine and 0.53 for a translation. Asserting sub-pixel here is what makes the affine
+    fit non-optional.
     """
     import cv2
     from aniposelib.cameras import CameraGroup
     from posetail.posetail.cube import project_points_torch
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import (_crop_affine, _resize_camera, _roll_camera_3d, _synth_roll)
+    from tailcyclenet.dataset import (_affines, _crop_affine, _fit_affine, _resize_camera,
+                                      _slide_world, _synth_path)
 
     W, H, T = 320, 240, 6
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
                   offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': True})
     cam = rig.posetail()[0]
 
-    # ONE frozen 3D point, repeated over T -- a synthetic camera motion cannot move a world point,
-    # and this test would not notice if it did.
-    pt = torch.tensor([[0.4, 0.2, 4.0]]).repeat(T, 1, 1)              # (T, K=1, 3)
-    src = project_points_torch([cam], pt)[0][0, 0]
-    img = np.zeros((H, W, 3), np.uint8)
-    img[int(round(float(src[1]))), int(round(float(src[0])))] = 255
+    coords = _tilted_body(seed=0)[None].repeat(T, 1, 1)               # (T,K,3), frozen
 
-    angles = np.linspace(-deg, deg, T)
-    path = np.stack([np.linspace(0, 0.25, T), np.linspace(0, -0.15, T)], 1)
-    R4, mats = _synth_roll(cam, angles, None)
-    rolled = _roll_camera_3d(cam, R4)
-    cgroup, boxes = cropmod.crop_to_points_3d_moving(
-        [rolled], pt, min_crop_dim=96, jitter=None, paths=[path])
-    cgroup = [_resize_camera(c, 64)[0] for c in cgroup]
+    rng = np.random.default_rng(0)
+    moved = _slide_world(coords, _synth_path(rng, T, 0.15), [cam], 256)
+    assert moved is not None
+    assert float((moved[-1] - moved[0]).abs().max()) > 0, 'the slide did nothing'
 
-    want = project_points_torch(cgroup, pt)[0]                        # (T, K, 2)
+    p_before = project_points_torch([cam], coords).numpy()
+    p_after = project_points_torch([cam], moved).numpy()
+    mats = _affines([_fit_affine(p_before[0][0], p_after[0][t]) for t in range(T)], cam['size'])
+
+    cg, boxes = cropmod.crop_to_points_3d([cam], moved, min_crop_dim=96)
+    assert cg is not None
+    cgr = [_resize_camera(cg[0], 64)[0]]
+    want = project_points_torch(cgr, moved)[0]                        # (T,K,2) TRUE label position
+
     for t in range(T):
-        M, size = _crop_affine((W, H), boxes[0][t], cgroup[0]['size'].tolist(), mats[t])
-        got = _marker_centroid(cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR))
-        assert got is not None, f'frame {t}: the marker left the crop'
-        assert np.allclose(got, np.asarray(want[t, 0], np.float64), atol=1.0), \
-            f'frame {t}: pixels say {got}, camera says {want[t, 0]}'
+        # the marker rides on the source pixels of frame 0 and is carried by that frame's affine
+        for k in range(coords.shape[1]):
+            src = p_before[0][0][k]
+            img = np.zeros((H, W, 3), np.uint8)
+            img[int(round(float(src[1]))), int(round(float(src[0])))] = 255
+            M, size = _crop_affine((W, H), boxes[0], cgr[0]['size'].tolist(), mats[t])
+            got = _marker_centroid(cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR))
+            if got is None:
+                continue
+            # 1.0 px of bilinear/rounding slack on top of the 0.25 px parallax bound
+            assert np.allclose(got, np.asarray(want[t, k], np.float64), atol=1.25), \
+                f'frame {t} kpt {k}: pixels say {got}, camera says {want[t, k]}'
 
-    # ... and the window really moved, or the assertion above is satisfied by a static crop.
-    assert len(set(tuple(b) for b in boxes[0].tolist())) > 1, 'the synthetic pan did nothing'
+
+def test_the_3d_slide_pixel_residual_is_sub_pixel():
+    """The parallax residual of the AFFINE fit, stated as a bound rather than an argument.
+
+    A translation reads 0.53 crop px on 3dpop at amp 0.15 and an affine 0.17. This asserts the
+    affine stays under 0.25 on a synthetic rig with a comparable depth spread, and that it BEATS a
+    pure translation -- so a regression to `np.median(B - A)` fails here rather than in a run.
+    """
+    from aniposelib.cameras import CameraGroup
+    from posetail.posetail.cube import project_points_torch
+
+    from tailcyclenet import format as fmt
+    from tailcyclenet.dataset import _fit_affine, _slide_world, _synth_path
+
+    W, H, T = 320, 240, 6
+    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
+                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': True})
+    cam = rig.posetail()[0]
+    coords = _tilted_body(seed=1)[None].repeat(T, 1, 1)
+    moved = _slide_world(coords, _synth_path(np.random.default_rng(3), T, 0.15), [cam], 256)
+    p0 = project_points_torch([cam], coords).numpy()[0][0]
+    aff_r, tr_r = [], []
+    for t in range(1, T):
+        pt = project_points_torch([cam], moved).numpy()[0][t]
+        A = _fit_affine(p0, pt)
+        pred = np.hstack([p0, np.ones((len(p0), 1))]) @ A.T
+        aff_r.append(np.median(np.linalg.norm(pred - pt, axis=-1)))
+        tr_r.append(np.median(np.linalg.norm(p0 + np.median(pt - p0, axis=0) - pt, axis=-1)))
+    disp = np.median([np.linalg.norm(project_points_torch([cam], moved).numpy()[0][t] - p0,
+                                     axis=-1).mean() for t in range(1, T)])
+    # RELATIVE, because the absolute px figure is a property of the rig. 3dpop measured 0.0038 for
+    # the affine and 0.0115 for a translation; this fixture reads ~0.0044 and ~0.048.
+    assert np.median(aff_r) / disp < 0.01, f'affine rel-residual {np.median(aff_r)/disp:.4f}'
+    assert np.median(aff_r) * 2 < np.median(tr_r), \
+        f'the affine must clearly beat a translation, got {np.median(tr_r)/np.median(aff_r):.1f}x'
 
 
-@pytest.mark.parametrize('deg', [0.0, 20.0])
-def test_synth_motion_2d_labels_follow_the_pixels(deg):
-    """The 2D twin. Here the COORDS are the target, so they carry the roll and the origin.
+def test_synth_motion_2d_labels_follow_the_pixels():
+    """The 2D twin, where the slide is EXACT: coords carry it and the pixels translate.
 
-    2D differs from 3D in where the motion goes, not in the rule: the roll is applied to the
-    points (a Z-roll would double-apply it) and the per-frame crop origin is subtracted from them
-    by `crop_to_points_2d_moving`, where 3D leaves the world points alone and puts both in the
-    camera. Both must land the label on the same pixel.
+    2D differs from 3D in where the slide lives, not in the rule: the coords ARE the target so the
+    displacement is added to them directly, and the source translation is exact rather than an
+    affine fit. Both must land the label on the same pixel.
     """
     import cv2
     from aniposelib.cameras import CameraGroup
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import _apply_affine, _crop_affine, _resize_camera, _synth_roll
+    from tailcyclenet.dataset import _affines, _crop_affine, _resize_camera, _slide_delta, _synth_path
 
     W, H, T = 320, 240, 6
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
@@ -1389,22 +1445,21 @@ def test_synth_motion_2d_labels_follow_the_pixels(deg):
     img = np.zeros((H, W, 3), np.uint8)
     img[int(src[1]), int(src[0])] = 255
 
-    angles = np.linspace(-deg, deg, T)
-    path = np.stack([np.linspace(0, -0.2, T), np.linspace(0, 0.3, T)], 1)
-    _, mats = _synth_roll(cam, angles, None)
-    coords = _apply_affine(coords, mats)
-    cam, boxes, coords = cropmod.crop_to_points_2d_moving(
-        cam, coords, min_crop_dim=96, jitter=None, path=path)
+    delta = _slide_delta(cam, coords, 20, _synth_path(np.random.default_rng(0), T, 0.15), 96)
+    assert delta is not None and float(delta.abs().max()) > 0, 'the slide did nothing'
+    coords = coords + delta[:, None, :]
+    mats = _affines([[[1.0, 0.0, float(d[0])], [0.0, 1.0, float(d[1])]] for d in delta],
+                    cam['size'])
+    cam, box, coords = cropmod.crop_to_points_2d(cam, coords, min_crop_dim=96)
     cam, scale = _resize_camera(cam, 64)
     coords = coords * scale
 
     for t in range(T):
-        M, size = _crop_affine((W, H), boxes[t], cam['size'].tolist(), mats[t])
+        M, size = _crop_affine((W, H), box, cam['size'].tolist(), mats[t])
         got = _marker_centroid(cv2.warpAffine(img, M, size, flags=cv2.INTER_LINEAR))
         assert got is not None, f'frame {t}: the marker left the crop'
         assert np.allclose(got, np.asarray(coords[t, 0], np.float64), atol=1.0), \
             f'frame {t}: pixels say {got}, labels say {coords[t, 0]}'
-    assert len(set(tuple(b) for b in boxes.tolist())) > 1, 'the synthetic pan did nothing'
 
 
 def test_moving_boxes_accepts_a_per_frame_shift():
@@ -1442,7 +1497,7 @@ def test_synth_motion_off_is_bit_identical(tiny_root):
 
     off = LoaderConfig(n_frames=8)
     on = LoaderConfig(n_frames=8, synth_motion_prob=0.0, synth_motion_amp=0.4,
-                      synth_motion_deg=20.0, synth_motion_frames=16)
+                      synth_motion_frames=16)
     for name in ('ratlike', 'mouselike'):
         a = PoseDataset(tiny_root / name, 'train', off)
         b = PoseDataset(tiny_root / name, 'train', on)
@@ -1492,7 +1547,7 @@ def test_synth_motion_expands_a_single_label_window(single_label_root):
     """
     cfg = LoaderConfig(n_frames=24, aug_prob=0.0, prompt_dropout=0.0, crop_jitter=0.0,
                        crop_jitter_scale=0.0, synth_motion_prob=1.0, synth_motion_amp=0.4,
-                       synth_motion_deg=15.0, synth_motion_frames=8)
+                       synth_motion_frames=8)
     ds = PoseDataset(single_label_root, 'train', cfg)
     seen = 0
     for i in range(len(ds)):
@@ -1510,6 +1565,44 @@ def test_synth_motion_expands_a_single_label_window(single_label_root):
     assert seen, 'no synth window was produced -- the fixture has no single-label window'
 
 
+def test_a_synth_window_has_a_STATIC_camera_and_contains_its_own_slide(single_label_root):
+    """The two invariants the slide exists to establish, asserted rather than argued.
+
+    STATIC CAMERA. The first version of this moved the camera -- per-frame `offset`, `ext` at
+    `(T,4,4)`, the library's `moving` flag -- and deployment at `moving_crop = false` presents ONE
+    static camera per window. A per-frame offset still produces perfectly plausible crops, so
+    nothing downstream would have complained; it cost `--anchor carry` 3.1 px instead (report 22
+    §8). This is the assertion that stops it coming back.
+
+    CONTAINS ITS SLIDE. The box is the crop rule over every frame's SLID points at once, so the
+    animal cannot leave it. Retention used to be a tunable with a measured failure rate
+    (`sweep_amp.py`: 36% of camera-windows losing a quarter of their frames at amp 0.35); under
+    the slide it is an invariant, which is why that sweep is retired.
+    """
+    cfg = LoaderConfig(n_frames=24, aug_prob=0.0, prompt_dropout=0.0, synth_motion_prob=1.0,
+                       synth_motion_amp=0.15, synth_motion_frames=8)
+    ds = PoseDataset(single_label_root, 'train', cfg)
+    seen = 0
+    for i in range(len(ds)):
+        item = ds._item(i, np.random.default_rng((21, i)))
+        if item is None or not item[5]['synth']:
+            continue
+        seen += 1
+        coords, cgroup = item[1], item[4]
+        for cam in cgroup:
+            assert cam['offset'].ndim == 1, 'a synth window must NOT carry a per-frame offset'
+            assert cam['ext'].ndim == 2, 'a synth window must NOT carry a per-frame extrinsic'
+            assert not bool(cam.get('moving', False)), 'the camera must not be flagged moving'
+        w, h = (float(v) for v in cgroup[0]['size'][:2])
+        fin = coords[torch.isfinite(coords).all(-1)]
+        assert len(fin), 'the window kept no finite label'
+        assert float(fin[:, 0].min()) >= 0 and float(fin[:, 0].max()) < w, 'slid out of the crop in x'
+        assert float(fin[:, 1].min()) >= 0 and float(fin[:, 1].max()) < h, 'slid out of the crop in y'
+        # ... and it really did slide, or the invariants hold vacuously
+        assert float((coords[-1] - coords[0]).abs().max()) > 0, 'the slide did nothing'
+    assert seen, 'no synth window was produced'
+
+
 def test_synth_motion_never_fires_on_a_densely_labelled_window(dense_root):
     """Synthesis must fire on a ONE-LABEL window and never on a densely-labelled one.
 
@@ -1524,8 +1617,7 @@ def test_synth_motion_never_fires_on_a_densely_labelled_window(dense_root):
     `dense_root` is 32 frames all labelled, so every window trips the fallback and none may
     synthesise even at `synth_motion_prob = 1.0`.
     """
-    cfg = LoaderConfig(n_frames=24, synth_motion_prob=1.0, synth_motion_amp=0.15,
-                       synth_motion_deg=15.0)
+    cfg = LoaderConfig(n_frames=24, synth_motion_prob=1.0, synth_motion_amp=0.15)
     ds = PoseDataset(dense_root, 'train', cfg)
     seen = 0
     for i in range(len(ds)):

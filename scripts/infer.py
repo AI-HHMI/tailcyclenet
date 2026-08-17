@@ -180,6 +180,15 @@ def main():
                          'the only arm that beat every detector crop on 3dpop. Costs one extra '
                          'forward AND one extra decode per animal per window: the crop moves, so '
                          'neither the pixels nor the scene encode can be reused.')
+    ap.add_argument('--refine-px', type=int, default=None,
+                    help='run --refine\'s FIRST pass at this input resolution instead of the '
+                         'run\'s own image_size. Refine\'s gain is MAGNIFICATION, not coordinate '
+                         'frame, so pass 1 only has to LOCALISE. calms21 2D: 96 px beats full-res '
+                         'refine outright (6.651 vs 6.765) at a third of the overhead. 3dpop 3D: '
+                         '192 is a NULL against 256 (+0.062 mm paired) at a quarter of the pixels, '
+                         'and 96-128 trade ~1.7 mm for +0.021 coverage and +0.03 MOTA. 64 IS THE '
+                         'CLIFF on both roots. No default: the floor scales with `patch_size` and '
+                         'with how big the animal is in the crop, so it is per-root.')
     ap.add_argument('--vis-thresh', type=float, default=None,
                     help='withhold an (animal, frame) row whose MEDIAN `vis_pred` logit across '
                          'keypoints is below this. Measured against a rate-matched random rejection '
@@ -268,6 +277,21 @@ def main():
               f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
               'prediction of anything. ***')
 
+    if args.refine_px is not None:
+        if not args.refine:
+            raise SystemExit('--refine-px sets the resolution of --refine\'s FIRST pass; without '
+                             '--refine there is only one pass and it is the answer.')
+        # THE STRUCTURAL FLOOR, and it is the spatial analogue of gotcha 1. At `patch_size` 16 a
+        # 16 px input gives a 1x1 token grid and the forward returns ALL-NaN with no exception,
+        # while `run_group` still marks every window `ok` -- only `coverage 0.0000` reveals it.
+        # 8 px raises. Two patches is the smallest input that can carry a spatial relation at all;
+        # the MEASURED floor is far above it (64 px is 3.2x worse than not refining, on both roots).
+        if args.refine_px < 32:
+            raise SystemExit(f'--refine-px {args.refine_px} is below the structural floor of 32 '
+                             '(about two patches). Below ~2 patches the forward returns all-NaN '
+                             'with no exception. The measured floor is 96; 64 is already worse '
+                             'than not refining at all.')
+
     device = args.device if torch.cuda.is_available() else 'cpu'
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
@@ -285,14 +309,23 @@ def main():
         raise SystemExit(f'--n-frames {args.n_frames} exceeds the run\'s trained window '
                          f'({trained_frames}). Shorter windows are fine; longer is not the same '
                          'model.')
+    trained_px = int(config['data'].get('image_size', 256))
+    # LARGER THAN THE TRAINED INPUT IS NOT A KNOB EITHER, for a different reason: `PadToSize` only
+    # ever pads UP, so a bigger input is not padded, not resized, and reaches the 2D head's fixed
+    # `image_size`-wide canvas as an out-of-range position. Smaller is what the compensations in
+    # `model._input_extent` exist for.
+    if args.refine_px and args.refine_px > trained_px:
+        raise SystemExit(f'--refine-px {args.refine_px} exceeds the run\'s image_size '
+                         f'({trained_px}). A reduced first pass is the lever; a larger one is a '
+                         'different model.')
     cfg = InferConfig(
         n_frames=args.n_frames or trained_frames,
-        overlap=args.overlap, image_size=int(config['data'].get('image_size', 256)),
+        overlap=args.overlap, image_size=trained_px,
         min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk,
-        vis_thresh=args.vis_thresh, refine=args.refine,
+        vis_thresh=args.vis_thresh, refine=args.refine, refine_px=args.refine_px,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
         crop_source=args.crop_source)
@@ -618,7 +651,8 @@ def main():
     # filename. `--refine` rides here too, being the other re-crop lever, so a three-way comparison
     # is legible from the files alone.
     flat['__crop_source__'] = np.asarray(
-        f'{cfg.crop_source}{"+refine" if cfg.refine else ""}')
+        f'{cfg.crop_source}{"+refine" if cfg.refine else ""}'
+        f'{f"@{cfg.refine_px}px" if cfg.refine and cfg.refine_px else ""}')
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
 

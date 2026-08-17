@@ -39,6 +39,7 @@ from contextlib import contextmanager
 import torch
 from einops import einsum, repeat
 
+from posetail.posetail import tracker_encoder as _te
 from posetail.posetail.cube import (from_homogeneous, get_camera_scale, to_homogeneous,
                                     undistort_points)
 from posetail.posetail.tracker_encoder import TrackerEncoder
@@ -215,8 +216,36 @@ class PoseTrackerEncoder(TrackerEncoder):
         self._kpt_cursor = k0 + n
         return super()._decode_from_scene(scene_features, views_norm, coords, *args, **kwargs)
 
-    def forward(self, views, kpt_ids, camera_group, mode, kpt_prior=None, prompt_time=None,
-                kpt_chunk=None):
+    def forward(self, views, kpt_ids, camera_group, mode, **kw):
+        """Run `_forward`, compensating if the input is SMALLER than the model's `image_size`.
+
+        `image_size` is baked into the weights and stands for THREE unrelated things — a padding
+        target, the width of the 2D head's fixed output canvas, and the pixel extent of the input.
+        Only the third is wrong for a smaller input, and `_input_extent` fixes every place it is
+        read that way. See there; measured in `scratch/refine3d/RESULT.md`.
+
+        **The gate is the CAMERA, not an argument**, so every caller benefits and nothing has to be
+        plumbed. It is unreachable from a config — `checkpoints.check_image_size` refuses a
+        `[data]`/`[model]` mismatch — so today only `--refine-px` (a deliberately low-resolution
+        FIRST pass of two-pass refinement) enters this regime. At `px == image_size` this method is
+        a bare call and the path is bit-identical, which `tests/test_infer.py` pins.
+        """
+        px = max(int(c['size'].max()) for c in camera_group)
+        if px >= self.image_size:
+            return self._forward(views, kpt_ids, camera_group, mode, **kw)
+        with _input_extent(self, px):
+            out = self._forward(views, kpt_ids, camera_group, mode, **kw)
+        if mode == '2d':
+            # 2D ONLY, and post-hoc is correct here: `run_group` divides by its own `scales`
+            # afterwards, so undoing the head's fixed `image_size`-wide canvas here and the resize
+            # there cancel exactly. In 3D there is no external back-mapping -- `coords_pred` is
+            # already world -- which is why the 3D corrections live inside the forward.
+            out = dict(out)
+            out['coords_pred'] = out['coords_pred'] * (px / self.decoder.image_size)
+        return out
+
+    def _forward(self, views, kpt_ids, camera_group, mode, kpt_prior=None, prompt_time=None,
+                 kpt_chunk=None):
         """
         Args:
             views: list of (B,T,H,W,3) float32 in [0,1], one per camera
@@ -332,6 +361,63 @@ class PoseTrackerEncoder(TrackerEncoder):
             # stands. This is the path `prob_2d_only` trains.
             return out
         return _reanchor_per_frame(out, coords_q)
+
+
+@contextmanager
+def _input_extent(model, px):
+    """For the duration of one forward, every `image_size` that means "pixels across the INPUT"
+    means `px`. Three sites, all inside the library's `forward`, all silent when wrong.
+
+    `image_size` is one constructor argument standing for three unrelated things, and only this one
+    breaks under a smaller input:
+
+    - a PADDING TARGET (`PadToSize`, `tracker_encoder.py:192`). Left alone it pads a small crop
+      back up to `image_size` with bottom-right zeros: geometrically correct, buys nothing (the
+      encoder still processes the full grid, 0.105 s against 0.106 s) and is 4x worse on accuracy,
+      because a quarter-size animal in the corner of a black canvas is out of distribution.
+    - the 2D HEAD'S OUTPUT CANVAS (`pix_grid`, a 256-long buffer; `heads_2d` is `2*image_size`
+      wide). That is a weight shape and must NOT move. The head reports at normalised position x
+      `decoder.image_size` whatever the input size -- measured, not assumed, on both head banks --
+      so the callers rescale instead. See `forward` (2D) and the undistort wrapper below (3D).
+    - THE PIXEL EXTENT OF THE INPUT, which is what this block corrects.
+
+    The three sites, with the 3dpop numbers at 192 px against the same window at 256
+    (`scratch/refine3d/`, `dev/reports/26_upstream_posetail.md` §5b/5c/5d):
+
+    - `:697` `p3d_cams * self.image_size` -- the gridresid normaliser is `cube_scale x (pixels
+      across)`. `cube_scale` is camera-derived and already scales as `image_size/px`, so the baked
+      factor double-counts it and the residual comes out over-scaled by exactly `image_size/px`.
+      Measured residual ratio 1.2716 stock / 0.9537 fixed, quotient **1.3334 = 256/192**.
+    - `:661` the ray-local gauge centre `[image_size//2, image_size//2]` -- corrected by the same
+      attribute. A null on this rig (~1 degree), fixed because it is free and grows as px shrinks.
+    - `:614` `undistort_points(cam, points_pred_scaled)` -- the 2D decode is on the baked canvas
+      while the camera is at `px`, so the two frames are mixed. Corrupts `points_und` and therefore
+      BOTH `3d_pred_rays` and `3d_pred_triangulate`: 45.2 mm against a model whose own error is
+      3.7 mm, and query-free -- where the triangulation IS the output -- 48.1 mm at scale 0.748
+      and 7.2 degrees of rotation. A similarity of the right answer, which is the hardest kind of
+      wrong number to notice.
+
+    `self.image_size` covers the first two because nothing else in `forward` reads it: `:609` is
+    `output_mode == 'direct'`, which `build_model` refuses, and `:797` only labels the loss-only
+    `grid` dict. The third is a module-level function, so it is wrapped rather than passed.
+
+    ponytail: the undistort wrap is a module global for the duration, so this is not safe against
+    two forwards in different threads. `run_group` decodes crops on threads and forwards on the
+    main one; make it a `threading.local` if that ever changes.
+    """
+    pad = model.transform_norm.transforms[0]
+    old_pad, old_size, old_undistort = pad.size, model.image_size, _te.undistort_points
+    head = model.decoder.image_size
+
+    def _undistort(cam, pts, *a, **kw):
+        return old_undistort(cam, pts * (px / head), *a, **kw)
+
+    pad.size = model.image_size = px
+    _te.undistort_points = _undistort
+    try:
+        yield
+    finally:
+        pad.size, model.image_size, _te.undistort_points = old_pad, old_size, old_undistort
 
 
 @contextmanager

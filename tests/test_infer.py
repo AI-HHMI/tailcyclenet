@@ -546,3 +546,114 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
     np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)
 
 
+
+
+def test_refine_px_off_is_bit_identical(scene):
+    """INERTNESS FIRST, and it must be bit-identical, not "within noise".
+
+    `--refine-px` is default-None and everything below it is gated on `px < image_size`, so
+    `--refine` alone must reproduce today's output exactly. `refine_px == image_size` is asserted
+    separately because the model's gate is a strict `<`: the two have to meet at the boundary or
+    the flag has an off-by-one regime nobody would ever run deliberately.
+    """
+    model, sess, registry, name = scene
+    torch.manual_seed(0)
+    a = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', refine=True))
+    torch.manual_seed(0)
+    b = run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='none', refine=True, refine_px=None))
+    torch.manual_seed(0)
+    c = run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='none', refine=True, refine_px=64))   # == _cfg's image_size
+    for other, why in ((b, 'refine_px=None'), (c, 'refine_px == image_size')):
+        for k in ('pred', 'crop', 'crop_refined', 'box_agree'):
+            np.testing.assert_array_equal(np.nan_to_num(a[k], nan=-9e9),
+                                          np.nan_to_num(other[k], nan=-9e9),
+                                          err_msg=f'{why} moved {k}')
+
+
+def test_a_smaller_input_is_compensated_at_all_four_sites(scene):
+    """THE SEAM ITSELF, pinned without depending on what the weights predict.
+
+    `image_size` stands for three things and only one -- the pixel extent of the input -- is wrong
+    for a smaller crop. This asserts the wiring of all of it: the pad target and the two
+    `self.image_size` reads inside the library's forward (`:661` gauge centre, `:697` gridresid
+    normaliser) move to `px`; `undistort_points` (`:614`) is wrapped; the 2D decode comes back
+    scaled by `px / decoder.image_size`; and every one of those globals is restored afterwards,
+    including on the exception path.
+
+    The MAGNITUDES are measured on real weights in `scratch/refine3d/RESULT.md` -- 45.2 mm on the
+    triangulation, 1.3334 = 256/192 on the residual. A random fixture model cannot pin those; it
+    can pin that each correction is applied exactly once, which is the part that rots.
+    """
+    from posetail.posetail import tracker_encoder as te
+
+    from tailcyclenet.model import _input_extent
+
+    model, sess, registry, name = scene
+    pad, full, head = model.transform_norm.transforms[0], model.image_size, model.decoder.image_size
+    stock_undistort = te.undistort_points
+    seen = {}
+    with _input_extent(model, 32):
+        seen = dict(pad=pad.size, size=model.image_size, wrapped=te.undistort_points)
+    assert seen == dict(pad=32, size=32, wrapped=seen['wrapped'])
+    assert seen['wrapped'] is not stock_undistort, 'the :614 frame mismatch is not corrected'
+    assert (pad.size, model.image_size, te.undistort_points) == (full, full, stock_undistort)
+
+    with pytest.raises(RuntimeError):
+        with _input_extent(model, 32):
+            raise RuntimeError('boom')
+    assert (pad.size, model.image_size, te.undistort_points) == (full, full, stock_undistort), \
+        'a forward that raised must not leave the library monkeypatched for the next one'
+
+    # ...and the 2D rescale, through the public `forward`, with `_forward` stubbed so the assertion
+    # is about the factor and not about the weights.
+    if sess.mode != '2d':
+        return
+    one = torch.ones(1, 2, 3, 2)
+    model._forward = lambda *a, **kw: {'coords_pred': one.clone()}
+    try:
+        cg = [{'size': torch.tensor([32, 32])}]
+        got = model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '2d')
+        torch.testing.assert_close(got['coords_pred'], one * (32 / head))
+        cg = [{'size': torch.tensor([full, full])}]
+        got = model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '2d')
+        torch.testing.assert_close(got['coords_pred'], one)   # the gate is a strict <
+    finally:
+        del model._forward
+
+
+def test_a_rejected_refinement_falls_back_at_full_resolution(scene):
+    """THE FLAGSHIP SILENT BUG, and the existing refine test cannot catch it.
+
+    `test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage` uses whole-frame boxes, so
+    `_overlaps` always passes and the fallback branch never runs. Here the box is a corner far from
+    where the random model predicts, so the refined box misses it and the plan falls back -- and
+    the fallback used to re-append the PASS-1 plan verbatim, carrying its reduced-resolution
+    camera. Pass 2 then ran at pass 1's resolution, on exactly the animal whose first pass had
+    already gone wrong.
+    """
+    model, sess, registry, name = scene
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    boxes[..., 0], boxes[..., 1] = 0, 0
+    boxes[..., 2], boxes[..., 3] = w // 8, h // 8      # a corner: refinement should be rejected
+
+    seen = []
+    inner = model.forward
+
+    def spy(views, *a, **kw):
+        seen.append(int(views[0].shape[-2]))
+        return inner(views, *a, **kw)
+
+    model.forward = spy
+    try:
+        run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='none', refine=True, refine_px=32), boxes_stc=boxes)
+    finally:
+        model.forward = inner
+
+    assert 32 in seen, 'pass 1 must have run at the reduced resolution'
+    assert 64 in seen, ('every SECOND pass must run at image_size, including the ones whose '
+                        'refinement was rejected -- that fallback is the silent half')

@@ -73,6 +73,16 @@ class InferConfig:
     # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
     # pixels and no scene encode can be shared). See `run_group`.
     refine: bool = False
+    # PASS 1'S INPUT RESOLUTION under `--refine`. None -> `image_size`, i.e. today's behaviour
+    # exactly. Refine's gain is MAGNIFICATION, not coordinate frame (an ablation that re-centred
+    # the crop at a fixed side recovered 42% of the mean gain, 3% of the median and 0.4% of
+    # pck@10), so pass 1 only has to LOCALISE and does not need full resolution. calms21 2D: 96 px
+    # beats full-res refine outright, 6.651 against 6.765, at a third of the overhead. 3dpop 3D:
+    # 192 is a NULL against 256 (+0.062 mm paired) at a quarter of the pixels, and 96-128 trade
+    # ~1.7 mm for +0.021 coverage and +0.03 MOTA. 64 is the cliff on BOTH. No shipped default --
+    # the floor is patch-size- and root-dependent, which is the `--vis-thresh` lesson.
+    # `model.PoseTrackerEncoder.forward` is what makes a smaller input correct; see `_input_extent`.
+    refine_px: int | None = None
     # WHERE THE WINDOW'S CROP COMES FROM. 'boxes' unions the detector's per-frame boxes, which is
     # what every recorded number uses. 'keypoints' runs THE CROP RULE on the detector's own
     # keypoints over the window -- see the long comment at the union below for why that is the one
@@ -240,6 +250,9 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
         raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
                          'overlap >= 1; got 0')
+    # A reduced pass-1 resolution is only a thing when there IS a second pass. Without `--refine`,
+    # pass 1 is the only pass and its output is the answer.
+    pass1_res = cfg.refine_px if (cfg.refine and cfg.refine_px) else cfg.image_size
 
     group = session.groups[gid]
     lab: Labels = session.labels(gid)
@@ -484,14 +497,19 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     outcome[a, wi] = OUTCOMES.index('crop failed')
                     continue
             scales = []
+            # PASS 1, which under `--refine-px` runs at a reduced resolution. The distinction
+            # between the two passes lives HERE, at the site, rather than in `_resize_camera` --
+            # that is a `dataset.py` helper shared with the loader and has no business knowing
+            # about inference passes.
+            uncropped = list(cgroup)      # pre-resize; only read by the refine fallback below
             for i, cam in enumerate(cgroup):
-                cgroup[i], s = _resize_camera(cam, cfg.image_size)
+                cgroup[i], s = _resize_camera(cam, pass1_res)
                 scales.append(s)
             # The box BEFORE the pixels, so a decode failure still shows what it was reaching for.
             for i, ci in enumerate(use):
                 crop[a, wi, ci] = np.asarray(boxes[i], np.float32)
             outcome[a, wi] = OUTCOMES.index('decode failed')
-            plans.append((a, use, boxes, cgroup, scales))
+            plans.append((a, use, boxes, cgroup, scales, uncropped))
 
         # ONE DECODE PER (CAMERA, FRAME) PER WINDOW, shared by every animal in it.
         #
@@ -522,7 +540,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # it takes out every animal that wanted this camera -- which is what the
                 # per-animal decode did too, one animal at a time.
                 ok = not any(im is None for im in imgs)
-                for a, use, boxes, cgroup, _ in plans:
+                for a, use, boxes, cgroup, *_ in plans:
                     if ci in use:
                         i = use.index(ci)
                         bx = boxes[i]
@@ -542,7 +560,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
         def forward(plan, crops):
             """One animal, one window -> its prediction in the SOURCE frame, or None."""
-            a, use, boxes, cgroup, scales = plan
+            a, use, boxes, cgroup, scales, *_ = plan
             # uint8; the model divides on device. Same contract as the training loader.
             views = [crops[a, ci] for ci in use]
             if any(v is None for v in views):
@@ -614,20 +632,36 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # without the second. It costs one extra forward AND one extra decode per animal per
             # window -- the crop moved, so neither the pixels nor `share_scene` can be reused.
             #
-            # An animal whose refined crop fails keeps its first-pass plan rather than being
+            # An animal whose refined crop fails keeps its first-pass BOX rather than being
             # dropped: a bad prediction must not cost coverage a loose box already had.
+            #
+            # ...but it must NOT keep the first-pass CAMERA under `--refine-px`, which is what
+            # re-appending `plan` did. That camera is at `pass1_res`, so the fallback silently ran
+            # the SECOND pass at the first pass's reduced resolution -- and it is the fallback, i.e.
+            # exactly the animal whose first pass already went wrong. `_at_image_size` rebuilds it.
+            def _at_image_size(plan):
+                a, use, boxes, _, _, uncropped = plan
+                if pass1_res == cfg.image_size:
+                    return plan                          # bit-identical: nothing to rebuild
+                cg, sc = [], []
+                for cam in uncropped:
+                    c, s = _resize_camera(cam, cfg.image_size)
+                    cg.append(c)
+                    sc.append(s)
+                return (a, use, boxes, cg, sc, uncropped)
+
             refined = []
             for plan in plans:
-                a, use, boxes, cgroup, scales = plan
+                a, use, boxes, cgroup, scales, *_ = plan
                 got = forward(plan, crops)
                 if got is None:
-                    refined.append(plan)
+                    refined.append(_at_image_size(plan))
                     continue
                 pts = torch.as_tensor(got[0], dtype=torch.float32)
                 cg2, b2 = boxes_from_points(pts, [window_cams[i] for i in use],
                                             cfg.min_crop_dim, mode)
                 if cg2 is None:
-                    refined.append(plan)
+                    refined.append(_at_image_size(plan))
                     continue
                 # A REFINED BOX THAT DOES NOT OVERLAP THE BOX IT CAME FROM IS NOT A REFINEMENT.
                 # `boxes_from_points` runs the first pass's own prediction through
@@ -637,23 +671,23 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # are exactly that. Nothing bounded it. Requiring overlap with the first-pass box
                 # is the weakest test that catches "somewhere else", and it costs nothing.
                 if any(not _overlaps(b2[i], boxes[i]) for i in range(len(use))):
-                    refined.append(plan)
+                    refined.append(_at_image_size(plan))
                     continue
-                sc2 = []
+                uncropped2, sc2 = list(cg2), []
                 for i, cam in enumerate(cg2):
-                    cg2[i], s = _resize_camera(cam, cfg.image_size)
+                    cg2[i], s = _resize_camera(cam, cfg.image_size)   # PASS 2, always full res
                     sc2.append(s)
                 # `crop` KEEPS THE FIRST-PASS BOX. Overwriting it lost the only record of what the
                 # detector actually offered, which is the box every coverage and crop-inflation
                 # number in reports 08 and 11 is computed from.
                 for i, ci in enumerate(use):
                     crop_refined[a, wi, ci] = np.asarray(b2[i], np.float32)
-                refined.append((a, use, b2, cg2, sc2))
+                refined.append((a, use, b2, cg2, sc2, uncropped2))
             plans = refined
             crops = decode_crops(plans)
 
         for plan in plans:
-            a, use, boxes, cgroup, scales = plan
+            a, use, boxes, cgroup, scales, *_ = plan
             got = forward(plan, crops)
             if got is None:
                 continue                        # already marked 'decode failed' above
@@ -851,7 +885,11 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup):
             [cropmod.with_static_offset(c) for c in cgroup], fin[None]))
         if not torch.isfinite(scale):
             return p, 0
-        width = float(scale) * cfg.image_size
+        # THE CAMERA'S OWN WIDTH, not `cfg.image_size`. `scale` is world-per-pixel of the camera
+        # in `cgroup`, which under `--refine-px` is the reduced pass-1 camera -- so pairing it with
+        # the baked 256 made the injected offset `image_size/refine_px` times too big. More
+        # correct today too, for a crop clamped non-square against a frame edge.
+        width = float(scale) * int(cgroup[0]['size'].max())
     rng = np.random.default_rng([a, int(frames[0])])
     v = rng.normal(size=p.shape[-1])
     v = v / max(float(np.linalg.norm(v)), 1e-9)

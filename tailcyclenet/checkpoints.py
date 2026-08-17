@@ -67,6 +67,12 @@ def check_image_size(config: dict) -> None:
     so a smaller data size leaves the crop in the corner of a zero-padded canvas while the
     cameras describe the unpadded one; either way 2D shifts by half the difference and 3D scales
     by their ratio. Both silent.
+
+    **`--refine-px` walks straight past this on purpose**, and is the only thing that may. It runs
+    `--refine`'s FIRST pass at a smaller input, and `model.PoseTrackerEncoder.forward` compensates
+    every one of the failures described above -- see `model._input_extent`, which names each site
+    and the mm it is worth. This check stays a config-time assertion because a config has no such
+    compensation: the loader would resize and nothing downstream would know.
     """
     model_px = config.get('model', {}).get('image_size')
     data_px = config.get('data', {}).get('image_size')

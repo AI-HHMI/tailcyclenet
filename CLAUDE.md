@@ -414,6 +414,7 @@ Rendering is a flag, not a separate script.
 | `--pose-nms` | off | +0.0223 MOTA on rat-city, **harmful on calms21** | untested | 21 §9k |
 | `--vis-thresh` | off | **cannot work** (untrained head) | +0.049 on 3dpop | 24 §1.2 |
 | `--refine` | off | helps calms21 PCK | loses to `--crop-source keypoints` at 2x compute | 11, 15 |
+| `--refine-px` | none | **96** (beats full-res refine) | 192 is a null; 96–128 trade mm for MOTA | 24 §9h, §9j |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | | |
 
 **`--anchor carry` IN 2D COSTS +52.42 px MPJPE [+50.77, +54.05] AND −0.4563 MOTA** on rat-city's
@@ -509,6 +510,33 @@ and 256 and ∞ are identical so the posterior never spreads further. A plain at
 averages the convex-spaced bin centres directly and overshoots through the warp at large motion;
 `"warped"` averages in the uniform space first and is overshoot-free. Reverting costs +0.19 mm
 (6.4%) at every quantile. Only measurable on a PROMPTED arm.
+
+**`--refine`'s GAIN IS MAGNIFICATION, NOT COORDINATE FRAME — so PASS 1 ONLY HAS TO LOCALISE.** An
+ablation that re-centred the crop while holding its SIDE fixed recovered 42% of the mean gain, 3% of
+the median and 0.4% of pck@10 (a null). Pass 2's advantage is ~1.5x more pixels per animal.
+**`--refine-px` is that corollary shipped**: calms21 2D reads a plateau from 96–192, a knee at 80 and
+a **cliff at 64** (3.2x worse than not refining), with **96 px beating full-resolution refine
+outright** — 6.651 against 6.765 — because a low-res pass 1 contracts its pose slightly toward the
+crop centre and so yields a *tighter* pass-2 box. 3dpop 3D: 192 against 256 is a **NULL** (+0.062 mm
+paired) at a quarter of the pass-1 pixels; 96–128 give back ~1.7 mm but recover +0.021 coverage and
+**+0.03 MOTA**; 64 is the cliff there too. **No shipped default** — the floor scales with
+`patch_size` and with how big the animal sits in the crop.
+
+**`image_size` MEANS THREE UNRELATED THINGS AND ONLY ONE IS WRONG FOR A SMALLER INPUT.** A padding
+target (`PadToSize` — disabled, or the crop sits in the corner of a zero canvas at 4x the error for
+no speedup), the 2D head's fixed output canvas (a WEIGHT SHAPE; the head reports at normalised
+position × `image_size` whatever the input size, so callers rescale), and **the pixel extent of the
+input** — which `model._input_extent` corrects at all three sites that read it that way. In 2D that
+correction may be post-hoc, because `run_group` undoes the resize externally; **in 3D there is no
+back-mapping at all** — `coords_pred` is already world — so it must land inside the forward. All
+three are library bugs (report 26 §5b/5c/5d), all silent, and the two that matter are worth 45.2 mm
+on the triangulation and exactly `image_size/px` on the gridresid residual.
+
+**AND THE UNCORRECTED VERSION READS BETTER ON MEAN MPJPE, which is a box-size confound.** Skipping
+the corrections splays the pass-1 pose, which squares up into a crop **14–26% wider** and so
+partially DISABLES refinement — worth −6 mm on 3dpop's mean while costing **+257 mm at p99** and
+nothing at p75/p90. **Score a resolution bug on the FORWARD against its own full-resolution
+reference**, not on a downstream metric. Same shape as eval rule 4.
 
 **Do NOT put the window union box through `crop_box_for_points`.** 08 §1.3 asks for it on gotcha-8
 grounds and it is measured worse: 3dpop +3.06 mm and −0.032 MOTA, rat-city −0.040 MOTA. The union of
@@ -845,6 +873,9 @@ site.
 **Config:** `moving_crop`; the dead loss weights `gamma`, `feature_loss_weight`, `pixel_thresh`; the
 inert model keys `corr_radius`, `use_volume_embedding`, `occlusion_embedding`, `mode_3d`,
 `cross_attn_dim`; and six `configs/datasets/*.toml` keys nothing ever read.
+**Never built, measured in `scratch/` and refuted there:** an `--anchor self` fixed-point iteration,
+a coarse-to-fine grid decode (the knob does not exist — `g3d_lo`/`g3d_hi` are never read at
+inference), "anchor refine", and `--anchor detector`. See the independence paragraph below.
 
 **THE CUE IS REAL AND EVERY MECHANISM THAT SPENDS IT IS REFUTED — all three forms are now tried.** A
 veto, a permutation and a Hungarian cost term were each built, measured on BOTH roots and lost; the
@@ -855,6 +886,26 @@ learned identity head reaches 25.1% on genuinely contested decisions against 8.3
 **≤0.31%** of associations; and SLEAP's `connect_single_track_breaks` fires **0 times in 57,593
 consecutive steps**. **When refuting a mechanism, refute it on the quantity a better model cannot
 change.**
+
+**A PRIOR HELPS ONLY WHEN IT IS INDEPENDENT EVIDENCE, and that retires four proposals at once.**
+Iterating `--anchor self` to a fixed point, a coarse-to-fine grid decode, and seeding pass 2 from
+pass 1's own pose ("anchor refine", −2.8 px where it is the *only* prior, which is the cleanest test
+and the worst result) all feed the model a prior derived from the SAME pixels the forward is about
+to see, so it carries nothing the forward does not have and its errors correlate with the ones it is
+meant to fix. `carry` is worth 10.2 px precisely because its prior comes from DIFFERENT pixels.
+**The fourth, `--anchor detector`, is the one that satisfies the independence test and it fails on
+the POPULATION instead** (report 24 §9k): the detector's keypoints are dense enough (96–100% of
+slots) and nowhere near accurate enough — p50 **31.8 mm** on 3dpop and **95.6 px** on rat-city
+against the model's own prior-free median of 9.96 mm, i.e. **3x worse than the answer it would
+seed**, and 10–35x the `prompt_noise_px` / `prompt_offset_px` the prompt trained against. Costs
++8.34 mm and +13.03 px.
+
+**THE PRE-SCREEN THAT FALLS OUT IS WORTH MORE THAN THE LEVER: a prior must be more accurate than the
+prediction it seeds, and `kpt_agree` on any prior-free arm already reports exactly that distance**
+(3dpop 0.140 box sides, rat-city 0.721). Either number predicts both refutations for ~1 min of CPU,
+before any inference. Same shape as the `fp_dup`-must-be-live rule for `--pose-nms`. And `kpt_agree`
+is CIRCULAR under any detector-seeded regime — the model is handed the keypoints it is then scored
+against — so it must never be quoted as a win for one.
 
 **`--pose-nms` is the one identity lever that works.** `--rotate-deg` survives with its 180-degree
 setting refuted. `synth_motion_*` survives **unmeasured**, and is the sole consumer of the

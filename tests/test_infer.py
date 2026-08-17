@@ -39,6 +39,29 @@ def scene(request):
     return model, sess, registry, ds.name
 
 
+@pytest.fixture(scope='module', params=['rat', 'mv'])
+def multiwindow_scene(request):
+    """The same two shapes as `scene`, but T=16 -- SEVERAL windows at n_frames=4/overlap=2
+
+    (`_window_starts(16, 4, 2)` is 7 starts), which `scene`'s T=4 cannot exercise at all (one
+    window only). This is what a prefetch-ahead pipeline needs to be tested against: with one
+    window there is nothing to prefetch and `prefetch_windows` is a no-op by construction.
+    """
+    import conftest as cf
+
+    root = Path(tempfile.mkdtemp())
+    if request.param == 'rat':
+        cf._session_2d(root / 'rat' / 'test' / 's', T=16)
+    else:
+        cf._session_3d(root / 'mv' / 'test' / 's', T=16, moving=True)
+    ds = load_dataset(root / request.param)
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+    return model, sess, registry, ds.name
+
+
 @pytest.fixture(scope='module')
 def cli():
     """`scripts/infer.py` as a module, without running main(). Same pattern as test_train.py."""
@@ -173,6 +196,60 @@ def test_kpt_chunk_matches_unchunked_end_to_end(scene):
     chunked = run_group(model, sess, 'g000', registry, name,
                         _cfg(anchor='none', kpt_chunk=2))['pred']
     np.testing.assert_allclose(chunked, whole, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize('anchor,refine', [('none', False), ('carry', False),
+                                           ('none', True), ('carry', True)])
+def test_prefetch_windows_is_bit_exact(multiwindow_scene, anchor, refine):
+    """THE PIPELINE PROTOTYPE'S OWN CLAIM (dev/reports/31): decoding a future window ahead of
+    the current one's forward must not move a single value, at any `prefetch_windows`.
+
+    `_build_plans`/`decode_crops` depend only on the box source and window geometry, never on
+    `carried` or any model output, so preparing window wi+1 while window wi forwards changes no
+    pixel and no order -- `carried` is still read and written strictly in window order, on the
+    main thread, inside `_process_window`. Checked under BOTH `refine` (the second decode pass)
+    and `carry` (the prior path most likely to break under reordering), which is why this needs
+    `multiwindow_scene` rather than `scene`: `scene`'s T=4 is one window and prefetching a
+    single-window run is a no-op by construction.
+    """
+    model, sess, registry, name = multiwindow_scene
+    base = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor=anchor, refine=refine, prefetch_windows=0))
+    for pf in (1, 2, 5):
+        got = run_group(model, sess, 'g000', registry, name,
+                        _cfg(anchor=anchor, refine=refine, prefetch_windows=pf))
+        assert set(got) == set(base)
+        for k in base:
+            va, vb = base[k], got[k]
+            if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
+                assert np.array_equal(np.isnan(va), np.isnan(vb)), f'{k}: finite mask differs'
+                fin = ~np.isnan(va)
+                np.testing.assert_array_equal(va[fin], vb[fin], err_msg=f'{k} (prefetch={pf})')
+            elif isinstance(va, np.ndarray):
+                np.testing.assert_array_equal(va, vb, err_msg=f'{k} (prefetch={pf})')
+            else:
+                assert str(va) == str(vb), f'{k} (prefetch={pf})'
+
+
+def test_prefetch_windows_default_matches_the_old_serial_loop(multiwindow_scene):
+    """THE DEFAULT (`prefetch_windows = 1`) IS A NO-OP ON THE PREDICTION, not just a documented
+    claim: a run with no new flag set must be indistinguishable from `prefetch_windows = 0`, the
+    exact old code path where `run_group` never builds the prefetch pool at all.
+    """
+    model, sess, registry, name = multiwindow_scene
+    default = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry'))   # default = 1
+    old = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='carry', prefetch_windows=0))
+    for k in old:
+        va, vb = old[k], default[k]
+        if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
+            assert np.array_equal(np.isnan(va), np.isnan(vb))
+            fin = ~np.isnan(va)
+            np.testing.assert_array_equal(va[fin], vb[fin], err_msg=k)
+        elif isinstance(va, np.ndarray):
+            np.testing.assert_array_equal(va, vb, err_msg=k)
+        else:
+            assert str(va) == str(vb), k
 
 
 def test_carry_requires_overlap(scene):

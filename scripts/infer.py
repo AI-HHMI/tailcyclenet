@@ -230,6 +230,16 @@ def main():
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
+    ap.add_argument('--prefetch-windows', type=int, default=1,
+                    help='decode this many windows AHEAD of the one currently forwarding on the '
+                         'GPU (dev/reports/31). BIT-EXACT: the prediction is unchanged at any '
+                         'value -- the pose loop was decode-bound with the GPU idle during every '
+                         'decode, and this overlaps the next window\'s decode with the current '
+                         'one\'s forward. `carried` (the anchor/carry prompt) is still read and '
+                         'written strictly in window order on the main thread, so the SEQUENCE '
+                         'of forwards is untouched. 0 restores the exact old serial loop -- no '
+                         'prefetch pool is even created. Costs one extra small `crops` buffer '
+                         '(already cropped to `image_size`), not a second full-frame decode.')
     ap.add_argument('--oracle-corrupt', default=None,
                     help='ONLY with --anchor labels, and never a deployment arm: break the oracle '
                          'prior on purpose and see how far the output follows it. `off:<x>` offsets '
@@ -381,7 +391,8 @@ def main():
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
         crop_source=args.crop_source,
-        box_prompt=box_prompt, crop_inflate=crop_inflate)
+        box_prompt=box_prompt, crop_inflate=crop_inflate,
+        prefetch_windows=args.prefetch_windows)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

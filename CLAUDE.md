@@ -441,6 +441,18 @@ The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one le
 | `--vis-thresh` | off | **cannot work** (untrained head) | +0.049 on 3dpop | 24 §1.2 |
 | `--refine-px` | none | **SWEEP IT**: 96 is best on calms21 and **+15.8 px / MOTA −0.238 SIG on rat-city** | 192 ≈ 256; 96–128 trade mm for MOTA | 24 §9h, §9j, §10 |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | | |
+| `--prefetch-windows` | **1** | bit-exact at any value (report 31) | bit-exact at any value | 31 |
+
+**`--prefetch-windows` IS A PURE PERFORMANCE LEVER, NOT AN ACCURACY ONE** (report 31). The pose
+loop was decode-bound with the GPU idle for the whole decode of every window; this overlaps
+window `wi+1`'s decode with window `wi`'s forward, on a background thread that never reads or
+writes `carried` (`--anchor carry`'s state), so the prediction is bit-identical at any value --
+measured on real 3dpop and johnson-mouse sessions, both anchors, `--refine` on and off. **On a
+video root it cannot make the pipeline GPU-bound** — 3dpop's decode is ~44 ms/frame-camera against
+a ~0.9 ms forward and no CUDA video decoder in this env can touch these files (report 14 §4,
+reconfirmed) — it only removes the GPU-idle stall, worth 1.5-1.7x wall clock on 3dpop (4 cam) and
+johnson-mouse (16 cam, jpeg). `--prefetch-windows 0` reproduces today's exact serial loop and
+memory profile.
 
 **`--anchor` IN 2D IS ROOT-CONDITIONAL, AND "HARMFUL IN 2D" WAS ONE ROOT GENERALISED** (report 24
 §10.2). On **calms21**, 6 sessions x 2000 frames, `carry` is significantly BETTER: **MOTA +0.0821

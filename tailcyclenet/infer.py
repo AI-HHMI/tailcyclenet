@@ -131,6 +131,17 @@ class InferConfig:
     # Inflate every crop about its centre by this factor -- the WIDE pass-1 regime where the box
     # is load-bearing (report 27 §9m). 1.0 is today's behaviour exactly.
     crop_inflate: float = 1.0
+    # HOW MANY WINDOWS AHEAD TO DECODE while the current window's forward runs on the GPU
+    # (dev/reports/31). BIT-EXACT: `_build_plans`/`decode_crops` depend only on the box source
+    # and window geometry, never on `carried` or any model output, so preparing a future
+    # window's pixels early changes no pixel and no order -- `carried` is still read and
+    # written strictly in window order, on the main thread, inside `_process_window`. 0 is the
+    # exact old serial code path: `run_group` never even builds the prefetch pool. 1 is the
+    # default because the memory cost is one extra small `crops` dict (already cropped to
+    # `image_size`, not a second full-frame decode buffer) -- see `_CAM_DECODE`'s own budget,
+    # which this does not multiply. Raise it on a many-core host if the forward is the slower
+    # half; drop it to 0 to reproduce today's exact memory profile on a very wide rig.
+    prefetch_windows: int = 1
 
 
 def _window_starts(n_frames: int, T: int, overlap: int):
@@ -409,7 +420,19 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # NaN confidence. `eval.py` reads `box_agree` per group and quotes `--vis-thresh` off `conf`,
     # so the two blend arms were reporting mismatched columns.
     #
-    for wi, start in enumerate(starts):
+    def _build_plans(wi, start):
+        """Everything the old inline loop did BEFORE any pixel touches: pure geometry.
+
+        Returns (frames, window_cams, plans). Writes into `outcome`/`crop`, which are
+        pre-allocated and indexed by `wi` -- two different windows' calls touch disjoint
+        slices, so this may run for window wi+1 on a background thread while window wi's
+        forward is still running on the main thread. IT NEVER READS `carried`: pass-1 crop
+        boxes depend only on the box source (`boxes_stc`/`inst_boxes`/`src`) and window
+        geometry, never on the carried prior or any model output -- `carried` is read only
+        inside `forward()`, on the main thread, in window order. So preparing a future
+        window's pixels changes no pixel and no order. See the driver below
+        (`cfg.prefetch_windows`, dev/reports/31).
+        """
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
             frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
@@ -582,144 +605,160 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 crop[a, wi, ci] = np.asarray(boxes[i], np.float32)
             outcome[a, wi] = OUTCOMES.index('decode failed')
             plans.append((a, use, boxes, cgroup, scales, uncropped))
+        return frames, window_cams, plans
 
-        # ONE DECODE PER (CAMERA, FRAME) PER WINDOW, shared by every animal in it.
+    # ONE DECODE PER (CAMERA, FRAME) PER WINDOW, shared by every animal in it.
+    #
+    # ponytail: peak memory is one camera's window of FULL frames plus every animal's crops --
+    # 24 x 21 MB on johnson-mouse's 3208x2200 rig, which has one animal. A wide rig with many
+    # animals would want the frame loop chunked; nothing shipped is both.
+    # AND THE CAMERAS OVERLAP, up to `_CAM_DECODE` of them. This loop used to be serial across
+    # cameras because `dataset._read_video` held ONE global lock, so a second thread would only
+    # have queued on it; the lock is now per container, and different cameras are different
+    # containers. Video is where it matters -- 3dpop decodes at ~44 ms per frame-camera against
+    # a pose forward two orders of magnitude cheaper -- but an image directory gains too, since
+    # `read_frames`'s own per-frame pool is per call and one camera at a time could not fill it.
+    #
+    # THE CAP IS MEMORY, NOT CORES. Each task holds one camera's whole window of FULL frames:
+    # 24 x 21 MB on johnson-mouse's 3208x2200 16-camera rig, so unbounded concurrency there is
+    # 8 GB of transient host memory for a rig that has one animal in it. 4 is decord's own
+    # `ChunkShuffle.mix` number and bounds it at four windows.
+    #
+    # `crops` is written from those threads: the keys are distinct per (animal, camera) and a
+    # dict store is atomic under the GIL, so the result does not depend on the order they land.
+    def decode_crops(frames, plans):
+        """`frames` is a PARAMETER (was a closure read of the enclosing loop's variable),
+        so this can run for a future window on a background thread while the current
+        window's forward runs on the main thread. Same body otherwise."""
+        crops = {}
+        cams = sorted({c for _, use, *_ in plans for c in use})
+
+        def one(ci, pool):
+            imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
+            # A file that will not decode is a property of the file, not of the animal, so
+            # it takes out every animal that wanted this camera -- which is what the
+            # per-animal decode did too, one animal at a time.
+            ok = not any(im is None for im in imgs)
+            for a, use, boxes, cgroup, *_ in plans:
+                if ci in use:
+                    i = use.index(ci)
+                    bx = boxes[i]
+                    crops[a, ci] = (_crop_views(imgs, bx, cgroup[i]['size'].tolist())
+                                    if ok else None)
+            del imgs
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            if len(cams) < 2:
+                one(cams[0], pool) if cams else None
+            else:
+                # A SECOND POOL: `one` runs in this one and waits on futures in `pool`, and a
+                # pool that waits on itself deadlocks as soon as both are full.
+                with ThreadPoolExecutor(max_workers=min(_CAM_DECODE, len(cams))) as cpool:
+                    list(cpool.map(lambda ci: one(ci, pool), cams))
+        return crops
+
+    def forward(frames, plan, crops):
+        """One animal, one window -> its prediction in the SOURCE frame, or None.
+
+        `frames` is a parameter for the same reason as `decode_crops`. `carried` is read
+        here on the MAIN THREAD ONLY, in window order -- the one place the prior loop's
+        state is read, so the window-order guarantee lives entirely in the caller."""
+        a, use, boxes, cgroup, scales, *_ = plan
+        # uint8; the model divides on device. Same contract as the training loader.
+        views = [crops[a, ci] for ci in use]
+        if any(v is None for v in views):
+            return None                     # already marked 'decode failed' above
+        prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
+                                       scales, mode, K, R, cgroup)
+        dev = cfg.device
+        chunk = cfg.kpt_chunk or None
+        views = [v.to(dev) for v in views]
+        cgroup_d = _to_device(cgroup, dev)
+        # ONE encode for both passes of `self`: the pixels are identical, and the encode is
+        # the bulk of the forward. A no-op under `kpt_chunk` (`model._forward_window`).
+        # DEPLOYMENT BOX PROMPT (report 27), 2D single-camera only. GUARDED: when
+        # `box_prompt == 'none'` NO kwarg is passed, so the stock model (whose forward has no
+        # box_prompt parameter) sees the identical call it always did -- byte-identical, pinned
+        # by `tests/test_infer.py`. When on, the box names animal `a` (its own source points
+        # under 'labels', an ORACLE) mapped into the crop frame; the model must be a
+        # `[model].box_prompt` (film/term) checkpoint.
+        mkw = {}
+        if cfg.box_prompt != 'none' and (mode != '2d' or len(use) != 1):
+            # The box is wired for 2D single-camera only (report 27). On a 3D / multi-camera
+            # window it is SKIPPED, not an error: a box model then runs box-withheld (film's
+            # zero-init token, ~= a plain wide model), so the default box recipe is safe on
+            # every root. Warned once via the stdlib, which dedupes.
+            warnings.warn(f'box_prompt {cfg.box_prompt!r} skipped on a {mode} '
+                          f'{len(use)}-camera window (2D single-camera only; report 27)')
+        elif cfg.box_prompt != 'none':
+            if cfg.box_prompt == 'labels':
+                # ORACLE: the animal's GT keypoints name which animal to return.
+                bp_pts = torch.as_tensor(src[a][frames], dtype=torch.float32)   # (T,K,2)
+            elif cfg.box_prompt == 'detector':
+                # DEPLOYABLE: the detector's own box for this animal slot -- its four corners
+                # are the points the crop rule boxes. Needs a detector / detections file.
+                if boxes_stc is None:
+                    raise ValueError('box_prompt = "detector" needs detector boxes '
+                                     '(--detector or --boxes); none were supplied.')
+                db = torch.as_tensor(boxes_stc[a][frames][:, use[0]], dtype=torch.float32)
+                bp_pts = cropmod.box_corners(db)                               # (T,4,2)
+            mkw['box_prompt'] = _deploy_box_prompt(bp_pts, boxes, scales, cgroup, dev)
+        with share_scene(model) if cfg.anchor == 'self' else nullcontext():
+            out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
+                        kpt_prior=None if prior is None else prior.to(dev),
+                        prompt_time=None if prompt_t is None else prompt_t.to(dev),
+                        kpt_chunk=chunk, **mkw)
+            if cfg.anchor == 'self':
+                out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
+                                  kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
+        p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
+        # WHAT THE NEXT WINDOW OPENS ON, and it is not always what this window reports.
         #
-        # ponytail: peak memory is one camera's window of FULL frames plus every animal's crops --
-        # 24 x 21 MB on johnson-mouse's 3208x2200 rig, which has one animal. A wide rig with many
-        # animals would want the frame loop chunked; nothing shipped is both.
-        # AND THE CAMERAS OVERLAP, up to `_CAM_DECODE` of them. This loop used to be serial across
-        # cameras because `dataset._read_video` held ONE global lock, so a second thread would only
-        # have queued on it; the lock is now per container, and different cameras are different
-        # containers. Video is where it matters -- 3dpop decodes at ~44 ms per frame-camera against
-        # a pose forward two orders of magnitude cheaper -- but an image directory gains too, since
-        # `read_frames`'s own per-frame pool is per call and one camera at a time could not fill it.
+        # Under `gridresid_offset = "query"` the reported 3D output is
+        # `query + R @ residual` with ONE anchor per keypoint for the whole window, so feeding
+        # it back as the next window's query closes a loop with GAIN: whatever the prior was
+        # wrong by is re-added, and only the residual carries new information. Measured on
+        # johnson-mouse, where the run is consistently trained so this is not RC0: a drift of
+        # p50 1.3-2.2 mm that changes by only 0.13-0.28 mm/frame (a smoothness ratio of 8-10),
+        # profiled as a SAWTOOTH locked to the window boundary, costing 30% of the animal's
+        # motion. The model has never seen a wrong prior either -- `dataset.py` offers GT
+        # +- i.i.d. 2.5 px or nothing at all -- so nothing trained it to correct one.
         #
-        # THE CAP IS MEMORY, NOT CORES. Each task holds one camera's whole window of FULL frames:
-        # 24 x 21 MB on johnson-mouse's 3208x2200 16-camera rig, so unbounded concurrency there is
-        # 8 GB of transient host memory for a rig that has one animal in it. 4 is decord's own
-        # `ChunkShuffle.mix` number and bounds it at four windows.
-        #
-        # `crops` is written from those threads: the keys are distinct per (animal, camera) and a
-        # dict store is atomic under the GIL, so the result does not depend on the order they land.
-        def decode_crops(plans):
-            crops = {}
-            cams = sorted({c for _, use, *_ in plans for c in use})
+        # `3d_pred_triangulate` is the anchor-free estimate: re-derived from THIS window's
+        # pixels every frame, supervised on every keypoint
+        # (`coords_loss_triangulate_weight` 0.1, `..._reproj_weight` 2.0), and already
+        # repaired for a degenerate solve by `model._query_anchored`. Carrying it leaves the
+        # reported output untouched -- so published numbers stay comparable -- and breaks the
+        # feedback path only.
+        q = None
+        if mode == '2d':
+            # crop pixels -> source pixels: undo the resize, then the crop origin
+            p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
+            # THE SAME TENSOR, deliberately: at one camera there is nothing to triangulate and
+            # the 2D grid head decodes ABSOLUTE pixel bins, so no anchor is being fed its own
+            # output. Every 2D root is therefore bit-identical under either `carry_source`,
+            # which is the free invariance check on this change.
+            q = p
+        elif cfg.carry_source == 'pred':
+            q = p
+        elif out.get('3d_pred_triangulate') is not None:
+            q = out['3d_pred_triangulate'][0].detach().cpu().numpy()
+        # else 3D SINGLE-VIEW: `_query_anchored` substitutes `_rays_fallback` there and
+        # deliberately does not write the key back, and a conf-weighted ray mean is too weak a
+        # position to seed the next window with. `carried[a]` is left alone, so the staleness
+        # bound in `_build_prior` retires it -- which is the honest answer, not a silent one.
+        return p, q, out
 
-            def one(ci, pool):
-                imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
-                # A file that will not decode is a property of the file, not of the animal, so
-                # it takes out every animal that wanted this camera -- which is what the
-                # per-animal decode did too, one animal at a time.
-                ok = not any(im is None for im in imgs)
-                for a, use, boxes, cgroup, *_ in plans:
-                    if ci in use:
-                        i = use.index(ci)
-                        bx = boxes[i]
-                        crops[a, ci] = (_crop_views(imgs, bx, cgroup[i]['size'].tolist())
-                                        if ok else None)
-                del imgs
+    def _process_window(wi, frames, window_cams, plans, crops):
+        """Forward and write every column for one window, given ALREADY-DECODED `crops`.
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                if len(cams) < 2:
-                    one(cams[0], pool) if cams else None
-                else:
-                    # A SECOND POOL: `one` runs in this one and waits on futures in `pool`, and a
-                    # pool that waits on itself deadlocks as soon as both are full.
-                    with ThreadPoolExecutor(max_workers=min(_CAM_DECODE, len(cams))) as cpool:
-                        list(cpool.map(lambda ci: one(ci, pool), cams))
-            return crops
-
-        def forward(plan, crops):
-            """One animal, one window -> its prediction in the SOURCE frame, or None."""
-            a, use, boxes, cgroup, scales, *_ = plan
-            # uint8; the model divides on device. Same contract as the training loader.
-            views = [crops[a, ci] for ci in use]
-            if any(v is None for v in views):
-                return None                     # already marked 'decode failed' above
-            prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
-                                           scales, mode, K, R, cgroup)
-            dev = cfg.device
-            chunk = cfg.kpt_chunk or None
-            views = [v.to(dev) for v in views]
-            cgroup_d = _to_device(cgroup, dev)
-            # ONE encode for both passes of `self`: the pixels are identical, and the encode is
-            # the bulk of the forward. A no-op under `kpt_chunk` (`model._forward_window`).
-            # DEPLOYMENT BOX PROMPT (report 27), 2D single-camera only. GUARDED: when
-            # `box_prompt == 'none'` NO kwarg is passed, so the stock model (whose forward has no
-            # box_prompt parameter) sees the identical call it always did -- byte-identical, pinned
-            # by `tests/test_infer.py`. When on, the box names animal `a` (its own source points
-            # under 'labels', an ORACLE) mapped into the crop frame; the model must be a
-            # `[model].box_prompt` (film/term) checkpoint.
-            mkw = {}
-            if cfg.box_prompt != 'none' and (mode != '2d' or len(use) != 1):
-                # The box is wired for 2D single-camera only (report 27). On a 3D / multi-camera
-                # window it is SKIPPED, not an error: a box model then runs box-withheld (film's
-                # zero-init token, ~= a plain wide model), so the default box recipe is safe on
-                # every root. Warned once via the stdlib, which dedupes.
-                warnings.warn(f'box_prompt {cfg.box_prompt!r} skipped on a {mode} '
-                              f'{len(use)}-camera window (2D single-camera only; report 27)')
-            elif cfg.box_prompt != 'none':
-                if cfg.box_prompt == 'labels':
-                    # ORACLE: the animal's GT keypoints name which animal to return.
-                    bp_pts = torch.as_tensor(src[a][frames], dtype=torch.float32)   # (T,K,2)
-                elif cfg.box_prompt == 'detector':
-                    # DEPLOYABLE: the detector's own box for this animal slot -- its four corners
-                    # are the points the crop rule boxes. Needs a detector / detections file.
-                    if boxes_stc is None:
-                        raise ValueError('box_prompt = "detector" needs detector boxes '
-                                         '(--detector or --boxes); none were supplied.')
-                    db = torch.as_tensor(boxes_stc[a][frames][:, use[0]], dtype=torch.float32)
-                    bp_pts = cropmod.box_corners(db)                               # (T,4,2)
-                mkw['box_prompt'] = _deploy_box_prompt(bp_pts, boxes, scales, cgroup, dev)
-            with share_scene(model) if cfg.anchor == 'self' else nullcontext():
-                out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
-                            kpt_prior=None if prior is None else prior.to(dev),
-                            prompt_time=None if prompt_t is None else prompt_t.to(dev),
-                            kpt_chunk=chunk, **mkw)
-                if cfg.anchor == 'self':
-                    out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
-                                      kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
-            p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
-            # WHAT THE NEXT WINDOW OPENS ON, and it is not always what this window reports.
-            #
-            # Under `gridresid_offset = "query"` the reported 3D output is
-            # `query + R @ residual` with ONE anchor per keypoint for the whole window, so feeding
-            # it back as the next window's query closes a loop with GAIN: whatever the prior was
-            # wrong by is re-added, and only the residual carries new information. Measured on
-            # johnson-mouse, where the run is consistently trained so this is not RC0: a drift of
-            # p50 1.3-2.2 mm that changes by only 0.13-0.28 mm/frame (a smoothness ratio of 8-10),
-            # profiled as a SAWTOOTH locked to the window boundary, costing 30% of the animal's
-            # motion. The model has never seen a wrong prior either -- `dataset.py` offers GT
-            # +- i.i.d. 2.5 px or nothing at all -- so nothing trained it to correct one.
-            #
-            # `3d_pred_triangulate` is the anchor-free estimate: re-derived from THIS window's
-            # pixels every frame, supervised on every keypoint
-            # (`coords_loss_triangulate_weight` 0.1, `..._reproj_weight` 2.0), and already
-            # repaired for a degenerate solve by `model._query_anchored`. Carrying it leaves the
-            # reported output untouched -- so published numbers stay comparable -- and breaks the
-            # feedback path only.
-            q = None
-            if mode == '2d':
-                # crop pixels -> source pixels: undo the resize, then the crop origin
-                p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
-                # THE SAME TENSOR, deliberately: at one camera there is nothing to triangulate and
-                # the 2D grid head decodes ABSOLUTE pixel bins, so no anchor is being fed its own
-                # output. Every 2D root is therefore bit-identical under either `carry_source`,
-                # which is the free invariance check on this change.
-                q = p
-            elif cfg.carry_source == 'pred':
-                q = p
-            elif out.get('3d_pred_triangulate') is not None:
-                q = out['3d_pred_triangulate'][0].detach().cpu().numpy()
-            # else 3D SINGLE-VIEW: `_query_anchored` substitutes `_rays_fallback` there and
-            # deliberately does not write the key back, and a conf-weighted ray mean is too weak a
-            # position to seed the next window with. `carried[a]` is left alone, so the staleness
-            # bound in `_build_prior` retires it -- which is the honest answer, not a silent one.
-            return p, q, out
-
-        crops = decode_crops(plans)
-
+        `crops` is a parameter, not recomputed here -- this is the whole point of prefetching:
+        `_prepare` (below) does `_build_plans` + `decode_crops` on a background thread, and this
+        function must consume that result rather than paying for a second, synchronous decode of
+        the same window. Runs on the MAIN THREAD, in window order -- `carried` is read and
+        written only here, so the prompt sequence (and every published number) is exactly what
+        it was before window-level decode-ahead existed.
+        """
         if cfg.refine:
             # CROP REFINEMENT, label-free. The first pass's own prediction re-enters the crop rule
             # as if it were the labels, so the second pass sees the box a GT crop would have given
@@ -752,7 +791,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             refined = []
             for plan in plans:
                 a, use, boxes, cgroup, scales, *_ = plan
-                got = forward(plan, crops)
+                got = forward(frames, plan, crops)
                 if got is None:
                     refined.append(_at_image_size(plan))
                     continue
@@ -783,11 +822,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     crop_refined[a, wi, ci] = np.asarray(b2[i], np.float32)
                 refined.append((a, use, b2, cg2, sc2, uncropped2))
             plans = refined
-            crops = decode_crops(plans)
+            crops = decode_crops(frames, plans)
 
         for plan in plans:
             a, use, boxes, cgroup, scales, *_ = plan
-            got = forward(plan, crops)
+            got = forward(frames, plan, crops)
             if got is None:
                 continue                        # already marked 'decode failed' above
             p, q, out = got
@@ -841,6 +880,45 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
                               None if vlogit is None else torch.as_tensor(vlogit[j]))
+
+    # THE DRIVER: decode window wi+1 while window wi is forwarded on the GPU, bounded by
+    # `cfg.prefetch_windows` (default 1; dev/reports/31). BIT-EXACT: `_build_plans` and
+    # `decode_crops` never read or write `carried`, and `_process_window` still runs
+    # strictly in window order on the main thread -- so the SEQUENCE of forwards and the
+    # SEQUENCE of `carried` updates are byte-identical to the serial loop; only the
+    # wall-clock OVERLAP with the next window's decode is new. `tests/test_infer.py` pins
+    # this against `prefetch_windows = 0`, which is the exact old code path unchanged --
+    # `_prefetch_pool` is never even created there.
+    #
+    # A prefetched window holds one extra window's worth of `crops` (already cropped to
+    # `image_size`, not full source frames -- `decode_crops` never keeps the full decode
+    # past its own call), so the memory cost of `prefetch_windows = 1` is one more
+    # small-buffer dict, not a second copy of `_CAM_DECODE`'s full-frame budget.
+    n_ahead = max(0, int(cfg.prefetch_windows))
+    _prefetch_pool = ThreadPoolExecutor(max_workers=1) if n_ahead else None
+
+    def _prepare(wi, start):
+        frames, window_cams, plans = _build_plans(wi, start)
+        crops = decode_crops(frames, plans)
+        return frames, window_cams, plans, crops
+
+    try:
+        pending = {}
+        if _prefetch_pool is not None:
+            for j in range(min(n_ahead, len(starts) - 1)):
+                pending[j + 1] = _prefetch_pool.submit(_prepare, j + 1, starts[j + 1])
+        for wi, start in enumerate(starts):
+            if wi in pending:
+                frames, window_cams, plans, crops = pending.pop(wi).result()
+            else:
+                frames, window_cams, plans, crops = _prepare(wi, start)
+            nxt = wi + n_ahead
+            if _prefetch_pool is not None and nxt < len(starts) and nxt not in pending:
+                pending[nxt] = _prefetch_pool.submit(_prepare, nxt, starts[nxt])
+            _process_window(wi, frames, window_cams, plans, crops)
+    finally:
+        if _prefetch_pool is not None:
+            _prefetch_pool.shutdown(wait=True)
 
     out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
                'outcome': outcome, 'crop': crop, 'box_agree': box_agree,

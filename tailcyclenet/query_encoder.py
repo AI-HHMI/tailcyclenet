@@ -502,6 +502,28 @@ class WideQueryEncoder(nn.Module):
                 cube_scale, occlusion=None):
         """Byte-compatible with `QueryEncoder.forward`, so it drops into `_decode_from_scene`.
 
+        Split into `_build_terms` (the fusion terms, up to the gate) and `_gate_and_fuse`, so a
+        box-prompt subclass (`BoxFilmEncoder` / `BoxTermEncoder`) can extend the SAME term list
+        rather than reimplementing this forward -- the one place the fusion terms are built.
+        """
+        terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
+                                       query_time, target_time)
+        return self._gate_and_fuse(terms, ctx)
+
+    def _gate_and_fuse(self, terms, ctx):
+        B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
+        assert len(terms) == self.n_fusion_terms, \
+            f'built {len(terms)} terms but n_fusion_terms is {self.n_fusion_terms}'
+        stack = torch.stack([t.expand(B, T_query, n_cams, self.dim) for t in terms], dim=-2)
+        weights = self.gate(rearrange(stack, 'b t c n d -> b t c (n d)'))
+        combined = torch.einsum('btcn,btcnd->btcd', weights, stack)
+        return self.fusion_mlp(self.fusion_norm(combined))
+
+    def _build_terms(self, preprocessed_views, camera_group, query_coords, query_time,
+                     target_time):
+        """The fusion terms up to (not including) the gate. Returns `(terms, ctx)`; `ctx` carries
+        what a box subclass needs (`B`, `T_query`, `n_cams`, `sizes`, `uniform`, `qpix`, `qt`).
+
         `occlusion` is unused: keypoint ids arrive on `self._kpt_ids`, stashed by
         `PoseTrackerEncoder.forward`. posetail-pose smuggled them through the occlusion channel
         because that was the only per-keypoint channel the library sliced for free; gotcha 5 freed
@@ -597,6 +619,8 @@ class WideQueryEncoder(nn.Module):
             if uniform:
                 embed_patch = embed_patch.expand(B, T_query, n_cams, embed_patch.shape[-1])
             terms.append(_sub_unprompted(self, embed_patch, self.missing_patch))
+        else:
+            qt = None
 
         # -- rig ---------------------------------------------------------------------------
         if self.principal_point_embedding:
@@ -613,9 +637,162 @@ class WideQueryEncoder(nn.Module):
             terms.append(self.linear_intrinsic(torch.cat(
                 [fn, get_fourier_encoding(fn, min_freq=0, max_freq=self.max_freq)], dim=-1)))
 
-        assert len(terms) == self.n_fusion_terms, \
-            f'built {len(terms)} terms but n_fusion_terms is {self.n_fusion_terms}'
-        stack = torch.stack([t.expand(B, T_query, n_cams, self.dim) for t in terms], dim=-2)
-        weights = self.gate(rearrange(stack, 'b t c n d -> b t c (n d)'))
-        combined = torch.einsum('btcn,btcnd->btcd', weights, stack)
-        return self.fusion_mlp(self.fusion_norm(combined))
+        ctx = dict(B=B, T_query=T_query, n_cams=n_cams, sizes=sizes, uniform=uniform,
+                   qpix=qpix, qt=qt, is_2d=is_2d, target_time=target_time)
+        return terms, ctx
+
+
+# ----------------------------------------------------------------------------------------------
+# the box prompt: which-animal-occupies-this-box, as a NON-position input channel
+# ----------------------------------------------------------------------------------------------
+#
+# Report 27. Told which box the target animal occupies -- per frame, per camera -- a box-prompt
+# model can be told which animal to return, WITHOUT the box being a position prior (it carries no
+# per-keypoint position, only the animal's extent). Measured on crowded 2D calms21: at fixed
+# weights the box removes -3.5 mm MPJPE held-out, and in the real window loop on WIDE crops it
+# adds +0.26 MOTA and removes 11.7% fp_dup (the report-24 §9m wide-crop collapse). It SELECTS the
+# named animal at own 0.94 on a shared/union crop against a no-box control's 0.00. It is
+# ROOT-CONDITIONAL by keypoint density (sparse rat-city K=4 selects far less) and
+# GEOMETRY-CONDITIONAL (redundant on a crop already centred on its target, decisive on a
+# shared/off-centre one). Two mechanisms work: `film` (the winner) and `term`; a patch-channel
+# variant was tried and its box conv never trains off zero in a warm start (report 27), so it is
+# not ported.
+#
+# The box arrives as an INSTANCE ATTRIBUTE `self._box_prompt` (T-frame (B,T,C,4) crop-pixel box),
+# stashed by `PoseTrackerEncoder._decode_from_scene` exactly like `_kpt_ids` -- the library's
+# call into the query encoder has a fixed signature with no box slot.
+
+BOX_MODES = ('film', 'term')
+
+
+def _normalize_box(box_prompt, sizes):
+    """(...,C,4) xyxy crop pixels -> (cx,cy,w,h) normalised per camera, the same `/size*2-1` the
+    position terms use, so the box lands in the distribution the fusion gate already expects."""
+    x0, y0, x1, y1 = box_prompt.unbind(-1)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    w, h = x1 - x0, y1 - y0
+    W, H = sizes[..., 0], sizes[..., 1]
+    return torch.stack([cx / W * 2.0 - 1.0, cy / H * 2.0 - 1.0, w / W * 2.0, h / H * 2.0], -1)
+
+
+def _gather_box_by_target_time(box_per_frame, target_time):
+    """(B,T_clip,cams,D) per-FRAME box features gathered onto the (t n) query axis by the
+    library's own `target_time` (B,T_query), the ACTUAL frame each query slot decodes. Safer than
+    re-deriving the t-major tiling by hand, and it sidesteps the `uniform` collapse (target_time
+    is never reduced to width 1 the way qpos/patch are)."""
+    B, T_clip, C, D = box_per_frame.shape
+    idx = target_time.to(torch.float32).round().long().clamp(0, T_clip - 1)      # (B,T_query)
+    idx = repeat(idx, 'b t -> b t c d', c=C, d=D)
+    return torch.gather(box_per_frame, 1, idx)
+
+
+def _box_features(box_prompt, sizes, target_time):
+    """(B,T_clip,cams,4) crop-pixel box -> ((B,T_query,cams,4) normalised, finite mask), gathered
+    per query slot. A NaN frame (no box) yields ok=False, so the missing-box token stands in."""
+    feat = _normalize_box(box_prompt, sizes[None, None])
+    feat = _gather_box_by_target_time(feat, target_time)
+    ok = torch.isfinite(feat).all(-1)
+    return torch.nan_to_num(feat), ok
+
+
+def _sub_missing(term, mask, token):
+    """The box-shaped `_sub_unprompted`: `mask` is already at the query axis's width (from
+    `_box_features`'s gather), so a plain masked blend with the learned no-box token. ONE routine
+    for every box variant."""
+    if term is None:
+        return term
+    m = mask.to(term.dtype)[..., None]
+    return m * torch.nan_to_num(term) + (1.0 - m) * token.view(1, 1, 1, -1)
+
+
+class BoxFilmEncoder(WideQueryEncoder):
+    """`kpt = kpt * (1 + gamma(box)) + beta(box)` -- FiLM on the identity term. THE WINNER
+    (report 27). Per-keypoint by construction, works query-free (the identity term is always
+    built), MIPNet's lambda at the cheapest site -- one linear off the identity term, not buried
+    in a frozen CNN. gamma/beta are ZERO-INITIALISED, so at init this is a bit-identical no-op
+    (`test_box_prompt.py` pins it) and warm start is undisturbed; it only diverges once trained.
+    """
+
+    def __init__(self, *args, box_max_freq=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.box_max_freq = int(box_max_freq if box_max_freq is not None else self.max_freq)
+        self.film = nn.Sequential(nn.Linear(8 * self.box_max_freq + 4, self.dim), nn.GELU(),
+                                  nn.Linear(self.dim, 2 * self.dim))
+        nn.init.zeros_(self.film[-1].weight)
+        nn.init.zeros_(self.film[-1].bias)
+        self.missing_film = nn.Parameter(torch.zeros(2 * self.dim))
+
+    def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
+                cube_scale, occlusion=None):
+        terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
+                                       query_time, target_time)
+        B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
+        box = getattr(self, '_box_prompt', None)
+        if box is not None:
+            feat, ok = _box_features(box, ctx['sizes'], target_time)
+            gb = self.film(torch.cat(
+                [feat, get_fourier_encoding(feat, min_freq=0, max_freq=self.box_max_freq)], -1))
+            gb = _sub_missing(gb, ok, self.missing_film)
+        else:
+            gb = repeat(self.missing_film, 'd -> b t c d', b=B, t=T_query, c=n_cams)
+        gamma, beta = gb[..., :self.dim], gb[..., self.dim:]
+        terms[0] = terms[0] * (1.0 + gamma) + beta          # terms[0] is the identity term
+        return self._gate_and_fuse(terms, ctx)
+
+
+class BoxTermEncoder(WideQueryEncoder):
+    """The box as its own [cx,cy,w,h] Fourier fusion term + one new gate row. Cheapest; scene-level
+    rather than per-keypoint, so slower to earn gate mass than `film` -- but by 10k it matches it
+    (report 27). Warm start inflates the wide parent's gate by NAME into the +1 slot, box row zero,
+    so the pretrained fusion behaviour is preserved rather than reset."""
+
+    def __init__(self, *args, box_max_freq=None, **kwargs):
+        super().__init__(*args, **kwargs)          # term_names() already counts 'box' -> gate sized
+        self.box_max_freq = int(box_max_freq if box_max_freq is not None else self.max_freq)
+        self.linear_box = nn.Linear(8 * self.box_max_freq + 4, self.dim)
+        self.missing_box = nn.Parameter(torch.zeros(self.dim))
+        nn.init.normal_(self.missing_box, std=0.02)
+
+    def term_names(self):
+        return super().term_names() + ['box']
+
+    def stock_term_names(self):
+        """The WIDE parent's term order -- what warm_start's inflate-print reports as the source."""
+        return WideQueryEncoder.term_names(self)
+
+    def inflate_stock_gate(self, weight, bias):
+        """Place the wide parent's N-term gate into this (N+1)-term one BY NAME, box row zero, so
+        warm start preserves the pretrained fusion behaviour instead of dropping the whole gate on
+        a shape mismatch (report 27). Called by `warm_start` because it is named this and the
+        shapes differ."""
+        src, dst = WideQueryEncoder.term_names(self), self.term_names()
+        D = self.dim
+        assert tuple(weight.shape) == (len(src), D * len(src)), \
+            f'checkpoint gate {tuple(weight.shape)} is not ({len(src)}, {D * len(src)})'
+        ix = {n: i for i, n in enumerate(dst)}
+        w = torch.zeros(len(dst), D * len(dst), dtype=weight.dtype)
+        b = torch.zeros(len(dst), dtype=bias.dtype)
+        for i, ni in enumerate(src):
+            for j, nj in enumerate(src):
+                w[ix[ni], ix[nj] * D:(ix[nj] + 1) * D] = weight[i, j * D:(j + 1) * D]
+            b[ix[ni]] = bias[i]
+        return w, b
+
+    def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
+                cube_scale, occlusion=None):
+        terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
+                                       query_time, target_time)
+        B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
+        box = getattr(self, '_box_prompt', None)
+        if box is not None:
+            feat, ok = _box_features(box, ctx['sizes'], target_time)
+            embed_box = self.linear_box(torch.cat(
+                [feat, get_fourier_encoding(feat, min_freq=0, max_freq=self.box_max_freq)], -1))
+            embed_box = _sub_missing(embed_box, ok, self.missing_box)
+        else:
+            embed_box = repeat(self.missing_box, 'd -> b t c d', b=B, t=T_query, c=n_cams)
+        terms.append(embed_box)
+        return self._gate_and_fuse(terms, ctx)
+
+
+BOX_ENCODERS = {'film': BoxFilmEncoder, 'term': BoxTermEncoder}

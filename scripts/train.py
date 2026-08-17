@@ -252,8 +252,10 @@ def run_batch(model, loss_fn, batch, device):
     mode = batch.sample_info['mode']
     _tune_smoothness(loss_fn, int(views[0].shape[1]), batch.sample_info.get('stride', 1),
                      bool(batch.sample_info.get('synth', False)))
+    box = getattr(batch, 'box_prompt', None)
     out = model(views, batch.kpt_ids.to(device), cgroup, mode=mode,
-                kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device))
+                kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device),
+                box_prompt=None if box is None else box.to(device))
     coords_true = batch.coords.to(device)
     try:
         loss = loss_fn(
@@ -318,9 +320,13 @@ def evaluate(model, batches, optimizer, device):
                 return {k: float(v) for k, v in m.items() if np.ndim(v) == 0}
 
             with share_scene(model):
-                out = model(views, kpt_ids, cgroup, mode=mode, kpt_prior=None, prompt_time=None)
+                bx = getattr(batch, 'box_prompt', None)
+                bx = None if bx is None else bx.to(device)
+                out = model(views, kpt_ids, cgroup, mode=mode, kpt_prior=None, prompt_time=None,
+                            box_prompt=bx)
                 free.append(score(out))
-                prompted.append(score(self_prompt(model, views, kpt_ids, cgroup, mode, out)))
+                prompted.append(score(self_prompt(model, views, kpt_ids, cgroup, mode, out,
+                                                  box_prompt=bx)))
     finally:
         model.train()
         if hasattr(optimizer, 'train'):
@@ -388,6 +394,10 @@ def main():
             f'{sorted(known)}')
     lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
                          if k in LoaderConfig.__dataclass_fields__})
+    # THE LOADER EMITS A BOX ONLY FOR A BOX MODEL, and the mode comes from [model].box_prompt so
+    # the two cannot disagree (report 27). A plain run leaves this 'none' and its items keep their
+    # 13-field shape, byte-identical.
+    lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'))
     # Hoisted out of the call because `warm_start` needs it too: it is the evidence that the
     # checkpoint's keypoint table is a PREFIX of this run's, and therefore that its trained rows
     # can be carried over instead of reset.

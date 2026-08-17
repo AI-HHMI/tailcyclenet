@@ -44,7 +44,7 @@ from posetail.posetail.cube import (from_homogeneous, get_camera_scale, to_homog
                                     undistort_points)
 from posetail.posetail.tracker_encoder import TrackerEncoder
 
-from .query_encoder import PoseQueryEncoder, WideQueryEncoder
+from .query_encoder import BOX_ENCODERS, BOX_MODES, PoseQueryEncoder, WideQueryEncoder
 
 QUERY_MODES = ('prior', 'none')
 QUERY_ENCODERS = ('pose', 'wide')
@@ -119,16 +119,22 @@ def scene_center(camera_group):
 
 class PoseTrackerEncoder(TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='pose',
-                 gridresid_offset='query', query_terms=None, **kwargs):
+                 gridresid_offset='query', query_terms=None, box_prompt='none', **kwargs):
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
         assert query_encoder in QUERY_ENCODERS, \
             f'query_encoder must be one of {QUERY_ENCODERS}, got {query_encoder!r}'
         assert gridresid_offset in GRIDRESID_OFFSETS, \
             f'gridresid_offset must be one of {GRIDRESID_OFFSETS}, got {gridresid_offset!r}'
+        assert box_prompt == 'none' or box_prompt in BOX_MODES, \
+            f'box_prompt must be "none" or one of {BOX_MODES}, got {box_prompt!r}'
+        assert box_prompt == 'none' or query_encoder == 'wide', (
+            f'box_prompt = {box_prompt!r} only applies to query_encoder = "wide"; '
+            f'{query_encoder!r} would ignore it.')
         super().__init__(*args, **kwargs)
         self.n_keypoints = n_keypoints
         self.query = query
         self.gridresid_offset = gridresid_offset
+        self.box_prompt = box_prompt
         # None -> encode per forward, the normal path. `share_scene` swaps in a dict.
         self._shared_scene = None
 
@@ -168,14 +174,20 @@ class PoseTrackerEncoder(TrackerEncoder):
                 assert not any(terms.values()), (
                     f'query = "none" supplies no prior, so {[k for k, v in terms.items() if v]} '
                     'would be constant no-query tokens feeding dead gate inputs for the whole run.')
-            self.query_encoder = WideQueryEncoder(
+            # A BOX PROMPT (report 27) swaps in a `WideQueryEncoder` SUBCLASS that consumes a
+            # per-frame animal box as a non-position channel -- `film` (FiLM on the identity term,
+            # the winner) or `term` (its own fusion term). Only `wide` carries it; naming it beside
+            # `pose` is refused in `build_model`. The box rides `self.query_encoder._box_prompt`,
+            # stashed by `_decode_from_scene`.
+            enc_cls = BOX_ENCODERS.get(box_prompt, WideQueryEncoder)
+            self.query_encoder = enc_cls(
                 dim=self.latent_dim, embed_dim=old.embed_dim, decoder_dim=old.decoder_dim,
                 n_frames=old.n_frames, max_freq=old.max_freq, patch_size=old.patch_size,
                 principal_point_embedding=old.principal_point_embedding,
                 intrinsic_embedding=old.intrinsic_embedding,
                 time_embed_mode=old.time_embed_mode, n_keypoints=n_keypoints, **terms)
-            print(f'query encoder: wide, dim {self.latent_dim}, '
-                  f'{self.query_encoder.n_fusion_terms} terms '
+            print(f'query encoder: wide{"" if box_prompt == "none" else "+box:" + box_prompt}, '
+                  f'dim {self.latent_dim}, {self.query_encoder.n_fusion_terms} terms '
                   f'({", ".join(self.query_encoder.term_names())})')
 
     def _forward_window(self, views_norm, *args, **kwargs):
@@ -213,6 +225,9 @@ class PoseTrackerEncoder(TrackerEncoder):
         k0, n = self._kpt_cursor, coords.shape[1]
         self.query_encoder._kpt_ids = self._kpt_ids_all[:, k0:k0 + n]
         self.query_encoder._query_ok = self._query_ok_all[:, k0:k0 + n]
+        # The box is PER FRAME, not per keypoint, so it is NOT sliced by the chunk cursor -- the
+        # whole (B,T,C,4) goes to the encoder, which gathers it onto the query axis by target_time.
+        self.query_encoder._box_prompt = getattr(self, '_box_prompt_all', None)
         self._kpt_cursor = k0 + n
         return super()._decode_from_scene(scene_features, views_norm, coords, *args, **kwargs)
 
@@ -245,7 +260,7 @@ class PoseTrackerEncoder(TrackerEncoder):
         return out
 
     def _forward(self, views, kpt_ids, camera_group, mode, kpt_prior=None, prompt_time=None,
-                 kpt_chunk=None):
+                 kpt_chunk=None, box_prompt=None):
         """
         Args:
             views: list of (B,T,H,W,3) float32 in [0,1], one per camera
@@ -299,6 +314,10 @@ class PoseTrackerEncoder(TrackerEncoder):
                     else torch.zeros((B, K), dtype=torch.bool, device=device))
         self._query_ok_all = query_ok      # local copy survives the `finally` clear below
         self._kpt_ids_all = kpt_ids.to(device).long()
+        # THE BOX PROMPT (report 27), stashed for `_decode_from_scene` to hand the encoder. A box
+        # only reaches the encoder when this model was built with `box_prompt` in ('film','term');
+        # a plain model ignores it, so passing one is harmless (the encoder never reads the stash).
+        self._box_prompt_all = None if box_prompt is None else box_prompt.to(device).float()
         self._kpt_cursor = 0
 
         # The frame the prompt describes. INT and CLAMPED: the library uses this as a
@@ -343,8 +362,10 @@ class PoseTrackerEncoder(TrackerEncoder):
             # silently, and only on multi-call paths like eval and the windowed driver.
             self._query_ok_all = self._kpt_ids_all = None
             self._kpt_cursor = 0
+            self._box_prompt_all = None
             self.query_encoder._query_ok = None
             self.query_encoder._kpt_ids = None
+            self.query_encoder._box_prompt = None
 
         if mode == '2d':
             # No re-anchoring in 2D and nothing to re-anchor onto -- triangulation is None at
@@ -652,6 +673,10 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
                    ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
     assert not (query_terms and enc != 'wide'), (
         f'{sorted(query_terms)} only apply to query_encoder = "wide"; {enc!r} would ignore them.')
+    # THE BOX PROMPT (report 27): 'none' | 'film' | 'term'. Only `wide` reads it; the constructor
+    # refuses it beside `pose`. 'none' is a plain wide model, byte-identical to a config without
+    # the key.
+    box_prompt = cfg.pop('box_prompt', 'none')
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
 
     # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
@@ -678,4 +703,5 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         'PoseTrackerEncoder, so any other value would be silently ignored rather than honoured.')
 
     return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc,
-                              gridresid_offset=offset, query_terms=query_terms, **cfg)
+                              gridresid_offset=offset, query_terms=query_terms,
+                              box_prompt=box_prompt, **cfg)

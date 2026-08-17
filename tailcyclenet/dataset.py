@@ -176,6 +176,16 @@ class LoaderConfig:
     # on rat-city and 0.033 on johnson-mouse, an 8x spread.
     synth_motion_amp: float | str = 'auto'   # peak slide, in BOX SIDES
     synth_motion_frames: int = 0       # T for a synth window; 0 means cfg.n_frames
+    # THE BOX PROMPT (report 27), the DATA side. 'none' | 'film' | 'term' -- when not 'none' the
+    # loader emits a per-frame animal box (`box_prompt.compute_box_prompt`) for a box-prompt model
+    # to consume as a non-position channel. 'none' emits nothing, so a plain run is byte-identical
+    # (the item has one fewer field and `pose_collate` adds no `box_prompt` key). Set by
+    # `scripts/train.py` from `[model].box_prompt` so the two cannot disagree.
+    box_prompt: str = 'none'
+    box_prompt_frames: str = 'all'     # 'all' (per frame) | 'first' (the starting frame's box)
+    box_prompt_dropout: float = 0.0    # fraction of STEPS the box is withheld (no-box token)
+    box_prompt_jitter: float = 0.0     # exposure bias: the deployed box is a DETECTOR box
+    box_prompt_scale_jitter: float = 0.0
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1628,8 +1638,24 @@ class PoseDataset(Dataset):
                'single_view': single_view, 'start': int(frames[0]), 'cameras': cam_names,
                'stride': stride, 'synth': bool(synth)}
 
-        return (views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
-                vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t)
+        out = [views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
+               vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t]
+        # THE BOX PROMPT (report 27), emitted only when a box model is training -- so a plain run
+        # keeps its 13-field item and is byte-identical. The box is the target's extent in THIS
+        # window's crop frame (`box_prompt.compute_box_prompt`), NOT a second copy of the crop
+        # geometry -- it reads the coords the crop already produced.
+        if self.cfg.box_prompt != 'none':
+            from . import box_prompt as bpmod
+            box = bpmod.compute_box_prompt(coords, cgroup, '2d' if R == 2 else '3d')
+            box = bpmod.apply_frames_mode(box, self.cfg.box_prompt_frames)
+            if self.train:
+                if self.cfg.box_prompt_dropout > 0 and rng.random() < self.cfg.box_prompt_dropout:
+                    box = torch.full_like(box, float('nan'))
+                elif self.cfg.box_prompt_jitter > 0 or self.cfg.box_prompt_scale_jitter > 0:
+                    box = bpmod.apply_jitter(box, rng, self.cfg.box_prompt_jitter,
+                                             self.cfg.box_prompt_scale_jitter)
+            out.append(box)
+        return tuple(out)
 
     def _augment(self, imgs, cnum, size, p2d, vis_2d, gray, rng):
         """Appearance augmentation for one camera's T crops. `vis_2d` is mutated by cutout."""
@@ -1738,4 +1764,8 @@ def pose_collate(batch):
     out['kpt_ids'] = torch.stack([b[10] for b in batch])
     out['kpt_prior'] = torch.stack([b[11] for b in batch])
     out['prompt_t'] = torch.stack([b[12] for b in batch])
+    # THE BOX PROMPT (report 27), present only when a box model is training (`_item` appends a
+    # 14th field then). Absent for a plain run, so nothing downstream sees it.
+    if len(batch[0]) > 13:
+        out['box_prompt'] = torch.stack([b[13] for b in batch])
     return out

@@ -261,7 +261,7 @@ def prior_out_of_bounds(p, mode, cgroup):
     return torch.stack(seen).sum(0) < 2
 
 
-def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
+def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_prompt=None):
     """Re-query at the model's OWN frame-0 prediction. THE label-free prompted regime.
 
     `first` is a completed prior-free pass. Its frame-0 pose becomes the prior for a second pass,
@@ -281,8 +281,11 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None):
     prior = p[0][None].clone()                         # (1,K,R), the frame-0 pose
     prior[0, prior_out_of_bounds(prior[0], mode, cgroup)] = float('nan')
     qt = torch.zeros(prior.shape[:2], dtype=torch.int32, device=prior.device)
+    # THE BOX PROMPT carries into the second pass unchanged (report 27): the window has not moved,
+    # so it describes the same crop. `None` (the default) is a plain model, unaffected.
+    mkw = {} if box_prompt is None else {'box_prompt': box_prompt}
     return model(views, kpt_ids, cgroup, mode=mode, kpt_prior=prior, prompt_time=qt,
-                 kpt_chunk=kpt_chunk)
+                 kpt_chunk=kpt_chunk, **mkw)
 
 
 @torch.no_grad()
@@ -674,7 +677,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                             kpt_chunk=chunk, **mkw)
                 if cfg.anchor == 'self':
                     out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
-                                      kpt_chunk=chunk)
+                                      kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
             p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
             # WHAT THE NEXT WINDOW OPENS ON, and it is not always what this window reports.
             #

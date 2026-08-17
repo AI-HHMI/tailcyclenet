@@ -80,11 +80,15 @@ than reimplements (it calls the original with `offset` withheld, then subtracts)
 the depth clamp and any future upstream change are inherited; a 1-D offset takes the original path
 and is bit-identical. `tests/test_patches.py` pins both halves and the end-to-end geometry.
 
-**THE ONLY THING THAT REACHES THE PATCHED PATH IS `synth_motion_*`.** A per-frame crop as a
-*deployment* choice (`moving_crop`) was measured on six roots and deleted (report 23), so the
-moving-crop geometry — `crop.moving_boxes`, `crop_to_points_{2d,3d}_moving`, `apply_crop_moving` —
-now has exactly one consumer: the synthetic camera motion below. Retiring that key too is what
-would make this whole stack, `patches.py` included, deletable.
+**NOTHING IN THE PACKAGE REACHES THE PATCHED PATH ANY MORE, AND THAT MAKES THIS STACK DELETABLE.**
+A per-frame crop as a *deployment* choice (`moving_crop`) was measured on six roots and deleted
+(report 23), which left the moving-crop geometry — `crop.moving_boxes`,
+`crop_to_points_{2d,3d}_moving`, `apply_crop_moving` — with exactly one consumer, the synthetic
+camera motion. **The slide then stopped routing through it** (report 29 §0: the animal moves inside
+a crop that stands still, so there is no per-frame camera), so the only callers left are
+`tests/test_patches.py` and two `tests/test_dataset.py` cases. **This is now a cleanup with no
+measurement blocking it** — the arm the geometry existed for is refuted (report 22) and its
+replacement does not use it.
 
 The `LD_LIBRARY_PATH` prepend in `[tool.pixi.activation.env]` is load-bearing: the env ships
 `libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it
@@ -328,7 +332,7 @@ is double what the config says.
 
 ### Synthetic motion: SLIDE THE ANIMAL, hold the camera still
 
-`synth_motion_prob` / `_amp` / `_frames` (report 22). An annotated group carries ONE labelled frame
+`synth_motion_prob` / `_amp` / `_frames` (reports 22, 29). An annotated group carries ONE labelled frame
 in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus trains NO temporal
 machinery: `SmoothnessLoss` returns 0, temporal attention sees two frames one of which has no
 target. These keys emit a T-frame window instead and **slide the animal through a crop that stands
@@ -378,8 +382,21 @@ a real rat's keypoint displacement over a window is non-rigid** (p50 0.144 at ga
 gap 1 is label noise). `_tune_smoothness` still zeroes the smoothness term on these windows, but
 the reason has lapsed — the target moves now — so re-enabling it is a real follow-up arm.
 
-**UNMEASURED: the slide has trained 12 iterations.** The moving-camera version it replaces is
-measured and refuted; this one is not yet measured at all.
+**MEASURED AND IT IS A NULL (report 29).** rat-city at matched 60k reads a carry cost of **+1.12
+against its control's +1.56 with both MPJPE deltas n.s.** — so the moving-camera version's +4.47 is
+gone and geometry genuinely was that failure's mechanism, but nothing replaces it with a gain. allen
+**cannot measure the endpoint at all**: the carry cost is ±0.01 mm on *both* arms, because in 3D the
+per-frame triangulation de-loops the feedback. johnson is unmeasured and its amp auto-tuned to 0.046
+box sides, the smallest of six roots, so it is predicted near-inert. **Stays default-off; do not tune
+`amp` chasing it** — the live suspect is the background-slides-with-the-animal ceiling, which is a
+compositing or pseudo-label fix and not a config key.
+
+**AND THE `best`/`last` PAIR IS NOT A PROTOCOL ON ITS OWN — READ THE `iteration` OUT OF THE `.pth`.**
+On slide-ratcity `checkpoint_best` is 34,800 against its control's 60,000, and on slide-allen `best`
+and `last` are the SAME file. Only one of four cells was iteration-matched, and the unmatched
+`best/carry` cell reads **−6.53 px "in favour"** of the arm — an under-trained prior doing less
+damage, 10x the matched cell in the opposite direction. Report 22 §8d is the same trap with the sign
+flipped.
 
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, `crop_side_mode`,
 `curriculum`, and `moving_crop`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
@@ -933,8 +950,9 @@ is CIRCULAR under any detector-seeded regime — the model is handed the keypoin
 against — so it must never be quoted as a win for one.
 
 **`--pose-nms` is the one identity lever that works.** `--rotate-deg` survives with its 180-degree
-setting refuted. `synth_motion_*` survives **unmeasured**, and is the sole consumer of the
-moving-crop geometry.
+setting refuted. `synth_motion_*` survives **measured as a null on the one root that can measure it**
+(report 29), and no longer consumes the moving-crop geometry — which leaves that geometry and
+`patches.py` with no in-package caller at all.
 
 ---
 
@@ -972,7 +990,10 @@ is that it is CENTRED, and widening destroys it. The rule is fitted on two roots
 shipping is a second 3D root (or 3dpop's other 57 test groups at `--chunk 500`) plus rat-city as the
 discriminator's test** — one group per root is not enough to license a flag here.
 
-**Larger.** `synth_motion_*` has never been trained. The pose loader's `aug_rotation_deg = 45` has
+**Larger.** `synth_motion_*` is measured and null on rat-city (report 29); what is left is **johnson**
+(unmeasured, predicted near-inert at amp 0.046), **allen re-run iteration-matched at 51,200**, and the
+one change that could plausibly rescue it — stopping the background from sliding with the animal, via
+compositing or real neighbouring frames. The pose loader's `aug_rotation_deg = 45` has
 no accuracy number in either dimension and is the one surviving unmeasured augmentation.
 `--link-boxes` is default-on and never measured. `link_rows`' `max_age = 24` and `birth_age` are
 pinned constants unreachable from any CLI that govern birth and expiry on a long clip.

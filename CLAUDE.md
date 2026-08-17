@@ -932,6 +932,21 @@ outstanding test of the `fp_dup`-must-be-live discriminator — **a rule that sa
 roots a lever will help is worth more than the lever**); `--overlap 12 + --pose-nms 0.6`, predicted
 to displace the current recommendation; `--overlap 16`.
 
+**MEASURED, LARGE, AND DELIBERATELY NOT SHIPPED: a WIDER pass-1 crop under `--refine`** (report 24
+§9m, `scratch/refine_wide/`). Inflating the pass-1 box about its centre is free — the same forward
+on a differently-positioned box, and pass 2's box is a function of the pass-1 PREDICTION, so it does
+not move. On 3dpop, 9 paired cells all agree in sign: MPJPE −6.9 to −15.2 mm, coverage +0.004 to
++0.088, **MOTA +0.011 to +0.099** (3–4x the seed floor), with **p99 better by 83–313 mm in every arm
+while p75 moves ≤ ±1.6** — it deletes catastrophic rows, it does not improve good ones. **INDEPENDENT
+of `--refine-px`** (the same size at full-resolution pass 1), except at 96 px where it is harmful.
+**On calms21 it is a catastrophe**: 1.5x costs +71.18 px and MOTA −1.0229, `fp_dup` +0.4813 — both
+rows on the same mouse on 48% of frames. **The discriminator is one label-free ratio off the
+detection cache: pass-1 crop side ÷ distance to the nearest other animal** (3dpop 0.38, helps;
+calms21 3.81, collapses) — where the crop already spans a neighbour, the only cue for WHICH animal
+is that it is CENTRED, and widening destroys it. The rule is fitted on two roots. **The bar for
+shipping is a second 3D root (or 3dpop's other 57 test groups at `--chunk 500`) plus rat-city as the
+discriminator's test** — one group per root is not enough to license a flag here.
+
 **Larger.** `synth_motion_*` has never been trained. The pose loader's `aug_rotation_deg = 45` has
 no accuracy number in either dimension and is the one surviving unmeasured augmentation.
 `--link-boxes` is default-on and never measured. `link_rows`' `max_age = 24` and `birth_age` are

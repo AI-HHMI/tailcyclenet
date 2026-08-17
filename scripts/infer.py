@@ -69,17 +69,15 @@ def main():
                     help='letterbox size the detector was TRAINED at. Only needed for a '
                          'posetail-pose checkpoint, which keeps it in a config file rather than '
                          'in the weights.')
-    ap.add_argument('--det-score', type=float, default=0.99,
-                    help='objectness floor for a detection. 0.99, not the 0.05 that reads like a '
-                         'floor: the objectness is SATURATED -- 98.5%% of rat-city\'s boxes and '
-                         '99.98%% of 3dpop\'s sit at exactly 1.0 -- so anything between 0.05 and 0.5 '
-                         'moves 1-3%% of boxes and does nothing. At 0.99 it is worth MOTA +0.074 '
-                         '[+0.009, +0.154] on 3dpop with MPJPE -2.11 mm and coverage +0.010 also '
-                         'SIG, and +0.073 on rat-city. The gain is `fp_none`, which is what a score '
-                         'threshold should remove. Its SIZE tracks how many boxes are actually '
-                         'below it (6-8%% on those two, 0.9%% on calms21, where it reads +0.012 '
-                         'n.s.), so a detector whose scores are not saturated wants this lowered -- '
-                         'the per-group box coverage printed below is how that shows up.')
+    ap.add_argument('--det-score', type=float, default=0.5,
+                    help='objectness floor for a detection. 0.5, NOT 0.99: saturation is a '
+                         'property of the RECIPE, not the dataset, and the current detector '
+                         'generation is NOT saturated (q01 0.45-0.84) -- 0.99 keeps only 26-33%% '
+                         'of detections (coverage 0.703, MOTA 0.622) where 0.5 keeps ~99%% '
+                         '(coverage 0.986, MOTA 0.524) and 0.97 maximises identity (MOTA 0.723). '
+                         '0.5 is the coverage-favouring default; 0.97 is the identity-favouring '
+                         'choice. Sweep per checkpoint: read the objectness quantiles recorded in '
+                         'it, and watch the per-group box coverage printed below.')
     ap.add_argument('--det-cache', type=Path, default=None,
                     help='npz of per-group detector boxes; read if it exists, written if not. '
                          'Detection is the expensive half of a run and depends on no model, so '
@@ -101,10 +99,11 @@ def main():
                          '`--no-link-boxes` restores that memoryless pass.')
     ap.add_argument('--box-prompt', default='auto', choices=('auto', 'none', 'labels', 'detector'),
                     help='DEPLOYMENT BOX PROMPT (report 27), 2D single-camera. DEFAULT `auto`: a '
-                         'box-model checkpoint deploys with the box (from the detector if one is '
-                         'given, else the GT `labels` ORACLE) at --crop-inflate 1.5 + --refine; a '
-                         'plain model is unaffected. `labels` is an ORACLE, not a deployment '
-                         'number. `none` forces the box off.')
+                         'box-model checkpoint deploys with the box from the detector at '
+                         '--crop-inflate 1.5 + --refine; a plain model is unaffected. `auto` '
+                         'REFUSES to run a box model without a detector/boxes file rather than '
+                         'silently falling back to ground truth -- `labels` is an EXPLICIT opt-in '
+                         'ORACLE (it warns), `none` forces the box off.')
     ap.add_argument('--crop-inflate', type=float, default=None,
                     help='inflate every crop about its centre. DEFAULT: 1.5 when the box is on '
                          '(the WIDE regime where the box is load-bearing, report 27 section 9m), '
@@ -359,19 +358,34 @@ def main():
                          f'({trained_px}). A reduced first pass is the lever; a larger one is a '
                          'different model.')
     # THE BOX DEPLOYMENT RECIPE (report 27) is the DEFAULT FOR A BOX MODEL and inert otherwise, so
-    # a plain run is unchanged and a box run needs no flags. `--box-prompt auto` resolves to
-    # `detector` (if a detector/boxes file is given) or the `labels` ORACLE, and pulls
-    # crop_inflate -> 1.5, refine -> on, refine_px -> 128 unless the user set them. Explicit flags
-    # always win. A box on a plain model, or a box source with no boxes, resolves to `none`.
+    # a plain run is unchanged and a box run with a detector needs no flags. `--box-prompt auto`
+    # resolves to `detector` when a detector/boxes file is given. It NEVER falls back to the GT
+    # `labels` oracle on its own: a box model with no detector/boxes is an error, because silently
+    # seeding a box from ground truth is eval rule 7's failure mode. `--box-prompt labels` is the
+    # explicit opt-in for the oracle and warns. Auto also pulls crop_inflate -> 1.5, refine -> on,
+    # refine_px -> 128 unless the user set them. Explicit flags always win. A box on a plain model
+    # resolves to `none`.
     model_is_box = config.get('model', {}).get('box_prompt', 'none') != 'none'
     box_prompt = args.box_prompt
     if box_prompt == 'auto':
-        box_prompt = ('detector' if (model_is_box and (args.detector or args.boxes))
-                      else 'labels' if model_is_box else 'none')
+        if model_is_box and (args.detector or args.boxes):
+            box_prompt = 'detector'
+        elif model_is_box:
+            raise SystemExit(
+                'this run is a box model ([model].box_prompt != "none") and --box-prompt auto '
+                'must source the box from pixels, but no --detector or --boxes file was given. '
+                'Pass --detector/--boxes (deployment), --box-prompt labels to EXPLICITLY use the '
+                'GROUND-TRUTH oracle, or --box-prompt none to run the box model with the box '
+                'withheld.')
+        else:
+            box_prompt = 'none'
     if box_prompt != 'none' and not model_is_box:
         print(f'--box-prompt {box_prompt}: this run is not a box model '
               '([model].box_prompt = "none"), so the box is ignored.')
         box_prompt = 'none'
+    if box_prompt == 'labels':
+        print('WARNING: --box-prompt labels seeds the box from GROUND TRUTH. This is an oracle '
+              'upper bound, not a deployment number. Label it as such wherever you quote it.')
     box_on = box_prompt != 'none'
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
     refine = args.refine if args.refine is not None else (True if box_on else None)
@@ -408,19 +422,20 @@ def main():
         det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile, det_objq = load_detector(
             args.detector, device, input_wh=args.det_input_wh)
         # `--det-score` IS NOT PORTABLE ACROSS DETECTOR GENERATIONS, and this is the only place
-        # that can tell. 0.99 was measured on detectors whose objectness is saturated; a
-        # tiled/masked one reads q01 0.45-0.84 and loses two thirds of its detections to the same
-        # number -- coverage 0.703 against 0.986 at 0.50 (dev/reports/21 0b). A warning and not a
-        # refusal, and no automatic threshold: which value is right depends on whether coverage or
-        # identity is the objective (0.50 maximises the first, 0.97 the second), and choosing on
-        # the caller's behalf would hide the trade.
+        # that can tell. Saturation is a property of the RECIPE, not the dataset: 0.99 was
+        # measured on detectors whose objectness is saturated, but a tiled/masked one reads q01
+        # 0.45-0.84 and loses two thirds of its detections to the same number -- coverage 0.703
+        # against 0.986 at 0.50 (dev/reports/21 0b). The DEFAULT is now 0.5 (coverage-favouring)
+        # and 0.97 maximises identity; this stays a warning rather than a refusal so the caller
+        # can choose, and never an automatic threshold, because the right value depends on which
+        # of coverage or identity is the objective.
         if det_objq and args.det_score >= det_objq.get('q50', 0.0):
             print(f'WARNING: --det-score {args.det_score} is at or above this detector\'s MEDIAN '
                   f'objectness ({det_objq["q50"]:.4f}), so it discards at least half of the '
                   f'detections it offers. q01 {det_objq.get("q01", float("nan")):.4f} '
                   f'q10 {det_objq.get("q10", float("nan")):.4f} '
                   f'q90 {det_objq.get("q90", float("nan")):.4f}. This detector is NOT saturated; '
-                  '0.99 was measured against ones that are.', flush=True)
+                  'sweep the threshold -- 0.97 maximises identity, 0.5 coverage.', flush=True)
         # A TILE-TRAINED DETECTOR IS DEPLOYED ON THE WHOLE FRAME AT ITS TRAINING SCALE, and
         # `det_wh` is its TILE size. `detect_group` derives the per-camera input from `det_tile`
         # (frame sizes vary WITHIN a root -- rat-city-annotated ships 4696x2048 beside 4500x2050),
@@ -469,8 +484,8 @@ def main():
     # were in fact exactly the right boxes. Under this form a new option carrying its default leaves
     # the stamp untouched, while any option a run actually set is still in it.
     #
-    # `det_score` is UNCONDITIONAL, and that is the exception the rule needs: its default moved from
-    # 0.05 to 0.99, so "equals the default" means different boxes before and after. Omitting it would
+    # `det_score` is UNCONDITIONAL, and that is the exception the rule needs: its default moved
+    # 0.05 -> 0.99 -> 0.5, so "equals the default" means different boxes before and after. Omitting it would
     # let a cache built under the old default be reused silently under the new one -- precisely the
     # mismatch this stamp exists to catch. Anything whose default may move belongs on this line.
     # `link_rev` for the same reason `det_score` is unconditional: the cache holds boxes that have
@@ -647,10 +662,10 @@ def main():
                           f'{nms_stats.get("nms_pairs", 0)} overlapping pair(s)'
                           + (' (no keypoint branch -- pose-nms is a no-op)' if not nms_stats
                              else ''), flush=True)
-                # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.99 because objectness is
-                # saturated on every detector shipped here; a detector whose scores are NOT
-                # saturated would lose most of its boxes to that, and this line is where that shows
-                # up rather than downstream as an unexplained miss rate.
+                # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.5 (coverage-favouring);
+                # a detector whose scores are NOT saturated would lose most of its boxes to a higher
+                # threshold, and this line is where that shows up rather than downstream as an
+                # unexplained miss rate.
                 filled = float(np.isfinite(det_boxes).all(-1).mean())
                 print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
                       f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')

@@ -18,13 +18,17 @@ detector across datasets is not offered: one letterbox cannot serve both.
 extent. rat-city wants it: its converter dropped noisy points, so 26k train instances carry no
 finite keypoint at all and would otherwise be trained as "no animal here".
 
-`--yolox {trimmed,nano,tiny,s,m,l,x}` is a MODEL-CAPACITY switch, default `trimmed` (the repo's
-bespoke ~0.66M-param net, byte-identical to every detector on record). The named tiers build the
-canonical YOLOX backbone at Megvii's own (depth_mul, width_mul, depthwise) -- see
-`tailcyclenet.detector.yolox.YOLOX_TIERS` -- to test whether the detector is capacity-limited
-rather than resolution-limited (dev/reports/16 §5.3b reached "capacity-limited" for the keypoint
-branch by elimination, never by scaling the model). It is recorded in the checkpoint and
-`load_detector` reconstructs the matching architecture; absent means `trimmed`.
+`--yolox {trimmed,nano,tiny,s,m,l,x}` is a MODEL-CAPACITY switch, DEFAULT `tiny` per user
+instruction (dev/reports/30 section 5.3 found this default is NOT evidence-backed -- `tiny`'s
+apparent downstream lead over `trimmed` on rat-city-combined did not survive its own
+seed-replicate check). `trimmed` is the repo's original bespoke ~0.66M-param net,
+byte-identical to every detector on record before dev/reports/28; pass `--yolox trimmed` to
+restore it. The named tiers build the canonical YOLOX backbone at Megvii's own (depth_mul,
+width_mul, depthwise) -- see `tailcyclenet.detector.yolox.YOLOX_TIERS` -- to test whether the
+detector is capacity-limited rather than resolution-limited (dev/reports/16 §5.3b reached
+"capacity-limited" for the keypoint branch by elimination, never by scaling the model). It is
+recorded in the checkpoint and `load_detector` reconstructs the matching architecture; absent
+means `trimmed` (every checkpoint written before this flag existed).
 
 Every checkpoint is written as its own `detector_it<n>.pth` WITH its scores inside, plus a
 `metrics.json` of the whole history, and both splits are scored each time. A single rolling
@@ -153,10 +157,23 @@ def main():
                     help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
                          'branson-fly each hold a single val group, so the default 8 makes the '
                          'recall readout 8 images; raise it to the group\'s labelled length.')
-    ap.add_argument('--augment', action='store_true',
-                    help='random similarity + brightness on the TRAIN split. Helps where a '
-                         'dataset fits its training data and lags on val; on one that fits '
-                         'neither it is the wrong lever. Read the train/val gap first.')
+    ap.add_argument('--augment', dest='augment', action='store_true',
+                    help='random similarity + brightness on the TRAIN split. ON BY DEFAULT as of '
+                         'dev/reports/30\'s recommendation, so this flag is now a harmless no-op '
+                         'kept for every existing sweep script that already passes it explicitly '
+                         '-- see --no-augment to turn it off. Helps where a dataset fits its '
+                         'training data and lags on val; on one that fits neither it is the wrong '
+                         'lever. Read the train/val gap first.')
+    ap.add_argument('--no-augment', dest='augment', action='store_false',
+                    help='DISABLE the random similarity + brightness on the TRAIN split -- '
+                         '--augment is ON BY DEFAULT as of dev/reports/30\'s recommendation; '
+                         'pass this to restore every earlier recorded recipe\'s off default.')
+    ap.set_defaults(augment=True)
+    ap.add_argument('--no-augment-strong', dest='augment_strong', action='store_false',
+                    help='DISABLE the strong appearance/erasure/mosaic-lite suite --'
+                         '--augment-strong is ON BY DEFAULT as of dev/reports/30\'s '
+                         'recommendation; pass this to restore the off default every detector '
+                         'before it was trained under. See --augment-strong for the recipe.')
     ap.add_argument('--augment-strong', action='store_true',
                     help='LAYERS a strong appearance/erasure/mosaic-lite suite on top of '
                          '--augment (needs it; a no-op without it): color jitter (gamma, '
@@ -167,14 +184,15 @@ def main():
                          'and mosaic-lite (p=0.2 -- copy-paste one WHOLE crop-rule box from a '
                          'different frame into empty space, never a 4-quadrant mosaic, which '
                          'would clip a box and break gotcha 8; undefined under --use-regions). '
-                         'ONE recipe, not five swept levers: this is a deliberate RE-TEST of a '
-                         'mix that includes a lever (additive noise) refuted alone before '
-                         '(dev/reports/21 section 7: MOTA -0.127 SIG, on a detector with no '
-                         'capacity lever, scored on in-domain downstream MOTA) -- the question '
-                         'here is the train/val BOX-SCREEN gap the capacity ladder opened '
-                         '(dev/reports/28 section 2.2/2.3), on a bigger model, as a mix. Off by '
-                         'default and off means none of these draws happen at all -- byte-'
-                         'identical to every recorded detector. Recorded in the checkpoint.')
+                         'ONE recipe, not five swept levers, and NOT independently validated -- '
+                         'dev/reports/30 section 5.1 found most of the box-screen train/val-gap '
+                         'closure this suite appeared to buy on rat-city-combined was actually '
+                         'attributable to --rotate-deg alone, and additive noise (one of the six '
+                         'components here) was separately refuted downstream before (dev/reports/21 '
+                         'section 7: MOTA -0.127 SIG, on a detector with no capacity lever). ON BY '
+                         'DEFAULT PER USER INSTRUCTION, not evidence -- see --no-augment-strong to '
+                         'restore the off default every detector before dev/reports/30 was trained '
+                         'under. Recorded in the checkpoint.')
     ap.add_argument('--reduce', action='store_true',
                     help='decode JPEGs at 1/N via libjpeg where the frame is far above the '
                          'letterbox target. A KEY, not a loader detail: it changes which source '
@@ -182,17 +200,16 @@ def main():
                          'a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block '
                          '-- with a proper box filter. Stored in the checkpoint; inference '
                          'reads it back. No effect on a video root.')
-    ap.add_argument('--rotate-deg', type=float, default=0.0, metavar='DEG',
+    ap.add_argument('--rotate-deg', type=float, default=45.0, metavar='DEG',
                     help='random in-plane rotation, +-DEG, drawn per visit. Needs --augment; 0 is '
                          'off and off is byte-identical (the draw is skipped, not multiplied by '
-                         'zero). DEFAULT-OFF ON EVIDENCE: at 180 on rat-city this is SIGNIFICANTLY '
-                         'WORSE on two roots and two label sources, one direction -- MPJPE '
-                         '+3.33 px hand / +1.28 px tracked, coverage -0.009, idsw x1.7, err p99 '
-                         '+29.9 (dev/reports/21 3a/3b). The knob is kept because that refutes one '
-                         'SETTING on one root, and because a full circle retains no less area than '
-                         'a quarter one, so a smaller amplitude is a different trade rather than '
-                         'obviously a safer one. Recorded in the checkpoint: it changes no tensor '
-                         'shape, so two arms are indistinguishable from the file alone.')
+                         'zero). DEFAULTS TO 45 PER USER INSTRUCTION, NOT EVIDENCE FOR THIS '
+                         'SETTING -- the only measurement on record for THIS knob is at 180 on '
+                         'rat-city, where it was SIGNIFICANTLY WORSE downstream on two roots and '
+                         'two label sources, one direction: MPJPE +3.33 px hand / +1.28 px '
+                         'tracked, coverage -0.009, idsw x1.7, err p99 +29.9 (dev/reports/21 '
+                         '3a/3b). 45 has never been measured downstream on any root. Pass 0 to '
+                         'restore the pre-this-default off behaviour, byte-identical.')
     ap.add_argument('--eval-every', type=int, default=2000)
     ap.add_argument('--eval-batches', type=int, default=25,
                     help='batches per split at each checkpoint. TRAIN is scored too: the '
@@ -237,12 +254,18 @@ def main():
                          'labelling and is unmasked.')
     ap.add_argument('--kpt-weight', type=float, default=1.0)
     ap.add_argument('--kpt-score-weight', type=float, default=1.0)
-    ap.add_argument('--yolox', default='trimmed', choices=['trimmed', *sorted(YOLOX_TIERS)],
+    ap.add_argument('--yolox', default='tiny', choices=['trimmed', *sorted(YOLOX_TIERS)],
                     help='the ARCHITECTURE, not a runtime choice -- it changes the state_dict and '
                          'is recorded in the checkpoint (`load_detector` reads it back; absent '
                          'means `trimmed`, i.e. every checkpoint from before this flag existed). '
-                         '`trimmed` (default) is the repo\'s bespoke ~0.66M-param net, BYTE-'
-                         'IDENTICAL to every detector on record. `nano/tiny/s/m/l/x` instead build '
+                         'DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE: dev/reports/30 '
+                         'section 5.3 found `tiny`\'s apparent downstream lead over `trimmed` on '
+                         'rat-city-combined (4.0 px) was SMALLER than its own seed-replicate swing '
+                         '(8.8 px) and does not survive that check -- no tier is distinguishable '
+                         'from `trimmed` on the evidence collected so far. Pass `--yolox trimmed` '
+                         'to restore the pre-this-default architecture, byte-identical to every '
+                         'detector on record before dev/reports/28. `trimmed` is the repo\'s '
+                         'bespoke ~0.66M-param net. `nano/tiny/s/m/l/x` instead build '
                          'the CANONICAL YOLOX backbone (Focus stem, 5-stage CSPDarknet) at that '
                          'tier\'s official (depth_mul, width_mul, depthwise) -- see '
                          '`tailcyclenet.detector.yolox.YOLOX_TIERS`. This exists to test whether '

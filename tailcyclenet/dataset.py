@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import threading
 from functools import lru_cache
 from pathlib import Path
@@ -171,7 +171,10 @@ class LoaderConfig:
     # Rigid is a fair model of the whole-animal part: measured on rat-city's tracked clip, only
     # ~14% of a real rat's keypoint displacement over a window is non-rigid.
     synth_motion_prob: float = 0.0     # P(a single-label TRAIN window is expanded)
-    synth_motion_amp: float = 0.0      # peak slide, in BOX SIDES -- scale-free across roots
+    # 'auto' MEASURES IT FROM THE ROOT'S OWN TRACKED HALF -- see `measure_slide_amp`. A float
+    # overrides. There is no portable constant: the same window is 0.265 box sides of real motion
+    # on rat-city and 0.033 on johnson-mouse, an 8x spread.
+    synth_motion_amp: float | str = 'auto'   # peak slide, in BOX SIDES
     synth_motion_frames: int = 0       # T for a synth window; 0 means cfg.n_frames
 
 
@@ -646,6 +649,91 @@ def _synth_path(rng, T, amp):
     return np.stack([axis(), axis()], 1)
 
 
+def measure_slide_amp(datasets, n_frames, n_samples=400, seed=0):
+    """How far a real animal moves over a window, in BOX SIDES, measured from the root itself.
+
+    THE POINT IS THAT NOBODY SHOULD TUNE THIS. The right slide is the size of the real thing, and
+    the real thing is not portable: over a 24-frame window the median animal moves 0.265 box sides
+    on rat-city, 0.252 on 3dpop, 0.215 on calms21, 0.123 on branson-fly, 0.075 on allen and 0.033
+    on johnson-mouse -- an 8x spread. A hand-set constant is wrong on five of six roots.
+
+    TWO CHEAPER PROXIES WERE TRIED AND BOTH FAIL. The animal box over the frame size looks right on
+    rat-city (0.044 -> 0.265) and 3dpop (0.038 -> 0.252), then calms21 has 4.6x rat-city's ratio and
+    the SAME displacement and johnson has 2x the ratio and 8x less. Window DURATION explains more --
+    normalising by `n_frames / fps` pulls the spread from 8x to 2.5x -- but `fps` is absent on two
+    of the six roots, so it cannot be the rule either.
+
+    IT GATES ON THE DATA, NOT ON `label_source`. Any window holding TWO labelled frames of one
+    animal measures a displacement; whether the session is called tracked or annotated is a
+    property of how it was made, not of what it can answer. Where the two labelled frames are
+    closer together than the window, the displacement is scaled up to a full window -- otherwise a
+    sparsely labelled source would report an artificially small motion purely because its labels
+    are near each other.
+
+    RANDOM AND BOUNDED. `n_samples` draws of (session, group, animal, start) at a FIXED seed, so it
+    is fast at construction, unbiased by whichever session happens to be enumerated first, and
+    reproducible -- a run has to record the amplitude it actually trained on. Reads LABELS only, so
+    it touches no video and cannot trip gotcha 11.
+
+    Returns None when nothing in the root carries two labelled frames in a window, where there is
+    nothing to measure and a guess would be worse than an error; the caller raises saying so.
+    """
+    cand = [(sess, gid) for ds in datasets for sess in ds.sessions.get('train', [])
+            for gid, g in sess.groups.items() if g.n_frames >= 2]
+    if not cand:
+        return None
+    # WEIGHTED BY FRAME COUNT, not uniform over groups. A `-combined` root is ~2,000 annotated
+    # groups of 65 frames beside THREE tracked groups of up to 57,594, so a uniform draw lands on
+    # a tracked group 0.15% of the time -- and the annotated groups carry one labelled frame each
+    # and can measure nothing. Measured: uniform sampling returned 0.093 box sides on
+    # rat-city-combined from a handful of usable draws, against 0.265 over the same data sampled
+    # by frame. The population this statistic is about is FRAMES.
+    w = np.array([float(sess.groups[gid].n_frames) for sess, gid in cand])
+    w = w / w.sum()
+    rng = np.random.default_rng(seed)
+    disp = []
+    for _ in range(n_samples):
+        sess, gid = cand[int(rng.choice(len(cand), p=w))]
+        lab = sess.labels(gid)
+        vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
+        n = sess.groups[gid].n_frames
+        a = int(rng.integers(vis.shape[0]))
+        v = vis[a].reshape(vis.shape[1], -1)
+        lf = np.flatnonzero((v != UNLABELED).any(-1))
+        if lf.size < 2:
+            continue
+        s0 = int(rng.integers(0, max(1, n - n_frames + 1)))
+        win = lf[(lf >= s0) & (lf < s0 + n_frames)]
+        if win.size < 2:
+            continue
+        cam = sess.cgroup(gid, [0])[0]
+        if lab.points3d is not None:
+            q = project_points_torch([cam], torch.as_tensor(lab.points3d[a, win],
+                                                            dtype=torch.float32))[0]
+        else:
+            q = torch.as_tensor(lab.points2d[a, win, :, 0, :], dtype=torch.float32)
+        per = [cropmod.crop_box_for_points(q[t], cam['size'], 64) for t in range(len(win))]
+        per = [b for b in per if b is not None]
+        if len(per) < 2:
+            continue
+        side = float(np.median([max(float(b[2] - b[0]), float(b[3] - b[1])) for b in per]))
+        c = torch.nanmean(q, dim=1)
+        c = c[torch.isfinite(c).all(-1)]
+        if side <= 0 or len(c) < 2:
+            continue
+        # PEAK-TO-PEAK over the labelled frames, because that is the statistic the synthetic side
+        # reports (`scratch/slide/probe.py`) and the two have to be the same quantity. Endpoint
+        # displacement reads ~2.3x smaller on rat-city, since a wandering animal comes back.
+        # Then scaled up to a full window, so labels that do not span it do not read as a slow
+        # animal.
+        span = max(int(win[-1]) - int(win[0]), 1)
+        disp.append(float((c.max(0).values - c.min(0).values).max()) / side
+                    * (n_frames - 1) / span)
+    # A thin estimate is worse than none: a median over a handful of windows is what the
+    # uniform-sampling bug above produced, and it looked like a number.
+    return float(np.median(disp)) if len(disp) >= 20 else None
+
+
 def _slide_delta(cam, src, pad, path, min_crop_dim):
     """`(T,2)` SOURCE-PIXEL displacement for a slide of `path` box sides, or None.
 
@@ -845,6 +933,33 @@ class PoseDataset(Dataset):
         # and invisible in the loss curve. `Registry.build` raises if an old id would move.
         self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
+        # RESOLVED ONCE, HERE, and printed: a run must record the amplitude it actually trained on,
+        # or the number is unreproducible in exactly the way gotcha 12 describes. Train-only and
+        # only when the lever is on, so nothing else pays for it.
+        if self.train and cfg.synth_motion_prob > 0 and cfg.synth_motion_amp == 'auto':
+            amp, how = measure_slide_amp(self.datasets, cfg.n_frames), 'measured'
+            if amp is None:
+                how = None
+            if amp is None:
+                # FALLBACK 1, and it is measured rather than assumed: normalising the six roots'
+                # real displacement by window DURATION pulls their spread from 8x to 2.5x, around
+                # a median of ~0.29 box sides per second (allen 0.63, 3dpop 0.31, calms21 0.27,
+                # johnson 0.25). Only reachable when nothing in the root carries two labelled
+                # frames in a window -- a purely annotated root -- and only when `fps` is recorded.
+                fps = [g.fps for ds in self.datasets for se in ds.sessions.get('train', [])
+                       for g in se.groups.values() if g.fps]
+                if fps:
+                    amp, how = 0.29 * cfg.n_frames / float(np.median(fps)), 'fps proxy'
+            if amp is None:
+                # FALLBACK 2. There is no portable constant -- that is the whole finding -- so this
+                # is a guess and says so. `fps` is absent on two of the six shipped roots, which is
+                # why this rung exists at all.
+                amp, how = 0.20, 'DEFAULT GUESS'
+            amp = float(np.clip(amp, 0.01, 1.0))
+            self.cfg = cfg = replace(cfg, synth_motion_amp=amp)
+            note = '' if how == 'measured' else f'  <-- {how}, no window had two labelled frames'
+            print(f'synth_motion_amp: auto -> {amp:.3f} box sides ({how}, over '
+                  f'{cfg.n_frames}-frame windows){note}')
         # Appearance augmentation is train-only, and `None` is also the flag the pixel path reads.
         # Val must stay clean: a metric computed on augmented pixels is not comparable to the last
         # one, and `test_val_windows_are_deterministic` would fail outright.

@@ -102,6 +102,18 @@ def chunk_frames(preds, labels, n):
         with np.errstate(all='ignore'):
             span = np.nanmax(full, axis=2) - np.nanmin(full, axis=2)
             extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
+        # THE LABELS' TIME AXIS IS NOT THE PREDICTION'S. A prediction may be a PREFIX of its group
+        # (`--max-frames`), and the label slice below used to be gated on `v.shape[1] == T` -- the
+        # PREDICTION's length -- so for a truncated prediction NO label array matched and every
+        # chunk was handed the WHOLE group's labels. `score` then truncates to the shorter, so chunk
+        # 0 scored against frames 0..n-1 and every later chunk scored its own frames against frames
+        # 0..n-1 AGAIN, i.e. against the wrong ones. Measured on calms21 (6 sessions x 2000 frames,
+        # predictions good to a median 8-11 px in EVERY chunk): coverage 0.9903 unchunked against
+        # 0.4656 at `--chunk 500`, with MOTA 0.76-0.95 on chunk 0 and -0.36 to -1.00 on chunks 1-3
+        # of all six. It reads exactly like a pipeline that falls apart after 500 frames.
+        # Frame indices are absolute within the group for both sides, so the fix is to gate on the
+        # LABELS' own length.
+        lab_T = int(np.asarray(full).shape[1])
         for t0 in range(0, T, n):
             t1 = min(t0 + n, T)
             if t1 - t0 < 2:                       # gotcha 1: T = 1 is not a usable window
@@ -117,7 +129,7 @@ def chunk_frames(preds, labels, n):
             for k, v in fields.items():
                 if isinstance(v, np.ndarray) and v.ndim >= 2 and k != 'regions':
                     # `ext` is (C,T,4,4) -- time on axis 1 as well, so the same rule covers it.
-                    if v.shape[1] == T:
+                    if v.shape[1] == lab_T:
                         fields[k] = v[:, t0:t1]
             if isinstance(fields.get('regions'), np.ndarray) and fields['regions'].size:
                 r = fields['regions']

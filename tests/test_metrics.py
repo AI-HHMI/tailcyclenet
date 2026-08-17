@@ -340,3 +340,49 @@ def test_match_cost_default_reproduces_every_published_number():
             == mota(pred, true, 8.0, cost='mean')['mota'])
     assert (matched_error(pred, true, max_dist=8.0)['err']
             == matched_error(pred, true, max_dist=8.0, cost='mean')['err'])
+
+
+def test_chunking_slices_the_labels_when_the_prediction_is_a_prefix(tmp_path):
+    """A `--max-frames` PREDICTION IS SHORTER THAN ITS GROUP, and every chunk must still be scored
+    against its OWN frames.
+
+    The label slice used to be gated on the PREDICTION's frame count, so for a truncated prediction
+    no label array matched and every chunk was handed the WHOLE group's labels. `score` truncates to
+    the shorter of the two, so chunk 0 scored against frames 0..n-1 and every LATER chunk scored its
+    own frames against frames 0..n-1 again. Measured on calms21 (6 sessions x 2000 frames of a
+    ~19,000-frame group, predictions good to a median 8-11 px in every chunk): coverage 0.9891 with
+    the fix against **0.4656** without, MPJPE 26.5 px against 98.6, and MOTA 0.76-0.95 on chunk 0
+    beside -0.36 to -1.00 on chunks 1-3 of all six sessions. It reads exactly like a pipeline that
+    falls apart after 500 frames, which is why it survived: the shape of the failure names the wrong
+    culprit.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    from tailcyclenet.format import Session
+
+    ev = _eval_module()
+    cf._session_2d(tmp_path / 'ds' / 'test' / 's', T=20)
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    gid = next(iter(sess.groups))
+    labels = {f's/{gid}': (sess.labels(gid), sess)}
+    true = labels[f's/{gid}'][0].points2d[..., 0, :]
+    assert true.shape[1] == 20
+
+    # THE PREDICTION COVERS ONLY THE FIRST 10 FRAMES -- what `--max-frames 10` produces.
+    preds = {f's/{gid}': {'pred': true[:, :10].copy(), 'mode': np.array('2d')}}
+    cp, cl = ev.chunk_frames(preds, labels, 5)
+    assert sorted(cp) == [f's/{gid}#0', f's/{gid}#5'], sorted(cp)
+    for t0 in (0, 5):
+        got = cl[f's/{gid}#{t0}'][0].points2d[..., 0, :]
+        np.testing.assert_array_equal(got, true[:, t0:t0 + 5],
+                                      err_msg=f'chunk {t0} was handed the wrong frames')
+    # ...and the second chunk is a PERFECT prediction of its own frames, so it must score as one.
+    # Unsliced labels made this chunk score frames 5-9 against frames 0-4 and read as a total miss.
+    rows = ev.score(cp, cl, quiet=True)
+    assert len(rows) == 2
+    for r in rows:
+        assert r['coverage'] == pytest.approx(1.0), f'{r["coverage"]} -- exact prediction, full labels'
+        assert r['err'] == pytest.approx(0.0, abs=1e-6), r['err']

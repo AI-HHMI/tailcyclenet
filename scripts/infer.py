@@ -99,14 +99,16 @@ def main():
                          'score-ordered rows, and the union crop spanning several animals. Every 2D '
                          'number in reports 11 and 13 came from an explicit opt-in. '
                          '`--no-link-boxes` restores that memoryless pass.')
-    ap.add_argument('--box-prompt', default='none', choices=('none', 'labels', 'detector'),
-                    help='DEPLOYMENT BOX PROMPT (report 27), 2D single-camera only. `labels` is '
-                         'an ORACLE (GT boxes) -- not a deployment number. Requires a '
-                         '[model].box_prompt (film/term) checkpoint, deployed via '
-                         'scratch/boxprompt/deploy_box.py.')
-    ap.add_argument('--crop-inflate', type=float, default=1.0,
-                    help='inflate every crop about its centre (1.5 = the WIDE regime where the '
-                         'box prompt is load-bearing; report 27 section 9m)')
+    ap.add_argument('--box-prompt', default='auto', choices=('auto', 'none', 'labels', 'detector'),
+                    help='DEPLOYMENT BOX PROMPT (report 27), 2D single-camera. DEFAULT `auto`: a '
+                         'box-model checkpoint deploys with the box (from the detector if one is '
+                         'given, else the GT `labels` ORACLE) at --crop-inflate 1.5 + --refine; a '
+                         'plain model is unaffected. `labels` is an ORACLE, not a deployment '
+                         'number. `none` forces the box off.')
+    ap.add_argument('--crop-inflate', type=float, default=None,
+                    help='inflate every crop about its centre. DEFAULT: 1.5 when the box is on '
+                         '(the WIDE regime where the box is load-bearing, report 27 section 9m), '
+                         'else 1.0.')
     ap.add_argument('--crop-source', default='boxes', choices=('boxes', 'keypoints'),
                     help="where the window's crop comes from. 'boxes' (default) unions the "
                          "detector's per-frame boxes -- what every recorded number uses. "
@@ -346,6 +348,28 @@ def main():
         raise SystemExit(f'--refine-px {args.refine_px} exceeds the run\'s image_size '
                          f'({trained_px}). A reduced first pass is the lever; a larger one is a '
                          'different model.')
+    # THE BOX DEPLOYMENT RECIPE (report 27) is the DEFAULT FOR A BOX MODEL and inert otherwise, so
+    # a plain run is unchanged and a box run needs no flags. `--box-prompt auto` resolves to
+    # `detector` (if a detector/boxes file is given) or the `labels` ORACLE, and pulls
+    # crop_inflate -> 1.5, refine -> on, refine_px -> 128 unless the user set them. Explicit flags
+    # always win. A box on a plain model, or a box source with no boxes, resolves to `none`.
+    model_is_box = config.get('model', {}).get('box_prompt', 'none') != 'none'
+    box_prompt = args.box_prompt
+    if box_prompt == 'auto':
+        box_prompt = ('detector' if (model_is_box and (args.detector or args.boxes))
+                      else 'labels' if model_is_box else 'none')
+    if box_prompt != 'none' and not model_is_box:
+        print(f'--box-prompt {box_prompt}: this run is not a box model '
+              '([model].box_prompt = "none"), so the box is ignored.')
+        box_prompt = 'none'
+    box_on = box_prompt != 'none'
+    crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
+    refine = args.refine if args.refine is not None else (True if box_on else None)
+    refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
+    if box_on:
+        print(f'box deployment recipe (report 27): --box-prompt {box_prompt} '
+              f'--crop-inflate {crop_inflate} --refine{"" if refine else " off"} '
+              f'--refine-px {refine_px}')
     cfg = InferConfig(
         n_frames=args.n_frames or trained_frames,
         overlap=args.overlap, image_size=trained_px,
@@ -353,11 +377,11 @@ def main():
         box_source=config['data'].get('box_source', 'keypoints'),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk,
-        vis_thresh=args.vis_thresh, refine=args.refine, refine_px=args.refine_px,
+        vis_thresh=args.vis_thresh, refine=refine, refine_px=refine_px,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
         crop_source=args.crop_source,
-        box_prompt=args.box_prompt, crop_inflate=args.crop_inflate)
+        box_prompt=box_prompt, crop_inflate=crop_inflate)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

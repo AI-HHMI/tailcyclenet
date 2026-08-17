@@ -208,14 +208,19 @@ def test_deploy_box_prompt_lands_inside_the_crop():
     assert x0 <= 20 and y0 <= 20 and x1 >= 60 and y1 >= 100
 
 
-def test_box_prompt_refuses_3d_and_multicam(scene):
-    """Guard: box_prompt is only wired for 2D single-camera; anything else raises rather than
-    being silently mishandled (report 27)."""
+def test_box_prompt_skipped_on_3d_and_multicam(scene):
+    """Guard: box_prompt is wired for 2D single-camera only; on 3D / multi-camera it is SKIPPED
+    with a warning (not an error), so a box model deploys gracefully on every root (report 27)."""
     model, sess, registry, name = scene
     if sess.mode != '3d':
         pytest.skip('needs the 3D scene')
-    with pytest.raises(ValueError, match='2D single-camera'):
-        run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', box_prompt='labels'))
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        out = run_group(model, sess, 'g000', registry, name,
+                        _cfg(anchor='none', box_prompt='labels'))
+    assert out['pred'].shape[0] >= 1                      # ran to completion, box skipped
+    assert any('2D single-camera' in str(x.message) for x in w)
 
 
 def test_carried_prior_is_bounds_masked_and_dated():

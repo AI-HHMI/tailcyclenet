@@ -47,8 +47,10 @@ query_encoder = "wide"      # "wide" (512-dim, identity + time + the two query t
 # (--crop-inflate 1.5) +0.26 MOTA / -0.117 fp_dup -- it removes the report-24 §9m wide-crop
 # collapse. ROOT-CONDITIONAL by keypoint density (sparse rat-city helps far less) and
 # GEOMETRY-CONDITIONAL (decisive on a shared/wide crop, redundant on one already centred on its
-# target). Deploy with `scripts/infer.py --box-prompt detector --crop-inflate 1.5`.
-box_prompt = "none"
+# target). Deploy with `scripts/infer.py` -- the box DEPLOYMENT recipe (--box-prompt detector
+# --crop-inflate 1.5 --refine) is now the DEFAULT for a box model and inert for a plain one, so
+# no flags are needed. "film" is the shipped default; "none" restores a plain wide model.
+box_prompt = "film"
 # What the 3D residual is an offset FROM. NO DEFAULT -- the two values load the same tensors, so a
 # checkpoint trained under one and built under the other produces numbers instead of an exception
 # (+23.1 mm MPJPE, -0.18 MOTA on 3dpop; gotcha 12). Inert in 2D, where `model.py` returns before

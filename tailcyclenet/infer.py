@@ -652,12 +652,14 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # under 'labels', an ORACLE) mapped into the crop frame; the model must be a
             # `[model].box_prompt` (film/term) checkpoint.
             mkw = {}
-            if cfg.box_prompt != 'none':
-                if mode != '2d' or len(use) != 1:
-                    raise ValueError(
-                        f'box_prompt = {cfg.box_prompt!r} is only wired for 2D single-camera '
-                        f'(report 27); got mode {mode!r} with {len(use)} camera(s). Refused rather '
-                        'than silently mishandled.')
+            if cfg.box_prompt != 'none' and (mode != '2d' or len(use) != 1):
+                # The box is wired for 2D single-camera only (report 27). On a 3D / multi-camera
+                # window it is SKIPPED, not an error: a box model then runs box-withheld (film's
+                # zero-init token, ~= a plain wide model), so the default box recipe is safe on
+                # every root. Warned once via the stdlib, which dedupes.
+                warnings.warn(f'box_prompt {cfg.box_prompt!r} skipped on a {mode} '
+                              f'{len(use)}-camera window (2D single-camera only; report 27)')
+            elif cfg.box_prompt != 'none':
                 if cfg.box_prompt == 'labels':
                     # ORACLE: the animal's GT keypoints name which animal to return.
                     bp_pts = torch.as_tensor(src[a][frames], dtype=torch.float32)   # (T,K,2)

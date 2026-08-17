@@ -33,7 +33,6 @@ tailcyclenet/
   model.py            PoseTrackerEncoder + build_model + the query-free scene centre
   query_encoder.py    PoseQueryEncoder with missing-query tokens
   checkpoints.py      run folders, save/load, warm start, config `extends`
-  patches.py          MONKEYPATCHES THE PINNED LIBRARY -- see Environment
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
   infer.py            THE inference path: one window loop
   detector/           YOLOX-Nano box predictor + cross-view association
@@ -61,34 +60,33 @@ pixi run python -c "import posetail, tailcyclenet"
 pixi run test
 ```
 
-`posetail==0.3.2` comes from **PyPI**, pinned. A checkout of the same version lives at
-`../../posetail/posetail-next` for reading source; do not depend on it by path and do not modify
-it. (posetail-pose's `path = "../posetail-next"` dep is how it ended up importing nothing after a
+`posetail==0.3.5` comes from **PyPI**, pinned. A checkout of the same version lives at
+`../posetail-next` for reading source; do not depend on it by path and do not modify it.
+(posetail-pose's `path = "../posetail-next"` dep is how it ended up importing nothing after a
 directory move.)
 
-**`tailcyclenet/patches.py` MONKEYPATCHES THE PINNED LIBRARY, AND EVERY ENTRY IN IT IS A BUG THAT
-SHOULD BE FIXED UPSTREAM.** It is applied from `tailcyclenet/__init__.py` — importing anything from
-this package applies it — because `posetail`'s own modules bind the patched names by VALUE at their
-import time, so a later patch would reach some call sites and not others. **When the pin moves,
-read that file and delete whatever landed upstream** rather than discovering a double-applied fix.
+**0.3.5 LANDED EVERY WORKAROUND THIS REPO CARRIED — the monkeypatch layer is deleted, not
+maintained** (report 33). Diffing installed 0.3.2 against the 0.3.5 checkout before the upgrade
+showed all four `patches.py` entries verbatim upstream: `cube.project_cam` right-aligns a
+per-frame `(T,2)` camera `offset` (the library assumed `offset` was static; `ext` already
+carried the time axis), `undistort_points` accepts one via the same `_align_offset` helper,
+`get_camera_scale` collapses it to frame 0 (a Jacobian, so exact), and `points_to_rays`
+resolves it from the pinned `ext`. Also landed: `crop_box_for_points` as a public function,
+`TrackerEncoder.forward` re-accepting `scene_features=` and gaining `input_size=`, the T=1
+zero-token guard, the smoothness-order clamp, the occlusion-channel id guard, the `vis_true` /
+`vis_true_cams` both-or-neither guard, moving-cams inference, and a checkpoint config-recording
+refusal that is the upstream version of this repo's `gridresid_offset` no-default rule.
+`tailcyclenet/__init__.py` no longer imports a patches module.
 
-Four entries, all one bug: the library assumes a camera `offset` is static. `cube.project_cam` does
-`p2d = p2d - offset[None, :]`, which prepends exactly one axis and so cannot express a PER-FRAME
-camera offset. The library already carries a time axis on `ext` (`(T,4,4)`); `offset` was never
-given the same treatment. **Upstream fix: right-align the subtraction.** The patch WRAPS rather
-than reimplements (it calls the original with `offset` withheld, then subtracts), so distortion,
-the depth clamp and any future upstream change are inherited; a 1-D offset takes the original path
-and is bit-identical. `tests/test_patches.py` pins both halves and the end-to-end geometry.
-
-**NOTHING IN THE PACKAGE REACHES THE PATCHED PATH ANY MORE, AND THAT MAKES THIS STACK DELETABLE.**
-A per-frame crop as a *deployment* choice (`moving_crop`) was measured on six roots and deleted
-(report 23), which left the moving-crop geometry — `crop.moving_boxes`,
-`crop_to_points_{2d,3d}_moving`, `apply_crop_moving` — with exactly one consumer, the synthetic
-camera motion. **The slide then stopped routing through it** (report 30 §0: the animal moves inside
-a crop that stands still, so there is no per-frame camera), so the only callers left are
-`tests/test_patches.py` and two `tests/test_dataset.py` cases. **This is now a cleanup with no
-measurement blocking it** — the arm the geometry existed for is refuted (report 22) and its
-replacement does not use it.
+**`synth_motion_*` is deleted, not defaulted off** (measured NULL, report 30; the keys now fail
+loudly as unknown). So is the moving-crop geometry it was the last consumer of: `crop.moving_boxes`,
+`crop_to_points_{2d,3d}_moving`, `apply_crop_moving`, `static_offset`, `with_static_offset` and
+`jitter_params` are gone from `crop.py`, and the two `static_offset` call sites use
+`cam['offset']` / the raw cgroup directly — identical on every shipped root, since nothing
+carries a `(T,2)` offset any more and 0.3.5 collapses one inside `get_camera_scale` anyway.
+`format.py`'s moving-rig support (`moving_ext` / `extrinsics.pq` / `moving = true`) is KEPT —
+that is the format spec's contract, and 0.3.5 now supports it end to end; no shipped root
+exercises it.
 
 The `LD_LIBRARY_PATH` prepend in `[tool.pixi.activation.env]` is load-bearing: the env ships
 `libstdc++.so.6.0.35`, the host may ship 6.0.29 with no `CXXABI_1.3.15`, and without it
@@ -330,80 +328,35 @@ only as a comment in that file; `feature_planes_levels` does not appear at all),
 only the two conf losses. `coords_loss_direct_weight` is applied **twice**, so its effective weight
 is double what the config says.
 
-### Synthetic motion: SLIDE THE ANIMAL, hold the camera still
+### Synthetic motion: DELETED, measured NULL
 
-`synth_motion_prob` / `_amp` / `_frames` (reports 22, 29). An annotated group carries ONE labelled frame
-in 65, so the derived-T rule gives it T = 2 and the annotated half of the corpus trains NO temporal
-machinery: `SmoothnessLoss` returns 0, temporal attention sees two frames one of which has no
-target. These keys emit a T-frame window instead and **slide the animal through a crop that stands
-still** — in 2D the displacement is added to the coordinates, in 3D it moves the world point, sized
-through `get_camera_scale` so one `amp` means the same crop-width displacement on a px session and
-a mm one. The static crop rule then bounds the SLID points, which makes the box the UNION over the
-window: exactly the crop inference builds, inflated by exactly how far the animal walked.
-
-**IT FIRES ON A WINDOW REACHING ONE LABEL, AND `first == last` IS NOT THAT TEST.** The gate is
-`near.size == 1`. `first == last` looks like the same question and is the opposite one: the
-wide-span fallback sets it when a window reaches MORE labels than T can span, the normal case on a
-densely tracked group. Gating on it froze **173 of 175 sampled rat-city-combined TRACKED windows**
-while the probe reported a healthy 99% synth rate. **A synth RATE cannot tell you WHICH windows
-synthesised** — check it equals `annot_frac`, and instrument by `label_source` if it does not.
-
-**THE FIRST VERSION MOVED THE CAMERA AND THAT IS WHY IT FAILED.** It gave the window a per-frame
-`offset`, `ext` at `(T,4,4)` and the library's `moving` flag, where deployment presents ONE STATIC
-camera per window. Measured at 60k on rat-city-combined (report 22 §8): prompted, all three arms
-are indistinguishable (`self` 7.990 / 8.021 / 7.901 px) and their **carry costs separate 7 px** —
-+1.33 (ctrl), +4.47 (pan), +9.30 (pan+roll), monotone in the amount of synthetic motion. The arm
-existed to train the carry shape and carry was the one regime it degraded. The ROLL
-(`synth_motion_deg`) is refuted outright, −2.8 to −3.3 px with four of four cells significant, and
-the key is **deleted** so an old config fails loudly on an unknown key.
-
-**IN 3D THE PIXELS ARE APPROXIMATE AND THE LABELS ARE NOT.** A world translation does not project
-to a pure 2D translation — each keypoint's displacement scales with its own depth — so each camera
-gets a per-frame **affine fitted to the true projected displacements** (`_fit_affine`), and the
-labels are the exact projection. Measured on 3dpop at amp 0.15, median residual against the true
-projection: **0.17 crop px for the affine against 0.53 for a translation**; a homography reaches
-0.14 for a nonlinear solve and is refused. The affine's advantage IS the depth ramp along an
-elongated body — on a random point cloud it has nothing to fit and reads slightly worse than a
-robust median shift, which is why `tests` uses a tilted-body fixture and not random points.
-This also retires the old design's worst property: the 3D world target now genuinely MOVES.
-
-**`synth_motion_amp = 0.25` IS CALIBRATED, NOT CHOSEN.** `scratch/slide/calibrate_amp.py` measures
-what a real rat does over a 24-frame window on the tracked sessions — displacement **p50 0.275 box
-sides**, union-crop inflation p50 1.141 against CLAUDE.md's own 1.23 — and `probe.py` measures what
-the loader realises: amp 0.25 → p50 0.294. Retention is no longer a tunable: the box is built to
-CONTAIN the slide, so `inside` reads 100% on 2D at every amp. (In 3D `inside` is not an invariant —
-a keypoint legitimately projects outside some cameras' views.)
-
-**WHAT IT STILL DOES NOT DO.** The animal is RIGID and **the background slides with it**, because
-one frame warped is all there is — so the model can still solve a synth window by tracking the
-background. Only real neighbouring frames (pseudo-labels) or compositing fix that. Rigid is a fair
-model of the whole-animal part: measured on rat-city's tracked clip by Umeyama fit, only **~14% of
-a real rat's keypoint displacement over a window is non-rigid** (p50 0.144 at gap 23; the 0.383 at
-gap 1 is label noise). `_tune_smoothness` still zeroes the smoothness term on these windows, but
-the reason has lapsed — the target moves now — so re-enabling it is a real follow-up arm.
+`synth_motion_prob` / `_amp` / `_frames` (reports 22, 29, 30) are **gone** — removed with the
+0.3.5 upgrade (report 33), not defaulted off, so an old config naming them fails loudly. What
+they did, for the record: an annotated group carries ONE labelled frame in 65, so the derived-T
+rule gives it T = 2 and the annotated half of the corpus trains NO temporal machinery. The keys
+emitted a T-frame window instead and **slid the animal through a crop that stands still** — in 2D
+the displacement was added to the coordinates, in 3D it moved the world point, sized through
+`get_camera_scale` so one `amp` meant the same crop-width displacement on a px session and a mm
+one. The static crop rule then bounded the SLID points, making the box the UNION over the window.
 
 **MEASURED AND IT IS A NULL (report 30).** rat-city at matched 60k reads a carry cost of **+1.12
-against its control's +1.56 with both MPJPE deltas n.s.** — so the moving-camera version's +4.47 is
-gone and geometry genuinely was that failure's mechanism, but nothing replaces it with a gain. allen
-**cannot measure the endpoint at all**: the carry cost is ±0.01 mm on *both* arms, because in 3D the
-per-frame triangulation de-loops the feedback — and johnson's carry cost is negative on both arms for
-the same reason, so **the endpoint is measurable on exactly one root in this repo**. johnson is the one
-root with a positive signal (+1.41 to +3.44 mm, 4 of 4 cells SIG) and **94% of that is two chunks whose
-mean is 112 mm against a median of 4** — both arms break on the same chunks, so the defensible size is
-the **~3% in the working regime**, on 6 of 6 chunks. **Stays default-off; do not tune `amp` chasing
-it** — the live suspect is the background-slides-with-the-animal ceiling, which is a compositing or
-pseudo-label fix and not a config key. **And amp did NOT predict where the arm would act**: johnson's
-auto-tuned to 0.046 box sides, the smallest of six roots, which predicted near-inert and was wrong.
-
-**AND THE `best`/`last` PAIR IS NOT A PROTOCOL ON ITS OWN — READ THE `iteration` OUT OF THE `.pth`.**
-On slide-ratcity `checkpoint_best` is 34,800 against its control's 60,000, and on slide-allen `best`
-and `last` are the SAME file. Only one of four cells was iteration-matched, and the unmatched
-`best/carry` cell reads **−6.53 px "in favour"** of the arm — an under-trained prior doing less
-damage, 10x the matched cell in the opposite direction. Report 22 §8d is the same trap with the sign
-flipped.
+against its control's +1.56 with both MPJPE deltas n.s.** — the moving-camera first version's
++4.47 is gone and geometry genuinely was that failure's mechanism, but nothing replaces it with a
+gain. allen **cannot measure the endpoint at all**: the carry cost is ±0.01 mm on *both* arms,
+because in 3D the per-frame triangulation de-loops the feedback — and johnson's carry cost is
+negative on both arms for the same reason, so **the endpoint was measurable on exactly one root in
+this repo**. johnson was the one root with a positive signal (+1.41 to +3.44 mm, 4 of 4 cells SIG)
+and **94% of that is two chunks whose mean is 112 mm against a median of 4** — both arms break on
+the same chunks, so the defensible size was the **~3% in the working regime**, on 6 of 6 chunks.
+The live suspect was the background-slides-with-the-animal ceiling, which is a compositing or
+pseudo-label fix and not a config key. The `best`/`last` iteration trap (report 22 §8d — an
+under-trained `best` reading 10x the matched cell, sign flipped) is a general eval rule and
+survives in this file under "checkpoint_best IS SELECTED ON val".
 
 Still deleted, deliberately: `kpt_table_mlp`, the crowd head, distractor crops, `crop_side_mode`,
-`curriculum`, and `moving_crop`. CLAUDE.md used to claim wide beat pose "3.395 vs 4.021 mm" — that
+`curriculum`, `moving_crop`, and — with the 0.3.5 upgrade — `synth_motion_*` and the
+moving-crop geometry it was the last consumer of (report 33). CLAUDE.md used to claim wide beat
+pose "3.395 vs 4.021 mm" — that
 is a **two-lever** comparison; the one-key figure is **3.535 vs 4.021**, unpaired, one seed, no CI,
 never re-run.
 
@@ -573,10 +526,12 @@ paired) at a quarter of the pass-1 pixels; 96–128 give back ~1.7 mm but recove
 target (`PadToSize` — disabled, or the crop sits in the corner of a zero canvas at 4x the error for
 no speedup), the 2D head's fixed output canvas (a WEIGHT SHAPE; the head reports at normalised
 position × `image_size` whatever the input size, so callers rescale), and **the pixel extent of the
-input** — which `model._input_extent` corrects at all three sites that read it that way. In 2D that
-correction may be post-hoc, because `run_group` undoes the resize externally; **in 3D there is no
-back-mapping at all** — `coords_pred` is already world — so it must land inside the forward. All
-three are library bugs (report 26 §5b/5c/5d), all silent, and the two that matter are worth 45.2 mm
+input**. posetail 0.3.5 splits the third out as `input_size=` on `TrackerEncoder.forward`, and
+`model.forward` passes the cameras' own extent (`px = max(c['size'])`) through, so the pad target,
+the 2D-head rescale and the gauge corrections all land inside the forward at every site that read
+`image_size` that way (report 26 §5b/5c/5d). The 2D post-hoc rescale in `model.forward` is gone
+because the library's `2d_pred` is already in input pixels; `run_group`'s external `scales` division
+is unchanged. All three were library bugs, all silent, and the two that matter were worth 45.2 mm
 on the triangulation and exactly `image_size/px` on the gridresid residual.
 
 **AND THE UNCORRECTED VERSION READS BETTER ON MEAN MPJPE, which is a box-size confound.** Skipping
@@ -771,10 +726,10 @@ MPEG-4 Part 2, and at 3840x2160 that is 32,400 macroblocks against NVDEC's 8,192
 
 ## Gotchas — every one of these has already cost someone a day
 
-1. **T = 1 is not usable.** `encoder_decoder.py:748` computes `gT = T // tubelet_size` → 0, so the
-   pos_embed is zero-length; `tracker_encoder.py:518` has the same shape. The fix existed on the
-   abandoned `memory` branch and was **lost in the moving-cams merge**. Never sample fewer than 2
-   frames; single-frame groups are padded at ingest.
+1. **T = 1 is not usable.** `encoder_decoder.py` computes `gT = T // tubelet_size` → 0, so the
+   pos_embed is zero-length. **FIXED UPSTREAM in 0.3.5**: a clip shorter than one tubelet now
+   raises (`view.shape[1] < tubelet_size`), and `gT` is derived from the tokens the encoder
+   actually produced. Never sample fewer than 2 frames; single-frame groups are padded at ingest.
 
    Relatedly, **a training window's T is derived, not configured.** `[data].n_frames` is only a
    ceiling: `_frames` sizes each train window to the labelled span it covers, rounded up to an even
@@ -790,9 +745,10 @@ MPEG-4 Part 2, and at 3840x2160 that is 32,400 macroblocks against NVDEC's 8,192
    it exists to catch is white and s-independent. **This used to be documented backwards.** And
    `SmoothnessLoss` raises below `order + 1` frames, so the order is clamped per batch; at T = 2 it
    degrades to a first difference rather than being disabled.
-2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x.**
-   Encoder sharing for inference goes through `SceneRepresentation` directly, or the private
-   `_forward_window` / `_decode_from_scene`.
+2. **`scene_features=` and `cube_scale=` were dropped from `TrackerEncoder.forward` in 0.3.x —
+   RESTORED in 0.3.5.** `forward` takes `scene_features=` again (plus `input_size=`), and
+   `share_scene` / `_forward_window` pass the stashed encode through that argument instead of
+   routing around the public API. `cube_scale` remains a derived quantity, not an argument.
 3. **`batch_size` is structurally 1.** `custom_collate` keeps only item 0's `cgroup` and the model
    takes one camera group per batch. This is why there is no DDP. Known ceiling, not a bug to fix
    casually.
@@ -800,17 +756,23 @@ MPEG-4 Part 2, and at 3840x2160 that is 32,400 macroblocks against NVDEC's 8,192
    shrinks and positions stop matching ids. The loader must never filter. **This failure is
    invisible in the loss curve.**
 5. **Keypoint ids ride in the occlusion channel**, and the stock `QueryEncoder` clamps
-   `occlusion+1` into `[0,2]`. Never share that tensor between the two consumers.
-6. **`vis` and `vis_2d` are both-or-neither** — supplying one dies inside einops. And
+   `occlusion+1` into `[0,2]`. **0.3.5 makes the misuse loud** — values outside `{-1,0,1}` raise —
+   but the rule stands: never share that tensor between the two consumers.
+6. **`vis` and `vis_2d` are both-or-neither** — supplying one dies inside einops (0.3.5 adds the
+   same guard on the loss side, so the silent discard is also loud now). And
    `get_eval_metrics` wants the trailing dim `(B,T,N,1)`.
 8. **The crop rule is exact, not approximate.** `crop.py` is lifted verbatim from posetail-pose's
-   verified copy (`crop_box_for_points` does not exist in 0.3.x). A test asserts it is int32-exact
-   against `crop_cgroup_to_points`. If that fails, **every detector number is invalid.**
-9. **Moving-camera inference is not supported upstream.** `load_camera_group_from_metadata` ignores
-   `moving_cams` entirely; we build the camera group via `format_camera_group(..., moving_ext=)`.
-   Only `TrackerEncoder` is moving-cam-safe — `ScorerEncoder` and `TrackerTapNext` shape-error on
-   `(T,3)` centres. **No shipped root has a moving rig** — every `calibration.toml` reads
-   `moving = false` and no `extrinsics.pq` exists anywhere — so this path is exercised by nothing.
+   verified copy. posetail 0.3.5 now exposes the same rule as a public `crop_box_for_points`
+   (report 26 #23), and the local one stays as a documented superset: it adds `pad` (0 for a
+   caller holding an already-padded stored extent) and None on an all-NaN input, both load-bearing
+   for the detector. A test asserts it is int32-exact against `crop_cgroup_to_points`. If that
+   fails, **every detector number is invalid.**
+9. **Moving-camera inference was not supported upstream.** 0.3.5's
+   `load_camera_group_from_metadata` honours `moving_cams: true`; we build the camera group via
+   `format_camera_group(..., moving_ext=)`. Only `TrackerEncoder` is moving-cam-safe —
+   `ScorerEncoder` and `TrackerTapNext` shape-error on `(T,3)` centres. **No shipped root has a
+   moving rig** — every `calibration.toml` reads `moving = false` and no `extrinsics.pq` exists
+   anywhere — so this path is exercised only by the synthetic fixtures in the tests.
 10. **allen-mouse's npz is column-sorted.** `pose3d.npz['pose']` is ordered by
    `sorted(f'{name}_{axis}')` while `keypoints` is name-sorted, which transposes all 8 `X` /
    `X-base` pairs — 16 of 47 keypoints. The converter applies the permutation once. Zipping `pose`
@@ -928,7 +890,8 @@ site.
 `--seam blend`, `--moving-crop`.
 **Detector training:** `--ignore-band`, `--ema-decay`, `--warmup-frac`, `--augment-photometric`,
 `--identity` / `--id-weight` (and the YOLOX identity head behind them).
-**Config:** `moving_crop`; the dead loss weights `gamma`, `feature_loss_weight`, `pixel_thresh`; the
+**Config:** `moving_crop`; `synth_motion_*` (report 33 — a measured null, deleted with the 0.3.5
+upgrade); the dead loss weights `gamma`, `feature_loss_weight`, `pixel_thresh`; the
 inert model keys `corr_radius`, `use_volume_embedding`, `occlusion_embedding`, `mode_3d`,
 `cross_attn_dim`; and six `configs/datasets/*.toml` keys nothing ever read.
 **Never built, measured in `scratch/` and refuted there:** an `--anchor self` fixed-point iteration,
@@ -966,9 +929,9 @@ is CIRCULAR under any detector-seeded regime — the model is handed the keypoin
 against — so it must never be quoted as a win for one.
 
 **`--pose-nms` is the one identity lever that works.** `--rotate-deg` survives with its 180-degree
-setting refuted. `synth_motion_*` survives **measured as a null on the one root that can measure it**
-(report 30), and no longer consumes the moving-crop geometry — which leaves that geometry and
-`patches.py` with no in-package caller at all.
+setting refuted. `synth_motion_*` was measured as a null on the one root that can measure it
+(report 30) and is **deleted** with the 0.3.5 upgrade (report 33), along with the moving-crop
+geometry and `patches.py` it was the last consumer of.
 
 ---
 
@@ -1006,13 +969,13 @@ is that it is CENTRED, and widening destroys it. The rule is fitted on two roots
 shipping is a second 3D root (or 3dpop's other 57 test groups at `--chunk 500`) plus rat-city as the
 discriminator's test** — one group per root is not enough to license a flag here.
 
-**Larger.** `synth_motion_*` is measured: null on rat-city, unmeasurable on allen, **+3% in the working
-regime on johnson** (report 30). What is left is **johnson's other two clips** and **why two of its six
-chunks break on both arms** — a clip or box-path failure that is 94% of that root's headline delta and
-worth more than the lever — plus **allen re-run iteration-matched at 50,000** (both sides have that
-checkpoint) and the one change that could plausibly rescue the arm: stopping the background from
-sliding with the animal, via compositing or real neighbouring frames. The pose loader's
-`aug_rotation_deg = 45` has
+**Larger.** `synth_motion_*` is DELETED (report 33) — measured: null on rat-city, unmeasurable on
+allen, **+3% in the working regime on johnson** (report 30). What the null leaves behind is
+**johnson's other two clips** and **why two of its six chunks break on both arms** — a clip or
+box-path failure that is 94% of that root's headline delta and worth more than the lever ever was
+— plus **allen re-run iteration-matched at 50,000** (both sides have that checkpoint) and the one
+change that could plausibly have rescued the arm: stopping the background from sliding with the
+animal, via compositing or real neighbouring frames. The pose loader's `aug_rotation_deg = 45` has
 no accuracy number in either dimension and is the one surviving unmeasured augmentation.
 `--link-boxes` is default-on and never measured. `link_rows`' `max_age = 24` and `birth_age` are
 pinned constants unreachable from any CLI that govern birth and expiry on a long clip.

@@ -28,11 +28,12 @@ LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 
 [tool.pixi.pypi-dependencies]
 # posetail is a LIBRARY here and is never modified: pinned to the PyPI release, not a path dep.
-# A checkout lives at ../../posetail/posetail-next for READING only.
-# 0.3.2 masks non-finite visibility targets (BCELossVis). Before it, a three-state visibility
-# annotation silently returned NaN gradients while the loss curve looked healthy, and the loader
-# had to collapse "not assessed" into "not visible". See dev/reports/02_model_and_training.md.
-posetail = "==0.3.2"
+# A checkout lives at ../posetail-next for READING only.
+# 0.3.5 lands every workaround this repo carried (see dev/reports/32_posetail_035_upgrade.md):
+# the four cube.py offset patches, crop_box_for_points, TrackerEncoder input_size=/scene_features=,
+# the T=1 guard, the smoothness clamp and the occlusion/vis guards. 0.3.2 masked non-finite
+# visibility targets (BCELossVis); 0.3.5 keeps that and adds the rest.
+posetail = "==0.3.5"
 # The pytorch branch, not PyPI's 0.8.0: its Camera is an nn.Module whose projection,
 # triangulation and Jacobians are torch ops, so camera geometry runs on GPU alongside the model
 # instead of round-tripping through numpy. Declares itself 0.7.2, which satisfies posetail's

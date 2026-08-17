@@ -32,7 +32,6 @@ from einops import rearrange, repeat
 
 from posetail.posetail.cube import is_point_visible, project_points_torch
 
-from . import crop as cropmod
 from posetail.posetail.encoder_decoder import PatchProcessor, QueryEncoder, sample_patches
 from posetail.posetail.utils import get_fourier_encoding
 
@@ -199,9 +198,11 @@ class PoseQueryEncoder(QueryEncoder):
         # Both this and the visibility branch below exist in the stock QueryEncoder and were lost
         # in the port (posetail-pose's kpt_query_encoder.py:361,392 dropped them too; it never
         # ran a moving rig through its own encoder).
-        # A PER-FRAME OFFSET IS A MOVING CAMERA TOO. `--moving-crop` leaves `ext` static and varies
-        # `offset`, but every branch this flag guards -- the (b,t,n) reshape before projecting, and
-        # the per-frame visibility -- is needed for exactly the same reason.
+        # A PER-FRAME OFFSET IS A MOVING CAMERA TOO: `ext` stays static while `offset` varies,
+        # and every branch this flag guards -- the (b,t,n) reshape before projecting, and the
+        # per-frame visibility -- is needed for exactly the same reason. Nothing in this repo
+        # builds a (T,2) offset any more, but posetail >= 0.3.5 supports it end to end and the
+        # encoder's guard stays for a rig that has one.
         moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
                                    for c in camera_group)
         T_clip = preprocessed_views[0].shape[1]
@@ -268,8 +269,7 @@ class PoseQueryEncoder(QueryEncoder):
 
         embed_pp = embed_intrinsic = None
         if self.principal_point_embedding:
-            ppt = torch.stack([(c["mat"][:2, 2] - cropmod.static_offset(c["offset"])
-                                ).to(query_coords.dtype)
+            ppt = torch.stack([(c["mat"][:2, 2] - c["offset"]).to(query_coords.dtype)
                                for c in camera_group])
             ppn = repeat(ppt / sizes * 2.0 - 1.0, 'cams r -> b t cams r', b=B, t=Tq)
             embed_pp = self.linear_pp(torch.cat(
@@ -574,9 +574,10 @@ class WideQueryEncoder(nn.Module):
         # and recomputes a constant term at full width on every query-free step.
         qpix, uniform = None, False
         if self.query_pos_embedding or self.query_patch_embedding:
-            # A PER-FRAME OFFSET IS A MOVING CAMERA TOO. `--moving-crop` leaves `ext` static and varies
-            # `offset`, but every branch this flag guards -- the (b,t,n) reshape before projecting, and
-            # the per-frame visibility -- is needed for exactly the same reason.
+            # A PER-FRAME OFFSET IS A MOVING CAMERA TOO: `ext` stays static while `offset` varies,
+            # and every branch this flag guards -- the (b,t,n) reshape before projecting, and the
+            # per-frame visibility -- is needed for exactly the same reason. Nothing in this repo
+            # builds a (T,2) offset any more; the guard stays for a rig that has one.
             moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
                                        for c in camera_group)
             T_clip = preprocessed_views[0].shape[1]
@@ -624,8 +625,7 @@ class WideQueryEncoder(nn.Module):
 
         # -- rig ---------------------------------------------------------------------------
         if self.principal_point_embedding:
-            ppt = torch.stack([(c["mat"][:2, 2] - cropmod.static_offset(c["offset"])
-                                ).to(query_coords.dtype)
+            ppt = torch.stack([(c["mat"][:2, 2] - c["offset"]).to(query_coords.dtype)
                                for c in camera_group])
             ppn = repeat(ppt / sizes * 2.0 - 1.0, 'cams r -> b t cams r', b=B, t=T_query)
             terms.append(self.linear_pp(torch.cat(

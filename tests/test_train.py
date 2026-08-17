@@ -76,6 +76,10 @@ def test_short_window_survives_the_smoothness_loss():
     there anyway. Both weights are 0.5, so the `weight == 0` early return does not cover it. Now
     that the loader sizes T to the labelled span, T = 2 is the COMMON case on annotated sessions:
     without the clamp every one of those steps would die.
+
+    posetail 0.3.5 clamps `order` to `T - 1` INSIDE `SmoothnessLoss.forward` (the same rule
+    `_tune_smoothness` applies), so the raw call no longer raises; this pins that the two clamps
+    agree and that the repo's per-batch rule still degrades to a first difference at T = 2.
     """
     from posetail.posetail.losses import TotalLoss
 
@@ -84,12 +88,14 @@ def test_short_window_survives_the_smoothness_loss():
                         smoothness_loss_order=4)
     assert loss_fn.smoothness_loss_3d.order == 4
 
-    # The real call raises before the clamp is applied...
+    # The library's own clamp makes the raw call safe at T = 2 (0.3.5); assert the forward runs
+    # rather than the old pre-0.3.5 raise.
     pred = torch.zeros(1, 2, 3, 3)
-    with pytest.raises(RuntimeError):
-        loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1), time_dim=1)
+    assert torch.isfinite(loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1),
+                                                     time_dim=1))
 
-    # ...and does not after it. Degraded to a first difference, not disabled.
+    # ...and `_tune_smoothness` applies the same rule per batch: degraded to a first difference,
+    # not disabled.
     mod._tune_smoothness(loss_fn, 2)
     assert loss_fn.smoothness_loss_3d.order == 1
     assert torch.isfinite(loss_fn.smoothness_loss_3d(pred, pred, torch.ones(1, 2, 3, 1),

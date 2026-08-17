@@ -15,7 +15,7 @@ and bulk training across datasets of differing keypoint sets, camera counts, and
 
 ## Setup
 
-Dependencies are managed with [pixi](https://pixi.sh). `posetail==0.3.2` is pinned from PyPI.
+Dependencies are managed with [pixi](https://pixi.sh). `posetail==0.3.5` is pinned from PyPI.
 
 ```bash
 pixi install
@@ -26,8 +26,9 @@ pixi run test                                        # test suite
 Notes:
 - The `LD_LIBRARY_PATH` prepend in `pyproject.toml` is load-bearing — the env ships a newer
   `libstdc++` than some hosts, and without it `import scipy.optimize` dies naming only `CXXABI`.
-- `tailcyclenet/patches.py` monkeypatches the pinned library (per-frame camera offset); it is
-  applied automatically on import. Every entry is an upstream bug to be deleted when the pin moves.
+- posetail >= 0.3.5 ships every behaviour this repo once monkeypatched (per-frame camera
+  offsets, `crop_box_for_points`, `scene_features=`/`input_size=` on the tracker forward);
+  there is no patch layer anymore.
 
 ---
 
@@ -38,7 +39,7 @@ tailcyclenet/     library: format, dataset, crop rule, model, inference, metrics
 scripts/          train.py  train_detector.py  infer.py  eval.py  convert_*.py
 configs/          base.toml + 2d.toml + 3d.toml (hand-written; extends one level deep)
 docs/             annotation_format.md — the data format spec (human-owned)
-tests/            invariants (crop rule, patches, converters, geometry)
+tests/            invariants (crop rule, converters, geometry)
 ```
 
 ---

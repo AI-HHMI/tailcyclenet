@@ -225,9 +225,10 @@ def _crop_views(imgs, box, target_size):
     twelve rats over a 24-frame window decoded the same 24 images twelve times. The warp itself
     is ~0.2 ms against ~27 ms for the decode it no longer repeats.
 
-    `box` is either ONE `[x1,y1,x2,y2]` for the whole window, or a (T,4) of per-frame boxes under
-    `--moving-crop`. The one-box path is kept as a single affine computed once, so the flag off is
-    the same arithmetic it always was.
+    `box` is either ONE `[x1,y1,x2,y2]` for the whole window, or a (T,4) of per-frame boxes (a
+    decode-level capability kept for the loader's per-frame crops; no deployed flag uses it). The
+    one-box path is kept as a single affine computed once, so the common case is the same
+    arithmetic it always was.
     """
     import cv2
 
@@ -563,13 +564,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 if not use:
                     outcome[a, wi] = OUTCOMES.index('no camera')
                     continue
-                # THE CAMERA MUST DESCRIBE THE BOX THE PIXELS WERE ACTUALLY CUT WITH, and under
-                # `--moving-crop` that is the moving box, not the window union. `apply_crop` sets
-                # `size`, `_resize_camera` turns it into `scales`, and `forward` divides by that --
-                # so leaving the union box here scales the decode by union_side/moving_side (p50
-                # 1.23 on this root) and lands every keypoint short of where it belongs. It cost
-                # pck@10 0.841 -> 0.383 at unchanged coverage, which is the signature: the rows are
-                # all there and every one of them is in the wrong place.
+                # THE CAMERA MUST DESCRIBE THE BOX THE PIXELS WERE ACTUALLY CUT WITH. `apply_crop`
+                # sets `size`, `_resize_camera` turns it into `scales`, and `forward` divides by
+                # that -- a camera that described a different box would scale the decode by
+                # union_side/moving_side (p50 1.23 on this root) and land every keypoint short of
+                # where it belongs. It cost pck@10 0.841 -> 0.383 at unchanged coverage, which is
+                # the signature: the rows are all there and every one of them is in the wrong
+                # place.
                 cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
             else:
                 pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
@@ -586,7 +587,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # resize, so the target sits off-centre in a wider crop that includes neighbours --
             # the regime where the box prompt is load-bearing. Guarded: crop_inflate 1.0 leaves
             # `boxes`/`cgroup` untouched, so this is a no-op on every existing run. Static boxes
-            # only (the moving-crop path is retired); each box is (4,) per camera here.
+            # only; each box is (4,) per camera here.
             if cfg.crop_inflate != 1.0:
                 boxes = [_inflate_box(b, window_cams[ci]['size'], cfg.crop_inflate)
                          for ci, b in zip(use, boxes)]
@@ -1060,10 +1061,9 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup):
         fin = p[torch.isfinite(p).all(-1)]
         if not len(fin):
             return p, 0
-        # Offset-invariant (a Jacobian) and `fin[None]` carries no time axis -- same reason as
-        # dataset.py's camera-scale probe, and the same collapse.
-        scale = torch.nanmedian(get_camera_scale(
-            [cropmod.with_static_offset(c) for c in cgroup], fin[None]))
+        # Offset-invariant (a Jacobian) and `fin[None]` carries no time axis; posetail 0.3.5
+        # collapses a per-frame offset inside get_camera_scale itself.
+        scale = torch.nanmedian(get_camera_scale(cgroup, fin[None]))
         if not torch.isfinite(scale):
             return p, 0
         # THE CAMERA'S OWN WIDTH, not `cfg.image_size`. `scale` is world-per-pixel of the camera

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import threading
 from functools import lru_cache
 from pathlib import Path
@@ -84,10 +84,10 @@ class LoaderConfig:
     # again, and the second instance of "motion_ratio near 1 is necessary but not sufficient".
     # Full numbers in dev/reports/23_moving_crop_sweep.md.
     #
-    # THE GEOMETRY IT USED SURVIVES AND IS NOT DEAD CODE. `crop.crop_to_points_{2d,3d}_moving`,
-    # `crop.moving_boxes`, `crop.apply_crop_moving` and all of `tailcyclenet/patches.py` are now
-    # reached solely by `synth_motion_*` below, which is their only consumer. Retiring those keys
-    # too is what would make that whole stack deletable.
+    # THE GEOMETRY IT USED IS DELETED TOO. `synth_motion_*` was its last consumer, and that arm
+    # is a measured null (dev/reports/30); with it gone, `crop.moving_boxes` / `apply_crop_moving`
+    # and all of `patches.py` had no caller left and were removed with the 0.3.5 upgrade
+    # (dev/reports/32).
     min_crop_dim: int = 64
     # What the crop rule bounds. `keypoints` is the labels themselves. `instances` bounds the
     # `instances.pq` box instead, for a root whose stored keypoints are too sparse to enclose the
@@ -140,42 +140,19 @@ class LoaderConfig:
     # is what every run before this change did. See `_pool_weights` for why this is load-bearing.
     annot_frac: float | None = None    # P(a step comes from an `annotated` session)
     mode_3d_frac: float | None = None  # P(3d | source), i.e. applied WITHIN each source
-    # SYNTHETIC CAMERA MOTION, i.e. a labelled video built from ONE labelled frame.
+    # `synth_motion_*` WAS HERE AND IS DELETED -- measured null (dev/reports/30).
     #
     # An annotated group carries one labelled frame in 65, so the derived-T rule gives it a T = 2
-    # window -- the label plus one unsupervised partner, because `_even_span` floors at 2. That is
-    # the cheapest correct thing to do and it means the annotated half of the corpus trains NO
-    # temporal machinery: `SmoothnessLoss` returns 0 (its stencil needs k+1 labelled frames),
-    # temporal self-attention sees two frames one of which has no target, and a per-frame crop
-    # would be inert (nothing to follow). It also means nothing in training has the shape
-    # `--anchor carry`
-    # deploys with -- a prior at frame 0 and a DISPLACED target after it.
-    #
-    # These keys emit a T-frame window instead, SLIDING THE ANIMAL inside a crop that stands still.
-    # The path is a smooth `_synth_path`; in 2D it is added to the coordinates, in 3D it moves the
-    # world point (sized through `get_camera_scale`, so one `amp` means the same crop-width
-    # displacement on a px session and a mm one). The static crop rule then bounds the SLID points,
-    # which makes the box the UNION over the window -- exactly the crop inference builds, inflated
-    # by exactly how far the animal walked.
-    #
-    # THE CAMERA NEVER MOVES, AND THAT IS THE WHOLE POINT. The first version of this moved the
-    # CAMERA instead -- a per-frame `offset`, `ext` expanded to `(T,4,4)`, the library's `moving`
-    # flag set -- and deployment at `moving_crop = false` presents ONE STATIC camera per window. So
-    # 40% of training steps carried a geometry inference never produces, and it cost `--anchor
-    # carry` 3.1 px on rat-city against its own control (report 22 §8).
-    #
-    # WHAT IT STILL DOES NOT DO, so nobody has to discover it: the animal is RIGID -- no
-    # articulation, no change of self-occlusion, no motion blur -- and THE BACKGROUND SLIDES WITH
-    # IT, because one frame warped is all there is. The model can therefore still solve a synth
-    # window by tracking the background. Only real neighbouring frames or compositing fix that.
-    # Rigid is a fair model of the whole-animal part: measured on rat-city's tracked clip, only
-    # ~14% of a real rat's keypoint displacement over a window is non-rigid.
-    synth_motion_prob: float = 0.0     # P(a single-label TRAIN window is expanded)
-    # 'auto' MEASURES IT FROM THE ROOT'S OWN TRACKED HALF -- see `measure_slide_amp`. A float
-    # overrides. There is no portable constant: the same window is 0.265 box sides of real motion
-    # on rat-city and 0.033 on johnson-mouse, an 8x spread.
-    synth_motion_amp: float | str = 'auto'   # peak slide, in BOX SIDES
-    synth_motion_frames: int = 0       # T for a synth window; 0 means cfg.n_frames
+    # window, and these keys used to expand such windows into T copies of the labelled frame with
+    # the ANIMAL slid through a static union crop (report 22; the moving-camera first version was
+    # refuted there too). Measured at matched 60k on rat-city: a carry cost of +1.12 px against
+    # its control's +1.56 with both MPJPE deltas n.s. -- nothing replaces the old moving-camera
+    # version's +4.47 with a gain. johnson's +3% is two chunks whose mean is 112 mm against a
+    # median of 4 (both arms break on the same chunks), so the defensible size is ~3% in the
+    # working regime. The live suspect was the background-slides-with-the-animal ceiling, which
+    # is a compositing or pseudo-label fix and not a config key. See dev/reports/30.
+    # The keys are deleted rather than defaulted off: an old config that names them now fails
+    # loudly on an unknown key instead of silently training without the arm.
     # THE BOX PROMPT (report 27), the DATA side. 'none' | 'film' | 'term' -- when not 'none' the
     # loader emits a per-frame animal box (`box_prompt.compute_box_prompt`) for a box-prompt model
     # to consume as a non-position channel. 'none' emits nothing, so a plain run is byte-identical
@@ -263,7 +240,7 @@ def _apply_affine(pts, rotation):
     the same line `rotate_points_image_plane` applies to the coords -- shared so a stored box and
     the labels can never end up in different frames.
 
-    A LIST of those is a PER-FRAME rotation (`_synth_roll`), and then `pts` is indexed on its
+    A LIST of those is a PER-FRAME rotation, and then `pts` is indexed on its
     leading axis, which is time in every caller: `(T,K,2)` labels and `(T,4,2)` stored box corners
     alike. Same requirement as the single form -- whatever moves the pixels must move the points.
     """
@@ -323,10 +300,9 @@ def load_warps(path, specs, target_size=None, reduce=1):
 
     DECODE COST IS PER FILE AND WARP COST IS PER OUTPUT, and fusing the two -- which is what one
     `load_image` call per output frame does -- charges the first at the rate of the second. That
-    is invisible until a caller wants several DIFFERENT crops of the SAME frame: a
-    synthetic-motion window is exactly one source frame under T crops, so the fused form pays 24
-    full decodes for one picture, 24 x 27 ms on a 4696x2048 jpeg, dominating the item. It is the
-    same waste `read_frames`' dedupe was written to prevent, arriving from the other side.
+    is invisible until a caller wants several DIFFERENT crops of the SAME frame: the fused form
+    pays N full decodes for one picture, N x 27 ms on a 4696x2048 jpeg, dominating the item. It is
+    the same waste `read_frames`' dedupe was written to prevent, arriving from the other side.
 
     BGR IS KEPT UNTIL AFTER THE WARP so the colour convert still runs on the SMALL output, which
     is the property the fused version had and the reason not to just decode-then-call-load_image.
@@ -555,12 +531,11 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     # that window decodes 24 copies of one image per camera (384 decodes for 16 distinct frames).
     want = [int(i) for i in frames]
     path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
-    # PER-FRAME CROPS MOVE THE DEDUPE KEY. Under a synth window the box is a function of the
-    # POSITION in the window, not of the source index -- and `_frames` clamp-pads a short window,
-    # so one index can occupy several positions. Keying on the index alone would then serve every
-    # repeat the first position's crop. The key becomes (index, box, rotation slot); with one box
-    # and one rotation for the whole window those halves are constant and this is the old
-    # behaviour exactly.
+    # PER-FRAME CROPS MOVE THE DEDUPE KEY. A per-frame box is a function of the POSITION in the
+    # window, not of the source index -- and `_frames` clamp-pads a short window, so one index can
+    # occupy several positions. Keying on the index alone would then serve every repeat the first
+    # position's crop. The key becomes (index, box, rotation slot); with one box and one rotation
+    # for the whole window those halves are constant and this is the old behaviour exactly.
     cc = None if crop_coords is None else np.asarray(crop_coords)
     per_box = cc is not None and cc.ndim == 2
     per_rot = isinstance(rotation, list)
@@ -627,226 +602,6 @@ def _even_span(span, ceiling):
     """
     hi = max(2, int(ceiling) - int(ceiling) % 2)
     return min(max(2, int(span) + int(span) % 2), hi)
-
-
-def _synth_path(rng, T, amp):
-    """A smooth slide, `(T,2)` in BOX SIDES. `path[0]` is exactly zero.
-
-    SINUSOIDAL rather than linear, and that is not decoration. `SmoothnessLoss` differences to
-    order 4 and hinges the prediction against `1.5 * |k-th difference of the TARGET|`, so a linear
-    slide -- whose 4th difference is identically zero -- hands it a zero threshold. A sinusoid has
-    nonzero derivatives at every order. (The term is off on these windows today for a separate
-    reason, `train._tune_smoothness`; under a SLIDE the target genuinely moves, so re-enabling it
-    is a real experiment and this keeps the path honest for it.)
-
-    IN BOX SIDES so one setting means the same visual displacement on a 30 px fly and a 4696 px
-    arena -- the same reason `prompt_noise_px` is in pixels and `box_agree` is in box sides.
-
-    ANCHORED AT FRAME 0 (`y - y[0]`), so `amp = 0` degenerates EXACTLY to the un-slid window and
-    frame 0 is always the crop the window would have had. That is what makes the inertness control
-    exact, and it keeps the prior at `prompt_t = 0` describing an ordinary pose.
-
-    Six draws, always the same six whatever the amplitude is, so the rng stream does not depend on
-    how far the animal is asked to move.
-    """
-    t = np.arange(T) / max(T - 1, 1)
-
-    def axis():
-        y = (float(amp) * rng.uniform(0.3, 1.0)
-             * np.sin(2 * np.pi * rng.uniform(0.5, 1.5) * t + rng.uniform(0.0, 2 * np.pi)))
-        return y - y[0]
-
-    return np.stack([axis(), axis()], 1)
-
-
-def measure_slide_amp(datasets, n_frames, n_samples=400, seed=0):
-    """How far a real animal moves over a window, in BOX SIDES, measured from the root itself.
-
-    THE POINT IS THAT NOBODY SHOULD TUNE THIS. The right slide is the size of the real thing, and
-    the real thing is not portable: over a 24-frame window the median animal moves 0.265 box sides
-    on rat-city, 0.252 on 3dpop, 0.215 on calms21, 0.123 on branson-fly, 0.075 on allen and 0.033
-    on johnson-mouse -- an 8x spread. A hand-set constant is wrong on five of six roots.
-
-    TWO CHEAPER PROXIES WERE TRIED AND BOTH FAIL. The animal box over the frame size looks right on
-    rat-city (0.044 -> 0.265) and 3dpop (0.038 -> 0.252), then calms21 has 4.6x rat-city's ratio and
-    the SAME displacement and johnson has 2x the ratio and 8x less. Window DURATION explains more --
-    normalising by `n_frames / fps` pulls the spread from 8x to 2.5x -- but `fps` is absent on two
-    of the six roots, so it cannot be the rule either.
-
-    IT GATES ON THE DATA, NOT ON `label_source`. Any window holding TWO labelled frames of one
-    animal measures a displacement; whether the session is called tracked or annotated is a
-    property of how it was made, not of what it can answer. Where the two labelled frames are
-    closer together than the window, the displacement is scaled up to a full window -- otherwise a
-    sparsely labelled source would report an artificially small motion purely because its labels
-    are near each other.
-
-    RANDOM AND BOUNDED. `n_samples` draws of (session, group, animal, start) at a FIXED seed, so it
-    is fast at construction, unbiased by whichever session happens to be enumerated first, and
-    reproducible -- a run has to record the amplitude it actually trained on. Reads LABELS only, so
-    it touches no video and cannot trip gotcha 11.
-
-    Returns None when nothing in the root carries two labelled frames in a window, where there is
-    nothing to measure and a guess would be worse than an error; the caller raises saying so.
-    """
-    cand = [(sess, gid) for ds in datasets for sess in ds.sessions.get('train', [])
-            for gid, g in sess.groups.items() if g.n_frames >= 2]
-    if not cand:
-        return None
-    # WEIGHTED BY FRAME COUNT, not uniform over groups. A `-combined` root is ~2,000 annotated
-    # groups of 65 frames beside THREE tracked groups of up to 57,594, so a uniform draw lands on
-    # a tracked group 0.15% of the time -- and the annotated groups carry one labelled frame each
-    # and can measure nothing. Measured: uniform sampling returned 0.093 box sides on
-    # rat-city-combined from a handful of usable draws, against 0.265 over the same data sampled
-    # by frame. The population this statistic is about is FRAMES.
-    w = np.array([float(sess.groups[gid].n_frames) for sess, gid in cand])
-    w = w / w.sum()
-    rng = np.random.default_rng(seed)
-    disp = []
-    for _ in range(n_samples):
-        sess, gid = cand[int(rng.choice(len(cand), p=w))]
-        lab = sess.labels(gid)
-        vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
-        n = sess.groups[gid].n_frames
-        a = int(rng.integers(vis.shape[0]))
-        v = vis[a].reshape(vis.shape[1], -1)
-        lf = np.flatnonzero((v != UNLABELED).any(-1))
-        if lf.size < 2:
-            continue
-        s0 = int(rng.integers(0, max(1, n - n_frames + 1)))
-        win = lf[(lf >= s0) & (lf < s0 + n_frames)]
-        if win.size < 2:
-            continue
-        cam = sess.cgroup(gid, [0])[0]
-        if lab.points3d is not None:
-            q = project_points_torch([cam], torch.as_tensor(lab.points3d[a, win],
-                                                            dtype=torch.float32))[0]
-        else:
-            q = torch.as_tensor(lab.points2d[a, win, :, 0, :], dtype=torch.float32)
-        per = [cropmod.crop_box_for_points(q[t], cam['size'], 64) for t in range(len(win))]
-        per = [b for b in per if b is not None]
-        if len(per) < 2:
-            continue
-        side = float(np.median([max(float(b[2] - b[0]), float(b[3] - b[1])) for b in per]))
-        c = torch.nanmean(q, dim=1)
-        c = c[torch.isfinite(c).all(-1)]
-        if side <= 0 or len(c) < 2:
-            continue
-        # PEAK-TO-PEAK over the labelled frames, because that is the statistic the synthetic side
-        # reports (`scratch/slide/probe.py`) and the two have to be the same quantity. Endpoint
-        # displacement reads ~2.3x smaller on rat-city, since a wandering animal comes back.
-        # Then scaled up to a full window, so labels that do not span it do not read as a slow
-        # animal.
-        span = max(int(win[-1]) - int(win[0]), 1)
-        disp.append(float((c.max(0).values - c.min(0).values).max()) / side
-                    * (n_frames - 1) / span)
-    # A thin estimate is worse than none: a median over a handful of windows is what the
-    # uniform-sampling bug above produced, and it looked like a number.
-    return float(np.median(disp)) if len(disp) >= 20 else None
-
-
-def _slide_delta(cam, src, pad, path, min_crop_dim):
-    """`(T,2)` SOURCE-PIXEL displacement for a slide of `path` box sides, or None.
-
-    The path is in box sides and the box is not known until the slide is -- the box has to CONTAIN
-    the slide. Resolved in one step rather than by iterating: the side comes from the UN-SLID box,
-    the crop the window would have had. The union box only ever grows, so the realised slide is a
-    slightly SMALLER fraction of the final box than `amp` says, never a larger one.
-    """
-    b = cropmod.crop_box_for_points(src, cam['size'], min_crop_dim, pad)
-    if b is None:
-        return None
-    side = float(max(b[2] - b[0], b[3] - b[1]))
-    return torch.as_tensor(np.asarray(path, np.float64) * side, dtype=torch.float32)
-
-
-def _affines(mats, wh, base=None):
-    """`[(M_2x3, (w, h))] * T` for `_crop_affine`, each composed onto the window rotation `base`.
-
-    `base` is whatever `_rotate_2d` / `rotate_camera_image_plane_3d` already produced for this
-    camera, so the returned affines map SOURCE pixels straight to the final canvas -- the one
-    thing `_crop_affine` can consume. The slide is applied AFTER the window rotation because the
-    points it was fitted to were measured after it.
-    """
-    w, h = (int(v) for v in (wh if base is None else base[1]))
-    out = []
-    for M in mats:
-        M = np.asarray(M, np.float64)
-        if base is not None:
-            B, R = np.eye(3), np.eye(3)
-            B[:2], R[:2] = base[0], M
-            M = (R @ B)[:2]
-        out.append((M, (w, h)))
-    return out
-
-
-def _slide_world(coords, path, cgroup, image_size):
-    """Move the ANIMAL through the world by `path` BOX SIDES. Returns (T,K,3) or None.
-
-    THE MAGNITUDE COMES FROM THE CAMERA, WHICH IS THE ONLY WAY ONE `amp` CAN MEAN THE SAME THING
-    ON TWO RIGS. `get_camera_scale` is world units per crop pixel -- the same conversion
-    `prompt_noise_px` uses below and `WeightedMAELoss` uses to enter its Huber in pixels -- so
-    `amp * image_size * cube_scale` is a displacement of `amp` crop widths whether the session is
-    in px or mm. Verified on 3dpop: a target of 38 crop px measured 42-46.
-
-    THE DIRECTION IS PERPENDICULAR TO THE MEAN VIEW, so the slide is in-image and the animal's
-    apparent SIZE does not change. That is a plausibility choice rather than an accuracy one --
-    measured on 3dpop, the pixel residual is 0.0038 either way -- but a slide along the viewing
-    axis would scale the animal instead of translating it, which is not a motion and not something
-    the crop rule can follow. Derived from `cam['center']` per window, so it needs no arena model.
-    """
-    fin = coords[torch.isfinite(coords).all(-1)]
-    if not len(fin):
-        return None
-    # Offset-invariant (a Jacobian), and `fin[None]` carries no time axis -- the same collapse the
-    # prior's camera-scale probe makes below.
-    scale = torch.nanmedian(get_camera_scale(
-        [cropmod.with_static_offset(c) for c in cgroup], fin[None]))
-    if not torch.isfinite(scale) or float(scale) <= 0:
-        return None
-    ctr = fin.mean(0)
-    view = torch.zeros(3)
-    for c in cgroup:
-        cen = torch.as_tensor(c['center'], dtype=torch.float32).reshape(-1, 3).mean(0)
-        v = ctr - cen
-        view = view + v / v.norm().clamp_min(1e-9)
-    n = view.norm()
-    if not torch.isfinite(n) or float(n) <= 1e-6:
-        return None
-    view = view / n
-    a = torch.tensor([1.0, 0.0, 0.0])
-    if abs(float(view @ a)) > 0.9:
-        a = torch.tensor([0.0, 1.0, 0.0])
-    e1 = torch.linalg.cross(view, a)
-    e1 = e1 / e1.norm().clamp_min(1e-9)
-    e2 = torch.linalg.cross(view, e1)
-    d = torch.as_tensor(np.asarray(path, np.float64), dtype=torch.float32)      # (T,2) box sides
-    delta = (d[:, 0:1] * e1 + d[:, 1:2] * e2) * float(scale) * float(image_size)
-    return coords + delta[:, None, :]
-
-
-def _fit_affine(p0, pt):
-    """The 2x3 taking frame 0's pixels onto frame t's, least squares over the keypoints.
-
-    AFFINE, NOT A TRANSLATION, and that is measured rather than assumed. A world translation does
-    not project to a pure 2D translation -- each keypoint's displacement scales with its own depth
-    -- so a single shift leaves a parallax residual. On 3dpop at `amp = 0.15` the median residual
-    against the true projection is 0.53 crop px for a translation and 0.17 for an affine, which is
-    the whole reason this is a least-squares fit. A homography reaches 0.14 for a nonlinear solve
-    and is refused.
-
-    It costs nothing: `_crop_affine` already composes an arbitrary per-frame 2x3.
-
-    Falls back to the median translation when fewer than 3 points are shared, where an affine is
-    underdetermined -- and to identity when nothing is.
-    """
-    ok = np.isfinite(p0).all(-1) & np.isfinite(pt).all(-1)
-    A, B = p0[ok], pt[ok]
-    if len(A) < 3:
-        d = np.median(B - A, axis=0) if len(A) else np.zeros(2)
-        return np.array([[1.0, 0.0, d[0]], [0.0, 1.0, d[1]]])
-    X = np.hstack([A, np.ones((len(A), 1))])
-    W, *_ = np.linalg.lstsq(X, B, rcond=None)                  # (3,2)
-    return W.T.astype(np.float64)
 
 
 def _build_augmenters(cfg):
@@ -943,33 +698,6 @@ class PoseDataset(Dataset):
         # and invisible in the loss curve. `Registry.build` raises if an old id would move.
         self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
-        # RESOLVED ONCE, HERE, and printed: a run must record the amplitude it actually trained on,
-        # or the number is unreproducible in exactly the way gotcha 12 describes. Train-only and
-        # only when the lever is on, so nothing else pays for it.
-        if self.train and cfg.synth_motion_prob > 0 and cfg.synth_motion_amp == 'auto':
-            amp, how = measure_slide_amp(self.datasets, cfg.n_frames), 'measured'
-            if amp is None:
-                how = None
-            if amp is None:
-                # FALLBACK 1, and it is measured rather than assumed: normalising the six roots'
-                # real displacement by window DURATION pulls their spread from 8x to 2.5x, around
-                # a median of ~0.29 box sides per second (allen 0.63, 3dpop 0.31, calms21 0.27,
-                # johnson 0.25). Only reachable when nothing in the root carries two labelled
-                # frames in a window -- a purely annotated root -- and only when `fps` is recorded.
-                fps = [g.fps for ds in self.datasets for se in ds.sessions.get('train', [])
-                       for g in se.groups.values() if g.fps]
-                if fps:
-                    amp, how = 0.29 * cfg.n_frames / float(np.median(fps)), 'fps proxy'
-            if amp is None:
-                # FALLBACK 2. There is no portable constant -- that is the whole finding -- so this
-                # is a guess and says so. `fps` is absent on two of the six shipped roots, which is
-                # why this rung exists at all.
-                amp, how = 0.20, 'DEFAULT GUESS'
-            amp = float(np.clip(amp, 0.01, 1.0))
-            self.cfg = cfg = replace(cfg, synth_motion_amp=amp)
-            note = '' if how == 'measured' else f'  <-- {how}, no window had two labelled frames'
-            print(f'synth_motion_amp: auto -> {amp:.3f} box sides ({how}, over '
-                  f'{cfg.n_frames}-frame windows){note}')
         # Appearance augmentation is train-only, and `None` is also the flag the pixel path reads.
         # Val must stay clean: a metric computed on augmented pixels is not comparable to the last
         # one, and `test_val_windows_are_deterministic` would fail outright.
@@ -1191,7 +919,7 @@ class PoseDataset(Dataset):
         raise RuntimeError(f'{self.split}: 8 consecutive items failed to build')
 
     def _frames(self, item, lab, group, rng):
-        """(T frame indices, is this a SYNTHETIC-MOTION window), clamp-padded so T >= 2.
+        """T frame indices, clamp-padded so T >= 2.
 
         ON TRAIN, T IS DERIVED FROM THE LABELS, and `cfg.n_frames` is only its ceiling. The
         annotated sessions carry ONE labelled frame per 65-frame group, so a fixed T = 24 encodes
@@ -1212,22 +940,15 @@ class PoseDataset(Dataset):
         can only reach labels congruent to it mod s, so the span is measured in lattice steps and
         the start is snapped onto the lattice.
 
-        A WINDOW THAT REACHES EXACTLY ONE LABEL MAY INSTEAD BE SYNTHESISED, which is the second
-        return value. That is the case this docstring calls "one label still carries an
-        unsupervised partner", and `synth_motion_prob` is the rate at which it is turned into T
-        copies of the labelled frame for a synthetic camera to move over instead. It fires on the
-        WINDOW rather than on the session -- an annotated group can only ever produce one, and a
-        densely tracked one never does -- so no flag has to be plumbed to find it.
-
         VAL AND TEST ARE UNTOUCHED -- `_starts` enumerates fixed `cfg.n_frames` windows there at
         stride 1, and a metric whose window geometry moved would not be comparable across
-        checkpoints. Synthesis is train-only for the same reason.
+        checkpoints.
         """
         T = self.cfg.n_frames
         vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
         labelled = self._labelled_frames(vis, item.animal)
         if labelled.size == 0:
-            return None, False
+            return None
         s = 1
         if item.start >= 0:
             start = item.start
@@ -1253,30 +974,6 @@ class PoseDataset(Dataset):
             near = labelled[(labelled > anchor - T * s) & (labelled < anchor + T * s)]
             near = near[(near - anchor) % s == 0]
             first, last = int(near[0]), int(near[-1])
-            # SYNTHETIC CAMERA MOTION. This window reaches exactly ONE label, so the derived-T rule
-            # is about to spend a T = 2 window supervising a single frame. Emit T copies of that
-            # frame instead and let `_item` move the CAMERA over them: the scene is frozen, so
-            # every frame is a real crop of a real image and every label is exact.
-            #
-            # THE TEST IS `near.size == 1`, AND `first == last` IS A DIFFERENT QUESTION THAT LOOKS
-            # LIKE THE SAME ONE. `first == last` is ALSO what the wide-span fallback below sets,
-            # and that fires when a window reaches MORE labels than T can span -- the opposite
-            # situation, and the normal one on a densely tracked group. Gating on it froze 173 of
-            # 175 sampled rat-city-combined TRACKED windows into synthetic ones, i.e. it destroyed
-            # the real motion on exactly the windows that had any, while the probe reported a
-            # healthy-looking 99% synth rate. Measured before the fix; `test_synth_motion_never_
-            # fires_on_a_densely_labelled_window` is what holds it.
-            #
-            # THE `> 0` GUARD IS WHAT MAKES THE CONTROL A CONTROL. With the key off, no draw is
-            # taken and the rng stream is the one every run on record consumed, so a
-            # `synth_motion_prob = 0` arm is bit-identical to a run predating these keys -- the
-            # same preservation `aug_rotation_prob is None` makes below and `rotate_deg = 0` makes
-            # in `detector/data.py`.
-            if near.size == 1 and self.cfg.synth_motion_prob > 0 \
-                    and rng.random() < self.cfg.synth_motion_prob:
-                T = _even_span(self.cfg.synth_motion_frames or self.cfg.n_frames,
-                               self.cfg.n_frames)
-                return np.full(T, anchor, dtype=np.int64), True
             T = _even_span((last - first) // s + 1, T)
             if last - first > (T - 1) * s:
                 # The span is wider than the ceiling allows; no placement covers it, so fall back
@@ -1290,7 +987,7 @@ class PoseDataset(Dataset):
             lo += (anchor - lo) % s                 # snap up onto the anchor's lattice
             start = int(lo + s * rng.integers(0, (hi - lo) // s + 1)) if hi > lo else lo
         f = np.clip(np.arange(start, start + T * s, s), 0, group.n_frames - 1)
-        return f, False
+        return f
 
     def _crop_pts(self, lab, a, frames, cam_ix):
         """One animal's stored boxes over a window, as points the crop rule can bound.
@@ -1311,7 +1008,7 @@ class PoseDataset(Dataset):
         item = self._pick(idx, rng)
         sess, group = item.session, item.session.groups[item.gid]
         lab = sess.labels(item.gid)
-        frames, synth = self._frames(item, lab, group, rng)
+        frames = self._frames(item, lab, group, rng)
         if frames is None:
             return None
         a, T = item.animal, len(frames)
@@ -1395,22 +1092,6 @@ class PoseDataset(Dataset):
                                               float(rng.uniform(-rot_deg, rot_deg)))
                 rotation_info = [rot]
                 cp = _apply_affine(cp, rot)
-            if synth:
-                # SLIDE THE ANIMAL, HOLD THE CAMERA STILL. In 2D the coords ARE the target, so the
-                # slide is added to them and to the stored box corners, and the SAME displacement
-                # goes to the pixels as a per-frame translation. Nothing touches the camera: the
-                # ordinary static crop rule below then bounds the SLID points, which makes the box
-                # the union over the window -- exactly the crop inference builds when it unions a
-                # window's per-frame boxes, inflated by exactly how far the animal walked.
-                delta = _slide_delta(cam, *cropmod._crop_source(coords, cp),
-                                     _synth_path(rng, T, self.cfg.synth_motion_amp),
-                                     self.cfg.min_crop_dim)
-                if delta is None:
-                    return None
-                coords = coords + delta[:, None, :]
-                cp = None if cp is None else cp + delta[:, None, :]
-                rotation_info = [_affines([[[1.0, 0.0, float(d[0])], [0.0, 1.0, float(d[1])]]
-                                           for d in delta], cam['size'], rotation_info[0])]
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp)
@@ -1459,33 +1140,12 @@ class PoseDataset(Dataset):
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
                             vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
-            if synth:
-                # SLIDE THE ANIMAL THROUGH THE WORLD, HOLD THE CAMERAS STILL. The 3D target is the
-                # world point, so here the slide moves the TARGET -- which is what retires the
-                # old design's worst property, that a synthetic CAMERA motion cannot move a world
-                # point and so left `coords` constant across the window by construction.
-                #
-                # ONE DRAW FOR THE RIG, not one per camera: this is a single physical motion of one
-                # animal, and every camera must see the SAME motion or the views contradict each
-                # other and no world point explains them. That is the opposite of the crop jitter's
-                # rule, which is per camera because a crop is a per-camera choice.
-                moved = _slide_world(coords, _synth_path(rng, T, self.cfg.synth_motion_amp),
-                                     cgroup, self.cfg.image_size)
-                if moved is None:
-                    return None
-                # THE LABELS ARE THE EXACT PROJECTION of the moved points -- nothing is
-                # approximated on the label side. Only the PIXELS are approximate: a world
-                # translation does not project to a pure 2D translation, so each camera gets a
-                # per-frame affine fitted to its own true displacements. Measured on 3dpop at
-                # amp = 0.15, median residual against the true projection is 0.17 crop px for the
-                # affine against 0.53 for a translation.
-                p_before = project_points_torch(cgroup, coords).numpy()      # (C,T,K,2)
-                p_after = project_points_torch(cgroup, moved).numpy()
-                rotation_info = [_affines([_fit_affine(p_before[c][0], p_after[c][t])
-                                           for t in range(T)],
-                                          cgroup[c]['size'], rotation_info[c])
-                                 for c in range(len(cgroup))]
-                coords = moved
+            if self.train:
+                # Random world rotation, applied to points AND cameras together, so the model
+                # cannot learn a fixed world gauge. Called unbound because the library's method
+                # reads no instance state -- calling it is what keeps this from drifting.
+                from posetail.datasets.posetail_dataset import PosetailDataset
+                cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
             # A stored box lives in SOURCE pixels, so it follows each camera's own in-plane
             # rotation -- the same affine `rotate_camera_image_plane_3d` hands back for the warp,
             # or one per frame under a slide.
@@ -1580,10 +1240,9 @@ class PoseDataset(Dataset):
                 and bool(torch.isfinite(kpt_prior).any()):
             pts = kpt_prior[torch.isfinite(kpt_prior).all(-1)][None]     # (1,n,3)
             # A PROJECTION JACOBIAN IS OFFSET-INVARIANT -- a constant image-plane translation
-            # has zero derivative -- and `pts` is one mean pose with no time axis, so a moving
-            # crop's (T,2) offset must be collapsed here. Exact, not an approximation.
-            px = float(torch.nanmedian(get_camera_scale(
-                [cropmod.with_static_offset(c) for c in cgroup], pts)))
+            # has zero derivative -- and `pts` is one mean pose with no time axis. posetail
+            # 0.3.5 collapses a per-frame (T,2) offset itself; there is none in this repo anyway.
+            px = float(torch.nanmedian(get_camera_scale(cgroup, pts)))
             if not np.isfinite(px):
                 px = 1.0
         # STALE: the pose from a DIFFERENT frame than `prompt_t` claims. What `carried` degrades into
@@ -1636,7 +1295,7 @@ class PoseDataset(Dataset):
         row = {'dataset': self.datasets[item.ds].name, 'session': sess.session_id,
                'group': item.gid, 'animal': lab.animal_ids[a], 'mode': '2d' if R == 2 else '3d',
                'single_view': single_view, 'start': int(frames[0]), 'cameras': cam_names,
-               'stride': stride, 'synth': bool(synth)}
+               'stride': stride}
 
         out = [views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
                vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t]
@@ -1678,20 +1337,6 @@ class PoseDataset(Dataset):
         if not self.train or self.cfg.crop_jitter <= 0:
             return None
         return cropmod.jitter_box(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
-
-    def _jitter_params(self, rng):
-        """`_jitter`'s moving-crop twin: the DRAW rather than the closure.
-
-        A FACTORY, not a draw, for the same reason `_jitter` returns a closure: the static 3D path
-        applies that closure once per CAMERA inside `crop_to_points_3d`'s loop, so each camera gets
-        its own jitter and the rng advances three numbers per camera. Returning a single drawn
-        triple here would jitter the whole rig identically AND leave the rng in a different state,
-        desynchronising every window sampled afterwards -- so the moving arm would differ from its
-        control in the augmentation and the data as well as the crop (eval rule 4).
-        """
-        if not self.train or self.cfg.crop_jitter <= 0:
-            return None
-        return lambda: cropmod.jitter_params(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
 
 
 def _mask_outside(coords, size):

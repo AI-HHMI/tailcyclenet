@@ -695,49 +695,36 @@ def test_a_smaller_input_is_compensated_at_all_four_sites(scene):
     """THE SEAM ITSELF, pinned without depending on what the weights predict.
 
     `image_size` stands for three things and only one -- the pixel extent of the input -- is wrong
-    for a smaller crop. This asserts the wiring of all of it: the pad target and the two
-    `self.image_size` reads inside the library's forward (`:661` gauge centre, `:697` gridresid
-    normaliser) move to `px`; `undistort_points` (`:614`) is wrapped; the 2D decode comes back
-    scaled by `px / decoder.image_size`; and every one of those globals is restored afterwards,
-    including on the exception path.
-
-    The MAGNITUDES are measured on real weights in `scratch/refine3d/RESULT.md` -- 45.2 mm on the
-    triangulation, 1.3334 = 256/192 on the residual. A random fixture model cannot pin those; it
-    can pin that each correction is applied exactly once, which is the part that rots.
+    for a smaller crop. posetail 0.3.5 splits it out as `input_size=` on `TrackerEncoder.forward`:
+    the pad target, the 2D-head rescale and the gridresid gauge all follow the canvas the forward
+    actually saw. The MAGNITUDES are measured on real weights in `scratch/refine3d/RESULT.md` --
+    45.2 mm on the triangulation, 1.3334 = 256/192 on the residual. A random fixture model cannot
+    pin those; it can pin that `input_size` reaches the library forward with the canvas's extent,
+    which is the part that rots.
     """
-    from posetail.posetail import tracker_encoder as te
-
-    from tailcyclenet.model import _input_extent
-
     model, sess, registry, name = scene
-    pad, full, head = model.transform_norm.transforms[0], model.image_size, model.decoder.image_size
-    stock_undistort = te.undistort_points
     seen = {}
-    with _input_extent(model, 32):
-        seen = dict(pad=pad.size, size=model.image_size, wrapped=te.undistort_points)
-    assert seen == dict(pad=32, size=32, wrapped=seen['wrapped'])
-    assert seen['wrapped'] is not stock_undistort, 'the :614 frame mismatch is not corrected'
-    assert (pad.size, model.image_size, te.undistort_points) == (full, full, stock_undistort)
 
-    with pytest.raises(RuntimeError):
-        with _input_extent(model, 32):
-            raise RuntimeError('boom')
-    assert (pad.size, model.image_size, te.undistort_points) == (full, full, stock_undistort), \
-        'a forward that raised must not leave the library monkeypatched for the next one'
+    def spy(*a, **kw):
+        seen['input_size'] = kw.get('input_size')
+        return {'coords_pred': torch.zeros(1)}
 
-    # ...and the 2D rescale, through the public `forward`, with `_forward` stubbed so the assertion
-    # is about the factor and not about the weights.
-    if sess.mode != '2d':
-        return
-    one = torch.ones(1, 2, 3, 2)
-    model._forward = lambda *a, **kw: {'coords_pred': one.clone()}
+    model._forward = spy
     try:
+        # 3D: the camera's long side IS the canvas (loaders resize max(W,H) to image_size).
         cg = [{'size': torch.tensor([32, 32])}]
-        got = model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '2d')
-        torch.testing.assert_close(got['coords_pred'], one * (32 / head))
-        cg = [{'size': torch.tensor([full, full])}]
-        got = model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '2d')
-        torch.testing.assert_close(got['coords_pred'], one)   # the gate is a strict <
+        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
+        assert seen['input_size'] == 32, f'input_size must be the canvas extent, got {seen}'
+        # A non-square camera: the canvas is the LONG side, and the pad target follows it.
+        cg = [{'size': torch.tensor([48, 64])}]
+        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
+        assert seen['input_size'] == 64
+        # At the build-time size the seam is a bare call -- input_size == image_size, and the
+        # upstream scaling factor is exactly 1.0 (pinned bit-identical by
+        # test_refine_px_equals_image_size_is_bit_identical).
+        cg = [{'size': torch.tensor([model.image_size, model.image_size])}]
+        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
+        assert seen['input_size'] == model.image_size
     finally:
         del model._forward
 

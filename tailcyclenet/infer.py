@@ -121,6 +121,16 @@ class InferConfig:
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
     # rule it never saw, and there would be nothing in the output to say so.
     box_source: str = 'keypoints'
+    # DEPLOYMENT BOX PROMPT (report 27). Which-animal-occupies-this-box, fed as a non-position
+    # input channel to a `[model].box_prompt` (film/term) model. 'none' | 'labels' (GT boxes,
+    # ORACLE -- gate off like `--anchor labels`) | 'detector'. GUARDED: 'none' + crop_inflate 1.0
+    # is byte-identical to a run without these keys, which `tests/test_infer.py` pins. Only the
+    # 2D single-camera path is wired (the crowded 2D roots endpoint 1 targets); a box on a 3D or
+    # multi-cam run is refused loudly rather than silently ignored.
+    box_prompt: str = 'none'
+    # Inflate every crop about its centre by this factor -- the WIDE pass-1 regime where the box
+    # is load-bearing (report 27 §9m). 1.0 is today's behaviour exactly.
+    crop_inflate: float = 1.0
 
 
 def _window_starts(n_frames: int, T: int, overlap: int):
@@ -153,6 +163,41 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode):
         return (cg, boxes) if cg is not None else (None, None)
     cam, box, _ = cropmod.crop_to_points_2d(cgroup[0], points, min_crop_dim)
     return ([cam], [box]) if cam is not None else (None, None)
+
+
+def _inflate_box(box, size, factor):
+    """Widen an xyxy crop box about its centre by `factor`, clamped to the image. Static (4,)
+    boxes only. Returns the same dtype as `box`."""
+    b = box.to(torch.float32) if torch.is_tensor(box) else torch.as_tensor(box, dtype=torch.float32)
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    hw, hh = (b[2] - b[0]) * factor / 2, (b[3] - b[1]) * factor / 2
+    W, H = float(size[0]), float(size[1])
+    out = torch.tensor([max(0.0, float(cx - hw)), max(0.0, float(cy - hh)),
+                        min(W, float(cx + hw)), min(H, float(cy + hh))])
+    return out.round().to(torch.int32)
+
+
+def _deploy_box_prompt(source, boxes, scales, cgroup, dev):
+    """The box-prompt tensor for one animal's window, 2D single-camera. (1,T,1,4) in crop pixels.
+
+    `source` (T,K,2) is the animal's SOURCE-pixel points that name WHICH animal to return -- the
+    labels under `box_prompt = 'labels'` (an ORACLE), a detector box's keypoints otherwise.
+    Mapped into the (possibly inflated) crop frame exactly as the pixels are: `(pt - origin) *
+    scale`. Then THE crop rule gives the animal's tight extent inside the crop, which is the
+    non-position channel a box-prompt model consumes. Matches the training-time
+    `boxdata.compute_box_prompt` by construction (both run `crop_box_for_points` on crop-frame
+    points), so a deployment box is the same object the model trained on.
+    """
+    origin = torch.as_tensor(boxes[0][:2], dtype=torch.float32)
+    cf = (source - origin) * float(scales[0])                    # (T,K,2) crop px
+    size = cgroup[0]['size']
+    T = cf.shape[0]
+    out = torch.full((T, 1, 4), float('nan'), dtype=torch.float32)
+    for t in range(T):
+        bx = cropmod.crop_box_for_points(cf[t], size, 32, 10)
+        if bx is not None:
+            out[t, 0] = bx.to(torch.float32)
+    return out[None].to(dev)
 
 
 def _to_device(cgroup, device):
@@ -511,6 +556,15 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 if cgroup is None:
                     outcome[a, wi] = OUTCOMES.index('crop failed')
                     continue
+            # WIDE-CROP DEPLOYMENT (report 27): inflate each crop about its centre before the
+            # resize, so the target sits off-centre in a wider crop that includes neighbours --
+            # the regime where the box prompt is load-bearing. Guarded: crop_inflate 1.0 leaves
+            # `boxes`/`cgroup` untouched, so this is a no-op on every existing run. Static boxes
+            # only (the moving-crop path is retired); each box is (4,) per camera here.
+            if cfg.crop_inflate != 1.0:
+                boxes = [_inflate_box(b, window_cams[ci]['size'], cfg.crop_inflate)
+                         for ci, b in zip(use, boxes)]
+                cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
             scales = []
             # PASS 1, which under `--refine-px` runs at a reduced resolution. The distinction
             # between the two passes lives HERE, at the site, rather than in `_resize_camera` --
@@ -588,11 +642,36 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             cgroup_d = _to_device(cgroup, dev)
             # ONE encode for both passes of `self`: the pixels are identical, and the encode is
             # the bulk of the forward. A no-op under `kpt_chunk` (`model._forward_window`).
+            # DEPLOYMENT BOX PROMPT (report 27), 2D single-camera only. GUARDED: when
+            # `box_prompt == 'none'` NO kwarg is passed, so the stock model (whose forward has no
+            # box_prompt parameter) sees the identical call it always did -- byte-identical, pinned
+            # by `tests/test_infer.py`. When on, the box names animal `a` (its own source points
+            # under 'labels', an ORACLE) mapped into the crop frame; the model must be a
+            # `[model].box_prompt` (film/term) checkpoint.
+            mkw = {}
+            if cfg.box_prompt != 'none':
+                if mode != '2d' or len(use) != 1:
+                    raise ValueError(
+                        f'box_prompt = {cfg.box_prompt!r} is only wired for 2D single-camera '
+                        f'(report 27); got mode {mode!r} with {len(use)} camera(s). Refused rather '
+                        'than silently mishandled.')
+                if cfg.box_prompt == 'labels':
+                    # ORACLE: the animal's GT keypoints name which animal to return.
+                    bp_pts = torch.as_tensor(src[a][frames], dtype=torch.float32)   # (T,K,2)
+                elif cfg.box_prompt == 'detector':
+                    # DEPLOYABLE: the detector's own box for this animal slot -- its four corners
+                    # are the points the crop rule boxes. Needs a detector / detections file.
+                    if boxes_stc is None:
+                        raise ValueError('box_prompt = "detector" needs detector boxes '
+                                         '(--detector or --boxes); none were supplied.')
+                    db = torch.as_tensor(boxes_stc[a][frames][:, use[0]], dtype=torch.float32)
+                    bp_pts = cropmod.box_corners(db)                               # (T,4,2)
+                mkw['box_prompt'] = _deploy_box_prompt(bp_pts, boxes, scales, cgroup, dev)
             with share_scene(model) if cfg.anchor == 'self' else nullcontext():
                 out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
                             kpt_prior=None if prior is None else prior.to(dev),
                             prompt_time=None if prompt_t is None else prompt_t.to(dev),
-                            kpt_chunk=chunk)
+                            kpt_chunk=chunk, **mkw)
                 if cfg.anchor == 'self':
                     out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                       kpt_chunk=chunk)

@@ -181,6 +181,43 @@ def test_carry_requires_overlap(scene):
         run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', overlap=0))
 
 
+def test_inflate_box_widens_about_its_centre():
+    """The wide-crop deployment helper (report 27): 1.5x the side, same centre, clamped."""
+    from tailcyclenet.infer import _inflate_box
+    box = torch.tensor([100, 100, 140, 160], dtype=torch.int32)     # 40x60, centre (120,130)
+    size = torch.tensor([1000, 1000])
+    out = _inflate_box(box, size, 1.5)
+    assert int((out[0] + out[2]) / 2) == 120 and int((out[1] + out[3]) / 2) == 130
+    assert int(out[2] - out[0]) == 60 and int(out[3] - out[1]) == 90       # 1.5x
+    # clamps to the image rather than going negative
+    clamped = _inflate_box(torch.tensor([0, 0, 40, 40], dtype=torch.int32), size, 4.0)
+    assert int(clamped[0]) == 0 and int(clamped[1]) == 0
+
+
+def test_deploy_box_prompt_lands_inside_the_crop():
+    """`_deploy_box_prompt` maps an animal's source points into the crop frame and boxes them."""
+    from tailcyclenet.infer import _deploy_box_prompt
+    source = torch.tensor([[[110., 110.], [130., 150.]]])          # (T=1,K=2,2) source px
+    boxes = [torch.tensor([100, 100, 200, 200], dtype=torch.int32)]
+    scales = [2.0]
+    cam = {'size': torch.tensor([200, 200], dtype=torch.int32)}
+    out = _deploy_box_prompt(source, boxes, scales, [cam], 'cpu')
+    assert out.shape == (1, 1, 1, 4)
+    x0, y0, x1, y1 = out[0, 0, 0].tolist()
+    # source (110,110)->(20,20) and (130,150)->(60,100) in crop px; the box must bound them
+    assert x0 <= 20 and y0 <= 20 and x1 >= 60 and y1 >= 100
+
+
+def test_box_prompt_refuses_3d_and_multicam(scene):
+    """Guard: box_prompt is only wired for 2D single-camera; anything else raises rather than
+    being silently mishandled (report 27)."""
+    model, sess, registry, name = scene
+    if sess.mode != '3d':
+        pytest.skip('needs the 3D scene')
+    with pytest.raises(ValueError, match='2D single-camera'):
+        run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', box_prompt='labels'))
+
+
 def test_carried_prior_is_bounds_masked_and_dated():
     """The two defects in the deployed prompt, both of which were silent.
 

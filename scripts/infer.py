@@ -99,6 +99,14 @@ def main():
                          'score-ordered rows, and the union crop spanning several animals. Every 2D '
                          'number in reports 11 and 13 came from an explicit opt-in. '
                          '`--no-link-boxes` restores that memoryless pass.')
+    ap.add_argument('--box-prompt', default='none', choices=('none', 'labels', 'detector'),
+                    help='DEPLOYMENT BOX PROMPT (report 27), 2D single-camera only. `labels` is '
+                         'an ORACLE (GT boxes) -- not a deployment number. Requires a '
+                         '[model].box_prompt (film/term) checkpoint, deployed via '
+                         'scratch/boxprompt/deploy_box.py.')
+    ap.add_argument('--crop-inflate', type=float, default=1.0,
+                    help='inflate every crop about its centre (1.5 = the WIDE regime where the '
+                         'box prompt is load-bearing; report 27 section 9m)')
     ap.add_argument('--crop-source', default='boxes', choices=('boxes', 'keypoints'),
                     help="where the window's crop comes from. 'boxes' (default) unions the "
                          "detector's per-frame boxes -- what every recorded number uses. "
@@ -348,7 +356,8 @@ def main():
         vis_thresh=args.vis_thresh, refine=args.refine, refine_px=args.refine_px,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
-        crop_source=args.crop_source)
+        crop_source=args.crop_source,
+        box_prompt=args.box_prompt, crop_inflate=args.crop_inflate)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
               'instances.pq falls back to its keypoints')

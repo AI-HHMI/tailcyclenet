@@ -50,6 +50,14 @@ query_encoder = "wide"      # "wide" (512-dim, identity + time + the two query t
 # target). Deploy with `scripts/infer.py` -- the box DEPLOYMENT recipe (--box-prompt detector
 # --crop-inflate 1.5 --refine) is now the DEFAULT for a box model and inert for a plain one, so
 # no flags are needed. "film" is the shipped default; "none" restores a plain wide model.
+#
+# LIVE IN 2D AND 3D, PER CAMERA (report 33). This used to be 2D-single-camera-only -- the
+# training loader always emitted a correct per-camera 3D box, but `infer.py` refused to consume
+# it on any 3D or multi-camera window and ran box-withheld there, silently, on every 3D box run
+# ever trained. A camera with nothing finite that frame gets a NaN column, substituted by the
+# encoder's learned no-box token -- the regime `[data].box_prompt_dropout` trains, not a silent
+# failure. `[data].crop_inflate` is the loader twin of `--crop-inflate`: 1.0 is inert, and no
+# shipped config trains above it yet.
 box_prompt = "film"
 # What the 3D residual is an offset FROM. NO DEFAULT -- the two values load the same tensors, so a
 # checkpoint trained under one and built under the other produces numbers instead of an exception

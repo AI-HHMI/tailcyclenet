@@ -114,6 +114,28 @@ def box_corners(boxes):
     return lib.stack([b[..., [0, 1]], b[..., [2, 1]], b[..., [2, 3]], b[..., [0, 3]]], -2)
 
 
+def inflate_box(box, size, factor):
+    """Widen an xyxy crop box about its centre by `factor`, clamped to the image. Static (4,)
+    boxes only. Returns int32, the same convention `crop_box_for_points` returns.
+
+    THE ONE INFLATION RULE, shared by the WIDE-crop training regime (`dataset._item`'s
+    `crop_inflate`) and the WIDE-crop deployment recipe (`infer.py`'s `--crop-inflate`) -- report
+    27's endpoint-1 mechanism needs the model to train and deploy on the SAME geometry, or a box
+    trained at one inflation is evaluated at another. `factor = 1.0` is an exact no-op (the box is
+    returned unchanged, not merely numerically close), which is what makes both callers
+    inert-by-default.
+    """
+    if factor == 1.0:
+        return box.to(torch.int32) if torch.is_tensor(box) else torch.as_tensor(box, dtype=torch.int32)
+    b = box.to(torch.float32) if torch.is_tensor(box) else torch.as_tensor(box, dtype=torch.float32)
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    hw, hh = (b[2] - b[0]) * factor / 2, (b[3] - b[1]) * factor / 2
+    W, H = float(size[0]), float(size[1])
+    out = torch.tensor([max(0.0, float(cx - hw)), max(0.0, float(cy - hh)),
+                        min(W, float(cx + hw)), min(H, float(cy + hh))])
+    return out.round().to(torch.int32)
+
+
 def apply_crop(cam, box):
     """A copy of `cam` describing the cropped image: origin moves, size shrinks."""
     x1, y1, x2, y2 = box
@@ -136,12 +158,16 @@ def _crop_source(coords, crop_pts):
     return coords, 20
 
 
-def crop_to_points_3d(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None):
+def crop_to_points_3d(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=None, inflate=1.0):
     """Crop every camera to the projection of `coords`. Returns (cgroup, boxes).
 
     `crop_pts` is an optional (C, ..., 2) of pixel points to bound INSTEAD of the projection --
     the fallback is decided per camera, so one view with a stored box and one without is fine.
     Only what gets bounded changes; `coords` still drives `apply_crop` and everything downstream.
+
+    `inflate` widens each camera's box about its own centre AFTER jitter, via `inflate_box` --
+    report 27's wide-crop regime. 1.0 is an exact no-op (`inflate_box`'s own contract), so an
+    unset caller is byte-identical.
     """
     p2d = project_points_torch(cgroup, coords)
     out, boxes = [], []
@@ -152,19 +178,27 @@ def crop_to_points_3d(cgroup, coords, min_crop_dim=64, jitter=None, crop_pts=Non
             return None, None
         if jitter is not None:
             box = jitter(box, cam['size'])
+        if inflate != 1.0:
+            box = inflate_box(box, cam['size'], inflate)
         out.append(apply_crop(cam, box))
         boxes.append(box)
     return out, boxes
 
 
-def crop_to_points_2d(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None):
-    """Single-camera pixel-space crop. Returns (cam, box, coords shifted into the crop)."""
+def crop_to_points_2d(cam, coords, min_crop_dim=64, jitter=None, crop_pts=None, inflate=1.0):
+    """Single-camera pixel-space crop. Returns (cam, box, coords shifted into the crop).
+
+    `inflate` widens the box about its own centre AFTER jitter, via `inflate_box` -- report 27's
+    wide-crop regime. 1.0 is an exact no-op, so an unset caller is byte-identical.
+    """
     src, pad = _crop_source(coords, crop_pts)
     box = crop_box_for_points(src, cam['size'], min_crop_dim, pad)
     if box is None:
         return None, None, None
     if jitter is not None:
         box = jitter(box, cam['size'])
+    if inflate != 1.0:
+        box = inflate_box(box, cam['size'], inflate)
     shifted = coords - box[:2].to(coords.dtype)
     return apply_crop(cam, box), box, shifted
 

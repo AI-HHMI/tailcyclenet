@@ -271,33 +271,229 @@ def test_inflate_box_widens_about_its_centre():
     assert int(clamped[0]) == 0 and int(clamped[1]) == 0
 
 
-def test_deploy_box_prompt_lands_inside_the_crop():
-    """`_deploy_box_prompt` maps an animal's source points into the crop frame and boxes them."""
+def test_deploy_box_prompt_lands_inside_the_crop_2d():
+    """`_deploy_box_prompt` maps an animal's source points into the crop frame and boxes them,
+    2D single-camera -- the path this function has always covered, unchanged in result."""
     from tailcyclenet.infer import _deploy_box_prompt
-    source = torch.tensor([[[110., 110.], [130., 150.]]])          # (T=1,K=2,2) source px
+    source = np.array([[[[110., 110.], [130., 150.]]]])            # (S=1,T=1,K=2,2) source px
     boxes = [torch.tensor([100, 100, 200, 200], dtype=torch.int32)]
     scales = [2.0]
     cam = {'size': torch.tensor([200, 200], dtype=torch.int32)}
-    out = _deploy_box_prompt(source, boxes, scales, [cam], 'cpu')
+    out = _deploy_box_prompt('2d', source, None, np.array([0]), 0, [0], boxes, scales, [cam],
+                             'cpu')
     assert out.shape == (1, 1, 1, 4)
     x0, y0, x1, y1 = out[0, 0, 0].tolist()
     # source (110,110)->(20,20) and (130,150)->(60,100) in crop px; the box must bound them
     assert x0 <= 20 and y0 <= 20 and x1 >= 60 and y1 >= 100
 
 
-def test_box_prompt_skipped_on_3d_and_multicam(scene):
-    """Guard: box_prompt is wired for 2D single-camera only; on 3D / multi-camera it is SKIPPED
-    with a warning (not an error), so a box model deploys gracefully on every root (report 27)."""
+def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
+    """3D + 'labels' must be BYTE-IDENTICAL to `box_prompt.compute_box_prompt` on the same world
+    points and cgroup -- the load-bearing deploy/train parity assertion (same class as the
+    int32-exact crop-rule test gotcha 8 exists for). Not a re-derivation of the training
+    computation, a direct call to it. Uses the REAL 3D scene's own rig (not a hand-built camera
+    dict, which is missing fields `project_cam` needs) so the projection geometry is exactly what
+    `run_group` builds.
+    """
+    from tailcyclenet import box_prompt as bpmod
+    from tailcyclenet.infer import _deploy_box_prompt
+
+    _, sess, _, _ = scene
+    if sess.mode != '3d':
+        pytest.skip('needs the 3D scene')
+    frames = np.arange(4)
+    cgroup = sess.cgroup('g000', frames)
+    lab = sess.labels('g000')
+    world = lab.points3d                                # (S,T,K,3)
+
+    got = _deploy_box_prompt('3d', world, None, frames, 0, list(range(len(cgroup))), None, None,
+                             cgroup, 'cpu')
+    want = bpmod.compute_box_prompt(torch.as_tensor(world[0]), cgroup, '3d')[None]
+    torch.testing.assert_close(got, want.to(got.dtype))
+
+
+def test_box_prompt_live_on_3d_multicam(scene):
+    """The box is LIVE on 3D / multi-camera, per camera -- no longer skipped (report 27's 3D fix).
+    Runs to completion with no warning, and the encoder actually receives a (1,T,C,4) box with
+    C == len(use)."""
     model, sess, registry, name = scene
     if sess.mode != '3d':
         pytest.skip('needs the 3D scene')
     import warnings
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter('always')
-        out = run_group(model, sess, 'g000', registry, name,
-                        _cfg(anchor='none', box_prompt='labels'))
-    assert out['pred'].shape[0] >= 1                      # ran to completion, box skipped
-    assert any('2D single-camera' in str(x.message) for x in w)
+
+    seen = {}
+    orig = model.query_encoder.forward
+
+    def spy(*a, **kw):
+        box = getattr(model.query_encoder, '_box_prompt', None)
+        if box is not None:
+            seen['shape'] = tuple(box.shape)
+        return orig(*a, **kw)
+
+    model.query_encoder.forward = spy
+    try:
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            out = run_group(model, sess, 'g000', registry, name,
+                            _cfg(anchor='none', box_prompt='labels'))
+    finally:
+        model.query_encoder.forward = orig
+    assert out['pred'].shape[0] >= 1
+    assert not any('skipped' in str(x.message) for x in w)
+    assert 'shape' in seen and seen['shape'][2] == len(sess.rig)
+    assert out['box_prompt_cams'][0, 0] >= 1
+
+
+def test_box_prompt_detector_per_camera_degradation():
+    """3D + 'detector': a camera with NO finite box that frame yields a NaN column, not an
+    exception -- the `_sub_missing` no-box token substitutes it in the encoder, which is the
+    regime `box_prompt_dropout` trains rather than a silent failure."""
+    from tailcyclenet.infer import _deploy_box_prompt
+
+    T = 3
+    cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)) for _ in range(2)]
+    boxes = [torch.tensor([0, 0, 64, 48], dtype=torch.int32) for _ in range(2)]
+    scales = [1.0, 1.0]
+    # (S=1,T,C=2,4) source px: camera 0 has a real box every frame, camera 1 is all-NaN.
+    boxes_stc = np.full((1, T, 2, 4), np.nan, np.float32)
+    boxes_stc[0, :, 0] = [10., 10., 30., 30.]
+    frames = np.arange(T)
+
+    got = _deploy_box_prompt('3d', None, boxes_stc, frames, 0, [0, 1], boxes, scales, cgroup,
+                             'cpu')
+    assert got.shape == (1, T, 2, 4)
+    assert torch.isfinite(got[:, :, 0]).all()           # camera 0: real box every frame
+    assert torch.isnan(got[:, :, 1]).all()              # camera 1: nothing finite -> NaN column
+
+
+def test_box_prompt_column_order_matches_use():
+    """Column `i` of the output must be built from `use[i]`'s own `boxes[i]`/`scales[i]`/
+    `cgroup[i]` and detection `ci` -- not from a neighbouring camera's. Two cameras with
+    DIFFERENT sizes, origins and scales (so a swapped index produces a visibly different box,
+    not a coincidentally-matching one); each column is checked against a DIRECT call to the same
+    primitives (`box_corners` + `crop_box_for_points`) for that camera alone, rather than a hand-
+    derived expected value."""
+    from tailcyclenet import box_prompt as bpmod
+    from tailcyclenet.infer import _deploy_box_prompt
+
+    T = 2
+    cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)),
+              dict(size=torch.tensor([32, 96], dtype=torch.int32))]
+    boxes = [torch.tensor([0, 0, 64, 48], dtype=torch.int32),
+             torch.tensor([100, 100, 132, 196], dtype=torch.int32)]
+    scales = [1.0, 2.0]
+    # use = [1, 0]: camera index 1 (source cam 1) is requested FIRST, camera 0 second.
+    boxes_stc = np.full((1, T, 2, 4), np.nan, np.float32)
+    boxes_stc[0, :, 0] = [10., 10., 30., 30.]           # source cam 0's own detector box
+    boxes_stc[0, :, 1] = [110., 104., 126., 140.]       # source cam 1's own detector box
+    frames = np.arange(T)
+
+    got = _deploy_box_prompt('3d', None, boxes_stc, frames, 0, [1, 0],
+                             [boxes[1], boxes[0]], [scales[1], scales[0]],
+                             [cgroup[1], cgroup[0]], 'cpu')
+    assert got.shape == (1, T, 2, 4)
+
+    from tailcyclenet import crop as cropmod
+
+    def expected(src_ci, origin, scale, size):
+        db = torch.as_tensor(boxes_stc[0, 0, src_ci], dtype=torch.float32)
+        corners = cropmod.box_corners(db)
+        cf = (corners - torch.as_tensor(origin, dtype=torch.float32)) * float(scale)
+        return cropmod.crop_box_for_points(cf, torch.as_tensor(size), bpmod.BOX_PROMPT_MIN_DIM,
+                                           bpmod.BOX_PROMPT_PAD)
+
+    # column 0 (use[0] = source cam 1): its OWN box/scale/cgroup, not source cam 0's
+    want0 = expected(1, [100, 100], 2.0, [32, 96])
+    torch.testing.assert_close(got[0, 0, 0], want0.to(got.dtype))
+    # column 1 (use[1] = source cam 0): its OWN box/scale/cgroup
+    want1 = expected(0, [0, 0], 1.0, [64, 48])
+    torch.testing.assert_close(got[0, 0, 1], want1.to(got.dtype))
+    # and swapped indices must NOT coincide -- the failure mode this guards against
+    assert not torch.allclose(got[0, 0, 0], want1.to(got.dtype))
+
+
+def test_box_prompt_none_is_byte_identical_on_2d_and_3d(scene):
+    """`box_prompt = 'none'` (the default) must be byte-identical to a run that never mentions
+    the box at all, on BOTH the 2D and the 3D/multi-camera scene -- the 3D fix must not perturb
+    the untouched path. `crop_inflate = 1.0` (the default) must be part of that invariant too.
+    """
+    model, sess, registry, name = scene
+    base = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
+    off = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='none', box_prompt='none', crop_inflate=1.0))
+    np.testing.assert_array_equal(base['pred'], off['pred'])
+    assert 'box_prompt_cams' not in off
+
+
+def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
+    """The shipped box recipe is WIDE pass 1 + TIGHT pass 2 (report 24 §9m + report 27): pass 1's
+    box is inflated about its centre by `crop_inflate`, but pass 2 is rebuilt from pass 1's own
+    PREDICTION via `boxes_from_points`, which never inflates -- so pass 2 sees a tight box around
+    wherever pass 1 landed, not an inflated one. `crop` (pass 1, as recorded) must show the
+    inflation; `crop_refined` (pass 2) must not be systematically wider than a plain refine's.
+    """
+    model, sess, registry, name = scene
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    cx, cy = w / 2, h / 2
+    side = min(w, h) / 4
+    boxes[..., 0], boxes[..., 1] = cx - side / 2, cy - side / 2
+    boxes[..., 2], boxes[..., 3] = cx + side / 2, cy + side / 2
+
+    tight = run_group(model, sess, 'g000', registry, name,
+                      _cfg(anchor='none', refine=True, crop_inflate=1.0), boxes_stc=boxes)
+    wide = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='none', refine=True, crop_inflate=1.5), boxes_stc=boxes)
+
+    # PASS 1 (`crop`): the wide arm's box must be ~1.5x the tight arm's, same centre.
+    c_tight, c_wide = tight['crop'][0, 0], wide['crop'][0, 0]
+    for ci in range(C):
+        if not (np.isfinite(c_tight[ci]).all() and np.isfinite(c_wide[ci]).all()):
+            continue
+        wt = c_tight[ci, 2] - c_tight[ci, 0]
+        ww = c_wide[ci, 2] - c_wide[ci, 0]
+        assert ww > wt * 1.2, 'pass 1 must be visibly wider under crop_inflate = 1.5'
+        cxt = (c_tight[ci, 0] + c_tight[ci, 2]) / 2
+        cxw = (c_wide[ci, 0] + c_wide[ci, 2]) / 2
+        assert abs(cxt - cxw) < wt, 'inflation is about the SAME centre, not a shifted one'
+
+    # PASS 2 (`crop_refined`) is NOT inflated -- it comes from `boxes_from_points` on the pass-1
+    # PREDICTION, which never reads `crop_inflate`. So the wide arm's pass-2 box side should be
+    # close to (not 1.5x) the tight arm's, modulo the two arms predicting from different pixels.
+    r_tight, r_wide = tight['crop_refined'][0, 0], wide['crop_refined'][0, 0]
+    for ci in range(C):
+        if not (np.isfinite(r_tight[ci]).all() and np.isfinite(r_wide[ci]).all()):
+            continue
+        rt = r_tight[ci, 2] - r_tight[ci, 0]
+        rw = r_wide[ci, 2] - r_wide[ci, 0]
+        assert rw < rt * 1.2, 'pass 2 must not carry pass 1\'s inflation forward'
+
+
+def test_box_prompt_detector_path_through_run_group(scene):
+    """`--box-prompt detector` end to end through `run_group`, 2D and 3D alike: a real
+    `boxes_stc` produces a finite box-prompt population without raising, and `box_prompt_cams`
+    reports it."""
+    model, sess, registry, name = scene
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, 4, C, 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h
+
+    out = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='none', box_prompt='detector'), boxes_stc=boxes)
+    assert out['pred'].shape[0] >= 1
+    assert 'box_prompt_cams' in out
+    assert (out['box_prompt_cams'][0] >= 1).any()
+
+
+def test_box_prompt_detector_with_no_boxes_raises(scene):
+    """`box_prompt = 'detector'` needs a detector/boxes source; without one it must raise, not
+    silently run box-withheld."""
+    model, sess, registry, name = scene
+    with pytest.raises(ValueError, match='detector'):
+        run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='none', box_prompt='detector'))
 
 
 def test_carried_prior_is_bounds_masked_and_dated():

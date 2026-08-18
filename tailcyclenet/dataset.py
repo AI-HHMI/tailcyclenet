@@ -163,6 +163,16 @@ class LoaderConfig:
     box_prompt_dropout: float = 0.0    # fraction of STEPS the box is withheld (no-box token)
     box_prompt_jitter: float = 0.0     # exposure bias: the deployed box is a DETECTOR box
     box_prompt_scale_jitter: float = 0.0
+    # WIDE-CROP TRAINING (report 27's endpoint-1 mechanism, ported from `scratch/boxprompt/inject.py`).
+    # Widen the crop-rule box about its centre by this factor BEFORE the coords are shifted into
+    # it, in both the 2D and 3D branches of `_item` -- so the animal sits off-centre in a wider
+    # crop that includes more of any neighbour, and `compute_box_prompt` (run post-hoc on the
+    # returned coords) reads the animal's TIGHT extent within that wider crop, making the box the
+    # only non-centred cue for which animal. 1.0 is INERT and byte-identical to a config without
+    # this key -- `_inflate_crop_box` is a no-op at 1.0, asserted by `tests/test_dataset.py`. No
+    # shipped config sets this above 1.0 yet; report 27's wide-crop arms trained through the
+    # scratch monkeypatch above, which this supersedes.
+    crop_inflate: float = 1.0
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1094,7 +1104,8 @@ class PoseDataset(Dataset):
                 cp = _apply_affine(cp, rot)
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
-                                                         jit, crop_pts=cp)
+                                                         jit, crop_pts=cp,
+                                                         inflate=self.cfg.crop_inflate)
             if cam is None:
                 return None
             cam, scale = _resize_camera(cam, self.cfg.image_size)
@@ -1153,7 +1164,8 @@ class PoseDataset(Dataset):
                 _apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
             jit = self._jitter(rng)
             cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
-                                                      jit, crop_pts=cp3)
+                                                      jit, crop_pts=cp3,
+                                                      inflate=self.cfg.crop_inflate)
             if cgroup is None:
                 return None
             cgroup = [_resize_camera(c, self.cfg.image_size)[0] for c in cgroup]

@@ -993,6 +993,75 @@ def test_box_source_rejects_a_typo(tiny_root):
         PoseDataset(tiny_root / 'ratlike', 'val', LoaderConfig(box_source='keypoint', **BOXCFG))
 
 
+def test_crop_inflate_default_is_inert(tiny_root):
+    """`crop_inflate = 1.0` (the default) must be BYTE-IDENTICAL to a config that never mentions
+    the key -- the wide-crop TRAINING regime (report 27) is only a no-op UNLESS a caller opts in.
+    val/test items are index-seeded (`__getitem__`), so two configs differing only in
+    `crop_inflate` draw the identical augmentation stream and any difference is the key's own
+    doing.
+    """
+    for root, split in ((tiny_root / 'ratlike', 'val'), (tiny_root / 'mouselike', 'train')):
+        base = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
+                            crop_jitter=0.3, prompt_dropout=0.4)
+        explicit = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
+                                crop_jitter=0.3, prompt_dropout=0.4, crop_inflate=1.0)
+        ds_base = PoseDataset(root, split, base, train=False)
+        ds_explicit = PoseDataset(root, split, explicit, train=False)
+        b = _batch(ds_base)
+        e = _batch(ds_explicit)
+        torch.testing.assert_close(b.coords, e.coords, equal_nan=True)
+        np.testing.assert_array_equal(b.views[0].numpy(), e.views[0].numpy())
+        torch.testing.assert_close(b.cgroup[0]['offset'], e.cgroup[0]['offset'])
+        torch.testing.assert_close(b.cgroup[0]['size'].float(), e.cgroup[0]['size'].float())
+
+
+def test_crop_inflate_widens_the_2d_crop():
+    """Above 1.0, `crop.crop_to_points_2d` must widen the returned box about its own centre,
+    AFTER jitter. Pure `crop.py` unit test: 2D needs no camera-projection fields at all (only
+    `size`), unlike the 3D path, which is exercised end to end through the real fixture rig in
+    `test_crop_inflate_widens_the_3d_crop` instead of a hand-built camera dict missing the
+    `project_cam`-required fields (`type`, etc).
+    """
+    cam = {'size': torch.tensor([2000, 2000], dtype=torch.int32), 'offset': torch.zeros(2)}
+    coords = torch.tensor([[900.0, 900.0], [1100.0, 1100.0]])       # (K=2,2), a small box
+
+    _, tight_box, _ = cropmod.crop_to_points_2d(cam, coords, min_crop_dim=16, inflate=1.0)
+    _, wide_box, _ = cropmod.crop_to_points_2d(cam, coords, min_crop_dim=16, inflate=1.5)
+    tw, ww = tight_box[2] - tight_box[0], wide_box[2] - wide_box[0]
+    assert float(ww) > float(tw) * 1.2
+    tc = (float(tight_box[0]) + float(tight_box[2])) / 2
+    wc = (float(wide_box[0]) + float(wide_box[2])) / 2
+    assert abs(tc - wc) < float(tw), 'inflation is about the SAME centre'
+
+
+def test_crop_inflate_widens_the_3d_crop(tiny_root):
+    """Above 1.0, `crop.crop_to_points_3d` must widen every camera's box about its own centre,
+    using the real fixture rig (`sess.cgroup`) so `project_points_torch` sees complete camera
+    dicts.
+    """
+    from tailcyclenet.format import load_dataset
+
+    ds = load_dataset(tiny_root / 'mouselike')
+    sess = ds.sessions['train'][0]
+    sess.preload()
+    frames = np.arange(4)
+    cgroup = sess.cgroup('g000', frames)
+    lab = sess.labels('g000')
+    coords = torch.as_tensor(lab.points3d[0][frames], dtype=torch.float32)
+
+    _, tight = cropmod.crop_to_points_3d(cgroup, coords, min_crop_dim=8, inflate=1.0)
+    _, wide = cropmod.crop_to_points_3d(cgroup, coords, min_crop_dim=8, inflate=1.5)
+    grew = False
+    for c in range(len(cgroup)):
+        tw, ww = tight[c][2] - tight[c][0], wide[c][2] - wide[c][0]
+        th, wh = tight[c][3] - tight[c][1], wide[c][3] - wide[c][1]
+        assert float(ww) >= float(tw) and float(wh) >= float(th)
+        # the tiny fixture's 64x48 frame CLAMPS a 1.5x box on the short axis, so require growth
+        # on at least one axis of at least one camera rather than every axis of every camera.
+        grew = grew or float(ww) > float(tw) * 1.1 or float(wh) > float(th) * 1.1
+    assert grew, 'crop_inflate = 1.5 produced no wider box on any camera/axis'
+
+
 # ----------------------------------------------------------------------------------------------
 # the reader cache size
 # ----------------------------------------------------------------------------------------------

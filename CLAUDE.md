@@ -392,7 +392,9 @@ The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one le
 | `--carry-source` | `triangulate` | **INERT** (bit-identical) | on | 13 RC1 |
 | `--pose-nms` | off | +0.0223 MOTA on rat-city, **harmful on calms21** | untested | 21 §9k |
 | `--vis-thresh` | off | **cannot work** (untrained head) | +0.049 on 3dpop | 24 §1.2 |
-| `--refine-px` | none | **SWEEP IT**: 96 is best on calms21 and **+15.8 px / MOTA −0.238 SIG on rat-city** | 192 ≈ 256; 96–128 trade mm for MOTA | 24 §9h, §9j, §10 |
+| `--refine-px` | none | **SWEEP IT**: 96 is best on calms21 and **+15.8 px / MOTA −0.238 SIG on rat-city** | 192 ≈ 256; 96–128 trade mm for MOTA. **INTERACTS WITH `--crop-inflate`**: report 24 §9m's wide pass-1 crop is harmful at 96, so a box model's default 128 is the nearest measured neighbour, not itself swept at 1.5× inflation | 24 §9h, §9j, §10, §9m |
+| `--box-prompt` | `auto` | **LIVE, 2D single-camera** (report 27) | **LIVE, PER CAMERA** (report 33 — this used to be skipped on every 3D/multi-camera window and ran box-withheld silently) | 27, 33 |
+| `--crop-inflate` | 1.5 iff box model | wide pass-1 + tight pass-2, report 27's mechanism | measured on 3dpop as a secondary axis alongside the box (report 33) | 27, 33 |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | | |
 | `--prefetch-windows` | **1** | bit-exact at any value (report 31) | bit-exact at any value | 31 |
 

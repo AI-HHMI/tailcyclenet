@@ -124,9 +124,12 @@ class InferConfig:
     # DEPLOYMENT BOX PROMPT (report 27). Which-animal-occupies-this-box, fed as a non-position
     # input channel to a `[model].box_prompt` (film/term) model. 'none' | 'labels' (GT boxes,
     # ORACLE -- gate off like `--anchor labels`) | 'detector'. GUARDED: 'none' + crop_inflate 1.0
-    # is byte-identical to a run without these keys, which `tests/test_infer.py` pins. Only the
-    # 2D single-camera path is wired (the crowded 2D roots endpoint 1 targets); a box on a 3D or
-    # multi-cam run is refused loudly rather than silently ignored.
+    # is byte-identical to a run without these keys, which `tests/test_infer.py` pins. LIVE IN
+    # 2D AND 3D, PER CAMERA (this used to be 2D-single-camera-only and silently ran box-withheld
+    # on every 3D/multi-camera window -- the training loader always emitted a correct per-camera
+    # 3D box via `box_prompt.compute_box_prompt`, so a 3D box model trained WITH the box and
+    # deployed WITHOUT it). A camera with no finite point that frame gets a NaN column, which the
+    # encoder's learned no-box token substitutes -- the regime `box_prompt_dropout` trains.
     box_prompt: str = 'none'
     # Inflate every crop about its centre by this factor -- the WIDE pass-1 regime where the box
     # is load-bearing (report 27 §9m). 1.0 is today's behaviour exactly.
@@ -178,34 +181,73 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode):
 
 def _inflate_box(box, size, factor):
     """Widen an xyxy crop box about its centre by `factor`, clamped to the image. Static (4,)
-    boxes only. Returns the same dtype as `box`."""
-    b = box.to(torch.float32) if torch.is_tensor(box) else torch.as_tensor(box, dtype=torch.float32)
-    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-    hw, hh = (b[2] - b[0]) * factor / 2, (b[3] - b[1]) * factor / 2
-    W, H = float(size[0]), float(size[1])
-    out = torch.tensor([max(0.0, float(cx - hw)), max(0.0, float(cy - hh)),
-                        min(W, float(cx + hw)), min(H, float(cy + hh))])
-    return out.round().to(torch.int32)
+    boxes only. Thin alias of `crop.inflate_box` -- THE ONE INFLATION RULE, shared with the
+    wide-crop TRAINING regime (`dataset.LoaderConfig.crop_inflate`) so the model trains and
+    deploys on the same geometry."""
+    return cropmod.inflate_box(box, size, factor)
 
 
-def _deploy_box_prompt(source, boxes, scales, cgroup, dev):
-    """The box-prompt tensor for one animal's window, 2D single-camera. (1,T,1,4) in crop pixels.
+def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, cgroup, dev):
+    """The box-prompt tensor for one animal's window, PER CAMERA, 2D or 3D. (1,T,C,4) in crop
+    pixels, C = len(use) -- column order matches cgroup/views/use.
 
-    `source` (T,K,2) is the animal's SOURCE-pixel points that name WHICH animal to return -- the
-    labels under `box_prompt = 'labels'` (an ORACLE), a detector box's keypoints otherwise.
-    Mapped into the (possibly inflated) crop frame exactly as the pixels are: `(pt - origin) *
-    scale`. Then THE crop rule gives the animal's tight extent inside the crop, which is the
-    non-position channel a box-prompt model consumes. Matches the training-time
-    `boxdata.compute_box_prompt` by construction (both run `crop_box_for_points` on crop-frame
-    points), so a deployment box is the same object the model trained on.
+    `src_pts` names WHICH animal to return: the GT points under box_prompt = 'labels' (an
+    ORACLE), or None under 'detector', where boxes_stc[a] supplies per-camera boxes instead.
+    `frames`/`a`/`use` index into whichever source is live.
+
+    3D + labels calls box_prompt.compute_box_prompt DIRECTLY on the animal's world points and
+    this window's own cropped+resized cgroup -- byte-for-byte the training-time computation
+    (dataset._item), not a re-derivation, which is what removes the class of bug gotcha 8 exists
+    for. 3D + detector maps each camera's own box into that camera's crop frame and runs THE crop
+    rule on it, per camera -- under --track these are one cross-view target's own per-camera
+    boxes, so "which animal" is already cross-view consistent and no new association is needed.
+
+    A camera absent from `use` is absent from the output too (never a NaN placeholder at the
+    wrong index): _box_features normalises columns against ctx['sizes'], built from
+    preprocessed_views in the SAME `use` order, so index i must mean the same camera in both.
     """
+    from . import box_prompt as bpmod
+
+    if mode == '3d' and src_pts is not None:
+        # LABELS, 3D: identical to what _item computes at training time -- cgroup here is
+        # already this window's cropped+resized camera list.
+        pts = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)      # (T,K,3) world
+        return bpmod.compute_box_prompt(pts, cgroup, '3d')[None].to(dev)
+
+    if mode == '3d':
+        # DETECTOR, 3D: per camera, map that camera's own box corners into ITS crop frame and
+        # box them there -- a 2D box-in-one-view computation repeated per camera, not a 3D
+        # projection, because the detector box is a per-camera detection to begin with.
+        T = len(frames)
+        C = len(use)
+        out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)
+        for i, ci in enumerate(use):
+            db = torch.as_tensor(boxes_stc[a][frames][:, ci], dtype=torch.float32)  # (T,4) src px
+            if not torch.isfinite(db).any():
+                continue
+            corners = cropmod.box_corners(db)                                # (T,4,2) src px
+            origin = torch.as_tensor(boxes[i][:2], dtype=torch.float32)
+            cf = (corners - origin) * float(scales[i])                       # (T,4,2) crop px
+            size = cgroup[i]['size']
+            for t in range(T):
+                bx = cropmod.crop_box_for_points(cf[t], size,
+                                                 bpmod.BOX_PROMPT_MIN_DIM, bpmod.BOX_PROMPT_PAD)
+                if bx is not None:
+                    out[t, i] = bx.to(torch.float32)
+        return out[None].to(dev)
+
+    # 2D, single camera -- UNCHANGED result from before this fix.
+    source = (torch.as_tensor(src_pts[a][frames], dtype=torch.float32) if src_pts is not None
+              else cropmod.box_corners(torch.as_tensor(boxes_stc[a][frames][:, use[0]],
+                                                       dtype=torch.float32)))
     origin = torch.as_tensor(boxes[0][:2], dtype=torch.float32)
     cf = (source - origin) * float(scales[0])                    # (T,K,2) crop px
     size = cgroup[0]['size']
     T = cf.shape[0]
     out = torch.full((T, 1, 4), float('nan'), dtype=torch.float32)
     for t in range(T):
-        bx = cropmod.crop_box_for_points(cf[t], size, 32, 10)
+        bx = cropmod.crop_box_for_points(cf[t], size, bpmod.BOX_PROMPT_MIN_DIM,
+                                         bpmod.BOX_PROMPT_PAD)
         if bx is not None:
             out[t, 0] = bx.to(torch.float32)
     return out[None].to(dev)
@@ -411,6 +453,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                  np.full((S, T_total, len(session.rig), det_kpts_stc.shape[3]),
                          np.nan, np.float32))
     crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
+    # THE POPULATION `--box-prompt` GOVERNS, per (animal, window) -- report-24 §9k's rule that a
+    # lever's selectivity must be read beside the population it can act on. -1 where the box was
+    # never supplied (box_prompt = 'none', or an oracle row with no label behind it); else the
+    # COUNT of cameras this window's box reached (0..C), so "the box did nothing" (count 0 despite
+    # being requested) is distinguishable from "the box was never requested" (-1).
+    box_cams = (np.full((S, len(starts)), -1, np.int8) if cfg.box_prompt != 'none' else None)
 
     # THE COMPANION COLUMNS BLEND TOO, and they used not to. `pred` became the nan-aware mean of
     # every window that decoded a frame while `conf`, `box_agree`, `kpt_agree` and `pred_tri`
@@ -658,7 +706,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
-    def forward(frames, plan, crops):
+    def forward(frames, plan, crops, wi):
         """One animal, one window -> its prediction in the SOURCE frame, or None.
 
         `frames` is a parameter for the same reason as `decode_crops`. `carried` is read
@@ -677,33 +725,33 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         cgroup_d = _to_device(cgroup, dev)
         # ONE encode for both passes of `self`: the pixels are identical, and the encode is
         # the bulk of the forward. A no-op under `kpt_chunk` (`model._forward_window`).
-        # DEPLOYMENT BOX PROMPT (report 27), 2D single-camera only. GUARDED: when
+        # DEPLOYMENT BOX PROMPT (report 27), 2D AND 3D, PER CAMERA. GUARDED: when
         # `box_prompt == 'none'` NO kwarg is passed, so the stock model (whose forward has no
         # box_prompt parameter) sees the identical call it always did -- byte-identical, pinned
-        # by `tests/test_infer.py`. When on, the box names animal `a` (its own source points
-        # under 'labels', an ORACLE) mapped into the crop frame; the model must be a
-        # `[model].box_prompt` (film/term) checkpoint.
+        # by `tests/test_infer.py`. When on, the box names animal `a` per camera (its own source
+        # points under 'labels', an ORACLE, or a detector's own per-camera box); the model must be
+        # a `[model].box_prompt` (film/term) checkpoint. A camera with nothing finite that frame
+        # gets a NaN column, which the encoder's `missing_film`/`missing_box` token substitutes --
+        # the regime `box_prompt_dropout` trains, not a silent failure.
         mkw = {}
-        if cfg.box_prompt != 'none' and (mode != '2d' or len(use) != 1):
-            # The box is wired for 2D single-camera only (report 27). On a 3D / multi-camera
-            # window it is SKIPPED, not an error: a box model then runs box-withheld (film's
-            # zero-init token, ~= a plain wide model), so the default box recipe is safe on
-            # every root. Warned once via the stdlib, which dedupes.
-            warnings.warn(f'box_prompt {cfg.box_prompt!r} skipped on a {mode} '
-                          f'{len(use)}-camera window (2D single-camera only; report 27)')
-        elif cfg.box_prompt != 'none':
+        if cfg.box_prompt != 'none':
             if cfg.box_prompt == 'labels':
                 # ORACLE: the animal's GT keypoints name which animal to return.
-                bp_pts = torch.as_tensor(src[a][frames], dtype=torch.float32)   # (T,K,2)
+                if src is None or a >= n_lab:
+                    box_t = None
+                else:
+                    box_t = _deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
+                                              cgroup, dev)
             elif cfg.box_prompt == 'detector':
-                # DEPLOYABLE: the detector's own box for this animal slot -- its four corners
-                # are the points the crop rule boxes. Needs a detector / detections file.
+                # DEPLOYABLE: the detector's own box for this animal slot, per camera.
                 if boxes_stc is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
-                db = torch.as_tensor(boxes_stc[a][frames][:, use[0]], dtype=torch.float32)
-                bp_pts = cropmod.box_corners(db)                               # (T,4,2)
-            mkw['box_prompt'] = _deploy_box_prompt(bp_pts, boxes, scales, cgroup, dev)
+                box_t = _deploy_box_prompt(mode, None, boxes_stc, frames, a, use, boxes, scales,
+                                          cgroup, dev)
+            if box_t is not None:
+                mkw['box_prompt'] = box_t
+                box_cams[a, wi] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
         with share_scene(model) if cfg.anchor == 'self' else nullcontext():
             out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
                         kpt_prior=None if prior is None else prior.to(dev),
@@ -792,7 +840,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             refined = []
             for plan in plans:
                 a, use, boxes, cgroup, scales, *_ = plan
-                got = forward(frames, plan, crops)
+                got = forward(frames, plan, crops, wi)
                 if got is None:
                     refined.append(_at_image_size(plan))
                     continue
@@ -827,7 +875,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
         for plan in plans:
             a, use, boxes, cgroup, scales, *_ = plan
-            got = forward(frames, plan, crops)
+            got = forward(frames, plan, crops, wi)
             if got is None:
                 continue                        # already marked 'decode failed' above
             p, q, out = got
@@ -941,6 +989,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         out_npz['tri_degenerate'] = tri_bad
     if crop_refined is not None:
         out_npz['crop_refined'] = crop_refined
+    if box_cams is not None:
+        # THE POPULATION `--box-prompt` GOVERNS (report 24 §9k's rule: quote a lever's
+        # selectivity beside the population it can act on, before its effect size). Per (animal,
+        # window): -1 never supplied, else the count of cameras this window's box reached.
+        out_npz['box_prompt_cams'] = box_cams
     return out_npz
 
 

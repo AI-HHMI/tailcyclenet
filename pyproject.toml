@@ -37,11 +37,12 @@ LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 # unset it (or delete the directory) to restore byte-for-byte upstream behaviour.
 PYTHONPYCACHEPREFIX = "${HOME}/.cache/tailcyclenet/pycache"
 
-# calms21 is the one root that trains on video, and its loader decodes a fresh ~42 MB frame
-# buffer per item, freed immediately -- churn that grows glibc's per-thread arenas without ever
-# giving the memory back to the OS. Measured (dev/plans/video_loader_memory.md): a calms21
-# loader worker's RSS 12.6 -> 32.3 GB over 5,500 items at glibc defaults, flat ~10 GB under this.
-# No image-directory root shows the growth, so this is calms21-only in effect and no-op elsewhere.
+# A calms21 loader worker decodes a fresh ~42 MB frame buffer per item, freed immediately; a
+# single-threaded standalone probe measured that churn growing glibc's arenas unboundedly and
+# flat under this cap (dev/plans/video_loader_memory.md). Removing it live on a real training
+# job (same report) made no measurable difference either way -- the real worker carries ~20+
+# threads the probe never did, so this is not shown to help THAT mechanism, but it is also not
+# shown to hurt, and it is the one arm with independent standalone evidence behind it.
 MALLOC_ARENA_MAX = "2"
 
 [tool.pixi.pypi-dependencies]

@@ -11,6 +11,7 @@ registry and the checkpoints -- so eval and inference take only `--run <folder>`
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import sys
 import time
@@ -21,6 +22,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+# The default `file_descriptor` sharing strategy keeps a fd open per worker-produced tensor
+# until BOTH ends are done with it. Tried as one candidate explanation for calms21's per-worker
+# RSS plateau under `multiprocessing_context='spawn'` (below) and made no measurable difference
+# on a real job (dev/plans/video_loader_memory.md §2.3) -- kept anyway, since it is the standard
+# mitigation for this class of shared-memory-handle accounting and costs nothing to leave in.
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -450,11 +458,20 @@ def main():
     #
     # batch_size is structurally 1: posetail's collate keeps only item 0's camera group, and the
     # model takes one camera group per batch. This is also why there is no DDP.
+    # `multiprocessing_context='spawn'`: `persistent_workers` forks on the loader's first
+    # `next()`, which is AFTER `model.to(device)` -- so the default `fork` start method hands
+    # every worker a live CUDA context it never asked for and never uses. Measured on calms21:
+    # each worker then independently grows its OWN heap by several GB within the first handful
+    # of items (private, not COW-shared -- confirmed via smaps), an LSF `TERM_MEMLIMIT` in well
+    # under ten minutes that no CUDA-free or checkpoint-free reproduction of the loader alone
+    # ever showed. `spawn` starts each worker as a fresh interpreter that never touches CUDA at
+    # all (dev/plans/video_loader_memory.md). Costs a few seconds of import time once, at start.
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, num_workers=nw, collate_fn=pose_collate,
         sampler=torch.utils.data.RandomSampler(train_ds, replacement=True, num_samples=n_iter),
         persistent_workers=nw > 0, pin_memory=True, drop_last=True,
-        prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init)
+        prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init,
+        multiprocessing_context='spawn' if nw > 0 else None)
 
     # THE SAME WINDOWS EVERY TIME. `PoseDataset` seeds val items by index, so materialising a
     # fixed set of them once makes every evaluation comparable to the last -- which is the only
@@ -688,6 +705,14 @@ def main():
         else:
             print('resuming: no saved_mpjpe in log.jsonl, so checkpoint_best.pth is unattributed '
                   'and the first val of this run will replace it')
+    # The train loader's persistent workers fork/spawn on its first `next()`, i.e. inside this
+    # loop -- AFTER build_model, warm_start's multi-GB `torch.load`, and the optimizer have all
+    # run and freed their scratch memory in this process. Tried as a candidate fix for calms21's
+    # per-worker RSS plateau and made no measurable difference on a real job
+    # (dev/plans/video_loader_memory.md §2.3) -- kept anyway, since a `malloc_trim` here is a
+    # cheap, harmless attempt to hand a fresh worker the smallest possible parent to inherit.
+    ctypes.CDLL('libc.so.6').malloc_trim(0)
+
     latest = (float('inf'), -1)
     waited, evalled, ckpted = [0.0], [0.0], [0.0]
     while it < n_iter:

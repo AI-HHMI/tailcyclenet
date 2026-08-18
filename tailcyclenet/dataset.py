@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import threading
 from functools import lru_cache
@@ -1221,7 +1222,16 @@ class PoseDataset(Dataset):
         # crops are ~256 px where a source frame can be 4696x2048, so it is the same augmentation
         # for a fraction of the work.
         gray = self._aug is not None and rng.random() < self.cfg.grayscale_prob
-        with ThreadPoolExecutor(max_workers=16) as pool:
+        # `read_frames` IGNORES `pool` outright on the video path -- `_read_video` decodes every
+        # frame of a camera in one `get_batch()` call, no per-frame `pool.submit()` at all -- so
+        # a video-backed group spawned and joined 16 OS threads that did NOTHING, every item. Pure
+        # overhead removed on that basis alone; tried as a candidate explanation for calms21's
+        # per-worker RSS plateau under spawn and it made no measurable difference on a real job
+        # (dev/plans/video_loader_memory.md §2.3) -- worker thread count was unchanged with or
+        # without it. A group's cameras are one kind or the other by the format spec, never
+        # mixed, so checking the first is checking all of them.
+        use_pool = group.source(cam_names[0])[0] != 'video'
+        with (ThreadPoolExecutor(max_workers=16) if use_pool else nullcontext()) as pool:
             views = []
             for cnum, cam_name in enumerate(cam_names):
                 imgs = read_frames(group, cam_name, frames, crop_coords=boxes[cnum],
@@ -1412,7 +1422,7 @@ def _resize_camera(cam, target_res):
 
 
 def worker_init(worker_id):
-    """A DataLoader `worker_init_fn`. Two things, both per-worker and both easy to miss.
+    """A DataLoader `worker_init_fn`. Four things, all per-worker and all easy to miss.
 
     1. **Pin cv2's thread pool to one thread.** OpenCV sizes it to the machine -- 128 threads here
        -- and each of `num_workers` processes runs a 16-thread `ThreadPoolExecutor` on top of
@@ -1420,11 +1430,31 @@ def worker_init(worker_id):
        in parallel. Measured 0.210 -> 0.180 s/it at 12 workers, and the gap widens on a smaller
        machine.
 
-    2. **Reseed imgaug.** It keeps its OWN global RNG, which fork copies and nothing else
+    2. **Pin torch's own intraop pool to one thread too.** A worker does small CPU-only work
+       (crop, augment, collate) and never calls an ATen op that would use torch's default
+       `nproc`-sized pool, so this is a correctness/hygiene fix (a pool that is never used should
+       not exist) rather than a measured memory win: tried as one candidate explanation for
+       calms21's per-worker RSS plateau under `multiprocessing_context='spawn'`
+       (`scripts/train.py`) and it made no measurable difference on a real job
+       (dev/plans/video_loader_memory.md §2.3) -- worker thread count stayed at ~23 with or
+       without this call, so whatever those threads are, they are not ATen's.
+
+    3. **Reseed imgaug.** It keeps its OWN global RNG, which fork copies and nothing else
        reseeds, so every worker's k-th `to_deterministic()` would draw the same gamma, hue and
        blur -- the appearance diversity silently divides by `num_workers`, and the loss curve
        looks identical either way. The seed is drawn from `np.random`, which torch HAS already
        decorrelated per worker (`torch/utils/data/_utils/worker.py:261-265`).
+
+    4. **Force imgaug's hue/saturation LUT cache to build in THIS process.**
+       `AddToHueAndSaturation.__init__` populates a CLASS attribute (`_LUT_CACHE`) as a side
+       effect the first time one is constructed with `backend='cv2'` -- under `fork` the worker
+       inherits it already-built from the parent (train.py's `_build_augmenters` runs once,
+       before the workers exist), but under `spawn` (train.py's train loader, since a persistent
+       worker forking from a CUDA-active parent leaked several GB per worker -- see
+       `scripts/train.py`) the dataset is unpickled without `__init__` ever re-running, so the
+       class attribute is still `None` and the first hue/saturation augmentation crashes with
+       `TypeError: 'NoneType' object is not subscriptable`. Building a throwaway instance here
+       re-triggers the side effect in every worker, fork or spawn alike.
 
     numpy itself is deliberately NOT reseeded here, for that same reason. The library's
     `make_worker_init_fn` exists to fold in a DDP rank, which torch's seeding ignores; there is
@@ -1434,11 +1464,14 @@ def worker_init(worker_id):
     """
     import cv2
     cv2.setNumThreads(1)
+    torch.set_num_threads(1)
     try:
         import imgaug
+        import imgaug.augmenters as iaa
     except ImportError:
         return
     imgaug.random.seed(int(np.random.randint(2 ** 31)))
+    iaa.AddToHue()
 
 
 def pose_collate(batch):

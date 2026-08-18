@@ -1,7 +1,21 @@
 #!/usr/bin/env python
 """Train the box predictor. ONE DETECTOR PER DATASET.
 
-    pixi run python scripts/train_detector.py --data <dataset root> --out runs/det-rat-city
+    pixi run python scripts/train_detector.py --config configs/detector.toml
+
+The recipe lives in the CONFIG, not on the command line -- the same split the pose side uses
+(`scripts/train.py` + `configs/base.toml`). `configs/detector.toml` ships every current default
+with its reasoning attached; a user overlay may `extends` it one level deep and change only what
+differs (see `checkpoints.load_config`). Per-root recipes from dev/reports/32 section 2.2 are
+expressed as key overrides in your config. Only three CLI knobs remain: `--out`, `--iters` and
+`--device` override `[training]` for a smoke test or a one-off. An unknown key in any block
+RAISES, so a typo cannot silently train at defaults.
+
+The run folder records the effective `config.toml` and `provenance.toml` (commit + dirty flag)
+before training starts, so a detector run carries the same reproducibility record a pose run
+does -- gotcha 12's shape. The checkpoint itself is byte-compatible with every detector on
+record: `load_detector`, `scripts/eval_detector.py` and `scripts/infer.py` read the same fields
+they always did.
 
 The input size is dataset-specific and it matters more than it looks. rat-city's frames are
 4696x2048 (2.29:1); letterboxed into a square 416 that scales by min(416/2048, 416/4696) = 0.089,
@@ -11,24 +25,26 @@ the finest level and absent from the other two: two thirds of the FPN cannot rep
 Measured against branson-fly (same detector, same 416, but a square 1024x1024 frame) the median
 fly arrives at 26.5 x 28.1 px and reaches AP50 0.985 where rat-city sits near 0.50.
 
-So `--input-wh` defaults to an aspect-matched size rather than a square, and training the
-detector across datasets is not offered: one letterbox cannot serve both.
+So `[data].input_wh` defaults to an aspect-matched size rather than a square, and training the
+detector across datasets is not offered: one letterbox cannot serve both. `[data].min_box_px`
+raises that size until the median animal is representable at every FPN level.
 
-`--boxes instances` regresses the dataset's own `instances.pq` extent instead of the keypoint
-extent. rat-city wants it: its converter dropped noisy points, so 26k train instances carry no
-finite keypoint at all and would otherwise be trained as "no animal here".
+`[data].boxes = "instances"` regresses the dataset's own `instances.pq` extent instead of the
+keypoint extent. rat-city wants it: its converter dropped noisy points, so 26k train instances
+carry no finite keypoint at all and would otherwise be trained as "no animal here". Set it to
+`"keypoints"` on calms21 / johnson-mouse / 3dpop-comparability runs -- see the config.
 
-`--yolox {trimmed,nano,tiny,s,m,l,x}` is a MODEL-CAPACITY switch, DEFAULT `tiny` per user
-instruction (dev/reports/30 section 5.3 found this default is NOT evidence-backed -- `tiny`'s
-apparent downstream lead over `trimmed` on rat-city-combined did not survive its own
-seed-replicate check). `trimmed` is the repo's original bespoke ~0.66M-param net,
-byte-identical to every detector on record before dev/reports/28; pass `--yolox trimmed` to
-restore it. The named tiers build the canonical YOLOX backbone at Megvii's own (depth_mul,
-width_mul, depthwise) -- see `tailcyclenet.detector.yolox.YOLOX_TIERS` -- to test whether the
-detector is capacity-limited rather than resolution-limited (dev/reports/16 §5.3b reached
-"capacity-limited" for the keypoint branch by elimination, never by scaling the model). It is
-recorded in the checkpoint and `load_detector` reconstructs the matching architecture; absent
-means `trimmed` (every checkpoint written before this flag existed).
+`[model].yolox` is a MODEL-CAPACITY switch, DEFAULT `tiny` per user instruction
+(dev/reports/30 section 5.3 found this default is NOT evidence-backed -- `tiny`'s apparent
+downstream lead over `trimmed` on rat-city-combined did not survive its own seed-replicate
+check). `trimmed` is the repo's original bespoke ~0.66M-param net, byte-identical to every
+detector on record before dev/reports/28; set `yolox = "trimmed"` to restore it. The named tiers
+build the canonical YOLOX backbone at Megvii's own (depth_mul, width_mul, depthwise) -- see
+`tailcyclenet.detector.yolox.YOLOX_TIERS` -- to test whether the detector is capacity-limited
+rather than resolution-limited (dev/reports/16 §5.3b reached "capacity-limited" for the keypoint
+branch by elimination, never by scaling the model). It is recorded in the checkpoint and
+`load_detector` reconstructs the matching architecture; absent means `trimmed` (every checkpoint
+written before this flag existed).
 
 Every checkpoint is written as its own `detector_it<n>.pth` WITH its scores inside, plus a
 `metrics.json` of the whole history, and both splits are scored each time. A single rolling
@@ -50,12 +66,17 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.crop import BOX_SOURCES
+import toml
+
+from tailcyclenet.checkpoints import provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.format import load_datasets
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOX_TIERS, YOLOXNano, box_collate,
-                                  detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate,
+                                   detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
+from tailcyclenet.format import load_datasets
+
+
 def default_input_wh(dataset, target_px=416 * 416):
     """An input size matched to the frame's aspect ratio, at roughly a square-416 pixel budget."""
     sess = next(iter(next(iter(dataset.sessions.values()))))
@@ -113,218 +134,87 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416)
     return ow, oh
 
 
+def _record_run(run: Path, config: dict) -> None:
+    """Write the run folder's reproducibility record: the effective config + provenance.
+
+    `config` is the dict `load_detector_config` returned. `None` values (an absent `input_wh` /
+    `tile_wh`) are dropped rather than serialised, so the recorded file round-trips through
+    `load_detector_config` to the same recipe. Checkpoint contents are untouched -- this is the
+    folder's record, not the weights'.
+    """
+    import copy
+
+    run.mkdir(parents=True, exist_ok=True)
+    record = copy.deepcopy(config)
+    for block in record.values():
+        if isinstance(block, dict):
+            for k in [k for k, v in block.items() if v is None]:
+                del block[k]
+    (run / 'config.toml').write_text(toml.dumps(record))
+    prov = provenance()
+    if prov:
+        (run / 'provenance.toml').write_text(toml.dumps(prov))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--data', required=True, type=Path, help='ONE dataset root')
-    ap.add_argument('--out', required=True, type=Path)
-    ap.add_argument('--input-wh', type=int, nargs=2, default=None,
-                    help='overrides --min-box-px entirely')
-    ap.add_argument('--min-box-px', type=int, default=32,
-                    help='raise the input size until the MEDIAN animal is this many detector '
-                         'pixels across. 32 is YOLOX\'s coarsest stride, i.e. the size at which '
-                         'the typical animal spans at least one cell at every FPN level. A floor '
-                         'only -- it never shrinks a dataset whose animals are already large. '
-                         '0 disables it and restores the plain 416^2 aspect-matched budget. '
-                         'MEASURED on 3dpop test, paired over 16 groups against the 23 px '
-                         'baseline: 32 -> +0.049 r@.75 at 1.9x the pixels, 64 -> +0.102 at 7.7x. '
-                         'The curve keeps rising past 32; 32 is where it is free enough to be a '
-                         'default, not where it stops paying.')
-    ap.add_argument('--max-input-px', type=int, default=4 * 416 * 416,
-                    help='ceiling on --min-box-px. It BINDS: 3dpop needs 4.3x the 416^2 budget '
-                         'for a 48 px median and 7.7x for 64, so the cap is the difference '
-                         'between a rule and a blank cheque. Reported when it applies.')
-    ap.add_argument('--iters', type=int, default=20000)
-    ap.add_argument('--batch-size', type=int, default=16)
-    ap.add_argument('--lr', type=float, default=1e-3)
-    ap.add_argument('--num-workers', type=int, default=8)
-    ap.add_argument('--frames-per-group', type=int, default=40)
-    ap.add_argument('--min-crop-dim', type=int, default=64,
-                    help='MUST equal the pose run\'s [data].min_crop_dim -- it is the same crop '
-                         'rule. Stored in the checkpoint, and scripts/infer.py refuses a mismatch.')
-    ap.add_argument('--boxes', default='instances', choices=BOX_SOURCES,
-                    help='what the regression target bounds. DEFAULTS TO `instances`, matching '
-                         '`dataset.LoaderConfig.box_source` so the detector reproduces the crop '
-                         'the pose model is trained on -- the two must agree or the detector '
-                         'serves a different crop rule, silently. Inert where a root ships no '
-                         'instances.pq (3dpop, allen, branson-fly: falls back per view); an exact '
-                         'no-op on rat-city-annotated; worth 3.7%% of animal-frames on '
-                         'rat-city-tracked, whose keypoint box is ~2.4 of 4 points. It DOES '
-                         'retarget calms21 (MARS) and johnson-mouse (COCO), whose boxes agree with '
-                         'the crop rule on 0.000 of instances -- pass `keypoints` there to '
-                         'reproduce reports 10-13. See dataset.LoaderConfig.box_source.')
-    ap.add_argument('--val-frames-per-group', type=int, default=8,
-                    help='A DATASET WITH ONE GROUP GETS ONE GROUP\'S WORTH OF VAL. rat-city and '
-                         'branson-fly each hold a single val group, so the default 8 makes the '
-                         'recall readout 8 images; raise it to the group\'s labelled length.')
-    ap.add_argument('--augment', dest='augment', action='store_true',
-                    help='random similarity + brightness on the TRAIN split. ON BY DEFAULT as of '
-                         'dev/reports/30\'s recommendation, so this flag is now a harmless no-op '
-                         'kept for every existing sweep script that already passes it explicitly '
-                         '-- see --no-augment to turn it off. Helps where a dataset fits its '
-                         'training data and lags on val; on one that fits neither it is the wrong '
-                         'lever. Read the train/val gap first.')
-    ap.add_argument('--no-augment', dest='augment', action='store_false',
-                    help='DISABLE the random similarity + brightness on the TRAIN split -- '
-                         '--augment is ON BY DEFAULT as of dev/reports/30\'s recommendation; '
-                         'pass this to restore every earlier recorded recipe\'s off default.')
-    ap.set_defaults(augment=True)
-    ap.add_argument('--no-augment-strong', dest='augment_strong', action='store_false',
-                    help='DISABLE the strong appearance/erasure/mosaic-lite suite --'
-                         '--augment-strong is ON BY DEFAULT as of dev/reports/30\'s '
-                         'recommendation; pass this to restore the off default every detector '
-                         'before it was trained under. See --augment-strong for the recipe.')
-    ap.add_argument('--augment-strong', action='store_true',
-                    help='LAYERS a strong appearance/erasure/mosaic-lite suite on top of '
-                         '--augment (needs it; a no-op without it): color jitter (gamma, '
-                         'saturation, hue, p=0.5), additive gaussian noise (sigma up to 10.2, '
-                         'p=0.3), salt & pepper (0.004, p=0.2), motion blur (k in {3,5}, p=0.2), '
-                         'cutout (1-3 rects of 15%%x15%% of the input, random fill, p=0.5 -- a '
-                         'covered keypoint gets BOTH its coordinate NaN\'d and its score zeroed), '
-                         'and mosaic-lite (p=0.2 -- copy-paste one WHOLE crop-rule box from a '
-                         'different frame into empty space, never a 4-quadrant mosaic, which '
-                         'would clip a box and break gotcha 8; undefined under --use-regions). '
-                         'ONE recipe, not five swept levers, and NOT independently validated -- '
-                         'dev/reports/30 section 5.1 found most of the box-screen train/val-gap '
-                         'closure this suite appeared to buy on rat-city-combined was actually '
-                         'attributable to --rotate-deg alone, and additive noise (one of the six '
-                         'components here) was separately refuted downstream before (dev/reports/21 '
-                         'section 7: MOTA -0.127 SIG, on a detector with no capacity lever). ON BY '
-                         'DEFAULT PER USER INSTRUCTION, not evidence -- see --no-augment-strong to '
-                         'restore the off default every detector before dev/reports/30 was trained '
-                         'under. Recorded in the checkpoint.')
-    ap.add_argument('--reduce', action='store_true',
-                    help='decode JPEGs at 1/N via libjpeg where the frame is far above the '
-                         'letterbox target. A KEY, not a loader detail: it changes which source '
-                         'pixels reach the model. rat-city 37.0 -> 21.8 ms/item, and it replaces '
-                         'a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block '
-                         '-- with a proper box filter. Stored in the checkpoint; inference '
-                         'reads it back. No effect on a video root.')
-    ap.add_argument('--rotate-deg', type=float, default=45.0, metavar='DEG',
-                    help='random in-plane rotation, +-DEG, drawn per visit. Needs --augment; 0 is '
-                         'off and off is byte-identical (the draw is skipped, not multiplied by '
-                         'zero). DEFAULTS TO 45 PER USER INSTRUCTION, NOT EVIDENCE FOR THIS '
-                         'SETTING -- the only measurement on record for THIS knob is at 180 on '
-                         'rat-city, where it was SIGNIFICANTLY WORSE downstream on two roots and '
-                         'two label sources, one direction: MPJPE +3.33 px hand / +1.28 px '
-                         'tracked, coverage -0.009, idsw x1.7, err p99 +29.9 (dev/reports/21 '
-                         '3a/3b). 45 has never been measured downstream on any root. Pass 0 to '
-                         'restore the pre-this-default off behaviour, byte-identical.')
-    ap.add_argument('--eval-every', type=int, default=2000)
-    ap.add_argument('--eval-batches', type=int, default=25,
-                    help='batches per split at each checkpoint. TRAIN is scored too: the '
-                         'train/val gap is what says whether a dataset needs augmentation '
-                         '(a gap) or resolution (no gap, low absolute recall).')
-    ap.add_argument('--keypoints', action='store_true',
-                    help='train a bottom-up KEYPOINT BRANCH beside the box head. Off by default '
-                         'and off means NOT CONSTRUCTED: with this absent the model, the loader '
-                         'and the loss are byte-identical to every recorded detector, so no '
-                         'existing recipe needs a new flag to reproduce. K is derived from the '
-                         "dataset's own registry, never configured. Turning it on also disables "
-                         'the horizontal flip -- see `random_affine`, whose no-`flip_pairs` '
-                         'justification holds only while the target is a box.')
-    ap.add_argument('--no-hflip', action='store_true',
-                    help='drop the horizontal flip from the augmentation. `--keypoints` already '
-                         'does this implicitly, so this exists for the box-only CONTROL arm that '
-                         'has to match it -- otherwise the control differs in two levers.')
-    ap.add_argument('--tile-wh', type=int, nargs=2, default=None,
-                    help='train on TILES of this size in INPUT pixels instead of whole frames. '
-                         'Off by default and off means whole frames, byte-identical to every '
-                         'recorded detector. This is the model\'s input size; the tile\'s SOURCE '
-                         'extent is --tile-wh / --tile-scale. Inference is unchanged -- one '
-                         'whole-frame forward at --tile-scale, derived per camera. Its ONE '
-                         'justification is --use-regions (report 16 §5.3b refuted the other).')
-    ap.add_argument('--tile-scale', type=float, default=1.0,
-                    help='source -> input scale for --tile-wh. 1.0 = native. DO NOT ALSO RESIZE '
-                         'THE TILE: the invariant is the animal\'s size in INPUT pixels, and '
-                         'tiling-then-downscaling is the number-one reported failure of this '
-                         'pattern. MEASURED on rat-city-annotated: this is what sets the mask\'s '
-                         'positive rate (5.2%% at 1.0, 10.2%% at 0.7, 17.5%% at 0.5, 48%% at '
-                         '0.25) '
-                         'because CENTER_RADIUS is 2.5 CELLS, so the certified region has to span '
-                         'many cells, not much area.')
-    ap.add_argument('--tile-bg-per-frame', type=int, default=1,
-                    help='background tiles per frame, centres inside the certified area')
-    ap.add_argument('--use-regions', action='store_true',
-                    help='mask the objectness loss to the area regions.pq certifies as completely '
-                         'labelled. ORTHOGONAL to --tile-wh so an arm can move one lever. MEASURED '
-                         'DEAD on whole frames: 69%% of supervised anchors are positive against '
-                         '0.68%% unmasked and 17%% of frames have no certified negative at all. '
-                         'Use it WITH tiles. A session with no regions.pq claims exhaustive '
-                         'labelling and is unmasked.')
-    ap.add_argument('--kpt-weight', type=float, default=1.0)
-    ap.add_argument('--kpt-score-weight', type=float, default=1.0)
-    ap.add_argument('--yolox', default='tiny', choices=['trimmed', *sorted(YOLOX_TIERS)],
-                    help='the ARCHITECTURE, not a runtime choice -- it changes the state_dict and '
-                         'is recorded in the checkpoint (`load_detector` reads it back; absent '
-                         'means `trimmed`, i.e. every checkpoint from before this flag existed). '
-                         'DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE: dev/reports/30 '
-                         'section 5.3 found `tiny`\'s apparent downstream lead over `trimmed` on '
-                         'rat-city-combined (4.0 px) was SMALLER than its own seed-replicate swing '
-                         '(8.8 px) and does not survive that check -- no tier is distinguishable '
-                         'from `trimmed` on the evidence collected so far. Pass `--yolox trimmed` '
-                         'to restore the pre-this-default architecture, byte-identical to every '
-                         'detector on record before dev/reports/28. `trimmed` is the repo\'s '
-                         'bespoke ~0.66M-param net. `nano/tiny/s/m/l/x` instead build '
-                         'the CANONICAL YOLOX backbone (Focus stem, 5-stage CSPDarknet) at that '
-                         'tier\'s official (depth_mul, width_mul, depthwise) -- see '
-                         '`tailcyclenet.detector.yolox.YOLOX_TIERS`. This exists to test whether '
-                         'the detector is CAPACITY-limited (report 16 §5.3b inferred "capacity-'
-                         'limited" for the keypoint branch by elimination -- 26.7x the resolution '
-                         'bought 2.8%% of its error -- never by scaling the model). NOT byte-'
-                         'identical to Megvii\'s release: GroupNorm throughout, and the neck '
-                         'unifies all three pyramid levels to one width rather than three '
-                         'per-level widths with per-level head stems. This is a MODEL-SELECTION '
-                         'sweep, not a single-lever ablation -- every named tier differs from '
-                         '`trimmed` in schedule, depth, conv type and stem all at once.')
-    ap.add_argument('--device', default='cuda:0')
-    ap.add_argument('--seed', type=int, default=0,
-                    help='model init, augmentation draws and the train shuffle order. Does NOT '
-                         "move `input_wh_for`'s own median-animal probe, which stays pinned at "
-                         'seed 0 regardless -- that is a MEASUREMENT of the dataset, not training '
-                         'stochasticity, and letting it vary would make --input-wh depend on '
-                         '--seed. A SAME-RECIPE REPLICATE (same flags, different --seed) is not '
-                         'optional before trusting a detector arm: report 21 §7.0 measured '
-                         'coverage +0.0575 and kpt_agree +0.1124, both SIG, with NO lever at all.')
+    ap.add_argument('--config', required=True, type=Path,
+                    help='the detector training config (see configs/detector.toml)')
+    ap.add_argument('--out', type=Path, default=None, help='override [training].out')
+    ap.add_argument('--iters', type=int, default=None, help='override [training].iters')
+    ap.add_argument('--device', default=None, help='override [training].device')
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = args.device if torch.cuda.is_available() else 'cpu'
+    config = load_detector_config(args.config, out=args.out, iters=args.iters,
+                                  device=args.device)
+    data_cfg, model_cfg, train_cfg = config['data'], config['model'], config['training']
+
+    torch.manual_seed(train_cfg['seed'])
+    np.random.seed(train_cfg['seed'])
+    device = train_cfg['device'] if torch.cuda.is_available() else 'cpu'
+    run = Path(train_cfg['out'])
+    _record_run(run, config)
+
     # Just the camera size, so just the discovery -- building a BoxDataset here scattered every
     # session's parquet into dense arrays to read two integers.
-    roots = load_datasets(args.data)
+    roots = load_datasets(data_cfg['path'])
     if len(roots) != 1:
-        raise SystemExit(f'{args.data}: the detector is trained per dataset; found {len(roots)}')
+        raise SystemExit(f'{data_cfg["path"]}: the detector is trained per dataset; '
+                         f'found {len(roots)}')
     probe_sess = roots[0].all_sessions()[0]
-    wh = (tuple(args.input_wh) if args.input_wh
-          else input_wh_for(args.data, roots[0], args.boxes, args.min_box_px,
-                            args.max_input_px))
+    wh = (tuple(data_cfg['input_wh']) if data_cfg['input_wh']
+          else input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
+                            data_cfg['min_box_px'], data_cfg['max_input_px']))
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
-    tiling = dict(tile_wh=args.tile_wh, tile_scale=args.tile_scale,
-                  tile_bg_per_frame=args.tile_bg_per_frame, use_regions=args.use_regions)
-    train = BoxDataset(args.data, 'train', input_wh=wh, box_source=args.boxes,
-                       min_crop_dim=args.min_crop_dim, augment=args.augment, reduce=args.reduce,
-                       max_frames_per_group=args.frames_per_group, keypoints=args.keypoints,
-                       hflip=0.0 if args.no_hflip else None, rotate_deg=args.rotate_deg,
-                       strong=args.augment_strong, seed=args.seed, **tiling)
+    tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
+                  tile_bg_per_frame=data_cfg['tile_bg_per_frame'],
+                  use_regions=data_cfg['use_regions'])
+    train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
+                       box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
+                       augment=data_cfg['augment'], reduce=data_cfg['reduce'],
+                       max_frames_per_group=data_cfg['frames_per_group'],
+                       keypoints=data_cfg['keypoints'],
+                       hflip=0.0 if not data_cfg['hflip'] else None,
+                       rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
+                       seed=train_cfg['seed'], **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
     # returned the whole-frame letterbox size and would have recorded a size the weights never saw.
     wh = train.input_wh
-    if args.tile_wh:
+    if data_cfg['tile_wh']:
         ext = train._tile_extent()
-        print(f'tiling: {args.tile_wh[0]}x{args.tile_wh[1]} input px at scale '
-              f'{args.tile_scale:g} = {ext[0]:.0f}x{ext[1]:.0f} SOURCE px, '
-              f'{args.tile_bg_per_frame} background tile(s)/frame')
+        print(f'tiling: {data_cfg["tile_wh"][0]}x{data_cfg["tile_wh"][1]} input px at scale '
+              f'{data_cfg["tile_scale"]:g} = {ext[0]:.0f}x{ext[1]:.0f} SOURCE px, '
+              f'{data_cfg["tile_bg_per_frame"]} background tile(s)/frame')
         print(f'  DEPLOYMENT INPUT is the whole frame at this scale, NOT the tile size: '
-              f'{tiled_input_wh(probe_sess.rig.size(probe_sess.cam_names[0]), args.tile_scale)}')
+              f'{tiled_input_wh(probe_sess.rig.size(probe_sess.cam_names[0]), data_cfg["tile_scale"])}')
     print(f'train: {len(train)} views')
     # DERIVED from the registry, never configured -- the same rule `n_keypoints` follows on the
     # pose side. A configured K that disagreed with the data would mis-index every target.
-    n_kpts = len(roots[0].names) if args.keypoints else 0
-    if args.keypoints:
+    n_kpts = len(roots[0].names) if data_cfg['keypoints'] else 0
+    if data_cfg['keypoints']:
         print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')
         # A MASKED KEYPOINT GETS ZERO GRADIENT, so a rarely-labelled one is never trained -- and
         # it still emits a number at inference, off the conv bias. That is the accepted cost of
@@ -344,28 +234,29 @@ def main():
               f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
         print(f'  thinnest: {", ".join(thin)}', flush=True)
     loader = torch.utils.data.DataLoader(
-        train, batch_size=args.batch_size,
-        sampler=ChunkShuffle(len(train), chunk=train.chunk, seed=args.seed),
-        num_workers=args.num_workers,
-        collate_fn=box_collate, drop_last=True, persistent_workers=args.num_workers > 0,
+        train, batch_size=train_cfg['batch_size'],
+        sampler=ChunkShuffle(len(train), chunk=train.chunk, seed=train_cfg['seed']),
+        num_workers=train_cfg['num_workers'],
+        collate_fn=box_collate, drop_last=True,
+        persistent_workers=train_cfg['num_workers'] > 0,
         worker_init_fn=worker_init)
     val = None
     try:
-        val = BoxDataset(args.data, 'val', input_wh=wh, box_source=args.boxes,
-                         min_crop_dim=args.min_crop_dim, reduce=args.reduce,
-                         max_frames_per_group=args.val_frames_per_group,
-                         keypoints=args.keypoints, seed=args.seed, **tiling)
+        val = BoxDataset(data_cfg['path'], 'val', input_wh=wh,
+                         box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
+                         reduce=data_cfg['reduce'],
+                         max_frames_per_group=data_cfg['val_frames_per_group'],
+                         keypoints=data_cfg['keypoints'], seed=train_cfg['seed'], **tiling)
         print(f'val:   {len(val)} views')
     except ValueError as e:
         print(f'val:   none ({e})')
 
-    model = YOLOXNano(n_keypoints=n_kpts, version=args.yolox).to(device)
+    model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox']).to(device)
     n = sum(p.numel() for p in model.parameters())
-    print(f'YOLOX [{args.yolox}]: {n / 1e6:.2f}M params')
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.iters)
+    print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params')
+    opt = torch.optim.AdamW(model.parameters(), lr=train_cfg['lr'], weight_decay=5e-4)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
 
-    args.out.mkdir(parents=True, exist_ok=True)
     history = []
     # `detector.pth` IS THE BEST CHECKPOINT, NOT THE LAST ONE. It used to be the last: the file was
     # rewritten at every evaluation and `best` was computed after the loop and only PRINTED, so a
@@ -378,9 +269,9 @@ def main():
     best_score = -float('inf')
     it, t0, running = 0, time.time(), []
     model.train()
-    while it < args.iters:
+    while it < train_cfg['iters']:
         for batch in loader:
-            if it >= args.iters:
+            if it >= train_cfg['iters']:
                 break
             # BY RANK, not by tuple length: with --keypoints off and --use-regions on, the
             # third element is regions, and reading it as `gt_kpts` would train the keypoint
@@ -393,8 +284,8 @@ def main():
             obj, boxes, kpt = out[0], out[1], out[2]
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
-                                        kpt_weight=args.kpt_weight,
-                                        kpt_score_weight=args.kpt_score_weight,
+                                        kpt_weight=train_cfg['kpt_weight'],
+                                        kpt_score_weight=train_cfg['kpt_score_weight'],
                                         regions=gt_regions)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -412,11 +303,11 @@ def main():
                 kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
                 kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
                 kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
-                print(f'{it:7d}/{args.iters}  loss {np.mean(running):7.4f}  '
+                print(f'{it:7d}/{train_cfg["iters"]}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
                 running, t0 = [], time.time()
-            if it % args.eval_every == 0 or it == args.iters:
+            if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
                 # Both splits, EVERY checkpoint, and the score stored beside the weights. A
                 # rolling `detector.pth` with no score cannot be selected on: johnson peaked at
                 # val recall 0.871 and shipped 0.706, branson peaked 0.885 and shipped 0.833.
@@ -428,8 +319,9 @@ def main():
                     # one), which is the distribution deployment meets.
                     obj_scores.clear()
                     scores[name] = overall(score_dataset(
-                        model, ds, device, batch_size=args.batch_size,
-                        batches=args.eval_batches, num_workers=2, out_scores=obj_scores))
+                        model, ds, device, batch_size=train_cfg['batch_size'],
+                        batches=train_cfg['eval_batches'], num_workers=2,
+                        out_scores=obj_scores))
                 # THE OBJECTNESS DISTRIBUTION, RECORDED BECAUSE `--det-score` CANNOT BE A CONSTANT.
                 # 0.99 was chosen against detectors whose objectness is saturated (98.5% of
                 # rat-city's boxes at exactly 1.0) and is wrong for the tiled/masked generation,
@@ -455,38 +347,39 @@ def main():
                 # is part of the WEIGHTS, and absent reads as 'trimmed' -- a fact about every
                 # checkpoint written before this switch existed, not a guess.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
-                        'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': args.yolox,
-                        'seed': args.seed,
+                        'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': model_cfg['yolox'],
+                        'seed': train_cfg['seed'],
                         # `input_wh` above is the TILE size when tiling, which is NOT the
                         # deployment input size -- `load_detector` raises if this is missing so
                         # nobody can run a tiled detector at its tile size on a whole frame.
-                        'tile_wh': args.tile_wh, 'tile_scale': args.tile_scale,
-                        'use_regions': args.use_regions,
-                        'dataset': train.ds.name, 'box_source': args.boxes,
-                        'min_crop_dim': args.min_crop_dim, 'augment': args.augment,
-                        'augment_strong': args.augment_strong,
-                        'reduce': args.reduce, 'rotate_deg': args.rotate_deg,
+                        'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
+                        'use_regions': data_cfg['use_regions'],
+                        'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
+                        'min_crop_dim': data_cfg['min_crop_dim'],
+                        'augment': data_cfg['augment'],
+                        'augment_strong': data_cfg['augment_strong'],
+                        'reduce': data_cfg['reduce'], 'rotate_deg': data_cfg['rotate_deg'],
                         'obj_quantiles': obj_q,
                         'eval': scores}
-                torch.save(ckpt, args.out / f'detector_it{it:06d}.pth')
+                torch.save(ckpt, run / f'detector_it{it:06d}.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the
                 # end-of-run `best` line reports, so the printed winner and the shipped file are
                 # now the same checkpoint instead of two different ones.
                 sel = scores.get('val', scores.get('train', {})).get('r50', -float('inf'))
                 if sel >= best_score:
                     best_score = sel
-                    torch.save(ckpt, args.out / 'detector.pth')
+                    torch.save(ckpt, run / 'detector.pth')
                 history.append({'iteration': it,
                                 **{f'{k}_{m}': v[m] for k, v in scores.items()
                                    for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
-                (args.out / 'metrics.json').write_text(json.dumps(history, indent=1))
+                (run / 'metrics.json').write_text(json.dumps(history, indent=1))
                 for name, s in scores.items():
                     print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
                           f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
                           flush=True)
                 t0 = time.time()               # evaluation is not part of the s/it readout
     best = max(history, key=lambda h: h.get('val_r50', h['train_r50'])) if history else None
-    print(f'done: {it} iterations -> {args.out}')
+    print(f'done: {it} iterations -> {run}')
     if best:
         print(f'best: it {best["iteration"]} (this is what detector.pth holds)  ' +
               '  '.join(f'{k} {v:.4f}' for k, v in best.items() if k != 'iteration'))

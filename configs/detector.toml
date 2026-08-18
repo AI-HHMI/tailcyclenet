@@ -1,0 +1,178 @@
+# The detector training config. `scripts/train_detector.py --config configs/detector.toml`.
+#
+# This is the ONE shipped detector recipe: every key below is the current default of the
+# corresponding CLI flag that `scripts/train_detector.py` used to take, so a run with this file
+# and no overrides is byte-identical to the old `--data <root> --out runs/det-<name>` invocation
+# under report 32's defaults. The per-root differences from report 32 section 2.2 (which flags
+# a given dataset wants) are now expressed as key overrides in YOUR config, not as a second
+# shipped file -- `extends` is supported one level deep (see `checkpoints.load_config`), so a
+# user overlay can name this file and change only what differs.
+#
+# Blocks: [data] (the loader + what the regression target bounds), [model] (the architecture),
+# [training] (schedule and run folder). An UNKNOWN KEY IN ANY BLOCK RAISES -- nothing here may
+# be a typo that silently trains at defaults (same guard `scripts/train.py` applies to [data]).
+# `weight_decay` (5e-4) and the cosine schedule are not configurable; they were never flags.
+
+[data]
+# ONE dataset root (has train/, optionally val/ and test/). Required. The detector is trained
+# per dataset -- a folder whose children are roots is refused, exactly as before.
+path = ""
+
+# what the regression target bounds. `instances` regresses the dataset's own instances.pq extent;
+# `keypoints` regresses the keypoint extent. DEFAULTS TO `instances`, matching
+# `dataset.LoaderConfig.box_source` so the detector reproduces the crop the pose model is trained
+# on -- the two must agree or the detector serves a different crop rule, silently. Inert where a
+# root ships no instances.pq (3dpop, allen, branson-fly: falls back per view); an exact no-op on
+# rat-city-annotated; worth 3.7% of animal-frames on rat-city-tracked, whose keypoint box is ~2.4
+# of 4 points. It DOES retarget calms21 (MARS) and johnson-mouse (COCO), whose boxes agree with
+# the crop rule on 0.000 of instances -- set `boxes = "keypoints"` there to reproduce reports
+# 10-13. See dataset.LoaderConfig.box_source.
+boxes = "instances"
+
+# MUST equal the pose run's [data].min_crop_dim -- it is the same crop rule. Stored in the
+# checkpoint, and scripts/infer.py refuses a mismatch.
+min_crop_dim = 64
+
+# Explicit input size, overriding the min_box_px rule entirely. Omit it (or set to []) to use
+# min_box_px instead.
+input_wh = []
+
+# Raise the input size until the MEDIAN animal is this many detector pixels across. 32 is
+# YOLOX's coarsest stride, i.e. the size at which the typical animal spans at least one cell at
+# every FPN level. A floor only -- it never shrinks a dataset whose animals are already large.
+# 0 disables it and restores the plain 416^2 aspect-matched budget. MEASURED on 3dpop test,
+# paired over 16 groups against the 23 px baseline: 32 -> +0.049 r@.75 at 1.9x the pixels,
+# 64 -> +0.102 at 7.7x. The curve keeps rising past 32; 32 is where it is free enough to be a
+# default, not where it stops paying.
+min_box_px = 32
+
+# Ceiling on min_box_px. It BINDS: 3dpop needs 4.3x the 416^2 budget for a 48 px median and 7.7x
+# for 64, so the cap is the difference between a rule and a blank cheque. Reported when it
+# applies.
+max_input_px = 692224
+
+# Max frames per group for the TRAIN loader. A group is a contiguous clip; 40 frames is a
+# sampling window over it, not a cap on the clip itself.
+frames_per_group = 40
+
+# A DATASET WITH ONE GROUP GETS ONE GROUP'S WORTH OF VAL. rat-city and branson-fly each hold a
+# single val group, so the default 8 makes the recall readout 8 images; raise it to the group's
+# labelled length.
+val_frames_per_group = 8
+
+# random similarity + brightness on the TRAIN split. ON BY DEFAULT as of dev/reports/30's
+# recommendation. Helps where a dataset fits its training data and lags on val; on one that fits
+# neither it is the wrong lever. Read the train/val gap first.
+augment = true
+
+# LAYERS a strong appearance/erasure/mosaic-lite suite on top of augment (needs it; a no-op
+# without it): color jitter (gamma, saturation, hue, p=0.5), additive gaussian noise (sigma up
+# to 10.2, p=0.3), salt & pepper (0.004, p=0.2), motion blur (k in {3,5}, p=0.2), cutout (1-3
+# rects of 15%x15% of the input, random fill, p=0.5 -- a covered keypoint gets BOTH its
+# coordinate NaN'd and its score zeroed), and mosaic-lite (p=0.2 -- copy-paste one WHOLE
+# crop-rule box from a different frame into empty space, never a 4-quadrant mosaic, which would
+# clip a box and break gotcha 8; undefined under use_regions). ONE recipe, not five swept levers,
+# and NOT independently validated -- dev/reports/30 section 5.1 found most of the box-screen
+# train/val-gap closure this suite appeared to buy on rat-city-combined was actually attributable
+# to rotate_deg alone, and additive noise (one of the six components here) was separately refuted
+# downstream before (dev/reports/21 section 7: MOTA -0.127 SIG, on a detector with no capacity
+# lever). ON BY DEFAULT PER USER INSTRUCTION, not evidence.
+augment_strong = true
+
+# random in-plane rotation, +-DEG, drawn per visit. Needs augment; 0 is off and off is
+# byte-identical (the draw is skipped, not multiplied by zero). DEFAULTS TO 45 PER USER
+# INSTRUCTION, NOT EVIDENCE FOR THIS SETTING -- the only measurement on record for THIS knob is
+# at 180 on rat-city, where it was SIGNIFICANTLY WORSE downstream on two roots and two label
+# sources, one direction: MPJPE +3.33 px hand / +1.28 px tracked, coverage -0.009, idsw x1.7,
+# err p99 +29.9 (dev/reports/21 3a/3b). 45 has never been measured downstream on any root. Set 0
+# to restore the pre-this-default off behaviour, byte-identical.
+rotate_deg = 45.0
+
+# decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target. A KEY, not
+# a loader detail: it changes which source pixels reach the model. rat-city 37.0 -> 21.8 ms/item,
+# and it replaces a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block -- with a
+# proper box filter. Stored in the checkpoint; inference reads it back. No effect on a video root.
+reduce = false
+
+# train a bottom-up KEYPOINT BRANCH beside the box head. Off means NOT CONSTRUCTED: with this
+# absent the model, the loader and the loss are byte-identical to every recorded detector, so no
+# existing recipe needs a new key to reproduce. K is derived from the dataset's own registry,
+# never configured. Turning it on also disables the horizontal flip -- see `random_affine`, whose
+# no-`flip_pairs` justification holds only while the target is a box.
+keypoints = false
+
+# the horizontal flip in the augmentation. `keypoints = true` already disables it implicitly, so
+# this exists for the box-only CONTROL arm that has to match it -- otherwise the control differs
+# in two levers.
+hflip = true
+
+# train on TILES of this size in INPUT pixels instead of whole frames. Off (empty) means whole
+# frames, byte-identical to every recorded detector. This is the model's input size; the tile's
+# SOURCE extent is tile_wh / tile_scale. Inference is unchanged -- one whole-frame forward at
+# tile_scale, derived per camera. Its ONE justification is use_regions (report 16 §5.3b refuted
+# the other).
+tile_wh = []
+
+# source -> input scale for tile_wh. 1.0 = native. DO NOT ALSO RESIZE THE TILE: the invariant is
+# the animal's size in INPUT pixels, and tiling-then-downscaling is the number-one reported
+# failure of this pattern. MEASURED on rat-city-annotated: this is what sets the mask's positive
+# rate (5.2% at 1.0, 10.2% at 0.7, 17.5% at 0.5, 48% at 0.25) because CENTER_RADIUS is 2.5 CELLS,
+# so the certified region has to span many cells, not much area.
+tile_scale = 1.0
+
+# background tiles per frame, centres inside the certified area
+tile_bg_per_frame = 1
+
+# mask the objectness loss to the area regions.pq certifies as completely labelled. ORTHOGONAL
+# to tile_wh so an arm can move one lever. MEASURED DEAD on whole frames: 69% of supervised
+# anchors are positive against 0.68% unmasked and 17% of frames have no certified negative at
+# all. Use it WITH tiles. A session with no regions.pq claims exhaustive labelling and is
+# unmasked. UNDEFINED under augment_strong -- the constructor raises (data.py:454-458), so pick
+# one per root.
+use_regions = false
+
+[model]
+# the ARCHITECTURE, not a runtime choice -- it changes the state_dict and is recorded in the
+# checkpoint (`load_detector` reads it back; absent means `trimmed`, i.e. every checkpoint from
+# before this key existed). DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE: dev/reports/30
+# section 5.3 found `tiny`'s apparent downstream lead over `trimmed` on rat-city-combined (4.0
+# px) was SMALLER than its own seed-replicate swing (8.8 px) and does not survive that check --
+# no tier is distinguishable from `trimmed` on the evidence collected so far. Set `yolox =
+# "trimmed"` to restore the pre-this-default architecture, byte-identical to every detector on
+# record before dev/reports/28. `trimmed` is the repo's bespoke ~0.66M-param net.
+# `nano/tiny/s/m/l/x` instead build the CANONICAL YOLOX backbone (Focus stem, 5-stage CSPDarknet)
+# at that tier's official (depth_mul, width_mul, depthwise) -- see
+# `tailcyclenet.detector.yolox.YOLOX_TIERS`. NOT byte-identical to Megvii's release: GroupNorm
+# throughout, and the neck unifies all three pyramid levels to one width rather than three
+# per-level widths with per-level head stems. This is a MODEL-SELECTION sweep, not a single-lever
+# ablation -- every named tier differs from `trimmed` in schedule, depth, conv type and stem all
+# at once.
+yolox = "tiny"
+
+[training]
+# run folder: checkpoints, metrics.json, and the effective config.toml + provenance.toml.
+# `--out` on the command line overrides this.
+out = ""
+
+# total iterations. 20000 is the shipped default; prefer the FINAL checkpoint for arm-vs-arm
+# (best-on-val iteration varies 12k-20k across identical recipes, report 21 §7.0c).
+iters = 20000
+
+batch_size = 16
+lr = 1e-3
+num_workers = 8
+seed = 0
+# model init, augmentation draws and the train shuffle order. Does NOT move the median-animal
+# probe, which stays pinned at seed 0 regardless -- that is a MEASUREMENT of the dataset, not
+# training stochasticity, and letting it vary would make input_wh depend on seed. A SAME-RECIPE
+# REPLICATE (same config, different seed) is not optional before trusting a detector arm: report
+# 21 §7.0 measured coverage +0.0575 and kpt_agree +0.1124, both SIG, with NO lever at all.
+device = "cuda:0"
+
+eval_every = 2000
+# batches per split at each checkpoint. TRAIN is scored too: the train/val gap is what says
+# whether a dataset needs augmentation (a gap) or resolution (no gap, low absolute recall).
+eval_batches = 25
+
+kpt_weight = 1.0
+kpt_score_weight = 1.0

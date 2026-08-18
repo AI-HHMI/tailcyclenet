@@ -6,6 +6,7 @@ RULE'S box. If it learned some other plausible box, every downstream pose number
 import numpy as np
 import pytest
 import torch
+from pathlib import Path
 
 from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
@@ -1073,7 +1074,9 @@ def test_train_detector_help_renders():
     p = Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py'
     r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
     assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
-    assert '--yolox' in r.stdout and '--seed' in r.stdout
+    # The CLI is now `--config` + three overrides; the recipe lives in the config file.
+    assert '--config' in r.stdout and '--out' in r.stdout
+    assert '--iters' in r.stdout and '--device' in r.stdout
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1487,7 +1490,7 @@ def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
     assert best['iteration'] == kept
 
     src = (Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py').read_text()
-    assert "torch.save(ckpt, args.out / 'detector.pth')" in src
+    assert "torch.save(ckpt, run / 'detector.pth')" in src
     assert 'if sel >= best_score:' in src, 'the unconditional overwrite is back'
 
 
@@ -1655,3 +1658,260 @@ def test_infer_help_renders():
     assert '--pose-nms' in r.stdout
 
 
+
+
+# --- detector training config (configs/detector.toml + tailcyclenet/detector/config.py) ------
+
+REPO = Path(__file__).resolve().parent.parent
+SHIPPED_DETECTOR_CONFIG = REPO / 'configs' / 'detector.toml'
+
+
+def _write_config(tmp_path, text, name='config.toml'):
+    p = tmp_path / name
+    p.write_text(text)
+    return p
+
+
+def test_detector_config_loads_with_shipped_defaults(tmp_path):
+    """The shipped config is the old CLI defaults, one key per flag -- and `--out`/`--iters`/
+    `--device` overrides land in [training]. Path/out are placeholders in the shipped file, so
+    the user flow is exercised: a one-key overlay `extends` it."""
+    import shutil
+    from tailcyclenet.detector.config import load_detector_config
+
+    # `extends` resolves against the config's OWN directory, so base and overlay share tmp_path.
+    shutil.copy(SHIPPED_DETECTOR_CONFIG, tmp_path / 'base.toml')
+    overlay = _write_config(tmp_path, f"""
+extends = "base.toml"
+[data]
+path = "/tmp/ds"
+[training]
+out = "/tmp/run-det"
+""", 'overlay.toml')
+    cfg = load_detector_config(overlay, out='/tmp/run-det', iters=7, device='cpu')
+    d, m, t = cfg['data'], cfg['model'], cfg['training']
+    assert d['path'] == '/tmp/ds'
+    assert d['boxes'] == 'instances'
+    assert d['min_crop_dim'] == 64
+    assert d['min_box_px'] == 32
+    assert d['max_input_px'] == 4 * 416 * 416
+    assert d['frames_per_group'] == 40
+    assert d['val_frames_per_group'] == 8
+    assert d['augment'] is True and d['augment_strong'] is True
+    assert d['rotate_deg'] == 45.0
+    assert d['reduce'] is False and d['keypoints'] is False and d['hflip'] is True
+    assert d['use_regions'] is False
+    assert d['input_wh'] is None and d['tile_wh'] is None       # absent pair -> None
+    assert d['tile_scale'] == 1.0 and d['tile_bg_per_frame'] == 1
+    assert m['yolox'] == 'tiny'
+    assert t['out'] == '/tmp/run-det'
+    assert t['iters'] == 7
+    assert t['batch_size'] == 16 and t['lr'] == 1e-3
+    assert t['num_workers'] == 8 and t['seed'] == 0
+    assert t['device'] == 'cpu'
+    assert t['eval_every'] == 2000 and t['eval_batches'] == 25
+    assert t['kpt_weight'] == 1.0 and t['kpt_score_weight'] == 1.0
+
+
+def test_detector_config_unknown_key_raises_in_every_block(tmp_path):
+    from tailcyclenet.detector.config import load_detector_config
+
+    for block, bad in (('data', 'bogus = 1'),
+                       ('model', 'bogus = 1'),
+                       ('training', 'bogus = 1')):
+        p = _write_config(tmp_path, f"""
+[data]
+path = "/tmp/ds"
+boxes = "instances"
+min_crop_dim = 64
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+iters = 1
+""")
+        # inject the unknown key into `block`
+        lines = p.read_text().splitlines(keepends=True)
+        out_lines = []
+        for ln in lines:
+            out_lines.append(ln)
+            if ln.strip() == f'[{block}]':
+                out_lines.append('bogus = 1\n')
+        p.write_text(''.join(out_lines))
+        with pytest.raises(SystemExit, match='unknown key'):
+            load_detector_config(p)
+
+
+def test_detector_config_bad_choices_raise(tmp_path):
+    from tailcyclenet.detector.config import load_detector_config
+
+    base = """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+iters = 1
+"""
+    # boxes lives in [data]; append the bad key to the existing [data] block instead of a second one.
+    p = _write_config(tmp_path, """\
+[data]
+path = "/tmp/ds"
+boxes = "nope"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+iters = 1
+""", 'b1.toml')
+    with pytest.raises(SystemExit, match='boxes'):
+        load_detector_config(p)
+    p = _write_config(tmp_path, """\
+[data]
+path = "/tmp/ds"
+boxes = "instances"
+[model]
+yolox = "nope"
+[training]
+out = "/tmp/run"
+iters = 1
+""", 'b2.toml')
+    with pytest.raises(SystemExit, match='yolox'):
+        load_detector_config(p)
+
+
+def test_detector_config_extends_one_level(tmp_path):
+    """User overlays can `extends` the shipped file; the merge is per BLOCK (pose rule)."""
+    from tailcyclenet.detector.config import load_detector_config
+
+    base = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+boxes = "instances"
+min_crop_dim = 64
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/base-run"
+iters = 20000
+""", 'base.toml')
+    overlay = _write_config(tmp_path, """
+extends = "base.toml"
+[data]
+boxes = "keypoints"
+[training]
+iters = 3
+""", 'overlay.toml')
+    cfg = load_detector_config(overlay)
+    assert cfg['data']['boxes'] == 'keypoints'
+    assert cfg['data']['min_crop_dim'] == 64          # base value survived the block merge
+    assert cfg['model']['yolox'] == 'tiny'            # untouched block carried over
+    assert cfg['training']['iters'] == 3
+    assert cfg['training']['out'] == '/tmp/base-run'
+
+
+def test_detector_config_round_trips_through_the_run_folder(tmp_path):
+    """The recorded config.toml (None values dropped) loads back to the same recipe."""
+    from tailcyclenet.detector.config import load_detector_config
+
+    src = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+boxes = "keypoints"
+min_crop_dim = 64
+input_wh = [96, 64]
+tile_wh = []
+[model]
+yolox = "trimmed"
+[training]
+out = "/tmp/run"
+iters = 2
+""", 'src.toml')
+    cfg = load_detector_config(src, out=str(tmp_path / 'run'), iters=2, device='cpu')
+    import toml
+    (tmp_path / 'run').mkdir()
+    (tmp_path / 'run' / 'config.toml').write_text(toml.dumps(cfg))
+    again = load_detector_config(tmp_path / 'run' / 'config.toml')
+    assert again['data']['input_wh'] == [96, 64] and again['data']['tile_wh'] is None
+    assert again['data']['boxes'] == 'keypoints'
+    assert again['training']['iters'] == 2
+    assert again['model']['yolox'] == 'trimmed'
+
+
+def test_train_detector_config_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A 2-iteration run through scripts/train_detector.py's `main()` with a config file
+    produces the same artefacts a CLI run did -- checkpoints, metrics.json, and now config.toml
+    + provenance.toml -- and the checkpoint still loads through the unchanged `load_detector`.
+
+    IN-PROCESS, not a subprocess: `train_detector.py` imports torch, and on this host a fresh
+    interpreter spends ~60s of the ~110s wall clock just importing -- a subprocess would pay it
+    twice. `test_train.py` runs `scripts/train.py` the same way.
+    """
+    import importlib.util
+    import sys
+    import tomllib
+
+    from tailcyclenet.detector import load_detector
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+reduce = false
+keypoints = false
+hflip = true
+tile_wh = []
+tile_scale = 1.0
+tile_bg_per_frame = 1
+use_regions = false
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+kpt_weight = 1.0
+kpt_score_weight = 1.0
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector_it000002.pth').exists()
+    assert (out / 'detector.pth').exists()
+    assert (out / 'metrics.json').exists()
+    assert (out / 'config.toml').exists()
+    assert (out / 'provenance.toml').exists()
+    with open(out / 'config.toml', 'rb') as f:
+        recorded = tomllib.load(f)
+    assert recorded['data']['boxes'] == 'keypoints'
+    assert recorded['data']['input_wh'] == [48, 48]
+    assert recorded['training']['iters'] == 2
+    model, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(out / 'detector.pth')
+    assert tuple(wh) == (48, 48)
+    assert mcd == 16
+    assert box_src == 'keypoints'
+    assert ts is None                                # untiled: tile_scale is dropped at the read
+    ckpt = torch.load(out / 'detector_it000002.pth', map_location='cpu', weights_only=False)
+    assert ckpt['yolox_version'] == 'tiny'
+    assert ckpt['min_crop_dim'] == 16
+    assert ckpt['box_source'] == 'keypoints'
+    assert tuple(ckpt['input_wh']) == (48, 48)

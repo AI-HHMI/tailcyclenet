@@ -586,11 +586,20 @@ split, because a delta over points only one arm attempted measures which arm dec
 ## The detector
 
 ```bash
-pixi run python scripts/train_detector.py --data <ONE dataset root> --out runs/det-<name>
+pixi run python scripts/train_detector.py --config configs/detector.toml
+# template -- set [data].path and [training].out. `extends` works one level deep.
 pixi run python scripts/infer.py --run runs/w9 --data <dataset> --detector runs/det-<name> ...
 ```
 
-**One detector per dataset**, and `--input-wh` defaults to an aspect-matched size rather than a
+**THE DETECTOR RECIPE LIVES IN A CONFIG FILE, NOT ON THE CLI.** `configs/detector.toml` ships
+every default (including `augment`/`augment_strong`/`rotate-deg`/`yolox` with the same evidence
+labels the old flag help carried); the only CLI knobs left are `--out`/`--iters`/`--device`
+overrides. Per-root recipes (report 32 §2.2) are key overrides in YOUR config, not a second
+shipped file. An unknown key in any block RAISES rather than silently training at defaults, and
+the run folder records the effective `config.toml` + `provenance.toml` like a pose run does.
+Checkpoints are byte-compatible: `load_detector`, `eval_detector.py` and `infer.py` are untouched.
+
+**One detector per dataset**, and `input_wh` defaults to an aspect-matched size rather than a
 square. This is not fussiness: rat-city's frames are 2.29:1, so a square 416 letterbox wastes 56% of
 the canvas and delivers the median rat at 15.8 x 12.5 px — about 2 x 1.6 cells at stride 8 and
 absent from strides 16 and 32, so two thirds of the FPN cannot represent it. The same detector on

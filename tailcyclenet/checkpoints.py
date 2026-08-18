@@ -172,7 +172,13 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     eval_state = None
-    if hasattr(optimizer, 'eval') and hasattr(optimizer, 'train'):
+    # A DualOptimizer exposes eval()/train() even when its Muon half has NO averaged iterate
+    # (`muon_schedulefree = false`), in which case `model_state_eval` would be only half-averaged.
+    # `has_averaged_iterate` reports whether both halves carry an `x`; fall back to the eval/train
+    # probe for a plain AdamW-schedule-free optimizer, which is unchanged.
+    averaged = getattr(optimizer, 'has_averaged_iterate',
+                       hasattr(optimizer, 'eval') and hasattr(optimizer, 'train'))
+    if averaged:
         optimizer.eval()
         eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         optimizer.train()

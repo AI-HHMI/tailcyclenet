@@ -215,6 +215,34 @@ shape changed *whole*, so before this, growing the registry reset every trained 
 A run folder also carries **`provenance.toml`** — the commit and a dirty flag at save time. A
 config is not a provenance record, and gotcha 12 is what that cost.
 
+**MUON IS THE OPTIMIZER, AND AN ABSENT `[training.optimizer].optimizer` KEY MEANS MUON** (report
+34, ported from posetail-next; **not** re-measured on this repo's roots, so it is the reference's
+~0.05-kubric-per-iter result and not one of ours). SF-Muon runs `torch.optim.Muon` on the 2D
+transformer matrices — `decoder.{cross_attns,mlps,camera_attns,temporal_attns}` + `scene_encoder.
+kv_proj` + the encoder blocks when unfrozen — with AdamW-schedule-free on everything else
+(`tailcyclenet/optim.py`). Three traps a reader must not rediscover: **`nn.Embedding` weights are
+2D but excluded**, because each row is a keypoint identity and orthogonalising mixes body parts (the
+`warm_start` row-copy hazard); **resuming an AdamW-SF run folder requires `optimizer =
+"schedulefree"`**, or train.py refuses the mismatched checkpoint by name rather than `KeyError`-ing
+mid-restart (the `gridresid_offset` rule, for optimizer state); and the **fresh 2D matrices go to
+Muon at `kpt_lr`** — one lever off the reference, so if a Muon arm disappoints that group is the
+first suspect to revert. `optimizer = "schedulefree"` restores the exact three-group AdamW-SF
+optimizer. `muon_schedulefree = false` drops the averaged iterate, and `save_checkpoint` then
+writes no `model_state_eval` (`has_averaged_iterate` is False).
+
+**ONLY THE AdamW HALF IS GRADIENT-CLIPPED, AND A MUON RUN'S `grad_norm` IS A DIFFERENT QUANTITY**
+(report 34b). Muon orthogonalizes its own gradients inside `step()`, so their raw norm is not a step
+size — and the Muon-routed matrices carry **~95% of the global grad norm**, so the old shared
+`clip_grad_norm_(model.parameters())` computed a ~0.05 coefficient and applied it to the fresh
+heads/embeddings/norms too, throttling them **8-20x**. The clip now targets `opt.adamw_params`;
+non-finiteness is still checked on BOTH halves. `train/grad_norm` is the clipped AdamW half and
+`train/grad_norm_muon` the unclipped Muon half — the two are not comparable to each other, and only
+the first is comparable to a schedulefree run. **A run started before this fix is not comparable to
+one after it.** Raising `max_grad_norm` past 10 does NOT help (measured); the residual is that Muon
+warms up ~2-3x slower on this Adam-pretrained checkpoint, which is the documented
+Adam-pretrained/Muon-finetune mismatch and the reason the default is still inherited, not measured. No DDP: `batch_size` is 1 and there
+is no world-size LR scaling, so the reference's `sqrt(world_size)` machinery is not ported.
+
 ### The architecture: two switches
 
 ```toml

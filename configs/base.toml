@@ -130,13 +130,29 @@ print_freq = 20
 freeze_encoder = true       # a DEPLOYMENT decision: one frozen encoder forward feeds both models
 
 [training.optimizer]
+# THE SHIPPED OPTIMIZER, and also what an ABSENT key means. "muon" runs torch.optim.Muon on the
+# 2D transformer matrices of the decoder (and the encoder blocks, when unfrozen) with AdamW-SF on
+# everything else -- heads, norms, biases, and every nn.Embedding, whose rows are keypoint
+# identities and must not be orthogonalized together. Ported from posetail-next, where SF-Muon
+# beat AdamW/schedulefree by ~0.05 kubric at every matched iteration; NOT re-measured on this
+# repo's roots, so it is the reference's result and not one of ours (dev/reports/34).
+#
+# "schedulefree" restores the previous AdamW-SF recipe and is what an EXISTING run folder needs in
+# order to resume -- its checkpoint carries AdamW-SF state, and train.py refuses to load it into a
+# Muon optimizer rather than guessing.
+optimizer = "muon"
 learning_rate = 1e-4        # what every hop of the golden chain actually ran
 kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
 encoder_lr_scale = 0.1      # inert while freeze_encoder = true: the encoder group is then empty
 weight_decay = 0.002
-warmup_steps = 500
+warmup_steps = 500          # drives the AdamW-SF half's warmup
 beta1 = 0.9
 beta2 = 0.95
+muon_schedulefree = true    # ScheduleFreeWrapper on top of Muon -- the reference's winning arm
+muon_lr_scale = 1.0         # adjust_lr_fn = "match_rms_adamw" makes Muon REUSE the AdamW lr
+muon_momentum = 0.95
+muon_warmup_steps = 500     # Muon hits full lr at step 0 otherwise; matches warmup_steps
+muon_adjust_lr_fn = "match_rms_adamw"
 
 [training.losses]
 # `delta` and `use_huber_loss` reach the 3D metric Hubers only -- the 2D and all four reprojection

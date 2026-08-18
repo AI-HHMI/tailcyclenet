@@ -34,12 +34,24 @@ from tailcyclenet.model import build_model
 
 
 def build_optimizer(model, fresh: set[str], cfg: dict):
-    """Three parameter groups.
+    """The run's optimizer, selected by `[training.optimizer].optimizer` (config key only).
+
+    `"muon"` (the shipped value, AND what an ABSENT key means) runs `torch.optim.Muon` on the 2D
+    transformer matrices with AdamW-schedule-free on everything else -- see `tailcyclenet.optim`.
+    `"schedulefree"` restores the previous AdamW-SF recipe below, and is what an existing run
+    folder needs to resume, since its checkpoint carries AdamW-SF optimizer state.
 
     Freshly initialised params -- the keypoint identity table, the no-query tokens, the rebuilt
     fusion gate -- start from noise and need a much higher rate than weights that arrive from
     ~1M pretraining steps. The video encoder, when unfrozen, needs a much lower one.
     """
+    kind = str(cfg.get('optimizer', 'muon'))
+    if kind == 'muon':
+        from tailcyclenet.optim import build_muon
+        return build_muon(model, fresh, cfg)
+    if kind != 'schedulefree':
+        raise SystemExit(f'[training.optimizer].optimizer = {kind!r} is not one of '
+                         '"muon" | "schedulefree".')
     lr = float(cfg['learning_rate'])
     kpt_lr = float(cfg.get('kpt_lr', lr))
     enc_scale = float(cfg.get('encoder_lr_scale', 1.0))
@@ -472,7 +484,19 @@ def main():
         print(f'encoder frozen: {n} tensors')
     model = model.to(device)
 
-    opt = build_optimizer(model, fresh, config['training']['optimizer'])
+    # AN UNKNOWN [training.optimizer] KEY IS A TYPO, NOT A COMMENT -- the same guard `[data]` and
+    # `build_model` already apply. This block was splatted unguarded, so `muon_lr` for
+    # `muon_lr_scale` would train at the default and the run folder would record the key nobody
+    # read (eval rule 4). This is what makes "config key only" safe as the whole selection surface.
+    opt_cfg = config['training']['optimizer']
+    from tailcyclenet.optim import KNOWN_OPTIMIZER_KEYS
+    opt_unknown = set(opt_cfg) - KNOWN_OPTIMIZER_KEYS
+    if opt_unknown:
+        raise SystemExit(
+            f'[training.optimizer]: unknown key(s) {sorted(opt_unknown)}. Nothing reads them, so '
+            f'this run would train at the defaults and report as the arm it is not. Known keys: '
+            f'{sorted(KNOWN_OPTIMIZER_KEYS)}')
+    opt = build_optimizer(model, fresh, opt_cfg)
     # `per_camera_cube_scale` is a GAUGE, and the model and the loss have to agree on it. It lives
     # in `[model]`, and `TotalLoss` defaults it False (`losses.py:98`) -- so leaving it out of
     # `[training.losses]` had the loss take the median over cameras while the model kept its own
@@ -502,6 +526,16 @@ def main():
     if resumed.exists() and not args.no_resume:
         ck = torch.load(resumed, map_location=device, weights_only=False)
         model.load_state_dict(ck['model_state'])
+        # REFUSE, by name, an optimizer state written by a DIFFERENT optimizer than this config
+        # builds. The model tensors above loaded either way; only the state's own shape can tell
+        # you that the run is being resumed under the wrong optimizer -- and making `muon` the
+        # default means every AdamW-SF run folder now hits this. Loud rather than a KeyError deep
+        # in `load_state_dict`. This is the gridresid_offset rule for optimizer state.
+        from tailcyclenet.optim import refuse_mismatched_optimizer_state
+        refuse_mismatched_optimizer_state(
+            opt, ck['optimizer_state'], resumed,
+            resolved=str(config['training']['optimizer'].get('optimizer', 'muon')),
+            explicit='optimizer' in config['training']['optimizer'])
         opt.load_state_dict(ck['optimizer_state'])
         start_it = int(ck['iteration'])
         print(f'resuming {resumed} at iteration {start_it} of {n_iter} '
@@ -515,6 +549,10 @@ def main():
     # WRONG for a run that takes the new default silently. Writing it makes the run folder say what
     # it trained as, which is the whole job of a run folder; gotcha 12 is what the alternative cost.
     config.setdefault('data', {})['box_source'] = train_ds.cfg.box_source
+    # RECORD THE RESOLVED OPTIMIZER too, for the same reason: an absent key means "muon", and a run
+    # folder must be able to say what it trained as. A folder that resolved to muon by default and a
+    # folder that will only resume as "schedulefree" must not read identically.
+    opt_cfg['optimizer'] = str(opt_cfg.get('optimizer', 'muon'))
     save_run_meta(run, config, registry)
     print(f'run folder: {run.resolve()}')
     wb = init_wandb(config, run, disabled=args.no_wandb)
@@ -534,6 +572,21 @@ def main():
 
     # -- loop ------------------------------------------------------------------------------
     max_grad = float(train_cfg.get('max_grad_norm', 0)) or None
+    # CLIP ONLY THE AdamW-ROUTED PARAMS ON A MUON RUN. Muon orthogonalizes its own gradients
+    # inside `step()` (Newton-Schulz), so their RAW norm is not a step size -- clipping it is
+    # meaningless. Worse, on this model the Muon-routed 2D matrices carry ~95% of the global grad
+    # norm, so a single shared `clip_grad_norm_(model.parameters())` computes a ~0.05 coefficient
+    # and applies it to the freshly-initialised heads/embeddings/norms too, throttling exactly the
+    # AdamW half that needs to learn fastest (report 34b: measured 8-20x on the AdamW grads, and a
+    # 3-7x higher reported grad_norm than the schedulefree arm at matched steps). So the clip
+    # targets `opt.adamw_params`; Muon's half is left to its own orthogonalisation. For a
+    # schedule-free (non-dual) optimizer this is every trainable param, exactly as before.
+    clip_params = getattr(opt, 'adamw_params',
+                          [p for p in model.parameters() if p.requires_grad])
+    # The Muon half is not clipped, but its gradient still must not be allowed to go non-finite
+    # into `step()` -- the all-params clip used to be what caught that. `muon_params` is empty for
+    # a schedule-free optimizer, so this guard is inert there.
+    unclipped_params = getattr(opt, 'muon_params', [])
     print_freq = int(train_cfg.get('print_freq', 20))
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
     # `best` is written at checkpoint boundaries using THAT iteration's val, so a val has to land
@@ -581,9 +634,12 @@ def main():
                 continue
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            gn = torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], max_grad or 1e9)
-            if not torch.isfinite(gn):
+            gn = torch.nn.utils.clip_grad_norm_(clip_params, max_grad or 1e9)
+            # `gn` now measures the AdamW half only; the Muon half is checked for finiteness
+            # separately (its grads are stepped unclipped, so a NaN there would otherwise slip in).
+            mgrads = [p.grad for p in unclipped_params if p.grad is not None]
+            mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())
+            if not (torch.isfinite(gn) and torch.isfinite(mgn)):
                 # A non-finite gradient is counted, not hidden: a run that silently skips half
                 # its steps looks like a run that trained.
                 skipped += 1
@@ -616,7 +672,11 @@ def main():
                 # `clipped` is the running fraction of steps hitting max_grad_norm. At
                 # batch_size 1 it has measured ~50%, which makes it the most informative
                 # training-health number here -- and it was being computed and thrown away.
+                # `train/grad_norm` is the CLIPPED (AdamW) half; `train/grad_norm_muon` is the
+                # unclipped Muon half, which reads several-fold higher by construction (it is a raw
+                # pre-orthogonalisation norm, not a step size -- report 34b). 0 for a schedulefree run.
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
+                         'train/grad_norm_muon': float(mgn),
                          'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
                          'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
                          'train/eval_frac': eval_frac,

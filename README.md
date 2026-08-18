@@ -75,6 +75,9 @@ behind each; report 25 is superseded):
   calms21/johnson; either for 3dpop depending on comparability). It is a live default that moved
   underneath cached artifacts and is absent from every shipped config.
 - `n_iterations = 60000`, `learning_rate = 1e-4`, `freeze_encoder = true`, `seed = 0` (golden chain).
+- `optimizer = "muon"` — the shipped default (SF-Muon, ported from posetail-next; **not**
+  re-measured here). An absent key also means `muon`. To resume an older AdamW-SF run folder set
+  `optimizer = "schedulefree"`, or train.py refuses the mismatched checkpoint by name.
 
 Detector (one per dataset, reproduces the pose model's crop rule):
 

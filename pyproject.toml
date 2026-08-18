@@ -72,6 +72,12 @@ pytest = "*"
 # each, and the box has 128 cores. noarch, pure python, needs only pytest + execnet, so it cannot
 # collide with the exact pins the note below is about.
 pytest-xdist = "*"
+# `--timeout=N` for a suite whose failure mode is a HANG, not an assertion: the loader deadlocks in
+# a futex when anything decodes video before the workers fork (gotcha 11) -- 0% GPU, no traceback,
+# no timeout, forever. Same noarch/pure-python argument as xdist, so it cannot collide with the
+# exact pins below. Not applied by default (no `timeout =` in [tool.pytest.ini_options]): the
+# model-building tests are legitimately slow and a global cap would flake on a busy host.
+pytest-timeout = "*"
 # NOT listed here, deliberately: toml, opencv, pillow, wandb, schedulefree, decord. This repo
 # imports all six directly, so declaring them looks right -- but posetail pins them EXACTLY
 # (`wandb==0.19.5`, `opencv-python==4.9.0.80`, `toml==0.10.2`) and posetail itself is pinned, so

@@ -17,6 +17,7 @@ import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
 from tailcyclenet.model import build_model
+from tailcyclenet.unfreeze import _norms_in_range, apply_staged_unfreeze
 
 # Everything structural from configs/w9.toml, everything expensive at its floor.
 SMALL = dict(
@@ -818,3 +819,71 @@ def test_an_unprompted_keypoint_carries_no_query_time(moving_batch, enc):
         at1 = model(b.views, b.kpt_ids, b.cgroup, mode='3d', kpt_prior=b.kpt_prior,
                     prompt_time=torch.ones((1, K), dtype=torch.int32))['coords_pred']
     assert not torch.allclose(at0, at1), 'query_time is inert here, so this test proves nothing'
+
+
+# ---------------------------------------------------------------------------------------------
+# the staged encoder unfreeze, on a REAL ViT
+# ---------------------------------------------------------------------------------------------
+# ViT-base is depth 12 with hierarchical taps at [2,5,8,11], so `video_encoder_finetune_last_n_
+# layers = 4` gives a trainable range of blocks 8..11 -- selecting SOME blocks, not all, which a
+# hand-built fixture cannot check for us. The gate, the idempotence and the block selection are
+# posetail 0.3.5's (`TrackerEncoder.unfreeze_video_encoder`); what is pinned here is that this
+# repo gets what upstream promises, plus the norms extension upstream does not do.
+
+def _staged_model(n_last=4, at=3):
+    return build_model(small('wide', video_encoder_requires_grad=at,
+                             video_encoder_finetune_last_n_layers=n_last), n_keypoints=3)
+
+
+def test_staged_unfreeze_selects_exactly_the_last_n_blocks():
+    m = _staged_model(n_last=4, at=3)
+    enc = m.scene_encoder.encoder
+    assert len(enc.blocks) == 12 and enc.hierarchical_layers == [2, 5, 8, 11], 'fixture moved'
+
+    for it in (0, 1, 2):
+        assert m.unfreeze_video_encoder(it) is False, f'fired early at {it}'
+        assert not any(p.requires_grad for p in enc.parameters()), 'encoder trainable before time'
+
+    assert m.unfreeze_video_encoder(3) is True
+    for i, blk in enumerate(enc.blocks):
+        want = i >= 8
+        got = all(p.requires_grad for p in blk.parameters())
+        assert got == want, f'block {i}: trainable={got}, expected {want}'
+    assert m.unfreeze_video_encoder(4) is False, 'not idempotent'
+
+
+def test_staged_unfreeze_norms_extension_tracks_the_block_range():
+    """Upstream unfreezes `blocks[-N:]` plus an `encoder.norm` VJEPA 2.1 has no attribute for, so
+    `norms_block` -- applied at the hierarchical taps and feeding the decoder -- would stay frozen
+    behind a trainable block. Taps [2,5,8,11]: N=4 -> range starts at 8, so norms 2,3; N=2 -> 3."""
+    m = _staged_model(n_last=4, at=0)
+    enc = m.scene_encoder.encoder
+    assert _norms_in_range(enc, 4) == [2, 3]
+    assert _norms_in_range(enc, 2) == [3]
+    assert _norms_in_range(enc, 12) == [0, 1, 2, 3], 'the whole encoder unfreezes every norm'
+
+    opt = torch.optim.AdamW([p for p in m.parameters() if p.requires_grad], lr=0.0)
+    info = apply_staged_unfreeze(m, opt, {'learning_rate': 1e-4, 'encoder_lr_scale': 0.1}, 0)
+    assert info['norms'] == [2, 3], info
+    for i, nrm in enumerate(enc.norms_block):
+        want = i >= 2
+        got = all(p.requires_grad for p in nrm.parameters())
+        assert got == want, f'norms_block[{i}]: trainable={got}, expected {want}'
+
+
+def test_gradients_reach_the_unfrozen_blocks_only(moving_batch):
+    """A real forward/backward after the unfreeze: finite grads on the trainable blocks, None on
+    the frozen ones. `SceneRepresentation` turns activation checkpointing on unconditionally, so
+    this also pins that the checkpointed backward works through a partially-frozen encoder."""
+    b = moving_batch
+    m = _staged_model(n_last=4, at=0)
+    assert m.unfreeze_video_encoder(0) is True
+    m(b.views, b.kpt_ids, b.cgroup, mode='3d')['coords_pred'].nansum().backward()
+    enc = m.scene_encoder.encoder
+    for i, blk in enumerate(enc.blocks):
+        grads = [p.grad for p in blk.parameters()]
+        if i >= 8:
+            assert all(g is not None and torch.isfinite(g).all() for g in grads), \
+                f'block {i} is trainable but got no finite gradient'
+        else:
+            assert all(g is None for g in grads), f'frozen block {i} received a gradient'

@@ -215,6 +215,36 @@ shape changed *whole*, so before this, growing the registry reset every trained 
 A run folder also carries **`provenance.toml`** — the commit and a dirty flag at save time. A
 config is not a provenance record, and gotcha 12 is what that cost.
 
+**THE ENCODER UNFREEZES MID-RUN NOW, AND `[model].video_encoder_requires_grad` IS THE ONLY THING
+THAT SAYS SO** (report 35). A bool means never / from step 0; an **int is the iteration to unfreeze
+at**, with `video_encoder_finetune_last_n_layers` for how many trailing blocks. Shipped: **8 blocks
+at iteration 10,000**, and **that is a default, not a result** — every number in this file was
+measured with the encoder frozen for its whole life, so a run started after this is not comparable
+to one before it; `video_encoder_requires_grad = false` restores the old arm exactly.
+`[training].freeze_encoder` is DELETED and naming it raises: it re-froze the encoder after
+`build_model`, so two sources of truth for one fact would have let the loop's silently win.
+
+The model side is **entirely posetail 0.3.5's** — `TrackerEncoder.unfreeze_video_encoder` owns the
+gate, the idempotence and the last-N selection. Three things this repo had to add, each a silent
+failure otherwise. **A FROZEN PARAM IS IN NO PARAM GROUP, EVER**, so `build_muon`'s
+`requires_grad` filter means a bare flag flip would hand the encoder gradients nothing steps —
+`tailcyclenet/unfreeze.py` adds the newly-trainable tensors, routed by the same `route_param`
+build time uses. **THEY MUST BE NEW GROUPS, NOT PRE-REGISTERED ONES**: both schedule-free impls
+advance `k`/`weight_sum` on every `step()` regardless of whether a param has a grad, and the
+averaging weight is `ckp1 ~ 1/k` — a group grad-less for 10,000 steps would fold its encoder into
+the averaged iterate at 1/10000, so `model_state_eval` (what is deployed, and what `best` is
+selected on) would hold a barely-moved encoder while `model_state` held a finetuned one. And the
+**clip target is recomputed after a fire**, or the new tensors are unclipped and unchecked for
+non-finiteness (report 34b). `encoder_lr_scale = 0.1` stops being inert at the unfreeze; the new
+AdamW group warms from its own `k = 0`, which is why there is no separate warmup key.
+
+**REPO-LOCAL DIVERGENCE:** upstream unfreezes `blocks[-N:]` plus an `encoder.norm` VJEPA 2.1 does
+not have, leaving `norms_block` — applied at the hierarchical taps and feeding the decoder —
+frozen behind a trainable block. This repo also unfreezes the norms whose layer is inside the
+range. Unmeasured, and separately measurable by dropping it. **Resume replays the unfreeze onto a
+frozen-layout optimizer** rather than building an unfrozen one, because `load_state_dict` matches
+groups by position; a count mismatch raises naming both keys.
+
 **MUON IS THE OPTIMIZER, AND AN ABSENT `[training.optimizer].optimizer` KEY MEANS MUON** (report
 34, ported from posetail-next; **not** re-measured on this repo's roots, so it is the reference's
 ~0.05-kubric-per-iter result and not one of ours). SF-Muon runs `torch.optim.Muon` on the 2D

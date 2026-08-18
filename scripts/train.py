@@ -31,6 +31,8 @@ from tailcyclenet.checkpoints import (check_image_size, load_config, resolve_che
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate, worker_init
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
+from tailcyclenet.unfreeze import (apply_staged_unfreeze, replay_staged_unfreeze,
+                                   trainable_encoder_params)
 
 
 def build_optimizer(model, fresh: set[str], cfg: dict):
@@ -475,13 +477,29 @@ def main():
     if not args.no_warm_start and train_cfg.get('checkpoint_path'):
         fresh = warm_start(model, resolve_checkpoint(Path(train_cfg['checkpoint_path'])),
                            base_names=base_reg.names if base_reg else None)
-    if train_cfg.get('freeze_encoder', True):
-        n = 0
-        for name, p in model.named_parameters():
-            if name.startswith('scene_encoder.encoder.'):
-                p.requires_grad_(False)
-                n += 1
-        print(f'encoder frozen: {n} tensors')
+    # THE ENCODER'S GRADIENT STATE IS `[model].video_encoder_requires_grad` AND NOTHING ELSE.
+    # `[training].freeze_encoder` used to re-freeze the encoder here, after `build_model` had
+    # already honoured the model key -- two sources of truth for one fact, and the loop's one
+    # would have silently won over the staged unfreeze. Same rule as `per_camera_cube_scale`.
+    # `[training]` has no unknown-key guard, so a config still naming it is refused by name
+    # rather than ignored.
+    if 'freeze_encoder' in train_cfg:
+        raise SystemExit(
+            '[training].freeze_encoder was removed: it re-froze the encoder AFTER build_model, so '
+            'it silently overrode [model].video_encoder_requires_grad and would defeat the staged '
+            'unfreeze. Set [model].video_encoder_requires_grad instead -- false (never train the '
+            'encoder), true (from step 0), or an ITERATION to unfreeze at -- with '
+            '[model].video_encoder_finetune_last_n_layers for how many trailing blocks.')
+    enc_grad = config['model'].get('video_encoder_requires_grad', False)
+    n_last = config['model'].get('video_encoder_finetune_last_n_layers')
+    n_frozen = sum(1 for n, p in model.named_parameters()
+                   if n.startswith('scene_encoder.encoder.') and not p.requires_grad)
+    if isinstance(enc_grad, bool):
+        print(f'encoder: {"trainable from step 0" if enc_grad else "frozen for the whole run"} '
+              f'({n_frozen} frozen tensors)')
+    else:
+        print(f'encoder: frozen now, last {n_last if n_last is not None else "all"} block(s) '
+              f'unfreeze at iteration {int(enc_grad)} ({n_frozen} frozen tensors)')
     model = model.to(device)
 
     # AN UNKNOWN [training.optimizer] KEY IS A TYPO, NOT A COMMENT -- the same guard `[data]` and
@@ -496,6 +514,14 @@ def main():
             f'[training.optimizer]: unknown key(s) {sorted(opt_unknown)}. Nothing reads them, so '
             f'this run would train at the defaults and report as the arm it is not. Known keys: '
             f'{sorted(KNOWN_OPTIMIZER_KEYS)}')
+    # READ THE CHECKPOINT BEFORE BUILDING THE OPTIMIZER, because `start_it` decides whether the
+    # staged unfreeze has already fired for the run being continued -- and that changes the param
+    # GROUPS the state below is keyed against by position. One 5.6 GB read, not two; only the read
+    # moves, the load ORDER below is unchanged.
+    start_it, ck, resumed = 0, None, run / 'checkpoints' / 'checkpoint_last.pth'
+    if resumed.exists() and not args.no_resume:
+        ck = torch.load(resumed, map_location=device, weights_only=False)
+        start_it = int(ck['iteration'])
     opt = build_optimizer(model, fresh, opt_cfg)
     # `per_camera_cube_scale` is a GAUGE, and the model and the loss have to agree on it. It lives
     # in `[model]`, and `TotalLoss` defaults it False (`losses.py:98`) -- so leaving it out of
@@ -522,10 +548,16 @@ def main():
     # NOT restored: the sampler position. The sampler draws with replacement, so window order
     # carries no contract, and a resumed run is simply not bit-identical to an uninterrupted one
     # -- inside the ~0.041 mm run-to-run floor either way.
-    start_it, resumed = 0, run / 'checkpoints' / 'checkpoint_last.pth'
-    if resumed.exists() and not args.no_resume:
-        ck = torch.load(resumed, map_location=device, weights_only=False)
+    if ck is not None:
         model.load_state_dict(ck['model_state'])
+        # REPLAY THE STAGED UNFREEZE BEFORE LOADING OPTIMIZER STATE. The optimizer above was
+        # built in the FROZEN layout whatever `start_it` is, so replaying the adds here reaches
+        # the same group ORDER a fresh run would hold at this iteration -- and `load_state_dict`
+        # matches groups by position, so order is the whole contract.
+        info = replay_staged_unfreeze(model, opt, opt_cfg, start_it, fresh=fresh)
+        if info:
+            print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
+                  f'norms {info["norms"]}, {info["n_params"]:,} params)')
         # REFUSE, by name, an optimizer state written by a DIFFERENT optimizer than this config
         # builds. The model tensors above loaded either way; only the state's own shape can tell
         # you that the run is being resumed under the wrong optimizer -- and making `muon` the
@@ -537,7 +569,6 @@ def main():
             resolved=str(config['training']['optimizer'].get('optimizer', 'muon')),
             explicit='optimizer' in config['training']['optimizer'])
         opt.load_state_dict(ck['optimizer_state'])
-        start_it = int(ck['iteration'])
         print(f'resuming {resumed} at iteration {start_it} of {n_iter} '
               '(--no-resume to start over, which OVERWRITES both checkpoints)')
     elif resumed.exists():
@@ -581,12 +612,17 @@ def main():
     # 3-7x higher reported grad_norm than the schedulefree arm at matched steps). So the clip
     # targets `opt.adamw_params`; Muon's half is left to its own orthogonalisation. For a
     # schedule-free (non-dual) optimizer this is every trainable param, exactly as before.
-    clip_params = getattr(opt, 'adamw_params',
-                          [p for p in model.parameters() if p.requires_grad])
+    def _clip_targets():
+        """RECOMPUTED AFTER AN UNFREEZE, not captured once. A stale list leaves the newly-trainable
+        encoder AdamW tensors unclipped and the new Muon tensors unchecked for non-finiteness --
+        and report 34b's whole point is that WHICH half is clipped is not incidental."""
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        return getattr(opt, 'adamw_params', trainable), getattr(opt, 'muon_params', [])
+
+    clip_params, unclipped_params = _clip_targets()
     # The Muon half is not clipped, but its gradient still must not be allowed to go non-finite
     # into `step()` -- the all-params clip used to be what caught that. `muon_params` is empty for
     # a schedule-free optimizer, so this guard is inert there.
-    unclipped_params = getattr(opt, 'muon_params', [])
     print_freq = int(train_cfg.get('print_freq', 20))
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
     # `best` is written at checkpoint boundaries using THAT iteration's val, so a val has to land
@@ -626,6 +662,21 @@ def main():
         for batch in timed(loader, waited):
             if it >= n_iter:
                 break
+            # THE STAGED UNFREEZE. Upstream owns the gate, the idempotence and the block
+            # selection (`TrackerEncoder.unfreeze_video_encoder`); `apply_staged_unfreeze` adds
+            # the newly-trainable tensors to the optimizer, which is the half a `requires_grad`
+            # flip alone cannot do -- a frozen param is in no param group, so it would receive
+            # gradients that nothing steps.
+            unfroze = apply_staged_unfreeze(model, opt, opt_cfg, it, fresh=fresh)
+            if unfroze:
+                clip_params, unclipped_params = _clip_targets()
+                print(f'  UNFROZE the video encoder at iteration {it}: blocks '
+                      f'{unfroze["blocks"]} of {unfroze["n_blocks"]}, norms {unfroze["norms"]}, '
+                      f'{unfroze["n_tensors"]} tensors / {unfroze["n_params"]:,} params '
+                      f'(+{unfroze["muon_groups"]} muon, +{unfroze["adamw_groups"]} adamw '
+                      f'group(s))', flush=True)
+                log(wb, {'train/encoder_unfrozen_at': it}, it)
+                record({'iter': it, 'unfroze_encoder': unfroze})
             loss, _ = run_batch(model, loss_fn, batch, device)
             if not torch.isfinite(loss):
                 skipped += 1
@@ -677,6 +728,11 @@ def main():
                 # pre-orthogonalisation norm, not a step size -- report 34b). 0 for a schedulefree run.
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
                          'train/grad_norm_muon': float(mgn),
+                         # The iteration as a plain METRIC, not just the wandb step: a resumed run
+                         # and a fresh one carry different step offsets, so panels compared across
+                         # runs need an x-axis that says which iteration a point is.
+                         'train/iteration': it,
+                         'train/encoder_trainable_params': trainable_encoder_params(model),
                          'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
                          'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
                          'train/eval_frac': eval_frac,

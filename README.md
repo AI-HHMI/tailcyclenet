@@ -74,7 +74,12 @@ behind each; report 25 is superseded):
 - `box_source` — **state it explicitly per root** (`instances` for rat-city; `keypoints` for
   calms21/johnson; either for 3dpop depending on comparability). It is a live default that moved
   underneath cached artifacts and is absent from every shipped config.
-- `n_iterations = 60000`, `learning_rate = 1e-4`, `freeze_encoder = true`, `seed = 0` (golden chain).
+- `n_iterations = 60000`, `learning_rate = 1e-4`, `seed = 0` (golden chain).
+- `video_encoder_requires_grad = 10000` + `video_encoder_finetune_last_n_layers = 8` — the staged
+  encoder unfreeze (report 35), now defaulted on. **A default, not a result**: every number on
+  record was measured with the encoder frozen for its whole life. Set
+  `video_encoder_requires_grad = false` to reproduce those. `[training].freeze_encoder` is gone
+  and naming it raises.
 - `optimizer = "muon"` — the shipped default (SF-Muon, ported from posetail-next; **not**
   re-measured here). An absent key also means `muon`. To resume an older AdamW-SF run folder set
   `optimizer = "schedulefree"`, or train.py refuses the mismatched checkpoint by name.

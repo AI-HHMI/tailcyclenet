@@ -67,7 +67,21 @@ box_prompt = "film"
 gridresid_offset = "query"
 
 video_encoder_version = "large"
-video_encoder_requires_grad = false
+# STAGED UNFREEZE, and the ONLY statement about the encoder's gradient state -- `[training]`'s
+# `freeze_encoder` is gone, because it re-froze the encoder after `build_model` and two sources of
+# truth for one fact is one config away from silently disagreeing (the `per_camera_cube_scale`
+# rule). A bool means never / from step 0; an INT is the iteration to unfreeze at, and posetail
+# 0.3.5's `TrackerEncoder.unfreeze_video_encoder` owns the gate and the block selection.
+#
+# NOT MEASURED ON THIS REPO'S ROOTS. Every run on record trained with the encoder frozen for its
+# whole life, so no number in CLAUDE.md is comparable to a run started after this default landed.
+# Set `video_encoder_requires_grad = false` to reproduce the old arm exactly.
+video_encoder_requires_grad = 10000
+# The last 8 of ViT-L's 24 blocks, plus (repo-local, not upstream) the hierarchical output norms
+# whose layer falls in that range -- `norms_block[3]` at layer 23 here. Upstream unfreezes blocks
+# and an `encoder.norm` that VJEPA 2.1 does not have, so the norm feeding the decoder off a
+# trainable block would otherwise stay frozen. Omit the key to train the WHOLE encoder.
+video_encoder_finetune_last_n_layers = 8
 video_encoder_hierarchical = true
 soft_argmax_temperature_learnable = true
 stride_length = 24
@@ -127,7 +141,8 @@ checkpoint_freq = 1000
 val_freq = 200
 val_batches = 20
 print_freq = 20
-freeze_encoder = true       # a DEPLOYMENT decision: one frozen encoder forward feeds both models
+# `freeze_encoder` REMOVED -- see [model].video_encoder_requires_grad, which is now the only
+# statement about the encoder's gradient state. A config still naming it is refused by name.
 
 [training.optimizer]
 # THE SHIPPED OPTIMIZER, and also what an ABSENT key means. "muon" runs torch.optim.Muon on the
@@ -143,7 +158,11 @@ freeze_encoder = true       # a DEPLOYMENT decision: one frozen encoder forward 
 optimizer = "muon"
 learning_rate = 1e-4        # what every hop of the golden chain actually ran
 kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
-encoder_lr_scale = 0.1      # inert while freeze_encoder = true: the encoder group is then empty
+# LIVE from the unfreeze iteration, not inert: before it the encoder groups do not exist, and at
+# the unfreeze they are created at this scale (1e-5). The AdamW half of them warms up over
+# `warmup_steps` from its own k = 0 because a new group starts fresh; the Muon half is long past
+# `muon_warmup_steps` by then and joins at full scaled LR, matching the reference.
+encoder_lr_scale = 0.1
 weight_decay = 0.002
 warmup_steps = 500          # drives the AdamW-SF half's warmup
 beta1 = 0.9

@@ -37,9 +37,86 @@ KNOWN_OPTIMIZER_KEYS = frozenset({
     'muon_adjust_lr_fn',
 })
 
+# The five routes a parameter can take. Order is the order the groups are BUILT in, which is the
+# order `load_state_dict` matches them by -- so a resumed run must reconstruct it exactly.
+ROUTES = ('muon_dec', 'muon_fresh', 'muon_enc', 'adamw_base', 'adamw_enc')
+
+_DEC_SUBSTR = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
+               'decoder.temporal_attns')
+
+
+def embedding_ids(model) -> set[int]:
+    """`id()` of every `nn.Embedding` param. Each row is a keypoint (or time) identity, so
+    orthogonalizing the table mixes body parts -- the hazard `warm_start`'s row-copy refusal
+    exists for. 2D by shape, AdamW by meaning."""
+    return {id(p) for m in model.modules() if isinstance(m, torch.nn.Embedding)
+            for p in m.parameters()}
+
+
+def route_param(name: str, p, fresh: set[str], embed_ids: set[int]) -> str:
+    """Which of `ROUTES` this parameter belongs to. THE single routing rule.
+
+    Called once per param at build time and again for each tensor a staged unfreeze makes
+    trainable. Factored out precisely so those two cannot drift: a param that would have been
+    Muon-routed had it been trainable at step 0 must be Muon-routed when it arrives at step 5000.
+    """
+    is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
+    is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
+    if is2d and is_fresh:
+        return 'muon_fresh'                    # NEW vs the reference: fresh 2D -> Muon @ kpt_lr
+    if is2d and 'scene_encoder.encoder.blocks' in name:
+        return 'muon_enc'
+    if is2d and ('scene_encoder.kv_proj' in name or any(s in name for s in _DEC_SUBSTR)):
+        return 'muon_dec'
+    if name.startswith('scene_encoder.encoder.'):
+        return 'adamw_enc'
+    return 'adamw_base'
+
 
 class PoseDualOptimizer(DualOptimizer):
-    """`DualOptimizer` with the three hooks this repo's `save_checkpoint`/resume path needs."""
+    """`DualOptimizer` with the hooks this repo's `save_checkpoint`/resume/unfreeze paths need."""
+
+    def add_muon_group(self, params, lr: float, weight_decay: float) -> None:
+        """Add a NEW Muon group at unfreeze time. See `add_adamw_group` for why it must be new.
+
+        `torch.optim.Muon` validates `ndim == 2` in `__init__` ONLY -- `add_param_group` does not
+        re-check, so a routing slip would surface as a shape error deep inside `step()` rather
+        than here. Asserted at the add.
+
+        `_muon_base_lrs` must grow with it: `DualOptimizer.step` zips it against
+        `opt_muon.param_groups` to apply the Muon warmup rescale, and `zip` truncates silently, so
+        a group added without this entry would escape the rescale without saying so.
+        """
+        params = list(params)
+        if not params:
+            return
+        for p in params:
+            assert p.ndim == 2, (
+                f'Muon only accepts 2D parameters; got {tuple(p.shape)}. add_param_group does not '
+                're-validate, so this would surface inside step() instead.')
+        self.opt_muon.add_param_group({'params': params, 'lr': lr, 'weight_decay': weight_decay})
+        self._muon_base_lrs.append(lr)
+
+    def add_adamw_group(self, params, lr: float, weight_decay: float) -> None:
+        """Add a NEW AdamW-SF group at unfreeze time, in phase with the existing ones.
+
+        NEW, NOT PRE-REGISTERED AT STEP 0, and that is correctness rather than taste. Both
+        schedule-free implementations advance `group['k']` and `group['weight_sum']` on EVERY
+        `step()` whether or not a param in the group has a gradient, and the averaging weight is
+        `ckp1 = weight / weight_sum ~ 1/k`. A group that sat grad-less for 5,000 steps would then
+        fold its encoder into the averaged iterate `x` at `ckp1 ~ 1/5000` -- so `model_state_eval`
+        (what is deployed, and what `checkpoint_best` is selected on) would hold a barely-moved
+        encoder while `model_state` held a finetuned one, silently. A fresh group starts at k = 0.
+
+        `train_mode` is copied from group 0 rather than taken from the defaults: `eval()`/`train()`
+        read it PER GROUP, so a group out of phase would be lerped the wrong way at the next
+        checkpoint write.
+        """
+        params = list(params)
+        if not params:
+            return
+        self.opt_adam.add_param_group({'params': params, 'lr': lr, 'weight_decay': weight_decay})
+        self.opt_adam.param_groups[-1]['train_mode'] = self.opt_adam.param_groups[0]['train_mode']
 
     @property
     def adamw_params(self):
@@ -79,6 +156,7 @@ class PoseDualOptimizer(DualOptimizer):
         """
         from schedulefree import ScheduleFreeWrapper
         _refuse_state_shape(self, sd)
+        refuse_group_count_mismatch(self, sd)
         super().load_state_dict(sd)
         for o in self._opts:
             if isinstance(o, ScheduleFreeWrapper):
@@ -97,8 +175,12 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
         by `id` and excluded (the technique the reference uses for its scene ids).
       * the output heads (`decoder.heads_*`) stay on AdamW, as in the reference; only the
         transformer MLPs (`decoder.mlps`) and attention projections go to Muon.
-      * frozen params are filtered first, so `freeze_encoder = true` leaves the encoder Muon group
-        empty rather than handing Muon a frozen tensor.
+      * frozen params are filtered first, so a frozen encoder leaves the encoder groups empty
+        rather than handing Muon a frozen tensor.
+
+    A FROZEN PARAM IS IN NO GROUP, EVER. That is why staged unfreezing cannot be a model-side
+    flip alone: `tailcyclenet.unfreeze` adds the newly-trainable tensors as new groups, routed by
+    the same `route_param` this uses, so build-time and unfreeze-time cannot drift apart.
 
     `torch.optim.Muon` raises at construction on any non-2D param, so a routing slip is loud on
     the run's first line rather than a silent wrong-optimizer arm.
@@ -118,26 +200,15 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
     muon_warmup = int(cfg.get('muon_warmup_steps', 0))
     betas = (float(cfg.get('beta1', 0.9)), float(cfg.get('beta2', 0.95)))
 
-    embed_ids = {id(p) for m in model.modules() if isinstance(m, torch.nn.Embedding)
-                 for p in m.parameters()}
-    dec_substr = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
-                  'decoder.temporal_attns')
-    muon_dec, muon_enc, muon_fresh, adamw_base, adamw_enc = [], [], [], [], []
+    embed_ids = embedding_ids(model)
+    groups = {k: [] for k in ROUTES}
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
-        is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
-        if is2d and is_fresh:
-            muon_fresh.append(p)                       # NEW vs the reference: fresh 2D -> Muon@kpt_lr
-        elif is2d and 'scene_encoder.encoder.blocks' in name:
-            muon_enc.append(p)
-        elif is2d and ('scene_encoder.kv_proj' in name or any(s in name for s in dec_substr)):
-            muon_dec.append(p)
-        elif name.startswith('scene_encoder.encoder.'):
-            adamw_enc.append(p)
-        else:
-            adamw_base.append(p)
+        groups[route_param(name, p, fresh, embed_ids)].append(p)
+    muon_dec, muon_enc, muon_fresh = (groups['muon_dec'], groups['muon_enc'],
+                                      groups['muon_fresh'])
+    adamw_base, adamw_enc = groups['adamw_base'], groups['adamw_enc']
 
     muon_groups = [{'params': muon_dec, 'lr': lr * muon_scale, 'weight_decay': wd}]
     if muon_fresh:
@@ -169,6 +240,18 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
     return PoseDualOptimizer(opt_muon, opt_adam, muon_warmup_steps=muon_warmup)
 
 
+def group_lr(route: str, cfg: dict) -> float:
+    """The LR a route's group is built at. One place, so the unfreeze cannot pick a different one."""
+    lr = float(cfg['learning_rate'])
+    if route == 'muon_fresh':
+        return float(cfg.get('kpt_lr', lr))
+    if route in ('muon_enc', 'adamw_enc'):
+        return lr * float(cfg.get('encoder_lr_scale', 1.0))
+    if route == 'muon_dec':
+        return lr * float(cfg.get('muon_lr_scale', 1.0))
+    return lr
+
+
 def _is_dual_state(state) -> bool:
     """A `PoseDualOptimizer.state_dict()` is `{'muon': ..., 'adam': ...}`; an AdamW-SF one is not."""
     return isinstance(state, dict) and 'muon' in state and 'adam' in state
@@ -184,6 +267,38 @@ def _refuse_state_shape(opt, state) -> None:
         raise SystemExit(
             'optimizer state is Muon but this config builds an AdamW-schedule-free optimizer. '
             'Set optimizer = "muon" in the config to resume, or --no-resume to start over.')
+
+
+def _group_counts(opt) -> tuple[int, int]:
+    if isinstance(opt, PoseDualOptimizer):
+        return len(opt.opt_muon.param_groups), len(opt.opt_adam.param_groups)
+    return 0, len(opt.param_groups)
+
+
+def _state_group_counts(state) -> tuple[int, int]:
+    if _is_dual_state(state):
+        return len(state['muon']['param_groups']), len(state['adam']['param_groups'])
+    return 0, len(state['param_groups'])
+
+
+def refuse_group_count_mismatch(opt, state) -> None:
+    """Raise a NAMED error when the saved state has a different number of param groups.
+
+    The staged encoder unfreeze ADDS groups mid-run, so a run resumed past its unfreeze iteration
+    must replay the unfreeze before loading (`scripts/train.py` does). Without this, torch reports
+    'loaded state dict has a different number of parameter groups' -- true, and useless about
+    which config key caused it. This is the `gridresid_offset` rule for the group layout.
+    """
+    have, want = _group_counts(opt), _state_group_counts(state)
+    if have == want:
+        return
+    raise SystemExit(
+        f'optimizer state holds {want[0]} Muon + {want[1]} AdamW param group(s) but this run built '
+        f'{have[0]} + {have[1]}. The group layout changes when the staged encoder unfreeze fires, '
+        f'so a resumed run must reach the same layout as the run it continues. Check that '
+        f'[model].video_encoder_requires_grad and [model].video_encoder_finetune_last_n_layers '
+        f'still hold the values this run folder was trained with, or --no-resume to start over '
+        f'(which OVERWRITES both checkpoints).')
 
 
 def refuse_mismatched_optimizer_state(opt, state, path, resolved: str, explicit: bool) -> None:

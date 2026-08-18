@@ -169,10 +169,18 @@ class LoaderConfig:
     # crop that includes more of any neighbour, and `compute_box_prompt` (run post-hoc on the
     # returned coords) reads the animal's TIGHT extent within that wider crop, making the box the
     # only non-centred cue for which animal. 1.0 is INERT and byte-identical to a config without
-    # this key -- `_inflate_crop_box` is a no-op at 1.0, asserted by `tests/test_dataset.py`. No
-    # shipped config sets this above 1.0 yet; report 27's wide-crop arms trained through the
-    # scratch monkeypatch above, which this supersedes.
-    crop_inflate: float = 1.0
+    # this key -- `_inflate_crop_box` is a no-op at 1.0, asserted by `tests/test_dataset.py`.
+    #
+    # A float, or a `[low, high]` pair drawn per TRAIN item -- the same `cams_to_sample` contract
+    # (`_n_cams`), reused here as `_crop_inflate_draw` rather than a second ad hoc parser. `[0.9,
+    # 1.5]` shows the model a range of context rather than one fixed geometry every step, which is
+    # a diversity lever a single scalar cannot be. VAL/TEST NEVER DRAW: `_crop_inflate` returns the
+    # range's MIDPOINT there (a scalar's own value if not a range), exactly as `crop_jitter` is
+    # gated to train-only by `_jitter` -- `checkpoint_best` selection has to read the SAME crop
+    # geometry every val pass, or a run's own val curve would be noise from the geometry draw
+    # rather than the weights. Sweeps launched under a scalar (report 33's `sweep_box_wide`) are
+    # unaffected: a plain float is not a range and is applied identically everywhere, as before.
+    crop_inflate: float | list = 1.0
 
 
 # ----------------------------------------------------------------------------------------------
@@ -587,6 +595,26 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
 # ----------------------------------------------------------------------------------------------
 # appearance augmentation
 # ----------------------------------------------------------------------------------------------
+
+def _crop_inflate(cfg, rng, train):
+    """THIS item's crop-inflate factor. `cfg.crop_inflate` is a float, or a `[low, high]` pair --
+    same contract as `_n_cams`/`cams_to_sample`, one continuous draw instead of `_n_cams`'
+    integer one.
+
+    TRAIN draws uniformly in `[low, high]` per item, so a wide-crop run shows the model a RANGE of
+    context rather than one fixed geometry every step. VAL/TEST NEVER DRAW -- they get the range's
+    MIDPOINT, for the same reason `_jitter` is gated to `self.train` alone: `checkpoint_best` is
+    selected on the val curve, and a val geometry that moved step to step would put noise from the
+    crop draw into a number that is supposed to isolate the weights. A plain scalar has no
+    range to be a midpoint of and returns unchanged either way, so a scalar config -- everything
+    shipped before this key existed a range -- is untouched.
+    """
+    spec = cfg.crop_inflate
+    if not isinstance(spec, (list, tuple)):
+        return float(spec)
+    lo, hi = float(spec[0]), float(spec[1])
+    return float(rng.uniform(lo, hi)) if train else (lo + hi) / 2.0
+
 
 def _n_cams(spec, rng):
     """How many cameras this item shows. `spec` is an int, or a [low, high] pair drawn per item.
@@ -1025,6 +1053,11 @@ class PoseDataset(Dataset):
         K = sess.n_keypoints
 
         cgroup = sess.cgroup(item.gid, frames)
+        # ONE DRAW FOR THE WHOLE ITEM, not one per camera -- the wide-crop regime widens every
+        # camera's box by the SAME factor (matching `_jitter`'s one-draw-per-item contract), so a
+        # multi-camera 3D window is one consistent geometry rather than each view getting its own
+        # unrelated inflation.
+        inflate = _crop_inflate(self.cfg, rng, self.train)
 
         true_2d = sess.mode == '2d'
         single_view = (not true_2d and self.train
@@ -1105,7 +1138,7 @@ class PoseDataset(Dataset):
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
-                                                         inflate=self.cfg.crop_inflate)
+                                                         inflate=inflate)
             if cam is None:
                 return None
             cam, scale = _resize_camera(cam, self.cfg.image_size)
@@ -1165,7 +1198,7 @@ class PoseDataset(Dataset):
             jit = self._jitter(rng)
             cgroup, boxes = cropmod.crop_to_points_3d(cgroup, coords, self.cfg.min_crop_dim,
                                                       jit, crop_pts=cp3,
-                                                      inflate=self.cfg.crop_inflate)
+                                                      inflate=inflate)
             if cgroup is None:
                 return None
             cgroup = [_resize_camera(c, self.cfg.image_size)[0] for c in cgroup]

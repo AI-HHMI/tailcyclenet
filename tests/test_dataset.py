@@ -1062,6 +1062,88 @@ def test_crop_inflate_widens_the_3d_crop(tiny_root):
     assert grew, 'crop_inflate = 1.5 produced no wider box on any camera/axis'
 
 
+def test_crop_inflate_draw_scalar_is_unaffected_by_train():
+    """A plain float has no range to be a midpoint of -- `_crop_inflate` must return it
+    unchanged whether `train` is True or False, so every scalar config (everything shipped
+    before the range form existed) is untouched by this change."""
+    from tailcyclenet.dataset import LoaderConfig, _crop_inflate
+
+    cfg = LoaderConfig(crop_inflate=1.3)
+    rng = np.random.default_rng(0)
+    assert _crop_inflate(cfg, rng, True) == 1.3
+    assert _crop_inflate(cfg, rng, False) == 1.3
+
+
+def test_crop_inflate_draw_range_on_train_only():
+    """`crop_inflate = [low, high]` draws uniformly IN RANGE on train, and returns the exact
+    MIDPOINT on val/test -- never a draw there, so `checkpoint_best` selection reads the SAME
+    crop geometry every val pass (the same reason `_jitter` is gated to `self.train` alone)."""
+    from tailcyclenet.dataset import LoaderConfig, _crop_inflate
+
+    cfg = LoaderConfig(crop_inflate=[0.9, 1.5])
+    rng = np.random.default_rng(0)
+
+    train_draws = [_crop_inflate(cfg, rng, True) for _ in range(200)]
+    assert all(0.9 <= v <= 1.5 for v in train_draws)
+    assert len(set(train_draws)) > 1, 'a range must actually vary draw to draw on train'
+
+    for _ in range(10):
+        assert _crop_inflate(cfg, rng, False) == pytest.approx(1.2)   # exact midpoint, no draw
+
+
+def test_crop_inflate_range_flows_through_a_real_item(tiny_root):
+    """End to end: a `[low, high]` `crop_inflate` must actually vary the TRAIN crop side across
+    repeated draws of the SAME item, verified through `PoseDataset._item` rather than only at the
+    `crop.py` unit level. Train items are entropy-seeded (`__getitem__`), so repeated calls draw
+    independently; val/test items are INDEX-seeded, so calling `ds[0]` twice is trivially
+    identical regardless of the midpoint logic -- that is not evidence of it. The real claim (val
+    uses the exact midpoint, not an arbitrary fixed draw) is checked against an explicit
+    scalar-midpoint config instead.
+    """
+    # THE DRAW IS FORCED, NOT HOPED FOR. The fixture's frame is 64x48 and its animal box is often
+    # already frame-sized, so an inflated box CLAMPS at the image edge and lands on the same scale
+    # as a tight one -- measured, all 12 draws of a `[0.9, 1.8]` range can coincide, which is what
+    # made an "assert the draws differ" version of this test flaky (~1 run in 6). Feeding
+    # `_crop_inflate` a stubbed rng that returns the range's endpoints makes the two ends of the
+    # range concrete and the assertion exact, instead of relying on the fixture to expose them.
+    range_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                             crop_jitter=0.0, prompt_dropout=0.0, min_crop_dim=8,
+                             crop_inflate=[0.9, 1.8])
+
+    class _FixedRng:
+        """Only `uniform` matters to `_crop_inflate`; everything else defers to a real rng so the
+        rest of `_item` (window start, augmentation draws) behaves normally."""
+        def __init__(self, value, inner):
+            self._value, self._inner = value, inner
+
+        def uniform(self, lo, hi):
+            return self._value
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    train_ds = PoseDataset(tiny_root / 'ratlike', 'train', range_cfg, train=True)
+    # `size` after `_resize_camera` is always `image_size` (the resize target), so the varying
+    # quantity is the SCALE that got it there -- `mat[0,0]`, smaller for a wider source box, as
+    # in `test_crop_inflate_widens_the_2d_crop`.
+    scales = []
+    for end in (0.9, 1.8):
+        item = train_ds._item(0, _FixedRng(end, np.random.default_rng(0)))
+        assert item is not None
+        scales.append(float(pose_collate([item]).cgroup[0]['mat'][0, 0]))
+    assert scales[1] < scales[0], (
+        f'the range\'s wide end must give a WIDER source box (smaller scale): {scales}')
+
+    midpoint_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                                crop_jitter=0.0, prompt_dropout=0.0, min_crop_dim=8,
+                                crop_inflate=1.35)
+    range_val = _batch(PoseDataset(tiny_root / 'ratlike', 'val', range_cfg, train=False))
+    midpoint_val = _batch(PoseDataset(tiny_root / 'ratlike', 'val', midpoint_cfg, train=False))
+    # `size` is always `image_size` after resize; `mat[0,0]` (the scale that produced it) is what
+    # actually differs between a wider and a tighter source box, so that is the meaningful compare.
+    torch.testing.assert_close(range_val.cgroup[0]['mat'][0, 0], midpoint_val.cgroup[0]['mat'][0, 0])
+
+
 # ----------------------------------------------------------------------------------------------
 # the reader cache size
 # ----------------------------------------------------------------------------------------------

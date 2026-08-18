@@ -84,6 +84,31 @@ behind each; report 25 is superseded):
   re-measured here). An absent key also means `muon`. To resume an older AdamW-SF run folder set
   `optimizer = "schedulefree"`, or train.py refuses the mismatched checkpoint by name.
 
+### GPU memory: cameras × unfrozen blocks
+
+Both axes are linear and they MULTIPLY — the scene encoder runs once per camera, so unfreezing N
+blocks costs N blocks' activations *per camera*. Peak GB is `torch.max_memory_allocated` (what the
+run needs), measured over 50 iterations at `image_size = 256`, `n_frames = 24`, `batch_size = 1`,
+`crop_inflate = [0.9, 1.5]`, activation checkpointing on. **An L4 is 22.5 GB usable.**
+
+| root | cams | N=0 | N=4 | N=8 | N=16 | N=24 (all) |
+|---|---|---|---|---|---|---|
+| calms21 (2D) | 1 | 2.3 G | 3.2 G | 4.0 G | 5.6 G | 7.3 G |
+| 3dpop (3D) | `[2,8]` draw | 3.9 G | 4.8 G | 5.6 G | 7.2 G | 8.9 G |
+| johnson-mouse | 8 | 6.8 G | 7.9 G | 8.9 G | 10.9 G | 13.0 G |
+| johnson-mouse | 12 | 9.2 G | 10.6 G | 11.8 G | 14.2 G | 16.6 G |
+| johnson-mouse | 16 | 11.6 G | 13.2 G | 14.6 G | 17.5 G | **20.3 G** |
+
+**Everything measured fits an L4**, worst case 20.3 G of 22.5 with the whole encoder trainable at
+16 cameras — but that is ~2 GB of headroom, and the shipped default (N=8) leaves 8 GB at 16 cams.
+Rough rule: **+0.6 GB per camera frozen, and each unfrozen block adds ~0.022 GB per camera**, so
+cameras are the dominant term and N is what you trade against them. Above 16 cameras with a large
+N, check before submitting rather than assuming.
+
+s/it is NOT in this table on purpose: the probes shared two GPUs, so the timings are contended and
+one cell (johnson 16 cams) reads *faster* at N=24 than at N=16, which is impossible. Re-run a probe
+solo if throughput matters. Reproduce with `scratch/unfreeze_mem/probe.sh <root> [iters] [cams]`.
+
 Detector (one per dataset, reproduces the pose model's crop rule):
 
 ```bash

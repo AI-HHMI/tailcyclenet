@@ -31,8 +31,8 @@ from tailcyclenet.checkpoints import (check_image_size, load_config, resolve_che
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate, worker_init
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
-from tailcyclenet.unfreeze import (apply_staged_unfreeze, replay_staged_unfreeze,
-                                   trainable_encoder_params)
+from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
+                                   replay_staged_unfreeze, trainable_encoder_params)
 
 
 def build_optimizer(model, fresh: set[str], cfg: dict):
@@ -117,6 +117,22 @@ def init_wandb(config: dict, run: Path, disabled: bool = False):
 def log(wb, values: dict, step: int) -> None:
     if wb is not None:
         wb.log(values, step=step)
+
+
+def _gpu_peak_gb(device, reset: bool = False) -> float:
+    """Peak allocator bytes since the last reset, in GB. 0.0 on CPU.
+
+    `max_memory_allocated`, not `memory_allocated`: whether a recipe FITS is a property of the
+    peak, and the peak is where an OOM happens. It is also not the same as `nvidia-smi`, which
+    reports the caching allocator's reserved pool -- the reserved figure is what the driver holds,
+    the allocated figure is what the run actually needs, and the gap is reusable.
+    """
+    if not (isinstance(device, str) and device.startswith('cuda')) or not torch.cuda.is_available():
+        return 0.0
+    peak = torch.cuda.max_memory_allocated(device) / 1e9
+    if reset:
+        torch.cuda.reset_peak_memory_stats(device)
+    return peak
 
 
 def _brief(m: dict) -> str:
@@ -353,6 +369,11 @@ def main():
     ap.add_argument('--no-resume', action='store_true',
                     help='start from iteration 0 even if the run folder holds a checkpoint_last')
     ap.add_argument('--no-wandb', action='store_true', help='ignore the [wandb] config block')
+    ap.add_argument('--no-checkpoints', action='store_true',
+                    help='write no checkpoints at all, including the final one. For probes '
+                         '(memory, throughput) whose weights are worthless and whose files are '
+                         '~5.6 GB each -- checkpoint_freq alone cannot express this, because the '
+                         'last iteration always writes.')
     args = ap.parse_args()
 
     config = load_config(args.config)
@@ -495,8 +516,19 @@ def main():
     n_frozen = sum(1 for n, p in model.named_parameters()
                    if n.startswith('scene_encoder.encoder.') and not p.requires_grad)
     if isinstance(enc_grad, bool):
-        print(f'encoder: {"trainable from step 0" if enc_grad else "frozen for the whole run"} '
-              f'({n_frozen} frozen tensors)')
+        # `= true` unfreezes inside the CONSTRUCTOR, which never reaches `apply_staged_unfreeze`,
+        # so the norms extension has to be applied here or `true` + n_last would train a different
+        # parameter set than an int + the same n_last. Before `build_optimizer`, so the norms are
+        # routed into a group like any other trainable tensor.
+        ext = apply_norms_extension(model)
+        n_frozen = sum(1 for n, p in model.named_parameters()
+                       if n.startswith('scene_encoder.encoder.') and not p.requires_grad)
+        if not enc_grad:
+            print(f'encoder: frozen for the whole run ({n_frozen} frozen tensors)')
+        else:
+            print(f'encoder: trainable from step 0, last '
+                  f'{n_last if n_last is not None else "all"} block(s)'
+                  f'{f" + norms {ext}" if ext else ""} ({n_frozen} frozen tensors)')
     else:
         print(f'encoder: frozen now, last {n_last if n_last is not None else "all"} block(s) '
               f'unfreeze at iteration {int(enc_grad)} ({n_frozen} frozen tensors)')
@@ -715,9 +747,12 @@ def main():
                 # anything large is the signal to look at `dataset.py` rather than the model.
                 wait_frac = waited[0] / elapsed
                 eval_frac = evalled[0] / wall if wall > 0 else 0.0
+                # Peak READ here and reset in the `log` call below -- one read per window, so the
+                # printed number and the logged one are the same peak rather than two windows'.
+                peak_gb = _gpu_peak_gb(device)
                 print(f'{it:7d}/{n_iter}  loss {np.mean(running):8.4f}  '
                       f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  eval {eval_frac:4.0%}  '
-                      f'skipped {skipped}  '
+                      f'peak {peak_gb:5.1f}G  skipped {skipped}  '
                       f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                       f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
                 # `clipped` is the running fraction of steps hitting max_grad_norm. At
@@ -733,6 +768,12 @@ def main():
                          # runs need an x-axis that says which iteration a point is.
                          'train/iteration': it,
                          'train/encoder_trainable_params': trainable_encoder_params(model),
+                         # PEAK GPU BYTES SINCE THE LAST PRINT, not the current allocation. The
+                         # staged unfreeze adds optimizer state AND the backward activations of N
+                         # blocks, and an L4 is 22.5 GB -- so whether a recipe fits is a property
+                         # of the PEAK, which nothing here logged. Reset each window so a spike is
+                         # attributable to the iterations it happened in rather than to the run.
+                         'train/gpu_peak_gb': _gpu_peak_gb(device, reset=True),
                          'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
                          'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
                          'train/eval_frac': eval_frac,
@@ -766,7 +807,7 @@ def main():
                 record({'iter': it, 'val': m, 'val_self': ms,
                         'best_mpjpe': best_mpjpe, 'best_iter': best_iter})
 
-            if it % ckpt_freq == 0 or it == n_iter:
+            if (it % ckpt_freq == 0 or it == n_iter) and not args.no_checkpoints:
                 t_ck = time.time()
                 p = save_checkpoint(run, it, model, opt, config)
                 # `best` is decided HERE, not at every val: these are the only iterations whose

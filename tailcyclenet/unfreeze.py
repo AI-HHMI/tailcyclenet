@@ -45,6 +45,33 @@ def _norms_in_range(encoder, n_last: int) -> list[int]:
     return [i for i, layer in enumerate(layers) if i < len(norms) and layer >= first]
 
 
+def apply_norms_extension(model) -> list[int]:
+    """Apply the norms extension to a model whose encoder is ALREADY trainable at build time.
+
+    `video_encoder_requires_grad = true` unfreezes inside the constructor
+    (`SceneRepresentation.__init__` -> `set_encoder_requires_grad`), which never reaches
+    `apply_staged_unfreeze` -- so without this, `true` + `n_last` would train a DIFFERENT parameter
+    set than an int + the same `n_last`: same blocks, but the hierarchical norms frozen. Two ways
+    to say "train the last N" that disagree is exactly the class of silent divergence this repo
+    refuses elsewhere.
+
+    Called from `scripts/train.py` BEFORE the optimizer is built, so the norms are routed into a
+    group like any other trainable tensor. Returns the indices unfrozen (empty when the encoder is
+    frozen, when no last-N is set, or when the variant has no `norms_block`).
+    """
+    if not getattr(model, 'video_encoder_requires_grad', False):
+        return []
+    n_last = getattr(model, 'video_encoder_finetune_last_n_layers', None)
+    if n_last is None:
+        return []                      # the whole encoder is trainable; every norm already is
+    encoder = model.scene_encoder.encoder
+    norms = _norms_in_range(encoder, int(n_last))
+    for i in norms:
+        for p in encoder.norms_block[i].parameters():
+            p.requires_grad_(True)
+    return norms
+
+
 def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
                           fresh: set[str] | None = None) -> dict | None:
     """Fire the staged unfreeze if `iteration` reaches it, and tell the optimizer about it.

@@ -2,6 +2,7 @@
 runs/
 .pixi/
 .pi/
+.pi-tasks/
 *.egg-info/
 __pycache__/
 *.pyc

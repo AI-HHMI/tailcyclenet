@@ -26,6 +26,17 @@ platforms = ["linux-64"]
 # a failure that looks like a broken install rather than a library-path ordering problem.
 LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 
+# The pixi env and the repo both live on NFS4 (prfs.hhmi.org:/groups). CPython stats every
+# source .py on NFS to validate its bytecode and then re-reads/writes the .pyc next to it,
+# so a cold import pays ~2x NFS round-trips per module and torch's ~500 modules dominate
+# startup. PYTHONPYCACHEPREFIX redirects the bytecode cache (read AND write) to a per-user
+# local ext4 path instead. Measured (median of 6 fresh interpreters):
+#   import numpy  2.87s -> 2.15s   import torch  7.3s -> 3.5s   import scipy 2.8s -> 2.2s
+# Home is local (/dev/nvme0n1p2), so the cache also survives reboots; the first import after
+# a clean cache recompiles once and is slower, every later one is fast. Safe and reversible:
+# unset it (or delete the directory) to restore byte-for-byte upstream behaviour.
+PYTHONPYCACHEPREFIX = "${HOME}/.cache/tailcyclenet/pycache"
+
 [tool.pixi.pypi-dependencies]
 # posetail is a LIBRARY here and is never modified: pinned to the PyPI release, not a path dep.
 # A checkout lives at ../posetail-next for READING only.

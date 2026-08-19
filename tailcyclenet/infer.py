@@ -1063,7 +1063,7 @@ def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
 ORACLE_CORRUPTIONS = ('off', 'stale', 'other')
 
 
-def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup):
+def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup):
     """The oracle prior, optionally broken on purpose. Returns (pose in the SOURCE frame, qt).
 
     THIS MEASURES alpha = d(output)/d(prior), the echo coefficient, and it is the cheapest thing in
@@ -1144,7 +1144,7 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
         # ORACLE. Ground truth as the prior; not a deployment number.
         if src is None or a >= n_lab:             # a detector row with no label row behind it
             return None, None
-        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, scales, mode, cgroup)
+        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup)
         if p is None:
             return None, None
     else:                                    # 'carry'

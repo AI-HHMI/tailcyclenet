@@ -24,7 +24,7 @@ PALETTE = [(60, 60, 255), (60, 220, 60), (255, 140, 40), (40, 220, 220), (230, 8
 CHUNK = 32          # frames read per batch. 480 rat-city frames at once is 13.8 GB.
 
 
-def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, show_ids=True):
+def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5):
     """One instance: skeleton (where the session has one) and keypoints, in place."""
     import cv2
 
@@ -37,7 +37,7 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, show
         # Dark halo under the coloured dot -- a marker on a pale rat is otherwise invisible.
         cv2.circle(img, c, radius + 1, (20, 20, 20), -1, cv2.LINE_AA)
         cv2.circle(img, c, radius, colour, -1, cv2.LINE_AA)
-    if show_ids and ok.any():
+    if ok.any():
         c = np.int32(p2d[ok].mean(0))
         cv2.putText(img, str(tid), (int(c[0]) + 6, int(c[1]) - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, font, colour, max(1, lw), cv2.LINE_AA)
@@ -113,8 +113,8 @@ def follow(pred, zoom, W, H, smooth=15):
                      np.clip(c[:, 1] - zoom / 2, 0, max(0, H - zoom))], 1).astype(np.int32)
 
 
-def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, show_ids=True,
-                 zoom=0, follow_from=None, boxes=None, frames=None, ids=None, label=''):
+def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoom=0,
+                 boxes=None):
     """Predicted tracks over one group's frames -> an mp4 at `out_path`.
 
     `pred` is `run_group`'s own output: `(S,T,K,2)` in SOURCE pixels for a 2D session, or
@@ -122,21 +122,11 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
     first `T` frames are drawn, so a `--max-frames` run renders exactly the clip it predicted.
 
     `zoom` is the side, in SOURCE pixels, of a window that follows the prediction; 0 draws the
-    whole frame. It is a view, not a crop rule -- it has nothing to do with `crop.py` and does
-    not affect anything that was predicted. `follow_from` places that window from a DIFFERENT
-    array: two renders of the same clip are only comparable frame-by-frame if they share a
-    window, and a window each method places for itself hides exactly the disagreement the
-    comparison is for.
+    whole frame. It is a view, not a crop rule -- it does not affect anything that was predicted.
 
     `boxes` is an optional `(S,T,4)` of `[x0,y0,x1,y1]` in the same source pixels, drawn in each
-    animal's own colour -- `instances.pq`, when there is one, so a render answers whether the box
-    and the keypoints describe the same animal.
-
-    `ids` labels each row with something other than its index -- `lab.animal_ids`, usually.
-
-    `frames` selects which of the group's frames to draw -- an int array of SOURCE indices, one
-    per column of `pred`. None means `0..T-1`. A clip out of the middle of a 21k-frame group is
-    otherwise unrenderable without slicing the pixels first.
+    animal's own colour, so a render answers whether the box and the keypoints describe the same
+    animal.
 
     A 3D render is a REPROJECTION, not a measurement: a depth error along camera `cam`'s ray is
     invisible in it. Draw more than one camera before believing a 3D pose.
@@ -145,16 +135,13 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
 
     assert pred.ndim == 4 and pred.shape[-1] in (2, 3), f'bad prediction shape {pred.shape}'
     if pred.shape[-1] == 3:
-        pred = project(session, pred, cam, gid, frames)
+        pred = project(session, pred, cam, gid)
     group = session.groups[gid]
     cam_name = session.cam_names[cam]
     W, H = (int(x) for x in session.rig.size(cam_name))
     zoom = min(int(zoom), W, H)
     scale = min(1.0, max_side / max(W, H))
-    src = pred if follow_from is None else (
-        project(session, follow_from, cam, gid, frames) if follow_from.shape[-1] == 3
-        else follow_from)
-    corners = follow(src, zoom, W, H) if zoom else None
+    corners = follow(pred, zoom, W, H) if zoom else None
     size = ((2 * zoom, 2 * zoom) if zoom else
             (int(round(W * scale)), int(round(H * scale))))
 
@@ -168,8 +155,7 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
     T = pred.shape[1]
     # `t` indexes a COLUMN of `pred`; `src[t]` is the frame that column was predicted from. They
     # are the same thing only when the whole group is rendered.
-    src = np.arange(T) if frames is None else np.asarray(frames, np.int64)
-    assert len(src) == T, f'{len(src)} frames for {T} predicted columns'
+    src = np.arange(T)
     try:
         for lo in range(0, T, CHUNK):
             cols = np.arange(lo, min(lo + CHUNK, T))
@@ -199,19 +185,12 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, sho
                     p = (pred[a, t] - origin) * s
                     if not np.isfinite(p).all(-1).any():
                         continue
-                    draw_instance(img, p, colour, skel_ix, a if ids is None else ids[a],
-                                  show_ids=show_ids)
+                    draw_instance(img, p, colour, skel_ix, a)
                     drawn += 1
                 cv2.putText(img, f'{session.session_id} {gid} {cam_name}  frame {int(src[t])}  '
                                  f'{drawn} tracked',
                             (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                             cv2.LINE_AA)
-                if label:
-                    # WHICH METHOD DREW THIS. Several arms over one clip are the same pixels with
-                    # the same overlay otherwise, and a tiled comparison of them is unreadable --
-                    # or worse, readable and mislabelled.
-                    cv2.putText(img, label, (10, size[1] - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                                (60, 255, 255), 2, cv2.LINE_AA)
                 writer.write(img)
     finally:
         writer.release()

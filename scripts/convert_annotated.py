@@ -181,12 +181,6 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
 # writing
 # ----------------------------------------------------------------------------------------------
 
-def link(dst: Path, src: Path) -> None:
-    if dst.is_symlink() or dst.exists():
-        dst.unlink()
-    dst.symlink_to(src)
-
-
 def drop_unlabelled(groups: dict, labels: dict, where: str) -> list[str]:
     """Groups with no `visible` row carry no supervision. Drop them, never silently."""
     dropped = []
@@ -290,7 +284,7 @@ def write_pixels(dst: Path, groups: dict, pixels: Path, cams: list[str]) -> None
         gdir = dst / 'groups' / gid
         gdir.mkdir(parents=True, exist_ok=True)
         for cam in cams:
-            link(gdir / cam, (pixels / gid / cam).resolve())
+            fmt.link(gdir / cam, (pixels / gid / cam).resolve())
 
 
 # ----------------------------------------------------------------------------------------------

@@ -246,12 +246,6 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
 # conversion
 # ----------------------------------------------------------------------------------------------
 
-def link(dst: Path, src: Path) -> None:
-    if dst.is_symlink() or dst.exists():
-        dst.unlink()
-    dst.symlink_to(src)
-
-
 def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int | None,
                     dry_run: bool) -> None:
     spec = load_spec(name)
@@ -313,7 +307,7 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                         gdir = dst / 'groups' / gid
                         gdir.mkdir(parents=True, exist_ok=True)
                         for cam, (kind, s) in pix.items():
-                            link(gdir / (cam if kind == 'frames' else cam + s.suffix), s)
+                            fmt.link(gdir / (cam if kind == 'frames' else cam + s.suffix), s)
 
                 note = f'  [dropped {len(empty)} all-NaN group(s)]' if empty else ''
                 print(f'   {split}/{session_id}: {len(groups)} group(s), '

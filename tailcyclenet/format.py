@@ -556,7 +556,7 @@ class Session:
             self.labels(gid)
         self.__dict__.pop('_tables', None)
 
-    def cgroup(self, gid: str, frames=None, device='cpu') -> list[dict]:
+    def cgroup(self, gid: str, frames=None) -> list[dict]:
         """posetail cameras for a group, carrying per-frame extrinsics where a camera moves.
 
         THE one place a camera group is built. There were five, and four of them silently dropped
@@ -573,7 +573,7 @@ class Session:
         (T,4,4) camera silently projects animal `i` through frame `i`'s pose.
         """
         if not any(self.rig.moving.values()):
-            return self.rig.posetail(device=device)
+            return self.rig.posetail()
 
         import torch
         ext = self.labels(gid).ext                      # (C,T,4,4), coverage already checked
@@ -584,7 +584,7 @@ class Session:
         # camera's rows with its own constant pose, so this is the same geometry either way.
         moving_ext = {n: torch.as_tensor(ext[i][sel], dtype=torch.float)
                       for i, n in enumerate(self.cam_names)}
-        return self.rig.posetail(device=device, moving_ext=moving_ext)
+        return self.rig.posetail(moving_ext=moving_ext)
 
     def labels(self, gid: str) -> Labels:
         """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12."""
@@ -809,6 +809,13 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
                     {k: np.asarray(v, dtype=object if k in DICT_COLS else None)
                      if k != 'ext' else v for k, v in cols.items()},
                     dict_cols=DICT_COLS)
+
+
+def link(dst: Path, src: Path) -> None:
+    """Replace `dst` with a symlink to `src`. Every converter links pixels rather than copying."""
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    dst.symlink_to(src)
 
 
 def empty_labels(n_animals: int, T: int, K: int, C: int, *, mode3d: bool,

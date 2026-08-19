@@ -53,12 +53,6 @@ def rig() -> fmt.Rig:
                    moving={'cam0': False}, calibrated={'cam0': False})
 
 
-def link(dst: Path, src: Path) -> None:
-    if dst.is_symlink() or dst.exists():
-        dst.unlink()
-    dst.symlink_to(src)
-
-
 def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:
     """One CalMS21 sequence -> dense labels. Returns (labels, fraction of kpts inside their box).
 
@@ -146,7 +140,7 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
 
             dst = out_root / split / stem
             (dst / 'groups' / stem).mkdir(parents=True, exist_ok=True)
-            link(dst / 'groups' / stem / 'cam0.mp4', mp4)
+            fmt.link(dst / 'groups' / stem / 'cam0.mp4', mp4)
             fmt.write_session(
                 dst, mode='2d', units='px', label_source='tracked', names=NAMES, rig=r,
                 groups={stem: group}, labels={stem: lab},

@@ -47,7 +47,7 @@ def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
             f'{sorted(known)}')
 
 
-def _pair(key: str, value, what: str):
+def _pair(key: str, value):
     """A `[w, h]` list from TOML, or None when empty. Any other shape raises."""
     if value in (None, [], ''):
         return None
@@ -98,8 +98,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
 
     # TOML has no null, so an "absent" pair is an empty list. Normalise to None for the code
     # that has always taken None-or-pair.
-    data['input_wh'] = _pair('input_wh', data.get('input_wh'), 'input size')
-    data['tile_wh'] = _pair('tile_wh', data.get('tile_wh'), 'tile size')
+    data['input_wh'] = _pair('input_wh', data.get('input_wh'))
+    data['tile_wh'] = _pair('tile_wh', data.get('tile_wh'))
 
     for k in ('iters', 'batch_size', 'num_workers', 'seed', 'eval_every', 'eval_batches'):
         train[k] = int(train.get(k, {'iters': 20000, 'batch_size': 16, 'num_workers': 8,

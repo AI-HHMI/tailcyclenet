@@ -58,7 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tailcyclenet import format as fmt
-from convert_johnson import (build_labels, build_rig, check_reprojection, link, modal_step,
+from convert_johnson import (build_labels, build_rig, check_reprojection, modal_step,
                              read_split, runs, triangulate_robust)
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/johnson-mouse/merge_aug')
@@ -370,7 +370,7 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
 
         for dst, srcp in links:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            link(dst, srcp)
+            fmt.link(dst, srcp)
         fmt.write_session(
             out / 'train' / trial, mode='3d', units='mm', label_source='annotated', names=names,
             rig=rig, groups=groups, labels=labels, skeleton=skeleton, flip_pairs=flip_pairs,
@@ -429,7 +429,7 @@ def convert_val(fallback: Path, out: Path, max_gap: int, reject_px: float, dry_r
                 cdir.mkdir(parents=True, exist_ok=True)
                 for t, frame in enumerate(run):
                     s = (fallback / 'val' / d['_imgs'][fsets[frame][cam]]['file_name']).resolve()
-                    link(cdir / f'{t:06d}.jpg', s)
+                    fmt.link(cdir / f'{t:06d}.jpg', s)
         note = f', {gated} outlier 2D observation(s) rejected' if gated else ''
         print(f'   val/{trial}: {len(groups)} group(s), '
               f'{sum(g.n_frames for g in groups.values())} frames, {len(rig)} cams{note}')

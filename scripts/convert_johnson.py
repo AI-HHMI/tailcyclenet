@@ -251,12 +251,6 @@ def _np(x) -> np.ndarray:
     return np.asarray(x.detach().cpu() if hasattr(x, 'detach') else x, dtype=np.float64)
 
 
-def link(dst: Path, src: Path) -> None:
-    if dst.is_symlink() or dst.exists():
-        dst.unlink()
-    dst.symlink_to(src)
-
-
 # ----------------------------------------------------------------------------------------------
 # conversion
 # ----------------------------------------------------------------------------------------------
@@ -307,7 +301,7 @@ def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_grou
                     cdir.mkdir(parents=True, exist_ok=True)
                     for t, frame in enumerate(run):
                         s = (src / split / d['_imgs'][fsets[frame][cam]]['file_name']).resolve()
-                        link(cdir / f'{t:06d}.jpg', s)
+                        fmt.link(cdir / f'{t:06d}.jpg', s)
 
             n_lab = sum(int((lab.vis2d != fmt.UNLABELED).any(2).sum()) for lab in labels.values())
             note = (f', {gated} outlier 2D observation(s) rejected from the triangulation'

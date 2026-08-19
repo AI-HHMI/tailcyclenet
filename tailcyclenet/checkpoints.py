@@ -236,42 +236,27 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
                base_names: tuple[str, ...] | None = None) -> set[str]:
     """Load the base tracker into a pose model. Returns the names of the params left fresh.
 
-    Three things happen that a plain `load_state_dict` would get wrong:
+    Two things happen that a plain `load_state_dict` would get wrong:
 
-    1. **The fusion gate is inflated, not dropped.** The base gate is an N-term Linear; this
-       model has N+1 terms, so the shapes differ and a strict load would fail while a filtered
-       load would throw away pretrained fusion behaviour. `inflate_stock_gate` places each of the
-       base's terms into the slot the SAME term occupies here, by name, leaving the identity row
-       and block zero -- so the model starts at the pretrained fusion behaviour rather than noise.
-    2. **The base's migrations run first.** `_convert_cross_attn` handles the old fused
+    1. **The base's migrations run first.** `_convert_cross_attn` handles the old fused
        `nn.MultiheadAttention` layout, `_interp_res_params` interpolates the resolution-coupled
        tensors if `image_size` changed.
-    3. **Everything dropped is named.** `strict=False` silently discards; a base checkpoint from
+    2. **Everything dropped is named.** `strict=False` silently discards; a base checkpoint from
        the abandoned memory branch would quietly lose its `memory_*` subtrees, and a keypoint
        table sized for a different registry would quietly reset. Both are printed.
+
+    `WideQueryEncoder` inherits no fusion behaviour to preserve -- 512-dim where the base is 256,
+    sharing only the patch CNN -- so its gate is left fresh and most of `query_encoder.*` finds no
+    home, which `_report` names and which is expected.
     """
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
 
-    # `WideQueryEncoder` inherits no fusion behaviour to preserve -- it is 512-dim where the base
-    # is 256 and shares only the patch CNN -- so it has no `inflate_stock_gate` and its gate is
-    # simply left fresh. `_filter_shape_mismatch` + `_report` below name every base tensor that
-    # finds no home, which for that encoder is most of `query_encoder.*` and is expected.
-    gate_w, gate_b = 'query_encoder.gate.0.weight', 'query_encoder.gate.0.bias'
-    if (gate_w in state and hasattr(model.query_encoder, 'inflate_stock_gate')
-            and state[gate_w].shape != model.query_encoder.gate[0].weight.shape):
-        state[gate_w], state[gate_b] = model.query_encoder.inflate_stock_gate(
-            state[gate_w], state[gate_b])
-        if verbose:
-            print(f'warm start: fusion gate inflated '
-                  f'{len(model.query_encoder.stock_term_names())} -> '
-                  f'{len(model.query_encoder.term_names())} terms, by name')
-
     state = _convert_cross_attn(state, model)
     # Returns (dict, BOOL) -- not a key list, and the flag is set by ANY shape mismatch, including
     # the many that fall through every interpolation branch untouched. `len()` on it was a latent
-    # crash that only fires when something mismatches: with `pose` the gate is inflated above so
-    # nothing does, and `wide` mismatches most of `query_encoder.*` by construction.
+    # crash that only fires when something mismatches, which `wide` does across most of
+    # `query_encoder.*` by construction.
     state, interpolated = _interp_res_params(state, model)
     if interpolated and verbose:
         print('warm start: resolution-coupled tensors checked; see any res-interp lines above')

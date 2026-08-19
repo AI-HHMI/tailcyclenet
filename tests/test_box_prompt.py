@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import box_prompt as bpmod
 from tailcyclenet import crop as cropmod
 from tailcyclenet.model import build_model
-from tailcyclenet.query_encoder import (BoxFilmEncoder, BoxTermEncoder, WideQueryEncoder,
+from tailcyclenet.query_encoder import (BoxFilmEncoder, WideQueryEncoder,
                                         _normalize_box)
 from test_model import SMALL
 
@@ -31,22 +31,16 @@ def _wide_cfg(**kw):
 
 # -- build_model wiring ---------------------------------------------------------------------
 
-def test_plain_wide_has_no_box_and_film_term_match_term_count():
+def test_plain_wide_has_no_box_and_film_matches_term_count():
     plain = build_model(_wide_cfg(), n_keypoints=4).query_encoder
     film = build_model(_wide_cfg(box_prompt='film'), n_keypoints=4).query_encoder
-    term = build_model(_wide_cfg(box_prompt='term'), n_keypoints=4).query_encoder
     assert type(plain) is WideQueryEncoder and not hasattr(plain, 'film')
     assert isinstance(film, BoxFilmEncoder) and film.n_fusion_terms == plain.n_fusion_terms
-    assert isinstance(term, BoxTermEncoder) and term.n_fusion_terms == plain.n_fusion_terms + 1
-    assert term.term_names()[-1] == 'box'
 
 
-def test_box_prompt_beside_pose_raises():
-    cfg = dict(SMALL)
-    cfg['query_encoder'] = 'pose'
-    cfg['box_prompt'] = 'film'
-    with pytest.raises(AssertionError, match='box_prompt'):
-        build_model(cfg, n_keypoints=4)
+def test_removed_box_prompt_term_raises_by_name():
+    with pytest.raises(SystemExit, match='term'):
+        build_model(_wide_cfg(box_prompt='term'), n_keypoints=4)
 
 
 def test_unknown_box_prompt_raises():
@@ -113,7 +107,7 @@ def _make(cls, **kw):
                patch_size=9, query_pos_embedding=True, query_patch_embedding=True, **kw)
 
 
-@pytest.mark.parametrize('cls', [BoxFilmEncoder, BoxTermEncoder])
+@pytest.mark.parametrize('cls', [BoxFilmEncoder])
 def test_none_box_is_finite_and_idempotent(cls):
     torch.manual_seed(0)
     enc = _make(cls).eval()
@@ -137,18 +131,8 @@ def test_film_is_a_no_op_at_init_and_diverges_once_trained():
     assert not torch.allclose(out_none, enc(views, cg, qc, qt, tt, cs))
 
 
-def test_term_changes_the_output_immediately():
-    torch.manual_seed(0)
-    enc = _make(BoxTermEncoder).eval()
-    views, cg, qc, qt, tt, cs = _enc_inputs(enc)
-    enc._box_prompt = None
-    out_none = enc(views, cg, qc, qt, tt, cs)
-    enc._box_prompt = torch.tensor([[[[5., 5., 20., 20.]], [[8., 8., 18., 25.]]]])
-    assert not torch.allclose(out_none, enc(views, cg, qc, qt, tt, cs))
-
-
 def test_nan_box_substitutes_the_missing_token_not_nan():
-    for cls in (BoxFilmEncoder, BoxTermEncoder):
+    for cls in (BoxFilmEncoder,):
         torch.manual_seed(0)
         enc = _make(cls).eval()
         views, cg, qc, qt, tt, cs = _enc_inputs(enc)

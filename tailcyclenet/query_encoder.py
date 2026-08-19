@@ -6,33 +6,21 @@ name is the thing that distinguishes them. So one fusion term becomes a learned 
 identity vector, and the appearance patch is kept alongside it -- the model gets to say both
 *which* keypoint and *what is there*, which neither encoder alone could.
 
-The honest part (posetail-pose's `w9_honest`, here the only behaviour): four of the fusion terms
-are computed FROM the query position -- `pos`, `patch`, `vis`, and `depth` in 3D. When a keypoint
-has no prior, there is no query position, and the natural fallback is the crop centre. That
-fallback is not neutral: it is indistinguishable from a real prior that happens to say "the crop
-centre", so the model cannot tell "I was not told" from "I was told this". Each of those terms
-therefore carries a learned no-query token instead.
+The position-derived terms carry a learned no-query token rather than falling back to the crop
+centre: that fallback is indistinguishable from a real prior that happens to say "the crop
+centre", so the model could not tell "I was not told" from "I was told this".
 
-The tokens are initialised to the value the unprompted case produces today -- `missing_pos` to
-`linear_pos([0, fourier(0)])`, `missing_vis` to the in-bounds row of the pretrained `vis_embed`
--- so an untrained model starts at the pretrained behaviour rather than at noise, and any
-measured difference is the model learning to use an honest token.
-
-**Keypoint ids do not travel through the occlusion channel.** posetail-pose had to smuggle them
-there because `TrackerEncoder.forward`'s only per-keypoint channel is `occlusion`, and the stock
-encoder clamps `occlusion + 1` into `[0, 2]` -- so the two consumers could never share the
-tensor, and mis-packing it was invisible. Here the model stashes `_kpt_ids` on this module
-directly, which frees the occlusion channel for actual occlusion. Nothing reads it yet (the
-occ term stays at all-unknown, exactly as `w9_honest` had it), but the format now carries real
-per-camera visibility, so wiring it up is a change to one line rather than an architecture.
+**Keypoint ids do not travel through the occlusion channel.** `TrackerEncoder.forward`'s only
+per-keypoint channel is `occlusion`, and the stock encoder clamps `occlusion + 1` into `[0, 2]`,
+so the two consumers can never share that tensor. The model stashes `_kpt_ids` on this module
+directly instead.
 """
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from posetail.posetail.cube import is_point_visible, project_points_torch
-
-from posetail.posetail.encoder_decoder import PatchProcessor, QueryEncoder, sample_patches
+from posetail.posetail.cube import project_points_torch
+from posetail.posetail.encoder_decoder import PatchProcessor, sample_patches
 from posetail.posetail.utils import get_fourier_encoding
 
 
@@ -74,338 +62,23 @@ def _sub_unprompted(owner, term, token):
     return m * term + (1.0 - m) * token.view(1, 1, 1, -1)
 
 
-
-
-class PoseQueryEncoder(QueryEncoder):
-    """Constructed with the same kwargs `TrackerEncoder` passes its own query encoder."""
-
-    def __init__(self, *args, n_keypoints, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.n_keypoints = n_keypoints
-        # `forward` below builds no volume term and `term_names()` has no slot for one, so the
-        # base checkpoint's volume gate row has nowhere to go. Caught here rather than as the
-        # assertion it would otherwise become deep inside `inflate_stock_gate`, a warm start later.
-        assert not self.use_volume_embedding, (
-            'use_volume_embedding is not supported: this encoder builds no volume term, so the '
-            "base checkpoint's volume gate row has no slot here. Set use_volume_embedding = false.")
-
-        # One learned vector per keypoint id. The ids are GLOBAL (see format.Registry), so this
-        # table spans every dataset in the run and a later run that appends datasets keeps the
-        # rows it already trained.
-        self.kpt_embed = nn.Embedding(n_keypoints, self.embed_dim)
-        nn.init.normal_(self.kpt_embed.weight, std=0.02)
-        self.kpt_norm = nn.LayerNorm(self.embed_dim)
-
-        # No-query tokens. `missing_depth` / `missing_intrinsic` already exist on the parent and
-        # are PRETRAINED, so they are reused rather than shadowed.
-        with torch.no_grad():
-            z = torch.zeros(1, 1, 1, 2)
-            pos0 = self.linear_pos(torch.cat(
-                [z, get_fourier_encoding(z, min_freq=0, max_freq=self.max_freq)], dim=-1))
-            self.missing_pos = nn.Parameter(pos0.reshape(-1).clone())
-            # The crop centre is always in bounds, so the unprompted `vis` term today always
-            # reports index 1 -- confidently "visible" about a query that does not exist.
-            self.missing_vis = nn.Parameter(self.vis_embed.weight[1].detach().clone())
-        self.missing_patch = nn.Parameter(torch.zeros(self.embed_dim))
-        nn.init.normal_(self.missing_patch, std=0.02)
-
-        # Identity is an extra term beside the ten the parent builds, so the gate is rebuilt.
-        # It MUST stay a gate: `fusion_norm` and `fusion_mlp` are inherited from the base
-        # checkpoint and were trained on `0.5 * sum(terms)`, because a stock gate outputs
-        # sigmoid(0) = 0.5 at init and stays in [0, 1] forever. Dropping the Sigmoid once left
-        # weights ranging -1.385..+1.244 and put the fusion output outside the distribution the
-        # pretrained decoder consumes.
-        self.n_fusion_terms += 1
-        self.gate = nn.Sequential(
-            nn.Linear(self.embed_dim * self.n_fusion_terms, self.n_fusion_terms), nn.Sigmoid())
-        nn.init.normal_(self.gate[0].weight, std=0.01)
-        nn.init.constant_(self.gate[0].bias, 0.0)
-
-    # -- term bookkeeping, used by the warm start ------------------------------------------
-    def _tail_terms(self):
-        t = ['gap'] if self.time_embed_mode == 'fourier_rel' else []
-        t += ['pos', 'depth', 'vis']
-        if self.principal_point_embedding:
-            t.append('pp')
-        if self.intrinsic_embedding:
-            t.append('intrinsic')
-        if self.occlusion_embedding:
-            t.append('occ')
-        return t
-
-    def stock_term_names(self):
-        """`QueryEncoder.forward`'s own term order."""
-        return ['patch', 'query_time', 'target_time'] + self._tail_terms() + (
-            ['volume'] if self.use_volume_embedding else [])
-
-    def term_names(self):
-        """This class's order. Must match the `terms` list built in `forward`."""
-        return ['kpt', 'query_time', 'target_time', 'patch'] + self._tail_terms()
-
-    def inflate_stock_gate(self, weight, bias):
-        """The base checkpoint's N-term gate placed into this (N+1)-term one, term by term.
-
-        Mapped BY NAME, not by index: the two orders differ (stock leads with `patch`, this leads
-        with `kpt`), so deriving the correspondence from names makes a future reordering a
-        KeyError instead of every term silently receiving the weights trained for another.
-
-        The identity row and identity input block stay zero, so at init the identity term is
-        gated at sigmoid(0) = 0.5 -- the stock init value -- and every inherited row reads
-        nothing from it. The model starts at the pretrained fusion behaviour.
-        """
-        src, dst = self.stock_term_names(), self.term_names()
-        assert len(dst) == self.n_fusion_terms, \
-            f'term_names() gives {len(dst)} but n_fusion_terms is {self.n_fusion_terms}'
-        D = self.embed_dim
-        assert tuple(weight.shape) == (len(src), D * len(src)), \
-            f'checkpoint gate {tuple(weight.shape)} is not ({len(src)}, {D * len(src)})'
-        ix = {n: i for i, n in enumerate(dst)}
-        missing = [n for n in src if n not in ix]
-        assert not missing, f'stock terms with no slot here: {missing}'
-        w = torch.zeros(len(dst), D * len(dst), dtype=weight.dtype)
-        b = torch.zeros(len(dst), dtype=bias.dtype)
-        for i, ni in enumerate(src):
-            for j, nj in enumerate(src):
-                w[ix[ni], ix[nj] * D:(ix[nj] + 1) * D] = weight[i, j * D:(j + 1) * D]
-            b[ix[ni]] = bias[i]
-        return w, b
-
-    # -- the honest substitution ------------------------------------------------------------
-    def _sub_unprompted(self, term, token):
-        """See the module-level `_sub_unprompted`; this is the only route to it here."""
-        return _sub_unprompted(self, term, token)
-
-    def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
-                cube_scale, occlusion=None):
-        """Byte-compatible with `QueryEncoder.forward`. Returns [B, T_query, n_cams, decoder_dim].
-
-        `occlusion` is the real occlusion channel and is currently always None/unknown; keypoint
-        ids arrive on `self._kpt_ids`, stashed by `PoseTrackerEncoder.forward`.
-        """
-        B, T_query, coord_dim = query_coords.shape
-        n_cams = len(preprocessed_views)
-        assert coord_dim in (2, 3), coord_dim
-        is_2d = coord_dim == 2
-        if is_2d:
-            assert n_cams == 1, f'2D queries are single-camera; got {n_cams}'
-
-        sizes = torch.stack([
-            torch.tensor([v.shape[-1], v.shape[-2]], dtype=query_coords.dtype,
-                         device=query_coords.device) for v in preprocessed_views])   # (cams, 2)
-
-        # A moving camera's extrinsic is (T,4,4), and `project_cam` aligns it against axis -3 of
-        # the points (cube.py:95-99) -- so the query axis has to be un-flattened to (t n) first.
-        # Both this and the visibility branch below exist in the stock QueryEncoder and were lost
-        # in the port (posetail-pose's kpt_query_encoder.py:361,392 dropped them too; it never
-        # ran a moving rig through its own encoder).
-        # A PER-FRAME OFFSET IS A MOVING CAMERA TOO: `ext` stays static while `offset` varies,
-        # and every branch this flag guards -- the (b,t,n) reshape before projecting, and the
-        # per-frame visibility -- is needed for exactly the same reason. Nothing in this repo
-        # builds a (T,2) offset any more, but posetail >= 0.3.5 supports it end to end and the
-        # encoder's guard stays for a rig that has one.
-        moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
-                                   for c in camera_group)
-        T_clip = preprocessed_views[0].shape[1]
-
-        # When every keypoint shares one query -- the unprompted case, where they all sit at the
-        # scene centre -- the position-derived terms are constant along a query axis that is
-        # T*K long (1128 on a 24-frame 47-keypoint window). Compute at width 1 and expand.
-        # Asserted rather than assumed, with a full-width fallback.
-        #
-        # NOT AVAILABLE ON A MOVING RIG. One shared query point still projects to a DIFFERENT
-        # pixel every frame, so a width-1 axis cannot represent the answer -- and it cannot be
-        # reshaped to (t n) either.
-        uniform = (not moving
-                   and bool(torch.equal(query_coords, query_coords[:, :1].expand_as(query_coords))))
-        Tq = 1 if uniform else T_query
-        qc = query_coords[:, :1] if uniform else query_coords
-
-        if is_2d:
-            p2d_full = rearrange(qc, 'b t r -> 1 b t r')
-        elif moving:
-            qc_btn = rearrange(qc, 'b (t n) r -> b t n r', t=T_clip)
-            p2d_full = rearrange(project_points_torch(camera_group, qc_btn),
-                                 'cams b t n r -> cams b (t n) r')
-        else:
-            p2d_full = project_points_torch(camera_group, qc)
-
-        pp = rearrange(p2d_full, 'ncams b t r -> b t ncams r') / sizes
-        pp = pp * 2.0 - 1.0
-        embed_pos = self.linear_pos(
-            torch.cat([pp, get_fourier_encoding(pp, min_freq=0, max_freq=self.max_freq)], dim=-1))
-
-        if is_2d:
-            # Depth and visibility have no 3D meaning here, and the PARENT's answers are used
-            # rather than invented: `missing_depth` is pretrained, and visibility degrades to a
-            # pixel bounds check with margin 2. Substituting anything else would feed the
-            # pretrained fusion gate a term it never saw.
-            embed_depth = repeat(self.missing_depth, 'd -> b t c d', b=B, t=Tq, c=n_cams)
-            W, H = sizes[0, 0], sizes[0, 1]
-            in_bounds = ((qc[..., 0] >= 2) & (qc[..., 0] < W - 2) &
-                         (qc[..., 1] >= 2) & (qc[..., 1] < H - 2))
-            embed_vis = self.vis_embed(rearrange(in_bounds, 'b t -> b t 1').to(torch.int32))
-        else:
-            # `center` is (3,) static or (T,3) moving; frame 0 anchors the depth term, matching
-            # the library's own approximation (encoder_decoder.py:455).
-            centers = torch.stack([c['center'][0] if c['center'].ndim == 2 else c['center']
-                                   for c in camera_group]).to(query_coords.dtype)
-            cs = rearrange(cube_scale, 'cams b -> b 1 cams')
-            raw = torch.linalg.norm(rearrange(qc, 'b t r -> b t 1 r') - centers, dim=-1) / cs
-            dr = rearrange(torch.log(raw + 1e-6) * self.depth_norm_scale, 'b t c -> b t c 1')
-            embed_depth = self.linear_depth(torch.cat(
-                [dr, get_fourier_encoding(dr, min_freq=0, max_freq=self.max_freq)], dim=-1))
-            if moving:
-                # Per-frame: the anchor is in view for some frames of the window and not others.
-                qc_btn = rearrange(qc, 'b (t n) r -> b t n r', t=T_clip)
-                visible = torch.stack([is_point_visible(c, qc_btn, margin=2)
-                                       for c in camera_group])          # (cams,b,t,n)
-                visible = rearrange(visible, 'ncams b t n -> b (t n) ncams')
-            else:
-                qflat = rearrange(qc, 'b t r -> (b t) r')
-                visible = torch.stack([is_point_visible(c, qflat, margin=2)
-                                       for c in camera_group])
-                visible = rearrange(visible, 'ncams (b t) -> b t ncams', b=B)
-            embed_vis = self.vis_embed(visible.to(torch.int32))
-
-        embed_pp = embed_intrinsic = None
-        if self.principal_point_embedding:
-            ppt = torch.stack([(c["mat"][:2, 2] - c["offset"]).to(query_coords.dtype)
-                               for c in camera_group])
-            ppn = repeat(ppt / sizes * 2.0 - 1.0, 'cams r -> b t cams r', b=B, t=Tq)
-            embed_pp = self.linear_pp(torch.cat(
-                [ppn, get_fourier_encoding(ppn, min_freq=0, max_freq=self.max_freq)], dim=-1))
-        if self.intrinsic_embedding:
-            if is_2d:
-                # The 2D camera is a NOMINAL pinhole, so its focal length says nothing about the
-                # real optics. The parent uses the pretrained token here; so do we.
-                embed_intrinsic = repeat(self.missing_intrinsic, 'd -> b t c d',
-                                         b=B, t=Tq, c=n_cams)
-            else:
-                focal = torch.stack([torch.stack([c['mat'][0, 0], c['mat'][1, 1]]).to(
-                    query_coords.dtype) for c in camera_group])
-                fn = repeat(focal / sizes, 'cams r -> b t cams r', b=B, t=Tq)
-                embed_intrinsic = self.linear_intrinsic(torch.cat(
-                    [fn, get_fourier_encoding(fn, min_freq=0, max_freq=self.max_freq)], dim=-1))
-
-        if uniform:
-            def widen(x):
-                return None if x is None else x.expand(B, T_query, n_cams, x.shape[-1])
-            embed_pos, embed_depth = widen(embed_pos), widen(embed_depth)
-            embed_vis, embed_pp = widen(embed_vis), widen(embed_pp)
-            embed_intrinsic = widen(embed_intrinsic)
-
-        # Honest no-query substitution, after widening so every term is on the (t n) axis.
-        embed_pos = self._sub_unprompted(embed_pos, self.missing_pos)
-        embed_vis = self._sub_unprompted(embed_vis, self.missing_vis)
-        if not is_2d:
-            embed_depth = self._sub_unprompted(embed_depth, self.missing_depth)
-
-        # -- identity --------------------------------------------------------------------
-        ids = getattr(self, '_kpt_ids', None)
-        assert ids is not None, (
-            'PoseQueryEncoder needs keypoint ids; PoseTrackerEncoder.forward must set _kpt_ids.')
-        ids = _tile_to_query_axis(ids, T_query, '_kpt_ids')
-        assert int(ids.min()) >= 0 and int(ids.max()) < self.n_keypoints, \
-            f'keypoint id out of range [0, {self.n_keypoints}): {int(ids.min())}..{int(ids.max())}'
-        embed_kpt = repeat(self.kpt_norm(self.kpt_embed(ids)), 'b t d -> b t cams d', cams=n_cams)
-
-        # -- appearance at the query -----------------------------------------------------
-        # `sample_patches` gathers frames with `query_time` and builds its grid from `centers`,
-        # so the two must agree on Z. Derive Z from the centres: this encoder is called per
-        # keypoint-chunk at inference, so the query axis it receives is not always the full one,
-        # and a mismatch surfaces as an opaque grid_sampler error rather than anything nameable.
-        cen = p2d_full[:, :, :1] if uniform else p2d_full
-        Z = cen.shape[2]
-        qt = query_time if query_time.dim() > 1 else query_time[:, None]
-        if qt.shape[-1] != Z:
-            qt = qt[..., :1].expand(-1, Z)
-        patches = torch.stack([sample_patches(preprocessed_views[i], cen[i], qt, self.patch_size)
-                               for i in range(n_cams)])
-        embed_patch = rearrange(self.patch_processor(
-            rearrange(patches, 'cams b t c p q -> (cams b t) c p q')),
-            '(cams b t) d -> b t cams d', cams=n_cams, b=B, t=Z)
-        if uniform:
-            embed_patch = embed_patch.expand(B, T_query, n_cams, embed_patch.shape[-1])
-        embed_patch = self._sub_unprompted(embed_patch, self.missing_patch)
-
-        # -- time ------------------------------------------------------------------------
-        embed_gap = None
-        if self.time_embed_mode == 'learned':
-            n_cur = preprocessed_views[0].shape[1]
-            embed_query_time = repeat(self._interp_time_embed(self.t_query_embed, query_time,
-                                                              n_cur), 'b t d -> b t c d', c=n_cams)
-            embed_target_time = repeat(self._interp_time_embed(self.t_target_embed, target_time,
-                                                               n_cur), 'b t d -> b t c d', c=n_cams)
-        else:
-            embed_query_time = repeat(self._fourier_time(query_time, self.linear_query_time),
-                                      'b t d -> b t c d', c=n_cams)
-            embed_target_time = repeat(self._fourier_time(target_time, self.linear_target_time),
-                                       'b t d -> b t c d', c=n_cams)
-            embed_gap = repeat(self._fourier_time(target_time - query_time, self.linear_gap),
-                               'b t d -> b t c d', c=n_cams)
-
-        embed_occ = None
-        if self.occlusion_embedding:
-            occ_idx = (torch.zeros((B, T_query, n_cams), dtype=torch.long,
-                                   device=query_coords.device) if occlusion is None
-                       else (occlusion.to(torch.long) + 1).clamp_(0, 2))
-            embed_occ = self.occ_embed(occ_idx)
-
-        # -- gated fusion; ORDER MUST MATCH term_names() ----------------------------------
-        terms = [embed_kpt, embed_query_time, embed_target_time, embed_patch]
-        if embed_gap is not None:
-            terms.append(embed_gap)
-        terms += [embed_pos, embed_depth, embed_vis]
-        for t in (embed_pp, embed_intrinsic, embed_occ):
-            if t is not None:
-                terms.append(t)
-        assert len(terms) == self.n_fusion_terms, \
-            f'built {len(terms)} terms but n_fusion_terms is {self.n_fusion_terms}'
-
-        stack = torch.stack([t.expand(B, T_query, n_cams, self.embed_dim) for t in terms], dim=-2)
-        weights = self.gate(rearrange(stack, 'b t c n d -> b t c (n d)'))
-        combined = torch.einsum('btcn,btcnd->btcd', weights, stack)
-        return self.fusion_mlp(self.fusion_norm(combined))
-
-
 class WideQueryEncoder(nn.Module):
-    """The pre-port query encoder: identity + time, fused at `latent_dim` instead of `embed_dim`.
+    """The query encoder: identity + time, fused at `latent_dim` instead of `embed_dim`.
 
-    `PoseQueryEncoder` above describes a keypoint with ten terms at 256 dims, 27 of its 30 tensors
-    inherited from the base tracker. This one describes it with six at 512 and inherits almost
-    nothing. Which wins is not obvious, and the record says this one does whenever no prior is
-    supplied: query-free, `PoseQueryEncoder`'s four distinguishing terms -- `pos`, `patch`, `vis`,
-    `depth` -- are all computed from the SAME derived scene point for every keypoint, so they are
-    constants and it degenerates into a lower-capacity version of this. `wide` won on fly (3.639
-    vs 3.873) and on 3dpop at every matched iteration; every `pose` win on record was anchored and
-    those are retracted GT leaks.
+    Six terms at 512 dims, inheriting almost nothing from the base tracker. 94% of the parameters
+    are the fusion MLP; the identity table is the one mechanism distinguishing LH-wrist from
+    RH-wrist, which is load-bearing in a query-free model.
 
-    So the width is not the point -- 94% of the parameters here are the fusion MLP, and the
-    identity table at 47x512 is twice the capacity for the one mechanism that distinguishes
-    LH-wrist from RH-wrist, which is load-bearing in a query-free model.
-
-    TWO TERMS put the prior back, and they are what make this more than a reproduction:
+    Two terms put the prior back:
 
     - `query_pos_embedding` -- where the query is. Without it this encoder ignores `query_coords`
-      ENTIRELY, which is how six posetail-pose configs declared an anchor, trained, and were
-      reported as anchored arms while the anchor was a literal no-op.
-    - `query_patch_embedding` -- WHAT IS AT the query, not just where. The stock point tracker
-      scored 100% on the two-animal probe where the pose model scored 0.0-8.5% on identical crops
-      with an identical scorer, and the difference between those two queries is exactly a patch
-      sampled at the query position.
+      ENTIRELY, so a declared prior becomes a silent no-op.
+    - `query_patch_embedding` -- WHAT IS AT the query, not just where.
 
-    THEY ARE NOT SEPARATELY CONFIGURABLE. `PoseTrackerEncoder` builds both iff `query = "prior"`,
-    because under `query = "none"` the prior is never read: `_query_ok` is all-False for the whole
-    run, `_sub_unprompted` substitutes both tokens on every query, and the terms are two constant
-    vectors feeding two dead gate inputs. Both off is therefore what `query = "none"` MEANS here
-    -- and that is exactly golden's `j3` encoder, which until now could not be built in this repo
-    at all: scoring it needed posetail-pose's own package, env and weights.
-
-    UNLIKE posetail-pose's copy, both terms carry a learned no-query token. Its source note says
-    missing-query tokens cannot work here because there is no position-derived term to be honest
-    about; that note predates these two terms, which are exactly that. Without the tokens an
-    unprompted keypoint's query is the derived scene point presented as a real answer -- and with
-    an item-level `prompt_dropout` that is now ~half of all training steps.
+    `PoseTrackerEncoder` builds both iff `query = "prior"`: under `query = "none"` the prior is
+    never read, so both terms would be constant vectors feeding dead gate inputs. Both terms carry
+    a learned no-query token, or an unprompted keypoint's query would be the derived scene point
+    presented as a real answer.
     """
 
     def __init__(self, *, dim, embed_dim, decoder_dim, n_keypoints, n_frames, max_freq=10,
@@ -662,7 +335,7 @@ class WideQueryEncoder(nn.Module):
 # stashed by `PoseTrackerEncoder._decode_from_scene` exactly like `_kpt_ids` -- the library's
 # call into the query encoder has a fixed signature with no box slot.
 
-BOX_MODES = ('film', 'term')
+BOX_MODES = ('film',)
 
 
 def _normalize_box(box_prompt, sizes):
@@ -740,59 +413,5 @@ class BoxFilmEncoder(WideQueryEncoder):
         return self._gate_and_fuse(terms, ctx)
 
 
-class BoxTermEncoder(WideQueryEncoder):
-    """The box as its own [cx,cy,w,h] Fourier fusion term + one new gate row. Cheapest; scene-level
-    rather than per-keypoint, so slower to earn gate mass than `film` -- but by 10k it matches it
-    (report 27). Warm start inflates the wide parent's gate by NAME into the +1 slot, box row zero,
-    so the pretrained fusion behaviour is preserved rather than reset."""
 
-    def __init__(self, *args, box_max_freq=None, **kwargs):
-        super().__init__(*args, **kwargs)          # term_names() already counts 'box' -> gate sized
-        self.box_max_freq = int(box_max_freq if box_max_freq is not None else self.max_freq)
-        self.linear_box = nn.Linear(8 * self.box_max_freq + 4, self.dim)
-        self.missing_box = nn.Parameter(torch.zeros(self.dim))
-        nn.init.normal_(self.missing_box, std=0.02)
-
-    def term_names(self):
-        return super().term_names() + ['box']
-
-    def stock_term_names(self):
-        """The WIDE parent's term order -- what warm_start's inflate-print reports as the source."""
-        return WideQueryEncoder.term_names(self)
-
-    def inflate_stock_gate(self, weight, bias):
-        """Place the wide parent's N-term gate into this (N+1)-term one BY NAME, box row zero, so
-        warm start preserves the pretrained fusion behaviour instead of dropping the whole gate on
-        a shape mismatch (report 27). Called by `warm_start` because it is named this and the
-        shapes differ."""
-        src, dst = WideQueryEncoder.term_names(self), self.term_names()
-        D = self.dim
-        assert tuple(weight.shape) == (len(src), D * len(src)), \
-            f'checkpoint gate {tuple(weight.shape)} is not ({len(src)}, {D * len(src)})'
-        ix = {n: i for i, n in enumerate(dst)}
-        w = torch.zeros(len(dst), D * len(dst), dtype=weight.dtype)
-        b = torch.zeros(len(dst), dtype=bias.dtype)
-        for i, ni in enumerate(src):
-            for j, nj in enumerate(src):
-                w[ix[ni], ix[nj] * D:(ix[nj] + 1) * D] = weight[i, j * D:(j + 1) * D]
-            b[ix[ni]] = bias[i]
-        return w, b
-
-    def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
-                cube_scale, occlusion=None):
-        terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
-                                       query_time, target_time)
-        B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
-        box = getattr(self, '_box_prompt', None)
-        if box is not None:
-            feat, ok = _box_features(box, ctx['sizes'], target_time)
-            embed_box = self.linear_box(torch.cat(
-                [feat, get_fourier_encoding(feat, min_freq=0, max_freq=self.box_max_freq)], -1))
-            embed_box = _sub_missing(embed_box, ok, self.missing_box)
-        else:
-            embed_box = repeat(self.missing_box, 'd -> b t c d', b=B, t=T_query, c=n_cams)
-        terms.append(embed_box)
-        return self._gate_and_fuse(terms, ctx)
-
-
-BOX_ENCODERS = {'film': BoxFilmEncoder, 'term': BoxTermEncoder}
+BOX_ENCODERS = {'film': BoxFilmEncoder}

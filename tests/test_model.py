@@ -28,7 +28,7 @@ SMALL = dict(
     principal_point_embedding=True, intrinsic_embedding=True, metric_ray_translation=True,
     occlusion_embedding=True, latent_dim=64, n_heads=2, n_time_space_blocks=1,
     embedding_factor=2, use_camera_self_attention=True, use_temporal_self_attention=True,
-    f_eff_scale=True, scene_encoder_proj=True, cross_attn_dim=64, scene_proj_dim=64,
+    f_eff_scale=True, scene_encoder_proj=True, scene_proj_dim=64,
     scene_pos_embed_mode='ropepos', rope_base=100.0, time_embed_mode='fourier_rel',
     gridresid_offset='query',
     output_mode='gridresid', head_3d_grid_size=64, head_3d_grid_radius=1.8,
@@ -38,10 +38,10 @@ SMALL = dict(
 CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                    crop_jitter=0.0, prompt_dropout=0.0)
 
-# Both query encoders, everywhere it is structural. `wide` is a hand-written forward rather than a
-# `QueryEncoder` subclass, so the moving-rig reshape and the per-chunk id slice are reimplemented
-# there and would break silently -- which is the whole reason this file exists.
-ENCODERS = ('pose', 'wide')
+# `wide` is a hand-written forward rather than a `QueryEncoder` subclass, so the moving-rig
+# reshape and the per-chunk id slice are reimplemented there and would break silently -- which is
+# the whole reason this file exists.
+ENCODERS = ('wide',)
 
 # The 3D single-view tests slice ONE camera out of the fixture rig, and it has to be one that can
 # actually see the animal. `conftest._session_3d`'s camera 0 cannot: none of its three synthetic
@@ -52,7 +52,7 @@ ENCODERS = ('pose', 'wide')
 SEEING_CAM = 1
 
 
-def small(query_encoder='pose', **over):
+def small(query_encoder='wide', **over):
     return {**SMALL, 'query_encoder': query_encoder, **over}
 
 
@@ -369,6 +369,11 @@ def test_missing_tokens_fire_per_keypoint(moving_batch, enc):
     assert all(per_kpt[1:]), f'it also changed other keypoints: {per_kpt}'
 
 
+def test_removed_query_encoder_pose_raises_by_name():
+    with pytest.raises(SystemExit, match='pose'):
+        build_model(small('pose'), n_keypoints=5)
+
+
 def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
     """`wide`'s patch CNN must LOAD, not re-initialise. Nothing else would show if it did not.
 
@@ -380,18 +385,30 @@ def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
     """
     from tailcyclenet.checkpoints import warm_start
 
-    base = build_model(small('pose'), n_keypoints=5)
-    ckpt = tmp_path / 'base.pth'
-    torch.save({'model_state': base.state_dict()}, ckpt)
+    from posetail.posetail.encoder_decoder import PatchProcessor
 
     model = build_model(small('wide'), n_keypoints=5)
+    # Built at the PRETRAINED width and projected to the fusion width -- not built at `dim`.
+    # This is the property the whole test exists for, asserted directly.
+    embed_dim = model.query_encoder.patch_proj.in_features
+    assert embed_dim != model.query_encoder.dim
+
+    # The base checkpoint as the pretrained tracker writes it: a PatchProcessor at embed_dim,
+    # under the name the encoder gives it.
+    torch.manual_seed(1234)
+    src_pp = PatchProcessor(in_channels=3, patch_size=model.query_encoder.patch_size,
+                            embed_dim=embed_dim, conv_channels=[32, 64, 128])
+    ckpt = tmp_path / 'base.pth'
+    torch.save({'model_state': {f'query_encoder.patch_processor.{k}': v
+                                for k, v in src_pp.state_dict().items()}}, ckpt)
+
     before = {k: v.clone() for k, v in model.query_encoder.patch_processor.state_dict().items()}
     fresh = warm_start(model, ckpt, verbose=False)
 
     patch = [n for n in fresh if 'patch_processor' in n]
     assert not patch, f'the patch CNN was left fresh instead of loaded: {patch}'
     after = model.query_encoder.patch_processor.state_dict()
-    src = base.query_encoder.patch_processor.state_dict()
+    src = src_pp.state_dict()
     assert after.keys() == before.keys()
     for k in after:
         torch.testing.assert_close(after[k], src[k])       # came from the checkpoint...
@@ -417,12 +434,12 @@ def test_wide_query_terms_follow_the_query_mode():
 
     assert prior.term_names() == ['kpt', 'query_time', 'target_time', 'gap', 'qpos', 'patch',
                                   'pp', 'intrinsic']
-    # 6 terms, no qpos, no patch: this IS golden's j3 encoder.
+    # 6 terms, no qpos, no patch.
     assert free.term_names() == ['kpt', 'query_time', 'target_time', 'gap', 'pp', 'intrinsic']
     assert not hasattr(free, 'linear_qpos') and not hasattr(free, 'patch_processor')
     assert free.n_fusion_terms == 6 and prior.n_fusion_terms == 8
 
-    # Overriding the pair is allowed, and pos-without-patch is the `j4_prior` recipe.
+    # Overriding the pair is allowed: pos without patch.
     j4 = build_model(small('wide', query='prior', query_patch_embedding=False),
                      n_keypoints=5).query_encoder
     assert j4.term_names() == ['kpt', 'query_time', 'target_time', 'gap', 'qpos', 'pp', 'intrinsic']
@@ -435,9 +452,6 @@ def test_wide_query_terms_follow_the_query_mode():
     # As does paying for a term that is constant all run.
     with pytest.raises(AssertionError, match='dead gate inputs'):
         build_model(small('wide', query='none', query_pos_embedding=True), n_keypoints=5)
-    # And naming them on the encoder that cannot read them.
-    with pytest.raises(AssertionError, match='only apply to'):
-        build_model(small('pose', query='prior', query_pos_embedding=True), n_keypoints=5)
 
 
 def test_item_dropout_reproduces_the_deployment_geometry(moving_batch):

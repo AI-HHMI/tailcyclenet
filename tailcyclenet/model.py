@@ -42,10 +42,10 @@ from einops import einsum, repeat
 from posetail.posetail.cube import from_homogeneous, to_homogeneous, undistort_points
 from posetail.posetail.tracker_encoder import TrackerEncoder
 
-from .query_encoder import BOX_ENCODERS, BOX_MODES, PoseQueryEncoder, WideQueryEncoder
+from .query_encoder import BOX_ENCODERS, BOX_MODES, WideQueryEncoder
 
 QUERY_MODES = ('prior', 'none')
-QUERY_ENCODERS = ('pose', 'wide')
+QUERY_ENCODERS = ('wide',)
 # What the gridresid residual is an offset FROM. See `_query_anchored` / `_reanchor_per_frame`.
 GRIDRESID_OFFSETS = ('query', 'triangulated')
 
@@ -116,7 +116,7 @@ def scene_center(camera_group):
 # ----------------------------------------------------------------------------------------------
 
 class PoseTrackerEncoder(TrackerEncoder):
-    def __init__(self, *args, n_keypoints, query='prior', query_encoder='pose',
+    def __init__(self, *args, n_keypoints, query='prior', query_encoder='wide',
                  gridresid_offset='query', query_terms=None, box_prompt='none', **kwargs):
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
         assert query_encoder in QUERY_ENCODERS, \
@@ -125,9 +125,6 @@ class PoseTrackerEncoder(TrackerEncoder):
             f'gridresid_offset must be one of {GRIDRESID_OFFSETS}, got {gridresid_offset!r}'
         assert box_prompt == 'none' or box_prompt in BOX_MODES, \
             f'box_prompt must be "none" or one of {BOX_MODES}, got {box_prompt!r}'
-        assert box_prompt == 'none' or query_encoder == 'wide', (
-            f'box_prompt = {box_prompt!r} only applies to query_encoder = "wide"; '
-            f'{query_encoder!r} would ignore it.')
         super().__init__(*args, **kwargs)
         self.n_keypoints = n_keypoints
         self.query = query
@@ -139,54 +136,33 @@ class PoseTrackerEncoder(TrackerEncoder):
         # Replace the stock query encoder, built from the same kwargs the parent used so it is a
         # drop-in either way.
         old = self.query_encoder
-        if query_encoder == 'pose':
-            self.query_encoder = PoseQueryEncoder(
-                embed_dim=old.embed_dim, decoder_dim=old.decoder_dim, n_frames=old.n_frames,
-                corr_radius=old.corr_radius, max_freq=old.max_freq, patch_size=old.patch_size,
-                use_volume_embedding=old.use_volume_embedding,
-                principal_point_embedding=old.principal_point_embedding,
-                intrinsic_embedding=old.intrinsic_embedding,
-                occlusion_embedding=old.occlusion_embedding,
-                time_embed_mode=old.time_embed_mode,
-                n_keypoints=n_keypoints)
+        # The two query terms DEFAULT to following `query`; `query_terms` overrides the pair (the
+        # `j4_prior` recipe is pos but no patch). Both off under `query = "prior"` is the trap:
+        # the encoder ignores `query_coords` entirely, so a declared prior is a silent no-op.
+        terms = dict.fromkeys(('query_pos_embedding', 'query_patch_embedding'),
+                              query == 'prior')
+        terms.update(query_terms or {})
+        if query == 'prior':
+            assert any(terms.values()), (
+                'query = "prior" with both query terms off: the encoder would ignore '
+                '`query_coords` entirely and the prior would be a no-op. Set at least one of '
+                'query_pos_embedding / query_patch_embedding, or use query = "none".')
         else:
-            # `wide`'s two query terms DEFAULT to following `query`. Under `query = "none"` the
-            # prior is never read, so `_query_ok` is all-False for the whole run and
-            # `_sub_unprompted` swaps both terms for their learned no-query token on every query --
-            # two constant vectors and two dead gate inputs.
-            #
-            # `query_terms` overrides the pair, which is what the `j4_prior` recipe needs (pos but
-            # no patch). The one combination that stays unrepresentable is the trap: with BOTH off,
-            # `wide` ignores `query_coords` entirely, so a declared prior cannot reach the encoder
-            # at all. That is how six posetail-pose configs declared an anchor, trained, and were
-            # reported as anchored arms whose anchor was a literal no-op.
-            terms = dict.fromkeys(('query_pos_embedding', 'query_patch_embedding'),
-                                  query == 'prior')
-            terms.update(query_terms or {})
-            if query == 'prior':
-                assert any(terms.values()), (
-                    'query = "prior" with both query terms off: `wide` would ignore `query_coords` '
-                    'entirely and the prior would be a no-op. Set at least one of '
-                    'query_pos_embedding / query_patch_embedding, or use query = "none".')
-            else:
-                assert not any(terms.values()), (
-                    f'query = "none" supplies no prior, so {[k for k, v in terms.items() if v]} '
-                    'would be constant no-query tokens feeding dead gate inputs for the whole run.')
-            # A BOX PROMPT (report 27) swaps in a `WideQueryEncoder` SUBCLASS that consumes a
-            # per-frame animal box as a non-position channel -- `film` (FiLM on the identity term,
-            # the winner) or `term` (its own fusion term). Only `wide` carries it; naming it beside
-            # `pose` is refused in `build_model`. The box rides `self.query_encoder._box_prompt`,
-            # stashed by `_decode_from_scene`.
-            enc_cls = BOX_ENCODERS.get(box_prompt, WideQueryEncoder)
-            self.query_encoder = enc_cls(
-                dim=self.latent_dim, embed_dim=old.embed_dim, decoder_dim=old.decoder_dim,
-                n_frames=old.n_frames, max_freq=old.max_freq, patch_size=old.patch_size,
-                principal_point_embedding=old.principal_point_embedding,
-                intrinsic_embedding=old.intrinsic_embedding,
-                time_embed_mode=old.time_embed_mode, n_keypoints=n_keypoints, **terms)
-            print(f'query encoder: wide{"" if box_prompt == "none" else "+box:" + box_prompt}, '
-                  f'dim {self.latent_dim}, {self.query_encoder.n_fusion_terms} terms '
-                  f'({", ".join(self.query_encoder.term_names())})')
+            assert not any(terms.values()), (
+                f'query = "none" supplies no prior, so {[k for k, v in terms.items() if v]} '
+                'would be constant no-query tokens feeding dead gate inputs for the whole run.')
+        # A box prompt swaps in a `WideQueryEncoder` subclass consuming a per-frame animal box as
+        # a non-position channel. The box rides `_box_prompt`, stashed by `_decode_from_scene`.
+        enc_cls = BOX_ENCODERS.get(box_prompt, WideQueryEncoder)
+        self.query_encoder = enc_cls(
+            dim=self.latent_dim, embed_dim=old.embed_dim, decoder_dim=old.decoder_dim,
+            n_frames=old.n_frames, max_freq=old.max_freq, patch_size=old.patch_size,
+            principal_point_embedding=old.principal_point_embedding,
+            intrinsic_embedding=old.intrinsic_embedding,
+            time_embed_mode=old.time_embed_mode, n_keypoints=n_keypoints, **terms)
+        print(f'query encoder: wide{"" if box_prompt == "none" else "+box:" + box_prompt}, '
+              f'dim {self.latent_dim}, {self.query_encoder.n_fusion_terms} terms '
+              f'({", ".join(self.query_encoder.term_names())})')
 
     def _forward_window(self, views_norm, *args, **kwargs):
         """Reuse one scene encode across several decodes over the SAME pixels.
@@ -570,11 +546,13 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     """
     cfg = dict(model_cfg)
     query = cfg.pop('query', 'prior')
-    # `query_encoder` picks the MODULE, `query` picks whether a prior is supplied to it. `wide`'s
-    # two query terms are DERIVED from `query`, not configured -- see PoseTrackerEncoder.__init__.
-    # So `query_encoder = "wide"` with `query = "none"` is exactly golden's j3 encoder, with no
-    # third key to get wrong.
-    enc = cfg.pop('query_encoder', 'pose')
+    # The two query terms are DERIVED from `query`, not configured -- see
+    # PoseTrackerEncoder.__init__. `query = "none"` is therefore golden's j3 encoder.
+    enc = cfg.pop('query_encoder', 'wide')
+    if enc == 'pose':
+        raise SystemExit(
+            'query_encoder = "pose" was removed: no shipped config selected it and `wide` won '
+            'every unanchored arm on record. Set query_encoder = "wide" (or drop the key).')
     # NO DEFAULT, DELIBERATELY. This key decides what the 3D residual is measured from, and the two
     # values are different architectures sharing one set of tensor shapes -- so a checkpoint trained
     # under one and loaded under the other produces numbers rather than an exception.
@@ -599,17 +577,15 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
             'pass --gridresid-offset (scripts/infer.py) / load_run(model_overrides=...) to state '
             'which one those weights were trained with.')
     offset = cfg.pop('gridresid_offset')
-    # `wide`'s two query terms DEFAULT to `query`, and setting one is the `j4_prior` recipe (pos,
-    # no patch). Only `wide` reads them -- `pose` derives its ten terms from the query directly --
-    # so naming one alongside `pose` is a silent no-op and must not be silent.
+    # The two query terms DEFAULT to `query`; setting one is the `j4_prior` recipe (pos, no patch).
     query_terms = {k: bool(cfg.pop(k)) for k in
                    ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
-    assert not (query_terms and enc != 'wide'), (
-        f'{sorted(query_terms)} only apply to query_encoder = "wide"; {enc!r} would ignore them.')
-    # THE BOX PROMPT (report 27): 'none' | 'film' | 'term'. Only `wide` reads it; the constructor
-    # refuses it beside `pose`. 'none' is a plain wide model, byte-identical to a config without
-    # the key.
+    # 'none' is a plain wide model, byte-identical to a config without the key.
     box_prompt = cfg.pop('box_prompt', 'none')
+    if box_prompt == 'term':
+        raise SystemExit(
+            'box_prompt = "term" was removed: no shipped config selected it and `film` matched or '
+            'beat it. Set box_prompt = "film" (or "none").')
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
 
     # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
@@ -634,6 +610,12 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     assert mode_3d == 'encoder', (
         f'mode_3d = {mode_3d!r} is not supported: build_model always constructs a '
         'PoseTrackerEncoder, so any other value would be silently ignored rather than honoured.')
+
+    # Consumed only by the stock QueryEncoder, which is no longer built. Refused rather than
+    # accepted-and-ignored, so it cannot read as a knob.
+    assert not cfg.get('use_volume_embedding'), (
+        'use_volume_embedding is not supported: the encoder builds no volume term, so the value '
+        'would be silently ignored. Set use_volume_embedding = false or drop the key.')
 
     return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc,
                               gridresid_offset=offset, query_terms=query_terms,

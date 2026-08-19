@@ -37,12 +37,11 @@ num_workers = 12
 
 [model]
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
-query_encoder = "wide"      # "wide" (512-dim, identity + time + the two query terms,
-                            # which are built iff query = "prior") | "pose" (256-dim, ten)
+query_encoder = "wide"      # the only encoder; the two query terms are built iff query = "prior"
 # THE BOX PROMPT (report 27): tell the model which box the target animal occupies, per frame per
 # camera, as a NON-position channel -- it can then be told which animal to return. "none" |
-# "film" (FiLM on the identity term, the winner) | "term" (its own fusion term). Only `wide`
-# reads it. "none" is byte-identical to a config without the key. Measured on crowded 2D calms21:
+# "film" (FiLM on the identity term). "none" is byte-identical to a config without the key.
+# Measured on crowded 2D calms21:
 # -3.5 mm MPJPE held-out at fixed weights, and in the deployment window loop on WIDE crops
 # (--crop-inflate 1.5) +0.26 MOTA / -0.117 fp_dup -- it removes the report-24 §9m wide-crop
 # collapse. ROOT-CONDITIONAL by keypoint density (sparse rat-city helps far less) and
@@ -125,7 +124,7 @@ depth_log_max = 2.5
 
 # Five keys that used to be here and reach nothing, removed rather than left reading as knobs:
 #   corr_radius, use_volume_embedding, occlusion_embedding -- consumed only by the stock
-#     QueryEncoder, which model.py builds and DISCARDS under query_encoder = "wide"
+#     QueryEncoder, which model.py no longer builds
 #   mode_3d      -- "stored and never read" (build_model only asserts it)
 #   cross_attn_dim -- restated latent_dim, which is also what None defaults to
 # `scratch/regress/probe_model_shapes.py` asserts the parameter set is identical without them.

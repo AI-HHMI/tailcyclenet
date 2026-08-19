@@ -1355,42 +1355,22 @@ def _resize_camera(cam, target_res):
 def worker_init(worker_id):
     """A DataLoader `worker_init_fn`. Four things, all per-worker and all easy to miss.
 
-    1. **Pin cv2's thread pool to one thread.** OpenCV sizes it to the machine -- 128 threads here
-       -- and each of `num_workers` processes runs a 16-thread `ThreadPoolExecutor` on top of
-       that, so the nesting is pure contention: the frames of a window are already being decoded
-       in parallel. Measured 0.210 -> 0.180 s/it at 12 workers, and the gap widens on a smaller
-       machine.
+    1. **Pin cv2's thread pool to one thread.** OpenCV sizes it to the machine, and each worker
+       already runs its own decode pool on top, so the nesting is pure contention.
 
-    2. **Pin torch's own intraop pool to one thread too.** A worker does small CPU-only work
-       (crop, augment, collate) and never calls an ATen op that would use torch's default
-       `nproc`-sized pool, so this is a correctness/hygiene fix (a pool that is never used should
-       not exist) rather than a measured memory win: tried as one candidate explanation for
-       calms21's per-worker RSS plateau under `multiprocessing_context='spawn'`
-       (`scripts/train.py`) and it made no measurable difference on a real job
-       (dev/plans/video_loader_memory.md §2.3) -- worker thread count stayed at ~23 with or
-       without this call, so whatever those threads are, they are not ATen's.
+    2. **Pin torch's intraop pool to one thread too.** A worker does small CPU-only work and never
+       calls an ATen op that would use it. Hygiene, not a measured win.
 
-    3. **Reseed imgaug.** It keeps its OWN global RNG, which fork copies and nothing else
-       reseeds, so every worker's k-th `to_deterministic()` would draw the same gamma, hue and
-       blur -- the appearance diversity silently divides by `num_workers`, and the loss curve
-       looks identical either way. The seed is drawn from `np.random`, which torch HAS already
-       decorrelated per worker (`torch/utils/data/_utils/worker.py:261-265`).
+    3. **Reseed imgaug.** It keeps its OWN global RNG, which fork copies and nothing else reseeds,
+       so every worker's k-th `to_deterministic()` would draw the same gamma, hue and blur --
+       appearance diversity silently divided by `num_workers`, invisible in the loss curve.
 
     4. **Force imgaug's hue/saturation LUT cache to build in THIS process.**
-       `AddToHueAndSaturation.__init__` populates a CLASS attribute (`_LUT_CACHE`) as a side
-       effect the first time one is constructed with `backend='cv2'` -- under `fork` the worker
-       inherits it already-built from the parent (train.py's `_build_augmenters` runs once,
-       before the workers exist), but under `spawn` (train.py's train loader, since a persistent
-       worker forking from a CUDA-active parent leaked several GB per worker -- see
-       `scripts/train.py`) the dataset is unpickled without `__init__` ever re-running, so the
-       class attribute is still `None` and the first hue/saturation augmentation crashes with
-       `TypeError: 'NoneType' object is not subscriptable`. Building a throwaway instance here
-       re-triggers the side effect in every worker, fork or spawn alike.
+       `AddToHueAndSaturation.__init__` populates a CLASS attribute as a side effect. Under
+       `spawn` the dataset is unpickled without `__init__` re-running, so the attribute is still
+       None and the first hue augmentation crashes. A throwaway instance re-triggers it.
 
-    numpy itself is deliberately NOT reseeded here, for that same reason. The library's
-    `make_worker_init_fn` exists to fold in a DDP rank, which torch's seeding ignores; there is
-    no DDP here (batch_size is structurally 1), so reusing it would only downgrade torch's seed
-    derivation to `base + worker_id`.
+    numpy is deliberately NOT reseeded: torch already decorrelates it per worker.
     `tests/test_dataset.py::test_workers_do_not_share_a_random_stream` pins both halves.
     """
     import cv2

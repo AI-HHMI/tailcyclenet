@@ -200,7 +200,7 @@ def test_computed_frame_paths_match_the_listing(dataset_3d):
     `.jpg` would find nothing. The fixture's frames differ per (cam, frame), so an off-by-one is
     visible in the pixels rather than hidden by constant images.
     """
-    from tailcyclenet.dataset import load_image, read_frames
+    from tailcyclenet.dataset import load_warps, read_frames
 
     sess = dataset_3d.sessions['train'][0]
     group = sess.groups['g000']
@@ -209,7 +209,8 @@ def test_computed_frame_paths_match_the_listing(dataset_3d):
         assert (kind, ext) == ('frames', '.png')
         listed = sorted(f for f in src.iterdir() if f.suffix in ('.png', '.jpg'))
         frames = [3, 0, 2, 0]                       # out of order and repeated, as windows are
-        want = [load_image(str(listed[i])) for i in frames]
+        want = [load_warps(str(listed[i]), [(None, None)], None, 1)[0]
+                for i in frames]
         got = read_frames(group, cam, frames)
         for a, b in zip(want, got):
             np.testing.assert_array_equal(a, b)

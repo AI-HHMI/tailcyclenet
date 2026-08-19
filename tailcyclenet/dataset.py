@@ -354,16 +354,6 @@ def load_warps(path, specs, target_size=None, reduce=1):
     return out
 
 
-def load_image(path, crop_coords=None, target_size=None, rotation=None, reduce=1):
-    """One decode and one affine -> (H,W,3) uint8 RGB. None if the file will not decode.
-
-    Replaces the library's `load_image`, which did the rotation, the crop and the resize as three
-    separate full-size buffers. The single-spec case of `load_warps`, which is where the
-    behaviour lives; kept as its own name because the detector wants exactly this.
-    """
-    return load_warps(path, [(crop_coords, rotation)], target_size, reduce)[0]
-
-
 # AN OPEN DECORD READER COSTS ABOUT A GIGABYTE, SO THE CACHE SIZE IS A MEMORY BUDGET, NOT A HINT.
 # A `VideoReader` is cheap until it decodes; the first seek allocates a frame pool sized by the
 # video, and on calms21's 1024x570 mpeg4s that settles at ~1.0 GB each. Measured on one loader

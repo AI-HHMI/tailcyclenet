@@ -192,7 +192,7 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     return path
 
 
-def load_run(run: Path, checkpoint: str | None = None, device='cpu', eval_weights: bool = True,
+def load_run(run: Path, checkpoint: str | None = None, device='cpu',
              model_overrides: dict | None = None):
     """(model, config, registry, checkpoint_path) from a run folder. Nothing else is needed.
 
@@ -222,10 +222,9 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu', eval_weight
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
 
     model = build_model(config['model'], n_keypoints=registry.n_keypoints)
-    state = ckpt.get('model_state_eval') if eval_weights else None
+    state = ckpt.get('model_state_eval')
     if state is None:
-        if eval_weights:
-            print(f'{path.name}: no model_state_eval; falling back to the raw training weights')
+        print(f'{path.name}: no model_state_eval; falling back to the raw training weights')
         state = ckpt['model_state']
     missing, unexpected = model.load_state_dict(state, strict=False)
     _report('load_run', missing, unexpected, [])

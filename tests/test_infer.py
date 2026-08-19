@@ -259,8 +259,9 @@ def test_carry_requires_overlap(scene):
 
 
 def test_inflate_box_widens_about_its_centre():
-    """The wide-crop deployment helper (report 27): 1.5x the side, same centre, clamped."""
-    from tailcyclenet.infer import _inflate_box
+    """THE ONE INFLATION RULE, shared with the wide-crop training regime
+    (`dataset.LoaderConfig.crop_inflate`) so the model trains and deploys on the same geometry."""
+    from tailcyclenet.crop import inflate_box as _inflate_box
     box = torch.tensor([100, 100, 140, 160], dtype=torch.int32)     # 40x60, centre (120,130)
     size = torch.tensor([1000, 1000])
     out = _inflate_box(box, size, 1.5)

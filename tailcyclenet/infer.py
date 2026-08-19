@@ -179,14 +179,6 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode):
     return ([cam], [box]) if cam is not None else (None, None)
 
 
-def _inflate_box(box, size, factor):
-    """Widen an xyxy crop box about its centre by `factor`, clamped to the image. Static (4,)
-    boxes only. Thin alias of `crop.inflate_box` -- THE ONE INFLATION RULE, shared with the
-    wide-crop TRAINING regime (`dataset.LoaderConfig.crop_inflate`) so the model trains and
-    deploys on the same geometry."""
-    return cropmod.inflate_box(box, size, factor)
-
-
 def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, cgroup, dev):
     """The box-prompt tensor for one animal's window, PER CAMERA, 2D or 3D. (1,T,C,4) in crop
     pixels, C = len(use) -- column order matches cgroup/views/use.
@@ -637,7 +629,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             # `boxes`/`cgroup` untouched, so this is a no-op on every existing run. Static boxes
             # only; each box is (4,) per camera here.
             if cfg.crop_inflate != 1.0:
-                boxes = [_inflate_box(b, window_cams[ci]['size'], cfg.crop_inflate)
+                boxes = [cropmod.inflate_box(b, window_cams[ci]['size'], cfg.crop_inflate)
                          for ci, b in zip(use, boxes)]
                 cgroup = [cropmod.apply_crop(window_cams[ci], b) for ci, b in zip(use, boxes)]
             scales = []

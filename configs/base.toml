@@ -131,7 +131,7 @@ depth_log_max = 2.5
 
 [training]
 n_iterations = 60000
-seed = 0
+seed = 23
 # The base tracker this finetunes from. Moving-camera support added ZERO parameters, so a
 # checkpoint from before that merge loads cleanly; the unexpected-keys list is printed anyway.
 checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260727_113457-ukt14i7c/files/checkpoints"

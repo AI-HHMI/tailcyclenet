@@ -161,7 +161,7 @@ iters = 20000
 batch_size = 16
 lr = 1e-3
 num_workers = 8
-seed = 0
+seed = 23
 # model init, augmentation draws and the train shuffle order. Does NOT move the median-animal
 # probe, which stays pinned at seed 0 regardless -- that is a MEASUREMENT of the dataset, not
 # training stochasticity, and letting it vary would make input_wh depend on seed. A SAME-RECIPE

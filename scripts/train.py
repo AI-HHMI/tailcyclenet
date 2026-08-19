@@ -395,8 +395,22 @@ def main():
     run = Path(args.out or train_cfg['out'])
     n_iter = int(train_cfg['n_iterations'])
     device = args.device if torch.cuda.is_available() else 'cpu'
-    torch.manual_seed(int(train_cfg.get('seed', 0)))
-    np.random.seed(int(train_cfg.get('seed', 0)))
+    # AN UNKNOWN [training] KEY IS A TYPO, NOT A COMMENT -- the same rule as [data] below, and
+    # for the same reason. `val_frequency` for `val_freq` yields val_freq = 0: no validation, no
+    # `checkpoint_best.pth`, and a run that prints fine for 60,000 iterations. The sub-blocks are
+    # guarded on their own (`[training.optimizer]` by name below, `[training.losses]` by
+    # `TotalLoss(**losses)`), so they are allowed through here as blocks.
+    known_training = {'n_iterations', 'seed', 'checkpoint_path', 'max_grad_norm', 'checkpoint_freq',
+                      'val_freq', 'val_batches', 'print_freq', 'out', 'optimizer', 'losses'}
+    unknown_training = set(train_cfg) - known_training - {'freeze_encoder'}
+    if unknown_training:
+        raise SystemExit(
+            f'[training]: unknown key(s) {sorted(unknown_training)}. Nothing reads them, so this '
+            f'run would train at the defaults and report as the arm it is not. Known keys: '
+            f'{sorted(known_training)}')
+
+    torch.manual_seed(int(train_cfg.get('seed', 23)))
+    np.random.seed(int(train_cfg.get('seed', 23)))
 
     # -- data ------------------------------------------------------------------------------
     # AN UNKNOWN [data] KEY IS A TYPO, NOT A COMMENT. The filter is needed -- `path` and
@@ -432,17 +446,26 @@ def main():
     # actually see -- allen-mouse-combined reads 1108 windows either way, while the share of
     # steps reaching the 3D head bank moves from 9.6% to 88%. Invisible in the loss curve.
     print('train: mix ' + '  '.join(f'{k}={v:.1%}' for k, v in train_ds.mix().items()))
+    # NO `val/` IS THE ONLY THING THAT MAY BE SWALLOWED HERE, and it is tested for rather than
+    # caught. `PoseDataset.__init__` raises ValueError for at least three CONFIG errors too -- a
+    # 3D session with no points3d, a split that yielded no usable windows, and all-zero sampling
+    # weights -- and catching those printed one line and then trained 60,000 iterations with no
+    # validation, no `checkpoint_best.pth` and a run that looked fine. An arm silently reporting
+    # its own control (eval rule 4).
+    #
+    # Val gets its OWN camera count: a 16-camera val session at full width cost ~200 s every 200
+    # iterations. Everything else about the val loader is deliberately shared.
     val_ds = None
-    try:
-        # Val gets its OWN camera count, like the reference's separate [dataset.val] block. It
-        # matters more than it looks: johnson's val sessions carry 16 cameras, so a 20-window
-        # eval at full width cost ~200 s every 200 iterations -- +1.0 s/it amortized onto a
-        # 2.9 s/it step. Everything else about the val loader is deliberately shared.
+    # `[data].path` is a dataset root OR a folder of them, so both shapes are checked.
+    root = Path(data_cfg['path'])
+    has_val = (root / 'val').is_dir() or any(
+        (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())
+    if not has_val:
+        print(f'val:   none (no val/ split under {root})')
+    else:
         val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
         val_ds = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry)
         print(f'val:   {len(val_ds)} windows, {lc.val_cams_to_sample} camera(s) each')
-    except (ValueError, KeyError) as e:
-        print(f'val:   none ({e})')
 
     nw = args.num_workers if args.num_workers is not None else int(data_cfg.get('num_workers', 8))
     # ONE epoch for the whole run, not one per pass over the index. rat-city's train index is 12
@@ -519,9 +542,8 @@ def main():
     # THE ENCODER'S GRADIENT STATE IS `[model].video_encoder_requires_grad` AND NOTHING ELSE.
     # `[training].freeze_encoder` used to re-freeze the encoder here, after `build_model` had
     # already honoured the model key -- two sources of truth for one fact, and the loop's one
-    # would have silently won over the staged unfreeze. Same rule as `per_camera_cube_scale`.
-    # `[training]` has no unknown-key guard, so a config still naming it is refused by name
-    # rather than ignored.
+    # would have silently won over the staged unfreeze. Named explicitly so the error says what
+    # to set instead; the general guard above would otherwise only say "unknown".
     if 'freeze_encoder' in train_cfg:
         raise SystemExit(
             '[training].freeze_encoder was removed: it re-froze the encoder AFTER build_model, so '

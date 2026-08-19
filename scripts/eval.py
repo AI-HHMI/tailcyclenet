@@ -33,7 +33,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.format import INST_PRESENT, UNLABELED, VISIBLE, Session, load_dataset
+from tailcyclenet.format import INST_PRESENT, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, match_instances, matched_error,
                                   mota, motion_ratio, paired_bootstrap, pck)
 
@@ -56,9 +56,7 @@ def load_predictions(path: Path):
 
 def label_lookup(data: Path, split: str):
     """{session/group: (Labels, Session)} for every group in the split."""
-    data = Path(data)
-    sessions = ([Session.load(data)] if (data / 'session.toml').exists()
-                else load_dataset(data).sessions.get(split, []))
+    _, sessions = sessions_for(Path(data), split)
     out = {}
     for sess in sessions:
         sess.preload()

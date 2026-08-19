@@ -28,17 +28,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.checkpoints import load_run
-from tailcyclenet.format import Session, load_dataset
+from tailcyclenet.dataset import LoaderConfig
+from tailcyclenet.format import sessions_for
 from tailcyclenet.infer import ANCHORS, CARRY_SOURCES, InferConfig, run_group
-
-
-def sessions_for(path: Path, split: str):
-    """(dataset_name, [Session]) from either a session directory or a dataset root."""
-    path = Path(path)
-    if (path / 'session.toml').exists():
-        return path.parent.parent.name, [Session.load(path)]
-    ds = load_dataset(path)
-    return ds.name, ds.sessions.get(split, [])
 
 
 def main():
@@ -339,7 +331,7 @@ def main():
           f'query={config["model"].get("query", "prior")}  '
           f'gridresid_offset={config["model"]["gridresid_offset"]}')
 
-    trained_frames = int(config['data'].get('n_frames', 24))
+    trained_frames = int(config['data'].get('n_frames', LoaderConfig.n_frames))
     # LONGER THAN THE TRAINED WINDOW IS NOT A KNOB. `n_frames` sizes the temporal pos_embed the
     # checkpoint carries; asking for more frames than it was built for interpolates at best and
     # shape-errors deep inside the encoder at worst. Shorter is safe -- val/test already enumerate
@@ -348,7 +340,7 @@ def main():
         raise SystemExit(f'--n-frames {args.n_frames} exceeds the run\'s trained window '
                          f'({trained_frames}). Shorter windows are fine; longer is not the same '
                          'model.')
-    trained_px = int(config['data'].get('image_size', 256))
+    trained_px = int(config['data'].get('image_size', LoaderConfig.image_size))
     # LARGER THAN THE TRAINED INPUT IS NOT A KNOB EITHER, for a different reason: `PadToSize` only
     # ever pads UP, so a bigger input is not padded, not resized, and reaches the 2D head's fixed
     # `image_size`-wide canvas as an out-of-range position. Smaller is what the compensations in
@@ -397,8 +389,8 @@ def main():
     cfg = InferConfig(
         n_frames=args.n_frames or trained_frames,
         overlap=args.overlap, image_size=trained_px,
-        min_crop_dim=int(config['data'].get('min_crop_dim', 64)),
-        box_source=config['data'].get('box_source', 'keypoints'),
+        min_crop_dim=int(config['data'].get('min_crop_dim', LoaderConfig.min_crop_dim)),
+        box_source=config['data'].get('box_source', LoaderConfig.box_source),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
         kpt_chunk=args.kpt_chunk,
         vis_thresh=args.vis_thresh, refine=refine, refine_px=refine_px,

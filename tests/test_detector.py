@@ -1706,7 +1706,7 @@ out = "/tmp/run-det"
     assert t['out'] == '/tmp/run-det'
     assert t['iters'] == 7
     assert t['batch_size'] == 16 and t['lr'] == 1e-3
-    assert t['num_workers'] == 8 and t['seed'] == 0
+    assert t['num_workers'] == 8 and t['seed'] == 23
     assert t['device'] == 'cpu'
     assert t['eval_every'] == 2000 and t['eval_batches'] == 25
     assert t['kpt_weight'] == 1.0 and t['kpt_score_weight'] == 1.0

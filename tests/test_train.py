@@ -179,3 +179,56 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     assert fresh_opt.state, 'no optimizer state came back, so the schedule-free z is lost'
     assert any('z' in s for s in fresh_opt.state.values()), \
         'the z iterate is the state that makes this a resume rather than a restart'
+
+
+# -- config guards -----------------------------------------------------------------------------
+
+KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'max_grad_norm', 'checkpoint_freq',
+                  'val_freq', 'val_batches', 'print_freq', 'out', 'optimizer', 'losses'}
+
+
+def test_known_training_keys_match_the_guard_in_main():
+    """The `[training]` allow-list must stay in step with what `main()` actually reads.
+
+    A typo'd `val_frequency` for `val_freq` yields `val_freq = 0` -- no validation, no
+    `checkpoint_best.pth`, and a run that prints fine for its whole life. That is an arm silently
+    reporting its own control, which is what the guard exists to stop.
+    """
+    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    assert 'known_training = {' in src, 'the [training] unknown-key guard is gone'
+    # every key the guard allows is either read from train_cfg or is a sub-block
+    for key in KNOWN_TRAINING - {'optimizer', 'losses', 'out'}:
+        assert f"train_cfg.get('{key}'" in src or f"train_cfg['{key}']" in src, \
+            f'{key} is allowed by the guard but nothing reads it'
+
+
+def test_val_is_skipped_only_for_a_missing_split_not_a_config_error():
+    """`no val/` may be swallowed. A config error inside PoseDataset may NOT.
+
+    The old `except (ValueError, KeyError)` caught both, so a 3D session with no points3d, a split
+    with no usable windows, or all-zero sampling weights each printed one line and then trained
+    with no validation at all.
+    """
+    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    body = src[src.index('    val_ds = None'):src.index('    nw = args.num_workers')]
+    assert 'except' not in body, 'val construction must not be wrapped in a bare except again'
+    assert "'val').is_dir()" in body, 'the missing-split case must be TESTED for, not caught'
+
+
+def test_infer_does_not_restate_loader_defaults():
+    """`LoaderConfig` owns its defaults; the CLI restating them is how `box_source` diverged."""
+    src = (Path(__file__).parent.parent / 'scripts' / 'infer.py').read_text()
+    for literal in ("'n_frames', 24", "'image_size', 256", "'min_crop_dim', 64",
+                    "'box_source', 'keypoints'"):
+        assert literal not in src, f'{literal} restates a LoaderConfig default at the CLI boundary'
+
+
+def test_det_score_has_one_default():
+    """Two defaults meant whichever caller omitted it got a different detector."""
+    import inspect
+
+    from tailcyclenet.detector import detect_raw
+    sig = inspect.signature(detect_raw).parameters['score_thresh'].default
+    src = (Path(__file__).parent.parent / 'scripts' / 'infer.py').read_text()
+    cli = float(src.split("'--det-score', type=float, default=")[1].split(',')[0])
+    assert sig == cli, f'detect_raw defaults to {sig} but the CLI to {cli}' 

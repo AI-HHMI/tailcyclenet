@@ -138,7 +138,7 @@ def tiled_input_wh(src_wh, tile_scale):
 
 
 @torch.no_grad()
-def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.99,
+def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.5,
                reduce=False, max_frames=0, tile_scale=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 

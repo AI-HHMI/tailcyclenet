@@ -386,7 +386,7 @@ class BoxDataset(Dataset):
     """
 
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
-                 max_frames_per_group: int = 40, seed: int = 0, box_source='keypoints',
+                 max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
                  strong=False):
@@ -1020,7 +1020,7 @@ class ChunkShuffle(torch.utils.data.Sampler):
     files, so locality buys nothing and costs nothing.
     """
 
-    def __init__(self, n, chunk=512, mix=4, seed=0):
+    def __init__(self, n, chunk=512, mix=4, seed=23):
         self.n, self.chunk, self.mix, self.seed = n, chunk, mix, seed
         self.epoch = 0
 

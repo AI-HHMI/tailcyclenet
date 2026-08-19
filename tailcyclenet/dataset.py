@@ -645,7 +645,7 @@ class _Item:
 
 class PoseDataset(Dataset):
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
-                 train: bool | None = None, seed: int = 0,
+                 train: bool | None = None, seed: int = 23,
                  registry_base: Registry | None = None):
         # Gotcha #1, and the clamp-pad in `_frames` does NOT cover it: that pads a short GROUP up
         # to `cfg.n_frames`, which does nothing when `cfg.n_frames` is itself 1. A 1-frame window

@@ -240,16 +240,22 @@ def main():
         collate_fn=box_collate, drop_last=True,
         persistent_workers=train_cfg['num_workers'] > 0,
         worker_init_fn=worker_init)
+    # NO `val/` IS THE ONLY THING SWALLOWED HERE, and it is tested for rather than caught:
+    # `BoxDataset.__init__` also raises ValueError for real config errors (a non-positive
+    # `tile_scale`, the multi-root refusal, `strong` beside `use_regions`), and those are meant to
+    # FAIL AT CONSTRUCTION rather than degrade to a printed note on the val loader.
     val = None
-    try:
+    root = Path(data_cfg['path'])
+    if not ((root / 'val').is_dir() or any(
+            (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())):
+        print(f'val:   none (no val/ split under {root})')
+    else:
         val = BoxDataset(data_cfg['path'], 'val', input_wh=wh,
                          box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
                          reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'], **tiling)
         print(f'val:   {len(val)} views')
-    except ValueError as e:
-        print(f'val:   none ({e})')
 
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox']).to(device)
     n = sum(p.numel() for p in model.parameters())

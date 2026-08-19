@@ -877,6 +877,19 @@ def load_dataset(root: Path) -> Dataset:
     return Dataset(name=root.name, root=root, sessions=sessions)
 
 
+def sessions_for(path: Path, split: str) -> tuple[str, list['Session']]:
+    """(dataset_name, sessions) from either ONE session directory or a dataset root.
+
+    A path is a session iff it holds `session.toml`; that is the format's own marker, and it is
+    the one rule both `scripts/infer.py` and `scripts/eval.py` need.
+    """
+    path = Path(path)
+    if (path / 'session.toml').exists():
+        return path.parent.parent.name, [Session.load(path)]
+    ds = load_dataset(path)
+    return ds.name, ds.sessions.get(split, [])
+
+
 def load_datasets(path: Path) -> list[Dataset]:
     """One dataset root, or a folder whose children are dataset roots.
 

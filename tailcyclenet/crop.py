@@ -89,7 +89,7 @@ def box_corners(boxes):
     the two cannot end up bounding different things.
 
     ROTATING THESE FOUR CORNERS AND RE-BOUNDING THEM IS THE RIGHT RULE, AND THAT IS MEASURED
-    RATHER THAN ASSUMED -- see `scratch/rat-city/check_rotation.py`. The objection is real: the
+    RATHER THAN ASSUMED (measured). The objection is real: the
     axis-aligned hull of a rotated rectangle is up to sqrt(2) wider on the side, and where a
     stored box is a crop-rule box it is ALREADY padded and ALREADY squared, so re-bounding it
     rotates the pad and the squaring, neither of which is a property of the animal. The

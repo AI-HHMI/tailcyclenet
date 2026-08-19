@@ -19,8 +19,8 @@ Two switches, and they are orthogonal:
 `query` -- whether a prior is supplied:
 
 - `"prior"`  -- a per-keypoint prior (`kpt_prior`), the previous window's pose at deployment,
-   with a learned no-query token wherever a keypoint has none. This is posetail-pose's
-   `w9_honest` with the instance-anchor machinery removed rather than defaulted off.
+   with a learned no-query token wherever a keypoint has none. The instance-anchor machinery
+   is removed here rather than defaulted off.
 - `"none"`   -- query-free. No prior is read at all; every keypoint is queried at the derived
    point and told only its identity.
 
@@ -136,8 +136,8 @@ class PoseTrackerEncoder(TrackerEncoder):
         # Replace the stock query encoder, built from the same kwargs the parent used so it is a
         # drop-in either way.
         old = self.query_encoder
-        # The two query terms DEFAULT to following `query`; `query_terms` overrides the pair (the
-        # `j4_prior` recipe is pos but no patch). Both off under `query = "prior"` is the trap:
+        # The two query terms DEFAULT to following `query`; `query_terms` overrides the pair
+        # (pos without patch). Both off under `query = "prior"` is the trap:
         # the encoder ignores `query_coords` entirely, so a declared prior is a silent no-op.
         terms = dict.fromkeys(('query_pos_embedding', 'query_patch_embedding'),
                               query == 'prior')
@@ -213,7 +213,7 @@ class PoseTrackerEncoder(TrackerEncoder):
         `image_size` is baked into the weights and stands for three unrelated things -- a padding
         target, the width of the 2D head's fixed output canvas, and the pixel extent of the input.
         Only the third is wrong for a smaller input, and posetail 0.3.5 splits it out as
-        `input_size=` (measured in `scratch/refine3d/RESULT.md` and dev/reports/26 §5b/5c/5d):
+        `input_size=` (measured; dev/reports/26 §5b/5c/5d):
         the pad target, the 2D-head rescale and the gridresid gauge all follow the canvas the
         forward actually saw, instead of the build-time 256.
 
@@ -463,7 +463,7 @@ def _query_anchored(out, query_ok):
         # Nothing to supervise the 3D grid CE with -- every point is triangulated. Kill THAT term
         # and nothing else. Popping `grid` (what this used to do) overshoots badly, because
         # `losses.py:680` gates on `'grid' in outputs` and TWO other things live behind it:
-        #   - `depth_softmax` (losses.py:756-772), weight 1.5, the LARGEST CE term in w9.toml,
+        #   - `depth_softmax` (losses.py:756-772), weight 1.5, the LARGEST CE term in the shipped 3D config,
         #     whose target (`:769`) is `log(depths_true / (cube_scale * f_eff * sdep))` -- nothing
         #     to do with the query anchor.
         #   - `f_eff` itself (losses.py:458), so the depth regression Huber silently reswitches
@@ -547,7 +547,7 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     cfg = dict(model_cfg)
     query = cfg.pop('query', 'prior')
     # The two query terms are DERIVED from `query`, not configured -- see
-    # PoseTrackerEncoder.__init__. `query = "none"` is therefore golden's j3 encoder.
+    # PoseTrackerEncoder.__init__. 
     enc = cfg.pop('query_encoder', 'wide')
     if enc == 'pose':
         raise SystemExit(
@@ -557,8 +557,8 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
     # values are different architectures sharing one set of tensor shapes -- so a checkpoint trained
     # under one and loaded under the other produces numbers rather than an exception.
     #
-    # That is not hypothetical. `runs/3dpop-prior` trained under unconditional per-frame
-    # re-anchoring, finished nine hours before `bcbfbc1` replaced it with the query-anchored
+    # That is not hypothetical. A 3D run trained under unconditional per-frame
+    # re-anchoring, finished nine hours before the commit that replaced it with the query-anchored
     # residual, and has no `gridresid_offset` in its config -- so every later run of it inferred
     # `world = prior + residual` from weights that learned `world = tri_t + residual_t`. Under
     # `--anchor carry` that turns the prior into a static anchor the residual head never saw, and
@@ -577,7 +577,7 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
             'pass --gridresid-offset (scripts/infer.py) / load_run(model_overrides=...) to state '
             'which one those weights were trained with.')
     offset = cfg.pop('gridresid_offset')
-    # The two query terms DEFAULT to `query`; setting one is the `j4_prior` recipe (pos, no patch).
+    # The two query terms DEFAULT to `query`; setting one gives pos without patch.
     query_terms = {k: bool(cfg.pop(k)) for k in
                    ('query_pos_embedding', 'query_patch_embedding') if k in cfg}
     # 'none' is a plain wide model, byte-identical to a config without the key.

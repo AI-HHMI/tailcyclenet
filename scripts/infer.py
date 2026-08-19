@@ -2,14 +2,14 @@
 """Run a trained model. The only entry point that touches a checkpoint.
 
     # every group of a split, cropping from the labels (the GT-crop upper bound)
-    pixi run python scripts/infer.py --run runs/w9 --data <dataset> --split test --out pred.npz
+    pixi run python scripts/infer.py --run runs/<name> --data <dataset> --split test --out pred.npz
 
     # one session, query-free
-    pixi run python scripts/infer.py --run runs/w9 --data <dataset>/test/<session> \\
+    pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> \\
         --anchor none --out pred.npz
 
     # crops from a detections file (the deployment number)
-    pixi run python scripts/infer.py --run runs/w9 --data <dataset> --boxes dets.npz --out p.npz
+    pixi run python scripts/infer.py --run runs/<name> --data <dataset> --boxes dets.npz --out p.npz
 
 A run folder carries its own config and keypoint registry, so `--run` is the whole model
 specification and a config/checkpoint mismatch cannot happen.
@@ -148,7 +148,7 @@ def main():
                          'instance -- coverage against precision, since a leftover box is exactly '
                          'one the geometry never corroborated. Whether the pose model can USE a '
                          'one-camera 3D window is the run\'s own `[data].prob_2d_only`: the shipped '
-                         '3dpop and rat-city runs set 0.25, configs/w9.toml sets 0, and under 0 it '
+                         'runs set 0.25, configs/3d.toml sets 0, and under 0 it '
                          'is an untrained input shape. Measured on 3dpop: no metric moves.')
     ap.add_argument('--max-animals', type=int, default=0)
     # DETECTION BUDGET, SEPARATE FROM THE ROW COUNT. `--max-animals` used to set both, so sweeping
@@ -525,7 +525,7 @@ def main():
     # a raw cache and an associated one are the same shape, the same dtype and the same key names.
     # An old cache read as raw would be associated a SECOND time, silently. There is no default to
     # move here -- the meaning of the file changed -- so every cache written before the split is
-    # refused. That is correct and nearly free: `scratch/phase*` caches hold BatchNorm-detector boxes
+    # refused. That is correct and nearly free: old caches hold BatchNorm-detector boxes
     # and are refused by `load_detector` already.
     #
     # `top_k` is what the raw depends on where `max_animals` used to be. It is one key rather than

@@ -19,7 +19,7 @@ from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
 from tailcyclenet.model import build_model
 from tailcyclenet.unfreeze import _norms_in_range, apply_staged_unfreeze
 
-# Everything structural from configs/w9.toml, everything expensive at its floor.
+# Everything structural from the shipped configs, everything expensive at its floor.
 SMALL = dict(
     query='prior', mode_3d='encoder', video_encoder_version='base',
     video_encoder_requires_grad=False, video_encoder_hierarchical=True,
@@ -326,8 +326,8 @@ def test_moving_camera_query_projects_per_frame(moving_batch):
 def test_missing_tokens_fire_per_keypoint(moving_batch, enc):
     """Withholding ONE keypoint's prior must move ONLY that keypoint's fused query.
 
-    This is the behavioural form of posetail-pose's defect 0.0, which was live for its whole
-    W4/W5 series: the validity mask is one flag per KEYPOINT, `(B, N)`, but the axis the
+    This is the behavioural form of a defect that was live in posetail-pose for many runs:
+    the validity mask is one flag per KEYPOINT, `(B, N)`, but the axis the
     position-derived terms live on is `(B, T*N)`. Its shape-mismatch branch broadcast keypoint 0's
     validity over every keypoint, so a single withheld prior either silenced all of them or none.
 
@@ -514,7 +514,7 @@ def test_query_free_keeps_the_depth_ce_and_drops_only_the_3d_ce(moving_batch, pr
     """The whole point of NaN-ing `anchor_local` instead of popping `grid`.
 
     `losses.py:680` gates BOTH `coords_softmax_3d` (weight 0.4) and `depth_softmax` (weight 1.5 --
-    the largest CE term in w9.toml) on `'grid' in outputs`. Only the first is query-anchored; the
+    the largest CE term in the shipped 3D config) on `'grid' in outputs`. Only the first is query-anchored; the
     depth target (`losses.py:769`) is `log(depths_true / (cube_scale * f_eff * sdep))`, which has
     nothing to do with the query. Popping `grid` therefore switched off the heavier of the two on
     every fully-unprompted step -- ~half of all steps at `prompt_dropout = 0.5`, and never on a
@@ -709,7 +709,7 @@ def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
 
     # AND AN ABSENT KEY IS AN ERROR, not `'query'`. Both values load the same tensors, so a
     # checkpoint trained under one and built under the other is wrong without raising -- which is
-    # exactly what happened to every keyless pre-`bcbfbc1` 3D run.
+    # exactly what happened to every 3D run written before the key was required.
     cfg = small(enc)
     cfg.pop('gridresid_offset')
     with pytest.raises(KeyError, match='gridresid_offset'):

@@ -27,11 +27,11 @@ prompt_noise_px = 2.5       # sigma on the prior, in PIXELS. 3D converts via cub
 # exactly -- the one quantity a whole-body lag gets wrong).
 #
 # 5.0 IS A CONSISTENCY CHOICE, NOT A MEASURED OPTIMUM. The measured value is 8.0, on allen, 3D
-# (`prior_self` 2.3275 against 2.5254, -0.277 mm [-0.395, -0.171] paired; report 13 step 6). 2D was
+# (prompted-self 2.3275 against 2.5254, -0.277 mm [-0.395, -0.171] paired; report 13 step 6). 2D was
 # proposed at 0.0 only because the key acts through `scene_center` and `cube_scale`, which are
 # 3D-derived, so report 17 section 7 argues it is UNMEASURABLE in 2D -- not that it is harmful
 # there. 5 buys one fewer knob that differs between the two files. The cost: a new 3D arm is no
-# longer paired with the `offset8` result on record, so say so when reporting one.
+# longer paired with the 8.0 result on record, so say so when reporting one.
 prompt_offset_px = 5.0
 num_workers = 12
 
@@ -127,7 +127,7 @@ depth_log_max = 2.5
 #     QueryEncoder, which model.py no longer builds
 #   mode_3d      -- "stored and never read" (build_model only asserts it)
 #   cross_attn_dim -- restated latent_dim, which is also what None defaults to
-# `scratch/regress/probe_model_shapes.py` asserts the parameter set is identical without them.
+# The parameter set is identical without them (measured).
 
 [training]
 n_iterations = 60000
@@ -155,7 +155,7 @@ print_freq = 20
 # order to resume -- its checkpoint carries AdamW-SF state, and train.py refuses to load it into a
 # Muon optimizer rather than guessing.
 optimizer = "muon"
-learning_rate = 1e-4        # what every hop of the golden chain actually ran
+learning_rate = 1e-4        # the value every run on record used
 kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
 # LIVE from the unfreeze iteration, not inert: before it the encoder groups do not exist, and at
 # the unfreeze they are created at this scale (1e-5). The AdamW half of them warms up over

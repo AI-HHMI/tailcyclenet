@@ -413,7 +413,7 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     position more than a window old is not evidence about now, and an unexpiring one made a row
     permanently unavailable for the animal that actually appeared there.
 
-    Three things this used to get wrong, and all three are visible in `scratch/phase3`'s renders:
+    Three things this used to get wrong, and all three were visible in the renders:
 
     - **THE COST WAS IoU, WHICH IS NON-DISCRIMINATIVE IN EXACTLY THE CROWDED CASE.** Replaying
       calms21 frame 301 -> 302 from the box cache: IoU picks the WRONG mouse (row0-det1 0.512
@@ -444,14 +444,14 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     WORK. THE FIX IS SPARE ROWS.** Both halves are measured, and the second is the useful one.
 
     The symptom, on rat-city's 500-frame clip where the detector fills 0.993 of slots
-    (`scratch/phase11/probe_link.py`): 5,946 detections offered, 3,891 matched, **7 born, 2,048
+    measured: 5,946 detections offered, 3,891 matched, **7 born, 2,048
     (34.4%) DROPPED** -- and 29% of the dropped were INSIDE the gate, so `max_move` is not what
     rejected them. They lost the Hungarian and had nowhere to go.
 
     The obvious reading is that eligibility is too strict: a row is open only when `last` is
     entirely non-finite, which needs `max_age = 24` frames of absence, one whole window. `birth_age`
     relaxes that -- a row unseen for that many frames is free even though `last` is kept for
-    MATCHING. It is measured and it is REFUTED (`scratch/phase11/probe_birth_age.py`), because
+    MATCHING. It is measured and it is REFUTED, because
     `run_group` crops a window to the UNION of a row's boxes and a row that changes animal
     mid-window spans both:
 

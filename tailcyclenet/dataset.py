@@ -96,7 +96,7 @@ class LoaderConfig:
     # finite point.
     # THE DEFAULT, changed deliberately: an `instances.pq` box is an ANNOTATED animal extent and a
     # keypoint crop is a box around the points that happen to be labelled, which on a sparse root
-    # is not the animal. Measured (`scratch/phase11/probe_boxsource.py`, train splits, box vs the
+    # is not the animal. Measured (train splits, box vs the
     # keypoint crop box re-entered at pad 0):
     #
     #   root                    has instances   box-only   identical   IoU p50
@@ -164,7 +164,7 @@ class LoaderConfig:
     box_prompt_dropout: float = 0.0    # fraction of STEPS the box is withheld (no-box token)
     box_prompt_jitter: float = 0.0     # exposure bias: the deployed box is a DETECTOR box
     box_prompt_scale_jitter: float = 0.0
-    # WIDE-CROP TRAINING (report 27's endpoint-1 mechanism, ported from `scratch/boxprompt/inject.py`).
+    # WIDE-CROP TRAINING (report 27's endpoint-1 mechanism).
     # Widen the crop-rule box about its centre by this factor BEFORE the coords are shifted into
     # it, in both the 2D and 3D branches of `_item` -- so the animal sits off-centre in a wider
     # crop that includes more of any neighbour, and `compute_box_prompt` (run post-hoc on the

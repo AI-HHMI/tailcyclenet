@@ -509,9 +509,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 #
                 # WHETHER A SUBSET IS A *TRAINED* INPUT IS A PROPERTY OF THE RUN. `cams_to_sample`
                 # picks camera subsets and `prob_2d_only` trains the one-camera case, and both are
-                # per-run: the `3dpop-*` and `rat-city-*` runs set `prob_2d_only = 0.25`, while
-                # `configs/w9.toml` ships 0 ("golden spent 0% of its steps on this path"). Under a
-                # config like w9's, a one-camera window is an untrained input shape rather than a
+                # per-run: a run may set `prob_2d_only = 0.25`, while `configs/3d.toml` ships 0.
+                # Under 0 a one-camera window is an untrained input shape rather than a
                 # supported one. Predicting it beats dropping it either way, but do not read a
                 # single-view arm without checking the run's own `[data].prob_2d_only`.
                 use, boxes = [], []
@@ -539,7 +538,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     # THE UNION IS PER CAMERA, over that camera's OWN finite frames, so camera A's
                     # crop can be positioned by frame 0 and camera B's by frame 23 -- the model then
                     # triangulates across crops that are not contemporaneous. That is left alone on
-                    # measurement (`scratch/phase4/union_spans.py`, over every 3dpop box cache): of
+                    # measurement, over every 3dpop box cache: of
                     # 480 multi-camera animal-windows, the intersection of the contributing cameras'
                     # spans has median 0.92-1.00 of the window, 12-15% fall below half, and only
                     # 6-12 (1.3-2.5%) are DISJOINT with nothing contemporaneous at all. Both

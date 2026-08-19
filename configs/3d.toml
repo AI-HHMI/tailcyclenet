@@ -24,5 +24,5 @@ cams_to_sample = 0
 val_cams_to_sample = 5      # the reference's [dataset.val] value
 # Rate at which a 3D session is shown a SINGLE camera. 0 turns the 3D-single-view path off
 # entirely -- there is no triangulation there, so a non-query point has nothing to predict and
-# leaves the 3D target. Golden spent 0% of its steps on this path.
+# leaves the 3D target.
 prob_2d_only = 0

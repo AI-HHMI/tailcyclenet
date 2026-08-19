@@ -322,7 +322,7 @@ def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
     `__getitem__` composes `tile @ warp @ decode`. About the FRAME centre a rotation sweeps an
     animal clean out of the 640-px window that was chosen for it -- measured on
     rat-city-annotated at 0.075 of animal-bearing tiles still holding an animal, against 0.820
-    about the tile centre (`scratch/rat-city/check_rotation.py`). Here the check is structural:
+    about the tile centre (measured). Here the check is structural:
     the tile's own centre is a fixed point of its warp, and the frame's centre is not.
     """
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(32, 32), min_crop_dim=8,

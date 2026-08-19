@@ -894,7 +894,7 @@ def test_a_smaller_input_is_compensated_at_all_four_sites(scene):
     `image_size` stands for three things and only one -- the pixel extent of the input -- is wrong
     for a smaller crop. posetail 0.3.5 splits it out as `input_size=` on `TrackerEncoder.forward`:
     the pad target, the 2D-head rescale and the gridresid gauge all follow the canvas the forward
-    actually saw. The MAGNITUDES are measured on real weights in `scratch/refine3d/RESULT.md` --
+    actually saw. The MAGNITUDES are measured on real weights (dev/reports/26 §5b) --
     45.2 mm on the triangulation, 1.3334 = 256/192 on the residual. A random fixture model cannot
     pin those; it can pin that `input_size` reaches the library forward with the canvas's extent,
     which is the part that rots.

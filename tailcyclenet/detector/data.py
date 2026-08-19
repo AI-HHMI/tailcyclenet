@@ -418,7 +418,7 @@ class BoxDataset(Dataset):
         # which 48 are positive, a ~69% positive rate against 0.68% unmasked, and 17% of frames
         # have no certified negative at all. Tiling is what fixes that: at 640x640 tiles rendered
         # at scale 1.0 the same measurement reads 5.2% positive with 0% of tiles lacking a
-        # certified negative (`scratch/tile_certified_rate.py`). The rate is set by how many
+        # certified negative. The rate is set by how many
         # stride-8 CELLS the certified region spans, not by its area, because `CENTER_RADIUS` is
         # 2.5 cells -- so it is a resolution knob and `tile_scale` is what sets it.
         self.use_regions = bool(use_regions)

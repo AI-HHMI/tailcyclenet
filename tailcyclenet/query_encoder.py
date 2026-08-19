@@ -46,8 +46,7 @@ def _sub_unprompted(owner, term, token):
 
     ONE implementation for every position-derived term in BOTH encoders. A second copy for `pos`,
     `vis` or `qpos` would be the same mistake as having three window loops -- and it is the exact
-    mistake posetail-pose made: `scripts/test_query_path.py`'s two worst defects, live for its
-    entire W4/W5 series, were a mask derived from an always-finite tensor (so `missing_patch` was
+    mistake posetail-pose made: the two worst defects in posetail-pose's query path, live for most of its history, were a mask derived from an always-finite tensor (so `missing_patch` was
     DEAD CODE and unprompted patches were sampled at the crop centre) and a `(B,N)` mask applied
     to a `(B,T*N)` axis (so keypoint 0's validity was broadcast over every keypoint). This repo
     fixes the first in `model.py` and the second in `_tile_to_query_axis` below -- but the second

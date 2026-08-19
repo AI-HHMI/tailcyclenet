@@ -69,9 +69,8 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
 
             **Whether the pose model can use that input is a property of the RUN, not of the
             model.** A single-view 3D window is the `prob_2d_only` path (`dataset.py`), and
-            `configs/w9.toml` ships `prob_2d_only = 0` -- "golden spent 0% of its steps on this
-            path" -- so under that config a one-camera instance is an UNTRAINED input shape. The
-            `3dpop-*` and `rat-city-*` runs set 0.25 and do train it. Check the run's own
+            `configs/3d.toml` ships `prob_2d_only = 0`, so under it a one-camera instance is an
+            UNTRAINED input shape. A run may set 0.25 and train it. Check the run's own
             `[data].prob_2d_only` before reading anything into a `min_views = 1` arm.
 
             It cannot be free either: a leftover box is one the geometry never corroborated, so it

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Render a tailcycle dataset so a human can see what is actually in it.
 
-    pixi run python scripts/render_dataset.py --data <root|session> --out scratch/render
+    pixi run python scripts/render_dataset.py --data <root|session> --out <outdir>
     pixi run python scripts/render_dataset.py --data <root> --out <dir> --n 4 --video
 
 Three views per sampled group, because no single one is checkable on its own:

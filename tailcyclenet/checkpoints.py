@@ -92,7 +92,7 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     weight a run resumes from. Pass `checkpoint='checkpoint_best.pth'` for the best-val one.
 
     The newest-by-name fallback is for external base-checkpoint folders, which still carry
-    `checkpoint_00001000.pth`-style names (`[training].checkpoint_path` in configs/w9.toml), and
+    `checkpoint_00001000.pth`-style names (`[training].checkpoint_path` in `configs/base.toml`), and
     for run folders written before the two-file scheme. There is no half-written file to guard
     against -- `save_checkpoint` renames into place atomically.
     """
@@ -122,8 +122,8 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
 def provenance() -> dict:
     """The commit this source tree is at, and whether it was dirty. Best effort.
 
-    A CONFIG IS NOT A PROVENANCE RECORD. `runs/3dpop-prior` trained under unconditional per-frame
-    re-anchoring, finished nine hours before `bcbfbc1` replaced that with the query-anchored
+    A CONFIG IS NOT A PROVENANCE RECORD. A 3D run trained under unconditional per-frame
+    re-anchoring, finished nine hours before the commit that replaced that with the query-anchored
     residual, and carries no `gridresid_offset` key -- so it was later loaded, silently, as the
     architecture it was not trained with. Nothing in the folder could have said otherwise: it holds
     `config.toml`, the registry, the checkpoints, and no statement about the code.

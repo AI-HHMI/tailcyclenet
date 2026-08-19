@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Finetune a posetail tracker into a pose estimator.
 
-    pixi run python scripts/train.py --config configs/w9.toml
-    pixi run python scripts/train.py --config configs/w9.toml --iters 200   # smoke test
+    pixi run python scripts/train.py --config configs/3d.toml
+    pixi run python scripts/train.py --config configs/3d.toml --iters 200   # smoke test
 
 The config is the source of truth for everything that defines a run; the CLI carries only
 overrides and one-offs. The run folder is the output, and it holds the config, the keypoint
@@ -111,8 +111,8 @@ def init_wandb(config: dict, run: Path, disabled: bool = False):
         print('wandb: not installed, skipping')
         return None
     Path(cfg.get('path', '.')).mkdir(parents=True, exist_ok=True)
-    # <timestamp>-<run folder name>. The folder name alone is not unique -- runs/a/w9 and
-    # runs/b/w9 both read `w9` in the UI, and wandb only guarantees uniqueness on the run ID --
+    # <timestamp>-<run folder name>. The folder name alone is not unique -- runs/a/exp and
+    # runs/b/exp both read `exp` in the UI, and wandb only guarantees uniqueness on the run ID --
     # and re-running into the same --out is the normal way to resume here. `%Y%m%d_%H%M%S` is
     # wandb's own directory convention (`run-20260727_113457-ukt14i7c`), so it sorts
     # lexicographically and carries no spaces or colons.
@@ -260,7 +260,7 @@ def run_batch(model, loss_fn, batch, device):
     NOT a root-cause fix, and the difference matters. The NaN is real and is not understood:
     measured on 3dpop's `query = "none"` arm, the whole forward goes NaN while the parameters,
     `scene_center` and every target are finite, and it is intermittent (step 16 and step 31 on two
-    runs of one config). `scratch/sweep/probe.py` is the instrument for chasing it.
+    runs of one config).
 
     WATCH `skipped`. A few isolated steps is the case this handles. A rising fraction means the
     model is sitting in a NaN state and the run is dead while still printing -- kill it.

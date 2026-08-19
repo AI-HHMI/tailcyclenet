@@ -564,7 +564,7 @@ def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
     """
     import numpy as np
 
-    from tailcyclenet.detector import box_iou, link_rows
+    from tailcyclenet.detector import link_rows
 
     last = np.array([100.0, 100.0, 300.0, 300.0], np.float32)     # remembered, 200 px
     near = np.array([170.0, 170.0, 230.0, 230.0], np.float32)      # same centre, 60 px
@@ -1534,7 +1534,6 @@ def test_strong_augment_off_is_byte_identical(tiny_root):
     `--augment-strong` is a KEY: every recorded arm before it existed must stay reproducible, so
     the off path has to be indistinguishable from a `BoxDataset` that has never heard of it.
     """
-    rng_state = np.random.get_state()
     ds_a = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
                      max_frames_per_group=2, augment=True, strong=False, seed=0)
     ds_b = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
@@ -1681,7 +1680,7 @@ def test_detector_config_loads_with_shipped_defaults(tmp_path):
 
     # `extends` resolves against the config's OWN directory, so base and overlay share tmp_path.
     shutil.copy(SHIPPED_DETECTOR_CONFIG, tmp_path / 'base.toml')
-    overlay = _write_config(tmp_path, f"""
+    overlay = _write_config(tmp_path, """
 extends = "base.toml"
 [data]
 path = "/tmp/ds"
@@ -1719,7 +1718,7 @@ def test_detector_config_unknown_key_raises_in_every_block(tmp_path):
     for block, bad in (('data', 'bogus = 1'),
                        ('model', 'bogus = 1'),
                        ('training', 'bogus = 1')):
-        p = _write_config(tmp_path, f"""
+        p = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
 boxes = "instances"
@@ -1745,15 +1744,6 @@ iters = 1
 def test_detector_config_bad_choices_raise(tmp_path):
     from tailcyclenet.detector.config import load_detector_config
 
-    base = """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-iters = 1
-"""
     # boxes lives in [data]; append the bad key to the existing [data] block instead of a second one.
     p = _write_config(tmp_path, """\
 [data]
@@ -1785,7 +1775,9 @@ def test_detector_config_extends_one_level(tmp_path):
     """User overlays can `extends` the shipped file; the merge is per BLOCK (pose rule)."""
     from tailcyclenet.detector.config import load_detector_config
 
-    base = _write_config(tmp_path, """
+    # writes base.toml, which the overlay below reaches by `extends` -- the call is the point,
+    # the path is not used here.
+    _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
 boxes = "instances"

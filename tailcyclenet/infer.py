@@ -35,7 +35,7 @@ from posetail.posetail.cube import is_point_visible, project_points_torch
 
 from . import crop as cropmod
 from .dataset import _crop_affine, _resize_camera, read_frames
-from .format import VISIBLE, Labels, Session
+from .format import Labels, Session
 from .model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')

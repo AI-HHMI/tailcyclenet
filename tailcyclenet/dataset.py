@@ -41,7 +41,7 @@ from posetail.posetail.cube import get_camera_scale, is_point_visible, project_p
 
 from . import crop as cropmod
 from .crop import BOX_SOURCES
-from .format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
+from .format import PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
 
 
 @dataclass
@@ -1050,7 +1050,7 @@ class PoseDataset(Dataset):
         frames = self._frames(item, lab, group, rng)
         if frames is None:
             return None
-        a, T = item.animal, len(frames)
+        a = item.animal
         K = sess.n_keypoints
 
         cgroup = sess.cgroup(item.gid, frames)

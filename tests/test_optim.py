@@ -253,7 +253,6 @@ def test_eval_train_swap_and_has_averaged_iterate():
 
 
 def test_unknown_optimizer_key_raises():
-    tr = _train_module()
     assert 'muon_lr' not in KNOWN_OPTIMIZER_KEYS
     # The guard lives in main(); replicate it exactly rather than standing up a full run.
     cfg = _cfg(muon_lr=1e-4)

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import itertools
 
-import numpy as np
 import torch
 
 from posetail.posetail.cube import project_points_torch

@@ -13,7 +13,6 @@ make a small distant animal look as big as a close one.
 """
 from __future__ import annotations
 
-import numpy as np
 import torch
 
 from posetail.posetail.cube import project_points_torch

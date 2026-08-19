@@ -8,6 +8,8 @@ The config is the source of truth for everything that defines a run; the CLI car
 overrides and one-offs. The run folder is the output, and it holds the config, the keypoint
 registry and the checkpoints -- so eval and inference take only `--run <folder>`.
 """
+# E402: the tailcyclenet imports below must follow this file's sys.path.insert.
+# ruff: noqa: E402
 from __future__ import annotations
 
 import argparse
@@ -15,7 +17,6 @@ import ctypes
 import json
 import sys
 import time
-import tomllib
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path

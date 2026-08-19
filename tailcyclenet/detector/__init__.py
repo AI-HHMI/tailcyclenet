@@ -485,8 +485,6 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
-    from . import identity as idy
-
     S, T, C, _ = boxes.shape
     last = boxes[:, 0].copy()                     # (S,C,4), each row's most recent known box
     age = np.zeros(S, int)                        # frames since this row was last seen

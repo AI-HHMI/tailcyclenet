@@ -532,7 +532,6 @@ def test_query_free_keeps_the_depth_ce_and_drops_only_the_3d_ce(moving_batch, pr
 def test_prior_points_are_query_anchored_and_others_triangulated(moving_batch):
     """Per-KEYPOINT selection: a prompted keypoint uses the residual, an unprompted one does not."""
     b = moving_batch
-    K = b.kpt_ids.shape[1]
     model = build_model(small('wide', query='prior', gridresid_offset='query'),
                         n_keypoints=int(b.kpt_ids.max()) + 1).eval()
 

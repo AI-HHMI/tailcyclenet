@@ -27,7 +27,6 @@ def test_crop_rule_is_int32_exact():
     supplies the one attribute it reads. Any drift here invalidates every detector number.
     """
     from types import SimpleNamespace
-    from posetail.datasets.posetail_dataset import PosetailDataset
 
     rng = np.random.default_rng(0)
     shim = SimpleNamespace(min_crop_dim=64)
@@ -39,7 +38,6 @@ def test_crop_rule_is_int32_exact():
             pts[rng.integers(n)] = float('nan')
         size = torch.tensor([w, h], dtype=torch.int32)
 
-        cam = {'size': size, 'offset': torch.zeros(2)}
         # the library projects first; feed it a camera whose projection is the identity by
         # calling the crop arithmetic on the same points through a one-camera group
         mine = cropmod.crop_box_for_points(pts, size, 64)
@@ -719,7 +717,6 @@ def test_no_visibility_supervision_without_ground_truth(tiny_root, monkeypatch):
     assert b.vis is None and b.vis_2d is None
 
     seen = []
-    real = TotalLoss.forward
 
     class Spy(TotalLoss):
         def forward(self, model, outputs, coords_true, vis_true, vis_true_cams, **kw):

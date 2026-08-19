@@ -17,7 +17,7 @@ from tailcyclenet import box_prompt as bpmod
 from tailcyclenet import crop as cropmod
 from tailcyclenet.model import build_model
 from tailcyclenet.query_encoder import (BoxFilmEncoder, BoxTermEncoder, WideQueryEncoder,
-                                        _box_features, _normalize_box)
+                                        _normalize_box)
 from test_model import SMALL
 
 

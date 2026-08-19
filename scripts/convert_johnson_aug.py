@@ -75,9 +75,7 @@ AUG_NOTE = ('13 photometric/compositing variants; an augmented image carries key
             'never eval')
 
 
-# ----------------------------------------------------------------------------------------------
 # the augmented frameset grammar
-# ----------------------------------------------------------------------------------------------
 
 def split_key(key: str) -> tuple[str, int, str]:
     """`<trial>/Frame_<N>[__<variant>]` -> (trial, source frame, variant or '')."""
@@ -104,9 +102,7 @@ def resolve_image(rel: str, src: Path, fallback: Path) -> Path:
                        f'and {b} does not exist')
 
 
-# ----------------------------------------------------------------------------------------------
 # reading
-# ----------------------------------------------------------------------------------------------
 
 def read_aug(src: Path) -> dict:
     """The augmented train JSON, indexed by (trial, variant) -> {source frame: {camera: image id}}.
@@ -141,9 +137,7 @@ def read_aug(src: Path) -> dict:
     return d
 
 
-# ----------------------------------------------------------------------------------------------
 # labels
-# ----------------------------------------------------------------------------------------------
 
 def fill_2d(d: dict, run: list[int], views: dict[int, dict[str, int]], cams: list[str],
             K: int) -> fmt.Labels:
@@ -250,9 +244,7 @@ def _same_2d(a: np.ndarray, b: np.ndarray) -> bool:
                                                                       b[~np.isnan(b)]))
 
 
-# ----------------------------------------------------------------------------------------------
 # conversion
-# ----------------------------------------------------------------------------------------------
 
 def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px: float,
                   only: list[str] | None, max_groups: int | None, dry_run: bool) -> dict:
@@ -450,9 +442,7 @@ def convert_val(fallback: Path, out: Path, max_gap: int, reject_px: float, dry_r
             })
 
 
-# ----------------------------------------------------------------------------------------------
 # checks
-# ----------------------------------------------------------------------------------------------
 
 def check_aug_equals_original(out: Path, limit: int) -> int:
     """Re-read from disk: an augmented group must equal its source frames' original group.
@@ -521,9 +511,7 @@ def check_no_dangling(out: Path) -> int:
     return n
 
 
-# ----------------------------------------------------------------------------------------------
 # main
-# ----------------------------------------------------------------------------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,

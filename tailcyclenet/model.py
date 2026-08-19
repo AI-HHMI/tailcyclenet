@@ -50,9 +50,7 @@ QUERY_ENCODERS = ('wide',)
 GRIDRESID_OFFSETS = ('query', 'triangulated')
 
 
-# ----------------------------------------------------------------------------------------------
 # the query-free scene point
-# ----------------------------------------------------------------------------------------------
 
 def scene_center(camera_group):
     """The 3D point every camera's crop centre looks at. (3,) float32.
@@ -111,9 +109,7 @@ def scene_center(camera_group):
     return torch.linalg.solve(A, b).to(torch.float32)
 
 
-# ----------------------------------------------------------------------------------------------
 # the model
-# ----------------------------------------------------------------------------------------------
 
 class PoseTrackerEncoder(TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='wide',

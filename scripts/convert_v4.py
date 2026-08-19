@@ -45,9 +45,7 @@ DATASETS = ('rat-city', 'allen-mouse', '3dpop', 'branson-fly', 'johnson-mouse')
 _IX = re.compile(r'_ix(\d+)$')
 
 
-# ----------------------------------------------------------------------------------------------
 # the allen column-sort repair
-# ----------------------------------------------------------------------------------------------
 
 def column_sort_perm(names):
     """perm[i] = the slot holding `names[i]` when a pose array is stored COLUMN-sorted.
@@ -72,9 +70,7 @@ def column_sort_perm(names):
     return None if (perm == np.arange(len(names))).all() else perm
 
 
-# ----------------------------------------------------------------------------------------------
 # v4 reading
-# ----------------------------------------------------------------------------------------------
 
 def load_spec(name: str) -> dict:
     with open(SPECS / f'{name}.toml', 'rb') as f:
@@ -242,9 +238,7 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     return lab
 
 
-# ----------------------------------------------------------------------------------------------
 # conversion
-# ----------------------------------------------------------------------------------------------
 
 def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int | None,
                     dry_run: bool) -> None:

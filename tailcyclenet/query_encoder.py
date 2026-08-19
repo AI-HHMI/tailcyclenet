@@ -314,9 +314,7 @@ class WideQueryEncoder(nn.Module):
         return terms, ctx
 
 
-# ----------------------------------------------------------------------------------------------
 # the box prompt: which-animal-occupies-this-box, as a NON-position input channel
-# ----------------------------------------------------------------------------------------------
 #
 # Report 27. Told which box the target animal occupies -- per frame, per camera -- a box-prompt
 # model can be told which animal to return, WITHOUT the box being a position prior (it carries no
@@ -410,7 +408,6 @@ class BoxFilmEncoder(WideQueryEncoder):
         gamma, beta = gb[..., :self.dim], gb[..., self.dim:]
         terms[0] = terms[0] * (1.0 + gamma) + beta          # terms[0] is the identity term
         return self._gate_and_fuse(terms, ctx)
-
 
 
 BOX_ENCODERS = {'film': BoxFilmEncoder}

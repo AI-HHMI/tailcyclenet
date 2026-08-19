@@ -400,87 +400,39 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
 def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
-    WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t
-    and row 0 at frame t+1 are unrelated -- measured on branson-fly, the median IoU between a
-    row's own consecutive boxes is 0.000 across ten near-identical flies. That matters because
-    `infer.run_group` crops each window to the UNION of its frames' boxes, to stop an animal
-    walking out of its own crop: fed unlinked rows, that union is 45x (branson-fly) / 59x
-    (rat-city) the area of one animal and the pose model receives the whole arena squeezed into
-    256 px.
+    WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t and
+    row 0 at frame t+1 are unrelated. That matters because `infer.run_group` crops each window to
+    the UNION of its frames' boxes, and fed unlinked rows that union is 45-59x the area of one
+    animal -- the whole arena squeezed into 256 px.
 
     Matching is against each row's LAST KNOWN box, not against frame t-1, so a one-frame detector
-    miss does not break the chain -- but that box EXPIRES after `max_age` frames, because a
-    position more than a window old is not evidence about now, and an unexpiring one made a row
-    permanently unavailable for the animal that actually appeared there.
+    miss does not break the chain -- but that box EXPIRES after `max_age` frames, or a stale
+    position makes a row permanently unavailable to the animal that actually appeared there.
 
-    Three things this used to get wrong, and all three were visible in the renders:
+    THE COST IS CENTRE DISTANCE OVER THE MEAN BOX SIDE, GATED AT ONE SIDE -- deliberately not IoU.
+    IoU ranks by shape agreement, which is not identity: two touching mice overlap almost equally,
+    and IoU is exactly ZERO under fast motion, where it cannot rank at all. The gate has 10-16x
+    headroom over real motion (p90 centre displacement is 0.06-0.11 body lengths on every
+    multi-animal root).
 
-    - **THE COST WAS IoU, WHICH IS NON-DISCRIMINATIVE IN EXACTLY THE CROWDED CASE.** Replaying
-      calms21 frame 301 -> 302 from the box cache: IoU picks the WRONG mouse (row0-det1 0.512
-      against row0-det0 0.233) because two touching 220 px mice overlap almost equally, while
-      centre distance picks the right one (0.24 against 0.50 box sides). Hungarian-matching the
-      pose to labels after that swap shows the error jump from 4-10 px to 60-82 px -- the user's
-      "the points go haywire". IoU is also exactly ZERO under fast motion, where it cannot rank at
-      all. So the cost is CENTRE DISTANCE OVER THE MEAN BOX SIDE, turned into an affinity that is
-      positive only inside the gate.
-    - **THERE WAS NO GATE.** The only test was `cost > 0`, i.e. any overlap whatsoever. Real motion
-      is tiny -- consecutive-frame box-centre displacement is p90 0.06-0.11 body lengths on all
-      three roots -- so a gate at ONE box side has 10-16x headroom and rejects essentially nothing
-      legitimate. What it does reject is the 3.4-3.9% of 3dpop row transitions that jump more than
-      a full body length (max 11) and rat-city's 8 jumps beyond two.
-    - **AN UNMATCHED ROW WAS FORCE-ASSIGNED SOMEBODY ELSE'S DETECTION** (`free.pop(0)`, an
-      arbitrary leftover). That is rat-city row 9, the user's "weird rat stretching across the
-      whole frame where there is no rat": its per-frame boxes are normal size (170x173, 278x169)
-      but TELEPORT -- x~3820 at t=0-10, x~1900 at t=12-14, back to 1937 at t=32, 3581 at t=42 --
-      and `run_group` then crops the window to their union, 1924x1924 against a 244 px rat, 62x the
-      area. Now an unmatched row stays EMPTY, which fixes the giant union crop at its source rather
-      than bounding it downstream.
+    AN UNMATCHED ROW STAYS EMPTY rather than taking an arbitrary leftover. A force-assigned row
+    TELEPORTS across the frame, and `run_group` then crops the window to the union of those
+    positions -- measured at 1924x1924 against a 244 px rat. Empty fixes it at the source.
 
-    A detection nobody claimed may still START a row, but only a row that is empty or expired --
-    which is a birth, not a swap. Beyond that it is dropped: there is no row for it, and inventing
-    one on top of a live animal is `fp_dup`.
+    A detection nobody claimed may still START a row, but only one that is empty or expired --
+    a birth, not a swap. Beyond that it is dropped; inventing a row on top of a live animal is
+    `fp_dup`.
 
-    **THIS FUNCTION DROPS A THIRD OF rat-city's DETECTIONS AND `birth_age` IS THE FIX THAT DOES NOT
-    WORK. THE FIX IS SPARE ROWS.** Both halves are measured, and the second is the useful one.
+    THIS DROPS A THIRD OF rat-city's DETECTIONS, AND SPARE ROWS ARE THE FIX -- NOT `birth_age`.
+    Relaxing eligibility (`birth_age`) buys coverage at exactly the price the strict rule exists to
+    prevent: the union p99 grows from 590 px to 4367 against a 244 px rat, because a row that
+    changes animal mid-window spans both. It defaults to None, off and byte-identical to the rule
+    before it existed. Raising the ROW COUNT instead seats nearly everything AND tightens the union
+    (p99 590 -> 525 at 12 -> 24 rows), because no row has to hold two animals.
 
-    The symptom, on rat-city's 500-frame clip where the detector fills 0.993 of slots
-    measured: 5,946 detections offered, 3,891 matched, **7 born, 2,048
-    (34.4%) DROPPED** -- and 29% of the dropped were INSIDE the gate, so `max_move` is not what
-    rejected them. They lost the Hungarian and had nowhere to go.
-
-    The obvious reading is that eligibility is too strict: a row is open only when `last` is
-    entirely non-finite, which needs `max_age = 24` frames of absence, one whole window. `birth_age`
-    relaxes that -- a row unseen for that many frames is free even though `last` is kept for
-    MATCHING. It is measured and it is REFUTED, because
-    `run_group` crops a window to the UNION of a row's boxes and a row that changes animal
-    mid-window spans both:
-
-        birth_age   999(off)   8      4      2      1      0
-        fill          0.652  0.716  0.730  0.764  0.816  0.993
-        union p99       590   3044   3804   4090   4200   4367     px, against a 244 px rat
-
-    Coverage is bought at exactly the price the strict rule exists to prevent, and `birth_age = 0`
-    is `--no-link-boxes` (78.9 px at coverage 0.131 end to end). So it DEFAULTS TO None -- off,
-    byte-identical to the rule before it existed -- and is kept only because the sweep above is
-    worth more than the knob.
-
-    **What actually works is giving births somewhere to go.** `--max-animals` sets the row count `S`
-    from the LABEL count, so 12 rats get 12 rows and an unmatched detection can only be seated by
-    evicting a live animal. With spare rows the STRICT rule seats nearly everything and the union
-    gets TIGHTER, because no row has to hold two animals (`probe_spare_rows.py`):
-
-        rows      12     18     24        (birth_age off throughout)
-        fill/GT  0.652  0.914  1.042
-        union p99  590    564    525      px
-
-    Not the row count's fault either, strictly: it is that `S` is derived from how many animals the
-    LABELS name, which is a statement about annotation and not about how many boxes a tracker needs.
-
-    ponytail: still per-frame Hungarian on geometry alone. No appearance model, no velocity (report
-    12 R2 measured that as not worth it), no re-identification after a long occlusion. `dev/reports/
-    12_crossview_tracking.md` R1 is the target state -- ONE cross-view target set with one affinity,
-    which deletes this function -- and this is the measurable interim that makes the renders usable
-    and gives R1 a baseline to beat.
+    ponytail: still per-frame Hungarian on geometry alone. No appearance model, no velocity
+    (measured as not worth it), no re-identification after a long occlusion. ONE cross-view target
+    set with one affinity is the target state and deletes this function; this is the interim.
     """
     import numpy as np
     from scipy.optimize import linear_sum_assignment

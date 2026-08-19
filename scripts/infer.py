@@ -474,64 +474,27 @@ def main():
     want = set(args.groups.split(',')) if args.groups else None
     render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
 
-    # The box cache. `stamp` is every input the boxes depend on: reusing a cache written under a
-    # different detector, threshold or animal count would quietly make one arm incomparable to
-    # the next, which is the kind of mismatch that gets published (eval rule 4).
+    # The box cache. `stamp` is every input the boxes DEPEND ON: reusing a cache written under a
+    # different detector, threshold or animal count would quietly make one arm incomparable to the
+    # next (eval rule 4).
     #
-    # ONLY THE OPTIONS THAT DIFFER FROM THEIR DEFAULTS, and sorted by name. A positional list of
-    # every value invalidated every cache on disk each time a new flag was added to the end of it --
-    # three times in one afternoon, twice in the middle of a sweep, each time refusing boxes that
-    # were in fact exactly the right boxes. Under this form a new option carrying its default leaves
-    # the stamp untouched, while any option a run actually set is still in it.
+    # ONLY THE OPTIONS THAT DIFFER FROM THEIR DEFAULTS, sorted by name -- a positional list of every
+    # value invalidated every cache on disk each time a flag was added.
     #
-    # `det_score` is UNCONDITIONAL, and that is the exception the rule needs: its default moved
-    # 0.05 -> 0.99 -> 0.5, so "equals the default" means different boxes before and after. Omitting it would
-    # let a cache built under the old default be reused silently under the new one -- precisely the
-    # mismatch this stamp exists to catch. Anything whose default may move belongs on this line.
-    # `link_rev` for the same reason `det_score` is unconditional: the cache holds boxes that have
-    # already been through `link_rows`, so changing that rule silently makes an old cache a
-    # different box set. It USED to appear only when linking was on -- which was safe only while
-    # linking defaulted off. Now that `--link-boxes` defaults ON, "equals the default" means a
-    # different box set before and after, exactly as it did for `track`: a cache written under the
-    # old default carries no `link_rev` and no `link_boxes` entry, and under this line is REFUSED
-    # rather than reused as if it had been linked. This is the FOURTH instance of the same trap.
+    # THE UNCONDITIONAL KEYS ARE THE EXCEPTION THAT RULE NEEDS: anything whose default may MOVE, or
+    # that comes from the CHECKPOINT rather than the command line, must be stamped always, or a
+    # cache written under the old meaning is reused silently under the new one. That covers
+    # `det_score`, `top_k`, `tile_scale`, `reduce` and `raw_rev`. `raw_rev` is the sharpest: a raw
+    # cache and a pre-split associated one share shape, dtype and key names, so an old one read as
+    # raw would be associated a SECOND time.
     #
-    # `track` IS UNCONDITIONAL TOO, and for the third instance of the same reason: its default moved
-    # from off to on, so "equals the default" means a different box set before and after. Every cache
-    # written while it was off carries no `track` entry, and under this line those caches are now
-    # REFUSED rather than silently reused as if they had been tracked -- which is the whole point of
-    # the stamp. Deleting them is correct; reproducing an untracked arm needs `--no-track`.
+    # THE CACHE HOLDS RAW DETECTIONS, SO THE ASSOCIATION OPTIONS LEAVE THE STAMP. `track`,
+    # `link_boxes`, `max_animals`, `min_views` and `max_move` change only what happens after
+    # detection, and `associate_group` re-runs every invocation -- microseconds per frame against
+    # 44 ms of 4K decode. One cache serves every identity arm, matching them BY CONSTRUCTION.
     #
-    # `tile_scale` is UNCONDITIONAL for the FIFTH instance of the same trap, and this one is not
-    # about a moved default: it comes from the CHECKPOINT rather than the command line, so two runs
-    # can differ in it with identical arguments. A tile-trained detector is deployed at a different
-    # whole-frame input size than a letterbox-trained one, which is a different box set under an
-    # otherwise identical stamp. Every cache written before the key existed carries no entry and is
-    # now refused rather than reused as if the scales matched.
-    #
-    # `reduce` is unconditional for the SAME reason, and it is the second checkpoint-derived one:
-    # `load_detector` reads it off the checkpoint, `detect_group` uses it to pick the decode
-    # resolution the detector sees, and a different decode resolution is a different box set. It
-    # was in neither list, so two detectors differing only in it shared a cache silently.
-    #
-    # **THE CACHE NOW HOLDS RAW DETECTIONS, SO THE ASSOCIATION OPTIONS LEAVE THIS STAMP.** `track`,
-    # `link_boxes`, `link_rev`, `max_animals`, `min_views`, `dup_res_px` and `max_move` change only
-    # what happens AFTER detection, and `associate_group` re-runs on every invocation -- microseconds
-    # per frame against 44 ms of 4K decode. So one cache now serves every identity arm, which makes
-    # those arms matched BY CONSTRUCTION rather than by trusting the detector to be deterministic
-    # (eval rule 4), and is the whole reason the split exists.
-    #
-    # `raw_rev` is UNCONDITIONAL and is the SIXTH instance of the `det_score` trap, and the sharpest:
-    # a raw cache and an associated one are the same shape, the same dtype and the same key names.
-    # An old cache read as raw would be associated a SECOND time, silently. There is no default to
-    # move here -- the meaning of the file changed -- so every cache written before the split is
-    # refused. That is correct and nearly free: old caches hold BatchNorm-detector boxes
-    # and are refused by `load_detector` already.
-    #
-    # `top_k` is what the raw depends on where `max_animals` used to be. It is one key rather than
-    # two because the dependency is genuinely one thing: `--det-top-k` when set, and the animal count
-    # `max_animals` implies when not. Conditional membership is what makes a stamp lie, so the key is
-    # always present and its VALUE says which rule produced it.
+    # `top_k` is always present and its VALUE says which rule produced it (`--det-top-k` when set,
+    # else the count `max_animals` implies). Conditional membership is what makes a stamp lie.
     from tailcyclenet.detector import RAW_REV
     top_k_stamp = (str(args.det_top_k) if args.det_top_k
                    else f'from-max-animals:{args.max_animals}')

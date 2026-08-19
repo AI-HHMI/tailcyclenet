@@ -174,7 +174,6 @@ def _photometric(img, rng):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# ================================================================================================
 # THE STRONG SUITE -- `--augment-strong`. Layered AFTER `_photometric`, gated on
 # `self.strong and self.augment and self.train`, off by default and off means none of these draws
 # happen at all (byte-identical to every recorded detector). Every op here is APPEARANCE-ONLY or,
@@ -272,7 +271,6 @@ def _keypoints_in_rects(kpts_xy, rects):
     for x0, y0, x1, y1, _ in rects:
         mask = mask | ((x >= x0) & (x < x1) & (y >= y0) & (y < y1))
     return mask
-# ================================================================================================
 
 
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,

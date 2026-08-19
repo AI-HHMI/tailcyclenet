@@ -99,9 +99,7 @@ ALIGN_TOL = 1.0             # mean |diff| between the extracted frame and decord
                             # neighbour, so this sits ~180x below the discriminating gap.
 
 
-# --------------------------------------------------------------------------------------------
 # reading the .lbl
-# --------------------------------------------------------------------------------------------
 
 def read_lbl(path: Path, tmp: Path) -> dict:
     """The APT project's variables. Accepts the tar wrapper or a bare MATLAB file."""
@@ -190,9 +188,7 @@ def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
     return f, np.stack([lo[0], lo[1], hi[0], hi[1]], -1)
 
 
-# --------------------------------------------------------------------------------------------
 # what becomes a session, and which split it lands in
-# --------------------------------------------------------------------------------------------
 
 _C5_DATE = re.compile(r'/original/.*_20250819_')
 
@@ -271,9 +267,7 @@ def build_jobs(d: dict) -> list[Job]:
     return jobs
 
 
-# --------------------------------------------------------------------------------------------
 # pixels
-# --------------------------------------------------------------------------------------------
 
 _readers: dict[str, object] = {}
 _readers_lock = threading.Lock()
@@ -400,9 +394,7 @@ def check_contiguity(movie: str, starts: list[int]) -> str:
     return ''
 
 
-# --------------------------------------------------------------------------------------------
 # labels
-# --------------------------------------------------------------------------------------------
 
 def padded_extent(pts: np.ndarray, wh) -> np.ndarray:
     """(K,2) source px -> [x0,y0,x1,y1], the padded extent of the finite points, or NaN.
@@ -479,9 +471,7 @@ def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int
     return out[keep], int((~keep).sum())
 
 
-# --------------------------------------------------------------------------------------------
 # one movie -> one session
-# --------------------------------------------------------------------------------------------
 
 def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     names = [RENAME.get(nm, nm) for nm in APT_NAMES]
@@ -605,8 +595,6 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
         })
     return stat
 
-
-# --------------------------------------------------------------------------------------------
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,

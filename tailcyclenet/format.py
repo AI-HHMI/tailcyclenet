@@ -57,9 +57,7 @@ class FormatError(Exception):
     """A dataset on disk does not satisfy docs/annotation_format.md."""
 
 
-# --------------------------------------------------------------------------------------------
 # cameras
-# --------------------------------------------------------------------------------------------
 
 def nominal_camera(name: str, size, dist=None):
     """An aniposelib Camera for an uncalibrated single view (a 2D session).
@@ -195,9 +193,7 @@ def dump_calibration(path: Path, rig: Rig) -> None:
     path.write_text(toml.dumps(doc))
 
 
-# --------------------------------------------------------------------------------------------
 # parquet helpers
-# --------------------------------------------------------------------------------------------
 
 def _codes(table: pa.Table, col: str) -> tuple[np.ndarray, list[str]]:
     """(int32 codes, distinct values) for a string column. Dictionary-encodes if it is not."""
@@ -265,9 +261,7 @@ def _inv(enum: dict[str, int]) -> dict[int, str]:
     return {v: k for k, v in enum.items()}
 
 
-# --------------------------------------------------------------------------------------------
 # labels
-# --------------------------------------------------------------------------------------------
 
 @dataclass
 class Labels:
@@ -373,9 +367,7 @@ def _animal_vocab(tables: list[pa.Table | None], gid: str) -> list[str]:
     return sorted(found)
 
 
-# --------------------------------------------------------------------------------------------
 # groups and sessions
-# --------------------------------------------------------------------------------------------
 
 @dataclass
 class Group:
@@ -686,9 +678,7 @@ class Session:
         return out
 
 
-# --------------------------------------------------------------------------------------------
 # writing -- the exact inverse of Session.labels, so a round-trip test is meaningful
-# --------------------------------------------------------------------------------------------
 
 def write_session(path: Path, *, mode: str, units: str, label_source: str, names: list[str],
                   rig: Rig, groups: dict[str, Group], labels: dict[str, Labels],
@@ -832,9 +822,7 @@ def empty_labels(n_animals: int, T: int, K: int, C: int, *, mode3d: bool,
     )
 
 
-# --------------------------------------------------------------------------------------------
 # discovery
-# --------------------------------------------------------------------------------------------
 
 @dataclass
 class Dataset:
@@ -904,9 +892,7 @@ def load_datasets(path: Path) -> list[Dataset]:
     return [load_dataset(p) for p in children]
 
 
-# --------------------------------------------------------------------------------------------
 # keypoint registry
-# --------------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Registry:
@@ -1000,9 +986,7 @@ class Registry:
                    datasets=tuple(sorted((k, tuple(v)) for k, v in doc['datasets'].items())))
 
 
-# --------------------------------------------------------------------------------------------
 # validation -- docs/annotation_format.md §11
-# --------------------------------------------------------------------------------------------
 
 def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     """Return a list of rule violations. Empty means the session is valid."""

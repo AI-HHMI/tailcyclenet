@@ -58,9 +58,7 @@ _MAT = re.compile(r'^(\w+):\s*!!opencv-matrix\s*\n\s*rows:\s*(\d+)\s*\n\s*cols:\
 _NUM = re.compile(r'-?[\d.]+(?:e[-+]?\d+)?')
 
 
-# ----------------------------------------------------------------------------------------------
 # calibration
-# ----------------------------------------------------------------------------------------------
 
 def parse_calib(path: Path) -> dict[str, np.ndarray]:
     """Read an OpenCV FileStorage yaml WITHOUT cv2.
@@ -101,9 +99,7 @@ def build_rig(src: Path, calib_paths: dict[str, str], sizes: dict[str, tuple[int
     return fmt.Rig(CameraGroup(cams), offset=offset, moving=moving, calibrated=calibrated)
 
 
-# ----------------------------------------------------------------------------------------------
 # source reading
-# ----------------------------------------------------------------------------------------------
 
 def read_split(src: Path, split: str) -> dict:
     """The annotation JSON, indexed. `images[i].id == i` holds but is not relied on."""
@@ -149,9 +145,7 @@ def modal_step(frames: list[int]) -> int:
     return int(Counter(np.diff(frames).tolist()).most_common(1)[0][0])
 
 
-# ----------------------------------------------------------------------------------------------
 # labels
-# ----------------------------------------------------------------------------------------------
 
 def triangulate_robust(cgroup, p2d: np.ndarray, reject_px: float,
                        iters: int = 2) -> tuple[np.ndarray, np.ndarray]:
@@ -251,9 +245,7 @@ def _np(x) -> np.ndarray:
     return np.asarray(x.detach().cpu() if hasattr(x, 'detach') else x, dtype=np.float64)
 
 
-# ----------------------------------------------------------------------------------------------
 # conversion
-# ----------------------------------------------------------------------------------------------
 
 def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_groups: int | None,
             dry_run: bool, reject_px: float) -> None:
@@ -324,9 +316,7 @@ def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_grou
                 })
 
 
-# ----------------------------------------------------------------------------------------------
 # the calibration check
-# ----------------------------------------------------------------------------------------------
 
 def check_reprojection(out: Path, limit: float) -> int:
     """Reproject the written 3D onto the written 2D, through the written calibration.

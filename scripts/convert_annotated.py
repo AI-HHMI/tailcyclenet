@@ -47,9 +47,7 @@ VAL_ROOT = 'motor-observatory-frames-2025-02-13-eval'
 TWOD_ROOT = 'motor-observatory-frames-2024-05-12'
 
 
-# ----------------------------------------------------------------------------------------------
 # reading the export
-# ----------------------------------------------------------------------------------------------
 
 def rows(path: Path) -> list[dict]:
     with open(path) as f:
@@ -128,9 +126,7 @@ def read_session(sdir: Path, names: list[str]) -> tuple:
     return cfg, rig, groups, labels
 
 
-# ----------------------------------------------------------------------------------------------
 # the 3D layer
-# ----------------------------------------------------------------------------------------------
 
 def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, int, int]:
     """Fill `lab.points3d` / `lab.vis3d` from the per-camera 2D. Returns (visible, gated, missing).
@@ -177,9 +173,7 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
     return n_vis, n_gated, int(miss.sum())
 
 
-# ----------------------------------------------------------------------------------------------
 # writing
-# ----------------------------------------------------------------------------------------------
 
 def drop_unlabelled(groups: dict, labels: dict, where: str) -> list[str]:
     """Groups with no `visible` row carry no supervision. Drop them, never silently."""
@@ -287,9 +281,7 @@ def write_pixels(dst: Path, groups: dict, pixels: Path, cams: list[str]) -> None
             fmt.link(gdir / cam, (pixels / gid / cam).resolve())
 
 
-# ----------------------------------------------------------------------------------------------
 # checks
-# ----------------------------------------------------------------------------------------------
 
 def keypoint_rows(sdir: Path, cams: list[str] | None, keep: set[str]) -> set:
     """The source's own keypoint rows as comparable tuples, for the round-trip check."""
@@ -340,9 +332,7 @@ def anatomy(root: Path) -> None:
         print(f'   {a:10s}-{b:14s} median {np.median(v):6.2f} mm   n={len(v)}')
 
 
-# ----------------------------------------------------------------------------------------------
 # main
-# ----------------------------------------------------------------------------------------------
 
 def canonical_names(src: Path) -> list[str]:
     """The majority `names` order. Rule 3 wants one order per root; three sessions disagree."""

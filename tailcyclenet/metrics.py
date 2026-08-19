@@ -31,17 +31,9 @@ def _dist(pred, true):
 #: Upper quantiles of the matched-distance vector, reported beside `err`.
 #:
 #: A MEAN CANNOT SHOW A TAIL, and every localisation failure this repo has found was found in a
-#: quantile: the seam p90 of 182 mm against an interior p90 of 2.4, the crop p90 566 -> 317 px, the
-#: soft-argmax sweep. It is also the direct instrument for eval rule 6 -- an arm that declines five
-#: sixths of the animals has a flattering mean and a p90 that says so.
-#:
-#: This is the only free comparability with the literature, and it is free because the three
-#: reference systems cannot be compared any other way. Their OKS sigmas are 0.025 (SLEAP, uniform,
-#: the human-eye value, and they state their mAP is a lower bound), 0.1 (maDLC -- and 0.072 in one
-#: place, inconsistent within its own codebase, plus a symmetric-flip exemption) and 0.05 (APT,
-#: with a bbox synthesised from the labelled keypoint extent). Three mutually incomparable mAPs, so
-#: a fourth sigma buys nothing. APT reports raw Euclidean percentiles and no OKS at all; SLEAP
-#: reports `dist.p50 ... p99` beside its mAP. The percentile is the common currency.
+#: quantile. It is also the direct instrument for eval rule 6 -- an arm that declines five sixths
+#: of the animals has a flattering mean and a p90 that says so. Percentiles rather than OKS mAP
+#: because the reference systems' sigmas are mutually inconsistent, so a fourth buys nothing.
 ERR_PCTS = (75, 90, 95, 99)
 
 
@@ -154,9 +146,7 @@ def motion_ratio(pred, ref) -> dict:
             'n_steps': int(both.sum())}
 
 
-# ----------------------------------------------------------------------------------------------
 # multi-instance
-# ----------------------------------------------------------------------------------------------
 
 def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean'):
     """Hungarian match predicted instances to labelled ones, per frame.
@@ -167,50 +157,35 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
         max_dist: a pair further apart than this is not a match
         cost: how a pair's distances become one number.
 
-            `'mean'` (default) divides by the SHARED count, which is the hazard `min_kpts_frac`
-            below exists to blunt. `'penalised'` is OKS's answer to the same problem, in distance
-            units: every keypoint the LABEL has and the prediction declined is charged at the gate
-            radius and stays in the denominator, so
+            `'mean'` (default) divides by the SHARED count, which is the hazard
+            `min_kpts_frac` below exists to blunt. `'penalised'` is OKS's answer to the same
+            problem, in distance units: every keypoint the LABEL has and the prediction declined
+            is charged at the gate radius and stays in the denominator, so
 
                 cost = (sum_shared d + max_dist * (n_labelled - n_shared)) / n_labelled
 
             A row sharing 1 of 4 can then no longer out-bid one sharing 4 unless it is 4x closer
             on that point. It degrades continuously where `min_kpts_frac` rejects the pair
-            outright, which is what makes it usable at K = 4 -- rat-city's absolute MOTA falls
-            0.587 -> 0.092 at `min_kpts_frac = 0.5` while the delta between two arms barely moves.
+            outright, which is what makes it usable at small K.
 
             The default stays `'mean'` because changing it moves every published number in this
-            repo. This is an arm, not a silent correction -- the same discipline
-            `min_kpts_frac = 0.0` follows.
+            repo -- an arm, not a silent correction.
 
-            `'penalised'` needs a FINITE `max_dist`; with the default `np.inf` every unshared
-            keypoint would charge infinity and the cost would be inf for any pair that is not
-            complete. It falls back to `'mean'` in that case rather than returning a matrix of
-            infinities, because a silent all-inf cost matrix matches arbitrarily.
+            `'penalised'` needs a FINITE `max_dist`, and falls back to `'mean'` otherwise rather
+            than returning a matrix of infinities, which would match arbitrarily.
 
-            **IT IS A NO-OP ON EVERY ARM CURRENTLY ON RECORD, and that is the useful half of the
-            measurement.** The two costs differ only where the PREDICTION is sparse, and the pose
-            decode emits every keypoint of every row it decodes at all: on rat-city's 500-frame
-            test group, 6,000 of 6,000 instance-frames carry all K = 4. So `n_ok == n_labelled`,
-            the penalty term is identically zero, and rat-city reads 41.781 px / MOTA identical
-            under both. The sparsity that root has is in its LABELS, which this cost does not
-            touch and should not -- a label the annotator did not place is not a prediction the
-            model declined.
-            What makes rows sparse is `--vis-thresh`, which is the one lever whose measured
-            justification CLAUDE.md records as "not yet clean" for exactly this reason. This is
-            the guard that re-run needs, and it is a better guard than `min_kpts_frac` there
-            because at K = 4 that one demands nearly every labelled point.
-        min_kpts_frac: the fraction of K a pair must SHARE before its mean distance is allowed to
-            stand for the pair at all. The cost is a mean over shared keypoints, so at the default
-            of 0 a pair sharing ONE keypoint is scored on that keypoint -- and a near-empty
-            prediction row can therefore out-bid a dense one and hijack a GT row, which inflates
-            coverage and MOTA for whatever made the rows sparse. `--vis-thresh` is exactly such a
-            thing, and its measured justification (report 11 §3) was never controlled for this.
+            IT IS A NO-OP ON EVERY ARM ON RECORD: the two costs differ only where the PREDICTION
+            is sparse, and the pose decode emits every keypoint of every row it decodes at all.
+            Label sparsity is not prediction sparsity and this cost does not touch it. What makes
+            rows sparse is `--vis-thresh`, which is the guard this exists for.
+        min_kpts_frac: the fraction of K a pair must SHARE before its mean distance is allowed
+            to stand for the pair at all. At the default of 0 a pair sharing ONE keypoint is
+            scored on that keypoint, so a near-empty row can out-bid a dense one and hijack a GT
+            row -- which inflates coverage and MOTA for whatever made the rows sparse.
 
-            A FRACTION, not a count: K is 4 on rat-city, 7 on calms21, 17 on 3dpop, 24 on
-            johnson-mouse and 47 on allen, so "at least 2 keypoints" means five different things.
-            Rounded up, floor 1. The default is 0 because changing it moves every published number
-            in this repo, so it has to be an arm rather than a silent correction.
+            A FRACTION, not a count: K ranges from 4 to 47 across roots, so "at least 2 keypoints"
+            means five different things. Rounded up, floor 1. The default is 0 because changing it
+            moves every published number, so it has to be an arm.
 
     Returns a list per frame of (pred_ix, true_ix, dist).
 

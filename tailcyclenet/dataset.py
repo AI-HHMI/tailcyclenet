@@ -75,52 +75,12 @@ class LoaderConfig:
     grayscale_prob: float = 0.2        # rate at which a train item drops colour entirely
     crop_jitter: float = 0.3           # box centre jitter, fraction of box size
     crop_jitter_scale: float = 0.3     # box scale jitter
-    # `moving_crop` WAS HERE AND IS DELETED -- a per-frame crop as a DEPLOYMENT choice is refuted.
-    # Six one-key arms against their own controls, paired, one detection pass shared per root:
-    # zero of six roots improve on MPJPE (rat-city +4.685 px [+1.97, +7.52] SIG worse, 3dpop
-    # +2.629 SIG worse, three nulls, calms21 unreadable), and coverage / MOTA / miss / fp / idsw
-    # are null on every root. The one thing it moved was `motion_ratio`, by adding a roughly
-    # constant amount of path length -- which lands the two roots that UNDERSHOOT nearer 1.0 and
-    # pushes the rest further past it. Motion back, accuracy nowhere: the `--seam blend` result
-    # again, and the second instance of "motion_ratio near 1 is necessary but not sufficient".
-    # Full numbers in dev/reports/23_moving_crop_sweep.md.
-    #
-    # THE GEOMETRY IT USED IS DELETED TOO. `synth_motion_*` was its last consumer, and that arm
-    # is a measured null (dev/reports/30); with it gone, `crop.moving_boxes` / `apply_crop_moving`
-    # and all of `patches.py` had no caller left and were removed with the 0.3.5 upgrade
-    # (dev/reports/32).
     min_crop_dim: int = 64
-    # What the crop rule bounds. `keypoints` is the labels themselves. `instances` bounds the
-    # `instances.pq` box instead, for a root whose stored keypoints are too sparse to enclose the
-    # animal: rat-city's converter dropped noisy points, leaving 26k train instances with NO
-    # finite point.
-    # THE DEFAULT, changed deliberately: an `instances.pq` box is an ANNOTATED animal extent and a
-    # keypoint crop is a box around the points that happen to be labelled, which on a sparse root
-    # is not the animal. Measured (train splits, box vs the
-    # keypoint crop box re-entered at pad 0):
-    #
-    #   root                    has instances   box-only   identical   IoU p50
-    #   3dpop                   NO              --         --          --
-    #   allen-mouse-combined    NO              0.0%       --          --
-    #   branson-fly             NO              0.0%       --          --
-    #   rat-city-annotated      yes             0.0%       1.000       1.000
-    #   rat-city-tracked        yes             3.7%       0.414       0.871
-    #   calms21                 yes (MARS)      0.0%       0.000       0.508
-    #   johnson-mouse-combined  yes (COCO)      0.0%       0.000       0.772
-    #
-    # So this is INERT on three of the seven roots (no table -- a view whose box is absent falls
-    # back to its keypoints per view, `crop._crop_source`), an exact no-op on rat-city-annotated,
-    # and the point of the exercise on rat-city-tracked, whose converter dropped noisy points: its
-    # keypoint box is built from ~2.4 of 4 points and floors at `min_crop_dim` against a ~235 px
-    # rat, and 3.7% of animal-frames have a box and NO keypoint at all and were being trained as
-    # background.
-    #
-    # IT RETARGETS calms21 AND johnson-mouse, AND THAT IS THE COST. Their tables hold MARS and COCO
-    # boxes, which agree with the crop rule on 0.000 of instances (IoU p50 0.508 and 0.772). Those
-    # are still annotated animal extents -- which is the argument for this default -- but they are a
-    # DIFFERENT extent from the one every run before this trained on, so a sweep3 number on those
-    # two roots is not comparable to reports 10-13 and `box_source = "keypoints"` is how to get the
-    # old behaviour back. It rides in the run folder's config.toml either way.
+    # What the crop rule bounds: `keypoints` is the labels themselves, `instances` the
+    # `instances.pq` box, for a root whose stored keypoints are too sparse to enclose the animal.
+    # INERT where a root ships no table (falls back to keypoints per view, `crop._crop_source`).
+    # A root whose table holds MARS/COCO boxes gets a DIFFERENT extent than a keypoint crop, so a
+    # number on one is not comparable to a run trained on the other; it rides in the run config.
     box_source: str = 'instances'
     prompt_dropout: float = 0.4        # fraction of TRAINING STEPS that run fully query-free
     prompt_noise_px: float = 0.0       # sigma on the prior, in PIXELS (3D scales by cube_scale)
@@ -141,19 +101,6 @@ class LoaderConfig:
     # is what every run before this change did. See `_pool_weights` for why this is load-bearing.
     annot_frac: float | None = None    # P(a step comes from an `annotated` session)
     mode_3d_frac: float | None = None  # P(3d | source), i.e. applied WITHIN each source
-    # `synth_motion_*` WAS HERE AND IS DELETED -- measured null (dev/reports/30).
-    #
-    # An annotated group carries one labelled frame in 65, so the derived-T rule gives it a T = 2
-    # window, and these keys used to expand such windows into T copies of the labelled frame with
-    # the ANIMAL slid through a static union crop (report 22; the moving-camera first version was
-    # refuted there too). Measured at matched 60k on rat-city: a carry cost of +1.12 px against
-    # its control's +1.56 with both MPJPE deltas n.s. -- nothing replaces the old moving-camera
-    # version's +4.47 with a gain. johnson's +3% is two chunks whose mean is 112 mm against a
-    # median of 4 (both arms break on the same chunks), so the defensible size is ~3% in the
-    # working regime. The live suspect was the background-slides-with-the-animal ceiling, which
-    # is a compositing or pseudo-label fix and not a config key. See dev/reports/30.
-    # The keys are deleted rather than defaulted off: an old config that names them now fails
-    # loudly on an unknown key instead of silently training without the arm.
     # THE BOX PROMPT (report 27), the DATA side. 'none' | 'film' | 'term' -- when not 'none' the
     # loader emits a per-frame animal box (`box_prompt.compute_box_prompt`) for a box-prompt model
     # to consume as a non-position channel. 'none' emits nothing, so a plain run is byte-identical
@@ -184,9 +131,7 @@ class LoaderConfig:
     crop_inflate: float | list = 1.0
 
 
-# ----------------------------------------------------------------------------------------------
 # pixels
-# ----------------------------------------------------------------------------------------------
 
 def _rotate_2d(cam, coords, angle_deg):
     """`rotate_points_image_plane` WITHOUT its border-free inscribed crop. Same return shape.
@@ -583,9 +528,7 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     return out
 
 
-# ----------------------------------------------------------------------------------------------
 # appearance augmentation
-# ----------------------------------------------------------------------------------------------
 
 def _crop_inflate(cfg, rng, train):
     """THIS item's crop-inflate factor. `cfg.crop_inflate` is a float, or a `[low, high]` pair --
@@ -688,9 +631,7 @@ def _cutout_rects(rng, size, p2d, vis_2d, cnum):
     return rects
 
 
-# ----------------------------------------------------------------------------------------------
 # the dataset
-# ----------------------------------------------------------------------------------------------
 
 @dataclass
 class _Item:

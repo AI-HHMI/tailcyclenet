@@ -62,88 +62,61 @@ class InferConfig:
     max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
     kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
     # None -> report every row predicted. A float withholds an (animal, frame) row whose MEDIAN
-    # `vis_pred` logit across keypoints is below it. Measured against a rate-matched random
-    # rejection, which is the only honest control (any rejection improves a mean over matched
-    # points): 3dpop MOTA +0.049 [+0.011, +0.110] SIG at 7.3% of rows, where the control reads
-    # +0.001 [-0.017, +0.028]; rat-city 0.601 -> 0.628 at 14%, control 0.493. THE THRESHOLD IS NOT
-    # PORTABLE -- rat-city's logits have median +2.7 and 3dpop's +15.4 -- so there is no default and
-    # a shipped one would have to be a quantile. See dev/reports/11 §3 item 20.
+    # `vis_pred` logit across keypoints is below it. NOT PORTABLE across roots (logit medians
+    # differ by an order of magnitude), so there is no default; score it against a rate-matched
+    # random rejection, which is the only honest control.
     vis_thresh: float | None = None
     # Re-crop each window to the FIRST PASS's own prediction and predict again. Label-free, and it
     # costs one extra forward AND one extra decode per animal per window (the crop moves, so no
-    # pixels and no scene encode can be shared). See `run_group`.
-    # None -> DERIVED FROM THE SESSION'S MODE: on in 3D, off in 2D. The two dimensions disagree and
-    # the code knows which one it is in, so the default says so rather than picking a loser.
-    # 3dpop, 16 sessions / 47 chunk-500 units, paired, one lever: MPJPE **-0.962 mm
-    # [-2.104, -0.216] SIG**, p75 -0.749 SIG, p95 -8.17 SIG, coverage and MOTA and idsw all null.
-    # (This RETIRES report 11's "loses to `--crop-source keypoints` at 2x compute", which was one
-    # 120-frame protocol.) In 2D it is a TRADE, not a win: bulk accuracy improves on both roots
-    # (rat-city p75 -0.744 SIG and coverage +0.008 SIG; calms21 p75 -4.14 SIG, pck@10 +0.07) while
-    # calms21's identity gets significantly worse (MOTA -0.0435 [-0.0640, -0.0238], idsw +0.0085,
-    # coverage -0.0053, all SIG). A default must not cost 2x the seed floor of MOTA on a
-    # multi-animal root, so 2D keeps it off and `--refine` turns it on.
+    # pixels and no scene encode can be shared).
+    # None -> DERIVED FROM THE SESSION'S MODE: on in 3D, off in 2D. 3D is a clean win; 2D is a
+    # TRADE -- bulk accuracy improves while multi-animal identity gets significantly worse -- so
+    # 2D keeps it off and `--refine` turns it on.
     refine: bool | None = None
-    # PASS 1'S INPUT RESOLUTION under `--refine`. None -> `image_size`, i.e. today's behaviour
-    # exactly. Refine's gain is MAGNIFICATION, not coordinate frame (an ablation that re-centred
-    # the crop at a fixed side recovered 42% of the mean gain, 3% of the median and 0.4% of
-    # pck@10), so pass 1 only has to LOCALISE and does not need full resolution. calms21 2D: 96 px
-    # beats full-res refine outright, 6.651 against 6.765, at a third of the overhead. 3dpop 3D:
-    # 192 is a NULL against 256 (+0.062 mm paired) at a quarter of the pixels, and 96-128 trade
-    # ~1.7 mm for +0.021 coverage and +0.03 MOTA. 64 is the cliff on BOTH. No shipped default --
-    # the floor is patch-size- and root-dependent, which is the `--vis-thresh` lesson.
+    # PASS 1'S INPUT RESOLUTION under `--refine`. None -> `image_size`. Refine's gain is
+    # MAGNIFICATION, not coordinate frame, so pass 1 only has to LOCALISE. No shipped default: the
+    # floor is patch-size- and root-dependent, and 64 is a cliff in both dimensions. Sweep it.
     # `model.PoseTrackerEncoder.forward` is what makes a smaller input correct; see `_input_extent`.
     refine_px: int | None = None
-    # WHERE THE WINDOW'S CROP COMES FROM. 'boxes' unions the detector's per-frame boxes, which is
-    # what every recorded number uses. 'keypoints' runs THE CROP RULE on the detector's own
-    # keypoints over the window -- see the long comment at the union below for why that is the one
-    # thing boxes cannot reproduce. Needs a keypoint-trained detector; ignored without one.
+    # WHERE THE WINDOW'S CROP COMES FROM. 'boxes' unions the detector's per-frame boxes.
+    # 'keypoints' runs THE CROP RULE on the detector's own keypoints over the window -- see the
+    # union comment below. Needs a keypoint-trained detector; ignored without one.
     crop_source: str = 'boxes'
     # How many finite (frame, camera) boxes a row needs before it gets a window crop at all. 1 is
-    # what the loop always did, and it is the reason coverage can be FABRICATED: `3dpop_nogate.npz`
-    # reports 0.000 of (row, frame) missing a pose while its box cache has 2.1-2.2% of (row, frame)
-    # with no camera at all -- one box out of T x C positions a crop for all 24 frames and every one
-    # of them is marked `ok`. Raising it LOWERS reported coverage, and that is the point.
+    # what the loop always did, and it is why coverage can be FABRICATED: one box out of T x C
+    # positions a crop for every frame and marks them all `ok`. Raising it LOWERS reported
+    # coverage, and that is the point.
     min_box_frames: int = 1
-    # WHAT `carry` FEEDS BACK. See `run_group`'s carry note.
+    # WHAT `carry` FEEDS BACK.
     #   'triangulate' -- the ANCHOR-FREE estimate (`3d_pred_triangulate`). Breaks the loop.
     #   'pred'        -- the reported prediction, which under gridresid_offset = "query" IS
     #                    `prior + residual` and so integrates its own error window over window.
-    # 2D is identical either way: there is no triangulation at one camera and `coords_pred` is an
-    # absolute pixel decode, so nothing is being fed its own anchor.
+    # 2D is identical either way: no triangulation at one camera, and `coords_pred` is an absolute
+    # pixel decode, so nothing is being fed its own anchor.
     carry_source: str = 'triangulate'
     # DELIBERATELY BREAK THE ORACLE PRIOR, to measure how far the output follows it. `--anchor
-    # labels` + this is the only cheap way to get the echo coefficient alpha = d(output)/d(prior)
-    # without a training run, and alpha is what decides whether the prior needs retraining at all.
+    # labels` + this gives the echo coefficient alpha = d(output)/d(prior) without a training run.
     # `off:<x>` | `stale:<n>` | `other`. See `_corrupt_prior`. Never a deployment arm.
     oracle_corrupt: str | None = None
     device: str = 'cuda:0'
     # Read from the RUN's own `[data]`, like `min_crop_dim` -- never from a CLI flag. A model
     # trained on `instances` crops and evaluated on keypoint crops is being scored against a crop
-    # rule it never saw, and there would be nothing in the output to say so.
+    # rule it never saw, and nothing in the output would say so.
     box_source: str = 'keypoints'
-    # DEPLOYMENT BOX PROMPT (report 27). Which-animal-occupies-this-box, fed as a non-position
-    # input channel to a `[model].box_prompt` (film/term) model. 'none' | 'labels' (GT boxes,
-    # ORACLE -- gate off like `--anchor labels`) | 'detector'. GUARDED: 'none' + crop_inflate 1.0
-    # is byte-identical to a run without these keys, which `tests/test_infer.py` pins. LIVE IN
-    # 2D AND 3D, PER CAMERA (this used to be 2D-single-camera-only and silently ran box-withheld
-    # on every 3D/multi-camera window -- the training loader always emitted a correct per-camera
-    # 3D box via `box_prompt.compute_box_prompt`, so a 3D box model trained WITH the box and
-    # deployed WITHOUT it). A camera with no finite point that frame gets a NaN column, which the
-    # encoder's learned no-box token substitutes -- the regime `box_prompt_dropout` trains.
+    # DEPLOYMENT BOX PROMPT. Which-animal-occupies-this-box, fed as a non-position channel to a
+    # `[model].box_prompt` model. 'none' | 'labels' (GT boxes, ORACLE -- gate off like
+    # `--anchor labels`) | 'detector'. GUARDED: 'none' + crop_inflate 1.0 is byte-identical to a
+    # run without these keys, which `tests/test_infer.py` pins. LIVE IN 2D AND 3D, PER CAMERA. A
+    # camera with no finite point that frame gets a NaN column, which the encoder's learned
+    # no-box token substitutes -- the regime `box_prompt_dropout` trains.
     box_prompt: str = 'none'
-    # Inflate every crop about its centre by this factor -- the WIDE pass-1 regime where the box
-    # is load-bearing (report 27 §9m). 1.0 is today's behaviour exactly.
+    # Inflate every crop about its centre -- the WIDE pass-1 regime where the box is load-bearing.
+    # 1.0 is today's behaviour exactly.
     crop_inflate: float = 1.0
-    # HOW MANY WINDOWS AHEAD TO DECODE while the current window's forward runs on the GPU
-    # (dev/reports/31). BIT-EXACT: `_build_plans`/`decode_crops` depend only on the box source
-    # and window geometry, never on `carried` or any model output, so preparing a future
-    # window's pixels early changes no pixel and no order -- `carried` is still read and
-    # written strictly in window order, on the main thread, inside `_process_window`. 0 is the
-    # exact old serial code path: `run_group` never even builds the prefetch pool. 1 is the
-    # default because the memory cost is one extra small `crops` dict (already cropped to
-    # `image_size`, not a second full-frame decode buffer) -- see `_CAM_DECODE`'s own budget,
-    # which this does not multiply. Raise it on a many-core host if the forward is the slower
-    # half; drop it to 0 to reproduce today's exact memory profile on a very wide rig.
+    # HOW MANY WINDOWS AHEAD TO DECODE while the current window's forward runs on the GPU.
+    # BIT-EXACT: `_build_plans`/`decode_crops` depend only on the box source and window geometry,
+    # never on `carried` or any model output, so `carried` is still read and written strictly in
+    # window order on the main thread inside `_process_window`. 0 is the exact old serial path.
     prefetch_windows: int = 1
 
 
@@ -279,8 +252,6 @@ def _crop_views(imgs, box, target_size):
             out.append(im if aff is None else
                        cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
     return torch.from_numpy(np.asarray(out))[None]
-
-
 
 
 def prior_out_of_bounds(p, mode, cgroup):
@@ -501,72 +472,37 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # Boxes given directly (detector / detections file / instances.pq). One box per
                 # camera for this window: the union over the window's frames, so the animal does
                 # not walk out of its own crop mid-window.
-                # USE THE CAMERAS THAT SAW IT, not all or nothing. A detector legitimately
-                # misses a view -- cross-view association leaves an unmatched camera NaN -- and
-                # requiring a box in every camera dropped the whole animal for the window even
-                # when two views had it, which is pure lost coverage -- and coverage is a number
-                # this repo reports.
-                #
-                # WHETHER A SUBSET IS A *TRAINED* INPUT IS A PROPERTY OF THE RUN. `cams_to_sample`
-                # picks camera subsets and `prob_2d_only` trains the one-camera case, and both are
-                # per-run: a run may set `prob_2d_only = 0.25`, while `configs/3d.toml` ships 0.
-                # Under 0 a one-camera window is an untrained input shape rather than a
-                # supported one. Predicting it beats dropping it either way, but do not read a
-                # single-view arm without checking the run's own `[data].prob_2d_only`.
+                # USE THE CAMERAS THAT SAW IT, not all or nothing -- a detector legitimately misses
+                # a view, and requiring a box in every camera dropped the whole animal.
+                # WHETHER A ONE-CAMERA WINDOW IS A *TRAINED* INPUT IS A PROPERTY OF THE RUN: check
+                # its own `[data].prob_2d_only` before reading a single-view arm.
                 use, boxes = [], []
                 for i, ci in enumerate(cam_ix):
                     v = bb[:, i][np.isfinite(bb[:, i]).all(-1)]
                     if not len(v):
                         continue
                     # THE UNION EXTENT, NOT `crop_box_for_points`, and that is measured rather than
-                    # lazy. 08 §1.3 asks for the crop rule here, on the grounds that the deployment
-                    # path must use the rule the model was trained on (gotcha 8). Running it costs
-                    # 3dpop +3.06 mm [+1.86, +4.41] MPJPE and -0.032 MOTA, both SIG over 58 groups,
-                    # and rat-city -0.040 MOTA. The reason is in the crop field of those two npz
-                    # files: the union of per-frame crop-rule boxes is ALREADY near-square (aspect
-                    # median 1.047), and squaring it again grows the p90 box AREA by 82% -- an
-                    # elongated union, which is an animal crossing the window, becomes a large
-                    # square and the resize to 256 px shrinks the animal inside it.
+                    # lazy: re-squaring an already near-square union grows the p90 box AREA by 82%
+                    # and costs both MPJPE and MOTA. A detector box IS a crop-rule box, so the
+                    # union already satisfies the `min_crop_dim` floor.
                     #
-                    # The premise is also weaker than it reads: a detector box IS a crop-rule box,
-                    # so it already satisfies the `min_crop_dim` floor, and a union of boxes that
-                    # each satisfy the floor satisfies it too. And the rule cannot be reproduced
-                    # exactly from boxes in any case -- `pad = 0` would fix double-padding, but the
-                    # per-frame extents that would have to be unioned BEFORE squaring are not
-                    # recoverable from the boxes. See dev/reports/11 §3 item 16.
-                    #
-                    # THE UNION IS PER CAMERA, over that camera's OWN finite frames, so camera A's
-                    # crop can be positioned by frame 0 and camera B's by frame 23 -- the model then
-                    # triangulates across crops that are not contemporaneous. That is left alone on
-                    # measurement, over every 3dpop box cache: of
-                    # 480 multi-camera animal-windows, the intersection of the contributing cameras'
-                    # spans has median 0.92-1.00 of the window, 12-15% fall below half, and only
-                    # 6-12 (1.3-2.5%) are DISJOINT with nothing contemporaneous at all. Both
-                    # alternatives -- requiring the spans to overlap, or unioning only over frames
-                    # two cameras share -- cost coverage on the other 97.5% to fix that, and a rule
-                    # tuned on 9 windows is a rule tuned on noise. `box_agree` is what makes it
-                    # visible where it happens: a crop cut from the wrong time is a camera whose box
-                    # the reprojected pose does not sit on.
+                    # THE UNION IS PER CAMERA, over that camera's OWN finite frames, so two
+                    # cameras' crops need not be contemporaneous. Left alone on measurement: the
+                    # contributing spans overlap over ~92-100% of the window and only ~2% are
+                    # disjoint. `box_agree` is what makes it visible where it happens.
                     #
                     # int32 and clamped into the image, exactly like the crop rule's own box: a
                     # float or off-frame box produces a negative cam['offset'] and breaks
                     # project_cam far downstream.
                     w, h = (int(x) for x in session.rig.size(session.cam_names[ci]))
                     if inst_boxes is not None:
-                        # STORED BOXES ARE NOT DETECTOR BOXES, AND TRAINING PUTS THEM THROUGH THE
-                        # RULE. Everything above is about a DETECTOR box, which is already a
-                        # crop-rule box. `instances.pq` is not: the loader routes it through
-                        # `_crop_source` -> `crop_box_for_points(..., pad=0)`, which SQUARES the
-                        # extent and applies the `min_crop_dim` floor -- and 96% of rat-city's
-                        # stored boxes are non-square (aspect p50 1.737). So an `instances`-trained
-                        # run was served a tight, unfloored, non-square crop here and a squared,
-                        # floored one in training, which after `_resize_camera` puts the animal at
-                        # a different scale on a different-aspect canvas than any crop it ever saw.
-                        #
-                        # This is the SAME arithmetic as training, not a second rule: training
-                        # unions the window's corners per camera and squares ONCE, which is what
-                        # `crop_box_for_points` over the union corners does. `pad=0` because the
-                        # stored extent is already padded -- see that function's own docstring.
+                        # STORED BOXES ARE NOT DETECTOR BOXES, AND TRAINING PUTS THEM THROUGH
+                        # THE RULE. `instances.pq` boxes are often non-square, and the loader
+                        # routes them through `crop_box_for_points(..., pad=0)`, which squares the
+                        # extent and applies the floor. Serving a tight unfloored box here would
+                        # put the animal at a different scale than any crop it trained on. This is
+                        # the SAME arithmetic as training, not a second rule; `pad=0` because the
+                        # stored extent is already padded.
                         corners = torch.as_tensor(
                             np.concatenate([v[:, :2], v[:, 2:]], 0), dtype=torch.float32)
                         box = cropmod.crop_box_for_points(

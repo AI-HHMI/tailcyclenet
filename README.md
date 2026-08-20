@@ -56,7 +56,17 @@ pixi run python scripts/train.py --config configs/3d.toml --data <root>
 
 # 2D (single-view)
 pixi run python scripts/train.py --config configs/2d.toml --data <root>
+
+# one node, N gpus: one item per rank, gradients averaged by DDP
+pixi run python scripts/train.py --config configs/3d.toml --data <root> --devices 4
 ```
+
+`--devices N` is the only batch dimension this repo has — the collate keeps one camera group per
+batch, so the per-rank batch is structurally 1. **Every iteration count in a config is a total
+across ranks** (`n_iterations = 60000` is 60,000 samples on any gpu count) and the learning rate is
+scaled by `sqrt(N)`, so a multi-gpu run is two levers off a single-gpu one; `provenance.toml`
+records which it was. See `CLAUDE.md` for the rest, including why the staged encoder unfreeze
+re-wraps the module.
 
 The two configs differ in exactly three keys (`cams_to_sample`, `val_cams_to_sample`,
 `prob_2d_only`) — all camera-count questions a one-camera root cannot ask. `n_keypoints` is derived

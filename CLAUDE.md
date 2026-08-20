@@ -30,6 +30,7 @@ tailcyclenet/
   model.py            PoseTrackerEncoder + build_model + the query-free scene centre
   query_encoder.py    WideQueryEncoder + the box-prompt subclass, missing-query tokens
   checkpoints.py      run folders, save/load, warm start, config `extends`
+  distributed.py      the world-size axis: what a config key means on N gpus + the rank guards
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
   infer.py            THE inference path: one window loop
   detector/           YOLOX-Nano box predictor + cross-view association
@@ -236,7 +237,59 @@ Muon orthogonalizes its own gradients inside `step()`, so their raw norm is not 
 those matrices carry ~95% of the global norm, so a shared clip throttled the fresh heads and
 embeddings by an order of magnitude. `train/grad_norm` and `train/grad_norm_muon` are not comparable
 to each other, and only the first is comparable to a schedulefree run. **A run started before this
-fix is not comparable to one after it.** Raising `max_grad_norm` past 10 does NOT help. No DDP.
+fix is not comparable to one after it.** Raising `max_grad_norm` past 10 does NOT help.
+
+### Multiple GPUs
+
+```bash
+pixi run python scripts/train.py --config configs/3d.toml --data <root> --devices 4
+```
+
+**`batch_size` IS STRUCTURALLY 1 PER RANK, AND THE WORLD IS THE BATCH DIMENSION.** Lightning
+Fabric (already pinned, as a posetail dependency) runs one rank per GPU on ONE node and DDP
+averages their gradients. `--devices 1` takes `SingleDeviceStrategy` and no wrapper at all, so it
+is the loop it always was; above one device the strategy is `ddp_find_unused_parameters_true`,
+because a 2D item and a 3D item drive different heads and the used parameter set genuinely varies
+per step and per rank.
+
+**EVERY ITERATION COUNT IN A CONFIG IS A TOTAL ACROSS RANKS.** `n_iterations = 60000` is 60,000
+SAMPLES on any GPU count, so N GPUs take 60,000/N optimizer steps and finish about N times sooner;
+`val_freq`, `checkpoint_freq`, `print_freq` and the staged-unfreeze iteration read the same way,
+and the loop carries a global `it` advancing by the world size. `learning_rate` and `kpt_lr` are
+multiplied by **sqrt(world)** (the multipliers — `encoder_lr_scale`, `muon_lr_scale` — are not, so
+every ratio holds). **So a multi-GPU number is TWO levers off a single-GPU one**, and
+`provenance.toml` records `world_size` and the effective rates; a resume at a different world size
+warns rather than refusing.
+
+**THE STAGED UNFREEZE RE-WRAPS THE MODULE, AND THAT IS NOT OPTIONAL.** DDP takes its parameter
+headcount when the module is WRAPPED (`_build_params_for_reducer`, torch/nn/parallel/
+distributed.py:1338, filters `requires_grad`) and never re-checks, so a tensor frozen at wrap time
+is never all-reduced however `requires_grad` changes later — each rank would step its own encoder
+from iteration 10,000, the ranks would drift apart, and only rank 0's copy would be saved, with no
+error and no change in the loss curve. **The reference has this bug latently**: `= true` unfreezes
+in the constructor and is safe, but its staged (int) form never adds the encoder to a param group
+either, so nothing steps it and the two gaps cancel. `tailcyclenet/unfreeze.py` closes the
+optimizer half, which is exactly what makes the DDP half load-bearing here.
+**`check_ranks_agree` runs at every checkpoint boundary (including under `--no-checkpoints`) and
+raises if the ranks' weights have parted company.** Measured, both arms, 2 ranks: with the re-wrap
+the drift is **exactly 0** at every boundary; with it disabled the guard raises on both ranks at
+the first boundary after the unfreeze at **4.56e-07**. The bar is essentially exact equality, and
+that is why — a first version normalised the drift by the largest signature entry and set
+`tol = 1e-5`, which rated that same divergence 5.6e-10 and waved it through. **A loose tolerance on
+a quantity whose correct value is zero hides exactly the failure it exists to catch.** The check
+costs 25.8–38.1 ms (frozen / 8 blocks unfrozen) beside a 5.6 GB write, i.e. ~0.006% of a 1000-step
+window, so it has no frequency knob.
+
+Smaller rules, each of which is a hang or a silent correlation otherwise: a skipped step is a
+**collective** decision (one rank skipping its backward leaves the others in the all-reduce
+forever); val windows are **sharded** `idxs[rank::world]` and the per-window metrics gathered
+before reducing, so the number is the same nanmean a 1-GPU run computes; the sampler and the
+DataLoader take a **per-rank generator** (a `DistributedSampler` is wrong here — an index entry is
+a poor sampling weight, which is why the sampler draws with replacement); `[data].num_workers` is
+**per rank**, so the process count is `world x workers` and `_reader_cache_size` divides its RAM
+ceiling by both. `--precision` accepts `32-true` (default) and `bf16-mixed`; `16-mixed` is refused
+by name, because this loop steps its own optimizer rather than handing it to Fabric and so has
+nowhere to put a `GradScaler`.
 
 ### The architecture: two switches
 
@@ -616,9 +669,10 @@ coverage.
    RESTORED in 0.3.5.** `forward` takes `scene_features=` again (plus `input_size=`), and
    `share_scene` / `_forward_window` pass the stashed encode through that argument instead of
    routing around the public API. `cube_scale` remains a derived quantity, not an argument.
-3. **`batch_size` is structurally 1.** `custom_collate` keeps only item 0's `cgroup` and the model
-   takes one camera group per batch. This is why there is no DDP. Known ceiling, not a bug to fix
-   casually.
+3. **`batch_size` is structurally 1 PER RANK.** `custom_collate` keeps only item 0's `cgroup` and
+   the model takes one camera group per batch. The batch dimension this repo has is therefore the
+   WORLD (`--devices N`, above): DDP averages one item per rank. Raising the per-rank batch is
+   still a known ceiling, not a bug to fix casually.
 4. **Keypoint identity ≠ array position.** The library drops keypoints with <2 valid frames, so `N`
    shrinks and positions stop matching ids. The loader must never filter. **This failure is
    invisible in the loss curve.**

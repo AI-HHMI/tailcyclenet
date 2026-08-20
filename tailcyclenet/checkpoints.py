@@ -145,12 +145,38 @@ def provenance() -> dict:
         return {}
 
 
-def save_run_meta(run: Path, config: dict, registry: Registry) -> None:
+def prior_provenance(run: Path) -> dict:
+    """The `provenance.toml` a previous run left in this folder, or {}. Read BEFORE it is rewritten.
+
+    The one consumer is the resume path: a run folder written by a 4-rank job and continued by a
+    1-rank one changes both the learning rate (sqrt of the world size) and what an iteration count
+    means, and only the previous record can say so.
+    """
+    p = Path(run) / 'provenance.toml'
+    if not p.exists():
+        return {}
+    try:
+        with open(p, 'rb') as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def save_run_meta(run: Path, config: dict, registry: Registry,
+                  extra: dict | None = None) -> None:
+    """`config.toml`, the keypoint registry and `provenance.toml`. `extra` joins the provenance.
+
+    `extra` carries facts about HOW the run was launched rather than what it trains -- the world
+    size, the gpu count, the effective (world-scaled) learning rates. They belong beside the commit
+    for the same reason the commit does: a config cannot state them, and without them a 4-gpu
+    number and a 1-gpu number read identically while being two levers apart. Deliberately NOT
+    written into `[training]`, which would make the next resume trip its own unknown-key guard.
+    """
     import toml
     run.mkdir(parents=True, exist_ok=True)
     (run / 'config.toml').write_text(toml.dumps(config))
     registry.save(run / 'keypoint_registry.toml')
-    prov = provenance()
+    prov = {**provenance(), **(extra or {})}
     if prov:
         (run / 'provenance.toml').write_text(toml.dumps(prov))
 

@@ -13,8 +13,11 @@ that the reference (Lightning fabric + a different save path) did not:
   * a named refusal when a run folder's optimizer state does not match the optimizer this config
     builds -- the cost of making `muon` the default an absent key resolves to.
 
-No DDP: `batch_size` is structurally 1 here and there is no world-size LR scaling, so the
-reference's `sqrt(world_size)` / `total_to_per_gpu` machinery is deliberately not ported.
+The reference's `sqrt(world_size)` / `total_to_per_gpu` machinery IS ported, but it lives in
+`tailcyclenet.distributed` rather than here: `build_muon` takes whatever `[training.optimizer]`
+dict it is handed, and `scripts/train.py` hands it a world-scaled COPY. `group_lr` below is the
+other consumer of that dict -- the staged unfreeze reads it thousands of iterations later -- so
+both must be given the same copy or the encoder arrives at an unscaled rate.
 """
 from __future__ import annotations
 

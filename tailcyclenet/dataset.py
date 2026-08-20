@@ -322,7 +322,8 @@ def load_warps(path, specs, target_size=None, reduce=1):
 # now derived per process by `_reader_cache_size`; `TAILCYCLENET_READER_CACHE` only overrides it.
 
 
-def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None = None) -> int:
+def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None = None,
+                       procs: int | None = None) -> int:
     """How many open decord readers this process may hold.
 
     THIS FUNCTION MUST NOT DECODE, STAT, OR OPEN ANYTHING (gotcha 11). It reads the environment,
@@ -339,6 +340,12 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
       `num_workers = 0`; that genuinely is one process, so the divisor below is 1.
     - **Memory.** The count is a wish; RAM is the constraint, and it is per PROCESS while the
       workers multiply it. Half of physical memory, split across the workers, is the ceiling.
+      **And there are now `procs` RANKS on this node**, each with its own worker pool, so the
+      divisor is `workers x procs`: a 4-gpu job is four times as many decoding processes on the
+      same host, and sizing as if it were one is how a job that fits on one gpu gets OOM-killed on
+      four. `procs` comes from `TAILCYCLENET_LOCAL_WORLD_SIZE`, which `scripts/train.py` sets from
+      `fabric.world_size` immediately after launch -- a parsed-environment fact, so this function
+      still opens, stats and decodes nothing (gotcha 11). Absent means 1, i.e. today's numbers.
 
     `per_gb` is `1.0 + 0.25/megapixel`, a line through the only two points anyone has measured:
     calms21's 1024x570 settles at ~1.0 GB an entry and johnson's 3208x2200 at 2.56 GB (41 GB
@@ -351,9 +358,12 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
         return max(1, int(env))
     if ram_gb is None:
         ram_gb = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 2 ** 30
+    if procs is None:
+        procs = int(os.environ.get('TAILCYCLENET_LOCAL_WORLD_SIZE', '1') or 1)
     want = 4 if workers else max(int(n_cams), 4)
     per_gb = 1.0 + 0.25 * (int(wh[0]) * int(wh[1])) / 1e6
-    return max(1, min(want, int(0.5 * ram_gb / max(workers or 1, 1) / per_gb)))
+    share = max(workers or 1, 1) * max(int(procs), 1)
+    return max(1, min(want, int(0.5 * ram_gb / share / per_gb)))
 
 
 # Built at the FIRST video read, not at import: `lru_cache`'s maxsize is fixed at decoration and
@@ -1389,9 +1399,10 @@ def pose_collate(batch):
     """posetail's collate for the first ten fields, plus this repo's three.
 
     `custom_collate` keeps only item 0's `cgroup` and asserts a batch does not mix 2D and 3D --
-    which is why batch_size is structurally 1 here and why there is no DDP. The same reason
-    covers K: sessions may carry different keypoint subsets, so a batch that mixed two of them
-    would fail the `kpt_ids` stack below. Loud, and unreachable at batch_size 1.
+    which is why batch_size is structurally 1 PER RANK, and why the only batch dimension this repo
+    has is the world (`--devices N`, `tailcyclenet.distributed`). The same reason covers K:
+    sessions may carry different keypoint subsets, so a batch that mixed two of them would fail the
+    `kpt_ids` stack below. Loud, and unreachable at batch_size 1.
     """
     batch = [b for b in batch if b is not None]
     out = custom_collate([b[:10] for b in batch])

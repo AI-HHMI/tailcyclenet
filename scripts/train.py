@@ -3,6 +3,14 @@
 
     pixi run python scripts/train.py --config configs/3d.toml
     pixi run python scripts/train.py --config configs/3d.toml --iters 200   # smoke test
+    pixi run python scripts/train.py --config configs/3d.toml --devices 4    # one node, 4 gpus
+
+ON N GPUS, EVERY ITERATION COUNT IN THE CONFIG IS A TOTAL ACROSS THEM. `n_iterations = 60000` is
+60,000 SAMPLES whatever the GPU count, so an N-GPU run takes 60,000/N optimizer steps and finishes
+about N times sooner; `val_freq`, `checkpoint_freq`, `print_freq` and the staged unfreeze iteration
+read the same way. The learning rate is scaled by sqrt(N) because the effective batch is N. So a
+multi-GPU run is NOT comparable to a single-GPU one -- two levers moved -- and `provenance.toml`
+records which it was. `--devices 1` is byte-identical to the loop before any of this existed.
 
 The config is the source of truth for everything that defines a run; the CLI carries only
 overrides and one-offs. The run folder is the output, and it holds the config, the keypoint
@@ -14,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import gc
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -35,8 +45,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from posetail.posetail.losses import TotalLoss
 
-from tailcyclenet.checkpoints import (check_image_size, load_config, resolve_checkpoint, save_checkpoint,
-                                      save_run_meta, warm_start)
+from tailcyclenet import distributed as dist_utils
+from tailcyclenet.checkpoints import (check_image_size, load_config, prior_provenance,
+                                      resolve_checkpoint, save_checkpoint, save_run_meta,
+                                      warm_start)
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate, worker_init
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
@@ -129,14 +141,15 @@ def log(wb, values: dict, step: int) -> None:
 
 
 def _gpu_peak_gb(device, reset: bool = False) -> float:
-    """Peak allocator bytes since the last reset, in GB. 0.0 on CPU.
+    """Peak allocator bytes since the last reset, in GB. 0.0 on CPU. Rank 0's, on N gpus.
 
     `max_memory_allocated`, not `memory_allocated`: whether a recipe FITS is a property of the
     peak, and the peak is where an OOM happens. It is also not the same as `nvidia-smi`, which
     reports the caching allocator's reserved pool -- the reserved figure is what the driver holds,
     the allocated figure is what the run actually needs, and the gap is reusable.
     """
-    if not (isinstance(device, str) and device.startswith('cuda')) or not torch.cuda.is_available():
+    # `torch.device` since the loop takes `fabric.device`, `str` from the tests and older callers.
+    if str(device).split(':')[0] != 'cuda' or not torch.cuda.is_available():
         return 0.0
     peak = torch.cuda.max_memory_allocated(device) / 1e9
     if reset:
@@ -247,8 +260,15 @@ def _tune_smoothness(loss_fn, T, stride=1):
         sl.weight = sl._configured_weight / float(stride) ** sl.order
 
 
-def run_batch(model, loss_fn, batch, device):
+def run_batch(model, loss_fn, batch, device, raw=None):
     """One forward + loss. A non-finite sub-loss comes back as NaN, never as an exception.
+
+    TWO HANDLES ON ONE MODEL, and they are not interchangeable. `model` is what the forward goes
+    through -- the DDP-wrapped `_FabricModule` on N gpus -- because that is what registers the
+    backward hooks that all-reduce the gradients. `raw` is the unwrapped module and is what
+    `TotalLoss` receives, since it reads `model.training` and `model.stride_overlap` and has no
+    business holding a wrapper. `raw = None` means they are the same object, which is the 1-gpu
+    case and every test.
 
     posetail's `TotalLoss.forward` RAISES on a poisoned sub-loss (`losses.py:873`). That is right
     for its own purpose -- a NaN term silently dropped from the total still returns NaN gradients --
@@ -275,7 +295,7 @@ def run_batch(model, loss_fn, batch, device):
     coords_true = batch.coords.to(device)
     try:
         loss = loss_fn(
-            model, out, coords_true=coords_true,
+            model if raw is None else raw, out, coords_true=coords_true,
             vis_true=None if batch.vis is None else batch.vis.to(device),
             vis_true_cams=None if batch.vis_2d is None else batch.vis_2d.to(device),
             cgroup=cgroup, p2d=None if batch.p2d is None else batch.p2d.to(device), device=device)
@@ -288,9 +308,15 @@ def run_batch(model, loss_fn, batch, device):
 
 
 @torch.no_grad()
-def evaluate(model, batches, optimizer, device):
+def evaluate(model, batches, optimizer, device, fabric=None):
     """Val metrics on a FIXED set of windows. BOTH regimes, from ONE pass. Returns (prior_free,
     self_prompted).
+
+    SHARDED ACROSS RANKS, REDUCED OVER ALL OF THEM. `batches` is this rank's slice of the fixed
+    window list (`idxs[rank::world]`), and the per-window metric dicts are gathered before
+    `_reduce` runs -- so the number is the nanmean over the SAME window set a single-GPU run
+    would produce, not a different metric on more gpus, and every rank ends holding it. `model`
+    here is the UNWRAPPED module: this is a no-grad forward, so it wants no DDP hooks.
 
     The prior-free number is the honest one: the loader's `kpt_prior` is ground truth (evaluation
     rule 7), so it is gated off -- letting it through inflates every number, and in the project this
@@ -347,7 +373,8 @@ def evaluate(model, batches, optimizer, device):
         model.train()
         if hasattr(optimizer, 'train'):
             optimizer.train()
-    return _reduce(free), _reduce(prompted)
+    return (_reduce(dist_utils.gather_metrics(fabric, free)),
+            _reduce(dist_utils.gather_metrics(fabric, prompted)))
 
 
 def _reduce(mets):
@@ -365,6 +392,73 @@ def _reduce(mets):
     return out
 
 
+def launch(args):
+    """The Fabric, launched. Everything after this call runs once PER RANK.
+
+    `--devices 1` resolves to strategy `auto`, i.e. `SingleDeviceStrategy` and no wrapper at all,
+    so a single-GPU run is the run it always was and every world-size rule below is the identity.
+    Above one device the strategy is `ddp_find_unused_parameters_true`, which is not caution: a 2D
+    item computes `coords_loss_2d` while a 3D item drives the depth bank, so WHICH parameters
+    receive gradients genuinely differs per step and per rank.
+
+    Fabric's launcher RE-EXECUTES this script for ranks 1..N-1 with `LOCAL_RANK` set, so
+    everything above `launch()` runs on every rank. Keep it cheap, and keep it free of anything
+    that decodes video -- gotcha 10 applies once per rank, not once per job.
+
+    ONE NODE. `--num-nodes` is deliberately not offered: every job this repo runs is
+    `-R "span[hosts=1]"`, and the local world size is therefore the world size, which is what
+    `_reader_cache_size` is told below.
+    """
+    from lightning.fabric import Fabric
+
+    devices = int(args.devices)
+    if args.precision == '16-mixed':
+        raise SystemExit(
+            '--precision 16-mixed needs a GradScaler applied to the optimizer, and this loop steps\n'
+            'its own optimizer rather than handing it to Fabric (PoseDualOptimizer is not an\n'
+            'Optimizer subclass, and at 32-true/bf16-mixed a Fabric optimizer wrapper adds\n'
+            'nothing). Use --precision 32-true, or bf16-mixed.')
+    if devices != 1 and args.device != 'cuda:0':
+        raise SystemExit(
+            f'--device {args.device} names ONE gpu and --devices {args.devices} asks for several. '
+            'At --devices != 1 the launcher places every rank, so --device would be silently '
+            'ignored -- pick one (CUDA_VISIBLE_DEVICES selects WHICH gpus).')
+    strategy = args.strategy or ('auto' if devices == 1 else 'ddp_find_unused_parameters_true')
+    # `--device cpu` still means CPU. It is how the smoke tests run on a box with no gpu free, and
+    # `torch.cuda.is_available()` would otherwise overrule it.
+    if not torch.cuda.is_available() or (devices == 1 and str(args.device).startswith('cpu')):
+        accelerator, dev_arg = 'cpu', 1
+    elif devices == 1:
+        # `--device cuda:2` still selects the gpu, as it always did.
+        accelerator = 'gpu'
+        dev_arg = [int(str(args.device).rsplit(':', 1)[-1])] if ':' in str(args.device) else 1
+    else:
+        accelerator, dev_arg = 'gpu', devices
+    fabric = Fabric(accelerator=accelerator, devices=dev_arg, strategy=strategy,
+                    precision=args.precision)
+    fabric.launch()
+    if not fabric.is_global_zero:
+        # TAG, DO NOT SILENCE. The setup phase prints from places this loop does not own -- warm
+        # start naming every dropped tensor, the sampling mix, each optimizer group -- and those
+        # lines are exactly the evidence you need when ONE rank disagrees with the others.
+        sys.stdout = dist_utils.RankPrefix(sys.stdout, fabric.global_rank)
+    # Reader caches and loader workers are per PROCESS and there are now `world` processes on this
+    # node, so the RAM ceiling in `_reader_cache_size` has to be divided by that too. Set here,
+    # before any dataset exists, because that derivation may read the environment and must not
+    # probe anything (gotcha 10).
+    os.environ['TAILCYCLENET_LOCAL_WORLD_SIZE'] = str(fabric.world_size)
+    if fabric.world_size > 1:
+        fabric.print(f'distributed: {fabric.world_size} ranks, strategy {strategy!r}, '
+                     f'precision {args.precision}. n_iterations/val_freq/checkpoint_freq/'
+                     f'print_freq and the unfreeze iteration are TOTALS across ranks; the '
+                     f'learning rate is scaled by sqrt({fabric.world_size}) = '
+                     f'{fabric.world_size ** 0.5:.3f}')
+    if args.precision == 'bf16-mixed':
+        fabric.print('--precision bf16-mixed is UNMEASURED on this repo\'s roots: every number in '
+                     'CLAUDE.md was measured at 32-true.')
+    return fabric
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -372,8 +466,21 @@ def main():
     ap.add_argument('--iters', type=int, default=None, help='override n_iterations')
     ap.add_argument('--out', type=Path, default=None, help='override the run folder')
     ap.add_argument('--data', type=Path, default=None, help='override [data].path')
-    ap.add_argument('--device', default='cuda:0')
-    ap.add_argument('--num-workers', type=int, default=None)
+    ap.add_argument('--device', default='cuda:0',
+                    help='which gpu, at --devices 1. Refused with --devices != 1, where placement '
+                         'is the launcher\'s job')
+    ap.add_argument('--devices', default=1,
+                    help='gpus to train on: a count, or -1 for every visible one. Above 1, one '
+                         'rank per gpu and DDP averages their gradients, so the effective batch '
+                         'is the world size (default: 1)')
+    ap.add_argument('--strategy', default=None,
+                    help='lightning strategy. Default `auto` at one device -- no wrapper at all, '
+                         'so a 1-gpu run is unchanged -- and `ddp_find_unused_parameters_true` '
+                         'above it')
+    ap.add_argument('--precision', default='32-true',
+                    help='32-true (default) or bf16-mixed. 16-mixed is refused by name')
+    ap.add_argument('--num-workers', type=int, default=None,
+                    help='loader workers PER RANK; the total is this times the world size')
     ap.add_argument('--no-warm-start', action='store_true')
     ap.add_argument('--no-resume', action='store_true',
                     help='start from iteration 0 even if the run folder holds a checkpoint_last')
@@ -384,6 +491,8 @@ def main():
                          '~5.6 GB each -- checkpoint_freq alone cannot express this, because the '
                          'last iteration always writes.')
     args = ap.parse_args()
+    fabric = launch(args)
+    world, is0 = fabric.world_size, fabric.is_global_zero
 
     config = load_config(args.config)
     check_image_size(config)
@@ -394,7 +503,7 @@ def main():
         train_cfg['n_iterations'] = args.iters
     run = Path(args.out or train_cfg['out'])
     n_iter = int(train_cfg['n_iterations'])
-    device = args.device if torch.cuda.is_available() else 'cpu'
+    device = fabric.device
     # AN UNKNOWN [training] KEY IS A TYPO, NOT A COMMENT -- the same rule as [data] below, and
     # for the same reason. `val_frequency` for `val_freq` yields val_freq = 0: no validation, no
     # `checkpoint_best.pth`, and a run that prints fine for 60,000 iterations. The sub-blocks are
@@ -439,6 +548,11 @@ def main():
     base_reg = base_registry(run, train_cfg.get('checkpoint_path'))
     train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=base_reg)
     registry = train_ds.registry
+    # EVERY RANK MUST HAVE BUILT THE SAME REGISTRY. Each one discovers its datasets from the
+    # filesystem independently, and a listing that ordered differently on one rank would point
+    # that rank's embedding rows at different body parts -- `warm_start`'s row-copy hazard, now
+    # with N chances to happen and nothing downstream that would notice.
+    dist_utils.check_registry(fabric, registry.names)
     print(f'train: {len(train_ds)} windows across {len(train_ds.datasets)} dataset(s), '
           f'{registry.n_keypoints} keypoints')
     # The sampling mix, not the window count. An index entry is one (session, group, animal)
@@ -468,6 +582,14 @@ def main():
         print(f'val:   {len(val_ds)} windows, {lc.val_cams_to_sample} camera(s) each')
 
     nw = args.num_workers if args.num_workers is not None else int(data_cfg.get('num_workers', 8))
+    # PER RANK, and the host is shared. `[data].num_workers` keeps its meaning, so the process
+    # count is `world * nw` and the warning is the only thing standing between an 8-gpu job and
+    # 64 decoding workers on a 96-core box.
+    if world * nw > (os.cpu_count() or 1):
+        fabric.print(f'WARNING: {world} rank(s) x {nw} loader worker(s) = {world * nw} decoding '
+                     f'processes on {os.cpu_count()} cores. Lower [data].num_workers or '
+                     f'--num-workers; the loader is this repo\'s documented bottleneck and '
+                     f'oversubscribing it is not free.')
     # ONE epoch for the whole run, not one per pass over the index. rat-city's train index is 12
     # windows, so `shuffle=True` exhausted and reset the iterator every 12 steps and drained the
     # prefetch queue each time -- 26% of its wall clock, and visible as a `wait` cycle with period
@@ -490,9 +612,26 @@ def main():
     # under ten minutes that no CUDA-free or checkpoint-free reproduction of the loader alone
     # ever showed. `spawn` starts each worker as a fresh interpreter that never touches CUDA at
     # all (dev/plans/video_loader_memory.md). Costs a few seconds of import time once, at start.
+    #
+    # ONE GENERATOR PER RANK, and `None` at world 1 so that path is untouched. The sampler stream
+    # and the workers' `base_seed` (which is what `worker_init` reseeds imgaug from) are both
+    # drawn from `loader.generator`; leaving it None on N ranks would give every rank the same
+    # index sequence and the same per-worker seeds off one `torch.manual_seed(seed)`.
+    #
+    # NOT a `DistributedSampler`, deliberately. An index entry here is one (session, group,
+    # animal) whatever the group's length -- a poor sampling weight, which is why the sampler
+    # draws WITH REPLACEMENT and `_pick`/`_frames` redraw inside `__getitem__` -- so partitioning
+    # the index would partition the wrong thing. Independent streams per rank is the right
+    # construction for sampling with replacement, and it is what the single-GPU loop already did.
+    gen = None
+    if world > 1:
+        gen = torch.Generator().manual_seed(int(train_cfg.get('seed', 23)) + fabric.global_rank)
+    local_iters = dist_utils.per_rank(n_iter, world)
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, num_workers=nw, collate_fn=pose_collate,
-        sampler=torch.utils.data.RandomSampler(train_ds, replacement=True, num_samples=n_iter),
+        sampler=torch.utils.data.RandomSampler(train_ds, replacement=True,
+                                               num_samples=local_iters, generator=gen),
+        generator=gen,
         persistent_workers=nw > 0, pin_memory=True, drop_last=True,
         prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init,
         multiprocessing_context='spawn' if nw > 0 else None)
@@ -508,10 +647,12 @@ def main():
     # entered the metric at all. Checkpoint selection ran off that number. `linspace` costs
     # nothing and keeps every val session represented.
     val_freq = int(train_cfg.get('val_freq', 0))
-    val_batches = []
+    val_batches, idxs = [], []
     if val_ds is not None and val_freq:
         n_val = min(int(train_cfg.get('val_batches', 20)), len(val_ds))
-        idxs = np.unique(np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))
+        # A LIST, not the numpy array: it is used as a plain truth value below (a numpy array of
+        # more than one element raises there) and it is sliced per rank.
+        idxs = [int(i) for i in np.unique(np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
         # THROUGH A CHILD, NOT IN THIS PROCESS, and that is a hang not a preference. These windows
         # used to be decoded here, in the parent, which is BEFORE the train loader above forks its
         # workers (`persistent_workers` forks on the first `next()`, not at construction). On a
@@ -524,14 +665,22 @@ def main():
         # One worker, no shuffle, `Subset` in `idxs` order, so `val_batches` is the same list in the
         # same order it always was -- and it is byte-identical, not merely equivalent, because
         # `PoseDataset` seeds val items by index rather than by RNG draw.
+        #
+        # SHARDED, `idxs[rank::world]`. The window LIST is identical on every rank (a `linspace`
+        # over the index), so the shard is a partition of it and `evaluate` gathers the per-window
+        # metrics back before reducing -- the val number is the same nanmean over the same windows
+        # a 1-gpu run computes, just decoded N times faster. Eval was the larger half of one
+        # root's projected wall clock, so this is the second reason to have a world at all.
+        mine = [int(i) for i in idxs[fabric.global_rank::world]]
         val_batches = list(torch.utils.data.DataLoader(
-            torch.utils.data.Subset(val_ds, [int(i) for i in idxs]), batch_size=1,
+            torch.utils.data.Subset(val_ds, mine), batch_size=1,
             num_workers=1, collate_fn=pose_collate, worker_init_fn=worker_init))
         seen = Counter(val_ds.index[int(i)].session.session_id for i in idxs)
-        print(f'val:   {len(val_batches)} fixed window(s) every {val_freq} iterations, '
-              f'over {len(seen)}/{len({it.session.session_id for it in val_ds.index})} session(s)')
+        fabric.print(f'val:   {len(idxs)} fixed window(s) every {val_freq} iterations, over '
+                     f'{len(seen)}/{len({it.session.session_id for it in val_ds.index})} '
+                     f'session(s)' + (f', {len(mine)} on this rank' if world > 1 else ''))
         for sid, n in sorted(seen.items()):
-            print(f'         {n:3d}  {sid}')
+            fabric.print(f'         {n:3d}  {sid}')
 
     # -- model -----------------------------------------------------------------------------
     model = build_model(config['model'], n_keypoints=registry.n_keypoints)
@@ -594,7 +743,19 @@ def main():
     if resumed.exists() and not args.no_resume:
         ck = torch.load(resumed, map_location=device, weights_only=False)
         start_it = int(ck['iteration'])
-    opt = build_optimizer(model, fresh, opt_cfg)
+    # THE SCALED COPY REACHES EVERY CONSUMER OF THE OPTIMIZER CONFIG, not just the build.
+    # `optim.group_lr` reads this dict again when the staged unfreeze adds the encoder's groups at
+    # iteration 10,000, so a copy that stopped at `build_optimizer` would give the encoder an
+    # unscaled rate half a run later and nothing would print a word about it. `config` itself is
+    # left alone -- the run folder records the CONFIGURED rate, or every resume would re-scale it.
+    opt_cfg_scaled = dist_utils.scale_optimizer_cfg(opt_cfg, world)
+    if world > 1:
+        fabric.print(f'lr: scaled by sqrt({world}) -> learning_rate '
+                     f'{opt_cfg_scaled["learning_rate"]:g}'
+                     + (f', kpt_lr {opt_cfg_scaled["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg_scaled
+                        else '')
+                     + ' (the multipliers -- encoder_lr_scale, muon_lr_scale -- are unchanged)')
+    opt = build_optimizer(model, fresh, opt_cfg_scaled)
     # `per_camera_cube_scale` is a GAUGE, and the model and the loss have to agree on it. It lives
     # in `[model]`, and `TotalLoss` defaults it False (`losses.py:98`) -- so leaving it out of
     # `[training.losses]` had the loss take the median over cameras while the model kept its own
@@ -626,7 +787,7 @@ def main():
         # built in the FROZEN layout whatever `start_it` is, so replaying the adds here reaches
         # the same group ORDER a fresh run would hold at this iteration -- and `load_state_dict`
         # matches groups by position, so order is the whole contract.
-        info = replay_staged_unfreeze(model, opt, opt_cfg, start_it, fresh=fresh)
+        info = replay_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh)
         if info:
             print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
                   f'norms {info["norms"]}, {info["n_params"]:,} params)')
@@ -646,6 +807,17 @@ def main():
     elif resumed.exists():
         print(f'--no-resume: {resumed} and any checkpoint_best.pth beside it WILL be overwritten')
 
+    # WRAP LAST, AND AFTER THE RESUME REPLAY ABOVE. DDP takes its parameter headcount when the
+    # module is WRAPPED -- `_build_params_for_reducer` filters `requires_grad` and nothing
+    # re-checks it afterwards -- so a run resumed past its unfreeze iteration has to wrap a model
+    # whose encoder is already trainable, or the encoder it just restored would never be
+    # all-reduced. (A fresh run wraps a frozen encoder and re-wraps when the unfreeze fires; see
+    # the loop.) `raw` stays the handle for everything that is not the forward: the loss, the
+    # optimizer, the unfreeze, the checkpoint writer and the evaluator.
+    raw = model
+    wrap = world > 1 or args.precision != '32-true'
+    model = fabric.setup_module(raw) if wrap else raw
+
     # RECORD THE RESOLVED `box_source`, not just the one the toml happened to name. Its default
     # moved from 'keypoints' to 'instances', and `scripts/infer.py` reads the run config with
     # `.get('box_source', 'keypoints')` -- which is RIGHT for every run trained before the move and
@@ -656,12 +828,36 @@ def main():
     # folder must be able to say what it trained as. A folder that resolved to muon by default and a
     # folder that will only resume as "schedulefree" must not read identically.
     opt_cfg['optimizer'] = str(opt_cfg.get('optimizer', 'muon'))
-    save_run_meta(run, config, registry)
-    print(f'run folder: {run.resolve()}')
-    wb = init_wandb(config, run, disabled=args.no_wandb)
+    # A RUN FOLDER MUST BE ABLE TO SAY HOW MANY GPUS IT TRAINED ON, for the same reason it records
+    # the resolved optimizer: the world size moves TWO levers at once -- effective batch 1 -> N and
+    # the lr by sqrt(N) -- so a number from a 4-gpu run and a number from a 1-gpu run are not one
+    # lever apart. It goes in `provenance.toml`, not `[training]`, because it is a record of how
+    # the run was launched rather than a knob anybody may set (and `[training]`'s unknown-key guard
+    # would reject it on the next resume).
+    prior = prior_provenance(run)
+    if prior.get('world_size') and int(prior['world_size']) != world:
+        fabric.print(
+            f'WARNING: this run folder was written by a {prior["world_size"]}-rank run and this '
+            f'is a {world}-rank one. The learning rate (sqrt of the world size) and the '
+            f'iteration-to-sample mapping both change, so the continued run is not the run it '
+            f'continues. Allowed on purpose -- a preempted job often comes back on fewer gpus -- '
+            f'but say so when reporting it.')
+    if is0:
+        save_run_meta(run, config, registry, extra={
+            'world_size': world, 'devices': str(args.devices), 'precision': args.precision,
+            'lr_effective': float(opt_cfg_scaled['learning_rate']),
+            'kpt_lr_effective': float(opt_cfg_scaled.get('kpt_lr',
+                                                         opt_cfg_scaled['learning_rate']))})
+    fabric.barrier()
+    fabric.print(f'run folder: {run.resolve()}')
+    wb = init_wandb(config, run, disabled=args.no_wandb or not is0)
     log_path = run / 'log.jsonl'                  # the numbers survive without wandb
 
     def record(rec):
+        # RANK 0 ONLY. Every rank holds the same reduced val metrics (see `evaluate`), so N ranks
+        # appending would write N identical lines and make `log.jsonl` unparseable as a history.
+        if not is0:
+            return
         with open(log_path, 'a') as f:
             f.write(json.dumps(rec) + '\n')
 
@@ -688,7 +884,7 @@ def main():
         """RECOMPUTED AFTER AN UNFREEZE, not captured once. A stale list leaves the newly-trainable
         encoder AdamW tensors unclipped and the new Muon tensors unchecked for non-finiteness --
         and report 34b's whole point is that WHICH half is clipped is not incidental."""
-        trainable = [p for p in model.parameters() if p.requires_grad]
+        trainable = [p for p in raw.parameters() if p.requires_grad]
         return getattr(opt, 'adamw_params', trainable), getattr(opt, 'muon_params', [])
 
     clip_params, unclipped_params = _clip_targets()
@@ -697,16 +893,29 @@ def main():
     # a schedule-free optimizer, so this guard is inert there.
     print_freq = int(train_cfg.get('print_freq', 20))
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
+    # EVERY FREQUENCY IS A TOTAL ACROSS RANKS, so each becomes a LOCAL step count. The loop below
+    # counts local optimizer steps and carries the global iteration `it = step * world` for
+    # logging, checkpointing and the unfreeze gate -- which is what keeps `n_iterations = 60000`
+    # meaning 60,000 samples on any gpu count, and keeps every schedule aligned across ranks
+    # (a rank-dependent gate would desynchronise the collectives, not just the numbers).
+    local_val_freq = dist_utils.per_rank(val_freq, world) if val_freq else 0
+    local_ckpt_freq = dist_utils.per_rank(ckpt_freq, world)
+    local_print_freq = dist_utils.per_rank(print_freq, world)
     # `best` is written at checkpoint boundaries using THAT iteration's val, so a val has to land
     # on one. Loud rather than silent: misaligned, no best checkpoint would ever be written and
-    # nothing else would say so.
-    if val_batches and val_freq and ckpt_freq % val_freq:
-        print(f'WARNING: checkpoint_freq {ckpt_freq} is not a multiple of val_freq {val_freq}, so '
-              'no evaluation lands on a checkpoint boundary and checkpoint_best.pth will never be '
-              'written. Pick freqs that divide.')
+    # nothing else would say so. Checked on the LOCAL freqs, since those are what the loop tests.
+    if idxs and local_val_freq and local_ckpt_freq % local_val_freq:
+        fabric.print(f'WARNING: checkpoint_freq {ckpt_freq} is not a multiple of val_freq '
+                     f'{val_freq} (as {local_ckpt_freq} and {local_val_freq} local steps on '
+                     f'{world} rank(s)), so no evaluation lands on a checkpoint boundary and '
+                     f'checkpoint_best.pth will never be written. Pick freqs that divide.')
     model.train()
     opt.train()
-    it, skipped, t0, running, clipped = start_it, 0, time.time(), [], []
+    # `step` counts THIS rank's optimizer steps; `it` is the global iteration and advances by
+    # `world`. On resume, `start_it` is a global count, so the local position is its ceiling
+    # division -- `ceil_div`, not `per_rank`, because a fresh run legitimately starts at step 0.
+    step = dist_utils.ceil_div(start_it, world)
+    it, skipped, t0, running, clipped = step * world, 0, time.time(), [], []
     # best_mpjpe/best_iter: the best val at ANY val step -- a number, used for plateau detection.
     # saved_mpjpe: the metric of the file currently on disk as `checkpoint_best.pth`. The two are
     # different on purpose; only the second one costs a 3.15 GB write. `latest` is the most recent
@@ -738,58 +947,91 @@ def main():
 
     latest = (float('inf'), -1)
     waited, evalled, ckpted = [0.0], [0.0], [0.0]
-    while it < n_iter:
+    while step < local_iters:
         for batch in timed(loader, waited):
-            if it >= n_iter:
+            if step >= local_iters:
                 break
             # THE STAGED UNFREEZE. Upstream owns the gate, the idempotence and the block
             # selection (`TrackerEncoder.unfreeze_video_encoder`); `apply_staged_unfreeze` adds
             # the newly-trainable tensors to the optimizer, which is the half a `requires_grad`
             # flip alone cannot do -- a frozen param is in no param group, so it would receive
             # gradients that nothing steps.
-            unfroze = apply_staged_unfreeze(model, opt, opt_cfg, it, fresh=fresh)
+            unfroze = apply_staged_unfreeze(raw, opt, opt_cfg_scaled, it, fresh=fresh)
             if unfroze:
                 clip_params, unclipped_params = _clip_targets()
-                print(f'  UNFROZE the video encoder at iteration {it}: blocks '
-                      f'{unfroze["blocks"]} of {unfroze["n_blocks"]}, norms {unfroze["norms"]}, '
-                      f'{unfroze["n_tensors"]} tensors / {unfroze["n_params"]:,} params '
-                      f'(+{unfroze["muon_groups"]} muon, +{unfroze["adamw_groups"]} adamw '
-                      f'group(s))', flush=True)
+                fabric.print(f'  UNFROZE the video encoder at iteration {it}: blocks '
+                             f'{unfroze["blocks"]} of {unfroze["n_blocks"]}, norms '
+                             f'{unfroze["norms"]}, {unfroze["n_tensors"]} tensors / '
+                             f'{unfroze["n_params"]:,} params (+{unfroze["muon_groups"]} muon, '
+                             f'+{unfroze["adamw_groups"]} adamw group(s))', flush=True)
                 log(wb, {'train/encoder_unfrozen_at': it}, it)
                 record({'iter': it, 'unfroze_encoder': unfroze})
-            loss, _ = run_batch(model, loss_fn, batch, device)
-            if not torch.isfinite(loss):
+                if wrap:
+                    # RE-WRAP, OR THE ENCODER IS NEVER ALL-REDUCED. DDP registered its parameters
+                    # when the module was wrapped and never re-checks, so the tensors this
+                    # unfreeze just made trainable are in NO reducer: each rank would step its own
+                    # encoder, the ranks would drift apart, and only rank 0's copy would be saved
+                    # -- with no error and no change in the loss curve. Dropping the old wrapper
+                    # first matters: the old Reducer removes its autograd hooks in its destructor,
+                    # so it has to be collected before the new one registers its own. Every rank
+                    # reaches this on the same global `it`, which is what makes the collective
+                    # inside `setup_module` (it broadcasts rank 0's weights) legal.
+                    model = None
+                    gc.collect()
+                    model = fabric.setup_module(raw)
+                    fabric.print(f'  re-wrapped DDP at iteration {it} over '
+                                 f'{sum(p.requires_grad for p in raw.parameters())} trainable '
+                                 f'tensor(s) -- the encoder is in the reducer from here',
+                                 flush=True)
+                    record({'iter': it, 'ddp_rewrapped': True})
+            loss, _ = run_batch(model, loss_fn, batch, device, raw=raw)
+            # A SKIPPED STEP IS A COLLECTIVE DECISION. One rank returning NaN and skipping its
+            # backward while the others run theirs leaves them waiting in the gradient all-reduce
+            # forever, so the finiteness flag is reduced first and every rank skips together.
+            if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(loss))):
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
-                it += 1
+                step += 1
+                it = step * world
                 continue
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            fabric.backward(loss)
             gn = torch.nn.utils.clip_grad_norm_(clip_params, max_grad or 1e9)
             # `gn` now measures the AdamW half only; the Muon half is checked for finiteness
             # separately (its grads are stepped unclipped, so a NaN there would otherwise slip in).
             mgrads = [p.grad for p in unclipped_params if p.grad is not None]
             mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())
-            if not (torch.isfinite(gn) and torch.isfinite(mgn)):
+            # Collective for the same reason the loss check above is: the grads are already
+            # averaged, so the ranks should agree, but a step skipped on one rank only is a hang.
+            if not dist_utils.all_ranks_finite(
+                    fabric, bool(torch.isfinite(gn) and torch.isfinite(mgn))):
                 # A non-finite gradient is counted, not hidden: a run that silently skips half
                 # its steps looks like a run that trained.
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
-                it += 1
+                step += 1
+                it = step * world
                 continue
             opt.step()
-            running.append(float(loss.detach()))
+            # THE BATCH MEAN, not rank 0's own draw: with one item per rank the loss of a single
+            # rank is a one-sample statistic, and the gradients that were just stepped are the
+            # average over all of them. Free at world 1.
+            running.append(dist_utils.all_ranks_mean(fabric, float(loss.detach())))
             clipped.append(float(max_grad is not None and float(gn) > max_grad))
-            it += 1
+            step += 1
+            it = step * world
 
-            if it % print_freq == 0:
+            if step % local_print_freq == 0:
                 wall = time.time() - t0
                 # `s/it` is the TRAINING step, with eval and checkpointing taken out. Left in, the
                 # print after a val step read 4.9 s/it on allen and 12.1 on johnson and meant
                 # nothing -- and what it hid was not noise: eval was the larger half of allen's
                 # projected wall time, and a checkpoint is 3.15 GB written on every val improvement.
                 elapsed = max(wall - evalled[0] - ckpted[0], 1e-9)
-                dt = elapsed / print_freq
+                # Per LOCAL step, i.e. per `world` samples. That is the wall-clock quantity: it is
+                # what multiplies out to the run's duration, and it stays comparable to a 1-gpu
+                # run's s/it (which is what it costs to add gpus, not what it costs to add data).
+                dt = elapsed / local_print_freq
                 # Fraction of that step time the GPU spent BLOCKED on pixels. Near zero means the
                 # loader is keeping up and no amount of loader work will speed this run up;
                 # anything large is the signal to look at `dataset.py` rather than the model.
@@ -798,11 +1040,13 @@ def main():
                 # Peak READ here and reset in the `log` call below -- one read per window, so the
                 # printed number and the logged one are the same peak rather than two windows'.
                 peak_gb = _gpu_peak_gb(device)
-                print(f'{it:7d}/{n_iter}  loss {np.mean(running):8.4f}  '
-                      f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  eval {eval_frac:4.0%}  '
-                      f'peak {peak_gb:5.1f}G  skipped {skipped}  '
-                      f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
-                      f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
+                # `wait`, `eval`, `peak` and the sampled cell are RANK 0's -- every rank draws its
+                # own item, so the bracket names rank 0's dataset/mode and nothing else's.
+                fabric.print(f'{it:7d}/{n_iter}  loss {np.mean(running):8.4f}  '
+                             f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  eval {eval_frac:4.0%}  '
+                             f'peak {peak_gb:5.1f}G  skipped {skipped * world}  '
+                             f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
+                             f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
                 # `clipped` is the running fraction of steps hitting max_grad_norm. At
                 # batch_size 1 it has measured ~50%, which makes it the most informative
                 # training-health number here -- and it was being computed and thrown away.
@@ -815,7 +1059,7 @@ def main():
                          # and a fresh one carry different step offsets, so panels compared across
                          # runs need an x-axis that says which iteration a point is.
                          'train/iteration': it,
-                         'train/encoder_trainable_params': trainable_encoder_params(model),
+                         'train/encoder_trainable_params': trainable_encoder_params(raw),
                          # PEAK GPU BYTES SINCE THE LAST PRINT, not the current allocation. The
                          # staged unfreeze adds optimizer state AND the backward activations of N
                          # blocks, and an L4 is 22.5 GB -- so whether a recipe fits is a property
@@ -826,16 +1070,19 @@ def main():
                          'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
                          'train/eval_frac': eval_frac,
                          'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
-                         'train/skipped_frac': skipped / max(it, 1)}, it)
+                         'train/skipped_frac': skipped / max(step, 1),
+                         'train/world_size': world}, it)
                 running, t0 = [], time.time()
                 waited[0] = evalled[0] = ckpted[0] = 0.0
 
-            if val_batches and it % val_freq == 0:
+            # `idxs`, NOT `val_batches`: the windows are sharded, so a rank can hold an empty
+            # shard and must still enter `evaluate` -- the gather inside it is collective.
+            if idxs and local_val_freq and step % local_val_freq == 0:
                 t_val = time.time()
-                m, ms = evaluate(model, val_batches, opt, device)
+                m, ms = evaluate(raw, val_batches, opt, device, fabric=fabric)
                 evalled[0] += time.time() - t_val
-                print(f'  EVAL  ({time.time() - t_val:.0f}s)  prior-free {_brief(m)}\n'
-                      f'        self-prompted {_brief(ms)}', flush=True)
+                fabric.print(f'  EVAL  ({time.time() - t_val:.0f}s)  prior-free {_brief(m)}\n'
+                             f'        self-prompted {_brief(ms)}', flush=True)
                 log(wb, {f'val/{k}': v for k, v in m.items()}, it)
                 log(wb, {f'val_self/{k}': v for k, v in ms.items()}, it)
                 # Tracked on EVERY val because it is just a number; the checkpoint it would justify
@@ -855,26 +1102,42 @@ def main():
                 record({'iter': it, 'val': m, 'val_self': ms,
                         'best_mpjpe': best_mpjpe, 'best_iter': best_iter})
 
-            if (it % ckpt_freq == 0 or it == n_iter) and not args.no_checkpoints:
+            if step % local_ckpt_freq == 0 or step == local_iters:
                 t_ck = time.time()
-                p = save_checkpoint(run, it, model, opt, config)
-                # `best` is decided HERE, not at every val: these are the only iterations whose
-                # weights are written at all, so they are the only ones that can honestly be
-                # labelled best. The comparison is against the metric of the file already on disk,
-                # and it uses THIS iteration's val -- an earlier, better val describes weights that
-                # no longer exist.
-                if latest[1] == it and latest[0] < saved_mpjpe:
-                    saved_mpjpe = latest[0]
-                    save_checkpoint(run, it, model, opt, config, name='best')
-                    print(f'  new best: mpjpe {saved_mpjpe:.4g} -> checkpoint_best.pth')
-                    # WHAT THE `best` FILE HOLDS, in the log, because the file itself does not
-                    # record it -- and a resumed run that cannot read this replaces a good `best`
-                    # with its own first val.
-                    record({'iter': it, 'saved_mpjpe': saved_mpjpe})
+                # THE RANKS MUST STILL HOLD ONE MODEL, and this runs even under
+                # `--no-checkpoints`: it is the guard, not part of the writing. Every rank steps
+                # identical averaged gradients, so their weights should be bit-identical; a tensor
+                # that stopped being all-reduced -- what a missed unfreeze re-wrap produces --
+                # drifts immediately and silently, and only rank 0's copy is what gets written.
+                # Collective, so every rank raises together instead of one raising and the rest
+                # hanging in the next reduction.
+                drift, p = dist_utils.check_ranks_agree(fabric, raw), None
+                if not args.no_checkpoints:
+                    p = save_checkpoint(run, it, raw, opt, config) if is0 else None
+                    # `best` is decided HERE, not at every val: these are the only iterations
+                    # whose weights are written at all, so they are the only ones that can
+                    # honestly be labelled best. The comparison is against the metric of the file
+                    # already on disk, and it uses THIS iteration's val -- an earlier, better val
+                    # describes weights that no longer exist.
+                    if latest[1] == it and latest[0] < saved_mpjpe:
+                        saved_mpjpe = latest[0]
+                        if is0:
+                            save_checkpoint(run, it, raw, opt, config, name='best')
+                        fabric.print(f'  new best: mpjpe {saved_mpjpe:.4g} -> '
+                                     f'checkpoint_best.pth')
+                        # WHAT THE `best` FILE HOLDS, in the log, because the file itself does not
+                        # record it -- and a resumed run that cannot read this replaces a good
+                        # `best` with its own first val.
+                        record({'iter': it, 'saved_mpjpe': saved_mpjpe})
+                # The barrier keeps `ckpt_frac` measuring the same wall time on every rank, and
+                # keeps a rank from racing into the next window while rank 0 writes 5.6 GB.
+                fabric.barrier()
                 ckpted[0] += time.time() - t_ck
-                print(f'saved {p} ({time.time() - t_ck:.0f}s)')
-    print(f'done: {it} iterations, {skipped} skipped')
-    record({'iter': it, 'done': True, 'skipped': skipped,
+                if p is not None or world > 1:
+                    fabric.print(f'saved {p} ({time.time() - t_ck:.0f}s'
+                                 + (f', rank drift {drift:.1e}' if world > 1 else '') + ')')
+    fabric.print(f'done: {it} iterations, {skipped * world} skipped')
+    record({'iter': it, 'done': True, 'skipped': skipped * world, 'world_size': world,
             'best_mpjpe': best_mpjpe, 'best_iter': best_iter})
     if wb is not None:
         wb.finish()

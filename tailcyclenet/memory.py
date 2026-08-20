@@ -44,16 +44,25 @@ GB = float(1 << 30)
 # of which is on this budget. A starting point corrected by measurement, not a result.
 DEFAULT_FRACTION = 0.6
 
-# THE PARTITION, AND IT MUST SUM BELOW 1. Three consumers hold large buffers at the same time and
-# each is sized independently, so a fraction that is generous on its own overcommits in company.
-# `FRACTION_READERS` is applied by `dataset._reader_cache_size` to `min(limit, available)`
-# DIRECTLY, not to `budget_gb` -- it keeps the 0.5 it always had so that an unconstrained host
-# resolves to exactly the cache size it resolved to before this module existed, and no shipped
-# measurement moves. The other two are fractions OF `budget_gb`, i.e. of `DEFAULT_FRACTION` of the
-# headroom, so their combined footprint is 0.6 * 0.5 = 0.30 of headroom against readers' 0.50.
-FRACTION_READERS = 0.5
-FRACTION_DETECT = 0.3
-FRACTION_CROPS = 0.2
+# THE PARTITION, AND IT MUST SUM BELOW 1. Three consumers hold large buffers and each is sized
+# independently, so a fraction that is generous alone overcommits in company.
+#
+# **WEIGHTED TOWARD FRAMES, NOT READERS, BECAUSE THE TWO COSTS HAVE DIFFERENT SHAPES.** Holding
+# `n` open decord readers costs `~0.035/megapixel * n^2` GB -- quadratic, measured, see
+# `dataset._reader_cache_size` -- while reopening one costs 41.5 ms against the ~300 ms it takes to
+# decode the window anyway. The frame cache is LINEAR in what it holds and removes reader pressure
+# outright, since a cached frame needs no reader at all. So a GB spent on frames buys strictly more
+# than a GB spent on readers, and the split moved 0.50/0.20 -> 0.25/0.45 to say so.
+#
+# The quadratic law also means readers self-limit: 0.25 of a large budget still clamps at the rig's
+# camera count, so an unconstrained host is unchanged, while a small budget now affords MORE
+# readers than the old linear price allowed (5 rather than 2 for johnson at 16 GB).
+#
+# `FRACTION_DETECT` overlaps neither of the others in time -- detection finishes before the pose
+# loop starts -- so it is deliberately the loosest of the three.
+FRACTION_READERS = 0.25
+FRACTION_DETECT = 0.30
+FRACTION_CROPS = 0.45
 
 ENV_MAX_RAM = 'TAILCYCLENET_MAX_RAM_GB'
 

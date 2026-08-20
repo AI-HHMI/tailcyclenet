@@ -214,12 +214,47 @@ def test_reader_cache_is_pure_given_ram_and_shrinks_under_a_cap():
     (gotcha 10: it must never open a container to measure anything)."""
     from tailcyclenet.dataset import _reader_cache_size
 
-    # johnson's rig: 16 cameras of 3208x2200, ~2.76 GB an entry by the documented fit.
+    # johnson's rig: 16 cameras of 3208x2200. The price is QUADRATIC in the count (measured:
+    # 0.28 / 3.58 / 15.34 / 34.09 / 59.38 GB at 1 / 4 / 8 / 12 / 16 readers).
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1024) == 16     # room -> the whole rig
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=16) == 2        # 16 GB node -> clamped
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1) == 1         # never zero
     # A loader worker still wants 4, not the rig, and the worker count still divides.
     assert _reader_cache_size(16, (3208, 2200), 4, ram_gb=1024) == 4
+    # Monotone in the budget, and quadratic: halving the count should cost ~4x less memory, so
+    # a 4x smaller budget should give ~2x fewer readers rather than 4x fewer.
+    big = _reader_cache_size(16, (3208, 2200), None, ram_gb=64)
+    small = _reader_cache_size(16, (3208, 2200), None, ram_gb=16)
+    assert big > small >= 1
+    assert small == pytest.approx(big / 2, abs=1)
+
+
+def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees():
+    """THE 2.4x. Every window touches all C cameras in the same order, which is the one access
+    pattern LRU cannot serve: at capacity < C it evicts exactly the entry needed next and takes
+    ZERO hits. Measured end to end before the fix -- 16 readers 61 s, ELEVEN readers 149 s, two
+    readers 222 s -- eleven cached readers were buying nothing.
+
+    Asserted against the real pattern, not against the implementation.
+    """
+    from tailcyclenet.dataset import _ReaderCache
+
+    cache = _ReaderCache(11)
+    cache_open = []
+
+    import tailcyclenet.dataset as dsmod
+    real = dsmod._open_reader
+    dsmod._open_reader = lambda p: cache_open.append(p) or object()
+    try:
+        for _ in range(60):                       # 60 passes over a 16-camera rig
+            for c in range(16):
+                cache(f'cam{c}')
+    finally:
+        dsmod._open_reader = real
+
+    rate = cache.hits / (cache.hits + cache.misses)
+    assert rate > 0.3, (
+        f'hit rate {rate:.1%} on a 16-cycle with an 11-entry cache -- an LRU scores 0.0% here, '
+        'which is the regression this guards')
 
 
 @pytest.mark.parametrize('budget_gb', [0.001, 4096])

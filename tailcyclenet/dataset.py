@@ -25,12 +25,12 @@ Two rules that are not negotiable:
 from __future__ import annotations
 
 import os
+import random
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 import threading
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -439,11 +439,25 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
       `fabric.world_size` immediately after launch -- a parsed-environment fact, so this function
       still opens, stats and decodes nothing (gotcha 11). Absent means 1, i.e. today's numbers.
 
-    `per_gb` is `1.0 + 0.25/megapixel`, a line through the only two points anyone has measured:
-    calms21's 1024x570 settles at ~1.0 GB an entry and johnson's 3208x2200 at 2.56 GB (41 GB
-    across 16). Both terms are rounded up from the fit, so the estimate errs toward a smaller
-    cache -- and the clamp only ever binds inside workers, where small is the safe direction. The
-    flat "~1 GB per entry" this replaces was wrong by 2.5x on the rig that needed it most.
+    **THE COST OF N OPEN READERS IS QUADRATIC IN N, NOT LINEAR, AND THAT INVERTS THE DESIGN.**
+    Measured on johnson (3208x2200), holding readers and trimming the arena after each so this is
+    retained memory and not allocator slack:
+
+        1 reader  0.28 GB      8 readers 15.34 GB
+        4 readers 3.58 GB     12 readers 34.09 GB      16 readers 59.38 GB
+
+    which is `0.231 * n^2` to within a few percent. The control that makes it a fact about readers
+    rather than about decode buffers: running the same 16 cameras while RELEASING each reader
+    immediately costs **0.01 GB** total. Decode output is returned in full; open readers are not.
+
+    So `per_gb` -- a LINEAR price, `1.0 + 0.25/megapixel` -- was the wrong shape. It happened to
+    land near the truth at n = 16 on johnson (2.76 vs 2.53 measured) and is wrong everywhere else,
+    badly under-pricing a small cache: at a 16 GB budget it allowed 2 readers where 5 fit.
+
+    And because reopening is CHEAP -- 41.5 ms to open and index a 50 MB container, against 300 ms
+    to decode a 12-frame window off it -- a small reader cache is a good trade, not a concession.
+    The budget is far better spent on the FRAME cache (`infer.run_group`), which is linear in size
+    and removes reader pressure outright: a cached frame needs no reader at all.
     """
     env = os.environ.get('TAILCYCLENET_READER_CACHE')
     if env:
@@ -462,22 +476,59 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     if procs is None:
         procs = int(os.environ.get('TAILCYCLENET_LOCAL_WORLD_SIZE', '1') or 1)
     want = 4 if workers else max(int(n_cams), 4)
-    per_gb = 1.0 + 0.25 * (int(wh[0]) * int(wh[1])) / 1e6
+    # `k * n^2` GB for n open readers, k fitted per megapixel from the table above:
+    # 0.231 at johnson's 7.06 MP -> 0.0327/MP. Rounded up to 0.035 so the estimate errs toward a
+    # smaller cache, which is the safe direction (a miss costs 41.5 ms; an over-estimate costs
+    # gigabytes and, inside workers, the job).
+    k = 0.035 * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
     share = max(workers or 1, 1) * max(int(procs), 1)
-    # `FRACTION_READERS` replaces the bare 0.5 this carried, and is deliberately chosen so that an
-    # unconstrained host resolves to the SAME count it always did: the readers' slice is
-    # `FRACTION_READERS x DEFAULT_FRACTION` of headroom rather than 0.5 of it, but on every rig
-    # this repo ships the `want` clamp binds long before the memory term does (johnson: 48 entries
-    # affordable, 16 wanted), so no shipped configuration moves. It binds only when the budget is
-    # genuinely small -- which is the entire point.
-    return max(1, min(want, int(_memory.FRACTION_READERS * ram_gb / share / per_gb)))
+    n = int((max(_memory.FRACTION_READERS * ram_gb, 0.0) / share / k) ** 0.5)
+    return max(1, min(want, n))
 
 
-# Built at the FIRST video read, not at import: `lru_cache`'s maxsize is fixed at decoration and
-# cannot be changed afterwards -- `cache_parameters()` hands back a copy and assigning `.maxsize`
-# silently does nothing -- so the only way to size it from the data is to wrap it late.
+# Built at the FIRST video read, not at import: the size is a function of the rig, and the rig is
+# not known until a group is in hand.
+#
+# NOT AN LRU, AND THAT IS WORTH 2.4x OF WALL CLOCK. The access here is a CYCLE -- every window
+# touches all `C` cameras, in the same order, window after window -- and a cycle is the
+# pathological case for LRU: with capacity `k < C` the entry evicted is always the one needed
+# next, so the hit rate is not `k/C`, it is ZERO. Simulated on the real pattern (16 cameras, 60
+# passes): `lru_cache(11)` takes 0 hits in 960 accesses where random eviction takes 44.4%.
+#
+# Measured end to end on johnson before this was fixed: 16 readers ran the clip in 61 s and ELEVEN
+# readers took 149 s, nearly as slow as two (222 s) -- eleven cached readers were buying nothing.
+# A cache holding two thirds of a rig should pay a third of the misses, not all of them.
+#
+# RANDOM EVICTION rather than "pin the first k": pinning would fill with the first group's cameras
+# and then never serve the second, and a deployment run walks many groups.
 _readers = None
 _cache_lock = threading.Lock()
+
+
+class _ReaderCache:
+    """At most `maxsize` open readers, evicting a RANDOM entry on overflow -- see above."""
+
+    def __init__(self, maxsize: int):
+        self.maxsize = max(1, int(maxsize))
+        self.hits = self.misses = 0
+        self._d: dict[str, object] = {}
+        self._rng = random.Random(0)        # seeded: eviction must not vary run to run
+
+    def __call__(self, path: str):
+        got = self._d.get(path)
+        if got is not None:
+            self.hits += 1
+            return got
+        self.misses += 1
+        if len(self._d) >= self.maxsize:
+            # Dropping the last reference is what frees decord's frame pool (~2.5 GB on a
+            # 3208x2200 container), which is why this is a memory budget and not a handle count.
+            del self._d[self._rng.choice(list(self._d))]
+        got = self._d[path] = _open_reader(path)
+        return got
+
+    def cache_clear(self):
+        self._d.clear()
 
 
 def _open_reader(path: str):
@@ -506,7 +557,7 @@ def _reader(path: str, group, cam: str):
 
     `_cache_lock` covers BOTH the late build and the lookup, because the cameras of one rig are now
     decoded concurrently (`detector.detect_group`): two threads racing the `is None` test would
-    build two caches and the first one's readers would leak, and two `lru_cache` misses on the same
+    build two caches and the first one's readers would leak, and two cache misses on the same
     path would open the same 4K container twice. Opening is once per file and off the hot path, so
     holding the lock across it costs nothing measurable; the DECODE is not under it.
     """
@@ -530,7 +581,7 @@ def _reader(path: str, group, cam: str):
                     f'{len(rig) - size} container(s) per window. The RAM budget would not hold '
                     f'more ({_memory.current()}). Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or '
                     'accept the slowdown.', stacklevel=2)
-            _readers = lru_cache(maxsize=size)(_open_reader)
+            _readers = _ReaderCache(size)
         return _readers(path)
 
 

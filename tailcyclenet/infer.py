@@ -395,11 +395,33 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     cam_decode = memory.fits(_budget.share(memory.FRACTION_CROPS) / 2,
                              _frame_bytes * cfg.n_frames,
                              want=min(_CAM_DECODE, len(cam_ix)))
-    # The other half of the crops share, spent on the cache. A window plus one step is what is
-    # live at once, so below that there is nothing to reuse and the cache is pure overhead.
+    # THE CACHE DEGRADES, IT DOES NOT SWITCH OFF, and that distinction was worth 42% of wall clock.
+    # This used to be all-or-nothing: it demanded room for `C x (T + step)` frames -- three windows
+    # of the whole rig -- and held NOTHING below that. So a budget one frame short of the
+    # requirement paid the full 6x re-decode, which is most of why `--max-ram 32` ran at 212 s
+    # against 149 s at 64 (both otherwise identical).
+    #
+    # There are two reuses here and they cost very different amounts to buy:
+    #
+    #   - `--refine` decodes THE SAME `frames` a second time, immediately, for the same cameras.
+    #     Buying that back needs only ONE window of the cameras in flight, and it is half of all
+    #     the decode work on a 3D root.
+    #   - the `T/step` overlapping windows reuse frames across window boundaries, which needs the
+    #     larger `C x (T + step)`.
+    #
+    # So the cache now holds whatever the budget affords and evicts to stay inside it, taking the
+    # cheap reuse first. `_frame_cap` of 0 is the old uncached path exactly.
     _step = max(1, cfg.n_frames - cfg.overlap)
-    _cache_frames = int(_budget.share(memory.FRACTION_CROPS) / 2 // max(1, _frame_bytes))
-    _frame_budget = _cache_frames >= len(cam_ix) * (cfg.n_frames + _step)
+    # The in-flight decode (`cam_decode` cameras x one window of full frames) comes out of the same
+    # share, so subtract it rather than halving blindly: on a small budget the halving threw away
+    # cache the loop could have used, and on a large one it under-spent by the same factor.
+    _inflight = cam_decode * cfg.n_frames * _frame_bytes
+    _frame_cap = int(max(0.0, _budget.share(memory.FRACTION_CROPS) - _inflight)
+                     // max(1, _frame_bytes))
+    # Below one window of the cameras actually in flight there is genuinely nothing to reuse --
+    # the entries would be evicted before the refine pass asked for them -- so spend nothing.
+    if _frame_cap < cam_decode * cfg.n_frames:
+        _frame_cap = 0
     _frame_cache: dict[tuple[int, int], np.ndarray] = {}
 
     outcome = np.full((S, len(starts)), OUTCOMES.index('no box'), np.int8)
@@ -630,8 +652,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             need = [t for t in frames if (ci, int(t)) not in _frame_cache]
             if need:
                 got = read_frames(group, session.cam_names[ci], need, pool=pool)
-                if _frame_budget:
+                if _frame_cap:
+                    # Insert what fits. `crops` is built from `imgs` below either way, so an entry
+                    # that does not fit simply is not reused -- never a correctness question.
                     for t, im in zip(need, got):
+                        if len(_frame_cache) >= _frame_cap:
+                            break
                         _frame_cache[ci, int(t)] = im
             else:
                 got = []

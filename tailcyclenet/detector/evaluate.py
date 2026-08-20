@@ -198,3 +198,140 @@ def overall(rows):
                    if m else float('nan'))
     out['n_gt'] = sum(r['n_gt'] for r in rows.values())
     return out
+
+
+def _labelled_frames(sess, gid):
+    """(F,) int frame indices with any labelled keypoint in this group, or empty."""
+    from ..format import UNLABELED
+    lab = sess.labels(gid)
+    vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
+    if vis is None:
+        return np.zeros(0, int)
+    v = vis.reshape(vis.shape[0], vis.shape[1], -1)
+    return np.flatnonzero((v != UNLABELED).any((0, 2)))
+
+
+def _gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
+    """Crop-rule box side (SOURCE px) for every labelled (animal, frame[, camera]), a POPULATION
+    -- not paired to any detector row. `deployment_score` compares this against the union-box
+    side distribution the box path actually produces, unpaired, exactly the scope
+    `dev/plans/detector_accuracy.md` T0.1 settled on: pairing a detector row to a GT identity
+    needs a matcher (MOTA's), and this is meant to run before spending a GPU-hour on either half
+    of the box path, not to replace `box_mota`.
+
+    2D: `points2d[:, f, :, ci]` directly. 3D: `points3d[:, f]` projected through frame `f`'s own
+    camera group, the same branch `BoxDataset._points_2d` takes (mirrored here rather than
+    imported, because building a whole `BoxDataset` -- augmentation RNG, tiling, the multi-root
+    refusal -- to read one projection is the wrong tool for a label-only pass).
+
+    `cap` bounds the frames sampled per group (evenly spaced), so a 20,000-frame calms21 clip
+    costs the same as a 500-frame one -- this is a population read, not a census.
+    """
+    from ..crop import crop_box_for_points
+    from posetail.posetail.cube import project_points_torch
+    frames = _labelled_frames(sess, gid)
+    if max_frames:
+        frames = frames[frames < max_frames]
+    if frames.size > cap:
+        frames = frames[np.linspace(0, frames.size - 1, cap).astype(int)]
+    lab = sess.labels(gid)
+    sides = []
+    for f in frames.tolist():
+        if sess.mode == '3d':
+            cams = sess.cgroup(gid, int(f))
+            pts3d = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)
+            for ci, cam in enumerate(cams):
+                p2d = project_points_torch([cam], pts3d)[0]
+                w, h = sess.rig.size(sess.cam_names[ci])
+                for s in range(p2d.shape[0]):
+                    box = crop_box_for_points(p2d[s], torch.tensor([w, h]), min_crop_dim)
+                    if box is not None:
+                        sides.append(float(0.5 * ((box[2] - box[0]) + (box[3] - box[1]))))
+        else:
+            for ci, cam_name in enumerate(sess.cam_names):
+                w, h = sess.rig.size(cam_name)
+                p2d = torch.as_tensor(lab.points2d[:, f, :, ci], dtype=torch.float32)
+                for s in range(p2d.shape[0]):
+                    box = crop_box_for_points(p2d[s], torch.tensor([w, h]), min_crop_dim)
+                    if box is not None:
+                        sides.append(float(0.5 * ((box[2] - box[0]) + (box[3] - box[1]))))
+    return np.array(sides)
+
+
+def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_animals=None,
+                     det_score=0.5, track=True, link=False, min_views=2, max_move=1.0,
+                     min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
+                     n_frames=24, overlap=4, min_box_frames=1, batch=16):
+    """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
+
+    `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on".
+    That number does not predict the box path's real cost (dev/plans/detector_accuracy.md, item
+    0): current-generation checkpoints read val r@.5 0.91-0.93 and IoU 0.79 while costing 43% of
+    pose coverage and +25 px MPJPE. This runs the SAME functions deployment does --
+    `detect_raw` then `associate_group`, and `infer._window_starts` for the window rule
+    `run_group` uses -- over a whole test group, and reports what a pose window actually gets:
+
+        det_fill       fraction of (frame, camera) with >=1 box surviving `det_score` --
+                       the DETECTION-ONLY ceiling, independent of row identity.
+        slot_fill      fraction of (row, frame, camera) with a finite box AFTER association --
+                       identity-bearing only under `track=True` (3D multiview) or `link=True`
+                       (2D); see the `--track` block in CLAUDE.md before reading this under
+                       neither. Comparing it against `det_fill` is what separates "the detector
+                       missed the animal" from "association dropped a detection it had".
+        window_miss    fraction of (row, window) with fewer than `min_box_frames` finite boxes
+                       anywhere in the window -- the EXACT quantity `infer.run_group` marks
+                       `no box`, using its own `_window_starts` rule so this cannot silently
+                       measure a different windowing than deployment's.
+        union_side_px  quantiles of each window's per-camera UNION box side (SOURCE px), the
+                       crop-inflation number `--refine` exists to survive.
+        gt_side_px     quantiles of the crop-RULE box side over this group's own labels, as an
+                       UNPAIRED population comparison against `union_side_px` -- not a per-row
+                       ratio, because pairing a detector row to a GT identity needs a matcher
+                       (`box_mota`'s), which this function does not run.
+
+    Returns a dict of floats/arrays; `n_gt` and `n_windows` say how much each rested on.
+    """
+    from . import detect_raw
+    from . import associate_group as _associate_group
+    from ..infer import _window_starts
+
+    n_animals = max_animals or max(1, len(sess.labels(gid).animal_ids))
+    raw = detect_raw(model, input_wh, sess, gid, top_k=max(top_k, n_animals), device=device,
+                     batch=batch, score_thresh=det_score, reduce=reduce, max_frames=max_frames,
+                     tile_scale=tile_scale)
+    r_box, r_sc, r_kp = raw
+    D, T, C = r_sc.shape
+    det_fill = float(np.isfinite(r_sc[0]).mean()) if D else 0.0
+
+    out, sc, kp = _associate_group(raw, sess, gid, n_animals, link=link, min_views=min_views,
+                                   track=track, max_move=max_move)
+    S, T, C = sc.shape
+    slot_fill = float(np.isfinite(sc).mean())
+
+    starts = _window_starts(T, n_frames, overlap)
+    miss, union_sides = [], []
+    for a in range(S):
+        for st in starts:
+            frames = np.arange(st, min(st + n_frames, T))
+            bb = out[a][frames]                                        # (t, C, 4)
+            n_ok = int(np.isfinite(bb).all(-1).sum())
+            miss.append(n_ok < min_box_frames)
+            if n_ok:
+                for ci in range(C):
+                    v = bb[:, ci][np.isfinite(bb[:, ci]).all(-1)]
+                    if len(v):
+                        x0, y0 = v[:, 0].min(), v[:, 1].min()
+                        x1, y1 = v[:, 2].max(), v[:, 3].max()
+                        union_sides.append(0.5 * ((x1 - x0) + (y1 - y0)))
+
+    gt_sides = _gt_crop_sides(sess, gid, min_crop_dim, max_frames=max_frames)
+    q = (0.5, 0.9, 0.99)
+
+    def _quant(a):
+        a = np.asarray(a, float)
+        return {p: float(np.quantile(a, p)) for p in q} if a.size else {p: float('nan') for p in q}
+
+    return {'det_fill': det_fill, 'slot_fill': slot_fill,
+           'window_miss': float(np.mean(miss)) if miss else float('nan'),
+           'n_windows': len(miss), 'n_gt': int(gt_sides.size),
+           'union_side_px': _quant(union_sides), 'gt_side_px': _quant(gt_sides)}

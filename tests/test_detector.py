@@ -1970,3 +1970,136 @@ def test_per_root_detector_overlays_load_and_raise_val_frames_per_group(tmp_path
         assert cfg['data']['val_frames_per_group'] == expect, name
         assert cfg['data']['val_frames_per_group'] > 8, \
             f'{name}: must exceed the shipped default of 8 or the overlay does nothing'
+
+
+def test_deployment_score_untrained_model_is_all_zero(tmp_path):
+    """`deployment_score` (T0.1, dev/plans/detector_accuracy.md) on a FRESH `YOLOXNano`: the
+    rare-positive objectness prior (bias -4.595, sigmoid ~0.0099) sits below any sane
+    `det_score`, so `det_fill` and `slot_fill` must read exactly 0 and `window_miss` exactly 1 --
+    a degenerate but DETERMINISTIC floor, pinned so a future change to the init or to the
+    threshold plumbing is caught rather than silently shifting the floor.
+    """
+    from .conftest import _session_2d
+    from tailcyclenet.detector.evaluate import deployment_score
+    from tailcyclenet.format import Session
+
+    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    sess = Session.load(tmp_path / 'r' / 'test' / 's0')
+    sess.preload()
+    gid = list(sess.groups)[0]
+    model = YOLOXNano()
+    r = deployment_score(model, sess, gid, input_wh=(64, 64), top_k=8, max_animals=2,
+                         det_score=0.05, n_frames=2, overlap=0, min_box_frames=1)
+    assert r['det_fill'] == 0.0 and r['slot_fill'] == 0.0 and r['window_miss'] == 1.0
+    assert r['n_windows'] == 4                        # 2 rows x 2 windows (T=4, n_frames=2)
+    assert r['n_gt'] == 8                              # 4 labelled frames x 1 camera x 2 animals
+    assert all(v != v for v in r['union_side_px'].values()), \
+        'no box ever fired, so the union-side quantiles must be all-NaN, not zero'
+    assert r['gt_side_px'][0.5] > 0                    # GT sides are label-derived, independent
+
+
+def test_deployment_score_forced_positive_objectness_fills_every_slot(tmp_path):
+    """The live path: force every objectness logit strongly positive (`obj_pred` bias) so every
+    anchor's box survives `det_score`, and confirm `det_fill` becomes 1.0 -- proving the
+    zero-floor above is the init prior firing correctly, not a broken wire that always reads 0.
+    """
+    from .conftest import _session_2d
+    from tailcyclenet.detector.evaluate import deployment_score
+    from tailcyclenet.format import Session
+
+    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    sess = Session.load(tmp_path / 'r' / 'test' / 's0')
+    sess.preload()
+    gid = list(sess.groups)[0]
+    model = YOLOXNano()
+    for m in model.head.obj_pred:
+        torch.nn.init.constant_(m.bias, 10.0)
+    r = deployment_score(model, sess, gid, input_wh=(64, 64), top_k=8, max_animals=2,
+                         det_score=0.05, n_frames=2, overlap=0, min_box_frames=1)
+    assert r['det_fill'] == 1.0
+    assert not any(v != v for v in r['union_side_px'].values()), \
+        'a box fired everywhere, so the union-side quantiles must be finite, not NaN'
+
+
+def test_gt_crop_sides_3d_projects_through_the_right_camera(tmp_path):
+    """`_gt_crop_sides` must take the 3D branch (project points3d per camera) rather than
+    silently reading `points2d`, which a 3D synthetic session does not even populate."""
+    from .conftest import _session_3d
+    from tailcyclenet.detector.evaluate import _gt_crop_sides
+    from tailcyclenet.format import Session
+
+    _session_3d(tmp_path / 'r' / 'test' / 's0', T=4)
+    sess = Session.load(tmp_path / 'r' / 'test' / 's0')
+    sess.preload()
+    gid = list(sess.groups)[0]
+    sides = _gt_crop_sides(sess, gid, min_crop_dim=8)
+    assert sides.size > 0 and np.all(sides >= 8)       # the floor must be respected
+
+
+def test_eval_detector_deploy_cli_end_to_end(tmp_path, monkeypatch):
+    """A 2-iteration checkpoint through `scripts/train_detector.py`, scored through
+    `scripts/eval_detector.py --deploy` -- the new mode, wired the same way `--compare` is:
+    argv in, printed table out, no crash. Not a numeric assertion (2 iterations is noise); this
+    pins that the CLI plumbing (load_detector -> load_datasets -> deployment_score -> print)
+    runs end to end on a REAL trained-and-reloaded checkpoint, not just synthetic tensors.
+    """
+    import importlib.util
+    import sys
+
+    from .conftest import _session_2d
+
+    root = tmp_path / 'root'
+    _session_2d(root / 'train' / 's0', T=4, S=2)
+    _session_2d(root / 'test' / 's1', T=4, S=2)
+
+    train_cfg = _write_config(tmp_path, f"""
+[data]
+path = "{root}"
+boxes = "keypoints"
+min_crop_dim = 8
+input_wh = [64, 64]
+min_box_px = 0
+frames_per_group = 4
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+reduce = false
+keypoints = false
+hflip = true
+tile_wh = []
+tile_scale = 1.0
+tile_bg_per_frame = 1
+use_regions = false
+[model]
+yolox = "trimmed"
+[training]
+out = "{tmp_path / 'run'}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+kpt_weight = 1.0
+kpt_score_weight = 1.0
+""", name='train.toml')
+
+    spec = importlib.util.spec_from_file_location('tcn_train_detector2',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    train_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(train_cfg)])
+    train_mod.main()
+
+    spec2 = importlib.util.spec_from_file_location('tcn_eval_detector',
+                                                    REPO / 'scripts' / 'eval_detector.py')
+    eval_mod = importlib.util.module_from_spec(spec2)
+    spec2.loader.exec_module(eval_mod)
+    monkeypatch.setattr(sys, 'argv', [
+        'eval_detector.py', '--run', str(tmp_path / 'run' / 'detector.pth'),
+        '--data', str(root), '--split', 'test', '--deploy', '--no-track', '--link-boxes',
+        '--score-thresh', '0.001', '--device', 'cpu', '--n-frames', '2', '--overlap', '0'])
+    eval_mod.main()                                    # must not raise

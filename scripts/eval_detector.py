@@ -28,13 +28,15 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.detector import BoxDataset, load_detector
-from tailcyclenet.detector.evaluate import score_dataset
+from tailcyclenet.detector.evaluate import deployment_score, score_dataset
+from tailcyclenet.format import load_datasets
 from tailcyclenet.metrics import paired_bootstrap
 
 
@@ -84,9 +86,30 @@ def main():
     ap.add_argument('--num-workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='cuda:0')
+    ap.add_argument('--deploy', action='store_true',
+                    help='switch to the DEPLOYMENT-SHAPED score (dev/plans/detector_accuracy.md '
+                         'T0.1): det_fill/slot_fill/window_miss/union_side/gt_side over WHOLE '
+                         'test groups via detect_raw+associate_group, the same functions '
+                         'scripts/infer.py calls -- not the per-view sampled recall above, which '
+                         'does not predict it. Ignores --compare/--batches/--frames-per-group.')
+    ap.add_argument('--track', dest='deploy_track', action='store_true', default=True,
+                    help='deploy mode only: CrossViewTracker for C>1 (the default, matches '
+                         'scripts/infer.py)')
+    ap.add_argument('--no-track', dest='deploy_track', action='store_false')
+    ap.add_argument('--link-boxes', action='store_true',
+                    help='deploy mode only: link_rows for C==1 (2D single-camera identity)')
+    ap.add_argument('--n-frames', type=int, default=24, help='deploy mode only: window size')
+    ap.add_argument('--overlap', type=int, default=4, help='deploy mode only: window overlap')
+    ap.add_argument('--min-box-frames', type=int, default=1,
+                    help='deploy mode only: matches infer.InferConfig.min_box_frames')
+    ap.add_argument('--top-k', type=int, default=24, help='deploy mode only: detection budget')
+    ap.add_argument('--det-max-frames', type=int, default=0,
+                    help='deploy mode only: 0 = the whole group; matches infer.py --max-frames')
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
+    if args.deploy:
+        return main_deploy(args, device)
     model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
     # A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE (gotcha 12's
     # shape). `tile_scale` was unpacked here and never used, so `BoxDataset(input_wh=wh)`
@@ -157,6 +180,50 @@ def main():
             # column. Saying so beats leaving a reader to compare two overlapping intervals.
             star = '' if d['lo'] <= 0 <= d['hi'] else '  *'
             print(f'{name:>5s} {d["mean"]:+7.4f}  [{d["lo"]:+.4f}, {d["hi"]:+.4f}]{star}')
+
+
+def main_deploy(args, device):
+    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
+    _tiled(args.run, tile_scale)
+    ds = load_datasets(args.data)[0]
+    sessions = ds.sessions.get(args.split, [])
+    if not sessions:
+        raise SystemExit(f'{args.data}: no {args.split!r} split')
+
+    print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={trained_on}  '
+          f'track={args.deploy_track} link={args.link_boxes}  det_score={args.score_thresh}\n')
+    print(f'{"group":40s} {"T":>6s} {"det_fill":>9s} {"slot_fill":>10s} {"win_miss":>9s} '
+          f'{"union_p50":>10s} {"union_p90":>10s} {"gt_p50":>8s}')
+    rows = []
+    for sess in sessions:
+        for gid, group in sess.groups.items():
+            r = deployment_score(model, sess, gid, input_wh=wh, device=device,
+                                 top_k=args.top_k, max_animals=args.max_animals,
+                                 det_score=args.score_thresh, track=args.deploy_track,
+                                 link=args.link_boxes, min_crop_dim=args.min_crop_dim or mcd,
+                                 reduce=red, tile_scale=tile_scale,
+                                 max_frames=args.det_max_frames, n_frames=args.n_frames,
+                                 overlap=args.overlap, min_box_frames=args.min_box_frames)
+            rows.append(r)
+            print(f'{f"{sess.session_id}/{gid}"[:40]:40s} {group.n_frames:6d} '
+                  f'{r["det_fill"]:9.4f} {r["slot_fill"]:10.4f} {r["window_miss"]:9.4f} '
+                  f'{r["union_side_px"][0.5]:10.1f} {r["union_side_px"][0.9]:10.1f} '
+                  f'{r["gt_side_px"][0.5]:8.1f}')
+
+    print(f'\n{len(rows)} group(s)')
+    for name in ('det_fill', 'slot_fill', 'window_miss'):
+        b = paired_bootstrap([r[name] for r in rows], seed=args.seed)
+        ci = ('DEGENERATE (one group -- no interval exists)' if b['n'] < 2
+              else f'[{b["lo"]:.3f}, {b["hi"]:.3f}] 95% over {b["n"]} groups')
+        print(f'{name:>12s} {b["mean"]:7.4f}  {ci}')
+    # union/gt side quantiles are POOLED per group (each group already a quantile of many
+    # windows/points), so a mean-of-medians is reported rather than bootstrapped a second time --
+    # the within-group distribution is not the between-group one `paired_bootstrap` resamples.
+    for k in (0.5, 0.9, 0.99):
+        us = [r['union_side_px'][k] for r in rows if r['union_side_px'][k] == r['union_side_px'][k]]
+        gs = [r['gt_side_px'][k] for r in rows if r['gt_side_px'][k] == r['gt_side_px'][k]]
+        print(f'  p{int(k*100):>2d}  union_side mean-of-groups {np.mean(us) if us else float("nan"):7.1f} px'
+              f'   gt_side mean-of-groups {np.mean(gs) if gs else float("nan"):7.1f} px')
 
 
 if __name__ == '__main__':

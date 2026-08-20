@@ -1249,6 +1249,30 @@ def test_detector_loss_without_regions_is_unchanged():
     assert 0.0 < np_['certified'] < 1.0
 
 
+def test_detector_loss_without_ignore_is_unchanged():
+    """T2.1's BACKWARD-COMPATIBILITY PROOF, the same shape as the `regions=None` one above.
+
+    `ignore_present` ships OFF (`configs/detector.toml`) and is meant to stay a free, always-on
+    lever regardless of what any single measurement reads: nobody who does not opt in pays for
+    it. That promise is this equality, not a comment -- if `ignore=None` ever stopped taking the
+    exact pre-T2.1 code path, every existing detector number would be silently invalid.
+    """
+    torch.manual_seed(1)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 64
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    base, bp = detector_loss(obj, boxes, anchors, gt)
+    same, sp = detector_loss(obj, boxes, anchors, gt, ignore=None)
+    assert float(base) == float(same) and 'ignored' not in bp and 'ignored' not in sp
+
+    # An ignore box that covers NOTHING near any anchor is the same loss as no ignore box at all.
+    nowhere = torch.tensor([[[9000.0, 9000.0, 9010.0, 9010.0]]] * 2)
+    noop, np_ = detector_loss(obj, boxes, anchors, gt, ignore=nowhere)
+    torch.testing.assert_close(noop, base)
+    assert np_['ignored'] == 0.0
+
+
 def test_a_nan_box_is_skipped_by_both_cross_view_paths():
     """The two halves of `unletterbox_boxes`' contract, joined. They never were.
 

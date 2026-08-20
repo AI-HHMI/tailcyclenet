@@ -138,8 +138,14 @@ use_regions = false
 # it for now -- both are the one opt-in (M,4) tuple slot box_collate/split_batch dispatch by
 # rank, and the constructor raises rather than let one silently clobber the other. Measured on
 # 3dpop's train split at 11.4% of animals in view PRESENT-but-unannotated, masking a mean 0.34%
-# of anchors per view (dev/plans/detector_accuracy.md T2.1) -- SHIPPED OFF: the mechanism is
-# built and tested, the end-to-end arm is not yet run. See BoxDataset.present_ignore_boxes_for.
+# of anchors per view. SHIPPED OFF -- not because a measurement cost it anything: one seed pair
+# on 3dpop reads within this recipe's own documented val-MOTA seed floor either way, and train
+# recall is flat. But one seed on a 64-frame val split is not evidence in either direction, and
+# --use-regions' own history is the warning against shipping an unmeasured default ON. The
+# correctness argument (an unannotated animal should not be trained as "nothing here") justifies
+# keeping the LEVER; it takes a real win to justify flipping the DEFAULT. Off is byte-identical
+# to every checkpoint on record either way -- see test_detector_loss_without_ignore_is_unchanged.
+# dev/plans/detector_accuracy.md T2.1.
 ignore_present = false
 
 [model]

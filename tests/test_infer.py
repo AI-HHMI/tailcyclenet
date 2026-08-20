@@ -717,24 +717,40 @@ def test_2d_is_bit_identical_under_either_carry_source(scene):
                                   np.nan_to_num(b['pred'], nan=-9e9))
 
 
-def test_3d_carry_feeds_back_the_anchor_free_estimate(scene):
+def test_3d_carry_feeds_back_the_anchor_free_estimate(tmp_path):
     """...and in 3D it must actually differ, or the de-loop is not wired to anything.
 
-    `pred_tri` is the tensor `carry` now hands the next window: re-derived from each window's own
-    pixels rather than `prior + residual`, which is a loop with gain. It also rides in the npz
-    because nothing had ever scored the triangulation against the labels.
+    `carry` hands the next window `3d_pred_triangulate` -- re-derived from that window's own pixels
+    rather than `prior + residual`, which is a loop with gain. Asserted on the PREDICTION, which is
+    what the choice is supposed to move. The test used to read a `pred_tri` output column instead,
+    and that column is gone: it was `(S,T,K,3)` for the whole clip, for a diagnostic no protocol
+    scores.
+
+    IT BUILDS ITS OWN SESSION AT T=8 RATHER THAN TAKING `scene`, and that is the whole point.
+    `scene` ships T=4 against `_cfg`'s `n_frames=4`, which is exactly ONE window -- so `carried` is
+    never read and the two carry sources are trivially identical. A single-window fixture cannot
+    test a between-window hand-off, and reading `pred_tri` inside one window was hiding that.
     """
-    model, sess, registry, name = scene
-    if sess.mode != '3d':
-        pytest.skip('3D only')
-    out = run_group(model, sess, 'g000', registry, name,
+    import conftest as cf
+
+    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=8)
+    ds = load_dataset(tmp_path / 'mv')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+
+    # n_frames 4, overlap 2 -> step 2 -> windows at 0, 2, 4 -- three hand-offs to disagree over.
+    tri = run_group(model, sess, 'g000', registry, ds.name,
                     _cfg(anchor='carry', carry_source='triangulate'))
-    assert 'pred_tri' in out and out['pred_tri'].shape == out['pred'].shape
-    # A single-camera 3D window has no triangulation, and the fixture rig has three cameras, so
-    # here it must be present -- and it is a different estimate from the reported one.
-    assert np.isfinite(out['pred_tri']).any(), 'the anchor-free estimate must be recorded'
-    assert not np.array_equal(np.nan_to_num(out['pred_tri'], nan=-9e9),
-                              np.nan_to_num(out['pred'], nan=-9e9))
+    pred = run_group(model, sess, 'g000', registry, ds.name,
+                     _cfg(anchor='carry', carry_source='pred'))
+    assert len(tri['window_start']) > 1, 'a one-window group cannot exercise the hand-off'
+    # The fixture rig has three cameras, so a triangulation exists and the two carries are two
+    # different tensors. In 2D they are bit-identical, which the test above pins.
+    assert not np.array_equal(np.nan_to_num(tri['pred'], nan=-9e9),
+                              np.nan_to_num(pred['pred'], nan=-9e9)), \
+        'carry_source must change the prediction in 3D, or the de-loop is wired to nothing'
 
 
 def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):

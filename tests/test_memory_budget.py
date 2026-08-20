@@ -319,9 +319,9 @@ def test_result_arrays_are_the_term_the_budget_cannot_shrink():
     shorter = memory.result_array_gb(hour // 100, 16, 24, 2, top_k=24, det_kpts=True)
     assert sum(shorter.values()) == pytest.approx(sum(big.values()) / 100, rel=0.01)
 
-    # A detector with no keypoint branch pays neither the kpt array nor kpt_agree.
+    # A detector with no keypoint branch does not pay for the keypoint array.
     none = memory.result_array_gb(hour, 16, 24, 2, top_k=24, det_kpts=False)
-    assert 'detect keypoints' not in none and 'kpt_agree' not in none
+    assert 'detect keypoints' not in none
 
     # Linear in every axis it claims to be linear in.
     a = memory.result_array_gb(1000, 8, 10, 1, top_k=4, det_kpts=True)

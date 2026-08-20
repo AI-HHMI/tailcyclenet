@@ -260,12 +260,14 @@ def result_array_gb(n_frames: int, n_cams: int, n_kpts: int, n_animals: int,
 
         detect_raw, top_k 2    6.6 GB   (6.2 of it keypoints)
         detect_raw, top_k 24  79.3 GB   (74.2 of it keypoints)
-        run_group,  1 animal   1.6 GB
-        run_group,  4 animals  6.5 GB
+        run_group,  1 animal   0.4 GB
+        run_group,  4 animals  1.6 GB
 
-    `kpt` dominates both because it is the only array with BOTH a camera and a keypoint axis:
+    `kpt` dominates because it is the only array left with BOTH a camera and a keypoint axis:
     `(top_k, T, C, K, 3)` float32. At top_k 24 it is 93% of the detection footprint, and it is
     allocated whenever the detector merely HAS a keypoint branch, whether or not anything reads it.
+    `run_group`'s share fell 4x when `pred_tri` and `kpt_agree` left the output -- `kpt_agree` was
+    the only pose-side array with a camera AND a keypoint axis, so it carried the same factor of K.
 
     Callers use this to fail loudly BEFORE the work rather than to be OOM-killed hours into it.
     """
@@ -277,10 +279,8 @@ def result_array_gb(n_frames: int, n_cams: int, n_kpts: int, n_animals: int,
         'detect scores': D * T * C * f4,
         'detect keypoints': (D * T * C * K * 3 * f4) if det_kpts else 0.0,
         'pred': S * T * K * dims * f4,
-        'pred_tri': (S * T * K * dims * f4) if dims == 3 else 0.0,
         'conf': S * T * K * f4,
         'box_agree': S * T * C * f4,
-        'kpt_agree': (S * T * C * K * f4) if det_kpts else 0.0,
     }
     return {k: v / GB for k, v in out.items() if v}
 

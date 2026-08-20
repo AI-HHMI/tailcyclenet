@@ -363,12 +363,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     pred = np.full((S, T_total, K, R), np.nan, np.float32)
     conf = np.full((S, T_total, K), np.nan, np.float32)
-    # THE ANCHOR-FREE ESTIMATE, kept beside the prediction in 3D. It is what `carry` now feeds back,
-    # every fix below rests on it, and nothing had ever scored it against the labels -- so it goes in
-    # the npz where `eval.py` can. Independent of `carry_source`, deliberately: it is a property of
-    # the forward, not of what the loop chose to do with it.
-    pred_tri = np.full((S, T_total, K, R), np.nan, np.float32) if mode == '3d' else None
-    tri_bad = np.zeros((S, T_total, K), bool) if mode == '3d' else None
+    # THE ANCHOR-FREE ESTIMATE IS NOT AN OUTPUT COLUMN, but it is still what `carry` feeds back.
+    # `3d_pred_triangulate` is read live out of `out` in `forward()` below and handed to the next
+    # window; `--carry-source triangulate` is the shipped 3D default and does not move. What went
+    # is the `(S,T,K,3)` array that shadowed it for the whole clip, plus its `tri_degenerate`
+    # companion -- two of the arrays that made a long clip unrepresentable, for a diagnostic no
+    # protocol reads.
     carried = [None] * S                      # per-animal prior for the next window
     # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
     # Both are what makes a coverage delta readable -- 08's crop-inflation measurement needed the
@@ -436,12 +436,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # (medians +2.7 / +4.0 / +15.4 across three roots, and a sign that flips per dataset) one value
     # means the same thing everywhere.
     box_agree = np.full((S, T_total, len(session.rig)), np.nan, np.float32)
-    # (S,T,C,K) pose-against-detector-keypoints, only when a keypoint-trained detector supplied
-    # them. Unlike `box_agree` this is per keypoint and structurally UNBOUNDED -- see
-    # `_fill_kpt_agreement`.
-    kpt_agree = (None if det_kpts_stc is None else
-                 np.full((S, T_total, len(session.rig), det_kpts_stc.shape[3]),
-                         np.nan, np.float32))
+    # `kpt_agree` -- (S,T,C,K) pose-against-detector-keypoints -- IS GONE. It was the largest
+    # array here by a factor of K and the third largest thing a long clip allocated, for a
+    # diagnostic nothing gates on: at 720,000 frames on a 16-camera 24-keypoint rig it is 2.06 GB
+    # of an 82 GB total. `det_kpts_stc` itself stays -- `--crop-source keypoints` and `--pose-nms`
+    # both read it -- so only the recorded column went.
     crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
     # THE POPULATION `--box-prompt` GOVERNS, per (animal, window) -- report-24 §9k's rule that a
     # lever's selectivity must be read beside the population it can act on. -1 where the box was
@@ -450,14 +449,9 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # being requested) is distinguishable from "the box was never requested" (-1).
     box_cams = (np.full((S, len(starts)), -1, np.int8) if cfg.box_prompt != 'none' else None)
 
-    # THE COMPANION COLUMNS BLEND TOO, and they used not to. `pred` became the nan-aware mean of
-    # every window that decoded a frame while `conf`, `box_agree`, `kpt_agree` and `pred_tri`
-    # stayed plain assignments -- so they described the LAST window's decode of a frame whose
-    # reported pose is an average of several. `--vis-thresh` made it worse: it NaNs `conf` and
-    # `box_agree` for frames it dropped in this window while the blend still carries an earlier,
-    # ungated window's contribution to `pred`, so a frame could have a finite blended pose and a
-    # NaN confidence. `eval.py` reads `box_agree` per group and quotes `--vis-thresh` off `conf`,
-    # so the two blend arms were reporting mismatched columns.
+    # EVERY COLUMN IS A PLAIN ASSIGNMENT, and a frame in an overlap takes the LAST window that
+    # decoded it (eval rule 11). There is no blend: the comment that used to sit here described
+    # one, and the nan-aware mean it described was removed without it.
     #
     def _build_plans(wi, start):
         """Everything the old inline loop did BEFORE any pixel touches: pure geometry.
@@ -859,18 +853,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 continue                        # already marked 'decode failed' above
             p, q, out = got
             outcome[a, wi] = OUTCOMES.index('ok')
-            if pred_tri is not None and out.get('3d_pred_triangulate') is not None:
-                pred_tri[a, frames] = out['3d_pred_triangulate'][0].detach().cpu().numpy()
-                if out.get('tri_degenerate') is not None:
-                    # A DEGENERATE SOLVE IS REPAIRED FROM THE RAYS, and `carry` now seeds the next
-                    # window from this tensor -- so how often that happened has to be visible rather
-                    # than absorbed into one silently-substituted array.
-                    tri_bad[a, frames] = out['tri_degenerate'][0].detach().cpu().numpy()
             _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
-            if kpt_agree is not None:
-                _fill_kpt_agreement(kpt_agree, a, frames, use,
-                                    [det_kpts_stc[a, frames, ci] for ci in use],
-                                    p, mode, window_cams)
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
@@ -969,7 +952,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
     out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
                'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
-               **({} if kpt_agree is None else {'kpt_agree': kpt_agree}),
                'window_start': np.asarray(starts),
                'outcome_names': np.asarray(OUTCOMES, object),
                'mode': mode, 'group_id': gid, 'session': session.session_id,
@@ -982,9 +964,6 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                'boxes_from': 'detector' if boxes_stc is not None else
                              ('given points' if box_points is not None else
                               ('instances.pq' if inst_boxes is not None else 'labels'))}
-    if pred_tri is not None:
-        out_npz['pred_tri'] = pred_tri
-        out_npz['tri_degenerate'] = tri_bad
     if crop_refined is not None:
         out_npz['crop_refined'] = crop_refined
     if box_cams is not None:
@@ -1001,44 +980,6 @@ def _overlaps(a, b):
     if not (np.isfinite(a).all() and np.isfinite(b).all()):
         return False
     return bool(min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1]))
-
-
-def _fill_kpt_agreement(kpt_agree, a, frames, use, det_kpts, p, mode, window_cams):
-    """PER-KEYPOINT distance from the pose to the DETECTOR's own keypoint, in box sides.
-
-    The third statement about where the animal is. `box_agree` compares the pose against its crop
-    BOX, and report 13 withdrew its 2D half because the pose is decoded inside that very box, which
-    bounds the statistic at about half a side by construction (every 2D arm reads p99 0.31-0.56).
-    **This has no such bound**: the detector regresses in the full frame, independent of the crop,
-    so pose and detector can disagree without limit and a large value means something in 2D too.
-
-    Per KEYPOINT rather than per centroid, so it localises WHICH joint the two disagree about --
-    and it needs no learned head and no per-dataset threshold, unlike `--vis-thresh`, whose logit
-    has no portable value across roots.
-
-    NOT a gate. Recorded as a diagnostic first; any gate built on it needs the rate-matched random
-    control that `--vis-thresh` is quoted with, for the same reason.
-    """
-    for i, ci in enumerate(use):
-        dk = det_kpts[i]                                  # (t,K,3) source pixels, or None
-        if dk is None:
-            continue
-        if mode == '2d':
-            q = np.asarray(p, np.float64)                 # already source pixels
-        else:
-            q = project_points_torch([window_cams[ci]],
-                                     torch.as_tensor(p, dtype=torch.float32))[0].numpy()
-        d = np.asarray(dk, np.float64)
-        # The detector's own box side, per frame, from its keypoint extent -- the same quantity
-        # every other distance in this file is normalised by.
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            lo = np.nanmin(d[..., :2], axis=-2)
-            hi = np.nanmax(d[..., :2], axis=-2)
-        side = 0.5 * ((hi[..., 0] - lo[..., 0]) + (hi[..., 1] - lo[..., 1]))
-        side = np.where(np.isfinite(side) & (side > 1e-6), side, np.nan)
-        kpt_agree[a, frames, ci] = (np.linalg.norm(q - d[..., :2], axis=-1)
-                                    / side[..., None])
 
 
 def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):

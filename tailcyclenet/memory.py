@@ -240,6 +240,45 @@ def reset() -> None:
     _cached = None
 
 
+def result_array_gb(n_frames: int, n_cams: int, n_kpts: int, n_animals: int,
+                    top_k: int, det_kpts: bool, dims: int = 3) -> dict[str, float]:
+    """GB of RESULT arrays a group will allocate up front, by name. Nothing to do with pixels.
+
+    **THIS IS THE TERM THE RAM BUDGET DOES NOT COVER, AND ON A LONG CLIP IT IS THE ONE THAT KILLS
+    THE RUN.** Everything else in this module sizes buffers that are reused window after window;
+    these are `np.full` allocations proportional to the WHOLE CLIP, made before a single frame is
+    decoded, and no budget can shrink them because they are the answer being computed.
+
+    A 200 fps hour -- 720,000 frames, which is an ordinary recording, not a pathological one --
+    on a 16-camera 24-keypoint rig:
+
+        detect_raw, top_k 2    6.6 GB   (6.2 of it keypoints)
+        detect_raw, top_k 24  79.3 GB   (74.2 of it keypoints)
+        run_group,  1 animal   1.6 GB
+        run_group,  4 animals  6.5 GB
+
+    `kpt` dominates both because it is the only array with BOTH a camera and a keypoint axis:
+    `(top_k, T, C, K, 3)` float32. At top_k 24 it is 93% of the detection footprint, and it is
+    allocated whenever the detector merely HAS a keypoint branch, whether or not anything reads it.
+
+    Callers use this to fail loudly BEFORE the work rather than to be OOM-killed hours into it.
+    """
+    f4 = 4.0
+    T, C, K, S, D = (max(int(n_frames), 0), max(int(n_cams), 1), max(int(n_kpts), 1),
+                     max(int(n_animals), 1), max(int(top_k), 1))
+    out = {
+        'detect boxes': D * T * C * 4 * f4,
+        'detect scores': D * T * C * f4,
+        'detect keypoints': (D * T * C * K * 3 * f4) if det_kpts else 0.0,
+        'pred': S * T * K * dims * f4,
+        'pred_tri': (S * T * K * dims * f4) if dims == 3 else 0.0,
+        'conf': S * T * K * f4,
+        'box_agree': S * T * C * f4,
+        'kpt_agree': (S * T * C * K * f4) if det_kpts else 0.0,
+    }
+    return {k: v / GB for k, v in out.items() if v}
+
+
 _libc = None
 _TRIM_OFF = os.environ.get('TAILCYCLENET_NO_MALLOC_TRIM')
 

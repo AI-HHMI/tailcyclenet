@@ -562,6 +562,36 @@ def main():
                 # and welding them meant a sweep over the row count also moved the detection budget
                 # -- which is why `link_rows`' spare-rows finding could not be run end to end.
                 n_det = args.det_top_k or n_want
+                # WILL THE ANSWER ITSELF FIT? Checked HERE, before `detect_raw` allocates and
+                # before hours of decode, because none of it is reachable by `--max-ram`: these
+                # are `np.full` arrays proportional to the whole clip, not reusable buffers.
+                #
+                # A 200 fps hour is 720,000 frames, which is an ordinary recording. On a
+                # 16-camera 24-keypoint rig that is 6.6 GB of detection arrays at top_k 2 and
+                # 79.3 GB at top_k 24 -- so the failure is not exotic, it is what happens the
+                # first time someone points this at a full session instead of a clip.
+                _T_est = min(sess.groups[gid].n_frames, args.max_frames or sess.groups[gid].n_frames)
+                _parts = _memory.result_array_gb(
+                    _T_est, len(sess.rig), registry.n_keypoints, n_want, n_det,
+                    det_kpts=bool(getattr(det, 'n_keypoints', 0)),
+                    dims=3 if sess.mode == '3d' else 2)
+                _need = sum(_parts.values())
+                if _need > _budget.budget_gb:
+                    _big = sorted(_parts.items(), key=lambda kv: -kv[1])[:3]
+                    raise SystemExit(
+                        f'{key}: this group would allocate {_need:.1f} GB of RESULT arrays for '
+                        f'{_T_est:,} frames, against a {_budget.budget_gb:.1f} GB budget '
+                        f'({_budget.source}).\n'
+                        + ''.join(f'    {n:<18} {v:7.2f} GB\n' for n, v in _big)
+                        + 'These scale with the LENGTH OF THE CLIP and are the answer itself, so '
+                        'no --max-ram can shrink them. Either:\n'
+                        f'  --max-frames N   score a prefix (N around '
+                        f'{max(1, int(_T_est * _budget.budget_gb / max(_need, 1e-9) * 0.8)):,} '
+                        'would fit here), then move the window and re-run; or\n'
+                        '  --det-top-k K    lower the detection budget -- the keypoint array is '
+                        '(top_k, T, C, K, 3) and is usually most of this; or\n'
+                        '  split the recording into shorter groups at conversion time, which is '
+                        'what every shipped root does.')
                 if key in det_cache:
                     raw = (det_cache[key], det_cache.get(f'{key}|score'),
                            det_cache.get(f'{key}|kpt'))

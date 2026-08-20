@@ -298,3 +298,36 @@ def test_the_frame_cache_changes_no_pixel_at_any_budget(multiwindow_scene, budge
             assert np.array_equal(a, b), f'{k} moved with the RAM budget'
         else:
             assert a == b, f'{k} moved with the RAM budget'
+
+
+def test_result_arrays_are_the_term_the_budget_cannot_shrink():
+    """A 200 fps hour is an ordinary recording and it does not fit.
+
+    720,000 frames on a 16-camera 24-keypoint rig allocates ~82 GB of RESULT arrays at
+    `--det-top-k 24`, 93% of it the detector's `(top_k, T, C, K, 3)` keypoint array -- before a
+    single frame is decoded, and unreachable by `--max-ram` because these arrays ARE the answer.
+
+    `scripts/infer.py` checks this before detection and refuses with the three ways out. This pins
+    the arithmetic behind that check, and the shape of the answer: the keypoint array dominates,
+    and it scales with `top_k`, so `--det-top-k` is the lever that matters most.
+    """
+    hour = 200 * 3600
+    big = memory.result_array_gb(hour, 16, 24, 2, top_k=24, det_kpts=True)
+    assert sum(big.values()) > 60, 'a 200 fps hour should be obviously too big'
+    assert max(big, key=big.get) == 'detect keypoints'
+    assert big['detect keypoints'] / sum(big.values()) > 0.8
+
+    # The two levers the error message offers must actually move it.
+    fewer = memory.result_array_gb(hour, 16, 24, 2, top_k=2, det_kpts=True)
+    assert sum(fewer.values()) < sum(big.values()) / 8
+    shorter = memory.result_array_gb(hour // 100, 16, 24, 2, top_k=24, det_kpts=True)
+    assert sum(shorter.values()) == pytest.approx(sum(big.values()) / 100, rel=0.01)
+
+    # A detector with no keypoint branch pays neither the kpt array nor kpt_agree.
+    none = memory.result_array_gb(hour, 16, 24, 2, top_k=24, det_kpts=False)
+    assert 'detect keypoints' not in none and 'kpt_agree' not in none
+
+    # Linear in every axis it claims to be linear in.
+    a = memory.result_array_gb(1000, 8, 10, 1, top_k=4, det_kpts=True)
+    b = memory.result_array_gb(2000, 8, 10, 1, top_k=4, det_kpts=True)
+    assert sum(b.values()) == pytest.approx(2 * sum(a.values()), rel=1e-9)

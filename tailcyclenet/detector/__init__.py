@@ -134,7 +134,7 @@ def tiled_input_wh(src_wh, tile_scale):
 
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.5,
-               reduce=False, max_frames=0, tile_scale=None):
+               reduce=False, max_frames=0, tile_scale=None, frames=None, read=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     -> (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None) with `D = top_k`, where index
@@ -167,6 +167,22 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     `max_frames` is the same PREFIX `infer.run_group` takes, and it has to be honoured here or the
     two disagree about the clip: rat-city's one test group is 57,594 frames and the protocol is its
     first 480, so detecting the whole group threw away 99.2% of the detection.
+
+    `frames` DETECTS A SLICE OF THE CLIP, so the inference loop can advance detection alongside its
+    window loop instead of paying for the whole group up front. The returned arrays are `len(frames)`
+    long and index `t` is a position in `frames`, not a source frame number -- the caller owns that
+    mapping. `None` is `range(T)`, exactly as before.
+
+    **A SLICE MUST START ON A GLOBAL `batch` BOUNDARY, and the assert below is not pedantry.**
+    `_units` partitions on `range(0, T, batch)`, so a slice that starts anywhere else produces a
+    short leading batch -- a different input SHAPE, and cuDNN picks convolution algorithms per
+    shape. Measured at 0.204 px of box and 1.69e-03 of objectness (dev/reports/38 §3.2), which is
+    enough to reorder NMS and return a different box set. Slicing on an aligned boundary reproduces
+    the whole-clip partition unit for unit, so detecting in slices is byte-identical to detecting
+    at once; slicing anywhere else silently is not.
+
+    `read` REPLACES THE DECODE with `(ci, cam_name, frames, pool) -> imgs`, so a caller that already
+    holds these frames does not decode them a second time. `None` is `read_frames`, unchanged.
     """
     import numpy as np
     import torch
@@ -176,7 +192,12 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     from .data import letterbox, reduce_factor, unletterbox_boxes, unletterbox_keypoints
 
     group = session.groups[gid]
-    T = min(group.n_frames, max_frames or group.n_frames)
+    T_clip = min(group.n_frames, max_frames or group.n_frames)
+    want = np.arange(T_clip) if frames is None else np.asarray(frames, np.int64)
+    T = len(want)
+    _read = read if read is not None else (
+        lambda ci, cam_name, fr, pool=None, reduce=1: read_frames(group, cam_name, fr,
+                                                                  reduce=reduce, pool=pool))
     C = len(session.rig)
     D = max(1, int(top_k))
     out = np.full((D, T, C, 4), np.nan, np.float32)
@@ -196,7 +217,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     # THE FORWARD STAYS SERIAL AND IN CAMERA ORDER: it is 1% of the time and moving it would put
     # two streams on one CUDA context for nothing.
     def _fetch(job):
-        ci, cam_name, frames = job
+        ci, cam_name, src_frames = job
         # THE SAME DECODE THE DETECTOR WAS TRAINED ON. `BoxDataset` reduces at decode where
         # the frame is far above the letterbox target, and a detector fed differently-sampled
         # pixels at deployment is being run off its own training distribution -- silently,
@@ -208,7 +229,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         # NMS, no seam handling -- only a different input size, derived rather than configured.
         wh = input_wh if tile_scale is None else tiled_input_wh(src, tile_scale)
         r = reduce_factor(src, wh) if reduce else 1
-        imgs = read_frames(group, cam_name, frames, reduce=r, pool=frame_pool)
+        imgs = _read(ci, cam_name, src_frames, pool=frame_pool, reduce=r)
         # ONE numpy CONVERSION FOR THE WHOLE BATCH, NOT ONE torch OP PER FRAME, and it stays that
         # way: a 544x320 frame is 0.5 MP, so `torch.as_tensor(...).permute(...) / 255.0` hands a
         # tiny elementwise op to torch's intraop pool (`nproc` wide, 96 here) -- measured at 67 ms
@@ -300,9 +321,23 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     # waits on these futures, and a pool that waits on itself deadlocks the moment both are full.
     frame_pool = ThreadPoolExecutor(max_workers=min(16, max(1, batch)))
 
+    # A SLICE MUST LINE UP WITH THE WHOLE-CLIP BATCH PARTITION, or its forwards have shapes the
+    # whole-clip pass never produces and cuDNN answers them differently (see the docstring). The
+    # only two legal shapes are "starts on a multiple of `batch`" and "ends where the clip does".
+    if frames is not None:
+        _aligned = (int(want[0]) % batch == 0
+                    and (T % batch == 0 or int(want[-1]) == T_clip - 1))
+        assert _aligned and np.array_equal(want, np.arange(want[0], want[0] + T)), (
+            f'detect_raw(frames=) must be a contiguous run starting on a multiple of batch '
+            f'({batch}) and ending on one or at the clip end; got {want[0]}..{want[-1]} of '
+            f'{T_clip}. `_units` partitions on range(0, T, batch), so a misaligned slice forwards '
+            'a short leading batch -- a shape the whole-clip pass never sees, and cuDNN selects '
+            'algorithms per shape (0.204 px of box, 1.69e-03 of objectness; dev/reports/38 §3.2).')
+
     # THE UNIT OF WORK IS (FRAME BATCH, CAMERA CHUNK), which is what makes the peak bounded while
     # every forward keeps its exact shape. With room, one chunk is the whole rig and this is the
-    # loop it always was, unit for unit.
+    # loop it always was, unit for unit. Indices are LOCAL to `want`; `_submit` maps them back to
+    # source frame numbers, which is the only place the two ever differ.
     _units = [(list(range(st, min(st + batch, T))), list(range(lo, min(lo + cams_flight, C))))
               for st in range(0, T, batch)
               for lo in range(0, C, cams_flight)]
@@ -312,7 +347,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         if u >= len(_units):
             return None
         fr, cams = _units[u]
-        return [pool.submit(_fetch, (ci, session.cam_names[ci], fr)) for ci in cams]
+        src_fr = want[fr]
+        return [pool.submit(_fetch, (ci, session.cam_names[ci], src_fr)) for ci in cams]
 
     try:
         # ONE UNIT OF LOOKAHEAD. Decode is ~100% of this loop's wall clock once the pack is fixed,
@@ -322,7 +358,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         # camera order and the forwards still run one camera at a time, in that order.
         pending = _submit(0)
         for _u in range(len(_units)):
-            frames, _ = _units[_u]
+            unit_ix, _ = _units[_u]
             fetched = [f.result() for f in pending]
             nxt = _submit(_u + 1)
             for ci, x, metas, src in fetched:
@@ -334,7 +370,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                 # 0-d TENSOR on purpose; the scalar form is 1 ULP wrong on CUDA.
                 _o = det(x.to(device).float().div_(_div255))
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
-                for j, t in enumerate(frames):
+                for j, t in enumerate(unit_ix):
                     b, s, ix = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
                                       return_index=True)
                     if not b.numel():

@@ -133,6 +133,59 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
         assert np.array_equal(a, b, equal_nan=True), f'{name} moved with the RAM budget'
 
 
+def test_detection_is_batch_aligned_and_slice_independent(det_scene):
+    """Detecting a clip in aligned SLICES must equal detecting it at once, byte for byte.
+
+    This is what lets the inference loop advance detection alongside its window loop instead of
+    paying for the whole group before a single pose is predicted -- and it is only safe because of
+    the alignment rule. `_units` partitions on `range(0, T, batch)`, so a slice that starts
+    anywhere else forwards a short leading batch, which is a SHAPE the whole-clip pass never
+    produces, and cuDNN selects algorithms per shape (0.204 px / 1.69e-03, dev/reports/38 §3.2).
+
+    So both halves are the test: aligned slices agree exactly, and a misaligned one RAISES rather
+    than quietly returning boxes that differ in the fourth decimal place.
+    """
+    from tailcyclenet.detector import detect_raw
+
+    det, sess, gid = det_scene                    # T = 8
+    kw = dict(device='cpu', batch=4)
+    whole = detect_raw(det, (64, 64), sess, gid, 2, **kw)
+
+    parts = [detect_raw(det, (64, 64), sess, gid, 2, frames=np.arange(lo, hi), **kw)
+             for lo, hi in ((0, 4), (4, 8))]
+    for i, name in enumerate(('boxes', 'scores', 'kpts')):
+        if whole[i] is None:
+            continue
+        joined = np.concatenate([p[i] for p in parts], axis=1)
+        assert np.array_equal(joined, whole[i], equal_nan=True), \
+            f'{name} moved when the clip was detected in aligned slices'
+
+    # A trailing slice may be short -- it ends where the clip does.
+    detect_raw(det, (64, 64), sess, gid, 2, frames=np.arange(4, 8), **kw)
+    # A slice starting off the batch grid must not be silently accepted.
+    with pytest.raises(AssertionError, match='multiple of batch'):
+        detect_raw(det, (64, 64), sess, gid, 2, frames=np.arange(2, 6), **kw)
+
+    # `read=` MUST BE A PURE SUBSTITUTION, and it is what stops the detector decoding frames the
+    # window loop is already holding. It is handed SOURCE frame numbers, not slice-local ones --
+    # the two differ for every slice but the first, and getting it wrong would detect the right
+    # count of the wrong frames.
+    from tailcyclenet.dataset import read_frames
+
+    seen = []
+
+    def _read(ci, cam_name, fr, pool=None, reduce=1):
+        seen.append((ci, tuple(int(x) for x in fr)))
+        return read_frames(sess.groups[gid], cam_name, fr, reduce=reduce, pool=pool)
+
+    via = detect_raw(det, (64, 64), sess, gid, 2, frames=np.arange(4, 8), read=_read, **kw)
+    assert seen and all(f == (4, 5, 6, 7) for _, f in seen), \
+        f'read= must receive SOURCE frame numbers, got {seen[:2]}'
+    for i in range(2):
+        assert np.array_equal(via[i], parts[1][i], equal_nan=True), \
+            'read= must be a pure substitution for the decode'
+
+
 def test_batch_is_NOT_inert_which_is_why_the_budget_may_not_touch_it(det_scene):
     """A FINDING ABOUT THE REPO, PINNED SO IT IS NOT REDISCOVERED THE EXPENSIVE WAY.
 

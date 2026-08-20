@@ -182,7 +182,7 @@ def keypoint_loss(pred, target, gt_boxes):
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
-                  regions=None):
+                  regions=None, ignore=None):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -198,6 +198,16 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     trained on -- which `tests/test_detector.py` asserts, because that equality is the only thing
     keeping reports 10-15's numbers comparable.
 
+    `ignore` (B,M,4) is the OPPOSITE polarity: `instances.pq` PRESENT boxes (T2.1,
+    dev/plans/detector_accuracy.md) -- an animal that IS in this view and was not annotated.
+    `regions` says where supervision may happen AT ALL; `ignore` excludes ONE animal's footprint
+    from the background target while leaving everything else supervised. Measured small on
+    3dpop's train split (mean 0.34% of anchors per view for one PRESENT box, against 69% certified
+    on a whole rat-city frame for `regions`), so it does not reweight `obj` against `box_weight`
+    the way `regions` can -- reported anyway, in `parts['ignored']`, for the same reason
+    `certified` is reported: a silent reweighting is exactly what an arm would misattribute to
+    the mask. `regions` and `ignore` are independent and may both be supplied.
+
     **THE NORMALISER IS DELIBERATELY UNCHANGED**, `/ max(n_pos, B)`. Masking shrinks the objectness
     SUM without shrinking its divisor, so it silently reweights `obj` against `box_weight` -- by
     ~100x on a full frame (104 certified of 7,056) and ~10x on a good tile. That is a real effect
@@ -208,16 +218,23 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     device = obj_logits.device
     B = obj_logits.shape[0]
     target = torch.zeros_like(obj_logits)
-    # `--use-regions` certifies where objectness may be supervised at all.
-    weight = None if regions is None else torch.ones_like(obj_logits)
-    n_cert = 0.0
+    # `--use-regions` certifies where objectness may be supervised at all; `ignore` excludes a
+    # specific unannotated animal's footprint from it. Either alone, or both, need the weight
+    # tensor built; neither means the byte-identical fast path below (`weight is None`).
+    weight = None if regions is None and ignore is None else torch.ones_like(obj_logits)
+    n_cert, n_ignored = 0.0, 0.0
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
         pos, gix = assign(anchors, gt_boxes[b])
         if regions is not None:
-            weight[b] = certified_anchors(anchors, regions[b], gt_boxes[b]).to(weight.dtype)
-            n_cert += float(weight[b].mean())
+            cert = certified_anchors(anchors, regions[b], gt_boxes[b])
+            weight[b] *= cert.to(weight.dtype)
+            n_cert += float(cert.float().mean())
+        if ignore is not None:
+            ig = certified_anchors(anchors, ignore[b], None)     # anchor inside an ignore box
+            weight[b] *= (~ig).to(weight.dtype)
+            n_ignored += float(ig.float().mean())
         if pos.numel():
             target[b, pos] = 1.0
             losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
@@ -248,6 +265,8 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     parts = {'obj': float(obj.detach()), 'box': float(box.detach()), 'n_pos': n_pos}
     if regions is not None:
         parts['certified'] = n_cert / max(B, 1)
+    if ignore is not None:
+        parts['ignored'] = n_ignored / max(B, 1)
     if kpts is not None and gt_kpts is not None:
         # Mean over the IMAGES that had a positive, matching how `box` is normalised. Both lists
         # are empty when nothing was assigned, and then these are exact zeros with no gradient.

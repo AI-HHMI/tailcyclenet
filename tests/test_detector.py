@@ -2103,3 +2103,157 @@ kpt_score_weight = 1.0
         '--data', str(root), '--split', 'test', '--deploy', '--no-track', '--link-boxes',
         '--score-thresh', '0.001', '--device', 'cpu', '--n-frames', '2', '--overlap', '0'])
     eval_mod.main()                                    # must not raise
+
+
+# ----------------------------------------------------------------------------------------------
+# T2.1: instances.pq PRESENT boxes as an objectness ignore mask (dev/plans/detector_accuracy.md)
+# ----------------------------------------------------------------------------------------------
+
+def test_present_ignore_boxes_for_matches_ignore_for_when_unwarped(tmp_path):
+    """`present_ignore_boxes_for` (training-side, warp-aware) must agree EXACTLY with
+    `ignore_for` (eval-side, no warp) at `warp=None` -- they read the same table."""
+    from .conftest import _session_2d
+
+    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    ds = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
+                    max_frames_per_group=4)
+    for i, (sess, gid, f, ci) in enumerate(ds.index):
+        b = ds.present_ignore_boxes_for(i)
+        ig, ig_boxes = ds.ignore_for(i)
+        if f == 1:                                    # the fixture's one PRESENT row
+            assert b.shape == (1, 4)
+            torch.testing.assert_close(b[0], torch.as_tensor(ig_boxes[1], dtype=torch.float32))
+        else:
+            assert b.shape == (0, 4)
+
+
+def test_present_ignore_boxes_for_moves_under_a_warp(tmp_path):
+    """The training-side version must actually be warped, or the loss masks the wrong pixels
+    under `--augment`/`--rotate-deg` -- the exact bug `ignore_for`'s own docstring names as the
+    reason it lives beside `boxes_for`/`regions_for` and takes item `i`'s own transform."""
+    from .conftest import _session_2d
+
+    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    ds = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
+                    max_frames_per_group=4)
+    rng = np.random.default_rng(0)
+    warp = random_affine((64, 48), rng, hflip=0.0, rotate_deg=30.0)
+    for i, (sess, gid, f, ci) in enumerate(ds.index):
+        if f == 1:
+            unwarped = ds.present_ignore_boxes_for(i)
+            warped = ds.present_ignore_boxes_for(i, warp=warp)
+            assert not torch.allclose(unwarped, warped)
+
+
+def test_ignore_present_and_use_regions_raise_together(tmp_path):
+    """Both are the ONE opt-in (M,4) tuple slot `box_collate`/`split_batch` dispatch by rank;
+    combining them would silently misroute one as the other rather than fail loudly."""
+    from .conftest import _session_2d
+
+    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    with pytest.raises(ValueError, match='ignore_present and use_regions'):
+        BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
+                  ignore_present=True, use_regions=True)
+
+
+def test_getitem_emits_ignore_boxes_as_the_fourth_element(tmp_path):
+    from .conftest import _session_2d
+
+    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    ds = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
+                    max_frames_per_group=4, ignore_present=True)
+    for i, (sess, gid, f, ci) in enumerate(ds.index):
+        item = ds[i]
+        assert len(item) == 3                          # (x, boxes, ignore_boxes): no keypoints
+        assert item[2].dim() == 2 and item[2].shape[-1] == 4
+        assert (item[2].shape[0] == 1) == (f == 1)      # only frame 1 carries the PRESENT row
+
+    # A dataset WITHOUT ignore_present stays exactly 2 elements -- byte-identical shape.
+    plain = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
+                       max_frames_per_group=4)
+    assert len(plain[0]) == 2
+
+
+def test_detector_loss_ignore_masks_present_but_unannotated_anchors():
+    """The polarity that matters: `ignore` REMOVES anchors from the background target (opposite
+    of `regions`, which RESTRICTS which anchors may be supervised at all), and a real positive
+    is protected even where it geometrically overlaps an ignore box (two animals can overlap)."""
+    torch.manual_seed(0)
+    anchors = torch.tensor([[10.0, 10.0, 8.0], [50.0, 50.0, 8.0]])
+    gt = torch.tensor([[[0.0, 0.0, 20.0, 20.0]]])          # anchor 0 is the sole positive
+    overlapping_ignore = torch.tensor([[[0.0, 0.0, 20.0, 20.0]]])   # same footprint
+    obj = torch.randn(1, 2)
+    boxes = torch.zeros(1, 2, 4)
+
+    _, parts = detector_loss(obj, boxes, anchors, gt, ignore=overlapping_ignore)
+    assert parts['n_pos'] == 1, 'a positive anchor must never be masked by an ignore box'
+    assert parts['ignored'] > 0
+
+    # A pure hard negative (no nearby GT) DOES get masked, and that measurably moves the loss --
+    # the direction that fixes T2.1's false negative.
+    far_gt = torch.tensor([[[1000.0, 1000.0, 1001.0, 1001.0]]])
+    covering_ignore = torch.tensor([[[0.0, 0.0, 20.0, 20.0]]])     # covers anchor 0 only
+    base, _ = detector_loss(obj, boxes, anchors, far_gt)
+    masked, mp = detector_loss(obj, boxes, anchors, far_gt, ignore=covering_ignore)
+    assert float(masked) < float(base), \
+        'masking a hard negative out of the BCE sum must lower the objectness loss'
+    assert mp['n_pos'] == 0 and 'certified' not in mp
+
+
+def test_train_detector_ignore_present_end_to_end(tmp_path, monkeypatch):
+    """A 2-iteration run with `[data].ignore_present = true` on the fixture's own PRESENT row
+    (frame 1) must not raise, must print the 'ign' fraction (the hook `train_detector.py` already
+    had), and the checkpoint must round-trip the flag."""
+    import importlib.util
+    import sys
+
+    from .conftest import _session_2d
+
+    root = tmp_path / 'root'
+    _session_2d(root / 'train' / 's0', T=4, S=2)
+
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{root}"
+boxes = "keypoints"
+min_crop_dim = 8
+input_wh = [64, 64]
+min_box_px = 0
+frames_per_group = 4
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+reduce = false
+keypoints = false
+hflip = true
+tile_wh = []
+tile_scale = 1.0
+tile_bg_per_frame = 1
+use_regions = false
+ignore_present = true
+[model]
+yolox = "trimmed"
+[training]
+out = "{tmp_path / 'run'}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+kpt_weight = 1.0
+kpt_score_weight = 1.0
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector3',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+
+    ckpt = torch.load(tmp_path / 'run' / 'detector_it000002.pth', map_location='cpu',
+                      weights_only=False)
+    assert ckpt['ignore_present'] is True

@@ -332,6 +332,21 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     return np.concatenate([A, t[:, None]], 1).astype(np.float32)
 
 
+def _drop_outside(x, bounds):
+    """(...,2) points -> the same shape, non-finite where outside `bounds` = (lo_x,lo_y,hi_x,hi_y).
+
+    A point warped off the region it belongs to is not that point any more: dropping it shrinks a
+    box to its visible part (a real crop of a half-out animal), and `crop_box_for_points` returns
+    None when every point of an animal is gone, i.e. "no animal here". Shared by `boxes_for` (its
+    own points and tile box) and `present_ignore_boxes_for` (T2.1's ignore boxes) so there is one
+    copy of this rule rather than two that can drift apart.
+    """
+    lo_x, lo_y, hi_x, hi_y = bounds
+    out = ((x[..., 0] < lo_x) | (x[..., 0] > hi_x) |
+          (x[..., 1] < lo_y) | (x[..., 1] > hi_y))
+    return torch.where(out[..., None], torch.nan, x)
+
+
 def _warp_region(rects, M):
     """(M,4) certified rects through an in-plane similarity, ROUNDING DOWN. Returns (M,4).
 
@@ -389,7 +404,7 @@ class BoxDataset(Dataset):
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
-                 strong=False):
+                 strong=False, ignore_present=False):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -420,6 +435,25 @@ class BoxDataset(Dataset):
         # stride-8 CELLS the certified region spans, not by its area, because `CENTER_RADIUS` is
         # 2.5 cells -- so it is a resolution knob and `tile_scale` is what sets it.
         self.use_regions = bool(use_regions)
+        # T2.1 (dev/plans/detector_accuracy.md): mask an `instances.pq` PRESENT box -- an animal
+        # in this view that was NOT annotated -- out of the objectness BACKGROUND target, instead
+        # of training the detector to call it "no animal here". Off by default: with it absent
+        # this loader is byte-identical to every recorded detector, the same discipline
+        # `use_regions` and `keypoints` follow. See `present_ignore_boxes_for`.
+        #
+        # MUTUALLY EXCLUSIVE with `use_regions` for now, not orthogonal to it: both are the
+        # opt-in 4th tuple element `box_collate`/`split_batch` dispatch by RANK alone (M,4), and
+        # that dispatch cannot tell two rank-2 tensors apart. Raised at construction rather than
+        # silently letting one clobber the other -- the same discipline `strong`+`use_regions`
+        # follows just above. Lifting this needs `box_collate`/`split_batch` to carry a THIRD
+        # rank-2 slot, which is a real but separable piece of work; the populations barely overlap
+        # in practice (`use_regions` wants tiling, `ignore_present` is measured on whole frames).
+        self.ignore_present = bool(ignore_present)
+        if self.ignore_present and self.use_regions:
+            raise ValueError('ignore_present and use_regions cannot both be set: both are the '
+                             'one opt-in (M,4) tuple slot box_collate/split_batch dispatch by '
+                             'rank, and that dispatch cannot tell two rank-2 tensors apart. See '
+                             'BoxDataset.__init__.')
         # Opt-in, default off: with it absent this loader is byte-identical to what every recorded
         # detector was trained on. See `random_affine` for why it also kills the horizontal flip.
         self.keypoints = bool(keypoints)
@@ -662,6 +696,68 @@ class BoxDataset(Dataset):
         out[:, 1::2] = out[:, 1::2] * scale + pad[1]
         return out
 
+    def present_ignore_boxes_for(self, i, warp=None):
+        """Crop-rule boxes for `instances.pq` PRESENT rows -- an animal in this view that was NOT
+        annotated -- in INPUT pixels, `(M,4)`, or None. T2.1, dev/plans/detector_accuracy.md.
+
+        These rows are trained as background by DEFAULT (`boxes_for` never sees them, so
+        `detector_loss`'s zeros-target treats every anchor inside one as "no animal here") --
+        measured on 3dpop's train split at 11.4% of animals in view, on the root whose `fp_none`
+        dominates `fp_dup` 10:1. This is the training-side counterpart of `ignore_for`, which
+        reports the SAME population as a scoring exclusion but takes no `warp` (a pinned test in
+        test_detector.py keeps it that way, because `score_dataset` disables augmentation
+        entirely instead of warping the ignore boxes to match); the loss needs the boxes warped
+        exactly as the GT boxes beside them are, or a rotated ignore box masks the wrong pixels.
+
+        FOUR corners through the warp, then RE-DERIVED by `crop_box_for_points` -- the same
+        `box_source = 'instances'` geometry `boxes_for` already uses for this exact table, not
+        `_warp_region`'s inscribed rectangle. The two need OPPOSITE polarity under a rotation: a
+        certified region is a claim that must shrink toward safety, but an ignore box exists to
+        keep covering an animal that might not be annotated, so shrinking it would re-expose the
+        animal's own edges to the false-negative target this function exists to remove.
+
+        None when the session ships no `instances.pq` boxes at all. An empty `(0,4)` when it does
+        but nothing in this view is PRESENT -- the same None/empty distinction `regions_for` keeps.
+        """
+        sess, gid, f, ci = self.index[i]
+        lab = sess.labels(gid)
+        if lab.instance is None or lab.boxes is None:
+            return None
+        present = np.flatnonzero(lab.instance[:, f, ci] == INST_PRESENT)
+        if not present.size:
+            return torch.zeros((0, 4), dtype=torch.float32)
+        cam = sess.cgroup(gid, f)[ci]
+        tile_box = None
+        if self.origins[i] is not None:
+            ox, oy = self.origins[i]
+            tw, th = self._tile_extent()
+            tile_box = (ox, oy, ox + tw, oy + th)
+
+        out = []
+        for s in present.tolist():
+            b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
+            if not torch.isfinite(b).all():
+                continue
+            x0, y0, x1, y1 = b
+            src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
+                               torch.stack([x1, y1]), torch.stack([x0, y1])])
+            if warp is not None:
+                src = _apply_affine(src, (warp, None))
+                src = _drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
+            if tile_box is not None:
+                src = _drop_outside(src, tile_box)
+            box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad=0)
+            if box is not None:
+                out.append(box.float())
+        if not out:
+            return torch.zeros((0, 4), dtype=torch.float32)
+        boxes = torch.stack(out)
+        scale, pad = self._transform(i, cam['size'])
+        boxes = boxes.clone()
+        boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
+        boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
+        return boxes
+
     def ignore_for(self, i):
         """`(ig (S,) bool, ig_boxes (S,4))` for item `i`, in INPUT pixels. Or `(None, None)`.
 
@@ -736,11 +832,7 @@ class BoxDataset(Dataset):
             tw, th = self._tile_extent()
             tile_box = (ox, oy, ox + tw, oy + th)
 
-        def drop_outside(x, bounds):
-            lo_x, lo_y, hi_x, hi_y = bounds
-            out = ((x[..., 0] < lo_x) | (x[..., 0] > hi_x) |
-                   (x[..., 1] < lo_y) | (x[..., 1] > hi_y))
-            return torch.where(out[..., None], torch.nan, x)
+        drop_outside = _drop_outside
 
         # The keypoint target rides the SAME warp and the SAME letterbox as the boxes below, and
         # is derived here so there is exactly one copy of that transform.
@@ -910,7 +1002,10 @@ class BoxDataset(Dataset):
                               centre=self._warp_centre(i)) if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
-        regions = self.regions_for(i, warp)
+        # `regions` and `ignore_boxes` share ONE opt-in (M,4) tuple slot -- `__init__` raises if
+        # both flags are set, so at most one of the two is non-None below.
+        regions = self.regions_for(i, warp) if self.use_regions else None
+        ignore_boxes = self.present_ignore_boxes_for(i, warp) if self.ignore_present else None
 
         # WHAT THE PIXELS ARE HEADED FOR, WHICH UNDER TILING IS NOT `input_wh`. Tiled,
         # `self.input_wh` IS the tile size, so comparing the whole 4696x2048 frame against it gave
@@ -993,6 +1088,12 @@ class BoxDataset(Dataset):
         # downstream. The None/empty distinction stays intact in `regions_for`, which is where a
         # consumer that needs it can see it.
         out = (x, boxes) if kpts is None else (x, boxes, kpts)
+        if self.ignore_present:
+            # Unlike `regions`, `None` and empty mean the SAME thing for an ignore box -- "nothing
+            # to mask here" either way, not a claim about the whole frame -- so there is no
+            # None -> whole-input substitution to make; an empty (0,4) is already correct.
+            return (*out, ignore_boxes if ignore_boxes is not None
+                   else torch.zeros((0, 4), dtype=torch.float32))
         if not self.use_regions:
             return out
         if regions is None:

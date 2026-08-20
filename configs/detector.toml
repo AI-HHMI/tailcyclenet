@@ -131,6 +131,17 @@ tile_bg_per_frame = 1
 # one per root.
 use_regions = false
 
+# mask an instances.pq PRESENT box -- an animal in this view that was NOT annotated -- out of the
+# objectness BACKGROUND target, instead of training the detector to call it "no animal here".
+# OPPOSITE polarity from use_regions (which says where supervision may happen AT ALL; this
+# excludes ONE animal's footprint while leaving the rest supervised) and MUTUALLY EXCLUSIVE with
+# it for now -- both are the one opt-in (M,4) tuple slot box_collate/split_batch dispatch by
+# rank, and the constructor raises rather than let one silently clobber the other. Measured on
+# 3dpop's train split at 11.4% of animals in view PRESENT-but-unannotated, masking a mean 0.34%
+# of anchors per view (dev/plans/detector_accuracy.md T2.1) -- SHIPPED OFF: the mechanism is
+# built and tested, the end-to-end arm is not yet run. See BoxDataset.present_ignore_boxes_for.
+ignore_present = false
+
 [model]
 # the ARCHITECTURE, not a runtime choice -- it changes the state_dict and is recorded in the
 # checkpoint (`load_detector` reads it back; absent means `trimmed`, i.e. every checkpoint from

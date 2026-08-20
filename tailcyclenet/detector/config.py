@@ -27,7 +27,7 @@ DATA_KEYS = frozenset({
     'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
     'frames_per_group', 'val_frames_per_group', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
-    'use_regions',
+    'use_regions', 'ignore_present',
 })
 MODEL_KEYS = frozenset({'yolox'})
 TRAINING_KEYS = frozenset({
@@ -137,6 +137,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['keypoints'] = bool(data.get('keypoints', False))
     data['hflip'] = bool(data.get('hflip', True))
     data['use_regions'] = bool(data.get('use_regions', False))
+    data['ignore_present'] = bool(data.get('ignore_present', False))
+    if data['ignore_present'] and data['use_regions']:
+        raise SystemExit('[data].ignore_present and [data].use_regions cannot both be set: both '
+                         'are the one opt-in (M,4) tuple slot box_collate/split_batch dispatch '
+                         'by rank. See BoxDataset.__init__.')
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
     return cfg

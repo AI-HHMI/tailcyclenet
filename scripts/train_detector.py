@@ -190,7 +190,8 @@ def main():
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
                   tile_bg_per_frame=data_cfg['tile_bg_per_frame'],
-                  use_regions=data_cfg['use_regions'])
+                  use_regions=data_cfg['use_regions'],
+                  ignore_present=data_cfg['ignore_present'])
     train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
                        box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
                        augment=data_cfg['augment'], reduce=data_cfg['reduce'],
@@ -281,18 +282,23 @@ def main():
                 break
             # BY RANK, not by tuple length: with --keypoints off and --use-regions on, the
             # third element is regions, and reading it as `gt_kpts` would train the keypoint
-            # branch against rectangles.
-            x, gt, gt_kpts, gt_regions = split_batch(batch)
+            # branch against rectangles. `split_batch`'s 4th slot is `regions` OR `ignore_present`
+            # boxes -- `BoxDataset.__init__` refuses to build both at once, so this dataset's OWN
+            # two flags (never both true) say which one it is; `split_batch` cannot, since a
+            # rank-2 (M,4) tensor looks the same either way.
+            x, gt, gt_kpts, gt_tail = split_batch(batch)
             x, gt = x.to(device), gt.to(device)
             gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
-            gt_regions = None if gt_regions is None else gt_regions.to(device)
+            gt_tail = None if gt_tail is None else gt_tail.to(device)
+            gt_regions = gt_tail if data_cfg['use_regions'] else None
+            gt_ignore = gt_tail if data_cfg['ignore_present'] else None
             out = model(x)
             obj, boxes, kpt = out[0], out[1], out[2]
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=train_cfg['kpt_weight'],
                                         kpt_score_weight=train_cfg['kpt_score_weight'],
-                                        regions=gt_regions)
+                                        regions=gt_regions, ignore=gt_ignore)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -360,6 +366,7 @@ def main():
                         # nobody can run a tiled detector at its tile size on a whole frame.
                         'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
                         'use_regions': data_cfg['use_regions'],
+                        'ignore_present': data_cfg['ignore_present'],
                         'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
                         'min_crop_dim': data_cfg['min_crop_dim'],
                         'augment': data_cfg['augment'],

@@ -34,24 +34,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.format import INST_PRESENT, UNLABELED, VISIBLE, sessions_for
+from tailcyclenet.infer.predictions import load_predictions
 from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, match_instances, matched_error,
                                   mota, motion_ratio, paired_bootstrap, pck)
 
 _PCT_KEYS = tuple(f'p{p}' for p in ERR_PCTS)
-
-
-def load_predictions(path: Path):
-    z = np.load(path, allow_pickle=True)
-    keys = [str(k) for k in z['__keys__']]
-    out = {}
-    for key in keys:
-        out[key] = {f.split('|', 1)[1]: z[f] for f in z.files
-                    if f.startswith(key + '|')}
-    meta = {'run': str(z['__run__']), 'anchor': str(z['__anchor__']),
-            'boxes': str(z['__boxes__']),
-            # Written since the detector's own crop rule became checkable; absent in older files.
-            'box_source': str(z['__box_source__']) if '__box_source__' in z.files else ''}
-    return out, meta
 
 
 def label_lookup(data: Path, split: str):

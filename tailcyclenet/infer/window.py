@@ -308,7 +308,7 @@ def _plan_blocks(starts, n_frames, T_total, frame_cost, store_bytes):
 
 # Which axis each returned column runs along, so blocks can be stitched back into a whole clip.
 # Anything not named here is a scalar or a per-group constant and is taken from the first block.
-_FRAME_KEYS = ('pred', 'conf', 'box_agree')
+_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'box_agree')
 _WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
 
 
@@ -499,6 +499,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # its first window: every array below is indexed `[a, frame - f0]` or `[a, wi - w0]`.
     f0, w0 = 0, 0
     pred = conf = box_agree = outcome = crop = crop_refined = box_cams = None
+    pred2d = conf2d = None
     boxes_stc = det_kpts_stc = None
     # Settled once: which of the three crop sources produced these pixels. Recorded on every block
     # so a reader of one block knows as much as a reader of the merged group.
@@ -811,7 +812,26 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         # deliberately does not write the key back, and a conf-weighted ray mean is too weak a
         # position to seed the next window with. `carried[a]` is left alone, so the staleness
         # bound in `_build_prior` retires it -- which is the honest answer, not a silent one.
-        return p, q, out
+        #
+        # THE PER-CAMERA 2D POSE, WHICH A 3D RUN USED TO THROW AWAY. `2d_pred` is
+        # `(cams, b, t, K, 2)` in the INPUT PIXELS of that camera's crop canvas
+        # (`tracker_encoder`: `points_pred * px_scale`), so the inverse is this plan's own crop --
+        # undo the resize, add the crop origin -- per camera.
+        #
+        # IT IS THE SAME EXPRESSION `p` TAKES IN 2D ABOVE, and deliberately not the more exact
+        # per-axis inverse in `dataset._crop_affine`. In 2D `coords_pred` IS `2d_pred[0]`, so
+        # using one expression makes camera 0's per-camera pose bit-identical to the reported
+        # prediction -- a free exact check, pinned as a test. The sub-pixel difference between the
+        # two comes from `_resize_camera` rounding `cam['size']`; changing it here would move
+        # every published 2D number.
+        p2 = v2 = None
+        if '2d_pred' in out:
+            p2 = out['2d_pred'][:, 0].detach().cpu().numpy().copy()   # (C_use, t, K, 2)
+            for i in range(len(use)):
+                p2[i] = p2[i] / scales[i] + np.asarray(boxes[i][:2], np.float32)
+            if out.get('vis_pred_2d') is not None:
+                v2 = out['vis_pred_2d'][:, 0].detach().cpu().numpy()  # (C_use, t, K) logits
+        return p, q, out, p2, v2
 
     def _process_window(wi, frames, window_cams, plans, crops):
         """Forward and write every column for one window, given ALREADY-DECODED `crops`.
@@ -893,9 +913,14 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             got = forward(frames, plan, crops, wi)
             if got is None:
                 continue                        # already marked 'decode failed' above
-            p, q, out = got
+            p, q, out, p2, v2 = got
             outcome[a, wi - w0] = OUTCOMES.index('ok')
             _fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
+            if p2 is not None:
+                for i, ci in enumerate(use):
+                    pred2d[a, frames - f0, ci] = p2[i]
+                    if v2 is not None:
+                        conf2d[a, frames - f0, ci] = v2[i]
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
@@ -973,6 +998,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
             conf = np.full((S, n_blk, K), np.nan, np.float32)
+            # THE PER-CAMERA 2D POSE AND ITS OWN VISIBILITY, which a 3D run discarded entirely --
+            # only the triangulated world point ever reached the output. `(S,t,C,K,2)` and
+            # `(S,t,C,K)`; see `forward` for the crop inverse.
+            pred2d = np.full((S, n_blk, len(session.rig), K, 2), np.nan, np.float32)
+            conf2d = np.full((S, n_blk, len(session.rig), K), np.nan, np.float32)
             box_agree = np.full((S, n_blk, len(session.rig)), np.nan, np.float32)
             outcome = np.full((S, n_win), OUTCOMES.index('no box'), np.int8)
             crop = np.full((S, n_win, len(session.rig), 4), np.nan, np.float32)
@@ -1014,6 +1044,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             memory.trim()
             keep = f_own - f0
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
+                   'pred2d': pred2d[:, :keep], 'conf2d': conf2d[:, :keep],
                    'box_agree': box_agree[:, :keep],
                    'animal_ids': np.asarray(animal_ids, object),
                    'outcome': outcome, 'crop': crop,

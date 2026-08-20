@@ -1,19 +1,24 @@
 """The DRIVER: one run over a dataset. Everything `run_group` is not.
 
-Flag resolution and the refusals that must happen before a checkpoint loads, the session/group
-loop, detection and association, and the flat-npz write. Lifted verbatim out of
-`scripts/infer.py`, where it could not be imported and so could only be tested by reading the file
-as text.
+Flag resolution and the refusals that must happen before a checkpoint loads, the group loop,
+detection and association interleaved with it, and the prediction session written a block at a
+time.
+
+ONE SOURCE SESSION PER RUN, because `--out` names one session directory and a session holds one
+calibration, one mode and one keypoint axis. `--data` therefore takes a session directory, which
+`format.sessions_for` has always accepted.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from ..checkpoints import load_run
+from ..checkpoints import load_run, provenance
 from ..dataset import LoaderConfig
-from ..format import sessions_for
-from .window import InferConfig, run_group
+from .predictions import SessionWriter, refuse_multi_session
+from .window import InferConfig, run_blocks
 
 
 
@@ -37,7 +42,7 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
     against this dict, so a new box-affecting parameter cannot be added without landing here.
     """
     return {
-        'detector': str(args.detector) if args.detector else '',
+        'detector': str(Path(args.detector).resolve()) if args.detector else '',
         'det_input_wh': str(args.det_input_wh or ''),
         'det_score': float(args.det_score),
         'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
@@ -45,7 +50,13 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
         'max_frames': int(args.max_frames),
         'tile_scale': float(det_tile) if det_tile else 0.0,
         'reduce': bool(det_red),
-        'box_source': str(det_boxsrc or 'keypoints') if args.detector else '',
+        # `det_box_source`, NOT `box_source`. They are two different facts and the names collided:
+        # this one is the DETECTOR'S TRAINING TARGET (what its boxes are boxes OF), while the
+        # run's own `[data].box_source` is the crop rule the pose model was trained on. They are
+        # allowed to disagree -- the best rat-city detector is `instances`-trained while every
+        # rat-city pose run is keypoint-trained -- which is exactly why both are recorded. Under
+        # one name the splat order silently decided which survived.
+        'det_box_source': str(det_boxsrc or 'keypoints') if args.detector else '',
     }
 
 
@@ -163,6 +174,11 @@ def run_dataset(args):
                              '(about two patches). Below ~2 patches the forward returns all-NaN '
                              'with no exception. The measured floor is 96; 64 is already worse '
                              'than not refining at all.')
+
+    # ONE SESSION PER RUN, AND IT IS A PURE-ARGUMENT CHECK -- so it belongs up here with the
+    # others, above the checkpoint load. `sessions_for` reads toml and opens no pixels, so this
+    # costs nothing and a mistyped `--data` does not cost a 5.6 GB load.
+    ds_name, sess = refuse_multi_session(args.data, args.split)
 
     # THE BUDGET IS RESOLVED ONCE, HERE, BEFORE ANYTHING ALLOCATES, and printed rather than
     # inferred: it depends on machine state, so a run that does not say which budget it had cannot
@@ -314,7 +330,6 @@ def run_dataset(args):
             print(f'WARNING: detector boxes are {det_boxsrc!r} but this run was trained on '
                   f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '
                   'a delta against a run whose detector matched as a detector-quality result.')
-    ds_name, sessions = sessions_for(args.data, args.split)
     # A registry is keyed by DATASET NAME, so deploying a run on a root it was not trained on --
     # the whole point of a shared keypoint vocabulary -- otherwise dies on the folder name alone.
     # `rat-city` and `rat-city-annotated` are the shipped instance: identical `names`, therefore
@@ -327,12 +342,41 @@ def run_dataset(args):
         ds_name = args.dataset_name
     want = set(args.groups.split(',')) if args.groups else None
 
-    results = {}
-    for sess in sessions:
-        sess.preload()
-        for gid in sess.groups:
-            if want and gid not in want:
-                continue
+    # ONE SESSION PER RUN. Checked before the loop, and above the checkpoint load -- see the
+    # `sessions_for` call, which reads toml and opens no pixels.
+    gids = [g for g in sess.groups if not want or g in want]
+    writer = SessionWriter(args.out, sess, registry,
+                           # A LIST OF PAIRS, not a dict: `SessionWriter` raises on a duplicate
+                           # key, where a dict would silently keep the last one.
+                           [*{'source': 'tailcyclenet infer',
+                            'source_session': str(Path(args.data).resolve()),
+                            'source_session_id': sess.session_id,
+                            'source_dataset': ds_name, 'source_split': args.split,
+                            # ABSOLUTE, like `source_session`: a relative path recorded from
+                            # whatever directory the run happened to start in names nothing later.
+                            # `checkpoint` is the resolved FILE, not just its name -- `_last` and
+                            # `_best` differ by up to 13,600 iterations and the name alone does not
+                            # say which folder it came from.
+                            'run': str(Path(args.run).resolve()),
+                            'checkpoint': str(Path(ckpt).resolve()),
+                            'checkpoint_name': ckpt.name,
+                            'anchor': cfg.anchor, 'carry_source': cfg.carry_source,
+                            'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
+                            'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
+                            'crop_source': cfg.crop_source,
+                            'boxes': (str(args.detector) if args.detector else
+                                      (str(args.boxes) if args.boxes else 'labels')),
+                            'box_source': ((det_boxsrc or 'keypoints') if args.detector
+                                           else cfg.box_source),
+                            'vis_thresh': float(cfg.vis_thresh) if cfg.vis_thresh else 0.0,
+                            # THE COMMIT AND THE DIRTY FLAG. A config is not a
+                            # provenance record -- gotcha 12 is what that cost.
+                            **provenance()}.items(),
+                            *_box_provenance(args, det_tile, det_red, det_boxsrc).items()],
+                           gids)
+    sess.preload()
+    try:
+        for gid in gids:
             key = f'{sess.session_id}/{gid}'
             # INITIALISED OUTSIDE THE BRANCH, for the reason the comment above `det_tile` gives:
             # every box source that is NOT a detector -- the GT-crop upper bound and the whole
@@ -365,11 +409,18 @@ def run_dataset(args):
                     f'{args.boxes}: no entry for {key!r}. Falling back to the labels here would '
                     'quietly turn this into the GT-crop upper bound. Keys present: '
                     f'{sorted(k for k in boxes if not k.startswith("__"))[:5]} ...')
-            out = run_group(model, sess, gid, registry, ds_name, cfg,
-                            box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want)
-            results[key] = out
-            print(f'{key}: {out["pred"].shape} '
-                  f'{np.isfinite(out["pred"]).all(-1).mean():.3f} finite')
+            # STREAMED: each block is written as it finishes, so nothing here is proportional
+            # to the length of the clip.
+            f0 = w0 = 0
+            n_fin = n_pt = 0
+            for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
+                                  box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want):
+                writer.write_block(gid, blk, f0, w0)
+                f0 += blk['pred'].shape[1]
+                w0 += blk['outcome'].shape[1]
+                n_fin += int(np.isfinite(blk['pred']).all(-1).sum())
+                n_pt += int(np.isfinite(blk['pred']).all(-1).size)
+            print(f'{key}: {f0} frames, {n_fin / max(n_pt, 1):.3f} finite')
             if det is not None:
                 # REPORTED AFTER THE RUN, because detection now happens block by block INSIDE it.
                 # The fire rate is what a rate-matched random control has to be matched TO and
@@ -393,36 +444,7 @@ def run_dataset(args):
                     print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
                           f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    flat = {}
-    for key, out in results.items():
-        for field, value in out.items():
-            flat[f'{key}|{field}'] = value
-    flat['__keys__'] = np.asarray(list(results), object)
-    flat['__run__'] = np.asarray(str(args.run))
-    flat['__anchor__'] = np.asarray(cfg.anchor)
-    flat['__boxes__'] = np.asarray(
-        str(args.detector) if args.detector else
-        (str(args.boxes) if args.boxes else 'labels'))
-    # WHICH CROP RULE PRODUCED THESE PIXELS, in the file rather than in a shell history. The run's
-    # own `[data].box_source` on the label path; the detector's own on the deployment path, which
-    # is the one that can disagree with it.
-    flat['__box_source__'] = np.asarray((det_boxsrc or 'keypoints') if args.detector
-                                        else cfg.box_source)
-    # EVERY INPUT THE DETECTIONS DEPENDED ON. This is what the `--det-cache` stamp used to carry,
-    # moved from a file that gets reused to the file that gets quoted.
-    flat['__provenance__'] = np.asarray(repr(_box_provenance(args, det_tile, det_red, det_boxsrc)))
-    # WHAT THE CROP WAS BUILT FROM, which `__box_source__` above does NOT say -- that one is the
-    # detector's TRAINING target. Two arms differing only in `--crop-source` were previously
-    # identical in their own provenance, so report 15 §6's pair could be told apart only by
-    # filename. `--refine` rides here too, being the other re-crop lever, so a three-way comparison
-    # is legible from the files alone.
-    # `refine` is resolved per session from its mode, so read the RESOLVED flag off the results
-    # rather than off `cfg`, which may still hold the tri-state None.
-    did_refine = any(bool(r.get('refine')) for r in results.values())
-    flat['__crop_source__'] = np.asarray(
-        f'{cfg.crop_source}{"+refine" if did_refine else ""}'
-        f'{f"@{cfg.refine_px}px" if did_refine and cfg.refine_px else ""}')
-    np.savez_compressed(args.out, **flat)
-    print(f'wrote {args.out} ({len(results)} group(s))')
+    finally:
+        writer.close()
+    print(f'wrote {args.out} ({len(gids)} group(s))')
 

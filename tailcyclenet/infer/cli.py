@@ -30,9 +30,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path)
-    ap.add_argument('--data', required=True, type=Path, help='dataset root or one session dir')
+    ap.add_argument('--data', required=True, type=Path,
+                    help='ONE session directory (a dataset root works only if it holds a '
+                         'single session in --split). --out is one session, and a session '
+                         'carries one calibration, one mode and one keypoint axis.')
     ap.add_argument('--split', default='test')
-    ap.add_argument('--out', required=True, type=Path)
+    ap.add_argument('--out', required=True, type=Path,
+                    help='the prediction SESSION directory to write: session.toml, '
+                         'calibration.toml, groups.pq and the label tables, in '
+                         'docs/annotation_format.md. No pixels -- [provenance] '
+                         'source_session says where they are.')
     ap.add_argument('--checkpoint', default=None)
     ap.add_argument('--anchor', default='carry', choices=ANCHORS,
                     help="'labels' is an ORACLE, not a deployment number")

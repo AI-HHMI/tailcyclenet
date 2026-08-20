@@ -1043,15 +1043,18 @@ def test_the_npz_records_which_crop_source_made_it():
     """
 
     src = _infer_program_source()
-    assert "flat['__crop_source__']" in src, 'the crop source must be in the npz, not the shell'
-    assert '"+refine" if did_refine' in src, '--refine is a crop change and belongs in that field'
-    # AND IT MUST BE THE RESOLVED FLAG, NOT `cfg.refine`. `refine` defaults by dimensionality, so
-    # `cfg.refine` is `None` on any run that did not pass the flag -- which is now the normal 3D
-    # case. Reading `cfg` there would stamp every auto-refined 3D file as unrefined.
-    assert 'any(bool(r.get(\'refine\')) for r in results.values())' in src, \
-        'the stamp must read the per-session RESOLVED refine flag, not the tri-state config'
+    # `[provenance]` in the written session.toml, not the shell history. `crop_source` says what
+    # the crop was BUILT from; `box_source` (checked by the provenance test above) is the
+    # detector's TRAINING target, and the two can disagree.
+    assert "'crop_source': cfg.crop_source" in src, \
+        'the crop source must be recorded in the prediction, not left to the command line'
+    # AND `refine` MUST BE THE RESOLVED FLAG, NOT THE TRI-STATE. It defaults by dimensionality, so
+    # `cfg.refine` is `None` on any run that did not pass the flag -- the normal 3D case -- and
+    # `run_blocks` folds it to a concrete bool before anything reads it.
+    assert "'refine': bool(cfg.refine)" in src, \
+        'the resolved refine flag belongs in the record; None would say nothing'
     assert "'refine': bool(cfg.refine)" in _infer_window_source(), \
-        'run_group must record the resolved refine flag for the stamp to read'
+        'run_blocks must resolve the tri-state before recording it'
 
 
 def test_crop_source_keypoints_refuses_a_keypointless_detector():

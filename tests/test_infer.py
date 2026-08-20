@@ -791,14 +791,57 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     save_run_meta(run, config, registry)
     save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
 
-    out = tmp_path / 'pred.npz'
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(root),
+    out = tmp_path / 'pred'
+    # `--data` IS THE SESSION DIRECTORY, because `--out` is one session and a session holds one
+    # calibration, one mode and one keypoint axis. `sessions_for` has always accepted this.
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'),
                                       '--split', 'test', '--anchor', 'none', '--device', 'cpu',
                                       '--overlap', '2', '--out', str(out)])
     cli.main()
-    assert out.exists()
-    got = dict(np.load(out, allow_pickle=True))
-    assert 's/g000|pred' in got, f'no prediction written; keys: {sorted(got)}'
+
+    # IT IS A SESSION IN THIS REPO'S OWN FORMAT, not a private schema.
+    from tailcyclenet.format import Session, validate_session
+    from tailcyclenet.infer.predictions import load_predictions
+
+    for f in ('session.toml', 'calibration.toml', 'groups.pq', 'keypoints.pq', 'windows.pq'):
+        assert (out / f).exists(), f'{f} missing; wrote {sorted(p.name for p in out.iterdir())}'
+    got = Session.load(out)
+    assert got.label_source == 'tracked'
+    # Only rule 7 may fail: a prediction carries NO PIXELS by design, and `[provenance]
+    # source_session` is what says where they are. Everything that does not need them must pass.
+    errs = [e for e in validate_session(got) if '[rule 7]' not in e]
+    assert not errs, f'a prediction session must be valid apart from its missing pixels: {errs}'
+    assert Path(got.provenance['source_session']).name == 's'
+
+    preds, meta = load_predictions(out)
+    assert 's/g000' in preds, f'no prediction read back; keys: {sorted(preds)}'
+    assert preds['s/g000']['pred'].shape[1] == 4
+    assert np.isfinite(preds['s/g000']['pred']).any(), 'the round trip lost every point'
+    assert meta['anchor'] == 'none'
+
+
+def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeypatch, tmp_path):
+    """`--out` is ONE session directory, so `--data` must name one session.
+
+    Refused BEFORE `load_run`, which is `driver.py`'s own stated rule -- a typo must not cost a
+    5.6 GB checkpoint load. `sessions_for` reads toml and opens no pixels, so the check is free.
+    """
+    import conftest as cf
+
+    root = tmp_path / 'two'
+    cf._session_2d(root / 'test' / 'a')
+    cf._session_2d(root / 'test' / 'b')
+
+    def boom(*a, **k):
+        raise AssertionError('the refusal must fire before the checkpoint loads')
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
+                                      '--data', str(root), '--split', 'test',
+                                      '--device', 'cpu', '--out', str(tmp_path / 'o')])
+    with pytest.raises(SystemExit, match='ONE session directory'):
+        cli.main()
 
 
 @pytest.mark.parametrize('argv,expect', [
@@ -1048,3 +1091,102 @@ def test_a_rejected_refinement_falls_back_at_full_resolution(scene):
     assert 32 in seen, 'pass 1 must have run at the reduced resolution'
     assert 64 in seen, ('every SECOND pass must run at image_size, including the ones whose '
                         'refinement was rejected -- that fallback is the silent half')
+
+
+def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
+    """In 2D `coords_pred` IS `2d_pred[0]`, so the two must come back bit-identical.
+
+    That is the whole reason `forward` un-crops the per-camera pose with the SAME expression the
+    2D path uses for `pred` (`p / scale + box[:2]`) rather than the more exact per-axis inverse in
+    `dataset._crop_affine`. The two differ by a sub-pixel amount that comes from `_resize_camera`
+    rounding `cam['size']`; adopting the exact form would move every published 2D number, so the
+    inexactness is kept deliberately and pinned here.
+
+    In 3D this is a genuinely new output -- the run reports world points and used to discard the
+    per-camera 2D entirely -- so there it is only checked for shape and for being populated.
+    """
+    model, sess, registry, name = scene
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
+    C, K = len(sess.rig), sess.n_keypoints
+    S, T = out['pred'].shape[0], out['pred'].shape[1]
+    assert out['pred2d'].shape == (S, T, C, K, 2)
+    assert out['conf2d'].shape == (S, T, C, K)
+    assert np.isfinite(out['pred2d']).any(), 'the per-camera pose must actually be written'
+    if sess.mode == '2d':
+        np.testing.assert_array_equal(np.nan_to_num(out['pred2d'][:, :, 0], nan=-9e9),
+                                      np.nan_to_num(out['pred'], nan=-9e9))
+
+
+def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp_path):
+    """The pose run, its checkpoint FILE and the detector, all resolvable later.
+
+    A prediction session carries no pixels and no weights, so `[provenance]` is the only thing that
+    says what produced it. Relative paths recorded from whatever directory the run started in name
+    nothing afterwards, which is why all three are resolved -- the same reason `source_session` is.
+
+    `checkpoint` is the file, not just its name: `checkpoint_last` and `checkpoint_best` differ by
+    up to 13,600 iterations in practice and the bare name does not say which folder it came from.
+    """
+    import tomllib
+
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL,
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out = tmp_path / 'pred'
+    # A RELATIVE --run, which is what a shell gives you, and must not be what is recorded.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', 'run',
+                                      '--data', str(root / 'test' / 's'),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--out', str(out)])
+    cli.main()
+
+    with open(out / 'session.toml', 'rb') as f:
+        prov = tomllib.load(f)['provenance']
+    for k in ('run', 'checkpoint', 'source_session'):
+        assert Path(prov[k]).is_absolute(), f'{k} = {prov[k]!r} is not resolvable from elsewhere'
+        assert Path(prov[k]).exists(), f'{k} = {prov[k]!r} does not exist'
+    assert Path(prov['checkpoint']).is_file(), 'checkpoint must be the FILE, not the run folder'
+    assert prov['checkpoint_name'] == Path(prov['checkpoint']).name
+    # `box_source` is the RUN's crop rule; `det_box_source` is the detector's training target.
+    # They were one name once, and the splat order silently decided which survived.
+    assert prov['box_source'] == 'keypoints'
+    assert prov['det_box_source'] == '' and prov['detector'] == ''
+
+
+def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path):
+    """Two facts under one name lost one of them, and nothing said so.
+
+    `box_source` (the run's crop rule) was overwritten by the detector's training target because
+    both were spelled `box_source` and the second splat won. `dict` merges without complaint, so
+    the writer takes ITEMS and checks.
+    """
+    import conftest as cf
+    from tailcyclenet.format import Registry, Session
+    from tailcyclenet.infer.predictions import SessionWriter
+
+    cf._session_2d(tmp_path / 'r' / 'test' / 's')
+    sess = Session.load(tmp_path / 'r' / 'test' / 's')
+    sess.preload()
+    reg = Registry.build([load_dataset(tmp_path / 'r')])
+
+    with pytest.raises(ValueError, match='given twice'):
+        SessionWriter(tmp_path / 'out', sess, reg,
+                      [('box_source', 'keypoints'), ('box_source', 'instances')],
+                      list(sess.groups))
+    # ...and the same value twice is not a conflict.
+    SessionWriter(tmp_path / 'ok', sess, reg,
+                  [('box_source', 'keypoints'), ('box_source', 'keypoints')],
+                  list(sess.groups)).close()

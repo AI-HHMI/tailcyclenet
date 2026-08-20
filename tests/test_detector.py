@@ -114,6 +114,141 @@ def test_assign_gives_each_anchor_one_box():
     assert pos.numel() == len(set(pos.tolist())), 'an anchor claimed by two boxes cancels'
 
 
+# ----------------------------------------------------------------------------------------------
+# T2.2 -- a per-GT positive cap (dev/plans/detector_accuracy.md). The centre prior has no cap on
+# how many anchors one GT box can claim, so a large box's candidate set can dwarf a small one's.
+# `max_pos_per_gt=None` (default) is uncapped and byte-identical to every checkpoint on record.
+# ----------------------------------------------------------------------------------------------
+
+def test_assign_max_pos_per_gt_default_is_unchanged():
+    m = YOLOXNano()
+    anchors = m.anchor_points(128, 128, torch.device('cpu'))
+    gt = torch.tensor([[20.0, 20.0, 100.0, 100.0], [30.0, 30.0, 110.0, 110.0]])
+    a_pos, a_gix = assign(anchors, gt)
+    b_pos, b_gix = assign(anchors, gt, max_pos_per_gt=None)
+    torch.testing.assert_close(a_pos, b_pos)
+    torch.testing.assert_close(a_gix, b_gix)
+
+
+def test_assign_max_pos_per_gt_caps_a_large_boxs_candidacy():
+    """A single big GT box on a fine-stride grid claims MANY anchors uncapped; capped at K it
+    must claim AT MOST K (every positive belongs to this one GT, so the cap is a direct bound on
+    its own positive count)."""
+    m = YOLOXNano()
+    anchors = m.anchor_points(256, 256, torch.device('cpu'))
+    gt = torch.tensor([[10.0, 10.0, 246.0, 246.0]])          # nearly the whole frame
+    pos_uncapped, _ = assign(anchors, gt)
+    assert pos_uncapped.numel() > 10, 'the test needs an uncapped count clearly above K'
+    K = 10
+    pos_capped, gix_capped = assign(anchors, gt, max_pos_per_gt=K)
+    assert pos_capped.numel() <= K
+    assert bool((gix_capped == 0).all())
+
+
+def test_assign_max_pos_per_gt_leaves_a_small_gt_alone():
+    """A SECOND, small GT box far from the first, with fewer than K candidates of its own, must
+    keep ALL of them under the cap -- the cap bounds candidacy per GT, it does not evict a small
+    box's anchors to make room for the large one (they never competed for the same anchors here,
+    by construction: far apart, no anchor is `ok` for both)."""
+    m = YOLOXNano()
+    anchors = m.anchor_points(256, 256, torch.device('cpu'))
+    big = [10.0, 10.0, 130.0, 130.0]
+    small = [200.0, 200.0, 216.0, 216.0]                      # one cell at the finest stride
+    gt = torch.tensor([big, small])
+    pos_u, gix_u = assign(anchors, gt)
+    small_count_uncapped = int((gix_u == 1).sum())
+    assert 0 < small_count_uncapped < 10, 'the small box needs an uncapped count under K'
+    pos_c, gix_c = assign(anchors, gt, max_pos_per_gt=10)
+    small_count_capped = int((gix_c == 1).sum())
+    assert small_count_capped == small_count_uncapped, \
+        'the small GT must keep every one of its own candidates'
+    assert int((gix_c == 0).sum()) <= 10
+
+
+def test_detector_loss_max_pos_per_gt_default_is_unchanged():
+    torch.manual_seed(7)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 64
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    base, bp = detector_loss(obj, boxes, anchors, gt)
+    same, sp = detector_loss(obj, boxes, anchors, gt, max_pos_per_gt=None)
+    assert float(base) == float(same) and bp['n_pos'] == sp['n_pos']
+
+
+def test_detector_loss_max_pos_per_gt_reduces_n_pos_for_a_large_box():
+    torch.manual_seed(8)
+    anchors = YOLOXNano().anchor_points(256, 256, 'cpu')
+    obj = torch.randn(1, anchors.shape[0])
+    boxes = torch.rand(1, anchors.shape[0], 4) * 256
+    gt = torch.tensor([[[10.0, 10.0, 246.0, 246.0]]])
+    uncapped, up = detector_loss(obj, boxes, anchors, gt)
+    capped, cp = detector_loss(obj, boxes, anchors, gt, max_pos_per_gt=10)
+    assert up['n_pos'] > 10
+    assert cp['n_pos'] <= 10
+    assert cp['n_pos'] < up['n_pos']
+
+
+def test_detector_config_max_pos_per_gt_default_is_zero(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['training']['max_pos_per_gt'] == 0
+
+
+def test_train_detector_max_pos_per_gt_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A short run with `max_pos_per_gt = 2` through the real CLI entry point: must train to
+    completion with no error (0 -> None conversion happens in `train_detector.py`, not the
+    config loader, so this is the one test that exercises that specific line)."""
+    import importlib.util
+    import sys
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+max_pos_per_gt = 2
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_max_pos_per_gt',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+    import tomllib
+    with open(out / 'config.toml', 'rb') as f:
+        recorded = tomllib.load(f)
+    assert recorded['training']['max_pos_per_gt'] == 2
+
+
 def test_loss_is_finite_with_no_animal_anywhere():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 128)
@@ -774,9 +909,13 @@ def test_infer_reads_pose_nms_stats_defensively():
     """
 
     src = _infer_program_source()
-    assert 'nms_stats["nms_pairs"]' not in src, 'a bare subscript will KeyError with no keypoints'
-    assert 'nms_stats.get("nms_pairs", 0)' in src
-    assert 'nms_stats.get("nms_dropped", 0)' in src
+    # Name-agnostic: what matters is that neither key is ever subscripted bare, whatever the dict
+    # holding them is called this month. It has been `nms_stats` and is now `det_stats`, which is
+    # also the accumulator for the box fill rate.
+    for k in ('nms_pairs', 'nms_dropped'):
+        assert f'["{k}"]' not in src, \
+            f'a bare [{k!r}] subscript will KeyError on a keypoint-less detector'
+        assert f'.get("{k}", 0)' in src, f'{k} must be read with a default'
 
 
 def test_unletterbox_clamps_a_runaway_box_into_the_frame():

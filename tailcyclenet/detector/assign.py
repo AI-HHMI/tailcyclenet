@@ -61,7 +61,7 @@ def giou_loss(pred, target, eps=1e-7):
     return 1.0 - (iou - (carea - union) / carea)
 
 
-def assign(anchors, gt_boxes):
+def assign(anchors, gt_boxes, max_pos_per_gt=None):
     """Positive anchors for each ground-truth box.
 
     Args:
@@ -69,6 +69,14 @@ def assign(anchors, gt_boxes):
         gt_boxes: (G,4) xyxy; rows with any non-finite value are skipped (an animal that is
             not croppable in this view -- the loader emits a NaN box rather than dropping the
             frame, so objectness still learns "no animal here").
+        max_pos_per_gt: T2.2 (dev/plans/detector_accuracy.md). Caps each GT's CANDIDATE set to
+            its `max_pos_per_gt` closest anchors (by centre distance), before the per-anchor
+            uniqueness resolution below runs. `None` (default) is UNCAPPED and byte-identical to
+            every checkpoint on record -- the centre prior otherwise has no cap at all, so a large
+            box's candidate set can outnumber a small one's several-fold, in both box-loss
+            gradient and objectness-positive count (measured 4.3x top-decile-vs-bottom-decile on
+            3dpop). This caps CANDIDACY, not the final positive count directly: an anchor capped
+            out of one GT's top-k may still be closest to a DIFFERENT GT that still wants it.
         (`return_band` and `--ignore-band` were here: withdrawing supervision from the anchors
             that sit inside a GT box but are positive for none is REFUTED -- MOTA -0.258
             [-0.402, -0.136] at a matched threshold, 12x the seed floor, because those anchors are
@@ -115,6 +123,15 @@ def assign(anchors, gt_boxes):
     # overlapping animals do not both claim it and cancel.
     d = (cx[:, None] - gcx[None]) ** 2 + (cy[:, None] - gcy[None]) ** 2
     d = torch.where(ok, d, torch.full_like(d, float('inf')))
+    if max_pos_per_gt is not None and max_pos_per_gt < d.shape[0]:
+        # KEEP ONLY THE K CLOSEST ANCHORS PER GT (T2.2), by centre distance -- `topk` still
+        # returns k indices even for a GT with fewer than k real candidates; `ok.gather` there
+        # reads back False (d was inf, never a candidate), so `scatter_` correctly leaves those
+        # slots uncapped-into rather than inventing a fake positive.
+        _, top_idx = torch.topk(d, max_pos_per_gt, dim=0, largest=False)
+        capped = torch.zeros_like(ok)
+        capped.scatter_(0, top_idx, ok.gather(0, top_idx))
+        d = torch.where(capped, d, torch.full_like(d, float('inf')))
     best = d.argmin(1)
     pos = torch.nonzero(torch.isfinite(d.min(1).values), as_tuple=True)[0]
     out = (pos, gt_ix[best[pos]])
@@ -200,7 +217,8 @@ def keypoint_loss(pred, target, gt_boxes):
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
-                  regions=None, ignore=None, iou_aware=False, iou_aware_warmup=2000, it=None):
+                  regions=None, ignore=None, iou_aware=False, iou_aware_warmup=2000, it=None,
+                  max_pos_per_gt=None):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -233,6 +251,10 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
       to 0.3 -- under-forcing the exact case it exists to protect. `pos_mask` (binary, 1 at every
       positive regardless of its target VALUE) is threaded through separately so this guard keeps
       forcing weight to a full 1 at every true positive, unchanged from before this key existed.
+
+    `max_pos_per_gt` (T2.2, dev/plans/detector_accuracy.md) is `assign`'s own cap, passed
+    straight through -- `None` (default) is uncapped and byte-identical to every checkpoint on
+    record.
 
     `regions` (B,M,4) restricts the objectness BCE to anchors inside the CERTIFIED area (see
     `certified_anchors`). Absent, this function is bit-identical to what every recorded detector
@@ -272,7 +294,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
-        pos, gix = assign(anchors, gt_boxes[b])
+        pos, gix = assign(anchors, gt_boxes[b], max_pos_per_gt=max_pos_per_gt)
         if regions is not None:
             cert = certified_anchors(anchors, regions[b], gt_boxes[b])
             weight[b] *= cert.to(weight.dtype)

@@ -328,7 +328,8 @@ def main():
                                         kpt_score_weight=train_cfg['kpt_score_weight'],
                                         regions=gt_regions, ignore=gt_ignore,
                                         iou_aware=train_cfg['iou_aware_obj'],
-                                        iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it)
+                                        iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it,
+                                        max_pos_per_gt=train_cfg['max_pos_per_gt'] or None)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)

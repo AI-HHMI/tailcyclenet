@@ -34,6 +34,7 @@ MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
+    'max_pos_per_gt',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -118,10 +119,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['tile_wh'] = _pair('tile_wh', data.get('tile_wh'))
 
     for k in ('iters', 'batch_size', 'num_workers', 'seed', 'eval_every', 'eval_batches',
-              'iou_aware_warmup'):
+              'iou_aware_warmup', 'max_pos_per_gt'):
         train[k] = int(train.get(k, {'iters': 20000, 'batch_size': 16, 'num_workers': 8,
                                      'seed': 0, 'eval_every': 2000, 'eval_batches': 25,
-                                     'iou_aware_warmup': 2000}[k]))
+                                     'iou_aware_warmup': 2000, 'max_pos_per_gt': 0}[k]))
     # T2.3 (dev/plans/detector_accuracy.md): the BCE objectness target at a positive anchor
     # becomes the detached IoU between its predicted and GT box, instead of a hard 1.0, once past
     # `iou_aware_warmup` iterations. Default OFF -- byte-identical to every checkpoint on record.

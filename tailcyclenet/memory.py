@@ -84,7 +84,7 @@ class Budget:
         return max(0.0, self.budget_gb * float(fraction) * GB)
 
     def __str__(self) -> str:
-        return (f'budget {self.budget_gb:.1f} GB of {self.limit_gb:.1f} GB '
+        return (f'buffers {self.budget_gb:.1f} GB, cap {self.limit_gb:.1f} GB '
                 f'({self.available_gb:.1f} GB free, {self.source})')
 
 
@@ -196,12 +196,18 @@ def host_budget(override_gb: float | None = None,
         avail = min(avail, max(0.0, cg_limit - cg_current))
     avail = min(avail, limit)
 
+    # `--max-ram N` IS A CEILING ON THE PROCESS, NOT AN ALLOWANCE FOR THE BUFFERS, so the same
+    # `fraction` applies to it as to a derived budget. The three shares below sum to 1.0 of
+    # `budget_gb`, and everything outside them -- the model, CUDA's host-side allocations, the
+    # result arrays, the interpreter, glibc's slack -- is real memory this number never sees.
+    # Spending the full stated figure on buffers is how `--max-ram 16` peaked at 16.8 GB and
+    # `--max-ram 8` at 10.5 GB: the flag was honoured exactly and the promise was still broken.
     if override_gb is not None and override_gb > 0:
-        budget = float(override_gb) * GB
+        budget = fraction * float(override_gb) * GB
         source = f'--max-ram {override_gb:g}'
     elif os.environ.get(ENV_MAX_RAM):
         try:
-            budget = float(os.environ[ENV_MAX_RAM]) * GB
+            budget = fraction * float(os.environ[ENV_MAX_RAM]) * GB
             source = f'{ENV_MAX_RAM}={os.environ[ENV_MAX_RAM]}'
         except ValueError:
             budget = fraction * min(limit, avail)

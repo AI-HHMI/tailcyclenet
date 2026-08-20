@@ -192,7 +192,7 @@ def test_budget_prefers_the_cgroup_over_the_machine():
     """
     memory.reset()
     b = memory.host_budget(override_gb=8)
-    assert b.budget_gb == pytest.approx(8.0)
+    assert b.budget_gb == pytest.approx(8.0 * memory.DEFAULT_FRACTION)  # a CEILING, not an allowance
     assert 'max-ram' in b.source
     # An override above the hard cap is a request to be OOM-killed; it must clamp and say so.
     huge = memory.host_budget(override_gb=b.limit_gb * 10)

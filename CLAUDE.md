@@ -51,6 +51,10 @@ Claude or any other assistant.
 
 ## Environment
 
+**Filesystem scope: never `find /` or search outside this repo and `~/ghome/projects/tailcycle`.**
+Run folders currently live at `/groups/karashchuk/home/karashchukl/results/tailcyclenet/runs`, not
+under the repo.
+
 ```bash
 pixi install
 pixi run python -c "import posetail, tailcyclenet"

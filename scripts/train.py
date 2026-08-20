@@ -44,7 +44,8 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import distributed as dist_utils
-from tailcyclenet.checkpoints import (check_image_size, load_config, prior_provenance,
+from tailcyclenet.checkpoints import (check_image_size, check_window_length, load_config,
+                                      prior_provenance,
                                       resolve_checkpoint, save_checkpoint, save_run_meta,
                                       warm_start)
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
@@ -508,6 +509,7 @@ def main():
 
     config = load_config(args.config)
     check_image_size(config)
+    check_window_length(config)
     data_cfg, train_cfg = config['data'], config['training']
     if args.data:
         data_cfg['path'] = str(args.data)

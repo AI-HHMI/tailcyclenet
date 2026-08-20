@@ -2060,7 +2060,7 @@ def test_gt_crop_sides_3d_projects_through_the_right_camera(tmp_path):
     assert sides.size > 0 and np.all(sides >= 8)       # the floor must be respected
 
 
-def test_eval_detector_deploy_cli_end_to_end(tmp_path, monkeypatch):
+def test_eval_detector_deploy_cli_end_to_end(tmp_path, monkeypatch, capsys):
     """A 2-iteration checkpoint through `scripts/train_detector.py`, scored through
     `scripts/eval_detector.py --deploy` -- the new mode, wired the same way `--compare` is:
     argv in, printed table out, no crash. Not a numeric assertion (2 iterations is noise); this
@@ -2125,8 +2125,17 @@ kpt_score_weight = 1.0
     monkeypatch.setattr(sys, 'argv', [
         'eval_detector.py', '--run', str(tmp_path / 'run' / 'detector.pth'),
         '--data', str(root), '--split', 'test', '--deploy', '--no-track', '--link-boxes',
-        '--score-thresh', '0.001', '--device', 'cpu', '--n-frames', '2', '--overlap', '0'])
+        '--score-thresh', '0.001', '--device', 'cpu', '--n-frames', '2', '--overlap', '0',
+        '--det-max-frames', '2'])
     eval_mod.main()                                    # must not raise
+
+    # THE PRINTED T COLUMN MUST REFLECT `--det-max-frames`, not the group's raw length -- the
+    # fixture's group is 4 frames, bounded here to 2. Printing the raw 4 would silently claim a
+    # full-length run when only a prefix was scored (the bug an actual 3dpop `--det-max-frames`
+    # run exposed: the table read T=899..2680 while `detect_raw` had truncated to 120 internally).
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if '/g' in ln and ln.strip()[0] != '=')
+    assert line.split()[1] == '2', f'expected the truncated T=2 in {line!r}'
 
 
 # ----------------------------------------------------------------------------------------------

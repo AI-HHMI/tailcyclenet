@@ -205,7 +205,13 @@ def main_deploy(args, device):
                                  max_frames=args.det_max_frames, n_frames=args.n_frames,
                                  overlap=args.overlap, min_box_frames=args.min_box_frames)
             rows.append(r)
-            print(f'{f"{sess.session_id}/{gid}"[:40]:40s} {group.n_frames:6d} '
+            # THE FRAMES `deployment_score` ACTUALLY SCORED, not the group's raw length --
+            # `--det-max-frames` truncates internally (`detect_raw`'s own `max_frames`), and
+            # printing the untruncated count here read as if every group ran full-length even
+            # when bounded to the 120-frame protocol.
+            t_scored = min(group.n_frames, args.det_max_frames) if args.det_max_frames \
+                else group.n_frames
+            print(f'{f"{sess.session_id}/{gid}"[:40]:40s} {t_scored:6d} '
                   f'{r["det_fill"]:9.4f} {r["slot_fill"]:10.4f} {r["window_miss"]:9.4f} '
                   f'{r["union_side_px"][0.5]:10.1f} {r["union_side_px"][0.9]:10.1f} '
                   f'{r["gt_side_px"][0.5]:8.1f}')

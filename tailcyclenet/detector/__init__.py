@@ -360,7 +360,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
-                    track=True, max_move=1.0, stats=None, pose_nms=None):
+                    track=True, max_move=1.0, stats=None, pose_nms=None, state=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     `raw` is `detect_raw`'s `(boxes, scores, kpts)`. Returns the same triple re-indexed so row `a`
@@ -391,6 +391,13 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
 
     `stats` collects `pose_nms`' fire count: a rejection rate is what its rate-matched random
     control has to be matched TO, and it cannot be recovered afterwards from the output.
+
+    `state` MAKES A SEQUENCE OF CALLS EQUAL TO ONE CALL OVER THE CONCATENATION, which is what lets
+    the inference loop associate a clip in blocks whose size comes from the RAM budget. It holds
+    the tracker (which is already stateful across `step()`, so it needed only to survive the call)
+    and `link_rows`' `last`/`age`. **`pose_nms` needs nothing**: it is a per-frame pass with no
+    cross-frame state, and `stats` already accumulates with `+=`. `state=None` builds a fresh
+    tracker per call and is byte-identical to the version before this parameter existed.
     """
     import numpy as np
     import torch
@@ -409,12 +416,17 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     cgroup = None if moving else session.cgroup(gid)
     # ONE CROSS-VIEW TARGET SET instead of `associate` per frame plus `link_rows` after -- see
     # `track.py`. It subsumes both, so `link_rows` must not run on top of it.
-    tracker = None
-    if track and C > 1:
-        from .track import CrossViewTracker
-        tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
-                                   min_views=min_views,
-                                   max_move=max_move)
+    if state is None:
+        state = {}
+    if 'tracker' not in state:
+        tracker = None
+        if track and C > 1:
+            from .track import CrossViewTracker
+            tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
+                                       min_views=min_views,
+                                       max_move=max_move)
+        state['tracker'] = tracker
+    tracker = state['tracker']
 
     def _cam(t, c):
         """This frame-camera's decoded detections as torch, plus their raw indices.
@@ -464,7 +476,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                 if kp is not None:
                     kp[a, t, c] = r_kp[per_cam[c][2][d], t, c]
     if link and tracker is None:
-        out, sc = link_rows(out, sc, max_move=max_move, extra=kp)
+        out, sc = link_rows(out, sc, max_move=max_move, extra=kp,
+                            state=state.setdefault('link', {}))
     # LEAD 1, AFTER ASSOCIATION: drop a row that is a duplicate of another row's animal, by
     # maDLC's keypoint-containment overlap rather than by IoU. It runs here, on the finished
     # assignment, because a duplicate is a property of the SEATED rows -- `decode`'s own NMS is
@@ -475,7 +488,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     return out, sc, kp
 
 
-def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None):
+def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None,
+              state=None):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS. `decode` orders by score, so row 0 at frame t and
@@ -508,6 +522,18 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     before it existed. Raising the ROW COUNT instead seats nearly everything AND tightens the union
     (p99 590 -> 525 at 12 -> 24 rows), because no row has to hold two animals.
 
+    `state` CARRIES THE MATCHER ACROSS A CALL BOUNDARY, so a clip processed in blocks links exactly
+    as the whole clip does. `last` and `age` are the entire state, and without carrying them every
+    block would restart the identity assignment from its own frame 0 -- which is a silent identity
+    break at a boundary whose position is chosen by the RAM budget. The block loop's size must not
+    be able to change the answer.
+
+    THE ASYMMETRY IN `t0` IS THE WHOLE OF IT. Frame 0 of the CLIP is the only frame nothing is
+    matched against: it seeds `last` and is left unpermuted. A block's own frame 0 is not that
+    frame, so with carried state the loop starts at 0 and permutes it against the previous block's
+    `last`, exactly as the whole-clip pass does mid-clip. `state=None` restores the original
+    single-call behaviour byte for byte.
+
     ponytail: still per-frame Hungarian on geometry alone. No appearance model, no velocity
     (measured as not worth it), no re-identification after a long occlusion. ONE cross-view target
     set with one affinity is the target state and deletes this function; this is the interim.
@@ -516,9 +542,13 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     from scipy.optimize import linear_sum_assignment
 
     S, T, C, _ = boxes.shape
-    last = boxes[:, 0].copy()                     # (S,C,4), each row's most recent known box
-    age = np.zeros(S, int)                        # frames since this row was last seen
-    for t in range(1, T):
+    if state is None or 'last' not in state:
+        last = boxes[:, 0].copy()                 # (S,C,4), each row's most recent known box
+        age = np.zeros(S, int)                    # frames since this row was last seen
+        t0 = 1                                    # frame 0 seeds `last` and is not permuted
+    else:
+        last, age, t0 = state['last'], state['age'], 0
+    for t in range(t0, T):
         cur = boxes[:, t]
         cost = np.zeros((S, S), np.float32)
         for c in range(C):
@@ -581,4 +611,6 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
         # EXPIRY IS A FORGET, not just a flag: a stale centre that stays in the cost matrix keeps
         # competing for the detection that belongs to whoever is there now.
         last[age > max_age] = np.nan
+    if state is not None:
+        state['last'], state['age'] = last, age
     return boxes if scores is None else (boxes, scores)

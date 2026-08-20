@@ -481,6 +481,127 @@ def test_link_rows_follows_one_animal():
     assert np.isfinite(linked).all()
 
 
+def test_link_rows_state_carries_across_a_split():
+    """N calls with `state=` must equal ONE call over the concatenation, byte for byte.
+
+    The inference loop associates a clip in BLOCKS whose size comes from the host RAM budget. If
+    the matcher restarted at each block's own frame 0, the identity assignment would break at a
+    boundary chosen by how much memory happened to be free -- two machines, two answers, and
+    nothing in the output saying so. That is the one thing the budget is never allowed to do.
+
+    The trap this pins is the `t0` asymmetry: frame 0 of the CLIP seeds `last` and is left
+    unpermuted, but a BLOCK's frame 0 is an ordinary mid-clip frame and must be permuted against
+    the carried `last`. Starting every block at `t0 = 1` would silently leave one frame per block
+    in score order.
+    """
+    import numpy as np
+
+    from tailcyclenet.detector import link_rows
+
+    T = 20
+    boxes = np.full((2, T, 1, 4), np.nan, np.float32)
+    for t in range(T):
+        a = np.array([10 + t, 10, 40 + t, 40], np.float32)
+        b = np.array([110 - t, 10, 140 - t, 40], np.float32)
+        boxes[0, t, 0], boxes[1, t, 0] = (a, b) if t % 2 == 0 else (b, a)
+    scores = np.tile(np.array([0.9, 0.8], np.float32)[:, None, None], (1, T, 1))
+
+    whole_b, whole_s = link_rows(boxes.copy(), scores.copy())
+
+    # The same clip in three unequal blocks, which is what a budget-derived split looks like.
+    part_b, part_s, st = boxes.copy(), scores.copy(), {}
+    for lo, hi in ((0, 7), (7, 8), (8, T)):
+        link_rows(part_b[:, lo:hi], part_s[:, lo:hi], state=st)
+
+    np.testing.assert_array_equal(np.nan_to_num(part_b, nan=-9e9),
+                                  np.nan_to_num(whole_b, nan=-9e9))
+    np.testing.assert_array_equal(np.nan_to_num(part_s, nan=-9e9),
+                                  np.nan_to_num(whole_s, nan=-9e9))
+    # And the split must not be a no-op: it has to actually reorder, or this proves nothing.
+    assert not np.array_equal(np.nan_to_num(whole_b, nan=-9e9),
+                              np.nan_to_num(boxes, nan=-9e9))
+
+
+def test_associate_group_state_carries_across_a_split(tmp_path):
+    """Same claim one level up, for BOTH branches: the tracker (C > 1) and `link_rows` (C == 1).
+
+    `associate_group` is where the block loop calls in, so the invariance has to hold there and
+    not only in the matcher underneath it. The two branches are separate code paths -- the tracker
+    subsumes `link_rows` and they never both run -- so a test that exercises one says nothing
+    about the other.
+
+    THE SCENE IS BUILT SO A STATELESS SPLIT ACTUALLY FAILS, and that took finding. Two animals
+    merely walking apart is NOT discriminating: a fresh tracker at the boundary re-births them into
+    the same slots in the same order, so the split matches the whole clip by luck and the test
+    passes while proving nothing. What breaks it is a row that VANISHES across the boundary -- the
+    survivor is then born into slot 0 by a fresh tracker, while the carried state keeps it in the
+    slot it already had. Verified both ways: without `state=` this scene disagrees with the whole
+    clip; with it, byte-identical. If a future change makes the tracker order-insensitive, check
+    that this test can still fail before trusting it.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    import numpy as np
+
+    from tailcyclenet.detector import associate_group
+    from tailcyclenet.format import Session
+
+    T = 12
+    for tag, cams, track in (('mv', 3, True), ('sv', 1, False)):
+        d = tmp_path / tag / 'test' / 's'
+        (cf._session_3d if cams > 1 else cf._session_2d)(d, T=T)
+        sess = Session.load(d)
+        sess.preload()
+
+        D, C, S = 4, cams, 2
+        box = np.full((D, T, C, 4), np.nan, np.float32)
+        sc = np.full((D, T, C), np.nan, np.float32)
+        for t in range(T):
+            for c in range(C):
+                for a in range(S):
+                    # Two animals drifting apart inside the fixture's 64x48 frame. What makes each
+                    # branch discriminating is different, so the scene is too:
+                    #   tracker (C > 1) -- the animal that lands in slot 0 VANISHES across the
+                    #     split, so a fresh tracker seats the survivor there instead;
+                    #   link_rows (C == 1) -- the DETECTION ORDER alternates, which is what a score
+                    #     reordering does and what `link_rows` exists to undo. Without this the
+                    #     rows arrive already in order and the matcher is a no-op.
+                    if C > 1 and a == 1 and 4 <= t < 7:
+                        continue
+                    d = a if C > 1 else (a + t) % 2
+                    x = 4.0 + 24.0 * a + 0.5 * t
+                    box[d, t, c] = [x, 12, x + 12, 32]
+                    sc[d, t, c] = 0.9 - 0.1 * d
+        raw = (box, sc, None)
+
+        def run(state):
+            parts = []
+            for lo, hi in ((0, 5), (5, T)):
+                sub = (box[:, lo:hi].copy(), sc[:, lo:hi].copy(), None)
+                parts.append(associate_group(sub, sess, 'g000', S, link=not track, track=track,
+                                             **({} if state is None else {'state': state})))
+            return [np.concatenate([p[i] for p in parts], axis=1) for i in range(2)]
+
+        whole = associate_group(raw, sess, 'g000', S, link=not track, track=track)
+        joined = run({})
+        for i, name in enumerate(('boxes', 'scores')):
+            np.testing.assert_array_equal(
+                np.nan_to_num(joined[i], nan=-9e9), np.nan_to_num(whole[i], nan=-9e9),
+                err_msg=f'{name} differ at C={cams}, track={track}: a block boundary changed the '
+                        'association, so the RAM budget can change the answer')
+
+        # THE TEST MUST BE ABLE TO FAIL. Without the carry, this scene disagrees -- if it stops
+        # disagreeing, the scene has gone back to being one a fresh matcher reproduces by luck
+        # and the assertion above is vacuous.
+        assert not np.array_equal(np.nan_to_num(run(None)[0], nan=-9e9),
+                                  np.nan_to_num(whole[0], nan=-9e9)), \
+            f'C={cams}, track={track}: a STATELESS split reproduces the whole clip here, so this ' \
+            'scene does not exercise the carry at all'
+
+
 def test_link_rows_survives_a_dropped_frame():
     """Matching is against each row's LAST KNOWN box, so a one-frame miss cannot break the chain."""
     import numpy as np

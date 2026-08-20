@@ -114,9 +114,18 @@ def conv3(cin, cout, k=3, s=1, depthwise=True):
 
 
 class Bottleneck(nn.Module):
-    def __init__(self, cin, cout, shortcut=True, depthwise=True):
+    """`expansion` is Megvii's own parameter name and the T4.1 fix
+    (dev/plans/detector_accuracy.md): `CSPLayer` below calls this with `cin == cout == hidden`
+    (its OWN CSP-split width), and this class used to halve that AGAIN unconditionally
+    (`hidden = cout // 2`), so every bottleneck conv in the shipped net was HALF Megvii's own
+    width -- 16 of 35 backbone tensors could not load from a COCO checkpoint at all. `0.5`
+    reproduces that byte-identically (`int(cout * 0.5) == cout // 2` for the even `cout` every
+    channel schedule here produces); `1.0` is what Megvii's `CSPLayer` actually passes to its
+    inner `Bottleneck`s (`expansion=1.0`, i.e. `hidden = cout`, full width, no second halving).
+    """
+    def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
         super().__init__()
-        hidden = cout // 2
+        hidden = int(cout * expansion)
         self.conv1 = conv_norm_act(cin, hidden, 1)
         self.conv2 = conv3(hidden, cout, 3, depthwise=depthwise)
         self.add = shortcut and cin == cout
@@ -127,14 +136,15 @@ class Bottleneck(nn.Module):
 
 
 class CSPLayer(nn.Module):
-    def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True):
+    def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True, bottleneck_expansion=0.5):
         super().__init__()
         hidden = cout // 2
         self.conv1 = conv_norm_act(cin, hidden, 1)
         self.conv2 = conv_norm_act(cin, hidden, 1)
         self.conv3 = conv_norm_act(2 * hidden, cout, 1)
         self.m = nn.Sequential(
-            *[Bottleneck(hidden, hidden, shortcut, depthwise=depthwise) for _ in range(n)])
+            *[Bottleneck(hidden, hidden, shortcut, depthwise=depthwise,
+                        expansion=bottleneck_expansion) for _ in range(n)])
 
     def forward(self, x):
         return self.conv3(torch.cat([self.m(self.conv1(x)), self.conv2(x)], dim=1))
@@ -206,21 +216,26 @@ class CSPDarknet(nn.Module):
     module docstring for the two deliberate deviations (GroupNorm, and the neck's unified width).
     """
 
-    def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False):
+    def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5):
         super().__init__()
         c = round8(64 * width_mul)
         d = max(1, round(3 * depth_mul))
+        be = bottleneck_expansion
         self.stem = Focus(3, c, 3, depthwise=depthwise)                                   # /2
         self.dark2 = nn.Sequential(conv3(c, c * 2, 3, 2, depthwise=depthwise),
-                                   CSPLayer(c * 2, c * 2, d, depthwise=depthwise))         # /4
+                                   CSPLayer(c * 2, c * 2, d, depthwise=depthwise,
+                                           bottleneck_expansion=be))                      # /4
         self.dark3 = nn.Sequential(conv3(c * 2, c * 4, 3, 2, depthwise=depthwise),
-                                   CSPLayer(c * 4, c * 4, d * 3, depthwise=depthwise))     # /8
+                                   CSPLayer(c * 4, c * 4, d * 3, depthwise=depthwise,
+                                           bottleneck_expansion=be))                      # /8
         self.dark4 = nn.Sequential(conv3(c * 4, c * 8, 3, 2, depthwise=depthwise),
-                                   CSPLayer(c * 8, c * 8, d * 3, depthwise=depthwise))     # /16
+                                   CSPLayer(c * 8, c * 8, d * 3, depthwise=depthwise,
+                                           bottleneck_expansion=be))                      # /16
         self.dark5 = nn.Sequential(
             conv3(c * 8, c * 16, 3, 2, depthwise=depthwise),
             SPPBottleneck(c * 16, c * 16),
-            CSPLayer(c * 16, c * 16, d, shortcut=False, depthwise=depthwise))              # /32
+            CSPLayer(c * 16, c * 16, d, shortcut=False, depthwise=depthwise,
+                    bottleneck_expansion=be))                                             # /32
         self.out_channels = (c * 4, c * 8, c * 16)          # p3, p4, p5 -- three DISTINCT widths
 
     def forward(self, x):
@@ -315,14 +330,28 @@ class YOLOXNano(nn.Module):
     (`round8(256 * width_mul)`, matching Megvii's own `int(256 * width)` head-stem convention), and
     passing a non-default `width` alongside a canonical `version` raises rather than silently
     ignoring it.
+
+    `bottleneck_expansion` (dev/plans/detector_accuracy.md T4.1) is the same class of key,
+    reversed: it only applies to a CANONICAL tier's BACKBONE (`CSPDarknet`, never `trimmed`'s
+    `CSPDarknetNano` and never the neck, which does not transfer at any width -- see
+    `tailcyclenet.detector.pretrained`). `0.5` (default) is byte-identical to every checkpoint on
+    record; `1.0` is the shape a Megvii COCO backbone actually loads into. Passing a non-default
+    value alongside `version='trimmed'` raises for the same reason `width` does the other way.
     """
     STRIDES = (8, 16, 32)
 
-    def __init__(self, width=96, n_keypoints=0, version='trimmed'):
+    def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
+        self.bottleneck_expansion = float(bottleneck_expansion)
         if self.version == 'trimmed':
+            if self.bottleneck_expansion != 0.5:
+                raise ValueError(
+                    f"bottleneck_expansion={bottleneck_expansion} was passed alongside "
+                    "version='trimmed', but trimmed's CSPDarknetNano does not take it -- it stays "
+                    "at 0.5 permanently (it is the repo's own deliberately-narrow net, not a bug "
+                    "to fix). Use a canonical tier for a COCO-compatible backbone.")
             self.backbone = CSPDarknetNano()
             neck_out, depthwise = width, True
         else:
@@ -334,7 +363,8 @@ class YOLOXNano(nn.Module):
                                  "width only applies to version='trimmed' -- a canonical tier "
                                  "derives its neck/head width from width_mul.")
             depth_mul, width_mul, depthwise = YOLOX_TIERS[self.version]
-            self.backbone = CSPDarknet(width_mul, depth_mul, depthwise=depthwise)
+            self.backbone = CSPDarknet(width_mul, depth_mul, depthwise=depthwise,
+                                       bottleneck_expansion=self.bottleneck_expansion)
             neck_out = round8(256 * width_mul)
         self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise)
         self.head = Head(neck_out, n_keypoints=self.n_keypoints, depthwise=depthwise)

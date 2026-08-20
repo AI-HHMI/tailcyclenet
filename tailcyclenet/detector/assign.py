@@ -26,6 +26,24 @@ def box_iou(a, b, eps=1e-7):
     return inter / (area_a[:, None] + area_b[None] - inter + eps)
 
 
+def paired_iou(a, b, eps=1e-7):
+    """Elementwise IoU between MATCHED rows -- a[i] against b[i], not every pair.
+
+    T2.3 (dev/plans/detector_accuracy.md): `box_iou` above is the cross-product form
+    (`(N,M)`, every anchor against every GT), which is what NMS and evaluation want. Objectness
+    supervision wants the OTHER shape: one IoU per POSITIVE anchor, against the one GT box
+    `assign` gave it -- `box_iou(boxes[pos], gt).diagonal()` would compute N^2 pairs to keep N of
+    them. Same maths as `box_iou`, no broadcasting.
+    """
+    area_a = (a[:, 2] - a[:, 0]).clamp(0) * (a[:, 3] - a[:, 1]).clamp(0)
+    area_b = (b[:, 2] - b[:, 0]).clamp(0) * (b[:, 3] - b[:, 1]).clamp(0)
+    lt = torch.max(a[:, :2], b[:, :2])
+    rb = torch.min(a[:, 2:], b[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, 0] * wh[:, 1]
+    return inter / (area_a + area_b - inter + eps)
+
+
 def giou_loss(pred, target, eps=1e-7):
     """1 - GIoU, elementwise over matched pairs. pred/target: (N,4) xyxy."""
     ap = (pred[:, 2] - pred[:, 0]).clamp(0) * (pred[:, 3] - pred[:, 1]).clamp(0)
@@ -182,7 +200,7 @@ def keypoint_loss(pred, target, gt_boxes):
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
-                  regions=None, ignore=None):
+                  regions=None, ignore=None, iou_aware=False, iou_aware_warmup=2000, it=None):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -192,6 +210,29 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     -- the centre-prior assignment already selects them, and reusing it is what keeps the two
     branches trained on the same notion of "this anchor owns this animal". Absent, nothing about
     this function changes.
+
+    `iou_aware` (T2.3, dev/plans/detector_accuracy.md) is the GFL/VarifocalNet/YOLOv6-v8 fix for
+    98.5%-saturated objectness: at a positive anchor, the BCE target becomes the DETACHED IoU
+    between its predicted box and its GT box, instead of a hard 1.0, so the score becomes a
+    localisation-quality estimate rather than a coin flip everywhere the model is already
+    confident. `False` (default) is byte-identical to every checkpoint on record -- the target
+    stays a hard 1.0 always, which is what every recorded run trained under.
+
+    Two traps this implementation exists to avoid, both from the plan:
+    - **Chicken-and-egg.** With the head's `-4.595` rare-positive prior bias, predicted IoU is
+      near 0 for the first iterations, so an IoU target there teaches objectness to stay off
+      everywhere -- it never escapes. `iou_aware_warmup` (default 2000, matching the plan) keeps
+      the target at hard 1.0 for `it < iou_aware_warmup`, then switches. `it=None` (a caller that
+      does not track iterations) behaves as "past warmup" -- i.e. IoU-aware immediately -- since
+      the only caller that needs the warmup (`train_detector.py`) always passes `it`.
+    - **The certified/ignore weight-forcing must key on WHETHER an anchor is positive, not on the
+      target VALUE at it.** The pre-existing `weight = torch.maximum(weight, target)` line forced
+      a positive's weight to at least 1 so `--use-regions`/`ignore` could never silently drop a
+      real animal from the objectness term. Under `iou_aware` the target at a positive can be
+      well under 1 (an early-training IoU of 0.3, say), so that guard would only force weight up
+      to 0.3 -- under-forcing the exact case it exists to protect. `pos_mask` (binary, 1 at every
+      positive regardless of its target VALUE) is threaded through separately so this guard keeps
+      forcing weight to a full 1 at every true positive, unchanged from before this key existed.
 
     `regions` (B,M,4) restricts the objectness BCE to anchors inside the CERTIFIED area (see
     `certified_anchors`). Absent, this function is bit-identical to what every recorded detector
@@ -218,6 +259,11 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     device = obj_logits.device
     B = obj_logits.shape[0]
     target = torch.zeros_like(obj_logits)
+    # WHICH anchors are true positives, independent of what VALUE `target` holds there -- see the
+    # docstring's second trap. Always built (cheap, boolean); only READ by the weight-forcing line
+    # below, which itself only runs when `weight is not None`.
+    pos_mask = torch.zeros_like(obj_logits, dtype=torch.bool)
+    use_iou_target = iou_aware and (it is None or it >= iou_aware_warmup)
     # `--use-regions` certifies where objectness may be supervised at all; `ignore` excludes a
     # specific unannotated animal's footprint from it. Either alone, or both, need the weight
     # tensor built; neither means the byte-identical fast path below (`weight is None`).
@@ -236,7 +282,12 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             weight[b] *= (~ig).to(weight.dtype)
             n_ignored += float(ig.float().mean())
         if pos.numel():
-            target[b, pos] = 1.0
+            pos_mask[b, pos] = True
+            if use_iou_target:
+                with torch.no_grad():
+                    target[b, pos] = paired_iou(boxes[b, pos], gt_boxes[b][gix]).clamp(0.0, 1.0)
+            else:
+                target[b, pos] = 1.0
             losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
             n_pos += pos.numel()
             if kpts is not None and gt_kpts is not None:
@@ -254,8 +305,11 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         # A POSITIVE IS CERTIFIED BY CONSTRUCTION -- `assign` only fires inside a GT box and
         # `certified_anchors` unions those boxes in -- but it is forced here rather than assumed,
         # because a positive dropped from the objectness term would be an animal trained as
-        # nothing, and no loss curve would show it.
-        weight = torch.maximum(weight, target)
+        # nothing, and no loss curve would show it. Keyed on `pos_mask` (WHETHER an anchor is a
+        # positive), never on `target` (its BCE VALUE there) -- under `iou_aware` those two come
+        # apart, and forcing off `target` would only guarantee weight up to the current IoU
+        # (possibly near 0 early on), not the full 1 this guard exists to provide.
+        weight = torch.maximum(weight, pos_mask.to(weight.dtype))
         obj_all = (F.binary_cross_entropy_with_logits(obj_logits, target, reduction='none')
                    * weight).sum()
     obj = obj_all / max(n_pos, B)
@@ -267,6 +321,12 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         parts['certified'] = n_cert / max(B, 1)
     if ignore is not None:
         parts['ignored'] = n_ignored / max(B, 1)
+    if iou_aware:
+        # THE WARMUP TRANSITION, VISIBLE IN THE LOG rather than inferred from a curve: reads
+        # exactly 1.000 for `it < iou_aware_warmup` (hard targets), then drops to the model's own
+        # mean positive-anchor IoU once the switch fires -- the chicken-and-egg trap the docstring
+        # warns about would show up here as a value stuck near 0 rather than climbing.
+        parts['iou_target'] = float(target[pos_mask].mean()) if bool(pos_mask.any()) else 0.0
     if kpts is not None and gt_kpts is not None:
         # Mean over the IMAGES that had a positive, matching how `box` is normalised. Both lists
         # are empty when nothing was assigned, and then these are exact zeros with no gradient.

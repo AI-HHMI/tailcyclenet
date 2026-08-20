@@ -1,18 +1,19 @@
 import torch
 
 from .assign import (assign, box_iou, certified_anchors, decode, detector_loss,
-                     giou_loss)
+                     giou_loss, paired_iou)
 from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, box_collate, letterbox, letterbox_transform,
                    reduce_factor, split_batch, tile_transform, unletterbox_boxes,
                    unletterbox_keypoints)
+from .pretrained import load_coco_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
            'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV', 'RAW_REV',
-           'detect_raw', 'associate_group', 'link_rows']
+           'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone', 'paired_iou']
 
 # BUMP THIS WHENEVER `link_rows` CHANGES WHAT IT EMITS. `--det-cache` stores boxes that have already
 # been linked, so a cache written under an older rule is a different box set under an identical
@@ -72,6 +73,9 @@ def load_detector(path, device='cpu', input_wh=None):
     every checkpoint written before the capacity switch existed, not a guess about one that could
     have been anything. The return signature here is UNCHANGED: this is used only to build the
     right model internally, so no caller needs a new field to keep working.
+
+    `bottleneck_expansion` (T4.1, dev/plans/detector_accuracy.md) rides the same way: absent means
+    0.5, the shape every checkpoint on record was built at, not a guess.
     """
     import torch
     from pathlib import Path
@@ -96,7 +100,8 @@ def load_detector(path, device='cpu', input_wh=None):
             'running statistics to load into). Retrain this detector -- see '
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
     model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
-                      version=str(ckpt.get('yolox_version', 'trimmed')))
+                      version=str(ckpt.get('yolox_version', 'trimmed')),
+                      bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

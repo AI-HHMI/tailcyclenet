@@ -74,6 +74,7 @@ from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_coll
                                    detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
+from tailcyclenet.detector.pretrained import load_coco_backbone
 from tailcyclenet.format import load_datasets
 
 
@@ -258,10 +259,37 @@ def main():
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'], **tiling)
         print(f'val:   {len(val)} views')
 
-    model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox']).to(device)
+    model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
+                      bottleneck_expansion=model_cfg['bottleneck_expansion']).to(device)
     n = sum(p.numel() for p in model.parameters())
-    print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params')
-    opt = torch.optim.AdamW(model.parameters(), lr=train_cfg['lr'], weight_decay=5e-4)
+    print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
+          f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
+    if model_cfg['pretrained'] == 'coco':
+        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'])
+        print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors '
+              f'(dev/plans/detector_accuracy.md T4.1)', flush=True)
+
+    # DIFFERENTIAL LR (T4.1): the pretrained backbone at BACKBONE_LR_SCALE x lr, the fresh
+    # neck/head at lr -- mirroring the pose side's own discipline for a similarly asymmetric
+    # unfreeze (`video_encoder_requires_grad`), NOT its staged-unfreeze machinery, which exists to
+    # solve schedule-free's `1/k` averaging problem and this optimiser is plain AdamW throughout.
+    # Conv weights trained under BatchNorm statistics landing in a fresh GroupNorm net is the
+    # reason for the lower backbone LR, not an equal one -- see `pretrained.py`'s own docstring.
+    # A `pretrained=''` run builds ONE param group, unconditionally -- so this is byte-identical
+    # to every optimizer on record whenever pretraining is not asked for.
+    BACKBONE_LR_SCALE = 0.1
+    if model_cfg['pretrained'] == 'coco':
+        backbone_ids = {id(p) for p in model.backbone.parameters()}
+        backbone_params = [p for p in model.parameters() if id(p) in backbone_ids]
+        other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+        opt = torch.optim.AdamW(
+            [{'params': backbone_params, 'lr': train_cfg['lr'] * BACKBONE_LR_SCALE},
+             {'params': other_params, 'lr': train_cfg['lr']}],
+            weight_decay=5e-4)
+        print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
+              f'neck/head {train_cfg["lr"]:g}', flush=True)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=train_cfg['lr'], weight_decay=5e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
 
     history = []
@@ -298,7 +326,9 @@ def main():
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=train_cfg['kpt_weight'],
                                         kpt_score_weight=train_cfg['kpt_score_weight'],
-                                        regions=gt_regions, ignore=gt_ignore)
+                                        regions=gt_regions, ignore=gt_ignore,
+                                        iou_aware=train_cfg['iou_aware_obj'],
+                                        iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -315,6 +345,7 @@ def main():
                 kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
                 kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
                 kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
+                kp += f'  iouT {parts["iou_target"]:5.3f}' if 'iou_target' in parts else ''
                 print(f'{it:7d}/{train_cfg["iters"]}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
@@ -360,6 +391,11 @@ def main():
                 # checkpoint written before this switch existed, not a guess.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
                         'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': model_cfg['yolox'],
+                        # T4.1 (dev/plans/detector_accuracy.md), part of the WEIGHTS like
+                        # `yolox_version` beside it -- absent means 0.5 / '', a fact about every
+                        # checkpoint written before this key existed, not a guess.
+                        'bottleneck_expansion': model_cfg['bottleneck_expansion'],
+                        'pretrained': model_cfg['pretrained'],
                         'seed': train_cfg['seed'],
                         # `input_wh` above is the TILE size when tiling, which is NOT the
                         # deployment input size -- `load_detector` raises if this is missing so

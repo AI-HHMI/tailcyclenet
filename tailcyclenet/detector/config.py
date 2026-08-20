@@ -8,7 +8,8 @@ an unknown key is a typo, not a comment, and must not silently train at defaults
 
 Blocks:
     [data]      the loader and what the regression target bounds
-    [model]     the architecture (one key: `yolox`)
+    [model]     the architecture: `yolox` (capacity tier), plus the T4.1 pretraining prototype
+                (`bottleneck_expansion`, `pretrained` -- dev/plans/detector_accuracy.md)
     [training]  schedule, run folder, device
 
 `weight_decay` (5e-4) and the cosine schedule are not configurable: they were never flags.
@@ -29,10 +30,10 @@ DATA_KEYS = frozenset({
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present',
 })
-MODEL_KEYS = frozenset({'yolox'})
+MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
-    'eval_batches', 'kpt_weight', 'kpt_score_weight',
+    'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -116,10 +117,15 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['input_wh'] = _pair('input_wh', data.get('input_wh'))
     data['tile_wh'] = _pair('tile_wh', data.get('tile_wh'))
 
-    for k in ('iters', 'batch_size', 'num_workers', 'seed', 'eval_every', 'eval_batches'):
+    for k in ('iters', 'batch_size', 'num_workers', 'seed', 'eval_every', 'eval_batches',
+              'iou_aware_warmup'):
         train[k] = int(train.get(k, {'iters': 20000, 'batch_size': 16, 'num_workers': 8,
-                                     'seed': 0, 'eval_every': 2000,
-                                     'eval_batches': 25}[k]))
+                                     'seed': 0, 'eval_every': 2000, 'eval_batches': 25,
+                                     'iou_aware_warmup': 2000}[k]))
+    # T2.3 (dev/plans/detector_accuracy.md): the BCE objectness target at a positive anchor
+    # becomes the detached IoU between its predicted and GT box, instead of a hard 1.0, once past
+    # `iou_aware_warmup` iterations. Default OFF -- byte-identical to every checkpoint on record.
+    train['iou_aware_obj'] = bool(train.get('iou_aware_obj', False))
     for k in ('min_crop_dim', 'min_box_px', 'max_input_px', 'frames_per_group',
               'val_frames_per_group', 'tile_bg_per_frame'):
         data[k] = int(data.get(k, {'min_crop_dim': 64, 'min_box_px': 32,
@@ -144,4 +150,33 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                          'by rank. See BoxDataset.__init__.')
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
+
+    # T4.1 (dev/plans/detector_accuracy.md), PROTOTYPE. `bottleneck_expansion`: 0.5 (default) is
+    # byte-identical to every checkpoint on record; 1.0 is the shape a Megvii COCO backbone
+    # actually loads into (see `yolox.Bottleneck`). `pretrained`: '' (default, from scratch, every
+    # run on record) or 'coco' (load the tier's COCO backbone -- `detector.pretrained`). An
+    # arbitrary path is NOT YET SUPPORTED (that is T4.1b's in-domain-pretraining artefact, which
+    # does not exist yet) -- raise by name rather than silently ignoring it.
+    model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))
+    model['pretrained'] = str(model.get('pretrained', ''))
+    if model['yolox'] == 'trimmed' and model['bottleneck_expansion'] != 0.5:
+        raise SystemExit(
+            f"[model].bottleneck_expansion={model['bottleneck_expansion']} was set alongside "
+            "yolox='trimmed', but trimmed's backbone does not take it -- it stays at 0.5 "
+            "permanently. Use a canonical tier (one of the YOLOX_TIERS names) for a "
+            "COCO-compatible backbone.")
+    if model['pretrained'] not in ('', 'coco'):
+        raise SystemExit(
+            f"[model].pretrained={model['pretrained']!r}: only '' (from scratch) and 'coco' are "
+            "supported by this prototype. An arbitrary path (T4.1b, in-domain pretraining) is not "
+            "wired up yet.")
+    if model['pretrained'] == 'coco':
+        if model['yolox'] == 'trimmed':
+            raise SystemExit("[model].pretrained='coco' requires a canonical yolox tier -- "
+                             "'trimmed' has no COCO counterpart to load.")
+        if model['bottleneck_expansion'] != 1.0:
+            raise SystemExit(
+                "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
+                "every bottleneck conv is half Megvii's width and the load would silently take "
+                "only 19 of 35 backbone tensors (dev/plans/detector_accuracy.md T4.1).")
     return cfg

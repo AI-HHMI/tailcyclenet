@@ -11,7 +11,7 @@ from pathlib import Path
 from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
                                    box_iou, decode, detector_loss, giou_loss, letterbox,
-                                   unletterbox_boxes)
+                                   paired_iou, unletterbox_boxes)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.data import _cutout_rects, _keypoints_in_rects, random_affine
 
@@ -1273,6 +1273,209 @@ def test_detector_loss_without_ignore_is_unchanged():
     assert np_['ignored'] == 0.0
 
 
+# ----------------------------------------------------------------------------------------------
+# T2.3 -- IoU-aware objectness (dev/plans/detector_accuracy.md). The BCE target at a positive
+# anchor becomes the detached predicted-vs-GT IoU instead of a hard 1.0, once past a warmup. Off
+# by default (`iou_aware=False`) and byte-identical to every checkpoint on record either way.
+# ----------------------------------------------------------------------------------------------
+
+def test_paired_iou_matches_box_iou_diagonal():
+    """`paired_iou` is the SAME maths as `box_iou`, just elementwise instead of all-pairs -- the
+    diagonal of the cross-product form must equal it exactly, on both perfect and partial overlap.
+    """
+    a = torch.tensor([[0.0, 0.0, 10.0, 10.0], [0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0]])
+    b = torch.tensor([[0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0], [5.0, 5.0, 15.0, 15.0]])
+    got = paired_iou(a, b)
+    want = box_iou(a, b).diagonal()
+    torch.testing.assert_close(got, want)
+    assert float(got[0]) == pytest.approx(1.0)         # perfect overlap
+    assert 0.0 < float(got[1]) < 1.0                    # partial overlap
+    assert float(got[2]) == pytest.approx(1.0)          # perfect overlap, offset box
+
+
+def test_detector_loss_iou_aware_default_off_is_unchanged():
+    """THE BACKWARD-COMPATIBILITY PROOF, same shape as `test_detector_loss_without_ignore_is_
+    unchanged`. `iou_aware` defaults to False, and passing it explicitly at False (or omitting it)
+    must produce the IDENTICAL loss and the IDENTICAL (hard 1.0) target regardless of how good or
+    bad the predicted boxes are.
+    """
+    torch.manual_seed(2)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    # Deliberately BAD boxes (far from the GT), so a hard-1.0 vs IoU-valued target would differ
+    # a lot if the flag were live -- the strongest test that it is not.
+    boxes = torch.rand(2, anchors.shape[0], 4) * 5
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    base, bp = detector_loss(obj, boxes, anchors, gt)
+    off, op = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
+    assert float(base) == float(off)
+    assert 'iou_target' not in bp and 'iou_target' not in op
+
+
+def test_detector_loss_iou_aware_holds_hard_target_during_warmup():
+    """`it < iou_aware_warmup` must still use the hard 1.0 target -- the chicken-and-egg trap the
+    plan names: an early, near-zero predicted IoU must not be allowed to teach objectness to stay
+    off. `parts['iou_target']` reads exactly 1.0 throughout warmup regardless of box quality.
+    """
+    torch.manual_seed(3)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 5             # bad boxes -> low true IoU
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    warm, wp = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000, it=0)
+    hard, hp = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
+    assert float(warm) == float(hard), 'during warmup the loss must equal the hard-target one'
+    assert wp['iou_target'] == pytest.approx(1.0)
+
+
+def test_detector_loss_iou_aware_switches_to_iou_target_after_warmup():
+    """Past warmup, the target at a positive must be the DETACHED IoU between its predicted and
+    GT box -- not 1.0 -- and `parts['iou_target']` must report the same value a direct
+    `paired_iou` computation gives, tying the loss's internal bookkeeping to the public helper.
+    """
+    torch.manual_seed(4)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 5              # bad boxes -> IoU well under 1
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    past, pp = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000,
+                             it=2000)
+    hard, _ = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
+    assert float(past) != float(hard), 'past warmup the loss must differ from the hard-target one'
+    assert 0.0 <= pp['iou_target'] < 1.0
+
+    pos, gix = assign(anchors, gt[0])
+    assert pos.numel(), 'need at least one positive anchor for this check to mean anything'
+    want = float(paired_iou(boxes[0, pos], gt[0][gix]).clamp(0, 1).mean())
+    assert pp['iou_target'] == pytest.approx(want, abs=1e-5)
+
+
+def test_detector_loss_iou_aware_it_none_means_past_warmup():
+    """`it=None` (a caller that does not track iterations) must behave as ALREADY past warmup --
+    the docstring's stated contract, since the only caller needing the warmup (`train_detector.py`)
+    always passes `it`."""
+    torch.manual_seed(5)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 5
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    none_it, p1 = detector_loss(obj, boxes, anchors, gt, iou_aware=True, it=None)
+    past_it, p2 = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000,
+                                it=999999)
+    torch.testing.assert_close(none_it, past_it)
+    assert p1['iou_target'] == pytest.approx(p2['iou_target'])
+
+
+def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
+    """THE SUBTLE CORRECTNESS CASE this key introduces: `--use-regions`/`ignore` mask the
+    objectness weight, and a pre-existing guard (`weight = maximum(weight, ...)`) forces a TRUE
+    POSITIVE's weight back to 1 so masking can never silently drop a real animal from the
+    objectness term. That guard must key on WHETHER an anchor is positive (`pos_mask`), not on the
+    VALUE its target holds -- under `iou_aware` with bad boxes the target there can be near 0, and
+    forcing off THAT would only guarantee a near-0 weight, defeating the guard's whole purpose.
+
+    Constructed so a `regions` mask certifies NOTHING (weight starts at 0 everywhere) and the
+    predicted boxes are deliberately bad (low true IoU): if the guard were wrongly keyed on
+    `target`, the positive anchor's contribution to `obj` would be scaled by ~its IoU instead of
+    1, and this loss would NOT match the identical computation with `iou_aware=False` (which is
+    known-correctly forced to weight 1 by the pre-existing, unchanged code path).
+    """
+    torch.manual_seed(6)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(1, anchors.shape[0])
+    boxes = torch.rand(1, anchors.shape[0], 4) * 5              # bad boxes -> low true IoU
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]]])
+    nothing_certified = torch.full((1, 1, 4), float('nan'))     # certifies NOTHING
+
+    _, sp = detector_loss(obj, boxes, anchors, gt, regions=nothing_certified,
+                          iou_aware=True, iou_aware_warmup=0, it=1)
+    assert sp['iou_target'] < 0.5, 'the test needs a genuinely low IoU to be a real check'
+    # The OBJ term (not the box term, which iou_aware never touches) must be identical: the
+    # positive's weight was forced to 1 in both cases, only the BCE TARGET value differs, and a
+    # BCE(logit, 1.0) vs BCE(logit, iou) at weight=1 are different numbers -- so this checks obj
+    # is computed off the same forced weight, not that the two total losses match.
+    pos, gix = assign(anchors, gt[0])
+    assert pos.numel()
+    logit = obj[0, pos]
+    target_hard = torch.ones_like(logit)
+    target_soft = paired_iou(boxes[0, pos], gt[0][gix]).clamp(0, 1)
+    import torch.nn.functional as F
+    norm = max(pos.numel(), 1)          # `detector_loss`'s own `obj_all / max(n_pos, B)`, B=1 here
+    expected_hard_obj = F.binary_cross_entropy_with_logits(
+        logit, target_hard, reduction='sum') / norm
+    expected_soft_obj = F.binary_cross_entropy_with_logits(
+        logit, target_soft, reduction='sum') / norm
+    # Re-derived directly rather than relying on `hard`/`soft` above (which also include
+    # box_weight * box, identical in both arms and therefore not informative here) -- read `obj`
+    # off `parts` instead.
+    _, hp = detector_loss(obj, boxes, anchors, gt, regions=nothing_certified, iou_aware=False)
+    assert hp['obj'] == pytest.approx(float(expected_hard_obj), rel=1e-4)
+    assert sp['obj'] == pytest.approx(float(expected_soft_obj), rel=1e-4)
+
+
+def test_detector_config_iou_aware_defaults(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['training']['iou_aware_obj'] is False
+    assert cfg['training']['iou_aware_warmup'] == 2000
+
+
+def test_train_detector_iou_aware_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A short run with `iou_aware_obj = true` through the real CLI entry point: it must train to
+    completion with no error, and the log line must show `iouT` once it fires (warmup=0 so it
+    fires on iteration 0 here, keeping the smoke test short)."""
+    import importlib.util
+    import sys
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+iou_aware_obj = true
+iou_aware_warmup = 0
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_iou_aware',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+    import tomllib
+    with open(out / 'config.toml', 'rb') as f:
+        recorded = tomllib.load(f)
+    assert recorded['training']['iou_aware_obj'] is True
+    assert recorded['training']['iou_aware_warmup'] == 0
+
+
 def test_a_nan_box_is_skipped_by_both_cross_view_paths():
     """The two halves of `unletterbox_boxes`' contract, joined. They never were.
 
@@ -2290,3 +2493,289 @@ kpt_score_weight = 1.0
     ckpt = torch.load(tmp_path / 'run' / 'detector_it000002.pth', map_location='cpu',
                       weights_only=False)
     assert ckpt['ignore_present'] is True
+
+
+# ----------------------------------------------------------------------------------------------
+# T4.1 -- pretrained COCO backbone (dev/plans/detector_accuracy.md). `bottleneck_expansion` is an
+# architecture SHAPE key (yolox.py); `pretrained` is the config-level switch. Both must be inert
+# at their defaults -- every checkpoint on record was built at bottleneck_expansion=0.5,
+# pretrained=''.
+# ----------------------------------------------------------------------------------------------
+
+WEIGHTS_DIR = REPO / 'scratch' / 'weights'
+_HAVE_COCO_WEIGHTS = (WEIGHTS_DIR / 'yolox_tiny.pth').exists()
+
+
+def test_bottleneck_expansion_default_matches_the_shipped_shape():
+    """At the default 0.5, `dark3`'s first bottleneck's conv1 is (24,48,1,1) on `tiny` -- the
+    exact shape dev/plans/detector_accuracy.md T4.1 names as the shipped (narrow) one, HALF
+    Megvii's own (48,48,1,1). This is the shape every checkpoint on record was built at; the test
+    pins it so a future change to `round8`/`YOLOX_TIERS` cannot silently move it.
+    """
+    m = YOLOXNano(version='tiny')
+    assert m.bottleneck_expansion == 0.5
+    w = m.backbone.dark3[1].m[0].conv1[0].weight
+    assert tuple(w.shape) == (24, 48, 1, 1)
+
+
+def test_bottleneck_expansion_one_matches_the_canonical_shape():
+    """At 1.0, the SAME tensor is (48,48,1,1) -- full width, Megvii's own `CSPLayer`s
+    `expansion=1.0` for its inner `Bottleneck`s. Everything else about the net is unchanged: only
+    the internal width of each bottleneck's first conv moves.
+    """
+    m = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
+    w = m.backbone.dark3[1].m[0].conv1[0].weight
+    assert tuple(w.shape) == (48, 48, 1, 1)
+    # And the net still forwards at the wider shape.
+    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+def test_bottleneck_expansion_default_is_byte_identical_to_no_key():
+    """Passing `bottleneck_expansion=0.5` explicitly must build the IDENTICAL module graph (same
+    state_dict keys and shapes) as never passing it -- the same contract `crop_inflate = 1.0` and
+    `pose_nms` off already carry elsewhere in this repo: a default value is not merely numerically
+    close to absent, it is indistinguishable from it.
+    """
+    a = YOLOXNano(version='s').state_dict()
+    b = YOLOXNano(version='s', bottleneck_expansion=0.5).state_dict()
+    assert set(a) == set(b)
+    for k in a:
+        assert a[k].shape == b[k].shape
+
+
+def test_bottleneck_expansion_raises_alongside_trimmed():
+    """`trimmed`'s `CSPDarknetNano` does not take this key -- a non-default value alongside it
+    must raise rather than silently being ignored, the same guard `width` already has the other
+    way (canonical tier + non-default `width`)."""
+    with pytest.raises(ValueError, match='bottleneck_expansion'):
+        YOLOXNano(version='trimmed', bottleneck_expansion=1.0)
+    YOLOXNano(version='trimmed', bottleneck_expansion=0.5)      # the default: must NOT raise
+
+
+def test_load_coco_backbone_raises_at_the_shipped_expansion():
+    """The guard must fire BEFORE touching disk -- a model built at the shipped 0.5 must be
+    refused even if no weights file exists at all, so the error names the real cause instead of a
+    confusing FileNotFoundError."""
+    from tailcyclenet.detector.pretrained import load_coco_backbone
+
+    m = YOLOXNano(version='tiny', bottleneck_expansion=0.5)
+    with pytest.raises(ValueError, match='bottleneck_expansion'):
+        load_coco_backbone(m, 'tiny', weights_dir='/nonexistent')
+
+
+def test_load_coco_backbone_raises_for_trimmed():
+    from tailcyclenet.detector.pretrained import load_coco_backbone
+
+    m = YOLOXNano(version='trimmed')
+    with pytest.raises(ValueError, match='trimmed'):
+        load_coco_backbone(m, 'trimmed', weights_dir='/nonexistent')
+
+
+def test_load_coco_backbone_missing_weights_file_raises(tmp_path):
+    from tailcyclenet.detector.pretrained import load_coco_backbone
+
+    m = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
+    with pytest.raises(FileNotFoundError, match='yolox_tiny'):
+        load_coco_backbone(m, 'tiny', weights_dir=tmp_path)
+
+
+def test_bgr_to_rgb_focus_perm_is_an_involution_over_three_blocks():
+    """The permutation must reverse each 3-channel block and nothing else -- it is claimed to be
+    its own inverse (`pretrained.py`'s own derivation), and this is the property that makes ONE
+    permutation correct for converting either direction."""
+    from tailcyclenet.detector.pretrained import BGR_TO_RGB_FOCUS_PERM
+
+    perm = BGR_TO_RGB_FOCUS_PERM
+    assert len(perm) == 12 and sorted(perm) == list(range(12))
+    for g in range(4):
+        block = perm[3 * g:3 * g + 3]
+        assert block == [3 * g + 2, 3 * g + 1, 3 * g + 0]
+    # Applying it twice must be the identity.
+    twice = [perm[perm[i]] for i in range(12)]
+    assert twice == list(range(12))
+
+
+def test_detector_config_bottleneck_expansion_and_pretrained_default_inert(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['model']['bottleneck_expansion'] == 0.5
+    assert cfg['model']['pretrained'] == ''
+
+
+def test_detector_config_pretrained_coco_requires_canonical_tier(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "trimmed"
+pretrained = "coco"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='trimmed'):
+        load_detector_config(p)
+
+
+def test_detector_config_pretrained_coco_requires_bottleneck_expansion_one(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+pretrained = "coco"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='bottleneck_expansion'):
+        load_detector_config(p)
+    # The paired, correct config must NOT raise.
+    p2 = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+pretrained = "coco"
+bottleneck_expansion = 1.0
+[training]
+out = "/tmp/run"
+""", 'ok.toml')
+    cfg = load_detector_config(p2)
+    assert cfg['model']['pretrained'] == 'coco' and cfg['model']['bottleneck_expansion'] == 1.0
+
+
+def test_detector_config_pretrained_unsupported_value_raises(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+pretrained = "/some/path.pth"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='pretrained'):
+        load_detector_config(p)
+
+
+def test_detector_config_bottleneck_expansion_raises_alongside_trimmed(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "trimmed"
+bottleneck_expansion = 1.0
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='bottleneck_expansion'):
+        load_detector_config(p)
+
+
+@pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
+                    '(CLAUDE.md) and may not be cached on this machine')
+def test_load_coco_backbone_transfers_every_backbone_tensor():
+    """The end-to-end claim T4.1 exists to fix: 35/35 backbone conv tensors load at
+    bottleneck_expansion=1.0, not the 19/35 the shipped 0.5 shape permits."""
+    from tailcyclenet.detector.pretrained import load_coco_backbone
+
+    m = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
+    n_loaded, n_total = load_coco_backbone(m, 'tiny', weights_dir=WEIGHTS_DIR)
+    assert (n_loaded, n_total) == (35, 35)
+    # And the loaded weights actually forward without shape errors.
+    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+@pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
+                    '(CLAUDE.md) and may not be cached on this machine')
+def test_load_coco_backbone_stem_correction_matches_megvii_activation():
+    """T4.1's own test: a corrected weight fed this repo's RGB/[0,1] convention must produce the
+    SAME stem activation Megvii's raw weight produces on the identical image fed BGR/[0,255] --
+    not merely a plausible-looking one. Ports `scratch/validate_pretrained_load.py`'s check into a
+    pinned test."""
+    import torch.nn.functional as F
+
+    from tailcyclenet.detector.pretrained import BGR_TO_RGB_FOCUS_PERM
+
+    ck = torch.load(WEIGHTS_DIR / 'yolox_tiny.pth', map_location='cpu', weights_only=False)
+    src = ck['model'] if 'model' in ck else ck
+    w_orig = src['backbone.backbone.stem.conv.conv.weight'].clone()
+
+    torch.manual_seed(0)
+    img_bgr_255 = torch.rand(1, 3, 32, 32) * 255.0
+    img_rgb_01 = img_bgr_255.flip(1) / 255.0
+
+    def focus_cat(x):
+        return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2],
+                          x[..., ::2, 1::2], x[..., 1::2, 1::2]], dim=1)
+
+    y_megvii = F.conv2d(focus_cat(img_bgr_255), w_orig, stride=1, padding=1)
+    w_corrected = (w_orig * 255.0)[:, BGR_TO_RGB_FOCUS_PERM]
+    y_repo = F.conv2d(focus_cat(img_rgb_01), w_corrected, stride=1, padding=1)
+    torch.testing.assert_close(y_megvii, y_repo, atol=1e-3, rtol=1e-4)
+
+
+@pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
+                    '(CLAUDE.md) and may not be cached on this machine')
+def test_train_detector_pretrained_coco_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A 2-iteration run with `pretrained = "coco"` through the real CLI entry point: the backbone
+    loads, training runs, and the checkpoint records both new keys so `load_detector` rebuilds the
+    right architecture later."""
+    import importlib.util
+    import sys
+
+    from tailcyclenet.detector import load_detector
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [96, 96]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+bottleneck_expansion = 1.0
+pretrained = "coco"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_pretrained',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    monkeypatch.setattr(mod, 'load_coco_backbone',
+                        lambda model, tier: __import__(
+                            'tailcyclenet.detector.pretrained', fromlist=['load_coco_backbone']
+                        ).load_coco_backbone(model, tier, weights_dir=WEIGHTS_DIR))
+    mod.main()
+
+    assert (out / 'detector.pth').exists()
+    ckpt = torch.load(out / 'detector_it000002.pth', map_location='cpu', weights_only=False)
+    assert ckpt['bottleneck_expansion'] == 1.0
+    assert ckpt['pretrained'] == 'coco'
+    model, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(out / 'detector.pth')
+    assert model.bottleneck_expansion == 1.0

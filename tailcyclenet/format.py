@@ -742,6 +742,12 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
     # said `regions is not None` -- the file's absence is the claim "exhaustively labelled" (§9b),
     # so the row count cannot be what decides whether it exists.
     emit_regions = any(lab is not None and lab.regions is not None for lab in labels.values())
+    # A session with no labelled row anywhere (an inference-only clip built on `empty_labels`)
+    # writes zero rows into the mode's own table -- but rule 6 requires that table to EXIST, so
+    # the empty-file-is-a-claim precedent above applies here too, keyed on the array being
+    # PRESENT rather than on any row being labelled.
+    emit_points3d = any(lab is not None and lab.vis3d is not None for lab in labels.values())
+    emit_keypoints = any(lab is not None and lab.vis2d is not None for lab in labels.values())
 
     def push(name, **cols):
         for k, v in cols.items():
@@ -793,7 +799,9 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
                      camera=[name] * T, ext=[e.ravel().tolist() for e in lab.ext[ci]])
 
     for stem, cols in tables.items():
-        if not cols['group_id'] and not (stem == 'regions' and emit_regions):
+        if not cols['group_id'] and not (stem == 'regions' and emit_regions) \
+                and not (stem == 'points3d' and emit_points3d) \
+                and not (stem == 'keypoints' and emit_keypoints):
             continue
         write_table(path / f'{stem}.pq',
                     {k: np.asarray(v, dtype=object if k in DICT_COLS else None)

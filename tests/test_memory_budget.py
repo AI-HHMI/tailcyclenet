@@ -380,3 +380,100 @@ def test_result_arrays_are_the_term_the_budget_cannot_shrink():
     a = memory.result_array_gb(1000, 8, 10, 1, top_k=4, det_kpts=True)
     b = memory.result_array_gb(2000, 8, 10, 1, top_k=4, det_kpts=True)
     assert sum(b.values()) == pytest.approx(2 * sum(a.values()), rel=1e-9)
+
+
+@pytest.mark.parametrize('anchor', ['none', 'carry'])
+@pytest.mark.parametrize('refine', [False, True])
+def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
+    """THE INVARIANT FOR THE POSE HALF, and the direct analogue of the prefetch test.
+
+    How many windows a block holds comes from FREE MEMORY, so if it could move a number then two
+    machines running one command would disagree and nothing in either output would say so. That is
+    the rule which licenses sizing anything from the budget at all (dev/reports/38 §7).
+
+    Exercised over a DETECTOR box source as well as the label path, because that is the arm where
+    a boundary has something to break: the association state has to cross it, and the detection
+    cursor has to stay on the global batch grid. The old whole-clip budget test could not reach it.
+    """
+    import conftest as cf
+    from tailcyclenet.format import Registry, load_dataset
+    from tailcyclenet.infer import InferConfig, merge_blocks, run_blocks
+    from tailcyclenet.model import build_model
+    from test_model import SMALL
+
+    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=16)
+    ds = load_dataset(tmp_path / 'mv')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, 16, C, 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h
+
+    def boxes_for(store, lo, hi):
+        return (boxes[:, lo:hi], None, None)
+
+    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
+                      anchor=anchor, refine=refine)
+
+    def run(gb):
+        memory.reset()
+        memory.current(override_gb=gb)
+        try:
+            blocks = list(run_blocks(model, sess, 'g000', registry, ds.name, cfg,
+                                     boxes_for=boxes_for, n_rows=1))
+            return len(blocks), merge_blocks(blocks)
+        finally:
+            memory.reset()
+
+    # 64x48x3 x 3 cameras is 27.6 kB a frame index, so these span one-window blocks to one block.
+    n_small, small = run(0.0008)
+    n_big, big = run(4096)
+    assert n_small > n_big, f'the budgets must actually differ in block count ({n_small} vs {n_big})'
+    assert n_big == 1, 'a roomy budget should take the whole clip in one block'
+    for k, v in big.items():
+        a, b = np.asarray(v), np.asarray(small[k])
+        if a.dtype.kind in 'fc':
+            assert np.array_equal(np.nan_to_num(a, nan=-9e9), np.nan_to_num(b, nan=-9e9)), \
+                f'{k} moved with the block size'
+        elif a.dtype.kind in 'iub':
+            assert np.array_equal(a, b), f'{k} moved with the block size'
+        else:
+            assert str(a) == str(b), f'{k} moved with the block size'
+
+
+def test_a_window_that_does_not_fit_is_refused_not_re_decoded(tmp_path):
+    """No silent degradation below one window, because there is nowhere to degrade TO.
+
+    Refine pass 2 crops from the SAME frames pass 1 did. Dropping them means either decoding the
+    window twice -- the 3x the store exists to remove -- or re-cropping from the stored crop, which
+    double-resamples and is not output-neutral. So the budget either holds a window or the run says
+    so, with the arithmetic and the flag that would fix it.
+    """
+    import conftest as cf
+    from tailcyclenet.format import Registry, load_dataset
+    from tailcyclenet.infer import InferConfig, run_group
+    from tailcyclenet.model import build_model
+    from test_model import SMALL
+
+    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=8)
+    ds = load_dataset(tmp_path / 'mv')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu')
+
+    memory.reset()
+    memory.current(override_gb=1e-6)
+    try:
+        with pytest.raises(SystemExit) as e:
+            run_group(model, sess, 'g000', registry, ds.name, cfg)
+    finally:
+        memory.reset()
+    msg = str(e.value)
+    assert '--max-ram' in msg and 'one window' in msg
+    assert 'frame store' in msg, 'the message must show the arithmetic, not just the verdict'

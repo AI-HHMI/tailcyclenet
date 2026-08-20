@@ -1,14 +1,11 @@
 """The DRIVER: one run over a dataset. Everything `run_group` is not.
 
 Flag resolution and the refusals that must happen before a checkpoint loads, the session/group
-loop, detection and association, the render pool, and the flat-npz write. Lifted verbatim out of
+loop, detection and association, and the flat-npz write. Lifted verbatim out of
 `scripts/infer.py`, where it could not be imported and so could only be tested by reading the file
 as text.
 """
 from __future__ import annotations
-
-import time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -50,6 +47,67 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
         'reduce': bool(det_red),
         'box_source': str(det_boxsrc or 'keypoints') if args.detector else '',
     }
+
+
+_DET_BATCH = 16
+
+
+def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
+                    stats=None):
+    """-> `boxes_for(store, lo, hi)`, detecting and associating on demand for one group.
+
+    **THE DETECTION CURSOR IS NOT THE BLOCK CURSOR, and that is the whole design.** Blocks are
+    sized by free memory, so if detection re-batched per block, every boundary would produce a
+    short leading batch -- a different input SHAPE, and cuDNN picks convolution algorithms per
+    shape (0.204 px of box, 1.69e-03 of objectness; dev/reports/38 §3.2). A budget-derived block
+    size would then move the boxes, which is exactly what the rule "every knob the budget sizes is
+    output-neutral" forbids. So detection advances in its OWN globally `batch`-aligned runs and
+    overshoots the block by up to `batch - 1` frames, which the buffer below holds.
+
+    `associate_group` carries its state, so the tracker and `link_rows` see one continuous clip
+    however the frames were divided up.
+
+    Frames come from `store.read`, so the detector consumes the same decode the pose loop is about
+    to crop -- which is the other half of "one pass over the video".
+    """
+    from tailcyclenet.detector import associate_group, detect_raw
+
+    T = min(sess.groups[gid].n_frames, args.max_frames or sess.groups[gid].n_frames)
+    # ONE association state for the whole group. Without it the tracker and `link_rows` would
+    # restart every `_DET_BATCH` frames -- an identity break every 16 frames, which is far worse
+    # than the block-boundary break `state=` was added for.
+    assoc_state, buf, cursor = {}, {}, 0
+
+    def boxes_for(store, lo, hi):
+        nonlocal cursor
+        while cursor < hi:
+            end = min(cursor + _DET_BATCH, T)
+            raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
+                             score_thresh=args.det_score, reduce=det_red,
+                             max_frames=args.max_frames, tile_scale=det_tile,
+                             frames=np.arange(cursor, end),
+                             read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
+                                 ci, cam, fr, pool=pool, reduce=reduce))
+            b, s, k = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
+                                      min_views=args.min_views, track=args.track,
+                                      max_move=args.max_move, stats=stats,
+                                      pose_nms=args.pose_nms, state=assoc_state)
+            for j, t in enumerate(range(cursor, end)):
+                buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
+            if stats is not None:
+                stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
+                stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
+            cursor = end
+        want = range(lo, min(hi, T))
+        out = tuple(np.stack([buf[t][i] for t in want], 1) if buf[lo][i] is not None else None
+                    for i in range(3))
+        # Frames below `lo` can never be asked for again -- blocks advance monotonically, exactly
+        # as the frame store's own eviction argument goes.
+        for t in [t for t in buf if t < lo]:
+            del buf[t]
+        return out
+
+    return boxes_for
 
 
 def run_dataset(args):
@@ -203,7 +261,7 @@ def run_dataset(args):
     det = det_wh = det_tile = det_boxsrc = None
     det_red = False
     if args.detector:
-        from tailcyclenet.detector import associate_group, detect_raw, load_detector
+        from tailcyclenet.detector import load_detector
         det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile, det_objq = load_detector(
             args.detector, device, input_wh=args.det_input_wh)
         # `--det-score` IS NOT PORTABLE ACROSS DETECTOR GENERATIONS, and this is the only place
@@ -268,24 +326,20 @@ def run_dataset(args):
         print(f'registry: reading session keypoints as {args.dataset_name!r}, not {ds_name!r}')
         ds_name = args.dataset_name
     want = set(args.groups.split(',')) if args.groups else None
-    render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
 
     results = {}
-    # `renders` holds the futures still encoding; drained after the npz is written, so a slow encode
-    # never delays the prediction reaching disk.
-    render_pool = ThreadPoolExecutor(max_workers=1)
-    renders = []
     for sess in sessions:
         sess.preload()
         for gid in sess.groups:
             if want and gid not in want:
                 continue
             key = f'{sess.session_id}/{gid}'
-            # ALL THREE INITIALISED TOGETHER, OUTSIDE THE BRANCH. `det_kpts` used to be bound
-            # inside it, so every box source that is NOT a detector -- the GT-crop upper bound and
-            # the whole `--boxes` path -- raised `UnboundLocalError` at the `run_group` call below,
-            # after paying the checkpoint load. Same trap the comment above `det_tile` names.
-            det_boxes = det_scores = det_kpts = None
+            # INITIALISED OUTSIDE THE BRANCH, for the reason the comment above `det_tile` gives:
+            # every box source that is NOT a detector -- the GT-crop upper bound and the whole
+            # `--boxes` path -- reaches the `run_group` call below, and binding this inside the
+            # branch is how `det_kpts` once raised `UnboundLocalError` after paying for a
+            # checkpoint load.
+            boxes_for, det_stats, n_want = None, {}, 0
             if det is not None:
                 # Default to what the session actually holds, not to 1. `associate_group` caps
                 # rows at this count, so a bare --detector run on a ten-animal dataset
@@ -296,72 +350,12 @@ def run_dataset(args):
                 # and welding them meant a sweep over the row count also moved the detection budget
                 # -- which is why `link_rows`' spare-rows finding could not be run end to end.
                 n_det = args.det_top_k or n_want
-                # WILL THE ANSWER ITSELF FIT? Checked HERE, before `detect_raw` allocates and
-                # before hours of decode, because none of it is reachable by `--max-ram`: these
-                # are `np.full` arrays proportional to the whole clip, not reusable buffers.
-                #
-                # A 200 fps hour is 720,000 frames, which is an ordinary recording. On a
-                # 16-camera 24-keypoint rig that is 6.6 GB of detection arrays at top_k 2 and
-                # 79.3 GB at top_k 24 -- so the failure is not exotic, it is what happens the
-                # first time someone points this at a full session instead of a clip.
-                _T_est = min(sess.groups[gid].n_frames, args.max_frames or sess.groups[gid].n_frames)
-                _parts = _memory.result_array_gb(
-                    _T_est, len(sess.rig), registry.n_keypoints, n_want, n_det,
-                    det_kpts=bool(getattr(det, 'n_keypoints', 0)),
-                    dims=3 if sess.mode == '3d' else 2)
-                _need = sum(_parts.values())
-                if _need > _budget.budget_gb:
-                    _big = sorted(_parts.items(), key=lambda kv: -kv[1])[:3]
-                    raise SystemExit(
-                        f'{key}: this group would allocate {_need:.1f} GB of RESULT arrays for '
-                        f'{_T_est:,} frames, against a {_budget.budget_gb:.1f} GB budget '
-                        f'({_budget.source}).\n'
-                        + ''.join(f'    {n:<18} {v:7.2f} GB\n' for n, v in _big)
-                        + 'These scale with the LENGTH OF THE CLIP and are the answer itself, so '
-                        'no --max-ram can shrink them. Either:\n'
-                        f'  --max-frames N   score a prefix (N around '
-                        f'{max(1, int(_T_est * _budget.budget_gb / max(_need, 1e-9) * 0.8)):,} '
-                        'would fit here), then move the window and re-run; or\n'
-                        '  --det-top-k K    lower the detection budget -- the keypoint array is '
-                        '(top_k, T, C, K, 3) and is usually most of this; or\n'
-                        '  split the recording into shorter groups at conversion time, which is '
-                        'what every shipped root does.')
-                # `flush`: redirected to a log, stdout is block-buffered, so a long detection
-                # shows nothing for minutes and reads as a hung run.
                 print(f'{key}: detecting up to {n_det} per camera, {n_want} animal row(s)'
                       f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
                       flush=True)
-                _t_det = time.time()
-                raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
-                                 score_thresh=args.det_score, reduce=det_red,
-                                 max_frames=args.max_frames, tile_scale=det_tile)
-                print(f'{key}: detected in {time.time() - _t_det:.1f} s', flush=True)
-                nms_stats = {}
-                det_boxes, det_scores, det_kpts = associate_group(
-                    raw, sess, gid, n_want, link=args.link_boxes, min_views=args.min_views,
-                    track=args.track, max_move=args.max_move, stats=nms_stats,
-                    pose_nms=args.pose_nms)
-                # THE FIRE RATE IS THE NUMBER A RATE-MATCHED RANDOM CONTROL MUST BE MATCHED TO, and
-                # it cannot be recovered afterwards from the npz -- a dropped row leaves no trace.
-                # "Report the fire rate before the metric" means printed, not recoverable.
-                if args.pose_nms is not None:
-                    # `.get(..., 0)`, both keys: `identity.pose_nms` returns before writing EITHER
-                    # key when the detector has no keypoint branch (`kpts is None`) -- a correct
-                    # no-op, since the maDLC overlap it computes needs keypoints to exist at all.
-                    # A keypoint-less detector is the NORMAL case for a 2D root (rat-city's own
-                    # recipe omits --keypoints), so `nms_stats` being empty here is not a bug
-                    # signal, and asserting `nms_pairs` unconditionally raised on every such run.
-                    print(f'{key}: pose-nms dropped {nms_stats.get("nms_dropped", 0)} row(s) of '
-                          f'{nms_stats.get("nms_pairs", 0)} overlapping pair(s)'
-                          + (' (no keypoint branch -- pose-nms is a no-op)' if not nms_stats
-                             else ''), flush=True)
-                # HOW MUCH THE THRESHOLD LEFT. `--det-score` defaults to 0.5 (coverage-favouring);
-                # a detector whose scores are NOT saturated would lose most of its boxes to a higher
-                # threshold, and this line is where that shows up rather than downstream as an
-                # unexplained miss rate.
-                filled = float(np.isfinite(det_boxes).all(-1).mean())
-                print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
-                      f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
+                boxes_for = _detector_boxes(
+                    det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
+                    stats=det_stats)
             # A MISSING `--boxes` KEY IS NOT AN ABSENT ARGUMENT. `boxes.get(key)` returning None
             # silently falls back to cropping from the LABELS, so a run whose keys did not match --
             # a different session naming, a stale npz, a typo in one group -- reported the GT-crop
@@ -372,42 +366,32 @@ def run_dataset(args):
                     'quietly turn this into the GT-crop upper bound. Keys present: '
                     f'{sorted(k for k in boxes if not k.startswith("__"))[:5]} ...')
             out = run_group(model, sess, gid, registry, ds_name, cfg,
-                            box_points=boxes.get(key), boxes_stc=det_boxes,
-                            det_kpts_stc=det_kpts)
-            if det_scores is not None:
-                # The objectness each crop was accepted on, beside the prediction it produced.
-                # `--det-score` is then an offline sweep instead of a re-detection per threshold.
-                out['det_score'] = det_scores[:, :out['pred'].shape[1]]
+                            box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want)
             results[key] = out
             print(f'{key}: {out["pred"].shape} '
                   f'{np.isfinite(out["pred"]).all(-1).mean():.3f} finite')
-            if args.render is not None:
-                from tailcyclenet.render import render_group
-                # RENDER ON A BACKGROUND THREAD so the loop can predict the next group while this
-                # one encodes. A render of a 480-frame 4696x2048 clip is comparable in cost to the
-                # inference that produced it, and it depends on nothing the loop mutates afterwards
-                # -- `out['pred']` and `det_boxes` are finished arrays by here.
-                #
-                # ONE worker, not several. `_read_video`'s lock is now PER CONTAINER, so two
-                # renders of two cameras would genuinely overlap their decodes -- but a render
-                # holds a clip's worth of full frames and the encode, not the decode, is where a
-                # render's time goes. The reason is memory now, not the lock.
-                for ci in render_cams:
-                    cam_name = sess.cam_names[ci]
-                    # The per-frame boxes the crop rule was fed, in each row's own colour: a box
-                    # with no skeleton in it is the disagreement worth seeing, and row `a` is not
-                    # label row `a` once boxes come from a detector. `crop` is per WINDOW and the
-                    # windows overlap, so it is not the array to draw here.
-                    bx = (det_boxes[:, :out['pred'].shape[1], ci]
-                          if det_boxes is not None else None)
-                    renders.append((key, render_pool.submit(
-                        render_group, sess, gid, out['pred'],
-                        args.render / f'{key.replace("/", "__")}__{cam_name}.mp4',
-                        cam=ci, zoom=args.render_zoom, boxes=bx)))
-                # Report whatever has landed, without waiting for anything.
-                for k, fut in [r for r in renders if r[1].done()]:
-                    print(f'{k}: wrote {fut.result()}')
-                    renders.remove((k, fut))
+            if det is not None:
+                # REPORTED AFTER THE RUN, because detection now happens block by block INSIDE it.
+                # The fire rate is what a rate-matched random control has to be matched TO and
+                # cannot be recovered from the output afterwards, so it is printed, not derived.
+                if args.pose_nms is not None:
+                    # `.get(..., 0)`, both keys: `identity.pose_nms` returns before writing EITHER
+                    # when the detector has no keypoint branch -- the normal case for a 2D root,
+                    # so an empty `det_stats` is not a bug signal.
+                    print(f'{key}: pose-nms dropped {det_stats.get("nms_dropped", 0)} row(s) of '
+                          f'{det_stats.get("nms_pairs", 0)} overlapping pair(s)'
+                          + (' (no keypoint branch -- pose-nms is a no-op)'
+                             if 'nms_pairs' not in det_stats else ''), flush=True)
+                # HOW MUCH THE THRESHOLD LEFT, accumulated over the blocks rather than measured on
+                # one whole-clip array. `--det-score` defaults to 0.5 (coverage-favouring); a
+                # detector whose scores are NOT saturated loses most of its boxes to a higher
+                # threshold, and this is where that shows up rather than downstream as an
+                # unexplained miss rate.
+                _sl = det_stats.get('slots', 0)
+                if _sl:
+                    filled = det_stats.get('filled', 0) / _sl
+                    print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
+                          f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     flat = {}
@@ -441,12 +425,4 @@ def run_dataset(args):
         f'{f"@{cfg.refine_px}px" if did_refine and cfg.refine_px else ""}')
     np.savez_compressed(args.out, **flat)
     print(f'wrote {args.out} ({len(results)} group(s))')
-
-    # THE PREDICTION IS ON DISK FIRST, then the renders are waited on. A render is a view and must
-    # never be able to lose a run that has already paid for its inference.
-    if renders:
-        print(f'waiting on {len(renders)} render(s) still encoding', flush=True)
-    for k, fut in renders:
-        print(f'{k}: wrote {fut.result()}')
-    render_pool.shutdown()
 

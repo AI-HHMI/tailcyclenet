@@ -156,16 +156,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
                          '`carry` needs the frames contiguous.')
-    ap.add_argument('--render', type=Path, default=None,
-                    help='also write <dir>/<session>__<group>__<cam>.mp4 of the prediction. A 3D '
-                         'prediction is REPROJECTED into each rendered camera.')
-    ap.add_argument('--render-cams', default='0',
-                    help='comma-separated camera indices to render. A reprojection hides a depth '
-                         'error along its own ray, so a 3D render wants more than one.')
-    ap.add_argument('--render-zoom', type=int, default=0,
-                    help='side, in SOURCE pixels, of a window that follows the prediction. 0 '
-                         'draws the whole frame, which on a 3208x2200 rig makes a 100 px mouse '
-                         'unreadable. A view only -- it changes nothing that was predicted.')
     ap.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
                     help='DEFAULT: ON IN 3D, OFF IN 2D -- derived from the session\'s own mode, '
                          'because the two dimensions disagree and the code knows which it is in. '

@@ -35,9 +35,10 @@ from posetail.posetail.cube import project_points_torch
 
 from .. import crop as cropmod
 from .. import memory
-from ..dataset import _crop_affine, _resize_camera, prior_out_of_bounds, read_frames
+from ..dataset import _crop_affine, _resize_camera, prior_out_of_bounds
 from ..format import Labels, Session
 from ..model import share_scene
+from .store import FrameStore
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 CARRY_SOURCES = ('triangulate', 'pred')
@@ -282,19 +283,91 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_
                  kpt_chunk=kpt_chunk, **mkw)
 
 
+def _plan_blocks(starts, n_frames, T_total, frame_cost, store_bytes):
+    """Group the windows into BLOCKS whose frames fit the store at once. -> [(w0, w1), ...].
+
+    A block is the unit that holds pixels and emits rows, so its size is what keeps peak memory
+    off the length of the clip. Greedy and maximal: the bigger the block, the fewer boundaries,
+    and a boundary costs one prefetch stall and one re-read of the seam frames.
+
+    At least one window always, which is what the refusal in `run_blocks` guarantees is affordable
+    before this is called -- so the caller never has to handle an empty plan.
+    """
+    blocks, w0 = [], 0
+    while w0 < len(starts):
+        m = 1
+        while w0 + m < len(starts):
+            span = min(T_total, starts[w0 + m] + n_frames) - starts[w0]
+            if span * frame_cost > store_bytes:
+                break
+            m += 1
+        blocks.append((w0, w0 + m))
+        w0 += m
+    return blocks
+
+
+# Which axis each returned column runs along, so blocks can be stitched back into a whole clip.
+# Anything not named here is a scalar or a per-group constant and is taken from the first block.
+_FRAME_KEYS = ('pred', 'conf', 'box_agree')
+_WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
+
+
+def merge_blocks(blocks):
+    """Every block of `run_blocks` stitched into the one dict `run_group` used to return.
+
+    Frame- and window-indexed columns concatenate on axis 1 (axis 0 for the 1-D `window_start`);
+    everything else is a per-group constant and comes from the first block. This is also the
+    ORACLE the block-invariance test compares against -- the same role `prefetch_windows = 0`
+    plays for the prefetch test -- so it is not test-only scaffolding.
+    """
+    blocks = list(blocks)
+    out = dict(blocks[0])
+    for k in _FRAME_KEYS + _WINDOW_KEYS:
+        if k not in out:
+            continue
+        axis = 0 if np.asarray(out[k]).ndim == 1 else 1
+        out[k] = np.concatenate([b[k] for b in blocks], axis=axis)
+    return out
+
+
 @torch.no_grad()
 def run_group(model, session: Session, gid: str, registry, dataset_name: str,
-              cfg: InferConfig, box_points=None, boxes_stc=None, det_kpts_stc=None) -> dict:
-    """Predict every animal in one group. Returns arrays in the SOURCE coordinate frame.
+              cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None) -> dict:
+    """`run_blocks` for a whole group, merged. See both for what a block is."""
+    return merge_blocks(run_blocks(model, session, gid, registry, dataset_name, cfg,
+                                   box_points=box_points, boxes_for=boxes_for, n_rows=n_rows))
 
-    Crops come from exactly one of two sources, and they are NOT comparable:
+
+@torch.no_grad()
+def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
+               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None):
+    """Predict every animal in one group, a BLOCK OF WINDOWS AT A TIME. Yields one dict per block.
+
+    Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, and
+    they are NOT comparable:
 
     - `box_points` (S,T,K,R): points the crop rule follows, shaped like the labels. Passing the
       labels themselves is the GT-crop upper bound.
-    - `boxes_stc` (S,T,C,4): boxes given directly, from a detector or a detections file. This is
-      the deployment number.
+    - `boxes_for(store, lo, hi) -> (boxes, scores, kpts)`: boxes for frames `[lo, hi)`, from a
+      detector or a detections file, `(S, hi-lo, C, 4)`. This is the deployment number.
 
     Whichever was used is recorded in the result so a caller cannot quote one as the other.
+
+    **WHY BLOCKS.** Nothing here may be proportional to the length of the clip: a 200 fps hour is
+    720,000 frames and an ordinary recording, and the arrays it used to allocate up front came to
+    82 GB (dev/reports/38 §4). A block owns a bounded frame span, allocates only that, and is
+    handed to the caller to write out before the next one starts.
+
+    **A BLOCK'S FRAMES ARE EXACTLY `[starts[w0], starts[w1])`, which PARTITIONS the clip.** A frame
+    in an overlap belongs to the LAST window containing it (eval rule 11), so the seam frames a
+    block's final window also touches belong to the NEXT block and are dropped here -- exactly as
+    the whole-clip loop overwrote them. That is what makes block-wise output byte-identical to
+    whole-clip output, and it is why `merge_blocks` can simply concatenate.
+
+    `boxes_for` is a callback and not an array because the array is the thing that would not fit:
+    it lets the caller detect only the frames this block needs, over the pixels the store already
+    holds. `n_rows` is `S` on that path, since the row count has to be known before the first
+    block and the boxes do not exist yet.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     assert cfg.carry_source in CARRY_SOURCES, \
@@ -339,10 +412,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # lost it has not, and the loader's own answer there is to fall back to the keypoints. Folding
     # this into `boxes_stc` would drop those animals from the window instead -- pure lost
     # coverage, silently, and coverage is a number this repo reports.
-    inst_boxes = (lab.boxes if (boxes_stc is None and box_points is None
+    inst_boxes = (lab.boxes if (boxes_for is None and box_points is None
                                 and cfg.box_source == 'instances' and lab.boxes is not None
                                 and bool(np.isfinite(lab.boxes).any())) else None)
-    n_src = boxes_stc.shape[0] if boxes_stc is not None else src.shape[0]
+    # `n_rows` ON THE BOX PATH, because the boxes do not exist yet. `S` used to come from
+    # `boxes_stc.shape[0]`, and there is no whole-clip box array any more -- the caller knows the
+    # row count (it is `--max-animals` or the session's own animal count) and states it.
+    n_src = (n_rows if boxes_for is not None else src.shape[0])
     S = n_src if cfg.max_animals == 0 else min(n_src, cfg.max_animals)
     # ONE camera in 2D, exactly as the loader picks it (`dataset.py`, `true_2d -> cam_ix = [0]`).
     # A 2D session may still ship a multi-camera rig -- rat-city's `calibration.toml` describes the
@@ -357,12 +433,10 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # labels' own ids would be a claim about identity that nothing established. So every row wears
     # an invented id on that path, and `eval.py` Hungarian-matches rather than trusting the index.
     n_lab = 0 if src is None else len(src)
-    animal_ids = ([f'det{a:02d}' for a in range(S)] if boxes_stc is not None else
+    animal_ids = ([f'det{a:02d}' for a in range(S)] if boxes_for is not None else
                   [lab.animal_ids[a] if a < len(lab.animal_ids) else f'det{a:02d}'
                    for a in range(S)])
 
-    pred = np.full((S, T_total, K, R), np.nan, np.float32)
-    conf = np.full((S, T_total, K), np.nan, np.float32)
     # THE ANCHOR-FREE ESTIMATE IS NOT AN OUTPUT COLUMN, but it is still what `carry` feeds back.
     # `3d_pred_triangulate` is read live out of `out` in `forward()` below and handed to the next
     # window; `--carry-source triangulate` is the shipped 3D default and does not move. What went
@@ -375,83 +449,62 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # box, and every one of the five aborts below needed to be distinguishable from the others.
     starts = _window_starts(T_total, cfg.n_frames, cfg.overlap)
 
-    # THE TWO PIXEL BUFFERS THIS LOOP OWNS, BOTH SIZED FROM THE ONE HOST BUDGET.
+    # THE PIXEL BUDGET, AND THE ONE REFUSAL IT CAN RAISE.
     #
-    # `cam_decode` bounds how many cameras decode a window CONCURRENTLY; each task holds one
-    # camera's whole window of FULL frames, so unbounded concurrency on johnson's 16-camera
-    # 3208x2200 rig is 16 x 12 x 21.2 MB = 4.1 GB of transient host memory for a rig with one
-    # animal in it. It was the literal 4 (decord's own `ChunkShuffle.mix`), which is right on a
-    # roomy host and is not a budget.
+    # `cam_decode` bounds how many cameras decode CONCURRENTLY; each task holds one camera's whole
+    # window of FULL frames, so unbounded concurrency on johnson's 16-camera 3208x2200 rig is
+    # 16 x 12 x 21.2 MB = 4.1 GB of transient host memory for a rig with one animal in it.
     #
-    # `_frame_cache` is the SPEED item -- see `decode_crops`. It holds full decoded frames keyed
-    # by (camera, source frame), which is what collapses the 6x re-decode to 1x. It is a cache,
-    # so it is the first thing to go when there is no room: at zero budget the dict is never
-    # written and the loop decodes exactly as it did before.
+    # `store` holds the frames themselves, and unlike the cache it replaces it does NOT degrade.
+    # The old one shrank to nothing on a tight budget and re-decoded, which was a silent 3x on
+    # wall clock; a block is instead sized so its frames FIT, and a budget too small for even one
+    # window is refused with the arithmetic. There is no third option: refine pass 2 crops from the
+    # same frames pass 1 did, so dropping them means either decoding twice or re-cropping from a
+    # stored crop, and the second is a double resample -- not output-neutral.
     #
-    # SIZED FROM PARSED TOML (`rig.size`), never by opening a container (gotcha 10).
-    _fw, _fh = session.rig.size(session.cam_names[cam_ix[0]])
-    _frame_bytes = int(_fw) * int(_fh) * 3
+    # SIZED FROM PARSED TOML (`rig.size`), never by opening a container (gotcha 10). `max` over the
+    # cameras, not camera 0: rat-city-annotated ships 4696x2048 beside 4500x2050, and pricing the
+    # rig off one camera under-sizes it.
+    _frame_bytes = max(int(w) * int(h) for w, h in
+                       (session.rig.size(session.cam_names[ci]) for ci in cam_ix)) * 3
+    _frame_cost = len(cam_ix) * _frame_bytes            # one frame INDEX, across the rig
     _budget = memory.current()
-    cam_decode = memory.fits(_budget.share(memory.FRACTION_CROPS) / 2,
-                             _frame_bytes * cfg.n_frames,
+    _store_bytes = _budget.share(memory.FRACTION_STORE)
+    cam_decode = memory.fits(_store_bytes / 2, _frame_bytes * cfg.n_frames,
                              want=min(_CAM_DECODE, len(cam_ix)))
-    # THE CACHE DEGRADES, IT DOES NOT SWITCH OFF, and that distinction was worth 42% of wall clock.
-    # This used to be all-or-nothing: it demanded room for `C x (T + step)` frames -- three windows
-    # of the whole rig -- and held NOTHING below that. So a budget one frame short of the
-    # requirement paid the full 6x re-decode, which is most of why `--max-ram 32` ran at 212 s
-    # against 149 s at 64 (both otherwise identical).
-    #
-    # There are two reuses here and they cost very different amounts to buy:
-    #
-    #   - `--refine` decodes THE SAME `frames` a second time, immediately, for the same cameras.
-    #     Buying that back needs only ONE window of the cameras in flight, and it is half of all
-    #     the decode work on a 3D root.
-    #   - the `T/step` overlapping windows reuse frames across window boundaries, which needs the
-    #     larger `C x (T + step)`.
-    #
-    # So the cache now holds whatever the budget affords and evicts to stay inside it, taking the
-    # cheap reuse first. `_frame_cap` of 0 is the old uncached path exactly.
-    _step = max(1, cfg.n_frames - cfg.overlap)
-    # The in-flight decode (`cam_decode` cameras x one window of full frames) comes out of the same
-    # share, so subtract it rather than halving blindly: on a small budget the halving threw away
-    # cache the loop could have used, and on a large one it under-spent by the same factor.
-    _inflight = cam_decode * cfg.n_frames * _frame_bytes
-    _frame_cap = int(max(0.0, _budget.share(memory.FRACTION_CROPS) - _inflight)
-                     // max(1, _frame_bytes))
-    # Below one window of the cameras actually in flight there is genuinely nothing to reuse --
-    # the entries would be evicted before the refine pass asked for them -- so spend nothing.
-    if _frame_cap < cam_decode * cfg.n_frames:
-        _frame_cap = 0
-    _frame_cache: dict[tuple[int, int], np.ndarray] = {}
+    _one = cfg.n_frames * _frame_cost
+    if _one > _store_bytes:
+        raise SystemExit(
+            f'{session.session_id}/{gid}: one window of frames does not fit, and there is no '
+            're-decode fallback.\n'
+            f'    {cfg.n_frames} frames x {len(cam_ix)} camera(s) x {_frame_bytes / 1e6:.1f} MB '
+            f'= {_one / (1 << 30):.2f} GB\n'
+            f'    frame store {_store_bytes / (1 << 30):.2f} GB  '
+            f'({_budget.budget_gb:.1f} GB budget x {memory.FRACTION_STORE:g}, {_budget.source})\n'
+            f'  --max-ram {_one / (memory.FRACTION_STORE * memory.DEFAULT_FRACTION) / (1 << 30):.0f}'
+            '   holds one window. The flag is a ceiling on the PROCESS, not an allowance for the '
+            'buffers, so the budget is a fraction of it.\n'
+            f'  --n-frames N     a shorter window needs proportionally less -- but it is NOT '
+            f'output-neutral: this run was trained at {cfg.n_frames} and a shorter window is a '
+            'different prediction.\n'
+            'Refine pass 2 crops from the SAME frames pass 1 did, so a window\'s frames cannot be '
+            'dropped and re-read: re-decoding would double the wall clock, and re-cropping from '
+            'the stored crop double-resamples and is not output-neutral.')
+    blocks = _plan_blocks(starts, cfg.n_frames, T_total, _frame_cost, _store_bytes)
+    store = FrameStore(group, session.cam_names)
 
-    outcome = np.full((S, len(starts)), OUTCOMES.index('no box'), np.int8)
-    crop = np.full((S, len(starts), len(session.rig), 4), np.nan, np.float32)
-    # DOES THE POSE AGREE WITH THE BOX IT WAS CROPPED FROM? Per (animal, frame, camera), the distance
-    # from the predicted centroid to that camera's crop-box centre, in units of one box side.
-    #
-    # The pipeline holds TWO independent statements about where an animal is -- the box and the pose
-    # -- and nothing ever compared them. Every artifact worth fixing shows up here: a box that
-    # teleported onto another animal, a prompt loop whose pose lags the box it is being cropped by, a
-    # union crop covering the arena. And it is in ANIMAL-SIZE units, so unlike `vis_pred`'s logit
-    # (medians +2.7 / +4.0 / +15.4 across three roots, and a sign that flips per dataset) one value
-    # means the same thing everywhere.
-    box_agree = np.full((S, T_total, len(session.rig)), np.nan, np.float32)
-    # `kpt_agree` -- (S,T,C,K) pose-against-detector-keypoints -- IS GONE. It was the largest
-    # array here by a factor of K and the third largest thing a long clip allocated, for a
-    # diagnostic nothing gates on: at 720,000 frames on a 16-camera 24-keypoint rig it is 2.06 GB
-    # of an 82 GB total. `det_kpts_stc` itself stays -- `--crop-source keypoints` and `--pose-nms`
-    # both read it -- so only the recorded column went.
-    crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
-    # THE POPULATION `--box-prompt` GOVERNS, per (animal, window) -- report-24 §9k's rule that a
-    # lever's selectivity must be read beside the population it can act on. -1 where the box was
-    # never supplied (box_prompt = 'none', or an oracle row with no label behind it); else the
-    # COUNT of cameras this window's box reached (0..C), so "the box did nothing" (count 0 despite
-    # being requested) is distinguishable from "the box was never requested" (-1).
-    box_cams = (np.full((S, len(starts)), -1, np.int8) if cfg.box_prompt != 'none' else None)
-
-    # EVERY COLUMN IS A PLAIN ASSIGNMENT, and a frame in an overlap takes the LAST window that
-    # decoded it (eval rule 11). There is no blend: the comment that used to sit here described
-    # one, and the nan-aware mean it described was removed without it.
+    # BLOCK-LOCAL STATE, REBOUND ONCE PER BLOCK. The nested functions below close over these names
+    # and read them at call time, so rebinding here is what makes them block-scoped without
+    # threading a context object through six signatures. `f0` is the block's first frame and `w0`
+    # its first window: every array below is indexed `[a, frame - f0]` or `[a, wi - w0]`.
+    f0, w0 = 0, 0
+    pred = conf = box_agree = outcome = crop = crop_refined = box_cams = None
+    boxes_stc = det_kpts_stc = None
+    # Settled once: which of the three crop sources produced these pixels. Recorded on every block
+    # so a reader of one block knows as much as a reader of the merged group.
+    _boxes_from = ('detector' if boxes_for is not None else
+                   ('given points' if box_points is not None else
+                    ('instances.pq' if inst_boxes is not None else 'labels')))
     #
     def _build_plans(wi, start):
         """Everything the old inline loop did BEFORE any pixel touches: pure geometry.
@@ -469,6 +522,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
             frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
+        fl = frames - f0                      # into this block's arrays; see `run_blocks`
+        wl = wi - w0
         # ONE camera group per window, carrying per-frame extrinsics where a camera moves. Built
         # here rather than per animal: the old per-animal build dropped `moving_ext` entirely and
         # cost O(C^2) `format_camera` calls per animal.
@@ -480,7 +535,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         for a in range(S):
             bb = None
             if boxes_stc is not None:
-                bb = boxes_stc[a][frames]                          # (t, C, 4)
+                bb = boxes_stc[a][fl]                              # (t, C, 4)
                 # NOT `.any()`: one finite box out of T x C used to position a crop for the whole
                 # window and mark every frame `ok`. See `cfg.min_box_frames`.
                 if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
@@ -544,7 +599,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     # unioning squares. That is why this is not the 08 §1.3 proposal that measured
                     # +3.06 mm worse: that one re-squared an already-square union.
                     if cfg.crop_source == 'keypoints' and det_kpts_stc is not None:
-                        kk = det_kpts_stc[a, frames, ci][..., :2].reshape(-1, 2)
+                        kk = det_kpts_stc[a, fl, ci][..., :2].reshape(-1, 2)
                         kk = kk[np.isfinite(kk).all(-1)]
                         if len(kk):
                             kb = cropmod.crop_box_for_points(
@@ -558,7 +613,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                     boxes.append(box)
                     use.append(ci)
                 if not use:
-                    outcome[a, wi] = OUTCOMES.index('no camera')
+                    outcome[a, wl] = OUTCOMES.index('no camera')
                     continue
                 # THE CAMERA MUST DESCRIBE THE BOX THE PIXELS WERE ACTUALLY CUT WITH. `apply_crop`
                 # sets `size`, `_resize_camera` turns it into `scales`, and `forward` divides by
@@ -571,13 +626,13 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             else:
                 pts = torch.as_tensor(src[a][frames], dtype=torch.float32)
                 if not torch.isfinite(pts).all(-1).any():
-                    outcome[a, wi] = OUTCOMES.index('no points')
+                    outcome[a, wl] = OUTCOMES.index('no points')
                     continue
                 use = cam_ix
                 cgroup, boxes = boxes_from_points(pts, [window_cams[i] for i in cam_ix],
                                                   cfg.min_crop_dim, mode)
                 if cgroup is None:
-                    outcome[a, wi] = OUTCOMES.index('crop failed')
+                    outcome[a, wl] = OUTCOMES.index('crop failed')
                     continue
             # WIDE-CROP DEPLOYMENT (report 27): inflate each crop about its centre before the
             # resize, so the target sits off-centre in a wider crop that includes neighbours --
@@ -599,8 +654,8 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 scales.append(s)
             # The box BEFORE the pixels, so a decode failure still shows what it was reaching for.
             for i, ci in enumerate(use):
-                crop[a, wi, ci] = np.asarray(boxes[i], np.float32)
-            outcome[a, wi] = OUTCOMES.index('decode failed')
+                crop[a, wl, ci] = np.asarray(boxes[i], np.float32)
+            outcome[a, wl] = OUTCOMES.index('decode failed')
             plans.append((a, use, boxes, cgroup, scales, uncropped))
         return frames, window_cams, plans
 
@@ -631,32 +686,19 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         cams = sorted({c for _, use, *_ in plans for c in use})
 
         def one(ci, pool):
-            # SIX DECODES PER (FRAME, CAMERA) WAS THE SHIPPED DEFAULT, and this is where they
-            # were paid. Windows step by `T - overlap`, so at the box recipe's `n_frames = 12`
+            # SEVEN DECODES PER (FRAME, CAMERA) WAS THE SHIPPED DEFAULT, and this is where six of
+            # them were paid. Windows step by `T - overlap`, so at the box recipe's `n_frames = 12`
             # and `--overlap 8` every frame sits in THREE windows; `--refine` (on by default in
             # 3D) then calls this function a SECOND time per window against the re-cropped plan,
-            # with the identical `frames`. `read_frames` dedupes within one call and nothing
-            # remembered anything across calls, so each source frame was decoded six times --
-            # 6 x 21.2 MB x 16 cameras of pure repeat work per johnson frame.
+            # with the identical `frames`; and `detect_raw` had already decoded the frame once on
+            # its own pass over the group. `read_frames` dedupes within one call and nothing
+            # remembered anything across calls.
             #
-            # `_frame_cache` is keyed by (camera, SOURCE frame index) and holds the FULL decoded
-            # frame, which is what makes it serve both repeats: the refine pass wants the same
+            # `store` is keyed by (camera, SOURCE frame index) and holds the FULL decoded frame,
+            # which is what makes it serve every one of them: the refine pass wants the same
             # pixels under a different crop, and `_crop_views` never mutates what it is given
             # (it warps into a new array, or returns the frame and lets `np.asarray` copy).
-            need = [t for t in frames if (ci, int(t)) not in _frame_cache]
-            if need:
-                got = read_frames(group, session.cam_names[ci], need, pool=pool)
-                if _frame_cap:
-                    # Insert what fits. `crops` is built from `imgs` below either way, so an entry
-                    # that does not fit simply is not reused -- never a correctness question.
-                    for t, im in zip(need, got):
-                        if len(_frame_cache) >= _frame_cap:
-                            break
-                        _frame_cache[ci, int(t)] = im
-            else:
-                got = []
-            at = dict(zip((int(t) for t in need), got))
-            imgs = [_frame_cache.get((ci, int(t)), at.get(int(t))) for t in frames]
+            imgs = store.read(ci, session.cam_names[ci], frames, pool=pool)
             # A file that will not decode is a property of the file, not of the animal, so
             # it takes out every animal that wanted this camera -- which is what the
             # per-animal decode did too, one animal at a time.
@@ -720,11 +762,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 if boxes_stc is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
-                box_t = _deploy_box_prompt(mode, None, boxes_stc, frames, a, use, boxes, scales,
-                                          cgroup, dev)
+                box_t = _deploy_box_prompt(mode, None, boxes_stc, frames - f0, a, use, boxes,
+                                          scales, cgroup, dev)
             if box_t is not None:
                 mkw['box_prompt'] = box_t
-                box_cams[a, wi] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
+                box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
         with share_scene(model) if cfg.anchor == 'self' else nullcontext():
             out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
                         kpt_prior=None if prior is None else prior.to(dev),
@@ -841,7 +883,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 # detector actually offered, which is the box every coverage and crop-inflation
                 # number in reports 08 and 11 is computed from.
                 for i, ci in enumerate(use):
-                    crop_refined[a, wi, ci] = np.asarray(b2[i], np.float32)
+                    crop_refined[a, wi - w0, ci] = np.asarray(b2[i], np.float32)
                 refined.append((a, use, b2, cg2, sc2, uncropped2))
             plans = refined
             crops = decode_crops(frames, plans)
@@ -852,12 +894,12 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             if got is None:
                 continue                        # already marked 'decode failed' above
             p, q, out = got
-            outcome[a, wi] = OUTCOMES.index('ok')
-            _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams)
+            outcome[a, wi - w0] = OUTCOMES.index('ok')
+            _fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
-                conf[a, frames] = v
+                conf[a, frames - f0] = v
                 vlogit = v
             # The pose the NEXT window opens on. Clamped from the front: a group shorter than
             # `overlap` gives a window with fewer frames than the step, and a plain negative
@@ -885,9 +927,9 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 p[drop] = np.nan
                 # Under blend the gated frames were already accumulated above, so they are removed
                 # from the accumulator rather than from the finished array -- same rule as `p`:
-                conf[a, frames[drop]] = np.nan
-                box_agree[a, frames[drop]] = np.nan
-            pred[a, frames] = p
+                conf[a, frames[drop] - f0] = np.nan
+                box_agree[a, frames[drop] - f0] = np.nan
+            pred[a, frames - f0] = p
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
                               None if vlogit is None else torch.as_tensor(vlogit[j]))
@@ -914,64 +956,83 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         return frames, window_cams, plans, crops
 
     try:
-        pending = {}
-        if _prefetch_pool is not None:
-            for j in range(min(n_ahead, len(starts) - 1)):
-                pending[j + 1] = _prefetch_pool.submit(_prepare, j + 1, starts[j + 1])
-        for wi, start in enumerate(starts):
-            if wi in pending:
-                frames, window_cams, plans, crops = pending.pop(wi).result()
-            else:
-                frames, window_cams, plans, crops = _prepare(wi, start)
-            nxt = wi + n_ahead
-            if _prefetch_pool is not None and nxt < len(starts) and nxt not in pending:
-                pending[nxt] = _prefetch_pool.submit(_prepare, nxt, starts[nxt])
-            _process_window(wi, frames, window_cams, plans, crops)
-            # EVICT BY WINDOW POSITION, NOT BY AN LRU, because the access pattern is known
-            # exactly: `starts` is monotone increasing and window `wi` reads `[start, start+T)`,
-            # so a frame below the OLDEST still-live window's start can never be asked for again.
-            # That is exact rather than heuristic, needs no ordering bookkeeping, and bounds the
-            # dict at one window plus the prefetch depth regardless of clip length -- which is the
-            # property that matters, since the peak must not grow with the length of the clip.
-            if _frame_cache:
-                keep = starts[max(0, wi - n_ahead + 1)] if wi + 1 < len(starts) else None
-                if keep is None:
-                    _frame_cache.clear()
+        for w0, w1 in blocks:
+            # THE BLOCK'S FRAMES. `f_read` is what its windows TOUCH; `f_own` is what it KEEPS.
+            # They differ by the seam: the last window reaches past `starts[w1]`, and those frames
+            # belong to the next block because a frame belongs to the last window containing it
+            # (eval rule 11). The whole-clip loop overwrote them for the same reason; here they
+            # are simply not emitted, which is what makes the two identical.
+            f0 = int(starts[w0])
+            f_read = int(min(T_total, starts[w1 - 1] + cfg.n_frames))
+            f_own = int(starts[w1]) if w1 < len(starts) else T_total
+            n_blk, n_win = f_read - f0, w1 - w0
+
+            boxes_stc = det_kpts_stc = None
+            if boxes_for is not None:
+                boxes_stc, _scores, det_kpts_stc = boxes_for(store, f0, f_read)
+
+            pred = np.full((S, n_blk, K, R), np.nan, np.float32)
+            conf = np.full((S, n_blk, K), np.nan, np.float32)
+            box_agree = np.full((S, n_blk, len(session.rig)), np.nan, np.float32)
+            outcome = np.full((S, n_win), OUTCOMES.index('no box'), np.int8)
+            crop = np.full((S, n_win, len(session.rig), 4), np.nan, np.float32)
+            crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
+            box_cams = (np.full((S, n_win), -1, np.int8) if cfg.box_prompt != 'none' else None)
+
+            pending = {}
+            if _prefetch_pool is not None:
+                for j in range(min(n_ahead, n_win - 1)):
+                    pending[w0 + j + 1] = _prefetch_pool.submit(
+                        _prepare, w0 + j + 1, starts[w0 + j + 1])
+            for wi in range(w0, w1):
+                if wi in pending:
+                    frames, window_cams, plans, crops = pending.pop(wi).result()
                 else:
-                    for k in [k for k in _frame_cache if k[1] < keep]:
-                        del _frame_cache[k]
-            # AT THE WINDOW BOUNDARY, where a window's worth of full frames has just been dropped.
-            # Without it the freed blocks stay in glibc's arena and RSS ratchets to whatever the
-            # host allows -- 123 GB on a run whose live buffers were budgeted at 8 (see
-            # `memory.trim`). Microseconds against a window of decode.
+                    frames, window_cams, plans, crops = _prepare(wi, starts[wi])
+                # CLAMPED TO THE BLOCK: a window of the next block would want boxes this block
+                # did not fetch. Prefetch only ever reduces wall clock, never changes a pixel, so
+                # clamping it costs one stall per boundary and nothing else.
+                nxt = wi + n_ahead
+                if _prefetch_pool is not None and nxt < w1 and nxt not in pending:
+                    pending[nxt] = _prefetch_pool.submit(_prepare, nxt, starts[nxt])
+                _process_window(wi, frames, window_cams, plans, crops)
+                # EVICT BY WINDOW POSITION, NOT BY AN LRU, because the access pattern is known
+                # exactly: `starts` is monotone increasing and window `wi` reads `[start, start+T)`,
+                # so a frame below the OLDEST still-live window's start can never be asked for
+                # again. Exact rather than heuristic, and it bounds the store at one window plus
+                # the prefetch depth regardless of clip length.
+                if wi + 1 < w1:
+                    store.evict_below(int(starts[max(w0, wi - n_ahead + 1)]))
+                # AT THE WINDOW BOUNDARY, where a window's worth of full frames has just been
+                # dropped. Without it the freed blocks stay in glibc's arena and RSS ratchets to
+                # whatever the host allows -- 123 GB on a run whose live buffers were budgeted at
+                # 8 (see `memory.trim`). Microseconds against a window of decode.
+                memory.trim()
+            # THE SEAM FRAMES STAY, everything before them goes: the next block's first window
+            # opens on `f_own` and would otherwise decode them a second time.
+            store.evict_below(f_own)
             memory.trim()
+            keep = f_own - f0
+            yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
+                   'box_agree': box_agree[:, :keep],
+                   'animal_ids': np.asarray(animal_ids, object),
+                   'outcome': outcome, 'crop': crop,
+                   'window_start': np.asarray(starts[w0:w1]),
+                   'outcome_names': np.asarray(OUTCOMES, object),
+                   'mode': mode, 'group_id': gid, 'session': session.session_id,
+                   'dataset': dataset_name, 'anchor': cfg.anchor,
+                   'carry_source': cfg.carry_source, 'n_frames': T_total,
+                   # THE RESOLVED VALUE, not the tri-state the caller passed. `refine` defaults by
+                   # dimensionality, so the file has to say which way it went -- otherwise a 3D run
+                   # and a `--no-refine` 3D run are indistinguishable in their own provenance.
+                   'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
+                   **({} if crop_refined is None else {'crop_refined': crop_refined}),
+                   **({} if box_cams is None else {'box_prompt_cams': box_cams}),
+                   'boxes_from': _boxes_from}
     finally:
-        _frame_cache.clear()
+        store.clear()
         if _prefetch_pool is not None:
             _prefetch_pool.shutdown(wait=True)
-
-    out_npz = {'pred': pred, 'conf': conf, 'animal_ids': np.asarray(animal_ids, object),
-               'outcome': outcome, 'crop': crop, 'box_agree': box_agree,
-               'window_start': np.asarray(starts),
-               'outcome_names': np.asarray(OUTCOMES, object),
-               'mode': mode, 'group_id': gid, 'session': session.session_id,
-               'dataset': dataset_name, 'anchor': cfg.anchor,
-               'carry_source': cfg.carry_source, 'n_frames': T_total,
-               # THE RESOLVED VALUE, not the tri-state the caller passed. `refine` defaults by
-               # dimensionality, so the file has to say which way it went -- otherwise a 3D run and
-               # a `--no-refine` 3D run are indistinguishable in their own provenance.
-               'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
-               'boxes_from': 'detector' if boxes_stc is not None else
-                             ('given points' if box_points is not None else
-                              ('instances.pq' if inst_boxes is not None else 'labels'))}
-    if crop_refined is not None:
-        out_npz['crop_refined'] = crop_refined
-    if box_cams is not None:
-        # THE POPULATION `--box-prompt` GOVERNS (report 24 §9k's rule: quote a lever's
-        # selectivity beside the population it can act on, before its effect size). Per (animal,
-        # window): -1 never supplied, else the count of cameras this window's box reached.
-        out_npz['box_prompt_cams'] = box_cams
-    return out_npz
 
 
 def _overlaps(a, b):

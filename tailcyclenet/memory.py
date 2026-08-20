@@ -58,11 +58,28 @@ DEFAULT_FRACTION = 0.6
 # camera count, so an unconstrained host is unchanged, while a small budget now affords MORE
 # readers than the old linear price allowed (5 rather than 2 for johnson at 16 GB).
 #
-# `FRACTION_DETECT` overlaps neither of the others in time -- detection finishes before the pose
-# loop starts -- so it is deliberately the loosest of the three.
+# **THE SPLIT MOVED WHEN DETECTION AND POSE BECAME ONE PASS, AND THE OLD COMMENT HERE WAS FALSE.**
+# It read "`FRACTION_DETECT` overlaps neither of the others in time -- detection finishes before
+# the pose loop starts -- so it is deliberately the loosest of the three". That was true of a
+# separate `detect_raw` pass over the whole group. It is not true now: the detector's letterbox
+# buffers are live WHILE the store holds the block, so the two are simultaneous and the detector's
+# share had to come down. Its own buffers are transient (`cams_flight x batch x 2` frames per
+# unit) and it no longer decodes anything the store is not already holding, so 0.10 is enough.
+#
+# **`FRACTION_READERS` DID NOT MOVE, AND THE OBVIOUS ARGUMENT FOR MOVING IT IS WRONG.** "A stored
+# frame needs no reader" is true of the number of READS and false of the number of open
+# CONTAINERS: every block still touches every camera, so the reader cycle is the rig, exactly as
+# before. Dropping this to 0.05 takes johnson from 16 readers to 10 on an unconstrained host, and
+# report 38 measured 16 at 61 s against 11 at 149 s -- a 2.4x regression bought for memory the
+# store does not need. The store takes what is left instead.
+#
+# The store gets the rest because it is the term that decides whether a run is possible at all --
+# it must hold a whole window of full frames across the refine pass, and if it cannot,
+# `run_blocks` refuses rather than degrading. **This split is reasoned, not measured, under the
+# one-pass regime: 0.10/0.65 are starting points and the store's floor is what to re-measure.**
 FRACTION_READERS = 0.25
-FRACTION_DETECT = 0.30
-FRACTION_CROPS = 0.45
+FRACTION_DETECT = 0.10
+FRACTION_STORE = 0.65
 
 ENV_MAX_RAM = 'TAILCYCLENET_MAX_RAM_GB'
 

@@ -73,6 +73,19 @@ def cli():
     return mod
 
 
+def _boxes_for(boxes, kpts=None):
+    """Adapt a whole-clip (S,T,C,4) array to `run_blocks`' `boxes_for` callback.
+
+    The tests build the box array up front because that is the clearest way to state a scenario;
+    the loop asks for one block at a time because a whole-clip array is the thing that does not
+    fit. This bridges the two and is deliberately trivial -- if it ever needs logic, the test is
+    exercising the adapter instead of the loop.
+    """
+    def f(store, lo, hi):
+        return (boxes[:, lo:hi], None, None if kpts is None else kpts[:, lo:hi])
+    return f
+
+
 def _cfg(**kw):
     kw.setdefault('overlap', 2)
     return InferConfig(n_frames=4, image_size=64, min_crop_dim=16, device='cpu', **kw)
@@ -105,7 +118,7 @@ def test_more_detector_rows_than_label_rows(scene):
 
     for anchor in ('none', 'carry', 'labels'):
         out = run_group(model, sess, 'g000', registry, name, _cfg(anchor=anchor),
-                        boxes_stc=boxes)
+                        boxes_for=_boxes_for(boxes), n_rows=len(boxes))
         assert out['pred'].shape[0] == 5
         # the id list must match the prediction row count, and name every row honestly
         assert len(out['animal_ids']) == 5
@@ -133,7 +146,7 @@ def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
     boxes[..., 2], boxes[..., 3] = w, h
     boxes[:, :, 0] = np.nan                       # camera 0 saw nothing
 
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     assert np.isfinite(out['pred']).all(-1).any(), 'the surviving cameras must still predict'
 
 
@@ -152,7 +165,7 @@ def test_the_window_union_covers_the_window_and_stays_in_the_image(scene):
     for t in range(4):
         boxes[0, t, :] = [10 + t, 12, 14 + t, 16]         # drifts right across the window
 
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     crop = out['crop'][0, 0]                              # (C,4), the first window's box per cam
     for ci in range(C):
         x0, y0, x1, y1 = crop[ci]
@@ -443,9 +456,9 @@ def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
     boxes[..., 2], boxes[..., 3] = cx + side / 2, cy + side / 2
 
     tight = run_group(model, sess, 'g000', registry, name,
-                      _cfg(anchor='none', refine=True, crop_inflate=1.0), boxes_stc=boxes)
+                      _cfg(anchor='none', refine=True, crop_inflate=1.0), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     wide = run_group(model, sess, 'g000', registry, name,
-                     _cfg(anchor='none', refine=True, crop_inflate=1.5), boxes_stc=boxes)
+                     _cfg(anchor='none', refine=True, crop_inflate=1.5), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
 
     # PASS 1 (`crop`): the wide arm's box must be ~1.5x the tight arm's, same centre.
     c_tight, c_wide = tight['crop'][0, 0], wide['crop'][0, 0]
@@ -482,7 +495,7 @@ def test_box_prompt_detector_path_through_run_group(scene):
     boxes[..., 2], boxes[..., 3] = w, h
 
     out = run_group(model, sess, 'g000', registry, name,
-                    _cfg(anchor='none', box_prompt='detector'), boxes_stc=boxes)
+                    _cfg(anchor='none', box_prompt='detector'), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     assert out['pred'].shape[0] >= 1
     assert 'box_prompt_cams' in out
     assert (out['box_prompt_cams'][0] >= 1).any()
@@ -616,9 +629,9 @@ def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
     boxes = np.zeros((1, 4, C, 4), np.float32)
     boxes[..., 2], boxes[..., 3] = w, h          # the whole frame: refinement must shrink it
 
-    plain = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=boxes)
+    plain = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     ref = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', refine=True),
-                    boxes_stc=boxes)
+                    boxes_for=_boxes_for(boxes), n_rows=len(boxes))
 
     assert (ref['outcome'] == 0).all(), 'refinement must not drop an animal'
     got = np.isfinite(ref['pred']).all(-1)
@@ -866,7 +879,7 @@ def test_instances_boxes_get_the_training_crop_rule_at_inference(scene):
     # A deliberately NON-SQUARE stored extent, which is the case the two rules disagree on.
     wide = np.tile(np.array([10.0, 10.0, 10.0 + 0.6 * w, 10.0 + 0.2 * h], np.float32),
                    (S, T, C, 1))
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_stc=wide)
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_for=_boxes_for(wide), n_rows=len(wide))
     det_box = out['crop'][0, 0, 0]
 
     # The DETECTOR path keeps the raw union: it must NOT equal the squared rule here.
@@ -1028,7 +1041,7 @@ def test_a_rejected_refinement_falls_back_at_full_resolution(scene):
     model.forward = spy
     try:
         run_group(model, sess, 'g000', registry, name,
-                  _cfg(anchor='none', refine=True, refine_px=32), boxes_stc=boxes)
+                  _cfg(anchor='none', refine=True, refine_px=32), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     finally:
         model.forward = inner
 

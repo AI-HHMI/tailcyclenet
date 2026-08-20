@@ -274,6 +274,20 @@ def main():
                          'own names, so a wrong value raises rather than relabelling.')
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
+    ap.add_argument('--max-ram', type=float, default=None, metavar='GB',
+                    help='HOST RAM this run may spend on its own pixel buffers -- the decord '
+                         'reader cache, how many CAMERAS the detector decodes at once, and the '
+                         "window loop's camera concurrency and frame cache. DEFAULT: derived, as "
+                         'the smallest of the cgroup limit (walked up EVERY ancestor), LSF\'s own '
+                         'LSB_CG_MEMLIMIT/LSB_MEMLIMIT, MemAvailable and MemTotal -- never '
+                         'SC_PHYS_PAGES, which is the MACHINE\'s memory and under a 16 GB cap '
+                         'still reported this host\'s 503 GB, a 20x over-estimate and exactly the '
+                         'case an LSF job dies in. EVERY KNOB THIS SIZES IS OUTPUT-NEUTRAL, so '
+                         'lowering it costs wall clock and never a predicted number -- which is '
+                         'why it sizes the CAMERA axis and never the detector batch: batch is NOT '
+                         'inert (16 vs 3 moves boxes 0.204 px, scores 1.7e-03), see '
+                         'tests/test_memory_budget.py. '
+                         'TAILCYCLENET_MAX_RAM_GB does the same for paths with no CLI.')
     args = ap.parse_args()
 
     # EVERY PURE-ARGUMENT CHECK BEFORE THE CHECKPOINT LOADS. These cost nothing and a typo
@@ -326,6 +340,15 @@ def main():
                              '(about two patches). Below ~2 patches the forward returns all-NaN '
                              'with no exception. The measured floor is 96; 64 is already worse '
                              'than not refining at all.')
+
+    # THE BUDGET IS RESOLVED ONCE, HERE, BEFORE ANYTHING ALLOCATES, and printed rather than
+    # inferred: it depends on machine state, so a run that does not say which budget it had cannot
+    # have its wall clock compared against another run's. Report a peak as a FRACTION of this
+    # number -- an absolute peak on an unconstrained host is retained allocator arena, not the
+    # working set, and says almost nothing (this file's plan, dev/plans/...ram_budget.md).
+    from tailcyclenet import memory as _memory
+    _budget = _memory.current(override_gb=args.max_ram)
+    print(f'ram: {_budget}')
 
     device = args.device if torch.cuda.is_available() else 'cpu'
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)

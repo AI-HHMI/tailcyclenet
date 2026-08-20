@@ -25,6 +25,7 @@ Two rules that are not negotiable:
 from __future__ import annotations
 
 import os
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from posetail.datasets.posetail_dataset import custom_collate, rotate_camera_ima
 from posetail.posetail.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
+from . import memory as _memory
 from .crop import BOX_SOURCES
 from .format import PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
 
@@ -416,9 +418,10 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     """How many open decord readers this process may hold.
 
     THIS FUNCTION MUST NOT DECODE, STAT, OR OPEN ANYTHING (gotcha 11). It reads the environment,
-    `os.sysconf`, a camera count and a frame size -- all of which come from parsed toml -- because
-    opening a `VideoReader` in the parent to measure anything is what deadlocks the forked
-    workers. It is pure given `ram_gb`, which is what makes the sizing testable on any host.
+    `/proc` and `/sys` via `memory.current()`, a camera count and a frame size -- all of which are
+    parsed strings or virtual files -- because opening a `VideoReader` in the parent to measure
+    anything is what deadlocks the forked workers. It is pure given `ram_gb`, which is what makes
+    the sizing testable on any host.
 
     Two axes, because one number cannot serve both callers:
 
@@ -446,7 +449,14 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     if env:
         return max(1, int(env))
     if ram_gb is None:
-        ram_gb = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 2 ** 30
+        # THE JOB'S MEMORY, NOT THE MACHINE'S. `SC_PHYS_PAGES` -- what this used to read -- is the
+        # host's total: it cannot see a cgroup cap, an LSF limit, or 288 GB another user already
+        # has resident. Under `MemoryMax=16G` it still reported 503 GB, a 20x error, and a 20x
+        # over-estimate here is 16 open readers of a 3208x2200 rig (~37 GB) on a node that has 16.
+        # `memory.current()` minimises over the cgroup ancestry, LSF's own variables, MemAvailable
+        # and MemTotal. It opens no data path (gotcha 11).
+        b = _memory.current()
+        ram_gb = min(b.limit_gb, b.available_gb)
     if procs is None:
         procs = int(os.environ.get('TAILCYCLENET_LOCAL_WORLD_SIZE', '1') or 1)
     want = 4 if workers else max(int(n_cams), 4)
@@ -497,8 +507,22 @@ def _reader(path: str, group, cam: str):
         if _readers is None:
             info = torch.utils.data.get_worker_info()
             rig = group.session.rig
-            _readers = lru_cache(maxsize=_reader_cache_size(
-                len(rig), rig.size(cam), None if info is None else info.num_workers))(_open_reader)
+            size = _reader_cache_size(
+                len(rig), rig.size(cam), None if info is None else info.num_workers)
+            # THE DOCUMENTED CLIFF, SAID OUT LOUD. The pose loop touches every camera inside one
+            # window, so a cache below the camera count misses on EVERY call -- a 16-camera video
+            # rig at 4 re-opened 12 containers per window and ran 2.5x slower. That used to be
+            # reachable only by setting `TAILCYCLENET_READER_CACHE` by hand; now a tight RAM budget
+            # can produce it too, and a run that is silently 2.5x slower for a legitimate reason
+            # should still say so rather than being diagnosed from a stopwatch.
+            if info is None and size < len(rig):
+                warnings.warn(
+                    f'decord reader cache is {size} for a {len(rig)}-camera rig: every window '
+                    f'touches all {len(rig)} cameras, so this misses on every call and re-opens '
+                    f'{len(rig) - size} container(s) per window. The RAM budget would not hold '
+                    f'more ({_memory.current()}). Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or '
+                    'accept the slowdown.', stacklevel=2)
+            _readers = lru_cache(maxsize=size)(_open_reader)
         return _readers(path)
 
 

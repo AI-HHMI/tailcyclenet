@@ -181,6 +181,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
     group = session.groups[gid]
     T = min(group.n_frames, max_frames or group.n_frames)
+    from .. import memory as _memory
     C = len(session.rig)
     D = max(1, int(top_k))
     out = np.full((D, T, C, 4), np.nan, np.float32)
@@ -213,53 +214,132 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         wh = input_wh if tile_scale is None else tiled_input_wh(src, tile_scale)
         r = reduce_factor(src, wh) if reduce else 1
         imgs = read_frames(group, cam_name, frames, reduce=r, pool=frame_pool)
-        lbs, metas = [], []
-        for im in imgs:
-            lb, scale, pad = letterbox(im, wh, src_wh=src)
-            lbs.append(lb)
+        # ONE numpy CONVERSION FOR THE WHOLE BATCH, NOT ONE torch OP PER FRAME, and it stays that
+        # way: a 544x320 frame is 0.5 MP, so `torch.as_tensor(...).permute(...) / 255.0` hands a
+        # tiny elementwise op to torch's intraop pool (`nproc` wide, 96 here) -- measured at 67 ms
+        # PER FRAME against 1.0 ms through numpy, 62% of this function's wall clock at ~2,200% CPU
+        # with every GPU idle. The batch is still packed once, in numpy.
+        #
+        # WHAT CHANGED IS THE DTYPE AND THE NUMBER OF LIVE COPIES. This used to build, per camera
+        # per batch: `imgs` + `lbs` + `np.stack` + `ascontiguousarray` + a float32 `astype` -- five
+        # buffers, the last at 4 bytes a pixel. On johnson (16 cameras, 3208x2200, whole-frame
+        # input at `tile_scale = 1.0`) that is ~2.4 GB per camera per batch, x16 cameras x2 batches
+        # in flight = ~76 GB of the measured 120 GB peak, against ~2.5 GB of live pixels.
+        #
+        # Now: letterbox straight into a preallocated uint8 (n,3,h,w) and DROP EACH SOURCE FRAME AS
+        # IT IS CONSUMED, so `imgs` shrinks while `arr` fills instead of both standing at full
+        # size. uint8 goes to the device and the `/255` happens THERE -- which is what the pose
+        # loader has always done (`dataset.py`, "UINT8, not float32/255") and the detector was the
+        # one path left. 4x less host memory, 4x less to copy over PCIe, 4x less device memory.
+        #
+        # BIT-IDENTICAL, and that is the whole reason this is allowed to be a memory change rather
+        # than a numerical one: uint8 -> float32 is exact and the float32 divide by 255 is
+        # correctly rounded, so the tensor the detector sees is the one it always saw. **This is
+        # NOT free -- see `_DIV255` below, where getting it wrong costs 1 ULP and every cached
+        # detection.** Pinned by `tests/test_detector_memory.py`.
+        n = len(imgs)
+        metas, arr = [], None
+        for i in range(n):
+            lb, scale, pad = letterbox(imgs[i], wh, src_wh=src)
+            if arr is None:
+                arr = np.empty((n, 3, lb.shape[0], lb.shape[1]), np.uint8)
+            arr[i] = lb.transpose(2, 0, 1)
             metas.append((scale, pad))
-        # ONE numpy CONVERSION FOR THE WHOLE BATCH, NOT ONE torch OP PER FRAME. Bit-identical --
-        # uint8 -> float32 and a divide by 255 are both correctly rounded either way, checked in
-        # `tests/test_detector.py` -- and 64x faster in wall clock: a 544x320 frame is 0.5 MP, so
-        # `torch.as_tensor(...).permute(...) / 255.0` hands a tiny elementwise op to torch's
-        # intraop pool, which is `nproc` wide (96 here). Measured at 67 ms PER FRAME against 1.0 ms
-        # through numpy, and it was 62% of this function's wall clock and ~2,200% of one process's
-        # CPU with every GPU idle. The pose loader already avoids this by keeping uint8 to the
-        # device (`dataset.py`, "UINT8, not float32/255"); the detector was the one path left.
-        arr = np.ascontiguousarray(np.stack(lbs).transpose(0, 3, 1, 2))
-        return ci, torch.from_numpy(arr.astype(np.float32) / np.float32(255)), metas, src
+            imgs[i] = None                 # the decode is dead the moment it is letterboxed
+        return ci, torch.from_numpy(arr), metas, src
 
+    # WHAT IS BOUNDED IS THE NUMBER OF CAMERAS IN FLIGHT, AND NEVER `batch`. `2 x C x batch` full
+    # frames is what OOMs -- every camera is fetched for every frame batch and one batch of
+    # lookahead is live, which on johnson is 2 x 16 x 16 x 42.4 MB = 21.7 GB even after the dtype
+    # fix above, on a node that may have 16 GB in total.
+    #
+    # **`batch` IS NOT AVAILABLE AS A MEMORY KNOB, BECAUSE IT IS NOT INERT.** It looks inert --
+    # `tests/test_detector.py`'s `--det-cache` stamp guard classifies it as `plumbing`, i.e.
+    # asserts it cannot change the detections and therefore need not be stamped -- and that
+    # assertion is FALSE on a GPU. Measured on johnson's own detector, 12 frames, batch 16 against
+    # batch 3: **boxes differ by 0.204 px, scores by 1.69e-03, keypoints by 0.447 px.** cuDNN
+    # selects convolution algorithms per input SHAPE, so a different batch is a different
+    # reduction order. It is not the decode: `read_frames` at batch 16 versus batch 3, and cached
+    # against reopened, are byte-identical (checked directly on this root's video).
+    #
+    # Making `batch` depend on free memory would therefore mean two runs of one command on two
+    # machines producing DIFFERENT BOXES and silently sharing a `--det-cache` -- precisely the
+    # class of divergence the stamp exists to prevent, introduced underneath it by the thing meant
+    # to be output-neutral. So `batch` is passed through untouched and the memory comes out of the
+    # camera axis instead.
+    #
+    # CHUNKING CAMERAS IS OUTPUT-NEUTRAL BY CONSTRUCTION: each camera is forwarded on its own, with
+    # its own `(batch, 3, h, w)` tensor, and `out`/`sc`/`kp` are indexed by `[.., ci]`. How many
+    # cameras happen to be decoding at the same moment changes no forward's shape and no array's
+    # contents -- only the wall clock, via how much of the decode overlaps.
+    #
+    # SIZED FROM PARSED TOML ONLY (`rig.size`), so this opens, stats and decodes nothing -- the
+    # gotcha-10 rule that governs every other sizing decision in this repo.
+    _per_frame_cam = 0
+    for _cam in session.cam_names:
+        _src = session.rig.size(_cam)
+        _wh = input_wh if tile_scale is None else tiled_input_wh(_src, tile_scale)
+        _per_frame_cam = max(_per_frame_cam,
+                             int(_src[0]) * int(_src[1]) * 3 + int(_wh[0]) * int(_wh[1]) * 3)
+    _budget = _memory.current().share(_memory.FRACTION_DETECT)
+    cams_flight = _memory.fits(_budget, _per_frame_cam * max(1, int(batch)) * 2, want=max(1, C))
+
+    # A 0-d TENSOR, NOT THE PYTHON INT 255, AND THE DIFFERENCE IS NOT COSMETIC.
+    #
+    # Moving the `/255` off the host is only allowed because it is bit-identical, and on CUDA
+    # `x / 255` is NOT: dividing by a Python scalar takes a reciprocal-multiply fast path that is
+    # off by 1 ULP on 156 of the 256 possible byte values. Dividing by a 0-d tensor is correctly
+    # rounded and matches numpy exactly. Measured, both ways, in `tests/test_detector_memory.py`.
+    #
+    # 1 ULP on the INPUT is not a rounding curiosity here: it perturbs every objectness score,
+    # which reorders NMS ties, which returns different boxes -- so it would silently invalidate
+    # every `--det-cache` on disk and make no recorded detector number reproducible, without
+    # changing a shape, a dtype or a `RAW_REV`. Exactly the class of silent divergence the cache
+    # stamp exists to prevent, arriving underneath it.
+    _div255 = torch.tensor(255.0, device=device)
+
+    pool = ThreadPoolExecutor(max_workers=cams_flight)
     # A SECOND POOL, FOR THE OTHER HALF OF THE ROOTS. `read_frames` threads an image directory over
     # its FRAMES (it ignores `pool` for video, which decodes a batch in one `get_batch`), and that is
     # where rat-city and branson-fly spend their time -- 39 ms per `cv2.imread` of a 4696x2048 JPEG
     # (dev/reports/08), one frame at a time, on roots that are single-camera so the camera pool above
     # buys them nothing. cv2 releases the GIL. It must NOT be `pool`: `_fetch` runs IN `pool` and
     # waits on these futures, and a pool that waits on itself deadlocks the moment both are full.
-    pool = ThreadPoolExecutor(max_workers=max(1, C))
     frame_pool = ThreadPoolExecutor(max_workers=min(16, max(1, batch)))
 
-    def _submit(start):
-        """The next batch's decode, started BEFORE the current one's forwards are run."""
-        if start >= T:
-            return None, None
-        fr = list(range(start, min(start + batch, T)))
-        return fr, [pool.submit(_fetch, (ci, cam, fr))
-                    for ci, cam in enumerate(session.cam_names)]
+    # THE UNIT OF WORK IS (FRAME BATCH, CAMERA CHUNK), which is what makes the peak bounded while
+    # every forward keeps its exact shape. With room, one chunk is the whole rig and this is the
+    # loop it always was, unit for unit.
+    _units = [(list(range(st, min(st + batch, T))), list(range(lo, min(lo + cams_flight, C))))
+              for st in range(0, T, batch)
+              for lo in range(0, C, cams_flight)]
+
+    def _submit(u):
+        """The next unit's decode, started BEFORE the current one's forwards are run."""
+        if u >= len(_units):
+            return None
+        fr, cams = _units[u]
+        return [pool.submit(_fetch, (ci, session.cam_names[ci], fr)) for ci in cams]
 
     try:
-        # ONE BATCH OF LOOKAHEAD. Decode is ~100% of this loop's wall clock once the pack is fixed,
+        # ONE UNIT OF LOOKAHEAD. Decode is ~100% of this loop's wall clock once the pack is fixed,
         # but the ~120 ms per batch of forward + NMS is time the decoder threads spent idle: they
-        # had nothing queued until the main thread came back round. Submitting batch i+1 first
+        # had nothing queued until the main thread came back round. Submitting unit i+1 first
         # overlaps the two. It changes no pixels and no order -- `_submit` returns the futures in
         # camera order and the forwards still run one camera at a time, in that order.
-        frames, pending = _submit(0)
-        while pending is not None:
+        pending = _submit(0)
+        for _u in range(len(_units)):
+            frames, _ = _units[_u]
             fetched = [f.result() for f in pending]
-            nxt = _submit(frames[-1] + 1)
+            nxt = _submit(_u + 1)
             for ci, x, metas, src in fetched:
                 # Indexed for the same reason `evaluate.py` is: the head's return arity grows
                 # with each optional branch, and `detect_raw` needs only the first three.
-                _o = det(x.to(device))
+                # THE `/255` HAPPENS HERE, ON THE DEVICE, off the uint8 `_fetch` handed back --
+                # see the bit-identical note there. `float()` then `div_` in place, so the float32
+                # copy exists only in device memory and only for this one camera. `_div255` is a
+                # 0-d TENSOR on purpose; the scalar form is 1 ULP wrong on CUDA.
+                _o = det(x.to(device).float().div_(_div255))
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
                 for j, t in enumerate(frames):
                     b, s, ix = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
@@ -274,7 +354,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                         # `unletterbox_keypoints`, which is why it lives next to the box version.
                         k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)
                         kp[:n, t, ci] = k[:n].numpy()
-            frames, pending = nxt
+            pending = nxt
     finally:
         frame_pool.shutdown()
         pool.shutdown()

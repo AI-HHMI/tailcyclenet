@@ -34,6 +34,7 @@ import torch
 from posetail.posetail.cube import project_points_torch
 
 from . import crop as cropmod
+from . import memory
 from .dataset import _crop_affine, _resize_camera, prior_out_of_bounds, read_frames
 from .format import Labels, Session
 from .model import share_scene
@@ -373,6 +374,34 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
     # Both are what makes a coverage delta readable -- 08's crop-inflation measurement needed the
     # box, and every one of the five aborts below needed to be distinguishable from the others.
     starts = _window_starts(T_total, cfg.n_frames, cfg.overlap)
+
+    # THE TWO PIXEL BUFFERS THIS LOOP OWNS, BOTH SIZED FROM THE ONE HOST BUDGET.
+    #
+    # `cam_decode` bounds how many cameras decode a window CONCURRENTLY; each task holds one
+    # camera's whole window of FULL frames, so unbounded concurrency on johnson's 16-camera
+    # 3208x2200 rig is 16 x 12 x 21.2 MB = 4.1 GB of transient host memory for a rig with one
+    # animal in it. It was the literal 4 (decord's own `ChunkShuffle.mix`), which is right on a
+    # roomy host and is not a budget.
+    #
+    # `_frame_cache` is the SPEED item -- see `decode_crops`. It holds full decoded frames keyed
+    # by (camera, source frame), which is what collapses the 6x re-decode to 1x. It is a cache,
+    # so it is the first thing to go when there is no room: at zero budget the dict is never
+    # written and the loop decodes exactly as it did before.
+    #
+    # SIZED FROM PARSED TOML (`rig.size`), never by opening a container (gotcha 10).
+    _fw, _fh = session.rig.size(session.cam_names[cam_ix[0]])
+    _frame_bytes = int(_fw) * int(_fh) * 3
+    _budget = memory.current()
+    cam_decode = memory.fits(_budget.share(memory.FRACTION_CROPS) / 2,
+                             _frame_bytes * cfg.n_frames,
+                             want=min(_CAM_DECODE, len(cam_ix)))
+    # The other half of the crops share, spent on the cache. A window plus one step is what is
+    # live at once, so below that there is nothing to reuse and the cache is pure overhead.
+    _step = max(1, cfg.n_frames - cfg.overlap)
+    _cache_frames = int(_budget.share(memory.FRACTION_CROPS) / 2 // max(1, _frame_bytes))
+    _frame_budget = _cache_frames >= len(cam_ix) * (cfg.n_frames + _step)
+    _frame_cache: dict[tuple[int, int], np.ndarray] = {}
+
     outcome = np.full((S, len(starts)), OUTCOMES.index('no box'), np.int8)
     crop = np.full((S, len(starts), len(session.rig), 4), np.nan, np.float32)
     # DOES THE POSE AGREE WITH THE BOX IT WAS CROPPED FROM? Per (animal, frame, camera), the distance
@@ -586,7 +615,28 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
         cams = sorted({c for _, use, *_ in plans for c in use})
 
         def one(ci, pool):
-            imgs = read_frames(group, session.cam_names[ci], frames, pool=pool)
+            # SIX DECODES PER (FRAME, CAMERA) WAS THE SHIPPED DEFAULT, and this is where they
+            # were paid. Windows step by `T - overlap`, so at the box recipe's `n_frames = 12`
+            # and `--overlap 8` every frame sits in THREE windows; `--refine` (on by default in
+            # 3D) then calls this function a SECOND time per window against the re-cropped plan,
+            # with the identical `frames`. `read_frames` dedupes within one call and nothing
+            # remembered anything across calls, so each source frame was decoded six times --
+            # 6 x 21.2 MB x 16 cameras of pure repeat work per johnson frame.
+            #
+            # `_frame_cache` is keyed by (camera, SOURCE frame index) and holds the FULL decoded
+            # frame, which is what makes it serve both repeats: the refine pass wants the same
+            # pixels under a different crop, and `_crop_views` never mutates what it is given
+            # (it warps into a new array, or returns the frame and lets `np.asarray` copy).
+            need = [t for t in frames if (ci, int(t)) not in _frame_cache]
+            if need:
+                got = read_frames(group, session.cam_names[ci], need, pool=pool)
+                if _frame_budget:
+                    for t, im in zip(need, got):
+                        _frame_cache[ci, int(t)] = im
+            else:
+                got = []
+            at = dict(zip((int(t) for t in need), got))
+            imgs = [_frame_cache.get((ci, int(t)), at.get(int(t))) for t in frames]
             # A file that will not decode is a property of the file, not of the animal, so
             # it takes out every animal that wanted this camera -- which is what the
             # per-animal decode did too, one animal at a time.
@@ -605,7 +655,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             else:
                 # A SECOND POOL: `one` runs in this one and waits on futures in `pool`, and a
                 # pool that waits on itself deadlocks as soon as both are full.
-                with ThreadPoolExecutor(max_workers=min(_CAM_DECODE, len(cams))) as cpool:
+                with ThreadPoolExecutor(max_workers=min(cam_decode, len(cams))) as cpool:
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
@@ -868,7 +918,21 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
             if _prefetch_pool is not None and nxt < len(starts) and nxt not in pending:
                 pending[nxt] = _prefetch_pool.submit(_prepare, nxt, starts[nxt])
             _process_window(wi, frames, window_cams, plans, crops)
+            # EVICT BY WINDOW POSITION, NOT BY AN LRU, because the access pattern is known
+            # exactly: `starts` is monotone increasing and window `wi` reads `[start, start+T)`,
+            # so a frame below the OLDEST still-live window's start can never be asked for again.
+            # That is exact rather than heuristic, needs no ordering bookkeeping, and bounds the
+            # dict at one window plus the prefetch depth regardless of clip length -- which is the
+            # property that matters, since the peak must not grow with the length of the clip.
+            if _frame_cache:
+                keep = starts[max(0, wi - n_ahead + 1)] if wi + 1 < len(starts) else None
+                if keep is None:
+                    _frame_cache.clear()
+                else:
+                    for k in [k for k in _frame_cache if k[1] < keep]:
+                        del _frame_cache[k]
     finally:
+        _frame_cache.clear()
         if _prefetch_pool is not None:
             _prefetch_pool.shutdown(wait=True)
 

@@ -92,6 +92,38 @@ def _session_2d(path, T=4, S=2, label_source='annotated'):
     return lab
 
 
+def _session_2d_tracked_dense(path, T=4, S=2):
+    """calms21 / rat-city-tracked / branson-fly's shape: `tracked`, every row `visible`, no
+    assessment ever recorded.
+
+    Distinct from `_session_2d` above (which is `annotated` and carries a real `missing` /
+    `unlabeled` pair): this is what `Session.has_visibility_assessment` must read as False, and
+    what the loader must therefore withhold a visibility target for -- for the WHOLE session, not
+    per window, because every row here reads `visible` (finite, not NaN), so the per-window
+    NaN-masking that catches an all-`projected` session cannot see this case at all.
+    """
+    W, H = 64, 48
+    rig = _rig([('cam0', W, H, False, False, 0)])
+    K = len(KPTS_2D)
+    lab = fmt.empty_labels(S, T, K, 1, mode3d=False, animal_ids=['a01', 'a02'])
+    rng = np.random.default_rng(3)
+    lab.vis2d[:] = fmt.VISIBLE
+    lab.points2d[..., 0, :] = rng.uniform(5, min(W, H) - 5, size=(S, T, K, 2)).astype(np.float32)
+    groups = {'g000': fmt.Group('g000', T, fps=40.0, source_video='movie.avi')}
+    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_2D,
+                      rig=rig, groups=groups, labels={'g000': lab},
+                      provenance={'source': 'synthetic', 'visibility': 'none'})
+    _write_frames(path / 'groups' / 'g000', 'cam0', T, (W, H))
+    return lab
+
+
+@pytest.fixture(scope='session')
+def tracked_no_assessment_root(tmp_path_factory):
+    root = tmp_path_factory.mktemp('tracked_dense')
+    _session_2d_tracked_dense(root / 'catlike' / 'train' / 's')
+    return root / 'catlike'
+
+
 def _session_3d(path, T=4, moving=False, label_source='tracked'):
     """allen-mouse's shape: native 3D plus coordinate-free per-camera visibility rows."""
     W, H = 64, 48

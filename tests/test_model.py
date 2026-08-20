@@ -900,3 +900,41 @@ def test_gradients_reach_the_unfrozen_blocks_only(moving_batch):
                 f'block {i} is trainable but got no finite gradient'
         else:
             assert all(g is None for g in grads), f'frozen block {i} received a gradient'
+
+
+def test_2d_forward_shapes_match_pose_loss_expectations(tiny_root):
+    """The one place `PoseLoss`'s shape assumptions meet a REAL forward, not a hand-built one.
+
+    `tailcyclenet/losses.py::PoseLoss.forward` assumes `outputs['vis_pred_2d']` is `(cams,b,t,n)`
+    and pairs it against `vis_2d_true`'s `(b,t,n,cams,1)` off the collate -- both asserted against
+    literal shapes in tests/test_losses.py, but never against what `TrackerEncoder` actually
+    returns for a real R == 2 forward. This is that check, end to end: `ratlike` carries a real
+    `missing` row, so `pose_collate` hands back a populated `vis_2d`, and the whole thing has to
+    run a finite backward through `PoseLoss`, not just avoid a shape exception.
+    """
+    from tailcyclenet.losses import PoseLoss
+
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG, train=False)
+    b = None
+    for i in range(len(ds)):
+        item = pose_collate([ds[i]])
+        if item.vis_2d is not None:
+            b = item
+            break
+    assert b is not None, 'ratlike must yield at least one item with a real vis_2d target'
+
+    model = build_model(small('wide'), n_keypoints=int(b.kpt_ids.max()) + 1)
+    out = model(b.views, b.kpt_ids, b.cgroup, mode='2d', kpt_prior=b.kpt_prior,
+               prompt_time=b.prompt_t)
+    assert 'vis_pred_2d' in out
+    assert out['vis_pred_2d'].shape == (1, 1, b.vis_2d.shape[1], b.vis_2d.shape[2])
+
+    loss_fn = PoseLoss(vis_loss_2d_weight=5.0)
+    total = loss_fn.forward(model, out, b.coords, None, None, vis_2d_true=b.vis_2d, p2d=b.p2d,
+                            cgroup=b.cgroup, device='cpu')
+    assert torch.isfinite(total)
+    assert torch.isfinite(torch.tensor(loss_fn.loss_history['vis_loss_2d'][-1]))
+    total.backward()
+    grads = [p.grad for p in model.query_encoder.parameters() if p.requires_grad]
+    assert any(g is not None and torch.isfinite(g).any() for g in grads), \
+        'the 2D visibility term must reach real parameters, not just compute a number'

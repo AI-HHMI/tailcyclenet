@@ -43,8 +43,6 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from posetail.posetail.losses import TotalLoss
-
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet.checkpoints import (check_image_size, load_config, prior_provenance,
                                       resolve_checkpoint, save_checkpoint, save_run_meta,
@@ -52,6 +50,7 @@ from tailcyclenet.checkpoints import (check_image_size, load_config, prior_prove
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
                                   worker_init)
 from tailcyclenet.format import Registry
+from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
 from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
                                    replay_staged_unfreeze, trainable_encoder_params)
@@ -294,11 +293,23 @@ def run_batch(model, loss_fn, batch, device, raw=None):
                 kpt_prior=batch.kpt_prior.to(device), prompt_time=batch.prompt_t.to(device),
                 box_prompt=None if box is None else box.to(device))
     coords_true = batch.coords.to(device)
+    # `batch.vis_2d` TRAVELS ON TWO DIFFERENT WIRES DEPENDING ON MODE, and they must never mix.
+    # In 3D it is `vis_true_cams`, posetail's own per-camera term, both-or-neither with `vis_true`
+    # (`losses.py:358` raises otherwise -- `batch.vis` is always None in 2D, so handing a 2D
+    # `vis_2d` to that parameter would either raise or, worse, silently recompute it from
+    # geometry). In 2D it is `vis_2d_true`, `PoseLoss`'s own repo-local term (tailcyclenet/losses.py)
+    # -- `TotalLoss.forward` never computes anything from it, by construction (its R == 2 branch
+    # has no visibility terms at all).
+    vis_true = vis_true_cams = vis_2d_true = None
+    if mode == '2d':
+        vis_2d_true = None if batch.vis_2d is None else batch.vis_2d.to(device)
+    else:
+        vis_true = None if batch.vis is None else batch.vis.to(device)
+        vis_true_cams = None if batch.vis_2d is None else batch.vis_2d.to(device)
     try:
         loss = loss_fn(
             model if raw is None else raw, out, coords_true=coords_true,
-            vis_true=None if batch.vis is None else batch.vis.to(device),
-            vis_true_cams=None if batch.vis_2d is None else batch.vis_2d.to(device),
+            vis_true=vis_true, vis_true_cams=vis_true_cams, vis_2d_true=vis_2d_true,
             cgroup=cgroup, p2d=None if batch.p2d is None else batch.p2d.to(device), device=device)
     except ValueError as e:
         if 'non-finite' not in str(e):
@@ -769,7 +780,9 @@ def main():
     losses = dict(config['training']['losses'])
     losses.setdefault('per_camera_cube_scale',
                       bool(config['model'].get('per_camera_cube_scale', False)))
-    loss_fn = TotalLoss(**losses)
+    # PoseLoss, not TotalLoss: it adds ONLY the 2D visibility term (tailcyclenet/losses.py),
+    # default weight 0.0, so an unset `vis_loss_2d_weight` is bit-identical to the bare class.
+    loss_fn = PoseLoss(**losses)
 
     # RESUME, because the jobs are preemptible and re-running into the same --out is the
     # documented way to restart one (`init_wandb`, above). This used to begin again at iteration 0

@@ -151,6 +151,24 @@ Five things that are easy to get wrong:
   so a fix in one place lands in up to three roots and `find` without `-L` undercounts them.
 - **A root's file date cannot settle whether its tables are current — regenerate and diff.** The
   one root that was actually stale would have looked *fine* on dates.
+- **THE STATUS POLICY: `missing` claims a real assessment; absence means none was made.** Checked
+  by `scripts/check_status.py`, not by prose — run it after any re-conversion. On the roots as
+  they ship: every tracked root (3dpop, rat-city-tracked, branson-fly, johnson-mouse-tracked,
+  calms21) already writes NaN/absent as no row, which the spec defines as identical to
+  `unlabeled`. **`allen-mouse-tracked`'s 2.1M `missing` keypoint rows are not NaNs** — they come
+  from the npz's own per-camera `vis` array, written only where the 3D point is finite, and are
+  the only dense per-camera occlusion target in the repo; do not read "no coordinate" as "no
+  assessment" and demote them. **calms21 has zero NaN and zero holes** (its converter asserts
+  finiteness) and stays `visible` on purpose — see `Session.has_visibility_assessment` in the
+  losses section below for what that means for training. The three small, deliberate exceptions
+  — rat-city-annotated's 220 APT skips, allen-mouse-annotated's 211 points3d holes
+  (`convert_annotated.py::triangulate_group`'s 1-view-or-over-reprojection-gate case, left as no
+  row — its SEPARATE 178 `missing` rows are the 0-view-and-every-camera-assessed case, already
+  written `missing` today, and are counted in `MISSING_OK` rather than `HOLE_EXEMPTIONS`),
+  johnson-mouse-annotated's 19 outlier-filtered holes — are named with their exact counts in
+  `scripts/check_status.py`'s `HOLE_EXEMPTIONS`; a count that moves there is a re-conversion
+  silently disagreeing with the documented reason. See
+  `dev/plans/status_consistency_and_occlusion.md` for the full survey.
 
 ### Which roots can carry a benchmark
 
@@ -363,16 +381,41 @@ divides by it, so at one camera it lands about half way from the world origin to
 depth CE from 6.24 to off and the depth Huber from 0.617 to 39.49, a 64x renormalisation. A
 non-finite anchor is the library's own off switch.
 
-### The losses: five keys fire in 2D and the rest are 3D-only
+### The losses: five keys fire in 2D from `TotalLoss` itself, plus one repo-local key
 
 `TotalLoss.forward` branches on `coords_true.shape[-1]`. The `R == 2` block computes
 `coords_loss_2d`, `coords_softmax_2d`, `smoothness_loss_2d` and the two smoothness shape keys;
 everything else is `_nan()`'d and dropped.
 
-**SO NOTHING SUPERVISES VISIBILITY ON A 2D-ONLY RUN.** Both vis terms live in the 3D `else`, and
-`vis_loss_weight = 5.0` — the largest weight in the block — gets no gradient there. That, and not
-"the converter wrote every point VISIBLE", is why `--vis-thresh` cannot work on a 2D root: **the
-head it gates on was never trained.**
+**`TotalLoss` ITSELF SUPERVISES NO VISIBILITY ON A 2D-ONLY RUN.** Both of its vis terms live in
+the 3D `else`, and `vis_loss_weight = 5.0` — the largest weight in the block — gets no gradient
+there. **`tailcyclenet/losses.py::PoseLoss` is the fix**, not a library key: `[training.losses]
+vis_loss_2d_weight` (default **0.0**, so an absent key is bit-identical to every run on record)
+adds a per-camera BCE on `outputs['vis_pred_2d']` against the loader's own `vis_2d` — the same
+tensor `noisy_or_logit` returns UNCHANGED at one camera, so this supervises exactly what
+`--vis-thresh` gates on. `scripts/train.py` builds `PoseLoss` in place of `TotalLoss`
+unconditionally; every other `[training.losses]` key is unaffected.
+
+**THE LOADER GATES THE TARGET AT THE SESSION LEVEL, NOT JUST PER WINDOW.** A `missing` row
+supervises occlusion in 2D exactly as it already did in 3D — a `MISSING`/`VISIBLE` window builds a
+real target, `PROJECTED`/`UNLABELED` masks out per-point as NaN (posetail's own per-entry mask).
+But a `tracked` session whose table is 100% `visible` (calms21, rat-city-tracked, branson-fly) has
+no NaN to mask on — every row is finite — so `Session.has_visibility_assessment` withholds the
+whole session's target instead: no `missing` row anywhere in a `tracked` table means no assessment
+ever happened, and training "always visible" from a target that asserts nothing is the calms21
+failure mode CLAUDE.md already warns about for `rat-city-annotated`, one level up. An `annotated`
+session is never gated this way, even at zero `missing` rows.
+
+**`rat-city-annotated` and calms21 must still not be used to judge or gate this head.**
+rat-city-annotated's 2,500 occluded-but-placed points are written `visible` on purpose (the
+bullet above), so its target calls real occlusions positive; calms21's target is withheld
+entirely (previous paragraph) and MUST NOT be turned on by naming it in
+`Session.has_visibility_assessment`'s gate. `allen-mouse-annotated` is the one root with a dense,
+honest 2D occlusion channel (41.9% `missing`) and is where a nonzero weight has to be measured
+first — see `dev/plans/status_consistency_and_occlusion.md`.
+
+That, and not "the converter wrote every point VISIBLE", is why `--vis-thresh` on a 2D root used
+to gate on **an untrained head** — see the table below for what changes once the weight is on.
 
 `conf_loss_weight`, `conf_2d_loss_weight` and `coords_loss_rays_weight` ship at 0.0 as documented
 off-switches for terms that do exist. `gamma`, `feature_loss_weight` and `pixel_thresh` were
@@ -409,12 +452,19 @@ The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one le
 | `--track` | on | **INERT** (`C > 1` gate) | on |
 | `--carry-source` | `triangulate` | **INERT** (bit-identical) | on |
 | `--pose-nms` | off | +0.0223 MOTA on rat-city, **harmful on calms21** | untested |
-| `--vis-thresh` | off | **cannot work** (untrained head) | +0.049 on 3dpop |
+| `--vis-thresh` | off | **untrained at `vis_loss_2d_weight = 0.0` (the shipped default) -- UNMEASURED at nonzero, and rat-city-annotated/calms21 must not be the arm that measures it** | +0.049 on 3dpop |
 | `--refine-px` | none | **SWEEP IT**: 96 best on calms21, **+15.8 px / MOTA −0.238 SIG on rat-city** | 192 ≈ 256; 96–128 trade mm for MOTA. **INTERACTS WITH `--crop-inflate`** |
 | `--box-prompt` | `auto` | **LIVE, 2D single-camera** | **LIVE, PER CAMERA** |
 | `--crop-inflate` | 1.5 iff box model | wide pass-1 + tight pass-2 | measured on 3dpop as a secondary axis alongside the box |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | |
 | `--prefetch-windows` | **1** | bit-exact at any value | bit-exact at any value |
+
+**THE `+0.049 on 3dpop` `--vis-thresh` FIGURE IS NOT A 3dpop RESULT.** 3dpop ships only
+`points3d.pq`, so `lab.vis2d is None` and the loader has always emitted `vis = vis_2d = None` for
+it -- `TotalLoss` then hard-zeros both visibility terms, so 3dpop's own training never touches the
+head `--vis-thresh` gates on. Whatever produced that gate figure came from the base checkpoint or
+another root in the training mix, not from 3dpop's own supervision. Unchecked; do not re-quote it
+as evidence for or against this root without finding out which.
 
 **`--anchor` IS ROOT-CONDITIONAL IN 2D, AND "HARMFUL IN 2D" WAS ONE ROOT GENERALISED.** The
 discriminator is **ANIMAL COUNT, not clip length** — a 12-animal root loses at 500 frames too,

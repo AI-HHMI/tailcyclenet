@@ -1064,10 +1064,25 @@ class PoseDataset(Dataset):
         # -- targets and visibility ------------------------------------------------------
         if true_2d:
             coords = torch.as_tensor(lab.points2d[a][frames][:, :, 0], dtype=torch.float32)
+            # `vis` (the 3D noisy-OR) has nothing to describe here -- there is no 3D layer at
+            # R == 2. `vis_2d` is the per-camera (single-camera) target, built the same way the
+            # 3D branch builds it below, and gated the same way: `sess.has_visibility_assessment`
+            # withholds it for a `tracked` session that never recorded a negative (calms21,
+            # rat-city-tracked, branson-fly) so the head is not trained toward "always visible"
+            # from labels that assert nothing (see the cached_property's docstring).
             vis = vis_2d = None
+            if lab.vis2d is not None and sess.has_visibility_assessment:
+                v2 = lab.vis2d[a][frames][:, :, cam_ix]             # (T,K,1), three-state
+                vis_2d = torch.as_tensor(np.where(np.isin(v2, (UNLABELED, PROJECTED)), np.nan,
+                                                  (v2 == VISIBLE).astype(np.float32)))
+                if not torch.isfinite(vis_2d).any():
+                    # Every assessed row in this WINDOW is `projected`/`unlabeled` even though
+                    # the session as a whole carries real assessments elsewhere -- withhold
+                    # exactly as the 3D branch does, for the same reason.
+                    vis_2d = None
         else:
             coords = torch.as_tensor(lab.points3d[a][frames], dtype=torch.float32)
-            if lab.vis2d is not None:
+            if lab.vis2d is not None and sess.has_visibility_assessment:
                 v2 = lab.vis2d[a][frames][:, :, cam_ix]            # (T,K,c), three-state
                 # PER-CAMERA: three states, passed through as three states. NaN means "not
                 # assessed", and posetail >= 0.3.2 masks it out of the visibility BCE so those
@@ -1093,7 +1108,8 @@ class PoseDataset(Dataset):
                     # Drop to the 3dpop path and let the loss derive both masks geometrically.
                     vis = vis_2d = None
             else:
-                # No per-camera assessment (3dpop): let the loss derive both masks
+                # No per-camera assessment (3dpop, or a `tracked` session with no `missing` row
+                # anywhere -- `sess.has_visibility_assessment`): let the loss derive both masks
                 # geometrically. vis and vis_2d are both-or-neither -- one without the other
                 # dies inside einops.
                 vis = vis_2d = None
@@ -1112,12 +1128,21 @@ class PoseDataset(Dataset):
         if true_2d:
             cam = cgroup[0]
             coords = _mask_outside(coords, cam['size'])
+            if vis_2d is not None:
+                # A point OUTSIDE the frame is not visible in the pixels the model is about to
+                # see -- the same argument the 3D path makes after its own rotation, below. Flip
+                # only entries that were a real POSITIVE (`== 1`): an entry already 0 (assessed
+                # occluded) or NaN (unassessed) needs no change, and `NaN == 1` is False so this
+                # is safe without an extra isnan check.
+                vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
             cp = None if crop_pts is None else crop_pts[:, 0]
             if self.train and rng.random() < rot_p:
                 cam, coords, rot = _rotate_2d(cam, coords,
                                               float(rng.uniform(-rot_deg, rot_deg)))
                 rotation_info = [rot]
                 cp = _apply_affine(cp, rot)
+                # `_rotate_2d` keeps the WHOLE expanded canvas (its own docstring), so nothing
+                # here can push a point outside `cam['size']` -- no vis_2d update from rotation.
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
@@ -1127,6 +1152,10 @@ class PoseDataset(Dataset):
             cam, scale = _resize_camera(cam, self.cfg.image_size)
             coords = coords * scale
             coords = _mask_outside(coords, cam['size'])
+            if vis_2d is not None:
+                # THE MEANINGFUL UPDATE: a point outside the final crop is not visible in the
+                # crop the model trains on, even though it was visible in the source frame.
+                vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
             cgroup, boxes = [cam], [box]
             p2d = p2d_all = coords[None]
             R = 2

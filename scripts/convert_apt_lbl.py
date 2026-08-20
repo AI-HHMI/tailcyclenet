@@ -38,7 +38,9 @@ FOUR CONVERSION DECISIONS, each recorded in `[provenance]` on disk:
    CHANNEL IS THE calms21 FAILURE MODE: a `vis_pred` head trained on it learns against a target
    that calls occluded points visible, so it must never be used as a row gate without a
    rate-matched random control. `Inf` still becomes `missing` and `NaN` still becomes no row at
-   all, so the negatives that do exist are real.
+   all, so the negatives that do exist are real. `scripts/check_status.py` names both counts
+   (171 `missing` in `MISSING_OK`, 220 holes in `HOLE_EXEMPTIONS`) -- a re-run that moves either
+   is a real change to this decision, not noise.
 2. APT's `tail` is renamed **`tail_base`** to match the tracked `rat-city` root, so the two share
    registry ids -- and therefore keypoint embedding rows -- instead of splitting the keypoint in
    two.

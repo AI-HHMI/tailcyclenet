@@ -15,6 +15,8 @@ from tailcyclenet import crop as cropmod
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
 from tailcyclenet.format import Registry
 
+from .conftest import KPTS_2D
+
 
 # ----------------------------------------------------------------------------------------------
 # the crop rule
@@ -305,6 +307,12 @@ def test_2d_item_shapes(tiny_root):
     assert b.kpt_ids.shape == (1, 4)
     assert b.kpt_prior.shape == (1, 4, 2)
     assert b.prompt_t.shape == (1, 4)
+    # `ratlike` is `annotated` and carries a real MISSING/UNLABELED pair (see `_session_2d`), so
+    # `has_visibility_assessment` is True unconditionally and the window's own assessed rows
+    # populate vis_2d. `vis` stays None: there is no 3D layer at R == 2.
+    assert b.vis is None
+    assert b.vis_2d is not None
+    assert b.vis_2d.shape == (1, 4, 4, 1, 1)               # (B, T, K, C=1, 1)
 
 
 def test_3d_item_shapes(tiny_root):
@@ -317,13 +325,68 @@ def test_3d_item_shapes(tiny_root):
     assert b.vis_2d.shape == (1, 4, 3, 3, 1)
 
 
-def test_vis_and_vis2d_are_both_or_neither(tiny_root):
-    """Supplying one without the other dies inside einops, so the loader must never do it."""
-    for name in ('ratlike', 'mouselike'):
-        ds = PoseDataset(tiny_root / name, 'train', CFG)
-        for i in range(len(ds)):
-            b = pose_collate([ds[i]])
-            assert (b.vis is None) == (b.vis_2d is None)
+def test_missing_2d_point_supervises_occlusion_despite_nan_coords(tiny_root):
+    """THE question a NaN-coordinate point raises: if the occlusion target were derived from
+    coordinate finiteness (as the position loss's own `get_vis_true` is) rather than from
+    `status` directly, a `missing` point's target would ALSO be NaN -- masked out of
+    `PoseLoss` exactly like an `unlabeled` one, and no `missing` row would ever supervise
+    occlusion at all. `_session_2d` writes ONE known `missing` slot (a01, frame 0, `left_ear`,
+    coords NaN by spec) and ONE known `unlabeled` slot (a02, frame 2, `tail_base`) -- this checks
+    the vis_2d VALUE at exactly those two slots, not just that some target exists somewhere.
+    """
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG)
+    kpt_missing = KPTS_2D.index('left_ear')
+    kpt_unlabeled = KPTS_2D.index('tail_base')
+
+    found_missing = found_unlabeled = False
+    for i in range(len(ds)):
+        b = pose_collate([ds[i]])
+        row, T = b.sample_info, b.coords.shape[1]
+        start = row['start']
+        if row['animal'] == 'a01' and start <= 0 < start + T:
+            local = 0 - start
+            coord = b.coords[0, local, kpt_missing]
+            assert torch.isnan(coord).all(), \
+                'the fixture wrote this point missing -> coords must be NaN by spec'
+            assert b.vis_2d is not None, 'a missing point is an ASSESSMENT; must not be withheld'
+            v = b.vis_2d[0, local, kpt_missing, 0, 0]
+            assert v.item() == 0.0, (
+                'a MISSING point must supervise occlusion (target 0.0) even though its own '
+                'coordinates are NaN -- the target comes from `status`, never from `coords`')
+            found_missing = True
+        if row['animal'] == 'a02' and start <= 2 < start + T and b.vis_2d is not None:
+            local = 2 - start
+            v = b.vis_2d[0, local, kpt_unlabeled, 0, 0]
+            assert torch.isnan(v), 'an UNASSESSED point must stay NaN, never a fabricated target'
+            found_unlabeled = True
+    assert found_missing, 'never saw a01 frame 0 -- fixture or window logic changed'
+    assert found_unlabeled, 'never saw a02 frame 2 -- fixture or window logic changed'
+
+
+def test_vis_and_vis2d_are_both_or_neither_in_3d(tiny_root):
+    """Supplying one without the other dies inside posetail's own einops, so the 3D loader path
+    must never do it. `vis_true`/`vis_true_cams` is what this pins -- see `run_batch`."""
+    ds = PoseDataset(tiny_root / 'mouselike', 'train', CFG)
+    for i in range(len(ds)):
+        b = pose_collate([ds[i]])
+        assert (b.vis is None) == (b.vis_2d is None)
+
+
+def test_2d_vis_is_never_both_with_vis(tiny_root):
+    """The 3D invariant above does NOT hold at R == 2, and it must not: `vis` (the 3D noisy-OR)
+    has nothing to describe at R == 2 and is always None, while `vis_2d` (the per-camera target)
+    is populated whenever the session records a real assessment -- `ratlike` does (see
+    `_session_2d`). The two must never be conflated: `run_batch` keeps them on separate wires
+    (`vis_true_cams` vs `PoseLoss`'s own `vis_2d_true`), which is the invariant that actually
+    matters and is pinned in `tests/test_train.py`.
+    """
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG)
+    saw_populated = False
+    for i in range(len(ds)):
+        b = pose_collate([ds[i]])
+        assert b.vis is None
+        saw_populated |= b.vis_2d is not None
+    assert saw_populated, 'ratlike carries a real assessment; some item must show it'
 
 
 def test_keypoints_are_never_filtered(tiny_root):
@@ -699,21 +762,26 @@ def test_gradients_survive_unassessed_visibility():
         'needs >= 0.3.2')
 
 
-def test_no_visibility_supervision_without_ground_truth(tiny_root, monkeypatch):
-    """A dataset with no visibility labels must not have its visibility head trained.
+def test_no_visibility_supervision_without_ground_truth(tracked_no_assessment_root, monkeypatch):
+    """A dataset with no visibility ASSESSMENT must not have its visibility head trained.
 
-    3dpop, rat-city and branson-fly ship no per-camera visibility, so the loader emits
-    `vis = vis_2d = None`. posetail then sets `valid_vis = False` and hard-zeros BOTH visibility
-    terms (`losses.py:493-508`). It still DERIVES a geometric `vis_true` -- but only to mask the
-    coordinate losses, never to supervise visibility.
+    3dpop and johnson-mouse-tracked ship no `keypoints.pq` at all, so the loader emits
+    `vis = vis_2d = None` directly (`lab.vis2d is None`). But calms21, rat-city-tracked and
+    branson-fly DO ship a `keypoints.pq` -- 100% `visible`, with no `missing` row anywhere -- and
+    that is the harder case this test is actually for: a per-window NaN-mask cannot see it (every
+    row is finite), so `Session.has_visibility_assessment` gates it at the SESSION level instead.
+    `tracked_no_assessment_root` is exactly that shape (see `_session_2d_tracked_dense`).
 
-    That distinction matters: the geometric proxy is "does the GT point project inside the
-    image", which the model could compute from its own prediction. Training the visibility head
-    against it would teach a tautology and call it supervision.
+    posetail then sets `valid_vis = False` and hard-zeros BOTH visibility terms
+    (`losses.py:493-508`). It still DERIVES a geometric `vis_true` -- but only to mask the
+    coordinate losses, never to supervise visibility. That distinction matters: the geometric
+    proxy is "does the GT point project inside the image", which the model could compute from its
+    own prediction. Training the visibility head against it would teach a tautology and call it
+    supervision.
     """
     from posetail.posetail.losses import TotalLoss
 
-    ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG)   # a 2D root: no visibility labels
+    ds = PoseDataset(tracked_no_assessment_root, 'train', CFG)
     b = _batch(ds)
     assert b.vis is None and b.vis_2d is None
 

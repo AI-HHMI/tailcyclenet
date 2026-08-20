@@ -177,20 +177,30 @@ muon_adjust_lr_fn = "match_rms_adamw"
 # losses hardcode delta = 16 and Huber on.
 delta = 6
 use_huber_loss = true
-# THE ONLY FIVE THAT FIRE ON A 2D SESSION. `TotalLoss.forward` branches on coords_true.shape[-1],
-# and the R == 2 block computes exactly these; everything else below is NaN'd and dropped. So a
-# 2D-only run trains NO visibility head at all -- see vis_loss_weight.
+# THE ONLY FIVE `TotalLoss` ITSELF FIRES ON A 2D SESSION. `TotalLoss.forward` branches on
+# coords_true.shape[-1], and the R == 2 block computes exactly these; everything else below is
+# NaN'd and dropped -- see vis_loss_weight for the visibility consequence of that.
 coords_loss_2d_weight = 1.5
 coords_softmax_2d_weight = 0.6
 smoothness_loss_2d_weight = 0.5
 smoothness_loss_order = 4   # a CEILING: train.py clamps to min(order, T-1) per batch, and the
 smoothness_loss_tolerance = 1.5   # derived-T rule makes T = 2 common, i.e. order 1.
+# A REPO-LOCAL TERM, not `TotalLoss`'s (`tailcyclenet/losses.py::PoseLoss`), and the ONLY key in
+# this block that fires on a 2D session and NOT on a 3D one -- the opposite scope of every key
+# below it. `TotalLoss.forward` never computes 2D visibility at all (see vis_loss_weight), so this
+# is the only way a `missing` row on a 2D session reaches the vis_pred head as a supervised
+# occlusion. DEFAULT 0.0 SO AN ABSENT KEY IS BIT-IDENTICAL to a run without this file's change --
+# every run on record trained at 0. Ship above 0 only after a paired arm on allen-mouse-annotated,
+# the one root with a dense, honest 2D occlusion channel (41.9% `missing`); rat-city-annotated and
+# calms21 must not be used to judge or gate this head (dev/plans/status_consistency_and_occlusion.md).
+vis_loss_2d_weight = 0.0
 # 3D-only from here down.
 #
-# NOTHING SUPERVISES VISIBILITY ON A 2D SESSION. Both vis terms live inside losses.py's 3D `else`
-# branch, so on a 2D-only root the vis_pred head gets no gradient -- and `--vis-thresh` there is
-# gating on an untrained head. That is the real reason the rat-city gate figure was withdrawn and
-# the calms21 one is negative, and it is why this weight looks larger than it acts.
+# NOTHING IN `TotalLoss` ITSELF SUPERVISES VISIBILITY ON A 2D SESSION. Both of ITS vis terms live
+# inside losses.py's 3D `else` branch, so on a 2D-only root the vis_pred head gets no gradient
+# from THIS weight -- and `--vis-thresh` there was gating on an untrained head until
+# `vis_loss_2d_weight` above existed. That is the real reason the rat-city gate figure was
+# withdrawn and the calms21 one is negative, and it is why this weight looks larger than it acts.
 vis_loss_weight = 5.0
 vis_loss_3d_weight = 1.0
 conf_loss_weight = 0.0            # documented off-switches: the terms exist, the weights are 0

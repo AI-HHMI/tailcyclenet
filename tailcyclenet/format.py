@@ -468,6 +468,33 @@ class Session:
         return len(self.names)
 
     @cached_property
+    def has_visibility_assessment(self) -> bool:
+        """Whether `keypoints.pq` ever records a real occlusion judgement (`status == missing`).
+
+        A `tracked` session whose table is 100% `visible` recorded no negative at all: calms21's
+        MARS pipeline emits all 7 keypoints unconditionally (`[provenance].visibility` already
+        disclaims it as not an assessment), and rat-city-tracked and branson-fly are the same
+        shape. The per-window NaN-masking that handles an all-`projected` session (dataset.py)
+        cannot catch this case the same way -- every row here IS `visible`, i.e. finite, not NaN
+        -- so the loader gates on this SESSION-LEVEL fact instead: no `missing` row anywhere in
+        the table means no assessment happened anywhere in it, and the visibility target must be
+        withheld rather than trained as "always visible" from labels nobody wrote as a judgement.
+
+        An `annotated` session is exempt even at zero `missing` rows -- a hand-labelled root with
+        no occluded points on record is still an assessment, just one with no negatives (yet).
+        The gate only fires on `labels == "tracked"`.
+        """
+        if self.label_source != 'tracked':
+            return True
+        t = self._tables['keypoints']
+        if t is None:
+            return True
+        codes, vocab = _codes(t, 'status')
+        if 'missing' not in vocab:
+            return False
+        return bool((codes == vocab.index('missing')).any())
+
+    @cached_property
     def _kpt_vocab(self) -> dict[str, int]:
         return {n: i for i, n in enumerate(self.names)}
 

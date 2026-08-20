@@ -227,7 +227,10 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
     lab.points3d[0][ok] = p3d[ok].astype(np.float32)
 
     # A rejected observation is demonstrably in the wrong place, so it leaves keypoints.pq too --
-    # as NO ROW, not `missing`: `missing` would claim someone looked and judged it occluded.
+    # as NO ROW, not `missing`: `missing` would claim someone looked and judged it occluded. This
+    # and the 18 zero-flag points above are together the 19 `scripts/check_status.py` names in
+    # `HOLE_EXEMPTIONS` for this root -- a moving count is a real change to the rejection rate,
+    # not noise.
     bad = rejected.reshape(C, T, K).transpose(1, 2, 0)                    # (T,K,C)
     lab.vis2d[0][bad] = fmt.UNLABELED
     lab.points2d[0][bad] = np.nan

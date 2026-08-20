@@ -189,7 +189,10 @@ def apply_rejections(lab: fmt.Labels, bad: np.ndarray) -> None:
 
     A view that loses every observation also loses its box: the source box is the keypoint hull,
     so it carries the same displacement, and rule 11 wants a `labeled` instance to still have
-    keypoint rows.
+    keypoint rows. `scripts/check_status.py` names the resulting hole count for this root in
+    `HOLE_EXEMPTIONS` (18, independently measured from the plain root's 19 -- this script re-runs
+    the same gate over its own, larger set of augmented frame variants, so the two need not
+    agree).
     """
     lab.vis2d[0][bad] = fmt.UNLABELED
     lab.points2d[0][bad] = np.nan

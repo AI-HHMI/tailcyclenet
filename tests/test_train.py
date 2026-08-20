@@ -137,6 +137,47 @@ def test_stride_is_divided_out_of_the_smoothness_weight():
     assert loss_fn.smoothness_loss_3d.weight == 0.5
 
 
+def test_run_batch_routes_2d_visibility_on_its_own_wire():
+    """`batch.vis_2d` means a DIFFERENT thing depending on mode, and `run_batch` must not blur it.
+
+    In 3D it is posetail's own per-camera term and travels as `vis_true_cams`, both-or-neither
+    with `vis_true` (`TotalLoss.forward` raises otherwise, `losses.py:358`). In 2D there is no 3D
+    layer, so `vis_true` is always None -- handing `vis_2d` to `vis_true_cams` there would either
+    raise or silently recompute it from geometry. It must instead reach `PoseLoss`'s own
+    `vis_2d_true` keyword, which `TotalLoss.forward` does not have and never sees.
+    """
+    tr = _train_module()
+    model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 2),   # noqa: E731
+                             'vis_pred_2d': torch.zeros(1, 1, 2, 2)}
+
+    seen = []
+
+    def spy(model_, out, coords_true, vis_true, vis_true_cams, vis_2d_true=None, **kw):
+        seen.append(dict(vis_true=vis_true, vis_true_cams=vis_true_cams,
+                         vis_2d_true=vis_2d_true))
+        return torch.tensor(0.0)
+
+    batch_2d = SimpleNamespace(
+        views=[torch.zeros(1, 2, 4, 4, 3, dtype=torch.uint8)],
+        cgroup=[{'size': torch.tensor([4, 4])}],
+        sample_info={'mode': '2d'},
+        kpt_ids=torch.zeros(1, 2, dtype=torch.long),
+        kpt_prior=torch.zeros(1, 2, 2),
+        prompt_t=torch.zeros(1, 2, dtype=torch.int32),
+        coords=torch.zeros(1, 2, 2, 2),
+        vis=None, vis_2d=torch.ones(1, 2, 2, 1, 1), p2d=torch.zeros(1, 1, 2, 2, 2))
+    tr.run_batch(model, spy, batch_2d, 'cpu')
+    assert seen[-1]['vis_true'] is None
+    assert seen[-1]['vis_true_cams'] is None, '2D must never reach vis_true_cams'
+    assert seen[-1]['vis_2d_true'] is not None
+
+    batch_3d = _batch()
+    batch_3d.vis_2d = torch.ones(1, 2, 2, 1, 1)          # a real 3D per-camera target this time
+    tr.run_batch(model, spy, batch_3d, 'cpu')
+    assert seen[-1]['vis_true_cams'] is not None, '3D keeps the library wire unchanged'
+    assert seen[-1]['vis_2d_true'] is None, '3D must never reach the 2D-only term'
+
+
 def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     """`optimizer_state` was written from day one and read by NOTHING.
 

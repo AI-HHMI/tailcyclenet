@@ -61,6 +61,29 @@ def test_vis_is_an_int8_compare(tiny_root):
     assert ((vis == fmt.VISIBLE).sum()) == 2 * 4 * 4 - 2
 
 
+def test_has_visibility_assessment(tiny_root, tracked_no_assessment_root):
+    """The session-level gate `dataset.py`'s 2D (and, symmetrically, 3D) path reads.
+
+    `ratlike` is `annotated` and carries a real `missing` row (`_session_2d`) -> True regardless
+    of the count. `catlike` (`tracked_no_assessment_root`) is `tracked`, 100% `visible`, zero
+    `missing` -- calms21 / rat-city-tracked / branson-fly's exact shape -- -> False. `mouselike`
+    is `tracked` but DOES carry real per-camera `missing` rows (allen-mouse-tracked's shape) ->
+    True: the gate must not fire on a `tracked` session just because it declares that label
+    source, only on one that never recorded a negative.
+    """
+    ann = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
+    assert ann.label_source == 'annotated'
+    assert ann.has_visibility_assessment is True
+
+    tracked_dense = fmt.Session.load(tracked_no_assessment_root / 'train' / 's')
+    assert tracked_dense.label_source == 'tracked'
+    assert tracked_dense.has_visibility_assessment is False
+
+    tracked_assessed = fmt.Session.load(tiny_root / 'mouselike' / 'train' / 'sess_c')
+    assert tracked_assessed.label_source == 'tracked'
+    assert tracked_assessed.has_visibility_assessment is True
+
+
 def test_moving_camera(tiny_root):
     """extrinsics.pq gives (C,T,4,4); static cameras in the same session broadcast to constant."""
     sess = fmt.Session.load(tiny_root / 'mouselike' / 'train' / 'sess_moving')

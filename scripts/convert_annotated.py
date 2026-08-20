@@ -138,6 +138,12 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
       >= 2 views over the gate, or exactly 1 view       -> unlabeled (no row)
       0 views visible and EVERY camera assessed it      -> missing, the honest 3D occlusion
       anything else                                     -> no row
+
+    THIS SPLIT IS DELIBERATE, not a shortcut: the gated/1-view case is a triangulation FAILURE on
+    a point several annotators saw, and writing `missing` there would teach "occluded" from a
+    calibration or label defect rather than an assessment. `scripts/check_status.py` names both
+    counts for allen-mouse-annotated (178 `missing` in `MISSING_OK`, 211 holes in
+    `HOLE_EXEMPTIONS`) -- a re-run that moves either is a real change to this decision, not noise.
     """
     import torch
 

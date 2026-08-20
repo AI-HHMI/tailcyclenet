@@ -178,7 +178,8 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     a finite point becomes `visible` and a NaN becomes NO ROW (`unlabeled`), never `missing`:
     claiming a point was assessed and judged occluded would be inventing an annotation that was
     never made. allen-mouse's per-camera `vis` array IS a real assessment, and is the one place
-    `missing` is written.
+    `missing` is written -- `scripts/check_status.py`'s `MISSING_OK` names allen-mouse-tracked
+    for exactly this reason; a re-run that stops producing those rows is a real regression.
     """
     mode3d = spec['mode'] == '3d'
     # allow_pickle: johnson-mouse writes `keypoints` as dtype('O') where allen writes '<U14'.

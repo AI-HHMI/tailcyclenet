@@ -66,7 +66,12 @@ def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:
     lab = fmt.empty_labels(2, T, len(NAMES), 1, mode3d=False, animal_ids=ANIMALS)
     lab.points2d[:, :, :, 0, :] = kp.transpose(1, 0, 3, 2)
     # MARS emits a position for all 7 parts on both mice in every frame and has no occlusion
-    # channel, so nothing here is an occlusion assessment -- see [provenance].visibility.
+    # channel, so nothing here is an occlusion assessment -- see [provenance].visibility. Kept
+    # `visible` rather than switched to `projected`, on purpose: `Session.has_visibility_
+    # assessment` (tailcyclenet/format.py) reads `labels == "tracked"` plus zero `missing` rows
+    # in keypoints.pq as its OWN signal that a session asserts nothing, and withholds any
+    # visibility target for the whole session on that basis -- so the effect is the same as
+    # `projected` without a second status meaning two things.
     lab.vis2d[:] = fmt.VISIBLE
 
     box = np.asarray(npz['bbox'], np.float32).transpose(0, 2, 1)          # (S, T, 4) normalised

@@ -32,7 +32,11 @@ tailcyclenet/
   checkpoints.py      run folders, save/load, warm start, config `extends`
   distributed.py      the world-size axis: what a config key means on N gpus + the rank guards
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
-  infer.py            THE inference path: one window loop
+  infer/              THE inference path. `scripts/infer.py` is a 17-line shim onto `cli.main`.
+    window.py           one window loop (`run_group`)
+    driver.py           one run over a dataset: session loop, --det-cache, render, npz
+    cli.py              `build_parser()` + `main()`
+  memory.py           ONE host RAM budget: cgroup ancestry / LSF / MemAvailable / MemTotal
   detector/           YOLOX-Nano box predictor + cross-view association
     track.py            ONE cross-view target set. `--track`
     identity.py         pose_nms, the one keypoint identity lever that works
@@ -458,6 +462,7 @@ The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one le
 | `--crop-inflate` | 1.5 iff box model | wide pass-1 + tight pass-2 | measured on 3dpop as a secondary axis alongside the box |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | |
 | `--prefetch-windows` | **1** | bit-exact at any value | bit-exact at any value |
+| `--max-ram` | derived | **byte-exact at any value** | byte-exact at any value |
 
 **THE `+0.049 on 3dpop` `--vis-thresh` FIGURE IS NOT A 3dpop RESULT.** 3dpop ships only
 `points3d.pq`, so `lab.vis2d is None` and the loader has always emitted `vis = vis_2d = None` for
@@ -503,6 +508,37 @@ it. **Use `--anchor none` on a crowded 2D root or a long 2D clip.**
   **saturation is a property of the RECIPE, not the dataset**. `infer.py` warns when the threshold is
   at or above the checkpoint's recorded median. Sweep per checkpoint: 0.50 maximises coverage, 0.97
   identity. `decode` and `eval_detector.py` stay at 0.05 — training and scoring paths.
+
+**HOST RAM IS A BUDGET, AND `--max-ram GB` IS A CEILING ON THE PROCESS, NOT AN ALLOWANCE FOR THE
+BUFFERS.** `memory.py` resolves one budget as the smallest of the cgroup limit (walked up EVERY
+ancestor), LSF's `LSB_CG_MEMLIMIT`/`LSB_MEMLIMIT`, `MemAvailable` and `MemTotal` — never
+`SC_PHYS_PAGES`, which is the MACHINE's memory and under a 16 GB cap still reported this host's
+503 GB, a 20x error and exactly the case an LSF job dies in. It sizes the decord cache, how many
+CAMERAS the detector decodes at once, and the window loop's camera concurrency and frame cache.
+
+**EVERY KNOB IT SIZES IS OUTPUT-NEUTRAL, and that is what licenses sizing anything from free
+memory** — a 288 GB budget and a 24 GB cgroup produce byte-identical npz on both video roots. It
+is why the budget sizes the CAMERA axis and never `detect_raw`'s `batch`: **`batch` is NOT inert**
+(16 vs 3 moves boxes 0.204 px and scores 1.7e-03, because cuDNN picks algorithms per input shape),
+yet `tests/test_detector.py` classifies it as `plumbing` and the `--det-cache` stamp rests on that.
+`eval_detector.py --batch-size` is therefore a live hazard: change it and two runs sharing a cache
+are not the same boxes.
+
+**AN UNCONSTRAINED RSS PEAK IS RETAINED ALLOCATOR ARENA, NOT THE WORKING SET, so never quote one
+as "how much this needs".** johnson at 120 frames peaks at 177 GB on an idle host and runs the same
+work in 10.3 GB under a 24 GB cap. Score memory under a cap (`systemd-run --user --scope -p
+MemoryMax=NG`), because the failure being prevented is an OOM kill: on that cap the pre-budget code
+sat pinned at 24.0 GB, swapped 67 GB and hit the limit 92,787 times. `MALLOC_MMAP_THRESHOLD_` is
+REFUTED as a fix — 10% of peak for 43% of wall clock.
+
+**THE RESULT ARRAYS ARE NOT ON THIS BUDGET AND ARE WHAT KILLS A LONG CLIP.** `detect_raw` and
+`run_group` allocate `np.full` arrays proportional to the WHOLE clip before a frame is decoded, and
+no `--max-ram` can shrink them because they are the answer. A 200 fps hour (720,000 frames, an
+ordinary recording) on a 16-camera 24-keypoint rig is **82 GB at `--det-top-k 24`, 90% of it the
+detector's `(top_k, T, C, K, 3)` keypoint array** — plus 17.5 hours of pose. `driver.py` refuses
+such a group BEFORE detection and names the three ways out (`--max-frames`, `--det-top-k`, or
+splitting at conversion). Chunked processing with the prior carried across boundaries is the real
+fix and is NOT built.
 
 **`soft_argmax_threshold = 60` IS LOAD-BEARING — do not widen it.** Swept against the labels,
 10/20/30/45/**60**/120/∞ read 8.114/8.032/7.991/7.981/**7.976**/8.374/**11.032** mm: removing the
@@ -739,11 +775,22 @@ coverage.
 
     This is also why **the reader cache may never be sized by probing**: opening one `VideoReader`
     in the parent to measure anything IS the deadlock. `_reader_cache_size` derives it from a camera
-    count, a frame size and `get_worker_info()` — all parsed-toml or in-process facts. **DO NOT SET
+    count, a frame size and `get_worker_info()` — all parsed-toml or in-process facts, now joined by
+    `/proc` and `/sys` through `memory.py`, which opens no data path either. **DO NOT SET
     `TAILCYCLENET_READER_CACHE` BY HAND**: at best a no-op repeating the derived value, at worst it
-    overrides the per-worker clamp that stands between a 16-camera rig and swapping. A cache below
-    the camera count misses on *every* call. If a run needs a different cache the fix belongs in
+    overrides the per-worker clamp that stands between a 16-camera rig and swapping. `--max-ram` is
+    the knob a human reaches for. If a run needs a different cache the fix belongs in
     `_reader_cache_size`, where it is testable.
+
+    **THE COST OF `n` OPEN READERS IS QUADRATIC IN `n`, AND THE CACHE IS NOT AN LRU.** Measured on
+    johnson, trimming the arena after each so this is retained memory: 0.28 / 3.58 / 15.34 / 59.38
+    GB at 1 / 4 / 8 / 16 readers — `~0.035/megapixel * n^2`. The control that makes it a fact about
+    readers: the same 16 cameras with each reader RELEASED immediately costs **0.01 GB**. Reopening
+    is only 41.5 ms, so a small cache is a good trade and the budget is better spent on the frame
+    cache, which is linear and removes reader pressure outright. And the access pattern is a CYCLE
+    (every window touches every camera in order), which is the one pattern LRU cannot serve: below
+    the cycle length it takes **zero** hits, so eleven cached readers ran a clip in 149 s against
+    two readers' 222 s and sixteen's 61 s. Eviction is RANDOM for that reason.
 11. **A RUN FOLDER USED TO RECORD NO COMMIT, and one config key had a default it could not
     justify.** A 3D run trained under unconditional per-frame re-anchoring, finished nine hours
     before the commit that replaced it, and carried no `gridresid_offset` — so it loaded as the

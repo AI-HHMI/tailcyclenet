@@ -33,8 +33,10 @@ tailcyclenet/
   distributed.py      the world-size axis: what a config key means on N gpus + the rank guards
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
   infer/              THE inference path. `scripts/infer.py` is a 17-line shim onto `cli.main`.
-    window.py           one window loop (`run_group`)
-    driver.py           one run over a dataset: session loop, --det-cache, render, npz
+    window.py           one window loop (`run_blocks`, a BLOCK of windows at a time)
+    store.py            THE one decode site: (camera, source frame) -> full frame, evicted by block
+    predictions.py      the prediction SESSION writer + `load_predictions` (npz still readable)
+    driver.py           one run over a dataset: group loop, detection interleaved, session write
     cli.py              `build_parser()` + `main()`
   memory.py           ONE host RAM budget: cgroup ancestry / LSF / MemAvailable / MemTotal
   detector/           YOLOX-Nano box predictor + cross-view association
@@ -432,13 +434,29 @@ what the config says.
 ## Inference: one entry point
 
 ```bash
-pixi run python scripts/infer.py --data <dataset|session|video> --run runs/<x>/ --out pred.npz
+pixi run python scripts/infer.py --data <ONE session dir> --run runs/<x>/ --out pred/
 ```
+
+**`--out` IS A SESSION DIRECTORY IN `docs/annotation_format.md`, NOT AN NPZ**, written a block at a
+time so nothing is proportional to clip length: `session.toml` (with a `[provenance]` naming the
+run, the checkpoint file, the detector and the SOURCE SESSION, all absolute), `calibration.toml`,
+`groups.pq`, `points3d.pq`, `keypoints.pq` (the per-camera 2D pose, which a 3D run used to
+discard), `instances.pq` (box + `score` + `box_agree`) and a non-spec `windows.pq`. **No pixels and
+no `groups/`** -- so `validate_session` reports one rule-7 error per (group, camera) and nothing
+else, and `scripts/render.py` opens `[provenance] source_session` for the frames.
+
+**ONE SOURCE SESSION PER RUN, refused before the checkpoint loads.** A session holds one
+calibration, one mode and one keypoint axis. A 58-group 3dpop protocol is now 16 invocations and 16
+directories; `eval.py` still keys on `session/group`, so scoring them together is a reader change
+that is NOT built.
+
+**`scripts/eval.py` STILL READS EVERY EXISTING `.npz`** -- `load_predictions` dispatches on the
+path -- because every published number lives in one.
 
 There is **one** window loop. Box sources are the annotation set, a detections npz, or a
 per-dataset detector. Prompt regimes: `none` (query-free), `carry` (previous window's own
 prediction — what deployment does, requires `overlap >= 1`), `self` (two passes), `labels`
-(ORACLE, gated off by default — see eval rule 7). Rendering is a flag, not a separate script.
+(ORACLE, gated off by default — see eval rule 7). **Rendering is `scripts/render.py`, no longer a flag**: the loop never holds a whole clip's `pred`.
 
 ### The measured defaults
 
@@ -462,7 +480,7 @@ The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one le
 | `--crop-inflate` | 1.5 iff box model | wide pass-1 + tight pass-2 | measured on 3dpop as a secondary axis alongside the box |
 | `--min-views`, `--max-move`, `--min-box-frames` | 2 / 1.0 / 1 | clean nulls or no gain available | |
 | `--prefetch-windows` | **1** | bit-exact at any value | bit-exact at any value |
-| `--max-ram` | derived | **byte-exact at any value** | byte-exact at any value |
+| `--max-ram` | derived | **byte-exact at any value** (it sizes the BLOCK) | byte-exact at any value |
 
 **THE `+0.049 on 3dpop` `--vis-thresh` FIGURE IS NOT A 3dpop RESULT.** 3dpop ships only
 `points3d.pq`, so `lab.vis2d is None` and the loader has always emitted `vis = vis_2d = None` for
@@ -513,16 +531,26 @@ it. **Use `--anchor none` on a crowded 2D root or a long 2D clip.**
 BUFFERS.** `memory.py` resolves one budget as the smallest of the cgroup limit (walked up EVERY
 ancestor), LSF's `LSB_CG_MEMLIMIT`/`LSB_MEMLIMIT`, `MemAvailable` and `MemTotal` — never
 `SC_PHYS_PAGES`, which is the MACHINE's memory and under a 16 GB cap still reported this host's
-503 GB, a 20x error and exactly the case an LSF job dies in. It sizes the decord cache, how many
-CAMERAS the detector decodes at once, and the window loop's camera concurrency and frame cache.
+503 GB, a 20x error and exactly the case an LSF job dies in. It sizes the decord cache
+(`FRACTION_READERS` 0.25), how many CAMERAS the detector decodes at once (`FRACTION_DETECT` 0.10),
+and **how many windows a BLOCK holds** (`FRACTION_STORE` 0.65).
+
+**`FRACTION_DETECT` NO LONGER OVERLAPS NOTHING IN TIME.** It was the loosest of the three because
+detection finished before the pose loop began; under one pass the detector's letterbox buffers are
+live WHILE the store holds the block, so its share came down. **`FRACTION_READERS` did NOT move,
+and the obvious argument for moving it is wrong**: "a stored frame needs no reader" is true of the
+number of READS and false of the number of open CONTAINERS — every block still touches every
+camera. Dropping it to 0.05 takes johnson from 16 readers to 10, and 16 ran at 61 s against 11 at
+149 s. **The 0.10/0.65 split is reasoned, not measured, under one pass.**
 
 **EVERY KNOB IT SIZES IS OUTPUT-NEUTRAL, and that is what licenses sizing anything from free
-memory** — a 288 GB budget and a 24 GB cgroup produce byte-identical npz on both video roots. It
+memory** — a 288 GB budget and a 24 GB cgroup produce byte-identical output on both video roots,
+and `tests/test_memory_budget.py` pins BLOCK SIZE as the newest instance of that rule. It
 is why the budget sizes the CAMERA axis and never `detect_raw`'s `batch`: **`batch` is NOT inert**
 (16 vs 3 moves boxes 0.204 px and scores 1.7e-03, because cuDNN picks algorithms per input shape),
-yet `tests/test_detector.py` classifies it as `plumbing` and the `--det-cache` stamp rests on that.
-`eval_detector.py --batch-size` is therefore a live hazard: change it and two runs sharing a cache
-are not the same boxes.
+yet `tests/test_detector.py` classifies it as `plumbing`, which holds ONLY because the value is
+pinned at 16 and no flag reaches it. `eval_detector.py --batch-size` is therefore a live hazard:
+change it and two runs are not the same boxes, with nothing in either output saying so.
 
 **AN UNCONSTRAINED RSS PEAK IS RETAINED ALLOCATOR ARENA, NOT THE WORKING SET, so never quote one
 as "how much this needs".** johnson at 120 frames peaks at 177 GB on an idle host and runs the same
@@ -531,14 +559,28 @@ MemoryMax=NG`), because the failure being prevented is an OOM kill: on that cap 
 sat pinned at 24.0 GB, swapped 67 GB and hit the limit 92,787 times. `MALLOC_MMAP_THRESHOLD_` is
 REFUTED as a fix — 10% of peak for 43% of wall clock.
 
-**THE RESULT ARRAYS ARE NOT ON THIS BUDGET AND ARE WHAT KILLS A LONG CLIP.** `detect_raw` and
-`run_group` allocate `np.full` arrays proportional to the WHOLE clip before a frame is decoded, and
-no `--max-ram` can shrink them because they are the answer. A 200 fps hour (720,000 frames, an
-ordinary recording) on a 16-camera 24-keypoint rig is **82 GB at `--det-top-k 24`, 90% of it the
-detector's `(top_k, T, C, K, 3)` keypoint array** — plus 17.5 hours of pose. `driver.py` refuses
-such a group BEFORE detection and names the three ways out (`--max-frames`, `--det-top-k`, or
-splitting at conversion). Chunked processing with the prior carried across boundaries is the real
-fix and is NOT built.
+**THE LONG CLIP IS FIXED, AND THE FIX IS THE BLOCK.** `run_blocks` runs a group a BLOCK of windows
+at a time — sized so the block's frames fit `FRACTION_STORE` — and yields each block for the writer
+to append, so no array is proportional to clip length. The whole-clip `np.full` allocations are
+gone: 82 GB of result arrays at 720,000 frames became a bounded block plus a parquet file. `carried`
+crosses a boundary for free (it is per-animal state), and the seam frames a block's last window
+touches belong to the NEXT block, which is what makes block output byte-identical to whole-clip
+output (eval rule 11: a frame belongs to the last window containing it).
+
+**WHAT REMAINS PROPORTIONAL, AND IS NOT OURS:** the `--boxes` npz a caller supplies, and
+`sess.preload()`'s dense LABEL arrays for the source session.
+
+**ONE DECODE PER (CAMERA, SOURCE FRAME).** `infer/store.py` is the only decode site; the detector,
+refine pass 1, refine pass 2 and the next window's overlap all read it. It was **seven** decodes:
+three overlapping windows x two refine passes, plus `detect_raw`'s own pass over the group.
+
+**AND IT DOES NOT DEGRADE.** A budget too small for ONE WINDOW of full frames is a `SystemExit`
+naming the arithmetic and the `--max-ram` that would fit, not a silent 3x re-decode. There is
+nowhere to degrade to: pass 2 crops from the same frames pass 1 did, so dropping them means either
+decoding twice or re-cropping from the stored crop, and the second double-resamples. This is why
+`[data].n_frames` is **12**: one window on a 16-camera 3208x2200 rig is 4.07 GB at 12 against
+8.13 at 24. `[data].n_frames` and `[model].stride_length` are ONE quantity and `check_window_length`
+refuses a config where they disagree.
 
 **`soft_argmax_threshold = 60` IS LOAD-BEARING — do not widen it.** Swept against the labels,
 10/20/30/45/**60**/120/∞ read 8.114/8.032/7.991/7.981/**7.976**/8.374/**11.032** mm: removing the
@@ -578,7 +620,7 @@ builds its GT crop from one or two points and floors at 64 px — detector arms 
 labels are complete the GT crop wins wide (+8.57 mm, +14.93 px). **The inversion is label sparsity
 and nothing else.** The "GT crop" row means different things on different roots; say which.
 
-`scripts/eval.py` is offline and model-free: prediction npz + annotation set → MPJPE (paired
+`scripts/eval.py` is offline and model-free: a prediction (session dir or npz) + annotation set → MPJPE (paired
 bootstrap), PCK, coverage, MOTA/miss/FP/idsw.
 
 **A METRIC THAT FAILS AT A CHUNK BOUNDARY IS A METRIC BUG UNTIL PROVEN OTHERWISE.** `chunk_frames`
@@ -635,7 +677,10 @@ spread val r@.5 by **0.0122** and best-iteration by 8,000, and a replicate with 
 coverage +0.0575 and miss −0.0619, both SIG. **ONE arm against ONE baseline establishes nothing
 here, on any column.** **AND A FIXED `--det-score` MEASURES CALIBRATION** whenever a lever moves the
 objectness distribution — re-score every arm at a matched threshold; several "significant" results
-evaporated to this. Inference arms off a shared `--det-cache` are subject to neither.
+evaporated to this. **`--det-cache` IS DELETED and this is what it cost**: detection and pose are
+ONE pass over the video now, so there is no separable detection phase to store and an association
+sweep costs a full decode pass instead of a CPU-minute. Two arms are no longer matched by
+construction -- match them by `[provenance]`, which records every input the boxes depend on.
 
 - **`--use-regions` is the one detector lever with a positive accuracy result** (MOTA +0.0489, via
   `fp_none`, at an idsw cost). Default-off. `--tile-wh` is what makes the mask viable — a hard mask
@@ -661,8 +706,7 @@ evaporated to this. Inference arms off a shared `--det-cache` are subject to nei
   agreement, which is not identity, and is exactly zero under fast motion where it cannot rank at
   all. The gate has 10-16x headroom (p90 centre displacement is 0.06-0.11 body lengths everywhere).
   An unmatched row stays EMPTY rather than taking a leftover, which is what produced a
-  **1924x1924 union against a 244 px rat**. **`LINK_REV` is in the `--det-cache` stamp.**
-  *Default-on, and its paired arm has never been run.* `max_age = 24` and `birth_age` are pinned
+  **1924x1924 union against a 244 px rat**. *Default-on, and its paired arm has never been run.* `max_age = 24` and `birth_age` are pinned
   constants unreachable from any CLI.
 
 **EVERY SENTENCE IN THIS `--track` BLOCK IS A 3D MULTIVIEW STATEMENT.** `CrossViewTracker` is built
@@ -691,14 +735,18 @@ only when `track and C > 1`, and every 2D root is `C == 1`; `associate` never ru
   and the magnitude is 37x smaller, because the spare rows only FILL on the short clip and those
   fills were false positives. **Measure the drop rate before porting a row count.**
 
-**DETECTION AND ASSOCIATION ARE SPLIT, AND `--det-cache` HOLDS RAW DETECTIONS**, so every identity
-arm shares ONE detection pass and is matched BY CONSTRUCTION. The stamp is the set of box-affecting
-options that **differ from their defaults** — a positional list refused every cache on disk whenever
-a flag was added. `det_score`, `raw_rev`, `top_k`, `tile_scale` and `reduce` are unconditional,
-because **moving a default would otherwise let an old cache be reused silently**, which has happened
-five times. `raw_rev` is the sharpest: a raw cache and a pre-split associated one share shape, dtype
-and key names, so an old one read as raw would be associated a SECOND time. **Every pre-split cache
-is refused.**
+**DETECTION AND ASSOCIATION ARE STILL SPLIT, but they now run INSIDE the window loop.**
+`detect_raw(frames=, read=)` detects a slice of the clip over frames the store already holds, and
+`associate_group(state=)` / `link_rows(state=)` carry the tracker and the matcher across every call
+boundary. Two rules make that safe and both are pinned by tests:
+
+- **A DETECTION SLICE MUST START ON A GLOBAL `batch` BOUNDARY.** `_units` partitions on
+  `range(0, T, batch)`, so a slice starting anywhere else forwards a short leading batch — a shape
+  the whole-clip pass never produces, and cuDNN picks algorithms per shape. `detect_raw` asserts it.
+  This is why the detection cursor is NOT the block cursor: blocks are sized by free memory, and a
+  budget-derived batch would move the boxes.
+- **ASSOCIATION STATE CROSSES THE BOUNDARY, or block size changes identity.** `state=None`
+  reproduces the old single-call behaviour byte for byte, so every other caller is unaffected.
 
 **Every detector box is bounded in `unletterbox_boxes`.** A side decodes as `exp(clamp(-6,6)) *
 stride` — up to ~12,910 px — and IoU-only NMS cannot suppress it (its IoU with the box it swallows
@@ -907,7 +955,9 @@ detector's keypoints are dense (96–100% of slots) and nowhere near accurate en
 the answer they would seed.
 
 **THE PRE-SCREEN THAT FALLS OUT IS WORTH MORE THAN THE LEVER: a prior must be more accurate than the
-prediction it seeds, and `kpt_agree` on any prior-free arm already reports that distance.** It
+prediction it seeds, and `kpt_agree` reported exactly that distance.** (It is **no longer written**
+— it was `(S,T,C,K)`, the largest pose-side array by a factor of K, for a diagnostic nothing gates
+on. Recompute it from `instances.pq` and the detector if the pre-screen is wanted again.) It
 predicts both refutations for ~1 min of CPU, before any inference — the same shape as the
 `fp_dup`-must-be-live rule for `--pose-nms`. And `kpt_agree` is CIRCULAR under any detector-seeded
 regime, so it must never be quoted as a win for one.

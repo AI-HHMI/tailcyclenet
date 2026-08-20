@@ -33,11 +33,11 @@ import torch
 
 from posetail.posetail.cube import project_points_torch
 
-from . import crop as cropmod
-from . import memory
-from .dataset import _crop_affine, _resize_camera, prior_out_of_bounds, read_frames
-from .format import Labels, Session
-from .model import share_scene
+from .. import crop as cropmod
+from .. import memory
+from ..dataset import _crop_affine, _resize_camera, prior_out_of_bounds, read_frames
+from ..format import Labels, Session
+from ..model import share_scene
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 CARRY_SOURCES = ('triangulate', 'pred')
@@ -172,7 +172,7 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
     wrong index): _box_features normalises columns against ctx['sizes'], built from
     preprocessed_views in the SAME `use` order, so index i must mean the same camera in both.
     """
-    from . import box_prompt as bpmod
+    from .. import box_prompt as bpmod
 
     if mode == '3d' and src_pts is not None:
         # LABELS, 3D: identical to what _item computes at training time -- cgroup here is

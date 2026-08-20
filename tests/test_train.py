@@ -257,19 +257,30 @@ def test_val_is_skipped_only_for_a_missing_split_not_a_config_error():
 
 
 def test_infer_does_not_restate_loader_defaults():
-    """`LoaderConfig` owns its defaults; the CLI restating them is how `box_source` diverged."""
-    src = (Path(__file__).parent.parent / 'scripts' / 'infer.py').read_text()
+    """`LoaderConfig` owns its defaults; the CLI restating them is how `box_source` diverged.
+
+    Reads `tailcyclenet/infer/driver.py`, which is where the config resolution went when the
+    inference program moved out of `scripts/infer.py` (now a shim).
+    """
+    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'infer' / 'driver.py').read_text()
     for literal in ("'n_frames', 24", "'image_size', 256", "'min_crop_dim', 64",
                     "'box_source', 'keypoints'"):
         assert literal not in src, f'{literal} restates a LoaderConfig default at the CLI boundary'
 
 
 def test_det_score_has_one_default():
-    """Two defaults meant whichever caller omitted it got a different detector."""
+    """Two defaults meant whichever caller omitted it got a different detector.
+
+    Asserts against the PARSER rather than against the text of the file, which is what became
+    possible once the argparse block was a `build_parser()` an importer can call. The old form
+    split on the literal `"'--det-score', type=float, default="` and would break on a reformat
+    that changed nothing.
+    """
     import inspect
 
     from tailcyclenet.detector import detect_raw
+    from tailcyclenet.infer import build_parser
+
     sig = inspect.signature(detect_raw).parameters['score_thresh'].default
-    src = (Path(__file__).parent.parent / 'scripts' / 'infer.py').read_text()
-    cli = float(src.split("'--det-score', type=float, default=")[1].split(',')[0])
-    assert sig == cli, f'detect_raw defaults to {sig} but the CLI to {cli}' 
+    cli = build_parser().get_default('det_score')
+    assert sig == cli, f'detect_raw defaults to {sig} but the CLI to {cli}'

@@ -16,6 +16,26 @@ from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.data import _cutout_rects, _keypoints_in_rects, random_affine
 
 
+
+def _infer_program_source():
+    """The inference PROGRAM as one string: `tailcyclenet/infer/{cli,driver}.py`.
+
+    These assertions predate the split and were written against `scripts/infer.py` when that file
+    held the argparse and the whole driver. It is now a six-line shim onto
+    `tailcyclenet.infer.main`, so reading it would silently assert nothing -- a scrape for an
+    absent literal PASSES. Concatenating the two files it became keeps each check meaning exactly
+    what it meant before.
+    """
+    base = Path(__file__).resolve().parent.parent / 'tailcyclenet' / 'infer'
+    return (base / 'cli.py').read_text() + (base / 'driver.py').read_text()
+
+
+def _infer_window_source():
+    """The window loop, formerly `tailcyclenet/infer.py`."""
+    return (Path(__file__).resolve().parent.parent
+            / 'tailcyclenet' / 'infer' / 'window.py').read_text()
+
+
 def test_forward_shapes_and_anchor_order():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 160)
@@ -631,9 +651,8 @@ def test_infer_reads_pose_nms_stats_defensively():
     `nms_stats["nms_pairs"]` raised `KeyError` on every keypoint-less detector -- the NORMAL case
     for a 2D root -- and `--pose-nms` is a documented default for exactly one of them (rat-city).
     """
-    from pathlib import Path
 
-    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    src = _infer_program_source()
     assert 'nms_stats["nms_pairs"]' not in src, 'a bare subscript will KeyError with no keypoints'
     assert 'nms_stats.get("nms_pairs", 0)' in src
     assert 'nms_stats.get("nms_dropped", 0)' in src
@@ -742,7 +761,6 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
     boxes that were already associated under whatever `track` was then.
     """
     import inspect
-    from pathlib import Path
 
     from tailcyclenet.detector import associate_group
 
@@ -750,7 +768,7 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
     assert sig.parameters['track'].default is True, 'the tracker is the default'
     assert sig.parameters['link'].default is False, '--link-boxes is opt-in'
 
-    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    src = _infer_program_source()
     assert "('raw_rev', str(RAW_REV))" in src, \
         'raw_rev must be UNCONDITIONAL in the stamp: it is what refuses a pre-split cache'
     assert "('track', str(args.track))" not in src, \
@@ -767,9 +785,8 @@ def test_the_npz_records_which_crop_source_made_it():
     the shape of gotcha 12, one field over. `--refine` rides the same field because it is the other
     re-crop lever.
     """
-    from pathlib import Path
 
-    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    src = _infer_program_source()
     assert "flat['__crop_source__']" in src, 'the crop source must be in the npz, not the shell'
     assert '"+refine" if did_refine' in src, '--refine is a crop change and belongs in that field'
     # AND IT MUST BE THE RESOLVED FLAG, NOT `cfg.refine`. `refine` defaults by dimensionality, so
@@ -777,8 +794,7 @@ def test_the_npz_records_which_crop_source_made_it():
     # case. Reading `cfg` there would stamp every auto-refined 3D file as unrefined.
     assert 'any(bool(r.get(\'refine\')) for r in results.values())' in src, \
         'the stamp must read the per-session RESOLVED refine flag, not the tri-state config'
-    assert "'refine': bool(cfg.refine)" in (
-        Path(__file__).resolve().parent.parent / 'tailcyclenet' / 'infer.py').read_text(), \
+    assert "'refine': bool(cfg.refine)" in _infer_window_source(), \
         'run_group must record the resolved refine flag for the stamp to read'
 
 
@@ -793,9 +809,8 @@ def test_a_cache_without_keypoints_cannot_serve_the_keypoint_crop_source():
     A source check, like the `track` stamp test above and for the same reason: the guard is inside
     `main`'s group loop, past `load_run`, so reaching it needs a trained detector and a checkpoint.
     """
-    from pathlib import Path
 
-    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    src = _infer_program_source()
     assert "det_cache[f'{key}|kpt'] = raw[2]" in src, \
         'detector keypoints must be cached, or the two crop sources cannot share one box set'
     assert "args.crop_source == 'keypoints' and raw[2] is None" in src, \
@@ -1575,11 +1590,10 @@ def test_every_box_affecting_option_reaches_the_det_cache_stamp():
     the FILE depends on, which is precisely `detect_raw`'s inputs.
     """
     import inspect
-    from pathlib import Path
 
     from tailcyclenet.detector import detect_raw
 
-    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py').read_text()
+    src = _infer_program_source()
     stamp = src[src.index('stamp = repr(sorted('):src.index('det_cache, cache_dirty')]
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing.

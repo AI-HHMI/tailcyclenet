@@ -888,15 +888,54 @@ class PoseDataset(Dataset):
 
     # -- item ----------------------------------------------------------------------------
     def __getitem__(self, idx):
+        """One window. `idx` is an index, or `(ordinal, index)` from `StepSampler`.
+
+        THE ORDINAL IS WHAT MAKES THE ITEM'S *COST* THE SAME ON EVERY RANK, and that is worth a
+        paragraph because it is the difference between 2.5x and 3.4x on 4 gpus. A DDP step costs
+        the SLOWEST rank's item, so what decides multi-gpu efficiency is `E[max of N]`, not the
+        mean. `cams_to_sample = [2, 8]` is drawn per item and the scene encoder runs once per
+        camera, so four independent draws make almost every step a 7-or-8-camera step: measured on
+        allen-mouse-combined, the tax is **1.57x at N = 4** (2.55x of a theoretical 4x), and
+        synchronising the camera count alone takes it to **1.18x** (3.38x). Synchronising the
+        sampling CELL as well adds nothing (1.18x), so it is deliberately left free -- the batch
+        stays heterogeneous in data and becomes homogeneous only in cost.
+
+        The ordinal is the item's position in the sampler stream, i.e. the global step, so a
+        `shape_rng` keyed on it draws the same camera count on every rank while the window, the
+        session and the augmentation stay independent. The MARGINAL distribution is untouched --
+        `test_camera_count_distribution_is_unchanged` pins that -- so this is not a recipe change,
+        and it applies at every world size so that a 4-gpu run is one lever off a 1-gpu one rather
+        than two.
+
+        DRAWN ONCE, OUTSIDE THE RETRY LOOP. A failed item re-picks `idx`, and if the shape were
+        redrawn there a rank that retried would consume a draw its peers did not and the ranks
+        would fall out of step for the rest of the run.
+        """
+        ordinal, idx = idx if isinstance(idx, tuple) else (None, idx)
         # Entropy-seeded on train so workers do not replay one another's augmentation;
         # index-seeded on val/test so a metric is reproducible.
         rng = np.random.default_rng(None if self.train else (self.seed, idx))
+        shape_rng = (rng if ordinal is None
+                     else np.random.default_rng((self.seed, 0x5AFE, int(ordinal))))
+        shape = self._shape(shape_rng)
         for _ in range(8):
-            out = self._item(idx, rng)
+            out = self._item(idx, rng, shape)
             if out is not None:
                 return out
             idx = int(rng.integers(len(self.index)))
         raise RuntimeError(f'{self.split}: 8 consecutive items failed to build')
+
+    def _shape(self, rng) -> dict:
+        """The cost-determining draws, made from a stream every rank shares. See `__getitem__`.
+
+        Exactly the two draws that change how much WORK an item is and nothing else: the camera
+        count (the encoder runs once per camera) and the single-view coin (which collapses a 3D
+        item to one camera). The cell, the session, the window start, T and every augmentation
+        stay on the item's own stream, because syncing them was measured to buy nothing and they
+        are what makes a batch diverse.
+        """
+        return {'n_cams': _n_cams(self.cfg.cams_to_sample, rng),
+                'single_view_draw': float(rng.random())}
 
     def _frames(self, item, lab, group, rng):
         """T frame indices, clamp-padded so T >= 2.
@@ -984,7 +1023,8 @@ class PoseDataset(Dataset):
         b = lab.boxes[a][frames][:, cam_ix]                        # (T,C,4) = x0,y0,x1,y1
         return torch.as_tensor(cropmod.box_corners(b), dtype=torch.float32)
 
-    def _item(self, idx, rng):
+    def _item(self, idx, rng, shape=None):
+        shape = shape or self._shape(rng)
         item = self._pick(idx, rng)
         sess, group = item.session, item.session.groups[item.gid]
         lab = sess.labels(item.gid)
@@ -1003,7 +1043,8 @@ class PoseDataset(Dataset):
 
         true_2d = sess.mode == '2d'
         single_view = (not true_2d and self.train
-                       and self.cfg.prob_2d_only > 0 and rng.random() < self.cfg.prob_2d_only)
+                       and self.cfg.prob_2d_only > 0
+                       and shape['single_view_draw'] < self.cfg.prob_2d_only)
 
         # -- pick cameras ----------------------------------------------------------------
         if true_2d:
@@ -1011,7 +1052,7 @@ class PoseDataset(Dataset):
         elif single_view:
             cam_ix = [int(rng.integers(len(cgroup)))]
         else:
-            n = _n_cams(self.cfg.cams_to_sample, rng)
+            n = shape['n_cams']
             # sorted(), where the reference leaves the draw unsorted: camera order is arbitrary
             # either way, and a stable one makes a window comparable to itself across runs.
             cam_ix = (sorted(rng.choice(len(cgroup), n, replace=False)) if 0 < n < len(cgroup)
@@ -1360,6 +1401,32 @@ def _resize_camera(cam, target_res):
     cam['mat'][2, 2] = 1
     cam['offset'] = cam['offset'] * scale
     return cam, scale
+
+
+class StepSampler(torch.utils.data.Sampler):
+    """Draws indices with replacement and yields `(ordinal, index)`.
+
+    The ordinal is the item's position in the stream, which is the global training step -- and it
+    is the SAME on every rank while the index is not. `PoseDataset.__getitem__` keys its
+    cost-determining draws on it so that every rank's step-k item costs the same, which is what a
+    synchronous DDP step needs (it costs the slowest rank's item; see `__getitem__`).
+
+    Replacement, and no `DistributedSampler`: an index entry here is one (session, group, animal)
+    whatever the group's length, so it is a poor sampling weight -- `_pick` re-draws inside
+    `__getitem__` and partitioning the index would partition the wrong thing. Independent streams
+    per rank is the right construction, and it is what the single-gpu loop already did.
+    """
+
+    def __init__(self, n: int, num_samples: int, generator=None, start: int = 0):
+        self.n, self.num_samples, self.generator, self.start = int(n), int(num_samples), generator, int(start)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        idx = torch.randint(0, self.n, (self.num_samples,), generator=self.generator)
+        for k, i in enumerate(idx.tolist()):
+            yield (self.start + k, i)
 
 
 def worker_init(worker_id):

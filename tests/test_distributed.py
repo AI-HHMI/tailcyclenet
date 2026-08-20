@@ -13,6 +13,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -181,6 +182,97 @@ def test_ranks_do_not_replay_one_anothers_sampler_stream():
 
     assert draw(0) != draw(1)
     assert draw(3) == draw(3), 'the same rank must still be reproducible'
+
+
+# -- the straggler fix: equal COST per rank, per step ---------------------------------------
+
+CGROUP = 4          # `_item`'s field order: views, coords, vis, frames, cgroup, ...
+
+
+def _ds(root, **over):
+    """`prob_2d_only = 0` unless a test says otherwise: it defaults to 0.25, which collapses a 3D
+    item to ONE camera and would otherwise supply the variation these tests are attributing to
+    `cams_to_sample`."""
+    from tailcyclenet.dataset import LoaderConfig, PoseDataset
+    return PoseDataset(root, 'train', LoaderConfig(**{'prob_2d_only': 0.0, **over}))
+
+
+def test_the_sampler_yields_an_ordinal_that_is_the_step_number():
+    """The ordinal must be the position in the STREAM, not the index: it is the only thing every
+    rank agrees on, and it is what the shape draw is keyed to."""
+    from tailcyclenet.dataset import StepSampler
+    g0 = torch.Generator().manual_seed(23)
+    g1 = torch.Generator().manual_seed(24)
+    a = list(StepSampler(100, num_samples=8, generator=g0))
+    b = list(StepSampler(100, num_samples=8, generator=g1))
+    assert [k for k, _ in a] == [k for k, _ in b] == list(range(8)), 'ordinals must agree'
+    assert [i for _, i in a] != [i for _, i in b], 'the INDEX stream must stay per-rank'
+    assert len(StepSampler(100, num_samples=8, generator=g0)) == 8
+
+
+def test_two_ranks_draw_the_same_camera_count_for_the_same_step(tiny_root):
+    """THE FIX. A DDP step costs the slowest rank's item, and `cams_to_sample = [2, 8]` drawn
+    independently per rank made almost every step an 8-camera step: measured 1.57x tax at N = 4 on
+    allen-mouse-combined, 1.18x once this holds.
+
+    Two datasets stand in for two ranks -- separate objects, separate item RNG (entropy-seeded on
+    train), same ordinals.
+    """
+    r0, r1 = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3]), \
+        _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
+    seen = set()
+    for ordinal in range(12):
+        a = r0[(ordinal, ordinal % len(r0))]
+        b = r1[(ordinal, (ordinal + 1) % len(r1))]       # a DIFFERENT window on the other rank
+        assert len(a[CGROUP]) == len(b[CGROUP]), \
+            f'step {ordinal}: {len(a[CGROUP])} cameras vs {len(b[CGROUP])}'
+        seen.add(len(a[CGROUP]))
+    assert len(seen) > 1, 'the draw must still VARY across steps, only not across ranks'
+
+
+def test_a_retry_does_not_desynchronise_the_shape(tiny_root):
+    """An item that fails to build re-picks its index inside `__getitem__`. If the shape were
+    redrawn on the retry, a rank that retried would consume a draw its peers did not and the two
+    would be out of step for the REST of the run -- a permanent, silent skew from one bad window.
+    """
+    ds = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
+    calls = []
+    real_shape = ds._shape
+    ds._shape = lambda rng: (calls.append(1), real_shape(rng))[1]
+    ds[(7, 0)]
+    assert len(calls) == 1, f'_shape drawn {len(calls)} times for one item'
+
+
+def test_camera_count_distribution_is_unchanged(tiny_root):
+    """Synchronising the draw must not RESHAPE it. The marginal over steps is what the recipe
+    means by `cams_to_sample`, and it has to survive, or this is a training change wearing a
+    performance fix's clothes."""
+    ds = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
+    counts = [ds._shape(np.random.default_rng((23, 0x5AFE, k)))['n_cams'] for k in range(3000)]
+    share = {c: counts.count(c) / len(counts) for c in (1, 2, 3)}
+    assert all(abs(v - 1 / 3) < 0.03 for v in share.values()), share
+
+
+def test_the_single_view_coin_is_also_synchronised(tiny_root):
+    """`prob_2d_only` collapses a 3D item to ONE camera, so it is a cost draw too -- a rank that
+    took the single-view branch while its peers encoded 8 cameras is the same straggler in
+    reverse. Its default is 0.25, so this fires on a quarter of steps in any 3D recipe that leaves
+    it alone."""
+    r0 = _ds(tiny_root / 'mouselike', cams_to_sample=3, prob_2d_only=0.5)
+    r1 = _ds(tiny_root / 'mouselike', cams_to_sample=3, prob_2d_only=0.5)
+    seen = set()
+    for ordinal in range(16):
+        a, b = r0[(ordinal, 0)], r1[(ordinal, 0)]
+        assert len(a[CGROUP]) == len(b[CGROUP]), f'step {ordinal}: single-view draw disagreed'
+        seen.add(len(a[CGROUP]))
+    assert seen == {1, 3}, f'both branches must still occur across steps, saw {seen}'
+
+
+def test_a_bare_index_still_works(tiny_root):
+    """Val and test address the index directly (`Subset`, `linspace`), and every test written
+    before the ordinal existed passes a plain int. That path must keep drawing its own shape."""
+    ds = _ds(tiny_root / 'mouselike', cams_to_sample=2)
+    assert len(ds[0][CGROUP]) == 2
 
 
 # -- the drift guard -----------------------------------------------------------------------

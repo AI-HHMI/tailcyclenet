@@ -49,7 +49,8 @@ from tailcyclenet import distributed as dist_utils
 from tailcyclenet.checkpoints import (check_image_size, load_config, prior_provenance,
                                       resolve_checkpoint, save_checkpoint, save_run_meta,
                                       warm_start)
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate, worker_init
+from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
+                                  worker_init)
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
 from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
@@ -623,14 +624,18 @@ def main():
     # draws WITH REPLACEMENT and `_pick`/`_frames` redraw inside `__getitem__` -- so partitioning
     # the index would partition the wrong thing. Independent streams per rank is the right
     # construction for sampling with replacement, and it is what the single-GPU loop already did.
+    #
+    # `StepSampler`, not `RandomSampler`: it yields `(ordinal, index)`, and the ordinal is what
+    # lets every rank's step-k item cost the same. A DDP step costs the SLOWEST rank's item, and
+    # with `cams_to_sample = [2, 8]` drawn independently per rank that was measured at a 1.57x tax
+    # on 4 gpus -- 2.55x of a theoretical 4x. See `PoseDataset.__getitem__`.
     gen = None
     if world > 1:
         gen = torch.Generator().manual_seed(int(train_cfg.get('seed', 23)) + fabric.global_rank)
     local_iters = dist_utils.per_rank(n_iter, world)
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, num_workers=nw, collate_fn=pose_collate,
-        sampler=torch.utils.data.RandomSampler(train_ds, replacement=True,
-                                               num_samples=local_iters, generator=gen),
+        sampler=StepSampler(len(train_ds), num_samples=local_iters, generator=gen),
         generator=gen,
         persistent_workers=nw > 0, pin_memory=True, drop_last=True,
         prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init,

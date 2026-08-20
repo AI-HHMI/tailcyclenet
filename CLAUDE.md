@@ -280,6 +280,25 @@ a quantity whose correct value is zero hides exactly the failure it exists to ca
 costs 25.8–38.1 ms (frozen / 8 blocks unfrozen) beside a 5.6 GB write, i.e. ~0.006% of a 1000-step
 window, so it has no frequency knob.
 
+**A DDP STEP COSTS THE SLOWEST RANK'S ITEM, SO THE COST-DETERMINING DRAWS ARE SYNCHRONISED.**
+`cams_to_sample = [2, 8]` is drawn per item and the scene encoder runs once per camera, so four
+independent draws make nearly every step an 8-camera step: measured on allen-mouse-combined, the
+straggler tax is **1.57x at 4 ranks** — 2.55x of a theoretical 4x, which is most of the observed
+1.83x per-step slowdown (the rest is the 595 MB gradient all-reduce). `StepSampler` yields
+`(ordinal, index)` and `PoseDataset.__getitem__` keys the camera count and the `prob_2d_only` coin
+on the ordinal, so every rank's step-k item costs the same while its window, session and
+augmentation stay independent. That takes the tax to **1.18x (3.38x of 4x)**. Measured end to end
+on 2 ranks, encoder unfrozen, 800 iterations: **0.618 s/it per-item vs 0.548 s/it synchronised**
+against a 1-GPU 0.468 (1.32x -> 1.17x, i.e. 1.51x -> 1.71x of 2x), and the control's 1.32x is the
+probe's predicted 1.31x. **Measure this in the UNFROZEN regime or not at all** — with the encoder
+frozen there is no backward through the per-camera path, the cost spread collapses and the same
+comparison reads a null. Synchronising the
+sampling CELL too was measured to add nothing (1.18x) and is deliberately not done — the batch
+stays heterogeneous in data and is homogeneous only in cost. **The marginal distribution of
+`cams_to_sample` is unchanged**, which is what makes this a scheduling fix rather than a recipe
+change, and it applies at every world size so a 4-GPU run stays one lever off a 1-GPU one.
+**Anything that varies per item and multiplies work belongs in `_shape`**; anything else does not.
+
 Smaller rules, each of which is a hang or a silent correlation otherwise: a skipped step is a
 **collective** decision (one rank skipping its backward leaves the others in the all-reduce
 forever); val windows are **sharded** `idxs[rank::world]` and the per-window metrics gathered

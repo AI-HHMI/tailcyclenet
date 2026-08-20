@@ -228,12 +228,12 @@ def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
     return table.column(col).combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64)
 
 
-def write_table(path: Path, rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> None:
-    """Write a tidy-long table, dictionary-encoding the columns the spec says are dictionaries.
+def _arrow(rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> pa.Table:
+    """One chunk of tidy-long rows as an arrow table. THE definition of "how a row becomes parquet".
 
-    Non-finite floats are written as NULL, not as NaN. The spec says a `missing` row's `x,y` are
-    empty, and a null is what "empty" means in parquet -- it costs a validity bit instead of four
-    bytes, and any other reader sees the absence rather than a sentinel it has to know about.
+    Non-finite floats become NULL, not NaN. The spec says a `missing` row's `x,y` are empty, and a
+    null is what "empty" means in parquet -- it costs a validity bit instead of four bytes, and any
+    other reader sees the absence rather than a sentinel it has to know about.
     """
     arrays, names = [], []
     for name, values in rows.items():
@@ -251,7 +251,72 @@ def write_table(path: Path, rows: dict[str, np.ndarray], dict_cols: tuple[str, .
             arr = arr.dictionary_encode()
         arrays.append(arr)
         names.append(name)
-    pq.write_table(pa.table(arrays, names=names), path, compression='zstd')
+    return pa.table(arrays, names=names)
+
+
+class TableWriter:
+    """A tidy-long table written in CHUNKS, so a producer need never hold the whole thing.
+
+    `write_table` below is this with one chunk, and every converter still calls that -- a converter
+    has its rows in memory anyway. What needs chunks is INFERENCE: a prediction over a 720,000-frame
+    clip is tens of millions of rows and the whole point of the streaming loop is that no array is
+    proportional to the clip.
+
+    **THE DICTIONARY COLUMNS FIX THEIR SCHEMA ON THE FIRST CHUNK, and that is not a detail.**
+    `format._codes` reads `DICT_COLS` back as a `DictionaryArray`, so they must be written as
+    `dictionary<int32, string>` -- a plain string column with parquet's `use_dictionary=True` has
+    the same bytes on disk but round-trips as plain strings, and every reader in this file would
+    break. Later chunks are CAST to the first chunk's schema; pyarrow unifies the per-chunk
+    dictionaries itself.
+
+    ROWS ARE BUFFERED to `chunk_rows` before a row group is emitted. Writing one row group per
+    call would give a long clip tens of thousands of tiny row groups -- metadata bloat, and a file
+    no reader can scan efficiently -- because a block at a tight budget can be a few dozen rows.
+    """
+
+    def __init__(self, path: Path, dict_cols: tuple[str, ...] = (), chunk_rows: int = 250_000):
+        self.path, self.dict_cols, self.chunk_rows = Path(path), dict_cols, int(chunk_rows)
+        self._w = None
+        self._buf: list[pa.Table] = []
+        self._n = 0
+
+    def write(self, rows: dict[str, np.ndarray]) -> None:
+        t = _arrow(rows, self.dict_cols)
+        if not len(t):
+            return
+        self._buf.append(t)
+        self._n += len(t)
+        if self._n >= self.chunk_rows:
+            self._flush()
+
+    def _flush(self) -> None:
+        if not self._buf:
+            return
+        t = pa.concat_tables(self._buf)
+        if self._w is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._w = pq.ParquetWriter(self.path, t.schema, compression='zstd')
+        else:
+            t = t.cast(self._w.schema)
+        self._w.write_table(t)
+        self._buf, self._n = [], 0
+
+    def close(self) -> None:
+        self._flush()
+        if self._w is not None:
+            self._w.close()
+            self._w = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def write_table(path: Path, rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> None:
+    """Write a tidy-long table in one shot. See `TableWriter` for the chunked form."""
+    pq.write_table(_arrow(rows, dict_cols), path, compression='zstd')
 
 
 DICT_COLS = ('group_id', 'animal_id', 'camera', 'bodypart', 'status')

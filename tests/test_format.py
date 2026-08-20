@@ -422,3 +422,52 @@ def test_rule_15_rejects_an_unknown_status(tmp_path):
                    path / 'regions.pq')
     errs = fmt.validate_session(fmt.Session.load(path), check_images=False)
     assert _rule(errs, 15) and 'present' in _rule(errs, 15)[0]
+def test_table_writer_chunks_match_one_shot(tmp_path):
+    """A table written in chunks must read back exactly as one written at once.
+
+    This is what lets inference stream a prediction to disk: the rows arrive a block at a time and
+    no array is ever proportional to the clip. It is only usable if the file is indistinguishable
+    from what a converter would have written.
+    """
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    from tailcyclenet.format import DICT_COLS, TableWriter, _codes, write_table
+
+    n = 500
+    rng = np.random.default_rng(0)
+    rows = {'group_id': np.array([f'g{i % 3:03d}' for i in range(n)], dtype=object),
+            'frame': np.arange(n, dtype=np.int32),
+            'animal_id': np.array(['a', 'b'] * (n // 2), dtype=object),
+            'status': np.array(['visible', 'missing'] * (n // 2), dtype=object),
+            'x': rng.normal(size=n)}
+    rows['x'][::7] = np.nan                       # nulls must survive chunking
+
+    write_table(tmp_path / 'one.pq', rows, DICT_COLS)
+    # Chunks small enough to force several row groups, and uneven so no boundary is special.
+    with TableWriter(tmp_path / 'many.pq', DICT_COLS, chunk_rows=64) as w:
+        for lo, hi in ((0, 33), (33, 200), (200, 201), (201, n)):
+            w.write({k: v[lo:hi] for k, v in rows.items()})
+
+    a, b = (pq.read_table(tmp_path / f) for f in ('one.pq', 'many.pq'))
+    assert a.column_names == b.column_names
+    assert a.to_pydict() == b.to_pydict(), 'chunked rows must equal one-shot rows'
+    assert pq.ParquetFile(tmp_path / 'many.pq').num_row_groups > 1, 'the chunks must be row groups'
+    # The dictionary columns must still READ BACK as dictionaries, or `_codes` breaks.
+    for col in ('group_id', 'animal_id', 'status'):
+        codes, vals = _codes(b, col)
+        assert len(codes) == n and vals
+
+
+def test_table_writer_skips_empty_chunks(tmp_path):
+    """A block that produced no rows must not write an empty row group, or emit a schema of nulls."""
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    from tailcyclenet.format import DICT_COLS, TableWriter
+
+    with TableWriter(tmp_path / 't.pq', DICT_COLS) as w:
+        w.write({'group_id': np.array([], dtype=object), 'frame': np.array([], np.int32)})
+        w.write({'group_id': np.array(['g0'], dtype=object), 'frame': np.array([3], np.int32)})
+    t = pq.read_table(tmp_path / 't.pq')
+    assert t.num_rows == 1 and t.column('frame').to_pylist() == [3]

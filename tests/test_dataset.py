@@ -1482,7 +1482,7 @@ def test_prompt_swaps_default_off_is_byte_identical(tiny_root):
                             crop_jitter=0.3, prompt_dropout=0.4)
         explicit = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
                                 crop_jitter=0.3, prompt_dropout=0.4, prompt_swap_kpt_pairs=0.0,
-                                prompt_swap_animal=0.0, prompt_swap_animal_frac=1.0)
+                                prompt_swap_animal=0.0)
         ds_base = PoseDataset(root, split, base, train=False)
         ds_explicit = PoseDataset(root, split, explicit, train=False)
         b = _batch(ds_base)
@@ -1504,9 +1504,9 @@ def test_prompt_swaps_default_off_is_byte_identical(tiny_root):
 
 
 def test_animal_swap_is_inert_on_a_single_animal_session(tmp_path):
-    """`want_swap_animal` requires `lab.n_animals >= 2`, checked BEFORE `rng.random()` -- so a
-    single-animal session must draw NOTHING extra, and the item must be bit-identical to one built
-    without the key at all. `_session_3d` ships exactly one animal.
+    """attempt_swap_animal requires lab.n_animals >= 2 -- a structural condition, not a draw --
+    so a single-animal session must consume NOTHING extra from rng, and the item must be
+    bit-identical to one built without the key at all. _session_3d ships exactly one animal.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1630,10 +1630,11 @@ def test_animal_swap_2d_prior_is_the_neighbours_own_labelled_pixel(tiny_root):
 
 def test_corrupted_prior_is_bounds_masked(tmp_path):
     """A neighbour placed outside every camera's usable pair (`sep` far larger than the crop)
-    must never be substituted in -- "I was not told" rather than "I was told a lie". Fewer than
-    two of its keypoints survive `prior_out_of_bounds`, so it never becomes eligible at all, and
-    the corruption is a NO-OP: `prompt_swap_animal`'s CONFIGURED rate and its PRESENTED rate then
-    differ (dev/plans/prompt_prior_corruptions.md Section 4.3).
+    must never be substituted in -- "I was not told" rather than "I was told a lie". EVERY one of
+    its keypoints fails `prior_out_of_bounds`, so `neighbour_prior` is all-NaN and the per-keypoint
+    `jump` mask is all-False regardless of the Bernoulli draws: the corruption is a NO-OP, and
+    `prompt_swap_animal`'s CONFIGURED rate and its PRESENTED rate then differ
+    (dev/plans/prompt_prior_corruptions.md Section 4.3).
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1651,7 +1652,7 @@ def test_corrupted_prior_is_bounds_masked(tmp_path):
 
 
 def test_kpt_swap_preserves_the_prior_set(tiny_root):
-    """A TRANSPOSITION, not a copy: the sorted set of finite prior POSITIONS must be unchanged by
+    """A PERMUTATION, not a copy: the sorted set of finite prior POSITIONS must be unchanged by
     `prompt_swap_kpt_pairs`, at any rate, on both dimensionalities -- which is what licenses
     drawing this PER KEYPOINT with none of `prompt_dropout`'s per-item warning applying
     (dev/plans/prompt_prior_corruptions.md Section 3): `scene_center` / `cube_scale` are derived
@@ -1664,19 +1665,23 @@ def test_kpt_swap_preserves_the_prior_set(tiny_root):
     for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
         base_ds = PoseDataset(root, 'train', CFG, train=True)
         b = pose_collate([_train_item(base_ds)])
-        for pairs in (0.3, 0.5, 1.0, 2.0):
-            swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_kpt_pairs=pairs),
+        for p in (0.3, 0.5, 1.0):          # a PROBABILITY now -- values must stay in [0, 1]
+            swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_kpt_pairs=p),
                                   train=True)
             s = pose_collate([_train_item(swap_ds)])
             assert sorted_points(b.kpt_prior) == sorted_points(s.kpt_prior), \
-                f'{root.name} pairs={pairs}: the prior SET moved'
+                f'{root.name} p={p}: the prior SET moved'
 
 
-def test_kpt_swap_pairs_is_a_count_not_a_rate(tiny_root):
-    """A COUNT, not a per-keypoint rate: at `prompt_swap_kpt_pairs = 1.0` (deterministic --
-    `frac(1.0) == 0`, so exactly one pair draws every time) exactly TWO keypoints must differ from
-    the unswapped prior, on BOTH the K=4 (`ratlike`) and K=3 (`mouselike`) roots -- not a count
-    that scales with K, which is the failure CLAUDE.md already names for `--pose-nms`.
+def test_kpt_swap_pairs_is_a_per_keypoint_rate(tiny_root):
+    """A PER-KEYPOINT PROBABILITY, not a fixed count: at `prompt_swap_kpt_pairs = 1.0`
+    (deterministic -- every finite keypoint is selected) EVERY finite keypoint must move, on BOTH
+    the K=4 (`ratlike`) and K=3 (`mouselike`) roots -- a count that DOES scale with K, which is
+    the deliberate opposite of the count-based design this key started with.
+
+    Every selected keypoint moving, not just "the sorted set is preserved", is Sattolo's
+    algorithm's own guarantee: a uniformly random SINGLE CYCLE over the selected subset has no
+    fixed points for a subset of size >= 2, so this also pins that guarantee end to end.
     """
     for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
         base_ds = PoseDataset(root, 'train', CFG, train=True)
@@ -1685,8 +1690,11 @@ def test_kpt_swap_pairs_is_a_count_not_a_rate(tiny_root):
         s = pose_collate([_train_item(swap_ds)])
         finite = torch.isfinite(b.kpt_prior[0]).all(-1) & torch.isfinite(s.kpt_prior[0]).all(-1)
         moved = ~torch.isclose(b.kpt_prior[0], s.kpt_prior[0]).all(-1) & finite
-        assert int(moved.sum()) == 2, \
-            f'{root.name} (K={b.kpt_prior.shape[1]}): expected exactly one swapped PAIR'
+        n_finite = int(finite.sum())
+        assert n_finite >= 2, f'{root.name}: need at least two finite keypoints for this test'
+        assert int(moved.sum()) == n_finite, \
+            (f'{root.name} (K={b.kpt_prior.shape[1]}): expected every one of the {n_finite} '
+             f'finite keypoints to move at p = 1.0, not a fixed pair count')
 
 
 # ----------------------------------------------------------------------------------------------

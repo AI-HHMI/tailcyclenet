@@ -94,32 +94,28 @@ class LoaderConfig:
     # TWO MORE FAILURES WITH THE SHAPE OF A DEPLOYMENT ERROR (dev/plans/
     # prompt_prior_corruptions.md), both off by default and both aimed at `--anchor carry`
     # specifically: a carried pose that swapped two keypoints, or latched onto the wrong animal.
+    # BOTH ARE PER-KEYPOINT PROBABILITIES -- every prompted keypoint independently draws its own
+    # Bernoulli, not a single per-item coin. K ranges 4 (rat-city, 3dpop) to 47 (allen-mouse)
+    # across roots trained jointly, so a shared rate corrupts a very different ABSOLUTE count of
+    # keypoints per root; that is accepted here rather than converted to a count.
     #
-    # A COUNT, NOT A PER-KEYPOINT RATE -- K ranges 4 (rat-city, 3dpop) to 47 (allen-mouse) across
-    # roots trained jointly, so a per-keypoint probability would mean 12x more corruption on one
-    # root than the other from one config line (the same quantisation CLAUDE.md already records
-    # for --pose-nms: 'quote it as a COUNT'). The EXPECTED number of transposed pairs per prompted
-    # item; floor(x) + Bernoulli(frac(x)) draws it, clamped to n_finite // 2. A TRANSPOSITION, not
-    # a copy: p_k := p_j while p_j keeps its own value would duplicate one point and delete
-    # another, moving scene_center/cube_scale for nothing -- a transposition leaves the prior SET
-    # unchanged, so those whole-set scalars stay bit-identical and this may be drawn PER KEYPOINT
-    # with none of prompt_dropout's per-item warning applying.
+    # The SELECTED subset (Bernoulli(`prompt_swap_kpt_pairs`) over `kpt_prior`'s own finite
+    # entries) is permuted among itself by SATTOLO'S ALGORITHM -- a uniformly random SINGLE CYCLE,
+    # which has no fixed points for a subset of size >= 2, so every selected keypoint's position
+    # actually moves. A TRANSPOSITION-OR-LARGER CYCLE, not a copy: `p_k := p_j` while `p_j` keeps
+    # its own value would duplicate one point and delete another, moving `scene_center`/
+    # `cube_scale` for nothing -- any permutation of the SET leaves it unchanged, so those
+    # whole-set scalars stay bit-identical regardless of the draw.
     prompt_swap_kpt_pairs: float = 0.0
-    # P(per prompted ITEM) the WHOLE prior becomes an ELIGIBLE neighbour's pose instead of this
-    # animal's own -- drawn PER ITEM, unlike the pairs above, because a wrong-animal prior moves
-    # scene_center onto the wrong animal and that whole-set scalar is the point (the same
-    # per-item/per-keypoint split prompt_dropout's own docstring argues for). 'Eligible' is
-    # prior_out_of_bounds applied to the CANDIDATE, reused rather than re-derived: it is the same
-    # rule --anchor carry already uses to decide a prior is usable, which also bounds how far a
-    # neighbour can be and still be a reachable 3D residual target (head_3d_grid_radius). A
-    # session with fewer than two animals never even draws this coin.
+    # Bernoulli(`prompt_swap_animal`), independently PER KEYPOINT, against the ONE neighbour
+    # animal picked for this item (uniformly among the others, before any geometry) -- so P(a
+    # given keypoint's prior becomes that neighbour's own point) is `prompt_swap_animal`,
+    # CONDITIONAL on that point itself being usable there (`prior_out_of_bounds`, reused rather
+    # than re-derived -- the same rule `--anchor carry` already uses to decide a prior is usable,
+    # which also bounds how far a neighbour can be and still be a reachable 3D residual target,
+    # `head_3d_grid_radius`). The CONFIGURED rate is therefore an upper bound on the PRESENTED
+    # one. A session with fewer than two animals never reaches for this key at all.
     prompt_swap_animal: float = 0.0
-    # Fraction of keypoints that jump with the animal swap; 1.0 (default) is the WHOLE prior and is
-    # INERT IN THE RNG STREAM -- no per-keypoint draw happens at 1.0, the same contract
-    # crop_inflate = 1.0 already has. Below 1.0 is a DIFFERENT geometry, not a weaker one (it puts
-    # scene_center between two animals rather than on the neighbour), so treat it as its own arm
-    # rather than a dial on the 1.0 result.
-    prompt_swap_animal_frac: float = 1.0
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
     # Frame stride for a TRAIN window, drawn per item -- posetail's `interval`
     # (`posetail_dataset.py:343-361`). [1] is consecutive frames, i.e. no augmentation. Repeat an
@@ -282,30 +278,31 @@ def _rotate_camera_group_with_neighbours(cgroup, coords, others):
     """`PosetailDataset.rotate_camera_group`, optionally carrying a SECOND point set through the
     identical draw. Returns `(cgroup, coords, others)`; `others` is None in, None out.
 
-    `others` is None on every item that does not draw `prompt_swap_animal` (the default), and then
-    this is EXACTLY `PosetailDataset.rotate_camera_group(None, cgroup, coords)` -- no concatenation,
-    no extra tensor, no extra draw, so a plain config is byte-identical (dev/plans/
+    `others` is None on every item that does not attempt `prompt_swap_animal` (the default), and
+    then this is EXACTLY `PosetailDataset.rotate_camera_group(None, cgroup, coords)` -- no
+    concatenation, no extra tensor, no extra draw, so a plain config is byte-identical (dev/plans/
     prompt_prior_corruptions.md Section 1, correction 6's underlying claim: the world rotation is
     drawn from the GLOBAL numpy RNG inside the library call, not from this loader's own `rng`, and
     is drawn exactly once here either way).
 
-    When `others` (T, n_other, K, R) is given, it rides through the SAME `rotmat` as `coords` by
-    being concatenated onto the keypoint axis for the one call and split back off after --
-    `coords @ rotmat` is a per-point operation, so this changes nothing about `coords`' own output
-    (no cross-talk between the concatenated rows) and needs no reimplementation of the rotation
-    itself. Callers must NOT pass this combined tensor to `crop_to_points_3d`: the crop is the
-    TARGET's own extent, and widening it with a neighbour would change the item's geometry, which
-    is the one thing dev/plans/prompt_prior_corruptions.md Section 4.4 requires never happens.
+    When given, `others` is (T, K, R) -- ONE neighbour's raw pose, exactly `coords`' own shape,
+    never a stack of several -- and rides through the SAME `rotmat` as `coords` by being
+    concatenated onto the keypoint axis for the one call and split back off after: `coords @
+    rotmat` is a per-point operation, so this changes nothing about `coords`' own output (no
+    cross-talk between the two point sets) and needs no reimplementation of the rotation itself.
+    Callers must NOT pass this combined tensor to `crop_to_points_3d`: the crop is the TARGET's
+    own extent, and widening it with a neighbour would change the item's geometry, which is the
+    one thing dev/plans/prompt_prior_corruptions.md Section 4.4 requires never happens.
     """
     from posetail.datasets.posetail_dataset import PosetailDataset
 
     if others is None:
         cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
         return cgroup, coords, None
-    T, K = coords.shape[0], coords.shape[1]
-    combined = torch.cat([coords, others.reshape(T, -1, 3)], dim=1)
+    K = coords.shape[1]
+    combined = torch.cat([coords, others], dim=1)
     cgroup, combined = PosetailDataset.rotate_camera_group(None, cgroup, combined)
-    return cgroup, combined[:, :K], combined[:, K:].reshape(others.shape)
+    return cgroup, combined[:, :K], combined[:, K:]
 
 
 def _crop_affine(src_wh, crop_coords, target_size, rotation):
@@ -1207,15 +1204,24 @@ class PoseDataset(Dataset):
         K = sess.n_keypoints
 
         # THE ANIMAL-SWAP PRIOR CORRUPTION (`prompt_swap_animal`, dev/plans/
-        # prompt_prior_corruptions.md), drawn HERE -- before any geometry, and before anything
-        # else in `_item` touches `rng` -- so the coin is a single shared decision for whichever
-        # branch runs below, and a session with fewer than two animals never draws it at all
-        # (`lab.n_animals >= 2` short-circuits BEFORE `rng.random()`). Gated on `self.cfg.
-        # prompt_swap_animal > 0` first for the same reason: a default config must draw nothing
-        # extra and stay byte-identical to one that never mentions the key.
-        want_swap_animal = (self.train and self.cfg.prompt_swap_animal > 0
-                            and lab.n_animals >= 2
-                            and rng.random() < self.cfg.prompt_swap_animal)
+        # prompt_prior_corruptions.md). `prompt_swap_animal` is a PER-KEYPOINT PROBABILITY --
+        # P(a given prompted keypoint's prior becomes an eligible neighbour's corresponding
+        # point) -- not a per-item coin, so there is no item-level Bernoulli draw here at all:
+        # every multi-animal train item ATTEMPTS the swap (structurally, not probabilistically),
+        # and the per-keypoint Bernoulli lives in the query-prior section below, against the ONE
+        # neighbour picked here. `attempt_swap_animal` is therefore a plain condition, not a draw,
+        # so a session with fewer than two animals costs nothing extra either way.
+        #
+        # THE NEIGHBOUR IS PICKED HERE -- before any geometry, and before anything else in
+        # `_item` touches `rng` -- uniformly among the OTHER animals in this window, so the coin
+        # is a single shared decision for whichever branch runs below rather than a per-branch
+        # re-derivation. Gated on `self.cfg.prompt_swap_animal > 0` first: a default config must
+        # draw nothing extra and stay byte-identical to one that never mentions the key.
+        attempt_swap_animal = self.train and self.cfg.prompt_swap_animal > 0 and lab.n_animals >= 2
+        neighbour_row = None
+        if attempt_swap_animal:
+            other_rows = [i for i in range(lab.n_animals) if i != a]
+            neighbour_row = other_rows[int(rng.integers(len(other_rows)))]
 
         cgroup = sess.cgroup(item.gid, frames)
         # ONE DRAW FOR THE WHOLE ITEM, not one per camera -- the wide-crop regime widens every
@@ -1308,10 +1314,11 @@ class PoseDataset(Dataset):
                  else self.cfg.aug_rotation_prob)
         rot_deg = self.cfg.aug_rotation_deg
         rotation_info = [None] * len(cgroup)
-        # (T, n_other, K, R) in the SAME final frame `coords` ends up in, or None -- built inside
-        # whichever branch below runs, and consumed once, after `prompt_t` exists, in the query
-        # prior section. None whenever `want_swap_animal` is False, which is every item on a
-        # default config: nothing here changes what either branch does today.
+        # (T, K, R) -- the ONE neighbour picked above, in the SAME final frame `coords` ends up
+        # in -- or None. Built inside whichever branch below runs, and consumed once, after
+        # `prompt_t` exists, in the query prior section. None whenever `attempt_swap_animal` is
+        # False, which is every item on a default config: nothing here changes what either
+        # branch does today.
         neighbour_full = None
         if true_2d:
             cam = cgroup[0]
@@ -1344,17 +1351,16 @@ class PoseDataset(Dataset):
                 # THE MEANINGFUL UPDATE: a point outside the final crop is not visible in the
                 # crop the model trains on, even though it was visible in the source frame.
                 vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
-            if want_swap_animal:
+            if attempt_swap_animal:
                 # THE SAME THREE STEPS `coords` JUST WENT THROUGH -- the in-plane rotation (if
-                # any), the crop's own shift, the resize's own scale -- reapplied to every OTHER
-                # animal's raw pose with the existing `_apply_affine` helper rather than a second
-                # copy of the arithmetic. Deliberately NOT `_mask_outside`'d against the ORIGINAL
-                # frame: the only masking this needs is the FINAL one, `prior_out_of_bounds`,
-                # applied once against the finished crop in the query-prior section below.
-                cand_ids = [i for i in range(lab.n_animals) if i != a]
-                raw = torch.as_tensor(lab.points2d[cand_ids][:, frames][..., 0, :],
-                                      dtype=torch.float32)          # (n_other,T,K,2)
-                raw = raw.permute(1, 0, 2, 3)                        # (T,n_other,K,2)
+                # any), the crop's own shift, the resize's own scale -- reapplied to the ONE
+                # picked neighbour's raw pose with the existing `_apply_affine` helper rather
+                # than a second copy of the arithmetic. Deliberately NOT `_mask_outside`'d
+                # against the ORIGINAL frame: the only masking this needs is the FINAL one,
+                # `prior_out_of_bounds`, applied once against the finished crop in the
+                # query-prior section below.
+                raw = torch.as_tensor(lab.points2d[neighbour_row][frames][..., 0, :],
+                                      dtype=torch.float32)          # (T,K,2), camera 0
                 raw = _apply_affine(raw, rotation_info[0])
                 neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
             cgroup, boxes = [cam], [box]
@@ -1397,17 +1403,18 @@ class PoseDataset(Dataset):
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
                             vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
-            # OTHER ANIMALS' RAW WORLD POSES, threaded through the SAME two random world rotations
-            # `coords` is about to go through -- and NOTHING else: the per-camera in-plane
-            # rotation above only moves cameras, and `crop_to_points_3d` below is never handed
-            # this tensor, so it cannot widen the crop or change `cube_scale`
-            # (dev/plans/prompt_prior_corruptions.md Section 4.4). None when `want_swap_animal` is
-            # False, which is the default -- see `_rotate_camera_group_with_neighbours`.
+            # THE ONE PICKED NEIGHBOUR'S RAW WORLD POSES, threaded through the SAME two random
+            # world rotations `coords` is about to go through -- and NOTHING else: the per-camera
+            # in-plane rotation above only moves cameras, and `crop_to_points_3d` below is never
+            # handed this tensor, so it cannot widen the crop or change `cube_scale`
+            # (dev/plans/prompt_prior_corruptions.md Section 4.4). Shape (T,K,3), exactly `coords`'
+            # own shape -- ONE neighbour, not a stack of them -- which is what lets it ride through
+            # `_rotate_camera_group_with_neighbours` as a plain second point set. None when
+            # `attempt_swap_animal` is False, which is the default.
             others_raw = None
-            if want_swap_animal:
-                cand_ids = [i for i in range(lab.n_animals) if i != a]
-                others_raw = torch.as_tensor(lab.points3d[cand_ids][:, frames],
-                                             dtype=torch.float32).permute(1, 0, 2, 3)
+            if attempt_swap_animal:
+                others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],
+                                             dtype=torch.float32)
             if self.train:
                 # Random world rotation, applied to points AND cameras together, so the model
                 # cannot learn a fixed world gauge. `_rotate_camera_group_with_neighbours` is
@@ -1540,55 +1547,53 @@ class PoseDataset(Dataset):
                 swap = torch.isfinite(alt).all(-1) & torch.isfinite(kpt_prior).all(-1)
                 kpt_prior = torch.where(swap[:, None], alt, kpt_prior)
         # B: THE PRIOR JUMPS TO A NEARBY ANIMAL (`prompt_swap_animal`, dev/plans/
-        # prompt_prior_corruptions.md). `neighbour_full` is None unless `want_swap_animal` drew
+        # prompt_prior_corruptions.md). `neighbour_full` is None unless `attempt_swap_animal` was
         # true at the top of `_item` -- so a default config, and every single-animal session,
         # never reaches this block at all.
+        #
+        # `prompt_swap_animal` IS THE PER-KEYPOINT PROBABILITY, not an item-level rate scaled by a
+        # fraction -- there is deliberately no `prompt_swap_animal_frac` any more. Every prompted
+        # keypoint independently draws Bernoulli(`prompt_swap_animal`) against the ONE neighbour
+        # picked at the top of `_item`, so P(a given keypoint's prior becomes that neighbour's
+        # point) is exactly `prompt_swap_animal` -- CONDITIONAL ON the neighbour's own point being
+        # in bounds there, which it need not be per keypoint. The CONFIGURED rate is therefore an
+        # upper bound on the PRESENTED one, the same caveat every other rate in this file carries.
         if neighbour_full is not None:
             mode_str = '2d' if R == 2 else '3d'
-            # (T, n_other, K, R) -> this item's own PROMPT_T per keypoint, exactly how
-            # `kpt_prior` itself was built above -- reused rather than re-derived.
-            cand = neighbour_full.permute(0, 2, 1, 3)[prompt_t, torch.arange(K)]  # (K,n_other,R)
-            oob = torch.stack([prior_out_of_bounds(cand[:, i], mode_str, cgroup)
-                               for i in range(cand.shape[1])], dim=1)              # (K,n_other)
-            eligible = (~oob).sum(0) >= 2
-            if bool(eligible.any()):
-                # UNIFORM among eligible neighbours: the nearest animal is already the modal
-                # eligible one, so a nearest rule would add tie-breaking machinery for no
-                # measured benefit (dev/plans/prompt_prior_corruptions.md Section 4.3).
-                elig_idx = eligible.nonzero(as_tuple=True)[0]
-                choice = int(elig_idx[int(rng.integers(len(elig_idx)))])
-                neighbour_prior = cand[:, choice].clone()
-                # THE BOUNDS MASK, APPLIED ONLY HERE. The neighbour survives as a WHOLE (>= 2
-                # keypoints eligible), but an individual keypoint may still be out of bounds, and
-                # that one becomes NaN exactly as a departed `carry` keypoint does.
-                neighbour_prior[oob[:, choice]] = float('nan')
-                frac = float(self.cfg.prompt_swap_animal_frac)
-                # 1.0 DRAWS NOTHING -- the same inert-at-1.0 contract `crop_inflate` already has.
-                jump = (torch.isfinite(neighbour_prior).all(-1) if frac >= 1.0 else
-                       (torch.as_tensor(rng.random(K)) < frac)
-                       & torch.isfinite(neighbour_prior).all(-1))
-                kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
-            # An INELIGIBLE draw (every other animal loses -- fewer than 2 keypoints survive the
-            # bounds mask) is a NO-OP: `prompt_swap_animal`'s CONFIGURED rate and its PRESENTED
-            # rate then differ, which is why an arm is measured with a loader audit rather than
-            # assumed from the config.
-        # A: THE PRIOR JUMPS TO OTHER KEYPOINTS OF THE SAME ANIMAL (`prompt_swap_kpt_pairs`). A
-        # TRANSPOSITION of `kpt_prior`'s own finite entries -- the prior SET is therefore
-        # unchanged and `px` above stays valid, unlike `prompt_dropout`'s per-item draw. `prompt_t`
-        # is deliberately left untouched, the same precedent `prompt_stale_frames` sets just
-        # above: staleness moves the POSE, never the CLAIMED frame.
+            # this item's own PROMPT_T per keypoint, exactly how `kpt_prior` itself was built
+            # above -- reused rather than re-derived.
+            neighbour_prior = neighbour_full[prompt_t, torch.arange(K)].clone()   # (K,R)
+            # THE BOUNDS MASK. A point outside the crop (2D) or seen by fewer than 2 cameras (3D)
+            # is not a prior -- exactly `--anchor carry`'s own rule, reused rather than re-derived.
+            neighbour_prior[prior_out_of_bounds(neighbour_prior, mode_str, cgroup)] = float('nan')
+            jump = (torch.as_tensor(rng.random(K)) < self.cfg.prompt_swap_animal) \
+                & torch.isfinite(neighbour_prior).all(-1)
+            kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
+        # A: THE PRIOR JUMPS TO OTHER KEYPOINTS OF THE SAME ANIMAL (`prompt_swap_kpt_pairs`). ALSO
+        # A PER-KEYPOINT PROBABILITY: each of `kpt_prior`'s own finite entries independently draws
+        # Bernoulli(`prompt_swap_kpt_pairs`) to be SELECTED, and the selected subset is then
+        # permuted among itself by Sattolo's algorithm -- a uniformly random SINGLE CYCLE, which
+        # has NO fixed points for a subset of size >= 2, so every selected keypoint's position
+        # actually moves (a per-keypoint coin that sometimes left a "selected" point exactly where
+        # it was would not be a swap). The prior SET is unchanged by construction -- any
+        # permutation preserves it, so `px` above stays valid, unlike `prompt_dropout`'s per-item
+        # draw. `prompt_t` is deliberately left untouched, the same precedent `prompt_stale_frames`
+        # sets just above: staleness moves the POSE, never the CLAIMED frame. A subset of size 1
+        # has no partner to swap with and is left alone -- an unavoidable edge case, not a bug.
         if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
             finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]
-            if len(finite_idx) >= 2:
-                x = float(self.cfg.prompt_swap_kpt_pairs)
-                n_pairs = int(x) + int(rng.random() < (x - int(x)))
-                n_pairs = min(n_pairs, len(finite_idx) // 2)
-                if n_pairs:
-                    perm = finite_idx[torch.from_numpy(rng.permutation(len(finite_idx)))]
-                    kpt_prior = kpt_prior.clone()
-                    for i in range(n_pairs):
-                        j, k = int(perm[2 * i]), int(perm[2 * i + 1])
-                        kpt_prior[j], kpt_prior[k] = kpt_prior[k].clone(), kpt_prior[j].clone()
+            sel = finite_idx[torch.as_tensor(rng.random(len(finite_idx))) <
+                             self.cfg.prompt_swap_kpt_pairs]
+            m = len(sel)
+            if m >= 2:
+                perm = torch.arange(m)
+                for i in range(m - 1, 0, -1):
+                    j = int(rng.integers(0, i))         # EXCLUDES i -- Sattolo's, not
+                                                         # Fisher-Yates, which is what guarantees
+                                                         # the single cycle has no fixed point.
+                    perm[i], perm[j] = perm[j].clone(), perm[i].clone()
+                kpt_prior = kpt_prior.clone()
+                kpt_prior[sel] = kpt_prior[sel][perm]
         if self.train and self.cfg.prompt_offset_px > 0 and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(
                 rng.normal(0.0, float(self.cfg.prompt_offset_px) * px, (1, R)),

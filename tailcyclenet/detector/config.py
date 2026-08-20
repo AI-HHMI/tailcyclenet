@@ -78,6 +78,20 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         _raise_unknown(block, cfg[block], known)
     data, model, train = cfg['data'], cfg['model'], cfg['training']
 
+    # THE CLI OVERRIDE MUST LAND BEFORE THE REQUIRED-FIELD CHECK, OR IT CANNOT RESCUE ANYTHING.
+    # `configs/detector.toml` ships `out = ""` on the promise that `--out` fills it in -- and
+    # every per-root overlay under `configs/detector/` follows that promise, leaving `out` for
+    # the CLI. Checking `train.get('out')` before this ran the promise into the requirement: a
+    # config with `out = ""` and a caller passing `out=`  still raised "required", because the
+    # override at the bottom of this function never got the chance to apply. `path` has no CLI
+    # override to rescue it (train_detector.py exposes none), so its check stays where it was.
+    if out is not None:
+        train['out'] = str(out)
+    if iters is not None:
+        train['iters'] = int(iters)
+    if device is not None:
+        train['device'] = str(device)
+
     # REQUIRED, never defaulted: a config that forgot the dataset would otherwise train on
     # whatever the CWD happened to be, silently.
     if not data.get('path'):
@@ -85,7 +99,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                          'val/ and test/). The detector is trained per dataset.')
     if not train.get('out'):
         raise SystemExit('[training].out is required: the run folder for checkpoints, '
-                         'metrics.json and the recorded config.')
+                         'metrics.json and the recorded config, and neither the config nor '
+                         '--out supplied one.')
 
     # CHOICE GUARDS, the same class as the pose side's `build_model` raise: a bad value must
     # fail at load, not train a different recipe than the one the config names.
@@ -124,11 +139,4 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['use_regions'] = bool(data.get('use_regions', False))
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
-
-    if out is not None:
-        train['out'] = str(out)
-    if iters is not None:
-        train['iters'] = int(iters)
-    if device is not None:
-        train['device'] = str(device)
     return cfg

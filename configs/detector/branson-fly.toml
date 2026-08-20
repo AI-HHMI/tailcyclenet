@@ -1,0 +1,11 @@
+# branson-fly: ONE val group, 32 labelled frames. Shipped `val_frames_per_group = 8` samples 25%
+# of it. Raised to the group's own labelled length (dev/plans/detector_accuracy.md T0.3) -- cheap
+# here, 32 frames is nothing.
+extends = "../detector.toml"
+
+[data]
+path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/branson-fly"
+val_frames_per_group = 32
+
+[training]
+out = ""

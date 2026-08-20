@@ -12,6 +12,7 @@ from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
                                    box_iou, decode, detector_loss, giou_loss, letterbox,
                                    unletterbox_boxes)
+from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.data import _cutout_rects, _keypoints_in_rects, random_affine
 
 
@@ -1907,3 +1908,65 @@ kpt_score_weight = 1.0
     assert ckpt['min_crop_dim'] == 16
     assert ckpt['box_source'] == 'keypoints'
     assert tuple(ckpt['input_wh']) == (48, 48)
+
+
+def test_load_detector_config_out_override_rescues_an_empty_out(tmp_path):
+    """`--out` must be able to fill in `[training].out = ""` -- the shipped `configs/detector.toml`
+    ships it empty on exactly that promise, and every per-root overlay under `configs/detector/`
+    leaves `out` for the CLI rather than restating a path in the file. The override used to be
+    applied AFTER the `out` required-check, so it could never rescue anything and the promise in
+    the config's own comment was false. Pinned so it cannot regress silently -- the failure mode
+    is a `SystemExit` at every real invocation of a per-root overlay via `--out`.
+    """
+    cfg = tmp_path / 'cfg.toml'
+    cfg.write_text("""
+[data]
+path = "/does/not/need/to/exist/for/this/check"
+
+[model]
+yolox = "trimmed"
+
+[training]
+out = ""
+""")
+    loaded = load_detector_config(cfg, out=tmp_path / 'run')
+    assert loaded['training']['out'] == str(tmp_path / 'run')
+
+    with pytest.raises(SystemExit, match='out.*required'):
+        load_detector_config(cfg)                    # nothing supplies `out`: still raises
+
+
+def test_load_detector_config_iters_and_device_override_too(tmp_path):
+    """The same ordering bug would have silently no-op'd `--iters`/`--device` as well, since all
+    three overrides shared one code path -- pinned together rather than only for `out`."""
+    cfg = tmp_path / 'cfg.toml'
+    cfg.write_text("""
+[data]
+path = "/does/not/need/to/exist/for/this/check"
+
+[model]
+yolox = "trimmed"
+
+[training]
+out = "runs/x"
+iters = 100
+device = "cpu"
+""")
+    loaded = load_detector_config(cfg, iters=5, device='cuda:1')
+    assert loaded['training']['iters'] == 5
+    assert loaded['training']['device'] == 'cuda:1'
+
+
+def test_per_root_detector_overlays_load_and_raise_val_frames_per_group(tmp_path):
+    """Every shipped per-root overlay under `configs/detector/` must resolve through
+    `extends = "../detector.toml"`, carry `[data].path` (the one thing with no CLI override), and
+    set `val_frames_per_group` past the shipped default of 8 -- each of these three roots has ONE
+    val group, so the default under-samples it (dev/plans/detector_accuracy.md T0.3)."""
+    root = Path(__file__).resolve().parent.parent / 'configs' / 'detector'
+    want = {'rat-city.toml': 64, 'branson-fly.toml': 32, '3dpop.toml': 16}
+    for name, expect in want.items():
+        cfg = load_detector_config(root / name, out=tmp_path / name)
+        assert cfg['data']['path'], f'{name}: [data].path must be set (no CLI override exists)'
+        assert cfg['data']['val_frames_per_group'] == expect, name
+        assert cfg['data']['val_frames_per_group'] > 8, \
+            f'{name}: must exceed the shipped default of 8 or the overlay does nothing'

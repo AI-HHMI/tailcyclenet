@@ -99,13 +99,13 @@ class LoaderConfig:
     # across roots trained jointly, so a shared rate corrupts a very different ABSOLUTE count of
     # keypoints per root; that is accepted here rather than converted to a count.
     #
-    # The SELECTED subset (Bernoulli(`prompt_swap_kpt_pairs`) over `kpt_prior`'s own finite
-    # entries) is permuted among itself by SATTOLO'S ALGORITHM -- a uniformly random SINGLE CYCLE,
-    # which has no fixed points for a subset of size >= 2, so every selected keypoint's position
-    # actually moves. A TRANSPOSITION-OR-LARGER CYCLE, not a copy: `p_k := p_j` while `p_j` keeps
-    # its own value would duplicate one point and delete another, moving `scene_center`/
-    # `cube_scale` for nothing -- any permutation of the SET leaves it unchanged, so those
-    # whole-set scalars stay bit-identical regardless of the draw.
+    # A SELECTED keypoint (Bernoulli(`prompt_swap_kpt_pairs`) over `kpt_prior`'s own finite
+    # entries) is REPLACED by another finite keypoint's ORIGINAL position, drawn UNIFORMLY and
+    # INDEPENDENTLY per selected point -- not a permutation. Two selected keypoints may land on
+    # the SAME source point, and a source point may end up represented nowhere in the corrupted
+    # prior. The prior SET is therefore NOT preserved (`scene_center`/`cube_scale` may move by a
+    # small amount, the same way `prompt_noise_px`/`prompt_offset_px` already do), which is the
+    # deliberate trade for keeping every keypoint's outcome independent of every other's.
     prompt_swap_kpt_pairs: float = 0.0
     # Bernoulli(`prompt_swap_animal`), independently PER KEYPOINT, against the ONE neighbour
     # animal picked for this item (uniformly among the others, before any geometry) -- so P(a
@@ -1569,31 +1569,37 @@ class PoseDataset(Dataset):
             jump = (torch.as_tensor(rng.random(K)) < self.cfg.prompt_swap_animal) \
                 & torch.isfinite(neighbour_prior).all(-1)
             kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
-        # A: THE PRIOR JUMPS TO OTHER KEYPOINTS OF THE SAME ANIMAL (`prompt_swap_kpt_pairs`). ALSO
-        # A PER-KEYPOINT PROBABILITY: each of `kpt_prior`'s own finite entries independently draws
-        # Bernoulli(`prompt_swap_kpt_pairs`) to be SELECTED, and the selected subset is then
-        # permuted among itself by Sattolo's algorithm -- a uniformly random SINGLE CYCLE, which
-        # has NO fixed points for a subset of size >= 2, so every selected keypoint's position
-        # actually moves (a per-keypoint coin that sometimes left a "selected" point exactly where
-        # it was would not be a swap). The prior SET is unchanged by construction -- any
-        # permutation preserves it, so `px` above stays valid, unlike `prompt_dropout`'s per-item
-        # draw. `prompt_t` is deliberately left untouched, the same precedent `prompt_stale_frames`
-        # sets just above: staleness moves the POSE, never the CLAIMED frame. A subset of size 1
-        # has no partner to swap with and is left alone -- an unavoidable edge case, not a bug.
+        # A: THE PRIOR JUMPS TO OTHER KEYPOINTS OF THE SAME ANIMAL (`prompt_swap_kpt_pairs`). A
+        # PER-KEYPOINT PROBABILITY: each of `kpt_prior`'s own finite entries independently draws
+        # Bernoulli(`prompt_swap_kpt_pairs`) to be REPLACED, and a replaced keypoint's new value
+        # is drawn UNIFORMLY from the OTHER finite keypoints' ORIGINAL positions -- NOT a
+        # permutation. Every keypoint's outcome is independent of every other's: two keypoints may
+        # land on the SAME source point (a duplicate), and a source point may end up represented
+        # nowhere in the corrupted prior at all. Reading from `original`, a snapshot taken BEFORE
+        # any replacement, is what keeps a later point from ever landing on an EARLIER point's
+        # already-corrupted value instead of its ground truth one. The prior SET is therefore NOT
+        # preserved by this corruption (unlike `--anchor carry`'s own bounds mask or a
+        # permutation), so `scene_center`/`cube_scale` may move by a small amount -- accepted, the
+        # same way `prompt_noise_px`/`prompt_offset_px` already perturb them. `prompt_t` is
+        # deliberately left untouched, the same precedent `prompt_stale_frames` sets just above:
+        # staleness moves the POSE, never the CLAIMED frame. Fewer than two finite keypoints means
+        # there is no "other" point to land on, so nothing happens -- an unavoidable edge case.
         if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
             finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]
-            sel = finite_idx[torch.as_tensor(rng.random(len(finite_idx))) <
-                             self.cfg.prompt_swap_kpt_pairs]
-            m = len(sel)
+            m = len(finite_idx)
             if m >= 2:
-                perm = torch.arange(m)
-                for i in range(m - 1, 0, -1):
-                    j = int(rng.integers(0, i))         # EXCLUDES i -- Sattolo's, not
-                                                         # Fisher-Yates, which is what guarantees
-                                                         # the single cycle has no fixed point.
-                    perm[i], perm[j] = perm[j].clone(), perm[i].clone()
-                kpt_prior = kpt_prior.clone()
-                kpt_prior[sel] = kpt_prior[sel][perm]
+                sel = torch.as_tensor(rng.random(m)) < self.cfg.prompt_swap_kpt_pairs
+                if bool(sel.any()):
+                    local = torch.arange(m)[sel]
+                    # A NONZERO OFFSET MOD m NEVER LANDS ON `local` ITSELF, and as the offset
+                    # ranges uniformly over 1..m-1 the result ranges uniformly over every OTHER
+                    # position -- a vectorized "pick one of the other m-1 finite keypoints", no
+                    # python loop and no rejection sampling.
+                    offset = torch.from_numpy(rng.integers(1, m, size=int(sel.sum())))
+                    src_idx = finite_idx[(local + offset) % m]
+                    original = kpt_prior
+                    kpt_prior = kpt_prior.clone()
+                    kpt_prior[finite_idx[sel]] = original[src_idx]
         if self.train and self.cfg.prompt_offset_px > 0 and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(
                 rng.normal(0.0, float(self.cfg.prompt_offset_px) * px, (1, R)),

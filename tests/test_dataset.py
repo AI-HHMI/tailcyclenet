@@ -1651,26 +1651,34 @@ def test_corrupted_prior_is_bounds_masked(tmp_path):
         'an ineligible neighbour must leave the prior untouched, not a partially-NaN\'d lie'
 
 
-def test_kpt_swap_preserves_the_prior_set(tiny_root):
-    """A PERMUTATION, not a copy: the sorted set of finite prior POSITIONS must be unchanged by
-    `prompt_swap_kpt_pairs`, at any rate, on both dimensionalities -- which is what licenses
-    drawing this PER KEYPOINT with none of `prompt_dropout`'s per-item warning applying
-    (dev/plans/prompt_prior_corruptions.md Section 3): `scene_center` / `cube_scale` are derived
-    from this exact set, and they must not move.
+def test_kpt_swap_lands_on_another_original_point_never_itself(tiny_root):
+    """NOT a permutation: each corrupted keypoint's new value must MATCH one of the OTHER
+    keypoints' ORIGINAL (uncorrupted) positions -- membership, not set-equality, since two
+    keypoints may independently land on the SAME source point and a source point may end up
+    represented nowhere in the corrupted prior. A corrupted point must never equal its OWN
+    original value (the `(local + offset) % m` draw in `_item` excludes it by construction).
     """
-    def sorted_points(prior):
-        pts = prior[0][torch.isfinite(prior[0]).all(-1)]
-        return sorted(tuple(round(float(x), 4) for x in row) for row in pts.tolist())
-
     for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
         base_ds = PoseDataset(root, 'train', CFG, train=True)
         b = pose_collate([_train_item(base_ds)])
-        for p in (0.3, 0.5, 1.0):          # a PROBABILITY now -- values must stay in [0, 1]
+        original = b.kpt_prior[0]
+        orig_finite = torch.isfinite(original).all(-1)
+        for p in (0.3, 0.5, 1.0):
             swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_kpt_pairs=p),
                                   train=True)
             s = pose_collate([_train_item(swap_ds)])
-            assert sorted_points(b.kpt_prior) == sorted_points(s.kpt_prior), \
-                f'{root.name} p={p}: the prior SET moved'
+            corrupted = s.kpt_prior[0]
+            moved = ~torch.isclose(original, corrupted, equal_nan=True).all(-1) & orig_finite
+            for k in moved.nonzero(as_tuple=True)[0].tolist():
+                mask = orig_finite.clone()
+                mask[k] = False
+                others = original[mask]
+                d = (others - corrupted[k]).norm(dim=-1)
+                assert float(d.min()) < 1e-4, \
+                    f'{root.name} p={p} keypoint {k}: new value matches no OTHER original point'
+                own = (corrupted[k] - original[k]).norm()
+                assert float(own) > 1e-4, \
+                    f'{root.name} p={p} keypoint {k}: landed back on its OWN original value'
 
 
 def test_kpt_swap_pairs_is_a_per_keypoint_rate(tiny_root):
@@ -1679,9 +1687,8 @@ def test_kpt_swap_pairs_is_a_per_keypoint_rate(tiny_root):
     the K=4 (`ratlike`) and K=3 (`mouselike`) roots -- a count that DOES scale with K, which is
     the deliberate opposite of the count-based design this key started with.
 
-    Every selected keypoint moving, not just "the sorted set is preserved", is Sattolo's
-    algorithm's own guarantee: a uniformly random SINGLE CYCLE over the selected subset has no
-    fixed points for a subset of size >= 2, so this also pins that guarantee end to end.
+    Every selected keypoint moving is the `(local + offset) % m` draw's own guarantee: the
+    offset is drawn from 1..m-1, so it can never land back on the keypoint's own position.
     """
     for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
         base_ds = PoseDataset(root, 'train', CFG, train=True)

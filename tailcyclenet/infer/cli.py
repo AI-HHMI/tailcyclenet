@@ -63,14 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
                          '0.5 is the coverage-favouring default; 0.97 is the identity-favouring '
                          'choice. Sweep per checkpoint: read the objectness quantiles recorded in '
                          'it, and watch the per-group box coverage printed below.')
-    ap.add_argument('--det-cache', type=Path, default=None,
-                    help='npz of per-group detector boxes; read if it exists, written if not. '
-                         'Detection is the expensive half of a run and depends on no model, so '
-                         'several arms over one clip set should share ONE set of boxes -- which '
-                         'makes them a matched comparison by construction instead of by trusting '
-                         'the detector to be deterministic. The box source is recorded in it and '
-                         'checked on load, so a cache from a different detector cannot be reused '
-                         'silently.')
     ap.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
                     help='follow one animal per instance row across frames -- per-frame Hungarian '
                          'on centre distance in units of the box side, gated at one side, with '
@@ -288,6 +280,5 @@ def main(argv=None):
     """Parse and run. `scripts/infer.py` is a six-line shim onto this."""
     from .driver import run_dataset
 
-    ap = build_parser()
-    args = ap.parse_args(argv)
-    return run_dataset(args, ap)
+    args = build_parser().parse_args(argv)
+    return run_dataset(args)

@@ -12,24 +12,14 @@ from .yolox import YOLOX_TIERS, YOLOXNano
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
-           'decode', 'detector_loss', 'giou_loss', 'associate', 'LINK_REV', 'RAW_REV',
+           'decode', 'detector_loss', 'giou_loss', 'associate',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone', 'paired_iou']
 
-# BUMP THIS WHENEVER `link_rows` CHANGES WHAT IT EMITS. `--det-cache` stores boxes that have already
-# been linked, so a cache written under an older rule is a different box set under an identical
-# stamp -- exactly the silent mismatch the stamp exists to catch (`scripts/infer.py`). Rev 2 is the
-# gated centre-distance matcher with births and expiry; rev 1 was ungated IoU with `free.pop(0)`.
-# `birth_age` did NOT bump this: it defaults to None, which is byte-identical to rev 2, and it is
-# unreachable from the CLI precisely because the sweep in `link_rows` refutes turning it on.
-LINK_REV = 2
-
-# BUMP THIS WHENEVER `detect_raw` CHANGES WHAT IT EMITS, and note that it is UNCONDITIONAL in the
-# `--det-cache` stamp for the reason `det_score` and `track` are. A cache is now RAW -- per-camera
-# detections, unassociated -- where every cache written before the split held boxes that had already
-# been through `associate`/`track`/`link_rows`. The two are the same shape and the same dtype under
-# what would otherwise be an identical stamp, so an old cache must be REFUSED rather than
-# reinterpreted: reading associated boxes as raw ones would silently associate them twice.
-RAW_REV = 1
+# `LINK_REV` and `RAW_REV` lived here to version a `--det-cache` on disk. There is no cache: the
+# detector and the pose loop are ONE pass over the video now, so there is no separable detection
+# phase to store. What the detections depended on is recorded in the prediction's own provenance
+# instead, where it describes the numbers that were actually produced rather than a file that might
+# be reused under a different meaning.
 
 
 def load_detector(path, device='cpu', input_wh=None):
@@ -259,19 +249,18 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     # fix above, on a node that may have 16 GB in total.
     #
     # **`batch` IS NOT AVAILABLE AS A MEMORY KNOB, BECAUSE IT IS NOT INERT.** It looks inert --
-    # `tests/test_detector.py`'s `--det-cache` stamp guard classifies it as `plumbing`, i.e.
-    # asserts it cannot change the detections and therefore need not be stamped -- and that
-    # assertion is FALSE on a GPU. Measured on johnson's own detector, 12 frames, batch 16 against
-    # batch 3: **boxes differ by 0.204 px, scores by 1.69e-03, keypoints by 0.447 px.** cuDNN
-    # selects convolution algorithms per input SHAPE, so a different batch is a different
-    # reduction order. It is not the decode: `read_frames` at batch 16 versus batch 3, and cached
-    # against reopened, are byte-identical (checked directly on this root's video).
+    # `tests/test_detector.py` classifies it as `plumbing`, i.e. asserts no run can differ in it --
+    # and it holds only because the value is PINNED here rather than exposed. Measured on johnson's
+    # own detector, 12 frames, batch 16 against batch 3: **boxes differ by 0.204 px, scores by
+    # 1.69e-03, keypoints by 0.447 px.** cuDNN selects convolution algorithms per input SHAPE, so a
+    # different batch is a different reduction order. It is not the decode: `read_frames` at batch
+    # 16 versus batch 3, and cached against reopened, are byte-identical (checked directly on this
+    # root's video).
     #
     # Making `batch` depend on free memory would therefore mean two runs of one command on two
-    # machines producing DIFFERENT BOXES and silently sharing a `--det-cache` -- precisely the
-    # class of divergence the stamp exists to prevent, introduced underneath it by the thing meant
-    # to be output-neutral. So `batch` is passed through untouched and the memory comes out of the
-    # camera axis instead.
+    # machines producing DIFFERENT BOXES, with nothing in either output saying so -- a
+    # machine-dependent answer introduced by the one thing that is meant to be output-neutral. So
+    # `batch` is passed through untouched and the memory comes out of the camera axis instead.
     #
     # CHUNKING CAMERAS IS OUTPUT-NEUTRAL BY CONSTRUCTION: each camera is forwarded on its own, with
     # its own `(batch, 3, h, w)` tensor, and `out`/`sc`/`kp` are indexed by `[.., ci]`. How many
@@ -297,10 +286,9 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     # rounded and matches numpy exactly. Measured, both ways, in `tests/test_detector_memory.py`.
     #
     # 1 ULP on the INPUT is not a rounding curiosity here: it perturbs every objectness score,
-    # which reorders NMS ties, which returns different boxes -- so it would silently invalidate
-    # every `--det-cache` on disk and make no recorded detector number reproducible, without
-    # changing a shape, a dtype or a `RAW_REV`. Exactly the class of silent divergence the cache
-    # stamp exists to prevent, arriving underneath it.
+    # which reorders NMS ties, which returns different boxes -- so it would make no recorded
+    # detector number reproducible, without changing a shape or a dtype. Nothing downstream would
+    # report the divergence, which is exactly why it is pinned here by a test.
     _div255 = torch.tensor(255.0, device=device)
 
     pool = ThreadPoolExecutor(max_workers=cams_flight)

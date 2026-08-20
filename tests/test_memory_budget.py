@@ -7,12 +7,10 @@ budget depends on machine state, so two runs of one command can resolve it diffe
 only acceptable because every knob downstream of it is output-neutral. **These tests are what makes
 that sentence true rather than aspirational.**
 
-`tests/test_detector.py`'s `--det-cache` stamp guard classifies `batch` as `plumbing`, i.e. it
-ASSERTS that `batch` cannot change what `detect_raw` returns and therefore need not be stamped.
-Nothing verified that. If it were false, every `--det-cache` on disk would be unsound: two arms
-sharing one cache would be sharing boxes produced at whatever batch the first run happened to
-resolve to. Now that `batch` is a budget-derived CEILING rather than a fixed 16, the claim is load
-bearing on hosts with different amounts of free memory, so it is checked here.
+`tests/test_detector.py` classifies `batch` as `plumbing`, i.e. ASSERTS that no run can differ in
+it. Nothing verified that. If `batch` were ever budget-derived the claim would be false, and two
+hosts with different amounts of free memory would produce different boxes with nothing in either
+output saying so -- so it is checked here, and `detect_raw` keeps the value pinned.
 
 Same for the dtype: `_fetch` hands back uint8 and the `/255` happens on the device. That is a 4x
 cut in host memory, PCIe traffic and device memory, and it is only legitimate because it is
@@ -59,8 +57,7 @@ def test_dividing_by_a_python_scalar_on_cuda_is_NOT_correctly_rounded():
     obvious spelling is not. `x / 255` with a PYTHON scalar takes a reciprocal-multiply fast path
     on CUDA that is off by one ULP on most byte values. That is 1 ULP on the detector's INPUT,
     which perturbs every objectness score, reorders NMS ties and returns different boxes -- so it
-    would invalidate every `--det-cache` on disk while changing no shape, no dtype and no
-    `RAW_REV`.
+    would change no shape and no dtype, so nothing downstream would report it.
 
     If this test ever starts PASSING, torch has changed its scalar-division lowering. That is good
     news, but check `detect_raw` still uses the tensor form before relaxing anything.
@@ -116,8 +113,7 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
 
     A budget so small that only one camera may be in flight must return exactly what a budget with
     room returns. This is what licenses sizing `detect_raw` from free memory at all: two machines
-    with different amounts of RAM must not produce different boxes and then silently share a
-    `--det-cache`.
+    with different amounts of RAM must not produce different boxes.
     """
     from tailcyclenet.detector import detect_raw
 
@@ -140,8 +136,8 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
 def test_batch_is_NOT_inert_which_is_why_the_budget_may_not_touch_it(det_scene):
     """A FINDING ABOUT THE REPO, PINNED SO IT IS NOT REDISCOVERED THE EXPENSIVE WAY.
 
-    `tests/test_detector.py`'s `--det-cache` stamp guard lists `batch` in `plumbing`, i.e. asserts
-    that it cannot change the detections and so need not be stamped. **That is false.** cuDNN and
+    `tests/test_detector.py` lists `batch` in `plumbing`, i.e. asserts that no run can differ in
+    it -- which holds only because it is pinned. **It is not inert.** cuDNN and
     the CPU kernels select algorithms per input SHAPE, so a different batch is a different
     reduction order. Measured on johnson's real detector (16 vs 3, 12 frames, 16 cameras): boxes
     differ by 0.204 px, scores by 1.69e-03, keypoints by 0.447 px -- enough to reorder NMS and

@@ -359,8 +359,8 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5, return
     # 3dpop's sit at exactly 1.0, so almost every comparison in this sort is a tie and an unstable
     # tie-break decides which of two overlapping boxes survives greedy NMS -- and in what row
     # order the survivors leave, which is the order `associate` and `CrossViewTracker` birth into.
-    # Without this the box set is reproducible only for a fixed torch version and device, which is
-    # exactly the property `--det-cache` exists to guarantee across two arms.
+    # Without this the box set is reproducible only for a fixed torch version and device, so two
+    # arms differing in one lever would differ in their boxes as well (eval rule 4).
     order = scores[keep].argsort(descending=True, stable=True)
     b, s = boxes[keep][order], scores[keep][order]
     ix = keep.nonzero().flatten()[order]

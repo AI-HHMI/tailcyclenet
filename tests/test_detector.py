@@ -750,31 +750,27 @@ def test_a_detector_records_its_objectness_and_load_detector_hands_it_back(tmp_p
 
 
 def test_the_tracker_is_the_default_and_can_be_turned_off():
-    """`--track` is ON by default (dev/reports/13).
+    """`--track` is ON by default (dev/reports/13), and `--no-track` restores the memoryless pass.
 
-    Pinned because the default is what every future arm inherits, and because flipping a default is
-    only safe if an old cache cannot be reused as if it had the new one. `track` USED to carry that
-    guard itself, as an unconditional stamp entry. It no longer needs to and no longer can: the
-    cache holds RAW detections and `associate_group` re-runs every invocation, so `track` does not
-    change the file at all. The guard moved to `raw_rev`, which refuses every pre-split cache
-    outright -- a strictly stronger statement than the one it replaced, since those caches hold
-    boxes that were already associated under whatever `track` was then.
+    Pinned because the default is what every future arm inherits. Asserted on the SIGNATURE and on
+    the parser, not on the source text: the three text scrapes this test used to carry were all
+    about the `--det-cache` stamp, which no longer exists.
     """
     import inspect
 
     from tailcyclenet.detector import associate_group
+    from tailcyclenet.infer.cli import build_parser
 
     sig = inspect.signature(associate_group)
     assert sig.parameters['track'].default is True, 'the tracker is the default'
     assert sig.parameters['link'].default is False, '--link-boxes is opt-in'
 
-    src = _infer_program_source()
-    assert "('raw_rev', str(RAW_REV))" in src, \
-        'raw_rev must be UNCONDITIONAL in the stamp: it is what refuses a pre-split cache'
-    assert "('track', str(args.track))" not in src, \
-        'track must NOT be stamped -- it does not change the cached raw detections, and stamping ' \
-        'it would refuse caches that hold exactly the right pixels'
-    assert 'BooleanOptionalAction' in src, '--no-track must exist to restore the old behaviour'
+    ap = build_parser()
+    assert ap.get_default('track') is True, '--track is on by default'
+    opts = {s for a in ap._actions for s in a.option_strings}
+    assert '--no-track' in opts, '--no-track must exist to restore the memoryless pass'
+    assert '--det-cache' not in opts, \
+        'the detector and the pose loop are one pass; there is no detection phase to cache'
 
 
 def test_the_npz_records_which_crop_source_made_it():
@@ -798,24 +794,20 @@ def test_the_npz_records_which_crop_source_made_it():
         'run_group must record the resolved refine flag for the stamp to read'
 
 
-def test_a_cache_without_keypoints_cannot_serve_the_keypoint_crop_source():
-    """A cache hit must not silently turn `--crop-source keypoints` into `--crop-source boxes`.
+def test_crop_source_keypoints_refuses_a_keypointless_detector():
+    """A detector with no keypoint branch must not silently become `--crop-source boxes`.
 
-    `run_group` switches on `det_kpts_stc is not None`, so a cache that holds only boxes does not
-    error -- it crops from the boxes and reports the arm under the other arm's name, which is the
-    one comparison item 3 exists to make. Two halves: keypoints are STORED under their own key, and
-    a cache lacking that key is REFUSED for this crop source rather than served.
+    `run_group` switches on `det_kpts_stc is not None`, so a detector that offers only boxes does
+    not error -- it crops from the boxes and reports the arm under the other arm's name, which is
+    the one comparison report 15 §6 item 3 exists to make.
 
-    A source check, like the `track` stamp test above and for the same reason: the guard is inside
-    `main`'s group loop, past `load_run`, so reaching it needs a trained detector and a checkpoint.
+    A source check because the guard sits beside `load_detector`, past `load_run`, so reaching it
+    needs a trained detector and a checkpoint.
     """
 
     src = _infer_program_source()
-    assert "det_cache[f'{key}|kpt'] = raw[2]" in src, \
-        'detector keypoints must be cached, or the two crop sources cannot share one box set'
-    assert "args.crop_source == 'keypoints' and raw[2] is None" in src, \
-        'a keypoint-free cache must be refused for --crop-source keypoints, not silently accepted'
-    assert '"|score", "|kpt"' in src, 'the cached-group count must not count the keypoint entries'
+    assert "args.crop_source == 'keypoints' and not int(getattr(det, 'n_keypoints', 0))" in src, \
+        'a keypointless detector must be refused for --crop-source keypoints, not silently served'
 
 
 def test_keypoint_head_is_off_by_default():
@@ -1573,48 +1565,50 @@ def test_reduce_under_tiling_matches_what_deployment_decodes():
     assert reduce_factor(size, (size[0] * 0.125, size[1] * 0.125)) > 1
 
 
-def test_every_box_affecting_option_reaches_the_det_cache_stamp():
-    """The stamp's whole safety property, which had NO test -- and shipped with a hole.
+def test_provenance_records_every_box_affecting_option():
+    """Nothing that changes a detection may go unrecorded beside the numbers it produced.
 
-    `--det-cache` shares one box set across arms so they are matched by construction. That is only
-    sound if two runs producing DIFFERENT boxes cannot produce the same stamp. `reduce` did:
-    `load_detector` reads it off the CHECKPOINT, `detect_group` uses it to choose the decode
-    resolution, and a different decode resolution is a different box set -- but it appeared in
-    neither the unconditional list nor the non-default one, so it was invisible to the stamp.
+    This is what is left of the `--det-cache` stamp's safety property. The stamp compared two runs
+    so a cache could be REFUSED; there is no cache, and no comparison to make -- but "which
+    detector, at which threshold, at which input size" is still the difference between two numbers
+    that look alike (eval rule 4), and it belongs in the output rather than in a shell history.
 
-    Table-driven against `detect_raw`'s own signature, so the next parameter added to that
-    function fails here instead of being found in review. It is `detect_raw` and no longer
-    `detect_group` because THE CACHE HOLDS RAW DETECTIONS: the association options change only what
-    happens after the cached array, and `associate_group` re-runs on every invocation, so stamping
-    them would refuse caches that are in fact exactly the right pixels. The stamp must cover what
-    the FILE depends on, which is precisely `detect_raw`'s inputs.
+    Table-driven against `detect_raw`'s own signature, so the next parameter added to that function
+    fails here instead of being found in review. Asserted on the VALUE `_box_provenance` returns
+    rather than on the driver's source text, which the stamp version had to do and which is why it
+    broke every time the block around it moved.
     """
+    import argparse
     import inspect
 
     from tailcyclenet.detector import detect_raw
+    from tailcyclenet.infer.driver import _box_provenance
 
-    src = _infer_program_source()
-    stamp = src[src.index('stamp = repr(sorted('):src.index('det_cache, cache_dirty')]
+    args = argparse.Namespace(detector=None, det_input_wh=None, det_score=0.5, det_top_k=0,
+                              max_animals=0, max_frames=0)
+    prov = _box_provenance(args, None, False, None)
 
-    # Everything `detect_raw` takes that can change the detections. The rest are plumbing.
-    plumbing = {'det', 'session', 'gid', 'device', 'batch'}
+    # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
+    # `batch` is in there under protest: it is NOT inert (report 38 §3.2) but it is pinned rather
+    # than exposed, so no run can differ in it. `frames`/`read` are the block loop's plumbing and
+    # change no pixel. See tests/test_memory_budget.py.
+    plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read'}
     params = set(inspect.signature(detect_raw).parameters) - plumbing
-    # How each is spelled in the stamp, where the CLI name differs from the parameter name.
-    alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'max_frames': 'max_frames'}
-    missing = [p for p in sorted(params)
-               if f"'{alias.get(p, p)}'" not in stamp and f'({alias.get(p, p)}' not in stamp]
+    # How each is spelled in the record, where the CLI name differs from the parameter name.
+    alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k'}
+    missing = [p for p in sorted(params) if alias.get(p, p) not in prov]
     assert not missing, (
-        f'these change the detections and are not in the --det-cache stamp: {missing}. A cache '
-        'written under one value would be reused under another, silently.')
+        f'these change the detections and are not recorded in the prediction: {missing}. Two runs '
+        'differing in one of them would be indistinguishable from their output alone.')
 
-    # And the CHECKPOINT-derived ones are UNCONDITIONAL, not "recorded only if non-default": they
-    # come from the checkpoint rather than the command line, so two runs can differ in them with
-    # identical arguments and would otherwise share a stamp. `raw_rev` is unconditional for a
-    # sharper reason -- a raw cache and a pre-split associated one are the same shape and dtype
-    # under an otherwise identical stamp, so reading one as the other associates it twice.
-    head = stamp[:stamp.index('+ [(k, str(getattr(args, k)))')]
-    for k in ('tile_scale', 'reduce', 'raw_rev', 'top_k'):
-        assert f"'{k}'" in head, f'{k} must be stamped unconditionally'
+    # UNCONDITIONAL, every key, always. The stamp recorded only the options that DIFFERED from
+    # their defaults, because a positional list invalidated every cache on disk each time a flag
+    # was added. Nothing here has that pressure, and conditional membership is what made the stamp
+    # need five exceptions to its own rule.
+    args2 = argparse.Namespace(detector='d.pt', det_input_wh=(416, 416), det_score=0.97,
+                               det_top_k=24, max_animals=2, max_frames=120)
+    assert set(_box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
+        'the same keys at every value -- conditional membership is what makes a record lie'
 
 
 def test_score_dataset_scores_unaugmented_and_restores_the_flag():
@@ -2219,7 +2213,15 @@ def test_deployment_score_untrained_model_is_all_zero(tmp_path):
     `det_score`, so `det_fill` and `slot_fill` must read exactly 0 and `window_miss` exactly 1 --
     a degenerate but DETERMINISTIC floor, pinned so a future change to the init or to the
     threshold plumbing is caught rather than silently shifting the floor.
+
+    THE SEED IS WHAT MAKES "DETERMINISTIC" TRUE. The objectness PRIOR sits at ~0.0099, but the
+    head's random init scatters the actual logits around it, and 3 of 20 torch seeds put at least
+    one anchor above `det_score = 0.05` -- so unseeded this test reads its own RNG state. It never
+    varied on its own because it ran at a fixed position in the suite; adding or removing a test
+    anywhere in this file reshuffles xdist's distribution and moves the state it happens to see.
     """
+    torch.manual_seed(0)
+
     from .conftest import _session_2d
     from tailcyclenet.detector.evaluate import deployment_score
     from tailcyclenet.format import Session

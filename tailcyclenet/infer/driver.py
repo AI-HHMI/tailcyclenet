@@ -1,9 +1,9 @@
 """The DRIVER: one run over a dataset. Everything `run_group` is not.
 
 Flag resolution and the refusals that must happen before a checkpoint loads, the session/group
-loop, the `--det-cache` stamp and its read/checkpoint/write, association, the render pool, and the
-flat-npz write. Lifted verbatim out of `scripts/infer.py`, where it could not be imported and so
-could only be tested by reading the file as text.
+loop, detection and association, the render pool, and the flat-npz write. Lifted verbatim out of
+`scripts/infer.py`, where it could not be imported and so could only be tested by reading the file
+as text.
 """
 from __future__ import annotations
 
@@ -21,9 +21,39 @@ from .window import InferConfig, run_group
 
 
 
-def run_dataset(args, ap):
-    """One inference run. `ap` is the parser `args` came from -- the `--det-cache` stamp records
-    only the options that DIFFER from their defaults and asks `ap.get_default` for them."""
+def _box_provenance(args, det_tile, det_red, det_boxsrc):
+    """Every input the DETECTIONS depend on, recorded beside the numbers they produced.
+
+    This is what is left of the `--det-cache` stamp, and it does a different job. The stamp
+    compared two runs so a cache could be REFUSED; there is no cache, so nothing needs comparing --
+    but "which detector, at which threshold, at which input size" is still the difference between
+    two numbers that look alike (eval rule 4), and it belonged in the output file rather than in a
+    shell history.
+
+    UNCONDITIONAL, every key, always. The stamp recorded only the options that DIFFERED from their
+    defaults, because a positional list invalidated every cache on disk each time a flag was added.
+    A provenance record has no such pressure, and conditional membership is what made the stamp
+    need five exceptions to its own rule.
+
+    Keyed by the CLI name where it differs from `detect_raw`'s parameter name, because that is what
+    a reader has to type to reproduce it. `tests/test_detector.py` walks `detect_raw`'s signature
+    against this dict, so a new box-affecting parameter cannot be added without landing here.
+    """
+    return {
+        'detector': str(args.detector) if args.detector else '',
+        'det_input_wh': str(args.det_input_wh or ''),
+        'det_score': float(args.det_score),
+        'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
+        'max_animals': int(args.max_animals),
+        'max_frames': int(args.max_frames),
+        'tile_scale': float(det_tile) if det_tile else 0.0,
+        'reduce': bool(det_red),
+        'box_source': str(det_boxsrc or 'keypoints') if args.detector else '',
+    }
+
+
+def run_dataset(args):
+    """One inference run."""
 
     # EVERY PURE-ARGUMENT CHECK BEFORE THE CHECKPOINT LOADS. These cost nothing and a typo
     # should not cost a 5.6 GB load; it also makes them testable without a GPU.
@@ -166,10 +196,11 @@ def run_dataset(args, ap):
               'instances.pq falls back to its keypoints')
 
     boxes = dict(np.load(args.boxes, allow_pickle=True)) if args.boxes else {}
-    # `det_tile` and `det_red` are initialised HERE and not only inside the branch: both go into
-    # the cache stamp unconditionally, and a NameError there would only fire on the box-source
-    # paths that have no detector at all -- which is exactly how `det_kpts` shipped broken.
-    det = det_wh = det_tile = None
+    # `det_tile`, `det_red` and `det_boxsrc` are initialised HERE and not only inside the branch:
+    # all three reach `_box_provenance` below unconditionally, and a NameError there would only
+    # fire on the box-source paths that have no detector at all -- which is exactly how `det_kpts`
+    # shipped broken.
+    det = det_wh = det_tile = det_boxsrc = None
     det_red = False
     if args.detector:
         from tailcyclenet.detector import associate_group, detect_raw, load_detector
@@ -210,6 +241,17 @@ def run_dataset(args, ap):
         # every rat-city pose run was trained on keypoint-extent crops, so this arm is a legitimate
         # thing to run -- it just is not a detector-quality comparison against a keypoint-trained
         # one, because the crop source moved too (eval rule 4). The npz records which.
+        # A DETECTOR WITH NO KEYPOINT BRANCH CANNOT SERVE `--crop-source keypoints`, and the failure
+        # is SILENT: `run_group` takes `det_kpts_stc is not None` as the switch, so a None does not
+        # error -- it quietly crops from the boxes and reports the arm under the other arm's name.
+        # Refused rather than warned, for the reason eval rule 4 exists: the two crop sources are
+        # only comparable when they differ in exactly one lever.
+        if args.crop_source == 'keypoints' and not int(getattr(det, 'n_keypoints', 0)):
+            raise SystemExit(
+                f'{args.detector}: has no keypoint branch, so --crop-source keypoints would '
+                'silently fall back to cropping from the boxes and measure the arm it is being '
+                'compared against. Train the detector with --keypoints, or use --crop-source '
+                'boxes.')
         if (det_boxsrc or 'keypoints') != cfg.box_source:
             print(f'WARNING: detector boxes are {det_boxsrc!r} but this run was trained on '
                   f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '
@@ -227,49 +269,6 @@ def run_dataset(args, ap):
         ds_name = args.dataset_name
     want = set(args.groups.split(',')) if args.groups else None
     render_cams = [int(c) for c in args.render_cams.split(',') if c.strip() != '']
-
-    # The box cache. `stamp` is every input the boxes DEPEND ON: reusing a cache written under a
-    # different detector, threshold or animal count would quietly make one arm incomparable to the
-    # next (eval rule 4).
-    #
-    # ONLY THE OPTIONS THAT DIFFER FROM THEIR DEFAULTS, sorted by name -- a positional list of every
-    # value invalidated every cache on disk each time a flag was added.
-    #
-    # THE UNCONDITIONAL KEYS ARE THE EXCEPTION THAT RULE NEEDS: anything whose default may MOVE, or
-    # that comes from the CHECKPOINT rather than the command line, must be stamped always, or a
-    # cache written under the old meaning is reused silently under the new one. That covers
-    # `det_score`, `top_k`, `tile_scale`, `reduce` and `raw_rev`. `raw_rev` is the sharpest: a raw
-    # cache and a pre-split associated one share shape, dtype and key names, so an old one read as
-    # raw would be associated a SECOND time.
-    #
-    # THE CACHE HOLDS RAW DETECTIONS, SO THE ASSOCIATION OPTIONS LEAVE THE STAMP. `track`,
-    # `link_boxes`, `max_animals`, `min_views` and `max_move` change only what happens after
-    # detection, and `associate_group` re-runs every invocation -- microseconds per frame against
-    # 44 ms of 4K decode. One cache serves every identity arm, matching them BY CONSTRUCTION.
-    #
-    # `top_k` is always present and its VALUE says which rule produced it (`--det-top-k` when set,
-    # else the count `max_animals` implies). Conditional membership is what makes a stamp lie.
-    from tailcyclenet.detector import RAW_REV
-    top_k_stamp = (str(args.det_top_k) if args.det_top_k
-                   else f'from-max-animals:{args.max_animals}')
-    stamp = repr(sorted([('det_score', str(args.det_score)), ('raw_rev', str(RAW_REV)),
-                         ('top_k', top_k_stamp),
-                         ('tile_scale', str(det_tile)), ('reduce', str(det_red))]
-                        + [(k, str(getattr(args, k))) for k in
-                           ('detector', 'det_input_wh', 'max_frames')
-                           if getattr(args, k) != ap.get_default(k)]))
-    det_cache, cache_dirty = {}, False
-    if args.det_cache and args.det_cache.exists():
-        loaded = dict(np.load(args.det_cache, allow_pickle=True))
-        got = str(loaded.pop('__stamp__', ''))
-        if got != stamp:
-            raise SystemExit(f'{args.det_cache}: written for {got}\n'
-                             f'{" " * len(str(args.det_cache))}  now running {stamp}\n'
-                             'Delete it or point --det-cache somewhere else.')
-        det_cache = loaded
-        print(f'detector boxes: '
-              f'{sum(1 for k in det_cache if not k.endswith(("|score", "|kpt")))} '
-              f'cached group(s) from {args.det_cache}')
 
     results = {}
     # `renders` holds the futures still encoding; drained after the npz is written, so a slow encode
@@ -327,69 +326,16 @@ def run_dataset(args, ap):
                         '(top_k, T, C, K, 3) and is usually most of this; or\n'
                         '  split the recording into shorter groups at conversion time, which is '
                         'what every shipped root does.')
-                if key in det_cache:
-                    raw = (det_cache[key], det_cache.get(f'{key}|score'),
-                           det_cache.get(f'{key}|kpt'))
-                    # A CACHE WITHOUT KEYPOINTS CANNOT SERVE `--crop-source keypoints`, and the
-                    # failure would be SILENT: `run_group` takes `det_kpts_stc is not None` as the
-                    # switch, so a None here does not error, it quietly crops from the boxes and
-                    # reports the arm under the other arm's name. That is the `--boxes`-key trap
-                    # below, one flag over. Refused rather than warned, because the whole purpose of
-                    # a shared cache is that two arms differ in exactly one lever.
-                    if args.crop_source == 'keypoints' and raw[2] is None:
-                        raise SystemExit(
-                            f'{args.det_cache}: holds no keypoints for {key!r}, so --crop-source '
-                            'keypoints would silently fall back to cropping from the boxes and '
-                            'measure the arm it is being compared against. Delete it and re-detect '
-                            '(a keypoint-trained detector fills this in), or drop --det-cache.')
-                    # `flush` for the same reason the detecting branch has it: redirected to a log,
-                    # stdout is block-buffered, so the CACHED path -- the fast one, which prints
-                    # little else -- shows nothing for minutes and reads as a hung run.
-                    print(f'{key}: up to {n_want} animal(s), raw boxes from --det-cache', flush=True)
-                else:
-                    print(f'{key}: detecting up to {n_det} per camera, {n_want} animal row(s)'
-                          f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
-                          flush=True)
-                    _t_det = time.time()
-                    raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
-                                     score_thresh=args.det_score, reduce=det_red,
-                                     max_frames=args.max_frames, tile_scale=det_tile)
-                    _det_secs = time.time() - _t_det
-                    # A keypoint-trained detector fills a third array, cached under its own key.
-                    # This does NOT change what an old cache is allowed to satisfy: a box-only arm
-                    # never looks at it, and a keypoint-crop arm is refused above rather than served
-                    # boxes under the wrong name. Storing it is what lets the two crop sources share
-                    # ONE box set and so differ in exactly one lever (eval rule 4) -- report 15 §6
-                    # had to match its item-3 arms by configuration for want of this.
-                    det_cache[key] = raw[0]
-                    det_cache[f'{key}|score'] = raw[1]
-                    if raw[2] is not None:
-                        det_cache[f'{key}|kpt'] = raw[2]
-                    cache_dirty = True
-                    # CHECKPOINT AN EXPENSIVE GROUP IMMEDIATELY, rather than only at the end of the
-                    # run. The end-of-run write below is still the one that matters for a short
-                    # protocol, but it held rat-city's 57,594-frame group -- 3h18m of decode, 62 GB
-                    # of JPEG -- in memory alone across a further ~3h pose pass, so any interruption
-                    # lost the entire detection. That cache IS the artifact the long-clip benchmark
-                    # exists to produce ("detect once, then every association arm is a CPU-minute"),
-                    # and it did not survive the run that creates it.
-                    #
-                    # GATED ON THE TIME THE DETECTION ACTUALLY TOOK, not on a frame count: 60 s is
-                    # "long enough that losing it would hurt", which is exactly the quantity in
-                    # question. A 58-group protocol detects each group in seconds and so writes
-                    # once, at the end, byte-identical to before; a single long group writes exactly
-                    # once, immediately. Only a root with many SLOW groups pays repeated
-                    # compression, and there it is buying back hours.
-                    if args.det_cache and _det_secs > 60.0:
-                        args.det_cache.parent.mkdir(parents=True, exist_ok=True)
-                        np.savez_compressed(args.det_cache, __stamp__=np.asarray(stamp),
-                                            **det_cache)
-                        print(f'{key}: detection took {_det_secs / 60:.1f} min -- checkpointed '
-                              f'{args.det_cache}', flush=True)
-                # THE ASSOCIATION HALF RUNS EVERY TIME, cached or not. It is microseconds per frame
-                # against 44 ms of 4K decode, so recomputing it costs nothing measurable and buys
-                # the property the cache exists for: two identity arms differ in exactly one lever
-                # over byte-identical pixels.
+                # `flush`: redirected to a log, stdout is block-buffered, so a long detection
+                # shows nothing for minutes and reads as a hung run.
+                print(f'{key}: detecting up to {n_det} per camera, {n_want} animal row(s)'
+                      f'{"" if args.max_animals else " (from the labels; set --max-animals)"}',
+                      flush=True)
+                _t_det = time.time()
+                raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
+                                 score_thresh=args.det_score, reduce=det_red,
+                                 max_frames=args.max_frames, tile_scale=det_tile)
+                print(f'{key}: detected in {time.time() - _t_det:.1f} s', flush=True)
                 nms_stats = {}
                 det_boxes, det_scores, det_kpts = associate_group(
                     raw, sess, gid, n_want, link=args.link_boxes, min_views=args.min_views,
@@ -479,6 +425,9 @@ def run_dataset(args, ap):
     # is the one that can disagree with it.
     flat['__box_source__'] = np.asarray((det_boxsrc or 'keypoints') if args.detector
                                         else cfg.box_source)
+    # EVERY INPUT THE DETECTIONS DEPENDED ON. This is what the `--det-cache` stamp used to carry,
+    # moved from a file that gets reused to the file that gets quoted.
+    flat['__provenance__'] = np.asarray(repr(_box_provenance(args, det_tile, det_red, det_boxsrc)))
     # WHAT THE CROP WAS BUILT FROM, which `__box_source__` above does NOT say -- that one is the
     # detector's TRAINING target. Two arms differing only in `--crop-source` were previously
     # identical in their own provenance, so report 15 §6's pair could be told apart only by
@@ -500,17 +449,4 @@ def run_dataset(args, ap):
     for k, fut in renders:
         print(f'{k}: wrote {fut.result()}')
     render_pool.shutdown()
-
-    # AFTER the prediction is on disk, never before: the cache is an optimisation for the next
-    # run and a failure writing it must not lose the run that just paid for the detection.
-    if args.det_cache and cache_dirty:
-        args.det_cache.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(args.det_cache, __stamp__=np.asarray(stamp), **det_cache)
-        # COUNT GROUPS, NOT KEYS. Each group holds boxes plus `|score` plus `|kpt` where a
-        # keypoint detector supplied them, so `len()` read 174 for 58 groups -- it was already
-        # double-counting before the keypoint key existed, which is why 2x looked plausible.
-        print(f'wrote {args.det_cache} '
-              f'({sum(1 for k in det_cache if not k.endswith(("|score", "|kpt")))} '
-              'group(s) of boxes)')
-
 

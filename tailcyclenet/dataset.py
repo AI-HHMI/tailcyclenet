@@ -89,6 +89,35 @@ class LoaderConfig:
     # reopen it with a measurement behind them rather than by preference. See the prior block below.
     prompt_offset_px: float = 0.0       # sigma of a WHOLE-BODY offset, one vector per item
     prompt_stale_frames: int = 0        # max frames the prior may describe away from `prompt_t`
+    # TWO MORE FAILURES WITH THE SHAPE OF A DEPLOYMENT ERROR (dev/plans/
+    # prompt_prior_corruptions.md), both off by default and both aimed at `--anchor carry`
+    # specifically: a carried pose that swapped two keypoints, or latched onto the wrong animal.
+    #
+    # A COUNT, NOT A PER-KEYPOINT RATE -- K ranges 4 (rat-city, 3dpop) to 47 (allen-mouse) across
+    # roots trained jointly, so a per-keypoint probability would mean 12x more corruption on one
+    # root than the other from one config line (the same quantisation CLAUDE.md already records
+    # for --pose-nms: 'quote it as a COUNT'). The EXPECTED number of transposed pairs per prompted
+    # item; floor(x) + Bernoulli(frac(x)) draws it, clamped to n_finite // 2. A TRANSPOSITION, not
+    # a copy: p_k := p_j while p_j keeps its own value would duplicate one point and delete
+    # another, moving scene_center/cube_scale for nothing -- a transposition leaves the prior SET
+    # unchanged, so those whole-set scalars stay bit-identical and this may be drawn PER KEYPOINT
+    # with none of prompt_dropout's per-item warning applying.
+    prompt_swap_kpt_pairs: float = 0.0
+    # P(per prompted ITEM) the WHOLE prior becomes an ELIGIBLE neighbour's pose instead of this
+    # animal's own -- drawn PER ITEM, unlike the pairs above, because a wrong-animal prior moves
+    # scene_center onto the wrong animal and that whole-set scalar is the point (the same
+    # per-item/per-keypoint split prompt_dropout's own docstring argues for). 'Eligible' is
+    # prior_out_of_bounds applied to the CANDIDATE, reused rather than re-derived: it is the same
+    # rule --anchor carry already uses to decide a prior is usable, which also bounds how far a
+    # neighbour can be and still be a reachable 3D residual target (head_3d_grid_radius). A
+    # session with fewer than two animals never even draws this coin.
+    prompt_swap_animal: float = 0.0
+    # Fraction of keypoints that jump with the animal swap; 1.0 (default) is the WHOLE prior and is
+    # INERT IN THE RNG STREAM -- no per-keypoint draw happens at 1.0, the same contract
+    # crop_inflate = 1.0 already has. Below 1.0 is a DIFFERENT geometry, not a weaker one (it puts
+    # scene_center between two animals rather than on the neighbour), so treat it as its own arm
+    # rather than a dial on the 1.0 result.
+    prompt_swap_animal_frac: float = 1.0
     val_stride: int = 0                # 0 -> non-overlapping windows for val/test
     # Frame stride for a TRAIN window, drawn per item -- posetail's `interval`
     # (`posetail_dataset.py:343-361`). [1] is consecutive frames, i.e. no augmentation. Repeat an
@@ -215,6 +244,66 @@ def _apply_affine(pts, rotation):
                             for t in range(pts.shape[0])])
     M = torch.as_tensor(rotation[0], dtype=pts.dtype)
     return pts @ M[:, :2].T + M[:, 2]
+
+
+def prior_out_of_bounds(p, mode, cgroup):
+    """Which keypoints of a prior are NOT usable as one. (K,) bool, in the MODEL's own frame.
+
+    MOVED HERE FROM `infer.py` (dev/plans/prompt_prior_corruptions.md) so the loader's own prior
+    corruptions -- the animal-swap jump, specifically -- can reuse the identical rule rather than
+    re-deriving it: a second copy is exactly the failure mode this docstring already warns about
+    (`carry` had it, `self` did not, and the two silently disagreed). `infer.py` re-imports this
+    name from here; nothing about its behaviour changed.
+
+    A PRIOR OUTSIDE THE CROP IS NOT A PRIOR. In 2D that is a point outside the crop rectangle; in
+    3D it is a point no PAIR of cameras can see, since a point one camera sees is not
+    reconstructible and so cannot be a position the model should trust. A MOVING camera answers per
+    frame ((T,K) rather than (K,)) and the prior is one pose for the whole window, so a camera
+    counts if it saw the point at any point during it.
+
+    ONE COPY OF THE RULE, called from both prompted regimes. `carry` had it and `self` did not, so
+    the two label-free regimes disagreed about what counts as a prior -- and `self` is the one the
+    periodic val eval reports, so training and deployment were being scored under different rules.
+    Masking this was worth MOTA +0.041, miss -0.032 SIG and idsw 24 -> 13 on rat-city under `carry`.
+    """
+    if mode == '2d':
+        w, h = (float(x) for x in cgroup[0]['size'][:2])
+        return (p[:, 0] < 0) | (p[:, 0] >= w) | (p[:, 1] < 0) | (p[:, 1] >= h)
+    seen = []
+    for c in cgroup:
+        v = is_point_visible(c, p, margin=2)
+        seen.append(v.any(0) if v.ndim > 1 else v)
+    return torch.stack(seen).sum(0) < 2
+
+
+def _rotate_camera_group_with_neighbours(cgroup, coords, others):
+    """`PosetailDataset.rotate_camera_group`, optionally carrying a SECOND point set through the
+    identical draw. Returns `(cgroup, coords, others)`; `others` is None in, None out.
+
+    `others` is None on every item that does not draw `prompt_swap_animal` (the default), and then
+    this is EXACTLY `PosetailDataset.rotate_camera_group(None, cgroup, coords)` -- no concatenation,
+    no extra tensor, no extra draw, so a plain config is byte-identical (dev/plans/
+    prompt_prior_corruptions.md Section 1, correction 6's underlying claim: the world rotation is
+    drawn from the GLOBAL numpy RNG inside the library call, not from this loader's own `rng`, and
+    is drawn exactly once here either way).
+
+    When `others` (T, n_other, K, R) is given, it rides through the SAME `rotmat` as `coords` by
+    being concatenated onto the keypoint axis for the one call and split back off after --
+    `coords @ rotmat` is a per-point operation, so this changes nothing about `coords`' own output
+    (no cross-talk between the concatenated rows) and needs no reimplementation of the rotation
+    itself. Callers must NOT pass this combined tensor to `crop_to_points_3d`: the crop is the
+    TARGET's own extent, and widening it with a neighbour would change the item's geometry, which
+    is the one thing dev/plans/prompt_prior_corruptions.md Section 4.4 requires never happens.
+    """
+    from posetail.datasets.posetail_dataset import PosetailDataset
+
+    if others is None:
+        cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
+        return cgroup, coords, None
+    T, K = coords.shape[0], coords.shape[1]
+    combined = torch.cat([coords, others.reshape(T, -1, 3)], dim=1)
+    cgroup, combined = PosetailDataset.rotate_camera_group(None, cgroup, combined)
+    return cgroup, combined[:, :K], combined[:, K:].reshape(others.shape)
 
 
 def _crop_affine(src_wh, crop_coords, target_size, rotation):
@@ -1034,6 +1123,17 @@ class PoseDataset(Dataset):
         a = item.animal
         K = sess.n_keypoints
 
+        # THE ANIMAL-SWAP PRIOR CORRUPTION (`prompt_swap_animal`, dev/plans/
+        # prompt_prior_corruptions.md), drawn HERE -- before any geometry, and before anything
+        # else in `_item` touches `rng` -- so the coin is a single shared decision for whichever
+        # branch runs below, and a session with fewer than two animals never draws it at all
+        # (`lab.n_animals >= 2` short-circuits BEFORE `rng.random()`). Gated on `self.cfg.
+        # prompt_swap_animal > 0` first for the same reason: a default config must draw nothing
+        # extra and stay byte-identical to one that never mentions the key.
+        want_swap_animal = (self.train and self.cfg.prompt_swap_animal > 0
+                            and lab.n_animals >= 2
+                            and rng.random() < self.cfg.prompt_swap_animal)
+
         cgroup = sess.cgroup(item.gid, frames)
         # ONE DRAW FOR THE WHOLE ITEM, not one per camera -- the wide-crop regime widens every
         # camera's box by the SAME factor (matching `_jitter`'s one-draw-per-item contract), so a
@@ -1125,6 +1225,11 @@ class PoseDataset(Dataset):
                  else self.cfg.aug_rotation_prob)
         rot_deg = self.cfg.aug_rotation_deg
         rotation_info = [None] * len(cgroup)
+        # (T, n_other, K, R) in the SAME final frame `coords` ends up in, or None -- built inside
+        # whichever branch below runs, and consumed once, after `prompt_t` exists, in the query
+        # prior section. None whenever `want_swap_animal` is False, which is every item on a
+        # default config: nothing here changes what either branch does today.
+        neighbour_full = None
         if true_2d:
             cam = cgroup[0]
             coords = _mask_outside(coords, cam['size'])
@@ -1156,6 +1261,19 @@ class PoseDataset(Dataset):
                 # THE MEANINGFUL UPDATE: a point outside the final crop is not visible in the
                 # crop the model trains on, even though it was visible in the source frame.
                 vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
+            if want_swap_animal:
+                # THE SAME THREE STEPS `coords` JUST WENT THROUGH -- the in-plane rotation (if
+                # any), the crop's own shift, the resize's own scale -- reapplied to every OTHER
+                # animal's raw pose with the existing `_apply_affine` helper rather than a second
+                # copy of the arithmetic. Deliberately NOT `_mask_outside`'d against the ORIGINAL
+                # frame: the only masking this needs is the FINAL one, `prior_out_of_bounds`,
+                # applied once against the finished crop in the query-prior section below.
+                cand_ids = [i for i in range(lab.n_animals) if i != a]
+                raw = torch.as_tensor(lab.points2d[cand_ids][:, frames][..., 0, :],
+                                      dtype=torch.float32)          # (n_other,T,K,2)
+                raw = raw.permute(1, 0, 2, 3)                        # (T,n_other,K,2)
+                raw = _apply_affine(raw, rotation_info[0])
+                neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
             cgroup, boxes = [cam], [box]
             p2d = p2d_all = coords[None]
             R = 2
@@ -1196,12 +1314,23 @@ class PoseDataset(Dataset):
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
                             vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
+            # OTHER ANIMALS' RAW WORLD POSES, threaded through the SAME two random world rotations
+            # `coords` is about to go through -- and NOTHING else: the per-camera in-plane
+            # rotation above only moves cameras, and `crop_to_points_3d` below is never handed
+            # this tensor, so it cannot widen the crop or change `cube_scale`
+            # (dev/plans/prompt_prior_corruptions.md Section 4.4). None when `want_swap_animal` is
+            # False, which is the default -- see `_rotate_camera_group_with_neighbours`.
+            others_raw = None
+            if want_swap_animal:
+                cand_ids = [i for i in range(lab.n_animals) if i != a]
+                others_raw = torch.as_tensor(lab.points3d[cand_ids][:, frames],
+                                             dtype=torch.float32).permute(1, 0, 2, 3)
             if self.train:
                 # Random world rotation, applied to points AND cameras together, so the model
-                # cannot learn a fixed world gauge. Called unbound because the library's method
-                # reads no instance state -- calling it is what keeps this from drifting.
-                from posetail.datasets.posetail_dataset import PosetailDataset
-                cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
+                # cannot learn a fixed world gauge. `_rotate_camera_group_with_neighbours` is
+                # exactly this call when `others_raw` is None (every item on a default config).
+                cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
+                    cgroup, coords, others_raw)
             # A stored box lives in SOURCE pixels, so it follows each camera's own in-plane
             # rotation -- the same affine `rotate_camera_image_plane_3d` hands back for the warp,
             # or one per frame under a slide.
@@ -1216,10 +1345,13 @@ class PoseDataset(Dataset):
             cgroup = [_resize_camera(c, self.cfg.image_size)[0] for c in cgroup]
             if self.train:
                 # Random world rotation, applied to points AND cameras together, so the model
-                # cannot learn a fixed world gauge. Called unbound because the library's method
-                # reads no instance state -- calling it is what keeps this from drifting.
-                from posetail.datasets.posetail_dataset import PosetailDataset
-                cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
+                # cannot learn a fixed world gauge. Second draw of the item (see the first call
+                # above); `others_raw` rides through this one too, so it ends up in EXACTLY the
+                # frame `coords` itself ends up in.
+                cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
+                    cgroup, coords, others_raw)
+            if others_raw is not None:
+                neighbour_full = others_raw
             # `p2d` is the reprojection AFTER crop/resize/rotate, so it lands in crop pixels.
             # Cutout needs it too, in the same frame -- projected once and shared, since a second
             # `project_points_torch` is a float64 reprojection of every point in the window.
@@ -1324,6 +1456,56 @@ class PoseDataset(Dataset):
                 # a withdrawn one, and swapping in NaN would be `prompt_dropout` under another name.
                 swap = torch.isfinite(alt).all(-1) & torch.isfinite(kpt_prior).all(-1)
                 kpt_prior = torch.where(swap[:, None], alt, kpt_prior)
+        # B: THE PRIOR JUMPS TO A NEARBY ANIMAL (`prompt_swap_animal`, dev/plans/
+        # prompt_prior_corruptions.md). `neighbour_full` is None unless `want_swap_animal` drew
+        # true at the top of `_item` -- so a default config, and every single-animal session,
+        # never reaches this block at all.
+        if neighbour_full is not None:
+            mode_str = '2d' if R == 2 else '3d'
+            # (T, n_other, K, R) -> this item's own PROMPT_T per keypoint, exactly how
+            # `kpt_prior` itself was built above -- reused rather than re-derived.
+            cand = neighbour_full.permute(0, 2, 1, 3)[prompt_t, torch.arange(K)]  # (K,n_other,R)
+            oob = torch.stack([prior_out_of_bounds(cand[:, i], mode_str, cgroup)
+                               for i in range(cand.shape[1])], dim=1)              # (K,n_other)
+            eligible = (~oob).sum(0) >= 2
+            if bool(eligible.any()):
+                # UNIFORM among eligible neighbours: the nearest animal is already the modal
+                # eligible one, so a nearest rule would add tie-breaking machinery for no
+                # measured benefit (dev/plans/prompt_prior_corruptions.md Section 4.3).
+                elig_idx = eligible.nonzero(as_tuple=True)[0]
+                choice = int(elig_idx[int(rng.integers(len(elig_idx)))])
+                neighbour_prior = cand[:, choice].clone()
+                # THE BOUNDS MASK, APPLIED ONLY HERE. The neighbour survives as a WHOLE (>= 2
+                # keypoints eligible), but an individual keypoint may still be out of bounds, and
+                # that one becomes NaN exactly as a departed `carry` keypoint does.
+                neighbour_prior[oob[:, choice]] = float('nan')
+                frac = float(self.cfg.prompt_swap_animal_frac)
+                # 1.0 DRAWS NOTHING -- the same inert-at-1.0 contract `crop_inflate` already has.
+                jump = (torch.isfinite(neighbour_prior).all(-1) if frac >= 1.0 else
+                       (torch.as_tensor(rng.random(K)) < frac)
+                       & torch.isfinite(neighbour_prior).all(-1))
+                kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
+            # An INELIGIBLE draw (every other animal loses -- fewer than 2 keypoints survive the
+            # bounds mask) is a NO-OP: `prompt_swap_animal`'s CONFIGURED rate and its PRESENTED
+            # rate then differ, which is why an arm is measured with a loader audit rather than
+            # assumed from the config.
+        # A: THE PRIOR JUMPS TO OTHER KEYPOINTS OF THE SAME ANIMAL (`prompt_swap_kpt_pairs`). A
+        # TRANSPOSITION of `kpt_prior`'s own finite entries -- the prior SET is therefore
+        # unchanged and `px` above stays valid, unlike `prompt_dropout`'s per-item draw. `prompt_t`
+        # is deliberately left untouched, the same precedent `prompt_stale_frames` sets just
+        # above: staleness moves the POSE, never the CLAIMED frame.
+        if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
+            finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]
+            if len(finite_idx) >= 2:
+                x = float(self.cfg.prompt_swap_kpt_pairs)
+                n_pairs = int(x) + int(rng.random() < (x - int(x)))
+                n_pairs = min(n_pairs, len(finite_idx) // 2)
+                if n_pairs:
+                    perm = finite_idx[torch.from_numpy(rng.permutation(len(finite_idx)))]
+                    kpt_prior = kpt_prior.clone()
+                    for i in range(n_pairs):
+                        j, k = int(perm[2 * i]), int(perm[2 * i + 1])
+                        kpt_prior[j], kpt_prior[k] = kpt_prior[k].clone(), kpt_prior[j].clone()
         if self.train and self.cfg.prompt_offset_px > 0 and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(
                 rng.normal(0.0, float(self.cfg.prompt_offset_px) * px, (1, R)),

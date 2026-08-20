@@ -6,6 +6,8 @@ independently-plausible rule would cost. `test_crop_rule_is_int32_exact` is what
 and it compares against the library's own inline arithmetic rather than a transcription of it.
 """
 from collections import Counter
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,7 +15,7 @@ import torch
 
 from tailcyclenet import crop as cropmod
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
-from tailcyclenet.format import Registry
+from tailcyclenet.format import Registry, load_dataset
 
 from .conftest import KPTS_2D
 
@@ -1436,6 +1438,248 @@ def test_the_3d_visibility_or_reflects_the_augmentation_that_followed_it():
         'keypoint 1 is the case: still claimed visible after every camera lost it'
     # NaN is not visible, and must not raise or propagate.
     assert not bool(fresh[0, 2])
+
+
+# ----------------------------------------------------------------------------------------------
+# the two prior corruptions (dev/plans/prompt_prior_corruptions.md): a swapped keypoint pair, and
+# a jump to a nearby animal's pose. Both are train-only, off by default, and gated so a default
+# config never draws an extra `rng` value -- see `_train_item`'s own docstring for why a 3D
+# comparison additionally reseeds the GLOBAL numpy RNG.
+# ----------------------------------------------------------------------------------------------
+
+def _train_item(ds, idx=0, seed=0):
+    """One TRAIN item, fully deterministic. `PoseDataset.__getitem__` entropy-seeds every train
+    item (`np.random.default_rng(None)`), so a byte-identity comparison has to go through `_item`
+    directly with an explicit rng -- the precedent is
+    `test_crop_inflate_range_flows_through_a_real_item`.
+
+    A 3D item ALSO needs the GLOBAL numpy seed reset: `rotate_camera_group` draws its rotation
+    from `np.random.uniform`, not from this `rng`, and both calls in the 3D branch of `_item` are
+    unconditional on `self.train` -- so two `_item` calls being compared must each start from the
+    same global state, or they silently diverge on a rotation neither call's own `rng` chose
+    (dev/plans/prompt_prior_corruptions.md Section 1, correction 6).
+    """
+    np.random.seed(seed)
+    return ds._item(idx, np.random.default_rng(seed))
+
+
+def test_prompt_swaps_default_off_is_byte_identical(tiny_root):
+    """`prompt_swap_kpt_pairs = 0.0`, `prompt_swap_animal = 0.0` (both defaults) must be
+    BYTE-IDENTICAL to a config that never mentions the keys -- mirroring
+    `test_crop_inflate_default_is_inert`'s own contract for the same reason: every number on
+    record was measured without these keys, and an unconditional draw would silently un-pair
+    every one of them from a run that now imports this code unchanged.
+    """
+    for root, split in ((tiny_root / 'ratlike', 'val'), (tiny_root / 'mouselike', 'train')):
+        base = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
+                            crop_jitter=0.3, prompt_dropout=0.4)
+        explicit = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
+                                crop_jitter=0.3, prompt_dropout=0.4, prompt_swap_kpt_pairs=0.0,
+                                prompt_swap_animal=0.0, prompt_swap_animal_frac=1.0)
+        ds_base = PoseDataset(root, split, base, train=False)
+        ds_explicit = PoseDataset(root, split, explicit, train=False)
+        b = _batch(ds_base)
+        e = _batch(ds_explicit)
+        torch.testing.assert_close(b.coords, e.coords, equal_nan=True)
+        torch.testing.assert_close(b.kpt_prior, e.kpt_prior, equal_nan=True)
+        torch.testing.assert_close(b.prompt_t, e.prompt_t)
+        np.testing.assert_array_equal(b.views[0].numpy(), e.views[0].numpy())
+
+    # TRAIN mode too, where the new coin draws are actually gated (`self.train`-guarded): a
+    # config that never mentions the keys must still draw exactly what it always drew, on both
+    # dimensionalities, so a run that predates this change replays identically.
+    for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
+        base_ds = PoseDataset(root, 'train', CFG, train=True)
+        b = pose_collate([_train_item(base_ds)])
+        e = pose_collate([_train_item(base_ds)])          # same seed twice: must reproduce itself
+        torch.testing.assert_close(b.kpt_prior, e.kpt_prior, equal_nan=True)
+        torch.testing.assert_close(b.coords, e.coords, equal_nan=True)
+
+
+def test_animal_swap_is_inert_on_a_single_animal_session(tmp_path):
+    """`want_swap_animal` requires `lab.n_animals >= 2`, checked BEFORE `rng.random()` -- so a
+    single-animal session must draw NOTHING extra, and the item must be bit-identical to one built
+    without the key at all. `_session_3d` ships exactly one animal.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    root = tmp_path / 'ds'
+    cf._session_3d(root / 'train' / 's', T=6)
+
+    base_ds = PoseDataset(root, 'train', CFG, train=True)
+    swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_animal=0.9), train=True)
+    b = pose_collate([_train_item(base_ds)])
+    s = pose_collate([_train_item(swap_ds)])
+    torch.testing.assert_close(b.kpt_prior, s.kpt_prior, equal_nan=True)
+    torch.testing.assert_close(b.coords, s.coords, equal_nan=True)
+    torch.testing.assert_close(b.cgroup[0]['mat'], s.cgroup[0]['mat'])
+
+
+def test_animal_swap_changes_only_the_prior(tiny_root):
+    """At `prompt_swap_animal = 1.0` on `ratlike` (2 animals, `_session_2d`), the corruption must
+    touch `kpt_prior` and NOTHING else -- `crop_to_points_2d`/`crop_to_points_3d` are never handed
+    the neighbour, so the crop, the pixels and every other target stay exactly what they were
+    (dev/plans/prompt_prior_corruptions.md Section 4.4). This is the guard against "the neighbour
+    leaked into the crop".
+    """
+    root = tiny_root / 'ratlike'
+    base_ds = PoseDataset(root, 'train', CFG, train=True)
+    swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_animal=1.0), train=True)
+
+    b = pose_collate([_train_item(base_ds)])
+    s = pose_collate([_train_item(swap_ds)])
+
+    torch.testing.assert_close(b.coords, s.coords, equal_nan=True)
+    torch.testing.assert_close(b.cgroup[0]['mat'], s.cgroup[0]['mat'])
+    torch.testing.assert_close(b.cgroup[0]['offset'], s.cgroup[0]['offset'])
+    torch.testing.assert_close(b.cgroup[0]['size'].float(), s.cgroup[0]['size'].float())
+    if b.vis_2d is not None:
+        torch.testing.assert_close(b.vis_2d, s.vis_2d, equal_nan=True)
+    assert not torch.allclose(b.kpt_prior, s.kpt_prior, equal_nan=True), \
+        'prompt_swap_animal = 1.0 on a 2-animal session must actually move the prior'
+
+
+def test_animal_swap_prior_is_in_the_model_frame(tmp_path):
+    """The corrupted prior must be the NEIGHBOUR's pose put through the SAME transform the
+    target's own `coords` received, not merely a differently-shaped tensor.
+
+    3D: the two animals are a RIGID pair (`_session_3d_multi`'s own contract -- animal 2 is
+    animal 1 plus one constant world-space offset), and a world ROTATION is linear, so the
+    corrupted prior minus the base prior must be the SAME vector at every keypoint, with the SAME
+    norm as the un-rotated offset (`sep`) -- exactly what threading the neighbour through both
+    `rotate_camera_group` calls (dev/plans/prompt_prior_corruptions.md Section 4.4) predicts, and
+    what re-deriving the rotation independently would not obviously satisfy if the wrong tensor
+    got split off.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    sep = 5.0
+    root = tmp_path / 'mv'
+    cf._session_3d_multi(root / 'train' / 's', T=6, sep=sep)
+    base_ds = PoseDataset(root, 'train', CFG, train=True)
+    swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_animal=1.0), train=True)
+
+    b = pose_collate([_train_item(base_ds)])
+    s = pose_collate([_train_item(swap_ds)])
+    assert not torch.allclose(b.kpt_prior, s.kpt_prior, equal_nan=True)
+
+    diff = (s.kpt_prior - b.kpt_prior)[0]                    # (K,3)
+    ok = torch.isfinite(diff).all(-1)
+    assert int(ok.sum()) >= 2, 'need at least two keypoints to check the diff is one vector'
+    torch.testing.assert_close(diff[ok], diff[ok][:1].expand_as(diff[ok]), atol=1e-3, rtol=1e-3)
+    assert float(diff[ok][0].norm()) == pytest.approx(sep, abs=1e-2), \
+        'a world ROTATION preserves the norm of a rigid offset'
+
+
+def test_animal_swap_2d_prior_is_the_neighbours_own_labelled_pixel(tiny_root):
+    """2D half of the same claim, inverted through the item's OWN recorded crop geometry rather
+    than a second copy of the crop rule.
+
+    `offset = cgroup[0]['offset']` is exactly the box origin `_item` computed for the TARGET
+    (`apply_crop` then `_resize_camera`), and `final = raw * scale - offset` for whatever scalar
+    `scale` the resize used. NOT `cgroup[0]['mat'][0, 0]`: that is the camera's own intrinsic fx
+    (`nominal_camera`'s `max(W, H)`) times `scale`, not `scale` alone, so dividing by it would be
+    wrong by exactly that factor. `scale` is instead solved from the TARGET's OWN known
+    correspondence -- its base (uncorrupted) `kpt_prior` against its own raw labelled pixel at
+    `prompt_t` -- which `test_animal_swap_changes_only_the_prior` already pins bit-identical
+    between the base and swap items, so reading it off either one is the same fact.
+    """
+    root = tiny_root / 'ratlike'
+    cfg = replace(CFG, aug_prob=0.0, crop_jitter=0.0)
+    base_ds = PoseDataset(root, 'train', cfg, train=True)
+    swap_ds = PoseDataset(root, 'train', replace(cfg, prompt_swap_animal=1.0), train=True)
+    b = pose_collate([_train_item(base_ds)])
+    s = pose_collate([_train_item(swap_ds)])
+    torch.testing.assert_close(b.prompt_t, s.prompt_t)
+
+    sess = load_dataset(root).sessions['train'][0]
+    sess.preload()
+    lab = sess.labels('g000')
+    target = torch.as_tensor(lab.points2d[0][:, :, 0], dtype=torch.float32)  # (T_group,K,2)
+    other = torch.as_tensor(lab.points2d[1][:, :, 0], dtype=torch.float32)  # (T_group,K,2)
+
+    offset = s.cgroup[0]['offset'].float()
+    start, stride = int(b.sample_info['start']), int(b.sample_info['stride'])
+    pt = b.prompt_t[0]
+    finite_t = torch.isfinite(b.kpt_prior[0]).all(-1)
+    assert bool(finite_t.any()), 'need at least one target keypoint to solve `scale` from'
+    k0 = int(finite_t.nonzero(as_tuple=True)[0][0])
+    raw0 = target[start + int(pt[k0]) * stride, k0]
+    scale = float(((b.kpt_prior[0, k0] + offset) / raw0).mean())
+
+    recovered = (s.kpt_prior[0] + offset) / scale              # (K, 2), back in SOURCE pixels
+    finite = torch.isfinite(s.kpt_prior[0]).all(-1)
+    assert bool(finite.any()), 'need at least one corrupted keypoint to check'
+    for k in finite.nonzero(as_tuple=True)[0].tolist():
+        d = (other[:, k] - recovered[k]).norm(dim=-1)
+        d = d[torch.isfinite(d)]                    # a02 carries an UNLABELED slot (`_session_2d`)
+        assert len(d) and float(d.min()) < 0.5, \
+            f'keypoint {k}: recovered source pixel matches no frame of the other animal'
+
+
+def test_corrupted_prior_is_bounds_masked(tmp_path):
+    """A neighbour placed outside every camera's usable pair (`sep` far larger than the crop)
+    must never be substituted in -- "I was not told" rather than "I was told a lie". Fewer than
+    two of its keypoints survive `prior_out_of_bounds`, so it never becomes eligible at all, and
+    the corruption is a NO-OP: `prompt_swap_animal`'s CONFIGURED rate and its PRESENTED rate then
+    differ (dev/plans/prompt_prior_corruptions.md Section 4.3).
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    root = tmp_path / 'mv'
+    cf._session_3d_multi(root / 'train' / 's', T=6, sep=1e6)
+    base_ds = PoseDataset(root, 'train', CFG, train=True)
+    swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_animal=1.0), train=True)
+
+    b = pose_collate([_train_item(base_ds)])
+    s = pose_collate([_train_item(swap_ds)])
+    torch.testing.assert_close(b.kpt_prior, s.kpt_prior, equal_nan=True), \
+        'an ineligible neighbour must leave the prior untouched, not a partially-NaN\'d lie'
+
+
+def test_kpt_swap_preserves_the_prior_set(tiny_root):
+    """A TRANSPOSITION, not a copy: the sorted set of finite prior POSITIONS must be unchanged by
+    `prompt_swap_kpt_pairs`, at any rate, on both dimensionalities -- which is what licenses
+    drawing this PER KEYPOINT with none of `prompt_dropout`'s per-item warning applying
+    (dev/plans/prompt_prior_corruptions.md Section 3): `scene_center` / `cube_scale` are derived
+    from this exact set, and they must not move.
+    """
+    def sorted_points(prior):
+        pts = prior[0][torch.isfinite(prior[0]).all(-1)]
+        return sorted(tuple(round(float(x), 4) for x in row) for row in pts.tolist())
+
+    for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
+        base_ds = PoseDataset(root, 'train', CFG, train=True)
+        b = pose_collate([_train_item(base_ds)])
+        for pairs in (0.3, 0.5, 1.0, 2.0):
+            swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_kpt_pairs=pairs),
+                                  train=True)
+            s = pose_collate([_train_item(swap_ds)])
+            assert sorted_points(b.kpt_prior) == sorted_points(s.kpt_prior), \
+                f'{root.name} pairs={pairs}: the prior SET moved'
+
+
+def test_kpt_swap_pairs_is_a_count_not_a_rate(tiny_root):
+    """A COUNT, not a per-keypoint rate: at `prompt_swap_kpt_pairs = 1.0` (deterministic --
+    `frac(1.0) == 0`, so exactly one pair draws every time) exactly TWO keypoints must differ from
+    the unswapped prior, on BOTH the K=4 (`ratlike`) and K=3 (`mouselike`) roots -- not a count
+    that scales with K, which is the failure CLAUDE.md already names for `--pose-nms`.
+    """
+    for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
+        base_ds = PoseDataset(root, 'train', CFG, train=True)
+        swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_kpt_pairs=1.0), train=True)
+        b = pose_collate([_train_item(base_ds)])
+        s = pose_collate([_train_item(swap_ds)])
+        finite = torch.isfinite(b.kpt_prior[0]).all(-1) & torch.isfinite(s.kpt_prior[0]).all(-1)
+        moved = ~torch.isclose(b.kpt_prior[0], s.kpt_prior[0]).all(-1) & finite
+        assert int(moved.sum()) == 2, \
+            f'{root.name} (K={b.kpt_prior.shape[1]}): expected exactly one swapped PAIR'
 
 
 # ----------------------------------------------------------------------------------------------

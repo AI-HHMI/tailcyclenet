@@ -158,6 +158,36 @@ def _session_3d(path, T=4, moving=False, label_source='tracked'):
     return lab
 
 
+def _session_3d_multi(path, T=4, sep=5.0, label_source='tracked'):
+    """`_session_3d`'s shape with a SECOND animal, for the animal-swap prior corruption
+    (dev/plans/prompt_prior_corruptions.md) -- `_session_3d` ships exactly one animal, which
+    cannot exercise `prompt_swap_animal` at all (`want_swap_animal` requires `n_animals >= 2`).
+
+    The second animal is the FIRST one's own pose rigidly shifted by `sep` world units along one
+    axis, so a SMALL `sep` keeps both animals inside one camera's crop (ELIGIBLE, per
+    `prior_out_of_bounds`) and a LARGE one puts the second animal well outside it (INELIGIBLE) --
+    both cases a test needs, from one knob, rather than two separately-authored fixtures.
+    """
+    W, H = 64, 48
+    rig = _rig([(f'cam{i}', W, H, True, False, i + 1) for i in range(3)])
+    K = len(KPTS_3D)
+    lab = fmt.empty_labels(2, T, K, 3, mode3d=True, animal_ids=['m1', 'm2'])
+    rng = np.random.default_rng(2)
+    lab.vis3d[:] = fmt.VISIBLE
+    base = rng.uniform(-50, 50, size=(T, K, 3)).astype(np.float32)
+    lab.points3d[0] = base
+    lab.points3d[1] = base + np.array([sep, 0.0, 0.0], dtype=np.float32)
+    lab.vis2d[:] = fmt.VISIBLE
+
+    groups = {'g000': fmt.Group('g000', T, fps=200.0)}
+    fmt.write_session(path, mode='3d', units='mm', label_source=label_source, names=KPTS_3D,
+                      rig=rig, groups=groups,
+                      labels={'g000': lab}, provenance={'source': 'synthetic'})
+    for name in rig.names:
+        _write_frames(path / 'groups' / 'g000', name, T, (W, H))
+    return lab
+
+
 @pytest.fixture(scope='session')
 def mixed_source_root(tmp_path_factory):
     """One root holding three of the four (mode, label_source) cells -- allen's exact shape.

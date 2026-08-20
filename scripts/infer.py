@@ -236,11 +236,14 @@ def main():
                          'prior on purpose and see how far the output follows it. `off:<x>` offsets '
                          'the WHOLE pose by x crop widths in one direction (the shape of a lag, '
                          'which i.i.d. training jitter never is); `stale:<n>` supplies the pose from '
-                         'n frames earlier; `other` supplies the NEIGHBOURING animal\'s. Those are '
-                         'the three failures deployment produces and none of them is in training. '
-                         'The ratio of output displacement to prior displacement is the echo '
-                         'coefficient alpha, and alpha is what decides whether the prompt needs '
-                         'retraining.')
+                         'n frames earlier; `other` supplies the NEIGHBOURING animal\'s (row a+1); '
+                         '`near` supplies the NEAREST ELIGIBLE animal\'s pose instead of the fixed '
+                         'a+1 row; `swap:<n>` transposes n pairs of this row\'s own keypoints. '
+                         'None of these is in training except through dataset.py\'s '
+                         'prompt_swap_kpt_pairs / prompt_swap_animal, which swap/near are the '
+                         'direct probes for. The ratio of output displacement to prior displacement '
+                         'is the echo coefficient alpha, and alpha is what decides whether the '
+                         'prompt needs retraining.')
     ap.add_argument('--min-box-frames', type=int, default=1,
                     help='how many finite (frame, camera) boxes a row needs before it gets a window '
                          'crop. 1 is what the loop always did, and it is how coverage gets '
@@ -296,9 +299,10 @@ def main():
         kind = args.oracle_corrupt.split(':')[0]
         if kind not in ORACLE_CORRUPTIONS:
             raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '
-                             f'{ORACLE_CORRUPTIONS} (off:<x> | stale:<n> | other)')
-        if kind in ('off', 'stale') and ':' not in args.oracle_corrupt:
-            raise SystemExit(f'--oracle-corrupt {kind} needs an amount, e.g. {kind}:0.5')
+                             f'{ORACLE_CORRUPTIONS} (off:<x> | stale:<n> | other | near | swap:<n>)')
+        if kind in ('off', 'stale', 'swap') and ':' not in args.oracle_corrupt:
+            example = f'{kind}:2' if kind == 'swap' else f'{kind}:0.5'
+            raise SystemExit(f'--oracle-corrupt {kind} needs an amount, e.g. {example}')
         if args.anchor != 'labels':
             raise SystemExit('--oracle-corrupt breaks the ORACLE prior, so it only means anything '
                              f'under --anchor labels; got {args.anchor!r}.')

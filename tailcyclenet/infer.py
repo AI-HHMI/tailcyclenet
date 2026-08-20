@@ -31,10 +31,10 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from posetail.posetail.cube import is_point_visible, project_points_torch
+from posetail.posetail.cube import project_points_torch
 
 from . import crop as cropmod
-from .dataset import _crop_affine, _resize_camera, read_frames
+from .dataset import _crop_affine, _resize_camera, prior_out_of_bounds, read_frames
 from .format import Labels, Session
 from .model import share_scene
 
@@ -252,30 +252,6 @@ def _crop_views(imgs, box, target_size):
             out.append(im if aff is None else
                        cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
     return torch.from_numpy(np.asarray(out))[None]
-
-
-def prior_out_of_bounds(p, mode, cgroup):
-    """Which keypoints of a prior are NOT usable as one. (K,) bool, in the MODEL's own frame.
-
-    A PRIOR OUTSIDE THE CROP IS NOT A PRIOR. In 2D that is a point outside the crop rectangle; in
-    3D it is a point no PAIR of cameras can see, since a point one camera sees is not
-    reconstructible and so cannot be a position the model should trust. A MOVING camera answers per
-    frame ((T,K) rather than (K,)) and the prior is one pose for the whole window, so a camera
-    counts if it saw the point at any point during it.
-
-    ONE COPY OF THE RULE, called from both prompted regimes. `carry` had it and `self` did not, so
-    the two label-free regimes disagreed about what counts as a prior -- and `self` is the one the
-    periodic val eval reports, so training and deployment were being scored under different rules.
-    Masking this was worth MOTA +0.041, miss -0.032 SIG and idsw 24 -> 13 on rat-city under `carry`.
-    """
-    if mode == '2d':
-        w, h = (float(x) for x in cgroup[0]['size'][:2])
-        return (p[:, 0] < 0) | (p[:, 0] >= w) | (p[:, 1] < 0) | (p[:, 1] >= h)
-    seen = []
-    for c in cgroup:
-        v = is_point_visible(c, p, margin=2)
-        seen.append(v.any(0) if v.ndim > 1 else v)
-    return torch.stack(seen).sum(0) < 2
 
 
 def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_prompt=None):
@@ -995,10 +971,70 @@ def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
         box_agree[a, frames, ci] = np.linalg.norm(c - centre, axis=-1) / side
 
 
-ORACLE_CORRUPTIONS = ('off', 'stale', 'other')
+ORACLE_CORRUPTIONS = ('off', 'stale', 'other', 'near', 'swap')
 
 
-def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup):
+def _prior_to_model_frame(p, mode, boxes, scales):
+    """The one conversion `_build_prior` applies before its bounds mask: source pixels/world to
+    the model's own crop frame. 3D passes straight through -- world points are never crop-scaled,
+    only cameras are. Factored out so `_corrupt_prior`'s `near` can apply the IDENTICAL conversion
+    to a candidate neighbour before testing it against `prior_out_of_bounds`, instead of a second
+    copy of this one line.
+    """
+    if mode == '2d':
+        return (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
+    return p
+
+
+def _nearest_eligible_row(src, a, t0, boxes, scales, mode, cgroup):
+    """The nearest OTHER label row whose pose at this frame would survive `prior_out_of_bounds` --
+    the same eligibility test `dataset.py`'s `prompt_swap_animal` applies (dev/plans/
+    prompt_prior_corruptions.md). Returns a row index, or None if no other row qualifies.
+
+    "Nearest" is measured in the MODEL's own frame (after `_prior_to_model_frame`), over whichever
+    keypoints both the target and the candidate have finite AND in bounds -- the same frame the
+    model itself will see the corrupted prior in, rather than source pixels or world mm, which
+    would rank rows by a distance the model never has to close.
+    """
+    target = _prior_to_model_frame(torch.as_tensor(src[a][t0], dtype=torch.float32),
+                                   mode, boxes, scales)
+    best_row, best_dist = None, None
+    for row in range(len(src)):
+        if row == a:
+            continue
+        cand = _prior_to_model_frame(torch.as_tensor(src[row][t0], dtype=torch.float32),
+                                     mode, boxes, scales)
+        oob = prior_out_of_bounds(cand, mode, cgroup)
+        if int((~oob).sum()) < 2:
+            continue
+        both = torch.isfinite(target).all(-1) & torch.isfinite(cand).all(-1) & ~oob
+        if int(both.sum()) < 1:
+            continue
+        d = float(torch.linalg.norm((cand - target)[both], dim=-1).mean())
+        if best_dist is None or d < best_dist:
+            best_row, best_dist = row, d
+    return best_row
+
+
+def _swap_kpt_pairs(p, n_pairs, seed):
+    """`swap:<n>` -- n transpositions among `p`'s own finite keypoints, seeded like every other
+    oracle corruption. The direct inference probe for `dataset.py`'s `prompt_swap_kpt_pairs`: a
+    decode that swapped two keypoints, not one that latched onto the wrong animal.
+    """
+    finite = torch.isfinite(p).all(-1).nonzero(as_tuple=True)[0]
+    if len(finite) < 2:
+        return p
+    rng = np.random.default_rng(seed)
+    idx = finite[torch.from_numpy(rng.permutation(len(finite)))]
+    n = min(n_pairs, len(idx) // 2)
+    p = p.clone()
+    for i in range(n):
+        j, k = int(idx[2 * i]), int(idx[2 * i + 1])
+        p[j], p[k] = p[k].clone(), p[j].clone()
+    return p
+
+
+def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales=None):
     """The oracle prior, optionally broken on purpose. Returns (pose in the SOURCE frame, qt).
 
     THIS MEASURES alpha = d(output)/d(prior), the echo coefficient, and it is the cheapest thing in
@@ -1006,14 +1042,21 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup):
     retraining at all. Near 0 means the model corrects a bad prior from the pixels; near 1 means it
     echoes it, and a loop that feeds the model its own output then has gain.
 
-    The three corruptions are the three failures deployment actually produces, and NONE of them is
-    in training -- `dataset.py` offers GT plus i.i.d. Gaussian jitter, or nothing at all:
+    Five corruptions now, and NONE of them is in training except through `dataset.py`'s own
+    `prompt_swap_kpt_pairs` / `prompt_swap_animal` (dev/plans/prompt_prior_corruptions.md), which
+    `swap` and `near` are the direct probes for:
 
     - `off:<x>`   a WHOLE-BODY offset of x crop widths, one direction for the whole pose. This is
                   the shape of a lag: every keypoint wrong the same way, which i.i.d. noise never is.
     - `stale:<n>` the pose from n frames earlier, which is what `carried` degrades into when the box
                   source loses an animal for a few windows.
-    - `other`     the NEIGHBOURING animal's pose, which is what a row swap hands the next window.
+    - `other`     the NEIGHBOURING animal's pose (`a + 1 % n_lab`), which is what a row swap hands
+                  the next window. KEPT AS-IS -- numbers on record used this exact row rule, and
+                  redefining it would make them silently incomparable.
+    - `near`      the NEAREST ELIGIBLE animal's pose instead of the fixed `a + 1` row -- the row a
+                  real identity mix-up is most likely to hand back.
+    - `swap:<n>`  n transpositions of THIS row's own keypoints -- a decode that swapped two
+                  keypoints rather than one that picked up a different animal.
 
     The magnitude is in CROP WIDTHS, not pixels or millimetres, for the same reason
     `prompt_noise_px` is in pixels and converts: `allen-mouse-combined` alone holds 63 px sessions
@@ -1027,9 +1070,15 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup):
     row, t0 = a, int(frames[0])
     if kind == 'other' and n_lab > 1:
         row = (a + 1) % n_lab
+    elif kind == 'near' and n_lab > 1:
+        nr = _nearest_eligible_row(src, a, t0, boxes, scales, mode, cgroup)
+        if nr is not None:
+            row = nr
     elif kind == 'stale':
         t0 = max(0, t0 - int(amt))
     p = torch.as_tensor(src[row][t0], dtype=torch.float32)
+    if kind == 'swap':
+        p = _swap_kpt_pairs(p, max(1, int(amt) if amt else 1), [a, t0, 0x5A7])
     if kind != 'off':
         return p, int(t0) - int(frames[0]) if kind == 'stale' else 0
     # ONE crop width, converted into whatever units the prior lives in.
@@ -1079,7 +1128,7 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
         # ORACLE. Ground truth as the prior; not a deployment number.
         if src is None or a >= n_lab:             # a detector row with no label row behind it
             return None, None
-        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup)
+        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales)
         if p is None:
             return None, None
     else:                                    # 'carry'
@@ -1105,10 +1154,7 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
             return None, None
     if p.shape != (K, R):
         return None, None
-    if mode == '2d':
-        # the carried/labelled pose is in SOURCE pixels; the model works in crop pixels
-        #
-        p = (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
+    p = _prior_to_model_frame(p, mode, boxes, scales)
     p = p.clone()
     p[prior_out_of_bounds(p, mode, cgroup)] = float('nan')
     qt = min(max(qt, 0), len(frames) - 1)

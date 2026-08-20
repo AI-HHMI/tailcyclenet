@@ -548,6 +548,64 @@ def test_carried_prior_is_bounds_masked_and_dated():
                         cgroup) == (None, None)
 
 
+def test_oracle_corrupt_near_picks_nearest_eligible_row():
+    """`near` (dev/plans/prompt_prior_corruptions.md) must pick the ELIGIBLE row closest to the
+    target in the MODEL's own frame -- not the fixed `a + 1` row `other` uses -- and must be a
+    NO-OP, exactly like `other` on a session with no usable neighbour, when nothing qualifies.
+    """
+    from tailcyclenet.infer import _corrupt_prior
+
+    K, size = 2, torch.tensor([100, 100], dtype=torch.int32)
+    cgroup = [{'size': size}]
+    frames = np.arange(0, 4)
+    boxes = [(0, 0, 100, 100)]
+    scales = [1.0]
+
+    # row 0 = target, row 1 = far away (INELIGIBLE -- both points land outside the crop), row 2 =
+    # close (ELIGIBLE -- both points land inside it).
+    src = np.zeros((3, 4, K, 2), dtype=np.float32)
+    src[0, 0] = [[10.0, 10.0], [20.0, 20.0]]
+    src[1, 0] = [[500.0, 500.0], [600.0, 600.0]]
+    src[2, 0] = [[15.0, 15.0], [25.0, 25.0]]
+
+    cfg = InferConfig(anchor='labels', oracle_corrupt='near')
+    p, qt = _corrupt_prior(cfg, src, 0, 3, frames, boxes, '2d', cgroup, scales)
+    assert torch.allclose(p, torch.as_tensor(src[2, 0])), \
+        'near must pick the ELIGIBLE row, never the out-of-bounds one'
+    assert qt == 0
+
+    # Nothing eligible -> a no-op, the target's own row comes back unchanged.
+    src2 = src.copy()
+    src2[2, 0] = [[500.0, 500.0], [600.0, 600.0]]     # make row 2 ineligible too
+    p2, _ = _corrupt_prior(cfg, src2, 0, 3, frames, boxes, '2d', cgroup, scales)
+    assert torch.allclose(p2, torch.as_tensor(src2[0, 0])), 'no eligible row must be a no-op'
+
+
+def test_oracle_corrupt_swap_transposes_keypoints():
+    """`swap:<n>` (dev/plans/prompt_prior_corruptions.md) must permute the CHOSEN row's own
+    keypoints -- the SET stays the same, `n` picks how many pairs -- and must never touch which
+    row or frame the pose came from. The direct inference probe for `dataset.py`'s
+    `prompt_swap_kpt_pairs`.
+    """
+    from tailcyclenet.infer import _corrupt_prior
+
+    K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
+    cgroup = [{'size': size}]
+    frames = np.arange(0, 4)
+    boxes = [(0, 0, 100, 100)]
+    src = np.zeros((1, 4, K, 2), dtype=np.float32)
+    src[0, 0] = [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]
+
+    cfg = InferConfig(anchor='labels', oracle_corrupt='swap:1')
+    p, qt = _corrupt_prior(cfg, src, 0, 1, frames, boxes, '2d', cgroup)
+    assert qt == 0, 'swap must not move which row or frame the pose came from'
+    base = torch.as_tensor(src[0, 0])
+    assert not torch.equal(p, base), 'swap:1 must move something'
+    assert sorted(p.tolist()) == sorted(base.tolist()), 'the keypoint SET must be unchanged'
+    moved = (p != base).any(-1)
+    assert int(moved.sum()) == 2, 'swap:1 is exactly one pair -- two rows differ'
+
+
 def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
     """The second pass must be crop-rule boxes around the FIRST pass's prediction, and an animal
     whose refined crop fails must keep the box it already had -- a bad prediction cannot be allowed
@@ -719,6 +777,7 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     (['--anchor', 'labels', '--boxes', 'nope.npz'], 'not label rows'),
     (['--oracle-corrupt', 'nonsense'], 'kind must be one of'),
     (['--oracle-corrupt', 'off'], 'needs an amount'),
+    (['--oracle-corrupt', 'swap'], 'needs an amount'),
     (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
 ])
 def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,

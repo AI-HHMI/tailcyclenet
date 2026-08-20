@@ -28,7 +28,11 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5):
     """One instance: skeleton (where the session has one) and keypoints, in place."""
     import cv2
 
-    ok = np.isfinite(p2d).all(-1)
+    # isfinite alone lets a degenerate triangulation (a finite but ~1e20 px point) through, which
+    # overflows the int32 cast below and crashes cv2 with a useless "wrong type" error. Bound to
+    # the frame plus a margin generous enough to still draw a point just off-canvas.
+    margin = 4 * max(img.shape[:2])
+    ok = np.isfinite(p2d).all(-1) & (np.abs(p2d[..., 0]) < margin) & (np.abs(p2d[..., 1]) < margin)
     for a, b in skel_ix:
         if ok[a] and ok[b]:
             cv2.line(img, tuple(np.int32(p2d[a])), tuple(np.int32(p2d[b])), colour, lw, cv2.LINE_AA)

@@ -231,6 +231,47 @@ def reset() -> None:
     _cached = None
 
 
+_libc = None
+_TRIM_OFF = os.environ.get('TAILCYCLENET_NO_MALLOC_TRIM')
+
+
+def trim() -> None:
+    """Hand glibc's free heap back to the OS. Safe to call often; a no-op off glibc.
+
+    **WITHOUT THIS, `--max-ram` BOUNDS THE BUFFERS AND NOT THE PROCESS, which is not what anyone
+    means by a memory limit.** Measured on johnson (16 cameras, 3208x2200, 120 frames): at
+    `--max-ram 8` the live buffers are a few GB and RSS still reached **123.4 GB**, because
+    `free()` returns a block to the arena rather than to the kernel and nothing on an idle host
+    ever forces the arena to shrink. The same run under a 24 GB cgroup sits at 10.5 GB -- the
+    working set was always small; only the retention was large.
+
+    So the flag has to do something the allocator would not do on its own. This is that something,
+    and it is why a peak on an unconstrained host is a statement about glibc rather than about
+    this repo.
+
+    Cheap where it matters: `malloc_trim` walks the free lists and `madvise`s what it can, which is
+    microseconds against the tens of milliseconds of decode that produced the garbage. Call it at a
+    LOOP BOUNDARY (a finished window, a finished detection unit), never per allocation.
+
+    `TAILCYCLENET_NO_MALLOC_TRIM=1` disables it, for measuring what it is worth.
+    """
+    global _libc
+    if _TRIM_OFF:
+        return
+    if _libc is None:
+        import ctypes
+        try:
+            _libc = ctypes.CDLL('libc.so.6')
+            _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+        except (OSError, AttributeError):
+            _libc = False
+    if _libc is not False:
+        try:
+            _libc.malloc_trim(0)
+        except (OSError, AttributeError):
+            pass
+
+
 def fits(budget_bytes: float, per_unit_bytes: float, want: int, floor: int = 1) -> int:
     """How many units of `per_unit_bytes` fit in `budget_bytes`, capped at `want`, never below
     `floor`.

@@ -449,20 +449,28 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     if env:
         return max(1, int(env))
     if ram_gb is None:
-        # THE JOB'S MEMORY, NOT THE MACHINE'S. `SC_PHYS_PAGES` -- what this used to read -- is the
-        # host's total: it cannot see a cgroup cap, an LSF limit, or 288 GB another user already
-        # has resident. Under `MemoryMax=16G` it still reported 503 GB, a 20x error, and a 20x
-        # over-estimate here is 16 open readers of a 3208x2200 rig (~37 GB) on a node that has 16.
-        # `memory.current()` minimises over the cgroup ancestry, LSF's own variables, MemAvailable
-        # and MemTotal. It opens no data path (gotcha 11).
-        b = _memory.current()
-        ram_gb = min(b.limit_gb, b.available_gb)
+        # THE JOB'S BUDGET, NOT THE MACHINE'S MEMORY. `SC_PHYS_PAGES` -- what this used to read --
+        # is the host's total: it cannot see a cgroup cap, an LSF limit, or 288 GB another user
+        # already has resident. Under `MemoryMax=16G` it still reported 503 GB, a 20x error, and a
+        # 20x over-estimate here is 16 open readers of a 3208x2200 rig (~37 GB) on a node with 16.
+        #
+        # `budget_gb`, NOT `min(limit, available)`. Reading the headroom instead was a real defect
+        # while it lasted: `--max-ram 8` left this at the full-host value, so the flag did not
+        # shrink the LARGEST consumer it advertises and RSS stayed at 94 GB on an 8 GB budget.
+        # An explicit budget has to bind here or it does not mean anything.
+        ram_gb = _memory.current().budget_gb
     if procs is None:
         procs = int(os.environ.get('TAILCYCLENET_LOCAL_WORLD_SIZE', '1') or 1)
     want = 4 if workers else max(int(n_cams), 4)
     per_gb = 1.0 + 0.25 * (int(wh[0]) * int(wh[1])) / 1e6
     share = max(workers or 1, 1) * max(int(procs), 1)
-    return max(1, min(want, int(0.5 * ram_gb / share / per_gb)))
+    # `FRACTION_READERS` replaces the bare 0.5 this carried, and is deliberately chosen so that an
+    # unconstrained host resolves to the SAME count it always did: the readers' slice is
+    # `FRACTION_READERS x DEFAULT_FRACTION` of headroom rather than 0.5 of it, but on every rig
+    # this repo ships the `want` clamp binds long before the memory term does (johnson: 48 entries
+    # affordable, 16 wanted), so no shipped configuration moves. It binds only when the budget is
+    # genuinely small -- which is the entire point.
+    return max(1, min(want, int(_memory.FRACTION_READERS * ram_gb / share / per_gb)))
 
 
 # Built at the FIRST video read, not at import: `lru_cache`'s maxsize is fixed at decoration and

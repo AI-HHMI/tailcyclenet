@@ -176,12 +176,12 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     import numpy as np
     import torch
     from concurrent.futures import ThreadPoolExecutor
+    from .. import memory as _memory
     from ..dataset import read_frames
     from .data import letterbox, reduce_factor, unletterbox_boxes, unletterbox_keypoints
 
     group = session.groups[gid]
     T = min(group.n_frames, max_frames or group.n_frames)
-    from .. import memory as _memory
     C = len(session.rig)
     D = max(1, int(top_k))
     out = np.full((D, T, C, 4), np.nan, np.float32)
@@ -354,6 +354,11 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                         # `unletterbox_keypoints`, which is why it lives next to the box version.
                         k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)
                         kp[:n, t, ci] = k[:n].numpy()
+            # A UNIT'S FRAMES ARE DEAD HERE, so give the arena back rather than letting RSS ratchet
+            # up to whatever the host tolerates -- see `memory.trim`. This is the loop that
+            # allocates and frees the most: `cams_flight x batch` full frames per unit.
+            del fetched
+            _memory.trim()
             pending = nxt
     finally:
         frame_pool.shutdown()

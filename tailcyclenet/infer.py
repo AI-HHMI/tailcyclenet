@@ -931,6 +931,11 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
                 else:
                     for k in [k for k in _frame_cache if k[1] < keep]:
                         del _frame_cache[k]
+            # AT THE WINDOW BOUNDARY, where a window's worth of full frames has just been dropped.
+            # Without it the freed blocks stay in glibc's arena and RSS ratchets to whatever the
+            # host allows -- 123 GB on a run whose live buffers were budgeted at 8 (see
+            # `memory.trim`). Microseconds against a window of decode.
+            memory.trim()
     finally:
         _frame_cache.clear()
         if _prefetch_pool is not None:

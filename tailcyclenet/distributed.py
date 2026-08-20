@@ -158,7 +158,7 @@ def param_signature(model) -> torch.Tensor:
     return torch.stack(vals).flatten()
 
 
-def check_ranks_agree(fabric, model, tol: float = 1e-12) -> float:
+def check_ranks_agree(fabric, model, tol: float = 1e-9) -> float:
     """Raise if the ranks' weights have drifted apart. Returns the worst relative difference.
 
     THIS IS THE GUARD FOR THE DDP HEADCOUNT RULE at the top of this module. Every rank steps
@@ -166,18 +166,26 @@ def check_ranks_agree(fabric, model, tol: float = 1e-12) -> float:
     being all-reduced -- because it was frozen when the module was wrapped and the unfreeze
     re-wrap did not fire -- drifts immediately and silently, and the loss curve does not care.
 
-    **THE BAR IS ESSENTIALLY EXACT EQUALITY, AND THAT IS MEASURED RATHER THAN CAUTIOUS.** NCCL
-    hands every rank bitwise-identical reduced gradients and the optimizer step is deterministic
-    given them, so a correct run reads exactly 0.0 -- it does, on a 2-rank job, at every checkpoint
-    boundary including the one right after the encoder unfreeze. A first attempt at this guard used
-    `tol = 1e-5` against a drift normalised by the largest signature entry, and the negative
-    control (the same job with the re-wrap disabled) read 5.6e-10 then 2.8e-09 two steps later:
-    unmistakably nonzero, unmistakably growing, and waved straight through. A loose tolerance on a
-    quantity whose correct value is ZERO buys nothing and hides the failure it exists to catch.
+    **`tol` IS SET FROM THE SEPARATION BETWEEN TWO MEASURED POPULATIONS, NOT FROM TASTE.**
 
-    What `tol` absorbs is therefore only the exotic: a job spanning two different GPU models, where
-    the same kernel may pick a different algorithm. If that is your cluster, this is where you will
-    find out, and finding out is the point.
+      * a correct run reads **exactly 0.0**, every time -- six clean 2-rank runs (with and without
+        checkpoint writes, with and without the staged unfreeze, 1200 iterations each) at every
+        checkpoint boundary. Not "small": zero. NCCL hands every rank bitwise-identical reduced
+        gradients and the optimizer step is deterministic given them.
+      * the one bug this has ever caught -- the unfreeze re-wrap not firing, negative-controlled --
+        reads **2.9e-07 to 4.9e-07**, on two cluster jobs and two local ones.
+
+    So the two populations are separated by seven orders of magnitude and `tol` can sit anywhere
+    between. 1e-9 is a thousand times looser than exact equality, which is real headroom for a
+    noise floor nobody has observed yet, and still ~300x below the smallest real failure on record.
+    **Do not raise it into the 1e-3 range**: that is 2,000x ABOVE the bug's signature, so the guard
+    would pass the exact failure it exists for while still looking like it was doing something. A
+    first version of this made that mistake in the other direction (normalising by the largest
+    signature entry, `tol = 1e-5`) and waved a real divergence through at 5.6e-10.
+
+    A drift in the 1e-7 range is NOT harmless-because-small: it is not a rounding wobble, it is
+    two ranks training two different models, and it GROWS -- 2.9e-07 at one boundary, 4.9e-07 by
+    the next. The number is small only because it is caught early.
 
     **IT COSTS NOTHING WORTH A KNOB, MEASURED.** On the real 3D model: 25.8 ms at 315 trainable
     tensors / 47.9M params, 38.1 ms at 411 / 148.7M (8 encoder blocks unfrozen). It fires only at
@@ -198,7 +206,7 @@ def check_ranks_agree(fabric, model, tol: float = 1e-12) -> float:
     sig = param_signature(model).cpu()
     ref = fabric.broadcast(sig, src=0)
     diff = signature_drift(sig, ref.cpu())
-    worst = float(fabric.all_reduce(torch.tensor(diff, device=fabric.device), reduce_op='max'))
+    worst = float(fabric.all_reduce(torch.tensor(diff, device=fabric.device), reduce_op="max"))
     # `NaN > tol` is False, so a poisoned parameter would slip through the comparison below as
     # agreement. Checked by name instead.
     if worst > tol or not math.isfinite(worst):

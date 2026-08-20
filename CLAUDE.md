@@ -245,70 +245,35 @@ fix is not comparable to one after it.** Raising `max_grad_norm` past 10 does NO
 pixi run python scripts/train.py --config configs/3d.toml --data <root> --devices 4
 ```
 
-**`batch_size` IS STRUCTURALLY 1 PER RANK, AND THE WORLD IS THE BATCH DIMENSION.** Lightning
-Fabric (already pinned, as a posetail dependency) runs one rank per GPU on ONE node and DDP
-averages their gradients. `--devices 1` takes `SingleDeviceStrategy` and no wrapper at all, so it
-is the loop it always was; above one device the strategy is `ddp_find_unused_parameters_true`,
-because a 2D item and a 3D item drive different heads and the used parameter set genuinely varies
-per step and per rank.
+One rank per GPU on ONE node, Lightning Fabric + DDP. `--devices 1` takes no wrapper at all and is
+the loop it always was. **The mechanism, every gotcha and every measurement are in
+`dev/reports/37_multi_gpu_ddp.md`; these are the standing rules.**
 
-**EVERY ITERATION COUNT IN A CONFIG IS A TOTAL ACROSS RANKS.** `n_iterations = 60000` is 60,000
-SAMPLES on any GPU count, so N GPUs take 60,000/N optimizer steps and finish about N times sooner;
-`val_freq`, `checkpoint_freq`, `print_freq` and the staged-unfreeze iteration read the same way,
-and the loop carries a global `it` advancing by the world size. `learning_rate` and `kpt_lr` are
-multiplied by **sqrt(world)** (the multipliers — `encoder_lr_scale`, `muon_lr_scale` — are not, so
-every ratio holds). **So a multi-GPU number is TWO levers off a single-GPU one**, and
-`provenance.toml` records `world_size` and the effective rates; a resume at a different world size
-warns rather than refusing.
-
-**THE STAGED UNFREEZE RE-WRAPS THE MODULE, AND THAT IS NOT OPTIONAL.** DDP takes its parameter
-headcount when the module is WRAPPED (`_build_params_for_reducer`, torch/nn/parallel/
-distributed.py:1338, filters `requires_grad`) and never re-checks, so a tensor frozen at wrap time
-is never all-reduced however `requires_grad` changes later — each rank would step its own encoder
-from iteration 10,000, the ranks would drift apart, and only rank 0's copy would be saved, with no
-error and no change in the loss curve. **The reference has this bug latently**: `= true` unfreezes
-in the constructor and is safe, but its staged (int) form never adds the encoder to a param group
-either, so nothing steps it and the two gaps cancel. `tailcyclenet/unfreeze.py` closes the
-optimizer half, which is exactly what makes the DDP half load-bearing here.
-**`check_ranks_agree` runs at every checkpoint boundary (including under `--no-checkpoints`) and
-raises if the ranks' weights have parted company.** Measured, both arms, 2 ranks: with the re-wrap
-the drift is **exactly 0** at every boundary; with it disabled the guard raises on both ranks at
-the first boundary after the unfreeze at **4.56e-07**. The bar is essentially exact equality, and
-that is why — a first version normalised the drift by the largest signature entry and set
-`tol = 1e-5`, which rated that same divergence 5.6e-10 and waved it through. **A loose tolerance on
-a quantity whose correct value is zero hides exactly the failure it exists to catch.** The check
-costs 25.8–38.1 ms (frozen / 8 blocks unfrozen) beside a 5.6 GB write, i.e. ~0.006% of a 1000-step
-window, so it has no frequency knob.
-
-**A DDP STEP COSTS THE SLOWEST RANK'S ITEM, SO THE COST-DETERMINING DRAWS ARE SYNCHRONISED.**
-`cams_to_sample = [2, 8]` is drawn per item and the scene encoder runs once per camera, so four
-independent draws make nearly every step an 8-camera step: measured on allen-mouse-combined, the
-straggler tax is **1.57x at 4 ranks** — 2.55x of a theoretical 4x, which is most of the observed
-1.83x per-step slowdown (the rest is the 595 MB gradient all-reduce). `StepSampler` yields
-`(ordinal, index)` and `PoseDataset.__getitem__` keys the camera count and the `prob_2d_only` coin
-on the ordinal, so every rank's step-k item costs the same while its window, session and
-augmentation stay independent. That takes the tax to **1.18x (3.38x of 4x)**. Measured end to end
-on 2 ranks, encoder unfrozen, 800 iterations: **0.618 s/it per-item vs 0.548 s/it synchronised**
-against a 1-GPU 0.468 (1.32x -> 1.17x, i.e. 1.51x -> 1.71x of 2x), and the control's 1.32x is the
-probe's predicted 1.31x. **Measure this in the UNFROZEN regime or not at all** — with the encoder
-frozen there is no backward through the per-camera path, the cost spread collapses and the same
-comparison reads a null. Synchronising the
-sampling CELL too was measured to add nothing (1.18x) and is deliberately not done — the batch
-stays heterogeneous in data and is homogeneous only in cost. **The marginal distribution of
-`cams_to_sample` is unchanged**, which is what makes this a scheduling fix rather than a recipe
-change, and it applies at every world size so a 4-GPU run stays one lever off a 1-GPU one.
-**Anything that varies per item and multiplies work belongs in `_shape`**; anything else does not.
-
-Smaller rules, each of which is a hang or a silent correlation otherwise: a skipped step is a
-**collective** decision (one rank skipping its backward leaves the others in the all-reduce
-forever); val windows are **sharded** `idxs[rank::world]` and the per-window metrics gathered
-before reducing, so the number is the same nanmean a 1-GPU run computes; the sampler and the
-DataLoader take a **per-rank generator** (a `DistributedSampler` is wrong here — an index entry is
-a poor sampling weight, which is why the sampler draws with replacement); `[data].num_workers` is
-**per rank**, so the process count is `world x workers` and `_reader_cache_size` divides its RAM
-ceiling by both. `--precision` accepts `32-true` (default) and `bf16-mixed`; `16-mixed` is refused
-by name, because this loop steps its own optimizer rather than handing it to Fabric and so has
-nowhere to put a `GradScaler`.
+- **`batch_size` IS STRUCTURALLY 1 PER RANK, SO THE WORLD IS THE BATCH DIMENSION.** The collate
+  keeps one camera group per batch; DDP averaging N items is the only batch this repo has.
+- **EVERY ITERATION COUNT IN A CONFIG IS A TOTAL ACROSS RANKS**, and `learning_rate` / `kpt_lr`
+  are scaled by **sqrt(world)** (the multipliers are not, so every ratio holds). **A multi-GPU
+  number is TWO levers off a single-GPU one**; `provenance.toml` records which it was.
+- **THE STAGED UNFREEZE RE-WRAPS THE MODULE, AND THAT IS NOT OPTIONAL.** DDP registers parameters
+  when the module is WRAPPED and never re-checks, so a tensor unfrozen later is never all-reduced
+  — each rank would train its own encoder, silently. The reference has this bug latently.
+- **A DDP STEP COSTS THE SLOWEST RANK'S ITEM**, so the cost-determining draws (camera count, the
+  `prob_2d_only` coin) are synchronised across ranks by `StepSampler`'s ordinal — worth 1.57x →
+  1.18x at 4 ranks. **Anything that varies per item and multiplies work belongs in `_shape`.**
+  Measure it with the encoder UNFROZEN or the cost spread collapses and it reads as a null.
+- **`check_ranks_agree` raises at every checkpoint boundary if the ranks have parted company.** A
+  correct run reads **exactly 0**; the one real bug it has caught reads **~3e-07**. `tol = 1e-9`
+  sits between those two measured populations — **do not loosen it toward 1e-3**, which is 2,000x
+  above the failure it exists to catch. A drift of 1e-7 is not a rounding wobble, it is two ranks
+  training two different models, and it grows.
+- **Anything rank-0-only that touches WEIGHTS must still run everywhere.** `save_checkpoint`'s
+  schedule-free eval/train toggle is not bit-exact, so it takes `write: bool` and every call site
+  runs on every rank as `save_checkpoint(..., write=is0)`. Gating the whole call on `is0`
+  reintroduces the bug.
+- Smaller ones, each a hang or a silent correlation otherwise: a skipped step is a **collective**
+  decision; val is **sharded** and gathered before reducing; the sampler takes a **per-rank
+  generator** (a `DistributedSampler` is wrong here); `[data].num_workers` is **per rank**;
+  `16-mixed` is refused by name.
 
 ### The architecture: two switches
 

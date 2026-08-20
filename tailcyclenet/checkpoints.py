@@ -182,7 +182,7 @@ def save_run_meta(run: Path, config: dict, registry: Registry,
 
 
 def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
-                    name: str = 'last') -> Path:
+                    name: str = 'last', write: bool = True) -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
     `model_state` is the raw training weight (resume from this). `model_state_eval` is the
@@ -193,10 +193,29 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     60k-iteration run kept a dozen of them. Overwriting in place is only safe because the write
     goes to a sibling temp file and is renamed atomically: a reader never sees a partial file, so
     there is nothing for `resolve_checkpoint` to guard against.
+
+    `write = False` runs the eval/train TOGGLE below but skips the CPU clones and the disk write,
+    returning None. **This is not an optimisation, it is a correctness requirement on N gpu
+    ranks, and it is the whole reason the parameter has a default of `True` rather than not
+    existing.** `eval()`/`train()` swap the model's LIVE parameters via `p.lerp_(z, w)` twice with
+    DIFFERENT weights, relying on the algebra to land back on `y` -- and in float32 that round
+    trip is not bit-exact (measured: individual elements off by up to ~1e-3 relative, from one
+    `eval()`+`train()` pair on a tensor the size of one unfrozen block). `scripts/train.py` calls
+    this once per rank at every checkpoint boundary with `write = is0`, because only rank 0 writes
+    a file -- and if the toggle above ran only there too, rank 0's RAW training parameters would
+    come out of every boundary perturbed relative to the untouched ranks, and DDP-averaged
+    gradients compound that gap over the next `checkpoint_freq` steps into exactly the drift
+    `check_ranks_agree` exists to catch. **Measured on the first live 4-gpu job**: drift `0.0e+00`
+    at the boundary before checkpointing was added back in, `2.9e-07` (and rising) at the very next
+    one once it was -- an entirely different mechanism from the unfreeze-rewrap bug the guard was
+    built for, caught by the same guard. So every rank pays the toggle; only rank 0 pays the clone
+    and the write.
     """
-    ckpt_dir = run / 'checkpoints'
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    state = None
+    if write:
+        ckpt_dir = run / 'checkpoints'
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     eval_state = None
     # A DualOptimizer exposes eval()/train() even when its Muon half has NO averaged iterate
     # (`muon_schedulefree = false`), in which case `model_state_eval` would be only half-averaged.
@@ -205,9 +224,12 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     averaged = getattr(optimizer, 'has_averaged_iterate',
                        hasattr(optimizer, 'eval') and hasattr(optimizer, 'train'))
     if averaged:
-        optimizer.eval()
-        eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        optimizer.train()
+        optimizer.eval()                    # UNCONDITIONAL -- see the `write` paragraph above
+        if write:
+            eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        optimizer.train()                   # UNCONDITIONAL, same reason
+    if not write:
+        return None
     path = ckpt_dir / f'checkpoint_{name}.pth'
     tmp = path.with_suffix('.tmp')
     torch.save({'iteration': iteration, 'model_state': state,

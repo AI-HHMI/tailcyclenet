@@ -282,6 +282,126 @@ def _tiny():
     return nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
 
 
+# -- save_checkpoint's eval/train toggle must run on EVERY rank ----------------------------
+#
+# Found on the FIRST real 4-gpu job: drift 0.0e+00 at the checkpoint boundary right after
+# resuming (checkpointing had been off during the smoke tests, so this never fired there),
+# 2.9e-07 -- and rising -- at the very next one. `save_checkpoint` was called `if is0 else None`,
+# so its internal schedule-free `optimizer.eval(); ...; optimizer.train()` toggle ran only on
+# rank 0 -- and that round trip is not float-exact (see below), so rank 0's RAW training
+# parameters came out of every boundary perturbed relative to the untouched ranks.
+
+def test_the_schedulefree_eval_train_round_trip_is_not_float_exact():
+    """THE MECHANISM. `eval()` does `p.lerp_(z, 1-1/beta1)`, `train()` does `p.lerp_(z, 1-beta1)`
+    -- two DIFFERENT lerps relying on algebra to land back on the original `p`, and float32 does
+    not guarantee that. If it were exact, calling it on one rank and not another would be
+    harmless; it is not, which is the whole reason the asymmetry mattered."""
+    from schedulefree import AdamWScheduleFree
+    torch.manual_seed(0)
+    model = nn.Linear(64, 64)
+    opt = AdamWScheduleFree(model.parameters(), lr=1e-3)
+    opt.train()
+    # 50 steps, not 3: `z` and `y` need to have genuinely diverged for the round trip to show any
+    # difference at all -- at a handful of steps `p.lerp_` on nearly-equal `p`/`z` rounds to
+    # exactly 0 diff, which would make this test pass for the wrong reason.
+    for _ in range(50):
+        opt.zero_grad()
+        model(torch.randn(8, 64)).sum().backward()
+        opt.step()
+    before = model.weight.clone()
+    opt.eval()
+    opt.train()
+    assert not torch.equal(model.weight, before), \
+        'if this round trip were exact the asymmetry below could not matter'
+
+
+@pytest.mark.filterwarnings('ignore')
+def test_save_checkpoint_write_false_still_tolls_the_toggle_but_touches_no_disk(tmp_path):
+    """`write=False` is not an optimisation -- it is what keeps a non-writing rank's raw
+    parameters in step with rank 0's. It must run the toggle and must not create the checkpoints
+    directory, matching the call `scripts/train.py` makes on every non-zero rank.
+    """
+    from schedulefree import AdamWScheduleFree
+
+    from tailcyclenet.checkpoints import save_checkpoint
+
+    torch.manual_seed(0)
+    model = nn.Linear(64, 64)
+    opt = AdamWScheduleFree(model.parameters(), lr=1e-3)
+    opt.train()
+    for _ in range(50):                # see the divergence note above
+        opt.zero_grad()
+        model(torch.randn(4, 64)).sum().backward()
+        opt.step()
+    before = model.weight.clone()
+    run = tmp_path / 'run'
+    p = save_checkpoint(run, 10, model, opt, {'model': {}}, write=False)
+    assert p is None
+    assert not run.exists(), 'write=False must create nothing on disk'
+    assert not torch.equal(model.weight, before), \
+        'the toggle must still have run -- this is the whole point of write=False'
+
+
+@pytest.mark.filterwarnings('ignore')
+def test_two_ranks_writing_asymmetrically_is_exactly_the_bug_this_fixes(tmp_path):
+    """Reproduces the real failure on two REAL `AdamWScheduleFree` copies with IDENTICAL state --
+    two synthetic ranks -- then shows the old call pattern (`if is0: save_checkpoint(...)`)
+    diverges them and the new one (`save_checkpoint(..., write=is0)`, called by both) does not.
+    """
+    from schedulefree import AdamWScheduleFree
+
+    from tailcyclenet.checkpoints import save_checkpoint
+
+    def _rank():
+        torch.manual_seed(0)
+        model = nn.Linear(64, 64)
+        opt = AdamWScheduleFree(model.parameters(), lr=1e-3)
+        opt.train()
+        g = torch.Generator().manual_seed(0)
+        for _ in range(50):             # see the divergence note in the test above
+            opt.zero_grad()
+            model(torch.randn(4, 64, generator=g)).sum().backward()
+            opt.step()
+        return model, opt
+
+    m0_old, o0_old = _rank()
+    m1_old, o1_old = _rank()
+    assert dist_utils.signature_drift(dist_utils.param_signature(m0_old),
+                                      dist_utils.param_signature(m1_old)) == 0.0
+
+    # THE OLD PATTERN: only "rank 0" calls save_checkpoint at all.
+    save_checkpoint(tmp_path / 'old', 10, m0_old, o0_old, {'model': {}})
+    old_drift = dist_utils.signature_drift(dist_utils.param_signature(m0_old),
+                                           dist_utils.param_signature(m1_old))
+    assert old_drift > 1e-9, 'the bug must reproduce, or this test proves nothing'
+
+    m0_new, o0_new = _rank()
+    m1_new, o1_new = _rank()
+    # THE FIX: both call it, only "rank 0" writes.
+    save_checkpoint(tmp_path / 'new', 10, m0_new, o0_new, {'model': {}}, write=True)
+    save_checkpoint(tmp_path / 'new', 10, m1_new, o1_new, {'model': {}}, write=False)
+    new_drift = dist_utils.signature_drift(dist_utils.param_signature(m0_new),
+                                           dist_utils.param_signature(m1_new))
+    assert new_drift == 0.0, f'the fix must leave both ranks bit-identical, got {new_drift:.3e}'
+
+
+def test_a_non_averaged_optimizer_is_unaffected_either_way(tmp_path):
+    """No `eval()`/`train()` means no toggle and no mechanism for this bug -- a plain optimizer
+    (or `muon_schedulefree = false`) must behave identically under both call patterns."""
+    from tailcyclenet.checkpoints import save_checkpoint
+
+    torch.manual_seed(0)
+    model = nn.Linear(8, 8)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+    for _ in range(2):
+        opt.zero_grad()
+        model(torch.randn(4, 8)).sum().backward()
+        opt.step()
+    before = model.weight.clone()
+    save_checkpoint(tmp_path / 'run', 5, model, opt, {'model': {}}, write=False)
+    assert torch.equal(model.weight, before)
+
+
 def test_the_signature_sees_a_single_changed_tensor():
     """This is the whole guard: two ranks that stopped all-reducing one tensor drift, and nothing
     else in the run notices. Two float64 scalars per tensor is enough to catch it and small enough
@@ -291,7 +411,7 @@ def test_the_signature_sees_a_single_changed_tensor():
     assert dist_utils.signature_drift(sa, sb) == 0.0, 'identical weights must read exactly 0'
     with torch.no_grad():
         b[0].weight[0, 0] += 1e-3
-    assert dist_utils.signature_drift(dist_utils.param_signature(b), sa) > 1e-12
+    assert dist_utils.signature_drift(dist_utils.param_signature(b), sa) > 1e-9
 
 
 def test_the_drift_is_relative_PER_ENTRY_not_to_the_largest_tensor():
@@ -302,6 +422,27 @@ def test_the_drift_is_relative_PER_ENTRY_not_to_the_largest_tensor():
     ref = torch.tensor([1e6, 1e-3], dtype=torch.float64)
     sig = torch.tensor([1e6, 1.1e-3], dtype=torch.float64)     # 10% off, in the small entry
     assert dist_utils.signature_drift(sig, ref) == pytest.approx(0.1, rel=1e-6)
+
+
+def test_the_tolerance_sits_between_the_two_measured_populations():
+    """THE TOLERANCE IS AN EMPIRICAL BOUNDARY, AND THIS IS WHAT STOPS IT DRIFTING INTO USELESSNESS.
+
+    Two measured populations, seven orders of magnitude apart:
+      * a correct 2-rank run reads EXACTLY 0.0 (six clean runs, every checkpoint boundary)
+      * the one real bug on record -- the unfreeze re-wrap not firing -- reads 2.9e-07 to 4.9e-07
+        (two cluster jobs, two local, negative-controlled)
+
+    `tol` must pass the first and catch the second. "A drift of 1e-7 is probably fine, set it to
+    1e-3" is the tempting reasoning this test exists to refuse: 1e-3 is ~2,000x ABOVE the real
+    bug's signature, so the guard would sail past the exact failure it was built for while still
+    appearing to run.
+    """
+    import inspect
+    tol = inspect.signature(dist_utils.check_ranks_agree).parameters['tol'].default
+    assert tol > 0.0, 'exact equality would be brittle against an unobserved noise floor'
+    assert tol < 2.9e-07 / 100, (
+        f'tol={tol:g} is too close to the smallest REAL divergence ever measured (2.9e-07); the '
+        'guard needs at least two orders of margin below it to catch the bug early')
 
 
 def test_a_non_finite_parameter_is_a_failure_not_agreement():

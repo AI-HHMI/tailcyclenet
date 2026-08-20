@@ -1118,16 +1118,26 @@ def main():
                 # hanging in the next reduction.
                 drift, p = dist_utils.check_ranks_agree(fabric, raw), None
                 if not args.no_checkpoints:
-                    p = save_checkpoint(run, it, raw, opt, config) if is0 else None
+                    # `write=is0`, CALLED ON EVERY RANK. `save_checkpoint` runs a schedule-free
+                    # eval()/train() toggle that is not float-exact (see its docstring) -- calling
+                    # it only where `is0` gated the WHOLE line, as an earlier version of this loop
+                    # did, perturbed rank 0's raw training parameters alone at every boundary and
+                    # produced exactly the drift `check_ranks_agree` exists to catch: 0.0e+00 at
+                    # the boundary before checkpointing was re-enabled, 2.9e-07 at the very next
+                    # one on a real 4-gpu job. Every rank must reach the toggle; only rank 0 must
+                    # reach the disk.
+                    p = save_checkpoint(run, it, raw, opt, config, write=is0)
                     # `best` is decided HERE, not at every val: these are the only iterations
                     # whose weights are written at all, so they are the only ones that can
                     # honestly be labelled best. The comparison is against the metric of the file
                     # already on disk, and it uses THIS iteration's val -- an earlier, better val
-                    # describes weights that no longer exist.
+                    # describes weights that no longer exist. `latest`/`saved_mpjpe` are the
+                    # REDUCED val metrics (`evaluate`'s `gather_metrics`), so this condition is
+                    # identical on every rank -- which is what makes calling it on every rank, with
+                    # only `write` differing, safe.
                     if latest[1] == it and latest[0] < saved_mpjpe:
                         saved_mpjpe = latest[0]
-                        if is0:
-                            save_checkpoint(run, it, raw, opt, config, name='best')
+                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0)
                         fabric.print(f'  new best: mpjpe {saved_mpjpe:.4g} -> '
                                      f'checkpoint_best.pth')
                         # WHAT THE `best` FILE HOLDS, in the log, because the file itself does not

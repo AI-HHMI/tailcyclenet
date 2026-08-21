@@ -19,6 +19,8 @@ touches no data path, so it is safe to create before any fork.
 """
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from ..dataset import read_frames
@@ -36,6 +38,10 @@ class FrameStore:
         self.group = group
         self.cam_names = list(cam_names)
         self._f: dict[tuple[int, int], np.ndarray] = {}
+        # `_busy` is the in-flight claim (see `read`); `_lock` guards both dicts. The lock is held
+        # only around bookkeeping, never across a decode, so the decodes themselves still overlap.
+        self._busy: dict[tuple[int, int], threading.Event] = {}
+        self._lock = threading.Lock()
         self.hits = self.misses = 0
 
     def read(self, ci, cam_name=None, frames=(), pool=None, reduce=1):
@@ -52,22 +58,49 @@ class FrameStore:
         want = [int(t) for t in frames]
         if reduce != 1:
             return read_frames(self.group, name, np.asarray(want), reduce=reduce, pool=pool)
-        need = [t for t in want if (ci, t) not in self._f]
-        self.hits += len(want) - len(need)
-        self.misses += len(need)
-        if need:
-            got = read_frames(self.group, name, np.asarray(need), pool=pool)
-            for t, im in zip(need, got):
-                self._f[ci, t] = im
-        return [self._f.get((ci, t)) for t in want]
+        # CLAIM THE MISSES BEFORE DECODING THEM. Detection for the NEXT block runs on a background
+        # thread while this block's windows decode on theirs, and the two overlap on the seam --
+        # so without a claim both would decode the same frames, which is not wrong but is exactly
+        # the duplicate work this module exists to remove. A claimed key is decoded by whoever
+        # claimed it; everyone else waits on the event.
+        with self._lock:
+            need, waits = [], []
+            for t in want:
+                if (ci, t) in self._f:
+                    self.hits += 1
+                elif (ci, t) in self._busy:
+                    waits.append((ci, t))
+                else:
+                    self._busy[ci, t] = threading.Event()
+                    need.append(t)
+            self.misses += len(need)
+        try:
+            if need:
+                got = read_frames(self.group, name, np.asarray(need), pool=pool)
+                with self._lock:
+                    for t, im in zip(need, got):
+                        self._f[ci, t] = im
+        finally:
+            with self._lock:
+                for t in need:
+                    self._busy.pop((ci, t)).set()
+        for k in waits:
+            ev = self._busy.get(k)
+            if ev is not None:
+                ev.wait()
+        with self._lock:
+            return [self._f.get((ci, t)) for t in want]
 
     def evict_below(self, t):
         """Drop every frame before `t`. Exact, not heuristic -- see the module docstring."""
-        for k in [k for k in self._f if k[1] < t]:
-            del self._f[k]
+        with self._lock:
+            for k in [k for k in self._f if k[1] < t]:
+                del self._f[k]
 
     def clear(self):
-        self._f.clear()
+        with self._lock:
+            self._f.clear()
 
     def __len__(self):
-        return len(self._f)
+        with self._lock:
+            return len(self._f)

@@ -1003,8 +1003,36 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         crops = decode_crops(frames, plans)
         return frames, window_cams, plans, crops
 
+    # THE THIRD PIPELINE STAGE: DETECT THE NEXT BLOCK WHILE THIS ONE POSES.
+    #
+    # Within a block the decode already overlaps the forward (`cfg.prefetch_windows`). What did
+    # not overlap is the DETECTION at the head of each block: it decodes that block's frames and
+    # runs the detector before the first window can be planned, and every frame of it is on the
+    # critical path. Capping the block at two windows made that stall more frequent, not less.
+    #
+    # **THIS IS A DECODE OVERLAP, NOT A COMPUTE ONE, AND THE MEASUREMENT SAYS SO.** On johnson,
+    # 120 frames x 16 cameras: decode is 84.8% of wall, the detector and pose forwards together
+    # are ~15%, and raising the decode thread count 4 -> 8 -> 16 moves nothing (64.4 / 64.9 / 64.9
+    # s) — so the decode is I/O bound and more concurrency on the same stage is worthless. What is
+    # worth having is putting the NEXT block's I/O behind the CURRENT block's GPU work.
+    #
+    # ORDER IS PRESERVED, WHICH IS WHAT KEEPS IT OUTPUT-NEUTRAL. `boxes_for` advances a detection
+    # cursor and the association state, so it must run once per block in block order: one worker,
+    # submitted one block ahead, and the result awaited before the block that needs it. Detection
+    # never reads `carried` or any pose output -- the dependency runs one way only.
+    _det_pool = ThreadPoolExecutor(max_workers=1) if boxes_for is not None else None
+
+    def _detect(bi):
+        """Boxes for block `bi`, or None past the end. Runs on `_det_pool`, in block order."""
+        if bi >= len(blocks):
+            return None
+        a, b = blocks[bi]
+        return boxes_for(store, int(starts[a]),
+                         int(min(T_total, starts[b - 1] + cfg.n_frames)))
+
     try:
-        for w0, w1 in blocks:
+        _pending_det = _det_pool.submit(_detect, 0) if _det_pool is not None else None
+        for bi, (w0, w1) in enumerate(blocks):
             # THE BLOCK'S FRAMES. `f_read` is what its windows TOUCH; `f_own` is what it KEEPS.
             # They differ by the seam: the last window reaches past `starts[w1]`, and those frames
             # belong to the next block because a frame belongs to the last window containing it
@@ -1016,8 +1044,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             n_blk, n_win = f_read - f0, w1 - w0
 
             boxes_stc = det_kpts_stc = None
-            if boxes_for is not None:
-                boxes_stc, _scores, det_kpts_stc = boxes_for(store, f0, f_read)
+            if _det_pool is not None:
+                # Await THIS block's detection, then start the next one's before any pose runs, so
+                # its decode overlaps the whole of this block's forwards rather than the tail.
+                boxes_stc, _scores, det_kpts_stc = _pending_det.result()
+                _pending_det = _det_pool.submit(_detect, bi + 1)
 
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
             conf = np.full((S, n_blk, K), np.nan, np.float32)
@@ -1084,9 +1115,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    **({} if box_cams is None else {'box_prompt_cams': box_cams}),
                    'boxes_from': _boxes_from}
     finally:
-        store.clear()
+        if _det_pool is not None:
+            _det_pool.shutdown(wait=True)
         if _prefetch_pool is not None:
             _prefetch_pool.shutdown(wait=True)
+        store.clear()
 
 
 def _overlaps(a, b):

@@ -430,7 +430,13 @@ def reader_cache_ram_gb(n_cams: int, wh, workers: int | None = None,
     k = _READER_GB_PER_MP * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
     share = max(workers or 1, 1) * max(int(procs or 1), 1)
     readers_gb = max(int(n_cams), 1) * k * share
-    return readers_gb / _memory.FRACTION_READERS / _memory.DEFAULT_FRACTION
+    exact = readers_gb / _memory.FRACTION_READERS / _memory.DEFAULT_FRACTION
+    # NUDGED UP BY ONE PART IN A MILLION, because `_reader_cache_size` ends in `int()` and the
+    # round trip lands EXACTLY on the boundary: at the algebraically exact figure the division
+    # returns 15.999999999999998 and truncates to 15, advertising a budget that buys one reader
+    # short of the rig -- which is the whole cliff. Far too small to pad the figure (the
+    # not-padded test still fails at `exact - 1`).
+    return exact * (1 + 1e-6)
 
 
 def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None = None,

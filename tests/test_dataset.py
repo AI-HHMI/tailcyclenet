@@ -1252,9 +1252,12 @@ def test_reader_cache_degrades_instead_of_oom_on_a_small_host():
     from tailcyclenet.dataset import _reader_cache_size
 
     # A LOADER WORKER still clamps below its own `want` of 4, and there are twelve of them.
-    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=64) < 4
+    # (At `ram_gb=64` it no longer does, since `FRACTION_READERS` moved 0.25 -> 0.35 and PyAV's
+    # readers are cheap -- twelve workers of four readers each is ~18 GB and genuinely fits. The
+    # clamp is what is being tested, so the budget has to be one where it actually binds.)
+    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=32) < 4
     # A GENUINELY SMALL BUDGET degrades the main process below the rig.
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=16) < 16
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=8) < 16
     # ...and a big one is allowed to hold the whole rig, which is worth 5.1x (the cycle cliff).
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=64) == 16
     # never zero -- one reader is the minimum that can serve a read at all

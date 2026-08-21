@@ -101,11 +101,35 @@ DEFAULT_FRACTION = 0.85
 #
 # The store gets the rest because it is the term that decides whether a run is possible at all --
 # it must hold a whole window of full frames across the refine pass, and if it cannot,
-# `run_blocks` refuses rather than degrading. **This split is reasoned, not measured, under the
-# one-pass regime: 0.10/0.65 are starting points and the store's floor is what to re-measure.**
-FRACTION_READERS = 0.25
+# `run_blocks` refuses rather than degrading.
+#
+# **`FRACTION_READERS` MOVED 0.25 -> 0.35, AND A FRACTION IS THE WRONG SHAPE FOR THIS CONSUMER.**
+# The reader cache is BOUNDED: it saturates at `n_cams` and cannot use another byte beyond that,
+# unlike the store, which can always hold more frames. So this fraction is a CEILING that the
+# reader need runs into, not an allocation it spends -- on a 16-camera 3208x2200 rig the whole rig
+# costs 6 GB (`dataset._READER_GB_PER_MP`, measured on PyAV) and anything above that is left for
+# nobody.
+#
+# The move is worth **5.1x on decode** and **15% end to end**, because the access pattern is a
+# CYCLE and a cache one camera short of the rig takes almost no hits (report 40 §4): at 0.25 this
+# rig needed `--max-ram 32` to reach its own camera count, and at 0.35 it reaches it at **24**.
+#
+# **THE STORE PAYS FOR IT, AND THE PRICE IS SMALLER THAN THE ARITHMETIC SUGGESTS.** `run_blocks`
+# REFUSES when one window of frames does not fit, so taking share from the store raises the
+# smallest `--max-ram` a rig can run at. Measured on johnson (16 x 3208x2200, one window 4.07 GB):
+# **7.4 -> 8.1 GB**, not the ~15 -> ~17 a fixed-pipelining calculation predicts -- because at a
+# tight budget `_pipeline_det` turns OFF FIRST and the store then gets the WHOLE share rather than
+# half of it. That is `run_blocks`'s own stated design -- the LOOKAHEAD degrades, not the ceiling
+# and not the floor -- absorbing the change.
+#
+# **AND BOTH FIGURES SIT BELOW THE 10.86 GB PROCESS FLOOR, so the regression is INERT**: a run at
+# `--max-ram 8` is OOM-killed during startup by torch and the checkpoints whatever these fractions
+# say. **Anything that lowers `FRACTION_STORE` further must re-check that floor on the widest rig
+# in use** -- the margin is only inert while the store floor stays under the process floor, and a
+# wider rig moves the store floor up.
+FRACTION_READERS = 0.35
 FRACTION_DETECT = 0.10
-FRACTION_STORE = 0.65
+FRACTION_STORE = 0.55
 
 ENV_MAX_RAM = 'TAILCYCLENET_MAX_RAM_GB'
 

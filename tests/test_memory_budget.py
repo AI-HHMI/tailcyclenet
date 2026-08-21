@@ -263,18 +263,20 @@ def test_reader_cache_is_pure_given_ram_and_shrinks_under_a_cap():
     (gotcha 10: it must never open a container to measure anything)."""
     from tailcyclenet.dataset import _reader_cache_size
 
-    # johnson's rig: 16 cameras of 3208x2200. The price is QUADRATIC in the count (measured:
-    # 0.28 / 3.58 / 15.34 / 34.09 / 59.38 GB at 1 / 4 / 8 / 12 / 16 readers).
+    # johnson's rig: 16 cameras of 3208x2200. The price is LINEAR in the count on PyAV (measured:
+    # 0.418 / 0.383 / 0.376 / 0.373 GB PER READER at 1 / 4 / 8 / 16). The quadratic law this test
+    # used to assert was decord's, and its 0.28/3.58/15.34/34.09/59.38 table was taken without a
+    # trim on an unconstrained host -- i.e. it measured allocator arena.
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1024) == 16     # room -> the whole rig
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1) == 1         # never zero
     # A loader worker still wants 4, not the rig, and the worker count still divides.
     assert _reader_cache_size(16, (3208, 2200), 4, ram_gb=1024) == 4
-    # Monotone in the budget, and quadratic: halving the count should cost ~4x less memory, so
-    # a 4x smaller budget should give ~2x fewer readers rather than 4x fewer.
-    big = _reader_cache_size(16, (3208, 2200), None, ram_gb=64)
-    small = _reader_cache_size(16, (3208, 2200), None, ram_gb=16)
+    # Monotone in the budget, and LINEAR: a 4x smaller budget gives ~4x fewer readers. Asserted
+    # below the rig at both ends, or the `want` cap hides the shape.
+    big = _reader_cache_size(64, (3208, 2200), None, ram_gb=64)
+    small = _reader_cache_size(64, (3208, 2200), None, ram_gb=16)
     assert big > small >= 1
-    assert small == pytest.approx(big / 2, abs=1)
+    assert small == pytest.approx(big / 4, rel=0.25)
 
 
 def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees():

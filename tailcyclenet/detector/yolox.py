@@ -164,11 +164,18 @@ class SPPBottleneck(nn.Module):
 
 
 class CSPDarknetNano(nn.Module):
-    """`trimmed`'s backbone. Strides 8/16/32 feature maps. Unchanged from before this switch."""
+    """`trimmed`'s backbone. Strides 8/16/32 feature maps. Unchanged from before this switch.
 
-    def __init__(self, w=(24, 48, 96, 192)):
+    `p2` (T4.3, dev/plans/detector_accuracy.md): `dark2`'s own output (stride 4) is already
+    computed on every forward -- it was just never RETURNED. `False` (default) keeps the
+    3-tuple `(p3, p4, p5)` return exactly as before; `True` returns the 4-tuple
+    `(p2, p3, p4, p5)` and widens `out_channels` to match, for a caller building a P2 FPN level.
+    """
+
+    def __init__(self, w=(24, 48, 96, 192), p2=False):
         super().__init__()
         c1, c2, c3, c4 = w
+        self.p2 = bool(p2)
         self.stem = conv_norm_act(3, c1, 3, 2)                 # /2
         self.dark2 = nn.Sequential(conv3(c1, c2, 3, 2), CSPLayer(c2, c2, 1))          # /4
         self.dark3 = nn.Sequential(conv3(c2, c3, 3, 2), CSPLayer(c3, c3, 3))          # /8
@@ -177,14 +184,14 @@ class CSPDarknetNano(nn.Module):
                                    CSPLayer(c4, c4, 1, shortcut=False))               # /32
         # p3, p4, p5 output widths -- dark4 and dark5 share `c4` in this 4-effective-width net,
         # unlike the canonical 5-stage backbone below where all three differ.
-        self.out_channels = (c3, c4, c4)
+        self.out_channels = (c2, c3, c4, c4) if self.p2 else (c3, c4, c4)
 
     def forward(self, x):
-        x = self.dark2(self.stem(x))
-        p3 = self.dark3(x)
+        p2 = self.dark2(self.stem(x))
+        p3 = self.dark3(p2)
         p4 = self.dark4(p3)
         p5 = self.dark5(p4)
-        return p3, p4, p5
+        return (p2, p3, p4, p5) if self.p2 else (p3, p4, p5)
 
 
 class Focus(nn.Module):
@@ -216,11 +223,13 @@ class CSPDarknet(nn.Module):
     module docstring for the two deliberate deviations (GroupNorm, and the neck's unified width).
     """
 
-    def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5):
+    def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5,
+                p2=False):
         super().__init__()
         c = round8(64 * width_mul)
         d = max(1, round(3 * depth_mul))
         be = bottleneck_expansion
+        self.p2 = bool(p2)
         self.stem = Focus(3, c, 3, depthwise=depthwise)                                   # /2
         self.dark2 = nn.Sequential(conv3(c, c * 2, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 2, c * 2, d, depthwise=depthwise,
@@ -236,20 +245,39 @@ class CSPDarknet(nn.Module):
             SPPBottleneck(c * 16, c * 16),
             CSPLayer(c * 16, c * 16, d, shortcut=False, depthwise=depthwise,
                     bottleneck_expansion=be))                                             # /32
-        self.out_channels = (c * 4, c * 8, c * 16)          # p3, p4, p5 -- three DISTINCT widths
+        # p2, p3, p4, p5 -- FOUR distinct widths when `p2` (T4.3); the 3-tuple contract is
+        # unchanged at the default, matching `CSPDarknetNano`'s own `p2` switch.
+        self.out_channels = (c * 2, c * 4, c * 8, c * 16) if self.p2 else (c * 4, c * 8, c * 16)
 
     def forward(self, x):
-        x = self.dark2(self.stem(x))
-        p3 = self.dark3(x)
+        p2 = self.dark2(self.stem(x))
+        p3 = self.dark3(p2)
         p4 = self.dark4(p3)
         p5 = self.dark5(p4)
-        return p3, p4, p5
+        return (p2, p3, p4, p5) if self.p2 else (p3, p4, p5)
 
 
 class PAFPN(nn.Module):
-    def __init__(self, chans=(96, 192, 192), out=96, depthwise=True):
+    """`p2` (T4.3, dev/plans/detector_accuracy.md): a 4th, finer level (stride 4). `False`
+    (default) is the original 3-level PAFPN, byte-identical -- the `p2`-only modules
+    (`lat2`/`mrg2`/`down2`/`out3`) are not even CONSTRUCTED, the same "not built and ignored"
+    contract the keypoint branch already uses.
+
+    The extra level slots into the EXISTING top-down/bottom-up pattern rather than bolting on a
+    new one: p2 becomes the new finest level (top-down only, like p3 was before), and p3 -- no
+    longer the finest -- gains the bottom-up refinement stage p3 never needed before (`out3`,
+    mirroring `out4`/`out5`). `down3`'s WEIGHTS are unchanged from the 3-level case (same
+    `out`-width input either way); only what feeds it changes, from the raw top-down p3 to the
+    now-refined one.
+    """
+
+    def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False):
         super().__init__()
-        c3, c4, c5 = chans
+        self.p2 = bool(p2)
+        if self.p2:
+            c2, c3, c4, c5 = chans
+        else:
+            c3, c4, c5 = chans
         self.lat5 = conv_norm_act(c5, out, 1)
         self.lat4 = conv_norm_act(c4, out, 1)
         self.lat3 = conv_norm_act(c3, out, 1)
@@ -259,14 +287,29 @@ class PAFPN(nn.Module):
         self.down4 = conv3(out, out, 3, 2, depthwise=depthwise)
         self.out4 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
         self.out5 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
+        if self.p2:
+            self.lat2 = conv_norm_act(c2, out, 1)
+            self.mrg2 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
+            self.down2 = conv3(out, out, 3, 2, depthwise=depthwise)
+            self.out3 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
 
     def forward(self, feats):
-        p3, p4, p5 = feats
+        if self.p2:
+            p2, p3, p4, p5 = feats
+        else:
+            p3, p4, p5 = feats
         p5 = self.lat5(p5)
         p4 = self.mrg4(torch.cat([F.interpolate(p5, size=p4.shape[-2:], mode='nearest'),
                                   self.lat4(p4)], 1))
         p3 = self.mrg3(torch.cat([F.interpolate(p4, size=p3.shape[-2:], mode='nearest'),
                                   self.lat3(p3)], 1))
+        if self.p2:
+            p2 = self.mrg2(torch.cat([F.interpolate(p3, size=p2.shape[-2:], mode='nearest'),
+                                      self.lat2(p2)], 1))
+            n3 = self.out3(torch.cat([self.down2(p2), p3], 1))
+            n4 = self.out4(torch.cat([self.down3(n3), p4], 1))
+            n5 = self.out5(torch.cat([self.down4(n4), p5], 1))
+            return p2, n3, n4, n5
         n4 = self.out4(torch.cat([self.down3(p3), p4], 1))
         n5 = self.out5(torch.cat([self.down4(n4), p5], 1))
         return p3, n4, n5
@@ -337,14 +380,24 @@ class YOLOXNano(nn.Module):
     `tailcyclenet.detector.pretrained`). `0.5` (default) is byte-identical to every checkpoint on
     record; `1.0` is the shape a Megvii COCO backbone actually loads into. Passing a non-default
     value alongside `version='trimmed'` raises for the same reason `width` does the other way.
+
+    `p2` (dev/plans/detector_accuracy.md T4.3) adds a stride-4 FPN level, on top of EITHER
+    backbone (unlike `bottleneck_expansion`, this one is not canonical-tier-only): `False`
+    (default) is byte-identical to every checkpoint on record -- `self.STRIDES` stays `(8, 16,
+    32)` and the backbone/neck/head are the original 3-level modules. `True` widens all three
+    (`CSPDarknetNano`/`CSPDarknet`'s own `p2` switch, `PAFPN`'s own `p2` switch, `Head`'s
+    `n_levels=4`) and sets `self.STRIDES = (4, 8, 16, 32)` -- `forward`/`anchor_points` already
+    loop over `self.STRIDES` generically, so nothing below this constructor needed to change.
     """
     STRIDES = (8, 16, 32)
 
-    def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5):
+    def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
+                p2=False):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
         self.bottleneck_expansion = float(bottleneck_expansion)
+        self.p2 = bool(p2)
         if self.version == 'trimmed':
             if self.bottleneck_expansion != 0.5:
                 raise ValueError(
@@ -352,7 +405,7 @@ class YOLOXNano(nn.Module):
                     "version='trimmed', but trimmed's CSPDarknetNano does not take it -- it stays "
                     "at 0.5 permanently (it is the repo's own deliberately-narrow net, not a bug "
                     "to fix). Use a canonical tier for a COCO-compatible backbone.")
-            self.backbone = CSPDarknetNano()
+            self.backbone = CSPDarknetNano(p2=self.p2)
             neck_out, depthwise = width, True
         else:
             if self.version not in YOLOX_TIERS:
@@ -364,10 +417,16 @@ class YOLOXNano(nn.Module):
                                  "derives its neck/head width from width_mul.")
             depth_mul, width_mul, depthwise = YOLOX_TIERS[self.version]
             self.backbone = CSPDarknet(width_mul, depth_mul, depthwise=depthwise,
-                                       bottleneck_expansion=self.bottleneck_expansion)
+                                       bottleneck_expansion=self.bottleneck_expansion,
+                                       p2=self.p2)
             neck_out = round8(256 * width_mul)
-        self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise)
-        self.head = Head(neck_out, n_keypoints=self.n_keypoints, depthwise=depthwise)
+        self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise,
+                          p2=self.p2)
+        n_levels = 4 if self.p2 else 3
+        self.head = Head(neck_out, n_levels=n_levels, n_keypoints=self.n_keypoints,
+                         depthwise=depthwise)
+        if self.p2:
+            self.STRIDES = (4, 8, 16, 32)
 
     def forward(self, x):
         """x: (B,3,H,W) normalized to [0,1].

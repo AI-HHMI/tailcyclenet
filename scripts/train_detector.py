@@ -260,7 +260,8 @@ def main():
         print(f'val:   {len(val)} views')
 
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
-                      bottleneck_expansion=model_cfg['bottleneck_expansion']).to(device)
+                      bottleneck_expansion=model_cfg['bottleneck_expansion'],
+                      p2=model_cfg['p2']).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
@@ -398,6 +399,10 @@ def main():
                         # checkpoint written before this key existed, not a guess.
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],
                         'pretrained': model_cfg['pretrained'],
+                        # T4.3 (dev/plans/detector_accuracy.md): same gotcha-12 shape -- absent
+                        # means False, a fact about every checkpoint written before the P2 level
+                        # existed, not a guess.
+                        'p2': model_cfg['p2'],
                         'seed': train_cfg['seed'],
                         # `input_wh` above is the TILE size when tiling, which is NOT the
                         # deployment input size -- `load_detector` raises if this is missing so

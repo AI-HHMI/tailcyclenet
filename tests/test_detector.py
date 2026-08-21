@@ -2909,6 +2909,133 @@ def test_bottleneck_expansion_raises_alongside_trimmed():
     YOLOXNano(version='trimmed', bottleneck_expansion=0.5)      # the default: must NOT raise
 
 
+# ----------------------------------------------------------------------------------------------
+# T4.3 -- a stride-4 (P2) FPN level (dev/plans/detector_accuracy.md). `p2=False` (default) is
+# byte-identical to every checkpoint on record; unlike `bottleneck_expansion`, this one is NOT
+# tier-restricted -- it applies to `trimmed` and every canonical tier alike.
+# ----------------------------------------------------------------------------------------------
+
+def test_p2_default_is_byte_identical_to_no_key():
+    """Same contract as `bottleneck_expansion`'s own default-identity test: passing `p2=False`
+    explicitly must build the IDENTICAL module graph as never passing it, on BOTH a canonical
+    tier and `trimmed` (this key is not tier-restricted)."""
+    for version in ('s', 'trimmed'):
+        a = YOLOXNano(version=version).state_dict()
+        b = YOLOXNano(version=version, p2=False).state_dict()
+        assert set(a) == set(b), version
+        for k in a:
+            assert a[k].shape == b[k].shape, (version, k)
+
+
+def test_p2_true_adds_a_stride_4_level():
+    """`p2=True` must widen `STRIDES` to `(4, 8, 16, 32)`, `anchor_points` must match it exactly
+    (the same invariant `test_forward_shapes_and_anchor_order` pins for the 3-level case), and
+    the model must have MORE parameters (the new `lat2`/`mrg2`/`down2`/`out3` PAFPN modules plus
+    the head's 4th level)."""
+    base = YOLOXNano(version='tiny')
+    m = YOLOXNano(version='tiny', p2=True)
+    assert m.STRIDES == (4, 8, 16, 32)
+    assert base.STRIDES == (8, 16, 32), 'the OTHER instance must be unaffected'
+    x = torch.zeros(1, 3, 128, 160)
+    obj, boxes, _ = m(x)
+    anchors = m.anchor_points(128, 160, x.device)
+    assert obj.shape[1] == boxes.shape[1] == anchors.shape[0]
+    assert set(anchors[:, 2].tolist()) == {4.0, 8.0, 16.0, 32.0}
+    n_base = sum(p.numel() for p in base.parameters())
+    n_p2 = sum(p.numel() for p in m.parameters())
+    assert n_p2 > n_base
+
+
+def test_p2_works_on_trimmed_too():
+    """Unlike `bottleneck_expansion`, `p2` is NOT tier-restricted -- it must build and forward on
+    `trimmed` as well as a canonical tier, and must NOT raise the way a non-default
+    `bottleneck_expansion` does alongside `trimmed`."""
+    m = YOLOXNano(version='trimmed', p2=True)          # must not raise
+    assert m.STRIDES == (4, 8, 16, 32)
+    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
+    """A `p2=True` checkpoint must reconstruct a `p2=True` model through `load_detector` -- absent
+    means `False` (gotcha 12's shape), so this is the proof a SAVED `p2=True` fact survives, not
+    just that the constructor kwarg works in isolation."""
+    from tailcyclenet.detector import load_detector
+
+    m = YOLOXNano(version='tiny', p2=True)
+    ckpt = {
+        'model_state': m.state_dict(), 'input_wh': (96, 96), 'n_keypoints': 0, 'norm': 'gn',
+        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': True,
+    }
+    p = tmp_path / 'detector.pth'
+    torch.save(ckpt, p)
+    loaded, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(p)
+    assert loaded.p2 is True
+    assert loaded.STRIDES == (4, 8, 16, 32)
+    obj, boxes, _ = loaded(torch.zeros(1, 3, 96, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+def test_detector_config_p2_default_false(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['model']['p2'] is False
+
+
+def test_train_detector_p2_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A short run with `[model].p2 = true` through the real CLI entry point: must train to
+    completion with no error, and the saved checkpoint must reload with `p2=True`."""
+    import importlib.util
+    import sys
+
+    from tailcyclenet.detector import load_detector
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+p2 = true
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_p2',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+    model, *_ = load_detector(out / 'detector.pth')
+    assert model.p2 is True
+    assert model.STRIDES == (4, 8, 16, 32)
+
+
 def test_load_coco_backbone_raises_at_the_shipped_expansion():
     """The guard must fire BEFORE touching disk -- a model built at the shipped 0.5 must be
     refused even if no weights file exists at all, so the error names the real cause instead of a

@@ -66,6 +66,9 @@ def load_detector(path, device='cpu', input_wh=None):
 
     `bottleneck_expansion` (T4.1, dev/plans/detector_accuracy.md) rides the same way: absent means
     0.5, the shape every checkpoint on record was built at, not a guess.
+
+    `p2` (T4.3, dev/plans/detector_accuracy.md) rides the same way too: absent means `False`, the
+    3-level FPN every checkpoint on record was built at.
     """
     import torch
     from pathlib import Path
@@ -91,7 +94,8 @@ def load_detector(path, device='cpu', input_wh=None):
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
     model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
                       version=str(ckpt.get('yolox_version', 'trimmed')),
-                      bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)))
+                      bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)),
+                      p2=bool(ckpt.get('p2', False)))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

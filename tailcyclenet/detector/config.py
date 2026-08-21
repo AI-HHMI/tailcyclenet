@@ -30,7 +30,7 @@ DATA_KEYS = frozenset({
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present',
 })
-MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained'})
+MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
@@ -185,4 +185,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                 "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
                 "every bottleneck conv is half Megvii's width and the load would silently take "
                 "only 19 of 35 backbone tensors (dev/plans/detector_accuracy.md T4.1).")
+
+    # T4.3 (dev/plans/detector_accuracy.md): a stride-4 FPN level, on top of EITHER backbone
+    # (canonical tier or `trimmed`) -- unlike `bottleneck_expansion`, not tier-restricted. Default
+    # `false` is byte-identical to every checkpoint on record (`YOLOXNano`'s own default).
+    model['p2'] = bool(model.get('p2', False))
     return cfg

@@ -116,14 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--checkpoint', default=None)
     ap.add_argument('--anchor', default='carry', choices=ANCHORS,
                     help="'labels' is an ORACLE, not a deployment number")
-    ap.add_argument('--overlap', type=int, default=8,
-                    help='frames each window shares with its predecessor. 8, and it is the one '
-                         'number that suits both dimensions: 3dpop reads -0.626 mm against 4 over '
-                         '16 sessions (and -0.355 [-0.751, -0.063] SIG on the 120-frame protocol, '
-                         'where overlap 2 costs +0.460 and 12 is no better), while 2D still '
-                         'improves at 12 -- but only by +0.787 px [-0.111, +1.951] n.s. over 8 on '
-                         'rat-city, at a small monotone identity cost. It is the SEAM COUNT against '
-                         'the SEAM SIZE and both terms depend on the clip; sweep it per root.')
+    ap.add_argument('--overlap', type=int, default=4,
+                    help='frames each window shares with its predecessor. The default is 4 by '
+                         'direct instruction (2026-08-21); the measured evidence says 8 suits 3D '
+                         '(3dpop -0.626 mm against 4 over 16 sessions, and -0.355 [-0.751, -0.063] '
+                         'SIG on the 120-frame protocol, where overlap 2 costs +0.460 and 12 is no '
+                         'better), while 2D still improves at 12 -- but only by +0.787 px '
+                         '[-0.111, +1.951] n.s. over 8 on rat-city, at a small monotone identity '
+                         'cost. It is the SEAM COUNT against the SEAM SIZE and both terms depend '
+                         'on the clip; sweep it per root.')
     ap.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
     ap.add_argument('--boxes', type=Path, default=None,
                     help='npz of crop points per group; default is to crop from the labels')

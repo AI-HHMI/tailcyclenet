@@ -562,13 +562,13 @@ prediction — what deployment does, requires `overlap >= 1`), `self` (two passe
 ### The measured defaults
 
 The 3D column is 3dpop, **16 sessions / 47 `--chunk 500` units**, paired, one lever off
-`--anchor carry --overlap 8`; the 2D column names its root because **the two 2D roots disagree**
+`--anchor carry --overlap 4`; the 2D column names its root because **the two 2D roots disagree**
 (rat-city 500 f / 5 units; calms21 6 sessions x 2000 f / 24 units).
 
 | flag | default | 2D | 3D |
 |---|---|---|---|
 | `--anchor` | `carry` | **ROOT-CONDITIONAL**: rat-city +5.04 px SIG worse, calms21 MOTA +0.082 SIG better | mean NULL; carry wins the bulk |
-| `--overlap` | **8** | 12 best, 8 within noise (+0.79 n.s.) | −0.626 mm vs 4 |
+| `--overlap` | **4** (moved from 8 by direct instruction, 2026-08-21; the 3D evidence below is the reason 8 was chosen and remains the sweepable alternative) | 12 best, 8 within noise (+0.79 n.s.) | −0.626 mm vs 4 |
 | `--refine` | **on in 3D, off in 2D** | accuracy yes, identity no | **−0.962 mm [−2.104, −0.216] SIG** |
 | `--crop-source` | `boxes` | **`boxes`** | **NULL** (+0.181 [−0.182, +0.546]) |
 | `--det-score` | 0.5 | **per-checkpoint** | per-checkpoint |

@@ -2,7 +2,7 @@
 
 Every consumer -- the detector, refine pass 1, refine pass 2, and the next window's overlap --
 wants the same `(camera, source frame)` pixels, and before this they each fetched their own. A
-frame sat in three windows at the shipped `n_frames = 12 --overlap 8`, `--refine` asked for it
+frame sat in three windows at the then-shipped `n_frames = 12 --overlap 8`, `--refine` asked for it
 twice per window, and `detect_raw` had already decoded it once on its own pass: **seven decodes of
 every frame-camera**, against a 44 ms 4K decode and a 0.86 ms forward (dev/reports/38 §5, 14).
 

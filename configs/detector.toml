@@ -166,6 +166,19 @@ ignore_present = false
 # at once.
 yolox = "tiny"
 
+# stride-4 (P2) FPN level, on top of either backbone tier -- absent/false means the 3-level FPN
+# every checkpoint before this key existed was built at. DEFAULTS TO true: CONFIRMED on 3dpop
+# (dev/plans/detector_accuracy.md T4.3, replicated at seed=1 -- r@.5/r@.75/IoU all SIG at BOTH
+# seeds, seed=1 effects LARGER not smaller). The extra level gives the smallest animals a
+# stride-4 cell instead of falling below stride 8 entirely (rat-city-tracked's p10 animal is
+# 8.7 input px, under one stride-8 cell). rat-city/test is the repo's ONE DEGENERATE
+# single-group split and read the opposite direction there -- NOT a refutation (one group has
+# no confidence interval; it is an unmeasurable point, not a counter-example) but a reason to
+# treat this as a 3dpop-confirmed win, not a blanket-proven one, until rat-city has a real split
+# to test it on. Set false to restore the pre-this-default 3-level FPN, byte-identical to every
+# checkpoint on record.
+p2 = true
+
 [training]
 # run folder: checkpoints, metrics.json, and the effective config.toml + provenance.toml.
 # `--out` on the command line overrides this.
@@ -176,6 +189,12 @@ out = ""
 iters = 20000
 
 batch_size = 16
+# STAYS AT 1e-3 -- SWEPT AND ITS OWN "WIN" REFUTED (dev/plans/detector_accuracy.md T2.4). A
+# short-run (6000-iter) sweep found a clean, large plateau across [3e-4, 8e-4]; a full-length
+# (20000-iter) confirmation at 6e-4 against a matched 1e-3 control REVERSED it (r@.75 went null,
+# IoU flipped sign and became SIGNIFICANTLY WORSE than 1e-3). Do not re-propose a lower `lr` off
+# the short-run numbers alone -- they measure a different schedule length than production trains
+# at, and this is the one lever in this file that demonstrated exactly why that gap matters.
 lr = 1e-3
 num_workers = 8
 seed = 23
@@ -193,3 +212,37 @@ eval_batches = 25
 
 kpt_weight = 1.0
 kpt_score_weight = 1.0
+
+# per-GT positive-anchor cap: the k closest anchors by centre distance, capping candidacy before
+# the per-anchor uniqueness resolution. 0/absent means uncapped, the shape every checkpoint
+# before this key existed was trained under. DEFAULTS TO 10 (YOLOX's own SimOTA-adjacent scale):
+# CONFIRMED (dev/plans/detector_accuracy.md T2.2, replicated at seed=1) -- 4/5 metrics
+# significant at BOTH seeds, the largest effect sizes measured anywhere in this file
+# (r@.75 -0.05 to -0.09). An uncapped centre prior gives large animals ~4.3x the box-loss share
+# and objectness positives of small ones; capping candidacy fixes both at once. 0 restores
+# uncapped, byte-identical to every checkpoint on record.
+max_pos_per_gt = 10
+
+# the BCE objectness target at a positive anchor becomes the DETACHED IoU between its predicted
+# and GT box (once past iou_aware_warmup iterations) instead of a hard 1.0. false/absent is the
+# hard-1.0 target every checkpoint before this key existed was trained under. DEFAULTS TO true:
+# CONFIRMED (dev/plans/detector_accuracy.md T2.3, replicated at seed=1) -- r@.5/IoU/fp
+# significant at BOTH seeds, r@.75 the same direction both times. Fixes objectness saturation
+# (98.5%+ of positives read exactly 1.0 under the old hard target), which is what gives
+# `--det-score` a live range and lets NMS keep the best-localised box in a huddle instead of an
+# arbitrary one. false restores the hard-1.0 target, byte-identical to every checkpoint on
+# record.
+iou_aware_obj = true
+iou_aware_warmup = 2000
+
+# weight on the GIoU box term (`detector_loss`'s own former hardcoded constant, never
+# configurable before this key existed -- 5.0 is what every checkpoint on record used, whether
+# or not this key is present). DEFAULTS TO 15.0: CONFIRMED (dev/plans/detector_accuracy.md
+# T2.4) -- the ONLY T2.4 lever to survive BOTH required checks (a full-length 20000-iter
+# confirmation AND a same-recipe seed=1 replicate, after `lr=6e-4` failed the first of those).
+# 3/5 metrics significant at both seeds with near-identical point estimates (IoU: -0.0267 vs
+# -0.0269 seed0/seed1). The short-run sweep found no upper edge through 20.0 -- 15.0 is the
+# value that was actually tested at full length and replicated, not the sweep's extreme; do not
+# push it higher without measuring there first. 5.0 restores the pre-this-default weight,
+# byte-identical to every checkpoint on record.
+box_weight = 15.0

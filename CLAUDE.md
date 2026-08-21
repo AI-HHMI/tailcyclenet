@@ -32,6 +32,7 @@ tailcyclenet/
   checkpoints.py      run folders, save/load, warm start, config `extends`
   distributed.py      the world-size axis: what a config key means on N gpus + the rank guards
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
+  adopt.py            --videos: filenames + an anipose calibration -> a Session, IN MEMORY
   infer/              THE inference path. `scripts/infer.py` is a 17-line shim onto `cli.main`.
     window.py           one window loop (`run_blocks`, a BLOCK of windows at a time)
     store.py            THE one decode site: (camera, source frame) -> full frame, evicted by block
@@ -435,6 +436,10 @@ what the config says.
 
 ```bash
 pixi run python scripts/infer.py --data <ONE session dir> --run runs/<x>/ --out pred/
+# or, straight off raw footage:
+pixi run python scripts/infer.py --run runs/<x>/ --out pred/ \
+    --videos rec/ --calibration anipose/calibration.toml --cam-regex 'cam([0-9]+)_' \
+    --detector runs/det-<x> --max-animals 4
 ```
 
 **`--out` IS A SESSION DIRECTORY IN `docs/annotation_format.md`, NOT AN NPZ**, written a block at a
@@ -443,12 +448,100 @@ run, the checkpoint file, the detector and the SOURCE SESSION, all absolute), `c
 `groups.pq`, `points3d.pq`, `keypoints.pq` (the per-camera 2D pose, which a 3D run used to
 discard), `instances.pq` (box + `score` + `box_agree`) and a non-spec `windows.pq`. **No pixels and
 no `groups/`** -- so `validate_session` reports one rule-7 error per (group, camera) and nothing
-else, and `scripts/render.py` opens `[provenance] source_session` for the frames.
+else.
+
+**NOTHING SHIPPED READS `[provenance] source_session`, and this file used to claim `render.py`
+does.** It does not: `render.py` takes its own `--data` and reads a prediction **npz**, and has
+never been updated for the prediction-session format. `predictions.py` reads only
+`source_session_id`. The `source_*` keys are what a future render path would read.
+
+### `--videos`: raw footage plus an anipose calibration
+
+**THE SESSION IS BUILT IN MEMORY (`tailcyclenet/adopt.py`). NOTHING IS STAGED.** `Group.source` is
+the ONLY filesystem entry point in the decode path and it is a cache over `_src`, so
+`format.video_group` pre-fills it and `pixels()`, `Group.dir` and `session.path` are never
+reached; `format.VideoSession` overrides `_table` to `None` so a colliding `path` cannot adopt
+someone else's parquet. `tests/test_format.py` pins both. **The cost: `validate_session` can no
+longer be the acceptance test**, so `tests/test_adopt.py` compares the in-memory session against
+the on-disk one `write_session` produces -- once, in CI. `--dump-session` is the debug artefact,
+not the mechanism.
+
+- **The naming rule is anipose's `cam_regex`, verbatim**: camera = `search(rx, stem).group(1)`,
+  group = `sub(rx, '', stem)`. **THE CAMERA NAME IS THE CAPTURE GROUP**, so `cam([0-9]+)_` yields
+  `0` and not `cam0` -- the most common error by a wide margin, and refusal 2 says so. Two
+  supersets: a **group-less** pattern matches the whole string (`Cam[0-9]+` -> `Cam2005325`, which
+  is what a raw rig dump needs, and which does NOT consume the separator), and a one-camera
+  calibration needs no regex. **An empty group id is about DISAGREEMENT, not emptiness**: all
+  empty is one group (`--group-id`), some empty and some not is refused.
+- **`--calibration` is the aniposelib layout and nothing else.** A `multiview_calib`/OpenCV-YAML
+  rig needs a converter script ending in `dump_calibration`; that stays out of `adopt.py`.
+- **No labels means no eval**, and it makes `--max-animals` (with `--detector`) and a box source
+  mandatory. Refusals 1-11 are PURE and fire above the checkpoint load and above any decode; 12-14
+  need the probe. `--anchor labels` / `--box-prompt labels` are refused, not warned.
+- **The keypoint axis comes from the run's own `keypoint_registry.toml`** -- `--dataset-name`, or
+  the sole entry, printed. This also retires the `path.parent.parent.name` trick: `ds_name` is
+  stated outright.
+- **`--videos` IS AN INPUT PATH, NOT A SECOND PIPELINE**, pinned as byte-identity against the same
+  videos reached through a hand-authored session directory.
+- **Provenance is the CLI INPUTS, not the derived map**: `source_videos` (the RESOLVED, expanded
+  file list -- **the one non-scalar provenance value in this repo**), `source_calibration`,
+  `source_cam_regex`, `source_group_id`, and `source_session = ""` deliberately. `plan()` is pure
+  over the filenames, so it re-derives the map exactly, and
+  `adopt.session_from_prediction` **CHECKS ITSELF** against the prediction's own `groups.pq` and
+  `calibration.toml`. A per-(group, camera) key would collide (`a_b`/`c` against `a`/`b_c`).
+- **`build()` OPENS CONTAINERS IN THE PARENT PROCESS (gotcha 10).** Safe from `scripts/infer.py`,
+  which never forks. **Never call `adopt` from `scripts/train.py`.** The probe opens one reader at
+  a time (pool of 4) and drops it -- it must NOT use `dataset._reader`, whose size would be fixed
+  before the run's own budget is resolved, and whose cost is quadratic in the reader count. On a
+  16-camera raw rig the probe is minutes of cold opens; it prints per camera, and it warms the
+  page cache the run then reads through.
+- **Frame counts come from decord, not from container metadata**, because `n_frames` is a promise
+  that every index in `[0, T)` decodes through the same reader the loader uses.
+- **A ragged group is refused, not min()'d** (`--trim-to-shortest` opts in): a dropped trigger and
+  two different recordings sharing a group id look identical to a `min`.
+
+### `--start-frame` / `--end-frame`: a frame range on BOTH inputs
+
+**A WINDOW-LOOP LEVER, NOT AN INPUT-FORMAT ONE**, which is why one implementation serves both.
+Half-open `[start, end)`, per group, `0` = to the end.
+
+- **`frame` IN THE OUTPUT IS ALWAYS THE SOURCE INDEX**, and `groups.pq` keeps the group's FULL
+  `n_frames`. `load_predictions` therefore densifies back to a full-length array that is NaN
+  outside the range, and `eval.py` / `--chunk` / `--vs` need no change. Re-basing to 0 would score
+  frames `[start, end)` against labels `[0, end-start)` -- the `chunk_frames` failure exactly.
+- **`--max-frames N` IS `--start-frame 0 --end-frame N`** and resolves into one quantity; the two
+  spellings are **REFUSED together**, not ordered, because "120 frames from 300" and "up to frame
+  120, from 300" read with equal force.
+- **A RANGED RUN IS NOT A SLICE OF THE WHOLE-CLIP ANSWER.** The detector boxes ARE byte-identical
+  (next bullet) and the accuracy columns are comparable, but `--track` and `--link-boxes` carry
+  state and `carry` has no prior at `start`, so the IDENTITY columns are comparable only between
+  runs that START together. **And byte-identity on the accuracy columns holds only where the
+  window partition agrees**: `_window_starts` pulls the LAST window back to end exactly at
+  `--end-frame`, which is not a whole-clip window boundary unless the range runs to the clip end,
+  so the few frames past the range's final start came from a different window (eval rule 11's
+  family). Pinned both ways in `tests/test_infer.py`.
+- **THE DETECTION CURSOR OPENS ON A GLOBAL `_DET_BATCH` BOUNDARY AT OR BELOW `--start-frame`, and
+  the lead-in is discarded.** `detect_raw` ASSERTS the alignment because a short leading batch is
+  an input SHAPE the whole-clip pass never produces. Do NOT relax that assert and do NOT quantise
+  the user's `--start-frame` by 16. Leaving the cursor at 0 is not merely wasteful -- it pulls the
+  whole prefix through the frame store, which is sized from the WORK.
+- **A group shorter than `--start-frame` is SKIPPED BY NAME; every group skipped is REFUSED.**
+- **NOT A RESUME.** It bounds which frames are predicted; it does not reconstruct the tracker or
+  the carried prior the whole-clip run would have held at that frame.
+- It also retires `make_clips.py`'s cut: a whole-video group plus a range indexes into the shared
+  mp4 (`VideoReader.get_batch` seeks), with no keyframe-lattice constraint and no duplicated
+  pixels.
 
 **ONE SOURCE SESSION PER RUN, refused before the checkpoint loads.** A session holds one
 calibration, one mode and one keypoint axis. A 58-group 3dpop protocol is now 16 invocations and 16
 directories; `eval.py` still keys on `session/group`, so scoring them together is a reader change
-that is NOT built.
+that is NOT built. **One session may hold MANY groups** -- twelve trials of a four-camera rig is
+one `--videos` invocation.
+
+**`--data` AND `--videos` ARE EXACTLY-ONE-OF**, and both contribute the same provenance KEYS with
+different values, which is what keeps the branches honest: `SessionWriter` raises on a key given
+twice with two values. `--split` defaults to `None` rather than `"test"` so the videos path can
+tell whether it was PASSED (it is inert there, and refused rather than ignored).
 
 **`scripts/eval.py` STILL READS EVERY EXISTING `.npz`** -- `load_predictions` dispatches on the
 path -- because every published number lives in one.
@@ -984,3 +1077,15 @@ Open work is sized and prioritised in `dev/plans/owed.md`. The headline items:
   the bar for shipping is a second 3D root plus rat-city as the discriminator's test.
 - **`--link-boxes` is default-on and never measured**, and `aug_rotation_deg = 45` is the one
   surviving unmeasured augmentation.
+- **THE `--videos` PATH IS BUILT AND UNMEASURED ON A REAL RIG.** The smoke test and the wall-clock
+  work are `dev/plans/infer_from_videos_and_calibration.md` §12-13: johnson `mouse_2_validate`,
+  16 cameras of 3208x2200 raw mp4 against the cut-clip reference. **§13.8 step 1 -- the
+  raw-symlink session at matched `--max-ram` -- is the number everything else hangs off and needs
+  NO new code; do it before proposing any lever.** Two traps carried from there: **report 39's
+  decode conclusions are JPEG conclusions** (four of six shipped roots are image directories, so
+  the reader cache cannot fire on them) and **the 40 s cold open is first-touch-per-node, not a
+  per-eviction price** (steady state 1.04 s). The reader-cache penalty measured on SHORT
+  containers is 2.4x; the fix is a `--max-ram` large enough to hold the rig, **but never below
+  ~12, which is an OOM kill with an empty log rather than a refusal**.
+- **`render.py` on a video-sourced prediction.** Two pre-existing gaps: it still reads an npz
+  rather than a prediction session, and it is not wired to `adopt.session_from_prediction`.

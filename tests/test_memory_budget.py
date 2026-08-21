@@ -477,3 +477,69 @@ def test_a_window_that_does_not_fit_is_refused_not_re_decoded(tmp_path):
     msg = str(e.value)
     assert '--max-ram' in msg and 'one window' in msg
     assert 'frame store' in msg, 'the message must show the arithmetic, not just the verdict'
+
+
+def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
+    """TWO BLOCKS ARE LIVE WHEN DETECTION RUNS AHEAD, and both come out of one share.
+
+    The detection thread decodes block k+1's frames while block k's are still held for its
+    forwards. Budgeting one block and running two overshot the flag -- measured at 11.6 GB peak
+    under `--max-ram 10`, and a ceiling on the process is the whole point of that flag.
+
+    The fix must not be "halve the block", which would double the budget a run needs before it can
+    START (johnson would refuse below --max-ram 19 where it runs at 10) -- that trades a hard
+    failure for a speedup. So the LOOKAHEAD degrades: with room for two blocks it pipelines, and
+    below that it detects inline exactly as it did before the pipeline existed.
+    """
+    import conftest as cf
+    from tailcyclenet.format import Registry, load_dataset
+    from tailcyclenet.infer import InferConfig, merge_blocks, run_blocks
+    from tailcyclenet.model import build_model
+    from test_model import SMALL
+
+    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=16)
+    ds = load_dataset(tmp_path / 'mv')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+
+    C = len(sess.rig)
+    w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
+    boxes = np.zeros((1, 16, C, 4), np.float32)
+    boxes[..., 2], boxes[..., 3] = w, h
+    seen = []
+
+    def boxes_for(store, lo, hi):
+        seen.append((lo, hi))
+        return (boxes[:, lo:hi], None, None)
+
+    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
+                      anchor='carry')
+
+    def run(gb):
+        seen.clear()
+        memory.reset()
+        memory.current(override_gb=gb)
+        try:
+            return merge_blocks(run_blocks(model, sess, 'g000', registry, ds.name, cfg,
+                                           boxes_for=boxes_for, n_rows=1)), list(seen)
+        finally:
+            memory.reset()
+
+    tight, tight_calls = run(0.0008)      # one window fits, two blocks do not
+    roomy, roomy_calls = run(4096)
+
+    # BOTH RUN -- the tight budget must not refuse, which is the failure the split avoids.
+    assert tight_calls and roomy_calls
+    # ...and detection is asked for the same frame spans in the same order either way, which is
+    # what makes the lookahead a pure wall-clock change.
+    assert tight_calls == sorted(tight_calls), 'detection must advance in block order'
+    # ...and the pixels are the same.
+    for k, v in roomy.items():
+        a, b = np.asarray(v), np.asarray(tight[k])
+        if a.dtype.kind in 'fc':
+            assert np.array_equal(np.nan_to_num(a, nan=-9e9), np.nan_to_num(b, nan=-9e9)), \
+                f'{k} moved when the detection lookahead was disabled by the budget'
+        elif a.dtype.kind in 'iub':
+            assert np.array_equal(a, b), f'{k} moved when the lookahead was disabled'

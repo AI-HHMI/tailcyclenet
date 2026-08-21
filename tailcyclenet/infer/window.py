@@ -493,7 +493,20 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # 6 MB frames would otherwise take blocks of two windows and split a 57,000-frame clip into
     # thousands of them.
     _want_store = max(2 * _one, _MIN_STORE_BYTES)
-    _store_bytes = min(_budget.share(memory.FRACTION_STORE), _want_store)
+    _share = _budget.share(memory.FRACTION_STORE)
+    # **TWO BLOCKS ARE LIVE WHEN DETECTION RUNS AHEAD, AND BOTH COME OUT OF THIS SHARE.** The
+    # detection thread decodes block k+1's frames while block k's are still held for its forwards,
+    # so budgeting one block and running two overshot the flag -- measured at 11.6 GB peak under
+    # `--max-ram 10`, where the ceiling is the whole point of the flag.
+    #
+    # THE LOOKAHEAD IS WHAT DEGRADES, NOT THE CEILING AND NOT THE FLOOR. Halving the block instead
+    # would double the budget a run needs before it can start at all (johnson would refuse below
+    # `--max-ram 19` where it now runs at 10), which trades a hard failure for a speedup. So a
+    # budget with room for two blocks pipelines; a tighter one detects inline, exactly as it did
+    # before the pipeline existed. Output is identical either way -- block order and association
+    # order are unchanged, and only the overlap goes.
+    _pipeline_det = _share >= 2 * _one          # room for two blocks of at least one window
+    _store_bytes = min(_share / (2 if _pipeline_det else 1), _want_store)
     cam_decode = memory.fits(_store_bytes / 2, _frame_bytes * cfg.n_frames,
                              want=min(_CAM_DECODE, len(cam_ix)))
     if _one > _store_bytes:
@@ -1020,7 +1033,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # cursor and the association state, so it must run once per block in block order: one worker,
     # submitted one block ahead, and the result awaited before the block that needs it. Detection
     # never reads `carried` or any pose output -- the dependency runs one way only.
-    _det_pool = ThreadPoolExecutor(max_workers=1) if boxes_for is not None else None
+    _det_pool = (ThreadPoolExecutor(max_workers=1)
+                 if (boxes_for is not None and _pipeline_det) else None)
 
     def _detect(bi):
         """Boxes for block `bi`, or None past the end. Runs on `_det_pool`, in block order."""
@@ -1049,6 +1063,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 # its decode overlaps the whole of this block's forwards rather than the tail.
                 boxes_stc, _scores, det_kpts_stc = _pending_det.result()
                 _pending_det = _det_pool.submit(_detect, bi + 1)
+            elif boxes_for is not None:
+                boxes_stc, _scores, det_kpts_stc = _detect(bi)
 
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
             conf = np.full((S, n_blk, K), np.nan, np.float32)

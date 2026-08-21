@@ -605,11 +605,15 @@ def _reader(path: str, group, cam: str):
             size = _reader_cache_size(
                 len(rig), rig.size(cam), None if info is None else info.num_workers)
             # THE DOCUMENTED CLIFF, SAID OUT LOUD. The pose loop touches every camera inside one
-            # window, so a cache below the camera count misses on EVERY call -- a 16-camera video
-            # rig at 4 re-opened 12 containers per window and ran 2.5x slower. That used to be
-            # reachable only by setting `TAILCYCLENET_READER_CACHE` by hand; now a tight RAM budget
-            # can produce it too, and a run that is silently 2.5x slower for a legitimate reason
-            # should still say so rather than being diagnosed from a stopwatch.
+            # window, so a cache below the camera count misses on nearly every call. Measured on
+            # PyAV over 12 windows of a 16-camera 3208x2200 rig, 3 replicates: cache 4 runs 7.4 s
+            # against cache 16's 1.5 s -- **5.1x**, and it is a THRESHOLD rather than a curve
+            # (1 -> 8 buys 24%, 8 -> 16 buys 4.2x), because a cycle only pays off once the whole
+            # cycle fits. The 2.5x this comment used to quote was decord's.
+            #
+            # A run that is silently 5x slower for a legitimate reason should still say so rather
+            # than being diagnosed from a stopwatch -- and the evidence lives HERE rather than in
+            # the warning, which only needs to say what to do about it.
             if info is None and size < len(rig):
                 # SAY WHAT IT WOULD TAKE, not just that it is small -- the price is LINEAR, so it
                 # inverts into an actual `--max-ram` figure. And do NOT blame the budget when the
@@ -618,16 +622,14 @@ def _reader(path: str, group, cam: str):
                 forced = os.environ.get('TAILCYCLENET_READER_CACHE')
                 why = (f'TAILCYCLENET_READER_CACHE={forced} forced this; unset it to size from '
                        'the RAM budget instead.' if forced else
-                       f'{_memory.current()} does not hold more -- --max-ram '
-                       f'{reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold all '
-                       f'{len(rig)}. Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or accept the '
+                       f'--max-ram {reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold '
+                       f'all {len(rig)}. Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or accept the '
                        'slowdown.')
                 warnings.warn(
                     f'video reader cache is {size} for a {len(rig)}-camera rig: every window '
                     f'touches all {len(rig)} cameras, so this misses on nearly every call and '
-                    f'reopens up to {len(rig) - size} container(s) per window -- worth about 5x '
-                    f'on decode (measured on PyAV: cache 4 -> 7.4 s, cache 16 -> 1.5 s over 12 '
-                    f'windows of a 16-camera 3208x2200 rig). {why}', stacklevel=2)
+                    f'reopens up to {len(rig) - size} container(s) per window. {why}',
+                    stacklevel=2)
             _readers = _ReaderCache(size)
         return _readers(path)
 

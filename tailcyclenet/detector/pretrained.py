@@ -125,3 +125,51 @@ def load_coco_backbone(model, tier, weights_dir=None):
     result = model.backbone.load_state_dict(to_load, strict=False)
     assert not result.unexpected_keys, result.unexpected_keys
     return n_loaded, n_total
+
+
+def load_pretrained_backbone(model, path):
+    """Load an IN-DOMAIN backbone-only checkpoint (T4.1b, `scripts/pretrain_detector_backbone.py`)
+    into `model.backbone`, IN PLACE.
+
+    Unlike `load_coco_backbone`, no scale or channel-order correction: this repo's own
+    pretraining loop already decodes through `BoxDataset`, i.e. already `[0, 1]` and RGB, so a
+    backbone trained here and one fine-tuned here speak the same convention from the start. That
+    is the whole point of T4.1b as T4.1's control -- it isolates "does PRETRAINING help" from
+    "does leaving this repo's own domain for COCO's help", and a silent correction here would
+    reintroduce the very confound it exists to remove.
+
+    Architecture must match EXACTLY -- `version` (tier), `bottleneck_expansion` and `in_channels`
+    all come from the checkpoint's own recorded facts (gotcha-12 shape: absent means the
+    PRE-key-existing default for each, i.e. every checkpoint this function could ever be asked to
+    load already has them, since the key existed before this function did) and are compared
+    against `model`'s own attributes BEFORE touching `load_state_dict`, so a mismatch raises with
+    a clear cause instead of a wall of shape-mismatch key names or -- worse -- a `strict=False`
+    partial load that trains a healthy-looking curve with most of the pretraining silently absent.
+    `p2` is NOT checked: it changes the NECK/head, never `model.backbone`'s own tensors, so a
+    backbone pretrained at `p2=False` loads unchanged into a `p2=True` fine-tune.
+    """
+    ck = torch.load(Path(path), map_location='cpu', weights_only=False)
+    tier = str(ck.get('yolox_version', getattr(model, 'version', '')))
+    exp = float(ck.get('bottleneck_expansion', getattr(model, 'bottleneck_expansion', 0.5)))
+    in_ch = int(ck.get('in_channels', getattr(model, 'in_channels', 3)))
+    if tier != model.version:
+        raise ValueError(f'{path}: pretrained at yolox={tier!r}, model built at '
+                         f'yolox={model.version!r} -- these must match exactly.')
+    if abs(exp - model.bottleneck_expansion) > 1e-9:
+        raise ValueError(f'{path}: pretrained at bottleneck_expansion={exp:g}, model built at '
+                         f'{model.bottleneck_expansion:g} -- these must match exactly.')
+    if in_ch != model.in_channels:
+        raise ValueError(f'{path}: pretrained at in_channels={in_ch}, model built at '
+                         f'{model.in_channels} -- these must match exactly.')
+    backbone_state = ck.get('backbone_state')
+    if backbone_state is None:
+        raise ValueError(f'{path}: no "backbone_state" key -- not a '
+                         'scripts/pretrain_detector_backbone.py checkpoint.')
+    own = model.backbone.state_dict()
+    if set(own) != set(backbone_state):
+        raise ValueError(f'{path}: backbone key set does not match this model\'s backbone -- '
+                         'built with a different architecture than the tier/expansion/in_channels '
+                         'checks above should have already caught.')
+    result = model.backbone.load_state_dict(backbone_state, strict=True)
+    assert not result.missing_keys and not result.unexpected_keys, result
+    return len(backbone_state)

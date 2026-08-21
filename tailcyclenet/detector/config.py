@@ -169,12 +169,18 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
 
-    # T4.1 (dev/plans/detector_accuracy.md), PROTOTYPE. `bottleneck_expansion`: 0.5 (default) is
+    # T4.1 (dev/plans/detector_accuracy.md). `bottleneck_expansion`: 0.5 (default) is
     # byte-identical to every checkpoint on record; 1.0 is the shape a Megvii COCO backbone
     # actually loads into (see `yolox.Bottleneck`). `pretrained`: '' (default, from scratch, every
-    # run on record) or 'coco' (load the tier's COCO backbone -- `detector.pretrained`). An
-    # arbitrary path is NOT YET SUPPORTED (that is T4.1b's in-domain-pretraining artefact, which
-    # does not exist yet) -- raise by name rather than silently ignoring it.
+    # run on record), 'coco' (load the tier's COCO backbone -- `detector.load_coco_backbone`), or
+    # ANY OTHER non-empty string is a PATH to a T4.1b in-domain backbone-only checkpoint
+    # (`scripts/pretrain_detector_backbone.py` -> `detector.load_pretrained_backbone`). Unlike
+    # 'coco', a path has NO tier or bottleneck_expansion restriction -- the pretrain script builds
+    # whatever architecture its own config names, so the two just need to AGREE, and
+    # `load_pretrained_backbone` is what checks that agreement (it raises, not `train_detector.py`,
+    # since the fine-tune side cannot know what the checkpoint was pretrained at without reading
+    # it). Required to exist NOW, at config load: a typo'd path should fail before 20000 iterations
+    # of training a randomly-initialised "pretrained" backbone, not after.
     model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))
     model['pretrained'] = str(model.get('pretrained', ''))
     if model['yolox'] == 'trimmed' and model['bottleneck_expansion'] != 0.5:
@@ -183,11 +189,6 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
             "yolox='trimmed', but trimmed's backbone does not take it -- it stays at 0.5 "
             "permanently. Use a canonical tier (one of the YOLOX_TIERS names) for a "
             "COCO-compatible backbone.")
-    if model['pretrained'] not in ('', 'coco'):
-        raise SystemExit(
-            f"[model].pretrained={model['pretrained']!r}: only '' (from scratch) and 'coco' are "
-            "supported by this prototype. An arbitrary path (T4.1b, in-domain pretraining) is not "
-            "wired up yet.")
     if model['pretrained'] == 'coco':
         if model['yolox'] == 'trimmed':
             raise SystemExit("[model].pretrained='coco' requires a canonical yolox tier -- "
@@ -197,6 +198,12 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                 "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
                 "every bottleneck conv is half Megvii's width and the load would silently take "
                 "only 19 of 35 backbone tensors (dev/plans/detector_accuracy.md T4.1).")
+    elif model['pretrained'] not in ('', 'coco'):
+        if not Path(model['pretrained']).exists():
+            raise SystemExit(
+                f"[model].pretrained={model['pretrained']!r}: no such file -- expected '' (from "
+                "scratch), 'coco', or a path to a T4.1b in-domain backbone checkpoint from "
+                "scripts/pretrain_detector_backbone.py.")
 
     # T4.3 (dev/plans/detector_accuracy.md): a stride-4 FPN level, on top of EITHER backbone
     # (canonical tier or `trimmed`) -- unlike `bottleneck_expansion`, not tier-restricted. Default

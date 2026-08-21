@@ -74,7 +74,7 @@ from tailcyclenet.detector import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_CHAN
                                    box_collate, detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
-from tailcyclenet.detector.pretrained import load_coco_backbone
+from tailcyclenet.detector.pretrained import load_coco_backbone, load_pretrained_backbone
 from tailcyclenet.format import load_datasets
 
 
@@ -277,17 +277,27 @@ def main():
         n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'])
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors '
               f'(dev/plans/detector_accuracy.md T4.1)', flush=True)
+    elif model_cfg['pretrained']:
+        # T4.1b: an in-domain backbone from scripts/pretrain_detector_backbone.py. No scale/
+        # channel correction (see load_pretrained_backbone's own docstring) -- this repo's own
+        # pretraining already speaks this repo's own [0,1] RGB convention.
+        n_loaded = load_pretrained_backbone(model, model_cfg['pretrained'])
+        print(f'  loaded in-domain backbone: {n_loaded} conv tensors from '
+              f'{model_cfg["pretrained"]} (dev/plans/detector_accuracy.md T4.1b)', flush=True)
 
-    # DIFFERENTIAL LR (T4.1): the pretrained backbone at BACKBONE_LR_SCALE x lr, the fresh
-    # neck/head at lr -- mirroring the pose side's own discipline for a similarly asymmetric
-    # unfreeze (`video_encoder_requires_grad`), NOT its staged-unfreeze machinery, which exists to
-    # solve schedule-free's `1/k` averaging problem and this optimiser is plain AdamW throughout.
-    # Conv weights trained under BatchNorm statistics landing in a fresh GroupNorm net is the
-    # reason for the lower backbone LR, not an equal one -- see `pretrained.py`'s own docstring.
+    # DIFFERENTIAL LR (T4.1/T4.1b): ANY pretrained backbone (COCO or in-domain) at
+    # BACKBONE_LR_SCALE x lr, the fresh neck/head at lr -- mirroring the pose side's own
+    # discipline for a similarly asymmetric unfreeze (`video_encoder_requires_grad`), NOT its
+    # staged-unfreeze machinery, which exists to solve schedule-free's `1/k` averaging problem and
+    # this optimiser is plain AdamW throughout. For COCO, conv weights trained under BatchNorm
+    # statistics landing in a fresh GroupNorm net is the reason for the lower backbone LR (see
+    # `pretrained.py`'s own docstring); for an in-domain backbone there is no BN/GN mismatch, but
+    # the general asymmetry -- a fresh head paired with an already-informative backbone -- still
+    # applies, so the same scale is used rather than inventing an unmeasured second number.
     # A `pretrained=''` run builds ONE param group, unconditionally -- so this is byte-identical
     # to every optimizer on record whenever pretraining is not asked for.
     BACKBONE_LR_SCALE = 0.1
-    if model_cfg['pretrained'] == 'coco':
+    if model_cfg['pretrained']:
         backbone_ids = {id(p) for p in model.backbone.parameters()}
         backbone_params = [p for p in model.parameters() if id(p) in backbone_ids]
         other_params = [p for p in model.parameters() if id(p) not in backbone_ids]

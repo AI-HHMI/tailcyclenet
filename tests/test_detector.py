@@ -3564,3 +3564,294 @@ eval_batches = 1
     assert ckpt['pretrained'] == 'coco'
     model, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(out / 'detector.pth')
     assert model.bottleneck_expansion == 1.0
+
+
+# ----------------------------------------------------------------------------------------------
+# T4.1b -- in-domain backbone pretraining, T4.1's control (dev/plans/detector_accuracy.md).
+# `scripts/pretrain_detector_backbone.py` + `detector.pretrained.load_pretrained_backbone` +
+# `[model].pretrained` accepting an arbitrary path.
+# ----------------------------------------------------------------------------------------------
+
+def _load_pretrain_script():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('tcn_pretrain_detector_backbone',
+                                                  REPO / 'scripts' / 'pretrain_detector_backbone.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_pretrain_config_requires_at_least_one_root(tmp_path):
+    mod = _load_pretrain_script()
+    p = _write_config(tmp_path, """
+[training]
+out = "/tmp/run"
+""", name='pretrain.toml')
+    with pytest.raises(SystemExit, match='roots'):
+        mod.load_pretrain_config(p)
+
+
+def test_pretrain_config_unknown_root_key_raises(tmp_path):
+    mod = _load_pretrain_script()
+    p = _write_config(tmp_path, """
+[[roots]]
+path = "/tmp/ds"
+bogus = 1
+[training]
+out = "/tmp/run"
+""", name='pretrain.toml')
+    with pytest.raises(SystemExit, match='unknown key'):
+        mod.load_pretrain_config(p)
+
+
+def test_pretrain_config_defaults(tmp_path):
+    mod = _load_pretrain_script()
+    p = _write_config(tmp_path, """
+[[roots]]
+path = "/tmp/a"
+[[roots]]
+path = "/tmp/b"
+boxes = "instances"
+[training]
+out = "/tmp/run"
+""", name='pretrain.toml')
+    roots, model, train = mod.load_pretrain_config(p)
+    assert len(roots) == 2
+    assert roots[0]['boxes'] == 'keypoints'
+    assert roots[1]['boxes'] == 'instances'
+    assert model['yolox'] == 'tiny'
+    assert model['bottleneck_expansion'] == 0.5
+    assert train['iters'] == 20000
+    assert train['out'] == '/tmp/run'
+
+
+def test_pretrain_detector_backbone_end_to_end_two_roots(tmp_path, dense_root, centred_root,
+                                                          monkeypatch):
+    """A short round-robin run across TWO synthetic roots through the real CLI entry point: must
+    train to completion with no error and save a `backbone.pth` that
+    `load_pretrained_backbone` can load into a freshly-built model of the SAME architecture."""
+    import sys
+
+    from tailcyclenet.detector import load_pretrained_backbone
+
+    out = tmp_path / 'pretrain_run'
+    cfg = _write_config(tmp_path, f"""
+[[roots]]
+path = "{dense_root}"
+boxes = "keypoints"
+frames_per_group = 8
+input_wh = [64, 64]
+[[roots]]
+path = "{centred_root}"
+boxes = "keypoints"
+frames_per_group = 8
+input_wh = [64, 64]
+[model]
+yolox = "tiny"
+bottleneck_expansion = 0.5
+[training]
+out = "{out}"
+iters = 4
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+snapshot_every = 4
+""", name='pretrain.toml')
+    mod = _load_pretrain_script()
+    monkeypatch.setattr(sys, 'argv', ['pretrain_detector_backbone.py', '--config', str(cfg)])
+    mod.main()
+
+    assert (out / 'backbone.pth').exists()
+    ck = torch.load(out / 'backbone.pth', map_location='cpu', weights_only=False)
+    assert ck['yolox_version'] == 'tiny'
+    assert ck['bottleneck_expansion'] == 0.5
+    assert ck['in_channels'] == 3
+    assert len(ck['roots']) == 2
+
+    m = YOLOXNano(n_keypoints=0, version='tiny', bottleneck_expansion=0.5)
+    n_loaded = load_pretrained_backbone(m, out / 'backbone.pth')
+    assert n_loaded == len(ck['backbone_state'])
+    obj, boxes, _ = m(torch.zeros(1, 3, 64, 64))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+def test_load_pretrained_backbone_tier_mismatch_raises(tmp_path):
+    from tailcyclenet.detector import load_pretrained_backbone
+
+    src = YOLOXNano(version='tiny', bottleneck_expansion=0.5)
+    ck = {'backbone_state': src.backbone.state_dict(), 'yolox_version': 'tiny',
+         'bottleneck_expansion': 0.5, 'in_channels': 3}
+    p = tmp_path / 'backbone.pth'
+    torch.save(ck, p)
+    dst = YOLOXNano(version='s', bottleneck_expansion=0.5)
+    with pytest.raises(ValueError, match='yolox'):
+        load_pretrained_backbone(dst, p)
+
+
+def test_load_pretrained_backbone_expansion_mismatch_raises(tmp_path):
+    from tailcyclenet.detector import load_pretrained_backbone
+
+    src = YOLOXNano(version='tiny', bottleneck_expansion=0.5)
+    ck = {'backbone_state': src.backbone.state_dict(), 'yolox_version': 'tiny',
+         'bottleneck_expansion': 0.5, 'in_channels': 3}
+    p = tmp_path / 'backbone.pth'
+    torch.save(ck, p)
+    dst = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
+    with pytest.raises(ValueError, match='bottleneck_expansion'):
+        load_pretrained_backbone(dst, p)
+
+
+def test_load_pretrained_backbone_missing_key_raises(tmp_path):
+    from tailcyclenet.detector import load_pretrained_backbone
+
+    p = tmp_path / 'backbone.pth'
+    torch.save({'not_a_backbone_checkpoint': True}, p)
+    dst = YOLOXNano(version='tiny')
+    with pytest.raises(ValueError, match='backbone_state'):
+        load_pretrained_backbone(dst, p)
+
+
+def test_load_pretrained_backbone_is_p2_agnostic(tmp_path):
+    """The backbone's own tensors are identical regardless of `p2` -- p2 only changes the NECK,
+    so a backbone pretrained at p2=False (the only value this script ever builds) must load
+    unchanged into a p2=True fine-tune model."""
+    from tailcyclenet.detector import load_pretrained_backbone
+
+    src = YOLOXNano(version='tiny', bottleneck_expansion=0.5, p2=False)
+    ck = {'backbone_state': src.backbone.state_dict(), 'yolox_version': 'tiny',
+         'bottleneck_expansion': 0.5, 'in_channels': 3}
+    p = tmp_path / 'backbone.pth'
+    torch.save(ck, p)
+    dst = YOLOXNano(version='tiny', bottleneck_expansion=0.5, p2=True)
+    n_loaded = load_pretrained_backbone(dst, p)
+    assert n_loaded == len(ck['backbone_state'])
+
+
+def test_detector_config_pretrained_path_default_and_coco_unaffected(tmp_path):
+    """T4.1b must not change either existing `pretrained` value's behaviour."""
+    for pretrained_line, expect in (('', ''), ('pretrained = "coco"', 'coco')):
+        p = _write_config(tmp_path, f"""
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+bottleneck_expansion = {"1.0" if expect == "coco" else "0.5"}
+{pretrained_line}
+[training]
+out = "/tmp/run"
+""")
+        cfg = load_detector_config(p)
+        assert cfg['model']['pretrained'] == expect
+
+
+def test_detector_config_pretrained_path_must_exist(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+pretrained = "/nonexistent/backbone.pth"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='no such file'):
+        load_detector_config(p)
+
+
+def test_detector_config_pretrained_path_no_tier_or_expansion_restriction(tmp_path):
+    """Unlike `pretrained = "coco"`, a path has no `bottleneck_expansion=1.0` or
+    canonical-tier requirement -- an in-domain backbone can be pretrained at any shape, and only
+    `load_pretrained_backbone` (which reads the checkpoint's OWN recorded shape) can check
+    agreement."""
+    backbone_path = tmp_path / 'backbone.pth'
+    backbone_path.write_bytes(b'not a real checkpoint, just needs to exist')
+    p = _write_config(tmp_path, f"""
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "trimmed"
+pretrained = "{backbone_path}"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['model']['pretrained'] == str(backbone_path)
+
+
+def test_train_detector_pretrained_path_end_to_end(tmp_path, dense_root, monkeypatch):
+    """Pretrain a tiny backbone on `dense_root`, then fine-tune through the real
+    `train_detector.py` CLI with `[model].pretrained` pointing at it -- the whole T4.1b loop, not
+    just the loader in isolation."""
+    import sys
+
+    from tailcyclenet.detector import load_detector
+
+    pretrain_out = tmp_path / 'pretrain_run'
+    pretrain_cfg = _write_config(tmp_path, f"""
+[[roots]]
+path = "{dense_root}"
+boxes = "keypoints"
+frames_per_group = 8
+input_wh = [64, 64]
+[model]
+yolox = "tiny"
+bottleneck_expansion = 0.5
+[training]
+out = "{pretrain_out}"
+iters = 2
+batch_size = 2
+num_workers = 0
+seed = 0
+device = "cpu"
+snapshot_every = 2
+""", name='pretrain.toml')
+    pretrain_mod = _load_pretrain_script()
+    monkeypatch.setattr(sys, 'argv', ['pretrain_detector_backbone.py', '--config',
+                                      str(pretrain_cfg)])
+    pretrain_mod.main()
+    backbone_path = pretrain_out / 'backbone.pth'
+    assert backbone_path.exists()
+
+    finetune_out = tmp_path / 'finetune_run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [64, 64]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+bottleneck_expansion = 0.5
+pretrained = "{backbone_path}"
+[training]
+out = "{finetune_out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_for_t41b',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    finetune_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(finetune_mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    finetune_mod.main()
+
+    assert (finetune_out / 'detector.pth').exists()
+    ckpt = torch.load(finetune_out / 'detector_it000002.pth', map_location='cpu',
+                      weights_only=False)
+    assert ckpt['pretrained'] == str(backbone_path)
+    model, *_ = load_detector(finetune_out / 'detector.pth')
+    assert model.bottleneck_expansion == 0.5

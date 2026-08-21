@@ -170,13 +170,20 @@ class CSPDarknetNano(nn.Module):
     computed on every forward -- it was just never RETURNED. `False` (default) keeps the
     3-tuple `(p3, p4, p5)` return exactly as before; `True` returns the 4-tuple
     `(p2, p3, p4, p5)` and widens `out_channels` to match, for a caller building a P2 FPN level.
+
+    `in_channels` (T4.2, dev/plans/detector_accuracy.md -- ARCHITECTURE SIDE ONLY as of this
+    commit; see the module-level note near `YOLOXNano` for what is and is not wired up yet) is
+    the stem's own input width. `3` (default) is byte-identical to every checkpoint on record;
+    a temporal-input caller (a stacked frame pair, or RGB + a difference channel) widens only
+    this one conv -- everything downstream of the stem is unaffected by what the input channels
+    mean.
     """
 
-    def __init__(self, w=(24, 48, 96, 192), p2=False):
+    def __init__(self, w=(24, 48, 96, 192), p2=False, in_channels=3):
         super().__init__()
         c1, c2, c3, c4 = w
         self.p2 = bool(p2)
-        self.stem = conv_norm_act(3, c1, 3, 2)                 # /2
+        self.stem = conv_norm_act(int(in_channels), c1, 3, 2)  # /2
         self.dark2 = nn.Sequential(conv3(c1, c2, 3, 2), CSPLayer(c2, c2, 1))          # /4
         self.dark3 = nn.Sequential(conv3(c2, c3, 3, 2), CSPLayer(c3, c3, 3))          # /8
         self.dark4 = nn.Sequential(conv3(c3, c4, 3, 2), CSPLayer(c4, c4, 3))          # /16
@@ -221,16 +228,21 @@ class CSPDarknet(nn.Module):
     Same contract as `CSPDarknetNano` (strides 8/16/32, returns p3/p4/p5), built at Megvii's
     official `(depth_mul, width_mul, depthwise)` for the six named tiers in `YOLOX_TIERS`. See the
     module docstring for the two deliberate deviations (GroupNorm, and the neck's unified width).
+
+    `in_channels` (T4.2): `Focus` already generalises to any `cin` (it space-to-depth SPLITS
+    whatever channel count `x` has, then convs `cin * 4` -> `cout`), so widening the stem is
+    exactly this one constructor argument -- `3` (default) is byte-identical to every checkpoint
+    on record.
     """
 
     def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5,
-                p2=False):
+                p2=False, in_channels=3):
         super().__init__()
         c = round8(64 * width_mul)
         d = max(1, round(3 * depth_mul))
         be = bottleneck_expansion
         self.p2 = bool(p2)
-        self.stem = Focus(3, c, 3, depthwise=depthwise)                                   # /2
+        self.stem = Focus(int(in_channels), c, 3, depthwise=depthwise)                    # /2
         self.dark2 = nn.Sequential(conv3(c, c * 2, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 2, c * 2, d, depthwise=depthwise,
                                            bottleneck_expansion=be))                      # /4
@@ -388,16 +400,28 @@ class YOLOXNano(nn.Module):
     (`CSPDarknetNano`/`CSPDarknet`'s own `p2` switch, `PAFPN`'s own `p2` switch, `Head`'s
     `n_levels=4`) and sets `self.STRIDES = (4, 8, 16, 32)` -- `forward`/`anchor_points` already
     loop over `self.STRIDES` generically, so nothing below this constructor needed to change.
+
+    `in_channels` (dev/plans/detector_accuracy.md T4.2) is the ARCHITECTURE HALF ONLY, as of the
+    commit that added it -- `3` (default) is byte-identical to every checkpoint on record; a
+    caller building a temporal-input model (a stacked frame pair, RGB + a difference channel)
+    passes a wider value and the stem's Focus/plain-conv absorbs it (`Focus` already generalises
+    to any `cin`). **NOT YET WIRED: `BoxDataset`'s loader still emits 3-channel RGB items
+    regardless of this argument, and `detect_raw` still decodes single frames** -- passing
+    `in_channels != 3` today builds a model that trains on garbage (3-channel data zero-padded
+    or truncated into a differently-shaped input) unless the CALLER also supplies genuinely wider
+    `x`. Do not wire a `[data].temporal_input` config key to this until the loader side exists;
+    this constructor argument is scaffolding for that follow-on, not a complete feature by itself.
     """
     STRIDES = (8, 16, 32)
 
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
-                p2=False):
+                p2=False, in_channels=3):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
         self.bottleneck_expansion = float(bottleneck_expansion)
         self.p2 = bool(p2)
+        self.in_channels = int(in_channels)
         if self.version == 'trimmed':
             if self.bottleneck_expansion != 0.5:
                 raise ValueError(
@@ -405,7 +429,7 @@ class YOLOXNano(nn.Module):
                     "version='trimmed', but trimmed's CSPDarknetNano does not take it -- it stays "
                     "at 0.5 permanently (it is the repo's own deliberately-narrow net, not a bug "
                     "to fix). Use a canonical tier for a COCO-compatible backbone.")
-            self.backbone = CSPDarknetNano(p2=self.p2)
+            self.backbone = CSPDarknetNano(p2=self.p2, in_channels=self.in_channels)
             neck_out, depthwise = width, True
         else:
             if self.version not in YOLOX_TIERS:
@@ -418,7 +442,7 @@ class YOLOXNano(nn.Module):
             depth_mul, width_mul, depthwise = YOLOX_TIERS[self.version]
             self.backbone = CSPDarknet(width_mul, depth_mul, depthwise=depthwise,
                                        bottleneck_expansion=self.bottleneck_expansion,
-                                       p2=self.p2)
+                                       p2=self.p2, in_channels=self.in_channels)
             neck_out = round8(256 * width_mul)
         self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise,
                           p2=self.p2)
@@ -429,7 +453,8 @@ class YOLOXNano(nn.Module):
             self.STRIDES = (4, 8, 16, 32)
 
     def forward(self, x):
-        """x: (B,3,H,W) normalized to [0,1].
+        """x: (B,`self.in_channels`,H,W) normalized to [0,1] -- 3 unless a temporal-input caller
+        widened the stem (T4.2; see the class docstring for what is and is not wired up yet).
 
         Returns obj_logits (B, A) and boxes (B, A, 4) in xyxy INPUT-image pixels, where A is
         the total number of anchor points across the three levels. With `n_keypoints > 0` it

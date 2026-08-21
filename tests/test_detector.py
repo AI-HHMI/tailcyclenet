@@ -12,7 +12,7 @@ from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
                                    box_iou, decode, detector_loss, giou_loss, letterbox,
                                    paired_iou, unletterbox_boxes)
-from tailcyclenet.detector.config import load_detector_config
+from tailcyclenet.detector.config import DATA_KEYS, MODEL_KEYS, load_detector_config
 from tailcyclenet.detector.data import _cutout_rects, _keypoints_in_rects, random_affine
 
 
@@ -2914,6 +2914,61 @@ def test_bottleneck_expansion_raises_alongside_trimmed():
 # byte-identical to every checkpoint on record; unlike `bottleneck_expansion`, this one is NOT
 # tier-restricted -- it applies to `trimmed` and every canonical tier alike.
 # ----------------------------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------------------------
+# T4.2 -- temporal input, ARCHITECTURE SIDE ONLY (dev/plans/detector_accuracy.md). `in_channels`
+# widens the stem so a caller CAN feed a stacked frame pair or RGB+difference -- the data loader
+# (`BoxDataset`, `detect_raw`) does NOT yet supply one, and no `[data]`/`[model]` config key is
+# exposed for this on purpose (see `YOLOXNano`'s own docstring: exposing one before the loader
+# exists would let a config train on garbage with no error). `in_channels=3` (default) is
+# byte-identical to every checkpoint on record.
+# ----------------------------------------------------------------------------------------------
+
+def test_in_channels_default_is_byte_identical_to_no_key():
+    for version in ('s', 'trimmed'):
+        a = YOLOXNano(version=version).state_dict()
+        b = YOLOXNano(version=version, in_channels=3).state_dict()
+        assert set(a) == set(b), version
+        for k in a:
+            assert a[k].shape == b[k].shape, (version, k)
+
+
+def test_in_channels_widens_only_the_stem():
+    """A wider `in_channels` must change ONLY the stem's own first conv -- every other tensor's
+    shape (backbone, neck, head) is unaffected, since nothing downstream of the stem cares what
+    the input channels MEAN."""
+    base = YOLOXNano(version='tiny')
+    wide = YOLOXNano(version='tiny', in_channels=6)
+    a, b = base.state_dict(), wide.state_dict()
+    assert set(a) == set(b)
+    stem_key = 'backbone.stem.conv.0.weight'
+    assert stem_key in a
+    diff = {k for k in a if a[k].shape != b[k].shape}
+    assert diff == {stem_key}, f'unexpected shape changes outside the stem: {diff}'
+    assert b[stem_key].shape[1] == 6 * 4    # Focus: cin=6 -> conv sees 6*4 after the space-to-depth split
+    assert a[stem_key].shape[1] == 3 * 4
+
+
+def test_in_channels_forwards_at_a_wider_input_on_both_backbones():
+    m_tiny = YOLOXNano(version='tiny', in_channels=6)
+    obj, boxes, _ = m_tiny(torch.zeros(1, 6, 96, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+    m_trimmed = YOLOXNano(version='trimmed', in_channels=4)
+    obj2, boxes2, _ = m_trimmed(torch.zeros(1, 4, 96, 96))
+    assert obj2.shape[1] == boxes2.shape[1]
+    # trimmed's stem is a plain conv, not Focus -- its weight's input-channel dim is `in_channels`
+    # directly, no x4 space-to-depth multiply.
+    assert m_trimmed.backbone.stem[0].weight.shape[1] == 4
+
+
+def test_in_channels_has_no_config_key_yet():
+    """Pins the deliberate scope limit: `[model]` must NOT accept `in_channels` (or a
+    `temporal_input` key) until `BoxDataset`/`detect_raw` actually supply a wider input --
+    exposing the config key first would let a run train silently on the wrong data shape."""
+    assert 'in_channels' not in MODEL_KEYS
+    assert 'temporal_input' not in DATA_KEYS
+
 
 def test_p2_default_is_byte_identical_to_no_key():
     """Same contract as `bottleneck_expansion`'s own default-identity test: passing `p2=False`

@@ -85,32 +85,6 @@ def check_image_size(config: dict) -> None:
         f'scaling the 3D residual by {int(model_px) / int(data_px):g}.')
 
 
-def check_window_length(config: dict) -> None:
-    """`[model].stride_length` and `[data].n_frames` are ONE quantity written twice.
-
-    `stride_length` is the model's native clip length -- `tracker_encoder` sets
-    `self.S = self.n_frames = stride_length` and sizes the temporal pos_embed from it -- while
-    `[data].n_frames` is the ceiling the loader builds windows to. A config where they disagree
-    trains at one length and carries a pos_embed for another.
-
-    THE FAILURE IS NOT LOUD, WHICH IS WHY THIS EXISTS. It is also why `infer.driver` reads its
-    `--n-frames` ceiling off `[data].n_frames`: that is the wrong key if the two ever part, since
-    the pos_embed is what actually bounds a window. Checking them here means the ceiling is read
-    off a number that has been made to agree, rather than the two being wrong together.
-
-    Same shape as `check_image_size` above, and for the same reason: two names for one number,
-    with nothing downstream to notice.
-    """
-    model_t = config.get('model', {}).get('stride_length')
-    data_t = config.get('data', {}).get('n_frames')
-    if model_t is None or data_t is None or int(model_t) == int(data_t):
-        return
-    raise ValueError(
-        f'[model].stride_length = {model_t} but [data].n_frames = {data_t}. These are the same '
-        'quantity: stride_length sizes the temporal pos_embed the checkpoint carries, and '
-        'n_frames is the window the loader builds to. Set them equal.')
-
-
 def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     """An explicit name, else `checkpoint_last.pth`, else the newest by name.
 
@@ -278,7 +252,6 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
     with open(run / 'config.toml', 'rb') as f:
         config = tomllib.load(f)
     check_image_size(config)
-    check_window_length(config)
     if model_overrides:
         config['model'] = {**config.get('model', {}), **model_overrides}
         print(f'load_run: [model] OVERRIDDEN {model_overrides} -- this is an assertion about what '

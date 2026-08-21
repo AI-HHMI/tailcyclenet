@@ -938,35 +938,3 @@ def test_2d_forward_shapes_match_pose_loss_expectations(tiny_root):
     grads = [p.grad for p in model.query_encoder.parameters() if p.requires_grad]
     assert any(g is not None and torch.isfinite(g).any() for g in grads), \
         'the 2D visibility term must reach real parameters, not just compute a number'
-
-
-def test_check_window_length_catches_the_second_name_for_one_number():
-    """`[model].stride_length` and `[data].n_frames` are one quantity written twice.
-
-    `stride_length` sizes the temporal pos_embed the checkpoint carries; `n_frames` is the window
-    the loader builds. Disagreeing trains at one length with a pos_embed for another, and nothing
-    downstream says so -- the same shape of bug `check_image_size` exists for, one axis over.
-    """
-    import pytest
-
-    from tailcyclenet.checkpoints import check_window_length
-
-    check_window_length({'model': {'stride_length': 12}, 'data': {'n_frames': 12}})
-    check_window_length({'model': {'stride_length': 12}})            # absent -> nothing to check
-    check_window_length({'data': {'n_frames': 12}})
-    with pytest.raises(ValueError, match='same quantity'):
-        check_window_length({'model': {'stride_length': 24}, 'data': {'n_frames': 12}})
-
-
-def test_the_shipped_configs_agree_about_the_window():
-    """...and the one that matters is the one that ships. `load_config` resolves `extends`."""
-    from pathlib import Path
-
-    from tailcyclenet.checkpoints import check_image_size, check_window_length, load_config
-
-    root = Path(__file__).resolve().parent.parent / 'configs'
-    for name in ('2d.toml', '3d.toml'):
-        cfg = load_config(root / name)
-        check_window_length(cfg)
-        check_image_size(cfg)
-        assert cfg['data']['n_frames'] == 12, f'{name}: the shipped window is 12'

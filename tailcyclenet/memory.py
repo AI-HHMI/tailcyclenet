@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 GB = float(1 << 30)
@@ -151,6 +151,10 @@ class Budget:
     # the inferred case is sized from the WORK. `--max-ram 24` is a grant: the caller has said 24
     # is theirs to use, and being frugal with it buys them nothing they asked for.
     stated: bool = False
+    # What the process already holds that no buffer share can touch -- torch, CUDA, the weights.
+    # 0.0 until `rebudget` MEASURES it; see there for why it is measured rather than a constant,
+    # and why `--max-ram` could not be honoured at a tight ceiling without it.
+    floor_gb: float = 0.0
 
     def share(self, fraction: float) -> float:
         """Bytes for one consumer's slice of the budget."""
@@ -320,6 +324,45 @@ def reset() -> None:
     """Drop the cached budget. For tests, and for a process that changes its own limits."""
     global _cached
     _cached = None
+
+
+def rebudget(override_gb: float | None = None,
+             fraction: float = DEFAULT_FRACTION) -> Budget:
+    """Re-resolve the budget with THIS PROCESS'S OWN FLOOR SUBTRACTED. Call once, after the
+    weights are loaded and before any buffer is sized.
+
+    **`--max-ram` NAMES THE PROCESS, BUT THE FRACTION ONLY EVER BOUNDED THE BUFFERS.** Importing
+    torch, initialising CUDA and loading the pose and detector checkpoints costs ~10.9 GB before a
+    frame is decoded, and that floor was on nobody's budget: at `--max-ram 24` the buffer share is
+    0.85 x 24 = 20.4 GB, and 20.4 + 10.9 = 31.3 GB, which is not 24. The ceiling held only while
+    the shares went UNSPENT -- raising `FRACTION_READERS` to 0.35 spent them, and a 1000-frame run
+    peaked at 24.38 GB against a stated 24. `check_peak` caught it.
+
+    **THE FLOOR IS MEASURED, NOT ASSUMED, WHICH IS WHY THIS IS A SECOND CALL RATHER THAN A
+    CONSTANT.** It depends on the workload -- a 2D single-camera run with no detector pays far less
+    than a 16-camera run with two checkpoints resident -- so a hardcoded 10.9 would refuse small
+    runs that fit comfortably. By the time the weights are loaded, `rss_gb()` IS the floor, so the
+    process can simply read it.
+
+    The budget is then the SMALLER of the fraction (which bounds how much of a large ceiling is
+    worth spending on buffers) and what is genuinely left (`limit - floor`). On a big ceiling the
+    fraction still wins and nothing changes; on a tight one the floor now binds, which is the whole
+    point.
+    """
+    global _cached
+    base = host_budget(override_gb, fraction)
+    floor = rss_gb()
+    if not (floor == floor) or not base.stated:
+        # An INFERRED budget is already "what was lying around" and is re-derived from live
+        # `MemAvailable`, which the floor is already inside. Subtracting it twice would halve a
+        # budget that was never a promise.
+        _cached = base
+        return base
+    ceiling = base.budget_gb / fraction              # the figure the caller actually named
+    _cached = replace(base, budget_gb=max(0.0, min(base.budget_gb, ceiling - floor)),
+                      floor_gb=floor,
+                      source=f'{base.source} minus a {floor:.1f} GB process floor')
+    return _cached
 
 
 def result_array_gb(n_frames: int, n_cams: int, n_kpts: int, n_animals: int,

@@ -450,6 +450,15 @@ def run_dataset(args):
         # The videos branch already consumed it, in `adopt.dataset_name`.
         print(f'registry: reading session keypoints as {args.dataset_name!r}, not {ds_name!r}')
         ds_name = args.dataset_name
+    # THE BUDGET, RE-RESOLVED NOW THAT THE WEIGHTS ARE RESIDENT. `--max-ram` names the PROCESS, and
+    # until this point nothing had subtracted what torch, CUDA and the two checkpoints already
+    # hold (~10.9 GB here) -- so the buffer shares could add up to more than the ceiling, and did:
+    # a 1000-frame run peaked at 24.38 GB against `--max-ram 24`. Measured rather than assumed,
+    # because a 2D run with no detector pays a far smaller floor. Everything that sizes a buffer
+    # runs after this line.
+    _budget = _memory.rebudget(override_gb=args.max_ram)
+    print(f'ram: {_budget}')
+
     want = set(args.groups.split(',')) if args.groups else None
 
     # ONE SESSION PER RUN. Checked before the loop, and above the checkpoint load -- see the

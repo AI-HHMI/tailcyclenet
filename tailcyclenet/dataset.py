@@ -430,7 +430,14 @@ def reader_cache_ram_gb(n_cams: int, wh, workers: int | None = None,
     k = _READER_GB_PER_MP * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
     share = max(workers or 1, 1) * max(int(procs or 1), 1)
     readers_gb = max(int(n_cams), 1) * k * share
-    exact = readers_gb / _memory.FRACTION_READERS / _memory.DEFAULT_FRACTION
+    need = readers_gb / _memory.FRACTION_READERS          # buffer budget the readers alone want
+    # **AND THE PROCESS FLOOR IS ON TOP, NOT INSIDE.** `--max-ram` names the PROCESS, and torch,
+    # CUDA and the weights hold ~10.9 GB of it before a frame is decoded -- so the ceiling that
+    # yields `need` GB of buffers is `need/fraction` on a large budget (where the fraction binds)
+    # and `need + floor` on a tight one (where the floor does). Advertising the first alone is how
+    # this would name a `--max-ram` that cannot actually hold the rig.
+    floor = _memory.current().floor_gb
+    exact = max(need / _memory.DEFAULT_FRACTION, need + floor)
     # NUDGED UP BY ONE PART IN A MILLION, because `_reader_cache_size` ends in `int()` and the
     # round trip lands EXACTLY on the boundary: at the algebraically exact figure the division
     # returns 15.999999999999998 and truncates to 15, advertising a budget that buys one reader

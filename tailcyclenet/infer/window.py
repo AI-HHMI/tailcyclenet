@@ -52,6 +52,11 @@ OUTCOMES = ('ok', 'no box', 'no camera', 'no points', 'crop failed', 'decode fai
 # How many cameras `decode_crops` may decode at once. A memory bound, not a core count -- see there.
 _CAM_DECODE = 4
 
+# The smallest frame store worth building, so a root with small frames does not take two-window
+# blocks and pay per-block overhead thousands of times over a long clip. Frames, not windows, is
+# the right unit here: what makes a block cheap is bytes.
+_MIN_STORE_BYTES = 512 << 20
+
 
 @dataclass
 class InferConfig:
@@ -469,10 +474,28 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                        (session.rig.size(session.cam_names[ci]) for ci in cam_ix)) * 3
     _frame_cost = len(cam_ix) * _frame_bytes            # one frame INDEX, across the rig
     _budget = memory.current()
-    _store_bytes = _budget.share(memory.FRACTION_STORE)
+    _one = cfg.n_frames * _frame_cost
+    # SPEND WHAT THE WORK NEEDS, NOT WHAT THE HOST HAPPENS TO HAVE.
+    #
+    # A block only has to hold the window being forwarded plus the one being prefetched, and those
+    # overlap by `n_frames - step`. Past that, a bigger block buys exactly one thing: fewer block
+    # boundaries, each worth one prefetch stall -- the seam frames are NOT re-decoded, since
+    # eviction keeps them for the next block. **MEASURED FLAT:** johnson, 120 frames x 16 cameras
+    # of 3208x2200, full detector-to-pose path, ran 62.4 s with a store of one window and 61.7 s
+    # with the whole clip resident (a 40.3 GB peak against 10.5). Wall clock over 10..288 GB of
+    # budget spans 60.9-65.1 s with no trend.
+    #
+    # So the budget is a CEILING and this is the ask. An unconstrained host would otherwise pull
+    # the whole clip into one block simply because it fits, which is how a 120-frame clip came to
+    # hold 40 GB of frames to do 10 GB of work.
+    #
+    # The floor keeps a small-frame root from paying per-block overhead for nothing: a 2D rig with
+    # 6 MB frames would otherwise take blocks of two windows and split a 57,000-frame clip into
+    # thousands of them.
+    _want_store = max(2 * _one, _MIN_STORE_BYTES)
+    _store_bytes = min(_budget.share(memory.FRACTION_STORE), _want_store)
     cam_decode = memory.fits(_store_bytes / 2, _frame_bytes * cfg.n_frames,
                              want=min(_CAM_DECODE, len(cam_ix)))
-    _one = cfg.n_frames * _frame_cost
     if _one > _store_bytes:
         raise SystemExit(
             f'{session.session_id}/{gid}: one window of frames does not fit, and there is no '

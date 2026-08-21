@@ -676,17 +676,24 @@ both input branches: it sat below them, so `--max-ram` was not in effect during 
 probe at all. `memory.py` resolves one budget as the smallest of the cgroup limit (walked up EVERY
 ancestor), LSF's `LSB_CG_MEMLIMIT`/`LSB_MEMLIMIT`, `MemAvailable` and `MemTotal` — never
 `SC_PHYS_PAGES`, which is the MACHINE's memory and under a 16 GB cap still reported this host's
-503 GB, a 20x error and exactly the case an LSF job dies in. It sizes the decord cache
-(`FRACTION_READERS` 0.25), how many CAMERAS the detector decodes at once (`FRACTION_DETECT` 0.10),
-and **how many windows a BLOCK holds** (`FRACTION_STORE` 0.65).
+503 GB, a 20x error and exactly the case an LSF job dies in. It sizes the video reader cache
+(`FRACTION_READERS` **0.35**), how many CAMERAS the detector decodes at once (`FRACTION_DETECT`
+0.10), and **how many windows a BLOCK holds** (`FRACTION_STORE` **0.55**).
 
 **`FRACTION_DETECT` NO LONGER OVERLAPS NOTHING IN TIME.** It was the loosest of the three because
 detection finished before the pose loop began; under one pass the detector's letterbox buffers are
-live WHILE the store holds the block, so its share came down. **`FRACTION_READERS` did NOT move,
-and the obvious argument for moving it is wrong**: "a stored frame needs no reader" is true of the
-number of READS and false of the number of open CONTAINERS — every block still touches every
-camera. Dropping it to 0.05 takes johnson from 16 readers to 10, and 16 ran at 61 s against 11 at
-149 s. **The 0.10/0.65 split is reasoned, not measured, under one pass.**
+live WHILE the store holds the block, so its share came down.
+
+**`FRACTION_READERS` MOVED 0.25 → 0.35, AND A FRACTION IS THE WRONG SHAPE FOR THAT CONSUMER.** The
+reader cache is BOUNDED — it saturates at `n_cams` and cannot use another byte — so the fraction is
+a CEILING the need runs into, not an allowance it spends; the store is the unbounded one. At 0.25
+a 16-camera rig needed `--max-ram 32` to reach its own camera count, so the default deployment
+budget sat on the wrong side of a **5.1x** cliff; at 0.35 it reaches it at **24**, halving decode
+work (0.58x wall → 0.30x) at byte-identical output. **The store pays for it in the MINIMUM RUNNABLE
+budget — johnson 7.4 → 8.1 GB, not the 15 → 17 arithmetic predicts, because `_pipeline_det` turns
+off first and the store then takes the whole share.** Both are under the 10.86 GB process floor, so
+it is inert *on this rig*; **a wider rig moves the store floor up, so anything that lowers
+`FRACTION_STORE` further must re-check it there.**
 
 **EVERY KNOB IT SIZES IS OUTPUT-NEUTRAL, and that is what licenses sizing anything from free
 memory** — a 288 GB budget and a 24 GB cgroup produce byte-identical output on both video roots,

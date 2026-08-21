@@ -19,6 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..crop import BOX_SOURCES
+from .data import TEMPORAL_INPUTS
 from .yolox import YOLOX_TIERS
 
 # THE ALLOWED KEYS, PER BLOCK. Anything else raises -- see module docstring. These are the
@@ -28,7 +29,7 @@ DATA_KEYS = frozenset({
     'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
     'frames_per_group', 'val_frames_per_group', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
-    'use_regions', 'ignore_present',
+    'use_regions', 'ignore_present', 'temporal_input',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -154,6 +155,17 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         raise SystemExit('[data].ignore_present and [data].use_regions cannot both be set: both '
                          'are the one opt-in (M,4) tuple slot box_collate/split_batch dispatch '
                          'by rank. See BoxDataset.__init__.')
+    # T4.2 (dev/plans/detector_accuracy.md): frame t-1 stacked beside frame t. Default `'none'` is
+    # byte-identical to every checkpoint on record. See `TEMPORAL_INPUT_CHANNELS`
+    # (`tailcyclenet/detector/data.py`) for what each mode does to the stem's input width.
+    data['temporal_input'] = str(data.get('temporal_input', 'none'))
+    if data['temporal_input'] not in TEMPORAL_INPUTS:
+        raise SystemExit(f"[data].temporal_input must be one of {TEMPORAL_INPUTS}, got "
+                         f"{data['temporal_input']!r}.")
+    if data['temporal_input'] != 'none' and data['augment_strong']:
+        raise SystemExit('[data].temporal_input != "none" is undefined under '
+                         '[data].augment_strong (mosaic-lite): the pasted source item needs its '
+                         'own t-1 frame too, not built yet. See BoxDataset.__init__.')
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
 

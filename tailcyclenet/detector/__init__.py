@@ -3,16 +3,18 @@ import torch
 from .assign import (assign, box_iou, certified_anchors, decode, detector_loss,
                      giou_loss, paired_iou)
 from .associate import associate
-from .data import (BoxDataset, ChunkShuffle, box_collate, letterbox, letterbox_transform,
-                   reduce_factor, split_batch, tile_transform, unletterbox_boxes,
-                   unletterbox_keypoints)
+from .data import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_BY_CHANNELS,
+                   TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, box_collate, letterbox,
+                   letterbox_transform, reduce_factor, split_batch, tile_transform,
+                   unletterbox_boxes, unletterbox_keypoints)
 from .pretrained import load_coco_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
-           'decode', 'detector_loss', 'giou_loss', 'associate',
+           'decode', 'detector_loss', 'giou_loss', 'associate', 'TEMPORAL_INPUT_CHANNELS',
+           'TEMPORAL_INPUTS', 'TEMPORAL_INPUT_BY_CHANNELS',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone', 'paired_iou']
 
 # `LINK_REV` and `RAW_REV` lived here to version a `--det-cache` on disk. There is no cache: the
@@ -69,6 +71,13 @@ def load_detector(path, device='cpu', input_wh=None):
 
     `p2` (T4.3, dev/plans/detector_accuracy.md) rides the same way too: absent means `False`, the
     3-level FPN every checkpoint on record was built at.
+
+    `in_channels` (T4.2, dev/plans/detector_accuracy.md) rides the same way too: absent means `3`,
+    the stem width every checkpoint on record was built at. Not a new tuple field -- like
+    `bottleneck_expansion`/`p2`, it only decides how the model is BUILT; a caller that also needs
+    to know which `BoxDataset(temporal_input=...)` matches these weights reads it off
+    `model.in_channels` (set by `YOLOXNano.__init__`) rather than a ninth return value here, so
+    this signature -- already used by `tailcyclenet/infer/driver.py` -- stays untouched.
     """
     import torch
     from pathlib import Path
@@ -95,7 +104,8 @@ def load_detector(path, device='cpu', input_wh=None):
     model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
                       version=str(ckpt.get('yolox_version', 'trimmed')),
                       bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)),
-                      p2=bool(ckpt.get('p2', False)))
+                      p2=bool(ckpt.get('p2', False)),
+                      in_channels=int(ckpt.get('in_channels', 3)))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

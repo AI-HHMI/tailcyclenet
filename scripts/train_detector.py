@@ -70,8 +70,8 @@ import toml
 
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, box_collate,
-                                   detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_CHANNELS, YOLOXNano,
+                                   box_collate, detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
 from tailcyclenet.detector.pretrained import load_coco_backbone
@@ -200,6 +200,7 @@ def main():
                        keypoints=data_cfg['keypoints'],
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
+                       temporal_input=data_cfg['temporal_input'],
                        seed=train_cfg['seed'], **tiling)
     # THE CHECKPOINT'S `input_wh` MUST BE THE SIZE THE MODEL SAW. When tiling, `BoxDataset`
     # resolves it to the tile, so read it back from there rather than from `input_wh_for` -- which
@@ -256,15 +257,22 @@ def main():
                          box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
                          reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
-                         keypoints=data_cfg['keypoints'], seed=train_cfg['seed'], **tiling)
+                         keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
+                         temporal_input=data_cfg['temporal_input'], **tiling)
         print(f'val:   {len(val)} views')
 
+    # T4.2 (dev/plans/detector_accuracy.md): the stem's input width is DERIVED from
+    # `[data].temporal_input`, never independently configured -- `TEMPORAL_INPUT_CHANNELS` is the
+    # one place that map lives, so the loader (which supplies the channels) and the model (which
+    # consumes them) cannot disagree.
+    in_channels = TEMPORAL_INPUT_CHANNELS[data_cfg['temporal_input']]
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
-                      p2=model_cfg['p2']).to(device)
+                      p2=model_cfg['p2'], in_channels=in_channels).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
-          f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
+          f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g}, '
+          f'temporal_input={data_cfg["temporal_input"]!r}, in_channels={in_channels})')
     if model_cfg['pretrained'] == 'coco':
         n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'])
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors '
@@ -403,6 +411,13 @@ def main():
                         # means False, a fact about every checkpoint written before the P2 level
                         # existed, not a guess.
                         'p2': model_cfg['p2'],
+                        # T4.2 (dev/plans/detector_accuracy.md): same gotcha-12 shape. `in_channels`
+                        # is what `load_detector` needs to rebuild the right stem (absent means 3,
+                        # every checkpoint written before this key existed); `temporal_input` rides
+                        # beside it purely for provenance/debugging -- nothing reconstructs the
+                        # model from it directly.
+                        'in_channels': in_channels,
+                        'temporal_input': data_cfg['temporal_input'],
                         'seed': train_cfg['seed'],
                         # `input_wh` above is the TILE size when tiling, which is NOT the
                         # deployment input size -- `load_detector` raises if this is missing so

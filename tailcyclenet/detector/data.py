@@ -28,6 +28,19 @@ from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
 from ..format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
 
+# T4.2 (dev/plans/detector_accuracy.md): the stem's `in_channels` for each loader mode. `'none'`
+# (default) is byte-identical to every checkpoint on record -- 3 channels, no second frame. Kept
+# as ONE dict so `train_detector.py` and `scripts/eval_detector.py` derive `in_channels` from the
+# same rule instead of each hardcoding `{'none': 3, 'stack2': 6}` and one of them drifting.
+# `'diff'` (RGB + a 1-channel frame difference) is named in the plan but not yet built -- owed.
+TEMPORAL_INPUT_CHANNELS = {'none': 3, 'stack2': 6}
+TEMPORAL_INPUTS = tuple(TEMPORAL_INPUT_CHANNELS)
+# The inverse: a loaded model only carries `in_channels` (`YOLOXNano.__init__`, part of the
+# WEIGHTS, same as `bottleneck_expansion`/`p2`) -- a caller that needs the matching
+# `BoxDataset(temporal_input=...)` to score it (`scripts/eval_detector.py`) reads it off this map
+# rather than `load_detector` growing a ninth return value for it.
+TEMPORAL_INPUT_BY_CHANNELS = {v: k for k, v in TEMPORAL_INPUT_CHANNELS.items()}
+
 
 def reduce_factor(size, out_wh):
     """The largest `cv2.IMREAD_REDUCED_COLOR_N` that still decodes above the letterbox target.
@@ -153,7 +166,7 @@ def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
     return out
 
 
-def _photometric(img, rng):
+def _photometric(img, rng, gain=None):
     """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
 
     DLC's extended form -- additive brightness plus per-channel gaussian noise -- was built,
@@ -162,6 +175,12 @@ def _photometric(img, rng):
     and neither rat-city split tests that, so the honest summary is that it costs accuracy in the
     only regime this repo can measure. Re-add it with a root that has a genuinely different camera
     or enclosure, not before.
+
+    `gain=None` draws its own -- every call site on record does this, and the draw happens at
+    exactly the same point in the rng stream as before `gain` existed, so those callers are
+    byte-identical. `gain=<value>` applies a PRE-DRAWN one instead of drawing again: T4.2's second
+    frame must see the SAME appearance shift as frame t, not an independent one, or a stacked pair
+    would carry a fake brightness "motion" between the two channels that no real clip has.
     """
     # THE `extended` BRANCH WAS DELETED, NOT DISABLED. The commit that pulled `--augment-
     # photometric` (`3dbb0a1`) removed the `extended` parameter from this function's signature
@@ -170,7 +189,8 @@ def _photometric(img, rng):
     # in the test suite calls `BoxDataset.__getitem__` with `augment=True` through to a real pixel
     # decode (the augmentation tests only exercise `boxes_for`, which never reaches this
     # function), so it went undetected until a real training run hit it.
-    out = img * rng.uniform(0.7, 1.3)
+    g = rng.uniform(0.7, 1.3) if gain is None else gain
+    out = img * g
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -404,7 +424,7 @@ class BoxDataset(Dataset):
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
-                 strong=False, ignore_present=False):
+                 strong=False, ignore_present=False, temporal_input='none'):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -488,6 +508,23 @@ class BoxDataset(Dataset):
             # composite frame has no expressible certified-area mask, so this combination can
             # never be trained correctly and a job should not discover that hours in.
             raise ValueError('--augment-strong (mosaic-lite) is undefined under --use-regions')
+        # T4.2 (dev/plans/detector_accuracy.md): stack frame t-1 beside frame t along the channel
+        # axis, so the detector has a signal a single-frame net categorically cannot -- motion is
+        # what separates an animal from arena clutter. `'none'` (default) is byte-identical to
+        # every checkpoint on record: `__getitem__` never fetches a second frame or touches `x`'s
+        # channel count. See `TEMPORAL_INPUT_CHANNELS` for the loader-mode -> channel-count map.
+        if temporal_input not in TEMPORAL_INPUTS:
+            raise ValueError(f'temporal_input must be one of {TEMPORAL_INPUTS}, got '
+                             f'{temporal_input!r}')
+        self.temporal_input = str(temporal_input)
+        if self.temporal_input != 'none' and self.strong:
+            # FAIL AT CONSTRUCTION, same discipline as `strong`+`use_regions` just above.
+            # Mosaic-lite pastes another item's OWN frame-t crop into this item's composite; doing
+            # that correctly under a temporal input needs that source item's t-1 frame too, at the
+            # same pasted location, which is not built yet -- a real but separable follow-on, not
+            # a silent gap (dev/plans/detector_accuracy.md T4.2's owed list).
+            raise ValueError('temporal_input is undefined under --augment-strong (mosaic-lite): '
+                             'the pasted source item needs its own t-1 frame too, not built yet')
         # Off by default, and it is a KEY rather than a loader detail: it changes which source
         # pixels reach the model, so every arm measured without it stays comparable only against
         # other arms without it. It rides in the checkpoint and `detect_group` reads it back,
@@ -1031,6 +1068,8 @@ class BoxDataset(Dataset):
             f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
             f'or {size} unreduced'
         d = size[0] / dec[0]                     # decoded pixels -> source pixels, 1.0 for video
+        M = None            # non-None only on the warpAffine branch -- reused below for t-1
+        gain = None         # the ONE photometric draw for this item -- reused below for t-1
         if warp is None and self.origins[i] is None:
             img, _, _ = letterbox(img, self.input_wh, src_wh=size)
         else:
@@ -1046,7 +1085,8 @@ class BoxDataset(Dataset):
             M = (L @ W @ D)[:2]
             img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
             if warp is not None:
-                img = _photometric(img, rng)
+                gain = rng.uniform(0.7, 1.3)
+                img = _photometric(img, rng, gain=gain)
                 # THE STRONG SUITE. Gated on `self.strong` alone here -- `rng is not None` already
                 # means `self.augment and self.train`, so nothing below runs off that path.
                 # FIXED ORDER, one independent per-op draw each: color jitter -> additive noise ->
@@ -1061,6 +1101,24 @@ class BoxDataset(Dataset):
                         img = _salt_pepper(img, rng)
                     if rng.random() < 0.2:
                         img = _motion_blur(img, rng)
+        # T4.2: frame t-1, warped by the EXACT SAME `M` (so both frames of a stacked pair are in
+        # register) and given the SAME photometric gain as frame t (so no fake per-frame
+        # brightness "motion" enters the stack) -- see `_photometric`'s `gain=` docstring. Cannot
+        # coexist with `self.strong` (raised at construction above), so this never has to
+        # interact with cutout or mosaic-lite below.
+        prev_img = None
+        if self.temporal_input != 'none':
+            prev_f = max(f - 1, 0)     # clip start: no t-1 exists, so repeat frame t
+            prev_raw = read_frames(sess.groups[gid], sess.cam_names[ci], [prev_f], reduce=r)[0]
+            if prev_raw is None:
+                raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {prev_f} (t-1 for '
+                                   'temporal_input) unreadable')
+            if M is None:
+                prev_img, _, _ = letterbox(prev_raw, self.input_wh, src_wh=size)
+            else:
+                prev_img = cv2.warpAffine(prev_raw, M, self.input_wh, borderValue=(114, 114, 114))
+                if gain is not None:
+                    prev_img = _photometric(prev_img, rng, gain=gain)
         if self.strong and rng is not None:
             # CUTOUT: an erasure, so it moves no box -- but a keypoint it covers must lose BOTH
             # its coordinate (-> NaN) and its score target (-> 0), or either the coordinate loss
@@ -1078,6 +1136,13 @@ class BoxDataset(Dataset):
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        if prev_img is not None:
+            # ORDER: (t-1, t), oldest first -- `TEMPORAL_INPUT_CHANNELS['stack2'] == 6` and
+            # `YOLOXNano(in_channels=6)`'s stem takes whatever six channels it is given; this
+            # ordering is the loader's own convention, not a model requirement, and any caller
+            # supplying frames at inference (still owed -- `detect_raw`) must match it.
+            xp = torch.as_tensor(prev_img, dtype=torch.float32).permute(2, 0, 1) / 255.0
+            x = torch.cat([xp, x], dim=0)
         # `regions` rides along as its own element rather than being folded into `boxes`: a region
         # is not an animal and must never reach `assign`. Appended only under `use_regions`, so
         # without it the item shape is exactly what every recorded detector trained on.

@@ -9,11 +9,13 @@ import torch
 from pathlib import Path
 
 from tailcyclenet.crop import box_corners, crop_box_for_points
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, YOLOXNano, assign, box_collate,
-                                   box_iou, decode, detector_loss, giou_loss, letterbox,
-                                   paired_iou, unletterbox_boxes)
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_BY_CHANNELS,
+                                   TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, YOLOXNano, assign,
+                                   box_collate, box_iou, decode, detector_loss, giou_loss,
+                                   letterbox, paired_iou, unletterbox_boxes)
 from tailcyclenet.detector.config import DATA_KEYS, MODEL_KEYS, load_detector_config
-from tailcyclenet.detector.data import _cutout_rects, _keypoints_in_rects, random_affine
+from tailcyclenet.detector.data import (_cutout_rects, _keypoints_in_rects, _photometric,
+                                        random_affine)
 
 
 
@@ -2917,12 +2919,13 @@ def test_bottleneck_expansion_raises_alongside_trimmed():
 # ----------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------
-# T4.2 -- temporal input, ARCHITECTURE SIDE ONLY (dev/plans/detector_accuracy.md). `in_channels`
-# widens the stem so a caller CAN feed a stacked frame pair or RGB+difference -- the data loader
-# (`BoxDataset`, `detect_raw`) does NOT yet supply one, and no `[data]`/`[model]` config key is
-# exposed for this on purpose (see `YOLOXNano`'s own docstring: exposing one before the loader
-# exists would let a config train on garbage with no error). `in_channels=3` (default) is
-# byte-identical to every checkpoint on record.
+# T4.2 -- temporal input (dev/plans/detector_accuracy.md). `in_channels` widens the stem; the
+# TRAINING data path (`BoxDataset`) now supplies a wider input via `[data].temporal_input`, one
+# mode ('stack2', frame t-1 stacked beside frame t). `detect_raw` (deployment) does NOT yet
+# supply one -- still owed, so a `temporal_input != 'none'` checkpoint can be trained and scored
+# via `eval_detector.py` but not yet run through `scripts/infer.py --detector`.
+# `in_channels=3` / `temporal_input='none'` (both default) are byte-identical to every checkpoint
+# on record.
 # ----------------------------------------------------------------------------------------------
 
 def test_in_channels_default_is_byte_identical_to_no_key():
@@ -2963,12 +2966,255 @@ def test_in_channels_forwards_at_a_wider_input_on_both_backbones():
     assert m_trimmed.backbone.stem[0].weight.shape[1] == 4
 
 
-def test_in_channels_has_no_config_key_yet():
-    """Pins the deliberate scope limit: `[model]` must NOT accept `in_channels` (or a
-    `temporal_input` key) until `BoxDataset`/`detect_raw` actually supply a wider input --
-    exposing the config key first would let a run train silently on the wrong data shape."""
+def test_in_channels_still_has_no_model_config_key():
+    """`in_channels` stays DERIVED from `[data].temporal_input`
+    (`TEMPORAL_INPUT_CHANNELS[temporal_input]`, `train_detector.py`), never independently
+    configured -- a `[model].in_channels` key could disagree with what the loader actually
+    supplies, which is exactly the class of bug `TEMPORAL_INPUT_CHANNELS` being the ONE place
+    that map lives exists to prevent."""
     assert 'in_channels' not in MODEL_KEYS
-    assert 'temporal_input' not in DATA_KEYS
+
+
+def test_temporal_input_key_now_exists_and_defaults_to_none():
+    assert 'temporal_input' in DATA_KEYS
+    assert TEMPORAL_INPUT_CHANNELS['none'] == 3
+    assert TEMPORAL_INPUT_CHANNELS['stack2'] == 6
+    assert TEMPORAL_INPUT_BY_CHANNELS == {3: 'none', 6: 'stack2'}
+    assert set(TEMPORAL_INPUTS) == set(TEMPORAL_INPUT_CHANNELS)
+
+
+def test_photometric_gain_none_is_byte_identical_to_before():
+    """`_photometric(img, rng)` must draw and consume the rng stream EXACTLY as it did before the
+    `gain=` parameter existed -- the T4.2 refactor's whole byte-identity claim rests on this."""
+    img = (np.arange(4 * 4 * 3, dtype=np.float64).reshape(4, 4, 3) % 200).astype(np.uint8)
+    rng1 = np.random.default_rng(7)
+    rng2 = np.random.default_rng(7)
+    out1 = _photometric(img, rng1)
+    gain = rng2.uniform(0.7, 1.3)          # the same single draw `_photometric` makes internally
+    out2 = _photometric(img, rng2, gain=gain)
+    np.testing.assert_array_equal(out1, out2)
+    # And the rng streams must have advanced identically -- the next draw from each must agree,
+    # or a caller downstream of `_photometric` (the strong-suite ops) would silently diverge.
+    assert rng1.uniform() == rng2.uniform()
+
+
+def test_photometric_explicit_gain_does_not_redraw():
+    """A caller supplying `gain=` must consume NOTHING from `rng` -- that is the whole point: the
+    t-1 frame reuses frame t's own gain rather than drawing a second, different one."""
+    img = np.full((4, 4, 3), 100, np.uint8)
+    rng = np.random.default_rng(3)
+    before = rng.bit_generator.state
+    _photometric(img, rng, gain=1.1)
+    after = rng.bit_generator.state
+    assert before == after
+
+
+def test_boxdataset_temporal_input_invalid_value_raises(dense_root):
+    with pytest.raises(ValueError, match='temporal_input'):
+        BoxDataset(dense_root, 'train', temporal_input='bogus')
+
+
+def test_boxdataset_temporal_input_stack2_raises_with_strong(dense_root):
+    """FAILS AT CONSTRUCTION, the same discipline `strong`+`use_regions` follows: mosaic-lite
+    would need the pasted source item's own t-1 frame too, which is not built yet."""
+    with pytest.raises(ValueError, match='augment-strong'):
+        BoxDataset(dense_root, 'train', augment=True, strong=True, temporal_input='stack2')
+
+
+def test_boxdataset_temporal_input_none_is_byte_identical(dense_root):
+    """The default arg and an explicit `temporal_input='none'` must decode the identical item --
+    proof `__getitem__`'s new branch is a true no-op at the default, not just untaken by luck."""
+    a = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16)
+    b = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
+                   temporal_input='none')
+    xa, ba = a[0][0], a[0][1]
+    xb, bb = b[0][0], b[0][1]
+    assert xa.shape[0] == 3
+    torch.testing.assert_close(xa, xb)
+    torch.testing.assert_close(ba, bb)
+
+
+def test_boxdataset_temporal_input_stack2_doubles_channels(dense_root):
+    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
+                    temporal_input='stack2')
+    x, boxes = ds[0]
+    assert x.shape[0] == 6
+    assert torch.isfinite(boxes).any()          # the box target itself is untouched by this
+
+
+def test_boxdataset_temporal_input_stack2_repeats_frame_at_clip_start(dense_root):
+    """The documented policy for a clip's first frame (no real t-1 exists): repeat frame t. Item 0
+    of `dense_root`'s dense group IS frame 0 (frames are indexed in ascending order per session),
+    so its stacked pair must be two IDENTICAL copies of the same decoded pixels -- no augmentation
+    in play (default `augment=False`), so this is exact, not approximate."""
+    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
+                    temporal_input='stack2')
+    sess, gid, f, ci = ds.index[0]
+    assert f == 0, 'this test assumes item 0 is frame 0 -- if the index order changed, so must this'
+    x, _ = ds[0]
+    torch.testing.assert_close(x[:3], x[3:])
+
+
+def test_boxdataset_temporal_input_stack2_differs_from_frame_t_alone_mid_clip(dense_root):
+    """A non-zero frame's t-1 half must be genuine PIXELS FROM A DIFFERENT FRAME, not another
+    silent repeat -- catches an implementation that always fetches frame `f` twice."""
+    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
+                    temporal_input='stack2')
+    mid = next(i for i, (_, _, f, _) in enumerate(ds.index) if f > 0)
+    x, _ = ds[mid]
+    assert not torch.allclose(x[:3], x[3:])
+
+
+def test_train_detector_temporal_input_stack2_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A short run with `[data].temporal_input = "stack2"` through the real CLI entry point: must
+    train to completion with no error, and the saved checkpoint must reload with `in_channels=6`
+    and score through `eval_detector.py`'s own `BoxDataset` construction (T4.2's whole point --
+    the loader and the reloaded model must agree on the shape without the caller stating it
+    twice)."""
+    import importlib.util
+    import sys
+
+    from tailcyclenet.detector import load_detector
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+temporal_input = "stack2"
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_temporal',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+    model, *_ = load_detector(out / 'detector.pth')
+    assert model.in_channels == 6
+
+    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
+                    temporal_input=TEMPORAL_INPUT_BY_CHANNELS[model.in_channels])
+    x, boxes = ds[0]
+    obj, pred_boxes, _ = model(x[None])
+    assert obj.shape[1] == pred_boxes.shape[1]
+
+
+def test_detector_config_temporal_input_default_none(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['data']['temporal_input'] == 'none'
+
+
+def test_detector_config_temporal_input_invalid_raises(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+temporal_input = "bogus"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='temporal_input'):
+        load_detector_config(p)
+
+
+def test_detector_config_temporal_input_raises_under_default_augment_strong(tmp_path):
+    """`augment_strong` DEFAULTS true (`config.py`), so a config that sets `temporal_input` and
+    says nothing about `augment_strong` must still raise -- the cross-key guard has to fire off
+    the RESOLVED value, not just an explicitly-written one."""
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+temporal_input = "stack2"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='augment_strong'):
+        load_detector_config(p)
+
+
+def test_detector_config_temporal_input_with_augment_strong_off_is_fine(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+temporal_input = "stack2"
+augment_strong = false
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['data']['temporal_input'] == 'stack2'
+    assert cfg['data']['augment_strong'] is False
+
+
+def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
+    """A `temporal_input='stack2'` checkpoint (`in_channels=6`) must reconstruct an
+    `in_channels=6` model through `load_detector` -- absent means 3 (gotcha 12's shape), so this
+    is the proof a SAVED fact survives, not just that the constructor kwarg works alone."""
+    from tailcyclenet.detector import load_detector
+
+    m = YOLOXNano(version='tiny', in_channels=6)
+    ckpt = {
+        'model_state': m.state_dict(), 'input_wh': (96, 96), 'n_keypoints': 0, 'norm': 'gn',
+        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': False,
+        'in_channels': 6, 'temporal_input': 'stack2',
+    }
+    p = tmp_path / 'detector.pth'
+    torch.save(ckpt, p)
+    loaded, *_ = load_detector(p)
+    assert loaded.in_channels == 6
+    obj, boxes, _ = loaded(torch.zeros(1, 6, 96, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+def test_load_detector_absent_in_channels_means_3(tmp_path):
+    """Every checkpoint written before this key existed carries no `in_channels` at all -- gotcha
+    12: absent is a FACT about those files (3, the only stem width they were ever built at), not
+    a guess."""
+    from tailcyclenet.detector import load_detector
+
+    m = YOLOXNano(version='tiny')
+    ckpt = {
+        'model_state': m.state_dict(), 'input_wh': (96, 96), 'n_keypoints': 0, 'norm': 'gn',
+        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': False,
+    }
+    p = tmp_path / 'detector.pth'
+    torch.save(ckpt, p)
+    loaded, *_ = load_detector(p)
+    assert loaded.in_channels == 3
 
 
 def test_p2_default_is_byte_identical_to_no_key():

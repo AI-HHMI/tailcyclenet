@@ -34,7 +34,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import BOX_SOURCES
-from tailcyclenet.detector import BoxDataset, load_detector
+from tailcyclenet.detector import BoxDataset, TEMPORAL_INPUT_BY_CHANNELS, load_detector
 from tailcyclenet.detector.evaluate import deployment_score, score_dataset
 from tailcyclenet.format import load_datasets
 from tailcyclenet.metrics import paired_bootstrap
@@ -122,9 +122,14 @@ def main():
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy '
               '(eval rule 2).')
+    # T4.2 (dev/plans/detector_accuracy.md): a temporal-input checkpoint's `BoxDataset` must
+    # supply the same stacked-frame shape it was trained on, or the forward's channel count
+    # mismatches the weights. `model.in_channels` (part of the WEIGHTS, read back by
+    # `load_detector`) is the source of truth, not a CLI flag -- see `TEMPORAL_INPUT_BY_CHANNELS`.
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
                     min_crop_dim=args.min_crop_dim or mcd, reduce=red,
-                    max_frames_per_group=args.frames_per_group)
+                    max_frames_per_group=args.frames_per_group,
+                    temporal_input=TEMPORAL_INPUT_BY_CHANNELS[model.in_channels])
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=args.score_thresh,
                          num_workers=args.num_workers, max_animals=args.max_animals)
@@ -164,7 +169,8 @@ def main():
                   'below are comparable.')
         ds2 = BoxDataset(args.data, args.split, input_wh=wh2, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
-                         max_frames_per_group=args.frames_per_group)
+                         max_frames_per_group=args.frames_per_group,
+                         temporal_input=TEMPORAL_INPUT_BY_CHANNELS[m2.in_channels])
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
                               seed=args.seed, score_thresh=args.score_thresh,
                               num_workers=args.num_workers, max_animals=args.max_animals)

@@ -1242,18 +1242,70 @@ def test_reader_cache_does_not_multiply_by_worker_count():
 def test_reader_cache_degrades_instead_of_oom_on_a_small_host():
     """The count is a wish and RAM is the constraint; the clamp binds before the OOM killer does.
 
-    The 12-worker case reads 2 rather than 1 since the price became QUADRATIC in the reader count
-    (measured: 0.28 / 3.58 / 15.34 / 59.38 GB at 1 / 4 / 8 / 16 open readers on a 3208x2200 rig,
-    against the linear `1.0 + 0.25/MP` this used to assume). Two readers per worker is 0.92 GB
-    each, 11 GB across twelve -- comfortably inside 64, and the point of the test is that it
-    degrades below the worker's `want` of 4 rather than that it degrades to exactly 1.
+    **THE NUMBERS HERE MOVED WITH THE BACKEND, AND THAT IS THE POINT OF THE COMMENT.** This used
+    to assert `< 16` at a 64 GB budget, which was true only under decord's QUADRATIC price
+    (0.28 / 3.58 / 15.34 / 59.38 GB at 1 / 4 / 8 / 16 readers). PyAV is LINEAR at ~0.053 GB per
+    megapixel per reader, so 16 readers of a 7.06 MP rig cost 6 GB and a 64 GB budget holds them
+    comfortably -- refusing to would be the defect, not the safety. A budget genuinely too small
+    still degrades, which is what this now asserts.
     """
     from tailcyclenet.dataset import _reader_cache_size
 
+    # A LOADER WORKER still clamps below its own `want` of 4, and there are twelve of them.
     assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=64) < 4
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=64) < 16
+    # A GENUINELY SMALL BUDGET degrades the main process below the rig.
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=16) < 16
+    # ...and a big one is allowed to hold the whole rig, which is worth 5.1x (the cycle cliff).
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=64) == 16
     # never zero -- one reader is the minimum that can serve a read at all
     assert _reader_cache_size(16, (3208, 2200), 64, ram_gb=1) == 1
+
+
+@pytest.mark.parametrize('n_cams,wh', [
+    (16, (3208, 2200)),        # johnson
+    (4, (3840, 2160)),         # 3dpop
+    (32, (3840, 2160)),        # a rig bigger than anything shipped
+    (2, (640, 480)),           # a small one
+])
+def test_the_advertised_ram_actually_buys_every_reader(n_cams, wh):
+    """The warning tells a user how much `--max-ram` would hold a reader per camera. **A figure
+    that does not actually work is worse than no figure**, because they raise the limit, pay the
+    memory and stay on the slow side of a 5x cliff with nothing to show for it.
+
+    So: at the advertised value the cache must reach the rig, and the value must not be padded --
+    it is the number a user types, and rounding it up 'for safety' spends their memory silently.
+    """
+    from tailcyclenet import memory
+    from tailcyclenet.dataset import _reader_cache_size, reader_cache_ram_gb
+
+    need = reader_cache_ram_gb(n_cams, wh)
+    at = _reader_cache_size(n_cams, wh, None,
+                            ram_gb=memory.host_budget(override_gb=need).budget_gb)
+    assert at >= n_cams, f'--max-ram {need:.1f} advertised for {n_cams} cameras but bought {at}'
+
+    # NOT PADDED: one GB less must fall short, unless `want` (which floors at 4) already caps it.
+    if n_cams > 4:
+        below = _reader_cache_size(
+            n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need - 1).budget_gb)
+        assert below < n_cams, (
+            f'{need:.1f} GB is padded: {need - 1:.1f} already buys {below} of {n_cams}')
+
+
+def test_the_reader_price_is_linear_not_quadratic():
+    """The SHAPE of the price, not just its value -- a quadratic law caps the cache at sqrt(budget)
+    and so can never reach the rig however much memory is offered.
+
+    Under the law this replaced, a 16-camera 3208x2200 rig got **10 readers at a 128 GB budget**
+    and never reached the 16 it needs, so the 5.1x cycle cliff was unreachable at ANY `--max-ram`.
+    Doubling the budget must roughly double the count.
+    """
+    from tailcyclenet.dataset import _reader_cache_size
+
+    a = _reader_cache_size(64, (3208, 2200), None, ram_gb=16)
+    b = _reader_cache_size(64, (3208, 2200), None, ram_gb=32)
+    assert b / a == pytest.approx(2.0, rel=0.2), f'{a} -> {b} is not linear in the budget'
+    # and the rig is reachable at a sane budget, which is the whole point of the refit
+    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=32) == 16
 
 
 def test_reader_cache_env_var_overrides_everything(monkeypatch):

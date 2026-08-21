@@ -410,6 +410,29 @@ def load_warps(path, specs, target_size=None, reduce=1):
 # now derived per process by `_reader_cache_size`; `TAILCYCLENET_READER_CACHE` only overrides it.
 
 
+# GB of retained memory per OPEN reader, per megapixel of frame. PyAV, measured at 1..16 readers
+# on a 7.06 MP rig with the codec opened and the arena trimmed (0.0529); rounded up.
+# A BACKEND FACT, NOT A RIG FACT -- quoted with its backend on purpose, because the law this
+# replaced was decord's and nothing in it said so.
+_READER_GB_PER_MP = 0.06
+
+
+def reader_cache_ram_gb(n_cams: int, wh, workers: int | None = None,
+                        procs: int | None = None) -> float:
+    """The `--max-ram` that would hold a reader for EVERY camera of this rig.
+
+    The inverse of `_reader_cache_size`, and it exists only because the price is LINEAR: a
+    quadratic law does not invert into a useful number, which is part of why the old one was never
+    reported to anybody. Undoes `FRACTION_READERS` (the reader share of the buffer budget) and
+    then `DEFAULT_FRACTION` (the buffer share of the process ceiling), because `--max-ram` names
+    the PROCESS and not the buffers.
+    """
+    k = _READER_GB_PER_MP * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
+    share = max(workers or 1, 1) * max(int(procs or 1), 1)
+    readers_gb = max(int(n_cams), 1) * k * share
+    return readers_gb / _memory.FRACTION_READERS / _memory.DEFAULT_FRACTION
+
+
 def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | None = None,
                        procs: int | None = None) -> int:
     """How many open decord readers this process may hold.
@@ -436,25 +459,39 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
       `fabric.world_size` immediately after launch -- a parsed-environment fact, so this function
       still opens, stats and decodes nothing (gotcha 11). Absent means 1, i.e. today's numbers.
 
-    **THE COST OF N OPEN READERS IS QUADRATIC IN N, NOT LINEAR, AND THAT INVERTS THE DESIGN.**
-    Measured on johnson (3208x2200), holding readers and trimming the arena after each so this is
-    retained memory and not allocator slack:
+    **THE PRICE IS LINEAR AND THE BACKEND IS PyAV. THE QUADRATIC LAW THIS USED TO CARRY WAS
+    decord's, AND IT OUTLIVED decord BY ONE COMMIT.** The old docstring quoted
+    `0.28 / 3.58 / 15.34 / 34.09 / 59.38 GB` at `1 / 4 / 8 / 12 / 16` readers -- `0.231 * n^2` --
+    measured on decord, which loads whole containers into memory (dmlc/decord#80) and is no longer
+    the backend (`tailcyclenet/video.py`). Re-measured on PyAV, same rig (3208x2200 = 7.06 MP),
+    trimmed after each step and with the codec actually opened:
 
-        1 reader  0.28 GB      8 readers 15.34 GB
-        4 readers 3.58 GB     12 readers 34.09 GB      16 readers 59.38 GB
+        n   retained   GB/reader        decord law said
+        1     0.418G     0.418                    0.2G
+        4     1.531G     0.383                    4.0G
+        8     3.010G     0.376                   15.8G
+       16     5.976G     0.373                   63.2G
 
-    which is `0.231 * n^2` to within a few percent. The control that makes it a fact about readers
-    rather than about decode buffers: running the same 16 cameras while RELEASING each reader
-    immediately costs **0.01 GB** total. Decode output is returned in full; open readers are not.
+    **FLAT PER READER: linear, at ~0.053 GB per megapixel per reader.** The whole 16-camera rig
+    costs 6 GB where the old law demanded 63, so that law was throttling the cache to 4 at
+    `--max-ram 24` and 6 at 48.
 
-    So `per_gb` -- a LINEAR price, `1.0 + 0.25/megapixel` -- was the wrong shape. It happened to
-    land near the truth at n = 16 on johnson (2.76 vs 2.53 measured) and is wrong everywhere else,
-    badly under-pricing a small cache: at a 16 GB budget it allowed 2 readers where 5 fit.
+    **AND THE CACHE IS WORTH 5.1x, NOT THE 2.4x REPORT 38 MEASURED -- BUT ONLY AT THE FULL RIG.**
+    The access pattern is a CYCLE (every window touches all C cameras in order), which is the one
+    pattern where a cache below the cycle length buys almost nothing. Decode-only, 3 replicates,
+    12 windows x 12 frames x 16 cameras:
 
-    And because reopening is CHEAP -- 41.5 ms to open and index a 50 MB container, against 300 ms
-    to decode a 12-frame window off it -- a small reader cache is a good trade, not a concession.
-    The budget is far better spent on the FRAME cache (`infer.run_group`), which is linear in size
-    and removes reader pressure outright: a cached frame needs no reader at all.
+        cache  1   7.8s      cache  8   6.3s
+        cache  2   7.7s      cache 16   1.5s     <-- the cliff
+        cache  4   7.4s
+
+    1 -> 8 is 24%; 8 -> 16 is **4.2x**. So this is a THRESHOLD at `n_cams`, not a curve, and a
+    budget that cannot reach it should not spend much trying -- which is what the linear price and
+    the `want` cap below now express. The warning at the call site fires exactly when a run is on
+    the wrong side of that cliff.
+
+    Reopening is cheap in itself (tens of ms); what the cliff costs is the SEEK that follows every
+    reopen, and on a long container that is the expensive part.
     """
     env = os.environ.get('TAILCYCLENET_READER_CACHE')
     if env:
@@ -473,13 +510,12 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     if procs is None:
         procs = int(os.environ.get('TAILCYCLENET_LOCAL_WORLD_SIZE', '1') or 1)
     want = 4 if workers else max(int(n_cams), 4)
-    # `k * n^2` GB for n open readers, k fitted per megapixel from the table above:
-    # 0.231 at johnson's 7.06 MP -> 0.0327/MP. Rounded up to 0.035 so the estimate errs toward a
-    # smaller cache, which is the safe direction (a miss costs 41.5 ms; an over-estimate costs
-    # gigabytes and, inside workers, the job).
-    k = 0.035 * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
+    # LINEAR: `k` GB per reader, k per megapixel from the PyAV table above. 0.053 measured,
+    # rounded UP to 0.06 so the estimate errs toward a smaller cache -- the safe direction, since
+    # an over-estimate costs gigabytes and, inside dataloader workers, the job.
+    k = _READER_GB_PER_MP * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
     share = max(workers or 1, 1) * max(int(procs), 1)
-    n = int((max(_memory.FRACTION_READERS * ram_gb, 0.0) / share / k) ** 0.5)
+    n = int(max(_memory.FRACTION_READERS * ram_gb, 0.0) / share / k)
     return max(1, min(want, n))
 
 
@@ -575,12 +611,23 @@ def _reader(path: str, group, cam: str):
             # can produce it too, and a run that is silently 2.5x slower for a legitimate reason
             # should still say so rather than being diagnosed from a stopwatch.
             if info is None and size < len(rig):
+                # SAY WHAT IT WOULD TAKE, not just that it is small -- the price is LINEAR, so it
+                # inverts into an actual `--max-ram` figure. And do NOT blame the budget when the
+                # env var forced the size: that message sent readers to raise a limit that was
+                # never the constraint.
+                forced = os.environ.get('TAILCYCLENET_READER_CACHE')
+                why = (f'TAILCYCLENET_READER_CACHE={forced} forced this; unset it to size from '
+                       'the RAM budget instead.' if forced else
+                       f'{_memory.current()} does not hold more -- --max-ram '
+                       f'{reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold all '
+                       f'{len(rig)}. Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or accept the '
+                       'slowdown.')
                 warnings.warn(
-                    f'decord reader cache is {size} for a {len(rig)}-camera rig: every window '
-                    f'touches all {len(rig)} cameras, so this misses on every call and re-opens '
-                    f'{len(rig) - size} container(s) per window. The RAM budget would not hold '
-                    f'more ({_memory.current()}). Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or '
-                    'accept the slowdown.', stacklevel=2)
+                    f'video reader cache is {size} for a {len(rig)}-camera rig: every window '
+                    f'touches all {len(rig)} cameras, so this misses on nearly every call and '
+                    f'reopens up to {len(rig) - size} container(s) per window -- worth about 5x '
+                    f'on decode (measured on PyAV: cache 4 -> 7.4 s, cache 16 -> 1.5 s over 12 '
+                    f'windows of a 16-camera 3208x2200 rig). {why}', stacklevel=2)
             _readers = _ReaderCache(size)
         return _readers(path)
 

@@ -40,9 +40,34 @@ from pathlib import Path
 GB = float(1 << 30)
 
 # What fraction of the headroom this repo's sized buffers may occupy. The rest is the model, the
-# CUDA host-side allocations, the npz accumulation, the interpreter and glibc's own slack -- none
-# of which is on this budget. A starting point corrected by measurement, not a result.
-DEFAULT_FRACTION = 0.6
+# CUDA host-side allocations, the interpreter and glibc's own slack -- none of which is on this
+# budget.
+#
+# **MEASURED UNDER A CGROUP CAP, which is the only measurement that answers the question this flag
+# exists for** (dev/reports/38 §3.1: an unconstrained RSS peak is retained arena, not the working
+# set). johnson, 120 frames x 16 cameras of 3208x2200, detector-to-pose, run inside
+# `systemd-run --user --scope -p MemoryMax=<flag>G -p MemorySwapMax=0`:
+#
+#     fraction   --max-ram 16        --max-ram 24        times the cap was hit
+#     0.60       10.96 GB / 63.1 s   11.88 GB / 61.1 s   0
+#     0.75       12.00 GB / 58.5 s   13.30 GB / 59.9 s   0
+#     0.85       11.89 GB / 57.8 s   17.36 GB / 59.4 s   0
+#     0.95       11.90 GB / 58.3 s   17.30 GB / 60.6 s   0
+#
+# 0.85 is the KNEE: it spends the grant (17.4 of 24 GB, where 0.6 spent 11.9) and is slightly
+# faster because the bigger block turns the detection lookahead on, while 0.95 buys nothing over
+# it and leaves no slack for the terms that are not on this budget. `memory.events max` reads 0
+# throughout, so the cap is never touched at any of these.
+#
+# **THE FLOOR IS 10.86 GB AND IT IS NOT ON THIS BUDGET EITHER.** Importing torch, initialising CUDA
+# and loading the pose and detector checkpoints costs that much before a frame is decoded -- so
+# `--max-ram` below ~12 is unusable at any fraction, and 8 and 10 are OOM-killed during startup
+# rather than refused. That is why 0.6 looked safe at 16: the store was not the binding term
+# there, the floor was.
+#
+# These are ONE workload's numbers. The three shares below are a ceiling this clip does not reach;
+# a wider rig or a longer window could, so re-measure under a cap before assuming 0.85 travels.
+DEFAULT_FRACTION = 0.85
 
 # THE PARTITION, AND IT MUST SUM BELOW 1. Three consumers hold large buffers and each is sized
 # independently, so a fraction that is generous alone overcommits in company.

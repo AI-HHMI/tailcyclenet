@@ -33,6 +33,7 @@ tailcyclenet/
   distributed.py      the world-size axis: what a config key means on N gpus + the rank guards
   metrics.py          MPJPE / PCK / multi-instance matching / MOTA
   adopt.py            --videos: filenames + an anipose calibration -> a Session, IN MEMORY
+  video.py            THE one place a video container is opened and decoded (PyAV)
   infer/              THE inference path. `scripts/infer.py` is a 17-line shim onto `cli.main`.
     window.py           one window loop (`run_blocks`, a BLOCK of windows at a time)
     store.py            THE one decode site: (camera, source frame) -> full frame, evicted by block
@@ -620,8 +621,32 @@ it. **Use `--anchor none` on a crowded 2D root or a long 2D clip.**
   at or above the checkpoint's recorded median. Sweep per checkpoint: 0.50 maximises coverage, 0.97
   identity. `decode` and `eval_detector.py` stay at 0.05 — training and scoring paths.
 
+**VIDEO IS READ THROUGH PyAV, NOT decord, AND THAT WAS A MEMORY FIX RATHER THAN A PREFERENCE.**
+decord loads whole containers into memory (dmlc/decord#80; #197 is the same symptom, and it is
+unmaintained since 0.6.0 in 2021). On sixteen 21 GB recordings that is 336 GB: a `--videos` run
+peaked at **456 GB under `--max-ram 24`** and had to be killed at 9 GB free on a shared node, and
+at a reader cache of 4 decord is **OOM-killed inside one round of 16 cameras under a 150 GB cap**
+where PyAV sits **flat at 1.59 GB**. **THE SWAP IS OUTPUT-NEUTRAL AND THAT IS MEASURED** --
+bit-identical to decord on every video root (johnson h264 3208x2200, 3dpop mpeg4 3840x2160,
+calms21 mpeg4), sampled at BOTH ENDS of each container because the seek path is what differs, and
+bit-identical through `read_frames` itself including clamp-padded REPEATS and OUT-OF-ORDER indices
+(`tests/test_video.py`). So no recorded number moves. **`TAILCYCLENET_VIDEO_BACKEND=decord`
+restores the old reader** and is kept for bisecting, because every recorded number was produced
+with it. **OpenCV IS REFUSED DESPITE PASSING HERE**: `CAP_PROP_POS_FRAMES` is documented at 8 to
+-3 frames off on MP4/AVC1 (opencv#9053), and an off-by-one frame is a different picture of a
+moving animal, silently. PyAV seeks to the preceding KEYFRAME and decodes forward COUNTING
+FRAMES, so the index arithmetic is ours. **COROLLARY: every decode measurement in reports 38/39 --
+the 44 ms 4K frame, the 3.5x camera concurrency, the 61/149/222 s reader-cache cliff -- was taken
+on decord and must be re-measured before it is quoted again.**
+
 **HOST RAM IS A BUDGET, AND `--max-ram GB` IS A CEILING ON THE PROCESS, NOT AN ALLOWANCE FOR THE
-BUFFERS.** `memory.py` resolves one budget as the smallest of the cgroup limit (walked up EVERY
+BUFFERS.** **AND IT IS NOW CHECKED RATHER THAN MERELY DERIVED FROM**: every consumer sized itself
+off the budget and nothing verified the TOTAL, which is how a run reached 456 GB with nothing in
+its output saying so. `memory.check_peak` warns ONCE, naming the phase, at the block boundary
+where `trim()` already runs -- diagnosis, not enforcement, and only against a STATED budget, since
+an inferred one is what was lying around rather than a promise. The budget is also resolved ABOVE
+both input branches: it sat below them, so `--max-ram` was not in effect during the `--videos`
+probe at all. `memory.py` resolves one budget as the smallest of the cgroup limit (walked up EVERY
 ancestor), LSF's `LSB_CG_MEMLIMIT`/`LSB_MEMLIMIT`, `MemAvailable` and `MemTotal` — never
 `SC_PHYS_PAGES`, which is the MACHINE's memory and under a 16 GB cap still reported this host's
 503 GB, a 20x error and exactly the case an LSF job dies in. It sizes the decord cache

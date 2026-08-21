@@ -202,6 +202,83 @@ out = "/tmp/run"
     assert cfg['training']['max_pos_per_gt'] == 0
 
 
+def test_detector_config_box_weight_default_is_five(tmp_path):
+    """T2.4 (dev/plans/detector_accuracy.md): `box_weight` used to be `detector_loss`'s own
+    hardcoded default (5.0), never exposed to a config. This pins that the NEW config-level
+    default is the SAME number, so an absent key stays byte-identical to every checkpoint on
+    record."""
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['training']['box_weight'] == 5.0
+
+
+def test_train_detector_box_weight_is_actually_wired_through(tmp_path, dense_root, monkeypatch):
+    """Proves the config->train_cfg->`detector_loss` call site is LIVE, not a dead key: two
+    otherwise-identical single-iteration runs (same seed, so the same batch and the same model
+    init) at `box_weight=5.0` vs `box_weight=1.0` must print DIFFERENT total losses -- if this
+    ever silently stopped passing `box_weight` through, both runs would read identically and this
+    test would catch it where a config-shape-only test (the one above) cannot.
+    """
+    import importlib.util
+    import re
+    import sys
+
+    def run(box_weight):
+        out = tmp_path / f'run_{box_weight}'
+        cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 50
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 50
+eval_batches = 1
+box_weight = {box_weight}
+""", f'cfg_{box_weight}.toml')
+        spec = importlib.util.spec_from_file_location(f'tcn_train_detector_box_weight_{box_weight}',
+                                                      REPO / 'scripts' / 'train_detector.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mod.main()
+        m = re.search(r'loss\s+([\d.]+)', buf.getvalue())
+        assert m, f'no loss line found in output:\n{buf.getvalue()}'
+        return float(m.group(1))
+
+    loss_5 = run(5.0)
+    loss_1 = run(1.0)
+    assert loss_5 != loss_1, \
+        'box_weight=5.0 and box_weight=1.0 produced the SAME loss -- the config value is not ' \
+        'reaching detector_loss'
+
+
 def test_train_detector_max_pos_per_gt_end_to_end(tmp_path, dense_root, monkeypatch):
     """A short run with `max_pos_per_gt = 2` through the real CLI entry point: must train to
     completion with no error (0 -> None conversion happens in `train_detector.py`, not the

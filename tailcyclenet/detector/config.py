@@ -34,7 +34,7 @@ MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
-    'max_pos_per_gt',
+    'max_pos_per_gt', 'box_weight',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -133,9 +133,14 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                                    'max_input_px': 4 * 416 * 416, 'frames_per_group': 40,
                                    'val_frames_per_group': 8,
                                    'tile_bg_per_frame': 1}[k]))
-    for k in ('lr', 'kpt_weight', 'kpt_score_weight'):
+    # T2.4 (dev/plans/detector_accuracy.md): `box_weight` was `detector_loss`'s own hardcoded
+    # default (5.0), never exposed to a config or CLI flag -- "the two untuned scalars" alongside
+    # `lr`. 5.0 here is BYTE-IDENTICAL to every checkpoint on record, since that is also
+    # `detector_loss`'s own Python default; this key only matters once a config states something
+    # else.
+    for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight'):
         train[k] = float(train.get(k, {'lr': 1e-3, 'kpt_weight': 1.0,
-                                       'kpt_score_weight': 1.0}[k]))
+                                       'kpt_score_weight': 1.0, 'box_weight': 5.0}[k]))
     for k, default in (('rotate_deg', 45.0), ('tile_scale', 1.0)):
         data[k] = float(data.get(k, default))
     data['augment'] = bool(data.get('augment', True))

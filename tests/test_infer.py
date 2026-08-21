@@ -1411,3 +1411,161 @@ def test_a_short_group_is_skipped_by_name_and_an_empty_run_is_refused(cli, monke
                                       '--start-frame', '99', '--out', str(tmp_path / 'p')])
     with pytest.raises(SystemExit, match='past the end of every group'):
         cli.main()
+
+
+# --videos: raw footage instead of a session directory.
+
+def _videos_fixture(tmp_path, T=8, wh=(64, 48)):
+    """Two calibrated cameras, videos named `cam<i>_t.mp4`, plus a hand-authored session
+    directory over THE SAME FILES. Everything a `--videos` run and its `--data` twin need."""
+    import conftest as cf
+    from tailcyclenet import format as fmt
+
+    W, H = wh
+    rig = cf._rig([(str(i), W, H, True, False, i + 1) for i in range(2)])
+    fmt.dump_calibration(tmp_path / 'calib.toml', rig)
+    vids = {str(i): cf._write_video(tmp_path / 'rec' / f'cam{i}_t.mp4', i, T, wh)
+            for i in range(2)}
+
+    # The `--data` twin: the same videos, symlinked into a session directory.
+    sdir = tmp_path / 'ds' / 'test' / 'rec'
+    groups = {'t': fmt.Group('t', T, fps=20.0)}
+    fmt.write_session(sdir, mode='3d', units='mm', label_source='tracked', names=cf.KPTS_3D,
+                      rig=rig, groups=groups,
+                      labels={'t': fmt.empty_labels(0, T, len(cf.KPTS_3D), 2, mode3d=True)})
+    (sdir / 'groups' / 't').mkdir(parents=True)
+    for cam, src in vids.items():
+        fmt.link(sdir / 'groups' / 't' / f'{cam}.mp4', src)
+    return rig, vids, sdir
+
+
+def _videos_run(tmp_path, names):
+    """A run folder whose registry holds exactly ONE dataset, so §5's default has to infer it."""
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    registry = Registry(names=tuple(names), datasets=(('ds', tuple(range(len(names)))),))
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    return run, registry
+
+
+def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch, tmp_path):
+    """THE ASSERTION THAT `--videos` IS NOT A SECOND INFERENCE PATH.
+
+    Same weights, same crop points, same pixels -- reached once through a hand-authored session
+    directory and once through an in-memory `VideoSession` -- must produce the same points3d.pq.
+    If they ever differ, `--videos` has become its own pipeline and every number measured on one
+    is incomparable with the other (eval rule 2).
+
+    Same shape as `test_box_prompt_none_is_byte_identical_on_2d_and_3d`.
+    """
+    import conftest as cf
+
+    rig, vids, sdir = _videos_fixture(tmp_path)
+    run, registry = _videos_run(tmp_path, cf.KPTS_3D)
+
+    pts = np.random.default_rng(0).uniform(-20, 20,
+                                           size=(2, 8, len(cf.KPTS_3D), 3)).astype(np.float32)
+    np.savez(tmp_path / 'boxes.npz', **{'rec/t': pts})
+
+    common = ['--run', str(run), '--boxes', str(tmp_path / 'boxes.npz'), '--anchor', 'none',
+              '--device', 'cpu', '--overlap', '2', '--dataset-name', 'ds']
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--data', str(sdir),
+                                      '--out', str(tmp_path / 'a')] + common)
+    cli.main()
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--videos', str(tmp_path / 'rec'),
+                                      '--calibration', str(tmp_path / 'calib.toml'),
+                                      '--cam-regex', 'cam([0-9]+)_', '--group-id', 't',
+                                      '--session-id', 'rec',
+                                      '--out', str(tmp_path / 'b')] + common)
+    cli.main()
+
+    import pyarrow.parquet as pq
+    cols = ['frame', 'animal_id', 'bodypart', 'x', 'y', 'z']
+
+    def rows(d):
+        # Sorted by (frame, animal, bodypart) rather than compared in file order: the two runs
+        # need not emit rows in the same order for the PREDICTION to be identical, and it is the
+        # prediction that is the claim.
+        t = pq.read_table(tmp_path / d / 'points3d.pq').select(cols).to_pydict()
+        return sorted(zip(*(t[c] for c in cols)))
+
+    a, b = rows('a'), rows('b')
+    assert a and a == b, '--videos must be an input path, not a second pipeline'
+
+
+def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
+    """Through `main()`, with `--boxes` so no detector checkpoint is needed.
+
+    Pins the two halves a user meets first: the prediction round-trips through `Session.load`, and
+    the three `source_*` provenance keys name the fixture's own inputs VERBATIM -- which is what
+    `adopt.session_from_prediction` replays, and the only record of where the pixels are.
+    """
+    import tomllib
+
+    import conftest as cf
+    from tailcyclenet.format import Session, validate_session
+    from tailcyclenet.infer.predictions import load_predictions
+
+    rig, vids, sdir = _videos_fixture(tmp_path)
+    run, registry = _videos_run(tmp_path, cf.KPTS_3D)
+    pts = np.random.default_rng(1).uniform(-20, 20,
+                                           size=(1, 8, len(cf.KPTS_3D), 3)).astype(np.float32)
+    np.savez(tmp_path / 'boxes.npz', **{'rec/t': pts})
+
+    out = tmp_path / 'pred'
+    monkeypatch.setattr(sys, 'argv', [
+        'infer.py', '--run', str(run), '--videos', str(tmp_path / 'rec'),
+        '--calibration', str(tmp_path / 'calib.toml'), '--cam-regex', 'cam([0-9]+)_',
+        '--group-id', 't', '--session-id', 'rec', '--units', 'mm',
+        '--boxes', str(tmp_path / 'boxes.npz'), '--anchor', 'none', '--device', 'cpu',
+        '--overlap', '2', '--dump-session', str(tmp_path / 'dumped'), '--out', str(out)])
+    cli.main()
+
+    got = Session.load(out)
+    assert got.mode == '3d' and got.units == 'mm' and got.names == list(cf.KPTS_3D)
+    errs = [e for e in validate_session(got) if '[rule 7]' not in e]
+    assert not errs, f'a prediction session must be valid apart from its missing pixels: {errs}'
+
+    with open(out / 'session.toml', 'rb') as f:
+        prov = tomllib.load(f)['provenance']
+    assert prov['source'] == 'tailcyclenet infer --videos'
+    # DELIBERATELY EMPTY: there is no directory, and writing the path of one that does not exist
+    # reads as a stale root rather than as an absent one.
+    assert prov['source_session'] == ''
+    assert prov['source_calibration'] == str(tmp_path / 'calib.toml')
+    assert prov['source_cam_regex'] == 'cam([0-9]+)_'
+    assert sorted(prov['source_videos']) == sorted(str(v) for v in vids.values())
+
+    preds, _ = load_predictions(out)
+    assert 'rec/t' in preds and np.isfinite(preds['rec/t']['pred']).any()
+
+    # `--dump-session` is a DEBUG artefact, and what it writes must be a valid session outright --
+    # that is the whole reason to be able to point `validate_session` at it.
+    assert not validate_session(Session.load(tmp_path / 'dumped'))
+
+    # And the reconstruction reaches the same pixels with no probe and no directory.
+    from tailcyclenet import adopt
+    back = adopt.session_from_prediction(out)
+    assert back.groups['t'].source('0')[1] == vids['0'].resolve()
+
+
+@pytest.mark.parametrize('argv,expect', [
+    ([], 'exactly one of --data'),
+    (['--data', '/tmp/x', '--videos', '/tmp/y.mp4'], 'not allowed with'),
+    (['--videos', '/tmp/y.mp4'], 'needs --calibration'),
+    (['--data', '/tmp/x', '--calibration', '/tmp/c.toml'], 'only means anything with --videos'),
+])
+def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, capsys, argv, expect):
+    """argparse's own mutual-exclusion message names one flag; "exactly one of" names both, which
+    is what a user who supplied neither needs to read. `ap.error` exits 2 and writes to stderr, so
+    the message is read there rather than off the exception."""
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', '/tmp/r', '--out', '/tmp/o'] + argv)
+    with pytest.raises(SystemExit):
+        cli.main()
+    err = capsys.readouterr().err
+    assert expect in err, f'wanted {expect!r}, got: {err}'

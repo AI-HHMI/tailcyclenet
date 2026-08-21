@@ -235,10 +235,43 @@ def run_dataset(args):
     # refusals 15-17 are pure argument arithmetic and must fire before the checkpoint loads.
     check_frame_range(args)
 
-    # ONE SESSION PER RUN, AND IT IS A PURE-ARGUMENT CHECK -- so it belongs up here with the
-    # others, above the checkpoint load. `sessions_for` reads toml and opens no pixels, so this
-    # costs nothing and a mistyped `--data` does not cost a 5.6 GB load.
-    ds_name, sess = refuse_multi_session(args.data, args.split)
+    # THE INPUT. Both branches contribute the same PROVENANCE KEYS with different values, which is
+    # what keeps them honest: `SessionWriter` raises on a key given twice with two values.
+    #
+    # The videos branch builds a `format.VideoSession` IN MEMORY -- no staging directory, no
+    # symlink farm, no second copy of the user's filenames on disk that can go stale. Every pure
+    # refusal fires above the checkpoint load AND above any decode; `Registry.load` is a toml read,
+    # so even the keypoint axis is settled before the weights.
+    if args.videos:
+        from .. import adopt
+        from ..format import Registry
+
+        adopt.check_flags(args)
+        reg = Registry.load(Path(args.run) / 'keypoint_registry.toml')
+        vplan = adopt.plan(args.videos, args.calibration, args.cam_regex,
+                          session_id=args.session_id, group_id=args.group_id)
+        # `--dataset-name` DOES DOUBLE DUTY HERE, and this also removes the directory-nesting
+        # trick the on-disk path needs: with no staged `<stage>/<dataset>/test/<session>/`,
+        # `ds_name` is STATED outright instead of recovered from `path.parent.parent.name`.
+        ds_name = adopt.dataset_name(reg, args.dataset_name)
+        sess = adopt.build(vplan, names=reg.local_names(ds_name), units=args.units,
+                           fps=args.fps, assoc_res_max_px=args.assoc_res_max_px,
+                           trim=args.trim_to_shortest)
+        src_prov = adopt.provenance_of(vplan)
+        src_prov['source_split'] = ''
+        if args.dump_session:
+            adopt.dump(sess, args.dump_session)
+    else:
+        # ONE SESSION PER RUN, AND IT IS A PURE-ARGUMENT CHECK -- so it belongs up here with the
+        # others, above the checkpoint load. `sessions_for` reads toml and opens no pixels, so
+        # this costs nothing and a mistyped `--data` does not cost a 5.6 GB load.
+        args.split = args.split or 'test'
+        ds_name, sess = refuse_multi_session(args.data, args.split)
+        src_prov = {'source': 'tailcyclenet infer',
+                    'source_session': str(Path(args.data).resolve()),
+                    'source_split': args.split,
+                    'source_calibration': '', 'source_cam_regex': '',
+                    'source_group_id': '', 'source_videos': []}
 
     # THE BUDGET IS RESOLVED ONCE, HERE, BEFORE ANYTHING ALLOCATES, and printed rather than
     # inferred: it depends on machine state, so a run that does not say which budget it had cannot
@@ -398,7 +431,8 @@ def run_dataset(args):
     # to override because it is CHECKED rather than assumed: `Registry.ids_for` aligns to the
     # session's own `names` and raises on any name the registry does not hold, which is gotcha 4's
     # guard and the reason a per-dataset id vector is never applied positionally.
-    if args.dataset_name:
+    if args.dataset_name and not args.videos:
+        # The videos branch already consumed it, in `adopt.dataset_name`.
         print(f'registry: reading session keypoints as {args.dataset_name!r}, not {ds_name!r}')
         ds_name = args.dataset_name
     want = set(args.groups.split(',')) if args.groups else None
@@ -423,10 +457,9 @@ def run_dataset(args):
     writer = SessionWriter(args.out, sess, registry,
                            # A LIST OF PAIRS, not a dict: `SessionWriter` raises on a duplicate
                            # key, where a dict would silently keep the last one.
-                           [*{'source': 'tailcyclenet infer',
-                            'source_session': str(Path(args.data).resolve()),
-                            'source_session_id': sess.session_id,
-                            'source_dataset': ds_name, 'source_split': args.split,
+                           [*src_prov.items(),
+                            *{'source_session_id': sess.session_id,
+                            'source_dataset': ds_name,
                             # ABSOLUTE, like `source_session`: a relative path recorded from
                             # whatever directory the run happened to start in names nothing later.
                             # `checkpoint` is the resolved FILE, not just its name -- `_last` and

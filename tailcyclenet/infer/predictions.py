@@ -12,10 +12,18 @@ one source session is refused rather than merged. `format.sessions_for` already 
 session directory, so `--data <one session>` is the answer and not a workaround.
 
 **NO PIXELS AND NO `groups/`.** The output is toml and parquet, a few MB beside the source's
-hundreds of GB. `[provenance] source_session` records where the pixels are, which is what
-`scripts/render.py` opens. The consequence is honest and worth knowing: the directory is NOT
-self-contained, and `validate_session` reports one rule-7 error per (group, camera) because of it.
-Everything that does not need pixels passes, which is what the test asserts.
+hundreds of GB. The consequence is honest and worth knowing: the directory is NOT self-contained,
+and `validate_session` reports one rule-7 error per (group, camera) because of it. Everything that
+does not need pixels passes, which is what the test asserts.
+
+**WHERE THE PIXELS ARE IS `[provenance]`, AND NOTHING SHIPPED READS IT YET.** This docstring used
+to say `source_session` "is what `scripts/render.py` opens". It is not: `render.py` takes its own
+`--data` and reads a prediction NPZ (`np.load`, `z['__keys__']`), and has never been updated for
+the prediction-session format. The honest statement is that `source_session` (a directory input)
+or the `source_videos`/`source_calibration`/`source_cam_regex` triple (a `--videos` input, read
+back by `adopt.session_from_prediction`, which CHECKS itself against `groups.pq` and
+`calibration.toml`) are what a future render path would read. `predictions.py` itself reads only
+`source_session_id`.
 
 THREE COLUMNS ARE ADDITIONS TO THE SPEC, all additive: `score` and `box_agree` on `instances.pq`
 (the detector's objectness and the pose-to-box distance, both per (animal, frame, camera), exactly
@@ -56,6 +64,12 @@ class SessionWriter:
         self.out.mkdir(parents=True, exist_ok=True)
         self._w = {t: TableWriter(self.out / f'{t}.pq', DICT_COLS) for t in _TABLES}
 
+        # THE PROVENANCE CONTRACT IS SCALARS AND LISTS OF STRINGS. Everything here was a scalar
+        # until `source_videos` (the resolved `--videos` file list, one entry per file); a TOML
+        # array of strings round-trips through `toml.dumps`/`tomllib` unchanged and the `!=` below
+        # compares lists correctly, but it is a first and the next caller should not have to
+        # discover which by experiment.
+        #
         # A DUPLICATE PROVENANCE KEY IS A SILENT LOSS, and it has already happened once: the
         # caller builds this dict by splatting `_box_provenance` over its own literals, and a name
         # in both meant the splat order decided which fact survived -- `box_source` (the run's

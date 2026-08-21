@@ -30,11 +30,84 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path)
-    ap.add_argument('--data', required=True, type=Path,
-                    help='ONE session directory (a dataset root works only if it holds a '
-                         'single session in --split). --out is one session, and a session '
-                         'carries one calibration, one mode and one keypoint axis.')
-    ap.add_argument('--split', default='test')
+    # EXACTLY ONE INPUT, and the mutual exclusion is checked by hand below `parse_args` so the
+    # error names BOTH flags rather than argparse's one-sided message.
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument('--data', type=Path,
+                     help='ONE session directory (a dataset root works only if it holds a '
+                          'single session in --split). --out is one session, and a session '
+                          'carries one calibration, one mode and one keypoint axis.')
+    src.add_argument('--videos', type=Path, nargs='+', default=None,
+                     help='RAW FOOTAGE INSTEAD OF A SESSION DIRECTORY: files and/or directories '
+                          '(a directory expands to its .mp4/.avi children, sorted, NOT '
+                          'recursively). THE SESSION IS BUILT IN MEMORY -- nothing is staged, and '
+                          'nothing is written but --out. Needs --calibration, and --cam-regex '
+                          'unless the calibration names exactly one camera. NO LABELS, therefore '
+                          'NO SCORING: scripts/eval.py has nothing to compare a video-sourced '
+                          'prediction against, and a number needs annotations, i.e. a converter. '
+                          'It also makes --max-animals and a box source (--detector/--boxes) '
+                          'mandatory, since neither can be recovered from footage.')
+    ap.add_argument('--calibration', type=Path, default=None,
+                    help='with --videos: an ANIPOSELIB-LAYOUT calibration.toml -- what '
+                         '`format.load_calibration` reads, which anipose itself writes and this '
+                         'repo dumps. "It is a toml" is NOT the same claim as "it is THIS toml": '
+                         # `%%`: argparse expands every help string as `help % params`, so a bare
+                         # `%Y` is a format spec and `--help` dies for every flag at once.
+                         'a multiview_calib / OpenCV-YAML rig (`%%YAML:1.0` Cam*.yaml, `rc_ext` '
+                         'as '
+                         'a rotation MATRIX) needs a conversion script ending in '
+                         '`format.dump_calibration`. That is a converter\'s job and stays out of '
+                         'this flag.')
+    ap.add_argument('--cam-regex', default=None,
+                    help="with --videos: anipose's own `[triangulation] cam_regex`, applied to "
+                         "each video's STEM -- the camera is `search(rx, stem).group(1)` and the "
+                         'group id is `sub(rx, "", stem)`. So `cam0_trial3.mp4` under '
+                         "'cam([0-9]+)_' is camera '0', group 'trial3', and `cam1_trial3.mp4` "
+                         'joins it as the same group\'s second camera. THE CAMERA NAME IS THE '
+                         "CAPTURE GROUP, so it is '0' and not 'cam0' -- the calibration must name "
+                         'it that way, and this is the number-one thing to get wrong. Two '
+                         'documented supersets of anipose: a pattern with NO capture group '
+                         "matches the whole string ('Cam[0-9]+' -> 'Cam2005325', which is what a "
+                         'raw rig dump needs), and a one-camera calibration needs no regex at '
+                         'all. Several groups in one invocation is expected and free.')
+    ap.add_argument('--session-id', default=None,
+                    help='with --videos: the `session/group` key every downstream table is '
+                         "written under. Default: the videos' common parent directory name.")
+    ap.add_argument('--group-id', default=None,
+                    help='with --videos: used ONLY when the regex leaves every remainder empty, '
+                         'i.e. one raw recording per invocation (`Cam2005325.mp4` under '
+                         "'Cam[0-9]+' leaves ''). INERT otherwise. Some empty and some not is a "
+                         'genuine ambiguity and is refused. Default: the session id.')
+    ap.add_argument('--units', default='mm',
+                    help='with --videos: the 3D units. A DECLARATION about the calibration, not a '
+                         'measurement, and it CANNOT BE CHECKED here -- a calibration in metres '
+                         'declared as mm produces a prediction 1000x off with no symptom, because '
+                         "nothing downstream knows the animal's size.")
+    ap.add_argument('--fps', type=float, default=None,
+                    help="with --videos: override the container's own fps. Reaches groups.pq "
+                         'only; nothing in inference reads it.')
+    ap.add_argument('--assoc-res-max-px', type=float, default=30.0,
+                    help='with --videos, 3D only: `Session.assoc_res_max_px`, which '
+                         '`CrossViewTracker` and `associate` both read as their reprojection '
+                         "gate. The format's default, and it was measured on NO ad-hoc rig -- it "
+                         'is a PIXEL gate on a reprojection residual, so a 4K rig and a 640x480 '
+                         'rig should not share it. Sweep per rig, exactly as --det-score is swept '
+                         'per checkpoint.')
+    ap.add_argument('--trim-to-shortest', action='store_true',
+                    help="with --videos: opt in to n_frames = min over a group's cameras. "
+                         'Without it a length disagreement is REFUSED, because a one-frame offset '
+                         '(a dropped trigger, usually harmless) and a 40,000-frame one (two '
+                         'different recordings sharing a group id) look identical to a min().')
+    ap.add_argument('--dump-session', type=Path, default=None,
+                    help='DEBUG ONLY: write the constructed --videos session out through '
+                         '`format.write_session`, pixels symlinked, and carry on -- so '
+                         '`validate_session` and your own eyes can be pointed at what the flags '
+                         'produced. Not the mechanism, and on no default path.')
+    # DEFAULT None, NOT 'test'. The videos path has to be able to tell whether it was PASSED,
+    # since it is inert there and silently ignoring it would let a user believe they selected
+    # something. The directory path resolves `args.split or 'test'`.
+    ap.add_argument('--split', default=None,
+                    help='default: test. Inert with --videos, and refused rather than ignored.')
     ap.add_argument('--out', required=True, type=Path,
                     help='the prediction SESSION directory to write: session.toml, '
                          'calibration.toml, groups.pq and the label tables, in '
@@ -311,5 +384,17 @@ def main(argv=None):
     """Parse and run. `scripts/infer.py` is a six-line shim onto this."""
     from .driver import run_dataset
 
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    # EXACTLY ONE OF, checked by hand so the message names both. argparse's mutually-exclusive
+    # group cannot express "required" here without making its own error name only one of them.
+    if bool(args.data) == bool(args.videos):
+        ap.error('exactly one of --data (a session directory in docs/annotation_format.md) or '
+                 '--videos (raw footage plus --calibration) is required.')
+    if args.videos and not args.calibration:
+        ap.error('--videos needs --calibration: an aniposelib-layout calibration.toml. There is '
+                 'no geometry in a filename.')
+    if args.calibration and not args.videos:
+        ap.error('--calibration only means anything with --videos; a session directory carries '
+                 'its own calibration.toml.')
     return run_dataset(args)

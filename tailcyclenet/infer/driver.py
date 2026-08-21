@@ -148,7 +148,15 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             end = min(cursor + _DET_BATCH, T)
             raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                              score_thresh=args.det_score, reduce=det_red,
-                             max_frames=args.max_frames, tile_scale=det_tile,
+                             # `T`, THE RESOLVED STOP INDEX -- NOT `args.max_frames`, which is 0
+                             # whenever the range came in as --start-frame/--end-frame. This is
+                             # what tells `detect_raw` where the clip ENDS, and its alignment
+                             # assert accepts a short final slice only at that end. Passing 0 left
+                             # it believing the clip ran to `group.n_frames`, so the last slice of
+                             # any range whose length is not a multiple of 16 was rejected -- an
+                             # AssertionError 272 s into a 1000-frame run, and invisible at 100
+                             # frames because 100 happens to leave a full final batch.
+                             max_frames=T, tile_scale=det_tile,
                              frames=np.arange(cursor, end),
                              read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
                                  ci, cam, fr, pool=pool, reduce=reduce))

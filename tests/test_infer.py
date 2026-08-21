@@ -1362,6 +1362,57 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
         assert lo % driver._DET_BATCH == 0, f'misaligned detection slice at {lo}'
 
 
+@pytest.mark.parametrize('start,stop', [(37, 53), (37, 64), (0, 20), (16, 100), (5, 7)])
+def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_path, start, stop):
+    """`detect_raw` accepts a short FINAL slice only when it sits at the clip end, and what it
+    believes the clip end to be comes from its `max_frames`.
+
+    The driver passed `args.max_frames`, which is **0** whenever the range arrived as
+    `--start-frame`/`--end-frame` -- so `detect_raw` thought the clip ran to `group.n_frames` and
+    REFUSED the last slice of any range whose length is not a multiple of `_DET_BATCH`. It failed
+    272 s into a 1000-frame run and was invisible at 100 frames, because 100 frames from an
+    aligned cursor happens to leave a full final batch. Parametrised over ragged and exact ends so
+    neither case can pass alone.
+    """
+    import argparse
+
+    from tailcyclenet.infer import driver
+
+    model, sess, registry, name = _range_scene(tmp_path, T=200)
+    seen = []
+
+    def fake_detect_raw(det, wh, session, gid, top_k, **kw):
+        fr = np.asarray(kw['frames'])
+        # THE REAL ASSERT, reproduced against what the driver actually passed.
+        T_clip = min(session.groups[gid].n_frames, kw['max_frames'] or session.groups[gid].n_frames)
+        batch = driver._DET_BATCH
+        assert int(fr[0]) % batch == 0 and (len(fr) % batch == 0 or int(fr[-1]) == T_clip - 1), (
+            f'slice {fr[0]}..{fr[-1]} of T_clip={T_clip} would be refused by detect_raw')
+        seen.append((int(fr[0]), int(fr[-1])))
+        C, D = len(session.rig), max(1, top_k)
+        return (np.full((D, len(fr), C, 4), np.nan, np.float32),
+                np.full((D, len(fr), C), np.nan, np.float32), None)
+
+    import tailcyclenet.detector as detmod
+    old = (detmod.detect_raw, detmod.associate_group)
+    detmod.detect_raw = fake_detect_raw
+    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n], None)
+    try:
+        args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
+                                  max_move=1.0, pose_nms=None, max_frames=0,
+                                  frame_start=start, frame_stop=stop)
+        boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
+                                           None, 2, 2)
+
+        class _Store:
+            def read(self, ci, cam, fr, pool=None, reduce=1):
+                return [None] * len(fr)
+        boxes_for(_Store(), start, stop)
+    finally:
+        detmod.detect_raw, detmod.associate_group = old
+    assert seen and seen[-1][1] == stop - 1, f'detection must reach the range end: {seen[-1]}'
+
+
 @pytest.mark.parametrize('argv,expect', [
     (['--max-frames', '120', '--start-frame', '300'], 'two readings of equal force'),
     (['--max-frames', '120', '--end-frame', '300'], 'two readings of equal force'),

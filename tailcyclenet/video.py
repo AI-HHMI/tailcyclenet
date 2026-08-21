@@ -63,7 +63,13 @@ class PyAVReader:
         self._st = self._c.streams.video[0]
         # `thread_type` is NOT settable once the codec is open, which a reader CACHE guarantees on
         # every hit after the first -- so it is set here, once, and never in `get_batch`.
-        self._st.thread_type = 'AUTO'
+        #
+        # **PyAV THREADS WITHIN A CONTAINER AND decord DID NOT** (`num_threads=1`), so this is a
+        # NEW axis that every decode measurement in reports 38/39 predates. It competes with the
+        # window loop's CROSS-container concurrency (`window._CAM_DECODE`) for the same cores, and
+        # it is their PRODUCT that oversubscribes -- which is why the two are swept together
+        # (dev/plans/...§16.2.5) rather than independently.
+        self._st.thread_type = os.environ.get('TAILCYCLENET_PYAV_THREADS', 'AUTO')
         self._tb = self._st.time_base
         self._rate = self._st.average_rate
         self._pos = None                    # next frame index the decoder would yield, if known

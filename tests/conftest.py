@@ -58,6 +58,34 @@ def _write_frames(group_dir, cam, n_frames, size):
         Image.fromarray(px).save(d / f'{i:06d}.png')
 
 
+def _video_colour(cam_ix, i):
+    """The RGB a `_write_video` frame should decode to. decord returns RGB; cv2 writes BGR."""
+    return (7 * i) % 256, (200 - 10 * i) % 256, (30 * i + 11 * cam_ix) % 256
+
+
+def _write_video(path, cam_ix, n_frames, size, fps=20.0):
+    """A tiny mp4 whose every frame is a SOLID COLOUR identifying (cam, frame).
+
+    There is no video fixture anywhere else in the suite -- every session fixture ships PNG
+    directories -- and `--videos` is a path that exists only for containers, so this is where one
+    belongs. Solid colours on purpose: the codec is lossy, so a test cannot assert exact pixels,
+    but a constant plane survives compression to within a few counts and a decode that returned
+    frame i+1 for frame i is still caught.
+    """
+    import cv2
+
+    W, H = size
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'), float(fps), (W, H))
+    assert vw.isOpened(), f'cannot write {path}'
+    for i in range(n_frames):
+        r, g, b = _video_colour(cam_ix, i)
+        vw.write(np.dstack([np.full((H, W), b, np.uint8), np.full((H, W), g, np.uint8),
+                            np.full((H, W), r, np.uint8)]))
+    vw.release()
+    return path
+
+
 def _session_2d(path, T=4, S=2, label_source='annotated'):
     """rat-city's shape: one uncalibrated camera, several animals, pixel labels.
 

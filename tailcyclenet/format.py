@@ -146,11 +146,22 @@ class Rig:
 
 def load_calibration(path: Path) -> Rig:
     """Parse a calibration.toml into a Rig. Camera order is the file's section order."""
-    from aniposelib.cameras import CameraGroup
-
     with open(path, 'rb') as f:
         doc = tomllib.load(f)
+    return rig_from_doc(doc, str(path))
 
+
+def rig_from_doc(doc: dict, where: str) -> Rig:
+    """`load_calibration`'s body, over an ALREADY-PARSED document.
+
+    Split out for one caller: `adopt.plan` has to fill a camera block that carries no `size` from
+    the video's own first frame (refusal 14), which means patching the document before the Rig is
+    built. Going through a temporary file to do that would be the only other way, and a temporary
+    file is a worse fact than a function.
+    """
+    from aniposelib.cameras import CameraGroup
+
+    path = where
     blocks = [b for k, b in doc.items() if k != 'metadata' and isinstance(b, dict)]
     if not blocks:
         raise FormatError(f'{path}: no camera sections')
@@ -906,6 +917,50 @@ def link(dst: Path, src: Path) -> None:
     if dst.is_symlink() or dst.exists():
         dst.unlink()
     dst.symlink_to(src)
+
+
+def video_group(group_id: str, n_frames: int, sources: dict[str, Path], *,
+                fps: float = float('nan'), **kw) -> Group:
+    """A Group whose pixels are NAMED FILES rather than a `groups/<gid>/` directory.
+
+    `Group.source` is the ONLY thing `dataset.read_frames` calls, and it is a cache over `_src`.
+    Pre-filling `_src` therefore virtualises the pixels completely: `pixels()` is not called,
+    `dir` is not dereferenced, and `session.path` is never read. Everything below that
+    (`_read_video`, `_reader`, `_ReaderCache`, `FrameStore`) already works off a bare path string
+    plus `group.session.rig`, both of which are in-memory facts.
+
+    EVERY camera of the group must be present. A missing key falls through to `pixels()` and
+    raises against a directory that does not exist -- loud, but for the wrong reason, which is why
+    `adopt.plan`'s refusal 4 exists rather than leaving it to fail here.
+
+    A function and not "the caller pokes `_src`": `_src` is a cache field in another module, and a
+    caller reaching into it is exactly the coupling that breaks silently on a refactor.
+    """
+    g = Group(group_id=str(group_id), n_frames=int(n_frames), fps=float(fps), **kw)
+    g._src = {str(cam): ('video', Path(p), '') for cam, p in sources.items()}
+    return g
+
+
+@dataclass
+class VideoSession(Session):
+    """A Session with no directory: pixels are named videos, and there are no label tables.
+
+    `path` IS A LABEL, NOT A LOCATION. It exists so `session_id` and error messages read sensibly;
+    nothing may be read from it, which is why `_table` is overridden to return None rather than
+    merely expected to miss. Without that override a session whose `path` happened to collide with
+    a real directory would silently adopt its parquet.
+
+    `labels` is overridden rather than pre-seeded into `_label_cache` because `preload()` does
+    `self.__dict__.pop('_tables', None)` -- anything that reads a `cached_property` after that
+    recomputes it, and a recomputed `_tables` would go to disk. An override cannot be popped.
+    """
+    empty: dict[str, Labels] = field(default_factory=dict, repr=False, compare=False)
+
+    def _table(self, stem: str) -> pa.Table | None:
+        return None
+
+    def labels(self, gid: str) -> Labels:
+        return self.empty[gid]
 
 
 def empty_labels(n_animals: int, T: int, K: int, C: int, *, mode3d: bool,

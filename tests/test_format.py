@@ -471,3 +471,82 @@ def test_table_writer_skips_empty_chunks(tmp_path):
         w.write({'group_id': np.array(['g0'], dtype=object), 'frame': np.array([3], np.int32)})
     t = pq.read_table(tmp_path / 't.pq')
     assert t.num_rows == 1 and t.column('frame').to_pylist() == [3]
+
+
+# A SESSION WITH NO DIRECTORY -- the two format additions `--videos` rests on.
+
+def _video_session(tmp_path, T=6, cams=('cam0', 'cam1'), where='vids'):
+    """A `VideoSession` whose `path` does not exist and whose pixels are loose mp4s."""
+    from .conftest import _rig, _write_video
+
+    W, H = 64, 48
+    d = tmp_path / where
+    src = {c: _write_video(d / f'{c}.mp4', i, T, (W, H)) for i, c in enumerate(cams)}
+    rig = _rig([(c, W, H, True, False, i + 1) for i, c in enumerate(cams)])
+    K = len(KPTS_3D)
+    groups = {'g0': fmt.video_group('g0', T, src, fps=20.0)}
+    empty = {'g0': fmt.empty_labels(0, T, K, len(cams), mode3d=True)}
+    sess = fmt.VideoSession(path=tmp_path / 'no_such_dir' / 's', mode='3d', units='mm',
+                            label_source='tracked', names=KPTS_3D, rig=rig, groups=groups,
+                            empty=empty)
+    for g in groups.values():
+        g.session = sess
+    return sess
+
+
+def test_a_video_group_decodes_with_no_session_directory(tmp_path):
+    """THE INVARIANT THE WHOLE --videos DESIGN RESTS ON.
+
+    `group.source` is the ONLY filesystem entry point in the decode path, and it is a cache over
+    `_src`. `format.video_group` pre-fills it, so `pixels()` is never called, `dir` is never
+    dereferenced and `session.path` -- which does not exist here -- is never read. If a refactor
+    makes `read_frames` reach for a directory again, this fails immediately instead of the videos
+    path failing in a user's hands.
+
+    Asserted on VALUES, not shapes: the fixture's frames are solid colours keyed on
+    (camera, frame), so a decode that is off by one frame or serving the wrong camera fails.
+    """
+    from tailcyclenet.dataset import read_frames
+
+    from .conftest import _video_colour
+
+    sess = _video_session(tmp_path)
+    assert not sess.path.exists(), 'the point is that there is no directory'
+    g = sess.groups['g0']
+    for ci, cam in enumerate(sess.cam_names):
+        imgs = read_frames(g, cam, np.asarray([0, 2, 5]))
+        assert len(imgs) == 3
+        for im, t in zip(imgs, (0, 2, 5)):
+            assert im.shape == (48, 64, 3)
+            got = im.reshape(-1, 3).mean(0)
+            want = np.asarray(_video_colour(ci, t), float)
+            assert np.abs(got - want).max() < 12, \
+                f'{cam} frame {t}: decoded {got}, expected {want} (wrong frame or wrong camera)'
+    # And it really did go through the pre-filled cache rather than the directory.
+    assert g.source('cam0')[0] == 'video'
+    with pytest.raises(fmt.FormatError):
+        g.pixels('cam0')                      # there IS no groups/ directory to find
+
+
+def test_a_video_session_never_reads_a_table(tmp_path):
+    """`_table` is overridden to return None as a GUARANTEE, not as an accident of a missing file.
+
+    `path` is a LABEL, not a location. Without the override a session whose `path` happened to
+    collide with a real directory would silently adopt its parquet -- so this puts a real
+    `keypoints.pq` exactly there and asserts the empty arrays survive.
+    """
+    sess = _video_session(tmp_path)
+    sess.path.mkdir(parents=True)
+    real = _session_2d(tmp_path / 'real')
+    (sess.path / 'keypoints.pq').write_bytes((tmp_path / 'real' / 'keypoints.pq').read_bytes())
+    assert real is not None
+
+    assert sess._table('keypoints') is None
+    assert all(v is None for v in sess._tables.values())
+    lab = sess.labels('g0')
+    assert lab.animal_ids == [] and lab.points3d.shape == (0, 6, len(KPTS_3D), 3)
+    # `preload()` pops `_tables`, which is a cached_property -- anything that reads it afterwards
+    # recomputes it, and a recomputed one would go to disk. An override cannot be popped.
+    sess.preload()
+    assert sess.labels('g0') is lab or sess.labels('g0').points3d.shape == lab.points3d.shape
+    assert sess._table('points3d') is None

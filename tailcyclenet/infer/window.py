@@ -492,7 +492,14 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # The floor keeps a small-frame root from paying per-block overhead for nothing: a 2D rig with
     # 6 MB frames would otherwise take blocks of two windows and split a 57,000-frame clip into
     # thousands of them.
-    _want_store = max(2 * _one, _MIN_STORE_BYTES)
+    # A STATED BUDGET IS A GRANT; AN INFERRED ONE IS JUST WHAT WAS LYING AROUND.
+    #
+    # `--max-ram 24` says 24 GB is ours to use, and being frugal with it buys the caller nothing
+    # they asked for -- so the work-derived cap does not apply and the share is spent, which is
+    # what turns the detection lookahead on and grows the block. With no flag the budget is the
+    # machine's spare memory, and spending THAT is how a 120-frame clip came to hold 40 GB of
+    # frames to do 10 GB of work; there the cap stands.
+    _want_store = (float('inf') if _budget.stated else max(2 * _one, _MIN_STORE_BYTES))
     _share = _budget.share(memory.FRACTION_STORE)
     # **TWO BLOCKS ARE LIVE WHEN DETECTION RUNS AHEAD, AND BOTH COME OUT OF THIS SHARE.** The
     # detection thread decodes block k+1's frames while block k's are still held for its forwards,

@@ -95,6 +95,12 @@ class Budget:
     available_gb: float
     budget_gb: float
     source: str
+    # DID A HUMAN STATE THIS NUMBER, or did we infer it from the machine? The two are different
+    # permissions, not different values. An inferred budget is "what is lying around", and
+    # spending it is how a 120-frame clip came to hold 40 GB of frames to do 10 GB of work -- so
+    # the inferred case is sized from the WORK. `--max-ram 24` is a grant: the caller has said 24
+    # is theirs to use, and being frugal with it buys them nothing they asked for.
+    stated: bool = False
 
     def share(self, fraction: float) -> float:
         """Bytes for one consumer's slice of the budget."""
@@ -219,13 +225,16 @@ def host_budget(override_gb: float | None = None,
     # result arrays, the interpreter, glibc's slack -- is real memory this number never sees.
     # Spending the full stated figure on buffers is how `--max-ram 16` peaked at 16.8 GB and
     # `--max-ram 8` at 10.5 GB: the flag was honoured exactly and the promise was still broken.
+    stated = False
     if override_gb is not None and override_gb > 0:
         budget = fraction * float(override_gb) * GB
         source = f'--max-ram {override_gb:g}'
+        stated = True
     elif os.environ.get(ENV_MAX_RAM):
         try:
             budget = fraction * float(os.environ[ENV_MAX_RAM]) * GB
             source = f'{ENV_MAX_RAM}={os.environ[ENV_MAX_RAM]}'
+            stated = True
         except ValueError:
             budget = fraction * min(limit, avail)
     else:
@@ -236,7 +245,7 @@ def host_budget(override_gb: float | None = None,
         source += f' (clamped to the {limit / GB:.1f} GB cap)'
         budget = limit
     return Budget(limit_gb=limit / GB, available_gb=avail / GB,
-                  budget_gb=max(budget, 0.0) / GB, source=source)
+                  budget_gb=max(budget, 0.0) / GB, source=source, stated=stated)
 
 
 _cached: Budget | None = None

@@ -235,6 +235,21 @@ def run_dataset(args):
     # refusals 15-17 are pure argument arithmetic and must fire before the checkpoint loads.
     check_frame_range(args)
 
+    # THE BUDGET IS RESOLVED ONCE, HERE, ABOVE BOTH INPUT BRANCHES, AND BEFORE ANYTHING ALLOCATES.
+    #
+    # It sat BELOW the input branch until the `--videos` path put a real consumer above it: the
+    # probe opens video containers, and `memory.current` caches process-wide, so during the probe
+    # the override was not yet in effect and any consumer that asked would have got the HOST
+    # figure. `--max-ram` cannot be a ceiling on a phase that runs before it is read.
+    #
+    # Printed rather than inferred: it depends on machine state, so a run that does not say which
+    # budget it had cannot have its wall clock compared against another run's. Report a peak as a
+    # FRACTION of this number -- an absolute peak on an unconstrained host is usually retained
+    # allocator arena rather than the working set.
+    from tailcyclenet import memory as _memory
+    _budget = _memory.current(override_gb=args.max_ram)
+    print(f'ram: {_budget}')
+
     # THE INPUT. Both branches contribute the same PROVENANCE KEYS with different values, which is
     # what keeps them honest: `SessionWriter` raises on a key given twice with two values.
     #
@@ -272,15 +287,6 @@ def run_dataset(args):
                     'source_split': args.split,
                     'source_calibration': '', 'source_cam_regex': '',
                     'source_group_id': '', 'source_videos': []}
-
-    # THE BUDGET IS RESOLVED ONCE, HERE, BEFORE ANYTHING ALLOCATES, and printed rather than
-    # inferred: it depends on machine state, so a run that does not say which budget it had cannot
-    # have its wall clock compared against another run's. Report a peak as a FRACTION of this
-    # number -- an absolute peak on an unconstrained host is retained allocator arena, not the
-    # working set, and says almost nothing (this file's plan, dev/plans/...ram_budget.md).
-    from tailcyclenet import memory as _memory
-    _budget = _memory.current(override_gb=args.max_ram)
-    print(f'ram: {_budget}')
 
     device = args.device if torch.cuda.is_available() else 'cpu'
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)

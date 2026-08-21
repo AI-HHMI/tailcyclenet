@@ -543,3 +543,127 @@ def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
                 f'{k} moved when the detection lookahead was disabled by the budget'
         elif a.dtype.kind in 'iub':
             assert np.array_equal(a, b), f'{k} moved when the lookahead was disabled'
+
+
+# `--max-ram` MUST ACTUALLY BIND -- dev/plans/infer_from_videos_and_calibration.md §15.
+#
+# The budget was purely ADVISORY: every consumer sized itself from it and nothing checked the
+# total, so a `--videos` run on 263,798-frame containers reached 456 GB under `--max-ram 24` with
+# nothing in its output saying so, and had to be killed at 9 GB free on a shared node.
+
+def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path):
+    """ORDERING. The `--videos` probe opens video containers, and `memory.current` caches
+    process-wide -- so with the budget resolved BELOW the input branch the override was not in
+    effect during the probe, and any consumer that asked would have got the HOST figure.
+
+    `--max-ram` cannot be a ceiling on a phase that runs before it is read. Asserted by having the
+    probe itself read `memory.current()`.
+    """
+    import argparse
+
+    from tailcyclenet import adopt, memory
+    from tailcyclenet.infer import driver
+
+    memory.reset()
+    seen = {}
+
+    def spy_build(plan, **kw):
+        seen['budget'] = memory.current()
+        raise SystemExit('stop here -- the budget has been observed')
+
+    monkeypatch.setattr(adopt, 'build', spy_build)
+    monkeypatch.setattr(adopt, 'plan', lambda *a, **k: 'PLAN')
+    monkeypatch.setattr(adopt, 'check_flags', lambda a: None)
+    monkeypatch.setattr(adopt, 'dataset_name', lambda r, n: 'ds')
+    monkeypatch.setattr('tailcyclenet.format.Registry.load',
+                        classmethod(lambda cls, p: _FakeReg()))
+    monkeypatch.setattr(driver, 'load_run',
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError('the budget must be resolved before the checkpoint')))
+
+    args = argparse.Namespace(
+        run=tmp_path / 'run',
+        videos=[tmp_path / 'v.mp4'], calibration=tmp_path / 'c.toml', cam_regex=None,
+        session_id=None, group_id=None, units='mm', fps=None, assoc_res_max_px=30.0,
+        trim_to_shortest=False, dump_session=None, data=None, split=None,
+        anchor='none', oracle_corrupt=None, refine_px=None, refine=None,
+        max_frames=0, start_frame=0, end_frame=0, max_ram=17.0, dataset_name=None,
+        box_prompt='none', detector=None, boxes='b.npz', max_animals=1)
+    try:
+        with pytest.raises(SystemExit, match='the budget has been observed'):
+            driver.run_dataset(args)
+    finally:
+        memory.reset()
+
+    assert seen['budget'].stated, 'the probe saw an INFERRED budget -- the override came too late'
+    assert '--max-ram 17' in seen['budget'].source, seen['budget'].source
+
+
+class _FakeReg:
+    names = ('a',)
+    datasets = (('ds', (0,)),)
+
+    def local_names(self, d):
+        return ['a']
+
+
+def test_the_probe_is_inside_the_budget_partition():
+    """An UNBUDGETED CONSUMER IS HOW THE NEXT ONE GETS ADDED. The probe holds open readers, so it
+    comes out of `FRACTION_READERS` rather than sitting outside a partition that sums to 1.00.
+
+    It does NOT change the number on any rig anyone has run -- an open reader on a 263,798-frame
+    3208x2200 container retains 0.03 GB, measured under a trim -- which is the honest outcome and
+    is why this asserts the bound rather than a new value.
+    """
+    from tailcyclenet import adopt, memory
+
+    big = memory.host_budget(override_gb=1024)
+    assert adopt.probe_workers(16, big) == adopt.PROBE_WORKERS_MAX
+    assert adopt.probe_workers(2, big) == 2, 'never more workers than videos'
+
+    tiny = memory.host_budget(override_gb=0.001)
+    assert adopt.probe_workers(16, tiny) == 1, 'must floor at 1, never 0'
+
+    # Monotone in the budget, and never above the reader share.
+    prev = 0
+    for gb in (0.001, 1, 8, 64, 1024):
+        b = memory.host_budget(override_gb=gb)
+        n = adopt.probe_workers(16, b)
+        assert n >= prev or gb == 0.001
+        prev = n
+        assert n == 1 or n * adopt._PROBE_READER_BYTES <= b.share(memory.FRACTION_READERS)
+
+
+def test_the_peak_check_fires_on_a_promise_and_stays_quiet_otherwise():
+    """A STATED budget is a promise; an INFERRED one is what was lying around, so exceeding it is
+    the host being busier than at startup rather than a broken promise.
+
+    Warn-once, and never a kill: the peak may be retained arena rather than working set, the
+    offending allocation is not always ours, and a run that is over budget is not a run that is
+    WRONG. What it buys is that the next 456 GB arrives as a line of output naming its phase.
+    """
+    import warnings as _w
+
+    from tailcyclenet import memory
+
+    assert memory.peak_gb() > 0 and memory.rss_gb() > 0
+
+    # An absurdly small STATED budget: this process is certainly above it.
+    memory._peak_warned = False
+    tiny = memory.host_budget(override_gb=0.001)
+    with _w.catch_warnings(record=True) as got:
+        _w.simplefilter('always')
+        memory.check_peak('a test phase', tiny)
+        memory.check_peak('a second phase', tiny)
+    assert len(got) == 1, 'warn ONCE per process, or a per-block warning trains the reader to skip'
+    assert 'a test phase' in str(got[0].message), 'the PHASE is the point of the message'
+
+    # An INFERRED budget of the same absurd size must say nothing.
+    memory._peak_warned = False
+    from dataclasses import replace
+    inferred = replace(memory.host_budget(), budget_gb=0.001, stated=False)
+    with _w.catch_warnings(record=True) as got:
+        _w.simplefilter('always')
+        memory.check_peak('an inferred phase', inferred)
+    assert not got, 'an inferred budget is not a promise and must not be reported as broken'
+    memory._peak_warned = False

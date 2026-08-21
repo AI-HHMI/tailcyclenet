@@ -34,6 +34,7 @@ a number, it does not belong on this budget -- it belongs in a config, where it 
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -375,6 +376,69 @@ def trim() -> None:
             _libc.malloc_trim(0)
         except (OSError, AttributeError):
             pass
+
+
+def rss_gb() -> float:
+    """This process's CURRENT resident set, in GB. `/proc` only -- opens no data path."""
+    return _proc_status_gb('VmRSS')
+
+
+def peak_gb() -> float:
+    """This process's HIGH-WATER resident set (`VmHWM`), in GB."""
+    return _proc_status_gb('VmHWM')
+
+
+def _proc_status_gb(key: str) -> float:
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith(key):
+                    return int(line.split()[1]) * 1024 / GB
+    except OSError:
+        pass
+    return float('nan')
+
+
+_peak_warned = False
+
+
+def check_peak(phase: str, budget: 'Budget | None' = None) -> float:
+    """WARN ONCE if the process has blown through its own STATED ceiling. -> the peak in GB.
+
+    **THE BUDGET WAS PURELY ADVISORY UNTIL THIS EXISTED, AND THAT IS HOW A `--max-ram 24` RUN
+    REACHED 456 GB WITH NOTHING IN ITS OUTPUT SAYING SO.** Every consumer in this module sizes
+    itself from the budget and no one ever checked the TOTAL, so a consumer that sits outside the
+    partition -- or an allocation nobody attributed to a fraction at all -- is invisible until the
+    node runs out of memory. On a shared host that is somebody else's job dying, not ours.
+
+    **DIAGNOSIS, NOT ENFORCEMENT, AND DELIBERATELY SO.** It names the phase and gets out of the
+    way. Killing the run would be worse than the disease: the peak may be retained arena rather
+    than working set (see `trim`), the offending allocation is not always ours, and a run that is
+    merely over budget is not a run that is WRONG. What it buys is that the next 456 GB arrives as
+    a line of output naming the phase it grew in, instead of as a stopwatch and a dead node.
+
+    **ONLY ON A STATED BUDGET.** An inferred budget is "what was lying around" (see `host_budget`),
+    so exceeding it is not a broken promise -- it is the host being busier than it was at startup.
+    A `--max-ram` or `TAILCYCLENET_MAX_RAM_GB` figure IS a promise.
+
+    Once per process: this is called at loop boundaries, and a warning per block is noise that
+    trains the reader to skip it.
+    """
+    global _peak_warned
+    b = current() if budget is None else budget
+    peak = peak_gb()
+    if _peak_warned or not b.stated or not (peak == peak):
+        return peak
+    # Against the STATED figure, not the buffer share: `--max-ram` is a ceiling on the PROCESS.
+    ceiling = b.budget_gb / DEFAULT_FRACTION
+    if peak > ceiling:
+        _peak_warned = True
+        warnings.warn(
+            f'RSS peaked at {peak:.1f} GB during {phase}, above the {ceiling:.1f} GB this run was '
+            f'given ({b.source}). Every buffer this module sizes is derived from that figure, so '
+            'something is allocating outside the budget -- report it with the phase named here. '
+            'Under a cgroup cap this is an OOM kill, not a warning.', stacklevel=2)
+    return peak
 
 
 def fits(budget_bytes: float, per_unit_bytes: float, want: int, floor: int = 1) -> int:

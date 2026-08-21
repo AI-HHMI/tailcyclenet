@@ -42,10 +42,39 @@ from pathlib import Path
 
 from . import format as fmt
 
-# How many videos to probe at once. It is I/O, so it parallelises -- but 16 concurrent decord
-# opens is exactly the quadratic reader cost (~59 GB at 16 on a 3208x2200 rig, see
-# `dataset._reader_cache_size`), so the pool is bounded and every reader is dropped immediately.
-PROBE_WORKERS = 4
+# How many videos to probe at once. It is I/O, so it parallelises.
+#
+# **DERIVED FROM THE BUDGET, NOT A CONSTANT, BECAUSE AN UNBUDGETED CONSUMER IS HOW THE NEXT ONE
+# GETS ADDED.** This holds open decord readers, which is what `FRACTION_READERS` is for, so it
+# comes out of that share rather than sitting outside the partition -- `FRACTION_READERS` +
+# `_DETECT` + `_STORE` sum to 1.00 and nothing else may be added to the total silently.
+#
+# **AND IT IS CHEAP, WHICH IS A MEASUREMENT AND NOT AN ASSUMPTION.** An open reader on a
+# 263,798-frame 3208x2200 container retains **0.03 GB**, LINEAR in the number held (2.01x at two),
+# trimmed after each step -- `scratch/reader_cost_vs_length.py`. So this derivation does not change
+# the number on any rig anyone has run; it makes the accounting honest, and it means a genuinely
+# tiny budget shrinks the pool instead of ignoring it.
+#
+# **DO NOT re-derive a price from `dataset._reader_cache_size`'s `0.035/megapixel * n^2`.** That
+# law over-prices by ~8x at one reader and its quadratic term is not reproducible under a trim;
+# both it and CLAUDE.md's 0.28/3.58/15.34/59.38 table were taken on an unconstrained host without
+# one, i.e. they measured allocator arena. Fixing that law is deliberately NOT in scope here (see
+# dev/plans/infer_from_videos_and_calibration.md §15.2a) because every video root's reader cache
+# would move with it.
+PROBE_WORKERS_MAX = 4
+# Measured above, rounded UP so the estimate errs toward a smaller pool -- the safe direction,
+# since a miss costs 41.5 ms of reopen and an over-estimate costs memory.
+_PROBE_READER_BYTES = 0.05 * (1 << 30)
+
+
+def probe_workers(n_videos: int, budget=None) -> int:
+    """How many containers the probe may hold open at once. Never above `PROBE_WORKERS_MAX`, never
+    below 1, and bounded by the reader share of the RAM budget."""
+    from . import memory
+
+    b = memory.current() if budget is None else budget
+    return memory.fits(b.share(memory.FRACTION_READERS), _PROBE_READER_BYTES,
+                       want=max(1, min(PROBE_WORKERS_MAX, int(n_videos))))
 
 
 @dataclass(frozen=True)
@@ -381,10 +410,11 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
     got: dict[tuple[str, str], tuple] = {}
     # A silent pause before the first box looks like a hang -- 40 s per cold open x 16 cameras is
     # ~11 minutes on a node that has never seen the recording. So it is parallel AND it says so.
+    workers = probe_workers(len(jobs))
     if verbose:
         print(f'--videos: probing {len(jobs)} video(s) for length and frame size '
-              f'({PROBE_WORKERS} at a time)...', flush=True)
-    with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
+              f'({workers} at a time)...', flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = [(gid, cam, pool.submit(probe, p)) for gid, cam, p in jobs]
         for gid, cam, fu in futs:
             n, wh, f = fu.result()
@@ -451,6 +481,11 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
         print(f'--videos: session {sess.session_id!r}, mode {sess.mode}, units {sess.units!r} '
               f'(a DECLARATION about the calibration, not a measurement), {len(groups)} group(s), '
               f'{len(plan.rig)} camera(s)')
+    # The probe is the first phase of a `--videos` run and it runs before the checkpoint loads, so
+    # if it is where the memory goes, this is where a reader finds out.
+    from . import memory
+    memory.trim()
+    memory.check_peak('the --videos probe')
     return sess
 
 

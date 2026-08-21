@@ -1156,6 +1156,10 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             # opens on `f_own` and would otherwise decode them a second time.
             store.evict_below(f_own)
             memory.trim()
+            # THE CEILING, ACTUALLY CHECKED -- at a block boundary, after the trim, so what is
+            # measured is the working set and not the arena. Warns once and never kills; see
+            # `memory.check_peak` for why diagnosis rather than enforcement.
+            memory.check_peak(f'the window loop ({session.session_id}/{gid})')
             keep = f_own - f0
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
                    'pred2d': pred2d[:, :keep], 'conf2d': conf2d[:, :keep],

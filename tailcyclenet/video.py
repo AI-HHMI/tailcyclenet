@@ -35,6 +35,9 @@ import os
 import numpy as np
 
 BACKENDS = ('pyav', 'decord')
+# libav's threading modes. 'NONE' is decord's old single-threaded behaviour, and is what a
+# measurement of per-container threading has to compare AUTO against.
+THREAD_TYPES = ('AUTO', 'FRAME', 'SLICE', 'NONE')
 # How far ahead it is worth DECODING to reach a wanted frame rather than seeking again. A seek
 # lands on the preceding keyframe and this container's GOP is 180, so a second seek costs up to a
 # GOP of decode anyway; below that, decoding forward is strictly cheaper than re-seeking.
@@ -69,7 +72,14 @@ class PyAVReader:
         # window loop's CROSS-container concurrency (`window._CAM_DECODE`) for the same cores, and
         # it is their PRODUCT that oversubscribes -- which is why the two are swept together
         # (dev/plans/...§16.2.5) rather than independently.
-        self._st.thread_type = os.environ.get('TAILCYCLENET_PYAV_THREADS', 'AUTO')
+        # A PyAV ENUM, NOT A COUNT: 'AUTO' | 'FRAME' | 'SLICE' | 'NONE'. Validated here because
+        # PyAV's own failure is a bare `KeyError: '1'` raised from inside an enum lookup, several
+        # frames below anything that names the setting.
+        _tt = os.environ.get('TAILCYCLENET_PYAV_THREADS', 'AUTO').strip().upper()
+        if _tt not in THREAD_TYPES:
+            raise ValueError(f'TAILCYCLENET_PYAV_THREADS={_tt!r} is not one of {THREAD_TYPES}. '
+                             'It names libav\'s threading MODE, not a thread count.')
+        self._st.thread_type = _tt
         self._tb = self._st.time_base
         self._rate = self._st.average_rate
         self._pos = None                    # next frame index the decoder would yield, if known

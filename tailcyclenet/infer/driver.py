@@ -10,6 +10,7 @@ calibration, one mode and one keypoint axis. `--data` therefore takes a session 
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -541,8 +542,10 @@ def run_dataset(args):
             # back scattered against the wrong frames.
             f0, w0 = cfg.frame_start, 0
             n_frames = n_fin = n_pt = 0
+            _t_group, _stats = time.time(), {}
             for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
-                                  box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want):
+                                  box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want,
+                                  stats=_stats):
                 assert f0 == int(blk['window_start'][0]), (f0, int(blk['window_start'][0]))
                 writer.write_block(gid, blk, f0, w0)
                 f0 += blk['pred'].shape[1]
@@ -553,6 +556,17 @@ def run_dataset(args):
             span = ('' if not (cfg.frame_start or cfg.frame_stop)
                     else f' [{cfg.frame_start}, {f0})')
             print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
+            # DECODE'S SHARE, MEASURED BY THIS RUN. `decode_s` sums across threads, so it is
+            # decode WORK and can exceed the elapsed time by up to the camera concurrency -- which
+            # is why it is printed beside the wall clock rather than as a percentage. The store's
+            # hit rate is the other half: a miss rate near 1 on a multi-camera rig means the
+            # reader cache is below the rig and the run is on the wrong side of that cliff.
+            _wall = time.time() - _t_group
+            _dec, _h, _m = (_stats.get('decode_s', 0.0), _stats.get('decode_hits', 0),
+                            _stats.get('decode_misses', 0))
+            print(f'{key}: {_wall:.1f}s wall, {_dec:.1f}s of decode work across threads '
+                  f'({_dec / max(_wall, 1e-9):.2f}x wall), store {_h}/{_h + _m} hits '
+                  f'({_h / max(_h + _m, 1):.2f})')
             if det is not None:
                 # REPORTED AFTER THE RUN, because detection now happens block by block INSIDE it.
                 # The fire rate is what a rate-matched random control has to be matched TO and

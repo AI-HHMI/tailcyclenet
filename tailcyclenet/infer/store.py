@@ -20,6 +20,7 @@ touches no data path, so it is safe to create before any fork.
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 
@@ -43,6 +44,15 @@ class FrameStore:
         self._busy: dict[tuple[int, int], threading.Event] = {}
         self._lock = threading.Lock()
         self.hits = self.misses = 0
+        # WALL SECONDS SPENT INSIDE `read_frames`, summed across threads. **NOT a duration** --
+        # decodes overlap, so this exceeds the elapsed time and is a measure of DECODE WORK, not
+        # of how long the run waited for it. Reported against the group's wall clock as a ratio
+        # bounded by `cam_decode`, which is what makes "decode is N% of wall" answerable at all.
+        #
+        # Reports 38/39 put decode at 84.8% of wall -- on JPEG directories, under decord. Neither
+        # half of that transfers (dev/plans/...§16.1), and this is what replaces the guess with a
+        # number every run prints for itself.
+        self.decode_s = 0.0
 
     def read(self, ci, cam_name=None, frames=(), pool=None, reduce=1):
         """The frames for one camera, decoding only what is not already held.
@@ -76,8 +86,11 @@ class FrameStore:
             self.misses += len(need)
         try:
             if need:
+                t0 = time.perf_counter()
                 got = read_frames(self.group, name, np.asarray(need), pool=pool)
+                dt = time.perf_counter() - t0
                 with self._lock:
+                    self.decode_s += dt
                     for t, im in zip(need, got):
                         self._f[ci, t] = im
         finally:

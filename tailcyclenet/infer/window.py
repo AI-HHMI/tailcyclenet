@@ -366,7 +366,7 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
 @torch.no_grad()
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
-               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None):
+               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None):
     """Predict every animal in one group, a BLOCK OF WINDOWS AT A TIME. Yields one dict per block.
 
     Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, and
@@ -1156,6 +1156,14 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             # opens on `f_own` and would otherwise decode them a second time.
             store.evict_below(f_own)
             memory.trim()
+            # TELEMETRY GOES IN `stats`, NEVER IN THE BLOCK DICT. The block dict is the
+            # PREDICTION, and `tests/test_memory_budget.py` compares every key of it across
+            # budgets to assert that nothing the budget sizes moves a number -- so a wall-clock
+            # figure in there fails that test correctly, being non-deterministic by construction.
+            # Same shape as `associate_group(stats=)`.
+            if stats is not None:
+                stats['decode_s'] = store.decode_s
+                stats['decode_hits'], stats['decode_misses'] = store.hits, store.misses
             # THE CEILING, ACTUALLY CHECKED -- at a block boundary, after the trim, so what is
             # measured is the working set and not the arena. Warns once and never kills; see
             # `memory.check_peak` for why diagnosis rather than enforcement.

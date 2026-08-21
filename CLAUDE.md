@@ -635,9 +635,36 @@ restores the old reader** and is kept for bisecting, because every recorded numb
 with it. **OpenCV IS REFUSED DESPITE PASSING HERE**: `CAP_PROP_POS_FRAMES` is documented at 8 to
 -3 frames off on MP4/AVC1 (opencv#9053), and an off-by-one frame is a different picture of a
 moving animal, silently. PyAV seeks to the preceding KEYFRAME and decodes forward COUNTING
-FRAMES, so the index arithmetic is ours. **COROLLARY: every decode measurement in reports 38/39 --
-the 44 ms 4K frame, the 3.5x camera concurrency, the 61/149/222 s reader-cache cliff -- was taken
-on decord and must be re-measured before it is quoted again.**
+FRAMES, so the index arithmetic is ours. **REPORTS 38/39's DECODE NUMBERS HAVE BEEN RE-MEASURED ON PyAV; THE OLD ONES ARE VOID.** They were
+void for two non-overlapping reasons -- most were taken on JPEG DIRECTORIES (four of six shipped
+roots), and the rest were video but on decord, whose `num_threads=1` is a regime PyAV never runs
+in. What replaces them, all on a 16-camera 3208x2200 h264 rig, decode-only, 3 replicates:
+
+- **THE READER-CACHE CLIFF IS 5.1x AND IS A THRESHOLD, NOT A CURVE** (cache 4 -> 7.4 s, 8 -> 6.3,
+  **16 -> 1.5**). The access pattern is a CYCLE, so the whole win arrives only when the last camera
+  fits. Report 38's 2.4x was right in kind and understated.
+- **THE PRICE OF A READER IS LINEAR, ~0.053 GB/megapixel** (0.418/0.383/0.376/0.373 GB per reader
+  at 1/4/8/16), not decord's `0.035 * MP * n^2`. The whole rig costs **6 GB where the old law
+  demanded 63**, and because that law grew the cache as `sqrt(budget)` it gave only **10 readers at
+  `--max-ram 128`** -- the cliff was unreachable at ANY budget. Refit; `--max-ram 32` now holds
+  this rig, and the warning says so, because **a linear price inverts and a quadratic one does
+  not**.
+- **CAMERA CONCURRENCY IS 2.8x FROM 1 -> 4 AND THEN SATURATES** (4 -> 16 buys 9%, inside the
+  spread). `_CAM_DECODE = 4` is unchanged and now measured rather than inherited.
+- **`thread_type = AUTO` IS WORTH 3.2x AND IS ALSO A MEMORY LEVER.** Per-container threading and
+  cross-container concurrency SUBSTITUTE: AUTO reaches at `_CAM_DECODE` 4 what NONE needs 16 to
+  approach, and each concurrent camera holds a whole window of FULL frames. **decord was the NONE
+  row**, which is why report 38 saw 3.5x from concurrency and report 39 saw none from raising it.
+- **DECODE'S SHARE IS NO LONGER A CONSTANT.** `FrameStore.decode_s` accumulates and the driver
+  prints it per group beside the store hit rate. Reported as a MULTIPLE OF WALL, not a percentage:
+  decodes overlap up to `cam_decode`, so the thread-sum exceeds elapsed time and the JPEG-era
+  "84.8%" framing is unbounded above 100%. **A store hit rate near 0 on a multi-camera rig IS the
+  cliff**, diagnosable without a stopwatch.
+
+**STILL OPEN: `FRACTION_READERS` 0.25 vs `FRACTION_STORE` 0.65 IS NOW BACKWARDS ON EVIDENCE** --
+readers buy 5.1x at the threshold, the store's extra windows buy 7% -- but raising the reader share
+pushes a small budget below one window of store, turning a working run into a refusal. It needs the
+store's floor re-measured first and is not an arithmetic change.
 
 **HOST RAM IS A BUDGET, AND `--max-ram GB` IS A CEILING ON THE PROCESS, NOT AN ALLOWANCE FOR THE
 BUFFERS.** **AND IT IS NOW CHECKED RATHER THAN MERELY DERIVED FROM**: every consumer sized itself

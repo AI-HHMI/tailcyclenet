@@ -16,14 +16,15 @@ hundreds of GB. The consequence is honest and worth knowing: the directory is NO
 and `validate_session` reports one rule-7 error per (group, camera) because of it. Everything that
 does not need pixels passes, which is what the test asserts.
 
-**WHERE THE PIXELS ARE IS `[provenance]`, AND NOTHING SHIPPED READS IT YET.** This docstring used
-to say `source_session` "is what `scripts/render.py` opens". It is not: `render.py` takes its own
-`--data` and reads a prediction NPZ (`np.load`, `z['__keys__']`), and has never been updated for
-the prediction-session format. The honest statement is that `source_session` (a directory input)
-or the `source_videos`/`source_calibration`/`source_cam_regex` triple (a `--videos` input, read
-back by `adopt.session_from_prediction`, which CHECKS itself against `groups.pq` and
-`calibration.toml`) are what a future render path would read. `predictions.py` itself reads only
-`source_session_id`.
+**WHERE THE PIXELS ARE IS `[provenance]`, AND `scripts/render.py` NOW READS IT.**
+`render.session_for_prediction` opens `source_session` (a directory input) or the
+`source_videos`/`source_calibration`/`source_cam_regex`/`source_group_id` quadruple (a `--videos`
+input), the latter via `adopt.session_from_prediction`, which CHECKS itself against `groups.pq`
+and `calibration.toml`. `--data` is an OVERRIDE for a root that MOVED, not the normal input, and
+is checked against `source_session_id` rather than trusted. `render.py` no longer reads an npz at
+all -- an npz carries none of this, so every npz render was a render against a hand-restated root,
+which is exactly the failure this closed. `predictions.py` itself reads only `source_session_id`,
+to confirm whatever session `render.py` found is the one this prediction was written over.
 
 THREE COLUMNS ARE ADDITIONS TO THE SPEC, all additive: `score` and `box_agree` on `instances.pq`
 (the detector's objectness and the pose-to-box distance, both per (animal, frame, camera), exactly
@@ -209,20 +210,29 @@ class SessionWriter:
             w.close()
 
 
-def load_predictions(path):
+def load_predictions(path, groups=None):
     """A prediction session or a legacy npz -> `({key: {field: ndarray}}, meta)`.
 
     THE NPZ HALF IS NOT LEGACY DEBT, it is the archive: every number this repo has published lives
     in one, and dropping the reader would make them unscoreable. It is the same argument that kept
-    `eval.py` able to read them at all.
+    `eval.py` able to read them at all -- `scripts/render.py` is what stopped reading it (an npz
+    carries no provenance to find its pixels with); scoring did not.
+
+    `groups`, given, restricts the read to those group ids (bare, not `session/group` keys).
+    `eval.py` leaves it `None` and gets every group, unchanged. A RENDER wants this: the session
+    half calls `Session.preload()` no longer -- it scatters one group at a time -- so a caller
+    asking for one group of a many-hundred-group clip never pays for the rest.
     """
     path = Path(path)
-    return _load_npz(path) if path.suffix == '.npz' else _load_session(path)
+    return (_load_npz(path, groups) if path.suffix == '.npz' else _load_session(path, groups))
 
 
-def _load_npz(path):
+def _load_npz(path, groups=None):
     z = np.load(path, allow_pickle=True)
     keys = [str(k) for k in z['__keys__']]
+    if groups is not None:
+        want = set(groups)
+        keys = [k for k in keys if k.split('/', 1)[1] in want]
     out = {}
     for key in keys:
         out[key] = {f.split('|', 1)[1]: z[f] for f in z.files if f.startswith(key + '|')}
@@ -232,24 +242,30 @@ def _load_npz(path):
     return out, meta
 
 
-def _load_session(path):
+def _load_session(path, groups=None):
     """Densify a prediction session back into the arrays `eval.py` reads.
 
     **THE SCATTER IS `format.Session`'s OWN**, not a second implementation: §12 of the spec already
     defines how long tables become `(S,T,K,3)` dense arrays, `Labels` already returns exactly that,
     and it is already tested. This function renames those fields and adds the two tables the spec
     does not define.
+
+    **NO `preload()`.** `Session.labels` caches PER GROUP, so scattering is already lazy; the old
+    `preload()` call scattered every group up front regardless of `groups`, which is the whole of
+    what made a render of one group out of a many-hundred-group clip cost the other 499.
     """
     import tomllib
 
     sess = Session.load(Path(path))
-    sess.preload()
     with open(Path(path) / 'session.toml', 'rb') as f:
         prov = tomllib.load(f).get('provenance', {})
     src_id = prov.get('source_session_id') or sess.session_id
 
+    want = set(groups) if groups is not None else None
     out = {}
     for gid in sess.groups:
+        if want is not None and gid not in want:
+            continue
         lab = sess.labels(gid)
         d = {'mode': sess.mode, 'group_id': gid, 'session': src_id,
              'animal_ids': np.asarray(list(lab.animal_ids), object)}

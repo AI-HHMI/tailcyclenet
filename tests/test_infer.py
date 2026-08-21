@@ -992,6 +992,22 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
     want = project_points_torch([cams[0]], torch.as_tensor(pred[0], dtype=torch.float32))[0]
     np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)
 
+    # AND A NON-IDENTITY `frames` ARRAY -- `render_group`'s own `--start-frame`/`--end-frame`
+    # slice, or a permutation, IN BOUNDS -- MUST READ EXTRINSIC `frames[t]` AT COLUMN `t`, NOT
+    # EXTRINSIC `t`. `render.py` used to always pass `np.arange(T)`; a ranged render passes the
+    # source slice instead, and if that offset silently failed to reach `cgroup` here, the
+    # skeleton would sit on the animal's position from an EARLIER OR LATER frame with no error.
+    shifted_frames = np.roll(np.arange(pred.shape[1]), 1)      # a permutation, still in bounds
+    shifted = project(sess, pred, 0, 'g000', shifted_frames)
+    ok2 = np.isfinite(shifted) & np.isfinite(per_frame)
+    assert ok2.any()
+    assert not np.allclose(shifted[ok2], per_frame[ok2]), \
+        'a permuted frames array must change the projection, or the offset never reached cgroup'
+    cams_shifted = sess.cgroup('g000', shifted_frames)
+    want_shifted = project_points_torch([cams_shifted[0]],
+                                        torch.as_tensor(pred[0], dtype=torch.float32))[0]
+    np.testing.assert_allclose(shifted[0], want_shifted.numpy(), rtol=1e-5, atol=1e-4)
+
 
 
 

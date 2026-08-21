@@ -1,16 +1,22 @@
-"""Draw a prediction over the pixels it was made from. `scripts/infer.py --render` is the caller.
+"""Draw a prediction over the pixels it was made from. `scripts/render.py` is the caller.
 
 Ported from `../posetail-pose/scripts/render_tracking.py` -- `PALETTE`, `draw_instance` and the
 lazy `VideoWriter` are that file's, near verbatim. What is deliberately NOT ported is the rest of
 it: `render_tracking.py` re-runs inference to get something to draw, and `render_clip_npz.py`'s
 docstring is explicit that this is the trap, because the render then shows a different pipeline
 from the one the numbers came from. So there is no model here and no window loop -- `render_group`
-takes the array `run_group` just returned.
+takes the array `run_group`/a prediction session already holds.
 
 Colour is per ANIMAL ROW, so an identity swap on a stationary animal shows up as a colour change
 rather than as a number in a table.
+
+`session_for_prediction` and `resolve_camera`, at the bottom, are the CLI's own two questions --
+where are this prediction's pixels, and which camera did `--cams TOKEN` mean -- kept here rather
+than in `scripts/render.py` because both need `Session`/`Rig` internals a thin CLI should not.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 
@@ -24,8 +30,14 @@ PALETTE = [(60, 60, 255), (60, 220, 60), (255, 140, 40), (40, 220, 220), (230, 8
 CHUNK = 32          # frames read per batch. 480 rat-city frames at once is 13.8 GB.
 
 
-def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5):
-    """One instance: skeleton (where the session has one) and keypoints, in place."""
+def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, marker='dot',
+                  label=True):
+    """One instance: skeleton (where the session has one) and keypoints, in place.
+
+    `marker='cross'` and `label=False` are the OVERLAY style (`render_group`'s `overlay=`): a
+    second prediction drawn over the first must be visually distinct with no halo and no second
+    id text competing for the same six pixels, or the two readings are indistinguishable.
+    """
     import cv2
 
     # isfinite alone lets a degenerate triangulation (a finite but ~1e20 px point) through, which
@@ -38,10 +50,15 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5):
             cv2.line(img, tuple(np.int32(p2d[a])), tuple(np.int32(p2d[b])), colour, lw, cv2.LINE_AA)
     for k in np.flatnonzero(ok):
         c = tuple(np.int32(p2d[k]))
-        # Dark halo under the coloured dot -- a marker on a pale rat is otherwise invisible.
-        cv2.circle(img, c, radius + 1, (20, 20, 20), -1, cv2.LINE_AA)
-        cv2.circle(img, c, radius, colour, -1, cv2.LINE_AA)
-    if ok.any():
+        if marker == 'cross':
+            d = radius
+            cv2.line(img, (c[0] - d, c[1] - d), (c[0] + d, c[1] + d), colour, lw, cv2.LINE_AA)
+            cv2.line(img, (c[0] - d, c[1] + d), (c[0] + d, c[1] - d), colour, lw, cv2.LINE_AA)
+        else:
+            # Dark halo under the coloured dot -- a marker on a pale rat is otherwise invisible.
+            cv2.circle(img, c, radius + 1, (20, 20, 20), -1, cv2.LINE_AA)
+            cv2.circle(img, c, radius, colour, -1, cv2.LINE_AA)
+    if label and ok.any():
         c = np.int32(p2d[ok].mean(0))
         cv2.putText(img, str(tid), (int(c[0]) + 6, int(c[1]) - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, font, colour, max(1, lw), cv2.LINE_AA)
@@ -118,19 +135,34 @@ def follow(pred, zoom, W, H, smooth=15):
 
 
 def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoom=0,
-                 boxes=None):
+                 boxes=None, frames=None, overlay=None):
     """Predicted tracks over one group's frames -> an mp4 at `out_path`.
 
-    `pred` is `run_group`'s own output: `(S,T,K,2)` in SOURCE pixels for a 2D session, or
-    `(S,T,K,3)` world points for a 3D one, which get projected into camera `cam` here. Only its
-    first `T` frames are drawn, so a `--max-frames` run renders exactly the clip it predicted.
+    `pred` is `run_group`'s own output (or a prediction session's `pred`/`pred2d`): `(S,T,K,2)` in
+    SOURCE pixels for a 2D session, or `(S,T,K,3)` world points for a 3D one, which get projected
+    into camera `cam` here. Only its first `T` frames are drawn, so a `--max-frames` run renders
+    exactly the clip it predicted.
+
+    `frames` is an optional `(T,)` array of SOURCE frame indices, aligned to `pred`'s columns --
+    the caller's own slice, e.g. `np.arange(f0, f1)` for a `--start-frame`/`--end-frame` render.
+    `None` keeps the old assumption, `np.arange(T)`, i.e. `pred`'s column `t` IS source frame `t`.
+    It is what decides which pixels are decoded, what the burned-in frame number reads, and --
+    on a MOVING rig -- which per-frame extrinsic `project` reads; passing the wrong one there
+    draws the skeleton off the animal with no other symptom (gotcha 9's class).
 
     `zoom` is the side, in SOURCE pixels, of a window that follows the prediction; 0 draws the
     whole frame. It is a view, not a crop rule -- it does not affect anything that was predicted.
 
-    `boxes` is an optional `(S,T,4)` of `[x0,y0,x1,y1]` in the same source pixels, drawn in each
-    animal's own colour, so a render answers whether the box and the keypoints describe the same
-    animal.
+    `boxes` is an optional `(S,T,4)` of `[x0,y0,x1,y1]` in the same source pixels, OR `(S,T,C,4)`
+    -- camera `cam`'s own boxes are then selected, so a caller holding `instances.pq`'s full
+    per-camera array does not have to slice it first. Drawn in each animal's own colour, so a
+    render answers whether the box and the keypoints describe the same animal.
+
+    `overlay` is an optional SECOND `(S,T,K,2)` (or `(S,T,C,K,2)`, camera-sliced the same way) set
+    of points, already in `cam`'s own pixel space -- drawn as thin, unlabelled crosses in the same
+    animal's colour. The one designed use is the 3D reprojection against the per-camera 2D head's
+    own prediction: they are different quantities and a render is the only place their
+    disagreement is legible.
 
     A 3D render is a REPROJECTION, not a measurement: a depth error along camera `cam`'s ray is
     invisible in it. Draw more than one camera before believing a 3D pose.
@@ -138,8 +170,21 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     import cv2
 
     assert pred.ndim == 4 and pred.shape[-1] in (2, 3), f'bad prediction shape {pred.shape}'
+    T = pred.shape[1]
+    # `t` indexes a COLUMN of `pred`; `src[t]` is the frame that column was predicted from. They
+    # are the same thing only when `frames` is None, i.e. the whole group is rendered.
+    src = np.asarray(frames) if frames is not None else np.arange(T)
+    assert len(src) == T, f'frames has {len(src)} entries for a {T}-frame prediction'
     if pred.shape[-1] == 3:
-        pred = project(session, pred, cam, gid)
+        pred = project(session, pred, cam, gid, src)
+    if boxes is not None:
+        boxes = np.asarray(boxes)
+        if boxes.ndim == 4:                  # (S,T,C,4) -> this camera's own boxes
+            boxes = boxes[:, :, cam]
+    if overlay is not None:
+        overlay = np.asarray(overlay)
+        if overlay.ndim == 5:                # (S,T,C,K,2) -> this camera's own overlay
+            overlay = overlay[:, :, cam]
     group = session.groups[gid]
     cam_name = session.cam_names[cam]
     W, H = (int(x) for x in session.rig.size(cam_name))
@@ -156,10 +201,6 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
     if not writer.isOpened():
         raise RuntimeError(f'cv2 could not open {out_path} for writing')
-    T = pred.shape[1]
-    # `t` indexes a COLUMN of `pred`; `src[t]` is the frame that column was predicted from. They
-    # are the same thing only when the whole group is rendered.
-    src = np.arange(T)
     try:
         for lo in range(0, T, CHUNK):
             cols = np.arange(lo, min(lo + CHUNK, T))
@@ -191,6 +232,10 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
                         continue
                     draw_instance(img, p, colour, skel_ix, a)
                     drawn += 1
+                    if overlay is not None:
+                        po = (overlay[a, t] - origin) * s
+                        if np.isfinite(po).all(-1).any():
+                            draw_instance(img, po, colour, skel_ix, a, marker='cross', label=False)
                 cv2.putText(img, f'{session.session_id} {gid} {cam_name}  frame {int(src[t])}  '
                                  f'{drawn} tracked',
                             (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
@@ -199,3 +244,113 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     finally:
         writer.release()
     return out_path
+
+
+def resolve_camera(session, token: str) -> int:
+    """A `--cams` token -> a camera INDEX. NAME first, then index.
+
+    `--cams 0` is fine on `cam0`/`cam1`; a johnson rig names its cameras `Cam2005325`, and
+    `--cams Cam2005325` must work too -- `--cam-regex` is what named them that way in the first
+    place, and a token that IS a camera name must never be silently re-read as a position.
+    """
+    names = list(session.cam_names)
+    if token in names:
+        return names.index(token)
+    try:
+        i = int(token)
+    except ValueError:
+        i = None
+    if i is not None and 0 <= i < len(names):
+        return i
+    raise SystemExit(f'--cams {token!r} is neither a camera name nor a valid index. This '
+                     f'session has {len(names)} camera(s): {names}.')
+
+
+def session_for_prediction(pred, data=None, split=None):
+    """The SOURCE session a prediction was made from: the pixels, the rig, the skeleton.
+
+    THE PREDICTION SAYS WHERE ITS OWN PIXELS ARE. `session.toml`'s `[provenance]` carries either
+    `source_videos` (a `--videos` run -- reconstructed by `adopt.session_from_prediction`, which
+    re-derives the group/camera map from the recorded file list and CHECKS itself against the
+    prediction's own `groups.pq`/`calibration.toml`, so nothing is probed and gotcha 10 is not
+    reachable here) or `source_session` (a directory run -- `sessions_for` on that path and split).
+
+    `data` is an OVERRIDE for a root that MOVED since the run, not the normal input, and it is
+    CHECKED against the prediction rather than trusted: given, it replaces the lookup above but
+    every guard below still runs, so a `--data` pointed at the wrong root still refuses.
+
+    Four refusals, all before a single frame is decoded:
+
+    - neither `source_session` nor `source_videos` and no `--data` -- this prediction predates
+      provenance or was hand-written, and there is nothing to find its pixels with.
+    - the resolved session's own id disagrees with the prediction's recorded `source_session_id`
+      -- rendering it would draw the prediction over the wrong pixels.
+    - the resolved session's `names` disagree with the prediction's own -- a reordered axis draws
+      bones between the wrong keypoints with no other symptom (gotcha 4's family).
+    - a predicted group is missing from the resolved session, or its `n_frames` disagrees -- the
+      shape of a re-converted root.
+    """
+    import tomllib
+
+    import pyarrow.parquet as pq
+
+    from . import adopt
+    from .format import sessions_for
+
+    pred = Path(pred)
+    with open(pred / 'session.toml', 'rb') as f:
+        cfg = tomllib.load(f)
+    prov = cfg.get('provenance', {})
+    src_id = prov.get('source_session_id') or ''
+
+    if data is not None:
+        _, sessions = sessions_for(Path(data), split or 'test')
+        if len(sessions) != 1:
+            raise SystemExit(
+                f'--data {data} covers {len(sessions)} session(s), and a prediction was made '
+                'from exactly one. Point --data at a single session directory, or drop it and '
+                "let the prediction's own provenance find its pixels.")
+        sess = sessions[0]
+    elif prov.get('source_videos'):
+        sess = adopt.session_from_prediction(pred)
+    elif prov.get('source_session'):
+        _, sessions = sessions_for(Path(prov['source_session']),
+                                   prov.get('source_split') or split or 'test')
+        if len(sessions) != 1:
+            raise SystemExit(
+                f'{pred}: [provenance] source_session {prov["source_session"]!r} now covers '
+                f'{len(sessions)} session(s); it named exactly one at run time. Pass --data to '
+                'point at the pixels by hand.')
+        sess = sessions[0]
+    else:
+        raise SystemExit(
+            f'{pred}: [provenance] has neither source_session nor source_videos, so this '
+            'prediction does not say where its pixels are. It predates provenance or was '
+            'hand-written; pass --data to point at them.')
+
+    if src_id and sess.session_id != src_id:
+        raise SystemExit(
+            f'{pred}: this prediction was made from session {src_id!r}, but the session found '
+            f'now is {sess.session_id!r}. Rendering it would draw the prediction over the wrong '
+            'pixels.')
+
+    names = list(cfg.get('names') or [])
+    if names and list(sess.names) != names:
+        raise SystemExit(
+            f"{pred}: the prediction's keypoint axis {names} does not match the source "
+            f"session's {list(sess.names)}. A reordered axis draws bones between the wrong "
+            'keypoints with no symptom other than being wrong.')
+
+    gt = pq.read_table(pred / 'groups.pq').to_pydict()
+    for gid, n in zip(gt['group_id'], gt['n_frames']):
+        gid = str(gid)
+        if gid not in sess.groups:
+            raise SystemExit(
+                f'{pred}: predicted group {gid!r} is not in session {sess.session_id!r} '
+                f'({sorted(sess.groups)[:5]}...).')
+        if sess.groups[gid].n_frames != int(n):
+            raise SystemExit(
+                f'{pred}: group {gid!r} was predicted at {int(n)} frames, but the session found '
+                f'now has {sess.groups[gid].n_frames}. This looks like a re-converted root.')
+
+    return sess

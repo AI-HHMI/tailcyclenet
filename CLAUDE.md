@@ -451,10 +451,17 @@ discard), `instances.pq` (box + `score` + `box_agree`) and a non-spec `windows.p
 no `groups/`** -- so `validate_session` reports one rule-7 error per (group, camera) and nothing
 else.
 
-**NOTHING SHIPPED READS `[provenance] source_session`, and this file used to claim `render.py`
-does.** It does not: `render.py` takes its own `--data` and reads a prediction **npz**, and has
-never been updated for the prediction-session format. `predictions.py` reads only
-`source_session_id`. The `source_*` keys are what a future render path would read.
+**`scripts/render.py` READS `[provenance]` TO FIND ITS OWN PIXELS, AND TAKES A PREDICTION SESSION
+DIRECTORY, NOT AN NPZ.** `tailcyclenet.render.session_for_prediction` opens `source_session` (a
+directory run) or the `source_videos`/`source_calibration`/`source_cam_regex` triple (a `--videos`
+run, via `adopt.session_from_prediction`, which checks itself against `groups.pq` and
+`calibration.toml`) -- so `scripts/render.py --pred pred/ --out clips/` needs no `--data` at all.
+`--data` is an OVERRIDE for a root that MOVED since the run, checked against the recorded
+`source_session_id` rather than trusted. **An npz is refused by name**: it carries none of this
+provenance, so drawing one is always a render against a hand-restated root -- exactly the failure
+this closed. `scripts/eval.py` keeps its own npz reader; scoring an archived number and drawing
+one are different requirements, and only the first still needs one. See
+`dev/plans/render_a_prediction_session.md`.
 
 ### `--videos`: raw footage plus an anipose calibration
 
@@ -1146,5 +1153,3 @@ Open work is sized and prioritised in `dev/plans/owed.md`. The headline items:
   per-eviction price** (steady state 1.04 s). The reader-cache penalty measured on SHORT
   containers is 2.4x; the fix is a `--max-ram` large enough to hold the rig, **but never below
   ~12, which is an OOM kill with an empty log rather than a refusal**.
-- **`render.py` on a video-sourced prediction.** Two pre-existing gaps: it still reads an npz
-  rather than a prediction session, and it is not wired to `adopt.session_from_prediction`.

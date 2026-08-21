@@ -529,16 +529,19 @@ class _ReaderCache:
 
 
 def _open_reader(path: str):
-    """One `VideoReader` per file per process. Opening the container and building its frame index
-    is not per-window work, but `read_frames` is called once per window per camera -- so a
-    windowed pass over 3dpop's test videos paid it hundreds of times.
+    """One reader per file per process. Opening the container and building its frame index is not
+    per-window work, but `read_frames` is called once per window per camera -- so a windowed pass
+    over 3dpop's test videos paid it hundreds of times.
 
-    `num_threads=1` because decord's default (0 = one decode context per core) costs 0.60 GB of
-    RSS per open reader on a 128-core host against 0.24 GB at one thread. Single-threaded decode
-    is 4.5 -> 7.3 ms/frame, which the loader never notices."""
-    from decord import VideoReader
+    **THE BACKEND IS `tailcyclenet/video.py`'s, NOT decord's, AND THAT IS A MEMORY FIX.** decord
+    loads the whole container into memory (dmlc/decord#80), which is survivable on a 600-frame
+    clip and fatal on a 21 GB recording -- a 16-camera `--videos` run peaked at 456 GB under
+    `--max-ram 24`. PyAV is bit-identical on every video root here, so nothing downstream moves;
+    see `video.py` for the parity table and `TAILCYCLENET_VIDEO_BACKEND=decord` to bisect.
+    """
+    from . import video
 
-    return VideoReader(path, num_threads=1)
+    return video.open_reader(path)
 
 
 def _reader(path: str, group, cam: str):
@@ -617,7 +620,7 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     want = [int(i) for i in frames]
     uniq = list(dict.fromkeys(want))
     with _read_lock_for(key):
-        dec = _reader(key, group, cam).get_batch(uniq).asnumpy()          # decord gives RGB
+        dec = _reader(key, group, cam).get_batch(uniq)                    # RGB, either backend
     at = {i: dec[n] for n, i in enumerate(uniq)}
     src_wh = (dec.shape[2], dec.shape[1])
     # A (T,4) `crop_coords` -- or a list of rotations -- is a MOVING crop: one affine per frame

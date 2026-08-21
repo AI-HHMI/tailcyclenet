@@ -89,6 +89,7 @@ pytest-timeout = "*"
 # noarch and pure python, like xdist and timeout above, so it cannot collide with the exact pins
 # the note below is about.
 ruff = "*"
+av = ">=18.0.0,<19"
 # NOT listed here, deliberately: toml, opencv, pillow, wandb, schedulefree, decord. This repo
 # imports all six directly, so declaring them looks right -- but posetail pins them EXACTLY
 # (`wandb==0.19.5`, `opencv-python==4.9.0.80`, `toml==0.10.2`) and posetail itself is pinned, so

@@ -373,30 +373,34 @@ def dataset_name(registry, explicit=None) -> str:
 def _probe(path: Path) -> tuple[int, tuple[int, int], float]:
     """(n_frames, (w, h), fps) for one video. OPENS ONE READER AND DROPS IT.
 
-    **THE FRAME COUNT COMES FROM DECORD, NOT FROM FFPROBE OR `cv2.CAP_PROP_FRAME_COUNT`.**
-    `Group.n_frames` is a promise that every index in `[0, T)` decodes, and `dataset._read_video`
-    fulfils it through `decord.VideoReader.get_batch`. A container-metadata count that disagrees
-    with decord's own index -- routine on a variable-frame-rate or truncated file -- turns into a
-    hard failure deep inside the window loop, after the checkpoint has loaded. Taking the count
-    from the same reader the loader uses makes it consistent by construction.
-    `scripts/convert_calms21.py` already does exactly this.
+    **THE FRAME COUNT COMES FROM THE SAME READER THE LOADER USES, NOT FROM FFPROBE OR
+    `cv2.CAP_PROP_FRAME_COUNT`.** `Group.n_frames` is a promise that every index in `[0, T)`
+    decodes, and `dataset._read_video` fulfils it through `video.open_reader`. A
+    container-metadata count that disagrees with the decoder's own index -- routine on a
+    variable-frame-rate or truncated file -- turns into a hard failure deep inside the window
+    loop, after the checkpoint has loaded. Going through the same backend makes it consistent by
+    construction, and it is why this reads `video.open_reader` rather than opening a container
+    itself. `scripts/convert_calms21.py` already takes its counts from the decoder for the same
+    reason.
 
-    **AND IT DOES NOT GO THROUGH `dataset._reader`.** That cache is process-wide, sized on FIRST
-    USE from whatever rig asked first, and the cost of `n` open readers is quadratic in `n`. A
-    probe that populated it would fix its size before the run's own RAM budget is resolved and
-    hold 16 containers open for the sake of 32 integers. Open, read three facts, drop; reopening
-    is 41.5 ms, and the open also WARMS THE PAGE CACHE the run then reads through.
+    **AND IT DOES NOT GO THROUGH `dataset._reader`.** That cache is process-wide and sized on
+    FIRST USE from whatever rig asked first, so a probe that populated it would fix its size
+    before the run's own RAM budget is resolved, and hold 16 containers open for the sake of 32
+    integers. Open, read three facts, drop -- measured at 1.06 GB FLAT across all 16 of johnson's
+    containers, so the probe is not where the memory goes. The open also WARMS THE PAGE CACHE the
+    run then reads through.
     """
-    from decord import VideoReader
+    from . import video
 
-    vr = VideoReader(str(path), num_threads=1)
+    vr = video.open_reader(str(path))
     try:
         n = len(vr)
-        shape = vr[0].shape
-        fps = float(vr.get_avg_fps())
+        h, w = vr.frame_shape()[:2]
+        fps = float(vr.fps)
     finally:
+        vr.close()
         del vr
-    return int(n), (int(shape[1]), int(shape[0])), fps
+    return int(n), (int(w), int(h)), fps
 
 
 def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0,

@@ -48,6 +48,10 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
         'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
         'max_animals': int(args.max_animals),
         'max_frames': int(args.max_frames),
+        # THE FRAME RANGE CHANGES THE DETECTIONS -- which frames, and the aligned lead-in -- so
+        # two runs differing in it must not be indistinguishable from their output.
+        'frame_start': int(args.frame_start),
+        'frame_stop': int(args.frame_stop),
         'tile_scale': float(det_tile) if det_tile else 0.0,
         'reduce': bool(det_red),
         # `det_box_source`, NOT `box_source`. They are two different facts and the names collided:
@@ -61,6 +65,36 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
 
 
 _DET_BATCH = 16
+
+
+def check_frame_range(args) -> None:
+    """Refusals 15-17 on `--start-frame` / `--end-frame`. PURE ARGUMENT ARITHMETIC, so it fires
+    above both input branches and before the checkpoint loads.
+
+    Resolves the ONE quantity the loop reads -- `args.frame_start` / `args.frame_stop`, with
+    `--max-frames N` folding into `frame_stop = N`. Refusal 18 (a group shorter than the start)
+    needs the group lengths and lives in the group loop.
+    """
+    if args.max_frames and (args.start_frame or args.end_frame):                     # 15
+        raise SystemExit(
+            f'--max-frames {args.max_frames} together with --start-frame {args.start_frame} / '
+            f'--end-frame {args.end_frame} has two readings of equal force -- "N frames from the '
+            'start" and "up to frame N, from the start" -- and no defensible precedence, so a '
+            'rule here would make one of them silently wrong. --max-frames N IS --start-frame 0 '
+            '--end-frame N; pick one spelling.')
+    if args.start_frame < 0 or args.end_frame < 0:                                   # 16
+        raise SystemExit(
+            f'--start-frame {args.start_frame} / --end-frame {args.end_frame}: negative frame '
+            'indices are not Python negative indexing here. "-1 means the last frame" and "-1 '
+            'means one before the end" are both obvious and differ by one, which is the class of '
+            'ambiguity that costs a day.')
+    if args.end_frame and args.end_frame <= args.start_frame:                        # 17
+        raise SystemExit(
+            f'--end-frame {args.end_frame} is not past --start-frame {args.start_frame}. The '
+            'range is half-open [start, end), so this predicts nothing; an empty range is a typo, '
+            'not a protocol.')
+    args.frame_start = int(args.start_frame)
+    args.frame_stop = int(args.end_frame or args.max_frames or 0)
 
 
 def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
@@ -83,11 +117,30 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
     """
     from tailcyclenet.detector import associate_group, detect_raw
 
-    T = min(sess.groups[gid].n_frames, args.max_frames or sess.groups[gid].n_frames)
+    T = min(sess.groups[gid].n_frames, args.frame_stop or sess.groups[gid].n_frames)
     # ONE association state for the whole group. Without it the tracker and `link_rows` would
     # restart every `_DET_BATCH` frames -- an identity break every 16 frames, which is far worse
     # than the block-boundary break `state=` was added for.
-    assoc_state, buf, cursor = {}, {}, 0
+    #
+    # **THE CURSOR STARTS ON A GLOBAL `_DET_BATCH` BOUNDARY AT OR BELOW `frame_start`, AND THE
+    # LEAD-IN IS DISCARDED.** `detect_raw` ASSERTS that a slice starts on a multiple of `batch`,
+    # because `_units` partitions on `range(0, T, batch)` and a short leading batch is an input
+    # SHAPE the whole-clip pass never produces -- cuDNN picks convolution algorithms per shape,
+    # worth 0.204 px of box and 1.7e-03 of objectness. So the boxes stay BYTE-IDENTICAL to the
+    # whole-clip run's. Do NOT relax that assert, and do NOT round `--start-frame` to a multiple
+    # of 16: the batch is an internal that no CLI value may be quantised by.
+    #
+    # It costs at most `batch - 1` extra frame-cameras of decode and detection, ONCE PER GROUP and
+    # not once per block -- the cursor is created with this closure and persists across every
+    # block, so the price does not scale with the clip.
+    #
+    # LEAVING IT AT 0 IS NOT MERELY WASTEFUL, IT IS A MEMORY FAILURE: the loop below reads through
+    # `store.read`, so a cursor at 0 would decode every frame from 0 to `frame_start` into the
+    # frame store -- and the store is sized from the WORK, about two windows, so a 300-frame
+    # prefix is the block sizing being wrong by two orders of magnitude on every group's first
+    # block.
+    assoc_state, buf = {}, {}
+    cursor = args.frame_start - args.frame_start % _DET_BATCH
 
     def boxes_for(store, lo, hi):
         nonlocal cursor
@@ -112,6 +165,9 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
         want = range(lo, min(hi, T))
         out = tuple(np.stack([buf[t][i] for t in want], 1) if buf[lo][i] is not None else None
                     for i in range(3))
+        # The aligned lead-in below `frame_start` was detected (it had to be, to keep the batch
+        # partition), associated (so the tracker enters the range warm rather than cold), and is
+        # written to nothing: it falls out here with every other frame below `lo`.
         # Frames below `lo` can never be asked for again -- blocks advance monotonically, exactly
         # as the frame store's own eviction argument goes.
         for t in [t for t in buf if t < lo]:
@@ -174,6 +230,10 @@ def run_dataset(args):
                              '(about two patches). Below ~2 patches the forward returns all-NaN '
                              'with no exception. The measured floor is 96; 64 is already worse '
                              'than not refining at all.')
+
+    # THE FRAME RANGE IS NOT AN INPUT-FORMAT LEVER, so it is checked above the input branch:
+    # refusals 15-17 are pure argument arithmetic and must fire before the checkpoint loads.
+    check_frame_range(args)
 
     # ONE SESSION PER RUN, AND IT IS A PURE-ARGUMENT CHECK -- so it belongs up here with the
     # others, above the checkpoint load. `sessions_for` reads toml and opens no pixels, so this
@@ -258,6 +318,7 @@ def run_dataset(args):
         min_crop_dim=int(config['data'].get('min_crop_dim', LoaderConfig.min_crop_dim)),
         box_source=config['data'].get('box_source', LoaderConfig.box_source),
         anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
+        frame_start=args.frame_start, frame_stop=args.frame_stop,
         kpt_chunk=args.kpt_chunk,
         vis_thresh=args.vis_thresh, refine=refine, refine_px=refine_px,
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
@@ -345,6 +406,20 @@ def run_dataset(args):
     # ONE SESSION PER RUN. Checked before the loop, and above the checkpoint load -- see the
     # `sessions_for` call, which reads toml and opens no pixels.
     gids = [g for g in sess.groups if not want or g in want]
+    # REFUSAL 18: a group shorter than `--start-frame` is SKIPPED BY NAME, not refused -- a ragged
+    # root with one short group must still be runnable. But a run that predicts NOTHING is a
+    # mistyped range, and writing an empty session and exiting 0 is the worst of both.
+    if cfg.frame_start:
+        short = [g for g in gids if sess.groups[g].n_frames <= cfg.frame_start]
+        for g in short:
+            print(f'{sess.session_id}/{g}: {sess.groups[g].n_frames} frames, which is at or below '
+                  f'--start-frame {cfg.frame_start}; skipped.')
+        gids = [g for g in gids if g not in set(short)]
+        if not gids:
+            raise SystemExit(
+                f'--start-frame {cfg.frame_start} is past the end of every group '
+                f'({ {g: sess.groups[g].n_frames for g in short} }), so this run would predict '
+                'nothing. An empty session written with exit 0 is worse than a refusal.')
     writer = SessionWriter(args.out, sess, registry,
                            # A LIST OF PAIRS, not a dict: `SessionWriter` raises on a duplicate
                            # key, where a dict would silently keep the last one.
@@ -362,6 +437,7 @@ def run_dataset(args):
                             'checkpoint_name': ckpt.name,
                             'anchor': cfg.anchor, 'carry_source': cfg.carry_source,
                             'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
+                            'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
                             'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
                             'crop_source': cfg.crop_source,
                             'boxes': (str(args.detector) if args.detector else
@@ -411,16 +487,25 @@ def run_dataset(args):
                     f'{sorted(k for k in boxes if not k.startswith("__"))[:5]} ...')
             # STREAMED: each block is written as it finishes, so nothing here is proportional
             # to the length of the clip.
-            f0 = w0 = 0
-            n_fin = n_pt = 0
+            # `f0` IS A SOURCE FRAME INDEX, so it opens at `frame_start` rather than at 0 --
+            # `write_block` then records source indices with no signature change. It is also
+            # redundant by construction (`f0 == blk['window_start'][0]`), which is asserted rather
+            # than trusted: a mis-set accumulator is exactly how a ranged prediction would come
+            # back scattered against the wrong frames.
+            f0, w0 = cfg.frame_start, 0
+            n_frames = n_fin = n_pt = 0
             for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
                                   box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want):
+                assert f0 == int(blk['window_start'][0]), (f0, int(blk['window_start'][0]))
                 writer.write_block(gid, blk, f0, w0)
                 f0 += blk['pred'].shape[1]
                 w0 += blk['outcome'].shape[1]
+                n_frames += blk['pred'].shape[1]
                 n_fin += int(np.isfinite(blk['pred']).all(-1).sum())
                 n_pt += int(np.isfinite(blk['pred']).all(-1).size)
-            print(f'{key}: {f0} frames, {n_fin / max(n_pt, 1):.3f} finite')
+            span = ('' if not (cfg.frame_start or cfg.frame_stop)
+                    else f' [{cfg.frame_start}, {f0})')
+            print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
             if det is not None:
                 # REPORTED AFTER THE RUN, because detection now happens block by block INSIDE it.
                 # The fire rate is what a rate-matched random control has to be matched TO and

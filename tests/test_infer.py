@@ -1190,3 +1190,224 @@ def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path
     SessionWriter(tmp_path / 'ok', sess, reg,
                   [('box_source', 'keypoints'), ('box_source', 'keypoints')],
                   list(sess.groups)).close()
+
+
+# --start-frame / --end-frame (dev/plans/infer_from_videos_and_calibration.md §7).
+#
+# INPUT-INDEPENDENT ON PURPOSE: the frame range is a window-loop lever, not an input-format one,
+# so every one of these runs on the existing session fixtures and needs no video at all.
+
+def _range_scene(tmp_path, T=16):
+    """A 2D session long enough for several windows -- `_window_starts(16, 4, 2)` is 7 starts."""
+    import conftest as cf
+
+    cf._session_2d(tmp_path / 'rat' / 'test' / 's', T=T)
+    ds = load_dataset(tmp_path / 'rat')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+    return model, sess, registry, ds.name
+
+
+def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
+    """§7'S CENTRAL CLAIM, STATED EXACTLY -- and the exactness is the finding.
+
+    With `--anchor none` the prediction is a pure function of the frames in its window, so a range
+    equals the whole-clip slice WHEREVER THE TWO RUNS PUT THE SAME WINDOW OVER THE SAME FRAMES.
+    Anything that breaks that -- a mis-set `f0`, a window-start arithmetic error, a frame array
+    clamped to the wrong floor -- fails here. Identity state (`--track`, `--link-boxes`) and the
+    carried prior are what a range genuinely does change, and they are off.
+
+    **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `_window_starts`
+    pulls the LAST window back to end exactly on the last frame rather than padding, so a range
+    ending at `b` has a final window `[b - T, b)` -- which is not a whole-clip window unless `b`
+    is the clip end. A frame belongs to the last window containing it (eval rule 11), so the few
+    frames after the range's final start were predicted from a DIFFERENT window than the
+    whole-clip run gave them. Same family as eval rule 11: a range moves one of the loop's own
+    boundaries.
+
+    So: an `--end-frame` at the clip end is byte-identical outright, and a mid-clip one is
+    byte-identical up to its own final window start.
+    """
+    model, sess, registry, name = _range_scene(tmp_path)
+    whole = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
+
+    # (1) TO THE CLIP END: the lattice is identical, so this is byte-identity outright.
+    a = 6
+    tail = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='none', frame_start=a))
+    assert list(tail['window_start']) == [w for w in whole['window_start'] if w >= a]
+    np.testing.assert_array_equal(np.nan_to_num(tail['pred'], nan=-9e9),
+                                  np.nan_to_num(whole['pred'][:, a:], nan=-9e9))
+
+    # (2) MID-CLIP: identical up to the range's own final window start, and the frames past it
+    # come from the pulled-back last window instead -- which is the documented difference.
+    b = 14
+    part = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='none', frame_start=a, frame_stop=b))
+    assert part['pred'].shape[1] == b - a
+    assert part['n_frames'] == b - a and part['frame_start'] == a and part['frame_stop'] == b
+    assert int(part['window_start'][0]) == a
+    assert int(part['window_start'][-1]) == b - 4, 'the last window must end exactly at --end-frame'
+    last = int(part['window_start'][-1])
+    np.testing.assert_array_equal(
+        np.nan_to_num(part['pred'][:, :last - a], nan=-9e9),
+        np.nan_to_num(whole['pred'][:, a:last], nan=-9e9))
+
+
+def test_max_frames_is_the_zero_start_case(tmp_path):
+    """`--max-frames N` IS `--start-frame 0 --end-frame N`, internally one quantity."""
+    model, sess, registry, name = _range_scene(tmp_path)
+    a = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=9))
+    b = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', frame_stop=9))
+    np.testing.assert_array_equal(np.nan_to_num(a['pred'], nan=-9e9),
+                                  np.nan_to_num(b['pred'], nan=-9e9))
+    assert a['frame_start'] == 0 and a['frame_stop'] == 9
+
+
+def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
+    """`frame` IS ALWAYS THE SOURCE INDEX, and groups.pq keeps the group's FULL length.
+
+    Rebasing to 0 would score frames [start, end) against labels [0, end-start): the
+    `chunk_frames` failure exactly, which read as a pipeline degrading over a clip rather than as
+    an indexing bug. Absence outside the range is the spec's own sparsity rule, so
+    `load_predictions` hands eval.py a full-length array that is NaN outside it and `--chunk` /
+    `--vs` need no change.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.infer.predictions import load_predictions
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's', T=16)
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out = tmp_path / 'pred'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                      '--device', 'cpu', '--overlap', '2',
+                                      '--start-frame', '6', '--end-frame', '14',
+                                      '--out', str(out)])
+    cli.main()
+
+    import pyarrow.parquet as pq
+    gt = pq.read_table(out / 'groups.pq').to_pydict()
+    assert int(gt['n_frames'][0]) == 16, 'groups.pq must keep the FULL group length'
+    kp = pq.read_table(out / 'keypoints.pq')
+    fr = np.asarray(kp.column('frame').to_pylist())
+    assert fr.min() >= 6 and fr.max() < 14, f'frames outside the range: {fr.min()}..{fr.max()}'
+
+    preds, _ = load_predictions(out)
+    p = preds['s/g000']['pred']
+    assert p.shape[1] == 16, 'a ranged prediction must densify to the FULL group length'
+    assert np.isfinite(p[:, 6:14]).any()
+    assert not np.isfinite(p[:, :6]).any() and not np.isfinite(p[:, 14:]).any()
+
+
+def test_the_detection_slice_stays_batch_aligned(tmp_path):
+    """`detect_raw` ASSERTS a slice starts on a multiple of `batch`, and 6 is not.
+
+    A short leading batch is an input SHAPE the whole-clip pass never produces and cuDNN picks
+    convolution algorithms per shape, so the cursor starts BELOW `--start-frame` on an aligned
+    boundary and the lead-in is detected and then written to nothing. Do NOT relax the assert, and
+    do NOT round the user's `--start-frame`: the batch is an internal that no CLI value may be
+    quantised by.
+    """
+    import argparse
+
+    from tailcyclenet.infer import driver
+
+    model, sess, registry, name = _range_scene(tmp_path, T=64)
+    seen = []
+
+    def fake_detect_raw(det, wh, session, gid, top_k, **kw):
+        fr = np.asarray(kw['frames'])
+        seen.append((int(fr[0]), int(fr[-1])))
+        C, D = len(session.rig), max(1, top_k)
+        return (np.full((D, len(fr), C, 4), np.nan, np.float32),
+                np.full((D, len(fr), C), np.nan, np.float32), None)
+
+    def fake_associate(raw, session, gid, n, **kw):
+        b, s, _ = raw
+        return b[:n], s[:n], None
+
+    import tailcyclenet.detector as detmod
+    old = (detmod.detect_raw, detmod.associate_group)
+    detmod.detect_raw, detmod.associate_group = fake_detect_raw, fake_associate
+    try:
+        args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
+                                  max_move=1.0, pose_nms=None, max_frames=0,
+                                  frame_start=37, frame_stop=64)
+        boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
+                                           None, 2, 2)
+
+        class _Store:
+            def read(self, ci, cam, fr, pool=None, reduce=1):
+                return [None] * len(fr)
+        boxes_for(_Store(), 37, 53)
+    finally:
+        detmod.detect_raw, detmod.associate_group = old
+
+    assert seen, 'no detection ran'
+    assert seen[0][0] == 32, f'the cursor must open on a multiple of 16, got {seen[0][0]}'
+    for lo, _ in seen:
+        assert lo % driver._DET_BATCH == 0, f'misaligned detection slice at {lo}'
+
+
+@pytest.mark.parametrize('argv,expect', [
+    (['--max-frames', '120', '--start-frame', '300'], 'two readings of equal force'),
+    (['--max-frames', '120', '--end-frame', '300'], 'two readings of equal force'),
+    (['--start-frame', '-1'], 'negative frame indices'),
+    (['--end-frame', '-4'], 'negative frame indices'),
+    (['--start-frame', '300', '--end-frame', '300'], 'not past --start-frame'),
+    (['--start-frame', '300', '--end-frame', '20'], 'not past --start-frame'),
+])
+def test_the_frame_range_refusals_fire_before_anything_loads(cli, monkeypatch, argv, expect):
+    """Refusals 15-17: pure argument arithmetic, above both input branches and above `load_run`."""
+    def boom(*a, **k):
+        raise AssertionError('the refusal must fire before the checkpoint loads')
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    repo = Path(__file__).resolve().parent.parent
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
+                                      '--data', str(repo), '--out', '/tmp/unused'] + argv)
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert expect in str(e.value), f'wanted {expect!r}, got: {e.value}'
+
+
+def test_a_short_group_is_skipped_by_name_and_an_empty_run_is_refused(cli, monkeypatch, tmp_path):
+    """Refusal 18, both halves.
+
+    A ragged root with one short group must still be runnable, so a group at or below
+    `--start-frame` is skipped BY NAME. But a run that predicts nothing at all is a mistyped
+    range, and writing an empty session and exiting 0 is the worst of both.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's', T=8)
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                      '--device', 'cpu', '--overlap', '2',
+                                      '--start-frame', '99', '--out', str(tmp_path / 'p')])
+    with pytest.raises(SystemExit, match='past the end of every group'):
+        cli.main()

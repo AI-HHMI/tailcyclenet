@@ -1925,7 +1925,7 @@ def test_provenance_records_every_box_affecting_option():
     from tailcyclenet.infer.driver import _box_provenance
 
     args = argparse.Namespace(detector=None, det_input_wh=None, det_score=0.5, det_top_k=0,
-                              max_animals=0, max_frames=0)
+                              max_animals=0, max_frames=0, frame_start=0, frame_stop=0)
     prov = _box_provenance(args, None, False, None)
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
@@ -1946,7 +1946,8 @@ def test_provenance_records_every_box_affecting_option():
     # was added. Nothing here has that pressure, and conditional membership is what made the stamp
     # need five exceptions to its own rule.
     args2 = argparse.Namespace(detector='d.pt', det_input_wh=(416, 416), det_score=0.97,
-                               det_top_k=24, max_animals=2, max_frames=120)
+                               det_top_k=24, max_animals=2, max_frames=120,
+                               frame_start=300, frame_stop=500)
     assert set(_box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
 

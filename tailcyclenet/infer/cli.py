@@ -162,7 +162,41 @@ def build_parser() -> argparse.ArgumentParser:
                          '--min-match-kpts (eval rule 9).')
     ap.add_argument('--max-frames', type=int, default=0,
                     help='predict only the first N frames of each group. A PREFIX, not a sample: '
-                         '`carry` needs the frames contiguous.')
+                         '`carry` needs the frames contiguous. Exactly --start-frame 0 '
+                         '--end-frame N, and it stays because every recorded protocol number is a '
+                         '--max-frames 120 invocation. REFUSED together with either of them '
+                         'rather than ordered: "120 frames from 300" and "up to frame 120, from '
+                         '300" read with equal force, and a precedence rule would make one of '
+                         'them silently wrong.')
+    # THE FRAME RANGE SERVES BOTH INPUT PATHS, because it is a WINDOW-LOOP lever and not an
+    # input-format one: a group carries its TRUE length either way and the range bounds only what
+    # is PREDICTED. That is what lets one implementation serve a session directory and raw videos
+    # alike, and it is why these sit outside any input-specific group.
+    ap.add_argument('--start-frame', type=int, default=0,
+                    help='first SOURCE frame to predict, per group. Half-open [start, end) -- '
+                         "range's convention, --chunk's convention, and every slice in this repo. "
+                         'THE `frame` COLUMN IN THE OUTPUT IS ALWAYS THE SOURCE INDEX, and '
+                         'groups.pq keeps the group\'s FULL n_frames, so `load_predictions` hands '
+                         'back a full-length array that is NaN outside the range and eval.py / '
+                         '--chunk / --vs need no change. Re-basing to 0 would score frames '
+                         '[start, end) against labels [0, end-start) -- the `chunk_frames` '
+                         'failure exactly (coverage 0.4656 against 0.9891), which survived '
+                         'because it looks like a pipeline degrading over a clip. '
+                         'A RANGED RUN IS NOT A SLICE OF THE WHOLE-CLIP ANSWER: the detector '
+                         'boxes are byte-identical and the per-frame accuracy columns are '
+                         'comparable, but --track and --link-boxes carry state across frames and '
+                         '--anchor carry has no prior at `start`, so the IDENTITY columns are '
+                         'comparable only between two runs that START at the same frame.')
+    ap.add_argument('--end-frame', type=int, default=0,
+                    help='one past the last SOURCE frame to predict, per group. 0 = to the end. '
+                         'Past the end CLAMPS, exactly as --max-frames does. A group shorter than '
+                         '--start-frame is SKIPPED BY NAME rather than refused, because a ragged '
+                         'root with one short group must still be runnable -- but if EVERY group '
+                         'is skipped the run IS refused: writing an empty session and exiting 0 '
+                         'is the worst of both. '
+                         'NOT A RESUME. It bounds which frames are predicted; it does not '
+                         'reconstruct the tracker or the carried prior the whole-clip run would '
+                         'have held at that frame.')
     ap.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
                     help='DEFAULT: ON IN 3D, OFF IN 2D -- derived from the session\'s own mode, '
                          'because the two dimensions disagree and the code knows which it is in. '

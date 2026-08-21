@@ -67,6 +67,23 @@ class InferConfig:
     anchor: str = 'carry'
     max_animals: int = 0          # 0 -> every animal the box source offers
     max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
+    # THE FRAME RANGE, half-open [frame_start, frame_stop). A WINDOW-LOOP LEVER, NOT AN
+    # INPUT-FORMAT ONE, which is why one implementation serves both `--data` and `--videos`: the
+    # group carries its TRUE length either way and this bounds only what is PREDICTED.
+    #
+    # `frame` IN THE OUTPUT IS ALWAYS THE SOURCE INDEX. `groups.pq` keeps the group's full
+    # `n_frames` and rows exist only inside the range, which is the spec's own sparsity rule --
+    # so `load_predictions` densifies back to a FULL-LENGTH array that is NaN outside it and
+    # eval.py, `--chunk` and `--vs` need no change. Re-basing to 0 would score frames
+    # [start, stop) against labels [0, stop-start): the `chunk_frames` failure exactly, which
+    # survived because it looks like a pipeline degrading over a clip.
+    #
+    # ONE QUANTITY WITH `max_frames`, resolved in `run_blocks` before anything reads it:
+    # `--max-frames N` IS `--start-frame 0 --end-frame N`. The CLI refuses them together rather
+    # than ordering them, because "120 frames from 300" and "up to frame 120, from 300" read with
+    # equal force and a precedence rule would make one of them silently wrong.
+    frame_start: int = 0
+    frame_stop: int = 0           # 0 -> to the end of the group
     kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
     # None -> report every row predicted. A float withholds an (animal, frame) row whose MEDIAN
     # `vis_pred` logit across keypoints is below it. NOT PORTABLE across roots (logit medians
@@ -127,18 +144,22 @@ class InferConfig:
     prefetch_windows: int = 1
 
 
-def _window_starts(n_frames: int, T: int, overlap: int):
-    """Contiguous windows covering [0, n_frames), stepping by T - overlap.
+def _window_starts(n_frames: int, T: int, overlap: int, start: int = 0):
+    """Contiguous windows covering [start, start + n_frames), stepping by T - overlap.
 
-    The last window is pulled back to end exactly at n_frames rather than padded, so no frame is
-    predicted from duplicated pixels.
+    The last window is pulled back to end exactly at the last frame rather than padded, so no
+    frame is predicted from duplicated pixels.
+
+    `start` is the SOURCE index of the first frame to predict (`InferConfig.frame_start`), and
+    the returned starts are source indices too. At the default 0 every value here is numerically
+    what it always was, which is what makes an unset range byte-identical to the old loop.
     """
     step = max(1, T - overlap)
     if n_frames <= T:
-        return [0]
-    starts = list(range(0, n_frames - T + 1, step))
-    if starts[-1] + T < n_frames:
-        starts.append(n_frames - T)
+        return [start]
+    starts = list(range(start, start + n_frames - T + 1, step))
+    if starts[-1] + T < start + n_frames:
+        starts.append(start + n_frames - T)
     return starts
 
 
@@ -394,9 +415,23 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # A reduced pass-1 resolution is only a thing when there IS a second pass. Without `--refine`,
     # pass 1 is the only pass and its output is the answer.
     pass1_res = cfg.refine_px if (cfg.refine and cfg.refine_px) else cfg.image_size
-    # A PREFIX of the group, not a sample of it: `carry` needs the frames contiguous, and
-    # rat-city's posetail-pose protocol is frames 0-479 of its one test trial.
-    T_total = min(group.n_frames, cfg.max_frames or group.n_frames)
+    # THE FRAME RANGE, RESOLVED ONCE. A CONTIGUOUS RUN of the group, not a sample of it: `carry`
+    # needs the frames contiguous, and rat-city's posetail-pose protocol is frames 0-479 of its
+    # one test trial.
+    #
+    # `T_total` IS NOW THE SOURCE STOP INDEX RATHER THAN A COUNT, and almost every site already
+    # wanted it that way -- it is used as an upper BOUND at `_plan_blocks`'s span, `_detect`'s hi,
+    # `f_read` and `f_own`, all of which are untouched. The two places it was a COUNT are changed
+    # by hand: the block dict's `n_frames`, and the short-group clamp's floor.
+    #
+    # `max_frames` folds in HERE and nowhere else, so there is one quantity below this line.
+    frame_start = max(0, int(cfg.frame_start))
+    T_total = min(group.n_frames, int(cfg.frame_stop or cfg.max_frames or group.n_frames))
+    if frame_start >= T_total:
+        raise ValueError(
+            f'{session.session_id}/{gid}: frame range [{frame_start}, {T_total}) is empty -- the '
+            f'group has {group.n_frames} frames. The driver skips such a group by name; reaching '
+            'here means the range was set programmatically.')
     # The registry is per DATASET and the keypoint axis is per SESSION -- and `scripts/infer.py`
     # will happily hand us a bare session directory. `ids_for` aligns to the axis we actually
     # hold, by name, so a session that reorders the root's keypoints or carries a subset of them
@@ -452,7 +487,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # THE DIAGNOSTICS, per (animal, window): why it produced nothing, and what box it was given.
     # Both are what makes a coverage delta readable -- 08's crop-inflation measurement needed the
     # box, and every one of the five aborts below needed to be distinguishable from the others.
-    starts = _window_starts(T_total, cfg.n_frames, cfg.overlap)
+    starts = _window_starts(T_total - frame_start, cfg.n_frames, cfg.overlap, start=frame_start)
 
     # THE PIXEL BUDGET, AND THE ONE REFUSAL IT CAN RAISE.
     #
@@ -565,7 +600,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         """
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
-            frames = np.clip(np.arange(start, start + 2), 0, T_total - 1)
+            # The floor is `frame_start`, not 0: a two-frame clamp must not reach BELOW the range
+            # the caller asked for, or a `--start-frame` run predicts a frame it was told not to.
+            frames = np.clip(np.arange(start, start + 2), frame_start, T_total - 1)
         fl = frames - f0                      # into this block's arrays; see `run_blocks`
         wl = wi - w0
         # ONE camera group per window, carrying per-frame extrinsics where a camera moves. Built
@@ -1129,7 +1166,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    'outcome_names': np.asarray(OUTCOMES, object),
                    'mode': mode, 'group_id': gid, 'session': session.session_id,
                    'dataset': dataset_name, 'anchor': cfg.anchor,
-                   'carry_source': cfg.carry_source, 'n_frames': T_total,
+                   # A COUNT, not the stop index -- one of the two sites where `T_total` is not a
+                   # bound. `frame_start`/`frame_stop` ride along beside it because a ranged run
+                   # and a whole-clip run are otherwise indistinguishable in their own output.
+                   'carry_source': cfg.carry_source, 'n_frames': T_total - frame_start,
+                   'frame_start': frame_start, 'frame_stop': T_total,
                    # THE RESOLVED VALUE, not the tri-state the caller passed. `refine` defaults by
                    # dimensionality, so the file has to say which way it went -- otherwise a 3D run
                    # and a `--no-refine` 3D run are indistinguishable in their own provenance.

@@ -490,6 +490,45 @@ def test_decode_suppresses_duplicates():
     assert s[0] > s[1]
 
 
+def test_decode_default_iou_thresh_is_unchanged():
+    """detector_v2 A1: `iou_thresh`/`center_dist_thresh` are new PARAMETERS, and every checkpoint
+    on record must decode identically at the old call convention (no `iou_thresh` passed at all,
+    the previous signature's only option)."""
+    boxes = torch.tensor([[10., 10., 50., 50.], [11., 11., 51., 51.], [200., 200., 260., 260.]])
+    logits = torch.tensor([3.0, 2.5, 2.0])
+    b_old, s_old = decode(logits, boxes, top_k=5)
+    b_new, s_new = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
+    assert torch.equal(b_old, b_new) and torch.equal(s_old, s_new)
+
+
+def test_decode_center_dist_suppresses_near_concentric_boxes_iou_misses():
+    """detector_v2 A5: two boxes of very different size but (nearly) the same centre are a
+    near-concentric duplicate (report 42 SS3.6's own measured shape of `fp_dup`) -- IoU-only NMS at
+    0.5 must NOT collapse them (that is the bug A5 exists to fix), while `center_dist_thresh`
+    must.
+    """
+    # Same centre (30, 30); side 40 vs side 100 -> IoU = 1600/10000 = 0.16, well under 0.5.
+    boxes = torch.tensor([[10., 10., 50., 50.], [-20., -20., 80., 80.], [400., 400., 440., 440.]])
+    logits = torch.tensor([3.0, 2.5, 2.0])
+    b, s = decode(logits, boxes, top_k=5, iou_thresh=0.5)
+    assert b.shape[0] == 3, 'IoU alone must not suppress a near-concentric pair this different in size'
+
+    b2, s2 = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=0.5)
+    assert b2.shape[0] == 2, 'centre-distance NMS must collapse the near-concentric pair'
+    assert s2[0] > s2[1], 'the higher-scored box of the pair must survive'
+
+
+def test_box_center_dist_is_scale_free():
+    """Units of box side, not pixels: doubling every coordinate must not move the ratio."""
+    from tailcyclenet.detector.assign import box_center_dist
+
+    a = torch.tensor([[0., 0., 10., 10.]])
+    b = torch.tensor([[5., 0., 15., 10.]])
+    r1 = box_center_dist(a, b)[0, 0].item()
+    r2 = box_center_dist(a * 2, b * 2)[0, 0].item()
+    assert abs(r1 - r2) < 1e-5
+
+
 def test_reduce_factor_never_decodes_below_the_target():
     from tailcyclenet.detector import reduce_factor
 
@@ -1057,6 +1096,55 @@ def test_pose_nms_drops_the_lower_scored_duplicate():
     assert dropped == 1 and stats == {'nms_pairs': 1, 'nms_dropped': 1}
     assert not np.isfinite(boxes[1, 0, 0]).all(), 'the LOWER-scored row must be the one dropped'
     assert np.isfinite(boxes[0, 0, 0]).all()
+
+
+def test_pose_nms_is_3d_aware_not_camera_0_only():
+    """detector_v2 C1: `identity.py:93-94` used to read `k[i, t, 0]` / `b[j, t, 0]` -- CAMERA 0
+    ONLY -- for both liveness and the containment overlap, while the loser deletion already spans
+    every camera. Construct a 2-camera duplicate pair that is invisible in camera 0 (row 1 has NO
+    box there at all) and only overlaps in camera 1: the camera-0-only version can neither see row
+    1 is alive nor compute an overlap, so it must have dropped nothing; the fixed version must
+    aggregate over camera 1 and drop the duplicate.
+    """
+    from tailcyclenet.detector.identity import pose_nms
+
+    C = 2
+    boxes = np.full((2, 1, C, 4), np.nan, np.float32)
+    # Row 0: alive in BOTH cameras. Row 1: alive ONLY in camera 1 -- invisible under the old
+    # camera-0-only liveness check (`np.isfinite(b[i, t, 0]).all()`).
+    boxes[0, 0, 0] = [0.0, 0.0, 100.0, 100.0]
+    boxes[0, 0, 1] = [0.0, 0.0, 100.0, 100.0]
+    boxes[1, 0, 1] = [5.0, 5.0, 105.0, 105.0]            # near-identical box, camera 1 only
+
+    kpts = np.zeros((2, 1, C, 3, 3), np.float32)
+    kpts[0, 0, 0] = [[10, 10, 1], [50, 50, 1], [90, 90, 1]]
+    kpts[0, 0, 1] = [[10, 10, 1], [50, 50, 1], [90, 90, 1]]
+    kpts[1, 0, 1] = [[12, 12, 1], [52, 52, 1], [92, 92, 1]]      # inside row 0's camera-1 box too
+    scores = np.array([[[0.9, 0.9]], [[np.nan, 0.5]]], np.float32)
+
+    dropped = pose_nms(boxes, kpts, scores=scores, thresh=0.8)
+    assert dropped == 1, 'aggregating over camera 1 must find and drop the duplicate'
+    assert not np.isfinite(boxes[1, 0]).any(), \
+        'the dropped row must go NaN in EVERY camera, not just the one the overlap was seen in'
+    assert np.isfinite(boxes[0, 0]).all()
+
+
+def test_pose_nms_c1_matches_camera_0_only_when_c_equals_1():
+    """The 3D-aware aggregation must be a no-op on 2D single-view (C=1) -- byte-identical to the
+    pre-fix behaviour, which is what every 2D checkpoint on record was measured under.
+    """
+    from tailcyclenet.detector.identity import pose_nms
+
+    boxes = np.zeros((2, 1, 1, 4), np.float32)
+    boxes[0, 0, 0] = [0.0, 0.0, 100.0, 100.0]
+    boxes[1, 0, 0] = [5.0, 5.0, 105.0, 105.0]
+    kpts = np.zeros((2, 1, 1, 3, 3), np.float32)
+    kpts[0, 0, 0] = [[10, 10, 1], [50, 50, 1], [90, 90, 1]]
+    kpts[1, 0, 0] = [[12, 12, 1], [52, 52, 1], [92, 92, 1]]
+    scores = np.array([[[0.9]], [[0.5]]], np.float32)
+    stats = {}
+    dropped = pose_nms(boxes, kpts, scores=scores, thresh=0.8, stats=stats)
+    assert dropped == 1 and stats == {'nms_pairs': 1, 'nms_dropped': 1}
 
 
 def test_pose_nms_is_a_correct_noop_with_no_keypoints():
@@ -1899,6 +1987,81 @@ iou_aware_warmup = 0
     assert recorded['training']['iou_aware_warmup'] == 0
 
 
+def test_support_count_counts_independently_corroborating_cameras():
+    """detector_v2 E1a/E3: `_support_count` must count OTHER cameras with an unused detection
+    near a candidate's reprojection, exclude the seeding pair itself, and exclude a detection
+    already claimed (`used`) -- the three properties the re-ranking fix relies on.
+    """
+    from aniposelib.cameras import Camera, CameraGroup
+
+    from tailcyclenet.detector.associate import _support_count
+    from tailcyclenet.detector.track import _project
+    from tailcyclenet.format import Rig
+
+    cams = []
+    for i, ang in enumerate((-0.5, 0.0, 0.5)):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
+                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+             moving=dict.fromkeys(names, False),
+             calibrated=dict.fromkeys(names, True)).posetail()
+
+    p3d = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+    proj = [_project(cam, p3d.reshape(1, 3).numpy()) for cam in cg]     # (1,2) per camera
+
+    # Every camera has a detection exactly at the true reprojection.
+    centres_all = [p.clone() for p in proj]
+    assert _support_count(cg, (0, 1), centres_all, set(), p3d, max_res_px=5.0) == 1, \
+        'excluding the seeding pair (0, 1), only camera 2 remains and it corroborates'
+
+    # Camera 2's detection moved far away: no corroboration left.
+    centres_far = [proj[0].clone(), proj[1].clone(), proj[2] + 1000.0]
+    assert _support_count(cg, (0, 1), centres_far, set(), p3d, max_res_px=5.0) == 0
+
+    # Camera 2's detection is still at the true point, but already `used` by an earlier group --
+    # an already-claimed detection must not corroborate a second candidate.
+    assert _support_count(cg, (0, 1), centres_all, {(2, 0)}, p3d, max_res_px=5.0) == 0
+
+
+def test_associate_corroborate_flag_is_a_noop_on_the_unambiguous_case():
+    """`corroborate=False` restores the pre-E1a residual-only ordering; on a scene with no
+    genuine ambiguity (one real animal, or a real pair plus one leftover box no pair can explain)
+    there is nothing for support-counting to change the ranking OF, so the two arms must agree.
+    """
+    from aniposelib.cameras import Camera, CameraGroup
+
+    from tailcyclenet.detector.associate import associate
+    from tailcyclenet.detector.track import _project
+    from tailcyclenet.format import Rig
+
+    cams = []
+    for i, ang in enumerate((-0.5, 0.0, 0.5)):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
+                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+             moving=dict.fromkeys(names, False),
+             calibrated=dict.fromkeys(names, True)).posetail()
+
+    world = np.array([[0.0, 0.0, 0.0]], np.float32)
+    per_cam = []
+    for cam in cg:
+        uv = _project(cam, world)
+        per_cam.append(torch.stack([uv[:, 0] - 20, uv[:, 1] - 20, uv[:, 0] + 20, uv[:, 1] + 20],
+                                   -1))
+    with_supp = associate(cg, per_cam, max_res_px=20.0, corroborate=True)
+    without = associate(cg, per_cam, max_res_px=20.0, corroborate=False)
+    assert len(with_supp) == len(without) == 1
+    torch.testing.assert_close(with_supp[0]['point'], without[0]['point'])
+
+
 def test_a_nan_box_is_skipped_by_both_cross_view_paths():
     """The two halves of `unletterbox_boxes`' contract, joined. They never were: `associate`'s
     `isfinite` guard was unreachable (SVD raises on non-finite input) and the tracker refused the
@@ -1982,7 +2145,8 @@ def test_provenance_records_every_box_affecting_option():
     from tailcyclenet.infer.driver import _box_provenance
 
     args = argparse.Namespace(detector=None, det_input_wh=None, det_score=0.5, det_top_k=0,
-                              max_animals=0, max_frames=0, frame_start=0, frame_stop=0)
+                              max_animals=0, max_frames=0, frame_start=0, frame_stop=0,
+                              det_nms_iou=0.5, det_nms_center_dist=None)
     prov = _box_provenance(args, None, False, None)
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
@@ -1992,7 +2156,8 @@ def test_provenance_records_every_box_affecting_option():
     plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read'}
     params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
-    alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k'}
+    alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k',
+             'iou_thresh': 'det_nms_iou', 'center_dist_thresh': 'det_nms_center_dist'}
     missing = [p for p in sorted(params) if alias.get(p, p) not in prov]
     assert not missing, (
         f'these change the detections and are not recorded in the prediction: {missing}. Two runs '
@@ -2004,7 +2169,8 @@ def test_provenance_records_every_box_affecting_option():
     # need five exceptions to its own rule.
     args2 = argparse.Namespace(detector='d.pt', det_input_wh=(416, 416), det_score=0.97,
                                det_top_k=24, max_animals=2, max_frames=120,
-                               frame_start=300, frame_stop=500)
+                               frame_start=300, frame_stop=500, det_nms_iou=0.65,
+                               det_nms_center_dist=0.25)
     assert set(_box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
 

@@ -337,7 +337,8 @@ class BoxDataset(Dataset):
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
                  strong=False, ignore_present=False, temporal_input='none',
-                 scale_jitter=None, aug_switch_off_iter=0, negative_frac=None):
+                 scale_jitter=None, aug_switch_off_iter=0, negative_frac=None,
+                 negative_crop_frac=None):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -481,6 +482,10 @@ class BoxDataset(Dataset):
                             self.origins.append(o)
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
+        # Snapshot BEFORE either negative source appends anything -- A6c (below) draws its crop
+        # candidates from these ORIGINAL labelled entries only, never from an A6 INST_ABSENT
+        # entry (which already has zero animals by construction and offers nothing new to learn).
+        n_positive = len(self.index)
         # A6 (detector_v2 plan SS2.3): NEGATIVE FRAMES, appended after every labelled entry so the
         # chunk/locality maths below sees the whole index. `is_negative` is parallel to `index`/
         # `origins`, like `origins` itself -- a 5th positional tuple element would break the six
@@ -495,6 +500,12 @@ class BoxDataset(Dataset):
         # `present`, zero `absent`) -- so `negative_frac` is a VERIFIED HARD NO-OP on every root
         # on record, ready the day a converter writes one, not a bug now.
         self.is_negative = np.zeros(len(self.index), dtype=bool)
+        # A6/A6c REPORTING ONLY: which source a negative came from ('absent' / 'crop'), '' for an
+        # ordinary positive entry. `negative_weights`' own sampling maths reads `is_negative`
+        # alone (both sources are trained identically); this exists so a caller can report or
+        # filter by source without a second boolean array (mirrors `label_source`'s own
+        # string-array convention, see `cohort_weights`).
+        self.negative_source = np.full(len(self.index), '', dtype=object)
         self.negative_frac = None if negative_frac is None else float(negative_frac)
         if self.negative_frac is not None:
             if not 0.0 <= self.negative_frac <= 1.0:
@@ -513,12 +524,52 @@ class BoxDataset(Dataset):
             if neg_flags:
                 self.is_negative = np.concatenate(
                     [self.is_negative, np.ones(len(neg_flags), dtype=bool)])
+                self.negative_source = np.concatenate(
+                    [self.negative_source, np.full(len(neg_flags), 'absent', dtype=object)])
             if not self.is_negative.any():
                 raise ValueError(
                     f'{path}: negative_frac={negative_frac} was set but split {split!r} has no '
                     '(frame, camera) where instances.pq marks EVERY animal INST_ABSENT -- no '
                     "converter in this repo writes that status yet (see BoxDataset.__init__'s own "
                     'comment). negative_frac cannot be a silent no-op: unset it instead.')
+        # A6c (detector_v2 plan, delegated investigation): CROP-LEVEL negatives -- a sub-region of
+        # an ORDINARY LABELLED frame, far from every known animal, needs no INST_ABSENT at all.
+        # Draws ONE candidate per original labelled entry (never from an A6 INST_ABSENT entry --
+        # see `n_positive` above), reusing `_region_rects`/`certified_anchors`'s own
+        # exhaustive-labelling contract: `regions is None` permits anywhere in the frame,
+        # non-empty restricts to the certified rect(s), empty means NO safe area and this entry is
+        # skipped. NEVER forces a placement -- `_crop_negative_origin` returns None rather than an
+        # unverified crop, and a None here is silently skipped, not an error (unlike
+        # `negative_frac`'s own raise): a per-entry miss is expected and does not mean the whole
+        # lever is inert the way a root with zero INST_ABSENT rows does.
+        self.negative_crop_frac = None if negative_crop_frac is None else float(negative_crop_frac)
+        if self.negative_crop_frac is not None:
+            if not 0.0 <= self.negative_crop_frac <= 1.0:
+                raise ValueError(
+                    f'negative_crop_frac must be in [0, 1], got {negative_crop_frac}')
+            crop_rng = np.random.default_rng([seed, 0xA6C])
+            crop_flags = []
+            for ci_pos in range(n_positive):
+                csess, cgid, cf, cci = self.index[ci_pos]
+                known = self._known_boxes_source_px(csess, cgid, cf, cci)
+                origin = self._crop_negative_origin(csess, cgid, cf, cci, crop_rng, known)
+                if origin is None:
+                    continue
+                self.index.append((csess, cgid, cf, cci))
+                self.origins.append(origin)
+                crop_flags.append(True)
+            if crop_flags:
+                self.is_negative = np.concatenate(
+                    [self.is_negative, np.ones(len(crop_flags), dtype=bool)])
+                self.negative_source = np.concatenate(
+                    [self.negative_source, np.full(len(crop_flags), 'crop', dtype=object)])
+            if not crop_flags:
+                raise ValueError(
+                    f'{path}: negative_crop_frac={negative_crop_frac} was set but no (frame, '
+                    f'camera) in split {split!r} yielded a crop clearing the margin from every '
+                    'known animal within a bounded certified area -- negative_crop_frac cannot '
+                    'be a silent no-op: unset it instead, or check regions.pq coverage for this '
+                    'root/split (see dev/plans/detector_v2.md A6c.5 for measured per-root pools).')
         # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
         # be. Its old hardcoded 512 spanned 13 videos on a session with 40 positions per group,
         # which is not locality at all -- the reader cache thrashed and OOM-killed the workers.
@@ -620,25 +671,38 @@ class BoxDataset(Dataset):
                              'check alpha')
         return w
 
-    def negative_weights(self, negative_frac):
-        """A6 (detector_v2 plan SS2.3): per-entry weights giving negative-frame items a total
-        draw probability of `negative_frac`, ordinary (positive) items the rest, uniform within
-        each half -- the same shape `cohort_weights` gives `annot_frac`. `None` (default) does
-        not weight and returns None. Raises if this split holds no negative frames at all (see
-        `__init__`'s own raise for why that must never be a silent no-op).
+    def negative_weights(self, negative_frac, source=None):
+        """A6/A6c (detector_v2 plan SS2.3): per-entry weights giving negative items a total draw
+        probability of `negative_frac`, ordinary (positive) items the rest, uniform within each
+        half -- the same shape `cohort_weights` gives `annot_frac`. `None` (default) does not
+        weight and returns None. Raises if this split holds no qualifying negative items at all
+        (see `__init__`'s own raise for why that must never be a silent no-op).
+
+        `source`, one of `None` (either source, the default), `'absent'` (A6's INST_ABSENT
+        negatives only) or `'crop'` (A6c's crop-level negatives only) -- lets an arm sweep ONE
+        source's share without also pulling in the other. The sampling MATH is identical
+        regardless of source (both get their `negative_frac` share, split uniformly among
+        whichever entries qualify); only which entries count as "negative" for this call changes.
         """
         if negative_frac is None:
             return None
         if not 0.0 <= float(negative_frac) <= 1.0:
             raise ValueError(f'negative_frac must be in [0, 1], got {negative_frac}')
-        if not self.is_negative.any():
+        if source is None:
+            neg = self.is_negative
+        else:
+            if source not in ('absent', 'crop'):
+                raise ValueError(f"source must be one of (None, 'absent', 'crop'), got {source!r}")
+            neg = self.is_negative & (self.negative_source == source)
+        if not neg.any():
             raise ValueError('negative_weights: no negative frames in this split -- build the '
-                             'dataset with negative_frac set (see BoxDataset.__init__).')
+                             'dataset with negative_frac/negative_crop_frac set (see '
+                             'BoxDataset.__init__), or check `source` matches what was drawn.')
         w = np.zeros(len(self.index), dtype=np.float64)
-        n_neg, n_pos = int(self.is_negative.sum()), int((~self.is_negative).sum())
-        w[self.is_negative] = float(negative_frac) / n_neg
+        n_neg, n_pos = int(neg.sum()), int((~neg).sum())
+        w[neg] = float(negative_frac) / n_neg
         if n_pos:
-            w[~self.is_negative] = (1.0 - float(negative_frac)) / n_pos
+            w[~neg] = (1.0 - float(negative_frac)) / n_pos
         if w.sum() <= 0:
             raise ValueError('negative_weights: sampling weights are all zero -- check '
                              'negative_frac')
@@ -649,8 +713,17 @@ class BoxDataset(Dataset):
     # ------------------------------------------------------------------------------------------
 
     def _tile_extent(self):
-        """The tile's extent in SOURCE pixels. `input_wh / tile_scale`, and nothing else."""
-        return (self.tile_wh[0] / self.tile_scale, self.tile_wh[1] / self.tile_scale)
+        """The tile's extent in SOURCE pixels. `input_wh / tile_scale`, and nothing else.
+
+        A6c (crop-level negatives): also the extent a CROP-NEGATIVE's origin represents when
+        `self.tile_wh is None` -- `tile_transform(origin, tile_scale)`/`_transform` already treat
+        any non-None origin identically regardless of whether tiling is on, so this falls back to
+        `self.input_wh` (the item's own resolved output size) rather than raising on `None[0]`.
+        Every caller of this method is already gated on `self.origins[i] is not None`, and a
+        crop-negative sets exactly that -- see `_crop_negative_origin`.
+        """
+        wh = self.tile_wh if self.tile_wh is not None else self.input_wh
+        return (wh[0] / self.tile_scale, wh[1] / self.tile_scale)
 
     def _warp_centre(self, i):
         """What `random_affine` turns and scales about: the TILE's centre, or None for the frame.
@@ -664,6 +737,94 @@ class BoxDataset(Dataset):
         ox, oy = self.origins[i]
         tw, th = self._tile_extent()
         return (ox + tw / 2, oy + th / 2)
+
+    def _known_boxes_source_px(self, sess, gid, f, ci):
+        """(N,4) SOURCE-pixel crop-rule boxes for every KNOWN animal at (frame, camera): the
+        ordinary labelled GT boxes (`boxes_for`'s own per-animal loop) UNION `instances.pq`
+        PRESENT boxes (`present_ignore_boxes_for`'s population) -- an animal known to be in view
+        but not annotated with keypoints/a box still counts as "known", and a crop-negative
+        candidate must clear it too (A6c.3: 3dpop's own PRESENT rows, ~a quarter of frames, have
+        no box target but ARE a real, located animal). NO warp, NO tile-clipping, NO letterbox
+        scale/pad -- this is deliberately the SAME crop-rule geometry `boxes_for`/
+        `present_ignore_boxes_for` compute, evaluated once at index-build time in plain SOURCE
+        pixels, because a crop-negative's margin test and its origin are both SOURCE-pixel
+        quantities.
+        """
+        lab = sess.labels(gid)
+        cam = sess.cgroup(gid, f)[ci]
+        p2d = self._points_2d(sess, gid, f, ci)
+        out = []
+        for s in range(p2d.shape[0]):
+            src, pad = p2d[s], 20
+            if self.box_source == 'instances' and lab.boxes is not None:
+                b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
+                if torch.isfinite(b).all():
+                    x0, y0, x1, y1 = b
+                    src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
+                                       torch.stack([x1, y1]), torch.stack([x0, y1])])
+                    pad = 0
+            box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
+            if box is not None:
+                out.append(box.float())
+        if lab.instance is not None and lab.boxes is not None:
+            present = np.flatnonzero(lab.instance[:, f, ci] == INST_PRESENT)
+            for s in present.tolist():
+                b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
+                if not torch.isfinite(b).all():
+                    continue
+                x0, y0, x1, y1 = b
+                src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
+                                   torch.stack([x1, y1]), torch.stack([x0, y1])])
+                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad=0)
+                if box is not None:
+                    out.append(box.float())
+        if not out:
+            return torch.zeros((0, 4), dtype=torch.float32)
+        return torch.stack(out)
+
+    def _crop_negative_origin(self, sess, gid, f, ci, rng, known_boxes, margin_sides=2.5,
+                              max_tries=12):
+        """A6c: one `(ox, oy)` SOURCE-pixel origin for a crop-level negative at (frame, camera),
+        or `None` if no candidate clears the margin within `max_tries` draws, the crop does not
+        fit in the frame at all, or the frame has NO certified area to draw from (`regions.pq`
+        present but empty -- A6c.1's "no safe area" case). NEVER forces a placement: matching
+        A6's own `negative_frac` raise-on-no-op guard, a crop-negative index must never contain an
+        unverified entry either, so an exhausted retry budget means this (frame, camera) simply
+        contributes no crop-negative, not a false one.
+
+        The candidate's extent is `_tile_extent()` -- the SAME source-pixel size a tile (or, when
+        untiled, this item's own `input_wh`) already represents, so a negative trains at the same
+        appearance scale a positive does. The margin is `box_center_dist` (`assign.py`), this
+        repo's own scale-free (units of box side) convention, applied between the candidate's own
+        box and EVERY known box -- ALL must clear `margin_sides`, not just the nearest.
+        """
+        from .assign import box_center_dist
+
+        W, H = (float(v) for v in sess.rig.size(sess.cam_names[ci]))
+        tw, th = self._tile_extent()
+        if tw > W or th > H:
+            return None
+        regions = self._region_rects(sess, gid, f, ci)
+        if regions is not None and not len(regions):
+            return None
+        for _ in range(max_tries):
+            if regions is None:
+                ox = float(rng.uniform(0.0, W - tw))
+                oy = float(rng.uniform(0.0, H - th))
+            else:
+                r = regions[rng.integers(len(regions))]
+                rw, rh = float(r[2] - r[0]), float(r[3] - r[1])
+                if rw < tw or rh < th:
+                    continue           # this certified rect is too small for the crop; redraw
+                ox = float(r[0] + rng.uniform(0.0, rw - tw))
+                oy = float(r[1] + rng.uniform(0.0, rh - th))
+            if known_boxes.shape[0] == 0:
+                return (ox, oy)
+            cand = torch.tensor([[ox, oy, ox + tw, oy + th]], dtype=torch.float32)
+            d = box_center_dist(cand, known_boxes)[0]
+            if bool((d >= margin_sides).all()):
+                return (ox, oy)
+        return None
 
     def _region_rects(self, sess, gid, f, ci):
         """(M,4) certified rects in SOURCE px for one (frame, camera), or None if no regions.pq.

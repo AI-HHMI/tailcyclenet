@@ -151,6 +151,7 @@ def main():
                        scale_jitter=data_cfg['scale_jitter'],
                        aug_switch_off_iter=data_cfg['aug_switch_off_iter'],
                        negative_frac=data_cfg['negative_frac'],
+                       negative_crop_frac=data_cfg['negative_crop_frac'],
                        seed=train_cfg['seed'], **tiling)
     # The checkpoint's `input_wh` must be the size the model saw: when tiling, read it back from
     # `BoxDataset`, which resolved it to the tile.
@@ -194,9 +195,13 @@ def main():
     # renormalised. `None` (default) leaves `cohort_w`/`None` exactly as `annot_frac` alone would.
     alpha_w = train.alpha_weights(data_cfg['alpha'])
     # A6 (detector_v2 plan SS2.3): negative-frame draw share, composed the same elementwise way.
-    neg_w = (train.negative_weights(data_cfg['negative_frac'])
+    neg_w = (train.negative_weights(data_cfg['negative_frac'], source='absent')
              if data_cfg['negative_frac'] is not None else None)
-    weights = [w for w in (cohort_w, alpha_w, neg_w) if w is not None]
+    # A6c: crop-level negative draw share, its OWN independent fraction -- `source='crop'` keeps
+    # this from also pulling A6's INST_ABSENT entries into the same target share.
+    neg_crop_w = (train.negative_weights(data_cfg['negative_crop_frac'], source='crop')
+                 if data_cfg['negative_crop_frac'] is not None else None)
+    weights = [w for w in (cohort_w, alpha_w, neg_w, neg_crop_w) if w is not None]
     combined_w = None
     for w in weights:
         combined_w = w if combined_w is None else combined_w * w
@@ -217,9 +222,13 @@ def main():
             print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied '
                   f'({"composed with annot_frac" if cohort_w is not None else "alone"})')
         if data_cfg['negative_frac'] is not None:
-            n_neg = int(train.is_negative.sum())
+            n_neg = int((train.is_negative & (train.negative_source == 'absent')).sum())
             print(f'negative_frac={data_cfg["negative_frac"]:g}: {n_neg} verified-empty '
                   f'(frame, camera) view(s) in the index, drawn at that share')
+        if data_cfg['negative_crop_frac'] is not None:
+            n_neg_crop = int((train.is_negative & (train.negative_source == 'crop')).sum())
+            print(f'negative_crop_frac={data_cfg["negative_crop_frac"]:g}: {n_neg_crop} '
+                  f'crop-level negative view(s) in the index, drawn at that share')
     loader = torch.utils.data.DataLoader(
         train, batch_size=train_cfg['batch_size'],
         sampler=sampler,

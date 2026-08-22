@@ -28,8 +28,8 @@ DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box
     'frames_per_group', 'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong',
     'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
-    'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'scale_jitter',
-    'aug_switch_off_iter', 'alpha', 'det_scale',
+    'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'negative_crop_frac',
+    'scale_jitter', 'aug_switch_off_iter', 'alpha', 'det_scale',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -235,6 +235,16 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['negative_frac'] = None if nf in (None, '', []) else float(nf)
     if data['negative_frac'] is not None and not 0.0 <= data['negative_frac'] <= 1.0:
         raise SystemExit(f"[data].negative_frac must be in [0, 1], got {data['negative_frac']}.")
+    # A6c (detector_v2 plan, delegated investigation): CROP-LEVEL negatives -- a sub-region of an
+    # ordinary LABELLED frame, far from every known animal, drawn without needing INST_ABSENT at
+    # all. `None`/unset (default) draws none and is byte-identical to every checkpoint on record.
+    # Complementary to `negative_frac`, not a replacement -- see `BoxDataset._crop_negative_origin`
+    # and dev/plans/detector_v2.md's A6c section for the full design and per-root feasibility.
+    ncf = data.get('negative_crop_frac', None)
+    data['negative_crop_frac'] = None if ncf in (None, '', []) else float(ncf)
+    if data['negative_crop_frac'] is not None and not 0.0 <= data['negative_crop_frac'] <= 1.0:
+        raise SystemExit(f"[data].negative_crop_frac must be in [0, 1], got "
+                         f"{data['negative_crop_frac']}.")
     # D1 (detector_v2 plan SS2.6): scale-jitter augmentation, layered into `random_affine`'s own
     # `scale=` draw range. `None`/unset (default) keeps the shipped `(0.8, 1.25)` range and is
     # byte-identical to every checkpoint on record. A `[lo, hi]` pair overrides it outright rather

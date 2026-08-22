@@ -123,6 +123,17 @@ def main():
     wh = (tuple(data_cfg['input_wh']) if data_cfg['input_wh']
           else input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
                             data_cfg['min_box_px'], data_cfg['max_input_px']))
+    # D2 (detector_v2 plan SS2.6): a HALF-RESOLUTION detector stage, SLEAP's `scale: 0.5` on its
+    # centroid stage. Scales whatever `wh` the two branches above already resolved to (explicit
+    # `input_wh` or the min_box_px-derived size) -- no new geometry path: every box target is
+    # RE-DERIVED by `crop_box_for_points` at whatever `input_wh` `BoxDataset` is built with, so
+    # scaling `wh` here is the whole of it. Rounded to a multiple of 32 (the coarsest FPN stride,
+    # same rounding `default_input_wh`/`input_wh_for` already use), floored at 64. 1.0 (default)
+    # is byte-identical to every checkpoint on record.
+    if data_cfg['det_scale'] != 1.0:
+        _wh0 = wh
+        wh = tuple(max(64, int(round(v * data_cfg['det_scale'] / 32)) * 32) for v in wh)
+        print(f'det_scale={data_cfg["det_scale"]:g}: input {_wh0[0]}x{_wh0[1]} -> {wh[0]}x{wh[1]}')
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],

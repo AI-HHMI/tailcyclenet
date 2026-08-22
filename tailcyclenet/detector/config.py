@@ -29,7 +29,7 @@ DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box
     'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'scale_jitter',
-    'aug_switch_off_iter', 'alpha',
+    'aug_switch_off_iter', 'alpha', 'det_scale',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -182,6 +182,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     train['neg_loss_weight'] = float(train.get('neg_loss_weight', 1.0))
     for k, default in (('rotate_deg', 45.0), ('tile_scale', 1.0)):
         data[k] = float(data.get(k, default))
+    # D2 (detector_v2 plan SS2.6): scales whatever [data].input_wh resolves to (explicit or
+    # min_box_px-derived). 1.0 (default) is byte-identical to every checkpoint on record.
+    data['det_scale'] = float(data.get('det_scale', 1.0))
+    if data['det_scale'] <= 0:
+        raise SystemExit(f"[data].det_scale must be > 0, got {data['det_scale']}.")
     data['augment'] = bool(data.get('augment', True))
     data['augment_strong'] = bool(data.get('augment_strong', True))
     data['reduce'] = bool(data.get('reduce', False))

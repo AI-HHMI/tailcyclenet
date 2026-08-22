@@ -16,7 +16,7 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
-from ..format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
+from ..format import INST_ABSENT, INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
 
 # The stem's `in_channels` for each loader mode. `'none'` (default) is 3 channels, no second
 # frame. Kept as ONE dict so the training and eval scripts derive `in_channels` from the same
@@ -337,7 +337,7 @@ class BoxDataset(Dataset):
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
                  strong=False, ignore_present=False, temporal_input='none',
-                 scale_jitter=None, aug_switch_off_iter=0):
+                 scale_jitter=None, aug_switch_off_iter=0, negative_frac=None):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -481,6 +481,44 @@ class BoxDataset(Dataset):
                             self.origins.append(o)
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
+        # A6 (detector_v2 plan SS2.3): NEGATIVE FRAMES, appended after every labelled entry so the
+        # chunk/locality maths below sees the whole index. `is_negative` is parallel to `index`/
+        # `origins`, like `origins` itself -- a 5th positional tuple element would break the six
+        # places that unpack `index` by position (CLAUDE.md gotcha).
+        #
+        # ONLY a per-camera `instances.pq` row explicitly marking EVERY animal `INST_ABSENT` at a
+        # (frame, camera) qualifies -- a REAL assessment, never bare silence ("not in the
+        # labelled-frame index" would risk training a false negative on a frame that holds an
+        # unannotated-but-PRESENT animal, exactly the failure mode CLAUDE.md's STATUS POLICY
+        # exists to prevent). NO CONVERTER IN THIS REPO EMITS INST_ABSENT TODAY (checked against
+        # rat-city-combined's and 3dpop's own instances.pq: every row reads `labeled` or
+        # `present`, zero `absent`) -- so `negative_frac` is a VERIFIED HARD NO-OP on every root
+        # on record, ready the day a converter writes one, not a bug now.
+        self.is_negative = np.zeros(len(self.index), dtype=bool)
+        self.negative_frac = None if negative_frac is None else float(negative_frac)
+        if self.negative_frac is not None:
+            if not 0.0 <= self.negative_frac <= 1.0:
+                raise ValueError(f'negative_frac must be in [0, 1], got {negative_frac}')
+            neg_flags = []
+            for nsess in self.ds.sessions.get(split, []):
+                for ngid in nsess.groups:
+                    nlab = nsess.labels(ngid)
+                    if nlab.instance is None or nlab.instance.shape[0] == 0:
+                        continue
+                    all_absent = (nlab.instance == INST_ABSENT).all(0)     # (T, C)
+                    for nf, nci in zip(*np.nonzero(all_absent)):
+                        self.index.append((nsess, ngid, int(nf), int(nci)))
+                        self.origins.append(None)
+                        neg_flags.append(True)
+            if neg_flags:
+                self.is_negative = np.concatenate(
+                    [self.is_negative, np.ones(len(neg_flags), dtype=bool)])
+            if not self.is_negative.any():
+                raise ValueError(
+                    f'{path}: negative_frac={negative_frac} was set but split {split!r} has no '
+                    '(frame, camera) where instances.pq marks EVERY animal INST_ABSENT -- no '
+                    "converter in this repo writes that status yet (see BoxDataset.__init__'s own "
+                    'comment). negative_frac cannot be a silent no-op: unset it instead.')
         # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
         # be. Its old hardcoded 512 spanned 13 videos on a session with 40 positions per group,
         # which is not locality at all -- the reader cache thrashed and OOM-killed the workers.
@@ -580,6 +618,30 @@ class BoxDataset(Dataset):
         if not np.isfinite(w).all() or w.sum() <= 0:
             raise ValueError('alpha_weights: sampling weights are all zero or non-finite -- '
                              'check alpha')
+        return w
+
+    def negative_weights(self, negative_frac):
+        """A6 (detector_v2 plan SS2.3): per-entry weights giving negative-frame items a total
+        draw probability of `negative_frac`, ordinary (positive) items the rest, uniform within
+        each half -- the same shape `cohort_weights` gives `annot_frac`. `None` (default) does
+        not weight and returns None. Raises if this split holds no negative frames at all (see
+        `__init__`'s own raise for why that must never be a silent no-op).
+        """
+        if negative_frac is None:
+            return None
+        if not 0.0 <= float(negative_frac) <= 1.0:
+            raise ValueError(f'negative_frac must be in [0, 1], got {negative_frac}')
+        if not self.is_negative.any():
+            raise ValueError('negative_weights: no negative frames in this split -- build the '
+                             'dataset with negative_frac set (see BoxDataset.__init__).')
+        w = np.zeros(len(self.index), dtype=np.float64)
+        n_neg, n_pos = int(self.is_negative.sum()), int((~self.is_negative).sum())
+        w[self.is_negative] = float(negative_frac) / n_neg
+        if n_pos:
+            w[~self.is_negative] = (1.0 - float(negative_frac)) / n_pos
+        if w.sum() <= 0:
+            raise ValueError('negative_weights: sampling weights are all zero -- check '
+                             'negative_frac')
         return w
 
     # ------------------------------------------------------------------------------------------
@@ -818,6 +880,15 @@ class BoxDataset(Dataset):
         image but the `min_crop_dim` floor would not, so a floored box scaled by 0.8 is a box the
         rule can never emit.
         """
+        if self.is_negative[i]:
+            # A6: a VERIFIED-EMPTY (frame, camera) -- `instances.pq` marks EVERY animal
+            # INST_ABSENT here. S=0, no animal rows at all, so `assign` finds no positives and
+            # the whole anchor field trains as background -- never NaN-padded rows for animals
+            # that might still be there, which is what "no animal labelled here" would mean.
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            if not with_keypoints:
+                return boxes
+            return boxes, torch.zeros((0, len(self.ds.names), 3), dtype=torch.float32)
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
         # Frame-indexed, not whole-group: `pts` below is (S,K,3) whose axis -3 is the ANIMAL, so a

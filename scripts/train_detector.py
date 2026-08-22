@@ -139,6 +139,7 @@ def main():
                        temporal_input=data_cfg['temporal_input'],
                        scale_jitter=data_cfg['scale_jitter'],
                        aug_switch_off_iter=data_cfg['aug_switch_off_iter'],
+                       negative_frac=data_cfg['negative_frac'],
                        seed=train_cfg['seed'], **tiling)
     # The checkpoint's `input_wh` must be the size the model saw: when tiling, read it back from
     # `BoxDataset`, which resolved it to the tile.
@@ -181,14 +182,13 @@ def main():
     # up (or within the whole index, if `cohort_w` is None) by group size -- elementwise product,
     # renormalised. `None` (default) leaves `cohort_w`/`None` exactly as `annot_frac` alone would.
     alpha_w = train.alpha_weights(data_cfg['alpha'])
-    if cohort_w is None and alpha_w is None:
-        combined_w = None
-    elif cohort_w is None:
-        combined_w = alpha_w
-    elif alpha_w is None:
-        combined_w = cohort_w
-    else:
-        combined_w = cohort_w * alpha_w
+    # A6 (detector_v2 plan SS2.3): negative-frame draw share, composed the same elementwise way.
+    neg_w = (train.negative_weights(data_cfg['negative_frac'])
+             if data_cfg['negative_frac'] is not None else None)
+    weights = [w for w in (cohort_w, alpha_w, neg_w) if w is not None]
+    combined_w = None
+    for w in weights:
+        combined_w = w if combined_w is None else combined_w * w
     if combined_w is None:
         sampler = ChunkShuffle(len(train), chunk=train.chunk, seed=train_cfg['seed'])
         if data_cfg['annot_frac'] is not None:
@@ -205,6 +205,10 @@ def main():
         if data_cfg['alpha'] is not None:
             print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied '
                   f'({"composed with annot_frac" if cohort_w is not None else "alone"})')
+        if data_cfg['negative_frac'] is not None:
+            n_neg = int(train.is_negative.sum())
+            print(f'negative_frac={data_cfg["negative_frac"]:g}: {n_neg} verified-empty '
+                  f'(frame, camera) view(s) in the index, drawn at that share')
     loader = torch.utils.data.DataLoader(
         train, batch_size=train_cfg['batch_size'],
         sampler=sampler,

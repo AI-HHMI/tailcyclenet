@@ -25,7 +25,8 @@ from .yolox import YOLOX_TIERS
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
 # `--boxes`' dash), so a config value means exactly what the flag meant.
 DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
-    'frames_per_group', 'val_frames_per_group', 'augment', 'augment_strong', 'rotate_deg',
+    'frames_per_group', 'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong',
+    'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input',
 })
@@ -160,6 +161,15 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         raise SystemExit('[data].temporal_input != "none" is undefined under '
                          '[data].augment_strong (mosaic-lite): the pasted source item needs its '
                          'own t-1 frame too, not built yet. See BoxDataset.__init__.')
+    # P(a training draw comes from an `annotated` session), the detector's counterpart to
+    # `LoaderConfig.annot_frac`. TOML has no null: absent (or an empty string) means "do not
+    # weight", which keeps `ChunkShuffle` and is byte-identical to every checkpoint on record.
+    # Also INERT on a single-cohort split -- `BoxDataset.cohort_weights` returns None there, so
+    # 3dpop/calms21/branson-fly are unaffected whatever this says.
+    af = data.get('annot_frac', None)
+    data['annot_frac'] = None if af in (None, '', []) else float(af)
+    if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:
+        raise SystemExit(f"[data].annot_frac must be in [0, 1], got {data['annot_frac']}.")
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
 

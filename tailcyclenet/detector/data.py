@@ -468,6 +468,47 @@ class BoxDataset(Dataset):
     def __len__(self):
         return len(self.index)
 
+    def cohort_weights(self, annot_frac):
+        """Per-entry sampling weights giving `annotated` sessions probability `annot_frac`.
+
+        The detector analogue of `PoseDataset._pool_weights`, and it exists for the same reason:
+        WITHOUT it the cohort mix is whatever `frames_per_group` happens to produce. On
+        rat-city-combined the cap leaves the one tracked session (57,594 labelled frames,
+        truncated to 40) at 4.3% of train views against 37 annotated sessions' 95.7% -- a ratio
+        nothing in the config names and nobody chose. `annot_frac` names it.
+
+        Uniform WITHIN a cohort, so a group's weight does not scale with how many frames survived
+        the cap; the two cohort totals are then set to `annot_frac` / `1 - annot_frac`. Returns
+        None when the question does not arise -- `annot_frac` unset, or the split holds one
+        cohort (3dpop, calms21 and branson-fly are entirely `tracked`) -- and None means the
+        caller uses `ChunkShuffle`, byte-identical to every detector on record.
+        """
+        if annot_frac is None:
+            return None
+        if not 0.0 <= float(annot_frac) <= 1.0:
+            raise ValueError(f'annot_frac must be in [0, 1], got {annot_frac}')
+        src = np.array([s.label_source for s, _, _, _ in self.index])
+        present = [c for c in ('annotated', 'tracked') if (src == c).any()]
+        if len(present) < 2:
+            return None
+        w = np.zeros(len(self.index), dtype=np.float64)
+        for cohort in present:
+            m = src == cohort
+            p = float(annot_frac) if cohort == 'annotated' else 1.0 - float(annot_frac)
+            w[m] = p / int(m.sum())
+        if w.sum() <= 0:
+            raise ValueError('sampling weights are all zero -- check annot_frac')
+        return w
+
+    def cohort_mix(self, weights=None):
+        """Realised share of train draws per cohort. Reporting only -- the mix is invisible in
+        the loss curve, so `train_detector.py` prints it, exactly as `PoseDataset.mix` is.
+        """
+        src = np.array([s.label_source for s, _, _, _ in self.index])
+        w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
+             else np.asarray(weights, dtype=np.float64) / np.sum(weights))
+        return {c: float(w[src == c].sum()) for c in sorted(set(src.tolist()))}
+
     # ------------------------------------------------------------------------------------------
     # tiling
     # ------------------------------------------------------------------------------------------
@@ -1034,6 +1075,51 @@ class ChunkShuffle(torch.utils.data.Sampler):
                                    for s in starts[i:i + self.mix]])
             rng.shuffle(pool)
             yield from (int(j) for j in pool)
+
+
+class CohortSampler(torch.utils.data.Sampler):
+    """Draw index positions WITH REPLACEMENT at fixed per-cohort probability.
+
+    Built from `BoxDataset.cohort_weights(annot_frac)`, which is None unless the split actually
+    holds both an `annotated` and a `tracked` session -- so this sampler is constructed only on
+    the roots where the question exists (rat-city-combined, allen-mouse-combined,
+    johnson-mouse-combined-aug). On the other three `train_detector.py` keeps `ChunkShuffle` and
+    the run is byte-identical to every detector on record.
+
+    REPLACEMENT, and therefore no epoch boundary, for `StepSampler`'s reason on the pose side: a
+    fixed cohort share is a property of the STEP, and an epoch that must contain each entry once
+    cannot hold one. `__len__` stays at `n` so `iters` keeps meaning what it meant.
+
+    LOCALITY IS DELIBERATELY DROPPED HERE, and only here. `ChunkShuffle` exists to keep a worker
+    inside a few video containers; all three roots that reach this sampler read IMAGE
+    DIRECTORIES on train (`Group.source` -> 'frames'), where random access is free -- measured on
+    rat-city-combined at 30.6 ms/frame random against 30.2 ms/frame sequential. calms21, the one
+    train-time video root, is single-cohort and never gets here. If that ever changes, this is
+    the line that has to be revisited, not `ChunkShuffle`.
+    """
+
+    def __init__(self, weights, num_samples=None, seed=23):
+        w = np.asarray(weights, dtype=np.float64)
+        if w.ndim != 1 or not w.size:
+            raise ValueError(f'weights must be a non-empty 1-D array, got shape {w.shape}')
+        if not np.isfinite(w).all() or (w < 0).any() or w.sum() <= 0:
+            raise ValueError('weights must be finite, non-negative and not all zero')
+        # One cumulative array and one `searchsorted` per draw, as `PoseDataset._pick` does.
+        self.cum = np.cumsum(w / w.sum())
+        self.num_samples = int(len(w) if num_samples is None else num_samples)
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        rng = np.random.default_rng([self.seed, self.epoch])
+        self.epoch += 1
+        draws = np.searchsorted(self.cum, rng.random(self.num_samples))
+        # `searchsorted` can return `len(cum)` on a draw of exactly 1.0; clamp rather than let a
+        # one-in-2^53 sample raise IndexError 14,000 iterations in.
+        yield from (int(j) for j in np.minimum(draws, len(self.cum) - 1))
 
 
 def box_collate(batch):

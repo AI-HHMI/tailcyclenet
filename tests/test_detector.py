@@ -9,7 +9,8 @@ import torch
 from pathlib import Path
 
 from tailcyclenet.crop import box_corners, crop_box_for_points
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_BY_CHANNELS,
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler,
+                                   TEMPORAL_INPUT_BY_CHANNELS,
                                    TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, YOLOXNano, assign,
                                    box_collate, box_iou, decode, detector_loss, giou_loss,
                                    letterbox, paired_iou, unletterbox_boxes)
@@ -64,6 +65,126 @@ def test_chunk_shuffle_is_a_permutation_that_keeps_locality():
     for i in range(0, n, chunk * mix):            # one pool = at most `mix` distinct videos
         assert len({j // chunk for j in order[i:i + chunk * mix]}) == mix
     assert list(iter(s)) != order, 'a second epoch must reshuffle'
+
+
+def _two_cohort_root(tmp_path, n_annot_frames=2, n_tracked_frames=30):
+    """A root with ONE `annotated` session and ONE `tracked` session, deliberately lopsided.
+
+    The shape rat-city-combined actually has: a handful of annotated stills against one long
+    tracked clip, so an unweighted draw and a weighted one cannot agree by accident.
+    """
+    from tailcyclenet import format as fmt
+    from tests.conftest import KPTS_3D, _rig, _write_frames
+
+    W = H = 48
+    root = tmp_path / 'two_cohort'
+    for name, source, n_lab, T in (('a', 'annotated', n_annot_frames, n_annot_frames),
+                                   ('t', 'tracked', n_tracked_frames, n_tracked_frames)):
+        path = root / 'train' / name
+        lab = fmt.empty_labels(1, T, len(KPTS_3D), 1, mode3d=False)
+        frames = list(range(n_lab))
+        lab.vis2d[0, frames, :, 0] = fmt.VISIBLE
+        lab.points2d[0, frames, :, 0] = (
+            10.0 + 3.0 * np.arange(len(frames), dtype=np.float32))[:, None, None] % (W - 10)
+        fmt.write_session(path, mode='2d', units='px', label_source=source, names=KPTS_3D,
+                          rig=_rig([('cam0', W, H, False, False, 0)]),
+                          groups={'g0': fmt.Group('g0', T)}, labels={'g0': lab})
+        _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
+    return root
+
+
+def test_annot_frac_absent_means_no_weighting(tmp_path):
+    """Absent must stay byte-identical: None weights => the caller keeps `ChunkShuffle`."""
+    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
+    assert ds.cohort_weights(None) is None
+
+
+def test_annot_frac_is_inert_on_a_single_cohort_split(dense_root):
+    """3dpop/calms21/branson-fly are entirely `tracked`. The key must not be able to affect them,
+    whatever it says -- and critically calms21 is the ONE train-time video root, so this is what
+    keeps the weighted sampler away from the only place decode locality still costs anything.
+    """
+    ds = BoxDataset(dense_root, 'train', input_wh=(64, 64))
+    assert len(ds.cohort_mix()) == 1, 'fixture must be single-cohort for this test to mean anything'
+    for frac in (0.0, 0.25, 0.5, 1.0):
+        assert ds.cohort_weights(frac) is None
+
+
+def test_annot_frac_sets_the_cohort_share(tmp_path):
+    """The whole point: the mix becomes the configured number instead of whatever the frame
+    counts happen to be."""
+    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
+    natural = ds.cohort_mix()
+    assert natural['annotated'] < 0.2, 'fixture must be lopsided or this proves nothing'
+    for frac in (0.25, 0.5, 0.75):
+        mix = ds.cohort_mix(ds.cohort_weights(frac))
+        assert mix['annotated'] == pytest.approx(frac)
+        assert mix['tracked'] == pytest.approx(1.0 - frac)
+
+
+def test_annot_frac_weights_are_uniform_within_a_cohort(tmp_path):
+    """A group's weight must not scale with how many of its frames survived `frames_per_group`:
+    that is the accident being removed, and re-introducing it inside a cohort would be the same
+    bug one level down.
+    """
+    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
+    w = ds.cohort_weights(0.5)
+    src = np.array([s.label_source for s, _, _, _ in ds.index])
+    for cohort in ('annotated', 'tracked'):
+        assert len(np.unique(w[src == cohort])) == 1
+
+
+def test_annot_frac_out_of_range_raises(tmp_path):
+    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match='annot_frac'):
+            ds.cohort_weights(bad)
+
+
+def test_cohort_sampler_realises_the_requested_share(tmp_path):
+    """The weights are only a claim until the sampler is drawn from -- this is the live check."""
+    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
+    w = ds.cohort_weights(0.5)
+    src = np.array([s.label_source for s, _, _, _ in ds.index])
+    s = CohortSampler(w, num_samples=20000, seed=0)
+    drawn = src[np.array(list(iter(s)))]
+    assert (drawn == 'annotated').mean() == pytest.approx(0.5, abs=0.02)
+
+
+def test_cohort_sampler_reshuffles_and_stays_in_range(tmp_path):
+    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
+    s = CohortSampler(ds.cohort_weights(0.5), num_samples=256, seed=0)
+    first = list(iter(s))
+    assert len(first) == len(s) == 256
+    assert min(first) >= 0 and max(first) < len(ds), 'a draw must be a valid index position'
+    assert list(iter(s)) != first, 'a second epoch must redraw'
+
+
+def test_detector_config_annot_frac_defaults_to_none(tmp_path):
+    """Absent means unchanged behaviour -- the key must not acquire a numeric default."""
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    assert load_detector_config(p)['data']['annot_frac'] is None
+
+
+def test_detector_config_annot_frac_rejects_out_of_range(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+annot_frac = 1.5
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='annot_frac'):
+        load_detector_config(p)
 
 
 def test_giou_is_zero_for_a_perfect_box():

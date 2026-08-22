@@ -40,6 +40,24 @@ frames_per_group = 40
 # branson-fly score just 8 images -- raise it to the group's labelled length.
 val_frames_per_group = 8
 
+# P(a TRAIN draw comes from an `annotated` session); the rest go to `tracked`. Absent (or empty)
+# means DO NOT WEIGHT: keeps `ChunkShuffle`, byte-identical to every checkpoint on record. The
+# counterpart to the pose loader's `[data].annot_frac`, and it exists for the same reason --
+# without it the cohort mix is not chosen, it is whatever `frames_per_group` leaves behind.
+# MEASURED implicit share of train views on the three roots holding both cohorts:
+# rat-city-combined 4.3% tracked (ONE 57,594-frame tracked session truncated to 40, against 37
+# annotated sessions), allen-mouse-combined 61.3% tracked, johnson-mouse-combined-aug 0.1%
+# tracked. Nothing chose those numbers.
+#
+# INERT on a single-cohort split -- 3dpop, calms21 and branson-fly are entirely `tracked`, so
+# `BoxDataset.cohort_weights` returns None and the run says so rather than silently ignoring the
+# key. That is also why this is safe for decode locality: calms21 is the ONE root reading video on
+# train and it never reaches the weighted sampler, while the three that do read image directories,
+# where random access measured 30.6 ms/frame against sequential's 30.2. See `CohortSampler`.
+#
+# NOT A MEASURED VALUE -- shipped absent, i.e. unchanged behaviour. Setting it is an arm.
+# annot_frac = 0.5
+
 # random similarity + brightness on TRAIN. Helps where a dataset fits its training data and lags
 # on val; read the train/val gap first.
 augment = true

@@ -3,14 +3,15 @@ import torch
 from .assign import (assign, box_iou, certified_anchors, decode, detector_loss,
                      giou_loss, paired_iou)
 from .associate import associate
-from .data import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_BY_CHANNELS,
+from .data import (BoxDataset, ChunkShuffle, CohortSampler, TEMPORAL_INPUT_BY_CHANNELS,
                    TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, box_collate, letterbox,
                    letterbox_transform, reduce_factor, split_batch, tile_transform,
                    unletterbox_boxes, unletterbox_keypoints)
 from .pretrained import load_coco_backbone, load_pretrained_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
-__all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'box_collate', 'letterbox',
+__all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
+           'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'box_iou', 'certified_anchors',
            'decode', 'detector_loss', 'giou_loss', 'associate', 'TEMPORAL_INPUT_CHANNELS',

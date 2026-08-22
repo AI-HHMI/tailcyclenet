@@ -23,8 +23,9 @@ import toml
 
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, TEMPORAL_INPUT_CHANNELS, YOLOXNano,
-                                   box_collate, detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler,
+                                   TEMPORAL_INPUT_CHANNELS, YOLOXNano, box_collate,
+                                   detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
 from tailcyclenet.detector.pretrained import load_coco_backbone, load_pretrained_backbone
@@ -167,9 +168,28 @@ def main():
         print(f'  labelled fraction per keypoint over {seen} sampled instances: '
               f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
         print(f'  thinnest: {", ".join(thin)}', flush=True)
+    # THE COHORT MIX IS A CONFIGURED NUMBER OR IT IS AN ACCIDENT. Without `annot_frac` the
+    # annotated:tracked ratio is whatever `frames_per_group` happens to leave behind -- on
+    # rat-city-combined the cap truncates the one tracked session (57,594 labelled frames) to 40
+    # and hands 95.7% of train views to 37 annotated sessions, a ratio no key names. `annot_frac`
+    # names it. None (the default), or a single-cohort split, keeps `ChunkShuffle` and is
+    # byte-identical to every detector on record -- see `BoxDataset.cohort_weights`.
+    cohort_w = train.cohort_weights(data_cfg['annot_frac'])
+    if cohort_w is None:
+        sampler = ChunkShuffle(len(train), chunk=train.chunk, seed=train_cfg['seed'])
+        if data_cfg['annot_frac'] is not None:
+            print(f'annot_frac={data_cfg["annot_frac"]:g} is INERT here: '
+                  f'{train.ds.name} train holds one cohort '
+                  f'({", ".join(train.cohort_mix())}) -- keeping ChunkShuffle')
+    else:
+        sampler = CohortSampler(cohort_w, seed=train_cfg['seed'])
+        was = train.cohort_mix()
+        now = train.cohort_mix(cohort_w)
+        print(f'annot_frac={data_cfg["annot_frac"]:g}: cohort mix '
+              + '  '.join(f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
     loader = torch.utils.data.DataLoader(
         train, batch_size=train_cfg['batch_size'],
-        sampler=ChunkShuffle(len(train), chunk=train.chunk, seed=train_cfg['seed']),
+        sampler=sampler,
         num_workers=train_cfg['num_workers'],
         collate_fn=box_collate, drop_last=True,
         persistent_workers=train_cfg['num_workers'] > 0,
@@ -322,6 +342,9 @@ def main():
                         'use_regions': data_cfg['use_regions'],
                         'ignore_present': data_cfg['ignore_present'],
                         'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
+                        # Part of the recipe: two checkpoints trained at different cohort mixes
+                        # are not the same arm, and nothing else in the file would say so.
+                        'annot_frac': data_cfg['annot_frac'],
                         'min_crop_dim': data_cfg['min_crop_dim'],
                         'augment': data_cfg['augment'],
                         'augment_strong': data_cfg['augment_strong'],

@@ -53,7 +53,49 @@ def _residual(cgroup, cams, pts, p3d):
     return float(torch.linalg.norm(proj - pts, dim=-1).median())
 
 
-def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0):
+def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
+    """How many cameras OTHER than `cams_excl` have an UNUSED detection within `max_res_px` of
+    `p3d`'s reprojection. detector_v2 plan E1a/E3.
+
+    `used` is the SAME set `associate`'s own consumption loop checks -- built once, up front, from
+    every non-finite centre (see `associate`'s own comment on it) and grown as groups are accepted.
+    Filtering by it here means a detection already claimed by an earlier, higher-support group
+    cannot corroborate a later, lower-support candidate for the same box twice.
+
+    THE MECHANISM E1a REPLACES: `associate`'s candidate list used to sort by the SEEDING PAIR's
+    own 2-view epipolar residual alone -- a number two rays can always satisfy near-exactly, so a
+    phantom (animal A's ray in one view x animal B's ray in another) with a low pair residual was
+    considered BEFORE a real pair and consumed greedily, turning one false positive into a false
+    positive plus a miss plus an identity switch (plan SS1.3/SS2.2).
+
+    WHY A COUNT, NOT A MEAN OR SUM (plan SS3.2.2): fusing corroboration as an average residual (or
+    JARVIS's confidence-weighted mean) lets one very-corroborated view mask one or two views that
+    do not corroborate at all -- exactly how a 2-camera phantom can look as good as a 3-camera real
+    animal under a mean. An INTEGER count of independently-corroborating cameras is not fooled the
+    same way: a ghost supported by 2 cameras needs a THIRD ray to also land near it by chance,
+    which is a measure-zero coincidence unless cameras are near-collinear, where a real occluded
+    animal only needs ITS OWN other views to have detected it at all.
+
+    Only DISTANCE is used here (nearest live detection in that camera to the projected point),
+    not yet a refit -- see plan SS2.2 item 3 ('growth still matches against the pair's un-refit
+    p3d'), left as a separate, un-landed item.
+    """
+    count = 0
+    for c in range(len(cgroup)):
+        if c in cams_excl:
+            continue
+        idx = [i for i in range(centres[c].shape[0]) if (c, i) not in used]
+        if not idx:
+            continue
+        proj = project_points_torch([cgroup[c]], p3d.reshape(1, 1, 3))[0, 0]
+        d = torch.linalg.norm(centres[c][idx] - proj, dim=-1)
+        if bool((d < max_res_px).any()):
+            count += 1
+    return count
+
+
+def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances=0,
+             corroborate=True):
     """Group boxes across cameras into 3D instances.
 
     Args:
@@ -76,6 +118,17 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         `dup_res_px` WAS HERE and is deleted: under `--track` (the default) it produced a
             byte-identical prediction file because the tracker claims the leftovers this gate
             existed to police.
+
+        corroborate: detector_v2 plan E1a/E3. Candidates used to be consumed in order of their
+            SEEDING PAIR's own 2-view epipolar residual alone -- an epipolar tautology two rays
+            can always satisfy, so a phantom (one ray from each of two DIFFERENT animals) with a
+            low pair residual could be accepted before a real pair and steal a box the real pair
+            needed, turning one false positive into a false positive plus a miss plus an identity
+            switch. `True` (default) re-ranks candidates by an all-camera SUPPORT COUNT first
+            (`_support_count`: how many OTHER cameras have an unused detection near the candidate's
+            reprojection) and only falls back to the pair residual as a tie-break. `False` restores
+            the exact pre-E1a ordering, kept ONLY so an arm can be measured against its own control
+            on the SAME checkpoint (plan SS4, Wave 0 -- inference-only, no retrain either way).
 
     Returns a list of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float}. A
     single-view instance has `point` all-NaN and `residual` inf: there is nothing to triangulate
@@ -104,10 +157,16 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
                 p3d = _triangulate(cgroup, (ca, cb), pts)
                 if not torch.isfinite(p3d).all():
                     continue
-                cands.append((_residual(cgroup, (ca, cb), pts, p3d), (ca, ia), (cb, ib), p3d))
-    cands.sort(key=lambda c: c[0])
+                res = _residual(cgroup, (ca, cb), pts, p3d)
+                support = (_support_count(cgroup, (ca, cb), centres, used, p3d, max_res_px)
+                          if corroborate else 0)
+                cands.append((support, res, (ca, ia), (cb, ib), p3d))
+    # DESCENDING support, ASCENDING residual as the tie-break within equal support -- see the
+    # docstring's `corroborate` entry and plan SS3.2.2 for why a count beats any fused reducer.
+    # `corroborate=False` sets every `support` to 0, collapsing this to the old residual-only sort.
+    cands.sort(key=lambda c: (-c[0], c[1]))
     out = []
-    for res, a, b, p3d in cands:
+    for _support, res, a, b, p3d in cands:
         if a in used or b in used or res > max_res_px:
             continue
         members = {a[0]: a[1], b[0]: b[1]}

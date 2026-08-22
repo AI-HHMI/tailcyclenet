@@ -85,7 +85,8 @@ def tiled_input_wh(src_wh, tile_scale):
 
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.5,
-               reduce=False, max_frames=0, tile_scale=None, frames=None, read=None):
+               reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
+               iou_thresh=0.5, center_dist_thresh=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     -> (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None) with `D = top_k`, where index
@@ -97,6 +98,10 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
     `score_thresh` defaults to 0.99, not `decode`'s 0.05: objectness is saturated near 1.0, so the
     live range starts at 0.99 where the bottom few percent are mostly false positives.
+
+    `iou_thresh` / `center_dist_thresh` are `decode`'s own NMS knobs, threaded through so a caller
+    (a CLI flag, a config key) can move them -- `decode`'s Python defaults (0.5 / off) are what
+    every checkpoint on record used, since neither was reachable before detector_v2 plan A1/A5.
 
     `max_frames` is the same PREFIX `infer.run_group` takes, so the two agree about the clip.
 
@@ -234,6 +239,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
                 for j, t in enumerate(unit_ix):
                     b, s, ix = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
+                                      iou_thresh=iou_thresh,
+                                      center_dist_thresh=center_dist_thresh,
                                       return_index=True)
                     if not b.numel():
                         continue

@@ -34,6 +34,9 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
         'detector': str(Path(args.detector).resolve()) if args.detector else '',
         'det_input_wh': str(args.det_input_wh or ''),
         'det_score': float(args.det_score),
+        'det_nms_iou': float(getattr(args, 'det_nms_iou', 0.5)),
+        'det_nms_center_dist': (float(args.det_nms_center_dist)
+                               if getattr(args, 'det_nms_center_dist', None) is not None else 0.0),
         'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
         'max_animals': int(args.max_animals),
         'max_frames': int(args.max_frames),
@@ -112,6 +115,8 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             end = min(cursor + _DET_BATCH, T)
             raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                              score_thresh=args.det_score, reduce=det_red,
+                             iou_thresh=getattr(args, 'det_nms_iou', 0.5),
+                             center_dist_thresh=getattr(args, 'det_nms_center_dist', None),
                              # `T`, the resolved STOP index -- not `args.max_frames` (0 whenever
                              # the range came in as --start-frame/--end-frame): it tells
                              # `detect_raw` where the clip ends, and its alignment assert accepts

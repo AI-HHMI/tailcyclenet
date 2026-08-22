@@ -121,7 +121,8 @@ def _summarise(s):
 
 @torch.no_grad()
 def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_thresh=0.05,
-                  num_workers=4, max_animals=None, out_scores=None):
+                  num_workers=4, max_animals=None, out_scores=None, iou_thresh=0.5,
+                  center_dist_thresh=None):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
     Sampled with `ChunkShuffle` rather than read off the front of an unshuffled loader: the index
@@ -170,7 +171,8 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
             if key not in n_want:
                 sessions[key] = sess
                 n_want[key] = max_animals or max(1, len(sess.labels(gid).animal_ids))
-            p, sc_j = decode(obj[j], pred_boxes[j], top_k=n_want[key], score_thresh=score_thresh)
+            p, sc_j = decode(obj[j], pred_boxes[j], top_k=n_want[key], score_thresh=score_thresh,
+                             iou_thresh=iou_thresh, center_dist_thresh=center_dist_thresh)
             if out_scores is not None and sc_j.numel():
                 out_scores.append(sc_j.detach().cpu().numpy())
             g_all = gt[j]
@@ -279,7 +281,8 @@ def _gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
 def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_animals=None,
                      det_score=0.5, track=True, link=False, min_views=2, max_move=1.0,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
-                     n_frames=24, overlap=4, min_box_frames=1, batch=16):
+                     n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
+                     center_dist_thresh=None):
     """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
 
     `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",
@@ -312,7 +315,8 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     n_animals = max_animals or max(1, len(sess.labels(gid).animal_ids))
     raw = detect_raw(model, input_wh, sess, gid, top_k=max(top_k, n_animals), device=device,
                      batch=batch, score_thresh=det_score, reduce=reduce, max_frames=max_frames,
-                     tile_scale=tile_scale)
+                     tile_scale=tile_scale, iou_thresh=iou_thresh,
+                     center_dist_thresh=center_dist_thresh)
     r_box, r_sc, r_kp = raw
     D, T, C = r_sc.shape
     det_fill = float(np.isfinite(r_sc[0]).mean()) if D else 0.0

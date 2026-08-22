@@ -62,6 +62,15 @@ def main():
     ap.add_argument('--score-thresh', type=float, default=0.05,
                     help='0.05, where deployment runs at 0.99. This scores the detector as '
                          'trained; pass 0.99 to see the boxes the pose model is actually served.')
+    ap.add_argument('--nms-iou', type=float, default=0.5,
+                    help="decode's box-NMS IoU threshold; 0.5 was hardcoded and unreachable "
+                         'before detector_v2 plan A1. Sweep upward (RTMDet 0.65, DLC/SLEAP '
+                         'instance-level 0.8), not around 0.5.')
+    ap.add_argument('--nms-center-dist', type=float, default=None,
+                    help='centre-distance NMS threshold in units of box side (scale-free); a '
+                         'candidate is also dropped if its centre sits within this many box '
+                         'sides of an already-kept box, regardless of IoU (detector_v2 plan A5). '
+                         'None (default) is off.')
     ap.add_argument('--num-workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='cuda:0')
@@ -104,7 +113,8 @@ def main():
                     temporal_input=TEMPORAL_INPUT_BY_CHANNELS[model.in_channels])
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=args.score_thresh,
-                         num_workers=args.num_workers, max_animals=args.max_animals)
+                         num_workers=args.num_workers, max_animals=args.max_animals,
+                         iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={args.boxes}  '
           f'min_crop_dim={ds.min_crop_dim}  max_animals={args.max_animals or "(GT count)"}\n')
@@ -150,7 +160,8 @@ def main():
                          temporal_input=TEMPORAL_INPUT_BY_CHANNELS[m2.in_channels])
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
                               seed=args.seed, score_thresh=args.score_thresh,
-                              num_workers=args.num_workers, max_animals=args.max_animals)
+                              num_workers=args.num_workers, max_animals=args.max_animals,
+                              iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
         keys = sorted(set(rows) & set(other))
         print(f'\nPAIRED: {args.run} minus {args.compare}, over {len(keys)} shared group(s)')
         for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
@@ -190,7 +201,8 @@ def main_deploy(args, device):
                                  link=args.link_boxes, min_crop_dim=args.min_crop_dim or mcd,
                                  reduce=red, tile_scale=tile_scale,
                                  max_frames=args.det_max_frames, n_frames=args.n_frames,
-                                 overlap=args.overlap, min_box_frames=args.min_box_frames)
+                                 overlap=args.overlap, min_box_frames=args.min_box_frames,
+                                 iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
             rows.append(r)
             # The frames `deployment_score` actually scored, not the group's raw length: a
             # `--det-max-frames` prefix would otherwise print as full-length.

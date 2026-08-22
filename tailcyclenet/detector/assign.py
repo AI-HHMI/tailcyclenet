@@ -335,11 +335,45 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     return total, parts
 
 
-def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5, return_index=False):
+def box_center_dist(a, b, eps=1e-7):
+    """Pairwise centre-distance ratio: Euclidean centre distance / mean box side. a:(N,4), b:(M,4)
+    -> (N,M), scale-free (units of box side, not pixels).
+
+    SLEAP's `min_centroid_distance` / `filters.py`'s own reasoning: IoU and OKS are both
+    degenerate for point-like or near-concentric detections -- two boxes of very different size
+    but (nearly) the same centre score a low IoU and survive NMS, while a duplicate detection on
+    one animal is exactly that shape (report 42 SS3.6's near-concentric `fp_dup` measurement).
+    Centre distance in units of the pair's own mean side catches that case directly and needs no
+    scale calibration across roots -- the same normalisation `link_rows` already uses for its
+    identity gate.
+    """
+    ca = torch.stack([(a[:, 0] + a[:, 2]) / 2, (a[:, 1] + a[:, 3]) / 2], -1)
+    cb = torch.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], -1)
+    d = torch.linalg.norm(ca[:, None] - cb[None], dim=-1)
+    sa = 0.5 * ((a[:, 2] - a[:, 0]) + (a[:, 3] - a[:, 1]))
+    sb = 0.5 * ((b[:, 2] - b[:, 0]) + (b[:, 3] - b[:, 1]))
+    side = (0.5 * (sa[:, None] + sb[None])).clamp_min(eps)
+    return d / side
+
+
+def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
+          center_dist_thresh=None, return_index=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     `top_k` is the expected animal count, not a hard cap: it is applied AFTER NMS so a frame
     with fewer animals returns fewer boxes rather than padding with duplicates.
+
+    `iou_thresh` (default 0.5, byte-identical to every checkpoint on record) is exposed here
+    ONLY as a Python default -- both call sites (`detect_raw`, `score_dataset`) must themselves
+    thread a caller-supplied value through for it to be reachable from a config or a CLI flag;
+    see detector_v2 plan SS2.1/A1.
+
+    `center_dist_thresh`, in units of box side (scale-free, see `box_center_dist`), is a SECOND,
+    independent survival condition alongside `iou_thresh`: a candidate box is suppressed if EITHER
+    its IoU with an already-kept box is >= `iou_thresh` OR its centre sits within
+    `center_dist_thresh` box-sides of one -- catching near-concentric duplicates IoU alone lets
+    through. `None` (default) is OFF and byte-identical to every checkpoint on record (detector_v2
+    plan A5).
 
     `return_index=True` adds the ANCHOR index of each kept box. The keypoint branch emits per
     anchor, so that index is the only way to pair a surviving box with its own keypoints --
@@ -367,6 +401,8 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5, return
         kept_s.append(s[:1])
         kept_i.append(ix[:1])
         survives = box_iou(b[:1], b)[0] < iou_thresh
+        if center_dist_thresh is not None:
+            survives &= box_center_dist(b[:1], b)[0] >= center_dist_thresh
         b, s, ix = b[survives], s[survives], ix[survives]
     out = (torch.cat(kept_b), torch.cat(kept_s))
     return (*out, torch.cat(kept_i)) if return_index else out

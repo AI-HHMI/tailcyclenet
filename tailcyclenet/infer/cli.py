@@ -140,6 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help='objectness floor for a detection. 0.5 favours coverage, 0.97 identity; '
                          'sweep per checkpoint (saturation is a property of the recipe, not the '
                          'dataset).')
+    ap.add_argument('--det-nms-iou', type=float, default=0.5,
+                    help="decode's box-NMS IoU threshold. 0.5 was HARDCODED and unreachable "
+                         'before detector_v2 plan A1; every external detector (RTMDet 0.65, '
+                         'DLC/SLEAP instance-level 0.8) ships higher -- sweep upward, not around '
+                         '0.5.')
+    ap.add_argument('--det-nms-center-dist', type=float, default=None,
+                    help='SECOND, independent NMS survival test in units of box side (scale-free): '
+                         'a candidate is also suppressed if its centre sits within this many box '
+                         'sides of an already-kept box, regardless of IoU -- catches '
+                         'near-concentric duplicates IoU-only NMS misses (detector_v2 plan A5). '
+                         'None (default) is off, byte-identical to every checkpoint on record.')
     ap.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
                     help='follow one animal per instance row across frames -- per-frame Hungarian '
                          'on centre distance in units of the box side, gated at one side. The '

@@ -366,6 +366,115 @@ def test_negative_weights_realises_the_requested_share(tmp_path):
     assert drawn.mean() == pytest.approx(0.4, abs=0.02)
 
 
+# ----------------------------------------------------------------------------------------------
+# A6c -- crop-level negatives (dev/plans/detector_v2.md, delegated investigation)
+# ----------------------------------------------------------------------------------------------
+
+def _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T=6,
+                               regions=None):
+    """ONE animal tightly clustered near a corner of a large-ish frame, every frame VISIBLE --
+    exhaustively labelled (no regions.pq) unless `regions` is given (an (M,6) array of
+    `[frame, camera, x0, y0, x1, y1]` rows, `_session_2d`-style), so there is plenty of room
+    elsewhere in the frame for a crop-negative candidate to clear the animal's margin.
+    """
+    from tailcyclenet import format as fmt
+    from tests.conftest import KPTS_2D, _rig, _write_frames
+
+    root = tmp_path / 'corner'
+    path = root / 'train' / 's'
+    K = len(KPTS_2D)
+    lab = fmt.empty_labels(1, T, K, 1, mode3d=False)
+    lab.vis2d[:] = fmt.VISIBLE
+    ax, ay = animal_xy
+    # A tight cluster (a few px spread) so the animal's own crop box stays small and near a corner.
+    rng = np.random.default_rng(0)
+    lab.points2d[0, :, :, 0] = np.stack(
+        [ax + rng.uniform(-2, 2, (T, K)), ay + rng.uniform(-2, 2, (T, K))], -1)
+    if regions is not None:
+        lab.regions = np.asarray(regions, dtype=np.float64)
+    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_2D,
+                      rig=_rig([('cam0', W, H, False, False, 0)]),
+                      groups={'g0': fmt.Group('g0', T)}, labels={'g0': lab})
+    _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
+    return root
+
+
+def test_negative_crop_frac_absent_means_no_weighting(tmp_path):
+    root = _session_one_corner_animal(tmp_path)
+    ds = BoxDataset(root, 'train', input_wh=(32, 32))
+    assert not ds.is_negative.any()
+    assert ds.negative_crop_frac is None
+
+
+def test_negative_crop_frac_draws_a_margin_clearing_crop_on_a_whole_frame_exhaustive_session(
+        tmp_path):
+    """detector_v2 A6c: no regions.pq at all (the 3dpop/calms21 shape) -- a crop negative may be
+    drawn from anywhere in the frame, subject to the margin from the one known animal."""
+    from tailcyclenet.detector.assign import box_center_dist
+
+    root = _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0))
+    ds = BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5, seed=0)
+    crop_ix = np.flatnonzero((ds.is_negative) & (ds.negative_source == 'crop'))
+    assert crop_ix.size > 0, 'a 200x150 frame with one small corner animal must yield crops'
+    for i in crop_ix.tolist():
+        sess, gid, f, ci = ds.index[i]
+        ox, oy = ds.origins[i]
+        assert ds.origins[i] is not None, 'a crop negative must carry its own sub-frame origin'
+        known = ds._known_boxes_source_px(sess, gid, f, ci)
+        tw, th = ds._tile_extent()
+        cand = torch.tensor([[ox, oy, ox + tw, oy + th]], dtype=torch.float32)
+        d = box_center_dist(cand, known)[0]
+        assert bool((d >= 2.5).all()), f'crop at ({ox},{oy}) did not clear the margin: {d}'
+        boxes = ds.boxes_for(i)
+        assert boxes.shape == (0, 4)
+
+
+def test_negative_crop_frac_restricted_to_a_certified_region(tmp_path):
+    """detector_v2 A6c: with `regions.pq` present and non-empty, every candidate must land INSIDE
+    the certified rect(s) -- never in the (formally unknown) area outside them."""
+    T = 6
+    # Certify a small rect on one side of the frame, far from the animal's own corner -- big
+    # enough to hold a 32x32 crop but nowhere near covering the whole 200x150 frame.
+    rows = [[float(f), 0.0, 120.0, 10.0, 190.0, 140.0] for f in range(T)]
+    root = _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T=T,
+                                      regions=rows)
+    ds = BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5, seed=0)
+    crop_ix = np.flatnonzero((ds.is_negative) & (ds.negative_source == 'crop'))
+    assert crop_ix.size > 0
+    for i in crop_ix.tolist():
+        ox, oy = ds.origins[i]
+        tw, th = ds._tile_extent()
+        assert ox >= 120.0 - 1e-6 and oy >= 10.0 - 1e-6
+        assert ox + tw <= 190.0 + 1e-6 and oy + th <= 140.0 + 1e-6
+
+
+def test_negative_crop_frac_raises_when_regions_certify_no_safe_area(tmp_path):
+    """detector_v2 A6c: `regions.pq` present but EMPTY for every frame means there is NO safe area
+    at all (outside the animal's own box) -- must raise, never silently draw zero crops."""
+    root = _session_one_corner_animal(tmp_path, regions=np.zeros((0, 6)))
+    with pytest.raises(ValueError, match='negative_crop_frac'):
+        BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5)
+
+
+def test_negative_crop_frac_out_of_range_raises(tmp_path):
+    root = _session_one_corner_animal(tmp_path)
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match='negative_crop_frac'):
+            BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=bad)
+
+
+def test_negative_source_distinguishes_absent_from_crop(tmp_path):
+    """`negative_weights(source=...)` must be able to sweep ONE source without pulling in the
+    other -- the two are orthogonal claims (A6c.4)."""
+    root = _session_one_corner_animal(tmp_path)
+    ds = BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5, seed=0)
+    assert (ds.negative_source[ds.is_negative] == 'crop').all()
+    w = ds.negative_weights(0.5, source='crop')
+    assert w is not None
+    with pytest.raises(ValueError, match='no negative frames'):
+        ds.negative_weights(0.5, source='absent')   # this session has no INST_ABSENT rows at all
+
+
 def test_detector_config_weight_decay_default_is_5e_4(tmp_path):
     """5e-4 was hardcoded in `train_detector.py`'s AdamW call. The config default must be the SAME
     number, or every checkpoint on record stops being reproducible from its own config.

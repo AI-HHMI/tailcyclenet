@@ -113,15 +113,15 @@ def main():
     # `fp_none` come from `box_mota`'s own uncapped pass and are what CLAUDE.md's standing rule
     # means by "want opposite fixes" -- never read `fp` alone as an over-detection number.
     print(f'{"group":40s} {"n_gt":>6s} {"r@.5":>7s} {"r@.75":>7s} {"IoU":>7s} {"fp":>7s} '
-          f'{"MOTA":>7s} {"fp_ig":>6s} {"fp_dup":>7s} {"fp_none":>8s}')
+          f'{"MOTA":>7s} {"fp_ig":>6s} {"fp_dup":>7s} {"fp_none":>8s} {"miss":>7s}')
     for g, r in sorted(rows.items()):
         print(f'{g[:40]:40s} {r["n_gt"]:6d} {r["r50"]:7.3f} {r["r75"]:7.3f} {r["iou"]:7.3f} '
               f'{r["fp"]:7.3f} {r["mota"]:7.3f} {r["fp_ignored"]:6d} {r["fp_dup"]:7.3f} '
-              f'{r["fp_none"]:8.3f}')
+              f'{r["fp_none"]:8.3f} {r["miss"]:7.3f}')
 
     n_gt = sum(r['n_gt'] for r in rows.values())
     print(f'\n{len(rows)} group(s), {n_gt} labelled boxes')
-    for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none'):
+    for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
         b = paired_bootstrap([r[name] for r in rows.values()], seed=args.seed)
         ci = ('DEGENERATE (one group -- no interval exists)' if b['n'] < 2
               else f'[{b["lo"]:.3f}, {b["hi"]:.3f}] 95% over {b["n"]} groups')
@@ -153,7 +153,7 @@ def main():
                               num_workers=args.num_workers, max_animals=args.max_animals)
         keys = sorted(set(rows) & set(other))
         print(f'\nPAIRED: {args.run} minus {args.compare}, over {len(keys)} shared group(s)')
-        for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none'):
+        for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
             d = paired_bootstrap([rows[k][name] for k in keys],
                                  [other[k][name] for k in keys], seed=args.seed)
             if d['n'] < 2:

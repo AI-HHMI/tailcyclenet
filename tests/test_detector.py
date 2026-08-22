@@ -2017,11 +2017,12 @@ def test_summarise_exposes_fp_dup_and_fp_none_as_rates():
     from tailcyclenet.detector.evaluate import _summarise
 
     s = {'n_gt': 4, 'hit50': 3, 'hit75': 2, 'iou': 3.0, 'fp': 1,
-        'mota': [{'mota': 0.5, 'gt': 4, 'fp_ignored': 1, 'fp_dup': 1, 'fp_none': 2}]}
+        'mota': [{'mota': 0.5, 'gt': 4, 'fp_ignored': 1, 'fp_dup': 1, 'fp_none': 2, 'misses': 3}]}
     r = _summarise(s)
     assert r['fp_ignored'] == 1
     assert r['fp_dup'] == pytest.approx(1 / 4)
     assert r['fp_none'] == pytest.approx(2 / 4)
+    assert r['miss'] == pytest.approx(3 / 4)
 
 
 def test_summarise_fp_dup_none_are_nan_with_no_mota_rows():
@@ -2031,7 +2032,7 @@ def test_summarise_fp_dup_none_are_nan_with_no_mota_rows():
     from tailcyclenet.detector.evaluate import _summarise
 
     r = _summarise({'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0, 'fp': 0, 'mota': []})
-    assert np.isnan(r['fp_dup']) and np.isnan(r['fp_none'])
+    assert np.isnan(r['fp_dup']) and np.isnan(r['fp_none']) and np.isnan(r['miss'])
 
 
 def test_overall_weights_fp_dup_and_fp_none_by_n_gt():
@@ -2042,14 +2043,15 @@ def test_overall_weights_fp_dup_and_fp_none_by_n_gt():
 
     rows = {
         'a': {'n_gt': 2, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 0, 'fp_dup': 0.5, 'fp_none': 0.0},
+             'fp_ignored': 0, 'fp_dup': 0.5, 'fp_none': 0.0, 'miss': 0.25},
         'b': {'n_gt': 6, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 2, 'fp_dup': 0.0, 'fp_none': 1.0},
+             'fp_ignored': 2, 'fp_dup': 0.0, 'fp_none': 1.0, 'miss': 0.0},
     }
     o = overall(rows)
     assert o['fp_ignored'] == 2
     assert o['fp_dup'] == pytest.approx((2 * 0.5 + 6 * 0.0) / 8)
     assert o['fp_none'] == pytest.approx((2 * 0.0 + 6 * 1.0) / 8)
+    assert o['miss'] == pytest.approx((2 * 0.25 + 6 * 0.0) / 8)
 
 
 def test_overall_fp_dup_none_skip_nan_groups_rather_than_propagate():
@@ -2057,13 +2059,15 @@ def test_overall_fp_dup_none_skip_nan_groups_rather_than_propagate():
 
     rows = {
         'a': {'n_gt': 2, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 0, 'fp_dup': float('nan'), 'fp_none': float('nan')},
+             'fp_ignored': 0, 'fp_dup': float('nan'), 'fp_none': float('nan'),
+             'miss': float('nan')},
         'b': {'n_gt': 6, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 0, 'fp_dup': 0.25, 'fp_none': 0.1},
+             'fp_ignored': 0, 'fp_dup': 0.25, 'fp_none': 0.1, 'miss': 0.4},
     }
     o = overall(rows)
     assert o['fp_dup'] == pytest.approx(0.25)
     assert o['fp_none'] == pytest.approx(0.1)
+    assert o['miss'] == pytest.approx(0.4)
 
 
 def test_box_mota_dup_and_none_reach_evaluate_via_the_real_pipeline():
@@ -2079,7 +2083,20 @@ def test_box_mota_dup_and_none_reach_evaluate_via_the_real_pipeline():
                         [1000.0, 1000.0, 1010.0, 1010.0]])   # far away -> none
     store = {0: (pred, gt, None, None)}
     r = box_mota(store)
-    assert r['fp'] == 2 and r['fp_dup'] == 1 and r['fp_none'] == 1
+    assert r['fp'] == 2 and r['fp_dup'] == 1 and r['fp_none'] == 1 and r['misses'] == 0
+
+
+def test_box_mota_a_missed_animal_is_a_miss_not_an_fp():
+    """The other direction from the dup/none test above: a real animal with NO prediction near it
+    must show up as `misses`, and must not move `fp_dup`/`fp_none` at all.
+    """
+    from tailcyclenet.detector.evaluate import box_mota
+
+    gt = torch.tensor([[0.0, 0.0, 10.0, 10.0], [1000.0, 1000.0, 1010.0, 1010.0]])
+    pred = torch.tensor([[0.0, 0.0, 10.0, 10.0]])   # only the first animal gets a box
+    store = {0: (pred, gt, None, None)}
+    r = box_mota(store)
+    assert r['misses'] == 1 and r['fp'] == 0 and r['fp_dup'] == 0 and r['fp_none'] == 0
 
 
 def test_score_dataset_scores_unaugmented_and_restores_the_flag():

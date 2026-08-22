@@ -395,6 +395,32 @@ weight_decay = -0.1
         load_detector_config(p)
 
 
+def test_detector_config_det_scale_defaults_to_1(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    assert load_detector_config(p)['data']['det_scale'] == 1.0
+
+
+def test_detector_config_det_scale_rejects_non_positive(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+det_scale = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='det_scale'):
+        load_detector_config(p)
+
+
 def test_detector_config_annot_frac_defaults_to_none(tmp_path):
     """Absent means unchanged behaviour -- the key must not acquire a numeric default."""
     p = _write_config(tmp_path, """
@@ -629,6 +655,60 @@ box_weight = {box_weight}
     assert loss_5 != loss_1, \
         'box_weight=5.0 and box_weight=1.0 produced the SAME loss -- the config value is not ' \
         'reaching detector_loss'
+
+
+def test_train_detector_det_scale_halves_the_input_end_to_end(tmp_path, dense_root, monkeypatch):
+    """detector_v2 D2: `det_scale=0.5` must actually shrink the model's input, not just parse."""
+    import importlib.util
+    import re
+    import sys
+
+    def run(det_scale):
+        out = tmp_path / f'run_ds_{det_scale}'
+        cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [128, 128]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+det_scale = {det_scale}
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""", f'cfg_ds_{det_scale}.toml')
+        spec = importlib.util.spec_from_file_location(f'tcn_train_detector_det_scale_{det_scale}',
+                                                      REPO / 'scripts' / 'train_detector.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mod.main()
+        m = re.search(r'input (\d+)x(\d+)  \(frame', buf.getvalue())
+        assert m, f'no input line found:\n{buf.getvalue()}'
+        return int(m.group(1)), int(m.group(2))
+
+    full = run(1.0)
+    half = run(0.5)
+    assert full == (128, 128)
+    assert half == (64, 64), f'det_scale=0.5 of 128x128 rounded to a multiple of 32 is 64x64, got {half}'
 
 
 def test_train_detector_no_decay_norm_bias_end_to_end(tmp_path, dense_root, monkeypatch):

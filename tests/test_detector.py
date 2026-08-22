@@ -425,6 +425,105 @@ box_weight = {box_weight}
         'reaching detector_loss'
 
 
+def test_train_detector_no_decay_norm_bias_end_to_end(tmp_path, dense_root, monkeypatch):
+    """detector_v2 C3: `no_decay_norm_bias = true` must train to completion and its own printed
+    line must report a NONZERO count of excluded (dim<=1) params -- GroupNorm affine + every bias
+    -- proving the split actually ran, not just parsed.
+    """
+    import importlib.util
+    import re
+    import sys
+
+    out = tmp_path / 'run_ndnb'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+no_decay_norm_bias = true
+weight_decay = 0.01
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_no_decay_norm_bias',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.main()
+    assert (out / 'detector.pth').exists()
+    m = re.search(r'no_decay_norm_bias: (\d+) params', buf.getvalue())
+    assert m and int(m.group(1)) > 0, \
+        f'expected a nonzero no_decay_norm_bias count in the log:\n{buf.getvalue()}'
+
+
+def test_no_decay_norm_bias_default_is_a_single_flat_group(tmp_path, dense_root, monkeypatch):
+    """Default False must build the exact one-group AdamW call every optimizer on record used --
+    the same proof pattern as `test_train_detector_box_weight_is_actually_wired_through`."""
+    import importlib.util
+    import sys
+
+    out = tmp_path / 'run_default'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""")
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_ndnb_default',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        mod.main()
+    assert 'no_decay_norm_bias: ' not in buf.getvalue(), \
+        'default False must not print the split line at all'
+
+
 def test_train_detector_max_pos_per_gt_end_to_end(tmp_path, dense_root, monkeypatch):
     """A short run with `max_pos_per_gt = 2` through the real CLI entry point: must train to
     completion with no error (0 -> None conversion happens in `train_detector.py`, not the

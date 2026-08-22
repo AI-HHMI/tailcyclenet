@@ -28,13 +28,15 @@ DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box
     'frames_per_group', 'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong',
     'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
-    'use_regions', 'ignore_present', 'temporal_input',
+    'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'scale_jitter',
+    'aug_switch_off_iter',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
-    'max_pos_per_gt', 'box_weight', 'weight_decay',
+    'max_pos_per_gt', 'box_weight', 'weight_decay', 'no_decay_norm_bias', 'nms_iou_thresh',
+    'nms_center_dist_thresh', 'neg_loss_weight',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -144,6 +146,23 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                                        'box_weight': 5.0, 'weight_decay': 5e-4}[k]))
     if train['weight_decay'] < 0:
         raise SystemExit(f"[training].weight_decay must be >= 0, got {train['weight_decay']}.")
+    # C3 (detector_v2 plan SS2.4): exclude every dim<=1 tensor (GroupNorm affine + every bias --
+    # 176 tensors, 14,300 params, 0.44%, measured on this repo's own YOLOXNano) from weight decay,
+    # RTMDet's `norm_decay_mult=0, bias_decay_mult=0` paired with a real `wd`. Default False,
+    # byte-identical to every checkpoint on record -- report 42's C1 tested `wd=0.05` WITH norm
+    # and bias decayed, a materially different configuration this key now makes reachable.
+    train['no_decay_norm_bias'] = bool(train.get('no_decay_norm_bias', False))
+    # A1/A5 (detector_v2 plan SS2.1), read by `train_detector.py`'s own periodic `score_dataset`
+    # eval so a config can sweep the SAME NMS thresholds `scripts/eval_detector.py`/`infer.py` do,
+    # instead of always scoring checkpoints at `decode`'s Python defaults. 0.5 / unset (None) are
+    # exactly those defaults -- byte-identical to every run on record.
+    train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
+    ncd = train.get('nms_center_dist_thresh', None)
+    train['nms_center_dist_thresh'] = None if ncd in (None, '', []) else float(ncd)
+    # The negative-frame objectness BCE's own weight relative to the ordinary positive-frame
+    # `obj` term -- SLEAP's `negative_loss_weight`. 1.0 (default) weighs a negative-frame item
+    # exactly like a positive-frame one; only reachable once `[data].negative_frac` draws any.
+    train['neg_loss_weight'] = float(train.get('neg_loss_weight', 1.0))
     for k, default in (('rotate_deg', 45.0), ('tile_scale', 1.0)):
         data[k] = float(data.get(k, default))
     data['augment'] = bool(data.get('augment', True))
@@ -177,6 +196,28 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:
         raise SystemExit(f"[data].annot_frac must be in [0, 1], got {data['annot_frac']}.")
+    # A6 (detector_v2 plan SS2.3): P(a train draw is a NEGATIVE frame -- an (frame, camera) an
+    # `instances.pq` row explicitly marks INST_ABSENT for EVERY animal, a real per-camera
+    # assessment, not silence). `None`/unset (default) draws no negative frames and is
+    # byte-identical to every checkpoint on record; see `BoxDataset.negative_index` for why only
+    # `INST_ABSENT` qualifies (not merely "not in the labelled-frame index", which would risk
+    # training false negatives wherever a frame holds an unannotated-but-present animal).
+    nf = data.get('negative_frac', None)
+    data['negative_frac'] = None if nf in (None, '', []) else float(nf)
+    if data['negative_frac'] is not None and not 0.0 <= data['negative_frac'] <= 1.0:
+        raise SystemExit(f"[data].negative_frac must be in [0, 1], got {data['negative_frac']}.")
+    # D1 (detector_v2 plan SS2.6): scale-jitter augmentation, layered into `random_affine`'s own
+    # `scale=` draw range. `None`/unset (default) keeps the shipped `(0.8, 1.25)` range and is
+    # byte-identical to every checkpoint on record. A `[lo, hi]` pair overrides it outright rather
+    # than composing (composing two ranges is not obviously either range, and the plan's own
+    # instruction is 'sweep, don't adopt' -- one explicit range per arm keeps that legible).
+    data['scale_jitter'] = _pair('scale_jitter', data.get('scale_jitter'))
+    # D3 (detector_v2 plan SS2.6): the ITERATION `[data].augment_strong` (mosaic-lite, colour
+    # jitter, additive noise, salt & pepper, motion blur, cutout) switches OFF for the remainder of
+    # the run -- RTMDet's `PipelineSwitchHook`, and this repo's own precedent for "an int means the
+    # step to change at" (`[model].video_encoder_requires_grad`). 0 (default) never switches off
+    # and is byte-identical to every checkpoint on record.
+    data['aug_switch_off_iter'] = int(data.get('aug_switch_off_iter', 0) or 0)
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
 

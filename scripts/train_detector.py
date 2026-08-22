@@ -235,19 +235,45 @@ def main():
     # fresh GroupNorm net; the same scale is reused for in-domain backbones. With no pretraining
     # this builds one param group, byte-identical to every optimizer on record.
     BACKBONE_LR_SCALE = 0.1
+
+    def _split_decay(params):
+        # C3 (detector_v2 plan SS2.4): every dim<=1 tensor (GroupNorm affine + every bias) goes to
+        # weight_decay=0; everything else keeps the configured decay. RTMDet's own
+        # norm_decay_mult=0, bias_decay_mult=0, paired with a real wd -- report 42's C1 tested
+        # wd=0.05 WITH norm and bias decayed, a materially different configuration. Returns 1 or 2
+        # param-group dicts (missing 'lr', filled in by the caller).
+        params = list(params)
+        if not train_cfg['no_decay_norm_bias']:
+            return [{'params': params, 'weight_decay': train_cfg['weight_decay']}]
+        decay = [p for p in params if p.dim() > 1]
+        no_decay = [p for p in params if p.dim() <= 1]
+        out = []
+        if decay:
+            out.append({'params': decay, 'weight_decay': train_cfg['weight_decay']})
+        if no_decay:
+            out.append({'params': no_decay, 'weight_decay': 0.0})
+        return out
+
+    groups = []
     if model_cfg['pretrained']:
         backbone_ids = {id(p) for p in model.backbone.parameters()}
         backbone_params = [p for p in model.parameters() if id(p) in backbone_ids]
         other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
-        opt = torch.optim.AdamW(
-            [{'params': backbone_params, 'lr': train_cfg['lr'] * BACKBONE_LR_SCALE},
-             {'params': other_params, 'lr': train_cfg['lr']}],
-            weight_decay=train_cfg['weight_decay'])
+        for g in _split_decay(backbone_params):
+            groups.append({**g, 'lr': train_cfg['lr'] * BACKBONE_LR_SCALE})
+        for g in _split_decay(other_params):
+            groups.append({**g, 'lr': train_cfg['lr']})
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
               f'neck/head {train_cfg["lr"]:g}', flush=True)
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=train_cfg['lr'],
-                                weight_decay=train_cfg['weight_decay'])
+        for g in _split_decay(model.parameters()):
+            groups.append({**g, 'lr': train_cfg['lr']})
+    if train_cfg['no_decay_norm_bias']:
+        n_no_decay = sum(p.numel() for g in groups if g['weight_decay'] == 0.0
+                         for p in g['params'])
+        print(f'  no_decay_norm_bias: {n_no_decay} params (dim<=1) excluded from weight decay',
+              flush=True)
+    opt = torch.optim.AdamW(groups, weight_decay=train_cfg['weight_decay'])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
 
     history = []

@@ -107,20 +107,27 @@ def main():
                          num_workers=args.num_workers, max_animals=args.max_animals)
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={args.boxes}  '
-          f'min_crop_dim={ds.min_crop_dim}\n')
+          f'min_crop_dim={ds.min_crop_dim}  max_animals={args.max_animals or "(GT count)"}\n')
+    # `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED, and on
+    # a single-view root it is close to `1 - r@.5` restated, not an independent quantity. `fp_dup`/
+    # `fp_none` come from `box_mota`'s own uncapped pass and are what CLAUDE.md's standing rule
+    # means by "want opposite fixes" -- never read `fp` alone as an over-detection number.
     print(f'{"group":40s} {"n_gt":>6s} {"r@.5":>7s} {"r@.75":>7s} {"IoU":>7s} {"fp":>7s} '
-          f'{"MOTA":>7s} {"fp_ig":>6s}')
+          f'{"MOTA":>7s} {"fp_ig":>6s} {"fp_dup":>7s} {"fp_none":>8s}')
     for g, r in sorted(rows.items()):
         print(f'{g[:40]:40s} {r["n_gt"]:6d} {r["r50"]:7.3f} {r["r75"]:7.3f} {r["iou"]:7.3f} '
-              f'{r["fp"]:7.3f} {r["mota"]:7.3f} {r["fp_ignored"]:6d}')
+              f'{r["fp"]:7.3f} {r["mota"]:7.3f} {r["fp_ignored"]:6d} {r["fp_dup"]:7.3f} '
+              f'{r["fp_none"]:8.3f}')
 
     n_gt = sum(r['n_gt'] for r in rows.values())
     print(f'\n{len(rows)} group(s), {n_gt} labelled boxes')
-    for name in ('r50', 'r75', 'iou', 'fp', 'mota'):
+    for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none'):
         b = paired_bootstrap([r[name] for r in rows.values()], seed=args.seed)
         ci = ('DEGENERATE (one group -- no interval exists)' if b['n'] < 2
               else f'[{b["lo"]:.3f}, {b["hi"]:.3f}] 95% over {b["n"]} groups')
-        print(f'{name:>5s} {b["mean"]:7.3f}  {ci}')
+        print(f'{name:>7s} {b["mean"]:7.3f}  {ci}')
+    fp_ig = sum(r['fp_ignored'] for r in rows.values())
+    print(f'fp_ignored (raw count, quote beside MOTA on any 3D root -- CLAUDE.md): {fp_ig}')
 
     if args.compare:
         m2, wh2, _, mcd2, red2, trained_on2, tile2, _ = load_detector(args.compare,
@@ -146,16 +153,20 @@ def main():
                               num_workers=args.num_workers, max_animals=args.max_animals)
         keys = sorted(set(rows) & set(other))
         print(f'\nPAIRED: {args.run} minus {args.compare}, over {len(keys)} shared group(s)')
-        for name in ('r50', 'r75', 'iou', 'fp', 'mota'):
+        for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none'):
             d = paired_bootstrap([rows[k][name] for k in keys],
                                  [other[k][name] for k in keys], seed=args.seed)
             if d['n'] < 2:
-                print(f'{name:>5s} {d["mean"]:+7.4f}  DEGENERATE (one group)')
+                print(f'{name:>7s} {d["mean"]:+7.4f}  DEGENERATE (one group)')
                 continue
             # A sign flip inside the interval means the arms are not distinguished on this
             # column; say so rather than leaving two overlapping intervals to compare.
             star = '' if d['lo'] <= 0 <= d['hi'] else '  *'
-            print(f'{name:>5s} {d["mean"]:+7.4f}  [{d["lo"]:+.4f}, {d["hi"]:+.4f}]{star}')
+            print(f'{name:>7s} {d["mean"]:+7.4f}  [{d["lo"]:+.4f}, {d["hi"]:+.4f}]{star}')
+        fp_ig1 = sum(rows[k]['fp_ignored'] for k in keys)
+        fp_ig2 = sum(other[k]['fp_ignored'] for k in keys)
+        print(f'fp_ignored: {args.run}={fp_ig1}  {args.compare}={fp_ig2}  '
+              '(raw counts, not paired-bootstrapped)')
 
 
 def main_deploy(args, device):

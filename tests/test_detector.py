@@ -2009,6 +2009,79 @@ def test_provenance_records_every_box_affecting_option():
         'the same keys at every value -- conditional membership is what makes a record lie'
 
 
+def test_summarise_exposes_fp_dup_and_fp_none_as_rates():
+    """D1: `box_mota`'s own fp_dup/fp_none split (already computed for `mota` above) must survive
+    into the per-group summary, not just `fp_ignored`. Rates, matching `mota()`'s own
+    `fp_dup_rate`/`fp_none_rate` and every other per-gt column here (`r50`, `r75`, `fp`).
+    """
+    from tailcyclenet.detector.evaluate import _summarise
+
+    s = {'n_gt': 4, 'hit50': 3, 'hit75': 2, 'iou': 3.0, 'fp': 1,
+        'mota': [{'mota': 0.5, 'gt': 4, 'fp_ignored': 1, 'fp_dup': 1, 'fp_none': 2}]}
+    r = _summarise(s)
+    assert r['fp_ignored'] == 1
+    assert r['fp_dup'] == pytest.approx(1 / 4)
+    assert r['fp_none'] == pytest.approx(2 / 4)
+
+
+def test_summarise_fp_dup_none_are_nan_with_no_mota_rows():
+    """A group `score_dataset` never ran `box_mota` on (e.g. every GT box absent) must not read
+    as a silent 0.0 -- that is indistinguishable from "measured, zero false positives".
+    """
+    from tailcyclenet.detector.evaluate import _summarise
+
+    r = _summarise({'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0, 'fp': 0, 'mota': []})
+    assert np.isnan(r['fp_dup']) and np.isnan(r['fp_none'])
+
+
+def test_overall_weights_fp_dup_and_fp_none_by_n_gt():
+    """Same weighting basis as every other column `overall` reports -- a group's vote on the
+    aggregate fp_dup/fp_none rate is proportional to how many labelled boxes it carries.
+    """
+    from tailcyclenet.detector.evaluate import overall
+
+    rows = {
+        'a': {'n_gt': 2, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
+             'fp_ignored': 0, 'fp_dup': 0.5, 'fp_none': 0.0},
+        'b': {'n_gt': 6, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
+             'fp_ignored': 2, 'fp_dup': 0.0, 'fp_none': 1.0},
+    }
+    o = overall(rows)
+    assert o['fp_ignored'] == 2
+    assert o['fp_dup'] == pytest.approx((2 * 0.5 + 6 * 0.0) / 8)
+    assert o['fp_none'] == pytest.approx((2 * 0.0 + 6 * 1.0) / 8)
+
+
+def test_overall_fp_dup_none_skip_nan_groups_rather_than_propagate():
+    from tailcyclenet.detector.evaluate import overall
+
+    rows = {
+        'a': {'n_gt': 2, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
+             'fp_ignored': 0, 'fp_dup': float('nan'), 'fp_none': float('nan')},
+        'b': {'n_gt': 6, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
+             'fp_ignored': 0, 'fp_dup': 0.25, 'fp_none': 0.1},
+    }
+    o = overall(rows)
+    assert o['fp_dup'] == pytest.approx(0.25)
+    assert o['fp_none'] == pytest.approx(0.1)
+
+
+def test_box_mota_dup_and_none_reach_evaluate_via_the_real_pipeline():
+    """End to end through `box_mota` itself (not a hand-built summary dict): one exact-match TP,
+    one prediction near the claimed GT (dup), one far away (none) -- the shape `_summarise`'s
+    comment describes.
+    """
+    from tailcyclenet.detector.evaluate import box_mota
+
+    gt = torch.tensor([[0.0, 0.0, 10.0, 10.0]])
+    pred = torch.tensor([[0.0, 0.0, 10.0, 10.0],      # exact match -> TP
+                        [1.0, 1.0, 11.0, 11.0],      # near the claimed GT -> dup
+                        [1000.0, 1000.0, 1010.0, 1010.0]])   # far away -> none
+    store = {0: (pred, gt, None, None)}
+    r = box_mota(store)
+    assert r['fp'] == 2 and r['fp_dup'] == 1 and r['fp_none'] == 1
+
+
 def test_score_dataset_scores_unaugmented_and_restores_the_flag():
     """`ignore_for` takes no `warp`, unlike `boxes_for` and `regions_for` beside it.
 

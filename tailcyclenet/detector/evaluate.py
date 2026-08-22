@@ -97,11 +97,22 @@ def _summarise(s):
     n = max(s['n_gt'], 1)
     m = s.get('mota', [])
     gt = sum(r['gt'] for r in m)
+    # `fp` above is `greedy_match`'s IoU-based count, DECODED AT `top_k = n_want` -- the training
+    # loop and `eval_detector.py` both call `score_dataset` with the ground-truth animal count as
+    # the budget by default, so a detector that wants to emit more boxes than that is never
+    # allowed to and `fp` cannot register the difference. `fp_dup`/`fp_none` come from `box_mota`'s
+    # OWN independent point-matching pass (already run, for `mota` above) and are NOT subject to
+    # that cap in the same way: `box_mota` scores every box `decode` returned at whatever `top_k`
+    # the caller passed, so raising `--max-animals` moves these two numbers even where `fp` cannot.
+    # `fp_dup` (near an already-claimed GT -- arbitration/NMS removes it) and `fp_none` (on no
+    # animal -- a detection problem) want opposite fixes; report them, never their sum alone.
     return {'n_gt': s['n_gt'], 'r50': s['hit50'] / n, 'r75': s['hit75'] / n,
             'iou': s['iou'] / n, 'fp': s['fp'] / n,
             'mota': (sum(r['mota'] * r['gt'] for r in m if np.isfinite(r['mota'])) / gt
                      if gt else float('nan')),
-            'fp_ignored': sum(r['fp_ignored'] for r in m)}
+            'fp_ignored': sum(r['fp_ignored'] for r in m),
+            'fp_dup': (sum(r['fp_dup'] for r in m) / gt) if gt else float('nan'),
+            'fp_none': (sum(r['fp_none'] for r in m) / gt) if gt else float('nan')}
 
 
 @torch.no_grad()
@@ -192,6 +203,15 @@ def overall(rows):
     out['mota'] = (sum(r['mota'] * r['n_gt'] for r in m) / sum(r['n_gt'] for r in m)
                    if m else float('nan'))
     out['n_gt'] = sum(r['n_gt'] for r in rows.values())
+    # A raw count, like every other place `fp_ignored` is reported -- see `_summarise`.
+    out['fp_ignored'] = sum(r.get('fp_ignored', 0) for r in rows.values())
+    # `fp_dup`/`fp_none` are already per-gt rates (see `_summarise`); weight by `n_gt` the same
+    # way `mota` is above, and the same way a group with none of `box_mota`'s inputs (no `mota`
+    # rows at all) drops out rather than contaminating the mean with a NaN.
+    for k in ('fp_dup', 'fp_none'):
+        mk = [r for r in rows.values() if np.isfinite(r.get(k, float('nan')))]
+        out[k] = (sum(r[k] * r['n_gt'] for r in mk) / sum(r['n_gt'] for r in mk)
+                  if mk else float('nan'))
     return out
 
 

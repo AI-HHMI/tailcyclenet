@@ -160,6 +160,128 @@ def test_cohort_sampler_reshuffles_and_stays_in_range(tmp_path):
     assert list(iter(s)) != first, 'a second epoch must redraw'
 
 
+def _two_group_root(tmp_path, n1=4, n2=32, label_source='tracked'):
+    """Two SINGLE-COHORT sessions with DIFFERENT frame counts -- for B1a/B1b, isolated from
+    `annot_frac`'s cohort question (both groups share one `label_source`).
+    """
+    from tailcyclenet import format as fmt
+    from tests.conftest import KPTS_3D, _rig, _write_frames
+
+    W = H = 48
+    root = tmp_path / 'two_group'
+    for name, T in (('a', n1), ('b', n2)):
+        path = root / 'train' / name
+        lab = fmt.empty_labels(1, T, len(KPTS_3D), 1, mode3d=False)
+        lab.vis2d[0, :, :, 0] = fmt.VISIBLE
+        lab.points2d[0, :, :, 0] = (
+            10.0 + 3.0 * np.arange(T, dtype=np.float32))[:, None, None] % (W - 10)
+        fmt.write_session(path, mode='2d', units='px', label_source=label_source, names=KPTS_3D,
+                          rig=_rig([('cam0', W, H, False, False, 0)]),
+                          groups={'g0': fmt.Group('g0', T)}, labels={'g0': lab})
+        _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
+    return root
+
+
+def test_max_frames_per_group_zero_drops_the_cap(tmp_path):
+    """detector_v2 B1a: 0 means every labelled frame is indexed, not just the first
+    `max_frames_per_group` a cap happened to keep."""
+    root = _two_group_root(tmp_path, n1=4, n2=32)
+    capped = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=8, seed=0)
+    uncapped = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=0, seed=0)
+    assert len(capped) == 4 + 8       # group 'a' (4 frames) under the cap, 'b' (32) truncated to 8
+    assert len(uncapped) == 4 + 32    # nothing truncated
+    # 40 (the shipped default) must be UNCHANGED from the pre-B1a behaviour.
+    default = BoxDataset(root, 'train', input_wh=(64, 64), seed=0)
+    assert len(default) == 4 + 32     # both groups are under the default cap of 40
+
+
+def test_alpha_weights_absent_means_no_weighting(tmp_path):
+    ds = BoxDataset(_two_group_root(tmp_path), 'train', input_wh=(64, 64), max_frames_per_group=0)
+    assert ds.alpha_weights(None) is None
+
+
+def test_alpha_1_is_frame_uniform(tmp_path):
+    """alpha=1.0: every entry the same weight, i.e. plain frame-uniform sampling."""
+    ds = BoxDataset(_two_group_root(tmp_path, n1=4, n2=32), 'train', input_wh=(64, 64),
+                    max_frames_per_group=0)
+    w = ds.alpha_weights(1.0)
+    assert np.allclose(w, w[0])
+
+
+def test_alpha_0_is_group_uniform(tmp_path):
+    """alpha=0.0: every GROUP gets the same TOTAL weight regardless of its view count -- the
+    naive 'weight by group' scheme SS2.7 warns starves a small group without this exponent form,
+    but AT alpha=0 exactly it reduces to that naive scheme and the two group totals must agree.
+    """
+    ds = BoxDataset(_two_group_root(tmp_path, n1=4, n2=32), 'train', input_wh=(64, 64),
+                    max_frames_per_group=0)
+    w = ds.alpha_weights(0.0)
+    keys = np.array([f'{s.session_id}/{g}' for s, g, _, _ in ds.index])
+    totals = {k: float(w[keys == k].sum()) for k in np.unique(keys)}
+    vals = list(totals.values())
+    assert vals[0] == pytest.approx(vals[1]), f'group totals must be equal at alpha=0: {totals}'
+
+
+def test_alpha_is_a_free_noop_on_uniform_group_sizes(tmp_path):
+    """3dpop's own shape (SS5.5): every group the SAME view count makes alpha provably inert --
+    a free null control, not a bug."""
+    ds = BoxDataset(_two_group_root(tmp_path, n1=16, n2=16), 'train', input_wh=(64, 64),
+                    max_frames_per_group=0)
+    for alpha in (0.0, 0.5, 1.0):
+        w = ds.alpha_weights(alpha)
+        assert len(np.unique(np.round(w, 10))) == 1, \
+            f'uniform group sizes must make alpha=({alpha}) a no-op, got {w}'
+
+
+def test_scale_jitter_overrides_random_affines_default_range(tmp_path, monkeypatch):
+    """detector_v2 D1: `scale_jitter` REPLACES `random_affine`'s own `(0.8, 1.25)` default
+    outright (not composed with it), and is simply absent from the call when unset."""
+    import tailcyclenet.detector.data as ddata
+
+    calls = []
+    orig = ddata.random_affine
+
+    def spy(*a, **kw):
+        calls.append(kw)
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(ddata, 'random_affine', spy)
+    root = _two_group_root(tmp_path, n1=8, n2=8)
+
+    ds = ddata.BoxDataset(root, 'train', input_wh=(64, 64), augment=True, scale_jitter=(0.5, 0.5))
+    _ = ds[0]
+    assert calls and calls[-1].get('scale') == (0.5, 0.5)
+
+    calls.clear()
+    ds2 = ddata.BoxDataset(root, 'train', input_wh=(64, 64), augment=True)
+    _ = ds2[0]
+    assert calls and 'scale' not in calls[-1], \
+        'unset scale_jitter must not override random_affine\'s own default'
+
+
+def test_aug_switch_off_iter_disables_strong_after_the_named_step(tmp_path):
+    """detector_v2 D3: an int names the STEP the strong suite switches off at, mirroring
+    `video_encoder_requires_grad`'s own precedent."""
+    root = _two_group_root(tmp_path, n1=8, n2=8)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), augment=True, strong=True,
+                    aug_switch_off_iter=5)
+    assert ds._strong_now() is True
+    ds.set_iter(4)
+    assert ds._strong_now() is True
+    ds.set_iter(5)
+    assert ds._strong_now() is False, 'at or past the named step, strong must be OFF'
+    ds.set_iter(1000)
+    assert ds._strong_now() is False
+
+
+def test_aug_switch_off_iter_default_is_a_noop(tmp_path):
+    root = _two_group_root(tmp_path, n1=8, n2=8)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), augment=True, strong=True)
+    assert ds._it is None, 'unset aug_switch_off_iter must not even allocate the shared counter'
+    ds.set_iter(999999)   # must be a harmless no-op, not an error
+    assert ds._strong_now() is True
+
+
 def test_detector_config_weight_decay_default_is_5e_4(tmp_path):
     """5e-4 was hardcoded in `train_detector.py`'s AdamW call. The config default must be the SAME
     number, or every checkpoint on record stops being reproducible from its own config.

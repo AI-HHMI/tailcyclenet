@@ -282,6 +282,90 @@ def test_aug_switch_off_iter_default_is_a_noop(tmp_path):
     assert ds._strong_now() is True
 
 
+def _absent_frames_root(tmp_path, T=10, n_absent=3, n_labelled=3):
+    """A session whose `instances.pq` marks the LAST `n_absent` frames INST_ABSENT for every
+    animal (a genuine per-camera assessment) and the FIRST `n_labelled` frames normally labelled
+    -- so the ordinary index is non-empty AND the negative-frame index has real material.
+    """
+    from tailcyclenet import format as fmt
+    from tests.conftest import KPTS_3D, _rig, _write_frames
+
+    W = H = 48
+    K = len(KPTS_3D)
+    root = tmp_path / 'absent'
+    path = root / 'train' / 's'
+    lab = fmt.empty_labels(1, T, K, 1, mode3d=False)
+    labelled = list(range(n_labelled))
+    lab.vis2d[0, labelled, :, 0] = fmt.VISIBLE
+    lab.points2d[0, labelled, :, 0] = 10.0
+    lab.instance = np.full((1, T, 1), fmt.INST_NONE, np.int8)
+    lab.boxes = np.full((1, T, 1, 4), np.nan, np.float32)
+    lab.instance[0, labelled, 0] = fmt.INST_LABELED
+    absent = list(range(T - n_absent, T))
+    lab.instance[0, absent, 0] = fmt.INST_ABSENT
+    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_3D,
+                      rig=_rig([('cam0', W, H, False, False, 0)]),
+                      groups={'g0': fmt.Group('g0', T)}, labels={'g0': lab})
+    _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
+    return root, absent
+
+
+def test_negative_frac_absent_means_no_weighting(tmp_path):
+    root, _ = _absent_frames_root(tmp_path)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64))
+    assert not ds.is_negative.any(), 'unset negative_frac must index NO negative frames at all'
+    assert ds.negative_frac is None
+
+
+def test_negative_frac_indexes_only_verified_absent_frames(tmp_path):
+    """detector_v2 A6: only a real per-camera INST_ABSENT assessment qualifies -- never bare
+    absence from the labelled-frame index (that would risk a false negative on an
+    unannotated-but-present animal)."""
+    root, absent = _absent_frames_root(tmp_path, T=10, n_absent=3, n_labelled=3)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.3)
+    assert int(ds.is_negative.sum()) == len(absent)
+    neg_frames = sorted(ds.index[i][2] for i in np.flatnonzero(ds.is_negative))
+    assert neg_frames == absent
+
+
+def test_negative_frame_yields_an_empty_box_target(tmp_path):
+    """S=0: no animal rows at all, so `assign` finds no positives and the whole anchor field
+    trains as background."""
+    root, _ = _absent_frames_root(tmp_path)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.3)
+    neg_i = int(np.flatnonzero(ds.is_negative)[0])
+    boxes = ds.boxes_for(neg_i)
+    assert boxes.shape == (0, 4)
+    x, b = ds[neg_i]
+    assert b.shape == (0, 4)
+
+
+def test_negative_frac_out_of_range_raises(tmp_path):
+    root, _ = _absent_frames_root(tmp_path)
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError, match='negative_frac'):
+            BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=bad)
+
+
+def test_negative_frac_raises_when_no_root_has_absent_rows(tmp_path):
+    """THE VERIFIED-NO-OP CASE: no converter in this repo writes INST_ABSENT today (checked
+    against rat-city-combined/3dpop), so `negative_frac` must FAIL LOUDLY on ordinary data rather
+    than silently doing nothing -- CLAUDE.md's STATUS POLICY standing rule."""
+    root = _two_group_root(tmp_path, n1=4, n2=4)     # no instances.pq at all
+    with pytest.raises(ValueError, match='negative_frac'):
+        BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.5)
+
+
+def test_negative_weights_realises_the_requested_share(tmp_path):
+    root, absent = _absent_frames_root(tmp_path, T=20, n_absent=10, n_labelled=10)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.4)
+    w = ds.negative_weights(0.4)
+    from tailcyclenet.detector import CohortSampler
+    s = CohortSampler(w, num_samples=20000, seed=0)
+    drawn = ds.is_negative[np.array(list(iter(s)))]
+    assert drawn.mean() == pytest.approx(0.4, abs=0.02)
+
+
 def test_detector_config_weight_decay_default_is_5e_4(tmp_path):
     """5e-4 was hardcoded in `train_detector.py`'s AdamW call. The config default must be the SAME
     number, or every checkpoint on record stops being reproducible from its own config.

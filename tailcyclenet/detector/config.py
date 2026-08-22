@@ -34,7 +34,7 @@ MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
-    'max_pos_per_gt', 'box_weight',
+    'max_pos_per_gt', 'box_weight', 'weight_decay',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -134,9 +134,16 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # config or CLI flag -- "the two untuned scalars" alongside `lr`. 5.0 here is BYTE-IDENTICAL
     # to every checkpoint on record, since that is also `detector_loss`'s own Python default; this
     # key only matters once a config states something else.
-    for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight'):
-        train[k] = float(train.get(k, {'lr': 1e-3, 'kpt_weight': 1.0,
-                                       'kpt_score_weight': 1.0, 'box_weight': 5.0}[k]))
+    # AdamW's DECOUPLED decay: p <- p*(1 - lr*wd). 5e-4 was hardcoded and is YOLOX's *SGD* number,
+    # where decay is coupled into the gradient; carried into AdamW at lr=1e-3 it is 5e-7 per step,
+    # i.e. a total shrink of x0.995 over a 20000-step cosine -- half a percent, on a detector every
+    # capacity sweep calls generalisation-limited (report 28). 5e-4 stays the DEFAULT and is
+    # byte-identical to every checkpoint on record; this key only matters once a config says else.
+    for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight', 'weight_decay'):
+        train[k] = float(train.get(k, {'lr': 1e-3, 'kpt_weight': 1.0, 'kpt_score_weight': 1.0,
+                                       'box_weight': 5.0, 'weight_decay': 5e-4}[k]))
+    if train['weight_decay'] < 0:
+        raise SystemExit(f"[training].weight_decay must be >= 0, got {train['weight_decay']}.")
     for k, default in (('rotate_deg', 45.0), ('tile_scale', 1.0)):
         data[k] = float(data.get(k, default))
     data['augment'] = bool(data.get('augment', True))

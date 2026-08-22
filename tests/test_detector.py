@@ -160,6 +160,35 @@ def test_cohort_sampler_reshuffles_and_stays_in_range(tmp_path):
     assert list(iter(s)) != first, 'a second epoch must redraw'
 
 
+def test_detector_config_weight_decay_default_is_5e_4(tmp_path):
+    """5e-4 was hardcoded in `train_detector.py`'s AdamW call. The config default must be the SAME
+    number, or every checkpoint on record stops being reproducible from its own config.
+    """
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    assert load_detector_config(p)['training']['weight_decay'] == 5e-4
+
+
+def test_detector_config_weight_decay_rejects_negative(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+weight_decay = -0.1
+""")
+    with pytest.raises(SystemExit, match='weight_decay'):
+        load_detector_config(p)
+
+
 def test_detector_config_annot_frac_defaults_to_none(tmp_path):
     """Absent means unchanged behaviour -- the key must not acquire a numeric default."""
     p = _write_config(tmp_path, """

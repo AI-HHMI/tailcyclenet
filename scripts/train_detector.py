@@ -242,11 +242,12 @@ def main():
         opt = torch.optim.AdamW(
             [{'params': backbone_params, 'lr': train_cfg['lr'] * BACKBONE_LR_SCALE},
              {'params': other_params, 'lr': train_cfg['lr']}],
-            weight_decay=5e-4)
+            weight_decay=train_cfg['weight_decay'])
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
               f'neck/head {train_cfg["lr"]:g}', flush=True)
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=train_cfg['lr'], weight_decay=5e-4)
+        opt = torch.optim.AdamW(model.parameters(), lr=train_cfg['lr'],
+                                weight_decay=train_cfg['weight_decay'])
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
 
     history = []
@@ -345,6 +346,7 @@ def main():
                         # Part of the recipe: two checkpoints trained at different cohort mixes
                         # are not the same arm, and nothing else in the file would say so.
                         'annot_frac': data_cfg['annot_frac'],
+                        'weight_decay': train_cfg['weight_decay'],
                         'min_crop_dim': data_cfg['min_crop_dim'],
                         'augment': data_cfg['augment'],
                         'augment_strong': data_cfg['augment_strong'],

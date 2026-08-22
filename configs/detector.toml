@@ -177,3 +177,13 @@ iou_aware_warmup = 2000
 # and a same-recipe replicate, with the effect replicated at both seeds. 5.0 restores the
 # pre-default weight, byte-identical to every checkpoint on record.
 box_weight = 15.0
+
+# AdamW's DECOUPLED weight decay: p <- p*(1 - lr*wd). 5e-4 is YOLOX's *SGD* number, where decay is
+# coupled into the gradient and scaled by SGD's much larger step; carried into AdamW at lr=1e-3 it
+# is 5e-7 per step -- a total shrink of x0.995 over the 20000-step cosine, i.e. HALF A PERCENT.
+# It was hardcoded until now and has never been swept, on a detector that report 28 (21 arms,
+# 0.56M-15M params, no arm clears its seed floor on val) calls generalisation-limited and that
+# report 30 shows responds strongly to augmentation. A normal AdamW setting is 0.01-0.05 (x0.905
+# / x0.607 over the same run). 5e-4 stays the default and is byte-identical to every checkpoint
+# on record. NOT A MEASURED VALUE in either direction -- changing it is an arm.
+weight_decay = 5e-4

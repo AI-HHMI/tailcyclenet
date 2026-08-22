@@ -81,7 +81,21 @@ class PyAVReader:
                              'It names libav\'s threading MODE, not a thread count.')
         self._st.thread_type = _tt
         self._tb = self._st.time_base
-        self._rate = self._st.average_rate
+        # **`guessed_rate`, NEVER `average_rate`. THE INDEX ARITHMETIC IS A RATE TIMES A pts, SO A
+        # RATE THAT IS OFF BY A PART IN 4,000 IS AN OFF-BY-ONE FRAME PART WAY THROUGH THE CLIP.**
+        # `average_rate` is duration/frames -- a DERIVED average, wrong whenever the container's
+        # declared duration is not exactly frames x period. The allen-mouse demo clips are the
+        # shipped instance: pts step exactly 256 at time_base 1/12800, i.e. exactly 50 fps, and
+        # `guessed_rate` (libav's `r_frame_rate`, what the container DECLARES) says 50 -- but
+        # their duration is one frame period short, so `average_rate` reads 200000/3999 =
+        # 50.0125. `round(pts * tb * rate)` then drifts, crossing a whole frame at n = 2000: the
+        # decoder yields 3000 frames whose indices are {0..1999, 2001..3000}, so index 2000 CANNOT
+        # BE PRODUCED and every frame after it is mislabelled +1. `get_batch` caught it as a hard
+        # refusal on the one skipped index, which is the only reason it was not a silent
+        # off-by-one over the last third of the clip -- exactly the failure this module rejected
+        # OpenCV for (opencv#9053). decord indexed by frame ORDINAL and never saw it, so every
+        # number taken on those clips before the PyAV swap predates this.
+        self._rate = self._st.guessed_rate or self._st.average_rate
         self._pos = None                    # next frame index the decoder would yield, if known
         self._iter = None
 

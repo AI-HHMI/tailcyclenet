@@ -94,6 +94,63 @@ def test_get_batch_honours_order_and_repeats(clip, idx):
             r.close()
 
 
+def test_a_vfr_remux_is_indexed_by_the_declared_rate_not_the_average(tmp_path):
+    """**A RATE OFF BY A PART IN 400 IS AN OFF-BY-ONE FRAME PART WAY THROUGH THE CLIP.**
+
+    `_index_of` turns a pts into a frame ORDINAL by multiplying by a rate, so which rate it picks
+    is the whole of the index arithmetic. `average_rate` is duration/frames -- a DERIVED average,
+    wrong whenever the declared duration is not exactly frames x period, which is what an ffmpeg
+    `select` + `-vsync vfr` remux produces (it is how the allen-mouse demo clips were cut: 3000
+    frames, pts step exactly 256 at time_base 1/12800 = exactly 50 fps, but `average_rate` reads
+    200000/3999). Under it the ordinals drift, and at some frame they SKIP one: the decoder then
+    cannot produce that index at all and every frame after it is mislabelled +1.
+
+    Caught because `get_batch` refuses a frame it cannot decode -- but the raise is the lucky
+    half. The silent half is the rest of the clip coming back one frame late, which is a different
+    picture of a moving animal and is exactly what this module rejected OpenCV for (opencv#9053).
+    So this asserts the COLOURS, not merely that nothing raised.
+    """
+    import subprocess
+
+    from .conftest import _write_video
+
+    src = _write_video(tmp_path / 'src.mp4', 1, 400, (64, 48), fps=200.0)
+    dst = tmp_path / 'clip.mp4'
+    keep, n_out = 4, 100
+    rc = subprocess.run(
+        ['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', '-i', str(src),
+         '-vf', f"select='not(mod(n\\,{keep}))'", '-vsync', 'vfr',
+         '-frames:v', str(n_out), '-an', '-c:v', 'libx264', '-crf', '16',
+         '-preset', 'veryfast', '-pix_fmt', 'yuv420p', str(dst)]).returncode
+    if rc != 0 or not dst.exists():
+        pytest.skip('ffmpeg could not produce the vfr remux')
+
+    import av
+    with av.open(str(dst)) as c:
+        st = c.streams.video[0]
+        # THE PRECONDITION. If a future ffmpeg stops producing this shape the test is no longer
+        # exercising the bug, and saying so is better than passing vacuously.
+        if st.average_rate == st.guessed_rate:
+            pytest.skip('this ffmpeg wrote a container whose two rates agree')
+
+    r = video.PyAVReader(str(dst))
+    try:
+        n = len(r)
+        # EVERY index in [0, n) decodes -- `n_frames` is a promise, and under `average_rate` one
+        # of these indices did not exist at all (frame 2000 of the real allen clip).
+        got = r.get_batch(list(range(n)))
+        assert got.shape[0] == n
+        # AND each one is the frame it claims to be. Output frame i is source frame keep*i, so a
+        # +1 ordinal shift anywhere shows up as the wrong colour rather than as a clean array.
+        for i in (0, n // 2, n - 2, n - 1):
+            mean = got[i].reshape(-1, 3).mean(0)
+            want = np.asarray(_video_colour(1, keep * i), float)
+            assert np.abs(mean - want).max() < 12, (
+                f'frame {i} decoded {mean}, wanted {want} -- the ordinal drifted')
+    finally:
+        r.close()
+
+
 def test_read_frames_is_identical_under_either_backend(tmp_path, monkeypatch):
     """THE REAL CALL PATH, not the reader in isolation: `read_frames` adds a dedupe, the
     clamp-pad's per-position copies and an optional warp on top."""

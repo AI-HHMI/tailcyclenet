@@ -5,7 +5,9 @@
 #
 # Blocks: [data] (loader + regression target), [model] (architecture), [training] (schedule).
 # An UNKNOWN KEY IN ANY BLOCK RAISES -- a typo must not silently train at defaults.
-# `weight_decay` (5e-4) and the cosine schedule are not configurable; they were never flags.
+# The cosine schedule itself is not configurable; it never was a flag. `weight_decay` IS a config
+# key (added post-report-42); its code-level fallback for an absent key is 5e-4 (the old hardcoded
+# value, byte-identical), but THIS FILE's own shipped value is 0.01 -- see the key's own comment.
 
 [data]
 # ONE dataset root (train/, optionally val/ and test/); a folder whose children are roots is refused.
@@ -178,12 +180,22 @@ iou_aware_warmup = 2000
 # pre-default weight, byte-identical to every checkpoint on record.
 box_weight = 15.0
 
-# AdamW's DECOUPLED weight decay: p <- p*(1 - lr*wd). 5e-4 is YOLOX's *SGD* number, where decay is
-# coupled into the gradient and scaled by SGD's much larger step; carried into AdamW at lr=1e-3 it
-# is 5e-7 per step -- a total shrink of x0.995 over the 20000-step cosine, i.e. HALF A PERCENT.
-# It was hardcoded until now and has never been swept, on a detector that report 28 (21 arms,
-# 0.56M-15M params, no arm clears its seed floor on val) calls generalisation-limited and that
-# report 30 shows responds strongly to augmentation. A normal AdamW setting is 0.01-0.05 (x0.905
-# / x0.607 over the same run). 5e-4 stays the default and is byte-identical to every checkpoint
-# on record. NOT A MEASURED VALUE in either direction -- changing it is an arm.
-weight_decay = 5e-4
+# AdamW's DECOUPLED weight decay: p <- p*(1 - lr*wd). The old hardcoded 5e-4 is YOLOX's *SGD*
+# number, where decay is coupled into the gradient and scaled by SGD's much larger step; carried
+# into AdamW at lr=1e-3 it was 5e-7 per step -- a total shrink of x0.995 over the 20000-step
+# cosine, i.e. HALF A PERCENT, on a detector report 28 calls generalisation-limited. 0.01 is a
+# normal AdamW setting (x0.905 total shrink over the same run) and SHIPPED HERE PER USER
+# INSTRUCTION, NOT A CONFIRMED WIN -- report 42 tested exactly this point (`al-wd01`, allen,
+# vs the old 5e-4) and got a real but MIXED trade-off, one seed, never replicated: `fp` SIG
+# better (-0.0223 [-0.0446,-0.0022]) but `r@.75` SIG worse (-0.0394 [-0.0804,-0.0000]), every
+# other metric null. The larger point 0.05 (`al-wd05`) looked like a clean win at one seed
+# (r50/r75/IoU all SIG better) and COMPLETELY REVERSED SIGN on its own seed-1 replicate (r@.75/
+# IoU/MOTA all SIG WORSE instead) -- report 42 §3.5/§5.5, the file's own standing warning against
+# trusting a clean-looking single-seed weight_decay result on this root. 0.01 was chosen over
+# 0.05 specifically because it is the smaller, more conservative step and was never the point that
+# catastrophically reversed -- but it was also never itself replicated, so treat it exactly like
+# `augment_strong`/`rotate_deg=45`/`yolox="tiny"` above: a default set by instruction, not evidence,
+# and the first thing to sweep-with-replicates if a future arm's generalisation gap looks like it
+# might be regularisation-shaped. Absent-key fallback (`tailcyclenet/detector/config.py`) stays at
+# the old hardcoded 5e-4, byte-identical for any config that predates this key.
+weight_decay = 0.01

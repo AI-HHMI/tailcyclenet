@@ -1,16 +1,11 @@
-# rat-city: ONE val group, 64 labelled frames. The shipped `val_frames_per_group = 8` selects
-# `detector.pth` on 8 of those 64 images -- checkpoint selection sees 12.5% of the val evidence
-# it could, on the root whose whole test split is also one group (dev/reports 09/18/28: the
-# rat-city-combined benchmark is DEGENERATE for exactly this reason). Raised to the group's own
-# labelled length (`dev/plans/detector_accuracy.md` T0.3): every labelled val frame is scored at
-# every checkpoint, at the cost of eval time nobody has measured yet -- watch `eval_every` if it
-# becomes the bottleneck.
+# rat-city: ONE val group, 64 labelled frames. Raised to the group's own labelled length -- the
+# shipped 8 made checkpoint selection see only 12.5% of the val evidence, on the root whose whole
+# test split is also one group. Watch `eval_every` if eval time becomes the bottleneck.
 #
-# `[data].boxes` stays at the base default ("instances") deliberately: report 10 measured
-# instance-trained beating keypoint-trained on rat-city (recall 0.531 vs 0.429), but T3.3 in the
-# plan flags that every SHIPPED rat-city POSE run is keypoint-trained, so this pair currently
-# serves two different crop rules and any delta off it is not detector accuracy alone until that
-# is resolved on the pose side.
+# `[data].boxes` stays at the base default ("instances") deliberately: instance-trained beat
+# keypoint-trained on rat-city, but every SHIPPED rat-city POSE run is keypoint-trained, so this
+# pair serves two different crop rules and any delta off it is not detector accuracy alone until
+# that is resolved on the pose side.
 extends = "../detector.toml"
 
 [data]

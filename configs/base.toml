@@ -1,95 +1,55 @@
-# Everything 2D and 3D agree on. Not runnable alone -- `configs/2d.toml` and `configs/3d.toml`
-# each `extends` this and add the few keys that genuinely differ.
-#
-# THE POINT OF THE SPLIT IS THAT THE OVERLAY IS THE WHOLE DIFFERENCE. If a key belongs here and is
-# repeated in an overlay, the overlay stops being readable as "what 3D needs that 2D does not",
-# which is the one question this layout exists to answer. Three keys differ. See the overlays.
-#
-# [model] below the `query` line is the ukt14i7c base recipe -- it is splatted into posetail's
-# TrackerEncoder and the warm start expects the same architecture it was trained with.
-# `n_keypoints` is NOT here: it is derived from the keypoint registry, which is derived from data.
+# Everything 2D and 3D agree on; 2d.toml / 3d.toml `extends` this and the overlay IS the whole
+# difference (a key repeated in an overlay stops the layout from answering what 3D needs that 2D
+# does not). [model] is the ukt14i7c base recipe; `n_keypoints` is derived from data, not configured.
 
 [data]
-n_frames = 12               # a CEILING: a train window is sized to the labelled span it covers
-                            # MUST EQUAL [model].stride_length -- see build_model. 24 -> 12 halves
-                            # what inference must hold: one window of FULL frames across the refine
-                            # pass is the irreducible working set, and on a 16-camera 3208x2200 rig
-                            # that is 8.13 GB at 24 against 4.07 at 12.
+n_frames = 12               # a CEILING: a train window is sized to the labelled span it covers;
+                            # must equal [model].stride_length (refused otherwise). 12 keeps the
+                            # full-frame working set across refine passes affordable.
 image_size = 256
 balance_datasets = true
 aug_prob = 0.25
-crop_jitter = 0.3           # 0.3/0.3 cut the cost of detector crops from +0.545 to +0.115 mm
-crop_jitter_scale = 0.3     # AND improved base accuracy -- a tight box teaches the model that
-min_crop_dim = 64           # the animal always fills the frame, which no detector delivers
-prompt_dropout = 0.5        # fraction of STEPS run fully query-free -> no-query tokens
-prompt_noise_px = 2.5       # sigma on the prior, in PIXELS. 3D converts via cube_scale (world
-                            # units per pixel), so ONE setting means the same visual displacement
-                            # on a 30 px fly and on allen's mm-space rig. Ships WITH the dropout --
-                            # dropout alone is retired at +0.146 SIG worse on fly.
-# A WHOLE-BODY offset, the corruption with the shape of a deployment failure (i.i.d. jitter
-# averages to zero over the keypoint set and so teaches the model to trust the prior's centroid
-# exactly -- the one quantity a whole-body lag gets wrong).
-#
-# 5.0 IS A CONSISTENCY CHOICE, NOT A MEASURED OPTIMUM. The measured value is 8.0, on allen, 3D
-# (prompted-self 2.3275 against 2.5254, -0.277 mm [-0.395, -0.171] paired; report 13 step 6). 2D was
-# proposed at 0.0 only because the key acts through `scene_center` and `cube_scale`, which are
-# 3D-derived, so report 17 section 7 argues it is UNMEASURABLE in 2D -- not that it is harmful
-# there. 5 buys one fewer knob that differs between the two files. The cost: a new 3D arm is no
-# longer paired with the 8.0 result on record, so say so when reporting one.
+crop_jitter = 0.3           # measured: tight crops cut the detector-crop penalty and improve base
+crop_jitter_scale = 0.3     # accuracy, because a tight box teaches the model the animal always
+min_crop_dim = 64           # fills the frame, which no detector delivers
+prompt_dropout = 0.5        # fraction of steps run fully query-free -> no-query tokens
+prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cube_scale), so one
+                            # setting means the same visual displacement on any rig; ship WITH the
+                            # dropout -- dropout alone is significantly worse
+# A WHOLE-BODY offset, the corruption shaped like a deployment failure: i.i.d. jitter averages to
+# zero over keypoints and teaches trust in the prior's centroid, which a whole-body lag gets wrong.
+# 5.0 is a CONSISTENCY choice, not a measured optimum (the measured value is 8.0, on 3D allen; 2D
+# argues the key is unmeasurable there, not harmful) -- say so when reporting a 3D arm.
 prompt_offset_px = 5.0
 num_workers = 12
 
 [model]
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
 query_encoder = "wide"      # the only encoder; the two query terms are built iff query = "prior"
-# THE BOX PROMPT (report 27): tell the model which box the target animal occupies, per frame per
-# camera, as a NON-position channel -- it can then be told which animal to return. "none" |
-# "film" (FiLM on the identity term). "none" is byte-identical to a config without the key.
-# Measured on crowded 2D calms21:
-# -3.5 mm MPJPE held-out at fixed weights, and in the deployment window loop on WIDE crops
-# (--crop-inflate 1.5) +0.26 MOTA / -0.117 fp_dup -- it removes the report-24 §9m wide-crop
-# collapse. ROOT-CONDITIONAL by keypoint density (sparse rat-city helps far less) and
-# GEOMETRY-CONDITIONAL (decisive on a shared/wide crop, redundant on one already centred on its
-# target). Deploy with `scripts/infer.py` -- the box DEPLOYMENT recipe (--box-prompt detector
-# --crop-inflate 1.5 --refine) is now the DEFAULT for a box model and inert for a plain one, so
-# no flags are needed. "film" is the shipped default; "none" restores a plain wide model.
-#
-# LIVE IN 2D AND 3D, PER CAMERA (report 33). This used to be 2D-single-camera-only -- the
-# training loader always emitted a correct per-camera 3D box, but `infer.py` refused to consume
-# it on any 3D or multi-camera window and ran box-withheld there, silently, on every 3D box run
-# ever trained. A camera with nothing finite that frame gets a NaN column, substituted by the
-# encoder's learned no-box token -- the regime `[data].box_prompt_dropout` trains, not a silent
-# failure. `[data].crop_inflate` is the loader twin of `--crop-inflate`: 1.0 is inert, and no
-# shipped config trains above it yet.
+# The BOX PROMPT tells the model which box the target animal occupies, per frame per camera, as
+# a NON-position channel; "film" = FiLM on the identity term, "none" = byte-identical to no key.
+# Live in 2D and 3D, per camera: a camera with nothing finite that frame gets a NaN column -> the
+# encoder's learned no-box token, the regime `[data].box_prompt_dropout` trains. `[data].crop_inflate`
+# is the loader twin of `--crop-inflate`; 1.0 is inert.
 box_prompt = "film"
-# What the 3D residual is an offset FROM. NO DEFAULT -- the two values load the same tensors, so a
-# checkpoint trained under one and built under the other produces numbers instead of an exception
-# (+23.1 mm MPJPE, -0.18 MOTA on 3dpop; gotcha 12). Inert in 2D, where `model.py` returns before
-# both offset paths -- but still required, because the key is about the WEIGHTS, not the run.
-# "triangulated" is REFUTED when paired with query = "prior": +0.289 mm [+0.115, +0.473] worse.
+# What the 3D residual is an offset FROM. No default: both values load the same tensors, so a
+# checkpoint trained under one and built under the other silently mis-reads -- the key asserts
+# what the weights were trained as (inert in 2D). "triangulated" is refuted with query = "prior".
 gridresid_offset = "query"
 
 video_encoder_version = "large"
-# STAGED UNFREEZE, and the ONLY statement about the encoder's gradient state -- `[training]`'s
-# `freeze_encoder` is gone, because it re-froze the encoder after `build_model` and two sources of
-# truth for one fact is one config away from silently disagreeing (the `per_camera_cube_scale`
-# rule). A bool means never / from step 0; an INT is the iteration to unfreeze at, and posetail
-# 0.3.5's `TrackerEncoder.unfreeze_video_encoder` owns the gate and the block selection.
-#
-# NOT MEASURED ON THIS REPO'S ROOTS. Every run on record trained with the encoder frozen for its
-# whole life, so no number in CLAUDE.md is comparable to a run started after this default landed.
-# Set `video_encoder_requires_grad = false` to reproduce the old arm exactly.
+# STAGED UNFREEZE, the only statement about the encoder's gradient state (the old
+# `freeze_encoder` is gone). A bool = never / from step 0; an INT = the iteration to unfreeze at.
+# Not measured on this repo's roots: every run on record froze the encoder for its whole life;
+# `false` reproduces the old arm exactly.
 video_encoder_requires_grad = 10000
-# The last 8 of ViT-L's 24 blocks, plus (repo-local, not upstream) the hierarchical output norms
-# whose layer falls in that range -- `norms_block[3]` at layer 23 here. Upstream unfreezes blocks
-# and an `encoder.norm` that VJEPA 2.1 does not have, so the norm feeding the decoder off a
-# trainable block would otherwise stay frozen. Omit the key to train the WHOLE encoder.
+# The last 8 of ViT-L's 24 blocks plus (repo-local) the hierarchical output norms inside the
+# range, which upstream would leave frozen behind a trainable block. Omit to train the whole encoder.
 video_encoder_finetune_last_n_layers = 8
 video_encoder_hierarchical = true
 soft_argmax_temperature_learnable = true
-stride_length = 12          # THE SAME QUANTITY as [data].n_frames -- it sizes the temporal
-                            # pos_embed (tracker_encoder: self.S = self.n_frames = stride_length).
-                            # build_model refuses a config where the two disagree.
+stride_length = 12          # the same quantity as [data].n_frames -- sizes the temporal pos_embed;
+                            # build_model refuses a config where the two disagree
 image_size = 256
 query_patch_size = 9
 per_camera_cube_scale = true
@@ -117,56 +77,45 @@ head_3d_grid_size = 1024
 head_3d_grid_radius = 1.8
 log_3d_output = true
 log_3d_eps = 0.1
-# LOAD-BEARING, do not widen. `_grid_softmax` masks to |argmax - index| <= 60 of 1024 bins. Swept
-# against labels: 10/20/30/45/60/120/inf read 8.114/8.032/7.991/7.981/7.976/8.374/11.032 mm --
-# removing the truncation costs +3.06 mm (38%). It suppresses spurious far modes; it is not a bias.
+# LOAD-BEARING, do not widen: `_grid_softmax` masks to |argmax - index| <= 60 of 1024 bins;
+# removing the truncation is measured to cost several mm. It suppresses spurious far modes.
 soft_argmax_threshold = 60
-# "head" averages convex-spaced bin centres directly and overshoots through the warp at large
-# motion; "warped" averages in the uniform space first. The library defaults to the wrong one.
+# "head" overshoots through the warp at large motion; "warped" averages in uniform space first.
+# The library defaults to the wrong one.
 grid_decode_space = "warped"
 enable_subpixel_refinement = false
 depth_log_min = -2.5
 depth_log_max = 2.5
 
-# Five keys that used to be here and reach nothing, removed rather than left reading as knobs:
-#   corr_radius, use_volume_embedding, occlusion_embedding -- consumed only by the stock
-#     QueryEncoder, which model.py no longer builds
-#   mode_3d      -- "stored and never read" (build_model only asserts it)
-#   cross_attn_dim -- restated latent_dim, which is also what None defaults to
-# The parameter set is identical without them (measured).
+# Keys that used to be here and reach nothing were removed (corr_radius, use_volume_embedding,
+# occlusion_embedding, mode_3d, cross_attn_dim); the parameter set is identical without them.
 
 [training]
 n_iterations = 60000
 seed = 23
-# The base tracker this finetunes from. Moving-camera support added ZERO parameters, so a
-# checkpoint from before that merge loads cleanly; the unexpected-keys list is printed anyway.
+# The base tracker this finetunes from; moving-camera support added zero parameters, so older
+# checkpoints load cleanly.
 checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260727_113457-ukt14i7c/files/checkpoints"
 max_grad_norm = 10.0
 checkpoint_freq = 1000
 val_freq = 200
 val_batches = 20
 print_freq = 20
-# `freeze_encoder` REMOVED -- see [model].video_encoder_requires_grad, which is now the only
-# statement about the encoder's gradient state. A config still naming it is refused by name.
+# `freeze_encoder` was REMOVED -- [model].video_encoder_requires_grad is the only statement of
+# the encoder's gradient state; naming the old key is refused.
 
 [training.optimizer]
-# THE SHIPPED OPTIMIZER, and also what an ABSENT key means. "muon" runs torch.optim.Muon on the
-# 2D transformer matrices of the decoder (and the encoder blocks, when unfrozen) with AdamW-SF on
-# everything else -- heads, norms, biases, and every nn.Embedding, whose rows are keypoint
-# identities and must not be orthogonalized together. Ported from posetail-next, where SF-Muon
-# beat AdamW/schedulefree by ~0.05 kubric at every matched iteration; NOT re-measured on this
-# repo's roots, so it is the reference's result and not one of ours (dev/reports/34).
-#
-# "schedulefree" restores the previous AdamW-SF recipe and is what an EXISTING run folder needs in
-# order to resume -- its checkpoint carries AdamW-SF state, and train.py refuses to load it into a
-# Muon optimizer rather than guessing.
+# THE SHIPPED OPTIMIZER, and what an ABSENT key means: Muon on the 2D transformer matrices (and
+# unfrozen encoder blocks) with AdamW-SF on everything else -- heads, norms, biases, and every
+# nn.Embedding, whose rows are keypoint identities and must not be orthogonalized together.
+# Ported from posetail-next; not re-measured on this repo's roots. "schedulefree" restores the
+# previous AdamW-SF recipe and is what an existing run folder needs to resume (train.py refuses
+# the mismatched checkpoint).
 optimizer = "muon"
 learning_rate = 1e-4        # the value every run on record used
 kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
-# LIVE from the unfreeze iteration, not inert: before it the encoder groups do not exist, and at
-# the unfreeze they are created at this scale (1e-5). The AdamW half of them warms up over
-# `warmup_steps` from its own k = 0 because a new group starts fresh; the Muon half is long past
-# `muon_warmup_steps` by then and joins at full scaled LR, matching the reference.
+# LIVE from the unfreeze iteration, not inert: the encoder groups are created at this scale
+# (1e-5) at the unfreeze, with their own warmup from a fresh k = 0.
 encoder_lr_scale = 0.1
 weight_decay = 0.002
 warmup_steps = 500          # drives the AdamW-SF half's warmup
@@ -179,34 +128,23 @@ muon_warmup_steps = 500     # Muon hits full lr at step 0 otherwise; matches war
 muon_adjust_lr_fn = "match_rms_adamw"
 
 [training.losses]
-# `delta` and `use_huber_loss` reach the 3D metric Hubers only -- the 2D and all four reprojection
-# losses hardcode delta = 16 and Huber on.
+# Reach the 3D metric Hubers only; the 2D and reprojection losses hardcode delta = 16 and Huber on.
 delta = 6
 use_huber_loss = true
-# THE ONLY FIVE `TotalLoss` ITSELF FIRES ON A 2D SESSION. `TotalLoss.forward` branches on
-# coords_true.shape[-1], and the R == 2 block computes exactly these; everything else below is
-# NaN'd and dropped -- see vis_loss_weight for the visibility consequence of that.
+# The only five TotalLoss keys that fire on a 2D session -- the R == 2 block computes exactly
+# these; everything else below is NaN'd and dropped.
 coords_loss_2d_weight = 1.5
 coords_softmax_2d_weight = 0.6
 smoothness_loss_2d_weight = 0.5
-smoothness_loss_order = 4   # a CEILING: train.py clamps to min(order, T-1) per batch, and the
-smoothness_loss_tolerance = 1.5   # derived-T rule makes T = 2 common, i.e. order 1.
-# A REPO-LOCAL TERM, not `TotalLoss`'s (`tailcyclenet/losses.py::PoseLoss`), and the ONLY key in
-# this block that fires on a 2D session and NOT on a 3D one -- the opposite scope of every key
-# below it. `TotalLoss.forward` never computes 2D visibility at all (see vis_loss_weight), so this
-# is the only way a `missing` row on a 2D session reaches the vis_pred head as a supervised
-# occlusion. DEFAULT 0.0 SO AN ABSENT KEY IS BIT-IDENTICAL to a run without this file's change --
-# every run on record trained at 0. Ship above 0 only after a paired arm on allen-mouse-annotated,
-# the one root with a dense, honest 2D occlusion channel (41.9% `missing`); rat-city-annotated and
-# calms21 must not be used to judge or gate this head (dev/plans/status_consistency_and_occlusion.md).
+smoothness_loss_order = 4   # a ceiling: train.py clamps to min(order, T-1) per batch, and the
+smoothness_loss_tolerance = 1.5   # derived-T rule makes T = 2 common, i.e. order 1
+# A REPO-LOCAL term (PoseLoss), the only key here that fires on a 2D session and NOT on a 3D one:
+# the only way a `missing` row reaches the vis_pred head as supervised occlusion in 2D. Default
+# 0.0 so an absent key is bit-identical to every run on record; measure a nonzero arm on
+# allen-mouse-annotated, the one root with a dense, honest 2D occlusion channel.
 vis_loss_2d_weight = 0.0
-# 3D-only from here down.
-#
-# NOTHING IN `TotalLoss` ITSELF SUPERVISES VISIBILITY ON A 2D SESSION. Both of ITS vis terms live
-# inside losses.py's 3D `else` branch, so on a 2D-only root the vis_pred head gets no gradient
-# from THIS weight -- and `--vis-thresh` there was gating on an untrained head until
-# `vis_loss_2d_weight` above existed. That is the real reason the rat-city gate figure was
-# withdrawn and the calms21 one is negative, and it is why this weight looks larger than it acts.
+# 3D-only from here down. In 2D the vis_pred head gets no gradient from this weight --
+# `vis_loss_2d_weight` above is the 2D channel.
 vis_loss_weight = 5.0
 vis_loss_3d_weight = 1.0
 conf_loss_weight = 0.0            # documented off-switches: the terms exist, the weights are 0
@@ -225,11 +163,8 @@ depth_softmax_weight = 1.5        # the largest CE term, and query-INDEPENDENT
 coords_3d_loss_scale = 50.0
 smoothness_loss_3d_weight = 0.5
 
-# Three keys that used to be here and reach nothing:
-#   gamma, feature_loss_weight -- both gate on outputs TrackerEncoder never emits
-#     (`coords_pred_iters` survives only as a comment at tracker_encoder.py:830;
-#      `feature_planes_levels` does not appear in that file at all)
-#   pixel_thresh -- feeds only the two conf losses, which are weighted 0
+# Three keys that used to be here and reach nothing were removed: gamma, feature_loss_weight
+# (both gate on outputs TrackerEncoder never emits) and pixel_thresh (feeds only the conf losses).
 
 [wandb]
 project_name = "tailcyclenet"

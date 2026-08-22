@@ -1,35 +1,12 @@
 """ADOPT A FOLDER OF VIDEOS PLUS AN ANIPOSE CALIBRATION AS A SESSION, IN MEMORY.
 
-`--data` is a session directory in `docs/annotation_format.md`. A user with a folder of videos and
-an anipose calibration had to write a converter before the model would look at their pixels, and
-there is no converter for unlabelled footage because every shipped converter exists to carry
-LABELS across.
+`plan` turns filenames into a group -> camera -> path map; `build` probes each video and returns
+a `format.VideoSession`, with nothing staged (`Group.source` is the one filesystem entry point
+and is pre-filled). The cost: `validate_session` cannot be the acceptance test, so
+`tests/test_adopt.py` compares the in-memory session against the on-disk one in CI.
 
-**THE SESSION IS BUILT IN MEMORY. NOTHING IS WRITTEN.** `plan` turns filenames into a
-group -> camera -> path map; `build` probes each video for its length and frame size and returns a
-`format.VideoSession`. No staging directory, no symlink farm, no second copy of the user's
-filenames on disk that can go stale.
-
-This is affordable because the decode path has exactly one filesystem entry point:
-`dataset.read_frames` opens with `kind, src, ext = group.source(cam)`, and `Group.source` is a
-cache over `Group._src`. `format.video_group` pre-fills it, so `Group.pixels()` is never called,
-`Group.dir` is never dereferenced, and `session.path` is never read.
-
-**THE COST IS REAL AND IS NOT HIDDEN: `validate_session` cannot be the acceptance test any more**,
-because it resolves pixels through `Group.pixels()` and reads tables off `path`. The check moves
-into `tests/test_adopt.py`, which builds the same plan both ways and compares the in-memory
-session against the on-disk one `format.write_session` produces -- once, in CI, instead of on
-every run.
-
-**GOTCHA 10 IS LIVE HERE AND THE ANSWER IS A SCOPE RULE, NOT A WORKAROUND.** `build` opens video
-containers in the PARENT process, which is the fork deadlock if that process later forks
-dataloader workers. Inference does not fork -- the window loop decodes in-process behind a thread
-pool -- so this module is safe from `scripts/infer.py` AND NOWHERE ELSE. Never call it from
-`scripts/train.py`.
-
-Pure/impure is split down the middle on purpose: `plan` and `check_flags` fire every refusal that
-does not need pixels, so they run before the checkpoint loads and before anything decodes, and
-they are testable with no video fixture at all.
+`build` opens video containers in the PARENT process (the fork deadlock), so this module is safe
+from `scripts/infer.py` -- which never forks -- and NOWHERE ELSE.
 """
 from __future__ import annotations
 
@@ -42,28 +19,12 @@ from pathlib import Path
 
 from . import format as fmt
 
-# How many videos to probe at once. It is I/O, so it parallelises.
-#
-# **DERIVED FROM THE BUDGET, NOT A CONSTANT, BECAUSE AN UNBUDGETED CONSUMER IS HOW THE NEXT ONE
-# GETS ADDED.** This holds open decord readers, which is what `FRACTION_READERS` is for, so it
-# comes out of that share rather than sitting outside the partition -- `FRACTION_READERS` +
-# `_DETECT` + `_STORE` sum to 1.00 and nothing else may be added to the total silently.
-#
-# **AND IT IS CHEAP, WHICH IS A MEASUREMENT AND NOT AN ASSUMPTION.** An open reader on a
-# 263,798-frame 3208x2200 container retains **0.03 GB**, LINEAR in the number held (2.01x at two),
-# trimmed after each step -- `scratch/reader_cost_vs_length.py`. So this derivation does not change
-# the number on any rig anyone has run; it makes the accounting honest, and it means a genuinely
-# tiny budget shrinks the pool instead of ignoring it.
-#
-# **DO NOT re-derive a price from `dataset._reader_cache_size`'s `0.035/megapixel * n^2`.** That
-# law over-prices by ~8x at one reader and its quadratic term is not reproducible under a trim;
-# both it and CLAUDE.md's 0.28/3.58/15.34/59.38 table were taken on an unconstrained host without
-# one, i.e. they measured allocator arena. Fixing that law is deliberately NOT in scope here (see
-# dev/plans/infer_from_videos_and_calibration.md §15.2a) because every video root's reader cache
-# would move with it.
+# How many videos to probe at once. It is I/O, so it parallelises; bounded by the READER share
+# of the RAM budget (an un-budgeted consumer is how the next one gets added), and cheap -- an
+# open reader retains little when trimmed after each step.
 PROBE_WORKERS_MAX = 4
-# Measured above, rounded UP so the estimate errs toward a smaller pool -- the safe direction,
-# since a miss costs 41.5 ms of reopen and an over-estimate costs memory.
+# Rounded UP so the estimate errs toward a smaller pool -- the safe direction, since a miss costs
+# a reopen and an over-estimate costs memory.
 _PROBE_READER_BYTES = 0.05 * (1 << 30)
 
 
@@ -103,29 +64,10 @@ def _die(msg: str):
 
 
 def parse_name(stem: str, cam_regex: str | None) -> tuple[str, str]:
-    """(camera, group_id) for one video basename, under anipose's `[triangulation] cam_regex`.
-
-        basename = Path(video).stem
-        camera   = re.search(cam_regex, basename).group(1).strip()
-        group_id = re.sub(cam_regex, '', basename).strip()
-
-    So `cam0_trial3.mp4` under `cam([0-9]+)_` is camera `0`, group `trial3`, and `cam1_trial3.mp4`
-    joins it as the same group's second camera. **THE CAMERA NAME IS THE CAPTURE GROUP**, so it is
-    `0` and not `cam0` -- anipose's convention, and the number-one thing a user gets wrong.
-
-    Two deviations, both supersets, both the same shape as `crop.py` being a documented superset of
-    posetail's crop rule:
-
-    - **No capture group means the whole match.** anipose does `match.groups()[0]` and raises
-      `IndexError` on a group-less pattern; here `--cam-regex 'Cam[0-9]+'` works and names the
-      camera `Cam2005325`. NOT A NICETY: johnson's `mouse_2_validate` ships `Cam2005325.mp4`
-      beside a calibration whose camera is named `Cam2005325`, so the capture-group convention
-      would name it `2005325` and refusal 2 would fire on all 16 cameras.
-    - **A one-camera calibration needs no regex.** `cam_regex is None` -> the whole stem is the
-      group id and the caller supplies the camera. Demanding a regex to select from a set of one
-      is ceremony, and 2D single-view is most of the intended traffic.
-
-    Returns ('', stem) when there is no regex; the caller names the camera.
+    """(camera, group_id) for one video basename, under anipose's `[triangulation] cam_regex`:
+    camera = search(rx, stem).group(1), group_id = sub(rx, '', stem). THE CAMERA NAME IS THE
+    CAPTURE GROUP (`cam([0-9]+)_` yields `0`, not `cam0`). Supersets: no capture group matches
+    the whole stem, and a one-camera calibration needs no regex (returns ('', stem)).
     """
     if not cam_regex:
         return '', stem.strip()
@@ -138,10 +80,8 @@ def parse_name(stem: str, cam_regex: str | None) -> tuple[str, str]:
 
 def _expand(videos) -> list[Path]:
     """Files and/or directories -> the resolved, sorted file list. A directory expands to its
-    `VIDEO_EXTS` children, sorted, NOT recursively.
-
-    RESOLVED AND EXPANDED BEFORE IT IS RECORDED (`provenance_of`), so a `--videos rec/` that later
-    grows a file does not reconstruct differently.
+    `VIDEO_EXTS` children, sorted, NOT recursively. Resolved BEFORE it is recorded, so a
+    `--videos rec/` that later grows a file does not reconstruct differently.
     """
     out: list[Path] = []
     for v in videos:
@@ -150,21 +90,17 @@ def _expand(videos) -> list[Path]:
             out.extend(sorted(q.resolve() for q in p.iterdir()
                               if q.is_file() and q.suffix.lower() in fmt.VIDEO_EXTS))
         else:
-            # Refusal 5, and only for an EXPLICITLY named file: a directory expansion already
-            # filtered, so an unopenable container here is something the user typed.
+            # Refusal 5, for an EXPLICITLY named file -- a directory expansion already filtered.
             if p.suffix.lower() not in fmt.VIDEO_EXTS:
                 _die(f'--videos {p}: extension {p.suffix!r} is not one of {fmt.VIDEO_EXTS}. '
                      'Nothing downstream distinguishes a container it cannot open from one it '
                      'was never given.')
-            # NAMED AND ABSENT IS A REFUSAL, not a silent drop. It is also what catches a video
-            # RENAMED OR MOVED since a run: `provenance_of` records the resolved file list, so
-            # `session_from_prediction` replays exactly these paths, and a missing one there means
-            # the prediction can no longer be rendered over the pixels it was made from.
+            # Named and absent is a refusal: the recorded file list is replayed on render, so a
+            # missing file means the prediction lost its pixels.
             if not p.exists():
                 _die(f'--videos {p}: no such file.')
             out.append(p.resolve())
-    # dict.fromkeys, not set: the ORDER is the sorted expansion above and must not become a hash
-    # order, because `source_videos` is recorded and compared.
+    # dict.fromkeys, not set: the order is the sorted expansion and must survive recording.
     return list(dict.fromkeys(out))
 
 
@@ -177,12 +113,9 @@ def _common_parent(files: list[Path]) -> Path:
 
 
 def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None) -> VideoPlan:
-    """PURE GIVEN THE FILESYSTEM'S NAMES. Refusals 1-6. Opens no video, decodes nothing,
-    loads no checkpoint.
-
-    `calibration` is an **aniposelib-layout** toml -- what `format.load_calibration` reads, which
-    is also what this repo writes and what anipose itself writes. It is NOT a converter for any
-    other calibration format; see `--calibration`'s help.
+    """PURE GIVEN THE FILESYSTEM'S NAMES. Refusals 1-6. Opens no video, decodes nothing, loads
+    no checkpoint. `calibration` is an aniposelib-layout toml -- what `format.load_calibration`
+    reads and what anipose itself writes.
     """
     files = _expand(videos)
     if not files:
@@ -194,9 +127,9 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
         _die(f'--calibration {cal}: no such file.')
     with open(cal, 'rb') as f:
         doc = tomllib.load(f)
-    # REFUSAL 14, and it is the one place this path may be generous: a size derived from the
-    # pixels cannot be wrong about the pixels. `load_calibration` raises on a block with no `size`,
-    # so the document is patched here and `build` fills it in -- and PRINTS that it did.
+    # REFUSAL 14, and the one place this path may be generous: a size derived from the pixels
+    # cannot be wrong about the pixels. `load_calibration` raises on a block with no `size`, so
+    # the document is patched here and `build` fills it in -- and PRINTS that it did.
     need_size = []
     for k, block in doc.items():
         if k == 'metadata' or not isinstance(block, dict):
@@ -206,10 +139,8 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
             block['size'] = [0, 0]
     rig = fmt.rig_from_doc(doc, str(cal))
 
-    # NO MOVING RIGS. `extrinsics.pq` is per-frame geometry no filename can supply. Refused here
-    # rather than left to fail: `labels()` is overridden on this path, so a moving camera would
-    # sail past the check that lives there and blow up inside `cgroup()` instead, much later and
-    # much worse.
+    # NO MOVING RIGS: `extrinsics.pq` is per-frame geometry no filename can supply, and
+    # `labels()` is overridden on this path so nothing downstream would catch it.
     moving = [n for n in rig.names if rig.moving[n]]
     if moving:
         _die(f'{cal}: cameras {moving} declare moving = true, and --videos cannot supply '
@@ -218,9 +149,8 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
 
     mode = '3d' if len(rig) > 1 else '2d'
     if mode == '3d':
-        # REFUSAL 6. `load_calibration` silently turns a block with no `matrix` into a
-        # `nominal_camera`, and with `validate_session` out of the loop nothing downstream would
-        # ever say so -- which is what makes this load-bearing rather than a convenience.
+        # Refusal 6: `load_calibration` silently turns a matrix-less block into a nominal
+        # camera, and with `validate_session` out of the loop nothing downstream would say so.
         bad = [n for n in rig.names if not rig.calibrated[n]]
         if bad:
             _die(f'{cal}: {len(rig)} cameras means 3D, but {bad} carry no matrix/rotation/'
@@ -265,10 +195,8 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
         print(f'--videos: camera {name!r} has video but no calibration block; skipping its '
               f'{sum(1 for p in matched_regex if p[1] == name)} file(s).')
 
-    # THE EMPTY GROUP ID IS ABOUT DISAGREEMENT, NOT ABOUT EMPTINESS. `Cam2005325.mp4` under
-    # `Cam[0-9]+` leaves '': the whole stem IS the camera name, because a raw multi-camera
-    # recording of ONE session has nothing else to put in the filename. That is the shape of every
-    # raw rig dump. But `cam0.mp4` beside `cam0_trial3.mp4` is a genuine ambiguity.
+    # An empty group id is about DISAGREEMENT, not emptiness: all empty is one group (a raw rig
+    # dump); some empty and some not is a genuine ambiguity.
     empty = [p for p in keep if not p[2]]
     if empty and len(empty) != len(keep):
         _die('--cam-regex leaves some filenames with a group id and some with nothing: '
@@ -310,10 +238,8 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
 
 
 def check_flags(args) -> None:
-    """Refusals 7-11: the flags that mean something on a labelled session and nothing here.
-
-    Every one is pure argparse arithmetic, so it fires before the checkpoint loads AND before
-    anything decodes -- which `tests/test_adopt.py` pins by asserting the probe was never called.
+    """Refusals 7-11: the flags that mean something on a labelled session and nothing here. Pure
+    argparse arithmetic, so it fires before the checkpoint loads and before anything decodes.
     """
     if args.anchor == 'labels':                                                   # 7
         _die('--anchor labels seeds the model with GROUND TRUTH, and --videos has no labels: the '
@@ -327,31 +253,25 @@ def check_flags(args) -> None:
              'are an S = 0 array, so every window would abort `no points` and the run would '
              'report coverage 0.000 with nothing saying why. Pass --detector <run folder> or '
              '--boxes <npz>.')
-    # 10, AND IT IS THE DETECTOR PATH'S REFUSAL SPECIFICALLY. `run_dataset` falls back to
-    # `max(1, len(sess.labels(gid).animal_ids))`, which is 1 for any footage -- the
-    # catastrophic-miss-rate failure the driver already warns about, here with no labels to make
-    # it visible. A `--boxes` npz states the row count in its own first axis, so there is nothing
-    # to guess and nothing to refuse.
+    # 10, the DETECTOR path's refusal specifically: the fallback animal count is 1 for any
+    # footage, a catastrophic miss rate with no labels to make it visible. A `--boxes` npz states
+    # its row count in its own first axis, so there is nothing to refuse.
     if args.detector and not args.max_animals:                                    # 10
         _die('--videos --detector needs --max-animals: the row count otherwise falls back to the '
              "session's own animal count, which is 0 here and clamps to 1 -- a catastrophic miss "
              'rate on any multi-animal footage, with no labels to make it visible. The animal '
              'count is a fact no file on this path carries, so the operator states it.')
-    # `--split` DEFAULTS TO None IN THE PARSER, not to 'test', precisely so this can tell whether
-    # it was passed. The directory path resolves `args.split or 'test'`.
+    # `--split` defaults to None so this can tell whether it was PASSED. The directory path
+    # resolves `args.split or 'test'`.
     if getattr(args, 'split', None) is not None:                                  # 11
         _die('--split selects among a dataset root\'s sessions and --videos has no root, so it is '
              'inert here. Silently ignoring it would let you believe you selected something.')
 
 
 def dataset_name(registry, explicit=None) -> str:
-    """WHICH REGISTRY ENTRY TO READ THIS FOOTAGE'S KEYPOINTS AS.
-
-    A session with no labels still needs `names`, and there is no data to derive them from -- so
-    they come from the run's own registry. Which ENTRY is the open question, and the answer is a
-    default plus a refusal: `--dataset-name` wins; otherwise a registry holding exactly one
-    dataset is used and PRINTED; otherwise refuse, listing them. A multi-root run has several
-    keypoint vocabularies and nothing on this path can choose between them.
+    """WHICH REGISTRY ENTRY TO READ THIS FOOTAGE'S KEYPOINTS AS. A session with no labels still
+    needs `names`, and there is no data to derive them from -- so `--dataset-name` wins, a
+    registry holding exactly one dataset is used and PRINTED, otherwise refuse.
     """
     have = [d for d, _ in registry.datasets]
     if explicit:
@@ -373,22 +293,9 @@ def dataset_name(registry, explicit=None) -> str:
 def _probe(path: Path) -> tuple[int, tuple[int, int], float]:
     """(n_frames, (w, h), fps) for one video. OPENS ONE READER AND DROPS IT.
 
-    **THE FRAME COUNT COMES FROM THE SAME READER THE LOADER USES, NOT FROM FFPROBE OR
-    `cv2.CAP_PROP_FRAME_COUNT`.** `Group.n_frames` is a promise that every index in `[0, T)`
-    decodes, and `dataset._read_video` fulfils it through `video.open_reader`. A
-    container-metadata count that disagrees with the decoder's own index -- routine on a
-    variable-frame-rate or truncated file -- turns into a hard failure deep inside the window
-    loop, after the checkpoint has loaded. Going through the same backend makes it consistent by
-    construction, and it is why this reads `video.open_reader` rather than opening a container
-    itself. `scripts/convert_calms21.py` already takes its counts from the decoder for the same
-    reason.
-
-    **AND IT DOES NOT GO THROUGH `dataset._reader`.** That cache is process-wide and sized on
-    FIRST USE from whatever rig asked first, so a probe that populated it would fix its size
-    before the run's own RAM budget is resolved, and hold 16 containers open for the sake of 32
-    integers. Open, read three facts, drop -- measured at 1.06 GB FLAT across all 16 of johnson's
-    containers, so the probe is not where the memory goes. The open also WARMS THE PAGE CACHE the
-    run then reads through.
+    The count comes from the SAME reader the loader uses (a metadata count that disagrees with
+    the decoder fails inside the window loop), and NOT from `dataset._reader`, whose size would
+    be fixed before the run's own budget is resolved. The open also warms the page cache.
     """
     from . import video
 
@@ -407,13 +314,12 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
           trim=False, probe=_probe, verbose=True) -> fmt.VideoSession:
     """Probe every video, then construct the session IN MEMORY. Refusals 12-14.
 
-    GOTCHA 10: this opens video containers in the calling process. Safe from `scripts/infer.py`,
-    which never forks; never call it from `scripts/train.py`.
+    Opens video containers in the calling process (the fork deadlock): safe from
+    `scripts/infer.py`, which never forks; never call it from `scripts/train.py`.
     """
     jobs = [(gid, cam, p) for gid, cams in plan.videos.items() for cam, p in cams.items()]
     got: dict[tuple[str, str], tuple] = {}
-    # A silent pause before the first box looks like a hang -- 40 s per cold open x 16 cameras is
-    # ~11 minutes on a node that has never seen the recording. So it is parallel AND it says so.
+    # Parallel AND it says so: a silent pause before the first box looks like a hang.
     workers = probe_workers(len(jobs))
     if verbose:
         print(f'--videos: probing {len(jobs)} video(s) for length and frame size '
@@ -436,10 +342,8 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
             print(f'--calibration: camera {name!r} carried no `size`; filled from its own first '
                   f'frame as {wh[0]}x{wh[1]}.')
 
-    # REFUSAL 13. `matrix` and `distortions` are in SENSOR pixels and `size` is the image on disk,
-    # so a calibration made at twice the deployment resolution projects to the wrong place with no
-    # symptom other than being wrong. This is the one `validate_session` rule 8 would have caught
-    # for an image root and never checks for video, so it is a check the format never had.
+    # Refusal 13: `matrix` and `distortions` are in SENSOR pixels and `size` is the image on
+    # disk, so a calibration at the wrong resolution projects to the wrong place, silently.
     for (gid, cam), (n, wh, f) in sorted(got.items()):
         want = plan.rig.size(cam)
         if tuple(wh) != tuple(want):
@@ -466,14 +370,14 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
             n = next(iter(lens.values()))
         got_fps = [got[gid, cam][2] for cam in cams]
         f = float(fps) if fps else (got_fps[0] if got_fps else float('nan'))
-        # `source_video` is the spec's own ONE string per group. Right and spec-native for a
-        # single-camera rig; left empty for a multi-camera one rather than picking arbitrarily.
+        # `source_video` is the spec's one string per group; left empty for multi-camera rather
+        # than picking arbitrarily.
         sv = str(next(iter(cams.values()))) if len(cams) == 1 else ''
         groups[gid] = fmt.video_group(gid, n, cams, fps=f, source_video=sv)
         empty[gid] = fmt.empty_labels(0, n, K, C, mode3d=(plan.mode == '3d'))
 
     sess = fmt.VideoSession(
-        # `path` IS A LABEL, NOT A LOCATION -- see VideoSession. The common parent is what makes
+        # `path` is a LABEL, not a location -- see VideoSession. The common parent is what makes
         # `session_id` right and error strings name something a human recognises.
         path=_common_parent(list(plan.files)) / plan.session_id,
         mode=plan.mode, units=str(units), label_source='tracked', names=list(names),
@@ -485,8 +389,7 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
         print(f'--videos: session {sess.session_id!r}, mode {sess.mode}, units {sess.units!r} '
               f'(a DECLARATION about the calibration, not a measurement), {len(groups)} group(s), '
               f'{len(plan.rig)} camera(s)')
-    # The probe is the first phase of a `--videos` run and it runs before the checkpoint loads, so
-    # if it is where the memory goes, this is where a reader finds out.
+    # If the probe is where the memory goes, this is where a reader finds out.
     from . import memory
     memory.trim()
     memory.check_peak('the --videos probe')
@@ -498,32 +401,18 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
 
 
 def provenance_of(plan: VideoPlan) -> dict:
-    """The CLI INPUTS, and that is the whole record.
-
-    `source_videos` is the resolved `--videos` list -- the files themselves, absolute, one entry
-    each, after directory expansion. NOT the glob as typed, and **not the derived
-    `group -> camera -> path` map**: `plan()` is pure over the filenames, so calibration + regex +
-    file list re-derives that map exactly, and recording a structure a pure function already
-    computes is a second copy that can disagree with the first.
-
-    It also kills a naming problem outright. A per-(group, camera) key like `video_<gid>_<cam>`
-    collides -- group `a_b` camera `c` against group `a` camera `b_c` -- and `SessionWriter` only
-    catches a collision when the two values differ, i.e. not reliably. A flat list has no key to
-    collide.
-
-    `source_videos` IS THE FIRST NON-SCALAR PROVENANCE VALUE IN THIS REPO. A TOML array of strings
-    round-trips through `toml.dumps`/`tomllib` unchanged and `SessionWriter`'s duplicate-key check
-    compares with `!=`, which works on lists.
+    """The CLI INPUTS, and that is the whole record. `source_videos` is the RESOLVED file list --
+    not the derived map, which `plan()` re-derives exactly from the list (and a per-(group,
+    camera) key would collide).
     """
     return {
         'source': 'tailcyclenet infer --videos',
-        # DELIBERATELY EMPTY: there is no directory, and writing the path of one that does not
-        # exist reads as a stale root rather than as an absent one.
+        # Deliberately empty: there is no directory, and a stale-looking path reads as a root.
         'source_session': '',
         'source_calibration': str(plan.calibration),
         'source_cam_regex': str(plan.cam_regex or ''),
-        # A fourth CLI input, and it is load-bearing exactly where the regex leaves every
-        # remainder empty -- without it the reconstruction below cannot name the group.
+        # Load-bearing exactly where the regex leaves every remainder empty -- without it the
+        # reconstruction cannot name the group.
         'source_group_id': str(plan.group_id),
         'source_videos': [str(p) for p in plan.files],
     }
@@ -532,13 +421,9 @@ def provenance_of(plan: VideoPlan) -> dict:
 def session_from_prediction(pred_dir) -> fmt.VideoSession:
     """Rebuild the identical `VideoSession` from a prediction session's own provenance.
 
-    `names`, `mode`, `units` and every group's `n_frames` come from the PREDICTION -- so no video
-    is probed and gotcha 10 is not reachable from this path at all.
-
-    **AND THE RECONSTRUCTION CHECKS ITSELF, which a stored group -> camera map could not.** The
-    re-derived group ids and camera names must equal the prediction's own `groups.pq` and
-    `calibration.toml`; a mismatch means a video was renamed, moved or added since the run, and it
-    raises naming the difference instead of rendering a prediction over the wrong pixels.
+    `names`, `mode`, `units` and `n_frames` come from the PREDICTION, so no video is probed. The
+    reconstruction CHECKS ITSELF against the prediction's own `groups.pq` and `calibration.toml`
+    -- a mismatch means a video was renamed, moved or added since the run.
     """
     pred_dir = Path(pred_dir)
     with open(pred_dir / 'session.toml', 'rb') as f:
@@ -589,7 +474,7 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
 
 
 def dump(sess: fmt.VideoSession, out: Path) -> None:
-    """**DEBUG ONLY.** Write the constructed session out through `format.write_session`, symlinking
+    """**DEBUG ONLY.** Write the constructed session through `format.write_session`, symlinking
     the pixels, so a user can point `validate_session` and their own eyes at what the flags
     produced. Not the mechanism, and on no default path.
     """

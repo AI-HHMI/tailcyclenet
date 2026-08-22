@@ -1,20 +1,10 @@
 """Box training data: labels -> the crop rule's box, letterboxed into the detector's input.
 
 The target is `tailcyclenet.crop.crop_box_for_points` applied to the same points the pose loader
-crops on. That is the point of the whole detector: it reproduces the crop the pose model was
-trained on, so swapping a GT crop for a detector crop costs a fraction of a millimetre instead
-of whatever an independently-plausible box rule would cost.
-
-An animal with no finite point in a view gets a **NaN box**, not a dropped frame. Objectness
-still has to learn "no animal here" for that view, and silently dropping those frames would
-train a detector that has never seen an empty image.
-
-`box_source='instances'` takes the extent from `instances.pq` instead, for a dataset whose stored
-keypoints are too sparse to bound the animal: rat-city's converter dropped noisy points, leaving
-25,777 train instances with NO finite point at all -- each one a NaN box teaching "no animal here"
-where a rat plainly is. It is opt-in rather than "use the table when it exists" because an
-`instances.pq` box is not a crop box in general (spec §9 says so outright; johnson-mouse ships COCO
-boxes and calms21 ships MARS ones), and defaulting to it would silently retarget those detectors.
+crops on, so the detector reproduces the crop the pose model was trained on. An animal with no
+finite point in a view gets a NaN box, not a dropped frame -- objectness still has to learn "no
+animal here". `box_source='instances'` takes the extent from `instances.pq` instead, opt-in,
+for a dataset whose stored keypoints are too sparse to bound the animal.
 """
 from __future__ import annotations
 
@@ -28,36 +18,22 @@ from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
 from ..format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
 
-# T4.2 (dev/plans/detector_accuracy.md): the stem's `in_channels` for each loader mode. `'none'`
-# (default) is byte-identical to every checkpoint on record -- 3 channels, no second frame. Kept
-# as ONE dict so `train_detector.py` and `scripts/eval_detector.py` derive `in_channels` from the
-# same rule instead of each hardcoding `{'none': 3, 'stack2': 6}` and one of them drifting.
-# `'diff'` (RGB + a 1-channel frame difference) is named in the plan but not yet built -- owed.
+# The stem's `in_channels` for each loader mode. `'none'` (default) is 3 channels, no second
+# frame. Kept as ONE dict so the training and eval scripts derive `in_channels` from the same
+# rule instead of each hardcoding it and one of them drifting.
 TEMPORAL_INPUT_CHANNELS = {'none': 3, 'stack2': 6}
 TEMPORAL_INPUTS = tuple(TEMPORAL_INPUT_CHANNELS)
-# The inverse: a loaded model only carries `in_channels` (`YOLOXNano.__init__`, part of the
-# WEIGHTS, same as `bottleneck_expansion`/`p2`) -- a caller that needs the matching
-# `BoxDataset(temporal_input=...)` to score it (`scripts/eval_detector.py`) reads it off this map
-# rather than `load_detector` growing a ninth return value for it.
+# The inverse: a loaded model only carries `in_channels`, so a caller that needs the matching
+# `BoxDataset(temporal_input=...)` to score it reads it off this map.
 TEMPORAL_INPUT_BY_CHANNELS = {v: k for k, v in TEMPORAL_INPUT_CHANNELS.items()}
 
 
 def reduce_factor(size, out_wh):
     """The largest `cv2.IMREAD_REDUCED_COLOR_N` that still decodes above the letterbox target.
 
-    rat-city's frames are 4696x2048 and the detector letterboxes them into 640x288 -- a 7.3x
-    downscale, which `cv2.resize`'s default INTER_LINEAR does by sampling 2x2 of every 7x7 block.
-    That is not a resize, it is aliasing: an animal 32 px across in the target is being built out
-    of a handful of source pixels chosen by position rather than content, and which ones depends
-    on the sub-pixel phase.
-
-    libjpeg's DCT-domain decimation is a proper box filter AND halves the decode, so the fix is to
-    ask for fewer pixels rather than to throw more away afterwards. `INTER_AREA` would also filter
-    correctly but costs 15.4 ms against INTER_LINEAR's 0.26 ms at this scale -- roughly +40% on a
-    loader-bound iteration -- where reducing at decode is free twice over.
-
-    N stays a power of two at or below 8 (what libjpeg offers) and never takes the decode below
-    the letterbox target, so the remaining resize is still a downscale.
+    libjpeg's DCT-domain decimation is a proper box filter AND halves the decode, where
+    `cv2.resize`'s default INTER_LINEAR at this downscale is aliasing. N stays a power of two at
+    or below 8 and never takes the decode below the letterbox target.
     """
     w, h = float(size[0]), float(size[1])
     n = 1
@@ -89,8 +65,8 @@ def letterbox(img, out_wh, src_wh=None):
 def letterbox_transform(size, out_wh):
     """The (scale, (padx, pady)) `letterbox` would return for an image of `size` = (w, h).
 
-    Same arithmetic, no pixels: the box target and the assignment diagnostics need the transform
-    without paying rat-city's 39 ms JPEG decode to learn it.
+    Same arithmetic, no pixels: the box target and assignment diagnostics need the transform
+    without paying the source decode to learn it.
     """
     w, h = float(size[0]), float(size[1])
     s = min(out_wh[0] / w, out_wh[1] / h)
@@ -101,14 +77,10 @@ def letterbox_transform(size, out_wh):
 def tile_transform(origin, scale):
     """The `(scale, (padx, pady))` that renders a source-pixel tile at `origin` into the input.
 
-    Deliberately the SAME two-number form `letterbox_transform` returns, and that is the whole
-    reason tiling is not a second data path in this file: every geometry line here applies a
-    transform as `x * scale + pad`, and a tile whose top-left source pixel is `(ox, oy)`, rendered
-    at scale `s`, is exactly `(s, (-ox*s, -oy*s))`. So `boxes_for`, `regions_for` and
-    `__getitem__`'s single `warpAffine` all tile by substituting this for the letterbox.
-
-    There is no padding term to compute because the tile's source extent is `input_wh / scale` by
-    construction, so its aspect ratio already matches the input and a letterbox would be a no-op.
+    Deliberately the SAME two-number form `letterbox_transform` returns: a tile at source origin
+    `(ox, oy)` rendered at scale `s` is exactly `(s, (-ox*s, -oy*s))`, so every geometry line here
+    tiles by substituting this for the letterbox. No padding term: the tile's source extent is
+    `input_wh / scale` by construction, so a letterbox would be a no-op.
     """
     s = float(scale)
     return s, (-float(origin[0]) * s, -float(origin[1]) * s)
@@ -118,19 +90,11 @@ def unletterbox_boxes(boxes, scale, pad, src_wh=None):
     """Detector-input boxes -> source-image boxes. With `src_wh`, clamped into the frame.
 
     THE CHOKE POINT EVERY DETECTOR BOX GOES THROUGH, which is why the bound is here and not in the
-    four callers. Nothing else bounds one: `yolox.py:167` decodes a side as
-    `exp(clamp(-6, 6)) * stride`, i.e. up to ~12,910 px per side at stride 32, and this function
-    then divides by a letterbox scale that can be 1/7 -- ~137,000 source pixels. IoU-only NMS
-    cannot suppress a box that big either, because its IoU with the real box it swallows is ~0.
-
-    Downstream that box becomes a crop: `run_group` unions the window's boxes and resizes the
-    result to 256 px, so ONE such frame delivers the whole arena as a thumbnail. A box with no
-    positive area after clamping is not a detection at all and comes back NaN, which every
-    consumer already reads as "no box here" -- `associate` skips a non-finite centre and
-    `run_group` counts it out of the union.
-
-    `src_wh` is optional only because `BoxDataset`'s training path has no frame to clamp against at
-    the point it calls this; every deployment caller passes it.
+    four callers: a decoded side can be ~12,910 px, and IoU-only NMS cannot suppress a box that
+    big (its IoU with the box it swallows is ~0). Downstream that box becomes a crop, so one such
+    frame delivers the whole arena as a thumbnail. A box with no positive area after clamping
+    comes back NaN, which every consumer already reads as "no box here". `src_wh` is optional
+    only because `BoxDataset`'s training path has no frame to clamp against.
     """
     out = boxes.clone().float()
     out[:, 0::2] = (out[:, 0::2] - pad[0]) / scale
@@ -147,14 +111,11 @@ def unletterbox_boxes(boxes, scale, pad, src_wh=None):
 def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
     """Detector-input keypoints (N,K,3) -> source-image keypoints. Sibling of `unletterbox_boxes`.
 
-    Lives HERE, beside the box version, for the reason the box version gives for living here: it
-    is the one inverse every consumer goes through, and a keypoint un-letterboxed by a different
-    rule than its own box is the class of bug that is invisible in every downstream number.
-
-    Out-of-frame keypoints go NaN rather than clamping. A box is clamped because a partly-visible
-    animal still has a real extent inside the frame; a keypoint outside the frame was not observed
-    there, and clamping it to the border would invent a position on the edge -- which is precisely
-    what `dataset.py`'s prior bounds mask exists to refuse.
+    Lives HERE, beside the box version, because it is the one inverse every consumer goes through,
+    and a keypoint un-letterboxed by a different rule than its own box is invisible in every
+    downstream number. Out-of-frame keypoints go NaN rather than clamping: a box is clamped because
+    a partly-visible animal still has a real extent, but a keypoint outside the frame was not
+    observed there and clamping it to the border would invent a position.
     """
     out = kpts.clone().float()
     out[..., 0] = (out[..., 0] - pad[0]) / scale
@@ -169,26 +130,11 @@ def unletterbox_keypoints(kpts, scale, pad, src_wh=None):
 def _photometric(img, rng, gain=None):
     """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
 
-    DLC's extended form -- additive brightness plus per-channel gaussian noise -- was built,
-    measured and REFUTED here: MOTA -0.127 [-0.256, -0.016] and miss +0.064, both significant, on
-    rat-city in-domain. DLC buys it for an OUT-of-domain gain (-0.25 mAP on marmosets without it)
-    and neither rat-city split tests that, so the honest summary is that it costs accuracy in the
-    only regime this repo can measure. Re-add it with a root that has a genuinely different camera
-    or enclosure, not before.
-
-    `gain=None` draws its own -- every call site on record does this, and the draw happens at
-    exactly the same point in the rng stream as before `gain` existed, so those callers are
-    byte-identical. `gain=<value>` applies a PRE-DRAWN one instead of drawing again: T4.2's second
-    frame must see the SAME appearance shift as frame t, not an independent one, or a stacked pair
-    would carry a fake brightness "motion" between the two channels that no real clip has.
+    DLC's extended form (additive brightness + per-channel gaussian noise) was built, measured
+    and REFUTED here: it costs accuracy in-domain, and neither shipped split tests the
+    out-of-domain gain it buys. `gain=None` draws its own; `gain=<value>` applies a PRE-DRAWN one
+    so a stacked (t-1, t) pair sees the same appearance shift, not an independent one.
     """
-    # THE `extended` BRANCH WAS DELETED, NOT DISABLED. The commit that pulled `--augment-
-    # photometric` (`3dbb0a1`) removed the `extended` parameter from this function's signature
-    # and from `BoxDataset.__init__`, but left an `if extended:` block referencing it -- a
-    # `NameError` on every call, live in every checkpoint trained with `--augment` since. Nothing
-    # in the test suite calls `BoxDataset.__getitem__` with `augment=True` through to a real pixel
-    # decode (the augmentation tests only exercise `boxes_for`, which never reaches this
-    # function), so it went undetected until a real training run hit it.
     g = rng.uniform(0.7, 1.3) if gain is None else gain
     out = img * g
     return np.clip(out, 0, 255).astype(np.uint8)
@@ -196,13 +142,8 @@ def _photometric(img, rng, gain=None):
 
 # THE STRONG SUITE -- `--augment-strong`. Layered AFTER `_photometric`, gated on
 # `self.strong and self.augment and self.train`, off by default and off means none of these draws
-# happen at all (byte-identical to every recorded detector). Every op here is APPEARANCE-ONLY or,
-# for cutout, an ERASURE -- neither moves a box target, which is the one invariant gotcha 8 exists
-# to protect. Mirrors posetail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`
-# (`posetail_dataset.py`), one lever (additive noise) of which was single-lever REFUTED here before
-# (report 21 §7: MOTA -0.127 SIG). This is a deliberate re-test of the whole mix together, on the
-# capacity ladder, against the train/val gap report 28 measured -- not a contradiction of that
-# result, which was a different arm on a different question.
+# happen at all. Every op here is APPEARANCE-ONLY or, for cutout, an ERASURE -- neither moves a
+# box target. Mirrors posetail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`.
 def _color_jitter(img, rng):
     """Gamma contrast, then HSV saturation and hue shifts -- posetail's `aug_per_camera` triplet
     (DefocusBlur is folded into `_motion_blur` below rather than duplicated).
@@ -219,9 +160,8 @@ def _color_jitter(img, rng):
 
 def _additive_noise(img, rng, sigma_max=10.2):
     """Per-channel gaussian noise, sigma ~ U(0, sigma_max). posetail's `AdditiveGaussianNoise`
-    (scale=(0, 0.04*255), i.e. sigma up to 10.2) -- the SAME lever report 21 §7 refuted alone, on
-    a detector with no capacity lever, scored on in-domain downstream MOTA. Re-tested here as part
-    of the mix, on a different question (the train/val box-screen gap).
+    (scale=(0, 0.04*255), i.e. sigma up to 10.2). Refuted alone on a detector with no capacity
+    lever; re-tested here as part of the whole mix.
     """
     sigma = rng.uniform(0.0, sigma_max)
     noise = rng.normal(0.0, sigma, img.shape)
@@ -281,8 +221,7 @@ def _apply_cutout(img, rects):
 def _keypoints_in_rects(kpts_xy, rects):
     """(..., 2) input-pixel keypoints, `rects` from `_cutout_rects` -> (...) bool, covered or not.
 
-    Half-open like the rects themselves (`_apply_cutout`'s slice), so a keypoint exactly on the
-    far edge of a rect is not counted as erased -- it was not overwritten.
+    Half-open like the rects themselves, so a keypoint exactly on the far edge is not erased.
     """
     if not rects:
         return torch.zeros(kpts_xy.shape[:-1], dtype=torch.bool)
@@ -301,48 +240,26 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     `crop_box_for_points`, an AXIS-ALIGNED extent, and a shear turns a box into a parallelogram
     whose extent is no longer the crop rule's box for anything.
 
-    `rotate_deg` IS THE REPLACEMENT FOR THE FLIP, and it is strictly easier than the flip was: a
-    mirror permutes left/right keypoint names and so needs a `flip_pairs` map, while a rotation
-    moves every keypoint through the same affine and permutes nothing. With `--keypoints` on
-    everywhere `hflip` is 0 everywhere, which left scale and translate as the whole of the
-    geometric augmentation.
+    `rotate_deg` REPLACES THE FLIP and is strictly easier: a rotation moves every keypoint through
+    the same affine and permutes nothing, where a mirror needs a `flip_pairs` map. Default-off on
+    evidence (its 180-degree setting is refuted on two roots), kept because a full circle costs no
+    more retained area than a quarter one.
 
-    `centre` IS WHY TILING AND ROTATION COMPOSE. `__getitem__` builds `tile @ warp @ decode`, so
-    the tile is cut AFTER this warp: about the frame centre, a scale of 0.8 moves an animal 2,000
-    px out by 400 -- already more than a 640 px tile -- and a large rotation moves it out of the
-    tile entirely, so every animal- and region-chosen tile would come back holding something else.
-    Passing the tile's own centre pins the tile's content and makes rotation FREE there, because a
-    tile interior to a 4696x2048 frame pulls real neighbouring pixels in at every angle. On whole
-    frames it is not free: the mean real-pixel fraction of a 2.29:1 frame is 0.92 at +-15, 0.79 at
-    +-45 and 0.644 (min 0.437) at BOTH +-90 and +-180 -- so the whole cost is paid by the first 90
-    degrees and nothing is saved by stopping short of a full circle.
+    `centre` IS WHY TILING AND ROTATION COMPOSE: the tile is cut AFTER this warp, so about the
+    frame centre a scale of 0.8 moves an animal 2,000 px out by 400 -- more than a 640 px tile --
+    and a rotation moves it out of the tile entirely. Passing the tile's own centre pins the tile's
+    content and makes rotation free there; on whole frames the corners pull real pixels in at
+    every angle.
 
     No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
-    relabelling left to right is a permutation of that set and the extent is unchanged.
-
-    **THAT JUSTIFICATION DIES THE MOMENT KEYPOINTS ARE A TARGET**, which is why `BoxDataset`
-    passes `hflip=0` whenever it is emitting them. A mirrored frame swaps every left/right pair,
-    so without a `flip_pairs` map the head sees `left_wing` labelled at the right wing half the
-    time, learns their mean, and collapses both toward the midline -- degrading exactly the
-    lateral asymmetry cross-view association depends on. Real `flip_pairs` need a per-dataset name
-    mapping and branson's names are placeholders (`kp00..kp20`, `names_provisional = true`), so
-    losing the flip is the cheap correct answer rather than inventing one.
+    relabelling left to right permutes the set and the extent is unchanged -- but only while
+    keypoints are not a target, which is why `BoxDataset` passes `hflip=0` whenever it emits them.
     """
     w, h = float(size[0]), float(size[1])
     s = rng.uniform(*scale)
     sx = -s if rng.random() < hflip else s
     cx, cy = (w / 2, h / 2) if centre is None else (float(centre[0]), float(centre[1]))
     A = np.array([[sx, 0.0], [0.0, s]], np.float64)
-    # The draw is SKIPPED at rotate_deg 0, not drawn and multiplied by zero: that keeps both the
-    # matrix and the rng stream bit-identical to every detector arm recorded before this key.
-    #
-    # DEFAULT-OFF ON EVIDENCE, not on caution. At +-180 on rat-city it is significantly WORSE on
-    # two roots and two label sources, one direction: MPJPE +3.33 px [+0.08, +7.06] on hand labels
-    # and +1.28 [+0.63, +1.88] on the tracker clip, coverage -0.009, idsw x1.7 (0.0189 -> 0.0328),
-    # err p99 +29.9. The knob is kept because the refutation is of that SETTING on that root, and
-    # because a full circle costs no more retained area than a quarter one
-    # (`_rotated_rect_max_inscribed` is 90-degree periodic), so a smaller amplitude is not
-    # obviously the same trade. dev/reports/21 sections 3a and 3b.
     if rotate_deg:
         a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
         A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
@@ -356,10 +273,9 @@ def _drop_outside(x, bounds):
     """(...,2) points -> the same shape, non-finite where outside `bounds` = (lo_x,lo_y,hi_x,hi_y).
 
     A point warped off the region it belongs to is not that point any more: dropping it shrinks a
-    box to its visible part (a real crop of a half-out animal), and `crop_box_for_points` returns
-    None when every point of an animal is gone, i.e. "no animal here". Shared by `boxes_for` (its
-    own points and tile box) and `present_ignore_boxes_for` (T2.1's ignore boxes) so there is one
-    copy of this rule rather than two that can drift apart.
+    box to its visible part, and `crop_box_for_points` returns None when every point of an animal
+    is gone. Shared by `boxes_for` and `present_ignore_boxes_for` so there is one copy of this
+    rule.
     """
     lo_x, lo_y, hi_x, hi_y = bounds
     out = ((x[..., 0] < lo_x) | (x[..., 0] > hi_x) |
@@ -371,16 +287,12 @@ def _warp_region(rects, M):
     """(M,4) certified rects through an in-plane similarity, ROUNDING DOWN. Returns (M,4).
 
     A certified region is a CLAIM -- "everything in here is labelled" -- and a claim must shrink
-    under a transform that makes it approximate, never grow. Taking four corners through the warp
-    and then their extent grows it: the axis-aligned hull of a rotated rectangle claims area the
-    annotator never marked, which re-admits exactly the unlabelled animals `regions.pq` exists to
-    exclude (this root labels a median of 2 rats where the tracked one finds 11). So this inscribes
-    instead, the same largest-axis-aligned-rect-in-a-rotated-rect computation
-    `posetail_dataset._rotated_rect_max_inscribed` uses for the rotated image canvas.
-
-    Under every warp that existed before rotation -- translation, scale, flip -- an axis-aligned
-    rect stays axis-aligned, inscribed and circumscribed coincide, and this is a no-op against the
-    old code. `test_a_region_is_unchanged_by_a_scale_and_translate_warp` is what holds that.
+    under a transform that makes it approximate, never grow: the axis-aligned hull of a rotated
+    rectangle claims area the annotator never marked, re-admitting the unlabelled animals
+    `regions.pq` exists to exclude. This inscribes instead, the same
+    `_rotated_rect_max_inscribed` computation the rotated image canvas uses. Under every warp that
+    existed before rotation the inscribed and circumscribed rects coincide, so this is a no-op
+    against the old code.
     """
     A = np.asarray(M)[:, :2]
     # The rotation angle of a similarity, reflection-safe: normalise the columns first so a scale
@@ -429,45 +341,35 @@ class BoxDataset(Dataset):
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
         # TILING, off by default and off means the whole frame -- with `tile_wh=None` every
-        # geometry path below takes the letterbox branch and this loader is byte-identical to what
-        # every recorded detector was trained on, the same discipline `keypoints` follows.
+        # geometry path takes the letterbox branch and this loader is byte-identical to what every
+        # recorded detector was trained on.
         #
         # `tile_wh` is the tile in INPUT pixels, i.e. the model's input size, so it REPLACES
         # `input_wh`. `tile_scale` is the source -> input scale and is the only scale there is:
-        # the tile's source extent is `tile_wh / tile_scale`. DO NOT ADD A SECOND RESIZE. Tiling
-        # and then downscaling the tiles is the number-one reported failure of this pattern (one
-        # practitioner reported zero precision at full-size inference from exactly that), because
-        # it breaks the invariant the whole scheme rests on -- the animal's size in INPUT pixels
-        # must be the same at train and at deployment.
+        # the tile's source extent is `tile_wh / tile_scale`. DO NOT ADD A SECOND RESIZE --
+        # tiling and then downscaling the tiles breaks the invariant the scheme rests on, the
+        # animal's size in INPUT pixels at train == deployment.
         self.tile_wh = None if tile_wh is None else tuple(int(v) for v in tile_wh)
         self.tile_scale = float(tile_scale)
         self.tile_bg_per_frame = int(tile_bg_per_frame)
         if self.tile_wh is not None and self.tile_scale <= 0:
             raise ValueError(f'tile_scale must be > 0, got {tile_scale}')
         # Mask the objectness loss to the area an annotator certified as completely labelled
-        # (`regions.pq`, spec §9b). ORTHOGONAL to tiling and off by default, so an arm can move one
-        # lever at a time (eval rule 4) -- but MEASURED DEAD on full-frame input: at 896x384's
-        # 7,056 anchors a labelled rat-city frame carries a median of 104 certified anchors of
-        # which 48 are positive, a ~69% positive rate against 0.68% unmasked, and 17% of frames
-        # have no certified negative at all. Tiling is what fixes that: at 640x640 tiles rendered
-        # at scale 1.0 the same measurement reads 5.2% positive with 0% of tiles lacking a
-        # certified negative. The rate is set by how many
-        # stride-8 CELLS the certified region spans, not by its area, because `CENTER_RADIUS` is
-        # 2.5 cells -- so it is a resolution knob and `tile_scale` is what sets it.
+        # (`regions.pq`). ORTHOGONAL to tiling and off by default, so an arm can move one lever at
+        # a time -- but MEASURED DEAD on full-frame input (a labelled rat-city frame carries ~69%
+        # certified positives against 0.68% unmasked), where tiling is what fixes it. The rate is
+        # set by how many stride-8 CELLS the certified region spans (`CENTER_RADIUS` is 2.5 cells),
+        # so it is a resolution knob and `tile_scale` is what sets it.
         self.use_regions = bool(use_regions)
-        # T2.1 (dev/plans/detector_accuracy.md): mask an `instances.pq` PRESENT box -- an animal
-        # in this view that was NOT annotated -- out of the objectness BACKGROUND target, instead
-        # of training the detector to call it "no animal here". Off by default: with it absent
-        # this loader is byte-identical to every recorded detector, the same discipline
-        # `use_regions` and `keypoints` follow. See `present_ignore_boxes_for`.
+        # T2.1: mask an `instances.pq` PRESENT box -- an animal in this view that was NOT annotated
+        # -- out of the objectness BACKGROUND target, instead of training the detector to call it
+        # "no animal here". Off by default, so with it absent this loader is byte-identical to
+        # every recorded detector.
         #
-        # MUTUALLY EXCLUSIVE with `use_regions` for now, not orthogonal to it: both are the
-        # opt-in 4th tuple element `box_collate`/`split_batch` dispatch by RANK alone (M,4), and
-        # that dispatch cannot tell two rank-2 tensors apart. Raised at construction rather than
-        # silently letting one clobber the other -- the same discipline `strong`+`use_regions`
-        # follows just above. Lifting this needs `box_collate`/`split_batch` to carry a THIRD
-        # rank-2 slot, which is a real but separable piece of work; the populations barely overlap
-        # in practice (`use_regions` wants tiling, `ignore_present` is measured on whole frames).
+        # MUTUALLY EXCLUSIVE with `use_regions`: both are the opt-in 4th tuple element
+        # `box_collate`/`split_batch` dispatch by RANK alone (M,4), and that dispatch cannot tell
+        # two rank-2 tensors apart. Raised at construction rather than letting one clobber the
+        # other.
         self.ignore_present = bool(ignore_present)
         if self.ignore_present and self.use_regions:
             raise ValueError('ignore_present and use_regions cannot both be set: both are the '
@@ -477,58 +379,44 @@ class BoxDataset(Dataset):
         # Opt-in, default off: with it absent this loader is byte-identical to what every recorded
         # detector was trained on. See `random_affine` for why it also kills the horizontal flip.
         self.keypoints = bool(keypoints)
-        # `hflip=None` means "decide from `keypoints`", which is the safe default. It is separable
-        # ONLY so a box-only CONTROL arm can match the keypoint arm's augmentation exactly: the
-        # keypoint arm necessarily loses the flip, so a control that keeps it differs in two
-        # levers and measures neither (eval rule 4).
+        # `hflip=None` means "decide from `keypoints`", the safe default. Separable only so a
+        # box-only CONTROL arm can match the keypoint arm's augmentation exactly: the keypoint arm
+        # loses the flip, so a control that keeps it differs in two levers and measures neither.
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
-        # 0 is off and off is byte-identical: `random_affine` skips the draw. See there for
-        # why the knob survives a refutation of its 180-degree setting.
+        # 0 is off and off is byte-identical: `random_affine` skips the draw.
         self.rotate_deg = float(rotate_deg)
-        # 0 is off and off is byte-identical: `random_affine` skips the draw entirely. See there
-        # for why this is free when tiling and not when not, and why a full circle costs no more
-        # than a half one.
-        # The APPEARANCE half of --augment. False is the shipped single gain and is
-        # byte-identical; True adds nothing extra by itself -- `--augment-strong` (below) is what
-        # layers the rest of the mix on top of it.
-        # Off by default and requested explicitly, not inferred from the split: it is a key, and
-        # an arm that turns it on has to be able to say so. `self.train` still gates it, so a val
-        # or test loader built by a script that passes `augment=True` blindly stays deterministic.
+        # The APPEARANCE half of --augment. False is the shipped single gain and is byte-identical;
+        # True adds nothing extra by itself -- `--augment-strong` (below) layers the rest of the
+        # mix on top. Requested explicitly, not inferred from the split: `self.train` still gates
+        # it, so a val or test loader built with `augment=True` blindly stays deterministic.
         self.augment = augment
         # THE STRONG SUITE. Off by default and off means byte-identical to every recorded
         # detector -- every new draw below is gated on `self.strong and self.augment and
-        # self.train`, so `strong=True` with `augment=False` (or on eval) does nothing either.
-        # It is a SINGLE recipe (color jitter, additive noise, salt & pepper, motion blur, cutout,
-        # mosaic-lite), not five independently-swept levers: isolating one component is a
-        # follow-on, and the single-lever additive-noise refutation (report 21 §7) is exactly why
-        # this sweep asks about the mix rather than the piece.
+        # self.train`. It is a SINGLE recipe (color jitter, additive noise, salt & pepper, motion
+        # blur, cutout, mosaic-lite), not five independently-swept levers.
         self.strong = bool(strong)
         if self.strong and self.use_regions:
             # FAIL AT CONSTRUCTION, not on the ~20% of items that happen to draw mosaic-lite: a
-            # composite frame has no expressible certified-area mask, so this combination can
-            # never be trained correctly and a job should not discover that hours in.
+            # composite frame has no expressible certified-area mask.
             raise ValueError('--augment-strong (mosaic-lite) is undefined under --use-regions')
-        # T4.2 (dev/plans/detector_accuracy.md): stack frame t-1 beside frame t along the channel
-        # axis, so the detector has a signal a single-frame net categorically cannot -- motion is
-        # what separates an animal from arena clutter. `'none'` (default) is byte-identical to
-        # every checkpoint on record: `__getitem__` never fetches a second frame or touches `x`'s
-        # channel count. See `TEMPORAL_INPUT_CHANNELS` for the loader-mode -> channel-count map.
+        # T4.2: stack frame t-1 beside frame t along the channel axis, so the detector has a signal
+        # a single-frame net categorically cannot -- motion is what separates an animal from arena
+        # clutter. `'none'` (default) is byte-identical to every checkpoint on record. See
+        # `TEMPORAL_INPUT_CHANNELS` for the loader-mode -> channel-count map.
         if temporal_input not in TEMPORAL_INPUTS:
             raise ValueError(f'temporal_input must be one of {TEMPORAL_INPUTS}, got '
                              f'{temporal_input!r}')
         self.temporal_input = str(temporal_input)
         if self.temporal_input != 'none' and self.strong:
-            # FAIL AT CONSTRUCTION, same discipline as `strong`+`use_regions` just above.
-            # Mosaic-lite pastes another item's OWN frame-t crop into this item's composite; doing
-            # that correctly under a temporal input needs that source item's t-1 frame too, at the
-            # same pasted location, which is not built yet -- a real but separable follow-on, not
-            # a silent gap (dev/plans/detector_accuracy.md T4.2's owed list).
+            # FAIL AT CONSTRUCTION: mosaic-lite pastes another item's OWN frame-t crop into this
+            # item's composite, and doing that under a temporal input needs the source item's t-1
+            # frame too, at the same pasted location -- not built yet.
             raise ValueError('temporal_input is undefined under --augment-strong (mosaic-lite): '
                              'the pasted source item needs its own t-1 frame too, not built yet')
-        # Off by default, and it is a KEY rather than a loader detail: it changes which source
-        # pixels reach the model, so every arm measured without it stays comparable only against
-        # other arms without it. It rides in the checkpoint and `detect_group` reads it back,
-        # because a detector fed differently-sampled pixels at deployment is off its own training
+        # Off by default, and a KEY rather than a loader detail: it changes which source pixels
+        # reach the model, so every arm measured without it stays comparable only against other
+        # arms without it. It rides in the checkpoint and `detect_group` reads it back, because a
+        # detector fed differently-sampled pixels at deployment is off its own training
         # distribution with nothing in the output to say so.
         self.reduce = reduce
         self.seed = seed
@@ -539,17 +427,16 @@ class BoxDataset(Dataset):
                 f'dataset-specific); found {len(self.datasets)} dataset roots')
         self.ds = self.datasets[0]
         # The tile IS the input when tiling; `input_wh` is then the tile size and the deployment
-        # input size is a DIFFERENT number (`frame_wh * tile_scale`). See `train_detector.py`, which
-        # records `tile_scale` in the checkpoint for exactly that reason.
+        # input size is a DIFFERENT number (`frame_wh * tile_scale`), recorded in the checkpoint.
         self.input_wh = tuple(input_wh) if self.tile_wh is None else self.tile_wh
         self.min_crop_dim = min_crop_dim
         self.train = split == 'train'
         rng = np.random.default_rng(seed)
 
-        # Parallel to `self.index`, one entry per item: the tile's source-pixel origin, or None for
-        # the whole frame. A parallel list rather than a fifth tuple element because `index` is
-        # unpacked as a 4-tuple in `evaluate.py` and `scripts/diag_assign.py` too, and widening it
-        # would break those silently at the call site rather than loudly here.
+        # Parallel to `self.index`, one entry per item: the tile's source-pixel origin, or None
+        # for the whole frame. A parallel list rather than a fifth tuple element because `index`
+        # is unpacked as a 4-tuple in `evaluate.py` too, and widening it would break those
+        # silently at the call site rather than loudly here.
         self.origins: list = []
         self.index = []
         for sess in self.ds.sessions.get(split, []):
@@ -573,11 +460,8 @@ class BoxDataset(Dataset):
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
         # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
-        # be. Its old hardcoded 512 was set against rat-city, where the whole split is one group;
-        # on calms21 a session contributes `max_frames_per_group` = 40 positions, so a 512-block
-        # spanned 13 videos and a 4-block pool spanned 52. The reader cache then held 8 of 52 and
-        # ran at a 16% hit rate -- and at the cache size that thrash used to need, ~1 GB of open
-        # decord reader each, it OOM-killed the workers.
+        # be. Its old hardcoded 512 spanned 13 videos on a session with 40 positions per group,
+        # which is not locality at all -- the reader cache thrashed and OOM-killed the workers.
         n_src = len({(s.session_id, g, c) for s, g, _, c in self.index})   # (group, camera) = file
         self.chunk = max(1, len(self.index) // n_src)
 
@@ -595,12 +479,9 @@ class BoxDataset(Dataset):
     def _warp_centre(self, i):
         """What `random_affine` turns and scales about: the TILE's centre, or None for the frame.
 
-        `__getitem__` composes `tile @ warp @ decode`, so the tile is cut after the warp. About the
-        frame centre a scale of 0.8 moves an animal 2,000 px out by 400 -- more than a 640 px tile
-        -- and a rotation moves it out entirely, so a tile chosen for a region or an animal comes
-        back holding something else and the tiled arms quietly degrade into background-only tiles.
-        The targets were always right (boxes and regions ride the same warp and are then dropped
-        outside the tile); what was wrong was which pixels the item contained.
+        `__getitem__` composes `tile @ warp @ decode`, so the tile is cut after the warp; about
+        the frame centre a scale of 0.8 moves an animal 400 px out -- more than a 640 px tile --
+        so a tile chosen for a region or an animal would come back holding something else.
         """
         if self.origins[i] is None:
             return None
@@ -613,8 +494,7 @@ class BoxDataset(Dataset):
 
         `None` and an empty `(0,4)` are DIFFERENT ANSWERS and both are returned faithfully: None is
         "the session carries no regions.pq, so it claims exhaustive labelling and every pixel is
-        certified", `(0,4)` is "the file exists and certifies nothing here". Collapsing them
-        inverts the claim the table exists to make (spec §9b).
+        certified", `(0,4)` is "the file exists and certifies nothing here".
         """
         r = sess.labels(gid).regions
         if r is None:
@@ -632,16 +512,10 @@ class BoxDataset(Dataset):
         dead centre has never seen one near a border, and `assign`'s centre prior would then be
         learned as a centre-of-image prior.
 
-        The background tiles are the population the mask exists to supply, and where they may be
-        drawn from is exactly the None/empty distinction:
-
-        - `regions is None` -- the session claims exhaustive labelling, so anywhere in the frame is
-          certified background and the centre is uniform over the frame.
-        - `regions` non-empty -- only inside a certified rect. Anywhere else is UNKNOWN, not
-          background, and sampling it would reintroduce the unlabelled animals this table exists
-          to exclude.
-        - `regions` empty `(0,4)` -- nothing here is certified, so there is no certified background
-          and none is drawn.
+        Where background tiles may be drawn from is exactly the None/empty distinction: `regions
+        is None` (exhaustively labelled) allows anywhere in the frame; non-empty restricts to
+        inside a certified rect (elsewhere is UNKNOWN, not background); empty `(0,4)` means no
+        certified background exists and none is drawn.
         """
         W, H = (float(v) for v in sess.rig.size(sess.cam_names[ci]))
         tw, th = self._tile_extent()
@@ -669,8 +543,7 @@ class BoxDataset(Dataset):
                 push(rng.uniform(r[0], r[2]), rng.uniform(r[1], r[3]))
         # A frame with no animal, no region and no certified background still yields ONE tile:
         # objectness has to learn "nothing here", and dropping the frame would train a detector
-        # that has never seen an empty image (the same reason a NaN box is emitted rather than the
-        # frame skipped).
+        # that has never seen an empty image.
         return out or [(max(0.0, (W - tw) / 2), max(0.0, (H - th) / 2))]
 
     def _animal_centres(self, sess, gid, f, ci):
@@ -706,9 +579,8 @@ class BoxDataset(Dataset):
     def _transform(self, i, size):
         """The `(scale, (padx, pady))` for item `i`: its tile's, or the whole-frame letterbox.
 
-        THE one place that choice is made. `boxes_for` and `regions_for` both come here, because a
-        region transformed by a different rule than its own boxes is invisible in a loss curve --
-        the same failure `unletterbox_keypoints` is placed beside `unletterbox_boxes` to avoid.
+        THE one place that choice is made; `boxes_for` and `regions_for` both come here, because a
+        region transformed by a different rule than its own boxes is invisible in a loss curve.
         """
         if self.origins[i] is None:
             return letterbox_transform(size, self.input_wh)
@@ -719,7 +591,7 @@ class BoxDataset(Dataset):
 
         None means the session carries no `regions.pq` and therefore claims to be exhaustively
         labelled -- every anchor is supervised. An empty `(0,4)` means the file exists and this
-        view certifies nothing, so nothing is supervised. See `_region_rects`.
+        view certifies nothing. See `_region_rects`.
         """
         sess, gid, f, ci = self.index[i]
         rects = self._region_rects(sess, gid, f, ci)
@@ -735,26 +607,21 @@ class BoxDataset(Dataset):
 
     def present_ignore_boxes_for(self, i, warp=None):
         """Crop-rule boxes for `instances.pq` PRESENT rows -- an animal in this view that was NOT
-        annotated -- in INPUT pixels, `(M,4)`, or None. T2.1, dev/plans/detector_accuracy.md.
+        annotated -- in INPUT pixels, `(M,4)`, or None.
 
         These rows are trained as background by DEFAULT (`boxes_for` never sees them, so
-        `detector_loss`'s zeros-target treats every anchor inside one as "no animal here") --
-        measured on 3dpop's train split at 11.4% of animals in view, on the root whose `fp_none`
-        dominates `fp_dup` 10:1. This is the training-side counterpart of `ignore_for`, which
-        reports the SAME population as a scoring exclusion but takes no `warp` (a pinned test in
-        test_detector.py keeps it that way, because `score_dataset` disables augmentation
-        entirely instead of warping the ignore boxes to match); the loss needs the boxes warped
-        exactly as the GT boxes beside them are, or a rotated ignore box masks the wrong pixels.
+        `detector_loss`'s zeros-target treats every anchor inside one as "no animal here"). This
+        is the training-side counterpart of `ignore_for`, which reports the SAME population as a
+        scoring exclusion but takes no `warp`; the loss needs the boxes warped exactly as the GT
+        boxes beside them are, or a rotated ignore box masks the wrong pixels.
 
         FOUR corners through the warp, then RE-DERIVED by `crop_box_for_points` -- the same
-        `box_source = 'instances'` geometry `boxes_for` already uses for this exact table, not
-        `_warp_region`'s inscribed rectangle. The two need OPPOSITE polarity under a rotation: a
-        certified region is a claim that must shrink toward safety, but an ignore box exists to
-        keep covering an animal that might not be annotated, so shrinking it would re-expose the
-        animal's own edges to the false-negative target this function exists to remove.
+        `box_source = 'instances'` geometry `boxes_for` uses -- not `_warp_region`'s inscribed
+        rectangle: a certified region is a claim that must shrink toward safety, but an ignore box
+        exists to keep covering an animal that might not be annotated.
 
-        None when the session ships no `instances.pq` boxes at all. An empty `(0,4)` when it does
-        but nothing in this view is PRESENT -- the same None/empty distinction `regions_for` keeps.
+        None when the session ships no `instances.pq` boxes at all; empty `(0,4)` when it does but
+        nothing in this view is PRESENT -- the same None/empty distinction `regions_for` keeps.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -798,14 +665,10 @@ class BoxDataset(Dataset):
     def ignore_for(self, i):
         """`(ig (S,) bool, ig_boxes (S,4))` for item `i`, in INPUT pixels. Or `(None, None)`.
 
-        The `instances.pq` PRESENT rows -- an animal that is in this view and was not annotated, so
-        a prediction on it is neither a true nor a false positive. rat-city ships 26,021 of them
-        and scoring them as false positives measures the annotator.
-
-        HERE rather than in `evaluate.py` because it needs item `i`'s own transform, which under
-        tiling is the tile's and not the frame letterbox. `evaluate.py` used to call
-        `letterbox_transform` itself, which is right for a whole frame and silently wrong for a
-        tile -- and it is the ignore mask, so being wrong makes real animals into false positives.
+        The `instances.pq` PRESENT rows -- an animal in this view that was not annotated, so a
+        prediction on it is neither a true nor a false positive; scoring them as false positives
+        would measure the annotator. HERE rather than in `evaluate.py` because it needs item `i`'s
+        own transform, which under tiling is the tile's and not the frame letterbox.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -825,26 +688,21 @@ class BoxDataset(Dataset):
         """The letterboxed target boxes for item `i`, without decoding its image.
 
         `with_keypoints=True` also returns the KEYPOINT target, (S,K,3) of (x, y, vis), in the
-        same letterboxed pixels. It is free: the keypoints are the input `crop_box_for_points`
-        is already called on, so there is no second data path and no second chance to disagree
-        about the transform -- which is the failure mode here (a keypoint letterboxed by a
-        different rule than its own box is invisible in the loss curve).
+        same letterboxed pixels -- free, because the keypoints are the input `crop_box_for_points`
+        is already called on, so there is no second data path to disagree about the transform.
 
-        The `vis` channel is the format's `status`, NOT coordinate-finiteness. The two come apart
-        in both directions and conflating them re-creates a failure this repo has paid for:
-        supervising `isfinite(x, y)` teaches "was this annotated", which on calms21 -- whose
-        converter writes every point VISIBLE -- is an all-true target, `occlusion_acc` 1.0, and a
-        row gate worth -0.037 to -0.123 MOTA. `vis` is NaN where the session made no assessment
-        at all, so the score loss is withheld there rather than asserting "not visible".
+        The `vis` channel is the format's `status`, NOT coordinate-finiteness: supervising
+        `isfinite(x, y)` teaches "was this annotated", which on a root that writes every point
+        VISIBLE is an all-true target. `vis` is NaN where the session made no assessment, so the
+        score loss is withheld there rather than asserting "not visible".
 
-        Split out of `__getitem__` so `scripts/diag_assign.py` can read what the loss is actually
-        assigned over a few hundred views without paying for the pixels -- and so there is one
-        copy of the box rule rather than a second one in the diagnostic that can drift from it.
+        Split out of `__getitem__` so the assignment diagnostic can read what the loss is actually
+        assigned over without paying for the pixels.
 
         `warp` is an augmentation's 2x3 in SOURCE pixels. The geometry moves through it and the
         box is then RE-DERIVED by the crop rule, never scaled: the 20 px pad would scale with the
         image but the `min_crop_dim` floor would not, so a floored box scaled by 0.8 is a box the
-        rule can never emit and the detector would be trained off its own target (gotcha 8).
+        rule can never emit.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -858,11 +716,10 @@ class BoxDataset(Dataset):
             vis = None if lab.vis2d is None else lab.vis2d[:, f, :, ci]
 
         # A point outside the TILE is not in this image, so it is dropped exactly as an
-        # out-of-frame point is: the box shrinks to the visible part, which is what a crop of a
-        # half-out animal looks like, and if every point goes `crop_box_for_points` returns None
-        # and the animal is correctly "not here". In SOURCE pixels and applied AFTER the warp,
-        # because the tile is defined in post-warp coordinates -- `__getitem__` composes
-        # `tile @ warp @ decode`, in that order.
+        # out-of-frame point is: the box shrinks to the visible part, and if every point goes
+        # `crop_box_for_points` returns None and the animal is correctly "not here". In SOURCE
+        # pixels and applied AFTER the warp, because the tile is defined in post-warp coordinates
+        # -- `__getitem__` composes `tile @ warp @ decode`, in that order.
         tile_box = None
         if self.origins[i] is not None:
             ox, oy = self.origins[i]
@@ -881,9 +738,9 @@ class BoxDataset(Dataset):
                 k = drop_outside(k, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
             if tile_box is not None:
                 k = drop_outside(k, tile_box)
-            # COORDINATES LIVE ON `VISIBLE` *OR* `PROJECTED` (fmt.POSITIONED), but only VISIBLE is
-            # a visibility CLAIM -- `projected` is a position from a source that never recorded
-            # occlusion. So a projected point keeps its coordinates and gets NO score target.
+            # COORDINATES LIVE ON `VISIBLE` *OR* `PROJECTED`, but only VISIBLE is a visibility
+            # CLAIM -- `projected` is a position from a source that never recorded occlusion. So a
+            # projected point keeps its coordinates and gets NO score target.
             if vis is None:
                 v = torch.full(k.shape[:-1], float('nan'))
             else:
@@ -904,9 +761,7 @@ class BoxDataset(Dataset):
                 if torch.isfinite(b).all():
                     # FOUR corners, not two. Under a rotation or a flip the extent of the two
                     # diagonal corners is strictly inside the extent of all four, so a two-corner
-                    # warp crops the animal the box exists to enclose. Re-bounding all four under
-                    # a ROTATION is also the measured-best rule -- see `crop.box_corners`, which
-                    # records the alternative that was built and refuted.
+                    # warp crops the animal the box exists to enclose.
                     x0, y0, x1, y1 = b
                     src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
                                        torch.stack([x1, y1]), torch.stack([x0, y1])])
@@ -921,7 +776,7 @@ class BoxDataset(Dataset):
                 src = drop_outside(src, tile_box)
             # `min_crop_dim` and the pad stay in SOURCE units and the box is RE-DERIVED here, never
             # scaled -- the pad would scale with the tile but the floor would not, so a floored box
-            # scaled by `tile_scale` is a box the rule can never emit (gotcha 8).
+            # scaled by `tile_scale` is a box the rule can never emit.
             box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
@@ -971,12 +826,10 @@ class BoxDataset(Dataset):
 
         Deliberately copy-paste and not true YOLOX 4-quadrant mosaic: a quadrant clips whatever
         animal sits on its seam, and a clipped extent is not `crop_box_for_points`'s box for
-        anything -- it would train the detector off a target it never emits (gotcha 8). A
-        relocated WHOLE box has exactly the crop rule's extent, translated -- the union of a
-        translation and the crop rule is the crop rule of the translated points.
-
-        Never clips: a placement that would not fit entirely inside `input_wh` is redrawn, up to
-        a few tries, and the item is returned unchanged if none fits.
+        anything -- it would train the detector off a target it never emits. A relocated WHOLE box
+        has exactly the crop rule's extent, translated. Never clips: a placement that would not
+        fit entirely inside `input_wh` is redrawn, up to a few tries, and the item is returned
+        unchanged if none fits.
         """
         if self.use_regions:
             raise RuntimeError('mosaic-lite is undefined under --use-regions: a composite frame '
@@ -1022,18 +875,11 @@ class BoxDataset(Dataset):
 
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
-        # FRESH ENTROPY PER VISIT ON TRAIN, seeded by index on eval. `default_rng([self.seed, i])`
-        # claimed to be "per item and per epoch" and was only per item: nothing supplies an epoch
-        # (`ChunkShuffle.epoch` only permutes the ORDER, and `persistent_workers=True` would keep
-        # a forked copy stale anyway). So item `i` got the identical `random_affine` and the
-        # identical brightness on every one of its ~300 revisits, i.e. `--augment` and
-        # `--rotate-deg` delivered ONE frozen pre-augmented copy of the dataset instead of a fresh
-        # draw -- which understates what both levers are worth.
-        #
-        # `default_rng(None)` draws from OS entropy per call, so there is no shared stream for the
-        # workers to share and no dependence on how the DataLoader interleaved them -- the two
-        # things the old seeding was defending against. This is what the pose loader already does
-        # (`dataset.py:769`), for the same reason. Eval still gets NO augmentation at all.
+        # FRESH ENTROPY PER VISIT ON TRAIN, seeded by index on eval. The old per-item seeding
+        # delivered the identical `random_affine` and brightness on every revisit -- one frozen
+        # pre-augmented copy of the dataset. `default_rng(None)` draws from OS entropy per call, so
+        # there is no shared stream for workers to share, exactly as the pose loader does. Eval
+        # still gets NO augmentation at all.
         rng = (np.random.default_rng(None) if self.augment and self.train else None)
         warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
                               centre=self._warp_centre(i)) if rng is not None else None)
@@ -1045,13 +891,11 @@ class BoxDataset(Dataset):
         ignore_boxes = self.present_ignore_boxes_for(i, warp) if self.ignore_present else None
 
         # WHAT THE PIXELS ARE HEADED FOR, WHICH UNDER TILING IS NOT `input_wh`. Tiled,
-        # `self.input_wh` IS the tile size, so comparing the whole 4696x2048 frame against it gave
-        # r = 2 for a 640x640 tile and r = 4 for 640x288 -- and `M = L @ W @ D` below multiplies
-        # the decode scale back up, so the tile became a 2-4x UPSAMPLE of a decimated frame.
-        # Deployment does the opposite: `detect_group` letterboxes the whole frame to
-        # `tiled_input_wh(src, tile_scale)`, where `reduce_factor` returns 1 and the detector sees
-        # native pixels. That is exactly the train/deploy sampling skew `reduce` is stamped into
-        # the checkpoint to PREVENT. The deployment-equivalent target is the frame at `tile_scale`.
+        # `self.input_wh` IS the tile size, so comparing the whole frame against it gave r = 2-4
+        # and the tile became a UPSAMPLE of a decimated frame -- while deployment letterboxes the
+        # whole frame at `tiled_input_wh(src, tile_scale)`, where `reduce_factor` returns 1 and the
+        # detector sees native pixels. The deployment-equivalent target is the frame at
+        # `tile_scale`.
         out_wh = (self.input_wh if self.tile_wh is None
                   else (size[0] * self.tile_scale, size[1] * self.tile_scale))
         r = reduce_factor(size, out_wh) if self.reduce else 1
@@ -1060,9 +904,8 @@ class BoxDataset(Dataset):
             raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {f} unreadable')
         dec = (img.shape[1], img.shape[0])
         # A video root IGNORES `reduce`, so the frame comes back full size -- both are legal, and
-        # what is not legal is a frame that matches neither. The box transform is derived from the
-        # rig's recorded size, so that would letterbox the boxes and the pixels differently and
-        # say nothing about it.
+        # what is not legal is a frame that matches neither: the box transform is derived from the
+        # rig's recorded size, so that would letterbox the boxes and the pixels differently.
         want = tuple(-(-size[a] // r) for a in (0, 1))                  # libjpeg rounds up
         assert dec == want or dec == size, \
             f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
@@ -1074,10 +917,9 @@ class BoxDataset(Dataset):
             img, _, _ = letterbox(img, self.input_wh, src_wh=size)
         else:
             # ONE warpAffine for the decode scale, the augmentation AND the letterbox-or-tile.
-            # Three would resample rat-city's frame three times, and the loader is the expensive
-            # half of an iteration. `L` is whichever transform `_transform` chose, which is what
-            # makes a tile cost no extra resample and no extra code -- and `borderValue` is already
-            # what a tile hanging off the frame edge should see.
+            # Three would resample the frame three times, and the loader is the expensive half of
+            # an iteration. `borderValue` is already what a tile hanging off the frame edge should
+            # see.
             scale, pad = self._transform(i, size)
             L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
             D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
@@ -1088,10 +930,9 @@ class BoxDataset(Dataset):
                 gain = rng.uniform(0.7, 1.3)
                 img = _photometric(img, rng, gain=gain)
                 # THE STRONG SUITE. Gated on `self.strong` alone here -- `rng is not None` already
-                # means `self.augment and self.train`, so nothing below runs off that path.
-                # FIXED ORDER, one independent per-op draw each: color jitter -> additive noise ->
-                # salt & pepper -> motion blur. Appearance-only, so no box or keypoint target
-                # moves through any of these four.
+                # means `self.augment and self.train`. FIXED ORDER, one independent per-op draw
+                # each: color jitter -> additive noise -> salt & pepper -> motion blur.
+                # Appearance-only, so no box or keypoint target moves through any of these four.
                 if self.strong:
                     if rng.random() < 0.5:
                         img = _color_jitter(img, rng)
@@ -1102,10 +943,9 @@ class BoxDataset(Dataset):
                     if rng.random() < 0.2:
                         img = _motion_blur(img, rng)
         # T4.2: frame t-1, warped by the EXACT SAME `M` (so both frames of a stacked pair are in
-        # register) and given the SAME photometric gain as frame t (so no fake per-frame
-        # brightness "motion" enters the stack) -- see `_photometric`'s `gain=` docstring. Cannot
-        # coexist with `self.strong` (raised at construction above), so this never has to
-        # interact with cutout or mosaic-lite below.
+        # register) and given the SAME photometric gain as frame t (so no fake per-frame brightness
+        # "motion" enters the stack). Cannot coexist with `self.strong` (raised at construction),
+        # so this never has to interact with cutout or mosaic-lite below.
         prev_img = None
         if self.temporal_input != 'none':
             prev_f = max(f - 1, 0)     # clip start: no t-1 exists, so repeat frame t
@@ -1121,8 +961,8 @@ class BoxDataset(Dataset):
                     prev_img = _photometric(prev_img, rng, gain=gain)
         if self.strong and rng is not None:
             # CUTOUT: an erasure, so it moves no box -- but a keypoint it covers must lose BOTH
-            # its coordinate (-> NaN) and its score target (-> 0), or either the coordinate loss
-            # or the visibility loss would still supervise a point the pixels no longer show.
+            # its coordinate (-> NaN) and its score target (-> 0), or either loss would still
+            # supervise a point the pixels no longer show.
             if rng.random() < 0.5:
                 rects = _cutout_rects(self.input_wh, rng)
                 img = _apply_cutout(img, rects)
@@ -1132,15 +972,14 @@ class BoxDataset(Dataset):
                     kpts[..., 1] = torch.where(mask, torch.nan, kpts[..., 1])
                     kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
             # MOSAIC-LITE: copy-paste one whole crop-rule box from another frame into empty space.
-            # The only op here that adds a box -- appearance and cutout never do (gotcha 8).
+            # The only op here that adds a box -- appearance and cutout never do.
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         if prev_img is not None:
             # ORDER: (t-1, t), oldest first -- `TEMPORAL_INPUT_CHANNELS['stack2'] == 6` and
-            # `YOLOXNano(in_channels=6)`'s stem takes whatever six channels it is given; this
-            # ordering is the loader's own convention, not a model requirement, and any caller
-            # supplying frames at inference (still owed -- `detect_raw`) must match it.
+            # `YOLOXNano(in_channels=6)`'s stem takes whatever six channels it is given; any caller
+            # supplying frames at inference must match it.
             xp = torch.as_tensor(prev_img, dtype=torch.float32).permute(2, 0, 1) / 255.0
             x = torch.cat([xp, x], dim=0)
         # `regions` rides along as its own element rather than being folded into `boxes`: a region
@@ -1150,13 +989,11 @@ class BoxDataset(Dataset):
         # `regions_for` returning None means the session claims exhaustive labelling, and the
         # faithful encoding of that HERE is one rect covering the whole input -- then "certified"
         # is all-True and the masked loss equals the unmasked one, with no special case anywhere
-        # downstream. The None/empty distinction stays intact in `regions_for`, which is where a
-        # consumer that needs it can see it.
+        # downstream.
         out = (x, boxes) if kpts is None else (x, boxes, kpts)
         if self.ignore_present:
             # Unlike `regions`, `None` and empty mean the SAME thing for an ignore box -- "nothing
-            # to mask here" either way, not a claim about the whole frame -- so there is no
-            # None -> whole-input substitution to make; an empty (0,4) is already correct.
+            # to mask here" either way -- so an empty (0,4) is already correct.
             return (*out, ignore_boxes if ignore_boxes is not None
                    else torch.zeros((0, 4), dtype=torch.float32))
         if not self.use_regions:
@@ -1170,17 +1007,11 @@ class ChunkShuffle(torch.utils.data.Sampler):
     """A shuffle that keeps a worker inside a few videos at a time.
 
     `BoxDataset.index` is built session-by-session, so a run of contiguous index positions stays
-    inside one video. A plain `shuffle=True` therefore sends every item to a different container:
-    on calms21's 63 one-mp4 sessions that thrashes `dataset._reader`'s cache and costs 486 ms per
-    batch of 16, against a 16 ms GPU step. Shuffling BLOCKS instead, and pooling `mix` of them so
-    a batch still spans several sessions, costs 40 ms -- 12x faster, and 7 sessions per batch.
-    (That diversity was originally about BatchNorm not normalising one animal's lighting;
-    normalisation is GroupNorm now and does not care, but a batch drawn from one video is still a
-    correlated gradient step, and the 12x is the reason this class exists either way.)
-
-    PASS `chunk=dataset.chunk`. The default 512 was set against rat-city, whose whole split is one
-    group; a dataset with 40 index positions per video gets 13 videos to a block and 52 to a pool,
-    which is not locality at all. `BoxDataset` derives the right value from its own index.
+    inside one video, and a plain `shuffle=True` would send every item to a different container
+    and thrash `dataset._reader`'s cache (486 ms per batch of 16 against a 16 ms GPU step, on a
+    multi-session root). Shuffling BLOCKS instead, and pooling `mix` of them so a batch still
+    spans several sessions, costs 40 ms -- and a batch drawn from one video is still a correlated
+    gradient step. PASS `chunk=dataset.chunk`; the default 512 was set against a one-group root.
 
     Image-directory datasets do not need this and are not harmed by it: their frames are separate
     files, so locality buys nothing and costs nothing.

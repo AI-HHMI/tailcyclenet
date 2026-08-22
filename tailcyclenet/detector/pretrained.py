@@ -1,38 +1,27 @@
 """Load a Megvii COCO YOLOX backbone into this repo's canonical-tier `CSPDarknet`.
 
-dev/plans/detector_accuracy.md T4.1 -- **PROTOTYPE, not yet wired into a shipped recipe.** Two
-facts make this non-trivial, and both are corrected here, once, in the loader -- never in the data
-path, so a run that does not ask for pretraining is byte-unchanged:
+**PROTOTYPE, not yet wired into a shipped recipe.** Two facts make this non-trivial, and both
+are corrected here, once, in the loader -- never in the data path, so a run that does not ask
+for pretraining is byte-unchanged:
 
 - **SCALE.** This repo feeds `[0, 1]` (`x / 255.0` in `detector/data.py`); Megvii's `0.1.1rc0`
   release trains on raw `[0, 255]` with no mean/std. Every conv here has no bias
   (`conv_norm_act`), so it is exactly LINEAR in the input -- `conv(w, 255*x) == conv(255*w, x)` --
-  and only the FIRST conv touching raw pixels needs correcting; everything downstream sees an
-  already-corrected activation, so the fix is one tensor, not one per layer.
-- **CHANNEL ORDER.** This repo is RGB (`dataset.read_frames` does `COLOR_BGR2RGB`; decord gives
-  RGB); Megvii is BGR (`cv2.imread`, unswapped). `Focus` makes this a reversal WITHIN each group of
-  3, not across all 12: the stem's 12 input channels are 4 spatial shifts (top_left, bot_left,
-  top_right, bot_right -- this repo's `Focus.forward` reproduces Megvii's own grouping order
-  exactly, checked in `tests/test_detector.py`) x 3 colour channels each.
+  and only the FIRST conv touching raw pixels needs correcting.
+- **CHANNEL ORDER.** This repo is RGB; Megvii is BGR. `Focus` makes this a reversal WITHIN each
+  group of 3, not across all 12: the stem's 12 input channels are 4 spatial shifts x 3 colour
+  channels each.
 
 A third mismatch is structural, not a numeric correction, and is fixed in `yolox.py` rather than
-here: `Bottleneck` used to halve its channel count unconditionally (`hidden = cout // 2`) where
-Megvii's own `CSPLayer` builds its inner `Bottleneck`s at `expansion=1.0` (full width), so 16 of
-35 backbone tensors could not load at all under the shipped shape. `[model].bottleneck_expansion`
-(`yolox.py`) fixes the SHAPE; this file assumes the caller already built the model at `1.0` and
-RAISES if it did not, rather than silently taking a partial `strict=False` load -- gotcha 12's
-shape: a model that took 19 of 35 tensors trains to a healthy-looking curve with half the
-pretraining silently absent.
+here: `Bottleneck` used to halve its channel count unconditionally where Megvii's own `CSPLayer`
+builds its inner `Bottleneck`s at `expansion=1.0`, so 16 of 35 backbone tensors could not load at
+all under the shipped shape. `[model].bottleneck_expansion` fixes the SHAPE; this file assumes the
+caller already built the model at `1.0` and RAISES if it did not, rather than silently taking a
+partial `strict=False` load.
 
 **Scope is the BACKBONE ONLY** (`model.backbone`). The neck does not transfer at any width,
 because this repo unifies all three FPN levels to one output width where Megvii's neck has three
-per-level widths (see `yolox.py`'s own module docstring) -- widening it would cost params and
-transfer nothing.
-
-Weights: `scratch/check_coco_transfer.py` already cached Megvii's own release checkpoints at
-`scratch/weights/yolox_{tiny,s}.pth`. `scratch/` is UNTRACKED (CLAUDE.md) -- this is a
-research/prototype location, not a shipped weights path; a caller that wants this durable should
-pass its own `weights_dir`.
+per-level widths.
 """
 from pathlib import Path
 
@@ -42,9 +31,8 @@ from .yolox import YOLOX_TIERS
 
 # The 4 Focus groups (top_left, bot_left, top_right, bot_right -- `Focus.forward`'s own
 # concatenation order), each 3 channels, BGR in the Megvii checkpoint. Reversing each 3-block is
-# its own inverse (a permutation matrix that is its own transpose), so the SAME permutation
-# converts BGR-trained weights to see RGB input -- see the module docstring's derivation: if
-# w_new = w_orig[:, perm] and perm reverses each 3-block, then conv(w_new, x_rgb) ==
+# its own inverse, so the SAME permutation converts BGR-trained weights to see RGB input:
+# if w_new = w_orig[:, perm] and perm reverses each 3-block, then conv(w_new, x_rgb) ==
 # conv(w_orig, x_bgr) exactly, because summing over the channel axis does not care which physical
 # channel carries which colour as long as weight and input agree.
 BGR_TO_RGB_FOCUS_PERM = [i for g in range(4) for i in (g * 3 + 2, g * 3 + 1, g * 3 + 0)]
@@ -55,12 +43,10 @@ DEFAULT_WEIGHTS_DIR = Path(__file__).resolve().parents[2] / 'scratch' / 'weights
 def _remap_backbone_key(k):
     """Megvii `backbone.backbone.<x>.conv.weight` -> this repo's `<x>.0.weight`, or None.
 
-    Two structural differences and nothing else (see `scratch/check_coco_transfer.py`, the dry
-    count this supersedes for anything beyond a shape audit): the CSPDarknet sits at
-    `backbone.backbone` inside Megvii's `YOLOPAFPN`, and Megvii's `BaseConv` is a Module with
-    `.conv`/`.bn` where this repo's `conv_norm_act` is an `nn.Sequential`, so the conv is index
-    `.0`. The `.bn.*` half is never remapped -- GroupNorm has no BatchNorm counterpart, and a key
-    this function does not return is a key `load_coco_backbone` will never try to load.
+    Two structural differences and nothing else: the CSPDarknet sits at `backbone.backbone` inside
+    Megvii's `YOLOPAFPN`, and Megvii's `BaseConv` is a Module with `.conv`/`.bn` where this repo's
+    `conv_norm_act` is an `nn.Sequential`, so the conv is index `.0`. The `.bn.*` half is never
+    remapped -- GroupNorm has no BatchNorm counterpart.
     """
     if not k.startswith('backbone.backbone.'):
         return None
@@ -92,7 +78,7 @@ def load_coco_backbone(model, tier, weights_dir=None):
             f'load_coco_backbone: model.bottleneck_expansion must be 1.0 (canonical) to accept a '
             f'COCO backbone, got {got!r}. At 0.5 every bottleneck conv is half Megvii\'s width and '
             'a strict=False load would silently take only 19 of 35 backbone tensors -- build the '
-            "model with bottleneck_expansion=1.0 first (dev/plans/detector_accuracy.md T4.1).")
+            "model with bottleneck_expansion=1.0 first.")
     w = Path(weights_dir) if weights_dir is not None else DEFAULT_WEIGHTS_DIR
     p = w / f'yolox_{tier}.pth'
     if not p.exists():
@@ -128,25 +114,22 @@ def load_coco_backbone(model, tier, weights_dir=None):
 
 
 def load_pretrained_backbone(model, path):
-    """Load an IN-DOMAIN backbone-only checkpoint (T4.1b, `scripts/pretrain_detector_backbone.py`)
+    """Load an IN-DOMAIN backbone-only checkpoint (`scripts/pretrain_detector_backbone.py`)
     into `model.backbone`, IN PLACE.
 
-    Unlike `load_coco_backbone`, no scale or channel-order correction: this repo's own
-    pretraining loop already decodes through `BoxDataset`, i.e. already `[0, 1]` and RGB, so a
-    backbone trained here and one fine-tuned here speak the same convention from the start. That
-    is the whole point of T4.1b as T4.1's control -- it isolates "does PRETRAINING help" from
-    "does leaving this repo's own domain for COCO's help", and a silent correction here would
-    reintroduce the very confound it exists to remove.
+    Unlike `load_coco_backbone`, no scale or channel-order correction: this repo's own pretraining
+    loop already decodes through `BoxDataset`, i.e. already `[0, 1]` and RGB, so a backbone trained
+    here and one fine-tuned here speak the same convention from the start. That is the whole point
+    of the in-domain control -- it isolates "does PRETRAINING help" from "does leaving this repo's
+    own domain for COCO's help".
 
     Architecture must match EXACTLY -- `version` (tier), `bottleneck_expansion` and `in_channels`
-    all come from the checkpoint's own recorded facts (gotcha-12 shape: absent means the
-    PRE-key-existing default for each, i.e. every checkpoint this function could ever be asked to
-    load already has them, since the key existed before this function did) and are compared
-    against `model`'s own attributes BEFORE touching `load_state_dict`, so a mismatch raises with
-    a clear cause instead of a wall of shape-mismatch key names or -- worse -- a `strict=False`
-    partial load that trains a healthy-looking curve with most of the pretraining silently absent.
-    `p2` is NOT checked: it changes the NECK/head, never `model.backbone`'s own tensors, so a
-    backbone pretrained at `p2=False` loads unchanged into a `p2=True` fine-tune.
+    all come from the checkpoint's own recorded facts (absent means the PRE-key-existing default
+    for each) and are compared against `model`'s own attributes BEFORE touching
+    `load_state_dict`, so a mismatch raises with a clear cause instead of a wall of shape-mismatch
+    key names or a `strict=False` partial load. `p2` is NOT checked: it changes the NECK/head,
+    never `model.backbone`'s own tensors, so a backbone pretrained at `p2=False` loads unchanged
+    into a `p2=True` fine-tune.
     """
     ck = torch.load(Path(path), map_location='cpu', weights_only=False)
     tier = str(ck.get('yolox_version', getattr(model, 'version', '')))

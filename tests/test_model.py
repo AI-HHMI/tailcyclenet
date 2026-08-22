@@ -43,12 +43,9 @@ CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
 # the whole reason this file exists.
 ENCODERS = ('wide',)
 
-# The 3D single-view tests slice ONE camera out of the fixture rig, and it has to be one that can
-# actually see the animal. `conftest._session_3d`'s camera 0 cannot: none of its three synthetic
-# keypoints project inside its 64x48 crop. `get_camera_scale` then leaves `sensitivity` NaN and
-# `fill_nan_with_batch_median` (cube.py:466) has no sibling camera to fill from, so `cube_scale`
-# comes back NaN and the whole forward follows. That is a real -- if narrow -- edge case (the sole
-# camera loses the animal), not the path these tests are about.
+# The 3D single-view tests slice ONE camera out of the fixture rig, and it must be one that can
+# actually see the animal: `_session_3d`'s camera 0 cannot (none of its keypoints project inside
+# its crop), which leaves `cube_scale` NaN with no sibling camera to fill from.
 SEEING_CAM = 1
 
 
@@ -253,8 +250,7 @@ def test_unsupported_config_is_rejected():
     """Every one of these is accepted by the library and wrong here. Construction only, no forward.
 
     `output_mode` is the dangerous one: the library DEFAULTS to 'direct', so a config that merely
-    omits the key builds a model whose predictions `_reanchor_per_frame` misdescribes -- and
-    nothing raises.
+    omits the key builds a model whose predictions `_reanchor_per_frame` misdescribes.
     """
     with pytest.raises(AssertionError, match='use_volume_embedding'):
         build_model({**SMALL, 'use_volume_embedding': True}, n_keypoints=3)
@@ -324,16 +320,9 @@ def test_moving_camera_query_projects_per_frame(moving_batch):
 
 @pytest.mark.parametrize('enc', ENCODERS)
 def test_missing_tokens_fire_per_keypoint(moving_batch, enc):
-    """Withholding ONE keypoint's prior must move ONLY that keypoint's fused query.
-
-    This is the behavioural form of a defect that was live in posetail-pose for many runs:
-    the validity mask is one flag per KEYPOINT, `(B, N)`, but the axis the
-    position-derived terms live on is `(B, T*N)`. Its shape-mismatch branch broadcast keypoint 0's
-    validity over every keypoint, so a single withheld prior either silenced all of them or none.
-
-    A string grep cannot check this -- the comment explaining the bug quotes the code that caused
-    it -- so the check has to be a differential forward. `wide` reimplements the forward by hand,
-    which is exactly how such a bug comes back.
+    """Withholding ONE keypoint's prior must move ONLY that keypoint's fused query. The validity
+    mask is per-keypoint but the fusion axis is (B, T*N), so a shape-mismatch broadcast silenced
+    all of them or none -- checkable only by a differential forward.
     """
     b = moving_batch
     K = b.kpt_ids.shape[1]
@@ -375,13 +364,9 @@ def test_removed_query_encoder_pose_raises_by_name():
 
 
 def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
-    """`wide`'s patch CNN must LOAD, not re-initialise. Nothing else would show if it did not.
-
-    `PatchProcessor`'s convs are independent of `embed_dim` (~93k params) but its MLP is not
-    (~5.4M at 256). Building it at `wide`'s fusion width would inherit 93k of 5.5M and silently
-    retrain 98% of the patch CNN from noise -- with no symptom other than a worse number months
-    later. Building it at the pretrained width and projecting instead makes every tensor load by
-    name at matching shape, which is why `warm_start` needs no special case for it at all.
+    """`wide`'s patch CNN must LOAD, not re-initialise: built at the fusion width it would inherit
+    93k of 5.5M params and silently retrain the rest from noise. Built at the pretrained width and
+    projected, every tensor loads by name.
     """
     from tailcyclenet.checkpoints import warm_start
 
@@ -456,14 +441,8 @@ def test_wide_query_terms_follow_the_query_mode():
 
 def test_item_dropout_reproduces_the_deployment_geometry(moving_batch):
     """A fully-dropped window must put the scene scalars exactly where deployment puts them.
-
-    This is what per-ITEM dropout buys and per-keypoint dropout cannot. The decode is per-keypoint
-    independent -- there is no attention across the query axis -- but `scene_center`,
-    `scene_radius` and `cube_scale` are derived from the WHOLE `coords_q` set
-    (`tracker_encoder.py:318,356`) and scale the depth and 3D outputs. Leave even a few keypoints
-    prompted and those scalars are partly GT-derived, which is a condition deployment never meets:
-    on allen, a per-keypoint draw at p = 0.5 lands `scene_center` 13.6 mm off (0 of 200 draws
-    within 1 mm), where a per-item drop lands it at exactly 0.
+    `scene_center`/`scene_radius`/`cube_scale` derive from the WHOLE `coords_q` set, so leaving
+    even a few keypoints prompted is a condition deployment never meets.
     """
     from tailcyclenet.model import scene_center
 
@@ -511,14 +490,10 @@ def test_query_free_prediction_is_the_triangulation(moving_batch, enc):
 
 @pytest.mark.parametrize('prompted', [True, False], ids=['prompted', 'query_free'])
 def test_query_free_keeps_the_depth_ce_and_drops_only_the_3d_ce(moving_batch, prompted):
-    """The whole point of NaN-ing `anchor_local` instead of popping `grid`.
-
-    `losses.py:680` gates BOTH `coords_softmax_3d` (weight 0.4) and `depth_softmax` (weight 1.5 --
-    the largest CE term in the shipped 3D config) on `'grid' in outputs`. Only the first is query-anchored; the
-    depth target (`losses.py:769`) is `log(depths_true / (cube_scale * f_eff * sdep))`, which has
-    nothing to do with the query. Popping `grid` therefore switched off the heavier of the two on
-    every fully-unprompted step -- ~half of all steps at `prompt_dropout = 0.5`, and never on a
-    `none` arm, which routes through `_reanchor_per_frame` and keeps `grid` alive.
+    """The whole point of NaN-ing `anchor_local` instead of popping `grid`: the loss gates BOTH
+    the 3D CE and the depth CE (weight 1.5, the largest CE term) on `'grid' in outputs`, and only
+    the first is query-anchored. Popping would switch off the heavier term on every
+    fully-unprompted step.
     """
     from posetail.posetail.losses import TotalLoss
 
@@ -600,12 +575,8 @@ def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
 
 
 def test_single_view_predicts_from_rays_instead_of_dropping_the_step(moving_batch):
-    """3D single-view has no triangulation, so the back-projected rays are the anchor.
-
-    This used to hand a `loss_kpt_mask` up and let `run_batch` NaN the entire 3D target, which
-    made the whole STEP non-finite whenever no keypoint had a prior. `cams_to_sample = [1, 8]`
-    draws one camera on 1/8 of 3D items, so at `prompt_dropout = 0.5` that binned ~6% of every
-    `prior` arm's gradient updates while the matched `none` arm kept all of its own.
+    """3D single-view has no triangulation, so the back-projected rays are the anchor. This used
+    to NaN the entire 3D target, dropping the whole STEP whenever no keypoint had a prior.
     """
     b = moving_batch
     model = build_model(small('wide', query='none', gridresid_offset='query'),
@@ -621,12 +592,9 @@ def test_single_view_predicts_from_rays_instead_of_dropping_the_step(moving_batc
 
 
 def test_rays_fallback_is_a_mean_not_the_library_weighted_sum(moving_batch):
-    """At one camera the prediction must BE that camera's ray point.
-
-    `3d_pred_rays` is `sum_c sigmoid(conf_c) * X_c` with no division (`tracker_encoder.py:637`),
-    so at one camera it lands a factor `sigmoid(conf)` -- about half -- of the way from the world
-    origin to the animal. Substituting it verbatim would have made the single-view path finite and
-    wrong, which is worse than skipping the step.
+    """At one camera the prediction must BE that camera's ray point: `3d_pred_rays` is a weighted
+    SUM with no division, so at one camera it lands about halfway from the world origin to the
+    animal -- substituting it verbatim would be finite and wrong.
     """
     b = moving_batch
     model = build_model(small('wide', query='none', gridresid_offset='query'),
@@ -670,16 +638,10 @@ def test_single_view_substitutes_the_detached_rays(moving_batch):
 
 @pytest.mark.parametrize('enc', ENCODERS)
 def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
-    """`gridresid_offset` picks what the residual is measured FROM, and the two must differ.
-
-    "triangulated" recovers the residual and re-adds it to EACH frame's own triangulation for
-    every keypoint -- posetail-pose's `_reanchor_per_frame` (its model.py:756, applied
-    unconditionally), measured 2.07 -> 1.37 mm within-session. "query" keeps the library's native
-    query anchor, but only where a real prior supplied one.
-
-    Query-free the two are maximally far apart: "triangulated" still produces a residual on top of
-    the triangulation, while "query" has no valid anchor anywhere and returns the triangulation
-    itself. If these ever compare equal the switch is not wired to anything.
+    """`gridresid_offset` picks what the residual is measured FROM, and the two must differ:
+    "triangulated" re-adds the residual to each frame's own triangulation; "query" keeps the
+    library's native query anchor where a real prior supplied one. Query-free they are maximally
+    far apart.
     """
     b = moving_batch
     n_kpt = int(b.kpt_ids.max()) + 1
@@ -717,17 +679,10 @@ def test_gridresid_offset_switches_the_anchor(moving_batch, enc):
 
 
 def test_a_degenerate_triangulation_does_not_nan_the_whole_step():
-    """`torch.where` DOES NOT STOP THE NaN, and that is not obvious.
-
-    `_query_anchored` guards the degenerate solve with
-    `torch.where(isfinite(tri), tri, rays)`, which routes zero gradient into the bad entries. But
-    the NaN is not carried through the forward -- it is CREATED in the backward:
-    `triangulate_simple_batch_reg` ends in `torch.linalg.solve` (cube.py:299), whose backward
-    solves against its own NaN factorisation and returns NaN regardless of the incoming gradient.
-    Param grads are summed over points, so ONE degenerate point NaNs every parameter and the whole
-    step is dropped by `train.py`'s grad-norm guard -- counted as an unattributed `skipped`.
-
-    `nan_to_num` on the forward value does not help, for the same reason. Detaching does.
+    """`torch.where` does not stop the NaN: `triangulate_simple_batch_reg` ends in
+    `torch.linalg.solve`, whose backward returns NaN on a NaN factorisation regardless of the
+    incoming gradient -- so ONE degenerate point NaNs every parameter and the step is dropped.
+    `nan_to_num` on the forward value does not help; detaching does.
     """
     def grads(detach):
         p = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
@@ -769,7 +724,7 @@ def test_a_grown_registry_keeps_its_trained_keypoint_rows(tmp_path, enc):
     `Registry.build(base=)` APPENDS -- it raises rather than renumbering -- so a run that adds a
     dataset gets `kpt_embed.weight` at (n0+k, d) where the checkpoint has (n0, d).
     `_filter_shape_mismatch` drops a changed shape WHOLE, so every trained identity row went back
-    to noise and retrained at `kpt_lr`, while CLAUDE.md promised the opposite. It is camouflaged
+    to noise and retrained at `kpt_lr`, while the intended behaviour was the opposite. It is camouflaged
     because under `wide` most of `query_encoder.*` is expected to be dropped anyway.
     """
     from tailcyclenet.checkpoints import warm_start
@@ -800,16 +755,10 @@ def test_a_grown_registry_keeps_its_trained_keypoint_rows(tmp_path, enc):
 
 @pytest.mark.parametrize('enc', ENCODERS)
 def test_an_unprompted_keypoint_carries_no_query_time(moving_batch, enc):
-    """A "query-free" TRAINING step must be the same forward as the query-free DEPLOYMENT step.
-
-    It was not. `prompt_dropout` NaNs `kpt_prior` and leaves `prompt_t` at each keypoint's first
-    labelled frame (>0 on 19.5% of rat-city windows), while `val`, `self_prompt` and `run_group`
-    all pass `prompt_time=None`, which zeroes it. `embed_query_time` and `embed_gap` are
-    UNCONDITIONAL fusion terms -- unlike `patch`/`qpos` they carry no learned no-query token -- so
-    at `prompt_dropout = 0.4` roughly 40% of steps trained a forward no deployment path produces.
-
-    It is also eval rule 7's shape: WHEN a keypoint was first labelled is GT-derived, and it was
-    reaching the model at a keypoint with no prior at all.
+    """A "query-free" TRAINING step must be the same forward as the query-free DEPLOYMENT step:
+    `prompt_dropout` NaNs the prior but left a real per-keypoint `prompt_t`, while val and
+    `run_group` pass `prompt_time=None`. Also the shape of a GT-derived input reaching the model
+    at a keypoint with no prior.
     """
     b = moving_batch
     model = build_model(small(enc, query='prior'), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
@@ -838,10 +787,9 @@ def test_an_unprompted_keypoint_carries_no_query_time(moving_batch, enc):
 # the staged encoder unfreeze, on a REAL ViT
 # ---------------------------------------------------------------------------------------------
 # ViT-base is depth 12 with hierarchical taps at [2,5,8,11], so `video_encoder_finetune_last_n_
-# layers = 4` gives a trainable range of blocks 8..11 -- selecting SOME blocks, not all, which a
-# hand-built fixture cannot check for us. The gate, the idempotence and the block selection are
-# posetail 0.3.5's (`TrackerEncoder.unfreeze_video_encoder`); what is pinned here is that this
-# repo gets what upstream promises, plus the norms extension upstream does not do.
+# layers = 4` gives a trainable range of blocks 8..11 -- selecting SOME blocks, not all. What is
+# pinned here is that this repo gets what upstream promises, plus the norms extension upstream
+# does not do.
 
 def _staged_model(n_last=4, at=3):
     return build_model(small('wide', video_encoder_requires_grad=at,

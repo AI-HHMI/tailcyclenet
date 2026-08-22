@@ -1,6 +1,6 @@
-"""The box prompt (report 27): the two encoders, the data helper, and the build guards.
+"""The box prompt: the two encoders, the data helper, and the build guards.
 
-The inference-loop wiring is pinned by `test_infer.py`; this pins the ENCODER and the DATA side.
+The inference-loop wiring is pinned by `test_infer.py`; this pins the encoder and the data side.
 """
 import sys
 from pathlib import Path

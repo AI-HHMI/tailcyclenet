@@ -3,24 +3,10 @@
 
     pixi run python scripts/eval_detector.py --run runs/det-calms21 --data <root> --split test
 
-The metric itself lives in `tailcyclenet.detector.evaluate`, shared with the training loop so the
-number a checkpoint is selected on and the number it is reported with cannot diverge. What the
-columns mean, and why each is there:
-
-- `r@.5` / `r@.75` -- recall under GREEDY ONE-TO-ONE matching. Two thresholds because calms21
-  saturates at 0.5 (0.967 at 0.66M params after 6k iters); a flat 0.5 column there is not
-  evidence of no effect.
-- `IoU` -- mean over EVERY labelled box, zero for an unmatched one.
-- `fp` -- unmatched predictions per labelled box, the term recall cannot see.
-- `MOTA` -- box-only, with `instances.pq` PRESENT rows as ignore regions. Its `idsw` component is
-  not a tracking number; see `evaluate.box_mota`.
-
-Two things to get right when using it:
-
-- `--boxes` must match what the arm was TRAINED on. Scoring an `instances`-trained detector
-  against keypoint boxes measures the crop source and calls it accuracy (eval rule 2).
-- 3dpop's val split is ONE session, so score it on `test`. `--split train` gives the train/val
-  gap, which is what decides between augmentation and resolution.
+The metric lives in `tailcyclenet.detector.evaluate`, shared with the training loop. `r@.5`/
+`r@.75` are greedy one-to-one recall, `IoU` a mean over every labelled box, `fp` unmatched
+predictions per labelled box, `MOTA` box-only with PRESENT rows ignored. `--boxes` must match
+what the arm was trained on; score 3dpop on `test` (its val is one session).
 """
 from __future__ import annotations
 
@@ -43,11 +29,9 @@ from tailcyclenet.metrics import paired_bootstrap
 def _tiled(run, tile_scale):
     """Refuse a tiled checkpoint rather than score it at the wrong scale.
 
-    Refusing rather than supporting: this script does ONE whole-frame forward per item, which is
-    also what deployment does, so the honest fix is to letterbox the frame at `tile_scale` -- and
-    that is `detect_group`'s job, per camera, because a root can ship two frame sizes
-    (rat-city-annotated is 4696x2048 beside 4500x2050). Scoring a tiled arm goes through
-    `scripts/infer.py`; this raises so that the choice is visible instead of silent.
+    This script does ONE whole-frame forward per item, so a tiled arm's `input_wh` is a tile size
+    and letterboxing whole frames into it would score the weights at the wrong scale -- score
+    tiled arms through `scripts/infer.py`, which derives the input per camera.
     """
     if tile_scale:
         raise SystemExit(
@@ -62,10 +46,7 @@ def main():
     ap.add_argument('--run', required=True, type=Path, help='detector run folder or .pth')
     ap.add_argument('--compare', type=Path, default=None,
                     help='a second run, scored on the SAME groups, reported as `--run` minus this '
-                         'one under a PAIRED bootstrap. Unpaired intervals on the same groups '
-                         'overstate the uncertainty enough to hide a real effect (eval rule 3): '
-                         'augmentation on 3dpop reads +0.005 r@.5 [-0.000, +0.010] paired, and '
-                         'two overlapping [0.93, 0.98] intervals unpaired.')
+                         'one under a PAIRED bootstrap.')
     ap.add_argument('--data', required=True, type=Path, help='ONE dataset root')
     ap.add_argument('--split', default='test')
     ap.add_argument('--boxes', default='keypoints', choices=BOX_SOURCES,
@@ -79,19 +60,16 @@ def main():
                     help='top_k for decode; default is the session\'s own animal count, which is '
                          'what scripts/infer.py supplies')
     ap.add_argument('--score-thresh', type=float, default=0.05,
-                    help='0.05, where DEPLOYMENT runs at 0.99 (`scripts/infer.py --det-score`). '
-                         'Deliberately not the same number: this scores the detector as trained, and '
-                         'every figure in dev/reports/10 is at 0.05. Pass 0.99 to see the boxes the '
-                         'pose model is actually served.')
+                    help='0.05, where deployment runs at 0.99. This scores the detector as '
+                         'trained; pass 0.99 to see the boxes the pose model is actually served.')
     ap.add_argument('--num-workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--deploy', action='store_true',
-                    help='switch to the DEPLOYMENT-SHAPED score (dev/plans/detector_accuracy.md '
-                         'T0.1): det_fill/slot_fill/window_miss/union_side/gt_side over WHOLE '
-                         'test groups via detect_raw+associate_group, the same functions '
-                         'scripts/infer.py calls -- not the per-view sampled recall above, which '
-                         'does not predict it. Ignores --compare/--batches/--frames-per-group.')
+                    help='switch to the DEPLOYMENT-SHAPED score: '
+                         'det_fill/slot_fill/window_miss/union_side/gt_side over WHOLE test '
+                         'groups via detect_raw+associate_group, not the per-view sampled recall. '
+                         'Ignores --compare/--batches/--frames-per-group.')
     ap.add_argument('--track', dest='deploy_track', action='store_true', default=True,
                     help='deploy mode only: CrossViewTracker for C>1 (the default, matches '
                          'scripts/infer.py)')
@@ -111,21 +89,15 @@ def main():
     if args.deploy:
         return main_deploy(args, device)
     model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
-    # A TILED CHECKPOINT'S `input_wh` IS ITS TILE SIZE, NOT ITS DEPLOYMENT INPUT SIZE (gotcha 12's
-    # shape). `tile_scale` was unpacked here and never used, so `BoxDataset(input_wh=wh)`
-    # letterboxed the WHOLE FRAME into one tile -- the 1/scale shift `tiled_input_wh` and
-    # `detect_group` exist to prevent, which `scripts/infer.py` guards and this script did not.
-    # A tiled arm scored here reads near-zero recall for a reason that is nothing to do with its
-    # weights, and that is precisely the arm this script exists to compare.
+    # A tiled checkpoint's `input_wh` is its TILE size, not its deployment input size. `tile_scale`
+    # was unpacked here and never used, so `BoxDataset(input_wh=wh)` letterboxed the WHOLE frame
+    # into one tile -- the 1/scale shift `tiled_input_wh`/`detect_group` exist to prevent.
     _tiled(args.run, tile_scale)
     if trained_on != args.boxes:
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
-              f'against {args.boxes!r} ones. That measures the crop source, not accuracy '
-              '(eval rule 2).')
-    # T4.2 (dev/plans/detector_accuracy.md): a temporal-input checkpoint's `BoxDataset` must
-    # supply the same stacked-frame shape it was trained on, or the forward's channel count
-    # mismatches the weights. `model.in_channels` (part of the WEIGHTS, read back by
-    # `load_detector`) is the source of truth, not a CLI flag -- see `TEMPORAL_INPUT_BY_CHANNELS`.
+              f'against {args.boxes!r} ones. That measures the crop source, not accuracy.')
+    # A temporal-input checkpoint's `BoxDataset` must supply the same stacked-frame shape it was
+    # trained on; `model.in_channels` (part of the weights) is the source of truth, not a CLI flag.
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
                     min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                     max_frames_per_group=args.frames_per_group,
@@ -156,14 +128,12 @@ def main():
         _tiled(args.compare, tile2)
         if trained_on2 != trained_on:
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
-                  f'{trained_on2!r}. The paired delta below moves TWO keys (eval rule 4).')
+                  f'{trained_on2!r}. The paired delta below moves TWO keys.')
         if wh2 != wh:
             # Pairable, and worth saying why: a letterbox is a uniform scale plus a translation
             # applied to the prediction AND the ground truth alike, and IoU is invariant under
-            # that. So recall, IoU and fp/box compare directly across input sizes, and box-MOTA
-            # does too -- its match radius is derived from the median box diagonal in whichever
-            # space it is measuring. What does NOT carry across is anything in absolute pixels,
-            # and this scorer reports none.
+            # that, so recall, IoU and fp/box compare directly across input sizes (box-MOTA too
+            # -- its radius derives from the median box diagonal in whichever space it measures).
             print(f'note: {args.compare} runs at {wh2[0]}x{wh2[1]} and --run at {wh[0]}x{wh[1]}. '
                   'Each is scored in its own letterbox; IoU is scale-invariant, so the columns '
                   'below are comparable.')
@@ -183,7 +153,7 @@ def main():
                 print(f'{name:>5s} {d["mean"]:+7.4f}  DEGENERATE (one group)')
                 continue
             # A sign flip inside the interval means the arms are not distinguished on this
-            # column. Saying so beats leaving a reader to compare two overlapping intervals.
+            # column; say so rather than leaving two overlapping intervals to compare.
             star = '' if d['lo'] <= 0 <= d['hi'] else '  *'
             print(f'{name:>5s} {d["mean"]:+7.4f}  [{d["lo"]:+.4f}, {d["hi"]:+.4f}]{star}')
 
@@ -211,10 +181,8 @@ def main_deploy(args, device):
                                  max_frames=args.det_max_frames, n_frames=args.n_frames,
                                  overlap=args.overlap, min_box_frames=args.min_box_frames)
             rows.append(r)
-            # THE FRAMES `deployment_score` ACTUALLY SCORED, not the group's raw length --
-            # `--det-max-frames` truncates internally (`detect_raw`'s own `max_frames`), and
-            # printing the untruncated count here read as if every group ran full-length even
-            # when bounded to the 120-frame protocol.
+            # The frames `deployment_score` actually scored, not the group's raw length: a
+            # `--det-max-frames` prefix would otherwise print as full-length.
             t_scored = min(group.n_frames, args.det_max_frames) if args.det_max_frames \
                 else group.n_frames
             print(f'{f"{sess.session_id}/{gid}"[:40]:40s} {t_scored:6d} '
@@ -228,9 +196,8 @@ def main_deploy(args, device):
         ci = ('DEGENERATE (one group -- no interval exists)' if b['n'] < 2
               else f'[{b["lo"]:.3f}, {b["hi"]:.3f}] 95% over {b["n"]} groups')
         print(f'{name:>12s} {b["mean"]:7.4f}  {ci}')
-    # union/gt side quantiles are POOLED per group (each group already a quantile of many
-    # windows/points), so a mean-of-medians is reported rather than bootstrapped a second time --
-    # the within-group distribution is not the between-group one `paired_bootstrap` resamples.
+    # union/gt side quantiles are pooled per group (each group already a quantile of many
+    # windows/points), so a mean-of-medians is reported rather than bootstrapped a second time.
     for k in (0.5, 0.9, 0.99):
         us = [r['union_side_px'][k] for r in rows if r['union_side_px'][k] == r['union_side_px'][k]]
         gs = [r['gt_side_px'][k] for r in rows if r['gt_side_px'][k] == r['gt_side_px'][k]]

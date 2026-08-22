@@ -1,18 +1,26 @@
 #!/usr/bin/env python
 """Run a trained model. The only entry point that touches a checkpoint.
 
-    # every group of a split, cropping from the labels (the GT-crop upper bound)
-    pixi run python scripts/infer.py --run runs/<name> --data <dataset> --split test --out pred.npz
+    # one session directory, cropping from the labels (the GT-crop upper bound)
+    pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> --out pred/
 
     # one session, query-free
     pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> \\
-        --anchor none --out pred.npz
+        --anchor none --out pred/
 
     # crops from a detections file (the deployment number)
-    pixi run python scripts/infer.py --run runs/<name> --data <dataset> --boxes dets.npz --out p.npz
+    pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> \\
+        --boxes dets.npz --out pred/
 
-A run folder carries its own config and keypoint registry, so `--run` is the whole model
-specification and a config/checkpoint mismatch cannot happen.
+    # raw footage plus an anipose calibration, straight off the camera files
+    pixi run python scripts/infer.py --run runs/<name> --out pred/ --videos rec/ \\
+        --calibration anipose/calibration.toml --cam-regex 'cam([0-9]+)_' \\
+        --detector runs/det-<name> --max-animals 4
+
+`--out` is a prediction SESSION DIRECTORY (session.toml, calibration.toml, groups.pq and the
+label tables), written a block at a time -- not an npz. A run folder carries its own config and
+keypoint registry, so `--run` is the whole model specification and a config/checkpoint mismatch
+cannot happen.
 """
 from __future__ import annotations
 
@@ -25,8 +33,8 @@ from .window import ANCHORS, CARRY_SOURCES
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """THE command line. A function, not a module-level block, so a test can assert against the
-    parser object rather than regex this file -- which is what several of them used to do."""
+    """The command line. A function, not a module-level block, so a test can assert against the
+    parser object rather than regex this file."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path)
@@ -103,9 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
                          '`format.write_session`, pixels symlinked, and carry on -- so '
                          '`validate_session` and your own eyes can be pointed at what the flags '
                          'produced. Not the mechanism, and on no default path.')
-    # DEFAULT None, NOT 'test'. The videos path has to be able to tell whether it was PASSED,
-    # since it is inert there and silently ignoring it would let a user believe they selected
-    # something. The directory path resolves `args.split or 'test'`.
+    # DEFAULT None, NOT 'test': the videos path has to tell whether it was PASSED (it is inert
+    # there and would otherwise be silently ignored).
     ap.add_argument('--split', default=None,
                     help='default: test. Inert with --videos, and refused rather than ignored.')
     ap.add_argument('--out', required=True, type=Path,
@@ -117,14 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--anchor', default='carry', choices=ANCHORS,
                     help="'labels' is an ORACLE, not a deployment number")
     ap.add_argument('--overlap', type=int, default=4,
-                    help='frames each window shares with its predecessor. The default is 4 by '
-                         'direct instruction (2026-08-21); the measured evidence says 8 suits 3D '
-                         '(3dpop -0.626 mm against 4 over 16 sessions, and -0.355 [-0.751, -0.063] '
-                         'SIG on the 120-frame protocol, where overlap 2 costs +0.460 and 12 is no '
-                         'better), while 2D still improves at 12 -- but only by +0.787 px '
-                         '[-0.111, +1.951] n.s. over 8 on rat-city, at a small monotone identity '
-                         'cost. It is the SEAM COUNT against the SEAM SIZE and both terms depend '
-                         'on the clip; sweep it per root.')
+                    help='frames each window shares with its predecessor. Default 4; 8 suits 3D, '
+                         '2D improves through 12 (seam count vs seam size -- sweep per root).')
     ap.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
     ap.add_argument('--boxes', type=Path, default=None,
                     help='npz of crop points per group; default is to crop from the labels')
@@ -136,191 +137,87 @@ def build_parser() -> argparse.ArgumentParser:
                          'posetail-pose checkpoint, which keeps it in a config file rather than '
                          'in the weights.')
     ap.add_argument('--det-score', type=float, default=0.5,
-                    help='objectness floor for a detection. 0.5, NOT 0.99: saturation is a '
-                         'property of the RECIPE, not the dataset, and the current detector '
-                         'generation is NOT saturated (q01 0.45-0.84) -- 0.99 keeps only 26-33%% '
-                         'of detections (coverage 0.703, MOTA 0.622) where 0.5 keeps ~99%% '
-                         '(coverage 0.986, MOTA 0.524) and 0.97 maximises identity (MOTA 0.723). '
-                         '0.5 is the coverage-favouring default; 0.97 is the identity-favouring '
-                         'choice. Sweep per checkpoint: read the objectness quantiles recorded in '
-                         'it, and watch the per-group box coverage printed below.')
+                    help='objectness floor for a detection. 0.5 favours coverage, 0.97 identity; '
+                         'sweep per checkpoint (saturation is a property of the recipe, not the '
+                         'dataset).')
     ap.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
                     help='follow one animal per instance row across frames -- per-frame Hungarian '
-                         'on centre distance in units of the box side, gated at one side, with '
-                         'births into empty rows and expiry after a window. ON BY DEFAULT, and it '
-                         'only ever runs where `--track` cannot: `detect_group` builds the tracker '
-                         'when `track and C > 1` and otherwise falls through to here, so this is '
-                         'the whole of 2D single-view identity. It was off while `--track` was on, '
-                         'which left the shipped 2D default with NO cross-frame identity at all -- '
-                         'score-ordered rows, and the union crop spanning several animals. Every 2D '
-                         'number in reports 11 and 13 came from an explicit opt-in. '
-                         '`--no-link-boxes` restores that memoryless pass.')
+                         'on centre distance in units of the box side, gated at one side. The '
+                         'whole of 2D single-view identity; `--no-link-boxes` restores the '
+                         'memoryless pass.')
     ap.add_argument('--box-prompt', default='auto', choices=('auto', 'none', 'labels', 'detector'),
-                    help='DEPLOYMENT BOX PROMPT (report 27), 2D single-camera. DEFAULT `auto`: a '
-                         'box-model checkpoint deploys with the box from the detector at '
-                         '--crop-inflate 1.5 + --refine; a plain model is unaffected. `auto` '
-                         'REFUSES to run a box model without a detector/boxes file rather than '
-                         'silently falling back to ground truth -- `labels` is an EXPLICIT opt-in '
-                         'ORACLE (it warns), `none` forces the box off.')
+                    help='DEPLOYMENT box prompt, 2D single-camera. `auto` deploys a box model with '
+                         'the detector box (--crop-inflate 1.5 + --refine) and REFUSES to run a '
+                         'box model without a detector/boxes file; `labels` is an explicit ORACLE; '
+                         '`none` forces the box off.')
     ap.add_argument('--crop-inflate', type=float, default=None,
-                    help='inflate every crop about its centre. DEFAULT: 1.5 when the box is on '
-                         '(the WIDE regime where the box is load-bearing, report 27 section 9m), '
+                    help='inflate every crop about its centre. DEFAULT 1.5 when the box is on, '
                          'else 1.0.')
     ap.add_argument('--crop-source', default='boxes', choices=('boxes', 'keypoints'),
                     help="where the window's crop comes from. 'boxes' (default) unions the "
-                         "detector's per-frame boxes -- what every recorded number uses. "
-                         "'keypoints' runs THE CROP RULE on the detector's own keypoints over the "
-                         'window, which is the one thing a union of boxes cannot reproduce: the '
-                         'per-frame extents are unioned BEFORE squaring rather than after. Needs '
-                         'a keypoint-trained detector and is ignored without one. Bounded by the '
-                         'same overlap test `--refine` carries.')
+                         "detector's per-frame boxes; 'keypoints' runs THE CROP RULE on the "
+                         'detector\'s own keypoints (needs a keypoint-trained detector, ignored '
+                         'without one).')
     ap.add_argument('--max-move', type=float, default=1.0,
-                    help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a '
-                         'target-detection pair further apart than this is not the same animal and '
-                         'is unavailable to the Hungarian. 1.0 was calibrated against CENTROID '
-                         'displacement -- p90 0.06-0.11 body lengths on every multi-animal root, so '
-                         '10-16x headroom -- and that calibration does not transfer to any cost '
-                         'that measures something other than a centroid. Sweepable so the headroom '
-                         'can be checked rather than assumed.')
+                    help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a pair '
+                         'further apart than this is not the same animal. 1.0 is ~10x headroom on '
+                         'every multi-animal root.')
     ap.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
-                    help='3D multiview only, and ON BY DEFAULT. ONE cross-view target set with one '
+                    help='3D multiview only, ON BY DEFAULT: ONE cross-view target set with one '
                          'affinity and one Hungarian, replacing per-frame `associate` plus '
-                         '`link_rows` -- see tailcyclenet/detector/track.py and dev/reports/12. '
-                         'Those two never talked to each other, which is where the teleporting rows '
-                         'and the starved animals come from. `--no-track` restores the memoryless '
-                         'pass. What it buys, measured (dev/reports/13): over 480 frames the error '
-                         'of the memoryless pass grows +0.6 mm/window to 39.4 mm while this holds '
-                         '12-13 mm flat (-0.02/window), because the union crop widens 193 -> 230 px '
-                         'and this keeps it at 187; the worst crop halves (p99 750 -> 376 px, max '
-                         '1312 -> 570); box slots filled rise 0.866 -> 0.888 (p10 0.653 -> 0.732); '
-                         'and it is 5-8x faster, widening with camera count, which is what makes a '
-                         'multi-animal 16-camera rig runnable at all. What it does NOT buy: on '
-                         'report 11 §2\'s 120-frame protocol none of report 12 §5\'s pre-registered '
-                         'endpoints moves (coverage -0.001, MOTA +0.035, miss -0.016, all n.s.) -- '
-                         'that benchmark is six windows long, too short to show a per-window effect. '
-                         'It subsumes --link-boxes on a multi-camera rig.')
+                         '`link_rows`. Buys scale and flat error over long clips; `--no-track` '
+                         'restores the memoryless pass.')
     ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
-                    help='3D only. 2 is cross-view association as it stands: every instance is '
-                         'built from a camera PAIR, so an animal only one view saw is dropped from '
-                         'the frame entirely. 1 also emits each leftover box as a single-view '
-                         'instance -- coverage against precision, since a leftover box is exactly '
-                         'one the geometry never corroborated. Whether the pose model can USE a '
-                         'one-camera 3D window is the run\'s own `[data].prob_2d_only`: the shipped '
-                         'runs set 0.25, configs/3d.toml sets 0, and under 0 it '
-                         'is an untrained input shape. Measured on 3dpop: no metric moves.')
+                    help='3D only. 2 builds every instance from a camera PAIR (single-view animals '
+                         'dropped); 1 also emits leftover boxes as single-view instances. Whether '
+                         'the pose model can use one is [data].prob_2d_only.')
     ap.add_argument('--max-animals', type=int, default=0)
-    # DETECTION BUDGET, SEPARATE FROM THE ROW COUNT. `--max-animals` used to set both, so sweeping
-    # the row count also moved how many boxes the detector was allowed to emit and neither lever
-    # could be read alone (`link_rows`, spare rows). Default 0 = follow `--max-animals`, which is
-    # what the two did when they were one number.
+    # Detection budget, separate from the row count: `--max-animals` used to set both, so neither
+    # lever could be read alone. 0 = follow `--max-animals`.
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')
-    # THE KEYPOINT IDENTITY CUES (dev/reports/16 §9, 19 §4). All default-off, all VETOES over an
-    # unchanged centroid cost -- each may only remove an edge the centre gate already accepted, so
-    # `--max-move`'s calibration in box sides is untouched and a wrong cue costs a missed match
-    # rather than a wrong one. A detection with too few keypoints ABSTAINS; it never vetoes.
+    # The keypoint identity cues: all default-off VETOES over an unchanged centroid cost -- each
+    # may only remove an edge the centre gate already accepted, and a detection with too few
+    # keypoints abstains.
     ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
-                    help='INSTANCE-LEVEL NMS on the seated rows (report 20 lead 1, maDLC\'s '
-                         '`Assembly.intersection_with`). Drops the lower-scored of two rows whose '
-                         'keypoint-containment overlap `min(#kpts of A in B\'s box / |A|, ...)` '
-                         'exceeds FRAC; 0.8 is maDLC\'s value. NOT IoU -- two touching animals '
-                         'overlap almost equally by IoU and it is zero under fast motion. Aimed at '
-                         '`fp_dup`, which is 90%% of calms21\'s detector-minus-GT FP rise and ~10%% '
-                         'of 3dpop\'s, so expect it to matter on crowded-overlap roots and be a '
-                         'near-no-op elsewhere. Default off; its fire rate is printed. '
-                         'QUANTISED: the overlap is a fraction of K keypoints, so at K = 4 it takes '
-                         'only {0, .25, .5, .75, 1} and this flag has FIVE meaningful settings, not '
-                         'a continuum -- 0.6 and 0.7 are byte-identical (both mean "3 of 4"). Quote '
-                         'it as a keypoint COUNT, not as a float, and note that maDLC\'s 0.8 means '
-                         'something different at K = 17 than at K = 4. Same trap as '
-                         '--min-match-kpts (eval rule 9).')
+                    help='INSTANCE-LEVEL NMS on the seated rows: drop the lower-scored of two rows '
+                         'whose keypoint-containment overlap exceeds FRAC. NOT IoU. QUANTISED by K '
+                         '(at K=4 there are five settings). Default off.')
     ap.add_argument('--max-frames', type=int, default=0,
-                    help='predict only the first N frames of each group. A PREFIX, not a sample: '
-                         '`carry` needs the frames contiguous. Exactly --start-frame 0 '
-                         '--end-frame N, and it stays because every recorded protocol number is a '
-                         '--max-frames 120 invocation. REFUSED together with either of them '
-                         'rather than ordered: "120 frames from 300" and "up to frame 120, from '
-                         '300" read with equal force, and a precedence rule would make one of '
-                         'them silently wrong.')
-    # THE FRAME RANGE SERVES BOTH INPUT PATHS, because it is a WINDOW-LOOP lever and not an
-    # input-format one: a group carries its TRUE length either way and the range bounds only what
-    # is PREDICTED. That is what lets one implementation serve a session directory and raw videos
-    # alike, and it is why these sit outside any input-specific group.
+                    help='predict only the first N frames of each group (a PREFIX, so `carry` '
+                         'stays contiguous). = --start-frame 0 --end-frame N; refused together '
+                         'with either.')
+    # The frame range serves both input paths: it is a window-loop lever, not an input-format
+    # one, which is why these sit outside any input-specific group.
     ap.add_argument('--start-frame', type=int, default=0,
-                    help='first SOURCE frame to predict, per group. Half-open [start, end) -- '
-                         "range's convention, --chunk's convention, and every slice in this repo. "
-                         'THE `frame` COLUMN IN THE OUTPUT IS ALWAYS THE SOURCE INDEX, and '
-                         'groups.pq keeps the group\'s FULL n_frames, so `load_predictions` hands '
-                         'back a full-length array that is NaN outside the range and eval.py / '
-                         '--chunk / --vs need no change. Re-basing to 0 would score frames '
-                         '[start, end) against labels [0, end-start) -- the `chunk_frames` '
-                         'failure exactly (coverage 0.4656 against 0.9891), which survived '
-                         'because it looks like a pipeline degrading over a clip. '
-                         'A RANGED RUN IS NOT A SLICE OF THE WHOLE-CLIP ANSWER: the detector '
-                         'boxes are byte-identical and the per-frame accuracy columns are '
-                         'comparable, but --track and --link-boxes carry state across frames and '
-                         '--anchor carry has no prior at `start`, so the IDENTITY columns are '
-                         'comparable only between two runs that START at the same frame.')
+                    help='first SOURCE frame to predict, per group (half-open [start, end)). The '
+                         'output `frame` column is always the source index. A ranged run is not a '
+                         'slice of the whole-clip answer: identity columns are comparable only '
+                         'between runs that start at the same frame.')
     ap.add_argument('--end-frame', type=int, default=0,
-                    help='one past the last SOURCE frame to predict, per group. 0 = to the end. '
-                         'Past the end CLAMPS, exactly as --max-frames does. A group shorter than '
-                         '--start-frame is SKIPPED BY NAME rather than refused, because a ragged '
-                         'root with one short group must still be runnable -- but if EVERY group '
-                         'is skipped the run IS refused: writing an empty session and exiting 0 '
-                         'is the worst of both. '
-                         'NOT A RESUME. It bounds which frames are predicted; it does not '
-                         'reconstruct the tracker or the carried prior the whole-clip run would '
-                         'have held at that frame.')
+                    help='one past the last SOURCE frame to predict, per group; 0 = to the end, '
+                         'past the end clamps. A group shorter than --start-frame is skipped by '
+                         'name; every group skipped is refused. NOT A RESUME.')
     ap.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
-                    help='DEFAULT: ON IN 3D, OFF IN 2D -- derived from the session\'s own mode, '
-                         'because the two dimensions disagree and the code knows which it is in. '
-                         '3dpop over 16 sessions / 47 units, paired, one lever: MPJPE -0.962 mm '
-                         '[-2.104, -0.216] SIG, p75 -0.749 SIG, p95 -8.17 SIG, with coverage, MOTA '
-                         'and idsw all null -- a clean win, which retires report 11\'s "loses to '
-                         '--crop-source keypoints at 2x compute". In 2D it is a TRADE: bulk accuracy '
-                         'improves on both roots (rat-city p75 -0.744 SIG, coverage +0.008 SIG; '
-                         'calms21 p75 -4.14 SIG) while calms21 identity gets SIG worse (MOTA '
-                         '-0.0435, idsw +0.0085, coverage -0.0053) -- 2x the seed floor, so 2D does '
-                         'not get it by default. `--refine` / `--no-refine` overrides either way. '
-                         'What it does: '
-                         're-crop each window to the first pass\'s OWN prediction and predict '
-                         'again, label-free. The prediction re-enters the crop rule as if it were '
-                         'the labels, so the second pass sees the box a GT crop would have given -- '
-                         'the only arm that beat every detector crop on 3dpop. Costs one extra '
-                         'forward AND one extra decode per animal per window: the crop moves, so '
-                         'neither the pixels nor the scene encode can be reused.')
+                    help='DEFAULT: on in 3D, off in 2D (derived from the session\'s own mode). '
+                         'Re-crops each window to the first pass\'s OWN prediction and predicts '
+                         'again, label-free. Costs one extra forward + decode per animal per '
+                         'window.')
     ap.add_argument('--refine-px', type=int, default=None,
-                    help='run --refine\'s FIRST pass at this input resolution instead of the '
-                         'run\'s own image_size. Refine\'s gain is MAGNIFICATION, not coordinate '
-                         'frame, so pass 1 only has to LOCALISE. calms21 2D: 96 px beats full-res '
-                         'refine outright (6.651 vs 6.765) at a third of the overhead. 3dpop 3D: '
-                         '192 is a NULL against 256 (+0.062 mm paired) at a quarter of the pixels, '
-                         'and 96-128 trade ~1.7 mm for +0.021 coverage and +0.03 MOTA. 64 IS THE '
-                         'CLIFF on both roots. No default: the floor scales with `patch_size` and '
-                         'with how big the animal is in the crop, so it is per-root.')
+                    help='run --refine\'s FIRST pass at this resolution instead of the run\'s '
+                         'image_size (the gain is magnification; pass 1 only localises). 96-192 is '
+                         'the plateau, 64 the cliff. No default.')
     ap.add_argument('--vis-thresh', type=float, default=None,
-                    help='withhold an (animal, frame) row whose MEDIAN `vis_pred` logit across '
-                         'keypoints is below this. Measured against a rate-matched random rejection '
-                         '-- the only honest control, since any rejection flatters a mean over '
-                         'matched points -- it is worth MOTA +0.049 SIG on 3dpop at 7.3%% of rows '
-                         'and 0.601 -> 0.628 on rat-city at 14%%, where the control gains nothing. '
-                         'A LOGIT, and NOT PORTABLE: rat-city sits at a median of +2.7 and 3dpop at '
-                         '+15.4, so pick it per dataset from the run\'s own `conf` field. Applies '
-                         'to what is reported, never to the carried prompt.')
+                    help='withhold an (animal, frame) row whose median `vis_pred` logit is below '
+                         'this. A logit, not portable across datasets; applies to what is '
+                         'reported, never the carried prompt.')
     ap.add_argument('--kpt-chunk', type=int, default=0,
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
     ap.add_argument('--prefetch-windows', type=int, default=1,
-                    help='decode this many windows AHEAD of the one currently forwarding on the '
-                         'GPU (dev/reports/31). BIT-EXACT: the prediction is unchanged at any '
-                         'value -- the pose loop was decode-bound with the GPU idle during every '
-                         'decode, and this overlaps the next window\'s decode with the current '
-                         'one\'s forward. `carried` (the anchor/carry prompt) is still read and '
-                         'written strictly in window order on the main thread, so the SEQUENCE '
-                         'of forwards is untouched. 0 restores the exact old serial loop -- no '
-                         'prefetch pool is even created. Costs one extra small `crops` buffer '
-                         '(already cropped to `image_size`), not a second full-frame decode.')
+                    help='decode this many windows AHEAD of the one forwarding. BIT-EXACT: the '
+                         'prediction is unchanged at any value. 0 restores the serial loop.')
     ap.add_argument('--oracle-corrupt', default=None,
                     help='ONLY with --anchor labels, and never a deployment arm: break the oracle '
                          'prior on purpose and see how far the output follows it. `off:<x>` offsets '
@@ -382,13 +279,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    """Parse and run. `scripts/infer.py` is a six-line shim onto this."""
+    """Parse and run; `scripts/infer.py` is a shim onto this."""
     from .driver import run_dataset
 
     ap = build_parser()
     args = ap.parse_args(argv)
-    # EXACTLY ONE OF, checked by hand so the message names both. argparse's mutually-exclusive
-    # group cannot express "required" here without making its own error name only one of them.
+    # Exactly one of, checked by hand so the error names both flags.
     if bool(args.data) == bool(args.videos):
         ap.error('exactly one of --data (a session directory in docs/annotation_format.md) or '
                  '--videos (raw footage plus --calibration) is required.')

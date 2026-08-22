@@ -1,13 +1,9 @@
 """The world-size axis: what a config key means on N gpus, and the guards around it.
 
-None of this needs a process group. Every rule that decides how a run behaves on 4 gpus is a pure
-function of ints or of tensors, and that is deliberate -- the parts that genuinely need NCCL (the
-gradient all-reduce, the unfreeze re-wrap) are guarded at RUNTIME by `check_ranks_agree`, which
-raises inside the real job rather than being approximated in a test.
-
-THE ONE RULE WORTH REMEMBERING: DDP registers parameters when the module is WRAPPED and never
-re-checks (`torch/nn/parallel/distributed.py:1338`), so a tensor frozen at wrap time is never
-all-reduced afterwards. This repo ships a staged encoder unfreeze, which is exactly that case.
+None of this needs a process group; the parts that genuinely need NCCL are guarded at RUNTIME by
+`check_ranks_agree`. THE ONE RULE WORTH REMEMBERING: DDP registers parameters when the module is
+WRAPPED and never re-checks, so a tensor frozen at wrap time is never all-reduced afterwards --
+this repo ships a staged encoder unfreeze, which is exactly that case.
 """
 import importlib.util
 from pathlib import Path
@@ -46,9 +42,9 @@ def _optim_tests():
 # -- what a count means on N gpus ----------------------------------------------------------
 
 def test_per_rank_is_a_ceiling_with_a_floor_of_one():
-    """`n_iterations` and every frequency are TOTALS across ranks. Ceiling, so an 8-gpu run does
-    at least the requested number of samples rather than 7 fewer; floor 1, because a frequency
-    that rounded to 0 would fire on every step (or divide by zero)."""
+    """`n_iterations` and every frequency are TOTALS across ranks: ceiling (an 8-gpu run does at
+    least the requested number of samples), floor 1 (a frequency rounded to 0 would fire every step).
+    """
     assert dist_utils.per_rank(60000, 4) == 15000
     assert dist_utils.per_rank(60001, 4) == 15001
     assert dist_utils.per_rank(3, 8) == 1
@@ -65,11 +61,8 @@ def test_world_one_leaves_every_schedule_exactly_as_configured():
 
 
 def test_the_unfreeze_iteration_cannot_be_stepped_over():
-    """The global iteration advances by `world`, so it lands ON 10,000 only when world divides it.
-
-    Upstream's gate is `iteration < unfreeze_iter -> False`, i.e. `>=`, which is what makes a
-    counter moving in strides of 8 safe. If it were `==`, a 3-gpu run would sail past 10,000 and
-    the encoder would never train -- silently, and only on some gpu counts.
+    """The global iteration advances by `world`, so it lands ON 10,000 only when world divides it;
+    the gate must be `>=`, or a 3-gpu run sails past and the encoder never trains, silently.
     """
     Tiny = _optim_tests().Tiny
     for world in range(1, 9):
@@ -85,8 +78,8 @@ def test_the_unfreeze_iteration_cannot_be_stepped_over():
 
 def test_scaling_touches_only_the_absolute_rates():
     """`encoder_lr_scale` and `muon_lr_scale` are MULTIPLIERS on the absolute rates, so scaling
-    them too would move the recipe's ratios and make a multi-gpu arm several levers off its
-    control rather than one."""
+    them too would move the recipe's ratios and make a multi-gpu arm several levers off its control.
+    """
     cfg = {'learning_rate': 1e-4, 'kpt_lr': 5e-4, 'encoder_lr_scale': 0.1, 'muon_lr_scale': 2.0,
            'weight_decay': 0.002, 'optimizer': 'muon'}
     s = dist_utils.scale_optimizer_cfg(cfg, 4)
@@ -112,9 +105,10 @@ def test_an_absent_kpt_lr_stays_absent_and_still_follows_the_scaled_rate():
 
 
 def test_the_staged_unfreeze_reads_the_scaled_rates():
-    """The unfreeze adds the encoder's groups THOUSANDS of iterations after the build, reading the
-    config dict again through `group_lr`. Handing the scaled copy to the build alone would give the
-    encoder a 1-gpu rate half a run later, with nothing printed about it."""
+    """The unfreeze adds the encoder's groups thousands of iterations after the build, reading the
+    config dict again -- handing the scaled copy to the build alone would give the encoder a
+    1-gpu rate half a run later.
+    """
     tests = _optim_tests()
     m = tests.Tiny(unfreeze_at=10, n_last=3)
     cfg = dist_utils.scale_optimizer_cfg(tests._cfg(learning_rate=1e-4, encoder_lr_scale=0.1), 4)
@@ -139,8 +133,9 @@ def test_train_hands_the_scaled_config_to_both_unfreeze_entry_points():
 # -- host resources ------------------------------------------------------------------------
 
 def test_reader_cache_divides_by_ranks_as_well_as_workers(monkeypatch):
-    """Four ranks of eight workers is 32 decoding processes on one host, not 8. Sizing the cache
-    as if it were one rank is how a job that fits on one gpu gets OOM-killed on four."""
+    """Four ranks of eight workers is 32 decoding processes on one host, not 8 -- sizing the cache
+    as if it were one rank is how a job that fits on one gpu gets OOM-killed on four.
+    """
     monkeypatch.delenv('TAILCYCLENET_READER_CACHE', raising=False)
     monkeypatch.delenv('TAILCYCLENET_LOCAL_WORLD_SIZE', raising=False)
     kw = dict(n_cams=16, wh=(1024, 570), workers=8, ram_gb=500.0)
@@ -161,8 +156,7 @@ def test_absent_local_world_size_reproduces_the_single_process_numbers(monkeypat
 
 
 def test_local_world_size_is_read_from_the_environment(monkeypatch):
-    """`scripts/train.py` sets it from `fabric.world_size` right after launch. Read, never probed
-    -- opening anything to measure this is gotcha 11."""
+    """`scripts/train.py` sets it from `fabric.world_size` right after launch. Read, never probed."""
     monkeypatch.delenv('TAILCYCLENET_READER_CACHE', raising=False)
     monkeypatch.setenv('TAILCYCLENET_LOCAL_WORLD_SIZE', '8')
     kw = dict(n_cams=16, wh=(1024, 570), workers=8, ram_gb=500.0)
@@ -170,9 +164,9 @@ def test_local_world_size_is_read_from_the_environment(monkeypatch):
 
 
 def test_ranks_do_not_replay_one_anothers_sampler_stream():
-    """Every rank runs the same `torch.manual_seed(seed)` so the model inits identically; the
-    sampler and the workers' base seed therefore have to be decorrelated explicitly, or all N ranks
-    draw the same windows and the extra gpus buy variance reduction of zero."""
+    """Every rank runs the same `torch.manual_seed(seed)`, so the sampler and workers' seeds must
+    be decorrelated explicitly or all N ranks draw the same windows.
+    """
     ds = list(range(100))
 
     def draw(rank):
@@ -211,12 +205,9 @@ def test_the_sampler_yields_an_ordinal_that_is_the_step_number():
 
 
 def test_two_ranks_draw_the_same_camera_count_for_the_same_step(tiny_root):
-    """THE FIX. A DDP step costs the slowest rank's item, and `cams_to_sample = [2, 8]` drawn
-    independently per rank made almost every step an 8-camera step: measured 1.57x tax at N = 4 on
-    allen-mouse-combined, 1.18x once this holds.
-
-    Two datasets stand in for two ranks -- separate objects, separate item RNG (entropy-seeded on
-    train), same ordinals.
+    """THE FIX. A DDP step costs the slowest rank's item, so a per-rank camera-count draw made
+    almost every step an 8-camera step. Two datasets stand in for two ranks -- separate objects,
+    same ordinals.
     """
     r0, r1 = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3]), \
         _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
@@ -231,9 +222,9 @@ def test_two_ranks_draw_the_same_camera_count_for_the_same_step(tiny_root):
 
 
 def test_a_retry_does_not_desynchronise_the_shape(tiny_root):
-    """An item that fails to build re-picks its index inside `__getitem__`. If the shape were
-    redrawn on the retry, a rank that retried would consume a draw its peers did not and the two
-    would be out of step for the REST of the run -- a permanent, silent skew from one bad window.
+    """An item that fails to build re-picks its index inside `__getitem__`; if the shape were
+    redrawn on the retry, one rank would consume a draw its peers did not and they'd skew for the
+    rest of the run.
     """
     ds = _ds(tiny_root / 'mouselike', cams_to_sample=[1, 3])
     calls = []
@@ -285,17 +276,16 @@ def _tiny():
 # -- save_checkpoint's eval/train toggle must run on EVERY rank ----------------------------
 #
 # Found on the FIRST real 4-gpu job: drift 0.0e+00 at the checkpoint boundary right after
-# resuming (checkpointing had been off during the smoke tests, so this never fired there),
-# 2.9e-07 -- and rising -- at the very next one. `save_checkpoint` was called `if is0 else None`,
-# so its internal schedule-free `optimizer.eval(); ...; optimizer.train()` toggle ran only on
-# rank 0 -- and that round trip is not float-exact (see below), so rank 0's RAW training
-# parameters came out of every boundary perturbed relative to the untouched ranks.
+# resuming, 2.9e-07 -- and rising -- at the very next one. `save_checkpoint` was called
+# `if is0 else None`, so its internal schedule-free eval/train toggle ran only on rank 0 -- and
+# that round trip is not float-exact, so rank 0's raw training parameters came out of every
+# boundary perturbed relative to the untouched ranks.
+
 
 def test_the_schedulefree_eval_train_round_trip_is_not_float_exact():
-    """THE MECHANISM. `eval()` does `p.lerp_(z, 1-1/beta1)`, `train()` does `p.lerp_(z, 1-beta1)`
-    -- two DIFFERENT lerps relying on algebra to land back on the original `p`, and float32 does
-    not guarantee that. If it were exact, calling it on one rank and not another would be
-    harmless; it is not, which is the whole reason the asymmetry mattered."""
+    """THE MECHANISM. `eval()` and `train()` are two DIFFERENT lerps relying on algebra to land
+    back on the original `p`, and float32 does not guarantee that.
+    """
     from schedulefree import AdamWScheduleFree
     torch.manual_seed(0)
     model = nn.Linear(64, 64)
@@ -425,17 +415,9 @@ def test_the_drift_is_relative_PER_ENTRY_not_to_the_largest_tensor():
 
 
 def test_the_tolerance_sits_between_the_two_measured_populations():
-    """THE TOLERANCE IS AN EMPIRICAL BOUNDARY, AND THIS IS WHAT STOPS IT DRIFTING INTO USELESSNESS.
-
-    Two measured populations, seven orders of magnitude apart:
-      * a correct 2-rank run reads EXACTLY 0.0 (six clean runs, every checkpoint boundary)
-      * the one real bug on record -- the unfreeze re-wrap not firing -- reads 2.9e-07 to 4.9e-07
-        (two cluster jobs, two local, negative-controlled)
-
-    `tol` must pass the first and catch the second. "A drift of 1e-7 is probably fine, set it to
-    1e-3" is the tempting reasoning this test exists to refuse: 1e-3 is ~2,000x ABOVE the real
-    bug's signature, so the guard would sail past the exact failure it was built for while still
-    appearing to run.
+    """THE TOLERANCE IS AN EMPIRICAL BOUNDARY: a correct run reads exactly 0.0, the one real bug
+    reads 2.9e-07 to 4.9e-07. `tol` must pass the first and catch the second; 1e-3 is ~2,000x
+    ABOVE the real bug's signature and would sail past it.
     """
     import inspect
     tol = inspect.signature(dist_utils.check_ranks_agree).parameters['tol'].default
@@ -483,7 +465,8 @@ def _args(**over):
 
 def test_16_mixed_is_refused_by_name():
     """It needs a GradScaler on the optimizer, and this loop steps its own optimizer rather than
-    handing it to Fabric. Refused loudly instead of silently training without the scaler."""
+    handing it to Fabric. Refused loudly instead of silently training without the scaler.
+    """
     with pytest.raises(SystemExit, match='GradScaler'):
         _train_module().launch(_args(precision='16-mixed'))
 
@@ -505,8 +488,9 @@ def test_one_device_and_many_devices_together_are_refused():
 # -- the two handles -----------------------------------------------------------------------
 
 def test_run_batch_gives_the_loss_the_unwrapped_module():
-    """`TotalLoss` reads `model.training` and `model.stride_overlap`; the forward has to go through
-    the WRAPPED module (that is what all-reduces the gradients) and the loss through the raw one."""
+    """`TotalLoss` reads `model.training` and `model.stride_overlap`; the forward goes through the
+    WRAPPED module (that all-reduces gradients) and the loss through the raw one.
+    """
     tr = _train_module()
     seen = {}
     wrapped = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 3)}    # noqa: E731

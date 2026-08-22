@@ -4,7 +4,6 @@ Companion to `tests/test_infer.py`'s `test_render_writes_every_predicted_frame` 
 `test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig`, which pin `render_group` itself
 against `run_group`'s raw output. This file pins the CLI end to end: a prediction SESSION
 directory in, an mp4 out, with no `--data` required and an npz refused outright.
-See dev/plans/render_a_prediction_session.md.
 """
 from __future__ import annotations
 
@@ -84,7 +83,6 @@ def _decode(path):
     return out
 
 
-# ---------------------------------------------------------------------------------------------
 # 1-2. rendering a real prediction session, in both modes, with no --data
 
 
@@ -124,18 +122,13 @@ def test_a_3d_prediction_renders_with_no_data(infer_cli, render_cli, monkeypatch
     assert any(f.std() > 0 for f in frames), 'a blank render would pass the frame-count check too'
 
 
-# ---------------------------------------------------------------------------------------------
 # 3. byte identity: a directory session and a --videos session reading the SAME file
 
 
 def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
-    """THE ONE TEST THAT MAKES `--videos` REAL FOR RENDERING.
-
-    Two `Session` objects -- one hand-authored on disk, one built by `adopt.build` from raw
-    footage -- pointed at the literal SAME mp4, drawing the literal same prediction array, must
-    decode to identical frames. Session id, group id and camera name are made to agree on
-    purpose: `render_group` burns them into the caption, and a caption-text difference is not the
-    risk this test exists to catch -- pixel decode agreement is.
+    """THE ONE TEST THAT MAKES `--videos` REAL FOR RENDERING: two `Session` objects -- one
+    hand-authored on disk, one built by `adopt.build` from raw footage -- pointed at the literal
+    SAME mp4, drawing the same prediction array, must decode to identical frames.
     """
     import conftest as cf
     from tailcyclenet import adopt
@@ -184,7 +177,6 @@ def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
         np.testing.assert_array_equal(a, b)
 
 
-# ---------------------------------------------------------------------------------------------
 # 4. the frame range
 
 
@@ -244,7 +236,6 @@ def test_the_cli_start_end_frame_narrows_the_predicted_range(infer_cli, render_c
     assert len(_decode(mp4s[0])) == 2, '--start-frame 1 --end-frame 3 must draw exactly 2 frames'
 
 
-# ---------------------------------------------------------------------------------------------
 # 6. the refusals
 
 
@@ -257,10 +248,8 @@ def test_an_npz_is_refused_by_name(render_cli, monkeypatch, tmp_path):
 
 
 def test_eval_still_scores_an_npz(tmp_path):
-    """THE OTHER HALF OF THE SAME CLAIM: render dropped npz, scoring did not.
-
-    `load_predictions` is the shared reader both `render.py` and `scripts/eval.py` used to call;
-    this pins that `eval.py`'s caller still works on an npz after render.py stopped accepting one.
+    """THE OTHER HALF OF THE SAME CLAIM: render dropped npz, scoring did not. This pins that
+    `eval.py`'s caller still works on an npz after render.py stopped accepting one.
     """
     from tailcyclenet.infer.predictions import load_predictions
 
@@ -315,7 +304,8 @@ def test_an_empty_range_is_refused(infer_cli, render_cli, monkeypatch, tmp_path)
 
 def test_a_prediction_over_the_wrong_root_is_refused(infer_cli, render_cli, monkeypatch, tmp_path):
     """The recorded `source_session_id` must match the resolved session's own -- whether reached
-    through provenance or through an explicit `--data` override."""
+    through provenance or through an explicit `--data` override.
+    """
     import conftest as cf
 
     root, run = _run_and_predict(tmp_path, cf, mode='2d')
@@ -332,7 +322,8 @@ def test_a_prediction_over_the_wrong_root_is_refused(infer_cli, render_cli, monk
 
 def test_a_prediction_with_no_provenance_needs_data(render_cli, monkeypatch, tmp_path):
     """A hand-written or pre-provenance prediction has neither source_session nor source_videos
-    -- refused naming both, pointed at --data."""
+    -- refused naming both, pointed at --data.
+    """
     import toml
 
     pred = tmp_path / 'pred'
@@ -344,7 +335,6 @@ def test_a_prediction_with_no_provenance_needs_data(render_cli, monkeypatch, tmp
         render_cli.main()
 
 
-# ---------------------------------------------------------------------------------------------
 # 8. load_predictions(groups=...)
 
 

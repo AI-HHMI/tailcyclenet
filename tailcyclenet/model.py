@@ -1,38 +1,11 @@
 """The pose model: posetail's `TrackerEncoder` with a pose-shaped query and a per-frame anchor.
 
-`TrackerEncoder` tracks arbitrary points given a query position. A pose model has K named
-keypoints and, at deployment, no ground truth to query with. Two changes make it a pose
-estimator, and `forward` is the only method overridden:
-
-1. **The query is derived, not given.** In 3D every keypoint is queried at a query-free scene
-   point back-projected from the cameras' own crop centres (`scene_center`); in 2D at the crop
-   centre. A per-keypoint prior, when present, replaces it. Keypoint identity rides in a
-   dedicated fusion term (see `query_encoder.py`), which is what tells the K queries apart.
-
-2. **What the 3D residual is an offset FROM is a switch.** The library reconstructs
-   `world = query + R @ residual` with one anchor for the whole window. That is right when the
-   query is a genuine prior and wrong when it is the derived scene centre -- identical for every
-   keypoint, so the residual would have to carry the whole centre-to-keypoint offset.
-
-Two switches, and they are orthogonal:
-
-`query` -- whether a prior is supplied:
-
-- `"prior"`  -- a per-keypoint prior (`kpt_prior`), the previous window's pose at deployment,
-   with a learned no-query token wherever a keypoint has none. The instance-anchor machinery
-   is removed here rather than defaulted off.
-- `"none"`   -- query-free. No prior is read at all; every keypoint is queried at the derived
-   point and told only its identity.
-
-`gridresid_offset` -- what the residual is measured from:
-
-- `"query"`         -- the library's NATIVE structure, kept per keypoint only where a real prior
-   anchored it; every other keypoint falls back to that frame's own triangulation, and the direct
-   head is supervised on query points only. See `_query_anchored`.
-- `"triangulated"`  -- the residual is recovered and re-added to EACH frame's own triangulation,
-   for every keypoint. Measured 2.07 -> 1.37 mm within-session in posetail-pose, where it was the
-   largest single architectural effect; it exists to rescue the fixed scene-centre anchor, so it
-   is the sensible pairing for `query = "none"`. See `_reanchor_per_frame`.
+(1) The query is DERIVED, not given: query-free keypoints are queried at a scene point
+back-projected from the cameras' own crop centres (2D: the crop centre), replaced by a
+per-keypoint prior when one is present (`query`: `"prior"` | `"none"`); identity rides in a
+dedicated fusion term. (2) What the 3D residual is an offset FROM is a switch
+(`gridresid_offset`): `"query"` keeps the native anchor where a real prior anchored it,
+`"triangulated"` re-adds the residual to each frame's own triangulation.
 """
 from contextlib import contextmanager
 
@@ -55,35 +28,15 @@ GRIDRESID_OFFSETS = ('query', 'triangulated')
 def scene_center(camera_group):
     """The 3D point every camera's crop centre looks at. (3,) float32.
 
-    The model needs a query position, and at deployment there is no ground truth to supply one.
-    A stored world constant will not do either: the loader applies a random world rotation to
-    points AND cameras every sample, so the world gauge changes per item and anything computed
-    from a fixed world coordinate would be in the wrong frame.
-
-    So derive it from the CAMERAS, which are rotated by that same gauge and are the only thing
-    available at inference anyway: each camera's crop centre back-projects to a ray, and the
-    point closest to all of them is the scene centre. Gauge-correct by construction, query-free,
-    and identical in training and deployment -- at inference the crop comes from the detector,
-    so the rays converge on whatever it boxed.
-
-    Feeding this as `coords` to the stock forward makes the library derive every remaining
-    scene scalar (`cube_scale`, `scene_radius`) correctly by itself.
-
-    ON A MOVING RIG, every FRAME contributes its own ray. The query anchor is structurally one
-    point per keypoint for the whole window, so the per-frame rays have to be reduced somehow --
-    and taking frame 0 alone put the anchor where the rig started rather than where it looked,
-    which for a rig that travels during the window is a different place. Solving over all
-    (camera, frame) rays at once is the same least-squares problem with more rows.
+    Deployment has no ground truth, so derive it from the CAMERAS: each crop centre back-projects
+    to a ray and the point closest to all of them is the scene centre -- gauge-correct by
+    construction. On a MOVING rig every frame contributes its own ray.
     """
     origins, dirs = [], []
     for cam in camera_group:
         px = (cam['size'].to(torch.float64) / 2.0).reshape(1, 2)
-        # A MOVING CROP GIVES EVERY FRAME ITS OWN RAY, for the same reason a moving rig does. The
-        # crop centre is a different SOURCE pixel each frame -- that is what following the animal
-        # means -- so it looks in a different direction, and `undistort_points` adds the offset
-        # back to reach source pixels. This is the one place a per-frame offset must NOT be
-        # collapsed: doing so would anchor the scene where the crop STARTED rather than where it
-        # followed the animal to, which is exactly the error the moving-rig note below describes.
+        # A moving crop gives every frame its own ray -- the one place a per-frame offset must
+        # not be collapsed.
         off = cam['offset']
         und = [undistort_points(dict(cam, offset=o), px)
                for o in (off if off.ndim == 2 else off[None])]
@@ -97,8 +50,7 @@ def scene_center(camera_group):
             origins.append(centre[min(t, centre.shape[0] - 1)].to(torch.float64))
     origins, dirs = torch.stack(origins), torch.stack(dirs)
 
-    # Least-squares point minimising distance to a set of lines:
-    #   sum_i ||(I - d_i d_i^T)(x - c_i)||^2  ->  (sum_i P_i) x = sum_i P_i c_i
+    # Least-squares point minimising distance to a set of lines: (sum_i P_i) x = sum_i P_i c_i.
     eye = torch.eye(3, dtype=origins.dtype, device=origins.device)
     P = eye - dirs[:, :, None] * dirs[:, None, :]
     A = P.sum(0)
@@ -133,8 +85,8 @@ class PoseTrackerEncoder(TrackerEncoder):
         # drop-in either way.
         old = self.query_encoder
         # The two query terms DEFAULT to following `query`; `query_terms` overrides the pair
-        # (pos without patch). Both off under `query = "prior"` is the trap:
-        # the encoder ignores `query_coords` entirely, so a declared prior is a silent no-op.
+        # (pos without patch). Both off under "prior" means the encoder ignores `query_coords`
+        # entirely -- a declared prior is a silent no-op.
         terms = dict.fromkeys(('query_pos_embedding', 'query_patch_embedding'),
                               query == 'prior')
         terms.update(query_terms or {})
@@ -147,8 +99,8 @@ class PoseTrackerEncoder(TrackerEncoder):
             assert not any(terms.values()), (
                 f'query = "none" supplies no prior, so {[k for k, v in terms.items() if v]} '
                 'would be constant no-query tokens feeding dead gate inputs for the whole run.')
-        # A box prompt swaps in a `WideQueryEncoder` subclass consuming a per-frame animal box as
-        # a non-position channel. The box rides `_box_prompt`, stashed by `_decode_from_scene`.
+        # A box prompt swaps in a `WideQueryEncoder` subclass consuming a per-frame animal box
+        # as a non-position channel, stashed as `_box_prompt` by `_decode_from_scene`.
         enc_cls = BOX_ENCODERS.get(box_prompt, WideQueryEncoder)
         self.query_encoder = enc_cls(
             dim=self.latent_dim, embed_dim=old.embed_dim, decoder_dim=old.decoder_dim,
@@ -161,17 +113,9 @@ class PoseTrackerEncoder(TrackerEncoder):
               f'({", ".join(self.query_encoder.term_names())})')
 
     def _forward_window(self, views_norm, *args, **kwargs):
-        """Reuse one scene encode across several decodes over the SAME pixels.
-
-        Inside `share_scene`, the first call computes `scene_features` and the rest pass it in
-        through the upstream `forward`'s `scene_features=` argument (posetail 0.3.5). Only the
-        encode is shareable: the decode also needs `cube_scale` / `scene_center` /
-        `scene_radius`, which `forward` derives from `coords_q` and which the prior changes -- so
-        they arrive per call in `*args` and are passed through untouched.
-
-        Outside the context, and whenever `kpt_chunk` is set, this delegates to the library
-        verbatim. That is deliberate: training and chunked inference must not route through a
-        reimplementation of a private method.
+        """Reuse one scene encode across several decodes over the SAME pixels. Inside
+        `share_scene` the first call computes `scene_features` and the rest pass it in; only the
+        encode is shareable (the decode derives geometry from the prior-changed `coords_q`).
         """
         if self._shared_scene is None or kwargs.get('kpt_chunk'):
             return super()._forward_window(views_norm, *args, **kwargs)
@@ -183,40 +127,23 @@ class PoseTrackerEncoder(TrackerEncoder):
                                        scene_features=self._shared_scene['f'])
 
     def _decode_from_scene(self, scene_features, views_norm, coords, *args, **kwargs):
-        """Hand the query encoder the keypoint slice belonging to THIS chunk.
-
-        `_forward_window` slices `coords[:, k0:k1]` when `kpt_chunk` is set and calls this once
-        per chunk, in order, without passing the bounds down -- so the offset is a running
-        cursor. `forward` asserts it lands exactly on K, which turns a future reordering into a
-        failure rather than one chunk's queries silently wearing another chunk's identities.
-
-        posetail-pose avoided half of this by routing ids through the `occlusion` channel, which
-        the library slices for free (`posetail_pose/model.py:718`); gotcha #5 deliberately freed
-        that channel here. Its `_query_ok` had this bug unfixed. Both halves are handled here.
+        """Hand the query encoder the keypoint slice belonging to THIS chunk. Ids must not ride
+        the `occlusion` channel (the stock encoder clamps it into [0, 2]), so the slices are
+        done here, tracked by a running cursor `forward` asserts lands exactly on K.
         """
         k0, n = self._kpt_cursor, coords.shape[1]
         self.query_encoder._kpt_ids = self._kpt_ids_all[:, k0:k0 + n]
         self.query_encoder._query_ok = self._query_ok_all[:, k0:k0 + n]
-        # The box is PER FRAME, not per keypoint, so it is NOT sliced by the chunk cursor -- the
-        # whole (B,T,C,4) goes to the encoder, which gathers it onto the query axis by target_time.
+        # The box is PER FRAME, not per keypoint, so it is not sliced by the chunk cursor -- the
+        # encoder gathers it onto the query axis by target_time.
         self.query_encoder._box_prompt = getattr(self, '_box_prompt_all', None)
         self._kpt_cursor = k0 + n
         return super()._decode_from_scene(scene_features, views_norm, coords, *args, **kwargs)
 
     def forward(self, views, kpt_ids, camera_group, mode, **kw):
-        """Run `_forward` at the input's actual pixel extent.
-
-        `image_size` is baked into the weights and stands for three unrelated things -- a padding
-        target, the width of the 2D head's fixed output canvas, and the pixel extent of the input.
-        Only the third is wrong for a smaller input, and posetail 0.3.5 splits it out as
-        `input_size=` (measured; dev/reports/26 §5b/5c/5d):
-        the pad target, the 2D-head rescale and the gridresid gauge all follow the canvas the
-        forward actually saw, instead of the build-time 256.
-
-        **The gate is the CAMERA, not an argument**, so every caller benefits and nothing has to be
-        plumbed. At `px == image_size` this is exactly the historical forward -- the upstream
-        scaling factor is 1.0 and every gauge constant is the baked one, which
-        `tests/test_infer.py` pins.
+        """Run `_forward` at the input's actual pixel extent: `image_size` is baked into the
+        weights (a pad target, a weight shape, and the input extent), and only the third is
+        wrong for a smaller input -- 0.3.5 splits it out as `input_size=`.
         """
         px = max(int(c['size'].max()) for c in camera_group)
         return self._forward(views, kpt_ids, camera_group, mode, input_size=px, **kw)
@@ -228,31 +155,27 @@ class PoseTrackerEncoder(TrackerEncoder):
             views: list of (B,T,H,W,3) float32 in [0,1], one per camera
             kpt_ids: (B,K) long -- GLOBAL registry ids, not positions
             camera_group: list of posetail camera dicts, one per view
-            mode: '2d' | '3d'. A property of the SAMPLED SESSION, not of the run -- one training
-                run mixes both, so it cannot be a config field.
-            kpt_prior: (B,K,R) or None. Per-keypoint prior; NaN where a keypoint has none.
-                Ignored entirely when `query == "none"`.
-            prompt_time: (B,K) int or None -- the frame each prior describes.
-            kpt_chunk: decode the keypoints in slices of this size, reusing one scene encode.
-                INFERENCE ONLY -- the library drops the loss-only `grid` tensors when chunking
-                (`_CHUNK_SKIP`), so `_reanchor_ce_target` correctly no-ops. Ignored when
-                `output_mode == 'gridnorm'`, whose per-camera gauge solve couples points.
+            mode: '2d' | '3d' -- a property of the SAMPLED session, not of the run (one run
+                mixes both)
+            kpt_prior: (B,K,R) or None; NaN where a keypoint has none. Ignored under
+                `query == "none"`.
+            prompt_time: (B,K) int or None -- the frame each prior describes
+            kpt_chunk: decode in slices of this size, reusing one scene encode (INFERENCE ONLY)
         """
         assert mode in ('2d', '3d'), mode
         B, K = kpt_ids.shape
         n_cams = len(views)
         device = views[0].device
-        # The loader hands over uint8 -- 4x fewer bytes to queue from the worker and to pin. The
-        # library's `transform_norm` wants [0,1] floats, so the divide happens HERE, after the
-        # transfer, where it is free. One seam for train, infer, eval and the tests; a no-op for
-        # anything that already arrives as float.
+        # The loader hands over uint8 -- 4x fewer bytes to queue from the worker and to pin --
+        # and the divide to [0,1] happens HERE, after the transfer, where it is free. A no-op
+        # for anything that already arrives as float.
         views = [v.float().div_(255) if v.dtype == torch.uint8 else v for v in views]
         prior = None if self.query == 'none' or kpt_prior is None else kpt_prior.to(device).float()
 
         if mode == '2d':
-            # ONE camera, and the query is a PIXEL. The library asserts len(views) == 1 for R==2
-            # and routes the forward through its separate 2D head bank (`mode_idx = 0`), which
-            # exists at full size in the base checkpoint and so is pretrained, not fresh.
+            # ONE camera, and the query is a PIXEL: the library asserts len(views) == 1 for R==2
+            # and routes through its separate 2D head bank (mode_idx = 0), pretrained at full
+            # size in the base checkpoint.
             assert n_cams == 1, f'2D mode is single-camera; got {n_cams}'
             size = camera_group[0]['size'].to(device).float()
             coords_q = (size * 0.5).view(1, 1, 2).expand(B, K, 2).contiguous()
@@ -266,62 +189,43 @@ class PoseTrackerEncoder(TrackerEncoder):
                 f'kpt_prior {tuple(prior.shape)} != {(B, K, coords_q.shape[-1])}'
             coords_q = torch.where(torch.isfinite(prior), prior, coords_q).contiguous()
 
-        # The query-validity mask comes from the PRIOR's own finiteness, not from `coords_q` --
-        # which has already had absent priors replaced by the derived point. This is what the
-        # no-query tokens key off.
-        #
-        # Stashed at FULL K here; `_decode_from_scene` below hands the query encoder the slice
-        # belonging to the chunk being decoded.
+        # The query-validity mask comes from the PRIOR's own finiteness, not from `coords_q`
+        # (absent priors are already replaced by the derived point) -- what the no-query tokens
+        # key off. Stashed at FULL K; `_decode_from_scene` hands the encoder the chunk's slice.
         query_ok = (torch.isfinite(prior).all(-1) if prior is not None
                     else torch.zeros((B, K), dtype=torch.bool, device=device))
         self._query_ok_all = query_ok      # local copy survives the `finally` clear below
         self._kpt_ids_all = kpt_ids.to(device).long()
-        # THE BOX PROMPT (report 27), stashed for `_decode_from_scene` to hand the encoder. A box
-        # only reaches the encoder when this model was built with `box_prompt` in ('film','term');
-        # a plain model ignores it, so passing one is harmless (the encoder never reads the stash).
+        # The box prompt, stashed for `_decode_from_scene`; a plain model ignores it, so passing
+        # one is harmless.
         self._box_prompt_all = None if box_prompt is None else box_prompt.to(device).float()
         self._kpt_cursor = 0
 
-        # The frame the prompt describes. INT and CLAMPED: the library uses this as a
-        # `torch.gather` index on the learnable-scale and gridnorm paths, so an out-of-range or
-        # floating value is an index error rather than a soft degradation. A prompt from BEFORE
-        # this window (deployment staleness) cannot be expressed and clamps to 0 -- the patch has
-        # to be sampled from a frame that exists.
+        # The frame the prompt describes. INT and CLAMPED: the library uses it as a
+        # `torch.gather` index, so an out-of-range or floating value is an index error; a prompt
+        # from BEFORE this window (deployment staleness) cannot be expressed and clamps to 0.
         if prompt_time is None or self.query == 'none':
             qt = torch.zeros((B, K), dtype=torch.int32, device=device)
         else:
             T_win = int(views[0].shape[1])
             qt = prompt_time.to(device).round().long().clamp_(0, T_win - 1).to(torch.int32)
             assert qt.shape == (B, K), f'prompt_time {tuple(qt.shape)} != {(B, K)}'
-            # A KEYPOINT WITH NO PRIOR HAS NO QUERY TIME. `embed_query_time` and `embed_gap` are
-            # UNCONDITIONAL terms in both encoders -- unlike `patch`/`qpos`/`pos`/`vis`/`depth`
-            # they carry no learned no-query token -- so an unprompted keypoint that still reports
-            # a frame index trains a forward NO deployment path produces: query-free, `val`,
-            # `self_prompt` and `run_group` all pass `prompt_time=None`, which is 0 everywhere.
-            #
-            # `prompt_dropout` NaNs `kpt_prior` and leaves `prompt_t` at each keypoint's first
-            # labelled frame (>0 on 19.5% of rat-city windows), so at `prompt_dropout = 0.4` some
-            # 40% of steps were training a "query-free" forward that differed from the real one in
-            # two of `wide`'s six fusion terms. It is also eval rule 7's shape: WHEN a keypoint was
-            # first labelled is GT-derived, and it was reaching the model at a point with no prior.
-            #
-            # Here rather than in the loader because this is the seam every caller routes through,
-            # and because it fixes the PARTIALLY prompted window too -- which is the case inference
-            # actually produces, since the bounds mask and `--prior-vis-thresh` withdraw individual
-            # keypoints from a prior that `_build_prior` dates with one scalar.
+            # A KEYPOINT WITH NO PRIOR HAS NO QUERY TIME: the time terms carry no no-query
+            # token, so an unprompted keypoint still reporting a frame index trains a forward no
+            # deployment path produces. `prompt_dropout` NaNs the prior but leaves `prompt_t`
+            # set -- exactly this case. Fixed here, at the seam every caller routes through.
             qt = torch.where(query_ok, qt, torch.zeros_like(qt))
 
         try:
             out = super().forward(views, coords_q, camera_group, query_times=qt,
                                   occlusion=None, kpt_chunk=kpt_chunk, input_size=input_size)
-            # AFTER the call, not in the `finally`: an assertion there would mask whatever real
-            # exception got us out. Every keypoint must have been decoded exactly once.
+            # After the call, not in the `finally`: an assertion there would mask the real error.
             assert self._kpt_cursor == K, (
                 f'{self._kpt_cursor} of {K} keypoints were decoded; _decode_from_scene is not '
                 'being called once per chunk in order, so the id slices are unreliable')
         finally:
             # Always clear: a leaked stash would apply one item's ids to the next forward,
-            # silently, and only on multi-call paths like eval and the windowed driver.
+            # silently, on multi-call paths like eval and the windowed driver.
             self._query_ok_all = self._kpt_ids_all = None
             self._kpt_cursor = 0
             self._box_prompt_all = None
@@ -330,10 +234,9 @@ class PoseTrackerEncoder(TrackerEncoder):
             self.query_encoder._box_prompt = None
 
         if mode == '2d':
-            # No re-anchoring in 2D and nothing to re-anchor onto -- triangulation is None at
-            # one camera, and the 2D grid head already decodes ABSOLUTE pixel bins. `coords_pred`
-            # is rebound to the 2D prediction so every downstream consumer can say "the
-            # prediction" without a mode branch. At R==2 it is in PIXELS, not mm.
+            # No re-anchoring in 2D: triangulation is None at one camera and the 2D grid head
+            # decodes ABSOLUTE pixel bins. `coords_pred` is rebound so every consumer can say
+            # "the prediction" without a mode branch; at R==2 it is in PIXELS, not mm.
             out = dict(out)
             out['coords_pred'] = out['2d_pred'][0]
             return out
@@ -348,18 +251,10 @@ class PoseTrackerEncoder(TrackerEncoder):
 
 @contextmanager
 def share_scene(model):
-    """Encode the scene ONCE for every forward inside the block. The pixels must be identical.
-
-    The val loop runs two forwards over one window -- prior-free, then re-queried at the model's own
-    frame-0 prediction -- and the video encoder is frozen, so encoding twice is pure waste. It is
-    also the bulk of the forward: johnson-mouse's 16-camera eval ran ~200 s per val step.
-
-    The caller owns the "identical pixels" precondition, which is why the scope is one window rather
-    than one eval: nothing here checks that `views_norm` matches between calls, because the tensors
-    are large and comparing them would cost what the sharing saves.
-
-    Only the encode is shared. `cube_scale`, `scene_center` and `scene_radius` are derived from
-    `coords_q`, which the prior changes, so the decode still runs per forward.
+    """Encode the scene ONCE for every forward inside the block. The pixels must be identical
+    (the caller owns that precondition, which is why the scope is one window). Only the encode
+    is shared -- `cube_scale`/`scene_center`/`scene_radius` derive from `coords_q`, which the
+    prior changes, so the decode still runs per forward.
     """
     prev = model._shared_scene
     model._shared_scene = {}
@@ -372,16 +267,9 @@ def share_scene(model):
 def _rays_fallback(out):
     """The conf-weighted MEAN of the per-camera ray points -- the honest version of `3d_pred_rays`.
 
-    `3d_pred_rays` is a weighted SUM, not a mean: `conf_pred_2d` is an unnormalized sigmoid
-    (`tracker_encoder.py:554`) and line 637 einsums it straight over the camera axis with no
-    division. So the library's own ray point is off by a factor of `sum_c conf_c`, which is ~C/2 at
-    C cameras and ~0.5 at one -- a single-camera "prediction" that lands halfway to the world
-    origin. Nothing pins that factor either: `coords_loss_rays_weight = 0` ships and the only
-    pressure is `coords_loss_rays_reproj` at 0.05/16, one weak term asked to satisfy every camera
-    count in `cams_to_sample` at once.
-
-    Used wherever a triangulation is missing or degenerate, so the scale error would otherwise be
-    inherited by the substituted point.
+    The library's is a weighted SUM with no division (an unnormalised sigmoid), so at one camera
+    it lands about halfway from the world origin to the animal. Used wherever a triangulation is
+    missing or degenerate.
     """
     w = torch.sigmoid(out['conf_pred_2d'])                          # (cams,b,t,n)
     num = einsum(out['3d_pred_cams_rays'], w, 'c b t n r, c b t n -> b t n r')
@@ -391,60 +279,35 @@ def _rays_fallback(out):
 def _query_anchored(out, query_ok):
     """gridresid is an OFFSET FROM THE QUERY POINT, so honour it only where the query is real.
 
-    The library reconstructs `world = query_world + R_{ray->world} @ residual`
-    (`tracker_encoder.py:736`) with ONE anchor for the whole window. That is the right structure
-    when the query is a genuine prior on the animal. It is the wrong one when the query is the
-    derived scene centre, which is identical for every keypoint and carries no information --
-    there the residual would have to explain the entire centre-to-keypoint offset from a fixed
-    point, and it is not a pose prediction so much as a memorised mean.
-
-    So the prediction is the query-anchored residual WHERE a prior exists, and each frame's own
-    triangulation everywhere else. Substituting the DETACHED triangulation is also what gates the
-    loss: `coords_loss_direct*` then compares a constant against the target at those points, which
-    contributes exactly zero gradient, so the direct head is supervised on query points only --
-    without forking posetail's `TotalLoss`.
-
-    THIS REPLACES per-frame re-anchoring. That mechanism (residual recovered as
-    `3d_pred_cams_direct - query`, re-added to every frame's triangulation) existed to rescue the
-    fixed scene-centre anchor and measured 2.07 -> 1.37 mm within-session in posetail-pose. It is
-    deliberately gone: with a real prior the native anchor is meaningful, and with no prior the
-    prediction is now the triangulation outright rather than a residual on a meaningless anchor.
+    The library reconstructs `world = query_world + R @ residual` with ONE anchor per window;
+    that is right for a genuine prior and wrong for the derived scene centre (identical for
+    every keypoint, carries no information). So the prediction is query-anchored WHERE a prior
+    exists and each frame's own triangulation elsewhere -- the DETACHED substitution is also the
+    loss gate: the direct terms then see a constant at those points and supervise query points
+    only.
     """
     tri = out.get('3d_pred_triangulate')
     out = dict(out)
     if tri is None:
-        # 3D SINGLE-VIEW: no triangulation exists, so the back-projected rays are the only anchor
-        # there is. This USED to hand `loss_kpt_mask` up and let `run_batch` NaN the whole 3D
-        # target, which killed the step outright whenever no keypoint had a prior -- and
-        # `cams_to_sample = [1, 8]` draws exactly that on 1/8 of 3D items, so with
-        # `prompt_dropout = 0.5` it silently binned ~6% of every `prior` arm's steps (measured:
-        # johnson 6.20% excess skips over the matched `none` arm, predicted 6.25%).
+        # 3D SINGLE-VIEW: no triangulation exists, so the back-projected rays are the only
+        # anchor there is (this used to NaN the whole 3D target, killing the step whenever no
+        # keypoint had a prior -- which `cams_to_sample = [1, 8]` draws).
         sub = _rays_fallback(out)
     else:
-        # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
-        # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
-        # numerator, full denominator), which is exactly how a wrong comparison gets published.
+        # Repair FIRST so the loss and the metric see ONE tensor. A non-finite entry also
+        # poisons the solve's BACKWARD (the NaN is created inside `torch.linalg.solve`'s
+        # factorisation, downstream of any forward-value fix), so on a degenerate step the
+        # triangulation supervision goes gradient-free; the forward value is unchanged.
         bad = ~torch.isfinite(tri).all(-1)
-        # A NON-FINITE ENTRY POISONS THE SOLVE'S BACKWARD EVEN AT ZERO GRADIENT, and `torch.where`
-        # cannot stop it. The `where` below routes 0 into the bad entries, but
-        # `triangulate_simple_batch_reg`'s `torch.linalg.solve` (cube.py:299) then solves against
-        # its own NaN factorisation and RETURNS NaN -- which reaches every upstream parameter and
-        # gets the whole step thrown away by the grad-norm guard in `train.py`, counted as an
-        # unattributed `skipped`. `nan_to_num` here does NOT help: the NaN is created in the
-        # backward, downstream of anything applied to the forward value. Per-entry detach cannot
-        # help either -- the graph node is the whole batched solve. So on the rare degenerate step
-        # the window's triangulation supervision goes gradient-free and every other term keeps
-        # training. The forward value is unchanged in every case.
         if not torch.isfinite(tri).all():
             tri = tri.detach()
         sub = torch.where(torch.isfinite(tri), tri, _rays_fallback(out))
-        # NOT written back on the single-view path: this key drives `coords_loss_triangulate_reproj`
-        # at weight 2.0, so pointing it at the rays would reweight the rays supervision by 40x.
+        # Not written back on the single-view path: that key drives
+        # `coords_loss_triangulate_reproj` at weight 2.0, and pointing it at the rays would
+        # reweight that supervision by 40x.
         out['3d_pred_triangulate'] = sub
-        # WHERE THE REPAIR ACTUALLY FIRED. The substitution is silent by design -- one tensor for the
-        # loss and the metric -- but `--anchor carry` now SEEDS the next window from this tensor, and
-        # a seed taken from `_rays_fallback` is a point no camera claimed rather than a triangulated
-        # one. Recorded, not gated: the caller decides what a degenerate frame is worth.
+        # Recorded, not gated: a seed taken from `_rays_fallback` is a point no camera claimed,
+        # and the caller decides what a degenerate frame is worth.
         out['tri_degenerate'] = bad
 
     m = query_ok[None, :, None, :, None]                    # -> (cams, b, t, n, r)
@@ -456,21 +319,10 @@ def _query_anchored(out, query_ok):
     out['coords_pred'] = coords_pred
 
     if not bool(query_ok.any()) and out.get('grid') is not None:
-        # Nothing to supervise the 3D grid CE with -- every point is triangulated. Kill THAT term
-        # and nothing else. Popping `grid` (what this used to do) overshoots badly, because
-        # `losses.py:680` gates on `'grid' in outputs` and TWO other things live behind it:
-        #   - `depth_softmax` (losses.py:756-772), weight 1.5, the LARGEST CE term in the shipped 3D config,
-        #     whose target (`:769`) is `log(depths_true / (cube_scale * f_eff * sdep))` -- nothing
-        #     to do with the query anchor.
-        #   - `f_eff` itself (losses.py:458), so the depth regression Huber silently reswitches
-        #     its normaliser mid-run and the arm trains two different depth losses in alternation.
-        # With `prompt_dropout = 0.5` that fired on ~half the steps of every `prior` arm and never
-        # on a `none` arm, contaminating the shipped sweep delta.
-        #
-        # A non-finite anchor is the library's own off switch: `anchor_local` is read at exactly
-        # one place (`losses.py:738`, `target_3d = (p_raylocal - anchor_local) / denom_resid`), and
-        # `grid_softmax_loss` (`:45-52`) drops non-finite targets and returns 0 when all are
-        # dropped. In a PARTIALLY prompted window the CE stays on and masks itself the same way.
+        # Nothing to supervise the 3D grid CE with -- every point is triangulated. Kill THAT
+        # term and nothing else: popping `grid` also drops `depth_softmax` (weight 1.5, the
+        # largest CE term) and `f_eff` behind it. A non-finite anchor is the library's own off
+        # switch.
         grid = dict(out['grid'])
         grid['anchor_local'] = torch.full_like(grid['anchor_local'], float('nan'))
         out['grid'] = grid
@@ -478,16 +330,13 @@ def _query_anchored(out, query_ok):
 
 
 def _reanchor_per_frame(out, anchor):
-    """Re-anchor the 3D residual on EACH frame's own triangulation.
-
-    The anchor is recoverable from the outputs -- `3d_pred_cams_direct = query + R @ residual` --
-    so subtracting the query returns the world-space residual, which is then added to each
-    frame's own (detached) triangulation. No change to posetail is needed.
+    """Re-anchor the 3D residual on EACH frame's own triangulation. `3d_pred_cams_direct =
+    query + R @ residual`, so subtracting the query recovers the world-space residual, re-added
+    to each frame's own (detached) triangulation.
     """
     src = out['3d_pred_triangulate']
-    # Repair FIRST, so the loss and the metric see ONE tensor and a degenerate solve cannot
-    # silently reduce coverage. `get_mpjpe` credits a non-finite prediction as perfect (nansum
-    # numerator, full denominator), which is exactly how a wrong comparison gets published.
+    # Repair FIRST so the loss and the metric see ONE tensor; see `_query_anchored` for the
+    # backward-poisoning reason the detach happens.
     bad = ~torch.isfinite(src).all(-1)
     if not torch.isfinite(src).all():
         src = src.detach()                    # see `_query_anchored`: the solve's backward NaNs
@@ -508,16 +357,10 @@ def _reanchor_per_frame(out, anchor):
 
 
 def _reanchor_ce_target(out, src):
-    """Move the 3D cross-entropy target onto the SAME anchor the outputs now use.
-
-    Without this, `grid['anchor_local']` still describes the query-anchored task, so with
-    `coords_softmax_3d_weight = 0.4` roughly 40% of the 3D objective would train fixed-anchor
-    propagation while every metric and reprojection term sees per-frame refinement -- two
-    objectives pulling in different directions.
-
-    float64 is mandatory, not defensive: the library does this einsum in float64 precisely so
-    `(p_raylocal - anchor_local)` cancels exactly. In float32 the ray-local coordinates are large
-    and nearly equal, and the difference annihilates.
+    """Move the 3D cross-entropy target onto the SAME anchor the outputs now use. Without this,
+    `grid['anchor_local']` still describes the query-anchored task while every metric sees
+    per-frame refinement. float64 is mandatory: the library's einsum cancels exactly only in
+    float64, where the ray-local coordinates are large and nearly equal.
     """
     grid = out.get('grid')
     if grid is None or grid.get('anchor_local') is None or grid.get('rays_c') is None:
@@ -534,35 +377,23 @@ def _reanchor_ce_target(out, src):
 
 
 def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
-    """`[model]` splatted into the constructor, with this repo's two keys pulled out first.
-
-    Two of the library's options are checked HERE rather than in the constructor, because both
-    are wrong in a way that produces numbers instead of exceptions and the message needs to name
-    the config key rather than surface later as bad accuracy.
+    """`[model]` splatted into the constructor, with this repo's two keys pulled out first. Two
+    library options are checked here because both are wrong in a way that produces numbers
+    instead of exceptions.
     """
     cfg = dict(model_cfg)
     query = cfg.pop('query', 'prior')
-    # The two query terms are DERIVED from `query`, not configured -- see
-    # PoseTrackerEncoder.__init__. 
+    # The two query terms are derived from `query` -- see PoseTrackerEncoder.__init__.
     enc = cfg.pop('query_encoder', 'wide')
     if enc == 'pose':
         raise SystemExit(
             'query_encoder = "pose" was removed: no shipped config selected it and `wide` won '
             'every unanchored arm on record. Set query_encoder = "wide" (or drop the key).')
-    # NO DEFAULT, DELIBERATELY. This key decides what the 3D residual is measured from, and the two
-    # values are different architectures sharing one set of tensor shapes -- so a checkpoint trained
-    # under one and loaded under the other produces numbers rather than an exception.
-    #
-    # That is not hypothetical. A 3D run trained under unconditional per-frame
-    # re-anchoring, finished nine hours before the commit that replaced it with the query-anchored
-    # residual, and has no `gridresid_offset` in its config -- so every later run of it inferred
-    # `world = prior + residual` from weights that learned `world = tri_t + residual_t`. Under
-    # `--anchor carry` that turns the prior into a static anchor the residual head never saw, and
-    # the pose lags the animal until the bounds mask drops the prior and the fallback snaps it back
-    # to the triangulation it was trained on. A default of `'query'` is what made that silent.
-    #
-    # A run folder from before this check has to be told which one it was, per
-    # `load_run(model_overrides=...)` / `scripts/infer.py --gridresid-offset`.
+    # NO DEFAULT, DELIBERATELY: the two values are different architectures sharing one set of
+    # tensor shapes, so a checkpoint trained under one and loaded under the other produces
+    # numbers instead of an exception -- which is exactly what happened to one 3D run, silently.
+    # A pre-key run folder must be told which it was (load_run(model_overrides=...) /
+    # --gridresid-offset).
     if 'gridresid_offset' not in cfg:
         raise KeyError(
             "[model].gridresid_offset is required, not defaulted: 'query' anchors the 3D residual "
@@ -584,13 +415,9 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
             'beat it. Set box_prompt = "film" (or "none").')
     cfg.pop('n_keypoints', None)          # derived from the registry, never configured
 
-    # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it wrong.
-    # BOTH `gridresid_offset` paths need the output to be query-anchored in the first place, and
-    # the library only adds `query_world` for 'residual' and 'gridresid' (tracker_encoder.py:670).
-    # Under 'direct' or 'grid' the prediction never depended on the query, so `"query"` would gate
-    # away a perfectly good absolute output at every unprompted point, and `"triangulated"` would
-    # subtract the query from something it was never added to and re-add the difference to every
-    # frame -- running the re-anchoring backwards, silently.
+    # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it
+    # wrong: both gridresid_offset paths need the output query-anchored, which the library only
+    # does for 'residual' and 'gridresid'.
     output_mode = cfg.setdefault('output_mode', 'gridresid')
     assert output_mode == 'gridresid', (
         f'output_mode = {output_mode!r} is not supported: both gridresid_offset modes assume the '
@@ -599,9 +426,8 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         '"triangulated" re-anchors a prediction that was never query-anchored. '
         'Set output_mode = "gridresid".')
 
-    # Upstream this selects the CLASS (train_utils.py:439 -- 'encoder' -> TrackerEncoder,
-    # 'tapnext' -> TrackerTapNext). Here it is stored and never read, so anything else would be
-    # accepted and then quietly ignored -- and TrackerTapNext is not moving-cam-safe anyway.
+    # Upstream uses this to select the CLASS; here it is stored and never read, so anything else
+    # would be accepted and quietly ignored (and TrackerTapNext is not moving-cam-safe anyway).
     mode_3d = cfg.setdefault('mode_3d', 'encoder')
     assert mode_3d == 'encoder', (
         f'mode_3d = {mode_3d!r} is not supported: build_model always constructs a '

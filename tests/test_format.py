@@ -62,14 +62,9 @@ def test_vis_is_an_int8_compare(tiny_root):
 
 
 def test_has_visibility_assessment(tiny_root, tracked_no_assessment_root):
-    """The session-level gate `dataset.py`'s 2D (and, symmetrically, 3D) path reads.
-
-    `ratlike` is `annotated` and carries a real `missing` row (`_session_2d`) -> True regardless
-    of the count. `catlike` (`tracked_no_assessment_root`) is `tracked`, 100% `visible`, zero
-    `missing` -- calms21 / rat-city-tracked / branson-fly's exact shape -- -> False. `mouselike`
-    is `tracked` but DOES carry real per-camera `missing` rows (allen-mouse-tracked's shape) ->
-    True: the gate must not fire on a `tracked` session just because it declares that label
-    source, only on one that never recorded a negative.
+    """The session-level gate `dataset.py` reads: `annotated` with a real `missing` row -> True;
+    `tracked` with 100% `visible` and zero `missing` -> False; `tracked` WITH real per-camera
+    `missing` rows -> True.
     """
     ann = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
     assert ann.label_source == 'annotated'
@@ -172,12 +167,9 @@ def _drop_keypoint(path, name):
 
 
 def test_ids_follow_each_sessions_own_keypoint_axis(tmp_path):
-    """A session may reorder the root's keypoints, or carry only some of them.
-
-    Both used to be silent relabels: the session scatters its rows through its OWN `names`
-    (`_kpt_vocab`), while the id vector came from the FIRST session's list. Same length,
-    different order, `nose` coordinates training the `left_ear` embedding row -- gotcha #4, and
-    invisible in the loss curve. `Registry.ids_for` now resolves by name.
+    """A session may reorder the root's keypoints, or carry only some of them -- both used to be
+    silent relabels (same length, different order, `nose` coordinates training the `left_ear`
+    embedding row, invisible in the loss curve). `Registry.ids_for` now resolves by name.
     """
     root = tmp_path / 'ds'
     lab_a = _session_2d(root / 'train' / 'a')
@@ -283,11 +275,9 @@ def test_unknown_bodypart_is_an_error(tmp_path):
 
 
 def test_animal_count_may_vary_between_groups(tmp_path):
-    """A parquet dictionary is per FILE, not per group.
-
-    branson-fly sessions hold 5..10 flies depending on the trial, so a session's `animal_id`
-    dictionary names animals that any individual group has never seen. Reading one group must
-    not trip over the others' animals.
+    """A parquet dictionary is per FILE, not per group: a session's `animal_id` dictionary names
+    animals that any individual group has never seen. Reading one group must not trip over the
+    others' animals.
     """
     from aniposelib.cameras import CameraGroup
 
@@ -312,14 +302,9 @@ def test_animal_count_may_vary_between_groups(tmp_path):
 
 
 def test_labels_key_is_required_and_closed(tmp_path):
-    """§4 / decision 6: `labels` is required, and its vocabulary is two values.
-
-    The point of a closed vocabulary is that a typo fails loudly. An open one would make
-    `labels = "traked"` a third source that every consumer silently weights on its own.
-
-    It is checked on BOTH seams -- `Session.load` for data already on disk, `write_session` for
-    data being produced -- because the loader is what protects a training run and the writer is
-    what stops a converter shipping 259 files that need backfilling again.
+    """§4 / decision 6: `labels` is required, and its vocabulary is two values so a typo fails
+    loudly. Checked on BOTH seams -- `Session.load` for data on disk, `write_session` for data
+    being produced.
     """
     path = tmp_path / 'ds' / 'train' / 'a'
     _session_2d(path)
@@ -343,11 +328,8 @@ def test_labels_key_is_required_and_closed(tmp_path):
 
 
 def test_label_source_does_not_shadow_the_labels_method(tiny_root):
-    """`Session.labels(gid)` stays callable.
-
-    session.toml spells the key `labels`; `Session` exposes it as `label_source`. That mismatch
-    is deliberate and this is what it buys -- a `labels` FIELD would shadow the method on every
-    instance, and ~35 call sites would fail with "'str' object is not callable" at run time.
+    """`Session.labels(gid)` stays callable: session.toml spells the key `labels` while `Session`
+    exposes it as `label_source`, so a `labels` FIELD would shadow the method on every instance.
     """
     sess = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
     assert sess.label_source in fmt.LABEL_SOURCES
@@ -389,10 +371,8 @@ def test_regions_roundtrip(tmp_path):
 
 
 def test_regions_empty_is_not_the_same_as_absent(tmp_path):
-    """The whole semantic: a certified-nothing group must not read as fully labelled.
-
-    This is the rat-city-annotated `test/` split, where APT's GT mode records no ROIs at all --
-    a MISSING regions.pq there would claim those frames are exhaustive, which they are not.
+    """The whole semantic: a certified-nothing group must not read as fully labelled. This is the
+    rat-city-annotated `test/` split, where APT's GT mode records no ROIs at all.
     """
     path = tmp_path / 'ds' / 'train' / 'a'
     _session_2d(path)

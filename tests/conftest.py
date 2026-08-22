@@ -1,8 +1,7 @@
 """A tiny synthetic dataset on disk, built through the public write path.
 
-Small enough to be fast, but it exercises every branch the real datasets use: a 2D
-single-camera multi-animal session, a 3D multi-camera session whose per-camera visibility is
-coordinate-free (allen-mouse's shape), a moving camera, and an ignore region.
+Exercises every branch the real datasets use: 2D multi-animal, 3D multi-camera,
+moving camera, ignore region.
 """
 import numpy as np
 import pytest
@@ -11,11 +10,7 @@ from PIL import Image
 
 from tailcyclenet import format as fmt
 
-# CAP THE INTRAOP POOL, OR `-n` MAKES THE SUITE SLOWER. torch's pool is `nproc` wide (report 14's
-# 67 ms/frame uint8 convert is the same cause), so on a 128-core box eight xdist workers ask for
-# 1024 threads and the suite goes from 58 s serial to 269 s at `-n 8`. Capped: 33 s. Here rather
-# than in the pixi task because a bare `pytest -n 8` has to be safe too, and a single process
-# barely notices (41.6 s against 39.4 s at 8 threads, measured on tests/test_model.py).
+# Cap the intraop pool, or `-n` makes the suite slower: `nproc`-wide torch pool vs many xdist workers.
 torch.set_num_threads(4)
 
 KPTS_2D = ['nose', 'left_ear', 'right_ear', 'tail_base']
@@ -42,12 +37,7 @@ def _rig(specs):
 
 
 def _write_frames(group_dir, cam, n_frames, size):
-    """Frames whose CONTENT identifies (cam, frame), not a constant.
-
-    A test that reads frame 3 and gets frame 4 cannot fail against all-zero images, and the
-    loader now computes frame paths from the `%06d` rule instead of listing the directory -- so
-    an off-by-one there has to be detectable in the pixels.
-    """
+    """Frames whose content identifies (cam, frame), so an off-by-one is visible in pixels."""
     d = group_dir / cam
     d.mkdir(parents=True, exist_ok=True)
     W, H = size
@@ -64,14 +54,7 @@ def _video_colour(cam_ix, i):
 
 
 def _write_video(path, cam_ix, n_frames, size, fps=20.0):
-    """A tiny mp4 whose every frame is a SOLID COLOUR identifying (cam, frame).
-
-    There is no video fixture anywhere else in the suite -- every session fixture ships PNG
-    directories -- and `--videos` is a path that exists only for containers, so this is where one
-    belongs. Solid colours on purpose: the codec is lossy, so a test cannot assert exact pixels,
-    but a constant plane survives compression to within a few counts and a decode that returned
-    frame i+1 for frame i is still caught.
-    """
+    """A tiny mp4 whose every frame is a solid colour identifying (cam, frame)."""
     import cv2
 
     W, H = size
@@ -87,11 +70,7 @@ def _write_video(path, cam_ix, n_frames, size, fps=20.0):
 
 
 def _session_2d(path, T=4, S=2, label_source='annotated'):
-    """rat-city's shape: one uncalibrated camera, several animals, pixel labels.
-
-    `label_source` is a parameter only so a test can drive an invalid value through
-    `write_session`; every fixture below leaves it at the default.
-    """
+    """rat-city's shape: one uncalibrated camera, several animals, pixel labels."""
     W, H = 64, 48
     rig = _rig([('cam0', W, H, False, False, 0)])
     K = len(KPTS_2D)
@@ -121,15 +100,8 @@ def _session_2d(path, T=4, S=2, label_source='annotated'):
 
 
 def _session_2d_tracked_dense(path, T=4, S=2):
-    """calms21 / rat-city-tracked / branson-fly's shape: `tracked`, every row `visible`, no
-    assessment ever recorded.
-
-    Distinct from `_session_2d` above (which is `annotated` and carries a real `missing` /
-    `unlabeled` pair): this is what `Session.has_visibility_assessment` must read as False, and
-    what the loader must therefore withhold a visibility target for -- for the WHOLE session, not
-    per window, because every row here reads `visible` (finite, not NaN), so the per-window
-    NaN-masking that catches an all-`projected` session cannot see this case at all.
-    """
+    """`tracked`, every row `visible`, no assessment ever recorded -- the calms21 shape
+    `has_visibility_assessment` must read as False."""
     W, H = 64, 48
     rig = _rig([('cam0', W, H, False, False, 0)])
     K = len(KPTS_2D)
@@ -163,9 +135,7 @@ def _session_3d(path, T=4, moving=False, label_source='tracked'):
     lab.points3d[:] = rng.uniform(-50, 50, size=(1, T, K, 3)).astype(np.float32)
     lab.vis3d[0, 1, 2] = fmt.MISSING
     lab.points3d[0, 1, 2] = np.nan
-    # per-camera visibility with NO x,y -- the rule 10 exemption.
-    # Three states on purpose: visible, assessed-but-occluded, and never assessed. The last one
-    # is what must survive to the loss as NaN rather than being collapsed into "not visible".
+    # Per-camera visibility with no x,y: visible, assessed-but-occluded, and never assessed.
     lab.vis2d[:] = fmt.VISIBLE
     lab.vis2d[0, :, 0, 2] = fmt.MISSING
     lab.vis2d[0, 1, 2] = fmt.UNLABELED          # keypoint 2, frame 1: nobody looked
@@ -187,15 +157,8 @@ def _session_3d(path, T=4, moving=False, label_source='tracked'):
 
 
 def _session_3d_multi(path, T=4, sep=5.0, label_source='tracked'):
-    """`_session_3d`'s shape with a SECOND animal, for the animal-swap prior corruption
-    (dev/plans/prompt_prior_corruptions.md) -- `_session_3d` ships exactly one animal, which
-    cannot exercise `prompt_swap_animal` at all (`want_swap_animal` requires `n_animals >= 2`).
-
-    The second animal is the FIRST one's own pose rigidly shifted by `sep` world units along one
-    axis, so a SMALL `sep` keeps both animals inside one camera's crop (ELIGIBLE, per
-    `prior_out_of_bounds`) and a LARGE one puts the second animal well outside it (INELIGIBLE) --
-    both cases a test needs, from one knob, rather than two separately-authored fixtures.
-    """
+    """`_session_3d`'s shape with a second animal (the first's pose shifted by `sep`), for the
+    animal-swap prior corruption: small `sep` = eligible neighbour, large = ineligible."""
     W, H = 64, 48
     rig = _rig([(f'cam{i}', W, H, True, False, i + 1) for i in range(3)])
     K = len(KPTS_3D)
@@ -218,11 +181,7 @@ def _session_3d_multi(path, T=4, sep=5.0, label_source='tracked'):
 
 @pytest.fixture(scope='session')
 def mixed_source_root(tmp_path_factory):
-    """One root holding three of the four (mode, label_source) cells -- allen's exact shape.
-
-    The missing cell is the point: `2d-tracked` is absent, so a scheme that fits both fractions
-    as joint marginals would be over-constrained here. The two-level draw is not.
-    """
+    """One root holding three of the four (mode, label_source) cells; `2d-tracked` is absent."""
     root = tmp_path_factory.mktemp('mixed') / 'ds'
     _session_2d(root / 'train' / 'a_2d_annot', label_source='annotated')
     _session_3d(root / 'train' / 'b_3d_annot', label_source='annotated')
@@ -252,13 +211,7 @@ def dataset_3d(tiny_root):
 
 
 def _session_projected(path, T=4):
-    """johnson-mouse's shape: per-camera 2D POSITIONS with no visibility assessment anywhere.
-
-    Every 2D row is `projected` -- the annotator placed the point in this view but never judged
-    whether it was actually seen there. The positions must survive, and no visibility target may
-    be built from them, in either direction: `visible` would train "always visible" and the
-    noisy-OR of "no camera says visible" would train "nothing is reconstructible".
-    """
+    """johnson-mouse's shape: per-camera 2D positions with no visibility assessment anywhere."""
     W, H = 64, 48
     rig = _rig([(f'cam{i}', W, H, True, False, i + 1) for i in range(3)])
     K = len(KPTS_3D)
@@ -286,12 +239,7 @@ def projected_root(tmp_path_factory):
 
 
 def _session_centred_labels(path, T=24, labelled=(11, 12, 13)):
-    """A group whose labels sit ONLY in the middle -- the shape the old loader could not use.
-
-    posetail-pose's `get_start_ixs_train` admitted a window only if its FIRST frame had a finite
-    coordinate, so a group like this yielded zero training windows and the natural annotation
-    shape (a label with context on both sides) was silently unusable.
-    """
+    """A group whose labels sit only in the middle -- the shape the old loader could not use."""
     W = H = 48
     K = len(KPTS_3D)
     rig = _rig([('cam0', W, H, False, False, 0)])

@@ -1,23 +1,7 @@
-"""SF-Muon for the pose network, ported from ../posetail-next (train.py + posetail/muon.py).
+"""SF-Muon for the pose network, ported from ../posetail-next.
 
-`torch.optim.Muon` orthogonalizes the momentum of 2D hidden matrices; it RAISES on any non-2D
-parameter, so it must be paired with an AdamW-family optimizer for everything else (biases, norms,
-heads, embeddings). The library ships `DualOptimizer`, which presents the pair as one optimizer to
-the training loop. This module subclasses it for the three things THIS repo's checkpointing needs
-that the reference (Lightning fabric + a different save path) did not:
-
-  * `has_averaged_iterate` -- whether BOTH halves carry a schedule-free averaged `x`, so
-    `save_checkpoint` knows whether `model_state_eval` is a real averaged weight.
-  * a `load_state_dict` that restores `ScheduleFreeWrapper.train_mode` -- a real resume bug (see
-    `PoseDualOptimizer.load_state_dict`).
-  * a named refusal when a run folder's optimizer state does not match the optimizer this config
-    builds -- the cost of making `muon` the default an absent key resolves to.
-
-The reference's `sqrt(world_size)` / `total_to_per_gpu` machinery IS ported, but it lives in
-`tailcyclenet.distributed` rather than here: `build_muon` takes whatever `[training.optimizer]`
-dict it is handed, and `scripts/train.py` hands it a world-scaled COPY. `group_lr` below is the
-other consumer of that dict -- the staged unfreeze reads it thousands of iterations later -- so
-both must be given the same copy or the encoder arrives at an unscaled rate.
+Muon orthogonalizes 2D hidden matrices and RAISES on non-2D params, so it is paired with
+AdamW-SF for the rest. This module adds what this repo's checkpointing needs: `has_averaged_iterate`, a `load_state_dict` that restores `train_mode` (a resume bug), and a named refusal on optimizer-state mismatch. World-size scaling lives in `tailcyclenet.distributed`.
 """
 from __future__ import annotations
 
@@ -27,11 +11,8 @@ import torch
 
 from posetail.posetail.muon import DualOptimizer
 
-# The one place [training.optimizer] keys are enumerated. `scripts/train.py` guards this block
-# against a typo the same way it guards [data] and `build_model` guards [model]: an unknown key
-# would otherwise train at the default and the run folder would record the key nobody read -- an
-# arm silently reporting its own control (eval rule 4). `muon_lr` for `muon_lr_scale` is exactly
-# the class of mistake this catches.
+# The one place [training.optimizer] keys are enumerated; an unknown key would otherwise train
+# at the default and the run folder would record the key nobody read.
 KNOWN_OPTIMIZER_KEYS = frozenset({
     'optimizer',
     'learning_rate', 'kpt_lr', 'encoder_lr_scale', 'weight_decay', 'warmup_steps',
@@ -50,18 +31,15 @@ _DEC_SUBSTR = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
 
 def embedding_ids(model) -> set[int]:
     """`id()` of every `nn.Embedding` param. Each row is a keypoint (or time) identity, so
-    orthogonalizing the table mixes body parts -- the hazard `warm_start`'s row-copy refusal
-    exists for. 2D by shape, AdamW by meaning."""
+    orthogonalizing the table mixes body parts.
+    """
     return {id(p) for m in model.modules() if isinstance(m, torch.nn.Embedding)
             for p in m.parameters()}
 
 
 def route_param(name: str, p, fresh: set[str], embed_ids: set[int]) -> str:
-    """Which of `ROUTES` this parameter belongs to. THE single routing rule.
-
-    Called once per param at build time and again for each tensor a staged unfreeze makes
-    trainable. Factored out precisely so those two cannot drift: a param that would have been
-    Muon-routed had it been trainable at step 0 must be Muon-routed when it arrives at step 5000.
+    """Which of `ROUTES` this parameter belongs to -- the single routing rule, shared by build
+    time and the staged unfreeze so the two cannot drift.
     """
     is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
     is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
@@ -82,13 +60,8 @@ class PoseDualOptimizer(DualOptimizer):
     def add_muon_group(self, params, lr: float, weight_decay: float) -> None:
         """Add a NEW Muon group at unfreeze time. See `add_adamw_group` for why it must be new.
 
-        `torch.optim.Muon` validates `ndim == 2` in `__init__` ONLY -- `add_param_group` does not
-        re-check, so a routing slip would surface as a shape error deep inside `step()` rather
-        than here. Asserted at the add.
-
-        `_muon_base_lrs` must grow with it: `DualOptimizer.step` zips it against
-        `opt_muon.param_groups` to apply the Muon warmup rescale, and `zip` truncates silently, so
-        a group added without this entry would escape the rescale without saying so.
+        Muon validates ndim == 2 only in `__init__`, so the shape is asserted here;
+        `_muon_base_lrs` must grow with the group or `zip` silently skips its warmup rescale.
         """
         params = list(params)
         if not params:
@@ -103,17 +76,9 @@ class PoseDualOptimizer(DualOptimizer):
     def add_adamw_group(self, params, lr: float, weight_decay: float) -> None:
         """Add a NEW AdamW-SF group at unfreeze time, in phase with the existing ones.
 
-        NEW, NOT PRE-REGISTERED AT STEP 0, and that is correctness rather than taste. Both
-        schedule-free implementations advance `group['k']` and `group['weight_sum']` on EVERY
-        `step()` whether or not a param in the group has a gradient, and the averaging weight is
-        `ckp1 = weight / weight_sum ~ 1/k`. A group that sat grad-less for 5,000 steps would then
-        fold its encoder into the averaged iterate `x` at `ckp1 ~ 1/5000` -- so `model_state_eval`
-        (what is deployed, and what `checkpoint_best` is selected on) would hold a barely-moved
-        encoder while `model_state` held a finetuned one, silently. A fresh group starts at k = 0.
-
-        `train_mode` is copied from group 0 rather than taken from the defaults: `eval()`/`train()`
-        read it PER GROUP, so a group out of phase would be lerped the wrong way at the next
-        checkpoint write.
+        NEW, not pre-registered: schedule-free advances `k` every step, so a grad-less group
+        would fold its encoder into the averaged iterate at ~1/k -- the deployed weight would
+        hold a barely-moved encoder. `train_mode` is copied from group 0 (read per group).
         """
         params = list(params)
         if not params:
@@ -124,8 +89,8 @@ class PoseDualOptimizer(DualOptimizer):
     @property
     def adamw_params(self):
         """The AdamW-routed params -- heads, embeddings, norms, biases. The ONLY half that should
-        be gradient-clipped: Muon orthogonalizes its own grads inside `step()`, so their raw norm
-        is not a step size (report 34b)."""
+        be gradient-clipped: Muon orthogonalizes its own grads inside `step()`.
+        """
         return [p for g in self.opt_adam.param_groups for p in g['params']]
 
     @property
@@ -136,26 +101,19 @@ class PoseDualOptimizer(DualOptimizer):
 
     @property
     def has_averaged_iterate(self) -> bool:
-        """True iff BOTH inner optimizers maintain a schedule-free averaged iterate.
-
-        Under `muon_schedulefree = true` the Muon half is a `ScheduleFreeWrapper` and the rest is
-        `AdamWScheduleFree`; both expose `eval()`/`train()` and both hold an `x`. Under
-        `muon_schedulefree = false` the Muon half is a bare `torch.optim.Muon` with no averaged
-        iterate, so `model_state_eval` would be only half-averaged -- this reports that, and
-        `save_checkpoint` then writes no eval weight (and `load_run` falls back with its message).
+        """True iff BOTH inner optimizers maintain a schedule-free averaged iterate. Under
+        `muon_schedulefree = false` the Muon half is bare `torch.optim.Muon`, so
+        `model_state_eval` would be only half-averaged -- `save_checkpoint` then writes no eval
+        weight and `load_run` falls back.
         """
         return all(hasattr(o, 'eval') and hasattr(o, 'train') for o in self._opts)
 
     def load_state_dict(self, sd):
         """Delegate, then force `ScheduleFreeWrapper.train_mode = True`.
 
-        THIS FIXES A REAL RESUME BUG. `AdamWScheduleFree` keeps `train_mode` inside its
-        `param_groups`, so it round-trips through `state_dict`. `ScheduleFreeWrapper` keeps it as a
-        plain attribute that does NOT, so after `load_state_dict` it is back at its constructed
-        `False`. `save_checkpoint` writes `model_state` at the **y** iterate (train mode), and the
-        training loop then calls `opt.train()` (train.py) -- which, believing the params are at the
-        averaged **x**, lerps y toward z a SECOND time. A resumed Muon run would silently restart
-        from a corrupted weight. Restored explicitly here so the resume is exact.
+        The wrapper keeps `train_mode` as an attribute that does NOT round-trip, so after load
+        the params sit at the averaged x while the loop calls `opt.train()` -- lerping y toward z
+        a second time.
         """
         from schedulefree import ScheduleFreeWrapper
         _refuse_state_shape(self, sd)
@@ -169,24 +127,9 @@ class PoseDualOptimizer(DualOptimizer):
 def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
     """Route the model's parameters into Muon (2D transformer matrices) + AdamW-SF (the rest).
 
-    The routing is by NAME and MODULE TYPE, not by `ndim == 2` alone, because three kinds of 2D
-    tensor must not reach Muon:
-
-      * `nn.Embedding` weights are `(rows, dim)` and 2D, but each row is a keypoint identity (or a
-        time index). Orthogonalizing mixes rows that point at different body parts -- the same
-        hazard `warm_start`'s row-copy refusal exists for. Every `nn.Embedding` param is collected
-        by `id` and excluded (the technique the reference uses for its scene ids).
-      * the output heads (`decoder.heads_*`) stay on AdamW, as in the reference; only the
-        transformer MLPs (`decoder.mlps`) and attention projections go to Muon.
-      * frozen params are filtered first, so a frozen encoder leaves the encoder groups empty
-        rather than handing Muon a frozen tensor.
-
-    A FROZEN PARAM IS IN NO GROUP, EVER. That is why staged unfreezing cannot be a model-side
-    flip alone: `tailcyclenet.unfreeze` adds the newly-trainable tensors as new groups, routed by
-    the same `route_param` this uses, so build-time and unfreeze-time cannot drift apart.
-
-    `torch.optim.Muon` raises at construction on any non-2D param, so a routing slip is loud on
-    the run's first line rather than a silent wrong-optimizer arm.
+    Routing is by NAME and MODULE TYPE, not ndim alone: `nn.Embedding` weights are 2D but each
+    row is a keypoint identity; the output heads stay on AdamW; frozen params are filtered first
+    (a frozen param is in no group, which is why the staged unfreeze must add new groups).
     """
     from torch.optim import Muon as TorchMuon
     from schedulefree import AdamWScheduleFree, ScheduleFreeWrapper
@@ -225,9 +168,8 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
     opt_adam = AdamWScheduleFree([g for g in adamw_groups if g['params']], lr=lr, weight_decay=wd,
                                  warmup_steps=warmup, betas=betas)
     if sf:
-        # ScheduleFreeWrapper is NOT an Optimizer subclass, so it wraps a constructed Muon; the
-        # decoupled weight decay is applied at the y point by the wrapper (weight_decay_at_y), the
-        # per-group value drives Muon's own decoupled decay -- mirroring the reference's arm.
+        # The wrapper applies decoupled weight decay at the y point; the per-group value drives
+        # Muon's own decay -- mirroring the reference's arm.
         base_muon = TorchMuon([g for g in muon_groups if g['params']], lr=lr, weight_decay=0.0,
                               momentum=momentum, adjust_lr_fn=adj)
         opt_muon = ScheduleFreeWrapper(base_muon, momentum=0.9, weight_decay_at_y=wd)
@@ -285,12 +227,9 @@ def _state_group_counts(state) -> tuple[int, int]:
 
 
 def refuse_group_count_mismatch(opt, state) -> None:
-    """Raise a NAMED error when the saved state has a different number of param groups.
-
-    The staged encoder unfreeze ADDS groups mid-run, so a run resumed past its unfreeze iteration
-    must replay the unfreeze before loading (`scripts/train.py` does). Without this, torch reports
-    'loaded state dict has a different number of parameter groups' -- true, and useless about
-    which config key caused it. This is the `gridresid_offset` rule for the group layout.
+    """Raise a NAMED error when the saved state has a different number of param groups. The
+    staged unfreeze ADDS groups mid-run, so a resumed run must replay the unfreeze before
+    loading -- torch's own message would not name the config key that caused it.
     """
     have, want = _group_counts(opt), _state_group_counts(state)
     if have == want:
@@ -305,13 +244,9 @@ def refuse_group_count_mismatch(opt, state) -> None:
 
 
 def refuse_mismatched_optimizer_state(opt, state, path, resolved: str, explicit: bool) -> None:
-    """Refuse to load an optimizer state that was written by a DIFFERENT optimizer, by name.
-
-    This is the `gridresid_offset` rule applied to optimizer state: the MODEL tensors load either
-    way, so nothing but an explicit check on the state's own shape can tell you the run is being
-    resumed under the wrong optimizer. It fires in BOTH directions -- an AdamW-SF checkpoint under
-    a Muon config (the case the new default creates for every old run folder) and a Muon checkpoint
-    under `optimizer = "schedulefree"`.
+    """Refuse to load an optimizer state written by a DIFFERENT optimizer, by name. The model
+    tensors load either way, so only an explicit shape check can tell you the resume is wrong.
+    Fires in both directions.
     """
     dual_opt = isinstance(opt, PoseDualOptimizer)
     dual_state = _is_dual_state(state)

@@ -35,12 +35,10 @@ def _batch():
 
 
 def test_non_finite_loss_becomes_a_skipped_step():
-    """posetail RAISES on a poisoned sub-loss; the loop needs a NaN it can skip.
-
-    `TotalLoss.forward` raising (`losses.py:873`) is right for its own purpose -- a NaN term
-    silently dropped from the total still returns NaN gradients -- but it killed two 60k-iteration
-    sweep jobs in their first 100 seconds over what is an intermittent bad step. `run_batch`
-    converts it into the signal the loop's own `torch.isfinite(loss)` guard already reads.
+    """posetail RAISES on a poisoned sub-loss; the loop needs a NaN it can skip. The raise is
+    right for its own purpose but killed two sweep jobs in their first 100 seconds over an
+    intermittent bad step; `run_batch` converts it into the signal the loop's own
+    `torch.isfinite(loss)` guard already reads.
     """
     tr = _train_module()
     model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 3)}   # noqa: E731
@@ -69,17 +67,10 @@ def test_other_value_errors_still_propagate():
 
 
 def test_short_window_survives_the_smoothness_loss():
-    """T = 2 must not raise inside `SmoothnessLoss`, and must not be silently disabled either.
-
-    `SmoothnessLoss.forward` narrows by `T - k` (`posetail/losses.py:1146`), so a window shorter
-    than `order + 1` frames raises on a negative length -- and `torch.diff(n=k)` is undefined
-    there anyway. Both weights are 0.5, so the `weight == 0` early return does not cover it. Now
-    that the loader sizes T to the labelled span, T = 2 is the COMMON case on annotated sessions:
-    without the clamp every one of those steps would die.
-
-    posetail 0.3.5 clamps `order` to `T - 1` INSIDE `SmoothnessLoss.forward` (the same rule
-    `_tune_smoothness` applies), so the raw call no longer raises; this pins that the two clamps
-    agree and that the repo's per-batch rule still degrades to a first difference at T = 2.
+    """T = 2 must not raise inside `SmoothnessLoss`, and must not be silently disabled either:
+    the loss narrows by `T - k`, so a window shorter than `order + 1` raises on a negative length.
+    0.3.5 clamps `order` to `T - 1` inside the loss; this pins that the repo's per-batch rule
+    (`_tune_smoothness`) degrades to a first difference at T = 2 and restores the order after.
     """
     from posetail.posetail.losses import TotalLoss
 
@@ -108,11 +99,9 @@ def test_short_window_survives_the_smoothness_loss():
 
 def test_stride_is_divided_out_of_the_smoothness_weight():
     """`torch.diff` is UNDIVIDED, so a stride-s window's k-th difference is s^k times a stride-1
-    one and the term's effective weight against every other loss would ride on a per-item draw.
-
-    Checked against the loss's own output rather than the attribute, because that is the thing
-    that has to be stride-invariant. A pure ramp is the right probe: its 1st difference is exactly
-    `s` per step, so an unnormalised term reads s times larger at stride s.
+    one and the term's effective weight would ride on a per-item draw. Checked against the loss's
+    own output (a pure ramp reads s times larger at stride s), and idempotent -- re-derived from
+    the configured weight each call.
     """
     from posetail.posetail.losses import TotalLoss
 
@@ -138,13 +127,9 @@ def test_stride_is_divided_out_of_the_smoothness_weight():
 
 
 def test_run_batch_routes_2d_visibility_on_its_own_wire():
-    """`batch.vis_2d` means a DIFFERENT thing depending on mode, and `run_batch` must not blur it.
-
-    In 3D it is posetail's own per-camera term and travels as `vis_true_cams`, both-or-neither
-    with `vis_true` (`TotalLoss.forward` raises otherwise, `losses.py:358`). In 2D there is no 3D
-    layer, so `vis_true` is always None -- handing `vis_2d` to `vis_true_cams` there would either
-    raise or silently recompute it from geometry. It must instead reach `PoseLoss`'s own
-    `vis_2d_true` keyword, which `TotalLoss.forward` does not have and never sees.
+    """`batch.vis_2d` means a DIFFERENT thing depending on mode: in 3D it is posetail's own
+    per-camera term (`vis_true_cams`, both-or-neither with `vis_true`); in 2D it must reach
+    `PoseLoss`'s own `vis_2d_true` keyword, which `TotalLoss.forward` does not have and never sees.
     """
     tr = _train_module()
     model = lambda *a, **k: {'coords_pred': torch.zeros(1, 2, 2, 2),   # noqa: E731
@@ -179,15 +164,10 @@ def test_run_batch_routes_2d_visibility_on_its_own_wire():
 
 
 def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
-    """`optimizer_state` was written from day one and read by NOTHING.
-
-    So a relaunch into the same --out began again at iteration 0 and overwrote both ~5.6 GB files
-    -- `checkpoint_last.pth` at the first boundary, and `checkpoint_best.pth` as soon as any val
-    beat `saved_mpjpe = inf`. On a preemptible job that is the whole run.
-
-    Pins the part that can be silently wrong: that the schedule-free optimizer's own state (the
-    `z` iterate) survives the round trip, and that resuming takes the RAW weights rather than the
-    averaged eval ones. The `it = start_it` arithmetic is not what breaks.
+    """`optimizer_state` was written from day one and read by NOTHING, so a relaunch into the same
+    --out restarted at iteration 0 and overwrote both ~5.6 GB files. Pins the part that can be
+    silently wrong: the schedule-free `z` iterate survives, and resuming takes the RAW weights
+    rather than the averaged eval ones.
     """
     from schedulefree import AdamWScheduleFree
 
@@ -229,11 +209,9 @@ KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'max_grad_norm', 'c
 
 
 def test_known_training_keys_match_the_guard_in_main():
-    """The `[training]` allow-list must stay in step with what `main()` actually reads.
-
-    A typo'd `val_frequency` for `val_freq` yields `val_freq = 0` -- no validation, no
-    `checkpoint_best.pth`, and a run that prints fine for its whole life. That is an arm silently
-    reporting its own control, which is what the guard exists to stop.
+    """The `[training]` allow-list must stay in step with what `main()` actually reads: a typo'd
+    key yields a silent default (no validation, no `checkpoint_best.pth`) -- an arm reporting its
+    own control.
     """
     src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
     assert 'known_training = {' in src, 'the [training] unknown-key guard is gone'
@@ -244,11 +222,8 @@ def test_known_training_keys_match_the_guard_in_main():
 
 
 def test_val_is_skipped_only_for_a_missing_split_not_a_config_error():
-    """`no val/` may be swallowed. A config error inside PoseDataset may NOT.
-
-    The old `except (ValueError, KeyError)` caught both, so a 3D session with no points3d, a split
-    with no usable windows, or all-zero sampling weights each printed one line and then trained
-    with no validation at all.
+    """`no val/` may be swallowed; a config error inside `PoseDataset` may NOT. The old bare
+    except caught both, so a broken session printed one line and then trained with no validation.
     """
     src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
     body = src[src.index('    val_ds = None'):src.index('    nw = args.num_workers')]
@@ -258,9 +233,7 @@ def test_val_is_skipped_only_for_a_missing_split_not_a_config_error():
 
 def test_infer_does_not_restate_loader_defaults():
     """`LoaderConfig` owns its defaults; the CLI restating them is how `box_source` diverged.
-
-    Reads `tailcyclenet/infer/driver.py`, which is where the config resolution went when the
-    inference program moved out of `scripts/infer.py` (now a shim).
+    Reads `tailcyclenet/infer/driver.py`, where the config resolution moved when inference did.
     """
     src = (Path(__file__).parent.parent / 'tailcyclenet' / 'infer' / 'driver.py').read_text()
     for literal in ("'n_frames', 24", "'image_size', 256", "'min_crop_dim', 64",
@@ -269,12 +242,8 @@ def test_infer_does_not_restate_loader_defaults():
 
 
 def test_det_score_has_one_default():
-    """Two defaults meant whichever caller omitted it got a different detector.
-
-    Asserts against the PARSER rather than against the text of the file, which is what became
-    possible once the argparse block was a `build_parser()` an importer can call. The old form
-    split on the literal `"'--det-score', type=float, default="` and would break on a reformat
-    that changed nothing.
+    """Two defaults meant whichever caller omitted it got a different detector. Asserts against
+    the PARSER rather than the file's text, which broke on reformats that changed nothing.
     """
     import inspect
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Run a trained model. The only entry point that touches a checkpoint.
 
-The program itself is `tailcyclenet.infer` -- `cli.py` for the command line, `driver.py` for the
-run over a dataset, `window.py` for the window loop. This file is the documented invocation
-(`pixi run python scripts/infer.py ...`) and nothing else, so that the half of the program that
-used to live here can be imported and tested.
+    pixi run python scripts/infer.py ...
+
+The program itself is `tailcyclenet.infer` (cli/driver/window); this file is the documented
+invocation, so the half of the program that used to live here can be imported and tested.
 """
 import sys
 from pathlib import Path

@@ -33,7 +33,7 @@ def _session_with_a_region(path):
     lab = sess.labels('g000')
     lab.regions = np.array([[1.0, 0.0, 4.0, 4.0, 40.0, 30.0]])      # frame 1, cam 0
     # `_session_2d` leaves every `labeled` instance's box NaN, so give the crop path something
-    # to crop -- a boxless labelled instance is legal (§9, decision 10) and yields no crop.
+    # to crop.
     lab.boxes[0, :, 0] = [8.0, 6.0, 34.0, 28.0]
     fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
                       names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},

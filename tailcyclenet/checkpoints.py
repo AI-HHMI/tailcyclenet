@@ -1,13 +1,8 @@
 """Run folders, warm start, save and load.
 
-A run folder is the unit of reproducibility: it holds the config it was launched with, the
-keypoint registry that fixes what every embedding row means, and the checkpoints. Everything
-downstream (eval, inference, rendering) takes only `--run <folder>`, so a config/checkpoint
-mismatch is impossible by construction rather than by discipline.
-
-Schedule-free training keeps TWO iterates. `model_state` is the raw `y` and is what you resume
-from; `model_state_eval` is the averaged `x` and is what you evaluate. Loading the wrong one is
-a silent accuracy loss, so both are saved explicitly and `load_run` defaults to the eval weights.
+A run folder holds the config, the keypoint registry and the checkpoints; every consumer takes
+only `--run <folder>`. Schedule-free training keeps two iterates -- `model_state` (raw, resume)
+and `model_state_eval` (averaged, evaluate) -- so both are saved explicitly.
 """
 from __future__ import annotations
 
@@ -26,15 +21,8 @@ from .model import build_model
 def load_config(path) -> dict:
     """A run config, with `extends = "<file>"` resolved once against the config's own directory.
 
-    ONE LEVEL, DELIBERATELY. `configs/2d.toml` and `configs/3d.toml` exist so that the DIFFERENCE
-    between the two settings is the whole content of each file -- three keys, all of them camera
-    counts a one-camera root cannot ask about. A chain of overlays would put that difference back
-    out of sight, which is the thing the split is for, so `extends` in a base raises rather than
-    recursing.
-
-    The merge is per BLOCK, not per file: an overlay's `[data]` updates the base's `[data]` key by
-    key rather than replacing the table. Replacing it would mean every overlay had to restate the
-    whole block, which is the duplication the base exists to remove.
+    One level deep, so `configs/2d.toml` vs `configs/3d.toml` show their whole difference in one
+    file. The merge is per BLOCK, key by key, so an overlay need not restate the base's blocks.
     """
     import tomllib
 
@@ -58,21 +46,10 @@ def load_config(path) -> dict:
 
 
 def check_image_size(config: dict) -> None:
-    """`[model].image_size` and `[data].image_size` must agree. Nothing else notices if they do not.
-
-    The loader resizes every crop so its long side is `[data].image_size`, while the weights bake
-    `[model].image_size` into the decode arithmetic -- `PadToSize` (tracker_encoder.py:192),
-    `points_pred + image_size // 2` for the absolute 2D bins (:609), and
-    `p3d_cams * image_size` for gridresid's metric motion (:697). `PadToSize` only ever pads UP,
-    so a smaller data size leaves the crop in the corner of a zero-padded canvas while the
-    cameras describe the unpadded one; either way 2D shifts by half the difference and 3D scales
-    by their ratio. Both silent.
-
-    **`--refine-px` walks straight past this on purpose**, and is the only thing that may. It runs
-    `--refine`'s FIRST pass at a smaller input, and `model.PoseTrackerEncoder.forward` compensates
-    every one of the failures described above -- see `model._input_extent`, which names each site
-    and the mm it is worth. This check stays a config-time assertion because a config has no such
-    compensation: the loader would resize and nothing downstream would know.
+    """`[model].image_size` and `[data].image_size` must agree; nothing else notices if they do
+    not. The loader resizes crops to the data value while the weights bake the model value into
+    the decode arithmetic -- both silent otherwise. `--refine-px` is the only thing that may walk
+    past this, because `model.PoseTrackerEncoder.forward` compensates for it.
     """
     model_px = config.get('model', {}).get('image_size')
     data_px = config.get('data', {}).get('image_size')
@@ -88,13 +65,8 @@ def check_image_size(config: dict) -> None:
 def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     """An explicit name, else `checkpoint_last.pth`, else the newest by name.
 
-    `checkpoint_last.pth` is the default DELIBERATELY, not by alphabetical accident: it is the
-    weight a run resumes from. Pass `checkpoint='checkpoint_best.pth'` for the best-val one.
-
-    The newest-by-name fallback is for external base-checkpoint folders, which still carry
-    `checkpoint_00001000.pth`-style names (`[training].checkpoint_path` in `configs/base.toml`), and
-    for run folders written before the two-file scheme. There is no half-written file to guard
-    against -- `save_checkpoint` renames into place atomically.
+    `last` is the default because it is the weight a resume continues from; pass
+    `checkpoint='checkpoint_best.pth'` for the best-val one.
     """
     folder = Path(folder)
     if checkpoint:
@@ -108,10 +80,8 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     files = sorted(folder.glob('checkpoint_*.pth'))
     if not files:
         raise FileNotFoundError(f'{folder}: no checkpoint_*.pth')
-    # HIGHEST ITERATION, NOT LAST BY NAME. `'b' > '0'`, so a folder holding
-    # `checkpoint_00060000.pth` beside `checkpoint_best.pth` returned `best` -- a warm start from a
-    # checkpoint other than the one the log line implies, which is gotcha 12's class. Numeric
-    # names win; a folder of only named ones falls back to the old order, and says which it took.
+    # HIGHEST ITERATION, NOT LAST BY NAME: 'b' > '0', so a folder holding
+    # `checkpoint_00060000.pth` beside `checkpoint_best.pth` must return the numeric one.
     numbered = sorted((int(p.stem.split('_')[-1]), p) for p in files if p.stem.split('_')[-1].isdigit())
     got = numbered[-1][1] if numbered else files[-1]
     print(f'{folder}: no checkpoint_last.pth, using {got.name} of '
@@ -120,15 +90,8 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
 
 
 def provenance() -> dict:
-    """The commit this source tree is at, and whether it was dirty. Best effort.
-
-    A CONFIG IS NOT A PROVENANCE RECORD. A 3D run trained under unconditional per-frame
-    re-anchoring, finished nine hours before the commit that replaced that with the query-anchored
-    residual, and carries no `gridresid_offset` key -- so it was later loaded, silently, as the
-    architecture it was not trained with. Nothing in the folder could have said otherwise: it holds
-    `config.toml`, the registry, the checkpoints, and no statement about the code.
-
-    Empty dict when git is unavailable (an installed copy, a tarball). It is a record, not a gate.
+    """The commit this source tree is at, and whether it was dirty. Best effort; empty when git
+    is unavailable (an installed copy, a tarball). It is a record, not a gate.
     """
     import subprocess
     root = Path(__file__).resolve().parent.parent
@@ -146,11 +109,8 @@ def provenance() -> dict:
 
 
 def prior_provenance(run: Path) -> dict:
-    """The `provenance.toml` a previous run left in this folder, or {}. Read BEFORE it is rewritten.
-
-    The one consumer is the resume path: a run folder written by a 4-rank job and continued by a
-    1-rank one changes both the learning rate (sqrt of the world size) and what an iteration count
-    means, and only the previous record can say so.
+    """The `provenance.toml` a previous run left in this folder, or {}. Read BEFORE it is
+    rewritten: the resume path needs the previous world size to know what the rates meant.
     """
     p = Path(run) / 'provenance.toml'
     if not p.exists():
@@ -164,13 +124,8 @@ def prior_provenance(run: Path) -> dict:
 
 def save_run_meta(run: Path, config: dict, registry: Registry,
                   extra: dict | None = None) -> None:
-    """`config.toml`, the keypoint registry and `provenance.toml`. `extra` joins the provenance.
-
-    `extra` carries facts about HOW the run was launched rather than what it trains -- the world
-    size, the gpu count, the effective (world-scaled) learning rates. They belong beside the commit
-    for the same reason the commit does: a config cannot state them, and without them a 4-gpu
-    number and a 1-gpu number read identically while being two levers apart. Deliberately NOT
-    written into `[training]`, which would make the next resume trip its own unknown-key guard.
+    """`config.toml`, the keypoint registry and `provenance.toml`. `extra` joins the provenance
+    with how the run was launched (world size, effective rates) -- a config cannot state these.
     """
     import toml
     run.mkdir(parents=True, exist_ok=True)
@@ -185,31 +140,13 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                     name: str = 'last', write: bool = True) -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
-    `model_state` is the raw training weight (resume from this). `model_state_eval` is the
-    averaged weight (evaluate with this) and is captured by flipping the optimizer into eval
-    mode, which swaps the model's parameter tensors in place, then flipping back.
+    `model_state` is the raw training weight (resume); `model_state_eval` is the averaged weight
+    (evaluate), captured by toggling the optimizer into eval mode and back. Only `last` and
+    `best` are ever written; the write renames a sibling temp file into place.
 
-    Only two names are ever written -- `last` and `best` -- because these files are ~5.6 GB and a
-    60k-iteration run kept a dozen of them. Overwriting in place is only safe because the write
-    goes to a sibling temp file and is renamed atomically: a reader never sees a partial file, so
-    there is nothing for `resolve_checkpoint` to guard against.
-
-    `write = False` runs the eval/train TOGGLE below but skips the CPU clones and the disk write,
-    returning None. **This is not an optimisation, it is a correctness requirement on N gpu
-    ranks, and it is the whole reason the parameter has a default of `True` rather than not
-    existing.** `eval()`/`train()` swap the model's LIVE parameters via `p.lerp_(z, w)` twice with
-    DIFFERENT weights, relying on the algebra to land back on `y` -- and in float32 that round
-    trip is not bit-exact (measured: individual elements off by up to ~1e-3 relative, from one
-    `eval()`+`train()` pair on a tensor the size of one unfrozen block). `scripts/train.py` calls
-    this once per rank at every checkpoint boundary with `write = is0`, because only rank 0 writes
-    a file -- and if the toggle above ran only there too, rank 0's RAW training parameters would
-    come out of every boundary perturbed relative to the untouched ranks, and DDP-averaged
-    gradients compound that gap over the next `checkpoint_freq` steps into exactly the drift
-    `check_ranks_agree` exists to catch. **Measured on the first live 4-gpu job**: drift `0.0e+00`
-    at the boundary before checkpointing was added back in, `2.9e-07` (and rising) at the very next
-    one once it was -- an entirely different mechanism from the unfreeze-rewrap bug the guard was
-    built for, caught by the same guard. So every rank pays the toggle; only rank 0 pays the clone
-    and the write.
+    `write = False` runs the eval/train toggle but skips the clone and disk write -- correctness,
+    not an optimisation: the float32 toggle round trip is not bit-exact, so every rank must pay
+    it (only rank 0 writes) or rank 0's weights drift, which `check_ranks_agree` exists to catch.
     """
     state = None
     if write:
@@ -218,13 +155,12 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
         state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     eval_state = None
     # A DualOptimizer exposes eval()/train() even when its Muon half has NO averaged iterate
-    # (`muon_schedulefree = false`), in which case `model_state_eval` would be only half-averaged.
-    # `has_averaged_iterate` reports whether both halves carry an `x`; fall back to the eval/train
-    # probe for a plain AdamW-schedule-free optimizer, which is unchanged.
+    # (`muon_schedulefree = false`), in which case `model_state_eval` would be half-averaged.
+    # `has_averaged_iterate` reports whether both halves carry an `x`.
     averaged = getattr(optimizer, 'has_averaged_iterate',
                        hasattr(optimizer, 'eval') and hasattr(optimizer, 'train'))
     if averaged:
-        optimizer.eval()                    # UNCONDITIONAL -- see the `write` paragraph above
+        optimizer.eval()                    # UNCONDITIONAL -- every rank pays the toggle
         if write:
             eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         optimizer.train()                   # UNCONDITIONAL, same reason
@@ -244,9 +180,8 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
              model_overrides: dict | None = None):
     """(model, config, registry, checkpoint_path) from a run folder. Nothing else is needed.
 
-    `model_overrides` patches `[model]` before the model is built, and exists for exactly one
-    situation: a run folder written before a key existed cannot say what it trained with, so the
-    caller has to. It is echoed loudly because it is a claim about weights nobody recorded.
+    `model_overrides` patches `[model]` before build, for a run folder written before a key
+    existed; it is echoed loudly because it is an assertion about weights nobody recorded.
     """
     run = Path(run)
     with open(run / 'config.toml', 'rb') as f:
@@ -283,44 +218,22 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
                base_names: tuple[str, ...] | None = None) -> set[str]:
     """Load the base tracker into a pose model. Returns the names of the params left fresh.
 
-    Two things happen that a plain `load_state_dict` would get wrong:
-
-    1. **The base's migrations run first.** `_convert_cross_attn` handles the old fused
-       `nn.MultiheadAttention` layout, `_interp_res_params` interpolates the resolution-coupled
-       tensors if `image_size` changed.
-    2. **Everything dropped is named.** `strict=False` silently discards; a base checkpoint from
-       the abandoned memory branch would quietly lose its `memory_*` subtrees, and a keypoint
-       table sized for a different registry would quietly reset. Both are printed.
-
-    `WideQueryEncoder` inherits no fusion behaviour to preserve -- 512-dim where the base is 256,
-    sharing only the patch CNN -- so its gate is left fresh and most of `query_encoder.*` finds no
-    home, which `_report` names and which is expected.
+    Base migrations run first and every `strict=False` drop is named. A GROWN REGISTRY KEEPS ITS
+    ROWS: the checkpoint's (n0, d) identity table is copied into the first n0 rows of this
+    model's (n, d) one -- refused if `base_names`'s length does not match n0, because a
+    mis-applied copy points each row at a different body part.
     """
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
 
     state = _convert_cross_attn(state, model)
-    # Returns (dict, BOOL) -- not a key list, and the flag is set by ANY shape mismatch, including
-    # the many that fall through every interpolation branch untouched. `len()` on it was a latent
-    # crash that only fires when something mismatches, which `wide` does across most of
-    # `query_encoder.*` by construction.
+    # Returns (dict, BOOL); `interpolated` is the flag, not a key list.
     state, interpolated = _interp_res_params(state, model)
     if interpolated and verbose:
         print('warm start: resolution-coupled tensors checked; see any res-interp lines above')
 
-    # A GROWN REGISTRY KEEPS ITS ROWS. `Registry.build(base=)` only ever APPENDS -- it raises if
-    # any dataset's ids move -- so the checkpoint's (n0, d) keypoint identity table is exactly the
-    # first n0 rows of this model's (n, d) one. `_filter_shape_mismatch` below drops any tensor
-    # whose shape changed WHOLE, so adding one dataset sent every trained identity row back to
-    # `normal_(std=0.02)` and retrained it at `kpt_lr`. That is the one workflow the registry file
-    # exists for, and it is camouflaged: under `wide` most of `query_encoder.*` is EXPECTED to be
-    # dropped, so the report line looks normal.
-    #
-    # `base_names` is the registry this run appended to. If its length is not n0 then the table in
-    # front of us is not that registry's -- a checkpoint from somewhere else, or a registry the
-    # caller resolved differently -- and the copy is REFUSED rather than guessed, because a
-    # mis-applied row copy points each embedding row at a different body part, which is worse than
-    # the reset it is fixing.
+    # A GROWN REGISTRY KEEPS ITS ROWS: the checkpoint's (n0, d) identity table is exactly the
+    # first n0 rows of this model's (n, d) one (see the docstring for the refusal rule).
     msd = model.state_dict()
     for k, v in list(state.items()):
         if not k.endswith('kpt_embed.weight') or k not in msd:

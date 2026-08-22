@@ -1,18 +1,4 @@
-"""Read, write and validate the `tailcycle-dataset` format.
-
-`docs/annotation_format.md` is the spec; this module implements it. When the two disagree, the
-document wins.
-
-The read path turns tidy-long parquet into dense arrays ONCE per group, in whatever process calls
-it, so forked dataloader workers share the pages copy-on-write. `status` is the visibility
-channel and is dictionary-encoded in parquet, which means "is this point visible" is an int8
-compare on the dictionary codes rather than a string comparison -- the reason the format uses
-parquet at all.
-
-Camera geometry is aniposelib's job -- `Rig` wraps a `CameraGroup` and adds only the two facts
-aniposelib has no field for (`offset`, `moving`). calibration.toml is aniposelib's own layout, so
-anipose can read it directly.
-"""
+"""Read, write and validate the `tailcycle-dataset` format; `docs/annotation_format.md` is the spec."""
 from __future__ import annotations
 
 import tomllib
@@ -24,19 +10,16 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Visibility codes, shared by points3d and keypoints. -1 doubles as "no row".
-# PROJECTED is a position with NO visibility claim: the annotator placed the point in this view
-# but never judged whether it was actually seen there. Consumers must not train visibility on it.
+# Visibility codes, shared by both label tables. -1 doubles as "no row".
+# PROJECTED: a position with no visibility claim -- never train visibility on it.
 UNLABELED, MISSING, VISIBLE, PROJECTED = -1, 0, 1, 2
 # The statuses that carry coordinates.
 POSITIONED = (VISIBLE, PROJECTED)
 # Instance codes. -1 doubles as "no row" == no determination.
 INST_NONE, INST_ABSENT, INST_PRESENT, INST_LABELED = -1, 0, 1, 2
 
-# Region codes, for the `regions.pq` table. A region is a statement about PIXELS, not about an
-# animal, which is why it cannot ride in `instances.pq`: that table is keyed by `animal_id`, and
-# its `present` status is an IGNORE region -- the opposite polarity to "this area is fully
-# labelled, so absence of a label here IS evidence of absence".
+# Region codes, for `regions.pq`. A region certifies a pixel area as fully labelled, so
+# absence of a label inside it IS evidence of absence -- opposite polarity to `instances.pq`.
 REGION_COMPLETE = 0
 
 KPT_STATUS = {'unlabeled': UNLABELED, 'missing': MISSING, 'visible': VISIBLE,
@@ -46,10 +29,8 @@ REGION_STATUS = {'labelled_complete': REGION_COMPLETE}
 IMAGE_EXTS = ('.png', '.jpg')
 VIDEO_EXTS = ('.mp4', '.avi')
 SPLITS = ('train', 'val', 'test')
-# session.toml `labels` (§4, decision 6): who produced the labels. Closed vocabulary, so a typo is
-# a FormatError rather than a silent third category. Exposed on Session as `label_source`, NOT as
-# `labels` -- `Session.labels(gid)` is the method that returns a group's label arrays, and a
-# dataclass field of that name would shadow it on every instance.
+# session.toml `labels`: who produced the labels. Closed vocabulary, so a typo is a FormatError;
+# exposed on Session as `label_source` so as not to shadow the `Session.labels()` method.
 LABEL_SOURCES = ('annotated', 'tracked')
 
 
@@ -62,9 +43,8 @@ class FormatError(Exception):
 def nominal_camera(name: str, size, dist=None):
     """An aniposelib Camera for an uncalibrated single view (a 2D session).
 
-    Focal length max(W, H) so normalised coords land in ~[-0.5, 0.5]; the value is irrelevant
-    because posetail's intrinsic embedding uses its missing-intrinsic token. `set_size` must be
-    the real image so `p2d / size` is pixel-normalised.
+    Focal length max(W, H) so normalised coords land in ~[-0.5, 0.5]; `set_size` must be the real
+    image so `p2d / size` is pixel-normalised.
     """
     from aniposelib.cameras import Camera
 
@@ -81,18 +61,9 @@ def nominal_camera(name: str, size, dist=None):
 class Rig:
     """An aniposelib `CameraGroup` plus the three per-camera facts it does not model.
 
-    aniposelib owns the geometry -- intrinsics, distortion, extrinsics, projection,
-    triangulation. This adds only what the format needs on top and aniposelib has no field for:
-
-    - `offset`: origin of the stored image inside the sensor frame. `matrix` and `distortions`
-      are in SENSOR coordinates and `size` is the image ON DISK, so projecting is "apply matrix,
-      then subtract offset" -- posetail's convention (`cube.project_cam` subtracts
-      `cam['offset']` after the intrinsic matmul; `undistort_points` adds it back).
-    - `moving`: whether per-frame extrinsics live in `extrinsics.pq`.
-    - `calibrated`: whether the file actually carried a matrix, or `nominal_camera` invented one.
-
-    `fisheye` is aniposelib's own per-camera flag and is what `CameraGroup.from_dicts` keys the
-    `FisheyeCamera` subclass off, so it is not duplicated here -- `cam_type` reads it back.
+    `offset` is the stored image's origin in the sensor frame (project, then subtract offset);
+    `moving` says per-frame extrinsics live in `extrinsics.pq`; `calibrated` says whether a
+    matrix was really carried or `nominal_camera` invented one.
     """
     cgroup: object                              # aniposelib.cameras.CameraGroup
     offset: dict[str, tuple[float, float]]
@@ -126,10 +97,8 @@ class Rig:
     def posetail(self, device='cpu', moving_ext: dict | None = None) -> list[dict]:
         """posetail's camera dicts, DETACHED.
 
-        On the pytorch branch aniposelib's intrinsics and extrinsics are `nn.Parameter`s, so
-        `format_camera` hands back tensors with `requires_grad=True`. Left attached, every
-        projection in the loss would build an autograd graph through the calibration and
-        gradients would flow into camera intrinsics we are not training.
+        On the torch branch aniposelib's intrinsics/extrinsics are `nn.Parameter`s; detaching stops
+        gradients flowing into calibration we are not training.
         """
         import torch
         from posetail.posetail.train_utils import format_camera
@@ -152,12 +121,10 @@ def load_calibration(path: Path) -> Rig:
 
 
 def rig_from_doc(doc: dict, where: str) -> Rig:
-    """`load_calibration`'s body, over an ALREADY-PARSED document.
+    """`load_calibration`'s body, over an already-parsed document.
 
-    Split out for one caller: `adopt.plan` has to fill a camera block that carries no `size` from
-    the video's own first frame (refusal 14), which means patching the document before the Rig is
-    built. Going through a temporary file to do that would be the only other way, and a temporary
-    file is a worse fact than a function.
+    Split out for one caller: `adopt.plan` patches a camera block that carries no `size` before
+    the Rig is built, and a temporary file is a worse fact than a function.
     """
     from aniposelib.cameras import CameraGroup
 
@@ -184,9 +151,8 @@ def rig_from_doc(doc: dict, where: str) -> Rig:
 def dump_calibration(path: Path, rig: Rig) -> None:
     """Write calibration.toml: aniposelib's own dicts plus `offset` / `moving`.
 
-    `fisheye` comes from aniposelib's `get_dict`; an uncalibrated camera writes only what it
-    really knows (name, size, offset) so that reading it back rebuilds the nominal camera rather
-    than resurrecting an invented matrix as if it were a calibration.
+    An uncalibrated camera writes only what it knows (name, size, offset), so reading it back
+    rebuilds the nominal camera rather than resurrecting an invented matrix as a calibration.
     """
     import toml
 
@@ -218,10 +184,8 @@ def _remap(codes: np.ndarray, values: list[str], vocab: dict[str, int],
            what: str, where: str, sel: np.ndarray | None = None) -> np.ndarray:
     """Translate dictionary codes into `vocab` indices, restricted to `sel` rows.
 
-    The restriction matters: a parquet dictionary is per FILE, not per group, so a session whose
-    groups hold different numbers of animals has `animal_id` values in the dictionary that the
-    group being read has never heard of. Validating the whole dictionary rejected every
-    branson-fly session, where the fly count varies 5..10 between trials.
+    A parquet dictionary is per FILE, not per group, so values other groups use must not be
+    validated here.
     """
     lut = np.array([vocab.get(v, -1) for v in values], dtype=np.int32)
     codes = codes if sel is None else codes[sel]
@@ -240,19 +204,15 @@ def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
 
 
 def _arrow(rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> pa.Table:
-    """One chunk of tidy-long rows as an arrow table. THE definition of "how a row becomes parquet".
-
-    Non-finite floats become NULL, not NaN. The spec says a `missing` row's `x,y` are empty, and a
-    null is what "empty" means in parquet -- it costs a validity bit instead of four bytes, and any
-    other reader sees the absence rather than a sentinel it has to know about.
+    """One chunk of tidy-long rows as an arrow table. Non-finite floats become NULL, which is
+    what "empty" means in parquet for a `missing` row's x,y.
     """
     arrays, names = [], []
     for name, values in rows.items():
         values = np.asarray(values) if not isinstance(values, list) else values
         if isinstance(values, np.ndarray) and values.dtype == object and values.size == 0:
-            # An empty object array infers pyarrow's `null` type, and a dictionary of nulls is not
-            # the schema any reader expects. Only a zero-row table gets here -- an empty
-            # regions.pq, which is a meaningful thing to write (§9b).
+            # An empty object array infers pyarrow's `null` type; only a zero-row table gets
+            # here (an empty regions.pq, which is meaningful).
             arr = pa.array([], pa.string())
         elif isinstance(values, np.ndarray) and values.dtype.kind == 'f':
             arr = pa.array(values, mask=~np.isfinite(values))
@@ -266,23 +226,10 @@ def _arrow(rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> pa.Table:
 
 
 class TableWriter:
-    """A tidy-long table written in CHUNKS, so a producer need never hold the whole thing.
+    """A tidy-long table written in chunks, so a producer need never hold the whole thing.
 
-    `write_table` below is this with one chunk, and every converter still calls that -- a converter
-    has its rows in memory anyway. What needs chunks is INFERENCE: a prediction over a 720,000-frame
-    clip is tens of millions of rows and the whole point of the streaming loop is that no array is
-    proportional to the clip.
-
-    **THE DICTIONARY COLUMNS FIX THEIR SCHEMA ON THE FIRST CHUNK, and that is not a detail.**
-    `format._codes` reads `DICT_COLS` back as a `DictionaryArray`, so they must be written as
-    `dictionary<int32, string>` -- a plain string column with parquet's `use_dictionary=True` has
-    the same bytes on disk but round-trips as plain strings, and every reader in this file would
-    break. Later chunks are CAST to the first chunk's schema; pyarrow unifies the per-chunk
-    dictionaries itself.
-
-    ROWS ARE BUFFERED to `chunk_rows` before a row group is emitted. Writing one row group per
-    call would give a long clip tens of thousands of tiny row groups -- metadata bloat, and a file
-    no reader can scan efficiently -- because a block at a tight budget can be a few dozen rows.
+    Dictionary columns fix their schema on the FIRST chunk (readers here expect `DictionaryArray`),
+    and rows buffer to `chunk_rows` so a long clip does not produce thousands of tiny row groups.
     """
 
     def __init__(self, path: Path, dict_cols: tuple[str, ...] = (), chunk_rows: int = 250_000):
@@ -350,10 +297,8 @@ class Labels:
     boxes: np.ndarray | None         # (S,T,C,4) float32
     instance: np.ndarray | None      # (S,T,C) int8
     ext: np.ndarray | None = None    # (C,T,4,4) float64, only when a camera is moving
-    # (M,6) float64 [frame, camera, x0, y0, x1, y1]. None IFF the session has no regions.pq, which
-    # claims exhaustive labelling; an empty (0,6) says the file exists and certifies nothing in
-    # this group. Collapsing the two reads an uncertified group as fully labelled -- the exact
-    # inversion the table exists to prevent (§9b).
+    # (M,6) float64 [frame, camera, x0, y0, x1, y1]. None IFF the session has no regions.pq
+    # (its absence claims exhaustive labelling); an empty (0,6) says the file certifies nothing.
     regions: np.ndarray | None = None
 
     @property
@@ -464,14 +409,8 @@ class Group:
     def source(self, cam: str) -> tuple[str, Path, str]:
         """('frames', dir, ext) or ('video', file, '') for one camera. Cached.
 
-        `pixels` costs three stats and the extension needs one more, and neither answer changes
-        during a run -- but the loader asks once per camera per item, so both were being paid
-        168 times per allen-mouse window.
-
-        The extension is all a caller needs to compute any frame's path: §12 of the spec
-        guarantees an image dir holds exactly `%06d.<ext>` contiguous from `000000` with one
-        extension per directory, and `validate_session` enforces it. Listing the directory
-        instead cost 0.90 s of a 1.06 s rat-city item, whose `cam0` holds 57,594 entries.
+        The extension is all a caller needs: spec \u00a712 guarantees `%06d.<ext>` contiguous from
+        000000 with one extension per directory.
         """
         if cam not in self._src:
             kind, p = self.pixels(cam)
@@ -547,18 +486,9 @@ class Session:
     def has_visibility_assessment(self) -> bool:
         """Whether `keypoints.pq` ever records a real occlusion judgement (`status == missing`).
 
-        A `tracked` session whose table is 100% `visible` recorded no negative at all: calms21's
-        MARS pipeline emits all 7 keypoints unconditionally (`[provenance].visibility` already
-        disclaims it as not an assessment), and rat-city-tracked and branson-fly are the same
-        shape. The per-window NaN-masking that handles an all-`projected` session (dataset.py)
-        cannot catch this case the same way -- every row here IS `visible`, i.e. finite, not NaN
-        -- so the loader gates on this SESSION-LEVEL fact instead: no `missing` row anywhere in
-        the table means no assessment happened anywhere in it, and the visibility target must be
-        withheld rather than trained as "always visible" from labels nobody wrote as a judgement.
-
-        An `annotated` session is exempt even at zero `missing` rows -- a hand-labelled root with
-        no occluded points on record is still an assessment, just one with no negatives (yet).
-        The gate only fires on `labels == "tracked"`.
+        A `tracked` session whose table is 100% `visible` recorded no negative anywhere, so the
+        visibility target must be withheld rather than trained as "always visible"; `annotated`
+        sessions are exempt even at zero `missing` rows.
         """
         if self.label_source != 'tracked':
             return True
@@ -643,9 +573,8 @@ class Session:
     def preload(self) -> None:
         """Scatter every group now and drop the parquet tables.
 
-        Call this in the PARENT process before forking dataloader workers: the dense arrays are
-        then shared copy-on-write, where lazy per-worker scattering would give 12 workers their
-        own copy of a 44 MB table apiece.
+        Call in the PARENT process before forking dataloader workers: the dense arrays are then
+        shared copy-on-write instead of each worker scattering its own copy.
         """
         for gid in self.groups:
             self.labels(gid)
@@ -654,18 +583,10 @@ class Session:
     def cgroup(self, gid: str, frames=None) -> list[dict]:
         """posetail cameras for a group, carrying per-frame extrinsics where a camera moves.
 
-        THE one place a camera group is built. There were five, and four of them silently dropped
-        `moving_ext` and used the static extrinsic instead.
-
-        `frames`:
-          - None       -> the whole group; a moving camera's `ext` is (T,4,4)
-          - a sequence -> (T_win,4,4) aligned to that window
-          - an INT     -> static (4,4) cameras at that one frame
-
-        The int form is what the per-frame consumers need. `project_cam` aligns a (T,4,4)
-        extrinsic against axis -3 of the points (cube.py:95-99), and cross-view association and
-        the box loader pass (S,K,3) whose axis -3 is the ANIMAL, not time -- so handing them a
-        (T,4,4) camera silently projects animal `i` through frame `i`'s pose.
+        The one place a camera group is built. `frames`: None -> whole group (moving `ext` is
+        (T,4,4)); a sequence -> (T_win,4,4) aligned to that window; an INT -> static (4,4) at one
+        frame. Per-frame consumers need the int form: `project_cam` aligns `ext` against axis -3,
+        which is the ANIMAL for box-loader callers, not time.
         """
         if not any(self.rig.moving.values()):
             return self.rig.posetail()
@@ -673,10 +594,8 @@ class Session:
         import torch
         ext = self.labels(gid).ext                      # (C,T,4,4), coverage already checked
         sel = slice(None) if frames is None else frames
-        # EVERY camera gets the per-frame form, not just the moving ones. `_decode_from_scene`
-        # stacks `cam['ext']` across cameras (tracker_encoder.py:623), so a mixed rig with one
-        # (T,4,4) and two (4,4) cameras is a stack error. `labels()` already back-fills a static
-        # camera's rows with its own constant pose, so this is the same geometry either way.
+        # Every camera gets the per-frame form, not just the moving ones: `_decode_from_scene`
+        # stacks `cam['ext']` across cameras, so a mixed rig is a stack error.
         moving_ext = {n: torch.as_tensor(ext[i][sel], dtype=torch.float)
                       for i, n in enumerate(self.cam_names)}
         return self.rig.posetail(moving_ext=moving_ext)
@@ -741,10 +660,9 @@ class Session:
         ext = None
         moving = [n for n in self.rig.names if self.rig.moving[n]]
         if moving:
-            # A gap here is NOT benign: the array is pre-filled with eye(4), which is a
-            # perfectly valid-looking extrinsic that puts the camera at the world origin. So the
-            # coverage is checked HERE rather than only in validate_session -- every consumer
-            # goes through labels(), and validation is opt-in.
+            # A gap here is NOT benign: the array is pre-filled with eye(4), a valid-looking
+            # extrinsic at the world origin -- so coverage is checked here, not only in
+            # validate_session, since every consumer goes through labels().
             tab = t['extrinsics']
             gvals = _codes(tab, 'group_id')[1] if tab is not None else []
             if tab is None or gid not in gvals:
@@ -789,14 +707,9 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
                   assoc_res_max_px: float | None = None) -> None:
     """Write session.toml, calibration.toml and the label tables. Pixels are the caller's job.
 
-    `labels` maps group_id -> dense arrays in exactly the layout `Session.labels` returns; a row
-    is emitted only where the status array says a determination was made, which is what makes
-    sparse hand annotation and dense tracking the same code path.
-
-    `label_source` is written as the `labels` KEY of session.toml -- the two names differ because
-    this function's `labels` argument is already the label tables. It is required and not
-    defaulted on purpose: a converter has to state whether a human or a machine produced these
-    points, and a default would let the next converter quietly inherit someone else's answer.
+    A row is emitted only where a status says a determination was made, so sparse hand
+    annotation and dense tracking are the same code path. `label_source` becomes the `labels`
+    key of session.toml and is required, not defaulted.
     """
     import toml
 
@@ -842,13 +755,11 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
         'extrinsics': {c: [] for c in ('group_id', 'frame', 'camera', 'ext')},
     }
     # A session that certifies nothing anywhere still writes an EMPTY regions.pq if any group
-    # said `regions is not None` -- the file's absence is the claim "exhaustively labelled" (§9b),
-    # so the row count cannot be what decides whether it exists.
+    # said `regions is not None` -- absence of the file is the claim of exhaustive labelling.
     emit_regions = any(lab is not None and lab.regions is not None for lab in labels.values())
-    # A session with no labelled row anywhere (an inference-only clip built on `empty_labels`)
-    # writes zero rows into the mode's own table -- but rule 6 requires that table to EXIST, so
-    # the empty-file-is-a-claim precedent above applies here too, keyed on the array being
-    # PRESENT rather than on any row being labelled.
+    # A session with no labelled row anywhere still writes the mode's own table: rule 6 requires
+    # it to EXIST, so the empty-file-is-a-claim rule applies here too, keyed on the array being
+    # present rather than on any row being labelled.
     emit_points3d = any(lab is not None and lab.vis3d is not None for lab in labels.values())
     emit_keypoints = any(lab is not None and lab.vis2d is not None for lab in labels.values())
 
@@ -923,18 +834,10 @@ def video_group(group_id: str, n_frames: int, sources: dict[str, Path], *,
                 fps: float = float('nan'), **kw) -> Group:
     """A Group whose pixels are NAMED FILES rather than a `groups/<gid>/` directory.
 
-    `Group.source` is the ONLY thing `dataset.read_frames` calls, and it is a cache over `_src`.
-    Pre-filling `_src` therefore virtualises the pixels completely: `pixels()` is not called,
-    `dir` is not dereferenced, and `session.path` is never read. Everything below that
-    (`_read_video`, `_reader`, `_ReaderCache`, `FrameStore`) already works off a bare path string
-    plus `group.session.rig`, both of which are in-memory facts.
-
-    EVERY camera of the group must be present. A missing key falls through to `pixels()` and
-    raises against a directory that does not exist -- loud, but for the wrong reason, which is why
-    `adopt.plan`'s refusal 4 exists rather than leaving it to fail here.
-
-    A function and not "the caller pokes `_src`": `_src` is a cache field in another module, and a
-    caller reaching into it is exactly the coupling that breaks silently on a refactor.
+    Pre-filling `_src` virtualises the pixels: `Group.source` is the only entry point
+    `dataset.read_frames` calls, so `pixels()`, `dir` and `session.path` are never reached.
+    Every camera must be present (a missing key falls through to `pixels()` and raises for the
+    wrong reason, which `adopt.plan` catches earlier). A function, not "the caller pokes `_src`".
     """
     g = Group(group_id=str(group_id), n_frames=int(n_frames), fps=float(fps), **kw)
     g._src = {str(cam): ('video', Path(p), '') for cam, p in sources.items()}
@@ -945,14 +848,9 @@ def video_group(group_id: str, n_frames: int, sources: dict[str, Path], *,
 class VideoSession(Session):
     """A Session with no directory: pixels are named videos, and there are no label tables.
 
-    `path` IS A LABEL, NOT A LOCATION. It exists so `session_id` and error messages read sensibly;
-    nothing may be read from it, which is why `_table` is overridden to return None rather than
-    merely expected to miss. Without that override a session whose `path` happened to collide with
-    a real directory would silently adopt its parquet.
-
-    `labels` is overridden rather than pre-seeded into `_label_cache` because `preload()` does
-    `self.__dict__.pop('_tables', None)` -- anything that reads a `cached_property` after that
-    recomputes it, and a recomputed `_tables` would go to disk. An override cannot be popped.
+    `path` is a label, not a location -- nothing may be read from it, so `_table` returns None
+    rather than silently adopting a colliding directory's parquet. `labels` is overridden rather
+    than pre-seeded because `preload()` pops `_tables`, which would recompute it to disk.
     """
     empty: dict[str, Labels] = field(default_factory=dict, repr=False, compare=False)
 
@@ -989,15 +887,9 @@ class Dataset:
     def names(self) -> list[str]:
         """The root's keypoint axis: the UNION of its sessions' names, in load order.
 
-        A session may declare the same names in a different order, or only a subset of them --
-        `allen-mouse-combined` holds 80 hand-annotated sessions in anatomical order beside a
-        tracked one in name-sorted order. Ids are handed out against THIS list and then remapped
-        per session by `Registry.ids_for`, which is what keeps a session's dense K axis (built
-        from its own `_kpt_vocab`) attached to the right embedding rows.
-
-        Order is deterministic -- `SPLITS` is a fixed tuple and `load_dataset` sorts `iterdir()`
-        -- and for a root whose sessions all agree this is exactly the first session's list, so
-        no existing registry's ids move.
+        A session may reorder or subset the root's names; ids are handed out against this list
+        and remapped per session by `Registry.ids_for`. Order is deterministic, and equals the
+        first session's list when all sessions agree, so no existing registry's ids move.
         """
         names: list[str] = []
         seen: set[str] = set()
@@ -1066,13 +958,9 @@ def load_datasets(path: Path) -> list[Dataset]:
 class Registry:
     """Global keypoint identity across one or more datasets.
 
-    A single dataset keeps its names as-is. A collection prefixes them with the dataset folder
-    name (`rat-city-nose`), which is what lets one embedding table serve every dataset at once.
-
-    Ids are append-only against a `base`: a later run that is handed an existing registry keeps
-    every old id, so the learned embedding rows behind them survive warm start. That is the whole
-    reason this is a file in the run folder and not something recomputed from a directory
-    listing.
+    A collection prefixes names with the dataset folder name so one embedding table serves every
+    dataset. Ids are append-only against a `base`: a later run keeps every old id, and the
+    learned embedding rows behind them survive warm start.
     """
     names: tuple[str, ...]
     datasets: tuple[tuple[str, tuple[int, ...]], ...]
@@ -1097,12 +985,9 @@ class Registry:
     def ids_for(self, dataset: str, names) -> np.ndarray:
         """Global ids ALIGNED TO `names` -- the keypoint axis the caller actually holds.
 
-        `names` is required and not defaulted. A per-dataset id vector applied to a session that
-        declares the same names in a different order is a silent relabel: the session scatters
-        its rows through its own `_kpt_vocab`, so `nose` coordinates would train the `L-ear`
-        embedding row and nothing downstream would notice (gotcha #4). A session may carry any
-        SUBSET of the dataset's names, in any order; a name the dataset does not have is an
-        error, loudly.
+        `names` is required, not defaulted: a per-dataset id vector applied to a session that
+        declares the same names in a different order is a silent relabel. A session may use any
+        SUBSET, in any order; an unknown name is an error, loudly.
         """
         ids = self.ids_for_dataset(dataset)
         local = self.local_names(dataset)
@@ -1172,8 +1057,8 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         for n in pair:
             if n not in known:
                 bad(2, f'skeleton/flip_pairs names unknown keypoint {n!r}')
-    # each pair is listed ONCE; the involution is the symmetric closure, so the only way to
-    # break it is to name the same keypoint in two pairs with different partners.
+    # Each pair is listed once; the involution is the symmetric closure, so the only way to
+    # break it is to name a keypoint in two pairs with different partners.
     flip: dict[str, str] = {}
     for a, b in sess.flip_pairs:
         for x, y in ((a, b), (b, a)):
@@ -1254,10 +1139,9 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
             bad(15, f'regions.pq has {int(empty.sum())} empty rectangle(s) (x1<=x0 or y1<=y0); a '
                     f'certificate covering nothing is a converter bug, not a no-op')
 
-    # 13. extrinsics only for cameras declared moving, and EVERY frame of every moving camera.
-    # A missing frame is not a gap: labels() pre-fills eye(4), so it reads as a real pose at the
-    # world origin. Reported here as well as raised in labels() so a bulk validate lists every
-    # bad session instead of stopping at the first.
+    # 13. extrinsics only for cameras declared moving, and EVERY frame of every moving camera:
+    # a missing frame reads as a real pose at the world origin (eye(4) pre-fill). Reported here
+    # as well as raised in labels() so a bulk validate lists every bad session.
     te = sess._tables['extrinsics']
     moving = {n for n in sess.cam_names if sess.rig.moving[n]}
     if te is not None and len(te):
@@ -1323,9 +1207,8 @@ def validate_dataset(ds: Dataset, check_images: bool = True) -> list[str]:
     sessions = ds.all_sessions()
     if not sessions:
         return [f'{ds.root}: no sessions']
-    # 3. cross-session agreement on names. A WARNING, not an error: `Registry.ids_for` resolves a
-    # session's axis BY NAME, so a reordering or a subset is handled rather than mislabelled. It
-    # is still worth saying out loud -- a "missing" keypoint is usually a typo, not a decision.
+    # 3. cross-session agreement on names. A WARNING, not an error: `Registry.ids_for` resolves
+    # a session's axis BY NAME, but a "missing" keypoint is usually a typo, not a decision.
     axis = ds.names
     for s in sessions:
         if s.names == axis:

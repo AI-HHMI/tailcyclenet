@@ -1,15 +1,9 @@
-"""The DATA side of the box prompt (report 27): compute a per-frame animal box for the loader.
+"""The DATA side of the box prompt: compute a per-frame animal box for the loader.
 
-The box a box-prompt model consumes is the target animal's extent in the crop frame, per frame
-per camera -- a NON-position channel (it carries no per-keypoint position, only which box the
-animal occupies). `compute_box_prompt` derives it POST HOC from what the loader already produced
-(`coords`, `cgroup`), reusing THE crop rule, so there is no second copy of the rotate/crop/resize
-chain. The ENCODER side (how the box is consumed) lives in `query_encoder.py`
-(`BoxFilmEncoder` / `BoxTermEncoder`).
-
-The box floor is deliberately SMALLER than the crop rule's own `min_crop_dim`: this is an
-occupancy DESCRIPTION, not a crop target, so flooring it to the model's minimum crop size would
-make a small distant animal look as big as a close one.
+The box is the target animal's crop-frame extent -- a NON-position channel, derived post hoc from
+the loader's own outputs by reusing THE crop rule. The encoder side lives in `query_encoder.py`.
+Its floor is deliberately below the crop rule's `min_crop_dim`: it is an occupancy description,
+not a crop target.
 """
 from __future__ import annotations
 
@@ -27,11 +21,9 @@ BOX_PROMPT_FRAMES = ('all', 'first')
 def compute_box_prompt(coords: torch.Tensor, cgroup: list[dict], mode: str,
                        min_dim: int = BOX_PROMPT_MIN_DIM, pad: int = BOX_PROMPT_PAD
                        ) -> torch.Tensor:
-    """(T, C, 4) xyxy crop-pixel box around the target, one per (frame, camera). A NaN row where
-    nothing was finite that frame in that camera -- the encoder substitutes its no-box token there.
-
-    `coords`: (T,K,2) crop pixels (2D) or (T,K,3) world mm (3D, already through this window's
-    crop/resize chain). `cgroup`: this window's own cropped+resized cameras.
+    """(T, C, 4) xyxy crop-pixel box around the target, one per (frame, camera); NaN where
+    nothing was finite. `coords` is (T,K,2) crop pixels or (T,K,3) world mm through this window's
+    crop chain.
     """
     is_2d = mode == '2d'
     if is_2d:
@@ -61,8 +53,8 @@ def apply_frames_mode(box_prompt: torch.Tensor, mode: str) -> torch.Tensor:
 
 def apply_jitter(box_prompt: torch.Tensor, rng, shift_frac: float, scale_frac: float
                  ) -> torch.Tensor:
-    """Exposure-bias jitter: the DEPLOYED box comes from a detector, not from labels. ONE draw for
-    the whole window (matching `crop.jitter_box`'s per-item contract). NaN rows stay NaN."""
+    """Exposure-bias jitter: the DEPLOYED box comes from a detector, not from labels. One draw
+    for the whole window; NaN rows stay NaN."""
     if shift_frac <= 0 and scale_frac <= 0:
         return box_prompt
     s = 1.0 + float(rng.uniform(-scale_frac, scale_frac))

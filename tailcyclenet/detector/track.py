@@ -1,55 +1,22 @@
 """ONE cross-view target set. Replaces `associate` + `link_rows` on a multi-camera rig.
 
-`dev/reports/12_crossview_tracking.md` §1 names the problem: the pipeline held **three identity
-mechanisms that never talked to each other** --
-
-1. `associate()`  -- per frame, memoryless, box CENTRES only, greedy pairwise triangulation.
-2. `link_rows()`  -- per frame, Hungarian on box IoU against last-known, per camera independently.
-3. `carried[a]` in `infer.run_group` -- a real 3D POSE per row, fed to the model as a prompt and
-   never read by 1 or 2.
-
-Every artifact in RC2 and RC4 of `dev/reports/13_deployment_path.md` is a consequence of that split:
-a row that teleports because its own last-known box was matched by IoU in one camera while the
-cross-view grouping was rebuilt from scratch, an instance accepted on a two-view residual that two
-rays can always satisfy, a real animal starved of a slot because a greedy pass consumed its box.
+The old pipeline held three identity mechanisms that never talked to each other -- per-frame
+memoryless `associate()`, per-camera `link_rows()`, and the pose `carried` prompt -- and every
+artifact of the old deployment path is a consequence of that split: a row that teleports because
+its own last-known box was matched by IoU in one camera while the cross-view grouping was rebuilt
+from scratch, a real animal starved of a slot because a greedy pass consumed its box.
 
 **One state, one affinity, one Hungarian.** A TARGET is a 3D point with a slot. Each frame every
 target reprojects into every camera and is matched, per camera, against that camera's detections;
-whatever nobody claims goes to `associate` as a BIRTH, which is the one place a memoryless pairwise
-search is the right algorithm. A target that claimed two or more cameras re-triangulates; one that
-claimed fewer HOLDS its point (report 12 R2: no velocity model -- it measured as not worth it).
+whatever nobody claims goes to `associate` as a BIRTH, which is the one place a memoryless
+pairwise search is the right algorithm. A target that claimed two or more cameras re-triangulates;
+one that claimed fewer HOLDS its point (no velocity model -- measured as not worth it).
 
-Two things this buys, both measured in report 12 on the real rig:
-
-- **Coverage.** §2.1: at 15 px box jitter `associate()` leaves **17.2%** of the boxes it was offered
-  unclaimed (accuracy 0.932, boxes used 0.828) where point-to-ray target matching claims all of them
-  at accuracy 0.979. Every unclaimed box is a `miss`, and 3dpop's miss term is 0.108.
-- **A capability, not just accuracy.** §2.2: `associate()` is O(C^2) in cameras -- 222 ms/frame at
-  C = 4, **4.1 s at C = 16, 13.7 s at C = 28** -- against 0.5-0.9 ms for target matching, and
-  `max_instances` does not bound it because the whole candidate list is built before the greedy loop
-  can break. johnson-mouse is a 16-camera rig; any multi-animal 16-camera rig is unrunnable today.
-  Births still pay O(C^2), but only over the boxes nothing claimed, which after the first frame is
-  nearly none.
-
-**THE AFFINITY IS IN PIXELS, over the detection's own box side**, and that is a deliberate
-simplification of report 12 eq 4's world-space point-to-ray distance. The two are the same test --
-a point-to-ray distance is its reprojection error times depth over focal length -- but the pixel form
-needs no `alpha_3d` normalisation constant, and dividing by the box side puts it in ANIMAL-SIZE units
-for free, so one gate serves a 30 px fly and a 250 px rat. It is also the same gate, in the same
-units, that `link_rows` uses, rather than a second threshold with its own calibration.
-
-Not here, deliberately:
-
-- **R3** (association inside the window loop, consuming `carried`) and **R5-proper** (the
-  keypoint-in-box term of eq 2) both need the POSE, which does not exist inside `detect_group` --
-  that pass finishes before any pose is computed. They are a structural change to `run_group`, and
-  they were also unsafe before `--carry-source triangulate`, because report 12 R3 assumes `carried`
-  does not accumulate error and RC1 shows it did. Next stage.
-- **R6** (a camera with no box contributes its last box at a decayed weight) is SUBSUMED: what
-  persists here is the target's 3D point, which reprojects into every camera whether or not that
-  camera saw anything, so there is no per-camera dropout to decay.
-- Appearance features, velocity, cross-track arbitration. Report 12 §2.3, §4, and report 11's
-  `fp_none` ~ 10x `fp_dup` on 3dpop.
+**THE AFFINITY IS IN PIXELS, over the detection's own box side**, a deliberate simplification of
+world-space point-to-ray distance: a point-to-ray distance is its reprojection error times depth
+over focal length, but the pixel form needs no `alpha_3d` normalisation constant, and dividing by
+the box side puts it in ANIMAL-SIZE units for free, so one gate serves a 30 px fly and a 250 px
+rat. It is also the same gate, in the same units, that `link_rows` uses.
 """
 from __future__ import annotations
 
@@ -76,7 +43,7 @@ class CrossViewTracker:
     """Stateful across frames. One instance per group; `step` once per frame, in order.
 
     `max_move` is in box sides, exactly as in `link_rows`: real consecutive-frame box-centre
-    displacement is p90 0.06-0.11 body lengths on all three shipped multi-animal roots, so one full
+    displacement is p90 0.06-0.11 body lengths on the shipped multi-animal roots, so one full
     side has 10-16x headroom and rejects essentially nothing legitimate.
     """
 
@@ -135,17 +102,16 @@ class CrossViewTracker:
             d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)  # (n_t,n_det)
             # THE DETECTION'S OWN SIDE, not the mean of it and the target's last claimed side.
             # `link_rows` uses the mean and making these two consistent was TRIED AND MEASURED
-            # WORSE: +1.71 mm MPJPE [+0.27, +3.15] and -0.038 MOTA [-0.070, -0.006], paired over
-            # 131,887 points on the two ten-bird clips. The paths are not analogous -- `link_rows`
-            # averages two boxes seen in the SAME frame, while a target's remembered side is
-            # carried forward, so one oversized box gives it an oversized gate for life. Box slots
-            # filled RISE (0.7605 -> 0.8075) while pose coverage FALLS: the extra boxes are wrong.
+            # WORSE: +1.71 mm MPJPE and -0.038 MOTA, paired over 131,887 points on the two
+            # ten-bird clips. The paths are not analogous -- `link_rows` averages two boxes seen in
+            # the SAME frame, while a target's remembered side is carried forward, so one oversized
+            # box gives it an oversized gate for life. Box slots filled RISE while pose coverage
+            # FALLS: the extra boxes are wrong.
             side = sides[c][None].clamp_min(1e-6)
             gap = (d / (self.max_move * side)).numpy()
             # THE GATE IS THE ALGORITHM, not a tie-break. A pair beyond one box side is not the same
             # animal, so it must be unavailable to Hungarian rather than merely expensive -- an
-            # optimum over an all-bad cost matrix is an arbitrary permutation, which is exactly how
-            # `link_rows` used to swap two animals that never touched.
+            # optimum over an all-bad cost matrix is an arbitrary permutation.
             # A NaN BOX IS UNAVAILABLE, NOT UNRANKABLE. `unletterbox_boxes` returns NaN for a box
             # with no area, which makes `gap` NaN, which `clip` leaves NaN -- and `affinity.any()`
             # is True for NaN, so `linear_sum_assignment` raised `matrix contains invalid numeric
@@ -167,12 +133,12 @@ class CrossViewTracker:
                 new = _triangulate(cgroup, cams, p)
                 if bool(torch.isfinite(new).all()):
                     self.targets[s]['point'] = new
-                # AND THE KEYPOINT SET, TRIANGULATED THE SAME WAY, so the cues have a 3D thing to
+                # THE KEYPOINT SET, TRIANGULATED THE SAME WAY, so the cues have a 3D thing to
                 # reproject rather than one camera's 2D opinion. HELD, not cleared, when a frame
-                # fails to produce one: the same rule the point follows (report 12 R2 -- no velocity
-                # model), and a shape is a slower-changing quantity than a position, so a held set is
-                # a better prior than none. Only keypoints valid in EVERY claimed camera can be
-                # triangulated, which is why this is per keypoint rather than all-or-nothing.
+                # fails to produce one: the same rule the point follows (no velocity model), and a
+                # shape is a slower-changing quantity than a position. Only keypoints valid in
+                # EVERY claimed camera can be triangulated, which is why this is per keypoint
+                # rather than all-or-nothing.
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
@@ -183,11 +149,10 @@ class CrossViewTracker:
             # SO A TARGET CLAIMING EXACTLY ONE CAMERA NEVER EXPIRES AND NEVER UPDATES ITS 3D POINT,
             # since `len(cams) >= 2` above never fires. That reads like a bug and a second counter
             # retiring it on frames-since-re-triangulation was TRIED AND MEASURED WORSE: +2.72 mm
-            # MPJPE [+0.51, +4.94], miss +0.021, `fp_none` +0.022, paired over 132,006 points on
-            # the same clips. The frozen point costs nothing, because `out[s, c]` below is written
-            # from the CLAIMED DETECTION and never from the reprojection -- so a one-camera target
-            # is still emitting a real box for a real animal, and expiring it hands its slot to a
-            # spurious birth (the slot starvation in dev/reports/12). Leave it immortal.
+            # MPJPE and miss +0.021, paired over 132,006 points on the same clips. The frozen point
+            # costs nothing, because `out[s, c]` below is written from the CLAIMED DETECTION and
+            # never from the reprojection -- so a one-camera target is still emitting a real box for
+            # a real animal, and expiring it hands its slot to a spurious birth. Leave it immortal.
             self.targets[s]['age'] = 0 if got[s] else self.targets[s]['age'] + 1
 
         # -- births: whatever nobody claimed, through the memoryless pairwise search --------

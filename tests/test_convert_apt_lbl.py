@@ -42,11 +42,7 @@ def test_p_is_x_then_y_and_one_based(cv):
 
 
 def test_interleaved_reshape_would_be_caught(cv):
-    """The interleaved (npts, 2) reading gives different points -- the axis order is load-bearing.
-
-    Both readings produce plausible coordinates, which is why this is asserted on values. On the
-    real project the interleaved one puts 28.25% of points outside the frame against 0.01%.
-    """
+    """Both readings produce plausible coordinates, so the axis order is asserted on values."""
     e = _entry([[10], [20], [30], [40], [50], [60], [70], [80]], [1], [1])
     _, _, xy = cv.movie_labels(e)
     interleaved = np.asarray(e.p, float).reshape(4, 2, 1)[..., 0] - 1.0
@@ -149,11 +145,7 @@ def test_a_rotated_roi_is_refused_not_squared(cv):
 
 
 def test_regions_stay_on_their_own_labelled_frame(cv):
-    """A context frame's ROI would certify an area whose animals live in a DIFFERENT group.
-
-    Group frame 100 covers source frames [68, 133); the ROI on source frame 120 belongs to the
-    group centered on 120, not to this one, because only that group carries frame 120's labels.
-    """
+    """A context frame's ROI would certify an area whose animals live in a DIFFERENT group."""
     job = SimpleNamespace(roi_f=np.array([100, 120]),
                           roi_rect=np.array([[1.0, 2.0, 30.0, 40.0], [0.0, 0.0, 9.0, 9.0]]))
     r, clipped = cv.group_regions(job, frame=100, start=68, wh=(4696, 2048))

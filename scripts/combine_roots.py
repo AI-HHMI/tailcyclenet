@@ -1,37 +1,13 @@
 #!/usr/bin/env python
 """Build a `-combined` dataset root: one symlink per session of each source root.
 
-    pixi run python scripts/combine_roots.py --out <base>/rat-city-combined \
-        <base>/rat-city-tracked <base>/rat-city-annotated
+    pixi run python scripts/combine_roots.py --out <base>/rat-city-combined <src>...
 
-A `-combined` root holds no pixels and no tables. It is a directory of SYMLINKS, one per source
-session, with each session's own split preserved as the parent directory -- split is a directory
-and not a column (`docs/annotation_format.md` §2.1), so a session in `<src>/val` lands in
-`<out>/val` and nothing is re-split. `allen-mouse-combined` and `johnson-mouse-combined` are
-exactly this shape, built by hand on 2026-08-10; this script reproduces it, and exists because
-"by hand" means nobody could rebuild or audit them. (Those two also silently DROP their tracked
-root's `test/` split. That is not reproduced here: every split a source carries is linked.)
-
-COLLISION RULE, and why it is computed root-wide rather than per split. Two roots may name the
-same session, and for rat-city they do: `cohort7_20251209_1659` is one recording that the tracked
-root and the annotated root both carry. A colliding name is suffixed with its SOURCE ROOT's
-folder name on BOTH sides -- `cohort7_20251209_1659__rat-city-tracked` beside
-`cohort7_20251209_1659__rat-city-annotated` -- so no bare name survives to be read as "the"
-session, and neither source is the one that silently won. Collisions are detected over the union
-of a root's session names across ALL its splits and the rename then applies in every split,
-because `rat-city-tracked` uses ONE session name in train, val and test (its splits are frame
-ranges of a single 57,594-frame recording). Renaming it only in the split where the collision
-happens would make one session look like two to anything enforcing the rule-14 leak check by
-folder name, which is the one check that name is load-bearing for.
-
-Keypoint names are verified across every source session before anything is written: a root whose
-sessions disagree on the SET of names is refused rather than built, because the combined root's
-axis is the union (`Dataset.names`) and a name that exists in one source only widens it silently.
-A pure REORDERING is legal -- `Registry.ids_for` remaps by name -- and is printed, not refused.
-
-Re-running is a no-op: a link that already points where it should is left alone. Anything else in
-the output root is refused rather than clobbered, and `--force` extends that only to symlinks --
-never to a real file or directory, and never to a whole split directory.
+Holds no pixels and no tables -- symlinks only, each session's split preserved as the parent
+directory. A colliding session name gets its source root's folder name suffixed on BOTH sides,
+detected root-wide (a session may span splits). Keypoint name sets are verified across all
+sources before anything is written. Re-running is a no-op; anything unexpected is refused unless
+`--force` (symlinks only).
 """
 from __future__ import annotations
 
@@ -76,7 +52,7 @@ def plan(roots: list[Path]) -> dict[str, dict[str, Path]]:
 
 
 def check_names(roots: list[Path]) -> list[str]:
-    """The union axis, or refuse. Gotcha 4: a keypoint-axis disagreement is invisible downstream."""
+    """The union axis, or refuse: a keypoint-axis disagreement is invisible downstream."""
     ref: tuple[Path, list[str]] | None = None
     for root in roots:
         for s in fmt.load_dataset(root).all_sessions():

@@ -1,14 +1,7 @@
 """`--videos`: raw footage plus an anipose calibration, adopted as a session IN MEMORY.
 
-Split the way the module is: the naming rule and every refusal that does not need pixels run in
-milliseconds with no video fixture at all, and the handful that genuinely need containers are
-grouped at the bottom.
-
-**THE ACCEPTANCE TEST FOR THE CONSTRUCTION IS HERE, NOT AT RUNTIME.** `validate_session` cannot
-certify a `VideoSession` -- it resolves pixels through `Group.pixels()` and reads tables off
-`path`, neither of which exists -- so `test_the_in_memory_session_matches_the_written_one` builds
-the same plan both ways and compares. The format's own validator still certifies it; it just does
-it once, in CI, instead of on every run.
+The acceptance test for the construction is here, not at runtime: `validate_session` cannot
+certify a `VideoSession`, so the in-memory session is compared against the written one once, in CI.
 """
 import argparse
 import sys
@@ -40,8 +33,7 @@ def _touch(d: Path, *names):
 
 
 def _no_probe(monkeypatch):
-    """Assert nothing decodes. Every refusal below fires above the checkpoint load AND above any
-    decode, which is what makes them testable with no video fixture."""
+    """Assert nothing decodes: every refusal fires above the checkpoint load and above any decode."""
     calls = []
 
     def boom(path):
@@ -52,7 +44,6 @@ def _no_probe(monkeypatch):
     return calls
 
 
-# ---------------------------------------------------------------------------------------------
 # the naming rule
 
 
@@ -62,14 +53,9 @@ def _no_probe(monkeypatch):
     ('cam12_trial3', r'cam([0-9]+)_', '12', 'trial3'),
     ('vid_A', r'_([A-Z])$', 'A', 'vid'),
     ('session1-camB', r'-cam([A-Z])', 'B', 'session1'),
-    # SUPERSET 1: no capture group means the WHOLE match. anipose raises IndexError here, and
-    # this is what johnson's `Cam2005325.mp4` beside a `Cam2005325` calibration entry needs --
-    # the capture-group convention would name it '2005325' and refusal 2 would fire on all 16.
-    #
-    # AND THE SEPARATOR IS NOT CONSUMED, which is the price of the superset and is anipose's own
-    # `re.sub` rule verbatim: 'cam[0-9]+' matches 'cam0' and leaves '_trial3', where
-    # 'cam([0-9]+)_' matches the underscore too and leaves 'trial3'. Both are stable group ids and
-    # neither is wrong; they are simply different, which is exactly why this asserts VALUES.
+    # SUPERSET 1: no capture group means the WHOLE match (anipose raises IndexError here --
+    # what johnson's `Cam2005325.mp4` needs). The separator is not consumed: 'cam[0-9]+' leaves
+    # '_trial3' where 'cam([0-9]+)_' leaves 'trial3' -- both stable, asserted on VALUES.
     ('cam0_trial3', r'cam[0-9]+', 'cam0', '_trial3'),
     ('cam0_trial3', r'cam[0-9]+_', 'cam0_', 'trial3'),
     ('Cam2005325', r'Cam[0-9]+', 'Cam2005325', ''),
@@ -77,15 +63,12 @@ def _no_probe(monkeypatch):
     ('anything_at_all', None, '', 'anything_at_all'),
 ])
 def test_the_anipose_naming_rule(stem, rx, cam, gid):
-    """Asserted on VALUES, both halves, not on shapes -- the `p`-column lesson from
-    `test_convert_apt_lbl.py`. Both the camera name and the group id are derived from one regex
-    and either can be silently wrong."""
+    """Both the camera name and the group id come from one regex; either can be silently wrong."""
     assert adopt.parse_name(stem, rx) == (cam, gid)
 
 
 def test_one_camera_needs_no_regex(tmp_path, monkeypatch):
-    """The 2D single-view case, which is most of the intended traffic. Demanding a regex to select
-    from a set of one is ceremony."""
+    """The 2D single-view case: demanding a regex to select from one camera is ceremony."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['cam0'], calibrated=False)
     _touch(tmp_path / 'rec', 'whatever.mp4', 'other.mp4')
@@ -96,9 +79,7 @@ def test_one_camera_needs_no_regex(tmp_path, monkeypatch):
 
 
 def test_multiple_groups_in_one_session_is_free(tmp_path, monkeypatch):
-    """A session holds one calibration, one mode and one keypoint axis, and every video in one
-    invocation shares all three by construction. Twelve trials of a four-camera rig is ONE session
-    of twelve groups, and that is the invocation this feature is for."""
+    """One invocation shares one calibration, mode and keypoint axis; twelve trials is one session."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['0', '1'])
     _touch(tmp_path / 'rec', *[f'cam{i}_{g}.mp4' for g in ('a', 'b', 'c') for i in (0, 1)])
@@ -108,14 +89,8 @@ def test_multiple_groups_in_one_session_is_free(tmp_path, monkeypatch):
 
 
 def test_the_empty_remainder_rule_is_about_disagreement(tmp_path, monkeypatch):
-    """`Cam2005325.mp4` under `Cam[0-9]+` leaves '': the whole stem IS the camera name, because a
-    raw multi-camera recording of ONE session has nothing else to put in the filename. That is the
-    shape of every raw rig dump, and an earlier "an empty group id raises" rule refused the first
-    real input this feature had.
-
-    But `cam0.mp4` beside `cam0_trial3.mp4` is a genuine ambiguity -- one of them is mis-named or
-    the regex is wrong -- and merging the bare one into a group called '' is the silent merge the
-    rule was reaching for.
+    """A raw rig dump names the whole stem as the camera; an all-empty group id is then one group.
+    But `cam0.mp4` beside `cam0_trial3.mp4` is a genuine ambiguity -- refusing the mix is the rule.
     """
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['Cam1', 'Cam2'])
@@ -131,7 +106,6 @@ def test_the_empty_remainder_rule_is_about_disagreement(tmp_path, monkeypatch):
         adopt.plan([tmp_path / 'mix'], cal, r'Cam[0-9]+')
 
 
-# ---------------------------------------------------------------------------------------------
 # refusals 1-6: pure over the filenames
 
 
@@ -145,9 +119,7 @@ def test_refusal_1_no_video_matches_the_regex(tmp_path, monkeypatch):
 
 
 def test_refusal_2_no_parsed_camera_is_in_the_calibration(tmp_path, monkeypatch):
-    """THE COLLISION THAT WILL BE THE MOST COMMON ERROR BY A WIDE MARGIN: `cam([0-9]+)_` yields
-    '0' and the calibration names it 'cam0'. The message has to say "the camera name is the
-    CAPTURE GROUP" or it reads as "no cameras matched"."""
+    """The most common error: `cam([0-9]+)_` yields '0' while the calibration names it 'cam0'."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['cam0', 'cam1'])
     _touch(tmp_path / 'rec', 'cam0_t.mp4', 'cam1_t.mp4')
@@ -161,10 +133,7 @@ def test_refusal_2_no_parsed_camera_is_in_the_calibration(tmp_path, monkeypatch)
 
 
 def test_refusal_2_some_matched_skips_rather_than_refusing(tmp_path, monkeypatch, capsys):
-    """REVISED AGAINST REAL DATA. `mouse_2_validate` ships 17 mp4s against 16 calibrated cameras:
-    a camera with video and no geometry can never join any group, so refusing the whole run is
-    wrong -- but silently dropping pixels is worse. None matched -> refuse; some -> SKIP the
-    unmatched, PRINTING each by name."""
+    """A camera with video and no geometry can never join a group: none matched -> refuse, some -> skip."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['Cam1', 'Cam2'])
     _touch(tmp_path / 'raw', 'Cam1.mp4', 'Cam2.mp4', 'Cam9.mp4')
@@ -184,9 +153,7 @@ def test_refusal_3_two_videos_on_one_group_camera(tmp_path, monkeypatch):
 
 
 def test_refusal_4_a_group_missing_a_camera(tmp_path, monkeypatch):
-    """The rig is the CALIBRATION'S, so a group with a hole would triangulate against a camera
-    whose pixels are a different recording -- and `video_group` would otherwise raise against a
-    nonexistent directory, which is loud for the wrong reason."""
+    """The rig is the calibration's: a group with a hole would triangulate against another recording."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['0', '1', '2'])
     _touch(tmp_path / 'rec', 'cam0_t.mp4', 'cam1_t.mp4', 'cam2_t.mp4', 'cam0_u.mp4',
@@ -197,8 +164,7 @@ def test_refusal_4_a_group_missing_a_camera(tmp_path, monkeypatch):
 
 
 def test_refusal_5_an_extension_nothing_can_open(tmp_path, monkeypatch):
-    """Only for an EXPLICITLY named file -- a directory expansion already filtered, so an
-    unopenable container here is something the user typed."""
+    """Only an explicitly named file: a directory expansion already filtered."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['cam0'], calibrated=False)
     _touch(tmp_path / 'rec', 'a.mkv')
@@ -210,9 +176,7 @@ def test_refusal_5_an_extension_nothing_can_open(tmp_path, monkeypatch):
 
 
 def test_refusal_6_three_d_with_an_uncalibrated_camera(tmp_path, monkeypatch):
-    """LOAD-BEARING, not a convenience: `load_calibration` silently turns a block with no `matrix`
-    into a `nominal_camera`, and with `validate_session` out of the loop nothing downstream would
-    ever say so."""
+    """`load_calibration` silently nominalises a block with no matrix; this refuses it instead."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['0', '1'], calibrated=False)
     _touch(tmp_path / 'rec', 'cam0_t.mp4', 'cam1_t.mp4')
@@ -221,9 +185,7 @@ def test_refusal_6_three_d_with_an_uncalibrated_camera(tmp_path, monkeypatch):
 
 
 def test_a_moving_rig_is_refused(tmp_path, monkeypatch):
-    """`extrinsics.pq` is per-frame geometry no filename can supply. Refused HERE rather than left
-    to fail: `labels()` is overridden on this path, so a moving camera sails past the check that
-    lives there and blows up inside `cgroup()` instead, much later and much worse."""
+    """`extrinsics.pq` is per-frame geometry no filename can supply; refuse here, not inside `cgroup()`."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['0', '1'], moving=True)
     _touch(tmp_path / 'rec', 'cam0_t.mp4', 'cam1_t.mp4')
@@ -239,8 +201,7 @@ def test_the_regex_is_required_when_the_rig_is_not_a_singleton(tmp_path, monkeyp
         adopt.plan([tmp_path / 'rec'], cal, None)
 
 
-# ---------------------------------------------------------------------------------------------
-# refusals 7-11: the flags that mean something on a labelled session and nothing here
+# refusals 7-11: flags that mean something on a labelled session and nothing here
 
 
 def _args(**kw):
@@ -258,8 +219,7 @@ def _args(**kw):
     ({'split': 'test'}, 'inert here'),
 ])
 def test_refusals_7_to_11(kw, expect, monkeypatch):
-    """Every one is pure argparse arithmetic, so it fires before the checkpoint loads AND before
-    anything decodes -- which the probe guard pins."""
+    """Pure argparse arithmetic, so each fires before the checkpoint loads or anything decodes."""
     _no_probe(monkeypatch)
     with pytest.raises(SystemExit) as e:
         adopt.check_flags(_args(**kw))
@@ -275,8 +235,7 @@ def test_the_flags_that_are_fine_pass(monkeypatch):
 
 
 def test_the_registry_entry_is_a_default_plus_a_refusal(capsys):
-    """A session with no labels still needs `names`, and there is no data to derive them from --
-    so they come from the RUN's own registry. Which entry is the open question."""
+    """A label-less session takes its keypoint names from the run's own registry; which entry is the question."""
     one = fmt.Registry(names=('a', 'b'), datasets=(('only', (0, 1)),))
     assert adopt.dataset_name(one, None) == 'only'
     assert "as 'only'" in capsys.readouterr().out
@@ -288,7 +247,6 @@ def test_the_registry_entry_is_a_default_plus_a_refusal(capsys):
         adopt.dataset_name(two, 'z')
 
 
-# ---------------------------------------------------------------------------------------------
 # provenance and the self-checking reconstruction
 
 
@@ -297,21 +255,15 @@ def _fake_probe(n=6, wh=(64, 48), fps=20.0):
 
 
 def test_the_three_source_keys_reconstruct_the_session(tmp_path):
-    """`plan()` IS PURE OVER THE FILENAMES, so calibration + regex + file list re-derives the
-    group -> camera map exactly. Recording a structure a pure function already computes is a
-    second copy that can disagree with the first -- and a per-(group, camera) key would collide
-    (group `a_b` camera `c` against group `a` camera `b_c`), which `SessionWriter` only catches
-    when the two values differ, i.e. not reliably. A flat list has no key to collide.
-
-    Round-tripped through TOML on purpose: `source_videos` is the first non-scalar provenance
-    value in this repo, and the regex is full of metacharacters that must survive quoting.
+    """`plan()` is pure over the filenames, so calibration + regex + file list re-derive the map
+    exactly; a flat list has no key to collide. Round-tripped through TOML on purpose.
     """
     import tomllib
 
     import toml
 
     cal = _calib(tmp_path, ['0', '1'])
-    # A group id WITH AN UNDERSCORE -- the composite-key collision this design refuses to risk.
+    # A group id with an underscore -- the composite-key collision this design refuses to risk.
     _touch(tmp_path / 'rec', 'cam0_a_b.mp4', 'cam1_a_b.mp4', 'cam0_c.mp4', 'cam1_c.mp4')
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
     assert sorted(p.videos) == ['a_b', 'c']
@@ -331,11 +283,8 @@ def test_the_three_source_keys_reconstruct_the_session(tmp_path):
 
 
 def test_a_renamed_video_is_caught_at_reconstruction(tmp_path):
-    """THE SELF-CHECK, and it is the reason the derived map is not stored.
-
-    A prediction is self-describing about the pixels it was made from, with no second directory to
-    go stale against it -- so a video renamed, moved or added since the run RAISES naming the
-    difference instead of rendering a prediction over the wrong pixels.
+    """The self-check: a video renamed, moved or added since the run raises instead of rendering
+    a prediction over the wrong pixels.
     """
     import toml
 
@@ -364,20 +313,16 @@ def test_a_renamed_video_is_caught_at_reconstruction(tmp_path):
     assert list(back.groups) == ['t'] and back.groups['t'].n_frames == 6
     assert back.groups['t'].source('0') == sess.groups['t'].source('0')
 
-    # (a) THE GROUPS DISAGREE -- the self-check the stored map could not do. The prediction was
-    # written over a group these videos no longer derive.
+    # (a) THE GROUPS DISAGREE -- the self-check the stored map could not do.
     with pytest.raises(fmt.FormatError, match='renamed, moved or added'):
         adopt.session_from_prediction(_pred('pred_wrong_group', ['somethingelse']))
 
-    # (b) A VIDEO MOVED. `provenance_of` records the RESOLVED file list, so the reconstruction
-    # replays exactly those paths and a missing one is refused by name rather than dropped --
-    # which is the whole reason the list is resolved and expanded before it is recorded.
+    # (b) A VIDEO MOVED: the resolved file list is replayed, so a missing one is refused by name.
     (tmp_path / 'rec' / 'cam1_t.mp4').rename(tmp_path / 'rec' / 'cam1_u.mp4')
     with pytest.raises(SystemExit, match='no such file'):
         adopt.session_from_prediction(good)
 
 
-# ---------------------------------------------------------------------------------------------
 # with pixels
 
 
@@ -390,10 +335,9 @@ def _two_cam(tmp_path, T=6, wh=(64, 48), lens=None):
 
 
 def test_frame_counts_come_from_the_decoder(tmp_path):
-    """`Group.n_frames` is a PROMISE that every index in [0, T) decodes, and `dataset._read_video`
-    fulfils it through `decord.VideoReader.get_batch`. A container-metadata count that disagrees
-    with decord's own index -- routine on a VFR or truncated file -- would turn into a hard
-    failure deep inside the window loop, after the checkpoint has loaded."""
+    """`n_frames` is a promise that every index in [0, T) decodes; a metadata count that disagrees
+    would fail deep inside the window loop, after the checkpoint has loaded.
+    """
     from decord import VideoReader
 
     from tailcyclenet.dataset import read_frames
@@ -409,8 +353,7 @@ def test_frame_counts_come_from_the_decoder(tmp_path):
 
 
 def test_length_mismatch_is_refused_and_trims_only_on_request(tmp_path, capsys):
-    """A one-frame offset is usually a dropped trigger and usually harmless; a 40,000-frame offset
-    is two different recordings sharing a group id, and both look identical to a min()."""
+    """A one-frame offset is a dropped trigger; a 40,000-frame one is two recordings sharing an id."""
     cal = _two_cam(tmp_path, lens=(6, 9))
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
     with pytest.raises(SystemExit, match='disagree on length'):
@@ -421,11 +364,7 @@ def test_length_mismatch_is_refused_and_trims_only_on_request(tmp_path, capsys):
 
 
 def test_size_mismatch_is_refused(tmp_path):
-    """`matrix` and `distortions` are in SENSOR pixels and `size` is the image on disk, so a
-    calibration made at twice the deployment resolution projects to the wrong place with no
-    symptom other than being wrong. This is the one `validate_session` rule 8 would have caught
-    for an image root and never checks for video -- not a regression, a check the format never
-    had."""
+    """Calibration at twice the deployment resolution projects to the wrong place with no symptom."""
     cal = _calib(tmp_path, ['0', '1'], wh=(64, 48))
     for i in (0, 1):
         _write_video(tmp_path / 'rec' / f'cam{i}_t.mp4', i, 6, (32, 24))
@@ -436,9 +375,7 @@ def test_size_mismatch_is_refused(tmp_path):
 
 
 def test_a_camera_block_with_no_size_is_filled_from_the_pixels(tmp_path, capsys):
-    """The one place this path may be generous: a size derived from the pixels cannot be wrong
-    about the pixels. `load_calibration` raises on such a block today, so the fill is real work
-    and it is PRINTED."""
+    """A size derived from the pixels cannot be wrong about the pixels; the fill is printed."""
     import tomllib
 
     import toml
@@ -459,14 +396,8 @@ def test_a_camera_block_with_no_size_is_filled_from_the_pixels(tmp_path, capsys)
 
 
 def test_the_in_memory_session_matches_the_written_one(tmp_path):
-    """THE REPLACEMENT FOR `validate_session` AS THE ACCEPTANCE TEST.
-
-    `validate_session` resolves pixels through `Group.pixels()` and reads tables off `path`, and a
-    `VideoSession` has neither -- so it cannot certify one at runtime. Instead: build the session
-    in memory, write the SAME plan out through `format.write_session` with the pixels symlinked,
-    and assert (a) `validate_session` on the written one returns [] under ALL rules with no
-    exemption, and (b) the two agree field for field. The format's own validator still certifies
-    the construction; it just does it once, here, instead of on every run.
+    """The replacement for `validate_session` as the acceptance test: build in memory, write the
+    same plan out with symlinked pixels, and assert the validator certifies it and the two agree.
     """
     cal = _two_cam(tmp_path, T=6)
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')

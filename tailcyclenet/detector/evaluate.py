@@ -7,10 +7,10 @@ Four choices, each of which the old in-loop `evaluate` got the generous way roun
 
 - **Greedy one-to-one matching.** `box_iou(gt, pred).max(1)` is not a matching -- in a huddle one
   well-placed box lands within IoU 0.5 of several animals and is counted for every one of them.
-- **`top_k` is the session's animal count**, what `scripts/infer.py:132` supplies at deployment,
-  never this frame's true count. The latter is an oracle.
+- **`top_k` is the session's animal count**, what deployment supplies, never this frame's true
+  count. The latter is an oracle.
 - **Mean IoU over EVERY labelled box**, zero where unmatched. Mean-over-matched rewards a
-  detector for declining the hard animals -- eval rule 6 in box form.
+  detector for declining the hard animals.
 - **False positives are counted.** Recall alone cannot see them.
 """
 from __future__ import annotations
@@ -125,13 +125,9 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     # SCORED WITHOUT AUGMENTATION, and that is a correctness fix rather than a preference.
     # `ignore_for` takes no `warp` -- unlike its two siblings `boxes_for` and `regions_for` -- so
     # under `--augment` the predictions and the GT came back warped while the `instances.pq`
-    # PRESENT boxes did not. rat-city ships 26,021 of those, so `fp_ignored` and `mota` on the
-    # train split were excusing the wrong pixels: most of the train-side FP readout, i.e. the very
-    # number the train/val gap is read from. The warp is also no longer recoverable from the item
-    # index (it is drawn fresh per visit now), so re-deriving it here is not available.
-    #
-    # Turning it off is the right answer anyway: this measures the model on the data, and the
-    # train split's number is only comparable to the val split's if both are unaugmented.
+    # PRESENT boxes did not, and the train-side FP readout excused the wrong pixels. Turning it
+    # off is the right answer anyway: this measures the model on the data, and the train split's
+    # number is only comparable to the val split's if both are unaugmented.
     aug_was = ds.augment
     ds.augment = False                      # restored at the end, like `was_training` below
     loader = torch.utils.data.DataLoader(
@@ -143,14 +139,13 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     sessions, n_want = {}, {}
     # `batch[2:]` is the keypoint target when the loader is emitting one. Scoring here is
     # box-only by design -- `n_keypoints` must not change what r@.5 means -- so it is dropped
-    # rather than unpacked, and a keypoint-trained detector stays comparable to every box-only
-    # number in reports 10-13.
+    # rather than unpacked.
     for bi, batch in enumerate(loader):
         x, gt = batch[0], batch[1]
-        # INDEXED, NOT UNPACKED. The head grew a fourth return (identity logits) and a fixed-arity
-        # unpack here crashed the whole eval at the first checkpoint -- after 2,000 iterations of
-        # training had already happened. Any future branch adds another tail element; this reads
-        # the two it needs and ignores the rest.
+        # INDEXED, NOT UNPACKED. The head grew extra returns and a fixed-arity unpack crashed the
+        # whole eval at the first checkpoint -- after 2,000 iterations of training had already
+        # happened. Any future branch adds another tail element; this reads the two it needs and
+        # ignores the rest.
         _out = model(x.to(device))
         obj, pred_boxes = _out[0], _out[1]
         for j in range(x.shape[0]):
@@ -214,18 +209,17 @@ def _labelled_frames(sess, gid):
 def _gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
     """Crop-rule box side (SOURCE px) for every labelled (animal, frame[, camera]), a POPULATION
     -- not paired to any detector row. `deployment_score` compares this against the union-box
-    side distribution the box path actually produces, unpaired, exactly the scope
-    `dev/plans/detector_accuracy.md` T0.1 settled on: pairing a detector row to a GT identity
-    needs a matcher (MOTA's), and this is meant to run before spending a GPU-hour on either half
-    of the box path, not to replace `box_mota`.
+    side distribution the box path actually produces, unpaired; pairing a detector row to a GT
+    identity needs a matcher (MOTA's), and this is meant to run before spending a GPU-hour on
+    either half of the box path, not to replace `box_mota`.
 
     2D: `points2d[:, f, :, ci]` directly. 3D: `points3d[:, f]` projected through frame `f`'s own
     camera group, the same branch `BoxDataset._points_2d` takes (mirrored here rather than
     imported, because building a whole `BoxDataset` -- augmentation RNG, tiling, the multi-root
     refusal -- to read one projection is the wrong tool for a label-only pass).
 
-    `cap` bounds the frames sampled per group (evenly spaced), so a 20,000-frame calms21 clip
-    costs the same as a 500-frame one -- this is a population read, not a census.
+    `cap` bounds the frames sampled per group (evenly spaced), so a 20,000-frame clip costs the
+    same as a 500-frame one -- this is a population read, not a census.
     """
     from ..crop import crop_box_for_points
     from posetail.posetail.cube import project_points_torch
@@ -264,30 +258,26 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      n_frames=24, overlap=4, min_box_frames=1, batch=16):
     """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
 
-    `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on".
-    That number does not predict the box path's real cost (dev/plans/detector_accuracy.md, item
-    0): current-generation checkpoints read val r@.5 0.91-0.93 and IoU 0.79 while costing 43% of
-    pose coverage and +25 px MPJPE. This runs the SAME functions deployment does --
-    `detect_raw` then `associate_group`, and `infer._window_starts` for the window rule
-    `run_group` uses -- over a whole test group, and reports what a pose window actually gets:
+    `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",
+    which does not predict the box path's real cost: current-generation checkpoints read val r@.5
+    0.91-0.93 and IoU 0.79 while costing 43% of pose coverage and +25 px MPJPE. This runs the SAME
+    functions deployment does -- `detect_raw` then `associate_group`, and `infer._window_starts`
+    for the window rule `run_group` uses -- over a whole test group, and reports what a pose
+    window actually gets:
 
         det_fill       fraction of (frame, camera) with >=1 box surviving `det_score` --
                        the DETECTION-ONLY ceiling, independent of row identity.
         slot_fill      fraction of (row, frame, camera) with a finite box AFTER association --
                        identity-bearing only under `track=True` (3D multiview) or `link=True`
-                       (2D); see the `--track` block in CLAUDE.md before reading this under
-                       neither. Comparing it against `det_fill` is what separates "the detector
-                       missed the animal" from "association dropped a detection it had".
+                       (2D). Comparing it against `det_fill` separates "the detector missed the
+                       animal" from "association dropped a detection it had".
         window_miss    fraction of (row, window) with fewer than `min_box_frames` finite boxes
                        anywhere in the window -- the EXACT quantity `infer.run_group` marks
-                       `no box`, using its own `_window_starts` rule so this cannot silently
-                       measure a different windowing than deployment's.
+                       `no box`, using its own `_window_starts` rule.
         union_side_px  quantiles of each window's per-camera UNION box side (SOURCE px), the
                        crop-inflation number `--refine` exists to survive.
         gt_side_px     quantiles of the crop-RULE box side over this group's own labels, as an
-                       UNPAIRED population comparison against `union_side_px` -- not a per-row
-                       ratio, because pairing a detector row to a GT identity needs a matcher
-                       (`box_mota`'s), which this function does not run.
+                       UNPAIRED population comparison against `union_side_px`.
 
     Returns a dict of floats/arrays; `n_gt` and `n_windows` say how much each rested on.
     """

@@ -2,21 +2,10 @@
 """Convert `posetail-finetuning-v4` into the tailcycle-dataset format.
 
     pixi run python scripts/convert_v4.py --dataset allen-mouse --validate
-    pixi run python scripts/convert_v4.py --dataset all
 
-One v4 trial becomes one group. **Pixels are symlinked, never copied**: 475 GB of frames live in
-`posetail-finetuning-v3` (v4 is a thin npz overlay whose `img`/`vid`/`metadata.yaml` are already
-symlinks into it), and one symlink per camera per group is ~900 links across all four datasets
-rather than 550,000.
-
-A v4 session becomes one session when its trials share camera metadata (allen-mouse: byte-
-identical across all 45) and one session PER TRIAL when they do not (3dpop: calibration is
-per-sequence). That rule is data-driven, not a per-dataset special case -- calibration is a
-session property in this format, so trials that disagree about it are not one session.
-
-Keypoint names come from configs/datasets/<name>.toml, copied from posetail-pose. They are
-authoritative: rat-city and branson-fly carry no `keypoints` array in their npz at all, so the
-provenance comment in those files IS the verification.
+One v4 trial becomes one group; pixels are symlinked, never copied. A v4 session becomes one
+session when its trials share camera metadata and one session per trial when they do not
+(calibration is a session property). Keypoint names come from configs/datasets/<name>.toml.
 """
 from __future__ import annotations
 
@@ -39,25 +28,18 @@ OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle
 SPECS = Path(__file__).resolve().parent.parent / 'configs' / 'datasets'
 DATASETS = ('rat-city', 'allen-mouse', '3dpop', 'branson-fly', 'johnson-mouse')
 
-# v4 cuts one recording into several trials named `<recording>_ix<N>`, where N is the source frame
-# of the trial's frame 0. Nothing else encodes that, and `source_frame_start = 0` on a trial that
-# starts at 9000 is a false statement about the provenance.
+# v4 names trials `<recording>_ix<N>`, where N is the source frame of the trial's frame 0;
+# nothing else encodes it, and a wrong `source_frame_start` is a false provenance statement.
 _IX = re.compile(r'_ix(\d+)$')
 
 
 # the allen column-sort repair
 
 def column_sort_perm(names):
-    """perm[i] = the slot holding `names[i]` when a pose array is stored COLUMN-sorted.
+    """perm[i] = the slot holding `names[i]` when a pose array is stored column-sorted.
 
-    allen's preprocessing writes `pose` from `df[sorted(coord_columns)]` but `keypoints` from
-    `np.unique(bare_names)`, and those orders differ wherever a name is a prefix of another:
-    '-' is 0x2D and '_' is 0x5F, so 'LF-index-base_x' < 'LF-index_x' as columns while
-    'LF-index' < 'LF-index-base' as names. That transposes all 8 `X` / `X-base` pairs -- 16 of
-    47 keypoints -- and nothing downstream notices.
-
-    Lifted from posetail-pose `dataset_spec.column_sort_perm`. Returns None when the ordering is
-    already name-sorted.
+    Prefix names sort differently as columns ('-x' < '_x') than as names, transposing the
+    `X`/`X-base` pairs. None when the ordering is already name-sorted.
     """
     cols = sorted(f'{n}_{a}' for n in names for a in 'xyz')
     order, seen = [], []
@@ -174,12 +156,8 @@ def n_pixel_frames(kind: str, src: Path, meta: dict | None) -> int:
 def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     """v4 npz -> dense label arrays.
 
-    v4 encodes "no label" as NaN and nothing else -- there is no assessed-but-occluded state. So
-    a finite point becomes `visible` and a NaN becomes NO ROW (`unlabeled`), never `missing`:
-    claiming a point was assessed and judged occluded would be inventing an annotation that was
-    never made. allen-mouse's per-camera `vis` array IS a real assessment, and is the one place
-    `missing` is written -- `scripts/check_status.py`'s `MISSING_OK` names allen-mouse-tracked
-    for exactly this reason; a re-run that stops producing those rows is a real regression.
+    v4 has no assessed-but-occluded state: finite -> `visible`, NaN -> no row (never `missing`),
+    except allen-mouse's own per-camera `vis` array, which is a real assessment.
     """
     mode3d = spec['mode'] == '3d'
     # allow_pickle: johnson-mouse writes `keypoints` as dtype('O') where allen writes '<U14'.
@@ -188,9 +166,8 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     names = list(spec['names'])
     K, C = len(names), len(rig)
 
-    # The one check that makes a keypoint-axis mistake (gotcha 4, spec 13) impossible to carry
-    # forward. Unconditional: it has nothing to do with the allen column-sort repair below, and a
-    # dataset that ships names and is never compared against the spec is exactly the silent failure.
+    # The one check that makes a keypoint-axis mistake impossible to carry forward -- it is
+    # unconditional, not part of the column-sort repair below.
     if 'keypoints' in npz:
         stored = [str(s) for s in npz['keypoints']]
         assert stored == names, (
@@ -215,8 +192,8 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
         lab.vis3d[finite] = fmt.VISIBLE
         lab.points3d[finite] = pose[finite].astype(np.float32)
         if 'vis' in npz:
-            # A real per-camera assessment: visible / occluded. No 2D position is recorded --
-            # the position lives in the 3D layer (spec §7, the rule 10 exemption).
+            # A real per-camera assessment: visible / occluded, with no 2D position (the position
+            # lives in the 3D layer).
             vis = npz['vis'][:, :T]
             if vis.shape[-1] != C:
                 raise RuntimeError(f'{trial}: vis has {vis.shape[-1]} cameras, expected {C}')
@@ -226,8 +203,7 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
         lab.vis2d[finite, 0] = fmt.VISIBLE
         lab.points2d[finite, 0] = pose[finite].astype(np.float32)
 
-    # Drop animals with no label anywhere in this group: S is per-group in this format, and an
-    # all-NaN row is a slot the tracker never filled, not an animal.
+    # Drop animals with no label anywhere: an all-NaN row is a slot the tracker never filled.
     keep = np.flatnonzero((lab.vis3d if mode3d else lab.vis2d).reshape(S, -1).max(1) != fmt.UNLABELED)
     if len(keep) != S:
         lab = fmt.Labels(
@@ -286,9 +262,8 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                         print(f'   ! {session_id}/{gid}: pose has {n_pose} frames, pixels have '
                               f'{T}; truncated to {T}')
                     if not lab.animal_ids:
-                        # v4's score-cleaning can NaN out an entire trial (3dpop val Pigeon01
-                        # Sequence49 is 16 frames of nothing). A group with no labels carries no
-                        # supervision, so drop it -- loudly, never silently.
+                        # Score-cleaning can NaN out an entire trial; a label-free group carries no
+                        # supervision, so drop it loudly.
                         empty.append(gid)
                         continue
                     ix = _IX.search(gid)

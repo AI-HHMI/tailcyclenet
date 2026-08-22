@@ -1,72 +1,14 @@
 #!/usr/bin/env python
 """Convert an APT (Animal Part Tracker) `.lbl` project into a tailcycle dataset.
 
-    pixi run python scripts/convert_apt_lbl.py \
-        --lbl /groups/branson/bransonlab/manan/ratCity_round13_mjpegqv5_bounded.lbl \
-        --out .../tailcycle-datasets/rat-city-annotated --validate
+    pixi run python scripts/convert_apt_lbl.py --lbl <project.lbl> --out ... --validate
 
-Built for `RatCityFullSizeRT` (round 13): 2,607 hand-labelled (frame, animal) instances over
-1,067 frames in 48 movies, plus APT's own 240-instance / 20-frame ground-truth set. Written as a
-2D single-view `labels = "annotated"` root beside the tracked `rat-city`.
-
-FACTS ABOUT THE SOURCE THAT THE CODE DEPENDS ON, all measured rather than assumed:
-
-- The `.lbl` is a **POSIX tar**; the MATLAB file is its `label_file.lbl` member.
-- That member is **MATLAB v5, not v7.3**, so `scipy.io.loadmat` reads it and h5py cannot. Two of
-  its variables are MCOS opaque objects, which is why `whosmat` dies and why `variable_names=` is
-  not just an optimisation.
-- `labels{i}.p` is `(2*npts, n)`, decoded as `reshape(npts, 2, n)` -- four x's then four y's per
-  column (MATLAB `s.p(:,end+1) = xy(:)` with `xy` npts-by-2, column-major). `frm`, `tgt` and the
-  coordinates are all **1-based**.
-- The coordinate sentinels are APT's: **NaN = unlabeled, Inf = fully occluded** with no position
-  (`Labels.getUnlabeledValue` / `getFullyOccValue`). Read with the correct `p` layout these agree
-  perfectly with the `occ` tag -- all 171 Inf slots carry `occ == 1` and all 220 NaN slots carry
-  `occ == 0`, zero off-diagonal -- which is independent corroboration of the reshape below.
-- The movies are **MJPEG**, all-intra, 40 fps, which is what makes the lossless extraction below
-  possible; 45 are 4696x2048 and the five `original/merged_video_all_keyframes*` are 4500x2050.
-- Those `merged_*` movies are **real contiguous video** -- "all_keyframes" is the encoding, not a
-  montage. Consecutive-frame mean |diff| reads 1.4-2.9 against 3.8-5.0 at +100 frames and
-  5.0-7.4 at +1000. `_contiguity_ok` re-checks it per movie rather than trusting this note,
-  because a scene cut inside a context window is corrupt data that nothing downstream reveals.
-
-FOUR CONVERSION DECISIONS, each recorded in `[provenance]` on disk:
-
-1. `occ == 1` (occluded, but the annotator placed the point) is written **`visible`, with its
-   coordinates** -- 2,500 of 11,388 point-slots, 22.0%, which is 22.7% of the visible rows. That
-   is a deliberate choice of label density over an honest visibility channel, and it means THIS
-   ROOT'S PER-CAMERA VISIBILITY
-   CHANNEL IS THE calms21 FAILURE MODE: a `vis_pred` head trained on it learns against a target
-   that calls occluded points visible, so it must never be used as a row gate without a
-   rate-matched random control. `Inf` still becomes `missing` and `NaN` still becomes no row at
-   all, so the negatives that do exist are real. `scripts/check_status.py` names both counts
-   (171 `missing` in `MISSING_OK`, 220 holes in `HOLE_EXEMPTIONS`) -- a re-run that moves either
-   is a real change to this decision, not noise.
-2. APT's `tail` is renamed **`tail_base`** to match the tracked `rat-city` root, so the two share
-   registry ids -- and therefore keypoint embedding rows -- instead of splitting the keypoint in
-   two.
-3. APT's `labelsRoi` ("Label Box") becomes **`regions.pq`**, and every session writes one even
-   when it has none. A Label Box marks an area the annotator certified as COMPLETELY LABELLED,
-   which is the only thing standing between this root and teaching ~9 rats per frame to a
-   detector as background: a labelled frame here names a median of 2 rats where the tracked root
-   finds a median of 11. An ROI is kept only on the group whose OWN labelled frame it sits on
-   (`group_regions` says why), so the 140 of 636 that sit elsewhere are dropped and counted. The
-   `test/` sessions get an EMPTY regions.pq -- APT's GT mode records no ROIs -- which certifies
-   nothing, where a missing file would certify everything.
-4. One group per labelled frame, `--context` frames wide, **label centered**, which is
-   allen-mouse's annotated shape. One labelled frame per group is also what makes APT's `tgt`
-   safe to use as `animal_id`: `tgt` is a per-frame slot, not a tracked identity, and a group
-   holding a single labelled frame asserts no identity across frames.
-
-THE PIXELS ARE COPIED, NOT RE-ENCODED. `ffmpeg -ss start/fps -c:v copy -bsf:v mjpeg2jpeg` lifts
-each stored JPEG out of the AVI byte-for-byte (the bitstream filter supplies the headers AVI
-omits). Verified frame-exact against decord: the extracted frame reads mean |diff| 0.016 against
-decord's decode of the same index -- its own YUV->RGB rounding -- and 2.9+ against either
-neighbour. `--extract decode` forces the re-encoding path, and a failed per-group alignment check
-falls back to it automatically rather than shipping a misaligned window.
-
-They are written as an image DIRECTORY rather than a symlinked video on purpose: format rules 7
-and 8 (contiguous %06d, count == n_frames, dims == camera size) are then checked for free, and a
-root of image dirs cannot trip gotcha 11's video-fork deadlock in the training loader.
+The `.lbl` is a POSIX tar holding a MATLAB-v5 `label_file.lbl`; `labels{i}.p` is x-block-then-
+y-block; NaN = unlabeled, Inf = fully occluded. Four conversion decisions are recorded in
+`[provenance]`: occ==1 points are written `visible` WITH coordinates (label density over an
+honest visibility channel); `tail` -> `tail_base`; `labelsRoi` -> `regions.pq`, written even when
+empty (absence would claim exhaustive labelling); one group per labelled frame, label centered.
+Pixels are COPIED from the MJPEG AVI (`ffmpeg -c:v copy -bsf:v mjpeg2jpeg`), verified frame-exact.
 """
 from __future__ import annotations
 
@@ -89,16 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt
 
 CAM = 'cam0'
-PAD = 20                    # THE crop rule's pad, as `backfill_boxes_v3.py` stores it: what goes
-                            # in `instances.pq` is the PADDED EXTENT (steps 1-2 of
-                            # `crop_box_for_points`), not the squared crop box, so `min_crop_dim`
-                            # stays a consumer parameter.
+PAD = 20                    # the crop rule's pad; instances.pq stores the PADDED extent.
 APT_NAMES = ['nose', 'left_ear', 'right_ear', 'tail']
 RENAME = {'tail': 'tail_base'}
 LBL_MEMBER = 'label_file.lbl'
-ALIGN_TOL = 1.0             # mean |diff| between the extracted frame and decord's own decode of
-                            # the same index. 0.016 measured for the right frame, 2.9+ for a
-                            # neighbour, so this sits ~180x below the discriminating gap.
+ALIGN_TOL = 1.0             # mean |diff| vs decord's decode: ~0.016 right, 2.9+ for a neighbour.
 
 
 # reading the .lbl
@@ -124,11 +61,10 @@ def _strs(v) -> list[str]:
 
 
 def check_axis(d: dict) -> None:
-    """Assert the keypoint axis against the name list -- format spec 13's first gotcha.
+    """Assert the keypoint axis against the name list.
 
-    Not a formality: allen-mouse's converter transposed 16 of 47 keypoints by trusting a column
-    order, and the failure is invisible in a loss curve. `skelNames` and `cfg.LabelPointNames`
-    are two independent statements of the same order in the project file, so both are checked.
+    `skelNames` and `cfg.LabelPointNames` are two independent statements of the same order;
+    a transposed axis is invisible in a loss curve.
     """
     if _strs(d['skelNames']) != APT_NAMES:
         raise SystemExit(f'skelNames is {_strs(d["skelNames"])}, expected {APT_NAMES}')
@@ -153,11 +89,8 @@ def movie_labels(entry) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frm = np.ravel(entry.frm).astype(int) - 1
     tgt = np.ravel(entry.tgt).astype(int) - 1
     npts = int(np.ravel(entry.npts)[0])
-    # (2*npts, n) -> (2, npts, n) -> (n, npts, 2). A column is [x1..xK, y1..yK] -- one BLOCK of
-    # x's then one of y's, not interleaved pairs -- so the coordinate axis leads and npts is
-    # second. Reading it interleaved is the failure this converter is most exposed to, because
-    # both readings produce plausible-looking numbers: measured on this project, the interleaved
-    # reading puts 28.25% of points outside the frame against 0.01% for this one.
+    # (2*npts, n) -> (2, npts, n) -> (n, npts, 2): a column is a BLOCK of x's then a block of
+    # y's, not interleaved pairs -- the interleaved reading puts ~28% of points out of frame.
     xy = np.asarray(entry.p, float).reshape(2, npts, frm.size) - 1.0
     return frm, tgt, np.transpose(xy, (2, 1, 0))
 
@@ -165,14 +98,9 @@ def movie_labels(entry) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
     """One `labelsRoi{i}` cell -> (frames, (n,4) [x0,y0,x1,y1]), both 0-based.
 
-    APT's "Label Box": a rectangle the annotator marked as COMPLETELY LABELLED, which its own
-    GUI help describes as "teaching the classifier what a negative label is". It is not an animal
-    box and could not be one -- `LabelROI` has no target index field at all.
-
-    `verts` is (4,2,n) -- four corners, (x,y), per ROI -- and `squeeze_me` flattens it to (4,2)
-    when a movie has exactly one. Every ROI in this project is axis-aligned; that is ASSERTED
-    rather than assumed, because a rotated one would silently become its bounding box, and a
-    bounding box certifies area the annotator did not.
+    APT's "Label Box" certifies an area as COMPLETELY LABELLED (not an animal box -- it has no
+    target index). Axis-alignment is asserted: a rotated ROI would silently become its bounding
+    box and certify area the annotator did not.
     """
     v = getattr(entry, 'verts', None)
     if v is None or np.size(v) == 0:
@@ -198,11 +126,8 @@ _C5_DATE = re.compile(r'/original/.*_20250819_')
 def split_of(movie: str, is_gt: bool) -> str:
     """Cross-cohort: cohort5 is held out for val, APT's own GT set is test.
 
-    The `original/*_20250819_*` movie goes to val WITH cohort5. It is dated inside cohort5's
-    range (cohort5_20250812 .. cohort5_20250822), so it is almost certainly the same rats, and
-    leaving it in train would make the cross-cohort claim false. The other four `original/`
-    movies are undated, so the val axis is honestly "cross-cohort modulo four undated movies" --
-    eval rule 1 is about not overclaiming exactly this.
+    The dated `original/*_20250819_*` movie joins val -- it sits inside cohort5's date range, so
+    leaving it in train would break the cross-cohort claim.
     """
     if is_gt:
         return 'test'
@@ -212,9 +137,8 @@ def split_of(movie: str, is_gt: bool) -> str:
 def session_id(movie: str) -> str:
     """One session per movie, named for the recording.
 
-    Per movie rather than per cohort because calibration is a session property and the frame size
-    is not constant across this project (4696x2048 vs 4500x2050); bucketing by movie makes that
-    a non-issue by construction instead of a rule-8 failure.
+    Frame size varies across this project, and calibration is a session property -- bucketing by
+    movie makes that a non-issue by construction.
     """
     p = Path(movie)
     return p.parent.name if p.stem == 'movie' else p.stem
@@ -339,10 +263,8 @@ def write_window(movie: str, start: int, n: int, fps: float, out: Path, mode: st
 def check_seek(movie: str, start: int, fps: float, tmp: Path) -> str:
     """Once per movie: is the time seek frame-EXACT, or merely close?
 
-    The per-group check above only asks whether the extracted frame is near decord's decode of
-    `start`, which a nearly-static scene could pass while off by one. This one demands that
-    `start` be the ARGMIN over its neighbours, which no off-by-one survives. Once per movie is
-    enough: `-ss` maps time to frame linearly, so if it lands for one group it lands for all.
+    Demands `start` be the argmin over its neighbours, which no off-by-one survives; `-ss` maps
+    time to frame linearly, so once per movie is enough.
     """
     tmp.mkdir(parents=True, exist_ok=True)
     for p in tmp.glob('*.jpg'):
@@ -353,12 +275,8 @@ def check_seek(movie: str, start: int, fps: float, tmp: Path) -> str:
     vr = reader(movie)
     cand = [f for f in (start - 1, start, start + 1) if 0 <= f < len(vr)]
     diffs = {f: _diff(got, vr.get_batch([f]).asnumpy()[0]) for f in cand}
-    # TIED, not strictly best. These recordings contain stalls where consecutive frames are
-    # byte-identical -- cohort1vs2_20240806_1030 has frames 11, 12 and 13 equal -- so an argmin
-    # picks the first of them and a strict test reads that as a seek failure. It is not: when the
-    # frames are identical it does not matter which one came back. Demanding only that `start` be
-    # tied for the minimum still rejects every real off-by-one, where the gap is ~180x this
-    # epsilon.
+    # Tied, not strictly best: stalled recordings hold byte-identical consecutive frames, and it
+    # does not matter which of them came back. Tied-for-minimum still rejects every real off-by-one.
     if diffs[start] > min(diffs.values()) + 1e-6:
         return f'-ss lands on frame {min(diffs, key=diffs.get)}, not {start} (diffs {diffs})'
     return ''
@@ -367,15 +285,9 @@ def check_seek(movie: str, start: int, fps: float, tmp: Path) -> str:
 def check_contiguity(movie: str, starts: list[int]) -> str:
     """Is this movie really contiguous video, or a montage of unrelated frames?
 
-    A context window straddling a scene cut is corrupt training data that no downstream metric
-    would expose, and `merged_video_all_keyframes*` is named exactly like a montage.
-
-    THE TEST IS THAT THE DIFFERENCE GROWS WITH TEMPORAL DISTANCE, not that the consecutive
-    difference is small. Sensor noise puts a floor under all three statistics, so the consec/+100
-    RATIO never approaches zero even on plainly contiguous video -- measured 0.38-0.66 across
-    these movies, which is why a 0.6 threshold flagged four of them spuriously. Monotone growth is
-    insensitive to that floor because the floor adds about equally to every lag, and it is what a
-    montage cannot produce: on shuffled frames all three lags read the same.
+    The test is that the frame difference GROWS with temporal distance, not that it is small:
+    sensor noise floors all lags equally (so a fixed ratio threshold flags real video), while a
+    montage's shuffled frames read the same at every lag.
     """
     vr = reader(movie)
     lags = (1, 10, 100)
@@ -401,9 +313,8 @@ def check_contiguity(movie: str, starts: list[int]) -> str:
 def padded_extent(pts: np.ndarray, wh) -> np.ndarray:
     """(K,2) source px -> [x0,y0,x1,y1], the padded extent of the finite points, or NaN.
 
-    Steps 1-2 of `crop.crop_box_for_points` and not step 3, exactly as `backfill_boxes_v3.py`
-    stores it for the tracked root: min/max over the two stored corners is min/max over the
-    points they came from, so a consumer re-enters the real rule at `pad=0` and reproduces it.
+    Steps 1-2 of the crop rule (not step 3), as the tracked root stores it: a consumer re-enters
+    the real rule at `pad=0` and reproduces it.
     """
     finite = np.isfinite(pts).all(-1)
     if not finite.any():
@@ -411,17 +322,14 @@ def padded_extent(pts: np.ndarray, wh) -> np.ndarray:
     p, wh = pts[finite], np.asarray(wh, np.float32)
     lo = np.clip(p.min(0) - PAD, 0, wh)
     hi = np.clip(p.max(0) + PAD, 0, wh)
-    # int32 truncation, as the rule does it, so reading the float back and truncating is a no-op
-    # rather than a second and different rounding.
+    # int32 truncation, as the rule does it -- re-truncating the float is then a no-op.
     return np.concatenate([lo, hi]).astype(np.int32).astype(np.float32)
 
 
 def window_start(frame: int, n_source: int, context: int) -> tuple[int, int]:
     """(start, n) for a group centered on `frame`, clamped into the movie.
 
-    Centering is not cosmetic: frame 0 is the one frame where per-frame anchoring contributes
-    nothing, so a label parked there measures the wrong thing (spec 14). Clamping rather than
-    padding keeps every frame a real frame.
+    Centering matters: frame 0 is the one frame where per-frame anchoring contributes nothing.
     """
     n = min(context, n_source)
     return int(np.clip(frame - n // 2, 0, max(0, n_source - n))), n
@@ -430,9 +338,7 @@ def window_start(frame: int, n_source: int, context: int) -> tuple[int, int]:
 def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels:
     """The dense arrays for one group: one labelled frame at `frame - start`, the rest unlabeled.
 
-    NaN becomes no row at all rather than a `missing` row -- `missing` claims a human looked and
-    judged occlusion, and APT's NaN is the opposite claim (spec 13). Inf is APT's fully-occluded
-    sentinel, which IS that claim, so it becomes `missing` with null coordinates.
+    NaN -> no row (an unlabeled skip, not an assessment); Inf -> `missing` with null coordinates.
     """
     rows = np.flatnonzero(job.frm == frame)
     slots = job.tgt[rows]
@@ -456,13 +362,8 @@ def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels
 def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int]:
     """Region rows for one group: the ROIs on ITS OWN labelled frame, and no others.
 
-    A Label Box certifies that one SOURCE frame is completely labelled, and that claim is only
-    sound in the group carrying that frame's LABELS. Every group here is 65 frames wide around a
-    single labelled frame, so a context frame's ROI would certify an area whose animals were
-    converted into a different group -- i.e. it would assert the area empty. This is why the ROIs
-    are keyed against `frame` rather than against the window.
-
-    Returns ((M,6) in `Labels.regions` layout, n_clipped_away).
+    A Label Box certifies one source frame; the claim is only sound in the group carrying that
+    frame's labels. Returns ((M,6) in `Labels.regions` layout, n_clipped_away).
     """
     r = job.roi_rect[np.flatnonzero(job.roi_f == frame)]
     out = np.zeros((len(r), 6))
@@ -500,10 +401,8 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
             stat['warnings'].append(err)
 
     groups, labels, extract = {}, {}, None
-    # `--labels-only`: the 70,655 extracted frames are lossless copies and already correct, so a
-    # change to the TABLES must not re-run 80 minutes of ffmpeg over them. The groups on disk are
-    # the authority for `n_frames` and `source_frame_start` -- re-deriving them would silently
-    # disagree with the pixels wherever a group was truncated or dropped at extraction time.
+    # `--labels-only`: the extracted frames are already correct, so a tables-only change must not
+    # re-run ffmpeg. The groups on disk stay the authority for `n_frames`/`source_frame_start`.
     reuse = args.labels_only and not args.dry_run
     if reuse:
         if not (dst / 'session.toml').exists():
@@ -528,9 +427,8 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
         cdir.mkdir(parents=True, exist_ok=True)
         got, used = write_window(job.movie, start, n, job.fps, cdir, mode)
         stat['decode_fallback'] += used == 'decode' and mode == 'copy'
-        # `nframes` from the project file is a claim about the container; the pixels are the fact.
-        # Truncate to what came out rather than padding -- spec 13 -- and drop the group if the
-        # labelled frame itself is past the end or gotcha 1's two-frame floor is not met.
+        # The project file's `nframes` is a claim about the container; truncate to what came out,
+        # and drop the group if the labelled frame is past the end or fewer than two frames.
         if got < 2 or f - start >= got:
             shutil.rmtree(dst / 'groups' / gid)
             stat['skipped'] += 1
@@ -545,12 +443,9 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     if args.dry_run or not groups:
         return stat
 
-    # EVERY group gets a `regions` array, empty or not, so every session here writes a regions.pq.
-    # Its absence is the format's claim of exhaustive labelling (§9b), and this project is the
-    # opposite: a labelled frame names a median of 2 rats where the tracker finds 11. The GT
-    # sessions in `test/` carry no ROIs at all -- APT builds them with `LabelROI.new()` -- so they
-    # get an EMPTY regions.pq, which certifies nothing, rather than a missing one, which would
-    # certify everything.
+    # Every group gets a `regions` array, empty or not: absence is the format's claim of
+    # exhaustive labelling, and a label-sparse root is the opposite. The GT sessions carry no
+    # ROIs, so they get an empty regions.pq rather than a missing one.
     clipped = 0
     for gid, g in groups.items():
         labels[gid].regions, n = group_regions(job, int(gid[1:]), g.source_frame_start, job.wh)
@@ -619,7 +514,7 @@ def main() -> int:
     ap.add_argument('--no-image-check', action='store_true')
     args = ap.parse_args()
     if args.context < 2:
-        raise SystemExit('--context must be >= 2 (gotcha 1: T=1 gives a zero-length pos_embed)')
+        raise SystemExit('--context must be >= 2 (T=1 gives a zero-length pos_embed)')
 
     with tempfile.TemporaryDirectory() as td:
         d = read_lbl(args.lbl, Path(td))
@@ -640,8 +535,7 @@ def main() -> int:
             budget -= len(j.frames)
         jobs = [j for j in jobs if j.frames]
 
-    # Over the KEPT frames, not the movie's whole row set -- otherwise `--max-groups` reports the
-    # instance count of a conversion it did not do.
+    # Over the kept frames, not the whole row set: `--max-groups` must report the conversion done.
     def n_inst(j):
         return int(np.isin(j.frm, j.frames).sum())
 
@@ -669,12 +563,9 @@ def main() -> int:
                   + (f' {stat["decode_fallback"]} fallback' if stat['decode_fallback'] else '')
                   + (f' {stat["skipped"]} skipped' if stat['skipped'] else ''))
 
-    # Both fallback routes are reported. A whole movie switched to `decode` is still correct data
-    # -- decord indexing is exact by construction -- but it is re-encoded rather than copied, and
-    # counting only the per-group route would leave that invisible.
+    # Both fallback routes reported: a movie-wide `decode` switch is correct but re-encoded.
     reenc = [s for s in stats if s['decode_movie']]
-    # A Label Box on a frame that is no group's LABELLED frame is dropped -- see `group_regions`.
-    # Reported because it is a real loss of certified negative area, not a rounding detail.
+    # ROIs on no group's labelled frame are dropped (`group_regions`) -- a real loss, reported.
     off = sum(s['roi_off_label'] for s in stats)
     print(f'\nregions: {sum(s["regions"] for s in stats)} written, '
           f'{off} label boxes dropped (on a frame no group is centered on)')

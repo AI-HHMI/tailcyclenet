@@ -1,37 +1,16 @@
 """A prediction IS a session in this repo's own format, written a block at a time.
 
-`docs/annotation_format.md` already describes exactly what a prediction is: a `labels = "tracked"`
-session -- long parquet tables, one row per assessed thing, `status` as the visibility channel,
-boxes in `instances.pq`. Writing predictions that way means `format.Session` reads them back,
-MATLAB's `parquetread` reads them, and a prediction directory is a first-class citizen of every
-tool here rather than a private npz schema nothing else understands.
+The output is a `labels = "tracked"` session (long parquet tables, `status` as the visibility
+channel, boxes in `instances.pq`), so `format.Session` reads it back and a prediction directory
+is a first-class citizen of every tool here. `--out` names the session directory itself: a session
+holds one calibration, one mode and one keypoint axis, so a run covering more than one source
+session is refused rather than merged.
 
-**`--out` NAMES THE SESSION DIRECTORY ITSELF.** A session holds ONE calibration, one `mode` and one
-keypoint axis, and sessions under a root need agree on none of them -- so a run covering more than
-one source session is refused rather than merged. `format.sessions_for` already accepts a bare
-session directory, so `--data <one session>` is the answer and not a workaround.
-
-**NO PIXELS AND NO `groups/`.** The output is toml and parquet, a few MB beside the source's
-hundreds of GB. The consequence is honest and worth knowing: the directory is NOT self-contained,
-and `validate_session` reports one rule-7 error per (group, camera) because of it. Everything that
-does not need pixels passes, which is what the test asserts.
-
-**WHERE THE PIXELS ARE IS `[provenance]`, AND `scripts/render.py` NOW READS IT.**
-`render.session_for_prediction` opens `source_session` (a directory input) or the
-`source_videos`/`source_calibration`/`source_cam_regex`/`source_group_id` quadruple (a `--videos`
-input), the latter via `adopt.session_from_prediction`, which CHECKS itself against `groups.pq`
-and `calibration.toml`. `--data` is an OVERRIDE for a root that MOVED, not the normal input, and
-is checked against `source_session_id` rather than trusted. `render.py` no longer reads an npz at
-all -- an npz carries none of this, so every npz render was a render against a hand-restated root,
-which is exactly the failure this closed. `predictions.py` itself reads only `source_session_id`,
-to confirm whatever session `render.py` found is the one this prediction was written over.
-
-THREE COLUMNS ARE ADDITIONS TO THE SPEC, all additive: `score` and `box_agree` on `instances.pq`
-(the detector's objectness and the pose-to-box distance, both per (animal, frame, camera), exactly
-that table's grain), and `score_logit` beside `score` on the two keypoint tables. The last one is
-not redundancy: `score` is the spec's `[0, 1]`, so it is `sigmoid(vis_pred)`, and `vis_pred` runs
-to a median of +15.4 on one root, where `sigmoid` rounds to exactly 1.0 in float32 and cannot be
-inverted. `--vis-thresh` and `eval.py`'s confusion matrix both read the logit.
+There are no pixels and no `groups/` -- the directory is not self-contained, and where the pixels
+are is recorded in `[provenance]`, which `scripts/render.py` reads (an npz carries no provenance
+to find its pixels with). Three columns are additive spec additions: `score` and `box_agree` on
+`instances.pq`, and `score_logit` beside `score` on the keypoint tables -- the latter because
+`sigmoid` rounds to exactly 1.0 in float32 at the logit medians this repo measures.
 """
 from __future__ import annotations
 
@@ -41,8 +20,8 @@ import numpy as np
 
 from ..format import DICT_COLS, Session, TableWriter, dump_calibration, sessions_for, write_table
 
-# The tables a prediction writes. `windows.pq` is NOT a spec table -- it is per (animal, window,
-# camera) diagnostics, named so it cannot be mistaken for one.
+# The tables a prediction writes; `windows.pq` is per (animal, window, camera) diagnostics,
+# deliberately NOT a spec table.
 _TABLES = ('points3d', 'keypoints', 'instances', 'windows')
 
 
@@ -53,9 +32,8 @@ def _sigmoid(x):
 class SessionWriter:
     """One prediction session, appended a block at a time.
 
-    The header -- `session.toml`, `calibration.toml`, `groups.pq` -- is written UP FRONT, before
-    any inference runs, so a run that dies half way leaves a directory that says what it was
-    rather than a pile of anonymous parquet.
+    The header (`session.toml`, `calibration.toml`, `groups.pq`) is written up front, so a run
+    that dies half way leaves a directory that says what it was.
     """
 
     def __init__(self, out: Path, source: Session, registry, provenance: dict, groups):
@@ -65,18 +43,9 @@ class SessionWriter:
         self.out.mkdir(parents=True, exist_ok=True)
         self._w = {t: TableWriter(self.out / f'{t}.pq', DICT_COLS) for t in _TABLES}
 
-        # THE PROVENANCE CONTRACT IS SCALARS AND LISTS OF STRINGS. Everything here was a scalar
-        # until `source_videos` (the resolved `--videos` file list, one entry per file); a TOML
-        # array of strings round-trips through `toml.dumps`/`tomllib` unchanged and the `!=` below
-        # compares lists correctly, but it is a first and the next caller should not have to
-        # discover which by experiment.
-        #
-        # A DUPLICATE PROVENANCE KEY IS A SILENT LOSS, and it has already happened once: the
-        # caller builds this dict by splatting `_box_provenance` over its own literals, and a name
-        # in both meant the splat order decided which fact survived -- `box_source` (the run's
-        # crop rule) was overwritten by the detector's training target, which is a different
-        # statement entirely. `dict` merges without complaint, so the caller passes ITEMS and this
-        # is where the collision is caught.
+        # Provenance values are scalars and lists of strings (`source_videos` is the resolved
+        # file list). A duplicate key is a silent loss -- `dict` merges without complaint -- so
+        # the caller passes ITEMS and the collision is caught here.
         if not isinstance(provenance, dict):
             seen = {}
             for k, v in provenance:
@@ -118,9 +87,8 @@ class SessionWriter:
             return
         a_ix, t_ix, k_ix = (x.ravel() for x in np.meshgrid(np.arange(S), np.arange(T),
                                                            np.arange(K), indexing='ij'))
-        # THE SPEC'S OWN SPARSITY RULE: "No row -- not labelled." A prediction that declined a
-        # point writes nothing, which is what every consumer here already reads as absence. On the
-        # deployment path coverage runs ~0.57, so this is most of the file.
+        # The spec's own sparsity rule -- "no row: not labelled" -- so a declined point writes
+        # nothing, which every consumer reads as absence.
         if pred.shape[-1] == 3:
             keep = np.isfinite(pred).all(-1).ravel()
             if keep.any():
@@ -136,8 +104,8 @@ class SessionWriter:
                     'score': _sigmoid(conf.ravel()[keep]).astype(np.float32),
                     'score_logit': conf.ravel()[keep].astype(np.float32)})
 
-        # THE PER-CAMERA 2D POSE. In 2D this is the prediction itself (`coords_pred` IS
-        # `2d_pred[0]`); in 3D it is the overlay a run used to discard.
+        # The per-camera 2D pose: in 2D this is the prediction itself; in 3D it is the overlay a
+        # run used to discard.
         p2, c2 = np.asarray(blk['pred2d']), np.asarray(blk['conf2d'])
         C = p2.shape[2]
         a2, t2, c2i, k2 = (x.ravel() for x in np.meshgrid(
@@ -157,8 +125,8 @@ class SessionWriter:
                 'score': _sigmoid(c2.ravel()[keep2]).astype(np.float32),
                 'score_logit': c2.ravel()[keep2].astype(np.float32)})
 
-        # `instances.pq`: the box, its objectness and the pose-to-box distance, all per
-        # (animal, frame, camera) -- exactly this table's grain, and all describing THIS box.
+        # `instances.pq`: the box, its objectness and the pose-to-box distance, per (animal,
+        # frame, camera) -- exactly this table's grain.
         ba = np.asarray(blk['box_agree'])
         det = blk.get('det_box')
         ai, ti, ci = (x.ravel() for x in np.meshgrid(np.arange(S), np.arange(T), np.arange(C),
@@ -181,8 +149,8 @@ class SessionWriter:
                              else np.asarray(ds).ravel()[have].astype(np.float32))
             self._w['instances'].write(rows)
 
-        # `windows.pq`: why a window produced nothing, and what box it was given. Per
-        # (animal, window, camera) -- deliberately NOT a spec table.
+        # `windows.pq`: why a window produced nothing and what box it was given -- deliberately
+        # NOT a spec table.
         oc, cr = np.asarray(blk['outcome']), np.asarray(blk['crop'])
         W = oc.shape[1]
         aw, ww, cw = (x.ravel() for x in np.meshgrid(np.arange(S), np.arange(W), np.arange(C),
@@ -213,15 +181,10 @@ class SessionWriter:
 def load_predictions(path, groups=None):
     """A prediction session or a legacy npz -> `({key: {field: ndarray}}, meta)`.
 
-    THE NPZ HALF IS NOT LEGACY DEBT, it is the archive: every number this repo has published lives
-    in one, and dropping the reader would make them unscoreable. It is the same argument that kept
-    `eval.py` able to read them at all -- `scripts/render.py` is what stopped reading it (an npz
-    carries no provenance to find its pixels with); scoring did not.
-
-    `groups`, given, restricts the read to those group ids (bare, not `session/group` keys).
-    `eval.py` leaves it `None` and gets every group, unchanged. A RENDER wants this: the session
-    half calls `Session.preload()` no longer -- it scatters one group at a time -- so a caller
-    asking for one group of a many-hundred-group clip never pays for the rest.
+    The npz half is the archive -- every published number lives in one -- and scoring kept reading
+    it even after rendering stopped. `groups`, given, restricts the read to those group ids (bare,
+    not `session/group` keys); the session half scatters one group at a time, so a caller asking
+    for one group never pays for the rest.
     """
     path = Path(path)
     return (_load_npz(path, groups) if path.suffix == '.npz' else _load_session(path, groups))
@@ -245,14 +208,9 @@ def _load_npz(path, groups=None):
 def _load_session(path, groups=None):
     """Densify a prediction session back into the arrays `eval.py` reads.
 
-    **THE SCATTER IS `format.Session`'s OWN**, not a second implementation: §12 of the spec already
-    defines how long tables become `(S,T,K,3)` dense arrays, `Labels` already returns exactly that,
-    and it is already tested. This function renames those fields and adds the two tables the spec
-    does not define.
-
-    **NO `preload()`.** `Session.labels` caches PER GROUP, so scattering is already lazy; the old
-    `preload()` call scattered every group up front regardless of `groups`, which is the whole of
-    what made a render of one group out of a many-hundred-group clip cost the other 499.
+    The scatter is `format.Session`'s own (the spec defines how long tables become dense arrays);
+    this renames fields and adds the two non-spec tables. No `preload()` -- `Session.labels`
+    caches per group, so scattering is already lazy.
     """
     import tomllib
 
@@ -347,11 +305,10 @@ def _instances_col(path, gid, sess, lab, col):
 
 
 def refuse_multi_session(data, split):
-    """One session per run, checked BEFORE the checkpoint loads. -> the single session.
+    """One session per run, checked before the checkpoint loads -> the single session.
 
-    A session directory holds one calibration, one `mode` and one keypoint axis; sessions under a
-    root need agree on none of them, so a prediction session cannot represent several at once.
-    `sessions_for` already accepts a bare session directory, which is the whole answer.
+    A session directory holds one calibration, one mode and one keypoint axis, so a prediction
+    session cannot represent several at once.
     """
     ds_name, sessions = sessions_for(Path(data), split)
     if len(sessions) != 1:

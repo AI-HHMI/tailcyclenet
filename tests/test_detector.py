@@ -116,10 +116,9 @@ def test_assign_gives_each_anchor_one_box():
     assert pos.numel() == len(set(pos.tolist())), 'an anchor claimed by two boxes cancels'
 
 
-# ----------------------------------------------------------------------------------------------
-# T2.2 -- a per-GT positive cap (dev/plans/detector_accuracy.md). The centre prior has no cap on
-# how many anchors one GT box can claim, so a large box's candidate set can dwarf a small one's.
-# `max_pos_per_gt=None` (default) is uncapped and byte-identical to every checkpoint on record.
+# T2.2 -- a per-GT positive cap. The centre prior has no cap on how many anchors one GT box can
+# claim, so a large box's candidate set can dwarf a small one's. `max_pos_per_gt=None` (default)
+# is uncapped and byte-identical to every checkpoint on record.
 # ----------------------------------------------------------------------------------------------
 
 def test_assign_max_pos_per_gt_default_is_unchanged():
@@ -134,8 +133,8 @@ def test_assign_max_pos_per_gt_default_is_unchanged():
 
 def test_assign_max_pos_per_gt_caps_a_large_boxs_candidacy():
     """A single big GT box on a fine-stride grid claims MANY anchors uncapped; capped at K it
-    must claim AT MOST K (every positive belongs to this one GT, so the cap is a direct bound on
-    its own positive count)."""
+    must claim at most K (every positive belongs to this one GT).
+    """
     m = YOLOXNano()
     anchors = m.anchor_points(256, 256, torch.device('cpu'))
     gt = torch.tensor([[10.0, 10.0, 246.0, 246.0]])          # nearly the whole frame
@@ -148,10 +147,9 @@ def test_assign_max_pos_per_gt_caps_a_large_boxs_candidacy():
 
 
 def test_assign_max_pos_per_gt_leaves_a_small_gt_alone():
-    """A SECOND, small GT box far from the first, with fewer than K candidates of its own, must
-    keep ALL of them under the cap -- the cap bounds candidacy per GT, it does not evict a small
-    box's anchors to make room for the large one (they never competed for the same anchors here,
-    by construction: far apart, no anchor is `ok` for both)."""
+    """The cap bounds candidacy PER GT: a small box far from the large one keeps all its own
+    anchors -- it is not evicted to make room.
+    """
     m = YOLOXNano()
     anchors = m.anchor_points(256, 256, torch.device('cpu'))
     big = [10.0, 10.0, 130.0, 130.0]
@@ -205,10 +203,9 @@ out = "/tmp/run"
 
 
 def test_detector_config_box_weight_default_is_five(tmp_path):
-    """T2.4 (dev/plans/detector_accuracy.md): `box_weight` used to be `detector_loss`'s own
-    hardcoded default (5.0), never exposed to a config. This pins that the NEW config-level
-    default is the SAME number, so an absent key stays byte-identical to every checkpoint on
-    record."""
+    """`box_weight` used to be `detector_loss`'s own hardcoded default (5.0), never exposed to a
+    config. The new config-level default is the SAME number, so an absent key stays byte-identical.
+    """
     p = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
@@ -223,10 +220,7 @@ out = "/tmp/run"
 
 def test_train_detector_box_weight_is_actually_wired_through(tmp_path, dense_root, monkeypatch):
     """Proves the config->train_cfg->`detector_loss` call site is LIVE, not a dead key: two
-    otherwise-identical single-iteration runs (same seed, so the same batch and the same model
-    init) at `box_weight=5.0` vs `box_weight=1.0` must print DIFFERENT total losses -- if this
-    ever silently stopped passing `box_weight` through, both runs would read identically and this
-    test would catch it where a config-shape-only test (the one above) cannot.
+    otherwise-identical single-iteration runs must print DIFFERENT total losses.
     """
     import importlib.util
     import re
@@ -577,12 +571,9 @@ def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
 
 
 def test_a_rotated_region_certifies_less_not_more(tiny_root):
-    """A certified area is a CLAIM, and under a rotation a claim must round DOWN.
-
-    Four corners then the extent -- right for a BOX, which must not crop its animal -- is exactly
-    backwards for a region: the axis-aligned hull of a rotated rectangle claims area the annotator
-    never marked, re-admitting the unlabelled animals `regions.pq` exists to exclude. That is the
-    one direction the mask cannot be wrong in, since this root labels a median of 2 rats per frame.
+    """A certified area is a CLAIM, and under a rotation a claim must round DOWN: the hull of a
+    rotated rect claims area the annotator never marked, re-admitting the unlabelled animals
+    `regions.pq` exists to exclude.
     """
     from tailcyclenet.detector.data import _warp_region
 
@@ -611,11 +602,8 @@ def test_a_rotated_region_certifies_less_not_more(tiny_root):
 
 
 def test_chunk_is_one_containers_worth_of_index(tiny_root):
-    """`ChunkShuffle`'s block must be one video, or the locality it exists for is not there.
-
-    A hardcoded 512 spanned 13 calms21 videos per block and 52 per pool, which ran the reader
-    cache at a 16% hit rate and, at the cache size that thrash needed, OOM-killed the workers at
-    ~1 GB of open decord reader each.
+    """`ChunkShuffle`'s block must be one video, or the locality it exists for is not there: a
+    hardcoded 512 spanned 13 calms21 videos per block and ran the reader cache at a 16% hit rate.
     """
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 64), max_frames_per_group=2)
     n_src = len({(s.session_id, g, c) for s, g, _, c in ds.index})
@@ -632,12 +620,9 @@ def test_collate_pads_uneven_animal_counts():
 
 
 def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
-    """`min_views = 2` is the ALGORITHM, not a threshold.
-
-    Every group `associate` emits starts from a cross-camera pair, so `len(members) >= 2` always
-    and the floor never fires -- an animal only one camera saw is dropped from the frame outright.
-    `min_views = 1` is a different rule: it emits each leftover box as a single-view instance, which
-    the pose model supports (`prob_2d_only` trains exactly that input).
+    """`min_views = 2` is the ALGORITHM, not a threshold: every group starts from a cross-camera
+    pair, so the floor never fires. `min_views = 1` emits each leftover box as a single-view
+    instance, which the pose model supports.
     """
     import sys
     from pathlib import Path
@@ -698,15 +683,9 @@ def test_link_rows_follows_one_animal():
 def test_link_rows_state_carries_across_a_split():
     """N calls with `state=` must equal ONE call over the concatenation, byte for byte.
 
-    The inference loop associates a clip in BLOCKS whose size comes from the host RAM budget. If
-    the matcher restarted at each block's own frame 0, the identity assignment would break at a
-    boundary chosen by how much memory happened to be free -- two machines, two answers, and
-    nothing in the output saying so. That is the one thing the budget is never allowed to do.
-
-    The trap this pins is the `t0` asymmetry: frame 0 of the CLIP seeds `last` and is left
-    unpermuted, but a BLOCK's frame 0 is an ordinary mid-clip frame and must be permuted against
-    the carried `last`. Starting every block at `t0 = 1` would silently leave one frame per block
-    in score order.
+    Blocks are sized by the RAM budget, so identity must not break at a budget-derived boundary;
+    the trap is the `t0` asymmetry -- a block's frame 0 is a mid-clip frame and must be permuted
+    against the carried `last`, unlike the clip's own frame 0.
     """
     import numpy as np
 
@@ -738,20 +717,8 @@ def test_link_rows_state_carries_across_a_split():
 
 def test_associate_group_state_carries_across_a_split(tmp_path):
     """Same claim one level up, for BOTH branches: the tracker (C > 1) and `link_rows` (C == 1).
-
-    `associate_group` is where the block loop calls in, so the invariance has to hold there and
-    not only in the matcher underneath it. The two branches are separate code paths -- the tracker
-    subsumes `link_rows` and they never both run -- so a test that exercises one says nothing
-    about the other.
-
-    THE SCENE IS BUILT SO A STATELESS SPLIT ACTUALLY FAILS, and that took finding. Two animals
-    merely walking apart is NOT discriminating: a fresh tracker at the boundary re-births them into
-    the same slots in the same order, so the split matches the whole clip by luck and the test
-    passes while proving nothing. What breaks it is a row that VANISHES across the boundary -- the
-    survivor is then born into slot 0 by a fresh tracker, while the carried state keeps it in the
-    slot it already had. Verified both ways: without `state=` this scene disagrees with the whole
-    clip; with it, byte-identical. If a future change makes the tracker order-insensitive, check
-    that this test can still fail before trusting it.
+    The scene is built so a stateless split actually FAILS -- a row that vanishes across the
+    boundary seats the survivor differently in a fresh tracker.
     """
     import sys
     from pathlib import Path
@@ -777,12 +744,8 @@ def test_associate_group_state_carries_across_a_split(tmp_path):
             for c in range(C):
                 for a in range(S):
                     # Two animals drifting apart inside the fixture's 64x48 frame. What makes each
-                    # branch discriminating is different, so the scene is too:
-                    #   tracker (C > 1) -- the animal that lands in slot 0 VANISHES across the
-                    #     split, so a fresh tracker seats the survivor there instead;
-                    #   link_rows (C == 1) -- the DETECTION ORDER alternates, which is what a score
-                    #     reordering does and what `link_rows` exists to undo. Without this the
-                    #     rows arrive already in order and the matcher is a no-op.
+                    # branch discriminating differs: the tracker seats a vanished row's survivor
+                    # differently; link_rows needs the DETECTION ORDER to alternate.
                     if C > 1 and a == 1 and 4 <= t < 7:
                         continue
                     d = a if C > 1 else (a + t) % 2
@@ -870,12 +833,8 @@ def test_box_source_rejects_a_typo(tiny_root):
 
 
 def test_link_rows_never_force_assigns_another_animal():
-    """rat-city row 9: a row that matches nothing must stay EMPTY, not take a leftover.
-
-    `free.pop(0)` handed an unmatched row an arbitrary other detection. Its per-frame boxes then
-    looked normal-sized while TELEPORTING across the arena, and `run_group` crops the window to
-    their union -- 1924x1924 against a 244 px rat, 62x the area, which is the giant box the user saw
-    where there was no animal. Fixing the assignment fixes the crop at its source.
+    """A row that matches nothing must stay EMPTY, not take a leftover: `free.pop(0)` handed an
+    unmatched row another detection, whose teleporting boxes blew up the window-union crop.
     """
     import numpy as np
 
@@ -909,14 +868,8 @@ def test_link_rows_gates_on_the_animals_own_size():
 
 
 def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
-    """IoU RANKS BY SHAPE AGREEMENT, WHICH IS NOT IDENTITY. Constructed, but the failure mode is
-    the one measured: replaying calms21 frame 301->302 from the box cache, IoU scored the WRONG
-    mouse at 0.512 against the right one's 0.233, and Hungarian-matching the pose to labels after
-    that swap showed the error jump from 4-10 px to 60-82 px.
-
-    Here the true continuation is a smaller box on the SAME centre (a mouse that curled up), and the
-    other animal's box happens to match the remembered box's size. IoU rewards the size match; the
-    union term punishes the true one for shrinking. Centre distance is not fooled.
+    """IoU ranks by shape agreement, which is not identity: a true continuation that shrank loses
+    to a size-matched wrong animal. Centre distance is not fooled.
     """
     import numpy as np
 
@@ -957,15 +910,8 @@ def test_pose_nms_drops_the_lower_scored_duplicate():
 
 
 def test_pose_nms_is_a_correct_noop_with_no_keypoints():
-    """`kpts=None` (a detector with no keypoint branch) must return 0 and leave `stats` EMPTY,
-    not populate it with zeros.
-
-    `scripts/infer.py` crashed on every `rat-city-combined` arm of the capacity sweep here:
-    `pose_nms` returns before writing `stats['nms_pairs']` in this branch (correctly -- the maDLC
-    overlap it computes needs keypoints to exist at all, and a 2D root's own recipe has no
-    `--keypoints`), but the caller read `nms_stats["nms_pairs"]` with a bare subscript instead of
-    `.get(..., 0)` like its neighbour on the same line. This is the empty-stats case that bug
-    needed to reproduce.
+    """`kpts=None` must return 0 and leave `stats` EMPTY, not populate it with zeros -- the
+    empty-stats case the caller's bare-subscript bug needed to reproduce.
     """
     from tailcyclenet.detector.identity import pose_nms
 
@@ -981,10 +927,8 @@ def test_pose_nms_is_a_correct_noop_with_no_keypoints():
 
 
 def test_infer_reads_pose_nms_stats_defensively():
-    """Source check: both stats keys must be `.get(..., 0)`, never a bare subscript.
-
-    `nms_stats["nms_pairs"]` raised `KeyError` on every keypoint-less detector -- the NORMAL case
-    for a 2D root -- and `--pose-nms` is a documented default for exactly one of them (rat-city).
+    """Both stats keys must be `.get(..., 0)`, never a bare subscript -- `nms_pairs` raised
+    KeyError on every keypoint-less detector, the NORMAL case for a 2D root.
     """
 
     src = _infer_program_source()
@@ -998,8 +942,9 @@ def test_infer_reads_pose_nms_stats_defensively():
 
 
 def test_unletterbox_clamps_a_runaway_box_into_the_frame():
-    """`yolox.py:167` decodes a side as exp(clamp(-6,6))*stride -- up to ~12,910 px, ~137,000 after
-    a 1/7 letterbox scale. IoU-only NMS cannot suppress it, and downstream it becomes the crop."""
+    """A decoded side can reach ~12,910 px; IoU-only NMS cannot suppress it, so the clamp bounds
+    it into the frame and a zero-area box comes back NaN.
+    """
     from tailcyclenet.detector import unletterbox_boxes
 
     b = torch.tensor([[-5000.0, -5000.0, 20000.0, 20000.0], [10.0, 10.0, 9.0, 40.0]])
@@ -1011,11 +956,9 @@ def test_unletterbox_clamps_a_runaway_box_into_the_frame():
 
 
 def test_the_cross_view_tracker_holds_identity_where_the_two_old_passes_could_not():
-    """`track.demo()` as a test: report 12 R1's target state, on a three-camera rig.
-
-    `associate` was memoryless and `link_rows` matched per camera against last-known IoU, and the
-    two never exchanged anything -- so a row could be re-grouped from scratch in one pass and
-    re-permuted in the other. One target set with one affinity cannot disagree with itself.
+    """`track.demo()` as a test: one target set with one affinity cannot disagree with itself.
+    `associate` was memoryless and `link_rows` matched per camera, so a row could be re-grouped
+    in one pass and re-permuted in the other.
     """
     from tailcyclenet.detector.track import demo
     demo()
@@ -1069,12 +1012,11 @@ def test_a_detector_records_its_objectness_and_load_detector_hands_it_back(tmp_p
 
     0.99 was measured against detectors whose objectness is saturated (98.5% of rat-city's boxes at
     exactly 1.0). The tiled/masked generation reads q01 0.45-0.84 and loses two thirds of its
-    detections to the same number -- coverage 0.703 against 0.986 at 0.50 (dev/reports/21 0b). That
+    detections to the same number -- coverage 0.703 against 0.986 at 0.50. That
     is a property of the RECIPE, not of the dataset, so no constant is right for both and the only
     durable answer is to record what a checkpoint actually produces.
 
-    A checkpoint written before the field returns `{}` rather than a guess: "nobody measured this"
-    and "this one is saturated" are different answers, and gotcha 12 is what conflating them costs.
+    A checkpoint written before the field returns `{}` rather than a guess.
     """
     from tailcyclenet.detector import YOLOXNano, load_detector
 
@@ -1089,11 +1031,8 @@ def test_a_detector_records_its_objectness_and_load_detector_hands_it_back(tmp_p
 
 
 def test_the_tracker_is_the_default_and_can_be_turned_off():
-    """`--track` is ON by default (dev/reports/13), and `--no-track` restores the memoryless pass.
-
-    Pinned because the default is what every future arm inherits. Asserted on the SIGNATURE and on
-    the parser, not on the source text: the three text scrapes this test used to carry were all
-    about the `--det-cache` stamp, which no longer exists.
+    """`--track` is ON by default, and `--no-track` restores the memoryless pass. Asserted on the
+    SIGNATURE and on the parser, not on source text.
     """
     import inspect
 
@@ -1113,12 +1052,8 @@ def test_the_tracker_is_the_default_and_can_be_turned_off():
 
 
 def test_the_npz_records_which_crop_source_made_it():
-    """`__box_source__` is the detector's TRAINING target and does not say what the crop came from.
-
-    Report 15 §6's two item-3 arms both wrote `__box_source__ = 'keypoints'` (same detector) and
-    nothing else distinguished them, so a `--crop-source` pair was told apart by filename alone --
-    the shape of gotcha 12, one field over. `--refine` rides the same field because it is the other
-    re-crop lever.
+    """`__box_source__` is the detector's TRAINING target and does not say what the crop came from;
+    `--crop-source` pairs must not be told apart by filename alone. `--refine` rides the same field.
     """
 
     src = _infer_program_source()
@@ -1137,14 +1072,8 @@ def test_the_npz_records_which_crop_source_made_it():
 
 
 def test_crop_source_keypoints_refuses_a_keypointless_detector():
-    """A detector with no keypoint branch must not silently become `--crop-source boxes`.
-
-    `run_group` switches on `det_kpts_stc is not None`, so a detector that offers only boxes does
-    not error -- it crops from the boxes and reports the arm under the other arm's name, which is
-    the one comparison report 15 §6 item 3 exists to make.
-
-    A source check because the guard sits beside `load_detector`, past `load_run`, so reaching it
-    needs a trained detector and a checkpoint.
+    """A detector with no keypoint branch must not silently become `--crop-source boxes`. A source
+    check because the guard sits past `load_run`, so reaching it needs a trained detector.
     """
 
     src = _infer_program_source()
@@ -1290,11 +1219,8 @@ def test_there_are_no_running_statistics():
 
 
 def test_the_forward_does_not_depend_on_the_rest_of_the_batch():
-    """Batch independence, which is what lets a high-resolution arm hold a smaller batch.
-
-    Without it, holding the batch equal across a resolution sweep is a hard constraint rather
-    than merely good practice (eval rule 4) -- an arm that had to drop its batch would be a
-    differently-normalised model, and the sweep would measure that instead of resolution.
+    """Batch independence is what lets a high-resolution arm hold a smaller batch: without it, a
+    resolution sweep that changed the batch would measure normalisation instead of resolution.
     """
     torch.manual_seed(0)
     m = YOLOXNano().eval()
@@ -1378,7 +1304,7 @@ def test_width_only_applies_to_trimmed():
 
 
 def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
-    """The fifth instance of gotcha 12's shape: absent means `trimmed`, never a guess."""
+    """The fifth instance of the absent-key rule: absent means `trimmed`, never a guess."""
     from tailcyclenet.detector import load_detector
 
     p = tmp_path / 'detector.pth'
@@ -1474,9 +1400,8 @@ def test_tile_transform_is_the_letterbox_form():
 
 
 def test_tiled_targets_are_still_the_crop_rule(tiny_root):
-    """gotcha 8 under tiling: the box is RE-DERIVED in source px, never scaled by tile_scale.
-
-    If this fails every tiled detector number is invalid, exactly as for the whole-frame version.
+    """The box is RE-DERIVED in source px, never scaled by tile_scale -- if this fails every tiled
+    detector number is invalid, exactly as for the whole-frame version.
     """
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2,
                     tile_wh=(32, 32), tile_scale=1.0)
@@ -1622,10 +1547,9 @@ def test_detector_loss_without_ignore_is_unchanged():
     assert np_['ignored'] == 0.0
 
 
-# ----------------------------------------------------------------------------------------------
-# T2.3 -- IoU-aware objectness (dev/plans/detector_accuracy.md). The BCE target at a positive
-# anchor becomes the detached predicted-vs-GT IoU instead of a hard 1.0, once past a warmup. Off
-# by default (`iou_aware=False`) and byte-identical to every checkpoint on record either way.
+# T2.3 -- IoU-aware objectness. The BCE target at a positive anchor becomes the detached
+# predicted-vs-GT IoU instead of a hard 1.0, once past a warmup. Off by default (`iou_aware=False`)
+# and byte-identical to every checkpoint on record either way.
 # ----------------------------------------------------------------------------------------------
 
 def test_paired_iou_matches_box_iou_diagonal():
@@ -1826,16 +1750,9 @@ iou_aware_warmup = 0
 
 
 def test_a_nan_box_is_skipped_by_both_cross_view_paths():
-    """The two halves of `unletterbox_boxes`' contract, joined. They never were.
-
-    That function returns NaN for a box the frame clamp left with no area, and the test above
-    asserts it. `associate`'s docstring said it skips a non-finite centre -- but `_triangulate`
-    ends in `torch.linalg.svd`, which RAISES on non-finite input, so the `isfinite(p3d)` guard
-    after it was unreachable. `CrossViewTracker` raised too, one step later: `clip(1 - nan)` is
-    NaN, `affinity.any()` is True for NaN, and `linear_sum_assignment` refuses the matrix.
-
-    Both were reachable from one anchor firing in the letterbox padding band, and both killed
-    `detect_group` mid-clip -- on rat-city's 57,594-frame test group, hours of decode in.
+    """The two halves of `unletterbox_boxes`' contract, joined. They never were: `associate`'s
+    `isfinite` guard was unreachable (SVD raises on non-finite input) and the tracker refused the
+    NaN affinity matrix -- both reachable from one anchor firing in the letterbox padding band.
     """
     from aniposelib.cameras import Camera, CameraGroup
 
@@ -1882,14 +1799,9 @@ def test_a_nan_box_is_skipped_by_both_cross_view_paths():
 
 
 def test_reduce_under_tiling_matches_what_deployment_decodes():
-    """`--reduce` compared the whole frame against the TILE size, which is not where it is headed.
-
-    Tiled, `input_wh` is the tile, so rat-city's 4696x2048 against a 640x640 tile gave r = 2 and
-    against 640x288 gave r = 4 -- and the warp multiplies the decode scale back up, so the tile
-    came out a 2-4x UPSAMPLE of a decimated frame. Deployment letterboxes the whole frame to
-    `tiled_input_wh(src, tile_scale)` instead, where the same function returns 1 and the detector
-    sees native pixels. That is the train/deploy sampling skew `reduce` is stamped into the
-    checkpoint to prevent.
+    """`--reduce` compared the whole frame against the TILE size, which is not where it is headed:
+    deployment letterboxes the whole frame to `tiled_input_wh`, where the same function returns 1
+    and the detector sees native pixels.
     """
     from tailcyclenet.detector.data import reduce_factor
 
@@ -1908,17 +1820,10 @@ def test_reduce_under_tiling_matches_what_deployment_decodes():
 
 
 def test_provenance_records_every_box_affecting_option():
-    """Nothing that changes a detection may go unrecorded beside the numbers it produced.
-
-    This is what is left of the `--det-cache` stamp's safety property. The stamp compared two runs
-    so a cache could be REFUSED; there is no cache, and no comparison to make -- but "which
-    detector, at which threshold, at which input size" is still the difference between two numbers
-    that look alike (eval rule 4), and it belongs in the output rather than in a shell history.
-
-    Table-driven against `detect_raw`'s own signature, so the next parameter added to that function
-    fails here instead of being found in review. Asserted on the VALUE `_box_provenance` returns
-    rather than on the driver's source text, which the stamp version had to do and which is why it
-    broke every time the block around it moved.
+    """Nothing that changes a detection may go unrecorded beside the numbers it produced: "which
+    detector, at which threshold, at which input size" belongs in the output, not in shell history.
+    Table-driven against `detect_raw`'s own signature, asserted on the VALUE `_box_provenance`
+    returns.
     """
     import argparse
     import inspect
@@ -1931,7 +1836,7 @@ def test_provenance_records_every_box_affecting_option():
     prov = _box_provenance(args, None, False, None)
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
-    # `batch` is in there under protest: it is NOT inert (report 38 §3.2) but it is pinned rather
+    # `batch` is in there under protest: it is NOT inert but it is pinned rather
     # than exposed, so no run can differ in it. `frames`/`read` are the block loop's plumbing and
     # change no pixel. See tests/test_memory_budget.py.
     plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read'}
@@ -1979,16 +1884,9 @@ def test_score_dataset_scores_unaugmented_and_restores_the_flag():
 
 
 def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
-    """`--min-views 1` births a target whose 3D point is all-NaN BY DESIGN (`associate`).
-
-    Such a target is filtered out of `slots`, so the update loop never touches its `age`, `retire`
-    never fires, and `free` excludes it because it is still in `self.targets`. One single-view
-    birth on frame 0 therefore cost a row for the rest of the clip -- on rat-city's 57,594-frame
-    test group, permanently.
-
-    This is NOT the documented immortal ONE-CAMERA target, which has a finite point, stays in
-    `slots`, and whose retirement was tried and measured worse (+2.72 mm MPJPE). This one is
-    invisible to the matcher altogether.
+    """`--min-views 1` births a target whose 3D point is all-NaN BY DESIGN; such a target is
+    invisible to the matcher, so it never ages and its row is lost for the whole clip. This is NOT
+    the documented immortal one-camera target, which has a finite point.
     """
     import torch
 
@@ -2011,12 +1909,8 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
 
 
 def test_ema_off_builds_nothing_and_on_tracks_the_weights_it_averages():
-    """`--ema-decay 0` must not construct an averaged model; on, it must actually average.
-
-    EMA is the one optimiser lever here that yields BOTH arms from a single run -- the raw and
-    averaged weights are scored on the same windows in the same iteration -- so the arms are paired
-    by construction rather than differing by seed noise as two runs would. That is only true if the
-    off path is untouched and the on path is a real average rather than a copy.
+    """`--ema-decay 0` must not construct an averaged model; on, it must actually average -- the
+    one optimiser lever that yields both arms from a single run.
     """
     from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
@@ -2026,10 +1920,8 @@ def test_ema_off_builds_nothing_and_on_tracks_the_weights_it_averages():
 
     p = next(model.parameters())
 
-    # THE FIRST `update_parameters` IS A COPY, NOT AN AVERAGE. `AveragedModel` starts with
-    # `n_averaged = 0` and seeds itself from the model on the first call; only from the second does
-    # `avg_fn` run. Worth pinning, because a test that changed the weights and updated ONCE would
-    # see a perfect copy and read it as "the EMA is not averaging".
+    # THE FIRST `update_parameters` IS A COPY, NOT AN AVERAGE: `AveragedModel` seeds itself from
+    # the model on the first call; only from the second does `avg_fn` run.
     ema.update_parameters(model)
     seeded = next(ema.module.parameters()).detach().clone()
     torch.testing.assert_close(seeded, p.detach())
@@ -2046,11 +1938,9 @@ def test_ema_off_builds_nothing_and_on_tracks_the_weights_it_averages():
 
 
 def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
-    """The run measured its own peak and then overwrote it -- worth up to -28% recall.
-
-    On rat-city-annotated recall PEAKS at 4-8k and falls to 20k, because a root whose labelled
-    frame names 2 of ~10 rats spends the rest of training learning that most rats are background.
-    So "last" is not a tie-break with "best" here, it is systematically the wrong end.
+    """The run measured its own peak and then overwrote it -- worth up to -28% recall: on a root
+    whose labelled frame names 2 of ~10 rats, recall peaks at 4-8k and falls by 20k, so "last" is
+    systematically the wrong end.
     """
     from pathlib import Path
 
@@ -2075,10 +1965,7 @@ def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
 
 def test_birth_age_off_is_the_rule_it_replaced():
     """`birth_age=None` must be byte-identical to the pre-knob rule, because it is the default.
-
-    Loosening the birth rule is REFUTED: it buys coverage by letting one row hold two animals, and
-    `run_group` unions a row's boxes over a window, so rat-city's union p99 goes 590 -> 3804 px
-    against a 244 px rat. The knob ships off; the fix for the 34% drop is spare rows.
+    Loosening the birth rule is refuted (it lets one row hold two animals); the knob ships off.
     """
     from tailcyclenet.detector import link_rows
     rng = np.random.default_rng(0)
@@ -2103,15 +1990,13 @@ def test_birth_age_off_is_the_rule_it_replaced():
 
 
 
-# ----------------------------------------------------------------------------------------------
-# `--augment-strong`: the strong appearance/erasure/mosaic-lite suite (gotcha 8 throughout).
+# `--augment-strong`: the strong appearance/erasure/mosaic-lite suite.
 # ----------------------------------------------------------------------------------------------
 
 def test_strong_augment_off_is_byte_identical(tiny_root):
-    """`strong=False` must never draw an extra rng value or touch a pixel or a box.
-
-    `--augment-strong` is a KEY: every recorded arm before it existed must stay reproducible, so
-    the off path has to be indistinguishable from a `BoxDataset` that has never heard of it.
+    """`strong=False` must never draw an extra rng value or touch a pixel or a box: every recorded
+    arm before it existed must stay reproducible. Asserted on shape/box count (the augmented path
+    draws fresh entropy per visit, so pixels are not literally reproducible).
     """
     ds_a = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
                      max_frames_per_group=2, augment=True, strong=False, seed=0)
@@ -2146,11 +2031,7 @@ def test_strong_augment_off_leaves_boxes_targets_unchanged(tiny_root):
 
 
 def test_strong_augment_preserves_box_targets(tiny_root):
-    """Appearance ops and cutout must never move a box -- only mosaic-lite may ADD one.
-
-    Runs the strong suite many times over a fixed set of items and checks that every box present
-    before the suite ran is still present, unchanged, after it -- the count may only GROW (mosaic).
-    """
+    """Appearance ops and cutout must never move a box -- only mosaic-lite may ADD one."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
                     max_frames_per_group=2, augment=True, strong=True, seed=0)
     for i in range(min(4, len(ds))):
@@ -2218,13 +2099,8 @@ def test_mosaic_rejected_when_use_regions(tiny_root):
 
 
 def test_infer_help_renders():
-    """`--help` must actually print. It did not, and nothing noticed for months.
-
-    argparse expands every `help=` string as `help % params`, so a BARE `%` in one is a format spec:
-    `80% of frames` reads as `%o` and `--help` dies with `TypeError: %o format: an integer is
-    required, not dict`. Three help strings carried one. Nothing else in the suite runs `--help`,
-    and `--help` is how anybody discovers a flag -- so a broken one silently hides every option this
-    script has.
+    """`--help` must actually print: argparse expands every `help=` string as `help % params`, so a
+    bare `%` kills it with a format TypeError and hides every option the script has.
     """
     import subprocess
     import sys
@@ -2411,13 +2287,9 @@ iters = 2
 
 
 def test_train_detector_config_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A 2-iteration run through scripts/train_detector.py's `main()` with a config file
-    produces the same artefacts a CLI run did -- checkpoints, metrics.json, and now config.toml
-    + provenance.toml -- and the checkpoint still loads through the unchanged `load_detector`.
-
-    IN-PROCESS, not a subprocess: `train_detector.py` imports torch, and on this host a fresh
-    interpreter spends ~60s of the ~110s wall clock just importing -- a subprocess would pay it
-    twice. `test_train.py` runs `scripts/train.py` the same way.
+    """A 2-iteration run through `scripts/train_detector.py`'s `main()` with a config file
+    produces the same artefacts a CLI run did, and the checkpoint still loads through `load_detector`.
+    IN-PROCESS, not a subprocess: a fresh interpreter pays ~60 s just importing torch.
     """
     import importlib.util
     import sys
@@ -2489,12 +2361,8 @@ kpt_score_weight = 1.0
 
 
 def test_load_detector_config_out_override_rescues_an_empty_out(tmp_path):
-    """`--out` must be able to fill in `[training].out = ""` -- the shipped `configs/detector.toml`
-    ships it empty on exactly that promise, and every per-root overlay under `configs/detector/`
-    leaves `out` for the CLI rather than restating a path in the file. The override used to be
-    applied AFTER the `out` required-check, so it could never rescue anything and the promise in
-    the config's own comment was false. Pinned so it cannot regress silently -- the failure mode
-    is a `SystemExit` at every real invocation of a per-root overlay via `--out`.
+    """`--out` must be able to fill in `[training].out = ""` -- the override used to be applied
+    AFTER the required-check, so it could never rescue anything.
     """
     cfg = tmp_path / 'cfg.toml'
     cfg.write_text("""
@@ -2539,7 +2407,7 @@ def test_per_root_detector_overlays_load_and_raise_val_frames_per_group(tmp_path
     """Every shipped per-root overlay under `configs/detector/` must resolve through
     `extends = "../detector.toml"`, carry `[data].path` (the one thing with no CLI override), and
     set `val_frames_per_group` past the shipped default of 8 -- each of these three roots has ONE
-    val group, so the default under-samples it (dev/plans/detector_accuracy.md T0.3)."""
+    val group, so the default under-samples it."""
     root = Path(__file__).resolve().parent.parent / 'configs' / 'detector'
     want = {'rat-city.toml': 64, 'branson-fly.toml': 32, '3dpop.toml': 16}
     for name, expect in want.items():
@@ -2551,17 +2419,12 @@ def test_per_root_detector_overlays_load_and_raise_val_frames_per_group(tmp_path
 
 
 def test_deployment_score_untrained_model_is_all_zero(tmp_path):
-    """`deployment_score` (T0.1, dev/plans/detector_accuracy.md) on a FRESH `YOLOXNano`: the
-    rare-positive objectness prior (bias -4.595, sigmoid ~0.0099) sits below any sane
-    `det_score`, so `det_fill` and `slot_fill` must read exactly 0 and `window_miss` exactly 1 --
-    a degenerate but DETERMINISTIC floor, pinned so a future change to the init or to the
-    threshold plumbing is caught rather than silently shifting the floor.
+    """`deployment_score` on a FRESH `YOLOXNano`: the rare-positive objectness prior sits below
+    any sane `det_score`, so `det_fill`/`slot_fill` read exactly 0 and `window_miss` exactly 1.
 
     THE SEED IS WHAT MAKES "DETERMINISTIC" TRUE. The objectness PRIOR sits at ~0.0099, but the
     head's random init scatters the actual logits around it, and 3 of 20 torch seeds put at least
-    one anchor above `det_score = 0.05` -- so unseeded this test reads its own RNG state. It never
-    varied on its own because it ran at a fixed position in the suite; adding or removing a test
-    anywhere in this file reshuffles xdist's distribution and moves the state it happens to see.
+    one anchor above `det_score = 0.05` -- so unseeded this test reads its own RNG state.
     """
     torch.manual_seed(0)
 
@@ -2623,11 +2486,9 @@ def test_gt_crop_sides_3d_projects_through_the_right_camera(tmp_path):
 
 
 def test_eval_detector_deploy_cli_end_to_end(tmp_path, monkeypatch, capsys):
-    """A 2-iteration checkpoint through `scripts/train_detector.py`, scored through
-    `scripts/eval_detector.py --deploy` -- the new mode, wired the same way `--compare` is:
-    argv in, printed table out, no crash. Not a numeric assertion (2 iterations is noise); this
-    pins that the CLI plumbing (load_detector -> load_datasets -> deployment_score -> print)
-    runs end to end on a REAL trained-and-reloaded checkpoint, not just synthetic tensors.
+    """A 2-iteration checkpoint through `train_detector.py`, scored through
+    `eval_detector.py --deploy`: pins that the CLI plumbing runs end to end on a REAL
+    trained-and-reloaded checkpoint, not just synthetic tensors.
     """
     import importlib.util
     import sys
@@ -2700,8 +2561,7 @@ kpt_score_weight = 1.0
     assert line.split()[1] == '2', f'expected the truncated T=2 in {line!r}'
 
 
-# ----------------------------------------------------------------------------------------------
-# T2.1: instances.pq PRESENT boxes as an objectness ignore mask (dev/plans/detector_accuracy.md)
+# T2.1: instances.pq PRESENT boxes as an objectness ignore mask
 # ----------------------------------------------------------------------------------------------
 
 def test_present_ignore_boxes_for_matches_ignore_for_when_unwarped(tmp_path):
@@ -2854,11 +2714,9 @@ kpt_score_weight = 1.0
     assert ckpt['ignore_present'] is True
 
 
-# ----------------------------------------------------------------------------------------------
-# T4.1 -- pretrained COCO backbone (dev/plans/detector_accuracy.md). `bottleneck_expansion` is an
-# architecture SHAPE key (yolox.py); `pretrained` is the config-level switch. Both must be inert
-# at their defaults -- every checkpoint on record was built at bottleneck_expansion=0.5,
-# pretrained=''.
+# T4.1 -- pretrained COCO backbone. `bottleneck_expansion` is an architecture SHAPE key
+# (yolox.py); `pretrained` is the config-level switch. Both must be inert at their defaults --
+# every checkpoint on record was built at bottleneck_expansion=0.5, pretrained=''.
 # ----------------------------------------------------------------------------------------------
 
 WEIGHTS_DIR = REPO / 'scratch' / 'weights'
@@ -2866,10 +2724,9 @@ _HAVE_COCO_WEIGHTS = (WEIGHTS_DIR / 'yolox_tiny.pth').exists()
 
 
 def test_bottleneck_expansion_default_matches_the_shipped_shape():
-    """At the default 0.5, `dark3`'s first bottleneck's conv1 is (24,48,1,1) on `tiny` -- the
-    exact shape dev/plans/detector_accuracy.md T4.1 names as the shipped (narrow) one, HALF
-    Megvii's own (48,48,1,1). This is the shape every checkpoint on record was built at; the test
-    pins it so a future change to `round8`/`YOLOX_TIERS` cannot silently move it.
+    """At the default 0.5, `dark3`'s first bottleneck's conv1 is (24,48,1,1) on `tiny` -- HALF
+    Megvii's own (48,48,1,1). This is the shape every checkpoint on record was built at; pin it
+    so a future change cannot silently move it.
     """
     m = YOLOXNano(version='tiny')
     assert m.bottleneck_expansion == 0.5
@@ -2912,18 +2769,17 @@ def test_bottleneck_expansion_raises_alongside_trimmed():
     YOLOXNano(version='trimmed', bottleneck_expansion=0.5)      # the default: must NOT raise
 
 
-# ----------------------------------------------------------------------------------------------
-# T4.3 -- a stride-4 (P2) FPN level (dev/plans/detector_accuracy.md). `p2=False` (default) is
-# byte-identical to every checkpoint on record; unlike `bottleneck_expansion`, this one is NOT
-# tier-restricted -- it applies to `trimmed` and every canonical tier alike.
+# T4.3 -- a stride-4 (P2) FPN level. `p2=False` (default) is byte-identical to every
+# checkpoint on record; unlike `bottleneck_expansion`, this one is NOT tier-restricted -- it
+# applies to `trimmed` and every canonical tier alike.
 # ----------------------------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------------------------
-# T4.2 -- temporal input (dev/plans/detector_accuracy.md). `in_channels` widens the stem; the
-# TRAINING data path (`BoxDataset`) now supplies a wider input via `[data].temporal_input`, one
-# mode ('stack2', frame t-1 stacked beside frame t). `detect_raw` (deployment) does NOT yet
-# supply one -- still owed, so a `temporal_input != 'none'` checkpoint can be trained and scored
-# via `eval_detector.py` but not yet run through `scripts/infer.py --detector`.
+# T4.2 -- temporal input. `in_channels` widens the stem; the TRAINING data path (`BoxDataset`)
+# now supplies a wider input via `[data].temporal_input`, one mode ('stack2', frame t-1 stacked
+# beside frame t). `detect_raw` (deployment) does NOT yet supply one -- still owed, so a
+# `temporal_input != 'none'` checkpoint can be trained and scored via `eval_detector.py` but not
+# yet run through `scripts/infer.py --detector`.
 # `in_channels=3` / `temporal_input='none'` (both default) are byte-identical to every checkpoint
 # on record.
 # ----------------------------------------------------------------------------------------------
@@ -3182,8 +3038,8 @@ out = "/tmp/run"
 
 def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
     """A `temporal_input='stack2'` checkpoint (`in_channels=6`) must reconstruct an
-    `in_channels=6` model through `load_detector` -- absent means 3 (gotcha 12's shape), so this
-    is the proof a SAVED fact survives, not just that the constructor kwarg works alone."""
+    `in_channels=6` model through `load_detector` -- absent means 3, so this proves a SAVED fact
+    survives, not just that the constructor kwarg works alone."""
     from tailcyclenet.detector import load_detector
 
     m = YOLOXNano(version='tiny', in_channels=6)
@@ -3201,9 +3057,9 @@ def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
 
 
 def test_load_detector_absent_in_channels_means_3(tmp_path):
-    """Every checkpoint written before this key existed carries no `in_channels` at all -- gotcha
-    12: absent is a FACT about those files (3, the only stem width they were ever built at), not
-    a guess."""
+    """Every checkpoint written before this key existed carries no `in_channels` at all -- absent
+    is a FACT about those files (3, the only stem width they were ever built at), not a guess.
+    """
     from tailcyclenet.detector import load_detector
 
     m = YOLOXNano(version='tiny')
@@ -3260,8 +3116,8 @@ def test_p2_works_on_trimmed_too():
 
 def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
     """A `p2=True` checkpoint must reconstruct a `p2=True` model through `load_detector` -- absent
-    means `False` (gotcha 12's shape), so this is the proof a SAVED `p2=True` fact survives, not
-    just that the constructor kwarg works in isolation."""
+    means `False`, so this proves a SAVED `p2=True` fact survives, not just that the constructor
+    kwarg works in isolation."""
     from tailcyclenet.detector import load_detector
 
     m = YOLOXNano(version='tiny', p2=True)
@@ -3465,7 +3321,7 @@ out = "/tmp/run"
 
 
 @pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
-                    '(CLAUDE.md) and may not be cached on this machine')
+                    'and may not be cached on this machine')
 def test_load_coco_backbone_transfers_every_backbone_tensor():
     """The end-to-end claim T4.1 exists to fix: 35/35 backbone conv tensors load at
     bottleneck_expansion=1.0, not the 19/35 the shipped 0.5 shape permits."""
@@ -3480,7 +3336,7 @@ def test_load_coco_backbone_transfers_every_backbone_tensor():
 
 
 @pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
-                    '(CLAUDE.md) and may not be cached on this machine')
+                    'and may not be cached on this machine')
 def test_load_coco_backbone_stem_correction_matches_megvii_activation():
     """T4.1's own test: a corrected weight fed this repo's RGB/[0,1] convention must produce the
     SAME stem activation Megvii's raw weight produces on the identical image fed BGR/[0,255] --
@@ -3509,7 +3365,7 @@ def test_load_coco_backbone_stem_correction_matches_megvii_activation():
 
 
 @pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
-                    '(CLAUDE.md) and may not be cached on this machine')
+                    'and may not be cached on this machine')
 def test_train_detector_pretrained_coco_end_to_end(tmp_path, dense_root, monkeypatch):
     """A 2-iteration run with `pretrained = "coco"` through the real CLI entry point: the backbone
     loads, training runs, and the checkpoint records both new keys so `load_detector` rebuilds the
@@ -3566,8 +3422,7 @@ eval_batches = 1
     assert model.bottleneck_expansion == 1.0
 
 
-# ----------------------------------------------------------------------------------------------
-# T4.1b -- in-domain backbone pretraining, T4.1's control (dev/plans/detector_accuracy.md).
+# T4.1b -- in-domain backbone pretraining, T4.1's control.
 # `scripts/pretrain_detector_backbone.py` + `detector.pretrained.load_pretrained_backbone` +
 # `[model].pretrained` accepting an arbitrary path.
 # ----------------------------------------------------------------------------------------------

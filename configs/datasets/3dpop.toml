@@ -1,12 +1,11 @@
 # 3D-POP: pigeons, 4 calibrated cameras, up to 10 birds per sequence.
 #
-# `names` is transcribed directly from pose3d.npz['keypoints'], and `check_npz` re-asserts that on
+# `names` is transcribed directly from pose3d.npz['keypoints'], re-asserted by `check_npz` on
 # every load, so this file cannot drift from the data.
 #
-# bp1-bp4 and hd1-hd4 are backpack / head marker points whose left-right correspondence is not
-# recoverable from the names. `flip_pairs` and `skeleton` are therefore left EMPTY rather than
-# partially filled -- a partial bilateral map would silently mislabel the markers it omits, and a
-# partial skeleton would make bone-length dispersion measure an invented constraint.
+# bp1-bp4 and hd1-hd4 are backpack/head markers with no recoverable left-right correspondence, so
+# `flip_pairs` and `skeleton` are left EMPTY rather than partially filled -- a partial bilateral
+# map would silently mislabel the markers it omits.
 name = "3dpop"
 mode = "3d"
 units = "mm"

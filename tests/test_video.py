@@ -1,17 +1,13 @@
 """THE VIDEO READ BACKEND, and the contract a replacement has to honour exactly.
 
-`tailcyclenet/video.py` exists because decord loads whole containers into memory (dmlc/decord#80,
-#197): a 16-camera `--videos` run over 21 GB recordings peaked at 456 GB under `--max-ram 24`.
-PyAV replaced it, and the ONLY thing that makes that swap legitimate is that it is output-neutral
--- which is measured against decord on the real roots
-(`scratch/backend_parity_roots.py`, `scratch/backend_parity_readframes.py`) and pinned HERE against
-the synthetic fixture, so it keeps being true.
+`tailcyclenet/video.py` exists because decord loads whole containers into memory: a 16-camera
+`--videos` run over 21 GB recordings peaked at 456 GB under `--max-ram 24`. PyAV replaced it, and
+the ONLY thing that makes that swap legitimate is that it is output-neutral -- pinned HERE against
+the synthetic fixture so it keeps being true.
 
 **decord's `get_batch` CONTRACT IS NOT JUST "give me these frames".** It returns them in the ORDER
 ASKED FOR, including REPEATS -- and `dataset.read_frames` leans on both: `_frames` clamp-pads a
 window that runs past the end of its group, so one index legitimately occupies several positions.
-A backend that silently returned sorted-unique frames would corrupt exactly those windows, and
-251 of johnson-mouse's 624 train windows are that shape.
 """
 import sys
 from pathlib import Path
@@ -95,20 +91,10 @@ def test_get_batch_honours_order_and_repeats(clip, idx):
 
 
 def test_a_vfr_remux_is_indexed_by_the_declared_rate_not_the_average(tmp_path):
-    """**A RATE OFF BY A PART IN 400 IS AN OFF-BY-ONE FRAME PART WAY THROUGH THE CLIP.**
-
-    `_index_of` turns a pts into a frame ORDINAL by multiplying by a rate, so which rate it picks
-    is the whole of the index arithmetic. `average_rate` is duration/frames -- a DERIVED average,
-    wrong whenever the declared duration is not exactly frames x period, which is what an ffmpeg
-    `select` + `-vsync vfr` remux produces (it is how the allen-mouse demo clips were cut: 3000
-    frames, pts step exactly 256 at time_base 1/12800 = exactly 50 fps, but `average_rate` reads
-    200000/3999). Under it the ordinals drift, and at some frame they SKIP one: the decoder then
-    cannot produce that index at all and every frame after it is mislabelled +1.
-
-    Caught because `get_batch` refuses a frame it cannot decode -- but the raise is the lucky
-    half. The silent half is the rest of the clip coming back one frame late, which is a different
-    picture of a moving animal and is exactly what this module rejected OpenCV for (opencv#9053).
-    So this asserts the COLOURS, not merely that nothing raised.
+    """A RATE OFF BY A PART IN 400 IS AN OFF-BY-ONE FRAME PART WAY THROUGH THE CLIP: `average_rate`
+    is a derived average that drifts on a `-vsync vfr` remux, and under it the ordinals eventually
+    SKIP -- the decoder then cannot produce that index, and every frame after is mislabelled +1.
+    So this asserts the COLOURS, not merely that nothing raised (the same reason OpenCV was rejected).
     """
     import subprocess
 

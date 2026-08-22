@@ -1,19 +1,10 @@
 """The query encoder: what the model is told about each keypoint before it looks.
 
-posetail's stock `QueryEncoder` describes a *point being tracked*: where it is, what it looks
-like, how far away, whether it is visible. A pose model instead has K NAMED keypoints, and the
-name is the thing that distinguishes them. So one fusion term becomes a learned per-keypoint
-identity vector, and the appearance patch is kept alongside it -- the model gets to say both
-*which* keypoint and *what is there*, which neither encoder alone could.
-
-The position-derived terms carry a learned no-query token rather than falling back to the crop
-centre: that fallback is indistinguishable from a real prior that happens to say "the crop
-centre", so the model could not tell "I was not told" from "I was told this".
-
-**Keypoint ids do not travel through the occlusion channel.** `TrackerEncoder.forward`'s only
-per-keypoint channel is `occlusion`, and the stock encoder clamps `occlusion + 1` into `[0, 2]`,
-so the two consumers can never share that tensor. The model stashes `_kpt_ids` on this module
-directly instead.
+A pose model has K NAMED keypoints, so one fusion term is a learned per-keypoint identity vector
+and the appearance patch is kept alongside it. Position-derived terms carry a learned no-query
+token instead of the crop centre, so "not told" is distinguishable from a prior that happens to
+say the crop centre. Keypoint ids never ride the occlusion channel (the stock encoder clamps it
+into [0, 2]); they are stashed as `_kpt_ids` instead.
 """
 import torch
 import torch.nn as nn
@@ -27,10 +18,8 @@ from posetail.posetail.utils import get_fourier_encoding
 def _tile_to_query_axis(x, n_query, what):
     """(B, N) per-keypoint -> (B, T*N) along the query axis, t-major.
 
-    `_decode_from_scene` repeats the query set as `b n r -> b (t n) r`, so a per-keypoint tensor
-    tiles that axis exactly. A non-divisible shape means the query set was chunked or reordered,
-    and silently broadcasting one keypoint's value over all of them is how this went wrong
-    before -- so it is an assertion, not a `repeat` that happens to work.
+    Must tile the (t n) axis exactly: a non-divisible shape is an assertion, not a silent
+    broadcast.
     """
     if x.shape[1] == n_query:
         return x
@@ -44,14 +33,8 @@ def _tile_to_query_axis(x, n_query, what):
 def _sub_unprompted(owner, term, token):
     """Replace `term` with `token` on every query slot that had no real prior.
 
-    ONE implementation for every position-derived term in BOTH encoders. A second copy for `pos`,
-    `vis` or `qpos` would be the same mistake as having three window loops -- and it is the exact
-    mistake posetail-pose made: the two worst defects in posetail-pose's query path, live for most of its history, were a mask derived from an always-finite tensor (so `missing_patch` was
-    DEAD CODE and unprompted patches were sampled at the crop centre) and a `(B,N)` mask applied
-    to a `(B,T*N)` axis (so keypoint 0's validity was broadcast over every keypoint). This repo
-    fixes the first in `model.py` and the second in `_tile_to_query_axis` below -- but the second
-    fix only holds if every substitution routes through HERE. A hand-written second copy in a new
-    encoder reintroduces it, and no string grep would catch that.
+    ONE implementation for every position-derived term in BOTH encoders; a hand-written second
+    copy in a new encoder reintroduces the mask-width bug.
     """
     ok = getattr(owner, '_query_ok', None)
     if ok is None or term is None:
@@ -64,20 +47,9 @@ def _sub_unprompted(owner, term, token):
 class WideQueryEncoder(nn.Module):
     """The query encoder: identity + time, fused at `latent_dim` instead of `embed_dim`.
 
-    Six terms at 512 dims, inheriting almost nothing from the base tracker. 94% of the parameters
-    are the fusion MLP; the identity table is the one mechanism distinguishing LH-wrist from
-    RH-wrist, which is load-bearing in a query-free model.
-
-    Two terms put the prior back:
-
-    - `query_pos_embedding` -- where the query is. Without it this encoder ignores `query_coords`
-      ENTIRELY, so a declared prior becomes a silent no-op.
-    - `query_patch_embedding` -- WHAT IS AT the query, not just where.
-
-    `PoseTrackerEncoder` builds both iff `query = "prior"`: under `query = "none"` the prior is
-    never read, so both terms would be constant vectors feeding dead gate inputs. Both terms carry
-    a learned no-query token, or an unprompted keypoint's query would be the derived scene point
-    presented as a real answer.
+    `query_pos_embedding` (where the query is) and `query_patch_embedding` (what is at it) put
+    the prior back; both are built iff `query = "prior"`, and both carry a learned no-query token
+    so an unprompted keypoint is not presented a derived scene point as a real answer.
     """
 
     def __init__(self, *, dim, embed_dim, decoder_dim, n_keypoints, n_frames, max_freq=10,
@@ -119,11 +91,8 @@ class WideQueryEncoder(nn.Module):
             self.missing_qpos = nn.Parameter(torch.zeros(dim))
             nn.init.normal_(self.missing_qpos, std=0.02)
         if query_patch_embedding:
-            # AT THE PRETRAINED WIDTH, then projected. `PatchProcessor`'s convs are independent of
-            # `embed_dim` (~93k params) but its MLP is not (~5.4M at 256): building it at `dim`
-            # would inherit 93k of 5.5M and retrain 98% of the patch CNN from noise. Built at
-            # `embed_dim` and named as the parent names it, every tensor loads by name at matching
-            # shape and `warm_start` needs no special case at all. The adapter is 131k fresh.
+            # AT THE PRETRAINED WIDTH, then projected: the patch CNN's MLP is `embed_dim`-bound
+            # (~5.4M at 256 vs 93k convs), so building it at `dim` would retrain it from noise.
             self.patch_processor = PatchProcessor(
                 in_channels=3, patch_size=self.patch_size, embed_dim=embed_dim,
                 conv_channels=[32, 64, 128])
@@ -172,12 +141,8 @@ class WideQueryEncoder(nn.Module):
 
     def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
                 cube_scale, occlusion=None):
-        """Byte-compatible with `QueryEncoder.forward`, so it drops into `_decode_from_scene`.
-
-        Split into `_build_terms` (the fusion terms, up to the gate) and `_gate_and_fuse`, so a
-        box-prompt subclass (`BoxFilmEncoder` / `BoxTermEncoder`) can extend the SAME term list
-        rather than reimplementing this forward -- the one place the fusion terms are built.
-        """
+        """Byte-compatible with `QueryEncoder.forward`; split into `_build_terms` and
+        `_gate_and_fuse` so a box-prompt subclass can extend the same term list."""
         terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
                                        query_time, target_time)
         return self._gate_and_fuse(terms, ctx)
@@ -193,13 +158,9 @@ class WideQueryEncoder(nn.Module):
 
     def _build_terms(self, preprocessed_views, camera_group, query_coords, query_time,
                      target_time):
-        """The fusion terms up to (not including) the gate. Returns `(terms, ctx)`; `ctx` carries
-        what a box subclass needs (`B`, `T_query`, `n_cams`, `sizes`, `uniform`, `qpix`, `qt`).
-
-        `occlusion` is unused: keypoint ids arrive on `self._kpt_ids`, stashed by
-        `PoseTrackerEncoder.forward`. posetail-pose smuggled them through the occlusion channel
-        because that was the only per-keypoint channel the library sliced for free; gotcha 5 freed
-        it here.
+        """The fusion terms up to (not including) the gate. `ctx` carries what a box subclass
+        needs (`B`, `T_query`, `n_cams`, `sizes`, `uniform`, `qpix`, `qt`); keypoint ids arrive
+        on `self._kpt_ids`, stashed by `PoseTrackerEncoder.forward`.
         """
         B, T_query, coord_dim = query_coords.shape
         n_cams = len(preprocessed_views)
@@ -240,16 +201,11 @@ class WideQueryEncoder(nn.Module):
             terms.append(embed_gap)
 
         # -- the query, in the pixel frame of THIS window's crop --------------------------
-        # Computed once and shared by the two query terms. Both the moving-rig reshape and the
-        # width-1 `uniform` collapse are ported from `PoseQueryEncoder`; posetail-pose's copy has
-        # neither, so it projects a (t n)-flattened axis against a (T,4,4) extrinsic (gotcha 9)
-        # and recomputes a constant term at full width on every query-free step.
+        # Computed once and shared by the two query terms.
         qpix, uniform = None, False
         if self.query_pos_embedding or self.query_patch_embedding:
-            # A PER-FRAME OFFSET IS A MOVING CAMERA TOO: `ext` stays static while `offset` varies,
-            # and every branch this flag guards -- the (b,t,n) reshape before projecting, and the
-            # per-frame visibility -- is needed for exactly the same reason. Nothing in this repo
-            # builds a (T,2) offset any more; the guard stays for a rig that has one.
+            # A PER-FRAME OFFSET IS A MOVING CAMERA TOO: every branch this flag guards is needed
+            # for exactly the same reason. No shipped rig builds one; the guard stays.
             moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
                                        for c in camera_group)
             T_clip = preprocessed_views[0].shape[1]
@@ -274,10 +230,8 @@ class WideQueryEncoder(nn.Module):
             terms.append(_sub_unprompted(self, embed_qpos, self.missing_qpos))
 
         if self.query_patch_embedding:
-            # `sample_patches` builds its grid from `centers` and gathers frames with `query_time`,
-            # so the two must agree on Z. Derive Z from the centres: this encoder is called per
-            # keypoint-chunk at inference, so the query axis it receives is not always the full
-            # one, and a mismatch surfaces as an opaque grid_sampler error rather than a name.
+            # `sample_patches` gathers with `query_time`, so Z must come from the centres:
+            # inference chunks the query axis, and a mismatch surfaces as a grid_sampler error.
             cen = qpix
             Z = cen.shape[2]
             qt = query_time if query_time.dim() > 1 else query_time[:, None]
@@ -314,23 +268,10 @@ class WideQueryEncoder(nn.Module):
         return terms, ctx
 
 
-# the box prompt: which-animal-occupies-this-box, as a NON-position input channel
-#
-# Report 27. Told which box the target animal occupies -- per frame, per camera -- a box-prompt
-# model can be told which animal to return, WITHOUT the box being a position prior (it carries no
-# per-keypoint position, only the animal's extent). Measured on crowded 2D calms21: at fixed
-# weights the box removes -3.5 mm MPJPE held-out, and in the real window loop on WIDE crops it
-# adds +0.26 MOTA and removes 11.7% fp_dup (the report-24 §9m wide-crop collapse). It SELECTS the
-# named animal at own 0.94 on a shared/union crop against a no-box control's 0.00. It is
-# ROOT-CONDITIONAL by keypoint density (sparse rat-city K=4 selects far less) and
-# GEOMETRY-CONDITIONAL (redundant on a crop already centred on its target, decisive on a
-# shared/off-centre one). Two mechanisms work: `film` (the winner) and `term`; a patch-channel
-# variant was tried and its box conv never trains off zero in a warm start (report 27), so it is
-# not ported.
-#
-# The box arrives as an INSTANCE ATTRIBUTE `self._box_prompt` (T-frame (B,T,C,4) crop-pixel box),
-# stashed by `PoseTrackerEncoder._decode_from_scene` exactly like `_kpt_ids` -- the library's
-# call into the query encoder has a fixed signature with no box slot.
+# The box prompt: which-animal-occupies-this-box, as a NON-position channel (the animal's
+# extent, no per-keypoint position). The box is stashed as `self._box_prompt` ((B,T,C,4)
+# crop-pixel box) by `PoseTrackerEncoder._decode_from_scene` -- the library's encoder call has
+# no box slot.
 
 BOX_MODES = ('film',)
 
@@ -347,9 +288,8 @@ def _normalize_box(box_prompt, sizes):
 
 def _gather_box_by_target_time(box_per_frame, target_time):
     """(B,T_clip,cams,D) per-FRAME box features gathered onto the (t n) query axis by the
-    library's own `target_time` (B,T_query), the ACTUAL frame each query slot decodes. Safer than
-    re-deriving the t-major tiling by hand, and it sidesteps the `uniform` collapse (target_time
-    is never reduced to width 1 the way qpos/patch are)."""
+    library's own `target_time` (B,T_query), the ACTUAL frame each query slot decodes -- safer
+    than re-deriving the t-major tiling by hand."""
     B, T_clip, C, D = box_per_frame.shape
     idx = target_time.to(torch.float32).round().long().clamp(0, T_clip - 1)      # (B,T_query)
     idx = repeat(idx, 'b t -> b t c d', c=C, d=D)
@@ -366,9 +306,8 @@ def _box_features(box_prompt, sizes, target_time):
 
 
 def _sub_missing(term, mask, token):
-    """The box-shaped `_sub_unprompted`: `mask` is already at the query axis's width (from
-    `_box_features`'s gather), so a plain masked blend with the learned no-box token. ONE routine
-    for every box variant."""
+    """The box-shaped `_sub_unprompted`: `mask` is already at the query axis's width, so a plain
+    masked blend with the learned no-box token."""
     if term is None:
         return term
     m = mask.to(term.dtype)[..., None]
@@ -376,11 +315,11 @@ def _sub_missing(term, mask, token):
 
 
 class BoxFilmEncoder(WideQueryEncoder):
-    """`kpt = kpt * (1 + gamma(box)) + beta(box)` -- FiLM on the identity term. THE WINNER
-    (report 27). Per-keypoint by construction, works query-free (the identity term is always
-    built), MIPNet's lambda at the cheapest site -- one linear off the identity term, not buried
-    in a frozen CNN. gamma/beta are ZERO-INITIALISED, so at init this is a bit-identical no-op
-    (`test_box_prompt.py` pins it) and warm start is undisturbed; it only diverges once trained.
+    """FiLM on the identity term: `kpt = kpt * (1 + gamma(box)) + beta(box)`.
+
+    Per-keypoint by construction and works query-free (the identity term is always built).
+    gamma/beta are ZERO-INITIALISED, so at init this is a bit-identical no-op and warm start is
+    undisturbed.
     """
 
     def __init__(self, *args, box_max_freq=None, **kwargs):

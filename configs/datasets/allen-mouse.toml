@@ -1,11 +1,9 @@
 # allen-mouse: 47 keypoints, one animal, 7 calibrated cameras.
 #
-# The authoritative list is `kpt_names.ALLEN_KEYPOINTS`; `dataset_spec.allen_spec()` asserts this
-# file agrees with it, so kpt_names.py's import-time transposition checks stay live.
+# The authoritative list is `kpt_names.ALLEN_KEYPOINTS`, asserted by `dataset_spec.allen_spec()`.
 #
 # npz_column_sorted repairs the upstream writer bug: pose3d.npz stores `pose` COLUMN-sorted and
-# `keypoints` NAME-sorted, which transposes all 8 `X` / `X-base` pairs (16 positions). Full
-# derivation and the 8/8 anatomical confirmation are in kpt_names.py.
+# `keypoints` NAME-sorted, transposing all 8 `X` / `X-base` pairs.
 name = "allen-mouse"
 # The v4 root is the TRACKED counterpart of allen-mouse-annotated (scripts/convert_annotated.py).
 out_name = "allen-mouse-tracked"

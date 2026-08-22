@@ -1,12 +1,7 @@
-"""THE inference program: the window loop, the driver over a dataset, and the command line.
+"""The inference program: the window loop, the driver over a dataset, and the command line.
 
-`scripts/infer.py` is a shim onto `main` here. Splitting it that way is what lets the driver be
-imported and tested rather than read as text -- see `dev/plans/infer_one_entry_point_and_ram_budget.md`.
-
-THE PRIVATE NAMES ARE RE-EXPORTED ON PURPOSE. Five of them are imported across this boundary
-today, and one is production rather than test code: `detector/evaluate.py` takes `_window_starts`
-so `eval_detector.py --deploy` scores over the same windows the pose loop uses. Dropping them from
-this list breaks callers silently at import time, which is the one thing a pure move must not do.
+Private names are re-exported on purpose -- `detector/evaluate.py` imports `_window_starts` --
+so dropping one breaks callers silently at import time.
 """
 from .cli import build_parser, main
 from .driver import run_dataset

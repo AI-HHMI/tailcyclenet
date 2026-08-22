@@ -1,16 +1,8 @@
 """Metrics, written to be hard to fool.
 
-Three rules are baked in because breaking them is how wrong numbers get published:
-
-1. **A non-finite prediction is a MISS, never a hit.** posetail's `get_mpjpe` divides a `nansum`
-   numerator by a full denominator, so a model that predicts NaN scores as perfect on those
-   points. Every function here counts coverage separately and never averages a NaN away.
-2. **Error and coverage are reported together.** `err` is a mean over matched points, so a method
-   that predicts fewer, easier points looks better while being worse. A delta in `err` means
-   nothing without the coverage that produced it.
-3. **The bootstrap is paired.** Two methods evaluated on the same windows are compared by
-   resampling the windows once and taking the difference within each resample. Unpaired intervals
-   on shared data overstate uncertainty enough to hide real effects.
+1. A non-finite prediction is a MISS, never a hit (a nansum/full-denominator mean credits NaN).
+2. Error and coverage are reported together -- a mean over matched points flatters decline.
+3. The bootstrap is paired: resample the windows once, take the difference within each resample.
 """
 from __future__ import annotations
 
@@ -28,12 +20,8 @@ def _dist(pred, true):
     return np.where(ok, d, np.nan)
 
 
-#: Upper quantiles of the matched-distance vector, reported beside `err`.
-#:
-#: A MEAN CANNOT SHOW A TAIL, and every localisation failure this repo has found was found in a
-#: quantile. It is also the direct instrument for eval rule 6 -- an arm that declines five sixths
-#: of the animals has a flattering mean and a p90 that says so. Percentiles rather than OKS mAP
-#: because the reference systems' sigmas are mutually inconsistent, so a fourth buys nothing.
+#: Upper quantiles of the matched-distance vector, reported beside `err`. A mean cannot show a
+#: tail, and every localisation failure this repo has found was found in a quantile.
 ERR_PCTS = (75, 90, 95, 99)
 
 
@@ -47,10 +35,8 @@ def _err_pcts(d) -> dict:
 
 
 def error_and_coverage(pred, true) -> dict:
-    """MPJPE over points BOTH sides have, plus the coverage that produced it.
-
-    `n_true` is the denominator that matters: it is how many points were labelled, so
-    `coverage = n_matched / n_true` says what fraction of the task was attempted.
+    """MPJPE over points BOTH sides have, plus the coverage that produced it. `n_true` is the
+    denominator that matters -- coverage = n_matched / n_true.
     """
     d = _dist(np.asarray(pred, float), np.asarray(true, float))
     labelled = np.isfinite(np.asarray(true, float)).all(-1)
@@ -67,10 +53,8 @@ def error_and_coverage(pred, true) -> dict:
 
 
 def pck(pred, true, thresholds) -> dict:
-    """Fraction of LABELLED points predicted within each threshold.
-
-    The denominator is labelled points, not matched ones -- a point the model declined to
-    predict is a failure at every threshold, not an abstention.
+    """Fraction of LABELLED points predicted within each threshold -- a declined point is a
+    failure at every threshold, not an abstention.
     """
     d = _dist(np.asarray(pred, float), np.asarray(true, float))
     n_true = int(np.isfinite(np.asarray(true, float)).all(-1).sum())
@@ -80,11 +64,9 @@ def pck(pred, true, thresholds) -> dict:
 
 
 def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
-    """Resample UNITS (windows, groups) -- not points -- and report the interval.
-
-    With `per_unit_b`, the difference is taken inside each resample, which is what makes the
-    comparison paired. Points within a window are correlated, so resampling points would give an
-    interval several times too tight.
+    """Resample UNITS (windows, groups) -- not points -- and report the interval. With
+    `per_unit_b`, the difference is taken inside each resample (paired); points within a window
+    are correlated, so resampling points would be several times too tight.
     """
     rng = np.random.default_rng(seed)
     a = np.asarray(per_unit_a, float)
@@ -102,25 +84,17 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
     idx = rng.integers(0, a.size, size=(n, a.size))
     stat = a[idx].mean(1) if b is None else (a[idx] - b[idx]).mean(1)
     point = float(a.mean() if b is None else (a - b).mean())
-    # PAIRING IS COMPLETE-CASE, and that FLATTERS THE ARM THAT FAILED MORE: a unit where either side
-    # is non-finite leaves the comparison entirely, so an arm that produced nothing on the hardest
-    # groups is scored only on the ones it managed. The count is returned rather than absorbed.
+    # Pairing is complete-case: a unit where either side is non-finite leaves the comparison,
+    # which flatters the arm that failed more -- the count is returned rather than absorbed.
     return {'mean': point, 'lo': float(np.quantile(stat, alpha / 2)),
             'hi': float(np.quantile(stat, 1 - alpha / 2)), 'n': int(a.size),
             'n_dropped': dropped}
 
 
 def motion_ratio(pred, ref) -> dict:
-    """Predicted path length over a reference's, over the steps BOTH sides have.
-
-    `ref` is either the same shape as `pred` (the labels) or one position per instance-frame, e.g. a
-    box centre -- in which case the prediction's own centroid is what moves. Both must live in the
-    SAME space: a 3D world path over a 2D pixel path is a number in no unit, so a box-centre
-    reference for a 3D prediction means reprojecting the prediction first.
-
-    NOT the trustworthy form on its own. A box-centre denominator carries the detector's own jitter,
-    which inflates it; the paired form (two arms over the SAME steps, `scripts/eval.py --vs`) is what
-    licenses a claim. This is the label-free screen that says where to look.
+    """Predicted path length over a reference's, over the steps BOTH sides have. `ref` is the
+    labels, or one position per instance-frame (the prediction's centroid then moves); both must
+    live in the SAME space. The paired form (`scripts/eval.py --vs`) is what licenses a claim.
     """
     p, r = np.asarray(pred, float), np.asarray(ref, float)
     if r.ndim == p.ndim - 1:
@@ -149,49 +123,12 @@ def motion_ratio(pred, ref) -> dict:
 # multi-instance
 
 def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean'):
-    """Hungarian match predicted instances to labelled ones, per frame.
-
-    Args:
-        pred: (Sp, T, K, R), NaN where absent
-        true: (St, T, K, R), NaN where absent
-        max_dist: a pair further apart than this is not a match
-        cost: how a pair's distances become one number.
-
-            `'mean'` (default) divides by the SHARED count, which is the hazard
-            `min_kpts_frac` below exists to blunt. `'penalised'` is OKS's answer to the same
-            problem, in distance units: every keypoint the LABEL has and the prediction declined
-            is charged at the gate radius and stays in the denominator, so
-
-                cost = (sum_shared d + max_dist * (n_labelled - n_shared)) / n_labelled
-
-            A row sharing 1 of 4 can then no longer out-bid one sharing 4 unless it is 4x closer
-            on that point. It degrades continuously where `min_kpts_frac` rejects the pair
-            outright, which is what makes it usable at small K.
-
-            The default stays `'mean'` because changing it moves every published number in this
-            repo -- an arm, not a silent correction.
-
-            `'penalised'` needs a FINITE `max_dist`, and falls back to `'mean'` otherwise rather
-            than returning a matrix of infinities, which would match arbitrarily.
-
-            IT IS A NO-OP ON EVERY ARM ON RECORD: the two costs differ only where the PREDICTION
-            is sparse, and the pose decode emits every keypoint of every row it decodes at all.
-            Label sparsity is not prediction sparsity and this cost does not touch it. What makes
-            rows sparse is `--vis-thresh`, which is the guard this exists for.
-        min_kpts_frac: the fraction of K a pair must SHARE before its mean distance is allowed
-            to stand for the pair at all. At the default of 0 a pair sharing ONE keypoint is
-            scored on that keypoint, so a near-empty row can out-bid a dense one and hijack a GT
-            row -- which inflates coverage and MOTA for whatever made the rows sparse.
-
-            A FRACTION, not a count: K ranges from 4 to 47 across roots, so "at least 2 keypoints"
-            means five different things. Rounded up, floor 1. The default is 0 because changing it
-            moves every published number, so it has to be an arm.
-
-    Returns a list per frame of (pred_ix, true_ix, dist).
-
-    The pairwise cost is vectorised rather than a double Python loop. rat-city is ONE group of
-    57,594 frames, so ten animals meant 5.7M `_dist` calls per eval and multi-animal scoring was
-    effectively unrunnable.
+    """Hungarian match predicted instances to labelled ones, per frame. Returns a list per frame
+    of (pred_ix, true_ix, dist). pred/true: (S,T,K,R), NaN where absent; max_dist: a pair
+    further apart is not a match. cost: `'mean'` (default) divides by the SHARED count;
+    `'penalised'` charges declined labelled keypoints at max_dist, so a sparse row cannot
+    out-bid a dense one (needs finite max_dist). min_kpts_frac: fraction of K a pair must share
+    to be scored at all -- a FRACTION, not a count, since K ranges 4..47 across roots.
     """
     if cost not in ('mean', 'penalised'):
         raise ValueError(f"match_instances: cost must be 'mean' or 'penalised', got {cost!r}")
@@ -226,28 +163,11 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
          cost='mean') -> dict:
     """MOTA and its three components, with an explicit ignore region.
 
-    MOTA = 1 - (misses + false positives + id switches) / labelled instances. Report the
-    components: two methods with the same MOTA and different miss/FP splits are not the same
-    method, and only MOTA replicates across seeds -- and only above a +-0.023 seed floor.
-
-    Args:
-        ignore: (St, T) bool -- instances asserted PRESENT but not annotated. 73% of a tracker's
-            false positives on rat-city were measured to be real animals the annotator skipped,
-            and counting them cost 0.017 MOTA.
-        ignore_boxes: (St, T, 4) xyxy for those instances. WITH boxes, an unmatched prediction is
-            excused only if its own centroid falls inside one. WITHOUT them there is nothing to
-            localise against, so presence alone excuses every unmatched prediction on the frame
-            -- which can zero the FP term outright. Either way the count is returned as
-            `fp_ignored` rather than folded silently into the score.
-
-    THE FP TERM IS SPLIT, because the two halves want opposite fixes. `fp_dup` is an unmatched
-    prediction sitting within `max_dist` of a GT that something else already claimed -- two crops
-    on one animal, which arbitration removes. `fp_none` landed on no labelled animal at all, which
-    arbitration cannot touch and a detector threshold can. They are one undifferentiated counter in
-    MOTA itself and were one here, so "MOTA is FP-limited" said nothing about what to build.
-    Duplicates are not otherwise representable: `match_instances` is one-to-one by construction
-    (`linear_sum_assignment`), so no second prediction is ever assigned to a claimed GT -- it falls
-    out as an ordinary false positive and the proximity has to be tested for separately.
+    MOTA = 1 - (misses + fp + idsw) / labelled instances; report the components, since a split
+    is not a method. `ignore` (St,T) marks PRESENT-but-unannotated instances: with
+    `ignore_boxes` (St,T,4) an unmatched prediction is excused only inside a box, without them
+    presence alone excuses it -- either way the count is `fp_ignored`. The FP term is split into
+    `fp_dup` (near an already-claimed GT; arbitration removes it) and `fp_none` (on no animal).
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     matches = match_instances(pred, true, max_dist, min_kpts_frac, cost)
@@ -301,10 +221,8 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
 
 
 def _in_ignore(centroid, rows, t, ignore_boxes) -> bool:
-    """Does this prediction land on a present-but-unannotated animal?
-
-    No boxes -> the frame-wide fallback: presence alone excuses it. That is the blanket rule, and
-    it is why `fp_ignored` is reported.
+    """Does this prediction land on a present-but-unannotated animal? No boxes -> presence alone
+    excuses it; that is the blanket rule and why `fp_ignored` is reported.
     """
     if ignore_boxes is None:
         return True
@@ -319,14 +237,9 @@ def _in_ignore(centroid, rows, t, ignore_boxes) -> bool:
 
 
 def matched_error(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean') -> dict:
-    """MPJPE over HUNGARIAN-MATCHED instances, for multi-animal predictions.
-
-    Row index is not identity. When boxes come from a detector, prediction row `a` and label row
-    `a` are different animals, and a row-indexed MPJPE then measures nothing -- it reported 385 px
-    on a fly dataset whose animals are ~30 px across. Match first, then measure.
-
-    `unmatched_true` is part of the answer, not a footnote: a method that predicts one animal
-    well and ignores nine looks excellent on `err` alone.
+    """MPJPE over HUNGARIAN-MATCHED instances, for multi-animal predictions. Row index is not
+    identity once boxes come from a detector. `unmatched_true` is part of the answer: a method
+    that predicts one animal well and ignores nine looks excellent on `err` alone.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     pairs = match_instances(pred, true, max_dist, min_kpts_frac, cost)
@@ -338,9 +251,7 @@ def matched_error(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean') -
         n_matched_inst += len(pairs[t])
         for i, j, _ in pairs[t]:
             dists.append(_dist(pred[i, t], true[j, t]))
-    # The POINT counts, not just the instance counts. The caller reports `err` over matched
-    # points and must report the coverage that produced it -- quoting a matched error beside a
-    # row-indexed coverage describes two different quantities as if they were one.
+    # The POINT counts, not just the instance counts -- quote matched error beside its coverage.
     n_true = int(np.isfinite(true).all(-1).sum())
     if not dists:
         return {'err': float('nan'), 'median': float('nan'), **_err_pcts([]), 'coverage': 0.0,

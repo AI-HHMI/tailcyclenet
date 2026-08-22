@@ -2,35 +2,13 @@
 """Convert `johnson-mouse/merge` into the tailcycle-dataset format.
 
     pixi run python scripts/convert_johnson.py --dry-run
-    pixi run python scripts/convert_johnson.py --clean
 
-A 16-camera, single-mouse, 24-keypoint COCO-like JSON with per-trial OpenCV calibration and a
-ready-made train/val partition. One session per (split, trial); the same 21 trial names appear in
-both splits, which trips `[rule 14 WARNING]` -- these really are the same recordings, and the
-split is per-frameset, so the warning is honest rather than something to rename around.
-
-Three source facts decide the shape of this script:
-
-- **`cv2.FileStorage` silently returns garbage** for 13 of the 21 calibration trials. The newer
-  yamls write bare integers (`0` not `0.`) under `dt: d`, which OpenCV misparses into ~2**32 and
-  -5.9e18. `parse_calib` is a regex reader instead. The convention -- verified against all four
-  transpose combinations on all 21 trials -- is `matrix = intrinsicMatrix.T`,
-  `rvec = Rodrigues(R.T)`, `tvec = T`, and ALL FIVE distortion coefficients: truncating to k1,k2
-  (as posetail-preprocessing's `camera_from_path` does) costs 7.7 px on 2025_10_20.
-
-- **There is no 3D in the source**, but a `mode="3d"` session is unusable without points3d.pq
-  (`dataset.py` and `detector/data.py` both index `lab.points3d` unconditionally) and `mode="2d"`
-  demands exactly one camera. So the 3D layer here is DERIVED -- triangulated from the 16-view 2D,
-  which reprojects at ~0.6 px. `provenance.points3d_source` says so, and `--check` measures it.
-  The fit rejects outliers (`triangulate_robust`) because plain least squares has no breakdown
-  point and one bad view is enough to make all sixteen look bad.
-
-- **1,871 ghost jpgs** sit on disk unreferenced by the current annotations. Everything is driven
-  from the JSON `images` list; a filesystem walk would silently enrol unlabelled frames.
-
-Annotated frames come in strided runs (modal source step 1, 4 or 6 depending on trial), so groups
-are runs cut wherever the source frame gap exceeds `--max-gap`. That buys real temporal context
-for 63% of frames instead of 3,614 single-frame groups.
+16-camera, single-mouse, 24-keypoint COCO-like JSON with per-trial OpenCV calibration; one
+session per (split, trial). `cv2.FileStorage` misparses the newer bare-integer yamls, so
+`parse_calib` is a regex reader. There is no 3D in the source, so it is triangulated from the
+16-view 2D with outlier rejection (plain least squares has no breakdown point). Everything is
+driven from the JSON `images` list -- a filesystem walk would enrol the unreferenced ghost jpgs.
+Groups are runs cut where the source frame gap exceeds `--max-gap`.
 """
 from __future__ import annotations
 
@@ -63,8 +41,7 @@ _NUM = re.compile(r'-?[\d.]+(?:e[-+]?\d+)?')
 def parse_calib(path: Path) -> dict[str, np.ndarray]:
     """Read an OpenCV FileStorage yaml WITHOUT cv2.
 
-    `cv2.FileStorage` returns ~2**32 and -5.9e18 for every trial from 2026_04_20 onward, because
-    those files write bare integers under `dt: d`. Nothing about the failure is loud.
+    `cv2.FileStorage` misparses the newer files' bare integers under `dt: d` -- silently.
     """
     txt = path.read_text()
     out: dict[str, np.ndarray] = {}
@@ -151,14 +128,9 @@ def triangulate_robust(cgroup, p2d: np.ndarray, reject_px: float,
                        iters: int = 2) -> tuple[np.ndarray, np.ndarray]:
     """DLT, then drop grossly disagreeing observations and refit. Returns (p3d, rejected mask).
 
-    Plain least squares has no breakdown point: ONE view off by an image height puts every one of
-    the other 15 reprojections at 130-400 px, which reads as "all views disagree" when in fact 15
-    of them agree to 0.6 px. That is exactly what 2025_02_12/Cam2006054 does on 10 framesets.
-
-    Rejection is per (point, camera), not per camera, so the offending view still contributes its
-    other keypoints. The threshold is `max(reject_px, 5x the point's median residual)`: relative,
-    because on the first pass a dragged fit makes every residual large, and absolute, so a clean
-    fit at 0.6 px never starts trimming its own tail.
+    Plain least squares has no breakdown point: one bad view drags all 15 good reprojections.
+    Rejection is per (point, camera); the threshold is `max(reject_px, 5x the point's median
+    residual)` -- relative on a dragged first pass, absolute so a clean fit never trims itself.
     """
     p2 = p2d.copy()
     p3 = _np(cgroup.triangulate(p2, progress=False))
@@ -180,19 +152,14 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
                  K: int, reject_px: float) -> tuple[fmt.Labels, int]:
     """Dense arrays for one group. 2D + boxes from the JSON, 3D triangulated from the 2D.
 
-    An image with no annotation leaves every cell UNLABELED (no row) rather than `present`: the
-    source records no determination about those views, and inventing one would be an annotation
-    nobody made.
-
-    Outlier 2D is rejected from the TRIANGULATION only. It is still exported verbatim to
-    keypoints.pq: it is the annotators' work, and the derived layer is the one that gets to be
-    opinionated about it.
+    An unannotated image leaves every cell UNLABELED (no row) -- inventing `present` would be an
+    annotation nobody made. Outlier 2D is rejected from the triangulation only; keypoints.pq keeps
+    the annotators' work verbatim.
     """
     cams = rig.names
     C, T = len(cams), len(run)
     lab = fmt.empty_labels(1, T, K, C, mode3d=True, animal_ids=['a00'])
-    # boxes and instance must be allocated together -- write_session indexes boxes wherever
-    # instance says a row exists.
+    # boxes and instance must be allocated together (write_session indexes boxes by instance).
     lab.boxes = np.full((1, T, C, 4), np.nan, np.float32)
     lab.instance = np.full((1, T, C), fmt.INST_NONE, np.int8)
 
@@ -206,11 +173,9 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
                 continue
             kp = np.asarray(a['keypoints'], dtype=np.float64).reshape(K, 3)
             seen = kp[:, 2] > 0
-            # PROJECTED, not VISIBLE. The source flags 1,235,334 points "visible" against 18 "not
-            # visible" across 16 views of a mouse on a dome -- the far-side limbs cannot all have
-            # been seen, so these are inferred positions and the visibility flag asserts nothing.
-            # The 18 zero-flag points carry (0,0), the source's null marker, so they get no row at
-            # all: `missing` would claim someone looked and judged them occluded (spec 13).
+            # PROJECTED, not VISIBLE: the source flags 1.2M points "visible" against 18 "not" on
+            # a dome, so the flag asserts nothing. Zero-flag points carry (0,0), the null marker,
+            # so they get no row at all.
             lab.vis2d[0, t, seen, ci] = fmt.PROJECTED
             lab.points2d[0, t, seen, ci] = kp[seen, :2].astype(np.float32)
 
@@ -226,17 +191,13 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
     lab.vis3d[0][ok] = fmt.VISIBLE
     lab.points3d[0][ok] = p3d[ok].astype(np.float32)
 
-    # A rejected observation is demonstrably in the wrong place, so it leaves keypoints.pq too --
-    # as NO ROW, not `missing`: `missing` would claim someone looked and judged it occluded. This
-    # and the 18 zero-flag points above are together the 19 `scripts/check_status.py` names in
-    # `HOLE_EXEMPTIONS` for this root -- a moving count is a real change to the rejection rate,
-    # not noise.
+    # A rejected observation is demonstrably wrong, so it leaves keypoints.pq as NO ROW (not
+    # `missing`, which would claim someone judged it occluded).
     bad = rejected.reshape(C, T, K).transpose(1, 2, 0)                    # (T,K,C)
     lab.vis2d[0][bad] = fmt.UNLABELED
     lab.points2d[0][bad] = np.nan
-    # A view that lost every observation also loses its box: the source box is the keypoint hull,
-    # so it carries the same displacement. Dropping it keeps rule 11 (a `labeled` instance must
-    # still have keypoint rows) as well.
+    # A view that lost every observation also loses its box -- the box is the keypoint hull, and
+    # a `labeled` instance must still have keypoint rows.
     dead = (lab.vis2d[0] == fmt.UNLABELED).all(1) & (lab.instance[0] != fmt.INST_NONE)
     lab.instance[0][dead] = fmt.INST_NONE
     lab.boxes[0][dead] = np.nan

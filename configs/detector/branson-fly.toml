@@ -1,6 +1,5 @@
-# branson-fly: ONE val group, 32 labelled frames. Shipped `val_frames_per_group = 8` samples 25%
-# of it. Raised to the group's own labelled length (dev/plans/detector_accuracy.md T0.3) -- cheap
-# here, 32 frames is nothing.
+# branson-fly: ONE val group, 32 labelled frames; raised to the group's own labelled length (the
+# shipped 8 sampled only a quarter -- cheap here).
 extends = "../detector.toml"
 
 [data]

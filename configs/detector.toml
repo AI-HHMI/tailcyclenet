@@ -1,248 +1,161 @@
-# The detector training config. `scripts/train_detector.py --config configs/detector.toml`.
+# The detector training config (`scripts/train_detector.py --config configs/detector.toml`).
+# One shipped recipe: every key is the current default of a former CLI flag, so a run with no
+# overrides is byte-identical to the old invocation. Per-root differences are key overrides in
+# YOUR config, not a second shipped file -- `extends` works one level deep.
 #
-# This is the ONE shipped detector recipe: every key below is the current default of the
-# corresponding CLI flag that `scripts/train_detector.py` used to take, so a run with this file
-# and no overrides is byte-identical to the old `--data <root> --out runs/det-<name>` invocation
-# under report 32's defaults. The per-root differences from report 32 section 2.2 (which flags
-# a given dataset wants) are now expressed as key overrides in YOUR config, not as a second
-# shipped file -- `extends` is supported one level deep (see `checkpoints.load_config`), so a
-# user overlay can name this file and change only what differs.
-#
-# Blocks: [data] (the loader + what the regression target bounds), [model] (the architecture),
-# [training] (schedule and run folder). An UNKNOWN KEY IN ANY BLOCK RAISES -- nothing here may
-# be a typo that silently trains at defaults (same guard `scripts/train.py` applies to [data]).
+# Blocks: [data] (loader + regression target), [model] (architecture), [training] (schedule).
+# An UNKNOWN KEY IN ANY BLOCK RAISES -- a typo must not silently train at defaults.
 # `weight_decay` (5e-4) and the cosine schedule are not configurable; they were never flags.
 
 [data]
-# ONE dataset root (has train/, optionally val/ and test/). Required. The detector is trained
-# per dataset -- a folder whose children are roots is refused, exactly as before.
+# ONE dataset root (train/, optionally val/ and test/); a folder whose children are roots is refused.
 path = ""
 
-# what the regression target bounds. `instances` regresses the dataset's own instances.pq extent;
-# `keypoints` regresses the keypoint extent. DEFAULTS TO `instances`, matching
-# `dataset.LoaderConfig.box_source` so the detector reproduces the crop the pose model is trained
-# on -- the two must agree or the detector serves a different crop rule, silently. Inert where a
-# root ships no instances.pq (3dpop, allen, branson-fly: falls back per view); an exact no-op on
-# rat-city-annotated; worth 3.7% of animal-frames on rat-city-tracked, whose keypoint box is ~2.4
-# of 4 points. It DOES retarget calms21 (MARS) and johnson-mouse (COCO), whose boxes agree with
-# the crop rule on 0.000 of instances -- set `boxes = "keypoints"` there to reproduce reports
-# 10-13. See dataset.LoaderConfig.box_source.
+# What the regression target bounds: `instances` (the dataset's instances.pq extent) or
+# `keypoints`. Defaults to `instances`, matching dataset.LoaderConfig.box_source so the detector
+# reproduces the crop the pose model was trained on. Set `keypoints` where the shipped boxes
+# disagree with the crop rule (calms21, johnson-mouse).
 boxes = "instances"
 
-# MUST equal the pose run's [data].min_crop_dim -- it is the same crop rule. Stored in the
-# checkpoint, and scripts/infer.py refuses a mismatch.
+# Must equal the pose run's [data].min_crop_dim -- same crop rule; infer.py refuses a mismatch.
 min_crop_dim = 64
 
-# Explicit input size, overriding the min_box_px rule entirely. Omit it (or set to []) to use
-# min_box_px instead.
+# Explicit input size, overriding min_box_px entirely; omit (or []) to use min_box_px.
 input_wh = []
 
-# Raise the input size until the MEDIAN animal is this many detector pixels across. 32 is
-# YOLOX's coarsest stride, i.e. the size at which the typical animal spans at least one cell at
-# every FPN level. A floor only -- it never shrinks a dataset whose animals are already large.
-# 0 disables it and restores the plain 416^2 aspect-matched budget. MEASURED on 3dpop test,
-# paired over 16 groups against the 23 px baseline: 32 -> +0.049 r@.75 at 1.9x the pixels,
-# 64 -> +0.102 at 7.7x. The curve keeps rising past 32; 32 is where it is free enough to be a
-# default, not where it stops paying.
+# Raise the input size until the MEDIAN animal is this many detector pixels across -- 32 is
+# YOLOX's coarsest stride, so the typical animal spans at least one cell at every FPN level.
+# A floor only; 0 restores the plain 416^2 budget. Measured to keep paying past 32; 32 is where
+# it is cheap enough to be the default.
 min_box_px = 32
 
-# Ceiling on min_box_px. It BINDS: 3dpop needs 4.3x the 416^2 budget for a 48 px median and 7.7x
-# for 64, so the cap is the difference between a rule and a blank cheque. Reported when it
+# Ceiling on min_box_px -- the difference between a rule and a blank cheque; reported when it
 # applies.
 max_input_px = 692224
 
-# Max frames per group for the TRAIN loader. A group is a contiguous clip; 40 frames is a
-# sampling window over it, not a cap on the clip itself.
+# Max frames per group for the TRAIN loader -- a sampling window over the clip, not a cap on it.
 frames_per_group = 40
 
-# A DATASET WITH ONE GROUP GETS ONE GROUP'S WORTH OF VAL. rat-city and branson-fly each hold a
-# single val group, so the default 8 makes the recall readout 8 images; raise it to the group's
-# labelled length.
+# A dataset with ONE group gets one group's worth of val: with the default 8, rat-city and
+# branson-fly score just 8 images -- raise it to the group's labelled length.
 val_frames_per_group = 8
 
-# random similarity + brightness on the TRAIN split. ON BY DEFAULT as of dev/reports/30's
-# recommendation. Helps where a dataset fits its training data and lags on val; on one that fits
-# neither it is the wrong lever. Read the train/val gap first.
+# random similarity + brightness on TRAIN. Helps where a dataset fits its training data and lags
+# on val; read the train/val gap first.
 augment = true
 
-# LAYERS a strong appearance/erasure/mosaic-lite suite on top of augment (needs it; a no-op
-# without it): color jitter (gamma, saturation, hue, p=0.5), additive gaussian noise (sigma up
-# to 10.2, p=0.3), salt & pepper (0.004, p=0.2), motion blur (k in {3,5}, p=0.2), cutout (1-3
-# rects of 15%x15% of the input, random fill, p=0.5 -- a covered keypoint gets BOTH its
-# coordinate NaN'd and its score zeroed), and mosaic-lite (p=0.2 -- copy-paste one WHOLE
-# crop-rule box from a different frame into empty space, never a 4-quadrant mosaic, which would
-# clip a box and break gotcha 8; undefined under use_regions). ONE recipe, not five swept levers,
-# and NOT independently validated -- dev/reports/30 section 5.1 found most of the box-screen
-# train/val-gap closure this suite appeared to buy on rat-city-combined was actually attributable
-# to rotate_deg alone, and additive noise (one of the six components here) was separately refuted
-# downstream before (dev/reports/21 section 7: MOTA -0.127 SIG, on a detector with no capacity
-# lever). ON BY DEFAULT PER USER INSTRUCTION, not evidence.
+# LAYERS a strong appearance/erasure/mosaic-lite suite on top of augment (a no-op without it):
+# color jitter, gaussian noise, salt & pepper, motion blur, cutout (a covered keypoint gets its
+# coordinate NaN'd and score zeroed) and mosaic-lite (a whole crop-rule box copy-pasted from
+# another frame; undefined under use_regions). ONE recipe, not independently validated -- its
+# apparent gap closure was mostly rotate_deg alone. ON BY DEFAULT PER USER INSTRUCTION, not evidence.
 augment_strong = true
 
-# random in-plane rotation, +-DEG, drawn per visit. Needs augment; 0 is off and off is
-# byte-identical (the draw is skipped, not multiplied by zero). DEFAULTS TO 45 PER USER
-# INSTRUCTION, NOT EVIDENCE FOR THIS SETTING -- the only measurement on record for THIS knob is
-# at 180 on rat-city, where it was SIGNIFICANTLY WORSE downstream on two roots and two label
-# sources, one direction: MPJPE +3.33 px hand / +1.28 px tracked, coverage -0.009, idsw x1.7,
-# err p99 +29.9 (dev/reports/21 3a/3b). 45 has never been measured downstream on any root. Set 0
-# to restore the pre-this-default off behaviour, byte-identical.
+# random in-plane rotation, +-DEG per visit. Needs augment; 0 is off, byte-identical. DEFAULTS TO
+# 45 PER USER INSTRUCTION, NOT EVIDENCE: 180 was measured significantly worse downstream, and 45
+# itself has never been measured. Set 0 for the pre-default off behaviour.
 rotate_deg = 45.0
 
-# decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target. A KEY, not
-# a loader detail: it changes which source pixels reach the model. rat-city 37.0 -> 21.8 ms/item,
-# and it replaces a 7.3x INTER_LINEAR downscale -- which samples 2x2 of every 7x7 block -- with a
-# proper box filter. Stored in the checkpoint; inference reads it back. No effect on a video root.
+# decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target -- changes
+# which source pixels reach the model, replacing a big INTER_LINEAR downscale with a proper box
+# filter. Stored in the checkpoint; no effect on a video root.
 reduce = false
 
-# train a bottom-up KEYPOINT BRANCH beside the box head. Off means NOT CONSTRUCTED: with this
-# absent the model, the loader and the loss are byte-identical to every recorded detector, so no
-# existing recipe needs a new key to reproduce. K is derived from the dataset's own registry,
-# never configured. Turning it on also disables the horizontal flip -- see `random_affine`, whose
-# no-`flip_pairs` justification holds only while the target is a box.
+# train a bottom-up KEYPOINT BRANCH beside the box head. Off means NOT CONSTRUCTED -- the model,
+# loader and loss are byte-identical to every recorded detector. K is derived from the registry.
+# Turning it on also disables the horizontal flip.
 keypoints = false
 
-# the horizontal flip in the augmentation. `keypoints = true` already disables it implicitly, so
-# this exists for the box-only CONTROL arm that has to match it -- otherwise the control differs
-# in two levers.
+# the horizontal flip in the augmentation; exists for the box-only control arm, since `keypoints
+# = true` disables it implicitly and the control must differ in exactly one lever.
 hflip = true
 
-# train on TILES of this size in INPUT pixels instead of whole frames. Off (empty) means whole
-# frames, byte-identical to every recorded detector. This is the model's input size; the tile's
-# SOURCE extent is tile_wh / tile_scale. Inference is unchanged -- one whole-frame forward at
-# tile_scale, derived per camera. Its ONE justification is use_regions (report 16 §5.3b refuted
-# the other).
+# train on TILES of this size in INPUT pixels instead of whole frames; empty = whole frames,
+# byte-identical to every recorded detector. The tile's SOURCE extent is tile_wh / tile_scale;
+# inference is one whole-frame forward as before. Its ONE justification is use_regions.
 tile_wh = []
 
-# source -> input scale for tile_wh. 1.0 = native. DO NOT ALSO RESIZE THE TILE: the invariant is
-# the animal's size in INPUT pixels, and tiling-then-downscaling is the number-one reported
-# failure of this pattern. MEASURED on rat-city-annotated: this is what sets the mask's positive
-# rate (5.2% at 1.0, 10.2% at 0.7, 17.5% at 0.5, 48% at 0.25) because CENTER_RADIUS is 2.5 CELLS,
-# so the certified region has to span many cells, not much area.
+# source -> input scale for tile_wh (1.0 = native). DO NOT ALSO RESIZE THE TILE: the invariant
+# is the animal's size in INPUT pixels. Measured to set the mask's positive rate, because
+# CENTER_RADIUS is 2.5 cells, not a pixel radius.
 tile_scale = 1.0
 
 # background tiles per frame, centres inside the certified area
 tile_bg_per_frame = 1
 
-# mask the objectness loss to the area regions.pq certifies as completely labelled. ORTHOGONAL
-# to tile_wh so an arm can move one lever. MEASURED DEAD on whole frames: 69% of supervised
-# anchors are positive against 0.68% unmasked and 17% of frames have no certified negative at
-# all. Use it WITH tiles. A session with no regions.pq claims exhaustive labelling and is
-# unmasked. UNDEFINED under augment_strong -- the constructor raises (data.py:454-458), so pick
-# one per root.
+# mask the objectness loss to the area regions.pq certifies as completely labelled; orthogonal to
+# tile_wh. Measured DEAD on whole frames -- use it WITH tiles. A session with no regions.pq
+# claims exhaustive labelling and is unmasked. UNDEFINED under augment_strong (the constructor
+# raises); pick one per root.
 use_regions = false
 
-# mask an instances.pq PRESENT box -- an animal in this view that was NOT annotated -- out of the
-# objectness BACKGROUND target, instead of training the detector to call it "no animal here".
-# OPPOSITE polarity from use_regions (which says where supervision may happen AT ALL; this
-# excludes ONE animal's footprint while leaving the rest supervised) and MUTUALLY EXCLUSIVE with
-# it for now -- both are the one opt-in (M,4) tuple slot box_collate/split_batch dispatch by
-# rank, and the constructor raises rather than let one silently clobber the other. Measured on
-# 3dpop's train split at 11.4% of animals in view PRESENT-but-unannotated, masking a mean 0.34%
-# of anchors per view. SHIPPED OFF -- not because a measurement cost it anything: one seed pair
-# on 3dpop reads within this recipe's own documented val-MOTA seed floor either way, and train
-# recall is flat. But one seed on a 64-frame val split is not evidence in either direction, and
-# --use-regions' own history is the warning against shipping an unmeasured default ON. The
-# correctness argument (an unannotated animal should not be trained as "nothing here") justifies
-# keeping the LEVER; it takes a real win to justify flipping the DEFAULT. Off is byte-identical
-# to every checkpoint on record either way -- see test_detector_loss_without_ignore_is_unchanged.
-# dev/plans/detector_accuracy.md T2.1.
+# mask an instances.pq PRESENT box (an in-view animal that was NOT annotated) out of the
+# objectness BACKGROUND target. OPPOSITE polarity from use_regions and MUTUALLY EXCLUSIVE with
+# it for now (the constructor raises rather than let one clobber the other). SHIPPED OFF: one
+# seed on a 64-frame val split is not evidence, and an unmeasured default should not flip ON.
+# The correctness argument justifies keeping the LEVER; a real win justifies the DEFAULT.
 ignore_present = false
 
 [model]
-# the ARCHITECTURE, not a runtime choice -- it changes the state_dict and is recorded in the
-# checkpoint (`load_detector` reads it back; absent means `trimmed`, i.e. every checkpoint from
-# before this key existed). DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE: dev/reports/30
-# section 5.3 found `tiny`'s apparent downstream lead over `trimmed` on rat-city-combined (4.0
-# px) was SMALLER than its own seed-replicate swing (8.8 px) and does not survive that check --
-# no tier is distinguishable from `trimmed` on the evidence collected so far. Set `yolox =
-# "trimmed"` to restore the pre-this-default architecture, byte-identical to every detector on
-# record before dev/reports/28. `trimmed` is the repo's bespoke ~0.66M-param net.
-# `nano/tiny/s/m/l/x` instead build the CANONICAL YOLOX backbone (Focus stem, 5-stage CSPDarknet)
-# at that tier's official (depth_mul, width_mul, depthwise) -- see
-# `tailcyclenet.detector.yolox.YOLOX_TIERS`. NOT byte-identical to Megvii's release: GroupNorm
-# throughout, and the neck unifies all three pyramid levels to one width rather than three
-# per-level widths with per-level head stems. This is a MODEL-SELECTION sweep, not a single-lever
-# ablation -- every named tier differs from `trimmed` in schedule, depth, conv type and stem all
-# at once.
+# the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, the repo's bespoke
+# ~0.66M-param net). DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE: its apparent lead
+# over `trimmed` was smaller than its own seed-replicate swing, so no tier is distinguishable on
+# the evidence so far. `trimmed` restores the pre-default architecture, byte-identical. The
+# canonical tiers (nano..x) differ from `trimmed` in schedule, depth, conv type and stem at once.
 yolox = "tiny"
 
-# stride-4 (P2) FPN level, on top of either backbone tier -- absent/false means the 3-level FPN
-# every checkpoint before this key existed was built at. DEFAULTS TO true: CONFIRMED on 3dpop
-# (dev/plans/detector_accuracy.md T4.3, replicated at seed=1 -- r@.5/r@.75/IoU all SIG at BOTH
-# seeds, seed=1 effects LARGER not smaller). The extra level gives the smallest animals a
-# stride-4 cell instead of falling below stride 8 entirely (rat-city-tracked's p10 animal is
-# 8.7 input px, under one stride-8 cell). rat-city/test is the repo's ONE DEGENERATE
-# single-group split and read the opposite direction there -- NOT a refutation (one group has
-# no confidence interval; it is an unmeasurable point, not a counter-example) but a reason to
-# treat this as a 3dpop-confirmed win, not a blanket-proven one, until rat-city has a real split
-# to test it on. Set false to restore the pre-this-default 3-level FPN, byte-identical to every
-# checkpoint on record.
+# stride-4 (P2) FPN level on top of either tier; absent = the 3-level FPN every pre-existing
+# checkpoint was built at. DEFAULTS TO true: confirmed on 3dpop at both seeds -- the extra level
+# gives the smallest animals a stride-4 cell instead of falling below stride 8 entirely.
+# rat-city's single-group test read the opposite way, which is an unmeasurable point, not a
+# refutation. false restores the 3-level FPN, byte-identical to every checkpoint on record.
 p2 = true
 
 [training]
-# run folder: checkpoints, metrics.json, and the effective config.toml + provenance.toml.
-# `--out` on the command line overrides this.
+# run folder: checkpoints, metrics.json, effective config.toml + provenance.toml. Overridden by
+# `--out` on the command line.
 out = ""
 
-# total iterations. 20000 is the shipped default; prefer the FINAL checkpoint for arm-vs-arm
-# (best-on-val iteration varies 12k-20k across identical recipes, report 21 §7.0c).
+# total iterations; prefer the FINAL checkpoint for arm-vs-arm (best-on-val iteration varies
+# widely across identical recipes).
 iters = 20000
 
 batch_size = 16
-# STAYS AT 1e-3 -- SWEPT AND ITS OWN "WIN" REFUTED (dev/plans/detector_accuracy.md T2.4). A
-# short-run (6000-iter) sweep found a clean, large plateau across [3e-4, 8e-4]; a full-length
-# (20000-iter) confirmation at 6e-4 against a matched 1e-3 control REVERSED it (r@.75 went null,
-# IoU flipped sign and became SIGNIFICANTLY WORSE than 1e-3). Do not re-propose a lower `lr` off
-# the short-run numbers alone -- they measure a different schedule length than production trains
-# at, and this is the one lever in this file that demonstrated exactly why that gap matters.
+# STAYS AT 1e-3: a short-run sweep's apparent win for 6e-4 was REVERSED at full length. Do not
+# re-propose a lower `lr` off short-run numbers -- they measure a different schedule length.
 lr = 1e-3
 num_workers = 8
 seed = 23
-# model init, augmentation draws and the train shuffle order. Does NOT move the median-animal
-# probe, which stays pinned at seed 0 regardless -- that is a MEASUREMENT of the dataset, not
-# training stochasticity, and letting it vary would make input_wh depend on seed. A SAME-RECIPE
-# REPLICATE (same config, different seed) is not optional before trusting a detector arm: report
-# 21 §7.0 measured coverage +0.0575 and kpt_agree +0.1124, both SIG, with NO lever at all.
+# model init, augmentation draws and the train shuffle order. The median-animal probe stays
+# pinned at seed 0 -- it is a MEASUREMENT of the dataset, not training stochasticity, and letting
+# it vary would make input_wh depend on seed. A same-recipe replicate (different seed) is not
+# optional before trusting a detector arm.
 device = "cuda:0"
 
 eval_every = 2000
-# batches per split at each checkpoint. TRAIN is scored too: the train/val gap is what says
-# whether a dataset needs augmentation (a gap) or resolution (no gap, low absolute recall).
+# batches per split at each checkpoint. TRAIN is scored too: the train/val gap says whether a
+# dataset needs augmentation (a gap) or resolution (no gap, low absolute recall).
 eval_batches = 25
 
 kpt_weight = 1.0
 kpt_score_weight = 1.0
 
-# per-GT positive-anchor cap: the k closest anchors by centre distance, capping candidacy before
-# the per-anchor uniqueness resolution. 0/absent means uncapped, the shape every checkpoint
-# before this key existed was trained under. DEFAULTS TO 10 (YOLOX's own SimOTA-adjacent scale):
-# CONFIRMED (dev/plans/detector_accuracy.md T2.2, replicated at seed=1) -- 4/5 metrics
-# significant at BOTH seeds, the largest effect sizes measured anywhere in this file
-# (r@.75 -0.05 to -0.09). An uncapped centre prior gives large animals ~4.3x the box-loss share
-# and objectness positives of small ones; capping candidacy fixes both at once. 0 restores
-# uncapped, byte-identical to every checkpoint on record.
+# per-GT positive-anchor cap (k closest anchors by centre distance). 0/absent = uncapped, the
+# shape every pre-existing checkpoint was trained under. DEFAULTS TO 10: confirmed at both seeds
+# with the largest effect sizes in this file -- uncapped, large animals hog ~4.3x the box-loss
+# share and objectness positives of small ones. 0 restores uncapped, byte-identical.
 max_pos_per_gt = 10
 
-# the BCE objectness target at a positive anchor becomes the DETACHED IoU between its predicted
-# and GT box (once past iou_aware_warmup iterations) instead of a hard 1.0. false/absent is the
-# hard-1.0 target every checkpoint before this key existed was trained under. DEFAULTS TO true:
-# CONFIRMED (dev/plans/detector_accuracy.md T2.3, replicated at seed=1) -- r@.5/IoU/fp
-# significant at BOTH seeds, r@.75 the same direction both times. Fixes objectness saturation
-# (98.5%+ of positives read exactly 1.0 under the old hard target), which is what gives
-# `--det-score` a live range and lets NMS keep the best-localised box in a huddle instead of an
-# arbitrary one. false restores the hard-1.0 target, byte-identical to every checkpoint on
-# record.
+# the BCE objectness target at a positive anchor becomes the DETACHED IoU between predicted and
+# GT box (past iou_aware_warmup) instead of a hard 1.0. DEFAULTS TO true: confirmed at both
+# seeds. Fixes objectness saturation, which gives `--det-score` a live range and lets NMS keep
+# the best-localised box in a huddle. false restores hard-1.0, byte-identical to every
+# pre-existing checkpoint.
 iou_aware_obj = true
 iou_aware_warmup = 2000
 
-# weight on the GIoU box term (`detector_loss`'s own former hardcoded constant, never
-# configurable before this key existed -- 5.0 is what every checkpoint on record used, whether
-# or not this key is present). DEFAULTS TO 15.0: CONFIRMED (dev/plans/detector_accuracy.md
-# T2.4) -- the ONLY T2.4 lever to survive BOTH required checks (a full-length 20000-iter
-# confirmation AND a same-recipe seed=1 replicate, after `lr=6e-4` failed the first of those).
-# 3/5 metrics significant at both seeds with near-identical point estimates (IoU: -0.0267 vs
-# -0.0269 seed0/seed1). The short-run sweep found no upper edge through 20.0 -- 15.0 is the
-# value that was actually tested at full length and replicated, not the sweep's extreme; do not
-# push it higher without measuring there first. 5.0 restores the pre-this-default weight,
-# byte-identical to every checkpoint on record.
+# weight on the GIoU box term (formerly a hardcoded constant -- 5.0 is what every pre-existing
+# checkpoint used). DEFAULTS TO 15.0: the only lever to survive both a full-length confirmation
+# and a same-recipe replicate, with the effect replicated at both seeds. 5.0 restores the
+# pre-default weight, byte-identical to every checkpoint on record.
 box_weight = 15.0

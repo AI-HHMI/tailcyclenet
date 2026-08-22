@@ -2,19 +2,10 @@
 """Convert CalMS21 task 1 into the tailcycle-dataset format.
 
     pixi run python scripts/convert_calms21.py --dry-run
-    pixi run python scripts/convert_calms21.py --clean --validate
 
-**Only task 1 becomes a dataset**: it is the only part of the release that ships pixels
-(`task1_videos_mp4/`, 70 train + 19 test). task 2, task 3 and `unlabeled_videos` are pose+behaviour
-tables with no frames behind them, so they cannot be sessions. `task1_videos_seq/` is the same
-content as the mp4s.
-
-One video = one session = one group (the whole contiguous recording; 2 mice, 7 MARS keypoints,
-~21k frames). Pixels are symlinked, one link per video.
-
-Keypoints come from the official 2021 json. `task1_MARS_features/` is a LATER re-run whose
-keypoints disagree with the json by ~2 px mean -- it is used only for `bbox`, `fps` (the mp4
-container claims 30, the truth is ~32.0) and `vid_name`.
+Only task 1 ships pixels; one video = one session = one group (2 mice, 7 MARS keypoints),
+pixels symlinked. Keypoints come from the official 2021 json; `task1_MARS_features/` (a later
+re-run whose keypoints differ by ~2 px) is used only for bbox/fps/vid_name.
 """
 from __future__ import annotations
 
@@ -33,8 +24,7 @@ from tailcyclenet import format as fmt
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/CalMS21')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/calms21')
 
-# readme: "7 tracked body parts, ordered (nose, left ear, right ear, neck, left hip, right hip,
-# tail base)"; "mouse 0 is the resident (black) mouse and mouse 1 is the intruder (white)".
+# readme order; mouse 0 = resident (black), mouse 1 = intruder (white).
 NAMES = ['nose', 'left_ear', 'right_ear', 'neck', 'left_hip', 'right_hip', 'tail_base']
 FLIP = [['left_ear', 'right_ear'], ['left_hip', 'right_hip']]
 SKELETON = [['nose', 'left_ear'], ['nose', 'right_ear'], ['left_ear', 'neck'],
@@ -65,13 +55,9 @@ def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:
 
     lab = fmt.empty_labels(2, T, len(NAMES), 1, mode3d=False, animal_ids=ANIMALS)
     lab.points2d[:, :, :, 0, :] = kp.transpose(1, 0, 3, 2)
-    # MARS emits a position for all 7 parts on both mice in every frame and has no occlusion
-    # channel, so nothing here is an occlusion assessment -- see [provenance].visibility. Kept
-    # `visible` rather than switched to `projected`, on purpose: `Session.has_visibility_
-    # assessment` (tailcyclenet/format.py) reads `labels == "tracked"` plus zero `missing` rows
-    # in keypoints.pq as its OWN signal that a session asserts nothing, and withholds any
-    # visibility target for the whole session on that basis -- so the effect is the same as
-    # `projected` without a second status meaning two things.
+    # MARS has no occlusion channel, so nothing here is an assessment; kept `visible` (not
+    # `projected`) because a tracked session with zero `missing` rows withholds its visibility
+    # target anyway.
     lab.vis2d[:] = fmt.VISIBLE
 
     box = np.asarray(npz['bbox'], np.float32).transpose(0, 2, 1)          # (S, T, 4) normalised
@@ -80,9 +66,8 @@ def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:
     lab.boxes = np.ascontiguousarray(box[:, :, None, :])                  # (S, T, C, 4)
     lab.instance = np.full((2, T, 1), fmt.INST_LABELED, np.int8)
 
-    # The box axis order is [x0,y0,x1,y1] normalised by (W,H). Checked rather than assumed: the
-    # [y0,x0,y1,x1] reading does NOT contain the points, so this discriminates. Reported, not
-    # asserted, because the boxes come from a different MARS run than the keypoints.
+    # Box axis order [x0,y0,x1,y1], normalised by (W,H) -- checked rather than assumed, because
+    # the boxes come from a different MARS run than the keypoints.
     p = lab.points2d[:, :, :, 0, :]                                       # (S, T, K, 2)
     lo, hi = box[:, :, None, :2], box[:, :, None, 2:]
     inside = float(((p >= lo - 1.0) & (p <= hi + 1.0)).all(-1).mean())
@@ -116,16 +101,13 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
             vr = VideoReader(str(mp4))
             T = len(vr)
             n_lab = len(seq['keypoints'])
-            # Array length and pixel count disagreeing is common enough that the spec calls it
-            # out; here they agree on all 89, so a disagreement is a broken file, not a truncation.
+            # They agree on all 89 sequences, so a disagreement is a broken file.
             assert n_lab == T, f'{stem}: {n_lab} labelled frames, {T} video frames'
 
             lab, inside = build(seq, npz, T)
-            # 87 of the 89 npz files say 30-32 fps; mouse067 says 2.99 and mouse068 says -4.44 --
-            # a timestamp regression in a re-run nobody checked. Those two fall back to the mp4
-            # container, which is the NOMINAL rate: it reads a flat 30.0 for every video,
-            # including the ones the npz measures at 32.02. So it is the right answer only where
-            # the measured one is broken, which is why it is a fallback and not the source.
+            # Two npz files carry a broken fps (a timestamp regression); they fall back to the
+            # container's nominal rate, which is the right answer only where the measured one is
+            # broken.
             fps = float(npz['fps'])
             if not 25.0 <= fps <= 35.0:
                 fps = float(vr.get_avg_fps())
@@ -135,8 +117,7 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
                               source_frame_step=1, notes=str(npz['vid_name']))
             print(f'   {split}/{stem}: {T} frames @ {fps:.2f} fps, '
                   f'{2 * T * len(NAMES)} kpt rows, {inside * 100:.2f}% of kpts inside their box')
-            # The worst video on record is 97.5%; a swapped axis order reads near 0%, so the
-            # threshold is set to catch that and not the ordinary re-run disagreement.
+            # A swapped axis order reads near 0% against a 97.5% worst case, so 0.90 catches it.
             if inside < 0.90:
                 print(f'   ! {stem}: only {inside * 100:.2f}% of keypoints fall inside their '
                       'box -- check the bbox axis order')

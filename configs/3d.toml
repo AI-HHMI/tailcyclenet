@@ -1,28 +1,19 @@
-# 3D, multiview or single-view. Everything shared lives in base.toml; THIS FILE IS THE DIFFERENCE.
+# 3D, multiview or single-view. Everything shared lives in base.toml; THIS FILE IS THE DIFFERENCE
+# -- three keys, all one fact: a 3D session has more than one camera, so it has a camera count to
+# sample and a triangulation to fall back on.
 #
-# Three keys, and they are all one fact: a 3D session has more than one camera, so it has a camera
-# count to sample and a triangulation to fall back on. There is no fourth thing.
-#
-#   pixi run python scripts/train.py --config configs/3d.toml --data <root>
-#
-# The deployment recipe, which is NOT config (it is `scripts/infer.py`):
-#
+# The deployment recipe lives in `scripts/infer.py`, not config:
 #   --anchor carry --overlap 8 --crop-source keypoints
-#
-# `--crop-source keypoints` is the one inference flag that differs from 2D, and it needs a
-# detector trained WITH `--keypoints`. It is worth -0.45 mm here and is REFUTED in 2D (err p90
-# +7.0 px, p95 +21.6 px), because 24.8% of 2D animal-frames carry exactly one keypoint and the
-# keypoint-extent box then floors at min_crop_dim against a much larger animal.
+# (needs a detector trained WITH `--keypoints`; measured worth -0.45 mm in 3D, refuted in 2D,
+# where single-keypoint frames floor the box at min_crop_dim).
 
 extends = "base.toml"
 
 [data]
-# 0 -> every camera of a 3D session. The pretrained tracker was trained at [1, 8], so a fixed
-# count above that is out of distribution as well as slow (johnson's 16-camera sessions ran at
-# 2.9 s/it against branson's 0.25).
+# 0 -> every camera of a 3D session; the pretrained tracker was trained at [1, 8], so a fixed
+# higher count is out of distribution as well as slow.
 cams_to_sample = 0
 val_cams_to_sample = 5      # the reference's [dataset.val] value
-# Rate at which a 3D session is shown a SINGLE camera. 0 turns the 3D-single-view path off
-# entirely -- there is no triangulation there, so a non-query point has nothing to predict and
-# leaves the 3D target.
+# Rate at which a 3D session is shown a SINGLE camera; 0 turns the 3D-single-view path off --
+# with no triangulation a non-query point has nothing to predict.
 prob_2d_only = 0

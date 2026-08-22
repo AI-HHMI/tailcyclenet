@@ -1,9 +1,7 @@
 """The loader, and the one thing in it that must be bit-exact.
 
-The crop rule is shared between the pose model and the detector: the detector is trained to
-reproduce the pose crop, which is why a detector box costs ~0.02 mm instead of whatever an
-independently-plausible rule would cost. `test_crop_rule_is_int32_exact` is what licenses that,
-and it compares against the library's own inline arithmetic rather than a transcription of it.
+The crop rule is shared between the pose model and the detector -- the detector is trained to
+reproduce the pose crop -- and `test_crop_rule_is_int32_exact` is what licenses that.
 """
 from collections import Counter
 from dataclasses import replace
@@ -25,10 +23,9 @@ from .conftest import KPTS_2D
 # ----------------------------------------------------------------------------------------------
 
 def test_crop_rule_is_int32_exact():
-    """crop_box_for_points must equal PosetailDataset.crop_cgroup_to_points, exactly.
+    """`crop_box_for_points` must equal the library's `crop_cgroup_to_points`, exactly.
 
-    The library exposes the rule only inline, so this drives the real method against a shim that
-    supplies the one attribute it reads. Any drift here invalidates every detector number.
+    Any drift here invalidates every detector number.
     """
     from types import SimpleNamespace
 
@@ -58,11 +55,7 @@ def test_crop_rule_is_int32_exact():
 
 
 def _library_box(self, pflat, size):
-    """PosetailDataset.crop_cgroup_to_points' arithmetic, transcribed from the library body.
-
-    Kept separate from tailcyclenet.crop so the two are independent derivations; if someone
-    "simplifies" one, the test still compares against the other.
-    """
+    """The library's crop arithmetic, transcribed independently so the two can drift apart."""
     low = torch.clamp(torch.min(pflat, dim=0).values - 20, torch.tensor([0, 0]), size).to(torch.int32)
     high = torch.clamp(torch.max(pflat, dim=0).values + 20, torch.tensor([0, 0]), size).to(torch.int32)
     cw, ch = high[0] - low[0], high[1] - low[1]
@@ -80,7 +73,7 @@ def _library_box(self, pflat, size):
 
 
 def test_crop_box_is_none_when_nothing_is_finite():
-    """The library raises here; the detector depends on getting None so it can emit a NaN box."""
+    """The library raises here; the detector depends on None so it can emit a NaN box."""
     pts = torch.full((5, 2), float('nan'))
     assert cropmod.crop_box_for_points(pts, torch.tensor([100, 100], dtype=torch.int32)) is None
 
@@ -104,15 +97,8 @@ def test_jitter_stays_inside_the_image():
 def test_the_fused_warp_agrees_with_the_camera(angle):
     """The composed rotate->crop->resize affine must land pixels where the CAMERA says they go.
 
-    Two halves of the same transform live apart: the camera side is `rotate_camera_image_plane_3d`
-    + `crop.apply_crop` (offset += x1) + `_resize_camera` (mat *= s), and the pixel side is
-    `_crop_affine`. If they disagree, every reprojection is off by that much and nothing in the
-    loss curve says so -- so paint a marker at a known projection, run the image through one half
-    and the camera through the other, and check they still agree.
-
-    This is also the only way the `A @ M3` composition can be silently wrong. Comparing pixels
-    against the old three-step path would not do it: that path is expected to differ (it resampled
-    twice and used cv2.resize's half-pixel convention).
+    Painted marker against known projection, through the two halves of the transform; also the
+    only way the `A @ M3` composition can be silently wrong.
     """
     import cv2
 
@@ -157,14 +143,8 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
 def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
     """`_rotate_2d` must lose NO label at any angle, and its 2x3 must match the camera it returns.
 
-    The library's `rotate_points_image_plane` crops to the border-free inscribed rectangle, which
-    keeps a mean 0.416 of a 4696x2048 frame. The pose loader crops around ONE animal afterwards, so
-    that step buys nothing and costs the animals outside it -- and costs them SILENTLY, because the
-    `< 2 finite` guard runs before the rotation and `crop_box_for_points` clamps instead of
-    refusing. Measured on rat-city-annotated: 61% of rotated items came back with no label at all.
-
-    Two properties, both of which the inscribed crop breaks: every source pixel is still inside the
-    canvas, and a label lands where the returned camera says it lands.
+    The library's inscribed-crop rotation silently loses animals outside it; the repo's own
+    rotation keeps every source pixel and lands labels where its camera says they land.
     """
     from aniposelib.cameras import CameraGroup
 
@@ -196,13 +176,8 @@ def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
 
 
 def test_computed_frame_paths_match_the_listing(dataset_3d):
-    """`read_frames` computes `%06d.<ext>` instead of listing the directory. Same pixels.
-
-    Listing rat-city's 57,594-entry `cam0` cost 0.90 s of a 1.06 s item, and the spec guarantees
-    the names, so the loader computes them. This is the check that the guarantee is being read
-    correctly -- including the extension probe, since the fixture writes `.png` and a default of
-    `.jpg` would find nothing. The fixture's frames differ per (cam, frame), so an off-by-one is
-    visible in the pixels rather than hidden by constant images.
+    """`read_frames` computes `%06d.<ext>` instead of listing the directory; the fixture's frames
+    differ per (cam, frame), so an off-by-one is visible in the pixels.
     """
     from tailcyclenet.dataset import load_warps, read_frames
 
@@ -227,15 +202,7 @@ def test_computed_frame_paths_match_the_listing(dataset_3d):
 def test_repeated_frames_are_decoded_once(dataset_3d, monkeypatch):
     """A clamp-padded window must not decode the same file T times.
 
-    `_frames` pads a group shorter than `n_frames` by repeating its last frame, and 251 of
-    johnson-mouse's 624 train windows come from `n_frames = 1` groups -- 24 copies of frame 0 per
-    camera, which was 384 decodes for 16 distinct images on a 16-camera session.
-
-    COUNTS `cv2.imread`, NOT A HELPER. The decode is the thing being conserved, and counting the
-    internal function that happens to wrap it means the test passes vacuously the moment that
-    function is renamed or bypassed -- which is exactly what happened when `read_frames` moved to
-    `load_warps`: it read `decoded 0 times` and the assertion was on the wrong side of zero to
-    notice.
+    Counts `cv2.imread`, not a helper -- the decode is the thing being conserved.
     """
     import cv2
 
@@ -259,13 +226,7 @@ def test_repeated_frames_are_decoded_once(dataset_3d, monkeypatch):
 
 
 def test_one_frame_under_many_crops_decodes_once(dataset_3d, monkeypatch):
-    """A per-frame-box window pays one decode for T crops.
-
-    This is the case the `(index, box)` dedupe key cannot catch -- every key differs, so a fused
-    decode-and-warp per key pays T full decodes for one picture (24 x 27 ms on a 4696x2048 jpeg,
-    dominating the item). `load_warps` splits the decode from the warp; this pins that it stays
-    split, and that the T outputs are genuinely different crops rather than one crop repeated.
-    """
+    """A per-frame-box window pays one decode for T crops: `load_warps` splits decode from warp."""
     import cv2
 
     from tailcyclenet import dataset as dsmod
@@ -301,8 +262,7 @@ def test_2d_item_shapes(tiny_root):
     b = _batch(ds)
     assert len(b.views) == 1
     assert b.views[0].shape[:2] == (1, 4)                 # (B, T, H, W, 3)
-    # uint8 out of the loader: 4x fewer bytes to queue and pin. `model.forward` divides by 255 on
-    # device, so a float here would mean the pixels get scaled twice.
+    # uint8 out of the loader: 4x fewer bytes to queue and pin; `model.forward` divides by 255.
     assert b.views[0].dtype == torch.uint8
     assert b.coords.shape == (1, 4, 4, 2)                 # R=2 for a true-2D session
     assert b.p2d.shape == (1, 1, 4, 4, 2)                 # 2D needs p2d; the loss reads it
@@ -328,13 +288,8 @@ def test_3d_item_shapes(tiny_root):
 
 
 def test_missing_2d_point_supervises_occlusion_despite_nan_coords(tiny_root):
-    """THE question a NaN-coordinate point raises: if the occlusion target were derived from
-    coordinate finiteness (as the position loss's own `get_vis_true` is) rather than from
-    `status` directly, a `missing` point's target would ALSO be NaN -- masked out of
-    `PoseLoss` exactly like an `unlabeled` one, and no `missing` row would ever supervise
-    occlusion at all. `_session_2d` writes ONE known `missing` slot (a01, frame 0, `left_ear`,
-    coords NaN by spec) and ONE known `unlabeled` slot (a02, frame 2, `tail_base`) -- this checks
-    the vis_2d VALUE at exactly those two slots, not just that some target exists somewhere.
+    """A `missing` point's target must come from `status`, not from coordinate finiteness, or no
+    `missing` row would ever supervise occlusion. Checks the vis_2d VALUE at the two known slots.
     """
     ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG)
     kpt_missing = KPTS_2D.index('left_ear')
@@ -366,8 +321,7 @@ def test_missing_2d_point_supervises_occlusion_despite_nan_coords(tiny_root):
 
 
 def test_vis_and_vis2d_are_both_or_neither_in_3d(tiny_root):
-    """Supplying one without the other dies inside posetail's own einops, so the 3D loader path
-    must never do it. `vis_true`/`vis_true_cams` is what this pins -- see `run_batch`."""
+    """Supplying one without the other dies inside posetail's einops, so the loader must never do it."""
     ds = PoseDataset(tiny_root / 'mouselike', 'train', CFG)
     for i in range(len(ds)):
         b = pose_collate([ds[i]])
@@ -375,12 +329,8 @@ def test_vis_and_vis2d_are_both_or_neither_in_3d(tiny_root):
 
 
 def test_2d_vis_is_never_both_with_vis(tiny_root):
-    """The 3D invariant above does NOT hold at R == 2, and it must not: `vis` (the 3D noisy-OR)
-    has nothing to describe at R == 2 and is always None, while `vis_2d` (the per-camera target)
-    is populated whenever the session records a real assessment -- `ratlike` does (see
-    `_session_2d`). The two must never be conflated: `run_batch` keeps them on separate wires
-    (`vis_true_cams` vs `PoseLoss`'s own `vis_2d_true`), which is the invariant that actually
-    matters and is pinned in `tests/test_train.py`.
+    """At R == 2 `vis` is always None while `vis_2d` is populated on a real assessment; the two
+    must never be conflated (they ride separate wires in `run_batch`).
     """
     ds = PoseDataset(tiny_root / 'ratlike', 'train', CFG)
     saw_populated = False
@@ -392,11 +342,7 @@ def test_2d_vis_is_never_both_with_vis(tiny_root):
 
 
 def test_keypoints_are_never_filtered(tiny_root):
-    """Array position must keep equalling keypoint identity, even when points are missing.
-
-    The library's filter_keypoints drops keypoints seen by too few views, and the resulting
-    mislabelling is invisible in the loss curve. Every item carries all K.
-    """
+    """The library's `filter_keypoints` would mislabel positions invisibly in the loss curve."""
     ds = PoseDataset(tiny_root / 'mouselike', 'train', CFG)
     for i in range(len(ds)):
         b = pose_collate([ds[i]])
@@ -405,11 +351,8 @@ def test_keypoints_are_never_filtered(tiny_root):
 
 
 def test_window_is_at_least_two_frames(tiny_root):
-    """T=1 routes posetail into gT = T // tubelet_size = 0 and a zero-length pos_embed.
-
-    This used to assert `shape[1] >= 1`, which is true of the exact 1-frame window it exists to
-    forbid -- so it passed while the guard did not exist. `n_frames = 1` is now refused outright:
-    the clamp-pad in `_frames` lengthens a short GROUP, not a short configured window.
+    """T=1 routes posetail into a zero-length pos_embed; `n_frames = 1` is refused outright, and
+    a group shorter than the ceiling yields its own length, never 1.
     """
     cfg = LoaderConfig(n_frames=1, image_size=64, aug_prob=0.0, crop_jitter=0.0)
     with pytest.raises(AssertionError, match='n_frames'):
@@ -436,15 +379,7 @@ def test_single_view_keeps_3d_targets(tiny_root):
 
 
 def test_cams_to_sample_takes_a_range(tiny_root):
-    """`[low, high]` draws a per-item camera count, as posetail's `sample_cameras` does.
-
-    This is the lever that took johnson-mouse from 2.9 s/it to under 1: its sessions carry 16
-    cameras and a fixed count fed all of them through the model every step. It is also what the
-    warm-start checkpoint was trained with ([1, 8]), so a fixed count is out of distribution too.
-
-    The fixture's 3D sessions have 3 cameras, so a range topping out above that must clamp to 3
-    rather than raise -- the reference's `if len(cam_names) > num_cams_to_sample` guard.
-    """
+    """`[low, high]` draws a per-item camera count, clamped to what the session has."""
     def counts(spec, n=60):
         cfg = LoaderConfig(n_frames=4, image_size=64, cams_to_sample=spec, prob_2d_only=0.0,
                            aug_prob=0.0, crop_jitter=0.0, prompt_dropout=0.0)
@@ -475,11 +410,7 @@ def test_mixed_2d_and_3d_in_one_run(tiny_root):
 
 def test_registry_ids_survive_a_later_run(tiny_root):
     """Ids must be APPEND-ONLY against an existing registry, or warm start remaps the embedding.
-
-    Discovery order is a directory listing, so it is not a stable thing to number against: with
-    no base, seeing the same two datasets in the other order moves every id, and each row of
-    `kpt_embed` then means a different body part than the checkpoint trained it to mean. Nothing
-    in the loss curve shows it -- gotcha #4.
+    Discovery order is a directory listing, so it is not a stable thing to number against.
     """
     from tailcyclenet.format import load_datasets
 
@@ -510,12 +441,8 @@ class _FakeDataset:
 
 
 def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
-    """The per-camera/per-frame split is the design, so it gets the test.
-
-    A camera's colour and focus must hold steady for the whole clip -- appearance is an identity
-    cue for a tracker, and re-rolling hue every frame teaches it that appearance is noise. Sensor
-    noise and motion blur are the opposite and must vary. Fed T copies of ONE image, the first
-    pipeline has to return T identical frames and the second T different ones.
+    """A camera's appearance must hold steady for the whole clip (it is an identity cue); sensor
+    noise and motion blur are the opposite and must vary.
     """
     from tailcyclenet.dataset import _build_augmenters
 
@@ -534,13 +461,7 @@ def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
 
 
 def test_cutout_marks_covered_keypoints_not_visible():
-    """A keypoint under a cutout rect must be labelled not-visible, including where it was NaN.
-
-    Asking the model to report "visible" for a patch that has been painted over is the one
-    visibility label that is certainly wrong. And `vis_2d` is three-state here: NaN means nobody
-    assessed that camera, and cutout turning NaN into 0 is a fact about the image we just made,
-    not an invention -- so the test covers that entry specifically.
-    """
+    """A keypoint under a cutout rect must be labelled not-visible, including where it was NaN."""
     from tailcyclenet.dataset import _cutout_rects
 
     rng = np.random.default_rng(0)
@@ -580,16 +501,8 @@ def test_appearance_augmentation_is_train_only(tiny_root):
 
 
 def test_workers_do_not_share_a_random_stream(tiny_root):
-    """Two workers must not produce identically-augmented items. Two RNGs decide that.
-
-    `rotate_camera_group` draws from the global `np.random`, which torch already reseeds per
-    worker (`torch/utils/data/_utils/worker.py:261-265`) -- that is torch's promise rather than
-    ours, so it is worth a test rather than a comment.
-
-    imgaug is the half that genuinely breaks: it keeps its OWN global RNG, which fork copies and
-    nothing reseeds, so without `worker_init` every worker's k-th `to_deterministic()` picks the
-    same gamma and hue. Invisible in the loss curve -- it just divides the appearance diversity by
-    `num_workers`.
+    """Two workers must not produce identically-augmented items: torch reseeds per worker, but
+    imgaug's own global RNG is fork-copied and needs `worker_init`.
     """
     from tailcyclenet.dataset import worker_init
 
@@ -632,10 +545,9 @@ def test_prompt_is_the_first_labelled_frame(tiny_root):
 def test_prompt_dropout_is_per_item_not_per_keypoint(tiny_root):
     """`prompt_dropout` is the fraction of STEPS that run fully query-free, per the reference.
 
-    Drawn i.i.d. per keypoint instead, P(a fully unprompted window) is 0.4^K -- 1e-19 at allen's
-    47 keypoints -- so the query-free forward that val and `best_mpjpe` score is never trained. A
-    per-keypoint draw also passes the `1.0` case below, which is why the mid-rate case is here:
-    at p = 0.5 every window must be ALL NaN or NO NaN, never a mixture.
+    A per-keypoint draw would make a fully-unprompted window exponentially unlikely, so the
+    query-free forward val scores is never trained; at p = 0.5 every window must be all-NaN or
+    no-NaN, never a mixture.
     """
     def cfg(p):
         return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
@@ -672,11 +584,8 @@ def test_prompt_noise_perturbs_only_real_priors(tiny_root):
 
 
 def test_window_is_sized_to_the_labelled_span(centred_root):
-    """T is derived from the labels, not configured; `n_frames` is only its ceiling.
-
-    The annotated sessions carry ONE labelled frame per 65-frame group, so a fixed T = 24 encodes
-    24 frames to supervise 1. This fixture labels frames 11-13 of a 24-frame group: span 3, so T
-    rounds up to 4 and the window must actually COVER 11..13 rather than merely touch one of them.
+    """T is derived from the labels, not configured; `n_frames` is only its ceiling. The window
+    must actually COVER the labelled frames rather than merely touch one of them.
     """
     cfg = LoaderConfig(n_frames=24, image_size=64, aug_prob=0.0, crop_jitter=0.0,
                        prompt_dropout=0.0)
@@ -690,21 +599,13 @@ def test_window_is_sized_to_the_labelled_span(centred_root):
 
 
 def test_frame_strides_widen_the_window_on_the_lattice(dense_root, centred_root):
-    """A strided train window must stay ON its lattice, in the group, and over its anchor label.
-
-    Stride is posetail's `interval` (`posetail_dataset.py:343-361`). It composes with the derived-T
-    rule by restricting the labelled span to the frames a stride-s window through the anchor can
-    actually reach -- so the two assertions that matter are that the spacing never silently
-    collapses (clamping off the end of the group would do exactly that, and would look like a
-    shorter window rather than an error) and that val is left at stride 1.
-    """
+    """A strided train window must stay ON its lattice, in the group, and over its anchor label."""
     def cfg(strides, n=8):
         return LoaderConfig(n_frames=n, image_size=32, aug_prob=0.0, crop_jitter=0.0,
                             prompt_dropout=0.0, frame_strides=strides)
 
     # 3 as well as 4: an odd stride does not divide the group, so the anchor's lattice offset eats
-    # into the room at the end of it. Sizing T from frame 0 instead lets the tail clamp onto the
-    # last frame, which shows up as a shorter window rather than as the error it is.
+    # into the room at the end of it.
     for s in (4, 3):
         ds = PoseDataset(dense_root, 'train', cfg([s]))
         for _ in range(30):
@@ -725,12 +626,9 @@ def test_frame_strides_widen_the_window_on_the_lattice(dense_root, centred_root)
 
 
 def test_visibility_stays_three_state(tiny_root):
-    """"Not assessed" must reach the loss as NaN, not as "not visible".
-
-    posetail >= 0.3.2 masks non-finite visibility targets, so an unassessed keypoint-camera pair
-    produces no gradient. Collapsing it to 0 instead would train the visibility head on ~18% of
-    allen-mouse's targets that nobody ever labelled. Under 0.3.0 the collapse was forced: a NaN
-    target there returned NaN gradients for every parameter while the loss looked healthy.
+    """"Not assessed" must reach the loss as NaN, not as "not visible" -- posetail >= 0.3.2
+    masks non-finite visibility targets, so collapsing to 0 would train the head on labels nobody
+    made.
     """
     ds = PoseDataset(tiny_root / 'mouselike', 'train', CFG)
     saw_unassessed = False
@@ -745,11 +643,8 @@ def test_visibility_stays_three_state(tiny_root):
 
 
 def test_gradients_survive_unassessed_visibility():
-    """The property the loader depends on, asserted against the INSTALLED posetail.
-
-    The failure this guards is invisible from the loss: it stays finite and falls normally while
-    every parameter receives NaN. Pinning it here means a dependency downgrade fails loudly
-    instead of quietly wasting a training run.
+    """The property the loader depends on, asserted against the INSTALLED posetail: a NaN target
+    must leave the loss finite and the gradient finite.
     """
     from posetail.posetail.losses import BCELossVis
 
@@ -765,21 +660,9 @@ def test_gradients_survive_unassessed_visibility():
 
 
 def test_no_visibility_supervision_without_ground_truth(tracked_no_assessment_root, monkeypatch):
-    """A dataset with no visibility ASSESSMENT must not have its visibility head trained.
-
-    3dpop and johnson-mouse-tracked ship no `keypoints.pq` at all, so the loader emits
-    `vis = vis_2d = None` directly (`lab.vis2d is None`). But calms21, rat-city-tracked and
-    branson-fly DO ship a `keypoints.pq` -- 100% `visible`, with no `missing` row anywhere -- and
-    that is the harder case this test is actually for: a per-window NaN-mask cannot see it (every
-    row is finite), so `Session.has_visibility_assessment` gates it at the SESSION level instead.
-    `tracked_no_assessment_root` is exactly that shape (see `_session_2d_tracked_dense`).
-
-    posetail then sets `valid_vis = False` and hard-zeros BOTH visibility terms
-    (`losses.py:493-508`). It still DERIVES a geometric `vis_true` -- but only to mask the
-    coordinate losses, never to supervise visibility. That distinction matters: the geometric
-    proxy is "does the GT point project inside the image", which the model could compute from its
-    own prediction. Training the visibility head against it would teach a tautology and call it
-    supervision.
+    """A dataset with no visibility ASSESSMENT (100% `visible`, no `missing` row anywhere) must
+    not have its visibility head trained -- the per-window NaN-mask cannot see it, so the session
+    level gates it.
     """
     from posetail.posetail.losses import TotalLoss
 
@@ -810,10 +693,7 @@ def test_no_visibility_supervision_without_ground_truth(tracked_no_assessment_ro
 @pytest.mark.parametrize('n_frames', [8, 24])
 def test_centred_labels_are_usable(centred_root, train, n_frames):
     """The old loader required the window's FIRST frame to be labelled; this one does not.
-
-    A group with labels only at frames 11-13 must still yield windows, every window must contain
-    a label, and the label must not be forced to frame 0 -- frame 0 is the one frame where
-    per-frame anchoring contributes nothing.
+    Every window must contain a label, and the label must not be forced to frame 0.
     """
     cfg = LoaderConfig(n_frames=n_frames, image_size=32, aug_prob=0.0, crop_jitter=0.0,
                        prompt_dropout=0.0)
@@ -831,11 +711,7 @@ def test_centred_labels_are_usable(centred_root, train, n_frames):
 
 
 def test_val_windows_do_not_pad_when_the_group_is_long_enough(centred_root):
-    """A start past `n_frames - T` clamp-pads with duplicates of the last frame.
-
-    That wastes real context: with T=24 on a 24-frame group whose labels are at 11-13, starting
-    at the first labelled frame padded 13 duplicated frames while frames 0-10 sat unused.
-    """
+    """A start past `n_frames - T` clamp-pads with duplicates of the last frame, wasting context."""
     cfg = LoaderConfig(n_frames=24, image_size=32, aug_prob=0.0, crop_jitter=0.0)
     ds = PoseDataset(centred_root, 'train', cfg, train=False)
     for item in ds.index:
@@ -857,13 +733,8 @@ def test_prompt_time_is_not_forced_to_zero(centred_root):
 
 def test_projected_carries_position_but_trains_no_visibility(projected_root):
     """`projected` is a 2D position with no visibility claim, and must reach the loss as neither.
-
-    johnson-mouse asks its annotators to place all 24 keypoints in all 16 views, inferring the
-    ones the body hides, and flags 1,235,334 of them "visible" against 18 "not". Written as
-    `visible` that trains the per-camera head toward "always visible" from labels that assert
-    nothing. Written as `missing` the positions are lost. The failure mode one level up is worse:
-    the 3D noisy-OR `any(status == visible)` reads all-False and claims no point is
-    reconstructible, so the whole visibility target has to be withheld, not merely masked.
+    Written as `visible` it would train "always visible" from labels that assert nothing; the
+    3D noisy-OR would claim nothing is reconstructible, so the target is withheld.
     """
     from tailcyclenet import format as fmt
 
@@ -887,21 +758,8 @@ def test_projected_carries_position_but_trains_no_visibility(projected_root):
 def test_sampling_mix_is_two_level_and_skips_absent_levels(mixed_source_root):
     """`annot_frac` then `mode_3d_frac` WITHIN each source, and the realised draw matches.
 
-    What this guards is the bug that made it necessary: `_starts` yields one index entry per
-    (session, group, animal) whatever the group's length, and the sampler draws entries
-    uniformly, so an entry is a sampling weight decoupled from the data behind it. On
-    allen-mouse-combined that put 90.4% of steps on the 2D path -- head bank 0, ~3 of 15 loss
-    terms -- and 3.9% on the tracked session holding 95% of the labelled frames.
-
-    `mixed_source_root` has no `2d-tracked` cell, so the mode level is SKIPPED inside `tracked`
-    and that source's 0.6 lands entirely on 3D. That asymmetry is the whole reason the two
-    fractions are conditional rather than joint marginals: as marginals they would be
-    over-constrained here, and `annot_frac = 1 - mode_3d_frac` would be the only feasible pair.
-
-    Both `mix()` and `_pick` are checked. They are computed from the same weights, but `mix()` is
-    what gets printed at startup and `_pick` is what the model actually sees; a reporting bug
-    that says the mix is fixed when it is not is the exact failure this whole change exists to
-    prevent.
+    The old sampler weighted by index-entry count, so a long tracked session could be starved;
+    `mixed_source_root` has no `2d-tracked` cell, so the mode level is skipped inside `tracked`.
     """
     cfg = LoaderConfig(n_frames=2, image_size=32, annot_frac=0.4, mode_3d_frac=0.7)
     ds = PoseDataset(mixed_source_root, 'train', cfg)
@@ -919,11 +777,7 @@ def test_sampling_mix_is_two_level_and_skips_absent_levels(mixed_source_root):
 
 
 def test_sampling_mix_defaults_to_the_uniform_draw(mixed_source_root):
-    """Unset fractions must reproduce the previous behaviour exactly, not approximately.
-
-    Eight arms of a sweep were mid-flight when this landed. An unconfigured run that merely
-    *resembled* the old draw would silently make every one of them incomparable to its successor.
-    """
+    """Unset fractions must reproduce the previous behaviour exactly, not approximately."""
     cfg = LoaderConfig(n_frames=2, image_size=32)
     ds = PoseDataset(mixed_source_root, 'train', cfg)
     assert ds._pools[0][1] is None, 'no weights should be built when neither fraction is set'
@@ -1063,10 +917,7 @@ def test_box_source_rejects_a_typo(tiny_root):
 
 def test_crop_inflate_default_is_inert(tiny_root):
     """`crop_inflate = 1.0` (the default) must be BYTE-IDENTICAL to a config that never mentions
-    the key -- the wide-crop TRAINING regime (report 27) is only a no-op UNLESS a caller opts in.
-    val/test items are index-seeded (`__getitem__`), so two configs differing only in
-    `crop_inflate` draw the identical augmentation stream and any difference is the key's own
-    doing.
+    the key -- the wide-crop TRAINING regime is only a no-op unless a caller opts in.
     """
     for root, split in ((tiny_root / 'ratlike', 'val'), (tiny_root / 'mouselike', 'train')):
         base = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
@@ -1084,11 +935,9 @@ def test_crop_inflate_default_is_inert(tiny_root):
 
 
 def test_crop_inflate_widens_the_2d_crop():
-    """Above 1.0, `crop.crop_to_points_2d` must widen the returned box about its own centre,
-    AFTER jitter. Pure `crop.py` unit test: 2D needs no camera-projection fields at all (only
-    `size`), unlike the 3D path, which is exercised end to end through the real fixture rig in
-    `test_crop_inflate_widens_the_3d_crop` instead of a hand-built camera dict missing the
-    `project_cam`-required fields (`type`, etc).
+    """Above 1.0, `crop_to_points_2d` must widen the returned box about its own centre, AFTER
+    jitter. (The 3D path is exercised end to end through the real fixture rig instead of a
+    hand-built camera dict.)
     """
     cam = {'size': torch.tensor([2000, 2000], dtype=torch.int32), 'offset': torch.zeros(2)}
     coords = torch.tensor([[900.0, 900.0], [1100.0, 1100.0]])       # (K=2,2), a small box
@@ -1103,9 +952,8 @@ def test_crop_inflate_widens_the_2d_crop():
 
 
 def test_crop_inflate_widens_the_3d_crop(tiny_root):
-    """Above 1.0, `crop.crop_to_points_3d` must widen every camera's box about its own centre,
-    using the real fixture rig (`sess.cgroup`) so `project_points_torch` sees complete camera
-    dicts.
+    """Above 1.0, `crop_to_points_3d` must widen every camera's box about its own centre, using
+    the real fixture rig so `project_points_torch` sees complete camera dicts.
     """
     from tailcyclenet.format import load_dataset
 
@@ -1131,9 +979,9 @@ def test_crop_inflate_widens_the_3d_crop(tiny_root):
 
 
 def test_crop_inflate_draw_scalar_is_unaffected_by_train():
-    """A plain float has no range to be a midpoint of -- `_crop_inflate` must return it
-    unchanged whether `train` is True or False, so every scalar config (everything shipped
-    before the range form existed) is untouched by this change."""
+    """A plain float has no range to be a midpoint of -- it must return unchanged under either
+    `train` value, so every scalar config predating the range form is untouched.
+    """
     from tailcyclenet.dataset import LoaderConfig, _crop_inflate
 
     cfg = LoaderConfig(crop_inflate=1.3)
@@ -1144,8 +992,8 @@ def test_crop_inflate_draw_scalar_is_unaffected_by_train():
 
 def test_crop_inflate_draw_range_on_train_only():
     """`crop_inflate = [low, high]` draws uniformly IN RANGE on train, and returns the exact
-    MIDPOINT on val/test -- never a draw there, so `checkpoint_best` selection reads the SAME
-    crop geometry every val pass (the same reason `_jitter` is gated to `self.train` alone)."""
+    MIDPOINT on val/test -- so `checkpoint_best` selection reads the same crop geometry every pass.
+    """
     from tailcyclenet.dataset import LoaderConfig, _crop_inflate
 
     cfg = LoaderConfig(crop_inflate=[0.9, 1.5])
@@ -1161,19 +1009,12 @@ def test_crop_inflate_draw_range_on_train_only():
 
 def test_crop_inflate_range_flows_through_a_real_item(tiny_root):
     """End to end: a `[low, high]` `crop_inflate` must actually vary the TRAIN crop side across
-    repeated draws of the SAME item, verified through `PoseDataset._item` rather than only at the
-    `crop.py` unit level. Train items are entropy-seeded (`__getitem__`), so repeated calls draw
-    independently; val/test items are INDEX-seeded, so calling `ds[0]` twice is trivially
-    identical regardless of the midpoint logic -- that is not evidence of it. The real claim (val
-    uses the exact midpoint, not an arbitrary fixed draw) is checked against an explicit
-    scalar-midpoint config instead.
+    repeated draws of the SAME item, and val uses the exact midpoint (checked against an explicit
+    scalar-midpoint config).
     """
-    # THE DRAW IS FORCED, NOT HOPED FOR. The fixture's frame is 64x48 and its animal box is often
-    # already frame-sized, so an inflated box CLAMPS at the image edge and lands on the same scale
-    # as a tight one -- measured, all 12 draws of a `[0.9, 1.8]` range can coincide, which is what
-    # made an "assert the draws differ" version of this test flaky (~1 run in 6). Feeding
-    # `_crop_inflate` a stubbed rng that returns the range's endpoints makes the two ends of the
-    # range concrete and the assertion exact, instead of relying on the fixture to expose them.
+    # THE DRAW IS FORCED, NOT HOPED FOR. The fixture's frame is small, so an inflated box often
+    # CLAMPS at the image edge and lands on the same scale as a tight one -- feeding `_crop_inflate`
+    # a stubbed rng that returns the range's endpoints makes the assertion exact.
     range_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                              crop_jitter=0.0, prompt_dropout=0.0, min_crop_dim=8,
                              crop_inflate=[0.9, 1.8])
@@ -1217,9 +1058,7 @@ def test_crop_inflate_range_flows_through_a_real_item(tiny_root):
 # ----------------------------------------------------------------------------------------------
 
 # `_reader_cache_size` is pure given `ram_gb`, which is the whole point: the sizing rule is
-# asserted here on any host, with no video, no decode and no GPU. The failure it exists to catch is
-# SILENT -- a cache below the camera count misses on every call and only shows up as a 2.5x
-# slowdown in a log nobody diffs.
+# asserted here on any host, with no video, no decode and no GPU.
 
 def test_reader_cache_holds_a_whole_rig_in_one_process():
     """A single process streaming windows must cache every camera, or it misses on every call."""
@@ -1232,7 +1071,7 @@ def test_reader_cache_holds_a_whole_rig_in_one_process():
 
 
 def test_reader_cache_does_not_multiply_by_worker_count():
-    """12 workers x a 16-camera rig x 2.56 GB would be 480 GB. A worker wants ChunkShuffle.mix."""
+    """A worker wants ChunkShuffle.mix, not the whole rig: 12 workers x 16 cameras would be 480 GB."""
     from tailcyclenet.dataset import _reader_cache_size
 
     assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=503) == 4
@@ -1241,13 +1080,9 @@ def test_reader_cache_does_not_multiply_by_worker_count():
 
 def test_reader_cache_degrades_instead_of_oom_on_a_small_host():
     """The count is a wish and RAM is the constraint; the clamp binds before the OOM killer does.
-
-    **THE NUMBERS HERE MOVED WITH THE BACKEND, AND THAT IS THE POINT OF THE COMMENT.** This used
-    to assert `< 16` at a 64 GB budget, which was true only under decord's QUADRATIC price
-    (0.28 / 3.58 / 15.34 / 59.38 GB at 1 / 4 / 8 / 16 readers). PyAV is LINEAR at ~0.053 GB per
-    megapixel per reader, so 16 readers of a 7.06 MP rig cost 6 GB and a 64 GB budget holds them
-    comfortably -- refusing to would be the defect, not the safety. A budget genuinely too small
-    still degrades, which is what this now asserts.
+    The numbers here moved with the backend: PyAV's readers are linear (~0.053 GB per megapixel),
+    so budgets that decord's quadratic price could not hold now fit, and a genuinely small budget
+    still degrades.
     """
     from tailcyclenet.dataset import _reader_cache_size
 
@@ -1322,8 +1157,9 @@ def test_reader_cache_env_var_overrides_everything(monkeypatch):
 
 
 def test_reader_cache_size_does_not_touch_the_filesystem(monkeypatch):
-    """GOTCHA 11. Opening a container in the parent deadlocks every forked worker, forever, so the
-    sizing rule may read toml-derived numbers and nothing else."""
+    """Opening a container in the parent deadlocks every forked worker, so the sizing rule may
+    read toml-derived numbers and nothing else.
+    """
     import builtins
 
     from tailcyclenet.dataset import _reader_cache_size
@@ -1337,11 +1173,9 @@ def test_reader_cache_size_does_not_touch_the_filesystem(monkeypatch):
 
 
 def test_a_whole_body_offset_moves_every_keypoint_the_same_way(tiny_root):
-    """I.I.D. JITTER IS NOT THE FAILURE DEPLOYMENT PRODUCES.
-
-    `--anchor carry` hands the model its own previous output, whose error is a whole-body LAG: every
-    keypoint displaced the same way. Gaussian noise averages to zero over the keypoint set, so it
-    trains the model to trust the prior's CENTROID exactly -- the one quantity a lag gets wrong.
+    """I.I.D. jitter is not the failure deployment produces: a carried prior's error is a
+    whole-body LAG, and i.i.d. noise averages to zero over the keypoint set, training the model
+    to trust the prior's centroid -- the one quantity a lag gets wrong.
     """
     def cfg(**kw):
         return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
@@ -1364,8 +1198,9 @@ def test_a_whole_body_offset_moves_every_keypoint_the_same_way(tiny_root):
 
 
 def test_a_stale_prior_is_a_wrong_position_not_a_withdrawn_one(tiny_root):
-    """`carried` degrades into a pose from an earlier frame than `prompt_t` claims when the box
-    source loses an animal. Swapping in NaN instead would just be `prompt_dropout` again."""
+    """A carried prior degrades into an earlier frame's pose when the box source loses an animal;
+    swapping in NaN instead would just be `prompt_dropout` again.
+    """
     def cfg(**kw):
         return LoaderConfig(n_frames=4, image_size=64, aug_prob=0.0, crop_jitter=0.0,
                             prompt_dropout=0.0, prob_2d_only=0.0, **kw)
@@ -1383,12 +1218,8 @@ def test_a_stale_prior_is_a_wrong_position_not_a_withdrawn_one(tiny_root):
 
 
 def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
-    """`cv2.warpAffine` with a 0 in `dsize` returns the FULL SOURCE FRAME, and does not raise.
-
-    So a camera rounded to [256, 0] handed the model a 4696x2048 image while its own dict said
-    256x0 -- silent garbage instead of a clean failure. Reachable from `run_group`'s per-camera
-    union box, which only guarantees `x1 >= x0 + 1`, i.e. one detector box clipped to a sliver
-    against a frame edge is enough.
+    """`cv2.warpAffine` with a 0 in `dsize` returns the FULL SOURCE FRAME and does not raise, so
+    a camera rounded to [256, 0] would hand the model silent garbage instead of a clean failure.
     """
     import cv2
 
@@ -1408,13 +1239,8 @@ def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
 
 
 def test_a_3d_session_with_no_points3d_is_refused_by_name(tmp_path):
-    """The format allows it; training on it does not. It used to CRASH mid-epoch instead.
-
-    Spec §8 and validation rule 12 admit a `mode = "3d"` session carrying only `keypoints.pq`
-    (rule 6 needs just one of the two tables), and the index builder admits its windows off
-    `vis2d`. But `_item` picks its target table off `sess.mode` alone, so it reached
-    `lab.points3d[a]` as `TypeError: 'NoneType' object is not subscriptable` -- uncaught, since
-    only a `None` return is retried, and with nothing in the message naming the session.
+    """The format allows it; training on it does not. It used to CRASH mid-epoch instead, with
+    nothing in the message naming the session.
     """
     import sys
     from pathlib import Path
@@ -1434,14 +1260,8 @@ def test_a_3d_session_with_no_points3d_is_refused_by_name(tmp_path):
         assert 's_3d' in str(e)
 
 def test_a_3d_rotation_that_loses_the_animal_is_reverted():
-    """`rotate_camera_image_plane_3d` crops to the BORDER-FREE INSCRIBED RECTANGLE, ~0.416 of the
-    frame -- the exact step `_rotate_2d` was hand-written to avoid.
-
-    An animal outside that rectangle projects out of `cam['size']`, and `crop_box_for_points`
-    CLAMPS rather than returning None, so the item came back as a `min_crop_dim` corner crop of
-    background carrying full-strength world targets. `_item`'s `< 2 finite` guard runs BEFORE the
-    rotation, so nothing caught it -- and the `vis_2d` recompute meant to soften it is gated on
-    `vis_2d is not None`, which excludes 3dpop, branson-fly and johnson-mouse (all `projected`).
+    """The library's rotation crops to the border-free inscribed rectangle, which can throw the
+    animal out of the frame; `_item`'s guard must revert such a rotation, not keep it silently.
     """
     from aniposelib.cameras import CameraGroup
     from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
@@ -1479,15 +1299,9 @@ def test_a_3d_rotation_that_loses_the_animal_is_reverted():
 
 
 def test_the_3d_visibility_or_reflects_the_augmentation_that_followed_it():
-    """The noisy-OR used to be taken BEFORE the augmentation that invalidates it.
-
-    The rotation loop zeroes `vis_2d[:, :, cnum]` for points the rotated camera no longer sees and
-    `_cutout_rects` zeroes more -- both AFTER `vis` was computed. So a point could end up
-    `vis_2d == 0` in every shown camera while `vis` still said True, and `TotalLoss` takes a
-    supplied `vis_true` verbatim (losses.py:421), weighting `mae_loss_coords`,
-    `coords_loss_direct` and `bce_loss_vis_3d` by it. That supervises the 3D coord and visibility
-    heads at points the crop provably does not contain -- i.e. supplying visibility was WORSE than
-    passing None, which lets the loss derive it geometrically.
+    """The noisy-OR used to be taken BEFORE the rotation/cutout that invalidates it, so a point
+    could read `vis == True` while every shown camera had zeroed it -- supplying visibility was
+    worse than passing None.
     """
     # (T=1, K=3, C=2): keypoint 0 seen by camera 1, keypoint 1 by neither, keypoint 2 unassessed.
     vis_2d = torch.tensor([[[0.0, 1.0], [0.0, 0.0], [float('nan')] * 2]])
@@ -1502,24 +1316,15 @@ def test_the_3d_visibility_or_reflects_the_augmentation_that_followed_it():
     assert not bool(fresh[0, 2])
 
 
-# ----------------------------------------------------------------------------------------------
-# the two prior corruptions (dev/plans/prompt_prior_corruptions.md): a swapped keypoint pair, and
-# a jump to a nearby animal's pose. Both are train-only, off by default, and gated so a default
-# config never draws an extra `rng` value -- see `_train_item`'s own docstring for why a 3D
-# comparison additionally reseeds the GLOBAL numpy RNG.
-# ----------------------------------------------------------------------------------------------
+# the two prior corruptions: a swapped keypoint pair, and a jump to a nearby animal's pose.
+# Both are train-only, off by default, and gated so a default config never draws an extra `rng`
+# value.
+
 
 def _train_item(ds, idx=0, seed=0):
-    """One TRAIN item, fully deterministic. `PoseDataset.__getitem__` entropy-seeds every train
-    item (`np.random.default_rng(None)`), so a byte-identity comparison has to go through `_item`
-    directly with an explicit rng -- the precedent is
-    `test_crop_inflate_range_flows_through_a_real_item`.
-
-    A 3D item ALSO needs the GLOBAL numpy seed reset: `rotate_camera_group` draws its rotation
-    from `np.random.uniform`, not from this `rng`, and both calls in the 3D branch of `_item` are
-    unconditional on `self.train` -- so two `_item` calls being compared must each start from the
-    same global state, or they silently diverge on a rotation neither call's own `rng` chose
-    (dev/plans/prompt_prior_corruptions.md Section 1, correction 6).
+    """One TRAIN item, fully deterministic. `__getitem__` entropy-seeds every train item, so a
+    byte-identity comparison goes through `_item` directly with an explicit rng; a 3D item ALSO
+    needs the global numpy seed reset, because `rotate_camera_group` draws from `np.random`.
     """
     np.random.seed(seed)
     return ds._item(idx, np.random.default_rng(seed))
@@ -1527,10 +1332,8 @@ def _train_item(ds, idx=0, seed=0):
 
 def test_prompt_swaps_default_off_is_byte_identical(tiny_root):
     """`prompt_swap_kpt_pairs = 0.0`, `prompt_swap_animal = 0.0` (both defaults) must be
-    BYTE-IDENTICAL to a config that never mentions the keys -- mirroring
-    `test_crop_inflate_default_is_inert`'s own contract for the same reason: every number on
-    record was measured without these keys, and an unconditional draw would silently un-pair
-    every one of them from a run that now imports this code unchanged.
+    BYTE-IDENTICAL to a config that never mentions the keys -- every number on record was measured
+    without them.
     """
     for root, split in ((tiny_root / 'ratlike', 'val'), (tiny_root / 'mouselike', 'train')):
         base = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.25,
@@ -1559,9 +1362,8 @@ def test_prompt_swaps_default_off_is_byte_identical(tiny_root):
 
 
 def test_animal_swap_is_inert_on_a_single_animal_session(tmp_path):
-    """attempt_swap_animal requires lab.n_animals >= 2 -- a structural condition, not a draw --
-    so a single-animal session must consume NOTHING extra from rng, and the item must be
-    bit-identical to one built without the key at all. _session_3d ships exactly one animal.
+    """`attempt_swap_animal` needs n_animals >= 2 (structural, not a draw), so a single-animal
+    session must consume NOTHING extra from rng and stay bit-identical.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1580,11 +1382,9 @@ def test_animal_swap_is_inert_on_a_single_animal_session(tmp_path):
 
 
 def test_animal_swap_changes_only_the_prior(tiny_root):
-    """At `prompt_swap_animal = 1.0` on `ratlike` (2 animals, `_session_2d`), the corruption must
-    touch `kpt_prior` and NOTHING else -- `crop_to_points_2d`/`crop_to_points_3d` are never handed
-    the neighbour, so the crop, the pixels and every other target stay exactly what they were
-    (dev/plans/prompt_prior_corruptions.md Section 4.4). This is the guard against "the neighbour
-    leaked into the crop".
+    """At `prompt_swap_animal = 1.0` the corruption must touch `kpt_prior` and NOTHING else --
+    the crop, pixels and every other target stay what they were ("the neighbour leaked into the
+    crop" guard).
     """
     root = tiny_root / 'ratlike'
     base_ds = PoseDataset(root, 'train', CFG, train=True)
@@ -1605,15 +1405,8 @@ def test_animal_swap_changes_only_the_prior(tiny_root):
 
 def test_animal_swap_prior_is_in_the_model_frame(tmp_path):
     """The corrupted prior must be the NEIGHBOUR's pose put through the SAME transform the
-    target's own `coords` received, not merely a differently-shaped tensor.
-
-    3D: the two animals are a RIGID pair (`_session_3d_multi`'s own contract -- animal 2 is
-    animal 1 plus one constant world-space offset), and a world ROTATION is linear, so the
-    corrupted prior minus the base prior must be the SAME vector at every keypoint, with the SAME
-    norm as the un-rotated offset (`sep`) -- exactly what threading the neighbour through both
-    `rotate_camera_group` calls (dev/plans/prompt_prior_corruptions.md Section 4.4) predicts, and
-    what re-deriving the rotation independently would not obviously satisfy if the wrong tensor
-    got split off.
+    target's own `coords` received -- with a rigid pair and a world rotation, the corrupted minus
+    base prior must be one vector of the same norm as `sep`.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1639,16 +1432,7 @@ def test_animal_swap_prior_is_in_the_model_frame(tmp_path):
 
 def test_animal_swap_2d_prior_is_the_neighbours_own_labelled_pixel(tiny_root):
     """2D half of the same claim, inverted through the item's OWN recorded crop geometry rather
-    than a second copy of the crop rule.
-
-    `offset = cgroup[0]['offset']` is exactly the box origin `_item` computed for the TARGET
-    (`apply_crop` then `_resize_camera`), and `final = raw * scale - offset` for whatever scalar
-    `scale` the resize used. NOT `cgroup[0]['mat'][0, 0]`: that is the camera's own intrinsic fx
-    (`nominal_camera`'s `max(W, H)`) times `scale`, not `scale` alone, so dividing by it would be
-    wrong by exactly that factor. `scale` is instead solved from the TARGET's OWN known
-    correspondence -- its base (uncorrupted) `kpt_prior` against its own raw labelled pixel at
-    `prompt_t` -- which `test_animal_swap_changes_only_the_prior` already pins bit-identical
-    between the base and swap items, so reading it off either one is the same fact.
+    than a second copy of the crop rule. `scale` is solved from the target's own correspondence.
     """
     root = tiny_root / 'ratlike'
     cfg = replace(CFG, aug_prob=0.0, crop_jitter=0.0)
@@ -1684,12 +1468,8 @@ def test_animal_swap_2d_prior_is_the_neighbours_own_labelled_pixel(tiny_root):
 
 
 def test_corrupted_prior_is_bounds_masked(tmp_path):
-    """A neighbour placed outside every camera's usable pair (`sep` far larger than the crop)
-    must never be substituted in -- "I was not told" rather than "I was told a lie". EVERY one of
-    its keypoints fails `prior_out_of_bounds`, so `neighbour_prior` is all-NaN and the per-keypoint
-    `jump` mask is all-False regardless of the Bernoulli draws: the corruption is a NO-OP, and
-    `prompt_swap_animal`'s CONFIGURED rate and its PRESENTED rate then differ
-    (dev/plans/prompt_prior_corruptions.md Section 4.3).
+    """A neighbour placed outside every camera's usable pair must never be substituted in: the
+    corruption is a NO-OP, so the configured rate and the presented rate differ.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -1708,10 +1488,7 @@ def test_corrupted_prior_is_bounds_masked(tmp_path):
 
 def test_kpt_swap_lands_on_another_original_point_never_itself(tiny_root):
     """NOT a permutation: each corrupted keypoint's new value must MATCH one of the OTHER
-    keypoints' ORIGINAL (uncorrupted) positions -- membership, not set-equality, since two
-    keypoints may independently land on the SAME source point and a source point may end up
-    represented nowhere in the corrupted prior. A corrupted point must never equal its OWN
-    original value (the `(local + offset) % m` draw in `_item` excludes it by construction).
+    keypoints' original positions, and never its own (the `(local + offset) % m` draw excludes it).
     """
     for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
         base_ds = PoseDataset(root, 'train', CFG, train=True)
@@ -1737,13 +1514,8 @@ def test_kpt_swap_lands_on_another_original_point_never_itself(tiny_root):
 
 
 def test_kpt_swap_pairs_is_a_per_keypoint_rate(tiny_root):
-    """A PER-KEYPOINT PROBABILITY, not a fixed count: at `prompt_swap_kpt_pairs = 1.0`
-    (deterministic -- every finite keypoint is selected) EVERY finite keypoint must move, on BOTH
-    the K=4 (`ratlike`) and K=3 (`mouselike`) roots -- a count that DOES scale with K, which is
-    the deliberate opposite of the count-based design this key started with.
-
-    Every selected keypoint moving is the `(local + offset) % m` draw's own guarantee: the
-    offset is drawn from 1..m-1, so it can never land back on the keypoint's own position.
+    """A PER-KEYPOINT PROBABILITY, not a fixed count: at p = 1.0 EVERY finite keypoint must move
+    on both roots -- the deliberate opposite of the count-based design this key started with.
     """
     for root in (tiny_root / 'ratlike', tiny_root / 'mouselike'):
         base_ds = PoseDataset(root, 'train', CFG, train=True)
@@ -1757,6 +1529,3 @@ def test_kpt_swap_pairs_is_a_per_keypoint_rate(tiny_root):
         assert int(moved.sum()) == n_finite, \
             (f'{root.name} (K={b.kpt_prior.shape[1]}): expected every one of the {n_finite} '
              f'finite keypoints to move at p = 1.0, not a fixed pair count')
-
-
-# ----------------------------------------------------------------------------------------------

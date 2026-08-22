@@ -2,14 +2,13 @@
 
 The detector is trained from a TOML config, the same way the pose side is (`scripts/train.py` +
 `checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml`; a user overlay
-may `extends` it one level deep. Every key is validated against an explicit allowed set --
-an unknown key is a typo, not a comment, and must not silently train at defaults (the same guard
-`scripts/train.py` applies to `[data]`).
+may `extends` it one level deep. Every key is validated against an explicit allowed set -- an
+unknown key is a typo, not a comment, and must not silently train at defaults.
 
 Blocks:
     [data]      the loader and what the regression target bounds
-    [model]     the architecture: `yolox` (capacity tier), plus the T4.1 pretraining prototype
-                (`bottleneck_expansion`, `pretrained` -- dev/plans/detector_accuracy.md)
+    [model]     the architecture: `yolox` (capacity tier), plus the pretraining prototype keys
+                (`bottleneck_expansion`, `pretrained`)
     [training]  schedule, run folder, device
 
 `weight_decay` (5e-4) and the cosine schedule are not configurable: they were never flags.
@@ -25,8 +24,7 @@ from .yolox import YOLOX_TIERS
 # THE ALLOWED KEYS, PER BLOCK. Anything else raises -- see module docstring. These are the
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
 # `--boxes`' dash), so a config value means exactly what the flag meant.
-DATA_KEYS = frozenset({
-    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
+DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
     'frames_per_group', 'val_frames_per_group', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input',
@@ -82,12 +80,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data, model, train = cfg['data'], cfg['model'], cfg['training']
 
     # THE CLI OVERRIDE MUST LAND BEFORE THE REQUIRED-FIELD CHECK, OR IT CANNOT RESCUE ANYTHING.
-    # `configs/detector.toml` ships `out = ""` on the promise that `--out` fills it in -- and
-    # every per-root overlay under `configs/detector/` follows that promise, leaving `out` for
-    # the CLI. Checking `train.get('out')` before this ran the promise into the requirement: a
-    # config with `out = ""` and a caller passing `out=`  still raised "required", because the
-    # override at the bottom of this function never got the chance to apply. `path` has no CLI
-    # override to rescue it (train_detector.py exposes none), so its check stays where it was.
+    # `configs/detector.toml` ships `out = ""` on the promise that `--out` fills it in; checking
+    # `train.get('out')` before this ran the promise into the requirement. `path` has no CLI
+    # override to rescue it, so its check stays where it was.
     if out is not None:
         train['out'] = str(out)
     if iters is not None:
@@ -124,9 +119,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         train[k] = int(train.get(k, {'iters': 20000, 'batch_size': 16, 'num_workers': 8,
                                      'seed': 0, 'eval_every': 2000, 'eval_batches': 25,
                                      'iou_aware_warmup': 2000, 'max_pos_per_gt': 0}[k]))
-    # T2.3 (dev/plans/detector_accuracy.md): the BCE objectness target at a positive anchor
-    # becomes the detached IoU between its predicted and GT box, instead of a hard 1.0, once past
-    # `iou_aware_warmup` iterations. Default OFF -- byte-identical to every checkpoint on record.
+    # T2.3: the BCE objectness target at a positive anchor becomes the detached IoU between its
+    # predicted and GT box, instead of a hard 1.0, once past `iou_aware_warmup` iterations.
+    # Default OFF -- byte-identical to every checkpoint on record.
     train['iou_aware_obj'] = bool(train.get('iou_aware_obj', False))
     for k in ('min_crop_dim', 'min_box_px', 'max_input_px', 'frames_per_group',
               'val_frames_per_group', 'tile_bg_per_frame'):
@@ -134,11 +129,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                                    'max_input_px': 4 * 416 * 416, 'frames_per_group': 40,
                                    'val_frames_per_group': 8,
                                    'tile_bg_per_frame': 1}[k]))
-    # T2.4 (dev/plans/detector_accuracy.md): `box_weight` was `detector_loss`'s own hardcoded
-    # default (5.0), never exposed to a config or CLI flag -- "the two untuned scalars" alongside
-    # `lr`. 5.0 here is BYTE-IDENTICAL to every checkpoint on record, since that is also
-    # `detector_loss`'s own Python default; this key only matters once a config states something
-    # else.
+    # T2.4: `box_weight` was `detector_loss`'s own hardcoded default (5.0), never exposed to a
+    # config or CLI flag -- "the two untuned scalars" alongside `lr`. 5.0 here is BYTE-IDENTICAL
+    # to every checkpoint on record, since that is also `detector_loss`'s own Python default; this
+    # key only matters once a config states something else.
     for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight'):
         train[k] = float(train.get(k, {'lr': 1e-3, 'kpt_weight': 1.0,
                                        'kpt_score_weight': 1.0, 'box_weight': 5.0}[k]))
@@ -155,9 +149,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         raise SystemExit('[data].ignore_present and [data].use_regions cannot both be set: both '
                          'are the one opt-in (M,4) tuple slot box_collate/split_batch dispatch '
                          'by rank. See BoxDataset.__init__.')
-    # T4.2 (dev/plans/detector_accuracy.md): frame t-1 stacked beside frame t. Default `'none'` is
-    # byte-identical to every checkpoint on record. See `TEMPORAL_INPUT_CHANNELS`
-    # (`tailcyclenet/detector/data.py`) for what each mode does to the stem's input width.
+    # T4.2: frame t-1 stacked beside frame t. Default `'none'` is byte-identical to every
+    # checkpoint on record. See `TEMPORAL_INPUT_CHANNELS` (`tailcyclenet/detector/data.py`) for
+    # what each mode does to the stem's input width.
     data['temporal_input'] = str(data.get('temporal_input', 'none'))
     if data['temporal_input'] not in TEMPORAL_INPUTS:
         raise SystemExit(f"[data].temporal_input must be one of {TEMPORAL_INPUTS}, got "
@@ -169,18 +163,16 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
 
-    # T4.1 (dev/plans/detector_accuracy.md). `bottleneck_expansion`: 0.5 (default) is
-    # byte-identical to every checkpoint on record; 1.0 is the shape a Megvii COCO backbone
-    # actually loads into (see `yolox.Bottleneck`). `pretrained`: '' (default, from scratch, every
-    # run on record), 'coco' (load the tier's COCO backbone -- `detector.load_coco_backbone`), or
-    # ANY OTHER non-empty string is a PATH to a T4.1b in-domain backbone-only checkpoint
-    # (`scripts/pretrain_detector_backbone.py` -> `detector.load_pretrained_backbone`). Unlike
-    # 'coco', a path has NO tier or bottleneck_expansion restriction -- the pretrain script builds
-    # whatever architecture its own config names, so the two just need to AGREE, and
-    # `load_pretrained_backbone` is what checks that agreement (it raises, not `train_detector.py`,
-    # since the fine-tune side cannot know what the checkpoint was pretrained at without reading
-    # it). Required to exist NOW, at config load: a typo'd path should fail before 20000 iterations
-    # of training a randomly-initialised "pretrained" backbone, not after.
+    # T4.1. `bottleneck_expansion`: 0.5 (default) is byte-identical to every checkpoint on record;
+    # 1.0 is the shape a Megvii COCO backbone actually loads into (see `yolox.Bottleneck`).
+    # `pretrained`: '' (default, from scratch, every run on record), 'coco' (load the tier's COCO
+    # backbone -- `detector.load_coco_backbone`), or ANY OTHER non-empty string is a PATH to an
+    # in-domain backbone-only checkpoint (`scripts/pretrain_detector_backbone.py` ->
+    # `detector.load_pretrained_backbone`). Unlike 'coco', a path has no tier or
+    # bottleneck_expansion restriction -- the pretrain script builds whatever architecture its own
+    # config names, so the two just need to AGREE, and `load_pretrained_backbone` is what checks
+    # that agreement. Required to exist NOW, at config load: a typo'd path should fail before
+    # 20000 iterations of training a randomly-initialised "pretrained" backbone, not after.
     model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))
     model['pretrained'] = str(model.get('pretrained', ''))
     if model['yolox'] == 'trimmed' and model['bottleneck_expansion'] != 0.5:
@@ -197,7 +189,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
             raise SystemExit(
                 "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
                 "every bottleneck conv is half Megvii's width and the load would silently take "
-                "only 19 of 35 backbone tensors (dev/plans/detector_accuracy.md T4.1).")
+                "only 19 of 35 backbone tensors.")
     elif model['pretrained'] not in ('', 'coco'):
         if not Path(model['pretrained']).exists():
             raise SystemExit(
@@ -205,8 +197,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                 "scratch), 'coco', or a path to a T4.1b in-domain backbone checkpoint from "
                 "scripts/pretrain_detector_backbone.py.")
 
-    # T4.3 (dev/plans/detector_accuracy.md): a stride-4 FPN level, on top of EITHER backbone
-    # (canonical tier or `trimmed`) -- unlike `bottleneck_expansion`, not tier-restricted. Default
-    # `false` is byte-identical to every checkpoint on record (`YOLOXNano`'s own default).
+    # T4.3: a stride-4 FPN level, on top of EITHER backbone (canonical tier or `trimmed`) --
+    # unlike `bottleneck_expansion`, not tier-restricted. Default `false` is byte-identical to
+    # every checkpoint on record (`YOLOXNano`'s own default).
     model['p2'] = bool(model.get('p2', False))
     return cfg

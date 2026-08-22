@@ -1,12 +1,9 @@
 """scripts/combine_roots.py -- the collision rule and the refusal to clobber.
 
-Two things here would be silently wrong rather than loud. The first is the SPLIT-INVARIANCE of
-the disambiguating suffix: `rat-city-tracked` carries one session name in train, val AND test
-(its splits are frame ranges of one 57,594-frame recording), so a suffix applied only in the
-split where the collision happens would make one session look like two to anything enforcing the
-rule-14 leak check by folder name. The second is idempotency: the sweep preflight exists because
-a half-built root looks fine to `-d train` and fails hours into a job, so a re-run must be a
-no-op and an unexpected entry must stop the build rather than be silently overwritten.
+Two things here would be silently wrong rather than loud: the SPLIT-INVARIANCE of the
+suffix (one session name appears in train, val AND test, so a suffix applied in only one
+split would make one session look like two), and idempotency (a re-run must be a no-op;
+an unexpected entry must stop the build rather than be overwritten).
 """
 import importlib.util
 import sys

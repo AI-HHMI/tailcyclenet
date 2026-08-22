@@ -1,10 +1,8 @@
 """tailcyclenet/losses.py -- `PoseLoss`, the repo-local 2D visibility term.
 
-Scoped to the ONE thing this module adds. `TotalLoss`'s own machinery -- coords, 3D visibility,
-smoothness -- is posetail's, exercised by its own suite and by the smoothness tests in
-tests/test_train.py; not duplicated here. `TotalLoss.forward` itself is stubbed out in most of
-these so each test isolates the new code from the library's, which is large enough to need a
-real, shape-correct `outputs` dict to run at all.
+Scoped to the ONE thing this module adds; `TotalLoss`'s own machinery is posetail's and is not
+duplicated here. `TotalLoss.forward` is stubbed out in most of these so each test isolates the
+new code from the library's.
 """
 import pytest
 import torch
@@ -18,8 +16,8 @@ from tailcyclenet.losses import PoseLoss, masked_bce_with_logits
 # ----------------------------------------------------------------------------------------------
 
 def test_masked_bce_matches_the_library_idiom():
-    """Duplicated from `BCELossVis._compute_loss` on purpose -- it is a private method, so this
-    is the guard against the two drifting apart rather than an import."""
+    """Duplicated from `BCELossVis._compute_loss` on purpose -- it is private, so this guards
+    against the two drifting apart rather than an import."""
     torch.manual_seed(0)
     pred = torch.randn(2, 3, 4, 1, 1)
     target = torch.randint(0, 2, (2, 3, 4, 1, 1)).float()
@@ -74,8 +72,8 @@ def _patch_total_forward(monkeypatch, value):
 
 def test_pose_loss_at_default_weight_is_bit_identical_to_totalloss(monkeypatch):
     """An absent `vis_loss_2d_weight` key must reproduce today's arm exactly -- every run on
-    record used bare `TotalLoss`, and this is the guarantee that a config without the key still
-    does."""
+    record used bare `TotalLoss`.
+    """
     calls = _patch_total_forward(monkeypatch, 0.5)
     plain = PoseLoss()                      # vis_loss_2d_weight defaults to 0.0
     got = plain.forward(None, {'vis_pred_2d': torch.zeros(1, 1, 2, 3)},
@@ -86,8 +84,9 @@ def test_pose_loss_at_default_weight_is_bit_identical_to_totalloss(monkeypatch):
 
 
 def test_pose_loss_is_inert_without_a_2d_target(monkeypatch):
-    """No target, whatever the weight, means no term -- this is what lets a 3D batch (which never
-    supplies `vis_2d_true`) share this class safely."""
+    """No target, whatever the weight, means no term -- what lets a 3D batch (which never
+    supplies `vis_2d_true`) share this class safely.
+    """
     _patch_total_forward(monkeypatch, 0.25)
     loss_fn = PoseLoss(vis_loss_2d_weight=5.0)
     got = loss_fn.forward(None, {}, torch.zeros(1, 2, 3, 2), None, None,
@@ -128,9 +127,9 @@ def test_pose_loss_shapes_the_target_camera_first_to_match_the_prediction():
 
 def test_pose_loss_raises_on_a_genuinely_poisoned_term(monkeypatch):
     """A non-finite PREDICTION (not a masked-out target) must reach the same poison check
-    `TotalLoss.forward` applies to its own stack (`losses.py:914-921`), and `run_batch` depends
-    on the message containing 'non-finite' to convert this into a skipped step rather than a
-    dead run."""
+    `TotalLoss.forward` applies, and `run_batch` depends on the 'non-finite' message to convert
+    this into a skipped step.
+    """
     _patch_total_forward(monkeypatch, 0.0)
     pred = torch.full((1, 1, 2, 3), float('inf'), requires_grad=True)
     target = torch.full((1, 2, 3, 1, 1), float('nan'))

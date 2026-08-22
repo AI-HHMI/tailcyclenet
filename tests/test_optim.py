@@ -28,9 +28,7 @@ def _train_module():
 
 class TinyEncoder(nn.Module):
     """The shape `unfreeze.py` reads: `blocks`, `norms_block` and `hierarchical_layers`.
-
-    Six blocks with the hierarchical taps at [1,3,4,5], so the last-N rule has something to select
-    other than everything -- at N = 3 the trainable range is blocks 3..5, i.e. norms 1,2,3.
+    Six blocks with taps at [1,3,4,5], so the last-N rule selects a proper sub-range.
     """
 
     def __init__(self, depth=6):
@@ -43,11 +41,8 @@ class TinyEncoder(nn.Module):
 class Tiny(nn.Module):
     """Named to match the router's substrings: `decoder.mlps` -> Muon, `decoder.heads_*` -> AdamW,
     `scene_encoder.encoder.blocks` -> the encoder Muon group, an Embedding that must stay AdamW.
-
-    It also stands in for `TrackerEncoder`'s staged-unfreeze contract: `unfreeze_video_encoder`
-    has the same signature, gate and idempotence as upstream's, and re-freezes before unfreezing
-    the last N exactly as `set_encoder_requires_grad` does -- which is what makes the norms
-    extension order-dependent.
+    Also stands in for `TrackerEncoder`'s staged-unfreeze contract, including re-freezing before
+    unfreezing the last N.
     """
 
     def __init__(self, unfreeze_at=None, n_last=3):
@@ -122,7 +117,7 @@ def test_routing_is_2d_disjoint_and_complete():
 
 
 def test_adamw_and_muon_param_sets_partition_and_clip_target_is_adamw_only():
-    """The clip must target the AdamW half only (report 34b). `adamw_params` ∪ `muon_params` is the
+    """The clip must target the AdamW half only. `adamw_params` ∪ `muon_params` is the
     full trainable set, disjoint, and no Muon-routed 2D matrix is in the clip target."""
     m = Tiny()
     opt = build_muon(m, fresh=set(), cfg=_cfg())
@@ -279,8 +274,9 @@ def _enc_tensors(m):
 
 
 def test_unfreeze_puts_every_new_param_in_exactly_one_group():
-    """THE NO-OP THIS FIXES. `build_muon` filters `requires_grad`, so a param frozen at step 0 is
-    in no group -- flipping the flag alone would give it gradients that nothing steps."""
+    """THE NO-OP THIS FIXES: `build_muon` filters `requires_grad`, so a param frozen at step 0 is
+    in no group -- flipping the flag alone would give it gradients that nothing steps.
+    """
     m, opt, cfg = _staged()
     routed = {id(p) for p in _all_params(opt)}
     assert not (routed & {id(p) for p in m.scene_encoder.encoder.parameters()}), \
@@ -324,10 +320,10 @@ def test_unfreeze_is_gated_and_idempotent():
 
 
 def test_added_groups_start_a_fresh_schedule():
-    """NEW GROUPS, NOT PRE-REGISTERED ONES. Both schedule-free impls advance `k`/`weight_sum` on
-    every `step()` regardless of whether a param has a grad, and the averaging weight is
-    `ckp1 = weight/weight_sum ~ 1/k` -- so a group that sat grad-less would fold its encoder into
-    the averaged iterate at ~1/k and `model_state_eval` would hold a barely-moved encoder."""
+    """NEW GROUPS, NOT PRE-REGISTERED ONES: both schedule-free impls advance `k`/`weight_sum` on
+    every `step()` regardless of grad, and the averaging weight is ~1/k -- so a group that sat
+    grad-less would fold its encoder into the averaged iterate at ~1/k.
+    """
     m, opt, cfg = _staged()
     opt.train()
     for _ in range(UNFREEZE_AT):
@@ -408,9 +404,10 @@ def test_muon_base_lrs_stays_aligned_after_an_add():
 
 
 def test_resume_replays_the_unfreeze_and_round_trips_the_state():
-    """A run resumed past its unfreeze must reach the layout a fresh run holds at that iteration.
-    Groups match BY POSITION, so this asserts the replay produces the same order AND that
-    `train()` after the load moves nothing (the ScheduleFreeWrapper `train_mode` bug)."""
+    """A run resumed past its unfreeze must reach the layout a fresh run holds at that iteration:
+    groups match BY POSITION, so this asserts the replay produces the same order AND that
+    `train()` after the load moves nothing (the ScheduleFreeWrapper `train_mode` bug).
+    """
     torch.manual_seed(0)
     m, opt, cfg = _staged()
     opt.train()
@@ -459,7 +456,9 @@ def test_schedulefree_optimizer_takes_the_same_staged_path():
 
 
 def test_schedulefree_escape_hatch_is_the_current_three_group_optimizer():
-    """`optimizer = "schedulefree"` must build the exact AdamW-SF optimizer that exists today."""
+    """`optimizer = "schedulefree"` must build the exact AdamW-SF optimizer that exists today:
+    fresh @ kpt_lr, rest @ lr, encoder @ lr*enc_scale -- three groups, no Muon.
+    """
     tr = _train_module()
     m = Tiny()
     fresh = {'decoder.mlps.0.weight'}

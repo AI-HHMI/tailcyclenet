@@ -2,23 +2,11 @@
 """Render a tailcycle dataset so a human can see what is actually in it.
 
     pixi run python scripts/render_dataset.py --data <root|session> --out <outdir>
-    pixi run python scripts/render_dataset.py --data <root> --out <dir> --n 4 --video
 
-Three views per sampled group, because no single one is checkable on its own:
-
-- **the sheet** — the labelled frame, downscaled to fit, with every overlay on it. This is where
-  a wrong animal count, a mis-split session or an absent Label Box shows up.
-- **per-animal crops at NATIVE resolution** — the only view in which a keypoint's position is
-  checkable at all. A rat is ~240 px on a 4696 px rat-city frame, i.e. ~50 px once the sheet is
-  scaled to fit a screen, and at that size a nose on the wrong end of the animal looks fine.
-- **`--video`** — the whole group at 10 fps with the frame index burned in, which is how you see
-  that the context frames are contiguous video around the label rather than a montage, and that
-  the label really sits where `source_frame_start` says.
-
-`regions.pq` is drawn in CYAN and everything else in warmer colours, deliberately: a region is the
-one overlay that is not about an animal. It marks the area the annotator certified as completely
-labelled, so on `rat-city-annotated` the honest reading of a sheet is "the rats inside the cyan
-box are all of them; outside it, unlabelled rats are expected".
+Three views per sampled group: the sheet (labelled frame, all overlays), per-animal crops at
+NATIVE resolution (the only view a keypoint's position is checkable in), and optionally a
+video of the whole group with the frame index burned in. `regions.pq` is drawn in CYAN: it marks
+the area the annotator certified as completely labelled, not an animal.
 """
 from __future__ import annotations
 
@@ -33,9 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt
 from tailcyclenet.dataset import read_frames
 
-# BGR, since cv2 writes BGR. Cyan for regions (not an animal), green/amber/grey for the three
-# instance statuses, and a fixed per-keypoint palette so the same keypoint is the same colour in
-# every render of every dataset.
+# BGR (cv2's order). Cyan for regions, instance-status colours, fixed per-keypoint palette.
 REGION = (255, 255, 0)
 INST_COLOR = {fmt.INST_LABELED: (80, 220, 80), fmt.INST_PRESENT: (60, 200, 255),
               fmt.INST_ABSENT: (150, 150, 150)}
@@ -122,8 +108,7 @@ def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dic
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
         stat['sheets'] += 1
 
-        # Per-animal crops from the ALREADY-DRAWN native-resolution image, so a crop shows the
-        # same overlay the sheet does at the resolution the annotator worked at.
+        # Crops from the already-drawn image, so they match the sheet at native resolution.
         if args.crops and lab.instance is not None:
             H, W = drawn.shape[:2]
             for a in np.flatnonzero(lab.instance[:, t, ci] == fmt.INST_LABELED):
@@ -194,9 +179,8 @@ def main() -> int:
     total = {'sheets': 0, 'crops': 0, 'videos': 0}
     for s in sessions:
         gids = [g for g in s.groups if args.group in g]
-        # Prefer groups that HAVE labels -- a random draw over rat-city-annotated's 65-frame
-        # groups would otherwise be dominated by whichever ones happen to be sampled, and every
-        # group there carries exactly one labelled frame anyway.
+        # Prefer groups that have labels -- a random draw would be dominated by whichever
+        # unlabelled ones happen to be sampled.
         if args.n and len(gids) > args.n:
             gids = [gids[i] for i in sorted(rng.choice(len(gids), args.n, replace=False))]
         for gid in gids:

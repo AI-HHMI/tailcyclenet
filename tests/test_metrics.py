@@ -60,12 +60,8 @@ def test_vectorised_matching_equals_the_loop_it_replaced():
 
 
 def test_ignore_boxes_excuse_only_what_they_cover():
-    """An ignore region is a place, not a licence for the whole frame.
-
-    Without boxes there is nothing to localise against, so presence alone excuses every unmatched
-    prediction -- which can zero the FP term. That fallback is kept, but it must SAY how many it
-    swallowed, or a method with no false positives is indistinguishable from a frame that
-    forgave them all.
+    """An ignore region is a place, not a licence for the whole frame: presence alone excuses
+    every unmatched prediction, but the count must SAY how many it swallowed.
     """
     true = np.full((1, 1, 2, 2), np.nan)                      # nothing annotated
     pred = np.array([[[[5., 5.], [5., 5.]]],                  # inside the ignore box
@@ -84,11 +80,8 @@ def test_ignore_boxes_excuse_only_what_they_cover():
 
 
 def test_a_surplus_predicted_row_is_a_false_positive():
-    """A detector offers as many animals as it finds, not as many as were labelled.
-
-    `eval.py` used to truncate `pred` to `true`'s row count, which deleted the surplus rows before
-    anything could score them -- so a detector that hallucinated a second animal in every frame
-    read as perfect. They are false positives.
+    """`eval.py` used to truncate `pred` to `true`'s row count, so a detector that hallucinated
+    a second animal in every frame read as perfect. Surplus rows are false positives.
     """
     true = np.zeros((1, 3, 4, 2))
     pred = np.zeros((3, 3, 4, 2))
@@ -99,11 +92,8 @@ def test_a_surplus_predicted_row_is_a_false_positive():
 
 
 def test_the_fp_term_separates_duplicates_from_nothing():
-    """The two halves want opposite fixes, so an undifferentiated `fp` cannot pick one.
-
-    Arbitration removes a second crop on an animal something else already claimed; a score
-    threshold removes a box on nothing. `match_instances` is one-to-one, so the duplicate is never
-    assigned and falls out as an ordinary false positive -- the proximity has to be tested for.
+    """The two halves want opposite fixes, so an undifferentiated `fp` cannot pick one: arbitration
+    removes a second crop on a claimed animal; a score threshold removes a box on nothing.
     """
     true = np.zeros((1, 1, 2, 2))                             # one animal at the origin
     pred = np.array([[[[0., 0.], [0., 0.]]],                  # matches it
@@ -117,8 +107,9 @@ def test_the_fp_term_separates_duplicates_from_nothing():
 
 
 def test_a_paired_delta_uses_only_the_points_both_arms_matched():
-    """Eval rule 6, as code. An arm that declines the hard points has a better mean over its OWN
-    matched set and must not read as better than one that attempted them."""
+    """An arm that declines the hard points has a better mean over its OWN matched set and must
+    not read as better than one that attempted them.
+    """
     ev = _eval_module()
     true = np.zeros((1, 4, 1, 2))
     good = np.zeros((1, 4, 1, 2))                             # exact on all four frames
@@ -146,8 +137,9 @@ def test_matched_error_reports_the_counts_behind_its_coverage():
 
 
 def test_a_frozen_prediction_reads_as_less_motion_than_a_moving_one():
-    """The statistic RC1 needed and nothing had. A locked pose scores best on every consistency
-    number in the repo (jerk, bone CV) while losing 30% of the animal's motion."""
+    """A locked pose scores best on every consistency number in the repo (jerk, bone CV) while
+    losing 30% of the animal's motion -- the statistic this test provides.
+    """
     true = np.zeros((1, 5, 2, 3))
     true[0, :, :, 0] = np.arange(5)[:, None]                   # the animal walks along x
     moving = true.copy()
@@ -171,7 +163,7 @@ def test_motion_ratio_takes_a_centroid_reference():
 
 
 def test_paired_motion_uses_only_the_steps_both_arms_have():
-    """Eval rule 6 again: a path summed over whatever an arm predicted rewards predicting less."""
+    """A path summed over whatever an arm predicted rewards predicting less."""
     ev = _eval_module()
     true = np.zeros((1, 4, 1, 2))
     true[0, :, 0, 0] = np.arange(4)
@@ -222,17 +214,9 @@ def test_mota_dist_zero_is_not_read_as_unset():
 
 
 def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path):
-    """`--chunk` gives a one-group clip something for the bootstrap to resample.
-
-    The bootstrap resamples GROUPS, and rat-city's whole test split is a single 500-frame group, so
-    every delta on it came back `DEGENERATE (one group -- no interval exists)`. The roots this repo
-    most wants long-clip numbers from are exactly the ones with the fewest groups.
-
-    Two properties, and the second is the one that makes it a resampling change rather than a METRIC
-    change: the chunks PARTITION the frames (nothing scored twice, nothing dropped), and the match
-    radius is the whole group's, not each chunk's. Sized per chunk it swung 27.6 to 101.9 px across
-    ten chunks of one clip -- a 3.7x swing that would leave chunks non-exchangeable, which is the
-    one thing a bootstrap needs them to be.
+    """`--chunk` gives a one-group clip something for the bootstrap to resample: the chunks
+    PARTITION the frames (nothing scored twice, nothing dropped) and the match radius is the whole
+    group's -- sized per chunk it swung 27.6 to 101.9 px, leaving chunks non-exchangeable.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
@@ -270,11 +254,8 @@ def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path
 
 
 def test_err_percentiles_describe_the_tail_the_mean_hides():
-    """p75..p99 come from the same matched vector as `err`, and outlast a flattering mean.
-
-    A MEAN CANNOT SHOW A TAIL. branson-fly reads MPJPE 0.599 px with p99 3.952 -- 6.6x the mean --
-    and every localisation failure this repo has found (the 182 mm seam p90 against a 2.4 interior,
-    the crop p90 566 -> 317) was found in a quantile and reported in one.
+    """p75..p99 come from the same matched vector as `err`, and outlast a flattering mean: every
+    localisation failure this repo has found was found in a quantile and reported in one.
     """
     true = np.zeros((1, 1000, 1, 2))
     pred = np.zeros((1, 1000, 1, 2))
@@ -291,10 +272,7 @@ def test_err_percentiles_describe_the_tail_the_mean_hides():
 
 def test_penalised_cost_charges_the_keypoints_a_prediction_declined():
     """OKS's rule in distance units: unshared LABEL keypoints cost `max_dist` and stay in `n`.
-
-    Under 'mean' a row sharing ONE keypoint is scored on that keypoint alone and can out-bid a
-    dense row (eval rule 9). Here the sparse row sits exactly on its target and the dense row is
-    0.5 px off, so 'mean' hands the GT to the one-point row -- and 'penalised' does not.
+    Under 'mean' a row sharing one keypoint can hijack a GT row; 'penalised' does not let it.
     """
     true = np.zeros((1, 1, 4, 2))
     pred = np.full((2, 1, 4, 2), np.nan)
@@ -309,8 +287,6 @@ def test_penalised_cost_charges_the_keypoints_a_prediction_declined():
     assert pen[0][2] == pytest.approx(np.hypot(0.5, 0.5))
 
     # A COMPLETE PREDICTION IS UNAFFECTED -- which is why this is a no-op on every arm on record.
-    # The pose decode emits every keypoint of every row it decodes (rat-city: 6,000 of 6,000
-    # instance-frames carry all K = 4), so `n_ok == n_labelled` and the penalty is identically 0.
     dense = np.zeros((2, 1, 4, 2)) + 0.5
     a = match_instances(dense, true, max_dist=20.0, cost='mean')[0]
     b = match_instances(dense, true, max_dist=20.0, cost='penalised')[0]
@@ -324,10 +300,8 @@ def test_penalised_cost_charges_the_keypoints_a_prediction_declined():
 
 
 def test_match_cost_default_reproduces_every_published_number():
-    """`cost='mean'` is the default and must be byte-identical to the pre-flag behaviour.
-
-    The flag is an ARM, not a silent correction -- the same discipline `min_kpts_frac = 0.0`
-    follows. If this drifts, every number in reports 10-19 becomes unreproducible.
+    """`cost='mean'` is the default and must be byte-identical to the pre-flag behaviour -- the
+    flag is an ARM, not a silent correction.
     """
     rng = np.random.default_rng(0)
     true = rng.normal(size=(3, 20, 5, 2)) * 10
@@ -344,17 +318,9 @@ def test_match_cost_default_reproduces_every_published_number():
 
 def test_chunking_slices_the_labels_when_the_prediction_is_a_prefix(tmp_path):
     """A `--max-frames` PREDICTION IS SHORTER THAN ITS GROUP, and every chunk must still be scored
-    against its OWN frames.
-
-    The label slice used to be gated on the PREDICTION's frame count, so for a truncated prediction
-    no label array matched and every chunk was handed the WHOLE group's labels. `score` truncates to
-    the shorter of the two, so chunk 0 scored against frames 0..n-1 and every LATER chunk scored its
-    own frames against frames 0..n-1 again. Measured on calms21 (6 sessions x 2000 frames of a
-    ~19,000-frame group, predictions good to a median 8-11 px in every chunk): coverage 0.9891 with
-    the fix against **0.4656** without, MPJPE 26.5 px against 98.6, and MOTA 0.76-0.95 on chunk 0
-    beside -0.36 to -1.00 on chunks 1-3 of all six sessions. It reads exactly like a pipeline that
-    falls apart after 500 frames, which is why it survived: the shape of the failure names the wrong
-    culprit.
+    against its OWN frames: the label slice used to be gated on the prediction's frame count, so
+    every later chunk re-scored its own frames against frames 0..n-1. It reads exactly like a
+    pipeline that falls apart after 500 frames, which is why it survived.
     """
     import sys
     sys.path.insert(0, str(Path(__file__).parent))

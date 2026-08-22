@@ -214,16 +214,10 @@ def test_kpt_chunk_matches_unchunked_end_to_end(scene):
 @pytest.mark.parametrize('anchor,refine', [('none', False), ('carry', False),
                                            ('none', True), ('carry', True)])
 def test_prefetch_windows_is_bit_exact(multiwindow_scene, anchor, refine):
-    """THE PIPELINE PROTOTYPE'S OWN CLAIM (dev/reports/31): decoding a future window ahead of
-    the current one's forward must not move a single value, at any `prefetch_windows`.
-
-    `_build_plans`/`decode_crops` depend only on the box source and window geometry, never on
-    `carried` or any model output, so preparing window wi+1 while window wi forwards changes no
-    pixel and no order -- `carried` is still read and written strictly in window order, on the
-    main thread, inside `_process_window`. Checked under BOTH `refine` (the second decode pass)
-    and `carry` (the prior path most likely to break under reordering), which is why this needs
-    `multiwindow_scene` rather than `scene`: `scene`'s T=4 is one window and prefetching a
-    single-window run is a no-op by construction.
+    """Decoding a future window ahead of the current one's forward must not move a single value,
+    at any `prefetch_windows`: the plans depend only on the box source and window geometry, never
+    on `carried` or any model output. Needs `multiwindow_scene` -- one window is a no-op by
+    construction.
     """
     model, sess, registry, name = multiwindow_scene
     base = run_group(model, sess, 'g000', registry, name,
@@ -303,11 +297,8 @@ def test_deploy_box_prompt_lands_inside_the_crop_2d():
 
 def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
     """3D + 'labels' must be BYTE-IDENTICAL to `box_prompt.compute_box_prompt` on the same world
-    points and cgroup -- the load-bearing deploy/train parity assertion (same class as the
-    int32-exact crop-rule test gotcha 8 exists for). Not a re-derivation of the training
-    computation, a direct call to it. Uses the REAL 3D scene's own rig (not a hand-built camera
-    dict, which is missing fields `project_cam` needs) so the projection geometry is exactly what
-    `run_group` builds.
+    points and cgroup -- the load-bearing deploy/train parity assertion. Uses the REAL 3D scene's
+    own rig so the projection geometry is exactly what `run_group` builds.
     """
     from tailcyclenet import box_prompt as bpmod
     from tailcyclenet.infer import _deploy_box_prompt
@@ -327,9 +318,9 @@ def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
 
 
 def test_box_prompt_live_on_3d_multicam(scene):
-    """The box is LIVE on 3D / multi-camera, per camera -- no longer skipped (report 27's 3D fix).
-    Runs to completion with no warning, and the encoder actually receives a (1,T,C,4) box with
-    C == len(use)."""
+    """The box is LIVE on 3D / multi-camera, per camera: runs to completion with no warning, and
+    the encoder actually receives a (1,T,C,4) box with C == len(use).
+    """
     model, sess, registry, name = scene
     if sess.mode != '3d':
         pytest.skip('needs the 3D scene')
@@ -440,11 +431,9 @@ def test_box_prompt_none_is_byte_identical_on_2d_and_3d(scene):
 
 
 def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
-    """The shipped box recipe is WIDE pass 1 + TIGHT pass 2 (report 24 §9m + report 27): pass 1's
-    box is inflated about its centre by `crop_inflate`, but pass 2 is rebuilt from pass 1's own
-    PREDICTION via `boxes_from_points`, which never inflates -- so pass 2 sees a tight box around
-    wherever pass 1 landed, not an inflated one. `crop` (pass 1, as recorded) must show the
-    inflation; `crop_refined` (pass 2) must not be systematically wider than a plain refine's.
+    """The shipped box recipe is WIDE pass 1 + TIGHT pass 2: pass 1's box is inflated about its
+    centre by `crop_inflate`, but pass 2 is rebuilt from pass 1's own PREDICTION via
+    `boxes_from_points`, which never inflates.
     """
     model, sess, registry, name = scene
     C = len(sess.rig)
@@ -562,9 +551,8 @@ def test_carried_prior_is_bounds_masked_and_dated():
 
 
 def test_oracle_corrupt_near_picks_nearest_eligible_row():
-    """`near` (dev/plans/prompt_prior_corruptions.md) must pick the ELIGIBLE row closest to the
-    target in the MODEL's own frame -- not the fixed `a + 1` row `other` uses -- and must be a
-    NO-OP, exactly like `other` on a session with no usable neighbour, when nothing qualifies.
+    """`near` must pick the ELIGIBLE row closest to the target in the MODEL's own frame -- not
+    the fixed `a + 1` row `other` uses -- and must be a NO-OP when nothing qualifies.
     """
     from tailcyclenet.infer import _corrupt_prior
 
@@ -595,10 +583,9 @@ def test_oracle_corrupt_near_picks_nearest_eligible_row():
 
 
 def test_oracle_corrupt_swap_transposes_keypoints():
-    """`swap:<n>` (dev/plans/prompt_prior_corruptions.md) must permute the CHOSEN row's own
-    keypoints -- the SET stays the same, `n` picks how many pairs -- and must never touch which
-    row or frame the pose came from. The direct inference probe for `dataset.py`'s
-    `prompt_swap_kpt_pairs`.
+    """`swap:<n>` must permute the CHOSEN row's own keypoints -- the SET stays the same, `n` picks
+    how many pairs -- and must never touch which row or frame the pose came from. The direct
+    inference probe for `dataset.py`'s `prompt_swap_kpt_pairs`.
     """
     from tailcyclenet.infer import _corrupt_prior
 
@@ -622,7 +609,8 @@ def test_oracle_corrupt_swap_transposes_keypoints():
 def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
     """The second pass must be crop-rule boxes around the FIRST pass's prediction, and an animal
     whose refined crop fails must keep the box it already had -- a bad prediction cannot be allowed
-    to cost coverage a loose box was already giving."""
+    to cost coverage a loose box was already giving.
+    """
     model, sess, registry, name = scene
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
@@ -731,18 +719,10 @@ def test_2d_is_bit_identical_under_either_carry_source(scene):
 
 
 def test_3d_carry_feeds_back_the_anchor_free_estimate(tmp_path):
-    """...and in 3D it must actually differ, or the de-loop is not wired to anything.
-
-    `carry` hands the next window `3d_pred_triangulate` -- re-derived from that window's own pixels
-    rather than `prior + residual`, which is a loop with gain. Asserted on the PREDICTION, which is
-    what the choice is supposed to move. The test used to read a `pred_tri` output column instead,
-    and that column is gone: it was `(S,T,K,3)` for the whole clip, for a diagnostic no protocol
-    scores.
-
-    IT BUILDS ITS OWN SESSION AT T=8 RATHER THAN TAKING `scene`, and that is the whole point.
-    `scene` ships T=4 against `_cfg`'s `n_frames=4`, which is exactly ONE window -- so `carried` is
-    never read and the two carry sources are trivially identical. A single-window fixture cannot
-    test a between-window hand-off, and reading `pred_tri` inside one window was hiding that.
+    """...and in 3D it must actually differ, or the de-loop is not wired to anything: `carry`
+    hands the next window the re-derived triangulation rather than `prior + residual`, which is a
+    loop with gain. Builds its own T=8 session because `scene`'s T=4 is ONE window -- a
+    single-window fixture cannot test a between-window hand-off.
     """
     import conftest as cf
 
@@ -767,15 +747,10 @@ def test_3d_carry_feeds_back_the_anchor_free_estimate(tmp_path):
 
 
 def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
-    """THE DEFAULT BOX PATH, THROUGH `main()`. Every other CLI test SystemExits inside argparse.
-
-    That gap is not theoretical: `det_kpts` was initialised inside `if det is not None:` while its
-    two siblings were initialised outside it, so every box source that is NOT a detector -- the
-    GT-crop upper bound and the whole `--boxes` path -- raised `UnboundLocalError` at the
-    `run_group` call, after paying the checkpoint load. Six CLI tests passed throughout.
-
-    Asserts almost nothing about the numbers on purpose. What it pins is that every name in the
-    group loop is bound on the path with no detector, which is the class of failure that shipped.
+    """THE DEFAULT BOX PATH, THROUGH `main()` -- every other CLI test SystemExits inside argparse.
+    Asserts almost nothing about the numbers; pins that every name in the group loop is bound on
+    the path with no detector (the class of failure that shipped: an UnboundLocalError after the
+    checkpoint load, which six CLI tests passed throughout).
     """
     import conftest as cf
     from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
@@ -822,10 +797,9 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
 
 
 def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeypatch, tmp_path):
-    """`--out` is ONE session directory, so `--data` must name one session.
-
-    Refused BEFORE `load_run`, which is `driver.py`'s own stated rule -- a typo must not cost a
-    5.6 GB checkpoint load. `sessions_for` reads toml and opens no pixels, so the check is free.
+    """`--out` is ONE session directory, so `--data` must name one session. Refused BEFORE
+    `load_run` -- a typo must not cost a 5.6 GB checkpoint load. `sessions_for` reads toml and
+    opens no pixels, so the check is free.
     """
     import conftest as cf
 
@@ -854,18 +828,10 @@ def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeyp
 ])
 def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
                                                                         argv, expect):
-    """These are the combinations that used to run and produce a number instead of an error.
-
-    The worst was `--anchor labels` with a box source: `run_group` seeds row `a` from LABEL row `a`,
-    and detector rows are score- or association-ordered, so the arm whose whole purpose is to be an
-    upper bound was being handed a DIFFERENT animal's ground truth.
-
-    Checked through the real entry point -- the script's own `main`, its own argparse, its own
-    guards -- but IN PROCESS rather than through six forks. Each fork re-imported
-    torch/torchvision/posetail for 13.7 s to reach an argument check, which was 60% of the whole
-    suite. `--run` still points at nothing, and that is what pins the property this test is for: a
-    guard that moved after `load_run` raises FileNotFoundError instead of a SystemExit carrying
-    `expect`, so it still fails here.
+    """These are the combinations that used to run and produce a number instead of an error. The
+    worst was `--anchor labels` with a box source: `run_group` seeds row `a` from LABEL row `a`,
+    but detector rows are score- or association-ordered, so the upper-bound arm was handed a
+    DIFFERENT animal's ground truth. Checked IN PROCESS rather than through six forks.
     """
     repo = Path(__file__).resolve().parent.parent
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
@@ -900,18 +866,11 @@ def test_the_tracker_projects_correctly_on_a_moving_rig():
 
 
 def test_instances_boxes_get_the_training_crop_rule_at_inference(scene):
-    """`box_source = 'instances'` used two different crop rules on the two sides of the run.
-
-    The loader routes a stored box through `_crop_source` -> `crop_box_for_points(..., pad=0)`,
-    which SQUARES the extent and floors it at `min_crop_dim`. The window loop took the raw clamped
-    union instead -- no squaring, no floor -- on the grounds that "a detector box IS a crop-rule
-    box". True of a detector box, false of `instances.pq`: 96% of rat-city's stored boxes are
-    non-square (aspect p50 1.737). After `_resize_camera` that puts the animal at a different
-    scale on a different-aspect canvas than any crop the model was trained on -- gotcha 8's axis,
-    and invisible in every number the run reports.
-
-    The detector path must be UNCHANGED, because re-squaring an already-square union is measured
-    +3.06 mm worse on 3dpop.
+    """`box_source = 'instances'` used two different crop rules on the two sides of the run: the
+    loader routes a stored box through `crop_box_for_points(..., pad=0)` (squaring + floor) while
+    the window loop took the raw clamped union -- a different scale and canvas aspect than any
+    crop the model trained on. The detector path must be UNCHANGED (re-squaring an already-square
+    union is measured worse).
     """
     from tailcyclenet import crop as cropmod
 
@@ -954,16 +913,9 @@ def test_instances_boxes_get_the_training_crop_rule_at_inference(scene):
 
 
 def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
-    """Gotcha 9's class, and the FIFTH camera-group builder to drop `moving_ext`.
-
-    `render.project` took `Rig.by_name`, which carries `calibration.toml`'s single NOMINAL
-    extrinsic; the per-frame ones exist only through `Session.cgroup(gid, frames)`. So `--render`
-    on johnson-mouse -- or any `moving = true` session -- drew the skeleton somewhere the animal
-    is not, which reads as a pose failure rather than as a render bug. `_fill_box_agreement` in
-    the same package already did this correctly, so the two disagreed.
-
-    `test_render_writes_every_predicted_frame` skips 3D entirely, and the `mv` fixture has been
-    the moving one all along, so nothing here had ever executed this path.
+    """`render.project` took `Rig.by_name`, which carries the single NOMINAL extrinsic; the
+    per-frame ones exist only through `Session.cgroup(gid, frames)`. So `--render` on a moving rig
+    drew the skeleton where the animal is not -- and nothing here had ever executed this path.
     """
     from tailcyclenet.render import project
 
@@ -1036,15 +988,10 @@ def test_refine_px_off_is_bit_identical(scene):
 
 
 def test_a_smaller_input_is_compensated_at_all_four_sites(scene):
-    """THE SEAM ITSELF, pinned without depending on what the weights predict.
-
-    `image_size` stands for three things and only one -- the pixel extent of the input -- is wrong
-    for a smaller crop. posetail 0.3.5 splits it out as `input_size=` on `TrackerEncoder.forward`:
-    the pad target, the 2D-head rescale and the gridresid gauge all follow the canvas the forward
-    actually saw. The MAGNITUDES are measured on real weights (dev/reports/26 §5b) --
-    45.2 mm on the triangulation, 1.3334 = 256/192 on the residual. A random fixture model cannot
-    pin those; it can pin that `input_size` reaches the library forward with the canvas's extent,
-    which is the part that rots.
+    """THE SEAM ITSELF, pinned without depending on what the weights predict: `image_size` stands
+    for three things and only one -- the pixel extent of the input -- is wrong for a smaller crop.
+    0.3.5 splits it out as `input_size=`; this pins that it reaches the library forward with the
+    canvas's extent, which is the part that rots.
     """
     model, sess, registry, name = scene
     seen = {}
@@ -1208,7 +1155,7 @@ def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path
                   list(sess.groups)).close()
 
 
-# --start-frame / --end-frame (dev/plans/infer_from_videos_and_calibration.md §7).
+# --start-frame / --end-frame: a frame range on BOTH inputs.
 #
 # INPUT-INDEPENDENT ON PURPOSE: the frame range is a window-loop lever, not an input-format one,
 # so every one of these runs on the existing session fixtures and needs no video at all.
@@ -1227,21 +1174,15 @@ def _range_scene(tmp_path, T=16):
 
 
 def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
-    """§7'S CENTRAL CLAIM, STATED EXACTLY -- and the exactness is the finding.
-
-    With `--anchor none` the prediction is a pure function of the frames in its window, so a range
-    equals the whole-clip slice WHEREVER THE TWO RUNS PUT THE SAME WINDOW OVER THE SAME FRAMES.
-    Anything that breaks that -- a mis-set `f0`, a window-start arithmetic error, a frame array
-    clamped to the wrong floor -- fails here. Identity state (`--track`, `--link-boxes`) and the
-    carried prior are what a range genuinely does change, and they are off.
+    """With `--anchor none` the prediction is a pure function of the frames in its window, so a
+    range equals the whole-clip slice wherever the two runs put the SAME window over the SAME
+    frames.
 
     **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `_window_starts`
-    pulls the LAST window back to end exactly on the last frame rather than padding, so a range
-    ending at `b` has a final window `[b - T, b)` -- which is not a whole-clip window unless `b`
-    is the clip end. A frame belongs to the last window containing it (eval rule 11), so the few
-    frames after the range's final start were predicted from a DIFFERENT window than the
-    whole-clip run gave them. Same family as eval rule 11: a range moves one of the loop's own
-    boundaries.
+    pulls the LAST window back to end exactly on the last frame, so a range ending at `b` has a
+    final window `[b - T, b)` -- not a whole-clip window unless `b` is the clip end. A frame
+    belongs to the last window containing it, so the few frames after the range's final start were
+    predicted from a DIFFERENT window than the whole-clip run gave them.
 
     So: an `--end-frame` at the clip end is byte-identical outright, and a mid-clip one is
     byte-identical up to its own final window start.
@@ -1521,14 +1462,9 @@ def _videos_run(tmp_path, names):
 
 
 def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch, tmp_path):
-    """THE ASSERTION THAT `--videos` IS NOT A SECOND INFERENCE PATH.
-
-    Same weights, same crop points, same pixels -- reached once through a hand-authored session
-    directory and once through an in-memory `VideoSession` -- must produce the same points3d.pq.
-    If they ever differ, `--videos` has become its own pipeline and every number measured on one
-    is incomparable with the other (eval rule 2).
-
-    Same shape as `test_box_prompt_none_is_byte_identical_on_2d_and_3d`.
+    """THE ASSERTION THAT `--videos` IS NOT A SECOND INFERENCE PATH: same weights, same crop
+    points, same pixels -- reached once through a hand-authored session directory and once through
+    an in-memory `VideoSession` -- must produce the same points3d.pq.
     """
     import conftest as cf
 

@@ -3,25 +3,11 @@
 
     pixi run python scripts/convert_annotated.py --validate
 
-The export is already spec-SHAPED -- session.toml, calibration.toml, per-group frame dirs -- but
-is not readable by `tailcyclenet.format`. Nine things differ, and each is closed here:
-
-1. tables are CSV, not parquet
-2. there is no split level; `--val-root` picks the split
-3. `calibration.toml` `size` is the SENSOR (1440x1080) while the JPEGs are the crop; the truth
-   lives in `session.toml` `[cameras.<c>] image_wh` / `offset`, which is where validation rule 8
-   and the 16.9-vs-2.38 mm offset lesson (spec S5) both bite
-4. `[cameras.*]` belongs in calibration.toml, not session.toml
-5. `groups.csv` carries `label_frames`, which the spec deleted on purpose (S6)
-6. three of the 27 sessions order `names` with the RF-* and LH-* blocks swapped; rule 3 wants one
-   order per root, and the tables are name-indexed so rewriting the list moves nothing
-7. there is no 3D layer at all -- see `triangulate_group`
-8. `--twod-root`'s cameras were not properly synced, so it is exported per camera as 2D sessions
-9. pixels are symlinked, one link per camera per group
-
-A group with no `visible` row anywhere is dropped, loudly (spec S13): it carries no supervision,
-and `dataset._labelled_frames` counts a `missing` row as labelled, so such a group yields index
-entries that `_item` rejects forever.
+The export is spec-shaped (session.toml, calibration.toml, per-group frame dirs) but not
+readable by `tailcyclenet.format`: tables are CSV, `--val-root` picks the split, the calibration
+`size` is the sensor while the JPEGs are the crop (the truth is `[cameras.*] image_wh`/`offset`),
+some sessions reorder `names`, and there is no 3D layer (triangulated here). A group with no
+`visible` row is dropped loudly -- it carries no supervision.
 """
 from __future__ import annotations
 
@@ -57,9 +43,7 @@ def rows(path: Path) -> list[dict]:
 def read_rig(sdir: Path, cfg: dict) -> fmt.Rig:
     """calibration.toml + session.toml's `[cameras.*]` -> a Rig whose `size` is the IMAGE.
 
-    The file's `size` is the sensor the intrinsics were calibrated against; the pixels on disk are
-    a crop of it. Keeping the sensor size would fail rule 8 and, worse, would make every consumer
-    project into the wrong place.
+    The file's size is the sensor; the pixels on disk are a crop of it.
     """
     rig = fmt.load_calibration(sdir / 'calibration.toml')
     cams = cfg.get('cameras', {})
@@ -131,19 +115,9 @@ def read_session(sdir: Path, names: list[str]) -> tuple:
 def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, int, int]:
     """Fill `lab.points3d` / `lab.vis3d` from the per-camera 2D. Returns (visible, gated, missing).
 
-    The 2D lives in stored-image pixels and the calibration in sensor pixels, so `offset` goes
-    back on before triangulating (spec S5) and the stored 2D is never touched.
-
-      >= 2 views, median reprojection residual <= gate  -> visible + xyz
-      >= 2 views over the gate, or exactly 1 view       -> unlabeled (no row)
-      0 views visible and EVERY camera assessed it      -> missing, the honest 3D occlusion
-      anything else                                     -> no row
-
-    THIS SPLIT IS DELIBERATE, not a shortcut: the gated/1-view case is a triangulation FAILURE on
-    a point several annotators saw, and writing `missing` there would teach "occluded" from a
-    calibration or label defect rather than an assessment. `scripts/check_status.py` names both
-    counts for allen-mouse-annotated (178 `missing` in `MISSING_OK`, 211 holes in
-    `HOLE_EXEMPTIONS`) -- a re-run that moves either is a real change to this decision, not noise.
+    `offset` goes back on before triangulating (2D is stored-image px, calibration is sensor px).
+    >= 2 views within the residual gate -> visible; over the gate or 1 view -> no row (a
+    triangulation failure, not an occlusion); 0 views with every camera assessed -> `missing`.
     """
     import torch
 
@@ -161,8 +135,7 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
     if idx.size:
         X = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))   # (C,n,2)
         with torch.no_grad():
-            # aniposelib on the pytorch branch holds intrinsics as nn.Parameters, so without
-            # no_grad both calls die on "Can't call numpy() on Tensor that requires grad".
+            # aniposelib on the pytorch branch holds intrinsics as nn.Parameters.
             p3 = np.asarray(rig.cgroup.triangulate(X, progress=False))
             rep = np.asarray(rig.cgroup.reprojection_error(p3, X, mean=False))
         err = np.linalg.norm(rep, axis=-1)                                  # (C,n)
@@ -242,13 +215,11 @@ def slice_camera(lab: fmt.Labels, c: int) -> fmt.Labels:
 
 
 def write_2d(out_split: Path, cfg, rig, groups, labels, names, root, sid, pixels, dry) -> int:
-    """One session PER CAMERA: rule 5 says mode=2d is exactly one camera.
+    """One session PER CAMERA: mode=2d is exactly one camera.
 
-    Real intrinsics and the real offset are kept. They are legal in a 2D session, cost nothing,
-    and let the same session be read later as 3D single-view; the 2D training path fixes
-    cam_ix = [0] and never looks at them. What is NOT kept is the cross-camera geometry: the
-    cameras in this root were not properly synced, so frame i of two views is not one instant and
-    triangulating them would be inventing a 3D label.
+    Real intrinsics/offset are kept (legal in 2D, and read later as 3D single-view); the
+    cross-camera geometry is not -- these cameras were not synced, so frame i of two views is
+    not one instant.
     """
     n = 0
     for c, cam in enumerate(rig.names):
@@ -321,7 +292,7 @@ BONES = [('nose', 'L-ear'), ('L-ear', 'R-ear'), ('LF-wrist', 'LF-index-base')]
 
 
 def anatomy(root: Path) -> None:
-    """Bone lengths, not aggregates: a keypoint-axis mistake moves exactly these (spec S13)."""
+    """Bone lengths, not aggregates: a keypoint-axis mistake moves exactly these."""
     got = defaultdict(list)
     for split in fmt.SPLITS:
         for sdir in sorted((root / split).glob('*')) if (root / split).is_dir() else []:

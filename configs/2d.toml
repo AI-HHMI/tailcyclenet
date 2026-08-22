@@ -1,34 +1,18 @@
-# 2D single-view. Everything shared lives in base.toml; THIS FILE IS THE DIFFERENCE.
+# 2D single-view. Everything shared lives in base.toml; THIS FILE IS THE DIFFERENCE -- and it is
+# empty of [data] overrides on purpose: 3d.toml's three keys are camera-count questions a
+# one-camera root cannot ask.
 #
-# It is empty of [data] overrides, and that is the result rather than an oversight: 2D needs
-# nothing that base.toml does not already say. The three keys 3d.toml adds (cams_to_sample,
-# val_cams_to_sample, prob_2d_only) are all camera-count questions a one-camera root cannot ask.
-#
-#   pixi run python scripts/train.py --config configs/2d.toml --data <root>
-#
-# The deployment recipe, which is NOT config (it is `scripts/infer.py`):
-#
+# The deployment recipe lives in `scripts/infer.py`, not config:
 #   --anchor carry --overlap 8 --crop-source boxes
+# (`--crop-source boxes` is the one flag that differs from 3D; a 2D detector is trained without
+# `--keypoints`, since its only payoff is that flag.)
 #
-# `--crop-source boxes` is the only inference flag that differs from 3D (see 3d.toml for why), and
-# a 2D detector is trained WITHOUT `--keypoints`, since its only payoff is that flag.
+# Two shared defaults are measured differently in 2D, so do not read the shared default as a
+# shared result: `--anchor carry` is HARMFUL here (the loop saturates rather than diverges -- use
+# `--anchor none` for a long 2D run), and `--overlap 8` is 3D's optimum, not 2D's (still improving
+# at 12).
 #
-# TWO THINGS THIS FILE INHERITS THAT ARE MEASURED DIFFERENTLY IN 2D, recorded so nobody reads the
-# shared default as a shared result:
-#
-#   `--anchor carry` is shared with 3D BY DECISION, and it is measured HARMFUL here: +52.42 px
-#   MPJPE [+50.77, +54.05] and MOTA -0.4563 against `--anchor none` on rat-city's 57,594-frame
-#   clip (report 21 section 9i), and -9.144 px even on a 500-frame clip (report 18 section 6). The
-#   loop saturates rather than diverging -- it climbs ~5x over the first ~300 windows and then
-#   plateaus -- so the cost is bounded and fixed, not unbounded. In 3D the per-frame triangulation
-#   de-loops the feedback and the sign flips. Use `--anchor none` for a long 2D deployment run.
-#
-#   `--overlap 8` is shared with 3D BY DECISION, and 8 is 3D's optimum, not this one: 2D is still
-#   improving at 12 (-0.408 px against overlap 4, where 8 buys -0.235). The sign transfers across
-#   dimensionality and the optimum does not. Sweep it per root if the ~0.17 px matters.
-#
-# `[model].gridresid_offset` is inherited and INERT here -- `model.py` returns at the 2D branch
-# before both offset paths -- but it is still required, because it is an assertion about what the
-# weights were trained as, not about what this run does.
+# `[model].gridresid_offset` is inherited and inert in 2D but still required -- it asserts what
+# the weights were trained as, not what this run does.
 
 extends = "base.toml"

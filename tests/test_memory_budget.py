@@ -1,21 +1,15 @@
 """The host-RAM budget, and the standing rule that NOTHING it sizes may move a number.
 
 `tailcyclenet/memory.py` resolves one budget from the cgroup ancestry, LSF's own variables,
-`MemAvailable` and `MemTotal`, and three consumers size their buffers from it: the decord reader
-cache, `detect_raw`'s batch, and the inference loop's camera concurrency and frame cache. The
-budget depends on machine state, so two runs of one command can resolve it differently -- which is
-only acceptable because every knob downstream of it is output-neutral. **These tests are what makes
-that sentence true rather than aspirational.**
+`MemAvailable` and `MemTotal`; three consumers size their buffers from it. The budget depends on
+machine state, so two runs of one command can resolve it differently -- acceptable only because
+every knob downstream of it is output-neutral. **These tests are what makes that sentence true.**
 
 `tests/test_detector.py` classifies `batch` as `plumbing`, i.e. ASSERTS that no run can differ in
-it. Nothing verified that. If `batch` were ever budget-derived the claim would be false, and two
-hosts with different amounts of free memory would produce different boxes with nothing in either
-output saying so -- so it is checked here, and `detect_raw` keeps the value pinned.
+it. Nothing verified that, so it is checked here and `detect_raw` keeps the value pinned.
 
-Same for the dtype: `_fetch` hands back uint8 and the `/255` happens on the device. That is a 4x
-cut in host memory, PCIe traffic and device memory, and it is only legitimate because it is
-bit-identical -- uint8 -> float32 is exact and one correctly-rounded float32 divide by 255 is the
-same float wherever it runs.
+Same for the dtype: `_fetch` hands back uint8 and the `/255` happens on the device -- a 4x cut
+that is only legitimate because it is bit-identical.
 """
 from __future__ import annotations
 
@@ -51,16 +45,10 @@ def test_uint8_then_divide_on_host_is_bit_identical_to_the_old_conversion():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a GPU')
 def test_dividing_by_a_python_scalar_on_cuda_is_NOT_correctly_rounded():
-    """THE TRAP, pinned as a fact rather than as a warning in a comment.
-
-    Moving the `/255` onto the device is legitimate only because it is bit-identical, and the
-    obvious spelling is not. `x / 255` with a PYTHON scalar takes a reciprocal-multiply fast path
-    on CUDA that is off by one ULP on most byte values. That is 1 ULP on the detector's INPUT,
-    which perturbs every objectness score, reorders NMS ties and returns different boxes -- so it
-    would change no shape and no dtype, so nothing downstream would report it.
-
-    If this test ever starts PASSING, torch has changed its scalar-division lowering. That is good
-    news, but check `detect_raw` still uses the tensor form before relaxing anything.
+    """The trap, pinned as a fact: `x / 255` with a PYTHON scalar takes a reciprocal-multiply fast
+    path on CUDA that is off by one ULP on most byte values -- 1 ULP on the detector's INPUT
+    perturbs every objectness score and can return different boxes. If this starts passing, torch
+    changed its scalar-division lowering.
     """
     scalar = torch.from_numpy(_ALL_BYTES).cuda().float().div_(255).cpu().numpy()
     assert not np.array_equal(_HOST_REFERENCE, scalar), \
@@ -134,16 +122,9 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
 
 
 def test_detection_is_batch_aligned_and_slice_independent(det_scene):
-    """Detecting a clip in aligned SLICES must equal detecting it at once, byte for byte.
-
-    This is what lets the inference loop advance detection alongside its window loop instead of
-    paying for the whole group before a single pose is predicted -- and it is only safe because of
-    the alignment rule. `_units` partitions on `range(0, T, batch)`, so a slice that starts
-    anywhere else forwards a short leading batch, which is a SHAPE the whole-clip pass never
-    produces, and cuDNN selects algorithms per shape (0.204 px / 1.69e-03, dev/reports/38 §3.2).
-
-    So both halves are the test: aligned slices agree exactly, and a misaligned one RAISES rather
-    than quietly returning boxes that differ in the fourth decimal place.
+    """Detecting a clip in aligned SLICES must equal detecting it at once, byte for byte -- what
+    lets the loop advance detection alongside its window loop. A misaligned slice RAISES rather
+    than quietly returning boxes that differ (cuDNN picks algorithms per shape).
     """
     from tailcyclenet.detector import detect_raw
 
@@ -187,26 +168,11 @@ def test_detection_is_batch_aligned_and_slice_independent(det_scene):
 
 
 def test_batch_is_NOT_inert_which_is_why_the_budget_may_not_touch_it(det_scene):
-    """A FINDING ABOUT THE REPO, PINNED SO IT IS NOT REDISCOVERED THE EXPENSIVE WAY.
-
-    `tests/test_detector.py` lists `batch` in `plumbing`, i.e. asserts that no run can differ in
-    it -- which holds only because it is pinned. **It is not inert.** cuDNN and
-    the CPU kernels select algorithms per input SHAPE, so a different batch is a different
-    reduction order. Measured on johnson's real detector (16 vs 3, 12 frames, 16 cameras): boxes
-    differ by 0.204 px, scores by 1.69e-03, keypoints by 0.447 px -- enough to reorder NMS and
-    return a different box set.
-
-    Two consequences, both live:
-
-    - `detect_raw` must NOT derive `batch` from the RAM budget, which is why the budget bounds the
-      CAMERA axis instead (chunking cameras cannot change a forward's shape).
-    - `eval_detector.py --batch-size` already lets a user change `batch` and get different
-      detections, while the stamp says two such runs are interchangeable. That is a pre-existing
-      hazard in the detector plan's territory, not something introduced here.
-
-    This test asserts the DIFFERENCE, so if a future torch makes batching bit-exact it fails and
-    someone re-reads this. On CPU the effect is smaller than on CUDA and may be absent, so an
-    equal result here is reported as a skip rather than a pass.
+    """A FINDING ABOUT THE REPO, PINNED SO IT IS NOT REDISCOVERED THE EXPENSIVE WAY: `batch` is
+    listed in `plumbing` only because it is pinned, not because it is inert. A different batch is a
+    different reduction order (boxes move ~0.2 px, enough to reorder NMS), so `detect_raw` must
+    NOT derive it from the RAM budget, and `eval_detector.py --batch-size` is a live hazard.
+    On CPU the effect may be absent; an equal result is reported as a skip.
     """
     from tailcyclenet.detector import detect_raw
 
@@ -233,11 +199,9 @@ def test_fits_never_exceeds_what_the_caller_asked_for():
 
 
 def test_budget_prefers_the_cgroup_over_the_machine():
-    """The bug this whole module exists for: `SC_PHYS_PAGES` is the HOST's memory.
-
-    Under a cgroup cap the old `_reader_cache_size` still read the host's 503 GB -- a 20x
-    over-estimate, and exactly the LSF case. Verified here against a synthetic limit rather than
-    against a real cgroup, so it runs anywhere.
+    """The bug this whole module exists for: `SC_PHYS_PAGES` is the HOST's memory, so under a
+    cgroup cap the old sizing read the host's 503 GB -- a 20x over-estimate, and exactly the LSF
+    case. Verified against a synthetic limit so it runs anywhere.
     """
     memory.reset()
     b = memory.host_budget(override_gb=8)
@@ -260,13 +224,13 @@ def test_budget_is_resolved_once_per_process():
 
 def test_reader_cache_is_pure_given_ram_and_shrinks_under_a_cap():
     """`_reader_cache_size` keeps its `ram_gb` parameter so the sizing is testable on any host
-    (gotcha 10: it must never open a container to measure anything)."""
+    (it must never open a container to measure anything).
+    """
     from tailcyclenet.dataset import _reader_cache_size
 
-    # johnson's rig: 16 cameras of 3208x2200. The price is LINEAR in the count on PyAV (measured:
-    # 0.418 / 0.383 / 0.376 / 0.373 GB PER READER at 1 / 4 / 8 / 16). The quadratic law this test
-    # used to assert was decord's, and its 0.28/3.58/15.34/34.09/59.38 table was taken without a
-    # trim on an unconstrained host -- i.e. it measured allocator arena.
+    # johnson's rig: 16 cameras of 3208x2200. The price is LINEAR in the count on PyAV; the
+    # quadratic law this test used to assert was decord's, measured without a trim on an
+    # unconstrained host (i.e. it measured allocator arena).
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1024) == 16     # room -> the whole rig
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1) == 1         # never zero
     # A loader worker still wants 4, not the rig, and the worker count still divides.
@@ -282,10 +246,7 @@ def test_reader_cache_is_pure_given_ram_and_shrinks_under_a_cap():
 def test_the_reader_cache_does_not_thrash_on_the_cyclic_access_it_actually_sees():
     """THE 2.4x. Every window touches all C cameras in the same order, which is the one access
     pattern LRU cannot serve: at capacity < C it evicts exactly the entry needed next and takes
-    ZERO hits. Measured end to end before the fix -- 16 readers 61 s, ELEVEN readers 149 s, two
-    readers 222 s -- eleven cached readers were buying nothing.
-
-    Asserted against the real pattern, not against the implementation.
+    ZERO hits. Asserted against the real pattern, not against the implementation.
     """
     from tailcyclenet.dataset import _ReaderCache
 
@@ -387,15 +348,10 @@ def test_result_arrays_are_the_term_the_budget_cannot_shrink():
 @pytest.mark.parametrize('anchor', ['none', 'carry'])
 @pytest.mark.parametrize('refine', [False, True])
 def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
-    """THE INVARIANT FOR THE POSE HALF, and the direct analogue of the prefetch test.
-
-    How many windows a block holds comes from FREE MEMORY, so if it could move a number then two
-    machines running one command would disagree and nothing in either output would say so. That is
-    the rule which licenses sizing anything from the budget at all (dev/reports/38 §7).
-
-    Exercised over a DETECTOR box source as well as the label path, because that is the arm where
-    a boundary has something to break: the association state has to cross it, and the detection
-    cursor has to stay on the global batch grid. The old whole-clip budget test could not reach it.
+    """THE INVARIANT FOR THE POSE HALF: how many windows a block holds comes from FREE MEMORY,
+    so if it could move a number, two machines running one command would disagree and nothing
+    would say so. Exercised over a DETECTOR box source as well as the label path, because that is
+    where a boundary has something to break (association state and the detection cursor).
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
@@ -482,16 +438,10 @@ def test_a_window_that_does_not_fit_is_refused_not_re_decoded(tmp_path):
 
 
 def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
-    """TWO BLOCKS ARE LIVE WHEN DETECTION RUNS AHEAD, and both come out of one share.
-
-    The detection thread decodes block k+1's frames while block k's are still held for its
-    forwards. Budgeting one block and running two overshot the flag -- measured at 11.6 GB peak
-    under `--max-ram 10`, and a ceiling on the process is the whole point of that flag.
-
-    The fix must not be "halve the block", which would double the budget a run needs before it can
-    START (johnson would refuse below --max-ram 19 where it runs at 10) -- that trades a hard
-    failure for a speedup. So the LOOKAHEAD degrades: with room for two blocks it pipelines, and
-    below that it detects inline exactly as it did before the pipeline existed.
+    """TWO BLOCKS ARE LIVE WHEN DETECTION RUNS AHEAD, and both come out of one share: budgeting
+    one block and running two overshot the flag. The fix is not to halve the block (which would
+    double the starting budget) -- the LOOKAHEAD degrades: with room for two blocks it pipelines,
+    and below that it detects inline exactly as before.
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
@@ -547,19 +497,17 @@ def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
             assert np.array_equal(a, b), f'{k} moved when the lookahead was disabled'
 
 
-# `--max-ram` MUST ACTUALLY BIND -- dev/plans/infer_from_videos_and_calibration.md §15.
+# `--max-ram` MUST ACTUALLY BIND.
 #
 # The budget was purely ADVISORY: every consumer sized itself from it and nothing checked the
 # total, so a `--videos` run on 263,798-frame containers reached 456 GB under `--max-ram 24` with
-# nothing in its output saying so, and had to be killed at 9 GB free on a shared node.
+# nothing in its output saying so.
+
 
 def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path):
     """ORDERING. The `--videos` probe opens video containers, and `memory.current` caches
     process-wide -- so with the budget resolved BELOW the input branch the override was not in
     effect during the probe, and any consumer that asked would have got the HOST figure.
-
-    `--max-ram` cannot be a ceiling on a phase that runs before it is read. Asserted by having the
-    probe itself read `memory.current()`.
     """
     import argparse
 
@@ -610,12 +558,9 @@ class _FakeReg:
 
 
 def test_the_probe_is_inside_the_budget_partition():
-    """An UNBUDGETED CONSUMER IS HOW THE NEXT ONE GETS ADDED. The probe holds open readers, so it
+    """An UNBUDGETED CONSUMER IS HOW THE NEXT ONE GETS ADDED: the probe holds open readers, so it
     comes out of `FRACTION_READERS` rather than sitting outside a partition that sums to 1.00.
-
-    It does NOT change the number on any rig anyone has run -- an open reader on a 263,798-frame
-    3208x2200 container retains 0.03 GB, measured under a trim -- which is the honest outcome and
-    is why this asserts the bound rather than a new value.
+    It does NOT change the number on any rig anyone has run -- an open reader retains ~0.03 GB.
     """
     from tailcyclenet import adopt, memory
 
@@ -638,11 +583,9 @@ def test_the_probe_is_inside_the_budget_partition():
 
 def test_the_peak_check_fires_on_a_promise_and_stays_quiet_otherwise():
     """A STATED budget is a promise; an INFERRED one is what was lying around, so exceeding it is
-    the host being busier than at startup rather than a broken promise.
-
-    Warn-once, and never a kill: the peak may be retained arena rather than working set, the
-    offending allocation is not always ours, and a run that is over budget is not a run that is
-    WRONG. What it buys is that the next 456 GB arrives as a line of output naming its phase.
+    the host being busier than at startup. Warn-once, never a kill: the peak may be retained
+    arena, the offending allocation is not always ours, and over budget is not WRONG -- what it
+    buys is that the next 456 GB arrives as a line of output naming its phase.
     """
     import warnings as _w
 

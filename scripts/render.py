@@ -2,33 +2,9 @@
 """Draw a prediction over the pixels it was made from. Offline, and model-free.
 
     pixi run python scripts/render.py --pred pred/ --out clips/
-    pixi run python scripts/render.py --pred pred/ --out clips/ --cams Cam2005325 --boxes
-    pixi run python scripts/render.py --pred pred/ --data <new/path/to/session> --out clips/
 
-**`--pred` IS A PREDICTION SESSION DIRECTORY, NOT AN NPZ.** A prediction already says where its
-own pixels are: `session.toml`'s `[provenance]` carries either `source_session` (a directory run)
-or the `source_videos`/`source_calibration`/`source_cam_regex` quadruple (a `--videos` run), and
-`tailcyclenet.render.session_for_prediction` reads whichever is there -- `--data` is an OVERRIDE
-for a root that MOVED since the run, not the normal input, and it is CHECKED against the
-prediction rather than trusted.
-
-**AN NPZ IS REFUSED, ON PURPOSE.** It carries no provenance, so a render of one is always a render
-against a root the user restated by hand -- exactly the failure this file used to have. Rendering
-is a diagnostic, not a measurement: nothing published depends on being able to draw an archived
-npz, and `scripts/eval.py` keeps its own npz reader (`load_predictions`) because every published
-number lives in one and dropping that reader would make them unscoreable. This file only stopped
-drawing them.
-
-**IT USED TO BE `infer.py --render`, AND MOVING IT OUT IS NOT A TIDY-UP.** The window loop now
-runs a group a BLOCK of windows at a time and writes each block out as it finishes, so there is no
-moment at which a whole clip's `pred` exists in memory -- which is exactly what `render_group`
-wants. Rendering inside the loop would mean either holding the block's frames until the encode
-finished (splitting ownership of the one thing that must be evicted on schedule) or rendering
-synchronously per block, which roughly doubles a run for a diagnostic.
-
-What it buys, beyond the loop staying simple: you can render a prediction you already have,
-without re-running inference. `tailcyclenet/render.py` itself owns the drawing and the pixel
-lookup; this file is the flags.
+`--pred` is a prediction SESSION directory (not an npz -- an npz carries no provenance saying
+where its pixels are); `--data` overrides a root that moved, checked against the prediction.
 """
 from __future__ import annotations
 
@@ -83,11 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _frame_range(prov, n_total, args):
-    """The [f0, f1) this call draws: the intersection of the REQUESTED range with the range this
-    prediction actually covers. Defaulting to the predicted range with no flags at all is the
-    point -- a ranged run then renders exactly the frames it predicted, and an explicit
-    --start-frame/--end-frame can only narrow that further (eval rule: extending past it would
-    draw guaranteed-NaN frames)."""
+    """The [f0, f1) this call draws: the requested range intersected with the range this
+    prediction actually covers (extending past it would draw guaranteed-NaN frames)."""
     pred_start = int(prov.get('frame_start', 0) or 0)
     pred_stop = int(prov.get('frame_stop', 0) or 0) or n_total   # 0 = to the end
     req_start = args.start_frame if args.start_frame is not None else pred_start
@@ -117,9 +90,7 @@ def main(argv=None):
         cfg = tomllib.load(f)
     prov = cfg.get('provenance', {})
 
-    # THE SESSION FIRST: it is the cheaper and more fundamental check -- wrong or absent pixels
-    # matter regardless of which groups were asked for, and `session_for_prediction` reads only
-    # toml/parquet metadata, no pixels, no label arrays.
+    # The session first: it is the cheaper and more fundamental check, and reads no pixels.
     sess = session_for_prediction(args.pred, data=args.data, split=args.split)
 
     want_groups = [g.strip() for g in args.groups.split(',') if g.strip()] if args.groups else None
@@ -156,8 +127,8 @@ def main(argv=None):
         for ci in cams:
             cam_name = sess.cam_names[ci]
             out_path = args.out / f'{key.replace("/", "__")}__{cam_name}.mp4'
-            # PRIMARY must be 4D -- `render_group` only auto-slices the camera axis on `overlay`
-            # and `boxes`, never on the array it projects/draws as the animal's own pose.
+            # `draw_arr` must be 4D: `render_group` only auto-slices the camera axis on `overlay`
+            # and `boxes`.
             draw_arr, overlay = pred_arr, None
             if args.draw in ('keypoints', 'both'):
                 if p2 is None:

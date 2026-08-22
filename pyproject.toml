@@ -20,43 +20,28 @@ channels = ["conda-forge"]
 platforms = ["linux-64"]
 
 [tool.pixi.activation.env]
-# The env ships libstdc++.so.6.0.35; the host may ship an older one (RHEL9 has 6.0.29, which has
-# no CXXABI_1.3.15). Without this the system copy wins the loader search and `import
-# scipy.optimize` dies inside _highspy with an ImportError that names CXXABI and nothing else --
-# a failure that looks like a broken install rather than a library-path ordering problem.
+# The env ships libstdc++.so.6.0.35, the host may ship 6.0.29 with no CXXABI_1.3.15 -- without
+# this the system copy wins the loader search and `import scipy.optimize` dies inside _highspy.
 LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib:$LD_LIBRARY_PATH"
 
-# The pixi env and the repo both live on NFS4 (prfs.hhmi.org:/groups). CPython stats every
-# source .py on NFS to validate its bytecode and then re-reads/writes the .pyc next to it,
-# so a cold import pays ~2x NFS round-trips per module and torch's ~500 modules dominate
-# startup. PYTHONPYCACHEPREFIX redirects the bytecode cache (read AND write) to a per-user
-# local ext4 path instead. Measured (median of 6 fresh interpreters):
-#   import numpy  2.87s -> 2.15s   import torch  7.3s -> 3.5s   import scipy 2.8s -> 2.2s
-# Home is local (/dev/nvme0n1p2), so the cache also survives reboots; the first import after
-# a clean cache recompiles once and is slower, every later one is fast. Safe and reversible:
-# unset it (or delete the directory) to restore byte-for-byte upstream behaviour.
+# The env and repo both live on NFS, so a cold import pays ~2x NFS round-trips per module
+# (torch's ~500 modules dominate startup); PYTHONPYCACHEPREFIX redirects the bytecode cache to a
+# local path, which also survives reboots. Unset it to restore upstream behaviour.
 PYTHONPYCACHEPREFIX = "${HOME}/.cache/tailcyclenet/pycache"
 
-# A calms21 loader worker decodes a fresh ~42 MB frame buffer per item, freed immediately; a
-# single-threaded standalone probe measured that churn growing glibc's arenas unboundedly and
-# flat under this cap (dev/plans/video_loader_memory.md). Removing it live on a real training
-# job (same report) made no measurable difference either way -- the real worker carries ~20+
-# threads the probe never did, so this is not shown to help THAT mechanism, but it is also not
-# shown to hurt, and it is the one arm with independent standalone evidence behind it.
+# A loader worker's per-item frame-buffer churn grows glibc's arenas unboundedly in a standalone
+# probe and flat under this cap; live, it made no measurable difference either way, but it is the
+# one arm with independent evidence behind it.
 MALLOC_ARENA_MAX = "2"
 
 [tool.pixi.pypi-dependencies]
-# posetail is a LIBRARY here and is never modified: pinned to the PyPI release, not a path dep.
-# A checkout lives at ../posetail-next for READING only.
-# 0.3.5 lands every workaround this repo carried (see dev/reports/32_posetail_035_upgrade.md):
-# the four cube.py offset patches, crop_box_for_points, TrackerEncoder input_size=/scene_features=,
-# the T=1 guard, the smoothness clamp and the occlusion/vis guards. 0.3.2 masked non-finite
-# visibility targets (BCELossVis); 0.3.5 keeps that and adds the rest.
+# posetail is a LIBRARY here, never modified: pinned to the PyPI release (a checkout lives at
+# ../posetail-next for READING only). 0.3.5 lands every workaround this repo carried -- the
+# cube.py patches, crop_box_for_points, input_size=/scene_features=, T=1 guard, occlusion/vis guards.
 posetail = "==0.3.5"
 # The pytorch branch, not PyPI's 0.8.0: its Camera is an nn.Module whose projection,
-# triangulation and Jacobians are torch ops, so camera geometry runs on GPU alongside the model
-# instead of round-tripping through numpy. Declares itself 0.7.2, which satisfies posetail's
-# `aniposelib>=0.7.0`.
+# triangulation and Jacobians are torch ops, so camera geometry runs on GPU with the model.
+# Declares itself 0.7.2, satisfying posetail's `aniposelib>=0.7.0`.
 aniposelib = { git = "https://github.com/lambdaloop/anipose-lib.git", branch = "pytorch" }
 tailcyclenet = { path = ".", editable = true }
 torch = { version = "<3", index = "https://download.pytorch.org/whl/cu128" }
@@ -76,33 +61,25 @@ pip = "*"
 pyarrow = "*"
 matplotlib = "*"
 pytest = "*"
-# The suite's cost is not its logic: it is 29 random inits of an 87.5M-parameter model at 0.8 s
-# each, and the box has 128 cores. noarch, pure python, needs only pytest + execnet, so it cannot
-# collide with the exact pins the note below is about.
+# noarch, pure python, needs only pytest + execnet, so it cannot collide with the exact pins
+# below; it parallelises the 29 model builds that dominate the suite.
 pytest-xdist = "*"
-# `--timeout=N` for a suite whose failure mode is a HANG, not an assertion: the loader deadlocks in
-# a futex when anything decodes video before the workers fork (gotcha 11) -- 0% GPU, no traceback,
-# no timeout, forever. Same noarch/pure-python argument as xdist, so it cannot collide with the
-# exact pins below. Not applied by default (no `timeout =` in [tool.pytest.ini_options]): the
-# model-building tests are legitimately slow and a global cap would flake on a busy host.
+# `--timeout=N` for a suite whose failure mode is a HANG (a loader futex deadlock when anything
+# decodes video before the workers fork), not an assertion. noarch/pure-python like xdist. Not
+# applied by default: the model-building tests are legitimately slow and a global cap would flake.
 pytest-timeout = "*"
 # noarch and pure python, like xdist and timeout above, so it cannot collide with the exact pins
 # the note below is about.
 ruff = "*"
 av = ">=18.0.0,<19"
-# NOT listed here, deliberately: toml, opencv, pillow, wandb, schedulefree, decord. This repo
-# imports all six directly, so declaring them looks right -- but posetail pins them EXACTLY
-# (`wandb==0.19.5`, `opencv-python==4.9.0.80`, `toml==0.10.2`) and posetail itself is pinned, so
-# the versions are already determined and captured in pixi.lock. Re-declaring them either
-# duplicates a pin that will conflict the moment posetail moves, or asks for `*` and conflicts
-# immediately -- conda's wandb 0.28.1 against posetail's 0.19.5 makes the solve unsatisfiable.
-# Tried; reverted. If posetail ever drops one, add it HERE as a pypi dependency at posetail's
-# own version, not as a conda package.
+# Deliberately NOT listed: toml, opencv, pillow, wandb, schedulefree, decord. posetail pins them
+# EXACTLY and is itself pinned, so the versions are already determined in pixi.lock; re-declaring
+# duplicates a pin that conflicts the moment posetail moves, or asks for `*` and conflicts
+# immediately. If posetail ever drops one, add it here at posetail's own version.
 
 [tool.pixi.tasks]
-# `-n 8`, and the default per-TEST distribution rather than `--dist loadfile`: loadfile pins all 29
-# model builds to one worker and the wall clock barely moves. Every worker re-pays the 14 s
-# torch/torchvision/posetail import, in parallel, which is the floor.
+# `-n 8`, default per-test distribution (loadfile pins all 29 model builds to one worker and the
+# wall clock barely moves); each worker re-pays the ~14 s torch import, which is the floor.
 test = "pytest tests/ -q -n 8"
 lint = "ruff check ."
 
@@ -111,10 +88,8 @@ line-length = 100
 target-version = "py311"
 extend-exclude = ["scratch", "dev"]
 
-# Pinned, not left to ruff's default: 0.16 widened the implied set to include C4/RUF/PLW, whose
-# autofixes rewrite import blocks and dict() calls across the repo. This is the classic default --
-# pyflakes plus the pycodestyle errors that catch real mistakes -- and it is what the repo is clean
-# against. Widening it is a deliberate act with its own diff, not a version bump.
+# Pinned, not ruff's default: 0.16 widened the implied set to autofix rules that rewrite import
+# blocks and dict() calls repo-wide. Widening it is a deliberate act with its own diff.
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
 

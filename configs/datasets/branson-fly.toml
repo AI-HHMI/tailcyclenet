@@ -1,17 +1,10 @@
 # branson-fly: 9 flies, ONE camera, 21 keypoints, 1024x1024 frames.
 #
-# >>> NAMES ARE PROVISIONAL. <<<
-# There is no branson-fly module in posetail-preprocessing (only a comment in
-# generate_processed_dataset_animal.py noting that ChimpACT "mirrors branson-fly"), the npz carries
-# no `keypoints` array, and no older dataset version has one either. Rather than invent 21 fly
-# landmark names, these are positional placeholders and `names_provisional = true`.
-#
-# What that costs, precisely:
-#   - training is UNAFFECTED. The embedding table is indexed positionally regardless of the names.
-#   - flip augmentation and any per-keypoint report WOULD be wrong, so the spec refuses to define
-#     `flip_pairs` or `skeleton` while this flag is set.
-#   - `names_provisional` is inside `spec.sha`, so replacing these with sourced names invalidates
-#     checkpoints trained against them rather than silently relabelling their per-keypoint tables.
+# NAMES ARE PROVISIONAL: no branson-fly module exists in posetail-preprocessing and the npz
+# carries no `keypoints` array, so these are positional placeholders. Training is unaffected
+# (the embedding table is positional); `flip_pairs`/`skeleton` are refused while the flag is
+# set; and `names_provisional` sits inside `spec.sha`, so replacing the names invalidates
+# checkpoints rather than silently relabelling them.
 name = "branson-fly"
 mode = "2d"
 units = "px"

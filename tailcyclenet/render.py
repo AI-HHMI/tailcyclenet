@@ -1,18 +1,8 @@
 """Draw a prediction over the pixels it was made from. `scripts/render.py` is the caller.
 
-Ported from `../posetail-pose/scripts/render_tracking.py` -- `PALETTE`, `draw_instance` and the
-lazy `VideoWriter` are that file's, near verbatim. What is deliberately NOT ported is the rest of
-it: `render_tracking.py` re-runs inference to get something to draw, and `render_clip_npz.py`'s
-docstring is explicit that this is the trap, because the render then shows a different pipeline
-from the one the numbers came from. So there is no model here and no window loop -- `render_group`
-takes the array `run_group`/a prediction session already holds.
-
-Colour is per ANIMAL ROW, so an identity swap on a stationary animal shows up as a colour change
-rather than as a number in a table.
-
-`session_for_prediction` and `resolve_camera`, at the bottom, are the CLI's own two questions --
-where are this prediction's pixels, and which camera did `--cams TOKEN` mean -- kept here rather
-than in `scripts/render.py` because both need `Session`/`Rig` internals a thin CLI should not.
+No model and no window loop: `render_group` takes the array a prediction session already holds,
+so the render shows the same pipeline the numbers came from. Colour is per ANIMAL ROW, so an
+identity swap shows as a colour change.
 """
 from __future__ import annotations
 
@@ -32,17 +22,13 @@ CHUNK = 32          # frames read per batch. 480 rat-city frames at once is 13.8
 
 def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, marker='dot',
                   label=True):
-    """One instance: skeleton (where the session has one) and keypoints, in place.
-
-    `marker='cross'` and `label=False` are the OVERLAY style (`render_group`'s `overlay=`): a
-    second prediction drawn over the first must be visually distinct with no halo and no second
-    id text competing for the same six pixels, or the two readings are indistinguishable.
+    """One instance: skeleton (where the session has one) and keypoints, in place. `cross`/
+    `label=False` is the overlay style: visually distinct, no halo, no competing id text.
     """
     import cv2
 
-    # isfinite alone lets a degenerate triangulation (a finite but ~1e20 px point) through, which
-    # overflows the int32 cast below and crashes cv2 with a useless "wrong type" error. Bound to
-    # the frame plus a margin generous enough to still draw a point just off-canvas.
+    # isfinite alone lets a degenerate triangulation (~1e20 px) through and overflow the int32
+    # cast below; bound to the frame plus a margin.
     margin = 4 * max(img.shape[:2])
     ok = np.isfinite(p2d).all(-1) & (np.abs(p2d[..., 0]) < margin) & (np.abs(p2d[..., 1]) < margin)
     for a, b in skel_ix:
@@ -68,19 +54,9 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, mark
 def project(session, pred, cam, gid=None, frames=None):
     """(S,T,K,3) world points -> (S,T,K,2) pixels in camera `cam`'s stored image.
 
-    aniposelib owns the projection, including distortion; `offset` is the one thing it does not
-    model -- `matrix` is in SENSOR coordinates and the image on disk starts at `offset`, so the
-    subtraction is what puts the point on the pixel a viewer sees (see `format.Rig`).
-
-    NaN passes through: `project_points` is elementwise, so an unpredicted keypoint stays NaN and
-    `draw_instance` skips it.
-
-    ON A MOVING RIG THIS NEEDS `gid`, and without it it drew the skeleton off the animal.
-    `Rig.by_name` hands back the camera carrying `calibration.toml`'s single NOMINAL extrinsic;
-    the per-frame ones exist only through `Session.cgroup(gid, frames)`. That is gotcha 9's class
-    and this was the fifth builder to drop `moving_ext` -- and the symptom, a pose that does not
-    sit on the animal, reads as a model failure rather than as a render bug. The static path is
-    left exactly as it was, so every 2D and static-rig render is unchanged.
+    aniposelib owns the projection; `offset` is subtracted because `matrix` is in SENSOR
+    coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
+    `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
     """
     import torch
 
@@ -92,10 +68,8 @@ def project(session, pred, cam, gid=None, frames=None):
         # already -- the same call `infer._fill_box_agreement` makes, for the same reason.
         cams = session.cgroup(gid, frames)
         S = pred.shape[0]
-        # PER ANIMAL, because `project_points_torch` aligns the (T,4,4) extrinsic against axis -3.
-        # Flattening (S,T) into one axis there would silently project animal i through frame i's
-        # camera pose -- the same alignment trap `test_the_tracker_projects_correctly_on_a_moving_rig`
-        # pins one module over.
+        # PER ANIMAL: `project_points_torch` aligns the (T,4,4) extrinsic against axis -3, so
+        # flattening (S,T) would project animal i through frame i's pose.
         with torch.no_grad():
             p = torch.as_tensor(np.asarray(pred), dtype=torch.float32)
             xy = [project_points_torch([cams[cam]], p[s])[0].cpu().numpy() for s in range(S)]
@@ -110,14 +84,8 @@ def project(session, pred, cam, gid=None, frames=None):
 
 
 def follow(pred, zoom, W, H, smooth=15):
-    """(T,2) int32 top-left corners of a `zoom`-square window that follows the prediction.
-
-    A johnson mouse is ~100 px on a 3208x2200 sensor: whole-frame at any sane bitrate, the
-    skeleton is a red smudge and the render cannot answer the question it was made to answer.
-
-    Carried forward through frames the prediction misses, so the view does not snap back to the
-    image corner every time the detector drops the animal, and smoothed, because a window that
-    tracks per-frame jitter makes the *background* move and nothing else.
+    """(T,2) int32 top-left corners of a `zoom`-square window that follows the prediction,
+    carried through missed frames and smoothed so the background does not jitter.
     """
     T = pred.shape[1]
     c = np.nanmean(np.moveaxis(pred, 1, 0).reshape(T, -1, 2), axis=1)
@@ -138,34 +106,12 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
                  boxes=None, frames=None, overlay=None):
     """Predicted tracks over one group's frames -> an mp4 at `out_path`.
 
-    `pred` is `run_group`'s own output (or a prediction session's `pred`/`pred2d`): `(S,T,K,2)` in
-    SOURCE pixels for a 2D session, or `(S,T,K,3)` world points for a 3D one, which get projected
-    into camera `cam` here. Only its first `T` frames are drawn, so a `--max-frames` run renders
-    exactly the clip it predicted.
-
-    `frames` is an optional `(T,)` array of SOURCE frame indices, aligned to `pred`'s columns --
-    the caller's own slice, e.g. `np.arange(f0, f1)` for a `--start-frame`/`--end-frame` render.
-    `None` keeps the old assumption, `np.arange(T)`, i.e. `pred`'s column `t` IS source frame `t`.
-    It is what decides which pixels are decoded, what the burned-in frame number reads, and --
-    on a MOVING rig -- which per-frame extrinsic `project` reads; passing the wrong one there
-    draws the skeleton off the animal with no other symptom (gotcha 9's class).
-
-    `zoom` is the side, in SOURCE pixels, of a window that follows the prediction; 0 draws the
-    whole frame. It is a view, not a crop rule -- it does not affect anything that was predicted.
-
-    `boxes` is an optional `(S,T,4)` of `[x0,y0,x1,y1]` in the same source pixels, OR `(S,T,C,4)`
-    -- camera `cam`'s own boxes are then selected, so a caller holding `instances.pq`'s full
-    per-camera array does not have to slice it first. Drawn in each animal's own colour, so a
-    render answers whether the box and the keypoints describe the same animal.
-
-    `overlay` is an optional SECOND `(S,T,K,2)` (or `(S,T,C,K,2)`, camera-sliced the same way) set
-    of points, already in `cam`'s own pixel space -- drawn as thin, unlabelled crosses in the same
-    animal's colour. The one designed use is the 3D reprojection against the per-camera 2D head's
-    own prediction: they are different quantities and a render is the only place their
-    disagreement is legible.
-
-    A 3D render is a REPROJECTION, not a measurement: a depth error along camera `cam`'s ray is
-    invisible in it. Draw more than one camera before believing a 3D pose.
+    `pred` is `run_group`'s own output (or a prediction session's `pred`/`pred2d`): `(S,T,K,2)`
+    in SOURCE pixels for a 2D session, or `(S,T,K,3)` world points for a 3D one, projected into
+    camera `cam` here; only its first `T` frames are drawn. `frames` optionally maps `pred`'s
+    columns to SOURCE frame indices (a ranged render); `zoom` is a follow window in source
+    pixels; `boxes` and `overlay` draw the animal's box and a second point set. A 3D render is a
+    REPROJECTION, not a measurement -- draw more than one camera before believing a 3D pose.
     """
     import cv2
 
@@ -221,8 +167,7 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
                 drawn = 0
                 for a in range(pred.shape[0]):
                     colour = PALETTE[a % len(PALETTE)]
-                    # Before the keypoint test: a box with no keypoints behind it is exactly the
-                    # disagreement worth seeing.
+                    # A box with no keypoints behind it is exactly the disagreement worth seeing.
                     if boxes is not None and np.isfinite(boxes[a, t]).all():
                         b = (boxes[a, t].reshape(2, 2) - origin) * s
                         cv2.rectangle(img, tuple(np.int32(b[0])), tuple(np.int32(b[1])),
@@ -247,11 +192,8 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
 
 
 def resolve_camera(session, token: str) -> int:
-    """A `--cams` token -> a camera INDEX. NAME first, then index.
-
-    `--cams 0` is fine on `cam0`/`cam1`; a johnson rig names its cameras `Cam2005325`, and
-    `--cams Cam2005325` must work too -- `--cam-regex` is what named them that way in the first
-    place, and a token that IS a camera name must never be silently re-read as a position.
+    """A `--cams` token -> a camera INDEX. NAME first, then index: a token that IS a camera name
+    must never be silently re-read as a position.
     """
     names = list(session.cam_names)
     if token in names:
@@ -269,26 +211,10 @@ def resolve_camera(session, token: str) -> int:
 def session_for_prediction(pred, data=None, split=None):
     """The SOURCE session a prediction was made from: the pixels, the rig, the skeleton.
 
-    THE PREDICTION SAYS WHERE ITS OWN PIXELS ARE. `session.toml`'s `[provenance]` carries either
-    `source_videos` (a `--videos` run -- reconstructed by `adopt.session_from_prediction`, which
-    re-derives the group/camera map from the recorded file list and CHECKS itself against the
-    prediction's own `groups.pq`/`calibration.toml`, so nothing is probed and gotcha 10 is not
-    reachable here) or `source_session` (a directory run -- `sessions_for` on that path and split).
-
-    `data` is an OVERRIDE for a root that MOVED since the run, not the normal input, and it is
-    CHECKED against the prediction rather than trusted: given, it replaces the lookup above but
-    every guard below still runs, so a `--data` pointed at the wrong root still refuses.
-
-    Four refusals, all before a single frame is decoded:
-
-    - neither `source_session` nor `source_videos` and no `--data` -- this prediction predates
-      provenance or was hand-written, and there is nothing to find its pixels with.
-    - the resolved session's own id disagrees with the prediction's recorded `source_session_id`
-      -- rendering it would draw the prediction over the wrong pixels.
-    - the resolved session's `names` disagree with the prediction's own -- a reordered axis draws
-      bones between the wrong keypoints with no other symptom (gotcha 4's family).
-    - a predicted group is missing from the resolved session, or its `n_frames` disagrees -- the
-      shape of a re-converted root.
+    `[provenance]` says where the pixels are (`source_videos` rebuilt by
+    `adopt.session_from_prediction`, or `source_session`); `data` is an OVERRIDE for a moved
+    root, checked rather than trusted. Refusals: no provenance, session id, `names` or a
+    predicted group's `n_frames` disagreeing.
     """
     import tomllib
 

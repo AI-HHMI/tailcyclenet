@@ -8,33 +8,21 @@ One class, so YOLOX simplifies hard:
   * BCE(objectness) + GIoU(box)
 
 **`version='trimmed'` (the default) is the repo's bespoke ~0.66M-param net** -- a 4-effective-width
-backbone `(24,48,96,192)` (dark4 and dark5 share the last width) with a plain-conv stem, unchanged
-from before this switch existed and BYTE-IDENTICAL to it: every checkpoint trained under the old
-`YOLOXNano()` still loads, because the `trimmed` construction path is untouched code.
+backbone `(24,48,96,192)` with a plain-conv stem, unchanged from before this switch existed and
+BYTE-IDENTICAL to it: every checkpoint trained under the old `YOLOXNano()` still loads.
 
 **`version in {'nano','tiny','s','m','l','x'}` builds the CANONICAL YOLOX backbone** (Focus stem,
 5-stage CSPDarknet at `base_channels = 64`) at that tier's official `(depth_mul, width_mul,
-depthwise)` -- see `YOLOX_TIERS`. This exists to test whether the detector is CAPACITY-limited:
-report 16 §5.3b found the keypoint branch's error flat across a 26.7x resolution range and called
-it "capacity-limited" purely by elimination, never by actually scaling the model. This is that
-follow-on, and it is a model-SELECTION sweep, not a single-lever ablation -- each named tier
-differs from `trimmed` in several things at once (schedule, depth, conv type, stem) by
-construction.
+depthwise)` -- see `YOLOX_TIERS`. It exists to test whether the detector is CAPACITY-limited.
 
-**NOT byte-identical to Megvii's release**, in two ways, both deliberate and both stated here so
-nobody mistakes a canonical-tier number for one comparable to a published YOLOX benchmark:
-  1. GroupNorm throughout, not BatchNorm -- see `conv_norm_act`. Every detector number in
-     dev/reports 10-13 and 15 is a BatchNorm number; every one from report 16 onward is GroupNorm.
-  2. The neck unifies all three pyramid levels to ONE output width (matching this file's single
-     shared `Head`), rather than Megvii's per-level neck width with three separate head stems
-     projecting down to a shared `cin`. The two are mathematically similar (a linear projection
-     either way) but are not the same parameter count. This mirrors how `trimmed` already works
-     here, just generalised to the canonical channel schedule.
+**NOT byte-identical to Megvii's release**, in two ways, both deliberate: (1) GroupNorm
+throughout, not BatchNorm -- see `conv_norm_act`; (2) the neck unifies all three pyramid levels to
+ONE output width rather than Megvii's per-level neck width with three separate head stems.
 
-~1M params at `trimmed`. The regression target is the SAME crop box the pose pipeline uses
+The regression target is the SAME crop box the pose pipeline uses
 (`tailcyclenet.crop.crop_box_for_points`), so the detector reproduces the crop the pose model
-was trained on rather than some other box, at every version. `tests/test_dataset.py` is what
-keeps that true.
+was trained on rather than some other box, at every version. `tests/test_dataset.py` keeps that
+true.
 """
 import torch
 import torch.nn as nn
@@ -45,9 +33,7 @@ CH_PER_GROUP = 8
 
 # (depth_mul, width_mul, depthwise), Megvii's own values. Only `nano` is depthwise-separable --
 # tiny/s/m/l/x are full-convolution. `base_channels = round8(64 * width_mul)` and
-# `base_depth = max(1, round(3 * depth_mul))` are applied in `CSPDarknet` below; at these six
-# points `64 * width_mul` already lands on a multiple of 8 (16/24/32/48/64/80), so `round8` is a
-# safety net for an arbitrary width_mul rather than a real rounding of the shipped tiers.
+# `base_depth = max(1, round(3 * depth_mul))` are applied in `CSPDarknet` below.
 YOLOX_TIERS = {
     'nano': (0.33, 0.25, True),
     'tiny': (0.33, 0.375, False),
@@ -66,12 +52,9 @@ def round8(v):
 def norm_groups(c, per_group=CH_PER_GROUP):
     """A group count that DIVIDES `c`, at about `per_group` channels each.
 
-    The usual `G = 32` is unusable at `trimmed`'s widths -- the backbone is (24, 48, 96, 192) with
-    the neck and head at 96, depthwise layers at those same counts, and bottlenecks at roughly
-    half -- so the count is derived and then walked down to a divisor. 8 channels per group gives
-    24 -> 3, 48 -> 6, 96 -> 12, 192 -> 24, all exactly 8, and sits inside the band Wu & He sweep,
-    over which GN is insensitive to G. The walk-down means this is correct for ANY channel count a
-    canonical tier produces too (128, 256, 384, 512, 768, 1024, 1280, ...), not just `trimmed`'s.
+    The usual `G = 32` is unusable at `trimmed`'s widths, so the count is derived and walked down
+    to a divisor; the walk-down makes this correct for any channel count a canonical tier produces
+    too.
     """
     g = max(1, c // per_group)
     while c % g:
@@ -84,12 +67,9 @@ def conv_norm_act(cin, cout, k=3, s=1, groups=1):
 
     GroupNorm, not BatchNorm, for two reasons that are one change. It has NO RUNNING STATISTICS,
     so train and inference are the same computation -- which is what makes training on crops and
-    inferring on a whole frame safe (Wu & He: GN/LN "do not require different training and
-    inference networks"), where BN's statistics would be collected on animal-rich crops and
-    applied to a mostly-empty arena. And it is batch-independent, so a high-resolution (or wider)
-    arm that can only hold a small batch is merely slower to optimise rather than a
-    differently-normalised model -- otherwise a capacity or resolution sweep confounds itself
-    with batch size (MegDet).
+    inferring on a whole frame safe, where BN's statistics would be collected on animal-rich
+    crops and applied to a mostly-empty arena. And it is batch-independent, so an arm that can
+    only hold a small batch is merely slower to optimise, not a differently-normalised model.
     """
     return nn.Sequential(
         nn.Conv2d(cin, cout, k, s, k // 2, groups=groups, bias=False),
@@ -107,21 +87,19 @@ def conv3(cin, cout, k=3, s=1, depthwise=True):
     """The one 'kxk conv' building block used everywhere below, switched by `depthwise`.
 
     Megvii's tiers differ on exactly this: `nano` (and this repo's `trimmed`) use the
-    depthwise-separable form: `tiny/s/m/l/x` use a single full convolution. Keeping one call site
-    for both is what makes `depthwise` a clean, single lever through the backbone, neck and head.
+    depthwise-separable form; `tiny/s/m/l/x` use a single full convolution. One call site for
+    both is what makes `depthwise` a single lever through the backbone, neck and head.
     """
     return dw_conv(cin, cout, k, s) if depthwise else conv_norm_act(cin, cout, k, s)
 
 
 class Bottleneck(nn.Module):
-    """`expansion` is Megvii's own parameter name and the T4.1 fix
-    (dev/plans/detector_accuracy.md): `CSPLayer` below calls this with `cin == cout == hidden`
-    (its OWN CSP-split width), and this class used to halve that AGAIN unconditionally
-    (`hidden = cout // 2`), so every bottleneck conv in the shipped net was HALF Megvii's own
-    width -- 16 of 35 backbone tensors could not load from a COCO checkpoint at all. `0.5`
-    reproduces that byte-identically (`int(cout * 0.5) == cout // 2` for the even `cout` every
-    channel schedule here produces); `1.0` is what Megvii's `CSPLayer` actually passes to its
-    inner `Bottleneck`s (`expansion=1.0`, i.e. `hidden = cout`, full width, no second halving).
+    """`expansion` is Megvii's own parameter name: `CSPLayer` calls this with `cin == cout ==
+    hidden` (its OWN CSP-split width), and this class used to halve that AGAIN unconditionally,
+    so every bottleneck conv in the shipped net was HALF Megvii's own width -- 16 of 35 backbone
+    tensors could not load from a COCO checkpoint at all. `0.5` reproduces that byte-identically;
+    `1.0` is what Megvii's `CSPLayer` actually passes to its inner `Bottleneck`s (full width, no
+    second halving).
     """
     def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
         super().__init__()
@@ -166,17 +144,13 @@ class SPPBottleneck(nn.Module):
 class CSPDarknetNano(nn.Module):
     """`trimmed`'s backbone. Strides 8/16/32 feature maps. Unchanged from before this switch.
 
-    `p2` (T4.3, dev/plans/detector_accuracy.md): `dark2`'s own output (stride 4) is already
-    computed on every forward -- it was just never RETURNED. `False` (default) keeps the
-    3-tuple `(p3, p4, p5)` return exactly as before; `True` returns the 4-tuple
-    `(p2, p3, p4, p5)` and widens `out_channels` to match, for a caller building a P2 FPN level.
+    `p2`: `dark2`'s own output (stride 4) is already computed on every forward -- it was just
+    never RETURNED. `False` (default) keeps the 3-tuple `(p3, p4, p5)` return exactly as before;
+    `True` returns the 4-tuple `(p2, p3, p4, p5)` and widens `out_channels` to match.
 
-    `in_channels` (T4.2, dev/plans/detector_accuracy.md -- ARCHITECTURE SIDE ONLY as of this
-    commit; see the module-level note near `YOLOXNano` for what is and is not wired up yet) is
-    the stem's own input width. `3` (default) is byte-identical to every checkpoint on record;
-    a temporal-input caller (a stacked frame pair, or RGB + a difference channel) widens only
-    this one conv -- everything downstream of the stem is unaffected by what the input channels
-    mean.
+    `in_channels` is the stem's own input width; `3` (default) is byte-identical to every
+    checkpoint on record, and a temporal-input caller widens only this one conv -- everything
+    downstream of the stem is unaffected.
     """
 
     def __init__(self, w=(24, 48, 96, 192), p2=False, in_channels=3):
@@ -227,12 +201,9 @@ class CSPDarknet(nn.Module):
 
     Same contract as `CSPDarknetNano` (strides 8/16/32, returns p3/p4/p5), built at Megvii's
     official `(depth_mul, width_mul, depthwise)` for the six named tiers in `YOLOX_TIERS`. See the
-    module docstring for the two deliberate deviations (GroupNorm, and the neck's unified width).
-
-    `in_channels` (T4.2): `Focus` already generalises to any `cin` (it space-to-depth SPLITS
-    whatever channel count `x` has, then convs `cin * 4` -> `cout`), so widening the stem is
-    exactly this one constructor argument -- `3` (default) is byte-identical to every checkpoint
-    on record.
+    module docstring for the two deliberate deviations. `in_channels` widens the stem: `Focus`
+    space-to-depth SPLITS whatever channel count `x` has, so this one argument is the whole of it
+    (`3` default is byte-identical to every checkpoint on record).
     """
 
     def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5,
@@ -270,17 +241,14 @@ class CSPDarknet(nn.Module):
 
 
 class PAFPN(nn.Module):
-    """`p2` (T4.3, dev/plans/detector_accuracy.md): a 4th, finer level (stride 4). `False`
-    (default) is the original 3-level PAFPN, byte-identical -- the `p2`-only modules
-    (`lat2`/`mrg2`/`down2`/`out3`) are not even CONSTRUCTED, the same "not built and ignored"
-    contract the keypoint branch already uses.
+    """`p2`: a 4th, finer level (stride 4). `False` (default) is the original 3-level PAFPN,
+    byte-identical -- the `p2`-only modules (`lat2`/`mrg2`/`down2`/`out3`) are not even
+    CONSTRUCTED, the same "not built and ignored" contract the keypoint branch uses.
 
-    The extra level slots into the EXISTING top-down/bottom-up pattern rather than bolting on a
-    new one: p2 becomes the new finest level (top-down only, like p3 was before), and p3 -- no
-    longer the finest -- gains the bottom-up refinement stage p3 never needed before (`out3`,
-    mirroring `out4`/`out5`). `down3`'s WEIGHTS are unchanged from the 3-level case (same
-    `out`-width input either way); only what feeds it changes, from the raw top-down p3 to the
-    now-refined one.
+    The extra level slots into the EXISTING top-down/bottom-up pattern: p2 becomes the new finest
+    level (top-down only, like p3 was before), and p3 -- no longer the finest -- gains the
+    bottom-up refinement stage it never needed before (`out3`, mirroring `out4`/`out5`).
+    `down3`'s WEIGHTS are unchanged from the 3-level case; only what feeds it changes.
     """
 
     def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False):
@@ -332,23 +300,21 @@ class Head(nn.Module):
 
     `n_keypoints > 0` adds a KEYPOINT BRANCH: a second tower off the same stem, and a 1x1 emitting
     `(dx, dy, score)` per keypoint. At the default 0 nothing is constructed -- not built and
-    ignored -- so an existing checkpoint's `state_dict` is unchanged and every recorded detector
-    number reproduces without passing a new flag.
+    ignored -- so an existing checkpoint's `state_dict` is unchanged.
 
-    DECOUPLED, not shared, and that is a measured choice: at batch 128 on an H100 the second
-    tower costs 1.15x the whole network against 1.01x for a shared one, which is 0.036% of a real
-    run's wall clock (the forward is 0.9% of it -- dev/reports/14). Compute is not the constraint
-    here by three orders of magnitude; accuracy is.
+    DECOUPLED, not shared, and that is a measured choice: the second tower costs ~1.15x the whole
+    network against 1.01x for a shared one, which is a rounding error on a real run's wall clock
+    (the forward is <1% of it). Compute is not the constraint here; accuracy is.
 
     `depthwise` matches the tier's own choice: `trimmed`/`nano` use depthwise-separable towers,
-    `tiny` and up use full convolutions, so the head is not a full-conv tier's odd one out.
+    `tiny` and up use full convolutions.
     """
 
     def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
-        # THE IDENTITY BRANCH (report 20 lead 5, SLEAP's `ClassVectorsHead` in a single-shot head).
-        # A per-anchor softmax over a CLOSED animal set -- which is what rat-city is, 12 fixed rats
+        # THE IDENTITY BRANCH -- a per-anchor softmax over a CLOSED animal set (what rat-city is,
+        # 12 fixed rats) -- was built and deleted; see the module docstring's refutation.
         self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
             [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
@@ -381,36 +347,24 @@ class YOLOXNano(nn.Module):
     `version` in `{'nano','tiny','s','m','l','x'}` instead builds `CSPDarknet` at that tier's
     official `(depth_mul, width_mul, depthwise)` (`YOLOX_TIERS`), with this file's GroupNorm,
     single-class crop-rule head and optional keypoint branch unchanged. `width` only applies to
-    `version='trimmed'` -- for a canonical tier the neck/head width is DERIVED from `width_mul`
-    (`round8(256 * width_mul)`, matching Megvii's own `int(256 * width)` head-stem convention), and
-    passing a non-default `width` alongside a canonical `version` raises rather than silently
-    ignoring it.
+    `version='trimmed'`; for a canonical tier the neck/head width is DERIVED from `width_mul`, and
+    passing a non-default `width` alongside a canonical `version` raises.
 
-    `bottleneck_expansion` (dev/plans/detector_accuracy.md T4.1) is the same class of key,
-    reversed: it only applies to a CANONICAL tier's BACKBONE (`CSPDarknet`, never `trimmed`'s
-    `CSPDarknetNano` and never the neck, which does not transfer at any width -- see
-    `tailcyclenet.detector.pretrained`). `0.5` (default) is byte-identical to every checkpoint on
-    record; `1.0` is the shape a Megvii COCO backbone actually loads into. Passing a non-default
-    value alongside `version='trimmed'` raises for the same reason `width` does the other way.
+    `bottleneck_expansion` applies only to a CANONICAL tier's BACKBONE (`0.5` default is
+    byte-identical to every checkpoint on record; `1.0` is the shape a Megvii COCO backbone
+    actually loads into). Passing a non-default value alongside `version='trimmed'` raises.
 
-    `p2` (dev/plans/detector_accuracy.md T4.3) adds a stride-4 FPN level, on top of EITHER
-    backbone (unlike `bottleneck_expansion`, this one is not canonical-tier-only): `False`
-    (default) is byte-identical to every checkpoint on record -- `self.STRIDES` stays `(8, 16,
-    32)` and the backbone/neck/head are the original 3-level modules. `True` widens all three
-    (`CSPDarknetNano`/`CSPDarknet`'s own `p2` switch, `PAFPN`'s own `p2` switch, `Head`'s
-    `n_levels=4`) and sets `self.STRIDES = (4, 8, 16, 32)` -- `forward`/`anchor_points` already
-    loop over `self.STRIDES` generically, so nothing below this constructor needed to change.
+    `p2` adds a stride-4 FPN level, on top of EITHER backbone: `False` (default) is byte-identical
+    to every checkpoint on record; `True` widens backbone, neck and head and sets
+    `self.STRIDES = (4, 8, 16, 32)` -- `forward`/`anchor_points` already loop over `self.STRIDES`
+    generically.
 
-    `in_channels` (dev/plans/detector_accuracy.md T4.2) is the ARCHITECTURE HALF ONLY, as of the
-    commit that added it -- `3` (default) is byte-identical to every checkpoint on record; a
-    caller building a temporal-input model (a stacked frame pair, RGB + a difference channel)
-    passes a wider value and the stem's Focus/plain-conv absorbs it (`Focus` already generalises
-    to any `cin`). **NOT YET WIRED: `BoxDataset`'s loader still emits 3-channel RGB items
-    regardless of this argument, and `detect_raw` still decodes single frames** -- passing
-    `in_channels != 3` today builds a model that trains on garbage (3-channel data zero-padded
-    or truncated into a differently-shaped input) unless the CALLER also supplies genuinely wider
-    `x`. Do not wire a `[data].temporal_input` config key to this until the loader side exists;
-    this constructor argument is scaffolding for that follow-on, not a complete feature by itself.
+    `in_channels` is the ARCHITECTURE HALF ONLY: `3` (default) is byte-identical to every
+    checkpoint on record; a temporal-input caller passes a wider value and the stem absorbs it.
+    NOT YET WIRED: `BoxDataset`'s loader still emits 3-channel RGB items and `detect_raw` still
+    decodes single frames, so passing `in_channels != 3` today builds a model that trains on
+    garbage unless the CALLER also supplies genuinely wider `x`. This constructor argument is
+    scaffolding for that follow-on, not a complete feature.
     """
     STRIDES = (8, 16, 32)
 
@@ -454,7 +408,7 @@ class YOLOXNano(nn.Module):
 
     def forward(self, x):
         """x: (B,`self.in_channels`,H,W) normalized to [0,1] -- 3 unless a temporal-input caller
-        widened the stem (T4.2; see the class docstring for what is and is not wired up yet).
+        widened the stem.
 
         Returns obj_logits (B, A) and boxes (B, A, 4) in xyxy INPUT-image pixels, where A is
         the total number of anchor points across the three levels. With `n_keypoints > 0` it
@@ -482,14 +436,13 @@ class YOLOXNano(nn.Module):
                 k = kpt.permute(0, 2, 3, 1).reshape(B, -1, self.n_keypoints, 3)
                 # NO `exp` HERE. ltrb distances are positive so the box decode exponentiates;
                 # keypoint offsets are SIGNED, and exponentiating them would fold every keypoint
-                # to one side of its anchor -- silently, with a healthy-looking loss curve.
+                # to one side of its anchor, silently.
                 #
                 # BOUNDED AT 1.25 BOX HALF-WIDTHS via tanh, borrowed from RTMO's bin range: a
-                # keypoint physically cannot land outside 1.25x its own box, which is the hard
-                # prior plain regression lacks and which directly attacks the failure that
-                # matters for identity -- a keypoint flying onto the NEIGHBOURING animal.
-                # `.detach()` on the box so the keypoint loss cannot perturb the box branch;
-                # every detector number in reports 10-13 rests on that branch.
+                # keypoint physically cannot land outside 1.25x its own box, which directly
+                # attacks the identity-relevant failure -- a keypoint flying onto the NEIGHBOURING
+                # animal. `.detach()` on the box so the keypoint loss cannot perturb the box
+                # branch.
                 half = torch.stack([(ltrb[..., 0] + ltrb[..., 2]) / 2,
                                     (ltrb[..., 1] + ltrb[..., 3]) / 2], -1).detach()
                 ctr = torch.stack([cx, cy], -1)[None]                    # (1,A,2)

@@ -2,45 +2,14 @@
 """Convert `johnson-mouse/merge_aug` into the tailcycle-dataset format.
 
     pixi run python scripts/convert_johnson_aug.py --dry-run
-    pixi run python scripts/convert_johnson_aug.py --clean
 
-`merge_aug` is `merge` with 13 photometric/compositing augmentation variants baked in as extra
-IMAGES. Everything reusable -- the calibration reader, the robust triangulation, the run cutter,
-the reprojection check -- is IMPORTED from `convert_johnson.py`; this script adds only what the
-augmented layout needs. `convert_johnson.py` is not modified.
-
-Five source facts decide the shape of this script, all measured:
-
-- **An augmented image's keypoints are byte-identical to its base image's** (280,002 identical, 0
-  differing, across all 13 variants; boxes too). So this root adds PIXELS AND NOT LABELS: 8.4x the
-  frames over the same 2,965 poses. It is a training root only -- a bootstrap or `--vs` over it
-  resamples the same poses many times. `assert_same_2d` turns that finding into a check rather
-  than a comment, and the 3D layer is triangulated ONCE per (trial, source frame) and reused.
-
-- **An aug frameset's 16 views are a random per-camera MIX** of augmented and original images:
-  `Frame_104__shadow_00` uses augmented pixels for 5 of 16 cameras and the originals for the rest.
-  Symlinks therefore follow the JSON per camera, never a filename rule.
-
-- **The originals under `merge_aug/train/` are 53,250 DANGLING symlinks** into an unmounted
-  `/mnt/nvme2`. `resolve_image` falls back to `merge/train/`, which holds them as real files, and
-  raises naming both paths if neither has it. The output root has zero dangling links.
-
-- **`mirror_00` is a ghost**: 21,554 images on disk whose keypoints genuinely DIFFER from their
-  base (it is a real geometric augmentation), referenced by ZERO framesets. Being JSON-driven
-  excludes it automatically -- the same ghost-jpg lesson `convert_johnson.py` carries.
-
-- **Trial `2026_08_07_16_45_33` cannot be converted**: it is new in `merge_aug` (154 framesets, 11
-  source frames), has no `calib_params/2026_08_07*` anywhere on disk, and its originals are
-  dangling with no `merge/` counterpart. It is skipped LOUDLY, by trial name.
-
-`val/` comes from `merge`, UNAUGMENTED: `merge_aug/annotations/instances_val.json` is a dangling
-symlink and `merge_aug/val` symlinks to `../merge/val`, so there is no augmented val to convert --
-and an unaugmented val is what model selection wants anyway.
-
-Group ids are variant-suffixed: `000104` for an original run, `000104__shadow_00` for a variant's.
-Runs are cut per (trial, variant), because a variant covers a SUBSET of the trial's frames, so its
-runs differ. **Group ids therefore do not pair 1:1 across variants**; key on (trial, source frame)
-via `source_frame_start`/`source_frame_step` if you want "the same clip under 13 augmentations".
+`merge_aug` is `merge` with 13 photometric/compositing variants baked in as extra IMAGES; the
+reusable machinery is imported from `convert_johnson.py`. Augmented keypoints are byte-identical
+to their base, so this root adds PIXELS AND NOT LABELS (training only) and the 3D is triangulated
+once per (trial, source frame). A frameset's views are a per-camera mix, so symlinks follow the
+JSON, never a filename rule. The originals are dangling symlinks into an unmounted /mnt/nvme2 --
+`resolve_image` falls back to `merge/`. Group ids are variant-suffixed and do not pair 1:1 across
+variants; key on (trial, source frame).
 """
 from __future__ import annotations
 
@@ -66,8 +35,7 @@ FALLBACK = Path('/groups/karashchuk/karashchuklab/animal-datasets/johnson-mouse/
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/'
            'johnson-mouse-annotated-aug')
 
-# `Frame_<N>` or `Frame_<N>__<variant>`. Anything else raises: a new suffix convention must not be
-# absorbed silently as part of the frame number or as a trial of its own.
+# `Frame_<N>` or `Frame_<N>__<variant>`; anything else raises, so a new suffix convention is loud.
 _KEY = re.compile(r'^(?P<trial>[^/]+)/Frame_(?P<frame>\d+)(?:__(?P<variant>[A-Za-z0-9_]+))?$')
 
 AUG_NOTE = ('13 photometric/compositing variants; an augmented image carries keypoints IDENTICAL '
@@ -88,9 +56,7 @@ def split_key(key: str) -> tuple[str, int, str]:
 def resolve_image(rel: str, src: Path, fallback: Path) -> Path:
     """`<trial>/<cam>/<file>.jpg` -> a real file, preferring the augmented root.
 
-    53,250 of `merge_aug/train`'s entries are symlinks into an unmounted /mnt/nvme2. `Path.exists`
-    already follows the link, so a dangling one fails this test and falls through to `merge`,
-    which holds the same originals as real files.
+    Dangling symlinks into an unmounted /mnt/nvme2 fail `Path.exists` and fall through to `merge`.
     """
     a = src / 'train' / rel
     if a.exists():
@@ -107,9 +73,7 @@ def resolve_image(rel: str, src: Path, fallback: Path) -> Path:
 def read_aug(src: Path) -> dict:
     """The augmented train JSON, indexed by (trial, variant) -> {source frame: {camera: image id}}.
 
-    Everything is driven from `framesets`; the `images` list is only a lookup. That is what keeps
-    `mirror_00`'s 21,554 unreferenced images out, and it is the reason a filesystem walk is never
-    used here.
+    Driven from `framesets` only, which keeps unreferenced images (e.g. mirror_00) out.
     """
     with open(src / 'annotations' / 'instances_train.json') as f:
         d = json.load(f)
@@ -143,9 +107,8 @@ def fill_2d(d: dict, run: list[int], views: dict[int, dict[str, int]], cams: lis
             K: int) -> fmt.Labels:
     """The 2D layer for one group: keypoints, boxes and the per-camera instance rows.
 
-    Same rules as `convert_johnson.build_labels`: an unannotated image leaves every cell
-    UNLABELED rather than `present`, and the status is PROJECTED because the source flags
-    1,235,334 points "visible" against 18 "not" across 16 views of a mouse on a dome.
+    Same rules as `convert_johnson.build_labels` -- unannotated cells stay UNLABELED, status is
+    PROJECTED.
     """
     C, T = len(cams), len(run)
     lab = fmt.empty_labels(1, T, K, C, mode3d=True, animal_ids=['a00'])
@@ -187,12 +150,7 @@ def fit_3d(rig: fmt.Rig, lab: fmt.Labels, reject_px: float) -> int:
 def apply_rejections(lab: fmt.Labels, bad: np.ndarray) -> None:
     """Drop outlier 2D from keypoints.pq as NO ROW -- `missing` would claim someone judged it.
 
-    A view that loses every observation also loses its box: the source box is the keypoint hull,
-    so it carries the same displacement, and rule 11 wants a `labeled` instance to still have
-    keypoint rows. `scripts/check_status.py` names the resulting hole count for this root in
-    `HOLE_EXEMPTIONS` (18, independently measured from the plain root's 19 -- this script re-runs
-    the same gate over its own, larger set of augmented frame variants, so the two need not
-    agree).
+    A view that lost every observation also loses its box (the box is the keypoint hull).
     """
     lab.vis2d[0][bad] = fmt.UNLABELED
     lab.points2d[0][bad] = np.nan
@@ -204,10 +162,8 @@ def apply_rejections(lab: fmt.Labels, bad: np.ndarray) -> None:
 class Solved:
     """Per-(trial, source frame) 3D, solved once from the ORIGINAL frameset and reused.
 
-    Reuse is only legal because an augmented image's keypoints are identical to its base's, so
-    `carry` ASSERTS that before copying. A variant that ever diverges is triangulated on its own
-    and counted -- the finding is a check, not a comment. Reuse is also ~9x fewer robust DLT fits
-    (2,965 instead of 27,817).
+    Legal only because augmented keypoints are identical to their base's -- `carry` asserts that
+    before copying, and a diverging variant is triangulated on its own and counted.
     """
 
     def __init__(self) -> None:
@@ -277,14 +233,9 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
             continue
         cal_root = src if all((src / p).exists() for p in cal.values()) else fallback
 
-        # An UNKNOWN camera raises -- that is a frameset and a calibration disagreeing about what
-        # the rig IS. A frameset holding a SUBSET is DROPPED, loudly: rule 7 wants every camera
-        # dir to hold exactly `n_frames` contiguous files, so a 15-of-16 frameset cannot be
-        # written at all, and the alternatives are inventing a pixel or failing validation.
-        # `merge` has all 16 everywhere, which is why `convert_johnson.py` could raise on any
-        # disagreement; merge_aug has exactly ONE such frameset in 27,817
-        # (2026_02_26_13_29_50/Frame_4431, missing Cam2006052), and refusing a whole trial over it
-        # is not a conversion rule either.
+        # An UNKNOWN camera raises -- a frameset and a calibration disagreeing about what the rig
+        # IS. A frameset holding a SUBSET is dropped loudly: the format wants every camera dir to
+        # hold exactly `n_frames` contiguous files, so a 15-of-16 frameset cannot be written.
         cams = sorted(cal)
         short: list[tuple[str, int]] = []
         for v in variants:
@@ -384,10 +335,7 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
 def convert_val(fallback: Path, out: Path, max_gap: int, reject_px: float, dry_run: bool) -> None:
     """val/ from `merge`, UNAUGMENTED -- merge_aug ships no readable val of its own.
 
-    `convert_johnson`'s own `read_split` and `build_labels` do the work, so this is the verified
-    val path rather than a second implementation of it. `convert_johnson.convert` itself is not
-    called because it writes BOTH splits, and re-converting merge's 51,888-link train half to
-    throw it away is not a cheap way to get one split.
+    Reuses `convert_johnson`'s `read_split`/`build_labels`; `convert` itself writes both splits.
     """
     print('== val/ from johnson-mouse/merge (unaugmented)')
     d = read_split(fallback, 'val')
@@ -450,15 +398,9 @@ def convert_val(fallback: Path, out: Path, max_gap: int, reject_px: float, dry_r
 def check_aug_equals_original(out: Path, limit: int) -> int:
     """Re-read from disk: an augmented group must equal its source frames' original group.
 
-    This is the one check that catches a variant/frame misalignment, which is the failure mode
-    the variant-suffixed layout is exposed to.
-
-    **The source frame index is read off the SYMLINK TARGET**, not reconstructed as
-    `source_frame_start + t * source_frame_step`. `modal_step` is what its name says -- a run cut
-    at `--max-gap 8` legitimately holds gaps of 8 among steps of 4, so the arithmetic form
-    mis-indexes the middle of most runs, and this check reported 22 false failures before it read
-    the links instead. Reading the target also verifies the pixels' own mapping, which the
-    arithmetic form never touched.
+    The source frame index is read off the SYMLINK TARGET, not reconstructed as
+    `source_frame_start + t * source_frame_step` -- a run cut at `--max-gap` legitimately holds
+    gaps, so the arithmetic form mis-indexes the middle of most runs.
     """
     print(f'\n== augmented groups vs their originals (up to {limit} per session)')
     bad = 0

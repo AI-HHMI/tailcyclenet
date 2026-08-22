@@ -1,6 +1,5 @@
-# 3dpop: ONE val session, 16 labelled frames. Shipped `val_frames_per_group = 8` samples 50% of
-# it -- cheap to remove entirely. Raised to the group's own labelled length
-# (dev/plans/detector_accuracy.md T0.3).
+# 3dpop: ONE val session, 16 labelled frames. Raised to the group's own labelled length (the
+# shipped 8 sampled only half of it).
 extends = "../detector.toml"
 
 [data]

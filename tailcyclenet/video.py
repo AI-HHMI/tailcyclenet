@@ -1,32 +1,10 @@
 """THE ONE PLACE A VIDEO CONTAINER IS OPENED AND DECODED.
 
-`dataset._read_video` and `adopt._probe` both used `decord` directly. **decord is unmaintained
-(0.6.0, 2021) and its buffering is what made a long container unusable**: dmlc/decord#80 reports
-that it loads the whole file into memory, and #197 is our exact symptom -- "RAM usage builds up
-beyond 30 GB and the process gets killed" on a `get_batch` of a 4K video. A `--videos` run over
-sixteen 21 GB containers peaked at **456 GB under `--max-ram 24`** and had to be killed at 9 GB
-free on a shared node; 21 GB x 16 = 336 GB is the right order, and it explains why isolated
-micro-benchmarks of `get_batch` were not reproducible -- how much of the file is resident depends
-on how far the decoder has been driven.
-
-**THE SWAP IS OUTPUT-NEUTRAL, AND THAT IS MEASURED RATHER THAN HOPED.** PyAV is BIT-IDENTICAL to
-decord on every video root this repo has, sampled at BOTH ENDS of each container because the seek
-path is what differs between backends:
-
-    johnson raw + cut   h264   3208x2200   263,798 f   frames 120,060+     bit-identical
-    3dpop               mpeg4  3840x2160       899 f   0-7, 886-893        bit-identical
-    calms21             mpeg4  1024x570     23,810 f   0-7, 23,797-23,804  bit-identical
-
-so no recorded number moves. `scratch/backend_parity_roots.py` is that check.
-
-**FRAME ACCURACY IS BY CONSTRUCTION, NOT BY LUCK, AND THAT IS WHY THIS IS NOT OpenCV.**
-`cv2.VideoCapture` + `CAP_PROP_POS_FRAMES` also passed on this container, but opencv#9053
-documents it landing **8 to -3 frames off on MP4/AVC1**, and one root behaving is not evidence the
-next will -- an off-by-one frame is a different picture of a moving animal and it is SILENT. The
-recipe here seeks to the preceding KEYFRAME and then decodes forward COUNTING FRAMES, so the index
-arithmetic is ours rather than the container's.
-
-`TAILCYCLENET_VIDEO_BACKEND=decord` restores the old reader exactly, for bisecting.
+PyAV, not decord (which buffers whole containers in memory and is unmaintained); the swap is
+output-neutral on every video root, so no recorded number moves. Frame accuracy is by
+construction: seek to the preceding KEYFRAME and decode forward counting frames -- OpenCV's
+`CAP_PROP_POS_FRAMES` is documented 8 to -3 frames off on MP4/AVC1, silently.
+`TAILCYCLENET_VIDEO_BACKEND=decord` restores the old reader for bisecting.
 """
 from __future__ import annotations
 
@@ -35,12 +13,10 @@ import os
 import numpy as np
 
 BACKENDS = ('pyav', 'decord')
-# libav's threading modes. 'NONE' is decord's old single-threaded behaviour, and is what a
-# measurement of per-container threading has to compare AUTO against.
+# libav's threading modes; 'NONE' is decord's old single-threaded behaviour.
 THREAD_TYPES = ('AUTO', 'FRAME', 'SLICE', 'NONE')
-# How far ahead it is worth DECODING to reach a wanted frame rather than seeking again. A seek
-# lands on the preceding keyframe and this container's GOP is 180, so a second seek costs up to a
-# GOP of decode anyway; below that, decoding forward is strictly cheaper than re-seeking.
+# Decode forward instead of re-seeking when the decoder is within this many frames: a seek lands
+# on the preceding keyframe, so re-seeking would throw away a partly-decoded GOP.
 _FORWARD_LIMIT = 256
 
 
@@ -64,37 +40,19 @@ class PyAVReader:
         self.path = str(path)
         self._c = av.open(self.path)
         self._st = self._c.streams.video[0]
-        # `thread_type` is NOT settable once the codec is open, which a reader CACHE guarantees on
-        # every hit after the first -- so it is set here, once, and never in `get_batch`.
-        #
-        # **PyAV THREADS WITHIN A CONTAINER AND decord DID NOT** (`num_threads=1`), so this is a
-        # NEW axis that every decode measurement in reports 38/39 predates. It competes with the
-        # window loop's CROSS-container concurrency (`window._CAM_DECODE`) for the same cores, and
-        # it is their PRODUCT that oversubscribes -- which is why the two are swept together
-        # (dev/plans/...§16.2.5) rather than independently.
-        # A PyAV ENUM, NOT A COUNT: 'AUTO' | 'FRAME' | 'SLICE' | 'NONE'. Validated here because
-        # PyAV's own failure is a bare `KeyError: '1'` raised from inside an enum lookup, several
-        # frames below anything that names the setting.
+        # `thread_type` is NOT settable once the codec is open, which a reader CACHE guarantees
+        # on every hit after the first -- so it is set here, once, and never in `get_batch`.
+        # PyAV threads WITHIN a container (decord did not), competing with the window loop's
+        # cross-container concurrency for the same cores. It is a PyAV ENUM, not a count.
         _tt = os.environ.get('TAILCYCLENET_PYAV_THREADS', 'AUTO').strip().upper()
         if _tt not in THREAD_TYPES:
             raise ValueError(f'TAILCYCLENET_PYAV_THREADS={_tt!r} is not one of {THREAD_TYPES}. '
                              'It names libav\'s threading MODE, not a thread count.')
         self._st.thread_type = _tt
         self._tb = self._st.time_base
-        # **`guessed_rate`, NEVER `average_rate`. THE INDEX ARITHMETIC IS A RATE TIMES A pts, SO A
-        # RATE THAT IS OFF BY A PART IN 4,000 IS AN OFF-BY-ONE FRAME PART WAY THROUGH THE CLIP.**
-        # `average_rate` is duration/frames -- a DERIVED average, wrong whenever the container's
-        # declared duration is not exactly frames x period. The allen-mouse demo clips are the
-        # shipped instance: pts step exactly 256 at time_base 1/12800, i.e. exactly 50 fps, and
-        # `guessed_rate` (libav's `r_frame_rate`, what the container DECLARES) says 50 -- but
-        # their duration is one frame period short, so `average_rate` reads 200000/3999 =
-        # 50.0125. `round(pts * tb * rate)` then drifts, crossing a whole frame at n = 2000: the
-        # decoder yields 3000 frames whose indices are {0..1999, 2001..3000}, so index 2000 CANNOT
-        # BE PRODUCED and every frame after it is mislabelled +1. `get_batch` caught it as a hard
-        # refusal on the one skipped index, which is the only reason it was not a silent
-        # off-by-one over the last third of the clip -- exactly the failure this module rejected
-        # OpenCV for (opencv#9053). decord indexed by frame ORDINAL and never saw it, so every
-        # number taken on those clips before the PyAV swap predates this.
+        # `guessed_rate`, NEVER `average_rate`: the index arithmetic is rate times pts, and the
+        # derived average drifts to an off-by-one frame when the declared duration is not exactly
+        # frames x period.
         self._rate = self._st.guessed_rate or self._st.average_rate
         self._pos = None                    # next frame index the decoder would yield, if known
         self._iter = None
@@ -105,7 +63,7 @@ class PyAVReader:
         if n > 0:
             return n
         # A container with no frame count in its header. Derive from duration x rate rather than
-        # guessing; `n_frames` is a PROMISE that every index in [0, T) decodes, so erring low is
+        # guessing; `n_frames` is a promise that every index in [0, T) decodes, so erring low is
         # the safe direction.
         dur = self._st.duration or (self._c.duration and self._c.duration / 1e6 / float(self._tb))
         return int(float(dur) * float(self._tb) * float(self._rate)) if dur else 0
@@ -132,9 +90,8 @@ class PyAVReader:
         if not want:
             return np.empty((0, *self.frame_shape()), np.uint8)
         need = sorted(set(want))
-        # CONTINUE RATHER THAN RE-SEEK where the decoder is already close enough. The window loop
-        # walks a clip forwards, so consecutive calls are usually a short hop apart and a seek
-        # would throw away a partly-decoded GOP.
+        # Continue rather than re-seek when the decoder is already close enough -- the loop walks
+        # the clip forwards, so consecutive calls are usually a short hop apart.
         if not (self._iter is not None and self._pos is not None
                 and self._pos <= need[0] <= self._pos + _FORWARD_LIMIT):
             self._seek(need[0])

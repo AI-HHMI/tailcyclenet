@@ -70,14 +70,12 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
             **Whether the pose model can use that input is a property of the RUN, not of the
             model.** A single-view 3D window is the `prob_2d_only` path (`dataset.py`), and
             `configs/3d.toml` ships `prob_2d_only = 0`, so under it a one-camera instance is an
-            UNTRAINED input shape. A run may set 0.25 and train it. Check the run's own
-            `[data].prob_2d_only` before reading anything into a `min_views = 1` arm.
-
-            It cannot be free either: a leftover box is one the geometry never corroborated, so it
-            is also where a false positive lives.
+            UNTRAINED input shape. Check the run's own `[data].prob_2d_only` before reading
+            anything into a `min_views = 1` arm. It cannot be free either: a leftover box is one
+            the geometry never corroborated, so it is also where a false positive lives.
         `dup_res_px` WAS HERE and is deleted: under `--track` (the default) it produced a
-            byte-identical prediction file -- same md5 -- because the tracker claims the leftovers
-            this gate existed to police.
+            byte-identical prediction file because the tracker claims the leftovers this gate
+            existed to police.
 
     Returns a list of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float}. A
     single-view instance has `point` all-NaN and `residual` inf: there is nothing to triangulate
@@ -88,12 +86,10 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
     n_cams = len(cgroup)
 
     # A NaN BOX IS "NO DETECTION HERE", AND IT USED TO RAISE. `unletterbox_boxes` returns NaN for
-    # a box the frame clamp left with no area (its docstring says this function skips a non-finite
-    # centre; it did not), and `_triangulate` ends in `torch.linalg.svd`, which RAISES on
-    # non-finite input -- so the `isfinite(p3d)` guard below was unreachable and `detect_group`
-    # died mid-clip, after hours of decode, on rat-city's 57k-frame group. `used` already means
-    # "this detection is not available", and both loops below honour it, so seeding it here is the
-    # one place that covers every consumer.
+    # a box the frame clamp left with no area, and `_triangulate` ends in `torch.linalg.svd`,
+    # which RAISES on non-finite input -- so `detect_group` died mid-clip, after hours of decode,
+    # on the 57k-frame group. `used` already means "this detection is not available", and both
+    # loops below honour it, so seeding it here is the one place that covers every consumer.
     used = {(c, i) for c in range(n_cams)
             for i in range(centres[c].shape[0]) if not bool(torch.isfinite(centres[c][i]).all())}
 
@@ -135,11 +131,10 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         refined = _triangulate(cgroup, cams, pts)
         # THE REFIT RESIDUAL WAS COMPUTED, STORED, AND NEVER TESTED. The group is accepted on the
         # residual of the PAIR that seeded it -- a two-view reprojection residual, which is only an
-        # epipolar statistic and which two rays can always satisfy -- and then grown by adding a
-        # third and fourth camera each accepted against the PAIR's point. Re-triangulating over all
-        # of them can land somewhere none of the views actually agrees with, and that instance was
-        # emitted anyway. Testing the number that was already here costs nothing and is the one
-        # place in this function where the geometry can speak with more than two rays.
+        # epipolar statistic and which two rays can always satisfy -- and then grown by cameras
+        # each accepted against the PAIR's point. Re-triangulating over all of them can land
+        # somewhere none of the views agrees with; testing the number that was already here is the
+        # one place the geometry can speak with more than two rays.
         res_fit = _residual(cgroup, cams, pts, refined)
         # NOT `res_fit > max_res_px`: that is False for NaN, so a degenerate refit passed the gate
         # and planted an instance whose `point` is non-finite -- which `CrossViewTracker` then

@@ -137,6 +137,8 @@ def main():
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
                        temporal_input=data_cfg['temporal_input'],
+                       scale_jitter=data_cfg['scale_jitter'],
+                       aug_switch_off_iter=data_cfg['aug_switch_off_iter'],
                        seed=train_cfg['seed'], **tiling)
     # The checkpoint's `input_wh` must be the size the model saw: when tiling, read it back from
     # `BoxDataset`, which resolved it to the tile.
@@ -175,18 +177,34 @@ def main():
     # names it. None (the default), or a single-cohort split, keeps `ChunkShuffle` and is
     # byte-identical to every detector on record -- see `BoxDataset.cohort_weights`.
     cohort_w = train.cohort_weights(data_cfg['annot_frac'])
-    if cohort_w is None:
+    # B1b/B1c (detector_v2 plan SS2.7): `alpha` reweights WITHIN whatever `cohort_w` already set
+    # up (or within the whole index, if `cohort_w` is None) by group size -- elementwise product,
+    # renormalised. `None` (default) leaves `cohort_w`/`None` exactly as `annot_frac` alone would.
+    alpha_w = train.alpha_weights(data_cfg['alpha'])
+    if cohort_w is None and alpha_w is None:
+        combined_w = None
+    elif cohort_w is None:
+        combined_w = alpha_w
+    elif alpha_w is None:
+        combined_w = cohort_w
+    else:
+        combined_w = cohort_w * alpha_w
+    if combined_w is None:
         sampler = ChunkShuffle(len(train), chunk=train.chunk, seed=train_cfg['seed'])
         if data_cfg['annot_frac'] is not None:
             print(f'annot_frac={data_cfg["annot_frac"]:g} is INERT here: '
                   f'{train.ds.name} train holds one cohort '
                   f'({", ".join(train.cohort_mix())}) -- keeping ChunkShuffle')
     else:
-        sampler = CohortSampler(cohort_w, seed=train_cfg['seed'])
-        was = train.cohort_mix()
-        now = train.cohort_mix(cohort_w)
-        print(f'annot_frac={data_cfg["annot_frac"]:g}: cohort mix '
-              + '  '.join(f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
+        sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
+        if cohort_w is not None:
+            was = train.cohort_mix()
+            now = train.cohort_mix(combined_w)
+            print(f'annot_frac={data_cfg["annot_frac"]:g}: cohort mix '
+                  + '  '.join(f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
+        if data_cfg['alpha'] is not None:
+            print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied '
+                  f'({"composed with annot_frac" if cohort_w is not None else "alone"})')
     loader = torch.utils.data.DataLoader(
         train, batch_size=train_cfg['batch_size'],
         sampler=sampler,
@@ -313,6 +331,9 @@ def main():
             sched.step()
             running.append(float(loss.detach()))
             it += 1
+            # D3: shared-memory value a forked worker reads at its own __getitem__ time -- see
+            # `BoxDataset.set_iter`'s own docstring for why this cannot be a plain attribute.
+            train.set_iter(it)
             if it % 50 == 0:
                 kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
                       if 'kpt' in parts else '')
@@ -337,7 +358,8 @@ def main():
                     scores[name] = overall(score_dataset(
                         model, ds, device, batch_size=train_cfg['batch_size'],
                         batches=train_cfg['eval_batches'], num_workers=2,
-                        out_scores=obj_scores))
+                        out_scores=obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
+                        center_dist_thresh=train_cfg['nms_center_dist_thresh']))
                 # Record the objectness distribution: saturation is a property of the recipe, not
                 # the dataset, so `--det-score` cannot be a constant.
                 obj_q = {}

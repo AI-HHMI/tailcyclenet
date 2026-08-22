@@ -336,7 +336,8 @@ class BoxDataset(Dataset):
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
-                 strong=False, ignore_present=False, temporal_input='none'):
+                 strong=False, ignore_present=False, temporal_input='none',
+                 scale_jitter=None, aug_switch_off_iter=0):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -385,6 +386,23 @@ class BoxDataset(Dataset):
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
         # 0 is off and off is byte-identical: `random_affine` skips the draw.
         self.rotate_deg = float(rotate_deg)
+        # D1 (detector_v2 plan SS2.6): overrides `random_affine`'s own `scale=(0.8, 1.25)` default
+        # OUTRIGHT (not composed -- the plan's own instruction is "sweep, don't adopt", so one
+        # explicit range per arm keeps that legible). `None` (default) keeps the shipped range and
+        # is byte-identical to every checkpoint on record.
+        self.scale_jitter = None if scale_jitter is None else tuple(float(v) for v in scale_jitter)
+        # D3 (detector_v2 plan SS2.6): the ITERATION `strong` (mosaic-lite, colour jitter,
+        # additive noise, salt & pepper, motion blur, cutout) switches OFF for the remainder of the
+        # run -- RTMDet's `PipelineSwitchHook`. 0 (default) never switches off. A
+        # `multiprocessing.Value`, not a plain int: `num_workers > 0` forks this dataset into
+        # worker processes, and a plain attribute mutated in the MAIN process (where the training
+        # loop lives) would never reach those forked copies -- shared memory, created here BEFORE
+        # any DataLoader forks a worker, is what makes `set_iter` visible on the other side.
+        self.aug_switch_off_iter = int(aug_switch_off_iter or 0)
+        self._it = None
+        if self.aug_switch_off_iter > 0:
+            from multiprocessing import Value
+            self._it = Value('l', 0)
         # The APPEARANCE half of --augment. False is the shipped single gain and is byte-identical;
         # True adds nothing extra by itself -- `--augment-strong` (below) layers the rest of the
         # mix on top. Requested explicitly, not inferred from the split: `self.train` still gates
@@ -448,7 +466,11 @@ class BoxDataset(Dataset):
                     continue
                 v = vis.reshape(vis.shape[0], vis.shape[1], -1)
                 frames = np.flatnonzero((v != UNLABELED).any((0, 2)))
-                if frames.size > max_frames_per_group:
+                # B1a (detector_v2 plan SS2.7): 0 (or any falsy value) DROPS THE CAP entirely --
+                # every labelled frame is indexed, not just the first `max_frames_per_group` this
+                # rng happened to draw. 40 (the shipped default) is unchanged and byte-identical;
+                # this only differs once a config asks for 0.
+                if max_frames_per_group and frames.size > max_frames_per_group:
                     frames = rng.choice(frames, max_frames_per_group, replace=False)
                 for f in sorted(frames):
                     for ci in range(len(sess.rig)):
@@ -467,6 +489,23 @@ class BoxDataset(Dataset):
 
     def __len__(self):
         return len(self.index)
+
+    def set_iter(self, it):
+        """D3: tell this dataset the training loop's current step, so `_strong_now` can switch
+        `strong` off past `aug_switch_off_iter`. A no-op when the key is unset (`self._it is
+        None`), so a caller may call this unconditionally every step with no byte-identity risk.
+        """
+        if self._it is not None:
+            self._it.value = int(it)
+
+    def _strong_now(self):
+        """D3: whether the strong augmentation suite is live THIS ITEM. `self.strong` alone
+        (unset `aug_switch_off_iter`) is the whole answer and is byte-identical to every
+        checkpoint on record; past `aug_switch_off_iter` it reads False for the rest of the run.
+        """
+        if self._it is None:
+            return self.strong
+        return self.strong and self._it.value < self.aug_switch_off_iter
 
     def cohort_weights(self, annot_frac):
         """Per-entry sampling weights giving `annotated` sessions probability `annot_frac`.
@@ -508,6 +547,40 @@ class BoxDataset(Dataset):
         w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
              else np.asarray(weights, dtype=np.float64) / np.sum(weights))
         return {c: float(w[src == c].sum()) for c in sorted(set(src.tolist()))}
+
+    def alpha_weights(self, alpha):
+        """B1b (detector_v2 plan SS2.7): per-entry weights giving each GROUP (session, gid) total
+        draw probability proportional to `n_views ** alpha`, where `n_views` is that group's own
+        (post-cap) entry count. Per-entry weight is `n_views ** (alpha - 1)`, so summing it over
+        one group's `n_views` entries gives `n_views ** alpha` exactly.
+
+        `alpha = 1.0` is FRAME-UNIFORM (every entry weight 1 -- `alpha_weights` returns an
+        all-ones array, and combined with nothing else this is byte-identical to `ChunkShuffle`).
+        `alpha = 0.0` is GROUP-UNIFORM (every group the same TOTAL weight regardless of how many
+        views survived B1a's cap -- the naive "weight by group" scheme SS2.7's own B1 section
+        warns is a trap on its own: it would starve rat-city's one 57,594-view tracked group down
+        to 1/886 of draws). `alpha = 0.5` sqrt-damps between the two. `None` (default) does not
+        weight and returns None, matching `cohort_weights`' own convention -- the caller falls
+        back to `ChunkShuffle`.
+
+        PROVABLY A NO-OP wherever every group has the same `n_views` (3dpop, branson-fly: SS5.5
+        already documents this) -- `n_views ** (alpha - 1)` is then a single constant, and any
+        constant array normalises away. That is a FREE null control for this lever, not a bug.
+
+        Composes with `cohort_weights` by elementwise product (renormalised) -- see
+        `train_detector.py`'s own composition, SS2.7 B1c.
+        """
+        if alpha is None:
+            return None
+        alpha = float(alpha)
+        keys = np.array([f'{s.session_id}/{g}' for s, g, _, _ in self.index])
+        _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
+        n_views = counts[inv].astype(np.float64)
+        w = n_views ** (alpha - 1.0)
+        if not np.isfinite(w).all() or w.sum() <= 0:
+            raise ValueError('alpha_weights: sampling weights are all zero or non-finite -- '
+                             'check alpha')
+        return w
 
     # ------------------------------------------------------------------------------------------
     # tiling
@@ -922,8 +995,13 @@ class BoxDataset(Dataset):
         # there is no shared stream for workers to share, exactly as the pose loader does. Eval
         # still gets NO augmentation at all.
         rng = (np.random.default_rng(None) if self.augment and self.train else None)
+        # D3: read ONCE per item -- `self._it.value` is shared-memory state a training loop can be
+        # mutating concurrently in another process, and every use below must agree on one answer.
+        strong = self._strong_now()
+        _affine_kw = {} if self.scale_jitter is None else {'scale': self.scale_jitter}
         warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
-                              centre=self._warp_centre(i)) if rng is not None else None)
+                              centre=self._warp_centre(i), **_affine_kw) if rng is not None
+               else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
         # `regions` and `ignore_boxes` share ONE opt-in (M,4) tuple slot -- `__init__` raises if
@@ -970,11 +1048,11 @@ class BoxDataset(Dataset):
             if warp is not None:
                 gain = rng.uniform(0.7, 1.3)
                 img = _photometric(img, rng, gain=gain)
-                # THE STRONG SUITE. Gated on `self.strong` alone here -- `rng is not None` already
+                # THE STRONG SUITE. Gated on `strong` alone here -- `rng is not None` already
                 # means `self.augment and self.train`. FIXED ORDER, one independent per-op draw
                 # each: color jitter -> additive noise -> salt & pepper -> motion blur.
                 # Appearance-only, so no box or keypoint target moves through any of these four.
-                if self.strong:
+                if strong:
                     if rng.random() < 0.5:
                         img = _color_jitter(img, rng)
                     if rng.random() < 0.3:
@@ -985,7 +1063,8 @@ class BoxDataset(Dataset):
                         img = _motion_blur(img, rng)
         # T4.2: frame t-1, warped by the EXACT SAME `M` (so both frames of a stacked pair are in
         # register) and given the SAME photometric gain as frame t (so no fake per-frame brightness
-        # "motion" enters the stack). Cannot coexist with `self.strong` (raised at construction),
+        # "motion" enters the stack). Cannot coexist with `self.strong` (raised at construction, on
+        # the STATIC flag -- D3's runtime `strong` switching off mid-run does not reopen this),
         # so this never has to interact with cutout or mosaic-lite below.
         prev_img = None
         if self.temporal_input != 'none':
@@ -1000,7 +1079,7 @@ class BoxDataset(Dataset):
                 prev_img = cv2.warpAffine(prev_raw, M, self.input_wh, borderValue=(114, 114, 114))
                 if gain is not None:
                     prev_img = _photometric(prev_img, rng, gain=gain)
-        if self.strong and rng is not None:
+        if strong and rng is not None:
             # CUTOUT: an erasure, so it moves no box -- but a keypoint it covers must lose BOTH
             # its coordinate (-> NaN) and its score target (-> 0), or either loss would still
             # supervise a point the pixels no longer show.

@@ -29,7 +29,7 @@ DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box
     'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'scale_jitter',
-    'aug_switch_off_iter',
+    'aug_switch_off_iter', 'alpha',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -63,6 +63,23 @@ def _pair(key: str, value):
     if len(pair) != 2 or min(pair) <= 0:
         raise SystemExit(err)
     return pair
+
+
+def _float_pair(key: str, value):
+    """A `[lo, hi]` list of FLOATS from TOML, or None when empty. `_pair`'s float sibling --
+    `_pair` truncates to int (fine for a pixel size, wrong for `scale_jitter`'s (0.4, 1.0)-shaped
+    range).
+    """
+    if value in (None, [], ''):
+        return None
+    err = f'{key}: expected [lo, hi], got {value!r}'
+    try:
+        pair = [float(v) for v in value]
+    except (TypeError, ValueError):
+        raise SystemExit(err)
+    if len(pair) != 2 or pair[0] <= 0 or pair[1] < pair[0]:
+        raise SystemExit(err)
+    return tuple(pair)
 
 
 def load_detector_config(path, out=None, iters=None, device=None) -> dict:
@@ -196,6 +213,13 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:
         raise SystemExit(f"[data].annot_frac must be in [0, 1], got {data['annot_frac']}.")
+    # B1b (detector_v2 plan SS2.7): per-GROUP draw weight exponent, `n_views ** alpha`. `None`
+    # (default) does not weight by group size and is byte-identical to every checkpoint on
+    # record. Composes with `annot_frac` (SS2.7 B1c) -- see `train_detector.py`'s own sampler
+    # construction. NOT restricted to [0, 1]: 0.5/1.0/0.0 are the plan's own sweep points but
+    # nothing about the maths requires the exponent stay in that range.
+    al = data.get('alpha', None)
+    data['alpha'] = None if al in (None, '', []) else float(al)
     # A6 (detector_v2 plan SS2.3): P(a train draw is a NEGATIVE frame -- an (frame, camera) an
     # `instances.pq` row explicitly marks INST_ABSENT for EVERY animal, a real per-camera
     # assessment, not silence). `None`/unset (default) draws no negative frames and is
@@ -211,7 +235,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # byte-identical to every checkpoint on record. A `[lo, hi]` pair overrides it outright rather
     # than composing (composing two ranges is not obviously either range, and the plan's own
     # instruction is 'sweep, don't adopt' -- one explicit range per arm keeps that legible).
-    data['scale_jitter'] = _pair('scale_jitter', data.get('scale_jitter'))
+    data['scale_jitter'] = _float_pair('scale_jitter', data.get('scale_jitter'))
     # D3 (detector_v2 plan SS2.6): the ITERATION `[data].augment_strong` (mosaic-lite, colour
     # jitter, additive noise, salt & pepper, motion blur, cutout) switches OFF for the remainder of
     # the run -- RTMDet's `PipelineSwitchHook`, and this repo's own precedent for "an int means the

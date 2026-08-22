@@ -7,8 +7,11 @@ runs/
 __pycache__/
 *.pyc
 
+# CLAUDE.md is personal working notes (standing rules), not the repo's product.
+CLAUDE.md
+
 # scratch/ is LLM working space and may be deleted between sessions; dev/ is its notes and
 # reports. Both are working material, not the repo's product -- what they concluded belongs in
-# CLAUDE.md or docs/, which is the only place worth versioning it.
+# docs/ or README.md.
 scratch/
 dev/

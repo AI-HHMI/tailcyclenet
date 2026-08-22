@@ -75,30 +75,46 @@ def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
     large animal's box scores 1.0 one way and a small fraction the other, so `min` keeps it -- two
     animals, one occluding the other, are not duplicates. Only a genuine double-detection scores
     high BOTH ways.
+
+    **3D-AWARE (detector_v2 plan C1).** `boxes`/`kpts` carry a CAMERA axis (S,T,C,4) / (S,T,C,K,3)
+    -- true even for 2D single-view, where C=1. This used to read camera 0 ONLY
+    (`b[i, t, 0]`/`k[i, t, 0]`) for BOTH liveness and the containment fraction, while the actual
+    drop (`b[loser, t] = np.nan`) already spans every camera -- so on a multiview root a row alive
+    only in cameras 1..C-1 was invisible to this function entirely, and the overlap it did compute
+    ignored every other view's evidence. Fixed by aggregating over every camera where BOTH rows
+    have a finite box: liveness is "finite in ANY camera", and the per-pair overlap fraction is the
+    MEAN of the per-camera fraction over cameras where the pair co-occurs (`np.nanmean`, since a
+    single camera can still return NaN when a row has no valid keypoints there). On C=1 this is
+    exactly the old computation -- byte-identical on every 2D single-view root on record.
     """
     # NO dtype CONVERSION. `np.asarray(x, float)` on a float32 array returns a COPY, so every
     # in-place drop below would land on a temporary and the caller would see nothing.
     b, k = boxes, kpts
-    S, T = b.shape[0], b.shape[1]
+    S, T, C = b.shape[0], b.shape[1], b.shape[2]
     sc = scores
     dropped, pairs = 0, 0
     if k is None:
         return 0
     for t in range(T):
-        live = [i for i in range(S) if np.isfinite(b[i, t, 0]).all()]
+        live = [i for i in range(S) if np.isfinite(b[i, t]).any()]
         for ii, i in enumerate(live):
             for j in live[ii + 1:]:
-                if not np.isfinite(b[i, t, 0]).all() or not np.isfinite(b[j, t, 0]).all():
+                cams = [c for c in range(C)
+                       if np.isfinite(b[i, t, c]).all() and np.isfinite(b[j, t, c]).all()]
+                if not cams:
                     continue
-                a = kpt_in_box_frac(k[i, t, 0], b[j, t, 0])
-                c = kpt_in_box_frac(k[j, t, 0], b[i, t, 0])
-                if not (np.isfinite(a) and np.isfinite(c)):
+                a_c = [kpt_in_box_frac(k[i, t, c], b[j, t, c]) for c in cams]
+                c_c = [kpt_in_box_frac(k[j, t, c], b[i, t, c]) for c in cams]
+                if not (np.isfinite(a_c).any() and np.isfinite(c_c).any()):
                     continue
+                a = float(np.nanmean(a_c))
+                c = float(np.nanmean(c_c))
                 ov = min(a, c)
                 pairs += 1
                 if ov <= thresh:
                     continue
-                # Lower score loses; with no scores, the higher row index loses (stable).
+                # Lower score loses; with no scores, the higher row index loses (stable). `sc[i,
+                # t]` is (C,) -- `nanmax` over it is already an all-camera aggregate.
                 si = -np.inf if sc is None else np.nanmax(sc[i, t])
                 sj = -np.inf if sc is None else np.nanmax(sc[j, t])
                 loser = j if (sj < si or (sj == si and j > i)) else i

@@ -334,7 +334,7 @@ def _plan_blocks(starts, n_frames, T_total, frame_cost, store_bytes):
 
 # Which axis each returned column runs along, so blocks can be stitched back into a whole clip.
 # Anything not named here is a scalar or a per-group constant and is taken from the first block.
-_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'box_agree')
+_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'box_agree', 'det_box', 'det_score')
 _WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
 
 
@@ -1110,6 +1110,18 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             elif boxes_for is not None:
                 boxes_stc, _scores, det_kpts_stc = _detect(bi)
 
+            # THE PER-FRAME DETECTION BOX AND ITS SCORE, in source pixels -- what instances.pq's
+            # x0..y1/score columns are FOR (the render's --boxes overlay reads them back). The
+            # crop uses the window UNION of these; recording the per-frame originals loses
+            # nothing and makes the box overlay a pure read of the prediction's own tables.
+            # NaN unless a detector produced them (labels/instances/--boxes crops stay NaN, as
+            # before this column existed).
+            det_box = np.full((S, n_blk, len(session.rig), 4), np.nan, np.float32)
+            det_score = np.full((S, n_blk, len(session.rig)), np.nan, np.float32)
+            if boxes_stc is not None:
+                det_box[...] = boxes_stc
+                det_score[...] = _scores
+
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
             conf = np.full((S, n_blk, K), np.nan, np.float32)
             # THE PER-CAMERA 2D POSE AND ITS OWN VISIBILITY, which a 3D run discarded entirely --
@@ -1172,6 +1184,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
                    'pred2d': pred2d[:, :keep], 'conf2d': conf2d[:, :keep],
                    'box_agree': box_agree[:, :keep],
+                   'det_box': det_box[:, :keep], 'det_score': det_score[:, :keep],
                    'animal_ids': np.asarray(animal_ids, object),
                    'outcome': outcome, 'crop': crop,
                    'window_start': np.asarray(starts[w0:w1]),

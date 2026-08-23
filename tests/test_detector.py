@@ -2710,7 +2710,8 @@ def test_provenance_records_every_box_affecting_option():
     # `batch` is in there under protest: it is NOT inert but it is pinned rather
     # than exposed, so no run can differ in it. `frames`/`read` are the block loop's plumbing and
     # change no pixel. See tests/test_memory_budget.py.
-    plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read', 'trace'}
+    plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read', 'trace',
+                'trace_detail'}
     params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
     alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k',

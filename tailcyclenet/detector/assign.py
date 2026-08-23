@@ -393,7 +393,10 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
     if not keep.any():
         empty = (boxes.new_zeros((0, 4)), scores.new_zeros((0,)))
         index = torch.zeros(0, dtype=torch.long, device=boxes.device)
+        all_order = scores.argsort(descending=True, stable=True)
         trace = {'n_total': int(scores.numel()), 'n_score': 0, 'n_nms': 0, 'n_top_k': 0,
+                 'all_boxes': boxes[all_order], 'all_scores': scores[all_order],
+                 'all_index': all_order,
                  'score_boxes': boxes.new_zeros((0, 4)), 'score_scores': scores.new_zeros((0,)),
                  'nms_boxes': boxes.new_zeros((0, 4)), 'nms_scores': scores.new_zeros((0,)),
                  'nms_index': index}
@@ -423,8 +426,11 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
     if return_index:
         out = (*out, nms_i[:top_k])
     if return_trace:
+        all_order = scores.argsort(descending=True, stable=True)
         trace = {'n_total': int(scores.numel()), 'n_score': int(keep.sum()),
                  'n_nms': int(nms_b.shape[0]), 'n_top_k': int(out[0].shape[0]),
+                 'all_boxes': boxes[all_order], 'all_scores': scores[all_order],
+                 'all_index': all_order,
                  'score_boxes': score_b, 'score_scores': score_s,
                  'nms_boxes': nms_b, 'nms_scores': nms_s, 'nms_index': nms_i}
         out = (*out, trace)

@@ -152,6 +152,8 @@ def main():
                        aug_switch_off_iter=data_cfg['aug_switch_off_iter'],
                        negative_frac=data_cfg['negative_frac'],
                        negative_crop_frac=data_cfg['negative_crop_frac'],
+                       hard_event_manifest=data_cfg['hard_event_manifest'],
+                       hard_event_frac=data_cfg['hard_event_frac'],
                        seed=train_cfg['seed'], **tiling)
     # The checkpoint's `input_wh` must be the size the model saw: when tiling, read it back from
     # `BoxDataset`, which resolved it to the tile.
@@ -194,6 +196,11 @@ def main():
     # up (or within the whole index, if `cohort_w` is None) by group size -- elementwise product,
     # renormalised. `None` (default) leaves `cohort_w`/`None` exactly as `annot_frac` alone would.
     alpha_w = train.alpha_weights(data_cfg['alpha'])
+    # W1.1: audited hard-event draw share, composed with the existing cohort/alpha controls.
+    hard_w = train.hard_event_weights(data_cfg['hard_event_frac'])
+    if hard_w is not None:
+        print(f'hard_event_frac={data_cfg["hard_event_frac"]:g}: '
+              f'{int(train.hard_event_mask.sum())} hard-event views / {len(train)} total')
     # A6 (detector_v2 plan SS2.3): negative-frame draw share, composed the same elementwise way.
     neg_w = (train.negative_weights(data_cfg['negative_frac'], source='absent')
              if data_cfg['negative_frac'] is not None else None)
@@ -201,7 +208,8 @@ def main():
     # this from also pulling A6's INST_ABSENT entries into the same target share.
     neg_crop_w = (train.negative_weights(data_cfg['negative_crop_frac'], source='crop')
                  if data_cfg['negative_crop_frac'] is not None else None)
-    weights = [w for w in (cohort_w, alpha_w, neg_w, neg_crop_w) if w is not None]
+    weights = [w for w in (cohort_w, alpha_w, hard_w, neg_w, neg_crop_w)
+               if w is not None]
     combined_w = None
     for w in weights:
         combined_w = w if combined_w is None else combined_w * w

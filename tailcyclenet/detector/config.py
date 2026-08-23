@@ -30,6 +30,7 @@ DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'negative_crop_frac',
     'scale_jitter', 'aug_switch_off_iter', 'alpha', 'det_scale',
+    'hard_event_manifest', 'hard_event_frac',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -133,6 +134,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # that has always taken None-or-pair.
     data['input_wh'] = _pair('input_wh', data.get('input_wh'))
     data['tile_wh'] = _pair('tile_wh', data.get('tile_wh'))
+    data['hard_event_manifest'] = str(data.get('hard_event_manifest', '') or '')
+    hef = data.get('hard_event_frac')
+    data['hard_event_frac'] = None if hef in (None, '') else float(hef)
+    if data['hard_event_frac'] is not None and not 0.0 <= data['hard_event_frac'] <= 1.0:
+        raise SystemExit(f"[data].hard_event_frac must be in [0, 1], got {hef}")
 
     for k in ('iters', 'batch_size', 'num_workers', 'seed', 'eval_every', 'eval_batches',
               'iou_aware_warmup', 'max_pos_per_gt'):

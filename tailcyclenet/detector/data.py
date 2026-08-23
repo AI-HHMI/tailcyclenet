@@ -8,6 +8,7 @@ for a dataset whose stored keypoints are too sparse to bound the animal.
 """
 from __future__ import annotations
 
+import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -338,7 +339,8 @@ class BoxDataset(Dataset):
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
                  strong=False, ignore_present=False, temporal_input='none',
                  scale_jitter=None, aug_switch_off_iter=0, negative_frac=None,
-                 negative_crop_frac=None):
+                 negative_crop_frac=None, hard_event_manifest=None,
+                 hard_event_frac=None):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -451,6 +453,20 @@ class BoxDataset(Dataset):
         self.min_crop_dim = min_crop_dim
         self.train = split == 'train'
         rng = np.random.default_rng(seed)
+        self.hard_event_mask = []
+        hard_events = {}
+        if hard_event_manifest:
+            with open(hard_event_manifest) as f:
+                for line in f:
+                    event = json.loads(line)
+                    if event.get('reason') != 'kept':
+                        key = (event['session'], event['group'], int(event['frame']),
+                               event['camera'])
+                        hard_events[key] = event.get('audit_label', 'visible')
+        self.hard_event_frac = (None if hard_event_frac in (None, '')
+                                else float(hard_event_frac))
+        if self.hard_event_frac is not None and not 0.0 <= self.hard_event_frac <= 1.0:
+            raise ValueError(f'hard_event_frac must be in [0, 1], got {hard_event_frac}')
 
         # Parallel to `self.index`, one entry per item: the tile's source-pixel origin, or None
         # for the whole frame. A parallel list rather than a fifth tuple element because `index`
@@ -471,8 +487,14 @@ class BoxDataset(Dataset):
                 # every labelled frame is indexed, not just the first `max_frames_per_group` this
                 # rng happened to draw. 40 (the shipped default) is unchanged and byte-identical;
                 # this only differs once a config asks for 0.
+                event_frames = sorted({f for (s, g, f, _), _label in hard_events.items()
+                                       if s == sess.session_id and g == gid and 0 <= f < group.n_frames})
+                if event_frames:
+                    frames = np.unique(np.concatenate([frames, np.asarray(event_frames)]))
                 if max_frames_per_group and frames.size > max_frames_per_group:
-                    frames = rng.choice(frames, max_frames_per_group, replace=False)
+                    keep = set(rng.choice(frames, max_frames_per_group, replace=False).tolist())
+                    keep.update(event_frames)
+                    frames = np.asarray(sorted(keep), dtype=np.int64)
                 for f in sorted(frames):
                     for ci in range(len(sess.rig)):
                         origins = ([None] if self.tile_wh is None
@@ -480,6 +502,8 @@ class BoxDataset(Dataset):
                         for o in origins:
                             self.index.append((sess, gid, int(f), ci))
                             self.origins.append(o)
+                            self.hard_event_mask.append(
+                                (sess.session_id, gid, int(f), sess.cam_names[ci]) in hard_events)
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
         # Snapshot BEFORE either negative source appends anything -- A6c (below) draws its crop
@@ -526,6 +550,7 @@ class BoxDataset(Dataset):
                     [self.is_negative, np.ones(len(neg_flags), dtype=bool)])
                 self.negative_source = np.concatenate(
                     [self.negative_source, np.full(len(neg_flags), 'absent', dtype=object)])
+                self.hard_event_mask.extend([False] * len(neg_flags))
             if not self.is_negative.any():
                 raise ValueError(
                     f'{path}: negative_frac={negative_frac} was set but split {split!r} has no '
@@ -563,6 +588,7 @@ class BoxDataset(Dataset):
                     [self.is_negative, np.ones(len(crop_flags), dtype=bool)])
                 self.negative_source = np.concatenate(
                     [self.negative_source, np.full(len(crop_flags), 'crop', dtype=object)])
+                self.hard_event_mask.extend([False] * len(crop_flags))
             if not crop_flags:
                 raise ValueError(
                     f'{path}: negative_crop_frac={negative_crop_frac} was set but no (frame, '
@@ -570,6 +596,9 @@ class BoxDataset(Dataset):
                     'known animal within a bounded certified area -- negative_crop_frac cannot '
                     'be a silent no-op: unset it instead, or check regions.pq coverage for this '
                     'root/split (see dev/plans/detector_v2.md A6c.5 for measured per-root pools).')
+        self.hard_event_mask = np.asarray(self.hard_event_mask, dtype=bool)
+        if self.hard_event_mask.shape != (len(self.index),):
+            raise RuntimeError('hard-event mask and dataset index diverged')
         # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
         # be. Its old hardcoded 512 spanned 13 videos on a session with 40 positions per group,
         # which is not locality at all -- the reader cache thrashed and OOM-killed the workers.
@@ -676,6 +705,30 @@ class BoxDataset(Dataset):
         if not np.isfinite(w).all() or w.sum() <= 0:
             raise ValueError('alpha_weights: sampling weights are all zero or non-finite -- '
                              'check alpha')
+        return w
+
+    def hard_event_weights(self, hard_event_frac):
+        """Give curated, source-pixel-audited hard events a configured draw share.
+
+        The manifest only marks non-kept visible GT events; kept controls and crop/absent negatives
+        are not hard events. ``None`` leaves the historical sampler unchanged. A non-None fraction
+        with no eligible event raises instead of silently training the control recipe.
+        """
+        if hard_event_frac is None:
+            return None
+        frac = float(hard_event_frac)
+        if not 0.0 <= frac <= 1.0:
+            raise ValueError(f'hard_event_frac must be in [0, 1], got {hard_event_frac}')
+        hard = self.hard_event_mask
+        if not hard.any():
+            raise ValueError('hard_event_frac was set but the manifest contributed no hard events')
+        ordinary = ~hard
+        if frac < 1.0 and not ordinary.any():
+            raise ValueError('hard_event_frac < 1 requires at least one ordinary dataset item')
+        w = np.zeros(len(self.index), dtype=np.float64)
+        w[hard] = frac / int(hard.sum())
+        if ordinary.any():
+            w[ordinary] = (1.0 - frac) / int(ordinary.sum())
         return w
 
     def negative_weights(self, negative_frac, source=None):

@@ -165,7 +165,7 @@ def tiled_input_wh(src_wh, tile_scale):
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
-               iou_thresh=0.5, center_dist_thresh=0.5):
+               iou_thresh=0.5, center_dist_thresh=0.5, trace=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     -> (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None) with `D = top_k`, where index
@@ -206,6 +206,10 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
     `read` REPLACES THE DECODE with `(ci, cam_name, frames, pool) -> imgs`, so a caller that
     already holds these frames does not decode them a second time. `None` is `read_frames`.
+
+    `trace`, when a list is supplied, receives one compact decode-stage record per
+    (source-frame, camera): score survivors, post-NMS survivors, and final top-k survivors. It is
+    diagnostic-only; the default is `None`, and output arrays/return arity are unchanged.
     """
     import numpy as np
     import torch
@@ -343,10 +347,17 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                 _o = det(x.to(device).float().div_(_div255))
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
                 for j, t in enumerate(unit_ix):
-                    b, s, ix = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
-                                      iou_thresh=iou_thresh,
-                                      center_dist_thresh=center_dist_thresh,
-                                      return_index=True)
+                    decoded = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
+                                     iou_thresh=iou_thresh,
+                                     center_dist_thresh=center_dist_thresh,
+                                     return_index=True, return_trace=trace is not None)
+                    if trace is None:
+                        b, s, ix = decoded
+                    else:
+                        b, s, ix, dt = decoded
+                        trace.append({'frame': int(want[t]), 'camera': session.cam_names[ci],
+                                      'n_total': dt['n_total'], 'n_score': dt['n_score'],
+                                      'n_nms': dt['n_nms'], 'n_top_k': dt['n_top_k']})
                     if not b.numel():
                         continue
                     n = min(D, b.shape[0])

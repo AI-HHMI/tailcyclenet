@@ -137,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--detector-checkpoint', default='latest',
                     help="detector checkpoint selector when --detector is a run folder: 'latest' "
                          '(default), \'best\' (historical detector.pth), or an explicit filename.')
+    ap.add_argument('--det-trace', type=Path, default=None,
+                    help='write output-neutral per-frame/camera detector decode-stage counts as '
+                         'JSON for coverage attribution (scratch diagnostic, not a prediction '
+                         'session file).')
     ap.add_argument('--allow-detector-transfer', action='store_true', default=False,
                     help='permit a detector checkpoint whose recorded [dataset] does not match '
                          'this session\'s own dataset root. A detector is trained per dataset '

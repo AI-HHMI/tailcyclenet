@@ -1015,6 +1015,22 @@ def test_decode_suppresses_duplicates():
     assert s[0] > s[1]
 
 
+def test_decode_trace_reports_score_nms_and_top_k_without_changing_output():
+    boxes = torch.tensor([[10., 10., 50., 50.], [11., 11., 51., 51.],
+                          [200., 200., 260., 260.]])
+    logits = torch.tensor([3.0, 2.5, 2.0])
+    plain = decode(logits, boxes, top_k=1, iou_thresh=0.5, return_index=True)
+    traced = decode(logits, boxes, top_k=1, iou_thresh=0.5, return_index=True,
+                    return_trace=True)
+    got = traced[:3]
+    trace = traced[3]
+    for a, b in zip(plain, got):
+        assert torch.equal(a, b), 'diagnostic tracing must not alter deployed boxes/scores/indexes'
+    assert (trace['n_total'], trace['n_score'], trace['n_nms'], trace['n_top_k']) == (3, 3, 2, 1)
+    assert trace['score_boxes'].shape[0] == 3
+    assert trace['nms_boxes'].shape[0] == 2
+
+
 def test_decode_default_iou_thresh_is_unchanged():
     """detector_v2 A1: `iou_thresh` is a new PARAMETER, and every checkpoint on record must decode
     identically to it at `iou_thresh=0.5` (the old hardcoded value). `center_dist_thresh` must be
@@ -2694,7 +2710,7 @@ def test_provenance_records_every_box_affecting_option():
     # `batch` is in there under protest: it is NOT inert but it is pinned rather
     # than exposed, so no run can differ in it. `frames`/`read` are the block loop's plumbing and
     # change no pixel. See tests/test_memory_budget.py.
-    plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read'}
+    plumbing = {'det', 'session', 'gid', 'device', 'batch', 'frames', 'read', 'trace'}
     params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
     alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k',

@@ -138,6 +138,8 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                              # a short final slice only at that end.
                              max_frames=T, tile_scale=det_tile,
                              frames=np.arange(cursor, end),
+                             trace=(stats.setdefault('decode_trace', [])
+                                    if getattr(args, 'det_trace', None) else None),
                              read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
                                  ci, cam, fr, pool=pool, reduce=reduce))
             b, s, k = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
@@ -461,6 +463,7 @@ def run_dataset(args):
                             *_box_provenance(args, det_tile, det_red, det_boxsrc).items()],
                            gids)
     sess.preload()
+    det_trace_groups = {}
     try:
         for gid in gids:
             key = f'{sess.session_id}/{gid}'
@@ -507,6 +510,8 @@ def run_dataset(args):
             span = ('' if not (cfg.frame_start or cfg.frame_stop)
                     else f' [{cfg.frame_start}, {f0})')
             print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
+            if args.det_trace and det is not None:
+                det_trace_groups[key] = det_stats.get('decode_trace', [])
             # Decode's share, measured by this run: `decode_s` sums across threads, so it can
             # exceed the elapsed time; printed beside the wall clock rather than as a percentage.
             # The store's hit rate is the other half.
@@ -538,5 +543,10 @@ def run_dataset(args):
 
     finally:
         writer.close()
+    if args.det_trace:
+        import json
+        args.det_trace.parent.mkdir(parents=True, exist_ok=True)
+        args.det_trace.write_text(json.dumps(det_trace_groups, indent=1) + '\\n')
+        print(f'wrote detector trace {args.det_trace}')
     print(f'wrote {args.out} ({len(gids)} group(s))')
 

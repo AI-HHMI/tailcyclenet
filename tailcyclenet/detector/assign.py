@@ -357,7 +357,7 @@ def box_center_dist(a, b, eps=1e-7):
 
 
 def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
-          center_dist_thresh=0.5, return_index=False):
+          center_dist_thresh=0.5, return_index=False, return_trace=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     `top_k` is the expected animal count, not a hard cap: it is applied AFTER NMS so a frame
@@ -382,13 +382,23 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
     anchor, so that index is the only way to pair a surviving box with its own keypoints --
     recovering it afterwards by matching box geometry is ambiguous wherever two anchors decode to
     near-identical boxes, which is exactly what NMS is there to collapse.
+
+    `return_trace=True` adds a fourth return value after the optional index: an output-neutral
+    diagnostic dictionary with candidate counts and the score-ordered boxes/scores before NMS and
+    after NMS but before the top-k cap. It is intentionally opt-in because retaining those tensors
+    costs memory; the ordinary return arity and values are unchanged.
     """
     scores = obj_logits.sigmoid()
     keep = scores >= score_thresh
     if not keep.any():
         empty = (boxes.new_zeros((0, 4)), scores.new_zeros((0,)))
-        return (*empty, torch.zeros(0, dtype=torch.long, device=boxes.device)) \
-            if return_index else empty
+        index = torch.zeros(0, dtype=torch.long, device=boxes.device)
+        trace = {'n_total': int(scores.numel()), 'n_score': 0, 'n_nms': 0, 'n_top_k': 0,
+                 'score_boxes': boxes.new_zeros((0, 4)), 'score_scores': scores.new_zeros((0,)),
+                 'nms_boxes': boxes.new_zeros((0, 4)), 'nms_scores': scores.new_zeros((0,)),
+                 'nms_index': index}
+        out = (*empty, index) if return_index else empty
+        return (*out, trace) if return_trace else out
     # STABLE, because these scores are SATURATED near 1.0, so almost every comparison in this
     # sort is a tie and an unstable tie-break decides which of two overlapping boxes survives
     # greedy NMS -- and in what row order the survivors leave, which is the order `associate` and
@@ -398,8 +408,9 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
     b, s = boxes[keep][order], scores[keep][order]
     ix = keep.nonzero().flatten()[order]
 
+    score_b, score_s = b, s
     kept_b, kept_s, kept_i = [], [], []
-    while b.numel() and len(kept_b) < top_k:
+    while b.numel():
         kept_b.append(b[:1])
         kept_s.append(s[:1])
         kept_i.append(ix[:1])
@@ -407,5 +418,14 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
         if center_dist_thresh is not None:
             survives &= box_center_dist(b[:1], b)[0] >= center_dist_thresh
         b, s, ix = b[survives], s[survives], ix[survives]
-    out = (torch.cat(kept_b), torch.cat(kept_s))
-    return (*out, torch.cat(kept_i)) if return_index else out
+    nms_b, nms_s, nms_i = torch.cat(kept_b), torch.cat(kept_s), torch.cat(kept_i)
+    out = (nms_b[:top_k], nms_s[:top_k])
+    if return_index:
+        out = (*out, nms_i[:top_k])
+    if return_trace:
+        trace = {'n_total': int(scores.numel()), 'n_score': int(keep.sum()),
+                 'n_nms': int(nms_b.shape[0]), 'n_top_k': int(out[0].shape[0]),
+                 'score_boxes': score_b, 'score_scores': score_s,
+                 'nms_boxes': nms_b, 'nms_scores': nms_s, 'nms_index': nms_i}
+        out = (*out, trace)
+    return out

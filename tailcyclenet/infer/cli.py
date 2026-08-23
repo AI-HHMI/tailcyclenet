@@ -131,7 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help='npz of crop points per group; default is to crop from the labels')
     ap.add_argument('--detector', type=Path, default=None,
                     help='a detector run folder. THE deployment path: boxes come from pixels, '
-                         'not from labels.')
+                         'not from labels. A run folder defaults to its latest complete '
+                         'detector_it*.pth; pass --detector-checkpoint best for historical '
+                         'detector.pth or pass an explicit checkpoint filename.')
+    ap.add_argument('--detector-checkpoint', default='latest',
+                    help="detector checkpoint selector when --detector is a run folder: 'latest' "
+                         '(default), \'best\' (historical detector.pth), or an explicit filename.')
     ap.add_argument('--allow-detector-transfer', action='store_true', default=False,
                     help='permit a detector checkpoint whose recorded [dataset] does not match '
                          'this session\'s own dataset root. A detector is trained per dataset '

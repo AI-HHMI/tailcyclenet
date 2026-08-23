@@ -1,3 +1,8 @@
+import json
+import re
+import tomllib
+from pathlib import Path
+
 import torch
 
 from .assign import (assign, box_iou, certified_anchors, decode, detector_loss,
@@ -10,6 +15,81 @@ from .data import (BoxDataset, ChunkShuffle, CohortSampler, TEMPORAL_INPUT_BY_CH
 from .pretrained import load_coco_backbone, load_pretrained_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
+
+def resolve_detector_checkpoint(path, checkpoint='latest'):
+    """Resolve a detector file from a run directory.
+
+    Directory deployment defaults to the highest complete ``detector_it*.pth`` checkpoint, not
+    historical ``detector.pth`` (which is the validation-selected *best* checkpoint). ``best``
+    remains an explicit compatibility selector; an explicit filename is also an override and is
+    therefore not subjected to the latest-completeness check.
+    """
+    p = Path(path)
+    if not p.is_dir():
+        return p
+    selector = str(checkpoint or 'latest')
+    if selector == 'best':
+        out = p / 'detector.pth'
+        if not out.exists():
+            raise ValueError(f'{p}: --detector-checkpoint best requested, but detector.pth is absent')
+        return out
+    if selector != 'latest':
+        out = p / selector
+        if not out.exists():
+            raise ValueError(f'{p}: explicit detector checkpoint {selector!r} does not exist')
+        return out
+
+    files = []
+    for candidate in p.glob('detector_it*.pth'):
+        match = re.fullmatch(r'detector_it(\d+)\.pth', candidate.name)
+        if match:
+            files.append((int(match.group(1)), candidate))
+    if not files:
+        raise ValueError(
+            f'{p}: latest detector checkpoint requested, but no detector_it*.pth files exist; '
+            'pass --detector-checkpoint best or an explicit filename for a legacy run')
+    files.sort(reverse=True)
+    expected = None
+    config_path = p / 'config.toml'
+    if config_path.exists():
+        with config_path.open('rb') as f:
+            expected = tomllib.load(f).get('training', {}).get('iters')
+        expected = None if expected is None else int(expected)
+    metrics_last = None
+    metrics_path = p / 'metrics.json'
+    if metrics_path.exists():
+        with metrics_path.open() as f:
+            history = json.load(f)
+        if history:
+            metrics_last = int(history[-1]['iteration'])
+
+    for iteration, candidate in files:
+        ckpt = torch.load(candidate, map_location='cpu', weights_only=False)
+        saved_iteration = ckpt.get('iteration')
+        if saved_iteration is None or int(saved_iteration) != iteration:
+            continue
+        if expected is not None and iteration != expected:
+            continue
+        if metrics_last is not None and iteration != metrics_last:
+            continue
+        if expected is None and metrics_last is None:
+            raise ValueError(
+                f'{p}: cannot establish that {candidate.name} is complete because neither '
+                'config.toml [training].iters nor metrics.json is present; pass '
+                '--detector-checkpoint best or an explicit filename')
+        return candidate
+
+    details = []
+    if expected is not None:
+        details.append(f'config iters={expected}')
+    if metrics_last is not None:
+        details.append(f'metrics last iteration={metrics_last}')
+    state = ', '.join(details) if details else 'missing completion metadata'
+    raise ValueError(
+        f'{p}: no complete latest detector checkpoint found ({state}); pass '
+        '--detector-checkpoint best or an explicit filename to override')
+
+
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
            'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
@@ -17,13 +97,13 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
            'decode', 'detector_loss', 'giou_loss', 'associate', 'TEMPORAL_INPUT_CHANNELS',
            'TEMPORAL_INPUTS', 'TEMPORAL_INPUT_BY_CHANNELS',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone',
-           'load_pretrained_backbone', 'paired_iou']
+           'load_pretrained_backbone', 'paired_iou', 'resolve_detector_checkpoint']
 
 # The `--det-cache` version constants lived here; detection and the pose loop are one pass now,
 # so the detections' dependencies are recorded in the prediction's own provenance instead.
 
 
-def load_detector(path, device='cpu', input_wh=None):
+def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source, tile_scale, obj_q).
 
     The input size, min_crop_dim, box_source and tile_scale are recorded in the checkpoint because
@@ -32,12 +112,11 @@ def load_detector(path, device='cpu', input_wh=None):
     supplies the size for checkpoints that predate the field. `yolox_version`,
     `bottleneck_expansion`, `p2` and `in_channels` similarly record the architecture the weights
     were shaped for (absent = the pre-key default), used only to build the right model internally.
+    For a run directory, `checkpoint='latest'` selects and verifies the highest complete
+    `detector_it*.pth`; `checkpoint='best'` explicitly selects historical `detector.pth`.
     """
     import torch
-    from pathlib import Path
-    p = Path(path)
-    if p.is_dir():
-        p = p / 'detector.pth'
+    p = resolve_detector_checkpoint(path, checkpoint=checkpoint)
     ckpt = torch.load(p, map_location='cpu', weights_only=False)
     wh = input_wh or ckpt.get('input_wh') or ckpt.get('det_input_wh')
     if wh is None:

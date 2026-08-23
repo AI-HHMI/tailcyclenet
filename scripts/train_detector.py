@@ -426,6 +426,12 @@ def main():
                         'obj_quantiles': obj_q,
                         'eval': scores}
                 torch.save(ckpt, run / f'detector_it{it:06d}.pth')
+                # Explicit latest alias for humans and downstream tooling. It is overwritten at
+                # each evaluation, so an interrupted run's alias may be incomplete; the loader's
+                # default does NOT trust this alias and instead verifies detector_it*.pth against
+                # config.toml/metrics.json. At the configured final iteration it is an unambiguous
+                # latest-complete pointer (while detector.pth retains historical best semantics).
+                torch.save(ckpt, run / 'detector_last.pth')
                 # Selected on `val` where there is one, `train` otherwise -- the same key the
                 # end-of-run `best` line reports.
                 sel = scores.get('val', scores.get('train', {})).get('r50', -float('inf'))

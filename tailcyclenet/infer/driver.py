@@ -46,6 +46,7 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
     """
     return {
         'detector': str(Path(args.detector).resolve()) if args.detector else '',
+        'detector_checkpoint': str(getattr(args, '_detector_checkpoint', '') or ''),
         'det_input_wh': str(args.det_input_wh or ''),
         'det_score': float(args.det_score),
         'det_nms_iou': float(getattr(args, 'det_nms_iou', 0.5)),
@@ -338,9 +339,11 @@ def run_dataset(args):
     det = det_wh = det_tile = det_boxsrc = None
     det_red = False
     if args.detector:
-        from tailcyclenet.detector import load_detector
+        from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
+        det_path = resolve_detector_checkpoint(args.detector, args.detector_checkpoint)
+        args._detector_checkpoint = str(det_path.resolve())
         det, det_wh, det_ds, det_mcd, det_red, det_boxsrc, det_tile, det_objq = load_detector(
-            args.detector, device, input_wh=args.det_input_wh)
+            det_path, device, input_wh=args.det_input_wh)
         # `--det-score` is not portable across detector generations, and this is the only place
         # that can tell: saturation is a property of the recipe, not the dataset. This is a
         # warning, never an automatic threshold -- the right value depends on whether coverage or
@@ -355,7 +358,7 @@ def run_dataset(args):
         # A tile-trained detector deploys on the whole frame at its training scale, and `det_wh`
         # is its TILE size: `detect_group` derives the per-camera input from `det_tile`, so
         # `det_wh` is only a fallback here.
-        print(f'detector: {args.detector} ({det_wh[0]}x{det_wh[1]}'
+        print(f'detector: {det_path} ({det_wh[0]}x{det_wh[1]}'
               + (f' TILE at scale {det_tile:g}, whole-frame input derived per camera'
                  if det_tile else '')
               + f', trained on {det_ds!r}, boxes={det_boxsrc or "keypoints"})')

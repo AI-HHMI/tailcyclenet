@@ -3286,6 +3286,7 @@ kpt_score_weight = 1.0
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
     mod.main()
     assert (out / 'detector_it000002.pth').exists()
+    assert (out / 'detector_last.pth').exists()
     assert (out / 'detector.pth').exists()
     assert (out / 'metrics.json').exists()
     assert (out / 'config.toml').exists()
@@ -4001,6 +4002,36 @@ def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
     assert loaded.in_channels == 6
     obj, boxes, _ = loaded(torch.zeros(1, 6, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
+
+
+def test_detector_run_directory_defaults_to_latest_complete_checkpoint(tmp_path):
+    from tailcyclenet.detector import resolve_detector_checkpoint
+
+    run = tmp_path / 'run'
+    run.mkdir()
+    for it in (2, 4):
+        torch.save({'iteration': it}, run / f'detector_it{it:06d}.pth')
+    (run / 'config.toml').write_text('[training]\niters = 4\n')
+    (run / 'metrics.json').write_text('[{"iteration": 2}, {"iteration": 4}]')
+    torch.save({'iteration': 2}, run / 'detector.pth')
+
+    assert resolve_detector_checkpoint(run) == run / 'detector_it000004.pth'
+    assert resolve_detector_checkpoint(run, checkpoint='best') == run / 'detector.pth'
+
+
+def test_detector_run_directory_refuses_incomplete_latest_by_default(tmp_path):
+    from tailcyclenet.detector import resolve_detector_checkpoint
+
+    run = tmp_path / 'run'
+    run.mkdir()
+    torch.save({'iteration': 2}, run / 'detector_it000002.pth')
+    (run / 'config.toml').write_text('[training]\niters = 4\n')
+    (run / 'metrics.json').write_text('[{"iteration": 2}]')
+    with pytest.raises(ValueError, match='no complete latest'):
+        resolve_detector_checkpoint(run)
+    # Explicit filename is the deliberate incomplete-run override.
+    assert resolve_detector_checkpoint(run, checkpoint='detector_it000002.pth') == \
+        run / 'detector_it000002.pth'
 
 
 def test_load_detector_absent_in_channels_means_3(tmp_path):

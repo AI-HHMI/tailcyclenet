@@ -652,9 +652,16 @@ class BoxDataset(Dataset):
         weight and returns None, matching `cohort_weights`' own convention -- the caller falls
         back to `ChunkShuffle`.
 
-        PROVABLY A NO-OP wherever every group has the same `n_views` (3dpop, branson-fly: SS5.5
-        already documents this) -- `n_views ** (alpha - 1)` is then a single constant, and any
-        constant array normalises away. That is a FREE null control for this lever, not a bug.
+        PROVABLY A NO-OP wherever every group has the SAME `n_views` -- `n_views ** (alpha - 1)`
+        is then a single constant, and any constant array normalises away. **This is NOT 3dpop as
+        actually converted**: detector_v2 plan B3 measured per-group train view counts of
+        148-160 (median 160, 59 groups) after B1a's uncapped indexing -- close to uniform but not
+        exactly, and that ~7% spread was enough to produce a real, 2-seed-confirmed positive
+        effect from `alpha=0.5` on 3dpop (r75/IoU both significantly better both seeds, see
+        `dev/scratch/wave0/b3_3d_a05_seed{23,1}.log`). The originally-planned "free null control"
+        premise for 3dpop was wrong in practice; treat any root's uniformity as measured, not
+        assumed from group-count tables alone. branson-fly was never re-measured this session --
+        do not assume its uniformity claim still holds either without checking.
 
         Composes with `cohort_weights` by elementwise product (renormalised) -- see
         `train_detector.py`'s own composition, SS2.7 B1c.

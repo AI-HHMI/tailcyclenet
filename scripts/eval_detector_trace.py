@@ -125,6 +125,8 @@ def main():
                     help='GT matching IoU threshold; default 0.5')
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--out', required=True, type=Path)
+    ap.add_argument('--events-out', type=Path,
+                    help='optional JSONL manifest of per-visible-GT stage events for W1 curation')
     args = ap.parse_args()
 
     device = args.device if torch.cuda.is_available() else 'cpu'
@@ -139,6 +141,7 @@ def main():
         session_items = [(ds.name, sess) for ds in load_datasets(args.data)
                          for sess in ds.sessions.get(args.split, [])]
     groups_out = {}
+    events = []
     for ds_name, sess in session_items:
         for gid, group in sess.groups.items():
                 trace = []
@@ -163,9 +166,14 @@ def main():
                     camera = by_camera.setdefault(record['camera'],
                                                   {'n_gt': 0, **{r: 0 for r in REASONS}})
                     camera['n_gt'] += len(reasons)
-                    for reason in reasons:
+                    for i, reason in enumerate(reasons):
                         counts[reason] += 1
                         camera[reason] += 1
+                        if args.events_out is not None:
+                            events.append({'session': sess.session_id, 'group': gid,
+                                           'frame': int(record['frame']),
+                                           'camera': record['camera'], 'gt_index': i,
+                                           'reason': reason, 'gt_box': gt[i].tolist()})
                 key = f'{sess.session_id}/{gid}'
                 groups_out[key] = {'n_gt': n_gt, **counts, 'by_camera': by_camera,
                                    'n_records': len(trace)}
@@ -176,6 +184,10 @@ def main():
                                     'nms_iou': args.nms_iou,
                                     'nms_center_dist': args.nms_center_dist,
                                     'gt_iou': args.iou, 'groups': groups_out}, indent=1) + '\n')
+    if args.events_out is not None:
+        args.events_out.parent.mkdir(parents=True, exist_ok=True)
+        args.events_out.write_text(''.join(json.dumps(event) + '\\n' for event in events))
+        print(f'wrote {args.events_out} ({len(events)} events)')
     print(f'wrote {args.out}')
 
 

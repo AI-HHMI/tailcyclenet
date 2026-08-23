@@ -985,14 +985,30 @@ def test_decode_suppresses_duplicates():
 
 
 def test_decode_default_iou_thresh_is_unchanged():
-    """detector_v2 A1: `iou_thresh`/`center_dist_thresh` are new PARAMETERS, and every checkpoint
-    on record must decode identically at the old call convention (no `iou_thresh` passed at all,
-    the previous signature's only option)."""
+    """detector_v2 A1: `iou_thresh` is a new PARAMETER, and every checkpoint on record must decode
+    identically to it at `iou_thresh=0.5` (the old hardcoded value). `center_dist_thresh` must be
+    passed explicitly as `None` here to isolate the `iou_thresh` claim -- its OWN default changed
+    to 0.5 once A5 was confirmed (see `test_decode_center_dist_is_on_by_default_now`), which is a
+    deliberate break from every checkpoint trained before A5 landed, not tested by this function."""
     boxes = torch.tensor([[10., 10., 50., 50.], [11., 11., 51., 51.], [200., 200., 260., 260.]])
     logits = torch.tensor([3.0, 2.5, 2.0])
-    b_old, s_old = decode(logits, boxes, top_k=5)
+    b_old, s_old = decode(logits, boxes, top_k=5, center_dist_thresh=None)
     b_new, s_new = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
     assert torch.equal(b_old, b_new) and torch.equal(s_old, s_new)
+
+
+def test_decode_center_dist_is_on_by_default_now():
+    """detector_v2 A5, CONFIRMED (2 seeds, 2 roots, dev/scratch/wave0/a5_centerdist_sweep*.log):
+    a bare `decode()` call (no `center_dist_thresh` passed) now suppresses a near-concentric
+    duplicate IoU alone would miss -- the opposite of the pre-A5 default. `center_dist_thresh=None`
+    is what restores the old byte-identical-to-every-prior-checkpoint behaviour."""
+    # Same centre (30, 30); side 40 vs side 100 -> IoU = 1600/10000 = 0.16, well under 0.5.
+    boxes = torch.tensor([[10., 10., 50., 50.], [-20., -20., 80., 80.], [400., 400., 440., 440.]])
+    logits = torch.tensor([3.0, 2.5, 2.0])
+    b, s = decode(logits, boxes, top_k=5, iou_thresh=0.5)
+    assert b.shape[0] == 2, 'the new default must suppress the near-concentric pair'
+    b_off, s_off = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
+    assert b_off.shape[0] == 3, 'center_dist_thresh=None must restore the pre-A5 behaviour'
 
 
 def test_decode_center_dist_suppresses_near_concentric_boxes_iou_misses():
@@ -1004,7 +1020,7 @@ def test_decode_center_dist_suppresses_near_concentric_boxes_iou_misses():
     # Same centre (30, 30); side 40 vs side 100 -> IoU = 1600/10000 = 0.16, well under 0.5.
     boxes = torch.tensor([[10., 10., 50., 50.], [-20., -20., 80., 80.], [400., 400., 440., 440.]])
     logits = torch.tensor([3.0, 2.5, 2.0])
-    b, s = decode(logits, boxes, top_k=5, iou_thresh=0.5)
+    b, s = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
     assert b.shape[0] == 3, 'IoU alone must not suppress a near-concentric pair this different in size'
 
     b2, s2 = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=0.5)

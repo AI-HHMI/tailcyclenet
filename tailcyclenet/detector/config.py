@@ -171,10 +171,14 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     train['no_decay_norm_bias'] = bool(train.get('no_decay_norm_bias', False))
     # A1/A5 (detector_v2 plan SS2.1), read by `train_detector.py`'s own periodic `score_dataset`
     # eval so a config can sweep the SAME NMS thresholds `scripts/eval_detector.py`/`infer.py` do,
-    # instead of always scoring checkpoints at `decode`'s Python defaults. 0.5 / unset (None) are
-    # exactly those defaults -- byte-identical to every run on record.
+    # instead of always scoring checkpoints at `decode`'s Python defaults. 0.5 / 0.5 are exactly
+    # those defaults -- `nms_center_dist_thresh`'s unset value CHANGED from None to 0.5 once A5
+    # was CONFIRMED (2 seeds, 2 roots): every checkpoint trained before that landed was scored
+    # (during training) without centre-distance NMS; every one trained after is scored with it on
+    # by default, matching `decode`'s own new default. Set explicitly to '' to restore the old
+    # off behaviour for a config that wants to reproduce a pre-A5 number.
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
-    ncd = train.get('nms_center_dist_thresh', None)
+    ncd = train.get('nms_center_dist_thresh', 0.5)
     train['nms_center_dist_thresh'] = None if ncd in (None, '', []) else float(ncd)
     # The negative-frame objectness BCE's own weight relative to the ordinary positive-frame
     # `obj` term -- SLEAP's `negative_loss_weight`. 1.0 (default) weighs a negative-frame item

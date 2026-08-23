@@ -357,7 +357,7 @@ def box_center_dist(a, b, eps=1e-7):
 
 
 def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
-          center_dist_thresh=None, return_index=False):
+          center_dist_thresh=0.5, return_index=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     `top_k` is the expected animal count, not a hard cap: it is applied AFTER NMS so a frame
@@ -372,8 +372,11 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
     independent survival condition alongside `iou_thresh`: a candidate box is suppressed if EITHER
     its IoU with an already-kept box is >= `iou_thresh` OR its centre sits within
     `center_dist_thresh` box-sides of one -- catching near-concentric duplicates IoU alone lets
-    through. `None` (default) is OFF and byte-identical to every checkpoint on record (detector_v2
-    plan A5).
+    through. **DEFAULT 0.5** (detector_v2 plan A5, CONFIRMED at 2 seeds on 2 roots: cuts `fp_dup`
+    74-94%, `dev/scratch/wave0/a5_centerdist_sweep*.log`, the strongest value of the {0.15, 0.3,
+    0.5} sweep). This is a DELIBERATE BREAK from every checkpoint trained before this default
+    landed -- pass `None` explicitly to restore the old byte-identical-to-every-prior-checkpoint
+    behaviour (e.g. to reproduce a pre-A5 number).
 
     `return_index=True` adds the ANCHOR index of each kept box. The keypoint branch emits per
     anchor, so that index is the only way to pair a surviving box with its own keypoints --

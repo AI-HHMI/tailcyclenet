@@ -72,12 +72,12 @@ def main():
                     help="decode's box-NMS IoU threshold; 0.5 was hardcoded and unreachable "
                          'before detector_v2 plan A1. Sweep upward (RTMDet 0.65, DLC/SLEAP '
                          'instance-level 0.8), not around 0.5.')
-    ap.add_argument('--nms-center-dist', type=float, default=0.5,
+    ap.add_argument('--nms-center-dist', type=float, default=0.3,
                     help='centre-distance NMS threshold in units of box side (scale-free); a '
                          'candidate is also dropped if its centre sits within this many box '
-                         'sides of an already-kept box, regardless of IoU. 0.5 (default) is '
-                         'CONFIRMED (detector_v2 plan A5, 2 seeds/2 roots); pass a negative value '
-                         'to disable and restore the pre-A5 behaviour.')
+                         'sides of an already-kept box, regardless of IoU. 0.3 is the deployment '
+                         'default from paired CALMS/rat-city controls; pass 0.5 for the historical '
+                         'A5 operating point or a negative value to disable.')
     ap.add_argument('--num-workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--device', default='cuda:0')

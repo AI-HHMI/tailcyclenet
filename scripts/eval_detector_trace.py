@@ -113,7 +113,7 @@ def main():
     ap.add_argument('--min-crop-dim', type=int, default=None)
     ap.add_argument('--score-thresh', type=float, default=0.01)
     ap.add_argument('--nms-iou', type=float, default=0.5)
-    ap.add_argument('--nms-center-dist', type=float, default=0.5)
+    ap.add_argument('--nms-center-dist', type=float, default=0.3)
     ap.add_argument('--top-k', type=int, default=24)
     ap.add_argument('--max-frames', type=int, default=0,
                     help='prefix length when --start-frame is zero')

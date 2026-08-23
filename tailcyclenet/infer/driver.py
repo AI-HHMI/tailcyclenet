@@ -131,7 +131,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                              score_thresh=args.det_score, reduce=det_red,
                              iou_thresh=getattr(args, 'det_nms_iou', 0.5),
-                             center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.5),
+                             center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
                              # `T`, the resolved STOP index -- not `args.max_frames` (0 whenever
                              # the range came in as --start-frame/--end-frame): it tells
                              # `detect_raw` where the clip ends, and its alignment assert accepts

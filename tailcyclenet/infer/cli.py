@@ -172,13 +172,14 @@ def build_parser() -> argparse.ArgumentParser:
                          'before detector_v2 plan A1; every external detector (RTMDet 0.65, '
                          'DLC/SLEAP instance-level 0.8) ships higher -- sweep upward, not around '
                          '0.5.')
-    ap.add_argument('--det-nms-center-dist', type=float, default=0.5,
+    ap.add_argument('--det-nms-center-dist', type=float, default=0.3,
                     help='SECOND, independent NMS survival test in units of box side (scale-free): '
                          'a candidate is also suppressed if its centre sits within this many box '
                          'sides of an already-kept box, regardless of IoU -- catches '
-                         'near-concentric duplicates IoU-only NMS misses. 0.5 (default) is '
-                         'CONFIRMED (detector_v2 plan A5, 2 seeds/2 roots, cuts fp_dup a lot); '
-                         'pass a negative value to disable and restore the pre-A5 behaviour.')
+                         'near-concentric duplicates IoU-only NMS misses. 0.3 is the deployment '
+                         'default: matched CALMS/rat-city coverage and MOTA controls beat 0.5; '
+                         'pass 0.5 for the historical A5 operating point or a negative value to '
+                         'disable.')
     ap.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
                     help='follow one animal per instance row across frames -- per-frame Hungarian '
                          'on centre distance in units of the box side, gated at one side. The '

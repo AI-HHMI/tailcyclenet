@@ -84,7 +84,7 @@ def tiled_input_wh(src_wh, tile_scale):
 
 
 @torch.no_grad()
-def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.05,
+def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
                iou_thresh=0.5, center_dist_thresh=0.5):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
@@ -96,13 +96,18 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     The split exists so every association arm shares one detection pass: detection is the
     decode-bound expensive half of a run, and identity levers change only what happens after it.
 
-    `score_thresh` defaults to 0.05, matching `decode`'s own default and `score_dataset`'s
-    "as-trained" scoring convention -- NOT the 0.99 an older, saturated-near-1.0 objectness
-    distribution (hard-1.0 target, pre-`iou_aware_obj`) would have tolerated. Measured directly
-    against the current default recipe (`iou_aware_obj=true`, COCO-pretrained): `score_thresh=0.5`
-    loses allen-mouse-combined miss 0.032->0.285 and collapses rat-city-combined miss 0.402->0.959
-    for almost no false-positive benefit (`dev/scratch/detscore/*.log`). Still sweep per
-    checkpoint -- this is a measured DEFAULT, not a universal constant.
+    `score_thresh` defaults to 0.01 -- NOT the 0.99 an older, saturated-near-1.0 objectness
+    distribution (hard-1.0 target, pre-`iou_aware_obj`) would have tolerated, and lower than
+    `decode`/`score_dataset`'s own 0.05 "as-trained" convention. Measured directly against the
+    current default recipe (`iou_aware_obj=true`, COCO-pretrained): rat-city-combined's MOTA
+    peaks AT 0.01 (0.795 vs 0.640 at 0.05 vs 0.747 at 0.0 -- 0.0 buys no MOTA over 0.01, just more
+    false positives); allen-mouse-combined and 3dpop are BYTE-IDENTICAL between 0.01 and 0.05 (no
+    detections score in that band). Deliberate choice: a false negative costs more than the extra
+    false positives a looser floor invites, and those extra candidates still pass through NMS
+    (IoU + centre-distance) and, in 3D multiview, `associate`/`CrossViewTracker`'s own
+    reprojection-residual gate (`assoc_res_max_px`, default 30px) before they can become a kept
+    detection -- this is not an unfiltered flood, it is more candidates for filters that already
+    exist. Still sweep per checkpoint -- this is a measured DEFAULT, not a universal constant.
 
     `iou_thresh` / `center_dist_thresh` are `decode`'s own NMS knobs, threaded through so a caller
     (a CLI flag, a config key) can move them -- `decode`'s Python defaults are now 0.5 / 0.5

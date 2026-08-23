@@ -60,11 +60,14 @@ def main():
                     help='top_k for decode; default is the session\'s own animal count, which is '
                          'what scripts/infer.py supplies')
     ap.add_argument('--score-thresh', type=float, default=0.05,
-                    help='0.05, matching infer.py --det-score\'s own default (CHANGED from 0.5: '
-                         'measured against the current iou_aware_obj+COCO-pretrained recipe, 0.5 '
-                         'loses allen-mouse-combined miss 0.032->0.285 and collapses rat-city-'
-                         'combined miss 0.402->0.959 for almost no false-positive benefit, '
-                         'dev/scratch/detscore/*.log). Also used as --det-score in --deploy mode.')
+                    help='0.05: score_dataset\'s own long-standing "as-trained" convention '
+                         '(unrelated to deployment tuning -- this is what the model candidate-'
+                         'decoded, not what a deployment run would keep). ALSO used as --det-score '
+                         'in --deploy mode, where it means something different: infer.py\'s own '
+                         '--det-score default is now 0.01 (CHANGED from 0.5 then 0.05, dev/reports/'
+                         '44_detector_recommended_defaults.md) -- pass --score-thresh 0.01 '
+                         'explicitly under --deploy to match it; this flag\'s own default stays '
+                         '0.05 for its primary, non-deploy purpose.')
     ap.add_argument('--nms-iou', type=float, default=0.5,
                     help="decode's box-NMS IoU threshold; 0.5 was hardcoded and unreachable "
                          'before detector_v2 plan A1. Sweep upward (RTMDet 0.65, DLC/SLEAP '

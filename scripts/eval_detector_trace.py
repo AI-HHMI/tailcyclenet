@@ -186,7 +186,7 @@ def main():
                                     'gt_iou': args.iou, 'groups': groups_out}, indent=1) + '\n')
     if args.events_out is not None:
         args.events_out.parent.mkdir(parents=True, exist_ok=True)
-        args.events_out.write_text(''.join(json.dumps(event) + '\\n' for event in events))
+        args.events_out.write_text(''.join(json.dumps(event) + '\n' for event in events))
         print(f'wrote {args.events_out} ({len(events)} events)')
     print(f'wrote {args.out}')
 

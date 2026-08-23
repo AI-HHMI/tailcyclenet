@@ -447,8 +447,10 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         ok = np.flatnonzero(np.isfinite(r_sc[:, t, c]))
         return torch.from_numpy(r_box[ok, t, c]), torch.from_numpy(r_sc[ok, t, c]), ok
 
+    raw_offered = 0
     for t in range(T):
         per_cam = [_cam(t, c) for c in range(C)]
+        raw_offered += sum(len(p[2]) for p in per_cam)
         if C == 1:
             b, s, ok = per_cam[0]
             n = min(S, len(ok))
@@ -481,15 +483,22 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                 sc[a, t, c] = float(per_cam[c][1][d])
                 if kp is not None:
                     kp[a, t, c] = r_kp[per_cam[c][2][d], t, c]
+    pre_link = int(np.isfinite(out).all(-1).sum())
     if link and tracker is None:
         out, sc = link_rows(out, sc, max_move=max_move, extra=kp,
                             state=state.setdefault('link', {}))
+    if stats is not None:
+        stats['association_raw_offered'] = stats.get('association_raw_offered', 0) + raw_offered
+        stats['association_pre_link'] = stats.get('association_pre_link', 0) + pre_link
     # LEAD 1, AFTER ASSOCIATION: drop a row that duplicates another row's animal, by maDLC's
     # keypoint-containment overlap rather than by IoU. It runs here, on the finished assignment,
     # because a duplicate is a property of the SEATED rows -- `decode`'s own per-box NMS cannot
     # see it.
     if pose_nms is not None and kp is not None:
         idy.pose_nms(out, kp, scores=sc, thresh=pose_nms, stats=stats)
+    if stats is not None:
+        stats['association_kept'] = stats.get('association_kept', 0) + \
+            int(np.isfinite(out).all(-1).sum())
 
     return out, sc, kp
 

@@ -837,6 +837,13 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 # At the window boundary, where a window's worth of full frames was just dropped:
                 # without this the freed blocks stay in glibc's arena and RSS ratchets.
                 memory.trim()
+            if stats is not None:
+                # `outcome` is allocated per block and each block owns disjoint windows, so these
+                # counts can be accumulated without double-counting overlap seams. This is the
+                # terminal window-stage ledger: detector/association loss is separate telemetry.
+                for oi, name in enumerate(OUTCOMES):
+                    key = f'window_{name.replace(" ", "_")}'
+                    stats[key] = stats.get(key, 0) + int((outcome == oi).sum())
             # THE SEAM FRAMES STAY, everything before them goes: the next block's first window
             # opens on `f_own` and would otherwise decode them a second time.
             store.evict_below(f_own)

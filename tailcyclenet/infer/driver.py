@@ -540,6 +540,16 @@ def run_dataset(args):
                     filled = det_stats.get('filled', 0) / _sl
                     print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
                           f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
+                _raw = det_stats.get('association_raw_offered', 0)
+                _pre = det_stats.get('association_pre_link', 0)
+                _kept = det_stats.get('association_kept', 0)
+                if _raw:
+                    print(f'{key}: association offered {_raw}, seated before link {_pre}, '
+                          f'kept {_kept}')
+            _window_counts = {k: v for k, v in _stats.items() if k.startswith('window_')}
+            if _window_counts:
+                print(f'{key}: window outcomes ' + ' '.join(
+                    f'{k.removeprefix("window_")}={v}' for k, v in sorted(_window_counts.items())))
 
     finally:
         writer.close()

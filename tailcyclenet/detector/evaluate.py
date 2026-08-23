@@ -130,9 +130,13 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
 
     `out_scores`, when given a list, collects every DECODED objectness this pass saw. That is the
     distribution `--det-score` cuts, and it has to be recorded at training time because it is a
-    property of the CHECKPOINT: the saturated detectors 0.99 was chosen against read q01 ~1.0,
-    while a tiled/masked one reads 0.45-0.84 and loses two thirds of its detections to the same
-    threshold. Optional so no existing caller changes.
+    property of the CHECKPOINT: an OLD, hard-1.0-objectness-target checkpoint (pre-`iou_aware_obj`)
+    saturates near 1.0 and can tolerate a threshold near 0.99, while the CURRENT default recipe
+    (`iou_aware_obj=true`, COCO-pretrained) does not saturate that way -- measured directly,
+    `--det-score 0.5` on this recipe loses allen-mouse-combined miss 0.032->0.285 and collapses
+    rat-city-combined miss 0.402->0.959 for almost no false-positive benefit
+    (`dev/scratch/detscore/*.log`), which is why the shipped default moved to 0.05. Optional so no
+    existing caller changes.
     """
     was_training = model.training
     model.eval()
@@ -279,7 +283,7 @@ def _gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
 
 
 def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_animals=None,
-                     det_score=0.5, track=True, link=False, min_views=2, max_move=1.0,
+                     det_score=0.05, track=True, link=False, min_views=2, max_move=1.0,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
                      n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
                      center_dist_thresh=0.5):

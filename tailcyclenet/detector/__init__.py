@@ -84,7 +84,7 @@ def tiled_input_wh(src_wh, tile_scale):
 
 
 @torch.no_grad()
-def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.5,
+def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.05,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
                iou_thresh=0.5, center_dist_thresh=0.5):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
@@ -96,8 +96,13 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     The split exists so every association arm shares one detection pass: detection is the
     decode-bound expensive half of a run, and identity levers change only what happens after it.
 
-    `score_thresh` defaults to 0.99, not `decode`'s 0.05: objectness is saturated near 1.0, so the
-    live range starts at 0.99 where the bottom few percent are mostly false positives.
+    `score_thresh` defaults to 0.05, matching `decode`'s own default and `score_dataset`'s
+    "as-trained" scoring convention -- NOT the 0.99 an older, saturated-near-1.0 objectness
+    distribution (hard-1.0 target, pre-`iou_aware_obj`) would have tolerated. Measured directly
+    against the current default recipe (`iou_aware_obj=true`, COCO-pretrained): `score_thresh=0.5`
+    loses allen-mouse-combined miss 0.032->0.285 and collapses rat-city-combined miss 0.402->0.959
+    for almost no false-positive benefit (`dev/scratch/detscore/*.log`). Still sweep per
+    checkpoint -- this is a measured DEFAULT, not a universal constant.
 
     `iou_thresh` / `center_dist_thresh` are `decode`'s own NMS knobs, threaded through so a caller
     (a CLI flag, a config key) can move them -- `decode`'s Python defaults are now 0.5 / 0.5

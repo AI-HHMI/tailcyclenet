@@ -136,10 +136,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help='letterbox size the detector was TRAINED at. Only needed for a '
                          'posetail-pose checkpoint, which keeps it in a config file rather than '
                          'in the weights.')
-    ap.add_argument('--det-score', type=float, default=0.5,
-                    help='objectness floor for a detection. 0.5 favours coverage, 0.97 identity; '
-                         'sweep per checkpoint (saturation is a property of the recipe, not the '
-                         'dataset).')
+    ap.add_argument('--det-score', type=float, default=0.05,
+                    help='objectness floor for a detection. 0.05 (default, CHANGED from 0.5) is '
+                         'measured against the current iou_aware_obj+COCO-pretrained recipe: at '
+                         '0.5, allen-mouse-combined loses miss 0.032 to 0.285 and rat-city-combined '
+                         'collapses miss 0.402 to 0.959 (dev/scratch/detscore/*.log), for a '
+                         'false-positive cost that barely moves; 0.5 was calibrated against an '
+                         'older, saturated-near-1.0 objectness distribution (hard-1.0 target, '
+                         'pre-iou_aware_obj) that no longer describes a checkpoint trained under '
+                         'the current recipe. Still sweep per checkpoint -- rat-city-combined '
+                         'measured its own true optimum closer to 0.01-0.02 (MOTA 0.64 vs 0.52 at '
+                         '0.05), and it remains a genuinely harder root even at its own best '
+                         'threshold.')
     ap.add_argument('--det-nms-iou', type=float, default=0.5,
                     help="decode's box-NMS IoU threshold. 0.5 was HARDCODED and unreachable "
                          'before detector_v2 plan A1; every external detector (RTMDet 0.65, '

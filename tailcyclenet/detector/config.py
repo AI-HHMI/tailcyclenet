@@ -183,7 +183,17 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # The negative-frame objectness BCE's own weight relative to the ordinary positive-frame
     # `obj` term -- SLEAP's `negative_loss_weight`. 1.0 (default) weighs a negative-frame item
     # exactly like a positive-frame one; only reachable once `[data].negative_frac` draws any.
+    # DEAD KEY: `scripts/train_detector.py`'s `detector_loss` call never receives it or any
+    # negative-item identity, so a non-default value trains byte-identically to 1.0 while a run
+    # folder records the arm as though it differed. Refuse rather than accept a config that
+    # would silently measure nothing (dev/plans/detector_false_negative_coverage.md W0.4).
     train['neg_loss_weight'] = float(train.get('neg_loss_weight', 1.0))
+    if train['neg_loss_weight'] != 1.0:
+        raise SystemExit(
+            f"[training].neg_loss_weight={train['neg_loss_weight']:g} was set, but nothing reads "
+            'it -- `detector_loss` has no negative-item weighting term, so this would train '
+            'byte-identically to the default 1.0 and report as an arm it is not. Wire it into '
+            '`detector_loss` before configuring a non-default value, or unset the key.')
     for k, default in (('rotate_deg', 45.0), ('tile_scale', 1.0)):
         data[k] = float(data.get(k, default))
     # D2 (detector_v2 plan SS2.6): scales whatever [data].input_wh resolves to (explicit or

@@ -818,6 +818,93 @@ def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeyp
         cli.main()
 
 
+def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
+    """A minimal but genuinely loadable detector checkpoint -- `load_detector` needs real
+    tensors and every key it reads, not a stub."""
+    from tailcyclenet.detector.yolox import YOLOXNano
+
+    m = YOLOXNano(version='tiny')
+    ckpt = {
+        'model_state': m.state_dict(), 'input_wh': (64, 48), 'n_keypoints': 0, 'norm': 'gn',
+        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': False,
+        'dataset': dataset, 'min_crop_dim': min_crop_dim, 'box_source': box_source,
+    }
+    p = tmp_path / 'det.pth'
+    torch.save(ckpt, p)
+    return p
+
+
+class _ReachedRunBlocks(Exception):
+    """Raised by the `run_blocks` stub in the dataset-family tests below, so a test can tell
+    "the driver got past every refusal and would have started detecting" without needing a real
+    decodable video -- `_dataset_family`'s check runs well before `run_blocks`, so reaching this
+    sentinel proves the check did NOT fire."""
+
+
+def _family_test_setup(monkeypatch, tmp_path, root_name, det_dataset, extra_argv=()):
+    """Shared plumbing for the three `_dataset_family` CLI tests: one 2D session under a
+    directory named `root_name` (so `sessions_for` reports that as `ds_name`), one detector
+    checkpoint recorded as trained on `det_dataset`, `run_blocks` stubbed to the sentinel above so
+    the test needs no real detectable pixels.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    root = tmp_path / root_name
+    cf._session_2d(root / 'test' / 's')
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL,
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                      'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    det_path = _detector_ckpt(tmp_path, det_dataset)
+
+    def boom(*a, **k):
+        raise _ReachedRunBlocks()
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.run_blocks', boom)
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--detector', str(det_path),
+                                      '--out', str(tmp_path / 'pred'), *extra_argv])
+
+
+def test_cli_refuses_a_cross_family_detector(cli, monkeypatch, tmp_path):
+    """A session under `.../other-species-tracked/test/s` (family 'other') deployed with a
+    detector recorded as trained on 'rat-city-combined' (family 'rat') must refuse before
+    `run_blocks` -- the class of accidental cross-dataset deploy the checkpoint's own `dataset`
+    key exists to catch.
+    """
+    _family_test_setup(monkeypatch, tmp_path, 'other-species-tracked', 'rat-city-combined')
+    with pytest.raises(SystemExit, match='different dataset families'):
+        cli.main()
+
+
+def test_cli_allows_a_same_family_detector_variant(cli, monkeypatch, tmp_path):
+    """`rat-city-tracked` (the session) against a `rat-city-combined` detector (family 'rat'
+    both) is the repo's OWN shipped pairing (`scratch/phase15/run.sh`'s rat-city arm) -- it must
+    reach `run_blocks`, not be refused as though it were a cross-species accident.
+    """
+    _family_test_setup(monkeypatch, tmp_path, 'rat-city-tracked', 'rat-city-combined')
+    with pytest.raises(_ReachedRunBlocks):
+        cli.main()
+
+
+def test_cli_allow_detector_transfer_bypasses_the_family_refusal(cli, monkeypatch, tmp_path):
+    """The escape hatch: an explicit, labelled transfer arm must still reach `run_blocks` even
+    when the families genuinely disagree.
+    """
+    _family_test_setup(monkeypatch, tmp_path, 'other-species-tracked', 'rat-city-combined',
+                       extra_argv=('--allow-detector-transfer',))
+    with pytest.raises(_ReachedRunBlocks):
+        cli.main()
+
+
 @pytest.mark.parametrize('argv,expect', [
     (['--anchor', 'labels', '--detector', 'nope'], 'not label rows'),
     (['--anchor', 'labels', '--boxes', 'nope.npz'], 'not label rows'),

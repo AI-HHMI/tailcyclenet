@@ -19,6 +19,20 @@ from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
 
 
+def _dataset_family(name: str) -> str:
+    """The leading `-`-token of a dataset name: 'rat-city-combined' and 'rat-city-tracked' are
+    both 'rat'; 'johnson-mouse-combined-aug' and 'johnson-mouse-combined' are both 'johnson'.
+
+    A detector-vs-session dataset check needs SOME notion of "the same dataset", but this repo
+    routinely trains a detector and a pose run, and evaluates them, on differently-suffixed roots
+    that are the same underlying species/rig (`-combined` / `-aug` / `-tracked` / `-annotated`
+    variants -- see `scratch/phase15/run.sh`'s own `rat-city-tracked` session against a
+    `rat-city-combined` detector). Exact string equality would refuse that ALREADY-WORKING,
+    ALREADY-CHECKED pairing. The first token is a coarse but effective family key for every
+    dataset name in this repo; it is not exact by construction, so it only guards the unambiguous
+    cross-species accident (a calms21 detector on a rat-city session), not a same-family variant.
+    """
+    return str(name).split('-', 1)[0].strip().lower()
 
 
 def _box_provenance(args, det_tile, det_red, det_boxsrc):
@@ -345,6 +359,24 @@ def run_dataset(args):
               + (f' TILE at scale {det_tile:g}, whole-frame input derived per camera'
                  if det_tile else '')
               + f', trained on {det_ds!r}, boxes={det_boxsrc or "keypoints"})')
+        # Training is explicitly per-dataset (scale/appearance statistics are dataset-specific --
+        # see CLAUDE.md), but nothing used to compare the checkpoint's recorded dataset against
+        # the session actually being run. A detector silently deployed on another SPECIES/rig can
+        # suffer genuine appearance/scale domain shift and report as an ordinary coverage number.
+        # Compared by FAMILY (`_dataset_family`), not exact string, so this does not refuse the
+        # repo's own `-combined`/`-aug`/`-tracked` root-name variants of one dataset. `''` means a
+        # checkpoint predating the `dataset` key -- refuse only where a real name is recorded and
+        # the family disagrees; `--allow-detector-transfer` states an explicit transfer arm (also
+        # needed for a session directory outside the `<root>/<split>/<session>` layout, where
+        # `ds_name` cannot be recovered from the path at all).
+        if det_ds and ds_name and (_dataset_family(det_ds) != _dataset_family(ds_name)) \
+                and not args.allow_detector_transfer:
+            raise SystemExit(
+                f'{args.detector}: trained on dataset {det_ds!r}, but this session is '
+                f'{ds_name!r} -- different dataset families. Detectors are trained one per '
+                'dataset -- see CLAUDE.md -- so a cross-dataset deploy risks domain-shift false '
+                'negatives measured as though they were this dataset\'s own coverage. Pass '
+                '--allow-detector-transfer for an explicit, labelled transfer-evaluation run.')
         # The detector regresses the crop rule's box, so its floor must be the pose model's floor.
         if det_mcd != cfg.min_crop_dim:
             raise SystemExit(

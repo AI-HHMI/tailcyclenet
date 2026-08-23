@@ -504,6 +504,37 @@ weight_decay = -0.1
         load_detector_config(p)
 
 
+def test_detector_config_neg_loss_weight_defaults_to_1(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    assert load_detector_config(p)['training']['neg_loss_weight'] == 1.0
+
+
+def test_detector_config_neg_loss_weight_rejects_non_default(tmp_path):
+    """DEAD KEY: `scripts/train_detector.py`'s `detector_loss` call never receives
+    `neg_loss_weight` or any negative-item identity, so a non-default value would train
+    byte-identically to 1.0 and report as an arm it is not -- refuse rather than silently no-op
+    (dev/plans/detector_false_negative_coverage.md W0.4).
+    """
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+neg_loss_weight = 2.0
+""")
+    with pytest.raises(SystemExit, match='neg_loss_weight'):
+        load_detector_config(p)
+
+
 def test_detector_config_det_scale_defaults_to_1(tmp_path):
     p = _write_config(tmp_path, """
 [data]
@@ -3987,6 +4018,36 @@ def test_load_detector_absent_in_channels_means_3(tmp_path):
     torch.save(ckpt, p)
     loaded, *_ = load_detector(p)
     assert loaded.in_channels == 3
+
+
+def test_detect_raw_refuses_a_wide_in_channels_checkpoint():
+    """`load_detector` correctly rebuilds an `in_channels=6` model (the two tests above), but
+    `detect_raw` -- the deployment loop -- has no paired-frame reader: `_fetch` always builds one
+    3-channel letterboxed frame per (camera, source frame). Forwarding a 6-channel model there
+    would silently run the stem on half real pixels and half whatever garbage occupies the other
+    three channels, and report ordinary-looking boxes. This must refuse before touching `session`
+    at all -- passing `session=None` proves the guard fires first, not after some session access
+    that happened to already be safe on this fixture.
+    """
+    from tailcyclenet.detector import detect_raw
+
+    det = YOLOXNano(version='tiny', in_channels=6)
+    with pytest.raises(SystemExit, match='in_channels=6'):
+        detect_raw(det, (96, 96), session=None, gid='g000', top_k=1)
+
+
+def test_detect_raw_default_in_channels_does_not_raise_the_guard():
+    """The ordinary `in_channels=3` model must clear the new guard and reach the (unrelated)
+    session access below it -- pinning that the guard is genuinely conditional, not a blanket
+    refusal that happens to match `in_channels=6` by coincidence.
+    """
+    from tailcyclenet.detector import detect_raw
+
+    det = YOLOXNano(version='tiny', in_channels=3)
+    with pytest.raises(AttributeError):
+        # Clears the in_channels guard, then fails on `session.groups[gid]` -- `None` has no
+        # `.groups` -- which is what proves the guard did not fire.
+        detect_raw(det, (96, 96), session=None, gid='g000', top_k=1)
 
 
 def test_p2_default_is_byte_identical_to_no_key():

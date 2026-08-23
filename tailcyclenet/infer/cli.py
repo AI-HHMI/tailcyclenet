@@ -132,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--detector', type=Path, default=None,
                     help='a detector run folder. THE deployment path: boxes come from pixels, '
                          'not from labels.')
+    ap.add_argument('--allow-detector-transfer', action='store_true', default=False,
+                    help='permit a detector checkpoint whose recorded [dataset] does not match '
+                         'this session\'s own dataset root. A detector is trained per dataset '
+                         '(scale/appearance are dataset-specific), so this is refused by default; '
+                         'pass this flag only for an explicit, labelled transfer-evaluation arm.')
     ap.add_argument('--det-input-wh', type=int, nargs=2, default=None,
                     help='letterbox size the detector was TRAINED at. Only needed for a '
                          'posetail-pose checkpoint, which keeps it in a config file rather than '

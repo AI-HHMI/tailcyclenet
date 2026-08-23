@@ -135,6 +135,20 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     from ..dataset import read_frames
     from .data import letterbox, reduce_factor, unletterbox_boxes, unletterbox_keypoints
 
+    # `_fetch` below always builds a 3-channel `arr` -- one letterboxed RGB frame per (camera,
+    # source frame). A `temporal_input='stack2'` checkpoint (`in_channels=6`) trains and
+    # `load_detector` reconstructs the wider stem correctly (that half is real, see
+    # `YOLOXNano.__init__`'s docstring), but this deployment loop has no paired-frame path to
+    # fill the other 3 channels. Forwarding it here would silently feed zeros/garbage into half
+    # the stem and report ordinary-looking boxes -- refuse instead of guessing.
+    if int(getattr(det, 'in_channels', 3)) != 3:
+        raise SystemExit(
+            f'detect_raw: this checkpoint has in_channels={det.in_channels}, but detection '
+            'always forwards one 3-channel frame at a time -- there is no paired-frame deployment '
+            "path yet (see YOLOXNano's docstring, `NOT YET WIRED`). Retrain with the default "
+            "[data].temporal_input='none', or wire a real deployment reader before using this "
+            'checkpoint.')
+
     group = session.groups[gid]
     T_clip = min(group.n_frames, max_frames or group.n_frames)
     want = np.arange(T_clip) if frames is None else np.asarray(frames, np.int64)

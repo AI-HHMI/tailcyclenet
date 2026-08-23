@@ -367,7 +367,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                                                        src_wh=src)
                                 record[f'{stage}_boxes'] = bx.numpy().tolist()
                                 record[f'{stage}_scores'] = dt[f'{key}_scores'].cpu().numpy().tolist()
-                            record['final_boxes'] = b.cpu().numpy().tolist()
+                            final_b = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
+                            record['final_boxes'] = final_b.numpy().tolist()
                             record['final_scores'] = s.cpu().numpy().tolist()
                         trace.append(record)
                     if not b.numel():

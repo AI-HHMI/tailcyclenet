@@ -115,7 +115,12 @@ def main():
     ap.add_argument('--nms-iou', type=float, default=0.5)
     ap.add_argument('--nms-center-dist', type=float, default=0.5)
     ap.add_argument('--top-k', type=int, default=24)
-    ap.add_argument('--max-frames', type=int, default=0)
+    ap.add_argument('--max-frames', type=int, default=0,
+                    help='prefix length when --start-frame is zero')
+    ap.add_argument('--start-frame', type=int, default=0)
+    ap.add_argument('--end-frame', type=int, default=0,
+                    help='exclusive source-frame end; must be a detector batch boundary unless it '
+                         'is the group end')
     ap.add_argument('--iou', type=float, default=0.5,
                     help='GT matching IoU threshold; default 0.5')
     ap.add_argument('--device', default='cuda:0')
@@ -137,10 +142,14 @@ def main():
     for ds_name, sess in session_items:
         for gid, group in sess.groups.items():
                 trace = []
+                end = args.end_frame or args.max_frames or group.n_frames
+                frames = (None if args.start_frame == 0 and not args.end_frame
+                          else np.arange(args.start_frame, min(end, group.n_frames)))
                 detect_raw(model, input_wh, sess, gid, top_k=args.top_k, device=device,
                            score_thresh=args.score_thresh, reduce=reduce,
-                           max_frames=args.max_frames, tile_scale=tile_scale,
-                           iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
+                           max_frames=min(end, group.n_frames), tile_scale=tile_scale,
+                           frames=frames, iou_thresh=args.nms_iou,
+                           center_dist_thresh=args.nms_center_dist,
                            trace=trace, trace_detail=True)
                 counts = {reason: 0 for reason in REASONS}
                 by_camera = {}

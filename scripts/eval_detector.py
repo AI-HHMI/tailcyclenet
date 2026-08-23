@@ -189,7 +189,9 @@ def main():
 
 def main_deploy(args, device):
     model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
-    _tiled(args.run, tile_scale)
+    # DEPLOYMENT's detect_raw path handles tile_scale itself: it derives a whole-frame input size
+    # per camera while preserving the animal's trained input-pixel scale. `_tiled` belongs only to
+    # score_dataset's one-whole-frame loader above, which cannot express that per-camera rule.
     ds = load_datasets(args.data)[0]
     sessions = ds.sessions.get(args.split, [])
     if not sessions:

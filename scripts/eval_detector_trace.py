@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet.crop import crop_box_for_points
 from tailcyclenet.detector import detect_raw, load_detector
 from tailcyclenet.detector.assign import box_iou
-from tailcyclenet.format import VISIBLE, load_datasets
+from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
 from posetail.posetail.cube import project_points_torch
 
 
@@ -127,11 +127,15 @@ def main():
         args.run, device=device)
     if box_source != args.boxes:
         print(f'WARNING: detector was trained on {box_source!r}, scoring GT {args.boxes!r}')
-    datasets = load_datasets(args.data)
+    if (args.data / 'session.toml').exists():
+        ds_name, sessions = sessions_for(args.data, args.split)
+        session_items = [(ds_name, sess) for sess in sessions]
+    else:
+        session_items = [(ds.name, sess) for ds in load_datasets(args.data)
+                         for sess in ds.sessions.get(args.split, [])]
     groups_out = {}
-    for ds in datasets:
-        for sess in ds.sessions.get(args.split, []):
-            for gid, group in sess.groups.items():
+    for ds_name, sess in session_items:
+        for gid, group in sess.groups.items():
                 trace = []
                 detect_raw(model, input_wh, sess, gid, top_k=args.top_k, device=device,
                            score_thresh=args.score_thresh, reduce=reduce,

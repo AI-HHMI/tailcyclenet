@@ -339,8 +339,8 @@ class BoxDataset(Dataset):
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
                  strong=False, ignore_present=False, temporal_input='none',
                  scale_jitter=None, aug_switch_off_iter=0, negative_frac=None,
-                 negative_crop_frac=None, hard_event_manifest=None,
-                 hard_event_frac=None):
+                 negative_crop_frac=None, augment_copypaste=False, copypaste_max=3,
+                 hard_event_manifest=None, hard_event_frac=None):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -416,6 +416,10 @@ class BoxDataset(Dataset):
         # self.train`. It is a SINGLE recipe (color jitter, additive noise, salt & pepper, motion
         # blur, cutout, mosaic-lite), not five independently-swept levers.
         self.strong = bool(strong)
+        self.copypaste = bool(augment_copypaste)
+        self.copypaste_max = int(copypaste_max)
+        if self.copypaste and self.copypaste_max < 1:
+            raise ValueError(f'copypaste_max must be >= 1, got {copypaste_max}')
         if self.strong and self.use_regions:
             # FAIL AT CONSTRUCTION, not on the ~20% of items that happen to draw mosaic-lite: a
             # composite frame has no expressible certified-area mask.
@@ -1276,6 +1280,69 @@ class BoxDataset(Dataset):
             break
         return boxes, kpts, img
 
+    def _copy_paste(self, i, boxes, kpts, img, rng):
+        """Paste whole donor crop-rule boxes into clear space in the rendered image.
+
+        This is deliberately a rectangular alpha crop: the detector target is a rectangular crop
+        rule, and an opaque interior keeps the donor's pixels and target exactly aligned. A one
+        pixel feather at the crop boundary supplies the alpha blend without inventing a
+        segmentation mask that the annotation format does not contain.
+        """
+        if not self.copypaste or not self.augment or not self.train or len(self) < 2:
+            return boxes, kpts, img
+        sess = self.index[i][0]
+        donors = [j for j, (dsess, _g, _f, _c) in enumerate(self.index)
+                  if dsess.session_id == sess.session_id and j != i]
+        if not donors:
+            return boxes, kpts, img
+        n = int(rng.integers(1, self.copypaste_max + 1))
+        for _ in range(n):
+            j = int(rng.choice(donors))
+            src_img, src_boxes, src_kpts = self._load_letterbox(j, with_keypoints=self.keypoints)
+            finite = torch.isfinite(src_boxes).all(-1)
+            for s in rng.permutation(torch.nonzero(finite).flatten().cpu().numpy()).tolist():
+                b = src_boxes[int(s)]
+                x0, y0, x1, y1 = (int(v) for v in b.round().tolist())
+                if x1 <= x0 or y1 <= y0 or x0 < 0 or y0 < 0 or \
+                        x1 > self.input_wh[0] or y1 > self.input_wh[1]:
+                    continue
+                bw, bh = x1 - x0, y1 - y0
+                placed = False
+                for _try in range(16):
+                    dx = int(rng.integers(0, self.input_wh[0] - bw + 1))
+                    dy = int(rng.integers(0, self.input_wh[1] - bh + 1))
+                    candidate = torch.tensor([[dx, dy, dx + bw, dy + bh]],
+                                             dtype=boxes.dtype, device=boxes.device)
+                    known = boxes[torch.isfinite(boxes).all(-1)]
+                    if known.numel():
+                        from .assign import box_center_dist
+                        if bool((box_center_dist(candidate, known)[0] < 2.5).any()):
+                            continue
+                    placed = True
+                    break
+                if not placed:
+                    continue
+                patch = src_img[y0:y1, x0:x1]
+                alpha = np.ones((bh, bw, 1), dtype=np.float32)
+                if bw > 2 and bh > 2:
+                    alpha[[0, -1], :, :] *= 0.5
+                    alpha[:, [0, -1], :] *= 0.5
+                dst = img[dy:dy + bh, dx:dx + bw].astype(np.float32)
+                img[dy:dy + bh, dx:dx + bw] = np.round(
+                    dst * (1.0 - alpha) + patch.astype(np.float32) * alpha).astype(np.uint8)
+                offset = torch.tensor([dx - x0, dy - y0, dx - x0, dy - y0],
+                                      dtype=boxes.dtype, device=boxes.device)
+                boxes = torch.cat([boxes, (b + offset).to(boxes.dtype)[None]], 0)
+                if self.keypoints and kpts is not None:
+                    k = src_kpts[int(s)].clone()
+                    k[..., :2] += offset[:2]
+                    outside = ((k[..., 0] < dx) | (k[..., 0] >= dx + bw) |
+                               (k[..., 1] < dy) | (k[..., 1] >= dy + bh))
+                    k[..., :2] = torch.where(outside[..., None], torch.nan, k[..., :2])
+                    kpts = torch.cat([kpts, k[None]], 0)
+                break
+        return boxes, kpts, img
+
     def __getitem__(self, i):
         import cv2
 
@@ -1387,6 +1454,10 @@ class BoxDataset(Dataset):
             # The only op here that adds a box -- appearance and cutout never do.
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
+        # Copy-paste is its own opt-in arm, separate from the existing strong mosaic-lite recipe.
+        # It is gated on augment/train so validation and the output-neutral default never draw it.
+        if self.copypaste and rng is not None:
+            boxes, kpts, img = self._copy_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         if prev_img is not None:
             # ORDER: (t-1, t), oldest first -- `TEMPORAL_INPUT_CHANNELS['stack2'] == 6` and

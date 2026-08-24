@@ -30,14 +30,15 @@ DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'negative_crop_frac',
     'scale_jitter', 'aug_switch_off_iter', 'alpha', 'det_scale',
-    'hard_event_manifest', 'hard_event_frac',
+    'hard_event_manifest', 'hard_event_frac', 'augment_copypaste', 'copypaste_max',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
     'max_pos_per_gt', 'box_weight', 'weight_decay', 'no_decay_norm_bias', 'nms_iou_thresh',
-    'nms_center_dist_thresh', 'neg_loss_weight',
+    'nms_center_dist_thresh', 'neg_loss_weight', 'assignment', 'box_loss', 'focal_obj',
+    'focal_gamma', 'tal_topk', 'tal_alpha', 'tal_beta', 'head_depthwise',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -277,6 +278,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # step to change at" (`[model].video_encoder_requires_grad`). 0 (default) never switches off
     # and is byte-identical to every checkpoint on record.
     data['aug_switch_off_iter'] = int(data.get('aug_switch_off_iter', 0) or 0)
+    data['augment_copypaste'] = bool(data.get('augment_copypaste', False))
+    data['copypaste_max'] = int(data.get('copypaste_max', 3))
+    if data['copypaste_max'] < 1:
+        raise SystemExit(f"[data].copypaste_max must be >= 1, got {data['copypaste_max']}")
     data['boxes'] = str(data.get('boxes', 'instances'))
     model['yolox'] = str(model.get('yolox', 'tiny'))
 
@@ -318,4 +323,27 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # unlike `bottleneck_expansion`, not tier-restricted. Default `false` is byte-identical to
     # every checkpoint on record (`YOLOXNano`'s own default).
     model['p2'] = bool(model.get('p2', False))
+
+    # Recall-v2 training switches. Defaults deliberately preserve the centre-prior/GIoU/BCE/
+    # depthwise recipe byte-for-byte; each alternative is explicit in the effective config.
+    train['assignment'] = str(train.get('assignment', 'center'))
+    if train['assignment'] not in ('center', 'tal'):
+        raise SystemExit(f"[training].assignment must be 'center' or 'tal', got "
+                         f"{train['assignment']!r}")
+    train['box_loss'] = str(train.get('box_loss', 'giou'))
+    if train['box_loss'] not in ('giou', 'ciou'):
+        raise SystemExit(f"[training].box_loss must be 'giou' or 'ciou', got "
+                         f"{train['box_loss']!r}")
+    train['focal_obj'] = bool(train.get('focal_obj', False))
+    train['focal_gamma'] = float(train.get('focal_gamma', 2.0))
+    if train['focal_gamma'] < 0:
+        raise SystemExit(f"[training].focal_gamma must be >= 0, got {train['focal_gamma']}")
+    train['tal_topk'] = int(train.get('tal_topk', 13))
+    train['tal_alpha'] = float(train.get('tal_alpha', 1.0))
+    train['tal_beta'] = float(train.get('tal_beta', 6.0))
+    if train['tal_topk'] < 1 or train['tal_alpha'] < 0 or train['tal_beta'] < 0:
+        raise SystemExit('[training].tal_topk must be >= 1 and tal_alpha/tal_beta must be >= 0')
+    train['head_depthwise'] = train.get('head_depthwise', None)
+    if train['head_depthwise'] not in (None, True, False):
+        raise SystemExit('[training].head_depthwise must be true, false, or absent')
     return cfg

@@ -369,13 +369,14 @@ class YOLOXNano(nn.Module):
     STRIDES = (8, 16, 32)
 
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
-                p2=False, in_channels=3):
+                p2=False, in_channels=3, head_depthwise=None):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
         self.bottleneck_expansion = float(bottleneck_expansion)
         self.p2 = bool(p2)
         self.in_channels = int(in_channels)
+        self.head_depthwise = head_depthwise
         if self.version == 'trimmed':
             if self.bottleneck_expansion != 0.5:
                 raise ValueError(
@@ -401,8 +402,9 @@ class YOLOXNano(nn.Module):
         self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise,
                           p2=self.p2)
         n_levels = 4 if self.p2 else 3
+        head_dw = depthwise if head_depthwise is None else bool(head_depthwise)
         self.head = Head(neck_out, n_levels=n_levels, n_keypoints=self.n_keypoints,
-                         depthwise=depthwise)
+                         depthwise=head_dw)
         if self.p2:
             self.STRIDES = (4, 8, 16, 32)
 

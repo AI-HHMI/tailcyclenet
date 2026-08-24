@@ -152,6 +152,8 @@ def main():
                        aug_switch_off_iter=data_cfg['aug_switch_off_iter'],
                        negative_frac=data_cfg['negative_frac'],
                        negative_crop_frac=data_cfg['negative_crop_frac'],
+                       augment_copypaste=data_cfg['augment_copypaste'],
+                       copypaste_max=data_cfg['copypaste_max'],
                        hard_event_manifest=data_cfg['hard_event_manifest'],
                        hard_event_frac=data_cfg['hard_event_frac'],
                        seed=train_cfg['seed'], **tiling)
@@ -265,7 +267,8 @@ def main():
     in_channels = TEMPORAL_INPUT_CHANNELS[data_cfg['temporal_input']]
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
-                      p2=model_cfg['p2'], in_channels=in_channels).to(device)
+                      p2=model_cfg['p2'], in_channels=in_channels,
+                      head_depthwise=train_cfg['head_depthwise']).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g}, '
@@ -355,7 +358,14 @@ def main():
                                         iou_aware=train_cfg['iou_aware_obj'],
                                         iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it,
                                         max_pos_per_gt=train_cfg['max_pos_per_gt'] or None,
-                                        box_weight=train_cfg['box_weight'])
+                                        box_weight=train_cfg['box_weight'],
+                                        assignment=train_cfg['assignment'],
+                                        box_loss_fn=train_cfg['box_loss'],
+                                        focal_obj=train_cfg['focal_obj'],
+                                        focal_gamma=train_cfg['focal_gamma'],
+                                        tal_topk=train_cfg['tal_topk'],
+                                        tal_alpha=train_cfg['tal_alpha'],
+                                        tal_beta=train_cfg['tal_beta'])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
@@ -410,6 +420,14 @@ def main():
                         # Part of the weights; absent means 0.5, a fact about old checkpoints.
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],
                         'pretrained': model_cfg['pretrained'],
+                        'head_depthwise': train_cfg['head_depthwise'],
+                        'assignment': train_cfg['assignment'],
+                        'box_loss': train_cfg['box_loss'],
+                        'focal_obj': train_cfg['focal_obj'],
+                        'focal_gamma': train_cfg['focal_gamma'],
+                        'tal_topk': train_cfg['tal_topk'],
+                        'tal_alpha': train_cfg['tal_alpha'],
+                        'tal_beta': train_cfg['tal_beta'],
                         # Same shape: absent means False, a fact about old checkpoints.
                         'p2': model_cfg['p2'],
                         # `in_channels` is what `load_detector` needs to rebuild the stem (absent

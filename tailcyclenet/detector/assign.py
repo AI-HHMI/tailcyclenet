@@ -60,6 +60,43 @@ def giou_loss(pred, target, eps=1e-7):
     return 1.0 - (iou - (carea - union) / carea)
 
 
+def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.0):
+    """Task-aligned assignment (YOLOv8/RTMDet style).
+
+    Candidate anchors are inside each finite GT box, then the detached prediction quality
+    ``sigmoid(obj)**alpha * IoU**beta`` selects up to ``topk`` anchors per GT.  An anchor that
+    appears in several GT top-k sets is assigned to the GT with the greatest alignment score.
+    """
+    empty = (torch.zeros(0, dtype=torch.long, device=anchors.device),) * 2
+    finite = torch.isfinite(gt_boxes).all(-1)
+    if not finite.any():
+        return empty
+    gt = gt_boxes[finite]
+    gt_ix = torch.nonzero(finite, as_tuple=True)[0]
+    cx, cy = anchors[:, 0], anchors[:, 1]
+    inside = ((cx[:, None] > gt[None, :, 0]) & (cx[:, None] < gt[None, :, 2]) &
+              (cy[:, None] > gt[None, :, 1]) & (cy[:, None] < gt[None, :, 3]))
+    if not inside.any():
+        return empty
+    with torch.no_grad():
+        quality = (obj_logits.sigmoid()[:, None].pow(alpha) *
+                   box_iou(boxes, gt).clamp_min(0).pow(beta))
+        quality = torch.where(inside, quality, torch.zeros_like(quality))
+        k = min(max(int(topk), 1), anchors.shape[0])
+        _, top_idx = quality.topk(k, dim=0)
+        pos_mask = torch.zeros_like(inside)
+        pos_mask.scatter_(0, top_idx, inside.gather(0, top_idx))
+        if not pos_mask.any():
+            return empty
+        multi = pos_mask.sum(1) > 1
+        if multi.any():
+            best_gt = quality[multi].argmax(1)
+            pos_mask[multi] = False
+            pos_mask[multi, best_gt] = True
+    pos_a, pos_g = torch.nonzero(pos_mask, as_tuple=True)
+    return pos_a, gt_ix[pos_g]
+
+
 def assign(anchors, gt_boxes, max_pos_per_gt=None):
     """Positive anchors for each ground-truth box.
 
@@ -204,10 +241,47 @@ def keypoint_loss(pred, target, gt_boxes):
     return reg, sc, int(xy_ok.sum()), int(v_ok.sum())
 
 
+def ciou_loss(pred, target, eps=1e-7):
+    """1 - CIoU, elementwise over matched ``xyxy`` box pairs."""
+    import math
+    ap = (pred[:, 2] - pred[:, 0]).clamp(0) * (pred[:, 3] - pred[:, 1]).clamp(0)
+    at = (target[:, 2] - target[:, 0]).clamp(0) * (target[:, 3] - target[:, 1]).clamp(0)
+    lt = torch.max(pred[:, :2], target[:, :2])
+    rb = torch.min(pred[:, 2:], target[:, 2:])
+    wh = (rb - lt).clamp_min(0)
+    inter = wh[:, 0] * wh[:, 1]
+    union = ap + at - inter + eps
+    iou = inter / union
+    clt = torch.min(pred[:, :2], target[:, :2])
+    crb = torch.max(pred[:, 2:], target[:, 2:])
+    cwh = (crb - clt).clamp_min(0)
+    c2 = cwh[:, 0].square() + cwh[:, 1].square() + eps
+    pcx, pcy = (pred[:, 0] + pred[:, 2]) / 2, (pred[:, 1] + pred[:, 3]) / 2
+    tcx, tcy = (target[:, 0] + target[:, 2]) / 2, (target[:, 1] + target[:, 3]) / 2
+    rho2 = (pcx - tcx).square() + (pcy - tcy).square()
+    pw = (pred[:, 2] - pred[:, 0]).clamp_min(eps)
+    ph = (pred[:, 3] - pred[:, 1]).clamp_min(eps)
+    tw = (target[:, 2] - target[:, 0]).clamp_min(eps)
+    th = (target[:, 3] - target[:, 1]).clamp_min(eps)
+    v = (4 / (math.pi ** 2)) * (torch.atan(tw / th) - torch.atan(pw / ph)).square()
+    with torch.no_grad():
+        a = v / (1 - iou + v + eps)
+    return 1.0 - iou + rho2 / c2 + a * v
+
+
+def quality_focal_loss(logits, targets, gamma=2.0):
+    """Quality Focal Loss per element for continuous quality targets in ``[0, 1]``."""
+    sigmoid = logits.sigmoid()
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    return (targets - sigmoid).abs().pow(gamma) * bce
+
+
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
                   regions=None, ignore=None, iou_aware=False, iou_aware_warmup=2000, it=None,
-                  max_pos_per_gt=None):
+                  max_pos_per_gt=None, assignment='center', box_loss_fn='giou',
+                  focal_obj=False, focal_gamma=2.0, tal_topk=13, tal_alpha=1.0,
+                  tal_beta=6.0):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -270,7 +344,12 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
-        pos, gix = assign(anchors, gt_boxes[b], max_pos_per_gt=max_pos_per_gt)
+        if assignment == 'tal':
+            pos, gix = assign_tal(anchors, gt_boxes[b], obj_logits[b].detach(),
+                                  boxes[b].detach(), topk=tal_topk, alpha=tal_alpha,
+                                  beta=tal_beta)
+        else:
+            pos, gix = assign(anchors, gt_boxes[b], max_pos_per_gt=max_pos_per_gt)
         if regions is not None:
             cert = certified_anchors(anchors, regions[b], gt_boxes[b])
             weight[b] *= cert.to(weight.dtype)
@@ -281,12 +360,13 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             n_ignored += float(ig.float().mean())
         if pos.numel():
             pos_mask[b, pos] = True
-            if use_iou_target:
+            if focal_obj or use_iou_target:
                 with torch.no_grad():
                     target[b, pos] = paired_iou(boxes[b, pos], gt_boxes[b][gix]).clamp(0.0, 1.0)
             else:
                 target[b, pos] = 1.0
-            losses_box.append(giou_loss(boxes[b, pos], gt_boxes[b][gix]))
+            loss_fn = ciou_loss if box_loss_fn == 'ciou' else giou_loss
+            losses_box.append(loss_fn(boxes[b, pos], gt_boxes[b][gix]))
             n_pos += pos.numel()
             if kpts is not None and gt_kpts is not None:
                 r, s, nk, nv = keypoint_loss(kpts[b, pos], gt_kpts[b][gix], gt_boxes[b][gix])
@@ -297,7 +377,12 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     # Divide by the image count, never by 1, when a batch has no positive at all: every animal
     # absent from every view is real on a multi-camera dataset, and a `sum` over 16 x 3780 anchors
     # over 1 is a loss of order 600 and one enormous gradient step.
-    if weight is None:
+    if focal_obj:
+        obj_all = quality_focal_loss(obj_logits, target, gamma=focal_gamma)
+        if weight is not None:
+            obj_all = obj_all * weight
+        obj_all = obj_all.sum()
+    elif weight is None:
         obj_all = F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
     else:
         # A POSITIVE IS CERTIFIED BY CONSTRUCTION -- `assign` only fires inside a GT box and

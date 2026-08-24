@@ -12,9 +12,11 @@ from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler,
                                    TEMPORAL_INPUT_BY_CHANNELS,
                                    TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, YOLOXNano, assign,
-                                   box_collate, box_iou, decode, detector_loss, giou_loss,
-                                   letterbox, paired_iou, unletterbox_boxes)
-from tailcyclenet.detector.config import DATA_KEYS, MODEL_KEYS, load_detector_config
+                                   assign_tal, box_collate, box_iou, ciou_loss, decode,
+                                   detector_loss, giou_loss, letterbox, paired_iou,
+                                   quality_focal_loss, unletterbox_boxes)
+from tailcyclenet.detector.config import (DATA_KEYS, MODEL_KEYS, TRAINING_KEYS,
+                                           load_detector_config)
 from tailcyclenet.detector.data import (_cutout_rects, _keypoints_in_rects, _photometric,
                                         random_affine)
 
@@ -399,6 +401,16 @@ def _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T
     return root
 
 
+def test_copypaste_adds_a_donor_box_without_changing_image_shape(tmp_path):
+    root = _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T=6)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), min_crop_dim=8,
+                    augment=True, augment_copypaste=True, copypaste_max=1, seed=0)
+    x, boxes = ds[0]
+    assert x.shape == (3, 64, 64)
+    assert boxes.shape[0] >= 1
+    assert torch.isfinite(boxes).all()
+
+
 def test_negative_crop_frac_absent_means_no_weighting(tmp_path):
     root = _session_one_corner_animal(tmp_path)
     ds = BoxDataset(root, 'train', input_wh=(32, 32))
@@ -592,6 +604,78 @@ def test_giou_is_zero_for_a_perfect_box():
     b = torch.tensor([[10.0, 20.0, 50.0, 80.0]])
     assert float(giou_loss(b, b)) < 1e-5
     assert float(giou_loss(b, b + 200)) > 1.0        # disjoint -> worse than any overlap
+
+
+def test_tal_finds_edge_candidates_without_center_radius():
+    anchors = torch.tensor([[4., 4., 8.], [12., 12., 8.], [20., 20., 8.], [80., 80., 8.]])
+    gt = torch.tensor([[0., 0., 100., 100.]])
+    obj = torch.zeros(4)
+    boxes = torch.tensor([[0., 0., 8., 8.], [4., 4., 16., 16.],
+                          [12., 12., 24., 24.], [70., 70., 90., 90.]])
+    tal_pos, tal_gt = assign_tal(anchors, gt, obj, boxes, topk=3)
+    center_pos, _ = assign(anchors, gt)
+    assert center_pos.numel() <= 1
+    assert tal_pos.numel() >= 3 and bool((tal_gt == 0).all())
+
+
+def test_tal_center_assignment_contract_is_unchanged():
+    anchors = torch.tensor([[4., 4., 8.], [12., 12., 8.], [20., 20., 8.]])
+    gt = torch.tensor([[0., 0., 25., 25.]])
+    expected = assign(anchors, gt)
+    got = assign(anchors, gt, max_pos_per_gt=None)
+    for a, b in zip(expected, got):
+        torch.testing.assert_close(a, b)
+
+
+def test_ciou_has_finite_nonzero_gradient_for_disjoint_boxes():
+    pred = torch.tensor([[0., 0., 1., 1.]], requires_grad=True)
+    target = torch.tensor([[5., 5., 6., 6.]])
+    loss = ciou_loss(pred, target).sum()
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(pred.grad).all()
+    assert float(pred.grad.abs().sum()) > 0
+
+
+def test_recall_v2_loss_switches_are_live_together():
+    torch.manual_seed(11)
+    anchors = YOLOXNano().anchor_points(128, 128, 'cpu')
+    obj = torch.randn(1, anchors.shape[0], requires_grad=True)
+    boxes = torch.rand(1, anchors.shape[0], 4) * 128
+    # Make every decoded box valid for the synthetic assignment quality calculation.
+    boxes[..., 2:] = boxes[..., :2] + boxes[..., 2:].abs() + 1.0
+    gt = torch.tensor([[[8., 8., 96., 96.]]])
+    loss, parts = detector_loss(obj, boxes, anchors, gt, assignment='tal', box_loss_fn='ciou',
+                                focal_obj=True)
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(obj.grad).all() and parts['n_pos'] > 0
+
+
+def test_detector_loss_giou_path_is_byte_identical():
+    torch.manual_seed(12)
+    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
+    obj = torch.randn(1, anchors.shape[0])
+    boxes = torch.rand(1, anchors.shape[0], 4) * 64
+    gt = torch.tensor([[[10., 10., 40., 40.]]])
+    a, ap = detector_loss(obj, boxes, anchors, gt)
+    b, bp = detector_loss(obj, boxes, anchors, gt, box_loss_fn='giou')
+    assert torch.equal(a, b) and ap == bp
+
+
+def test_qfl_gamma_zero_is_bce():
+    logits = torch.tensor([-2., 0.3, 4.])
+    targets = torch.tensor([0., 0.2, 1.])
+    got = quality_focal_loss(logits, targets, gamma=0.0)
+    want = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    torch.testing.assert_close(got, want)
+
+
+def test_head_depthwise_none_keeps_tier_default():
+    default = YOLOXNano(version='nano')
+    explicit = YOLOXNano(version='nano', head_depthwise=None)
+    dconv = default.head.reg_convs[0][0][0][0]
+    econv = explicit.head.reg_convs[0][0][0][0]
+    assert dconv.groups == econv.groups
+    assert dconv.groups == dconv.in_channels
 
 
 def test_assign_ignores_nan_boxes():
@@ -3088,6 +3172,40 @@ def _write_config(tmp_path, text, name='config.toml'):
     p = tmp_path / name
     p.write_text(text)
     return p
+
+
+def test_detector_config_recall_v2_defaults_and_keys(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    t = cfg['training']
+    d = cfg['data']
+    assert (t['assignment'], t['box_loss'], t['focal_obj']) == ('center', 'giou', False)
+    assert t['focal_gamma'] == 2.0 and t['tal_topk'] == 13
+    assert t['head_depthwise'] is None
+    assert d['augment_copypaste'] is False and d['copypaste_max'] == 3
+    assert 'assignment' in TRAINING_KEYS and 'augment_copypaste' in DATA_KEYS
+
+
+@pytest.mark.parametrize(('key', 'value'), [('assignment', 'bad'), ('box_loss', 'bad')])
+def test_detector_config_recall_v2_choice_validation(tmp_path, key, value):
+    p = _write_config(tmp_path, f"""
+[data]
+path = "/tmp/ds"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+{key} = "{value}"
+""")
+    with pytest.raises(SystemExit, match=key):
+        load_detector_config(p)
 
 
 def test_detector_config_loads_with_shipped_defaults(tmp_path):

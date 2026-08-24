@@ -67,6 +67,11 @@ def load_coco_backbone(model, tier, weights_dir=None):
     stays at its fresh `nn.GroupNorm` init, weight 1 / bias 0, which is deliberate: conv weights
     trained under BatchNorm statistics landing in a GroupNorm net is exactly why the backbone
     wants a lower LR than the fresh neck/head, not a reason to fake BN stats that do not exist).
+
+    The stem's first conv (`stem.conv.0.weight`) also gets the two numeric corrections the module
+    docstring sets up: Megvii [0,255] input -> this repo's [0,1] input (the loader feeds
+    `x / 255.0`; the conv is bias-free so it is exactly linear in the input), then BGR -> RGB per
+    Focus group via `BGR_TO_RGB_FOCUS_PERM`.
     """
     if tier == 'trimmed' or tier not in YOLOX_TIERS:
         raise ValueError(f"load_coco_backbone: tier must be a canonical YOLOX_TIERS name "
@@ -96,7 +101,6 @@ def load_coco_backbone(model, tier, weights_dir=None):
     own = model.backbone.state_dict()
     to_load, n_loaded, n_total = {}, 0, 0
     for k, v in own.items():
-        # GroupNorm affine -- no BN source.
         if v.dim() != 4:
             continue
         n_total += 1
@@ -104,7 +108,6 @@ def load_coco_backbone(model, tier, weights_dir=None):
             continue
         w_src = remapped[k].clone()
         if k == 'stem.conv.0.weight':
-            # Megvii [0,255] -> this repo's [0,1] input, then BGR -> RGB per Focus group.
             w_src = w_src * 255.0
             w_src = w_src[:, BGR_TO_RGB_FOCUS_PERM]
         to_load[k] = w_src

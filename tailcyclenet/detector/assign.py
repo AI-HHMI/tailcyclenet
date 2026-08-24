@@ -134,6 +134,31 @@ def assign(anchors, gt_boxes, max_pos_per_gt=None):
 
     Returns (pos_anchor_ix, pos_gt_ix). Empty when there is no
     finite box.
+
+    Notes.
+
+    The candidacy is AND, not OR: `yolox.py` builds a box as `centre +- exp(ltrb) * stride` and
+    `exp` is strictly positive, so a predicted box ALWAYS contains its own anchor centre -- an
+    anchor outside its assigned GT box has a target it cannot reach, while the objectness line
+    simultaneously teaches the head to fire there. Upstream YOLOX takes the OR as a SimOTA
+    *candidate* set and then prunes it; with no SimOTA the candidate set is the positive set.
+    Measured under `|`: 71% of rat-city's positives sat outside their own box and the model
+    could not fit them; under `&`, 0.94-0.97.
+
+    THE IGNORE BAND: anchors inside an animal but positive for none. `detector_loss` starts from
+    a zeros target and sets only the positives, so every one of these is supervised as "no animal
+    here" WHILE SITTING ON ONE. Screened at the shipped geometry it is 43.5% of every anchor in
+    the image on rat-city's 640x640 tiles at scale 1.0 -- 13.5x the positive count -- and
+    provably 0.00% on branson-fly, where a 30 px fly is smaller than the centre radius at every
+    stride so `inside` is a subset of `near`. That makes branson-fly a free inertness control.
+    APT's assigner has the same three bands and ignores this one deliberately.
+
+    An anchor can only serve one box: it is given the one whose centre it is closest to, so two
+    overlapping animals do not both claim it and cancel. When `max_pos_per_gt` caps a GT's
+    candidates, KEEP ONLY THE K CLOSEST ANCHORS PER GT by centre distance -- `topk` still
+    returns k indices even for a GT with fewer than k real candidates; `ok.gather` there reads
+    back False (d was inf, never a candidate), so `scatter_` correctly leaves those slots
+    uncapped-into rather than inventing a fake positive.
     """
     empty = (torch.zeros(0, dtype=torch.long, device=anchors.device),) * 2
     keep = torch.isfinite(gt_boxes).all(-1)
@@ -149,33 +174,13 @@ def assign(anchors, gt_boxes, max_pos_per_gt=None):
     gcy = (gt[:, 1] + gt[:, 3]) / 2
     r = CENTER_RADIUS * stride[:, None]
     near = ((cx[:, None] - gcx[None]).abs() < r) & ((cy[:, None] - gcy[None]).abs() < r)
-    # AND, not OR. `yolox.py` builds a box as `centre +- exp(ltrb) * stride` and `exp` is strictly
-    # positive, so a predicted box ALWAYS contains its own anchor centre: an anchor outside its
-    # assigned GT box has a target it cannot reach, while the objectness line below simultaneously
-    # teaches the head to fire there. Upstream YOLOX takes the OR as a SimOTA *candidate* set and
-    # then prunes it; with no SimOTA the candidate set is the positive set. Measured under `|`:
-    # 71% of rat-city's positives sat outside their own box and the model could not fit them;
-    # under `&`, 0.94-0.97.
     ok = inside & near
-    # THE IGNORE BAND: inside an animal, positive for none. `detector_loss` starts from a zeros
-    # target and sets only the positives, so today every one of these is supervised as "no animal
-    # here" WHILE SITTING ON ONE. Screened at the shipped geometry it is 43.5% of every anchor in
-    # the image on rat-city's 640x640 tiles at scale 1.0 -- 13.5x the positive count -- and
-    # provably 0.00% on branson-fly, where a 30 px fly is smaller than the centre radius at every
-    # stride so `inside` is a subset of `near`. That makes branson-fly a free inertness control.
-    # APT's assigner has the same three bands and ignores this one deliberately.
     if not ok.any():
         return empty
 
-    # An anchor can only serve one box: give it the one whose centre it is closest to, so two
-    # overlapping animals do not both claim it and cancel.
     d = (cx[:, None] - gcx[None]) ** 2 + (cy[:, None] - gcy[None]) ** 2
     d = torch.where(ok, d, torch.full_like(d, float('inf')))
     if max_pos_per_gt is not None and max_pos_per_gt < d.shape[0]:
-        # KEEP ONLY THE K CLOSEST ANCHORS PER GT, by centre distance -- `topk` still returns k
-        # indices even for a GT with fewer than k real candidates; `ok.gather` there reads back
-        # False (d was inf, never a candidate), so `scatter_` correctly leaves those slots
-        # uncapped-into rather than inventing a fake positive.
         _, top_idx = torch.topk(d, max_pos_per_gt, dim=0, largest=False)
         capped = torch.zeros_like(ok)
         capped.scatter_(0, top_idx, ok.gather(0, top_idx))
@@ -235,23 +240,25 @@ def keypoint_loss(pred, target, gt_boxes):
     4. **L1 over the box side, not OKS.** OKS buys scale-invariance through a per-keypoint sigma
        table we would have to invent per dataset; dividing by the side gets the same invariance
        with no table.
+
+    Notes.
+
+    The finite coordinates are SELECTED, not multiplied by a mask (see note 1 above):
+    `target[xy_ok]` is (n_finite, 2) with no NaN in it, so `0 * NaN` can never poison the
+    gradient. The normaliser is the per-animal box side `(P,1)`.
     """
     if pred.numel() == 0:
         z = pred.sum() * 0.0
         return z, z, 0, 0
-    # Per-animal normaliser (P,1); the coordinate mask (P,K).
     side = (0.5 * ((gt_boxes[:, 2] - gt_boxes[:, 0]) + (gt_boxes[:, 3] - gt_boxes[:, 1]))
             ).clamp_min(1.0)[:, None]
     xy_ok = torch.isfinite(target[..., :2]).all(-1)
-    # SELECT, do not multiply -- see note 1. `target[xy_ok]` is (n_finite, 2) with no NaN in it.
     if xy_ok.any():
         d = (pred[..., :2][xy_ok] - target[..., :2][xy_ok]).abs().sum(-1)
         reg = d / side.expand_as(xy_ok)[xy_ok]
-        # note 2: normalise by the finite count, not by K.
         reg = reg.sum() / xy_ok.sum()
     else:
         reg = pred.sum() * 0.0
-    # note 3: the score channel's mask is `status`, not coordinate-finiteness.
     v_ok = torch.isfinite(target[..., 2])
     if v_ok.any():
         sc = F.binary_cross_entropy_with_logits(
@@ -347,18 +354,41 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     `box_weight` -- a real effect, and the alternative (normalising by the certified count)
     would have made the masked and unmasked arms differ in two things at once. So the shift is
     left in and `parts['certified']` REPORTS it.
+
+    Notes.
+
+    `pos_mask` is WHICH anchors are true positives, independent of what VALUE `target` holds
+    there -- always built (cheap, boolean), only READ by the weight-forcing line, which itself
+    only runs when `weight is not None`. The weight tensor is built when `--use-regions`
+    certifies where objectness may be supervised at all and/or `ignore` excludes a specific
+    unannotated animal's footprint from it; neither means the byte-identical fast path
+    (`weight is None`).
+
+    The objectness term divides by the image count, never by 1, when a batch has no positive at
+    all: every animal absent from every view is real on a multi-camera dataset, and a `sum` over
+    16 x 3780 anchors over 1 is a loss of order 600 and one enormous gradient step.
+
+    A POSITIVE IS CERTIFIED BY CONSTRUCTION (`assign` only fires inside a GT box and
+    `certified_anchors` unions those boxes in), but it is forced in the weight rather than
+    assumed, because a positive dropped from the objectness term would be an animal trained as
+    nothing, and no loss curve would show it. Keyed on `pos_mask` (WHETHER an anchor is a
+    positive), never on `target` (its BCE VALUE there) -- under `iou_aware` those two come
+    apart.
+
+    THE WARMUP TRANSITION IS VISIBLE IN THE LOG rather than inferred from a curve: `iou_target`
+    reads exactly 1.000 for `it < iou_aware_warmup` (hard targets), then drops to the model's
+    own mean positive-anchor IoU once the switch fires -- the chicken-and-egg trap the docstring
+    warns about would show up here as a value stuck near 0 rather than climbing.
+
+    The keypoint terms average over the IMAGES that had a positive, matching how `box` is
+    normalised; both lists are empty when nothing was assigned, and then these are exact zeros
+    with no gradient.
     """
     device = obj_logits.device
     B = obj_logits.shape[0]
     target = torch.zeros_like(obj_logits)
-    # WHICH anchors are true positives, independent of what VALUE `target` holds there -- see the
-    # docstring's second trap. Always built (cheap, boolean); only READ by the weight-forcing line
-    # below, which itself only runs when `weight is not None`.
     pos_mask = torch.zeros_like(obj_logits, dtype=torch.bool)
     use_iou_target = iou_aware and (it is None or it >= iou_aware_warmup)
-    # `--use-regions` certifies where objectness may be supervised at all; `ignore` excludes a
-    # specific unannotated animal's footprint from it. Either alone, or both, need the weight
-    # tensor built; neither means the byte-identical fast path below (`weight is None`).
     weight = None if regions is None and ignore is None else torch.ones_like(obj_logits)
     n_cert, n_ignored = 0.0, 0.0
     losses_box, n_pos = [], 0
@@ -375,7 +405,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             weight[b] *= cert.to(weight.dtype)
             n_cert += float(cert.float().mean())
         if ignore is not None:
-            # Anchor inside an ignore box.
             ig = certified_anchors(anchors, ignore[b], None)
             weight[b] *= (~ig).to(weight.dtype)
             n_ignored += float(ig.float().mean())
@@ -395,9 +424,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                 kpt_sc.append(s)
                 n_kpt += nk
                 n_vis += nv
-    # Divide by the image count, never by 1, when a batch has no positive at all: every animal
-    # absent from every view is real on a multi-camera dataset, and a `sum` over 16 x 3780 anchors
-    # over 1 is a loss of order 600 and one enormous gradient step.
     if focal_obj:
         obj_all = quality_focal_loss(obj_logits, target, gamma=focal_gamma)
         if weight is not None:
@@ -406,12 +432,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     elif weight is None:
         obj_all = F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
     else:
-        # A POSITIVE IS CERTIFIED BY CONSTRUCTION -- `assign` only fires inside a GT box and
-        # `certified_anchors` unions those boxes in -- but it is forced here rather than assumed,
-        # because a positive dropped from the objectness term would be an animal trained as
-        # nothing, and no loss curve would show it. Keyed on `pos_mask` (WHETHER an anchor is a
-        # positive), never on `target` (its BCE VALUE there) -- under `iou_aware` those two come
-        # apart.
         weight = torch.maximum(weight, pos_mask.to(weight.dtype))
         obj_all = (F.binary_cross_entropy_with_logits(obj_logits, target, reduction='none')
                    * weight).sum()
@@ -425,14 +445,8 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     if ignore is not None:
         parts['ignored'] = n_ignored / max(B, 1)
     if iou_aware:
-        # THE WARMUP TRANSITION, VISIBLE IN THE LOG rather than inferred from a curve: reads
-        # exactly 1.000 for `it < iou_aware_warmup` (hard targets), then drops to the model's own
-        # mean positive-anchor IoU once the switch fires -- the chicken-and-egg trap the docstring
-        # warns about would show up here as a value stuck near 0 rather than climbing.
         parts['iou_target'] = float(target[pos_mask].mean()) if bool(pos_mask.any()) else 0.0
     if kpts is not None and gt_kpts is not None:
-        # Mean over the IMAGES that had a positive, matching how `box` is normalised. Both lists
-        # are empty when nothing was assigned, and then these are exact zeros with no gradient.
         kr = (torch.stack(kpt_reg).mean() if kpt_reg else torch.zeros((), device=device))
         ks = (torch.stack(kpt_sc).mean() if kpt_sc else torch.zeros((), device=device))
         total = total + kpt_weight * kr + kpt_score_weight * ks
@@ -493,6 +507,14 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
     diagnostic dictionary with candidate counts and the score-ordered boxes/scores before NMS and
     after NMS but before the top-k cap. It is intentionally opt-in because retaining those tensors
     costs memory; the ordinary return arity and values are unchanged.
+
+    Notes.
+
+    The sort is STABLE, because these scores are SATURATED near 1.0, so almost every comparison
+    in this sort is a tie and an unstable tie-break decides which of two overlapping boxes
+    survives greedy NMS -- and in what row order the survivors leave, which is the order
+    `associate` and `CrossViewTracker` birth into. Without this the box set is reproducible only
+    for a fixed torch version and device.
     """
     scores = obj_logits.sigmoid()
     keep = scores >= score_thresh
@@ -508,11 +530,6 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
                  'nms_index': index}
         out = (*empty, index) if return_index else empty
         return (*out, trace) if return_trace else out
-    # STABLE, because these scores are SATURATED near 1.0, so almost every comparison in this
-    # sort is a tie and an unstable tie-break decides which of two overlapping boxes survives
-    # greedy NMS -- and in what row order the survivors leave, which is the order `associate` and
-    # `CrossViewTracker` birth into. Without this the box set is reproducible only for a fixed
-    # torch version and device.
     order = scores[keep].argsort(descending=True, stable=True)
     b, s = boxes[keep][order], scores[keep][order]
     ix = keep.nonzero().flatten()[order]

@@ -45,6 +45,13 @@ class PoseLoss(TotalLoss):
         """Identical to `TotalLoss.forward`, plus one term. `vis_2d_true` is THIS repo's own
         field, kept on a separate wire from `vis_true_cams` (which RAISES without `vis_true` --
         exactly the state every 2D batch is in).
+
+        The target `(b,t,n,cams,1)` is moved to cams-first and the prediction `(cams,b,t,n)` is
+        given a matching trailing singleton, so both end up `(cams,b,t,n,1)`. The BCE is applied
+        UNCONDITIONALLY: gating on `isfinite` would let a genuinely poisoned prediction silently
+        revert to the detached placeholder instead of reaching the poison check. A non-finite
+        term still attached to the graph would return NaN gradients to every upstream parameter;
+        `run_batch` converts this exact message into a skipped step.
         """
         total = super().forward(model, outputs, coords_true, vis_true, vis_true_cams,
                                 cgroup=cgroup, p2d=p2d, device=device)
@@ -52,17 +59,10 @@ class PoseLoss(TotalLoss):
         vis_loss_2d = torch.tensor(float('nan'), device=device)
         if self.vis_loss_2d_weight != 0 and vis_2d_true is not None \
                 and 'vis_pred_2d' in outputs:
-            # outputs['vis_pred_2d'] is (cams,b,t,n); vis_2d_true is (b,t,n,cams,1). Move the
-            # target to cams-first and give the prediction a matching trailing singleton.
-            # target -> (cams,b,t,n,1); pred -> (cams,b,t,n,1).
             target = vis_2d_true.permute(3, 0, 1, 2, 4)
             pred = outputs['vis_pred_2d'][..., None]
-            # UNCONDITIONAL: gating on `isfinite` would let a genuinely poisoned prediction
-            # silently revert to the detached placeholder instead of reaching the poison check.
             vis_loss_2d = self.vis_loss_2d_weight * masked_bce_with_logits(pred, target)
 
-        # A non-finite term still attached to the graph would return NaN gradients to every
-        # upstream parameter; `run_batch` converts this exact message into a skipped step.
         if vis_loss_2d.requires_grad and not torch.isfinite(vis_loss_2d):
             raise ValueError(
                 "sub-loss(es) went non-finite while attached to the autograd graph: "

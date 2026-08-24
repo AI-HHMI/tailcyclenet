@@ -140,20 +140,45 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
     Returns a list of dicts: {'point': (3,), 'boxes': {cam_ix: box}, 'residual': float}. A
     single-view instance has `point` all-NaN and `residual` inf: there is nothing to triangulate
     from one ray, and inventing a depth would be a position no camera claimed.
+
+    Notes.
+
+    A NaN BOX IS "NO DETECTION HERE". `unletterbox_boxes` returns NaN for a box the frame clamp
+    left with no area, and `_triangulate` ends in `torch.linalg.svd`, which RAISES on non-finite
+    input -- so the caller died mid-clip, after hours of decode, on a 57k-frame group. `used`
+    already means "this detection is not available", and both loops honour it, so seeding it up
+    front is the one place that covers every consumer.
+
+    Every cross-camera pair is scored by its own reprojection residual; candidates are sorted
+    DESCENDING support, ASCENDING residual as the tie-break within equal support -- see the
+    `corroborate` entry above and plan SS3.2.2 for why a count beats any fused reducer.
+    `corroborate=False` sets every `support` to 0, collapsing this to the old residual-only sort.
+    Each group is then GROWN with any unused box in another camera that agrees with the point.
+
+    THE REFIT RESIDUAL WAS COMPUTED, STORED, AND NEVER TESTED: the group is accepted on the
+    residual of the PAIR that seeded it -- a two-view reprojection residual, which is only an
+    epipolar statistic and which two rays can always satisfy -- and then grown by cameras each
+    accepted against the PAIR's point. Re-triangulating over all of them can land somewhere none
+    of the views agrees with; testing the number that was already here is the one place the
+    geometry can speak with more than two rays. The gate is `not res_fit <= max_res_px`, NOT
+    `res_fit > max_res_px`: the latter is False for NaN, so a degenerate refit passed the gate
+    and planted an instance whose `point` is non-finite -- which `CrossViewTracker` then holds
+    forever (a target with a non-finite point is filtered out of `slots`, so it is never matched,
+    never aged and never retired, and its row goes dead for the clip).
+
+    `members` records WHICH detection in each camera, so a caller holding a per-camera score
+    array can follow it through the association instead of re-deriving the match. The
+    `min_views == 1` pass emits whatever no pair claimed, in camera order then score order (the
+    boxes arrive score-ordered from `decode`) -- deterministic, so two arms over one clip see the
+    same rows.
     """
     assert min_views in (1, 2), f'min_views is 1 or 2, got {min_views}'
     centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
     n_cams = len(cgroup)
 
-    # A NaN BOX IS "NO DETECTION HERE", AND IT USED TO RAISE. `unletterbox_boxes` returns NaN for
-    # a box the frame clamp left with no area, and `_triangulate` ends in `torch.linalg.svd`,
-    # which RAISES on non-finite input -- so `detect_group` died mid-clip, after hours of decode,
-    # on the 57k-frame group. `used` already means "this detection is not available", and both
-    # loops below honour it, so seeding it here is the one place that covers every consumer.
     used = {(c, i) for c in range(n_cams)
             for i in range(centres[c].shape[0]) if not bool(torch.isfinite(centres[c][i]).all())}
 
-    # Every cross-camera pair, scored by its own reprojection residual.
     cands = []
     for ca, cb in itertools.combinations(range(n_cams), 2):
         for ia in range(centres[ca].shape[0]):
@@ -168,16 +193,12 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
                 support = (_support_count(cgroup, (ca, cb), centres, used, p3d, max_res_px)
                           if corroborate else 0)
                 cands.append((support, res, (ca, ia), (cb, ib), p3d))
-    # DESCENDING support, ASCENDING residual as the tie-break within equal support -- see the
-    # docstring's `corroborate` entry and plan SS3.2.2 for why a count beats any fused reducer.
-    # `corroborate=False` sets every `support` to 0, collapsing this to the old residual-only sort.
     cands.sort(key=lambda c: (-c[0], c[1]))
     out = []
     for _support, res, a, b, p3d in cands:
         if a in used or b in used or res > max_res_px:
             continue
         members = {a[0]: a[1], b[0]: b[1]}
-        # Grow the group with any unused box in another camera that agrees with the point.
         for c in range(n_cams):
             if c in members:
                 continue
@@ -195,31 +216,17 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         cams = tuple(sorted(members))
         pts = torch.stack([centres[c][members[c]] for c in cams])
         refined = _triangulate(cgroup, cams, pts)
-        # THE REFIT RESIDUAL WAS COMPUTED, STORED, AND NEVER TESTED. The group is accepted on the
-        # residual of the PAIR that seeded it -- a two-view reprojection residual, which is only an
-        # epipolar statistic and which two rays can always satisfy -- and then grown by cameras
-        # each accepted against the PAIR's point. Re-triangulating over all of them can land
-        # somewhere none of the views agrees with; testing the number that was already here is the
-        # one place the geometry can speak with more than two rays.
         res_fit = _residual(cgroup, cams, pts, refined)
-        # NOT `res_fit > max_res_px`: that is False for NaN, so a degenerate refit passed the gate
-        # and planted an instance whose `point` is non-finite -- which `CrossViewTracker` then
-        # holds forever (a target with a non-finite point is filtered out of `slots`, so it is
-        # never matched, never aged and never retired, and its row goes dead for the clip).
         if not res_fit <= max_res_px:
             continue
         out.append({'point': refined, 'residual': res_fit,
                     'boxes': {c: boxes_per_cam[c][members[c]] for c in cams},
-                    # WHICH detection in each camera, so a caller holding a per-camera score array
-                    # can follow it through the association instead of re-deriving the match.
                     'members': {c: members[c] for c in cams}})
         used.update((c, members[c]) for c in members)
         if max_instances and len(out) >= max_instances:
             break
 
     if min_views == 1:
-        # Whatever no pair claimed, in camera order then score order (the boxes arrive score-ordered
-        # from `decode`). Deterministic, so two arms over one clip see the same rows.
         for c in range(n_cams):
             for i in range(centres[c].shape[0]):
                 if max_instances and len(out) >= max_instances:

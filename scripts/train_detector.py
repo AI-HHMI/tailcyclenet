@@ -85,6 +85,16 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     Returns (optimizer, scheduler_or_None). Under 'adamw' the pair is byte-identical to the
     pre-existing AdamW + CosineAnnealingLR path. Under 'muon' the scheduler is None
     (schedule-free replaces it).
+
+    Muon routing: 2D .weight -> Muon (wrapped in ScheduleFree), everything else -> AdamW-SF.
+    `torch.optim.Muon` ONLY ACCEPTS 2D TENSORS and raises on 4D conv weights. For a pure CNN
+    (tiny/nano/s/cspnext), every conv weight is 4D, so Muon gets NOTHING and the optimizer is
+    just AdamW-ScheduleFree (no cosine schedule). For a ViT backbone, ~96% of params are 2D and
+    Muon routes them all -- confirmed by `dev/scratch/prototype_muon_detector.py`. The routing
+    rule is the same as the pose model's in tailcyclenet/optim.py: 2D .weight tensors that are
+    NOT nn.Embedding -> Muon; everything else (4D conv, 1D bias, GroupNorm/LayerNorm affine) ->
+    AdamW-SF. The detector has no nn.Embedding layers. Decay is applied by the
+    ScheduleFreeWrapper, so the Muon group is decay-free.
     """
     kind = train_cfg['optimizer']
     lr = train_cfg['lr']
@@ -122,12 +132,6 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
         return opt, sched
 
-    # === kind == 'muon' ===
-    # Route: 2D .weight -> Muon (wrapped in ScheduleFree), everything else -> AdamW-SF.
-    # `torch.optim.Muon` ONLY ACCEPTS 2D TENSORS and raises on 4D conv weights. For a pure CNN
-    # (tiny/nano/s/cspnext), every conv weight is 4D, so Muon gets NOTHING and the optimizer is
-    # just AdamW-ScheduleFree (no cosine schedule). For a ViT backbone, ~96% of params are 2D
-    # and Muon routes them all -- confirmed by `dev/scratch/prototype_muon_detector.py`.
     from torch.optim import Muon as TorchMuon
     from schedulefree import AdamWScheduleFree, ScheduleFreeWrapper
 
@@ -141,10 +145,6 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
         is_backbone = id(p) in backbone_ids
         base_lr = lr * (BACKBONE_LR_SCALE if is_backbone and model_cfg['pretrained'] else 1.0)
 
-        # Muon routing rule (same as the pose model in tailcyclenet/optim.py): 2D .weight
-        # tensors that are NOT nn.Embedding -> Muon. Everything else (4D conv, 1D bias,
-        # GroupNorm/LayerNorm affine) -> AdamW-SF. The detector has no nn.Embedding layers.
-        # Decay is applied by the ScheduleFreeWrapper, so the Muon group is decay-free.
         if p.ndim == 2 and name.endswith('.weight'):
             muon_groups.append({
                 'params': [p],
@@ -172,14 +172,12 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
         from posetail.posetail.muon import DualOptimizer
         opt = DualOptimizer(opt_muon, opt_adam)
     else:
-        # Pure CNN path: no 2D .weight params exist, Muon has nothing to route.
         opt = opt_adam
 
     n_muon = sum(p.numel() for g in muon_groups for p in g['params'])
     n_adamw = sum(p.numel() for g in adamw_groups for p in g['params'])
     print(f'optimizer: muon | {n_muon/1e6:.2f}M Muon-routed (2D), '
           f'{n_adamw/1e6:.2f}M AdamW-SF (4D conv + bias + norm)')
-    # No scheduler -- schedule-free replaces the cosine.
     return opt, None
 
 
@@ -208,6 +206,76 @@ def main():
     Inputs: argv (via argparse): --config, --out, --iters, --device.
     Side effects: writes checkpoints + metrics.json + config/provenance under
                   the run folder; prints progress and eval lines.
+
+    Notes:
+    - The camera-size probe needs just the discovery -- building a BoxDataset would densify
+      parquet. D2 (detector_v2 plan SS2.6) is a HALF-RESOLUTION detector stage (SLEAP's
+      `scale: 0.5`): it scales whatever `wh` the two branches above resolved to (explicit
+      `input_wh` or the min_box_px-derived size) with no new geometry path -- every box target
+      is RE-DERIVED by `crop_box_for_points` at whatever `input_wh` BoxDataset is built with,
+      so scaling `wh` here is the whole of it. Rounded to a multiple of 32 (the coarsest FPN
+      stride, the same rounding `default_input_wh`/`input_wh_for` already use), floored at 64.
+      1.0 (default) is byte-identical to every checkpoint on record. A2.5: DINOv2's patch
+      embedding requires both dimensions divisible by patch_size=14, and the coarsest FPN
+      stride (32) requires divisibility by 32 too -- LCM(14, 32) = 224. The checkpoint's
+      `input_wh` must be the size the model saw: when tiling, it is read back from `BoxDataset`,
+      which resolved it to the tile.
+    - `n_keypoints` is derived from the registry, never configured: a K that disagreed would
+      mis-index targets. A masked keypoint gets zero gradient but still emits a number at
+      inference (conv bias), so the labelled fraction must be visible in the log (sampled, not
+      exhaustive).
+    - THE COHORT MIX IS A CONFIGURED NUMBER OR IT IS AN ACCIDENT: without `annot_frac` the
+      annotated:tracked ratio is whatever `frames_per_group` happens to leave behind -- on
+      rat-city-combined the cap truncates the one tracked session (57,594 labelled frames) to
+      40 and hands 95.7% of train views to 37 annotated sessions, a ratio no key names.
+      `annot_frac` names it. None (the default), or a single-cohort split, keeps `ChunkShuffle`
+      and is byte-identical to every detector on record -- see `BoxDataset.cohort_weights`.
+      B1b/B1c (detector_v2 plan SS2.7): `alpha` reweights WITHIN whatever `cohort_w` already
+      set up (or within the whole index, if `cohort_w` is None) by group size -- elementwise
+      product, renormalised. W1.1: audited hard-event draw share, composed with the existing
+      cohort/alpha controls. A6 (detector_v2 plan SS2.3): negative-frame draw share, composed
+      the same elementwise way. A6c: crop-level negative draw share is its OWN independent
+      fraction -- `source='crop'` keeps this from also pulling A6's INST_ABSENT entries into
+      the same target share.
+    - No `val/` is the only thing swallowed here; `BoxDataset.__init__`'s config errors are
+      meant to fail at construction rather than degrade to a note. The stem's input width
+      derives from `[data].temporal_input`, and `TEMPORAL_INPUT_CHANNELS` is the one place that
+      map lives, so loader and model cannot disagree. An in-domain backbone comes from
+      scripts/pretrain_detector_backbone.py with no scale/channel correction -- it already
+      speaks this repo's [0,1] RGB convention. A2.6: the ViT backbone is frozen BEFORE the
+      optimizer is built -- a frozen param must be excluded from every param group, not merely
+      left with a grad-less one. Differential LR: any pretrained backbone gets
+      BACKBONE_LR_SCALE x lr, the fresh neck/head lr; the lower backbone rate is because COCO
+      conv weights trained under BatchNorm land in a fresh GroupNorm net (the same scale is
+      reused for in-domain backbones). With no pretraining this builds one param group,
+      byte-identical to every optimizer on record.
+    - `detector.pth` is the BEST checkpoint, not the last one -- recall peaks early and falls
+      monotonically on a root whose labels name only some of the animals; every
+      `detector_it*.pth` is still written. The 4th collate slot is split by rank, not tuple
+      length: it is `regions` OR `ignore_present` boxes, and only this dataset's own two flags
+      say which (never both true). On a Muon run only AdamW-routed params (biases, norms, 4D
+      conv weights) are clipped -- Muon orthogonalises its own gradients via Newton-Schulz
+      inside step(), so clipping them fights the orthogonalisation. `train.set_iter` is a
+      shared-memory value a forked worker reads at its own __getitem__ time (D3) -- see
+      `BoxDataset.set_iter`'s own docstring for why this cannot be a plain attribute.
+    - Every evaluation scores both splits, stores the score beside the weights -- a rolling
+      `detector.pth` with no score cannot be selected on -- and swaps in the averaged iterate
+      for scoring (`obj_scores` is from the last split scored, val where there is one), then
+      restores the working iterate for training. The objectness distribution is recorded
+      because saturation is a property of the recipe, not the dataset, so `--det-score` cannot
+      be a constant. `n_keypoints` and `yolox_version` ride in the checkpoint: they are part of
+      the weights, and absent reads as a fact about the file (0 / 'trimmed'), not a guess.
+      `bottleneck_expansion`, `shared_head`, `fpn_upsample`, `p2_bottomup`, `in_channels` and
+      `tile_wh`/`tile_scale` ride for the same reason -- each is either needed to rebuild the
+      model before `load_state_dict` can match keys (G1/G3; `fpn_upsample` adds no params, an
+      interpolate mode) or part of the recipe (two checkpoints trained at different cohort
+      mixes are not the same arm, and nothing else in the file would say so); absent means the
+      byte-identical default. `detector_last.pth` is an explicit latest alias for humans and
+      downstream tooling; it is overwritten at each evaluation, so an interrupted run's alias
+      may be incomplete and the loader's default does NOT trust it (it verifies
+      detector_it*.pth against config.toml/metrics.json instead). `detector.pth` is selected on
+      `val` where there is one, `train` otherwise -- the same key the end-of-run `best` line
+      reports. Evaluation is not part of the s/it readout.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -228,7 +296,6 @@ def main():
     run = Path(train_cfg['out'])
     _record_run(run, config)
 
-    # Just the camera size, so just the discovery -- building a BoxDataset would densify parquet.
     roots = load_datasets(data_cfg['path'])
     if len(roots) != 1:
         raise SystemExit(f'{data_cfg["path"]}: the detector is trained per dataset; '
@@ -237,19 +304,10 @@ def main():
     wh = (tuple(data_cfg['input_wh']) if data_cfg['input_wh']
           else input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
                             data_cfg['min_box_px'], data_cfg['max_input_px']))
-    # D2 (detector_v2 plan SS2.6): a HALF-RESOLUTION detector stage, SLEAP's `scale: 0.5` on its
-    # centroid stage. Scales whatever `wh` the two branches above already resolved to (explicit
-    # `input_wh` or the min_box_px-derived size) -- no new geometry path: every box target is
-    # RE-DERIVED by `crop_box_for_points` at whatever `input_wh` `BoxDataset` is built with, so
-    # scaling `wh` here is the whole of it. Rounded to a multiple of 32 (the coarsest FPN stride,
-    # same rounding `default_input_wh`/`input_wh_for` already use), floored at 64. 1.0 (default)
-    # is byte-identical to every checkpoint on record.
     if data_cfg['det_scale'] != 1.0:
         _wh0 = wh
         wh = tuple(max(64, int(round(v * data_cfg['det_scale'] / 32)) * 32) for v in wh)
         print(f'det_scale={data_cfg["det_scale"]:g}: input {_wh0[0]}x{_wh0[1]} -> {wh[0]}x{wh[1]}')
-    # A2.5: DINOv2's patch embedding requires both dimensions divisible by patch_size=14; the
-    # coarsest FPN stride (32) requires divisibility by 32 too. LCM(14, 32) = 224.
     if model_cfg['yolox'].startswith('vit_'):
         _wh0 = wh
         wh = tuple(max(64, int(-(-v // 224)) * 224) for v in wh)
@@ -279,8 +337,6 @@ def main():
                        hard_event_manifest=data_cfg['hard_event_manifest'],
                        hard_event_frac=data_cfg['hard_event_frac'],
                        seed=train_cfg['seed'], **tiling)
-    # The checkpoint's `input_wh` must be the size the model saw: when tiling, read it back from
-    # `BoxDataset`, which resolved it to the tile.
     wh = train.input_wh
     if data_cfg['tile_wh']:
         ext = train._tile_extent()
@@ -290,12 +346,9 @@ def main():
         print(f'  DEPLOYMENT INPUT is the whole frame at this scale, NOT the tile size: '
               f'{tiled_input_wh(probe_sess.rig.size(probe_sess.cam_names[0]), data_cfg["tile_scale"])}')
     print(f'train: {len(train)} views')
-    # Derived from the registry, never configured: a K that disagreed would mis-index targets.
     n_kpts = len(roots[0].names) if data_cfg['keypoints'] else 0
     if data_cfg['keypoints']:
         print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')
-        # A masked keypoint gets zero gradient but still emits a number at inference (conv bias),
-        # so the labelled fraction must be visible in the log. Sampled, not exhaustive.
         cen = np.zeros(n_kpts)
         step = max(1, len(train) // 200)
         seen = 0
@@ -309,27 +362,14 @@ def main():
         print(f'  labelled fraction per keypoint over {seen} sampled instances: '
               f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
         print(f'  thinnest: {", ".join(thin)}', flush=True)
-    # THE COHORT MIX IS A CONFIGURED NUMBER OR IT IS AN ACCIDENT. Without `annot_frac` the
-    # annotated:tracked ratio is whatever `frames_per_group` happens to leave behind -- on
-    # rat-city-combined the cap truncates the one tracked session (57,594 labelled frames) to 40
-    # and hands 95.7% of train views to 37 annotated sessions, a ratio no key names. `annot_frac`
-    # names it. None (the default), or a single-cohort split, keeps `ChunkShuffle` and is
-    # byte-identical to every detector on record -- see `BoxDataset.cohort_weights`.
     cohort_w = train.cohort_weights(data_cfg['annot_frac'])
-    # B1b/B1c (detector_v2 plan SS2.7): `alpha` reweights WITHIN whatever `cohort_w` already set
-    # up (or within the whole index, if `cohort_w` is None) by group size -- elementwise product,
-    # renormalised. `None` (default) leaves `cohort_w`/`None` exactly as `annot_frac` alone would.
     alpha_w = train.alpha_weights(data_cfg['alpha'])
-    # W1.1: audited hard-event draw share, composed with the existing cohort/alpha controls.
     hard_w = train.hard_event_weights(data_cfg['hard_event_frac'])
     if hard_w is not None:
         print(f'hard_event_frac={data_cfg["hard_event_frac"]:g}: '
               f'{int(train.hard_event_mask.sum())} hard-event views / {len(train)} total')
-    # A6 (detector_v2 plan SS2.3): negative-frame draw share, composed the same elementwise way.
     neg_w = (train.negative_weights(data_cfg['negative_frac'], source='absent')
              if data_cfg['negative_frac'] is not None else None)
-    # A6c: crop-level negative draw share, its OWN independent fraction -- `source='crop'` keeps
-    # this from also pulling A6's INST_ABSENT entries into the same target share.
     neg_crop_w = (train.negative_weights(data_cfg['negative_crop_frac'], source='crop')
                  if data_cfg['negative_crop_frac'] is not None else None)
     weights = [w for w in (cohort_w, alpha_w, hard_w, neg_w, neg_crop_w)
@@ -368,8 +408,6 @@ def main():
         collate_fn=box_collate, drop_last=True,
         persistent_workers=train_cfg['num_workers'] > 0,
         worker_init_fn=worker_init)
-    # No `val/` is the only thing swallowed here; `BoxDataset.__init__`'s config errors are meant
-    # to fail at construction rather than degrade to a note.
     val = None
     root = Path(data_cfg['path'])
     if not ((root / 'val').is_dir() or any(
@@ -384,8 +422,6 @@ def main():
                          temporal_input=data_cfg['temporal_input'], **tiling)
         print(f'val:   {len(val)} views')
 
-    # The stem's input width derives from `[data].temporal_input`; `TEMPORAL_INPUT_CHANNELS` is
-    # the one place that map lives, so loader and model cannot disagree.
     in_channels = TEMPORAL_INPUT_CHANNELS[data_cfg['temporal_input']]
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
@@ -405,24 +441,16 @@ def main():
     elif model_cfg['pretrained'] == 'dinov2':
         print('  loaded DINOv2 hub weights into the ViT backbone', flush=True)
     elif model_cfg['pretrained']:
-        # In-domain backbone from scripts/pretrain_detector_backbone.py; no scale/channel
-        # correction -- it already speaks this repo's [0,1] RGB convention.
         n_loaded = load_pretrained_backbone(model, model_cfg['pretrained'])
         print(f'  loaded in-domain backbone: {n_loaded} conv tensors from '
               f'{model_cfg["pretrained"]}', flush=True)
 
-    # A2.6: freeze the ViT backbone BEFORE the optimizer is built -- a frozen param must be
-    # excluded from every param group, not merely left with a grad-less one.
     if train_cfg['freeze_backbone'] and hasattr(model.backbone, 'freeze_backbone'):
         model.backbone.freeze_backbone()
         n_frozen = sum(1 for p in model.parameters() if not p.requires_grad)
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
         print(f'freeze_backbone: {n_frozen} frozen, {n_trainable} trainable')
 
-    # Differential LR: any pretrained backbone gets BACKBONE_LR_SCALE x lr, the fresh neck/head
-    # lr. The lower backbone rate is because COCO conv weights trained under BatchNorm land in a
-    # fresh GroupNorm net; the same scale is reused for in-domain backbones. With no pretraining
-    # this builds one param group, byte-identical to every optimizer on record.
     opt, sched = build_detector_optimizer(model, train_cfg, model_cfg)
     if model_cfg['pretrained'] and train_cfg['optimizer'] == 'adamw':
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
@@ -434,9 +462,6 @@ def main():
               flush=True)
 
     history = []
-    # `detector.pth` is the BEST checkpoint, not the last one -- recall peaks early and falls
-    # monotonically on a root whose labels name only some of the animals. Every `detector_it*.pth`
-    # is still written.
     best_score = -float('inf')
     it, t0, running = 0, time.time(), []
     model.train()
@@ -446,8 +471,6 @@ def main():
         for batch in loader:
             if it >= train_cfg['iters']:
                 break
-            # By rank, not tuple length: the 4th slot is `regions` OR `ignore_present` boxes, and
-            # only this dataset's own two flags say which (never both true).
             x, gt, gt_kpts, gt_tail = split_batch(batch)
             x, gt = x.to(device), gt.to(device)
             gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
@@ -476,9 +499,6 @@ def main():
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if train_cfg['optimizer'] == 'muon':
-                # Clip only AdamW-routed params (biases, norms, 4D conv weights) -- Muon
-                # orthogonalises its own gradients via Newton-Schulz inside step(), so clipping
-                # them fights the orthogonalisation (see CLAUDE.md's pose-model precedent).
                 adamw_groups = (opt.opt_adam.param_groups if hasattr(opt, 'opt_adam')
                                 else opt.param_groups)
                 adamw_ps = [p for g in adamw_groups for p in g['params'] if p.grad is not None]
@@ -491,13 +511,10 @@ def main():
                 sched.step()
             running.append(float(loss.detach()))
             it += 1
-            # D3: shared-memory value a forked worker reads at its own __getitem__ time -- see
-            # `BoxDataset.set_iter`'s own docstring for why this cannot be a plain attribute.
             train.set_iter(it)
             if it % 50 == 0:
                 kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
                       if 'kpt' in parts else '')
-                # The certified fraction: masking reweights obj against box_weight silently.
                 kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
                 kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
                 kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
@@ -507,27 +524,20 @@ def main():
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
                 running, t0 = [], time.time()
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
-                # Both splits, every checkpoint, the score stored beside the weights -- a rolling
-                # `detector.pth` with no score cannot be selected on.
-                # Swap in the averaged iterate for scoring.
                 if hasattr(opt, 'eval'):
                     opt.eval()
                 scores, obj_scores = {}, []
                 for name, ds in (('train', train), ('val', val)):
                     if ds is None:
                         continue
-                    # `obj_scores` is from the last split scored (val where there is one).
                     obj_scores.clear()
                     scores[name] = overall(score_dataset(
                         model, ds, device, batch_size=train_cfg['batch_size'],
                         batches=train_cfg['eval_batches'], num_workers=2,
                         out_scores=obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
                         center_dist_thresh=train_cfg['nms_center_dist_thresh']))
-                # Restore the working iterate for training.
                 if hasattr(opt, 'train'):
                     opt.train()
-                # Record the objectness distribution: saturation is a property of the recipe, not
-                # the dataset, so `--det-score` cannot be a constant.
                 obj_q = {}
                 if obj_scores:
                     a = np.concatenate(obj_scores)
@@ -537,12 +547,9 @@ def main():
                           f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}'
                           + ('   <-- NOT saturated: --det-score 0.99 would drop most of these'
                              if obj_q['q50'] < 0.99 else ''), flush=True)
-                # `n_keypoints` and `yolox_version` ride in the checkpoint: they are part of the
-                # weights, and absent reads as a fact about the file (0 / 'trimmed'), not a guess.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
                         'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': model_cfg['yolox'],
                         'optimizer_kind': train_cfg['optimizer'],
-                        # Part of the weights; absent means 0.5, a fact about old checkpoints.
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],
                         'pretrained': model_cfg['pretrained'],
                         'head_depthwise': train_cfg['head_depthwise'],
@@ -554,30 +561,17 @@ def main():
                         'tal_alpha': train_cfg['tal_alpha'],
                         'tal_beta': train_cfg['tal_beta'],
                         'tal_soft_prior': train_cfg['tal_soft_prior'],
-                        # G1/G3: `shared_head=False`/`p2_bottomup=True` each add tensors
-                        # (`obj_convs`/`out2`) that `load_detector` must reconstruct before
-                        # `load_state_dict` can match keys -- both part of the weights, not just
-                        # provenance. `fpn_upsample` adds no params (an interpolate mode) but
-                        # rides beside them for the same reason `box_loss` does. Absent means the
-                        # byte-identical default for each.
                         'shared_head': train_cfg['shared_head'],
                         'fpn_upsample': train_cfg['fpn_upsample'],
                         'p2_bottomup': train_cfg['p2_bottomup'],
-                        # Same shape: absent means False, a fact about old checkpoints.
                         'p2': model_cfg['p2'],
-                        # `in_channels` is what `load_detector` needs to rebuild the stem (absent
-                        # means 3); `temporal_input` rides beside it for provenance only.
                         'in_channels': in_channels,
                         'temporal_input': data_cfg['temporal_input'],
                         'seed': train_cfg['seed'],
-                        # `input_wh` is the TILE size when tiling, not the deployment input size;
-                        # `load_detector` raises if `tile_wh`/`tile_scale` are missing.
                         'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
                         'use_regions': data_cfg['use_regions'],
                         'ignore_present': data_cfg['ignore_present'],
                         'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
-                        # Part of the recipe: two checkpoints trained at different cohort mixes
-                        # are not the same arm, and nothing else in the file would say so.
                         'annot_frac': data_cfg['annot_frac'],
                         'weight_decay': train_cfg['weight_decay'],
                         'min_crop_dim': data_cfg['min_crop_dim'],
@@ -587,14 +581,7 @@ def main():
                         'obj_quantiles': obj_q,
                         'eval': scores}
                 torch.save(ckpt, run / f'detector_it{it:06d}.pth')
-                # Explicit latest alias for humans and downstream tooling. It is overwritten at
-                # each evaluation, so an interrupted run's alias may be incomplete; the loader's
-                # default does NOT trust this alias and instead verifies detector_it*.pth against
-                # config.toml/metrics.json. At the configured final iteration it is an unambiguous
-                # latest-complete pointer (while detector.pth retains historical best semantics).
                 torch.save(ckpt, run / 'detector_last.pth')
-                # Selected on `val` where there is one, `train` otherwise -- the same key the
-                # end-of-run `best` line reports.
                 sel = scores.get('val', scores.get('train', {})).get('r50', -float('inf'))
                 if sel >= best_score:
                     best_score = sel
@@ -607,7 +594,6 @@ def main():
                     print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
                           f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
                           flush=True)
-                # Evaluation is not part of the s/it readout.
                 t0 = time.time()
     best = max(history, key=lambda h: h.get('val_r50', h['train_r50'])) if history else None
     print(f'done: {it} iterations -> {run}')

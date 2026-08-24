@@ -36,10 +36,13 @@ def _scale(wh) -> int:
 
 def draw(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
          skeleton: list[list[str]]) -> np.ndarray:
-    """Every overlay for one (frame, camera), on a COPY at native resolution."""
+    """Every overlay for one (frame, camera), on a COPY at native resolution.
+
+    A keypoint may be POSITIONED yet carry no coordinates -- a coordinate-free visibility
+    observation (§7); those are skipped.
+    """
     import cv2
 
-    # RGB -> BGR
     im = np.ascontiguousarray(im[:, :, ::-1]).copy()
     s = _scale((im.shape[1], im.shape[0]))
     ix = {n: i for i, n in enumerate(names)}
@@ -63,7 +66,6 @@ def draw(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
         vis, pts = lab.vis2d[a, t, :, ci], lab.points2d[a, t, :, ci]
         for k in np.flatnonzero(np.isin(vis, fmt.POSITIONED)):
             if not np.isfinite(pts[k]).all():
-                # A coordinate-free visibility observation (§7).
                 continue
             cv2.circle(im, (int(pts[k][0]), int(pts[k][1])), 3 * s, PALETTE[k % len(PALETTE)], -1)
         for u, v in skeleton:
@@ -106,6 +108,9 @@ def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dic
             args -- parsed CLI args (width, crops, video, fps).
     Outputs: per-kind render counts for the group.
     Side effects: writes jpg/mp4 files under out.
+
+    Per-animal crops are cut from the already-drawn image so they match the sheet at native
+    resolution.
     """
     import cv2
 
@@ -126,7 +131,6 @@ def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dic
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
         stat['sheets'] += 1
 
-        # Crops from the already-drawn image, so they match the sheet at native resolution.
         if args.crops and lab.instance is not None:
             H, W = drawn.shape[:2]
             for a in np.flatnonzero(lab.instance[:, t, ci] == fmt.INST_LABELED):
@@ -170,6 +174,9 @@ def main() -> int:
             --group, --width, --video, --fps, --no-crops, --seed.
     Outputs: process exit code.
     Side effects: writes renders under --out; prints a per-group summary.
+
+    Labelled groups are preferred when sampling -- a random draw would be dominated by whichever
+    unlabelled ones happen to be sampled.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -204,8 +211,6 @@ def main() -> int:
     total = {'sheets': 0, 'crops': 0, 'videos': 0}
     for s in sessions:
         gids = [g for g in s.groups if args.group in g]
-        # Prefer groups that have labels -- a random draw would be dominated by whichever
-        # unlabelled ones happen to be sampled.
         if args.n and len(gids) > args.n:
             gids = [gids[i] for i in sorted(rng.choice(len(gids), args.n, replace=False))]
         for gid in gids:

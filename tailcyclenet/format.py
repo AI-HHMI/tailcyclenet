@@ -221,14 +221,14 @@ def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
 
 def _arrow(rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> pa.Table:
     """One chunk of tidy-long rows as an arrow table. Non-finite floats become NULL, which is
-    what "empty" means in parquet for a `missing` row's x,y.
+    what "empty" means in parquet for a `missing` row's x,y. An empty object array would
+    otherwise infer pyarrow's `null` type; only a zero-row table gets here (an empty
+    regions.pq, which is meaningful).
     """
     arrays, names = [], []
     for name, values in rows.items():
         values = np.asarray(values) if not isinstance(values, list) else values
         if isinstance(values, np.ndarray) and values.dtype == object and values.size == 0:
-            # An empty object array infers pyarrow's `null` type; only a zero-row table gets
-            # here (an empty regions.pq, which is meaningful).
             arr = pa.array([], pa.string())
         elif isinstance(values, np.ndarray) and values.dtype.kind == 'f':
             arr = pa.array(values, mask=~np.isfinite(values))
@@ -638,23 +638,27 @@ class Session:
         The one place a camera group is built. `frames`: None -> whole group (moving `ext` is
         (T,4,4)); a sequence -> (T_win,4,4) aligned to that window; an INT -> static (4,4) at one
         frame. Per-frame consumers need the int form: `project_cam` aligns `ext` against axis -3,
-        which is the ANIMAL for box-loader callers, not time.
+        which is the ANIMAL for box-loader callers, not time. `ext` is (C,T,4,4) and its coverage
+        is already checked. Every camera gets the per-frame form, not just the moving ones:
+        `_decode_from_scene` stacks `cam['ext']` across cameras, so a mixed rig is a stack error.
         """
         if not any(self.rig.moving.values()):
             return self.rig.posetail()
 
         import torch
-        # (C,T,4,4), coverage already checked
         ext = self.labels(gid).ext
         sel = slice(None) if frames is None else frames
-        # Every camera gets the per-frame form, not just the moving ones: `_decode_from_scene`
-        # stacks `cam['ext']` across cameras, so a mixed rig is a stack error.
         moving_ext = {n: torch.as_tensor(ext[i][sel], dtype=torch.float)
                       for i, n in enumerate(self.cam_names)}
         return self.rig.posetail(moving_ext=moving_ext)
 
     def labels(self, gid: str) -> Labels:
-        """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12."""
+        """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12.
+
+        A gap in a moving camera's extrinsics is NOT benign: the array is pre-filled with
+        eye(4), a valid-looking extrinsic at the world origin -- so coverage is checked here,
+        not only in `validate_session`, since every consumer goes through `labels()`.
+        """
         if gid in self._label_cache:
             return self._label_cache[gid]
         group = self.groups[gid]
@@ -713,9 +717,6 @@ class Session:
         ext = None
         moving = [n for n in self.rig.names if self.rig.moving[n]]
         if moving:
-            # A gap here is NOT benign: the array is pre-filled with eye(4), a valid-looking
-            # extrinsic at the world origin -- so coverage is checked here, not only in
-            # validate_session, since every consumer goes through labels().
             tab = t['extrinsics']
             gvals = _codes(tab, 'group_id')[1] if tab is not None else []
             if tab is None or gid not in gvals:
@@ -763,6 +764,12 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
     A row is emitted only where a status says a determination was made, so sparse hand
     annotation and dense tracking are the same code path. `label_source` becomes the `labels`
     key of session.toml and is required, not defaulted.
+
+    A session that certifies nothing anywhere still writes an EMPTY regions.pq if any group
+    said `regions is not None` -- absence of the file is the claim of exhaustive labelling.
+    The same empty-file-is-a-claim rule applies to the mode's own tables: rule 6 requires
+    them to EXIST, so `points3d.pq`/`keypoints.pq` are emitted when the corresponding array is
+    present, not when any row is labelled.
     """
     import toml
 
@@ -807,12 +814,7 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
                     ('group_id', 'frame', 'camera', 'x0', 'y0', 'x1', 'y1', 'status')},
         'extrinsics': {c: [] for c in ('group_id', 'frame', 'camera', 'ext')},
     }
-    # A session that certifies nothing anywhere still writes an EMPTY regions.pq if any group
-    # said `regions is not None` -- absence of the file is the claim of exhaustive labelling.
     emit_regions = any(lab is not None and lab.regions is not None for lab in labels.values())
-    # A session with no labelled row anywhere still writes the mode's own table: rule 6 requires
-    # it to EXIST, so the empty-file-is-a-claim rule applies here too, keyed on the array being
-    # present rather than on any row being labelled.
     emit_points3d = any(lab is not None and lab.vis3d is not None for lab in labels.values())
     emit_keypoints = any(lab is not None and lab.vis2d is not None for lab in labels.values())
 
@@ -1116,7 +1118,21 @@ class Registry:
 # validation -- docs/annotation_format.md §11
 
 def validate_session(sess: Session, check_images: bool = True) -> list[str]:
-    """Return a list of rule violations. Empty means the session is valid."""
+    """Return a list of rule violations. Empty means the session is valid.
+
+    The checks follow docs/annotation_format.md §11 and are labelled with their rule numbers:
+    rule 2 (names unique; skeleton/flip_pairs reference known names; flip is an involution --
+    each pair is listed once, and the involution is the symmetric closure, so the only way to
+    break it is to name a keypoint in two pairs with different partners); rules 4/5 (cameras
+    and calibration); rule 6 (a label table exists); rule 9 (no duplicate keys); rule 10 (a
+    positioned row -- visible or projected -- carries its coordinates); rule 15 (regions:
+    known status, non-empty rectangles; camera and frame are checked by `labels()`); rule 13
+    (extrinsics only for cameras declared moving, and EVERY frame of every moving camera -- a
+    missing frame reads as a real pose at the world origin (eye(4) pre-fill); reported here as
+    well as raised in `labels()` so a bulk validate lists every bad session); and rules 6/7/8
+    (per group: frames in range, pixels present and the right shape). `sess.labels(gid)` is
+    also run per group and raises on unknown bodypart/camera/animal or bad frame.
+    """
     errs: list[str] = []
     here = str(sess.path)
 
@@ -1124,7 +1140,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         """Record one rule violation against this session."""
         errs.append(f'{here}: [rule {rule}] {msg}')
 
-    # 2. names unique; skeleton/flip_pairs reference known names; flip is an involution
     if len(set(sess.names)) != len(sess.names):
         bad(2, 'names has duplicates')
     known = set(sess.names)
@@ -1132,8 +1147,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         for n in pair:
             if n not in known:
                 bad(2, f'skeleton/flip_pairs names unknown keypoint {n!r}')
-    # Each pair is listed once; the involution is the symmetric closure, so the only way to
-    # break it is to name a keypoint in two pairs with different partners.
     flip: dict[str, str] = {}
     for a, b in sess.flip_pairs:
         for x, y in ((a, b), (b, a)):
@@ -1143,7 +1156,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if a == b:
             bad(2, f'flip_pairs has a self-pair at {a!r}')
 
-    # 4/5. cameras and calibration
     for name in sess.cam_names:
         if not name:
             bad(4, 'a camera has an empty name')
@@ -1161,7 +1173,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     if not (sess.path / 'keypoints.pq').exists() and not (sess.path / 'points3d.pq').exists():
         bad(6, 'neither keypoints.pq nor points3d.pq exists')
 
-    # 9. no duplicate keys
     keys = {'keypoints': ('group_id', 'frame', 'animal_id', 'camera', 'bodypart'),
             'points3d': ('group_id', 'frame', 'animal_id', 'bodypart'),
             'instances': ('group_id', 'frame', 'animal_id', 'camera'),
@@ -1178,7 +1189,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if n and len(table.select(cols).group_by(list(cols)).aggregate([])) != n:
             bad(9, f'{stem}.pq has duplicate keys')
 
-    # 10. a positioned row (visible or projected) carries its coordinates
     positioned = ('visible', 'projected')
     t3 = sess._tables['points3d']
     if t3 is not None and len(t3):
@@ -1200,7 +1210,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if (~vis).any() and np.isfinite(xy[~vis]).any():
             bad(10, 'keypoints.pq has a missing/unlabeled row carrying coordinates')
 
-    # 15. regions: known status, non-empty rectangles. Camera and frame are checked by labels().
     tr = sess._tables['regions']
     if tr is not None and len(tr):
         _, vals = _codes(tr, 'status')
@@ -1214,9 +1223,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
             bad(15, f'regions.pq has {int(empty.sum())} empty rectangle(s) (x1<=x0 or y1<=y0); a '
                     f'certificate covering nothing is a converter bug, not a no-op')
 
-    # 13. extrinsics only for cameras declared moving, and EVERY frame of every moving camera:
-    # a missing frame reads as a real pose at the world origin (eye(4) pre-fill). Reported here
-    # as well as raised in labels() so a bulk validate lists every bad session.
     te = sess._tables['extrinsics']
     moving = {n for n in sess.cam_names if sess.rig.moving[n]}
     if te is not None and len(te):
@@ -1244,7 +1250,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     elif moving:
         bad(13, f'cameras {sorted(moving)} are moving=true but extrinsics.pq is absent/empty')
 
-    # 6/7/8. per group: frames in range, pixels present and the right shape
     for gid, g in sess.groups.items():
         for cname in sess.cam_names:
             try:
@@ -1271,7 +1276,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
                         bad(8, f'group {gid!r} camera {cname!r}: image is {im.size}, '
                                f'calibration size is {want}')
         try:
-            # Raises on unknown bodypart/camera/animal or bad frame.
             sess.labels(gid)
         except FormatError as e:
             errs.append(str(e))
@@ -1284,13 +1288,16 @@ def validate_dataset(ds: Dataset, check_images: bool = True) -> list[str]:
     Inputs: ds -- the dataset to validate.
             check_images -- also verify each frame image's size against calibration.
     Outputs: a list of rule violations; empty means the dataset is valid.
+
+    The cross-session checks are rule 3 (cross-session agreement on names -- a WARNING, not an
+    error: `Registry.ids_for` resolves a session's axis BY NAME, but a "missing" keypoint is
+    usually a typo, not a decision) and rule 14 (a leak: a session folder name used in more
+    than one split).
     """
     errs: list[str] = []
     sessions = ds.all_sessions()
     if not sessions:
         return [f'{ds.root}: no sessions']
-    # 3. cross-session agreement on names. A WARNING, not an error: `Registry.ids_for` resolves
-    # a session's axis BY NAME, but a "missing" keypoint is usually a typo, not a decision.
     axis = ds.names
     for s in sessions:
         if s.names == axis:
@@ -1299,7 +1306,6 @@ def validate_dataset(ds: Dataset, check_images: bool = True) -> list[str]:
         what = (f'is missing {len(missing)} of the root\'s {len(axis)} keypoints ({missing})'
                 if missing else 'declares the root\'s keypoints in a different order')
         errs.append(f'{s.path}: [rule 3 WARNING] {what}; resolved by name')
-    # 14. leak: a session folder name used in more than one split
     seen: dict[str, str] = {}
     for split, group in ds.sessions.items():
         for s in group:

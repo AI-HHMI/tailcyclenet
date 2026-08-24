@@ -37,7 +37,6 @@ def plan(roots: list[Path]) -> dict[str, dict[str, Path]]:
     per_root = [sessions(r) for r in roots]
     seen: Counter[str] = Counter()
     for s in per_root:
-        # A SET: one vote per root.
         seen.update({p.name for ss in s.values() for p in ss})
     collide = {n for n, c in seen.items() if c > 1}
 
@@ -69,7 +68,10 @@ def check_names(roots: list[Path]) -> list[str]:
 
 
 def build(out_root: Path, links_by_split: dict[str, dict[str, Path]], force: bool) -> tuple[int, int]:
-    """(links written, stale links removed). Idempotent; never deletes anything but a symlink."""
+    """(links written, stale links removed). Idempotent; never deletes anything but a symlink.
+
+    Links are RELATIVE, like the hand-built roots, so the whole datasets tree stays movable.
+    """
     out_root.mkdir(parents=True, exist_ok=True)
     extra = sorted(set(os.listdir(out_root)) - set(links_by_split))
     if extra:
@@ -88,7 +90,6 @@ def build(out_root: Path, links_by_split: dict[str, dict[str, Path]], force: boo
             p.unlink()
             removed += 1
         for name, target in links.items():
-            # RELATIVE, like the hand-built roots: the whole datasets tree stays movable.
             rel = os.path.relpath(target, d)
             p = d / name
             if p.is_symlink():

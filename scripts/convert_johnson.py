@@ -56,7 +56,11 @@ def parse_calib(path: Path) -> dict[str, np.ndarray]:
 
 
 def build_rig(src: Path, calib_paths: dict[str, str], sizes: dict[str, tuple[int, int]]) -> fmt.Rig:
-    """One aniposelib camera per view. MATLAB exports column-major, hence the transposes."""
+    """One aniposelib camera per view. MATLAB exports column-major, hence the transposes.
+
+    The yaml's own image_width/height is 0 for five trials, so the size always comes from the
+    JSON. The offset is the full sensor (no crop).
+    """
     import cv2
     from aniposelib.cameras import Camera, CameraGroup
 
@@ -67,10 +71,8 @@ def build_rig(src: Path, calib_paths: dict[str, str], sizes: dict[str, tuple[int
         cam = Camera(matrix=c['intrinsicMatrix'].T,
                      dist=c['distortionCoefficients'].ravel()[:5],
                      rvec=rvec, tvec=c['T'].ravel(), name=name)
-        # The yaml's own image_width/height is 0 for five trials; the JSON always knows.
         cam.set_size(sizes[name])
         cams.append(cam)
-        # Full sensor, no crop.
         offset[name] = (0.0, 0.0)
         moving[name] = False
         calibrated[name] = True
@@ -80,7 +82,10 @@ def build_rig(src: Path, calib_paths: dict[str, str], sizes: dict[str, tuple[int
 # source reading
 
 def read_split(src: Path, split: str) -> dict:
-    """The annotation JSON, indexed. `images[i].id == i` holds but is not relied on."""
+    """The annotation JSON, indexed. `images[i].id == i` holds but is not relied on.
+
+    `_framesets` is `trial -> {source frame index: {camera: image_id}}`.
+    """
     with open(src / 'annotations' / f'instances_{split}.json') as f:
         d = json.load(f)
 
@@ -91,7 +96,6 @@ def read_split(src: Path, split: str) -> dict:
             raise RuntimeError(f'{split}: image {a["image_id"]} has >1 annotation')
         anns[a['image_id']] = a
 
-    # trial -> {source frame index: {camera: image_id}}
     framesets: dict[str, dict[int, dict[str, int]]] = defaultdict(dict)
     for key, fs in d['framesets'].items():
         trial, frame = key.rsplit('/Frame_', 1)
@@ -136,13 +140,10 @@ def triangulate_robust(cgroup, p2d: np.ndarray, reject_px: float,
     """
     p2 = p2d.copy()
     p3 = _np(cgroup.triangulate(p2, progress=False))
-    # (C, N)
     rejected = np.zeros(p2.shape[:2], bool)
     for _ in range(iters):
-        # (C, N)
         e = np.linalg.norm(_np(cgroup.reprojection_error(p3, p2)), axis=-1)
         with np.errstate(invalid='ignore'):
-            # (N,)
             med = np.nanmedian(np.where(np.isfinite(e), e, np.nan), axis=0)
         bad = e > np.maximum(reject_px, 5.0 * med)
         if not bad.any():
@@ -160,11 +161,19 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
     An unannotated image leaves every cell UNLABELED (no row) -- inventing `present` would be an
     annotation nobody made. Outlier 2D is rejected from the triangulation only; keypoints.pq keeps
     the annotators' work verbatim.
+
+    `boxes` and `instance` are allocated together because write_session indexes boxes by
+    instance. Status is PROJECTED, not VISIBLE: the source flags 1.2M points "visible" against
+    18 "not" on a dome, so the flag asserts nothing; zero-flag points carry (0,0), the null
+    marker, so they get no row at all. The 2D->3D step uses aniposelib's NaN-safe triangulate
+    (NaN below 2 views). A rejected observation is demonstrably wrong, so it leaves keypoints.pq
+    as NO ROW, not `missing` (which would claim someone judged it occluded); a view that lost
+    every observation also loses its box -- the box is the keypoint hull, and a `labeled`
+    instance must still have keypoint rows.
     """
     cams = rig.names
     C, T = len(cams), len(run)
     lab = fmt.empty_labels(1, T, K, C, mode3d=True, animal_ids=['a00'])
-    # boxes and instance must be allocated together (write_session indexes boxes by instance).
     lab.boxes = np.full((1, T, C, 4), np.nan, np.float32)
     lab.instance = np.full((1, T, C), fmt.INST_NONE, np.int8)
 
@@ -174,14 +183,10 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
             if iid is None:
                 continue
             a = d['_anns'].get(iid)
-            # Image exists, nobody labelled it.
             if a is None:
                 continue
             kp = np.asarray(a['keypoints'], dtype=np.float64).reshape(K, 3)
             seen = kp[:, 2] > 0
-            # PROJECTED, not VISIBLE: the source flags 1.2M points "visible" against 18 "not" on
-            # a dome, so the flag asserts nothing. Zero-flag points carry (0,0), the null marker,
-            # so they get no row at all.
             lab.vis2d[0, t, seen, ci] = fmt.PROJECTED
             lab.points2d[0, t, seen, ci] = kp[seen, :2].astype(np.float32)
 
@@ -189,7 +194,6 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
             lab.boxes[0, t, ci] = (x, y, x + w, y + h)
             lab.instance[0, t, ci] = fmt.INST_LABELED
 
-    # 2D -> 3D. aniposelib's triangulate is NaN-safe and returns NaN below 2 views.
     p2d = np.moveaxis(lab.points2d[0], 2, 0).reshape(C, T * K, 2).astype(np.float64)
     p3d, rejected = triangulate_robust(rig.cgroup, p2d, reject_px)
     p3d = p3d.reshape(T, K, 3)
@@ -197,14 +201,9 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
     lab.vis3d[0][ok] = fmt.VISIBLE
     lab.points3d[0][ok] = p3d[ok].astype(np.float32)
 
-    # A rejected observation is demonstrably wrong, so it leaves keypoints.pq as NO ROW (not
-    # `missing`, which would claim someone judged it occluded).
-    # (T,K,C)
     bad = rejected.reshape(C, T, K).transpose(1, 2, 0)
     lab.vis2d[0][bad] = fmt.UNLABELED
     lab.points2d[0][bad] = np.nan
-    # A view that lost every observation also loses its box -- the box is the keypoint hull, and
-    # a `labeled` instance must still have keypoint rows.
     dead = (lab.vis2d[0] == fmt.UNLABELED).all(1) & (lab.instance[0] != fmt.INST_NONE)
     lab.instance[0][dead] = fmt.INST_NONE
     lab.boxes[0][dead] = np.nan
@@ -305,6 +304,8 @@ def check_reprojection(out: Path, limit: float) -> int:
 
     Everything is re-read from disk on purpose: a mangled calibration.toml round-trip and a bad
     calibration both surface here, and 1684 px is what the wrong transpose convention looks like.
+    `few` counts points labelled in at least one view but carrying no 3D: seen by <2 cameras, or
+    dropped by the triangulation gate in build_labels.
     """
     ds = fmt.load_dataset(out)
     print(f'\n== reprojection ({out.name})')
@@ -318,8 +319,6 @@ def check_reprojection(out: Path, limit: float) -> int:
                 T, K, C = lab.points2d.shape[1], lab.points2d.shape[2], lab.points2d.shape[3]
                 p3d = lab.points3d[0].reshape(T * K, 3).astype(np.float64)
                 p2d = np.moveaxis(lab.points2d[0], 2, 0).reshape(C, T * K, 2).astype(np.float64)
-                # labelled in at least one view but carrying no 3D: seen by <2 cameras, or
-                # dropped by the triangulation gate in build_labels
                 nviews = np.isfinite(p2d).all(-1).sum(0)
                 few += int(((nviews >= 1) & ~np.isfinite(p3d).all(-1)).sum())
                 e = np.linalg.norm(_np(sess.rig.cgroup.reprojection_error(p3d, p2d)), axis=-1)

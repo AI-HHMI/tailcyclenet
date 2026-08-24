@@ -70,7 +70,6 @@ def _holes(table, key_cols: list[str]) -> int:
 
     df = table.select([*key_cols, 'bodypart']).to_pandas()
     n_kpts = df['bodypart'].nunique()
-    # Instances with >= 1 row.
     live_keys = df.groupby(key_cols, observed=True).ngroups
     return int(live_keys * n_kpts - len(df))
 

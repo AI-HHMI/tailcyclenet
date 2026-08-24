@@ -41,6 +41,14 @@ def chunk_frames(preds, labels, n):
     The bootstrap resamples groups, and a long clip is ONE group -- so chunks give a long clip a
     usable n. Chunks of one clip are more alike than independent clips, so the interval is
     WITHIN-clip uncertainty and optimistic against the between-clip kind.
+
+    The match radius comes from the whole group, not the chunk: chunks scored under different
+    radii are not exchangeable, which a bootstrap needs them to be. The labels' time axis is not
+    the prediction's -- a `--max-frames` prefix must slice labels by the LABELS' own length, or
+    every chunk past the first re-scores frames 0..n-1. Frame indices are absolute within the
+    group for both sides. T = 1 is not a usable window. Axis 1 is time only for frame-indexed
+    arrays; `outcome`/`crop` are window-indexed and stay whole. `ext` is (C,T,4,4) -- time on
+    axis 1 as well, so the same slicing rule covers it.
     """
     import dataclasses
 
@@ -51,31 +59,22 @@ def chunk_frames(preds, labels, n):
             continue
         lab, sess = labels[key]
         T = int(np.asarray(out['pred']).shape[1])
-        # The match radius comes from the whole group, not the chunk: chunks scored under
-        # different radii are not exchangeable, which a bootstrap needs them to be.
         full = lab.points3d if str(out['mode']) == '3d' else lab.points2d[..., 0, :]
         with np.errstate(all='ignore'):
             span = np.nanmax(full, axis=2) - np.nanmin(full, axis=2)
             extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
-        # The labels' time axis is not the prediction's: a `--max-frames` prefix must slice labels
-        # by the LABELS' own length, or every chunk past the first re-scores frames 0..n-1.
-        # Frame indices are absolute within the group for both sides.
         lab_T = int(np.asarray(full).shape[1])
         for t0 in range(0, T, n):
             t1 = min(t0 + n, T)
-            # T = 1 is not a usable window.
             if t1 - t0 < 2:
                 continue
             sub = {}
             for k, v in out.items():
                 a = np.asarray(v)
-                # Axis 1 is time only for frame-indexed arrays; `outcome`/`crop` are
-                # window-indexed and stay whole.
                 sub[k] = a[:, t0:t1] if (a.ndim >= 2 and a.shape[1] == T) else v
             fields = {f.name: getattr(lab, f.name) for f in dataclasses.fields(lab)}
             for k, v in fields.items():
                 if isinstance(v, np.ndarray) and v.ndim >= 2 and k != 'regions':
-                    # `ext` is (C,T,4,4) -- time on axis 1 as well, so the same rule covers it.
                     if v.shape[1] == lab_T:
                         fields[k] = v[:, t0:t1]
             if isinstance(fields.get('regions'), np.ndarray) and fields['regions'].size:
@@ -91,6 +90,28 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
     """One row per group: error, the coverage behind it, MOTA where there are instances.
 
     Factored out so `--vs` scores the second file through the identical path.
+
+    Surplus predicted rows are not discardable: truncating `pred` to `true`'s row count deletes
+    them as coverage, not as false positives -- the matchers all take Sp != St; only
+    `error_and_coverage` needs equal shapes, and row-indexed error is meaningless under detector
+    boxes. Row index is not identity under detector boxes: match first, then measure, taking the
+    matched counts so coverage describes the same points as the error. The `__extent__` carried
+    by `--chunk` is the WHOLE group's. Zero is a finite, valid radius: one finite labelled
+    keypoint gives a 0 diagonal, so a sparse root can read as a catastrophic failure that is an
+    artefact of the radius.
+
+    PCK gets the same pairing as the error: it reads positionally, so detector boxes need the
+    aligned rows. NOT shared with MOTA, which reads the raw rows -- aligning them first would
+    zero `idsw` by construction. The alignment is shaped like true (a label row index), not
+    pred.
+
+    `motion_ratio` screens how much the prediction moved vs the animal -- a carried prompt
+    low-passes the prediction, which no error/coverage/MOTA column can see; `--vs` pairs it.
+    `box_agree` is where the pose landed relative to its own crop box, in units of one box side:
+    a pose off its crop is not a prediction of that animal. `kpt_agree` is the 2D half of the
+    same check: `box_agree` is structurally bounded in 2D (the pose is decoded inside its own
+    crop), while the detector's keypoints are regressed in the full frame, so `kpt_agree` has no
+    ceiling and is the 2D diagnostic.
     """
     rows = []
     for key, out in sorted(preds.items()):
@@ -102,10 +123,6 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         mode = str(out['mode'])
         true = lab.points3d if mode == '3d' else lab.points2d[..., 0, :]
         pred = out['pred']
-        # Surplus predicted rows are not discardable: truncating `pred` to `true`'s row count
-        # deleted them as coverage, not as false positives. The matchers all take Sp != St; only
-        # `error_and_coverage` needs equal shapes, and row-indexed error is meaningless under
-        # detector boxes.
         T = min(pred.shape[1], true.shape[1])
         pred, true = pred[:, :T], true[:, :T]
         Sp, St = pred.shape[0], true.shape[0]
@@ -113,17 +130,12 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
 
         m = error_and_coverage(pred[:min(Sp, St)], true[:min(Sp, St)])
         if S > 1:
-            # Row index is not identity under detector boxes: match, then measure, taking the
-            # matched counts so coverage describes the same points as the error.
             if '__extent__' in out:
-                # The WHOLE group's, carried by --chunk.
                 extent = float(out['__extent__'])
             else:
                 with np.errstate(all='ignore'):
                     span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
                     extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
-            # Zero is a finite, valid radius: one finite labelled keypoint gives a 0 diagonal, so
-            # a sparse root can read as a catastrophic failure that is an artefact of the radius.
             max_dist = extent if np.isfinite(extent) and extent > 0 else np.inf
             mm = matched_error(pred, true, max_dist=max_dist,
                                min_kpts_frac=min_kpts_frac, cost=match_cost)
@@ -131,10 +143,6 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
                       if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')
                       or k in _PCT_KEYS})
             m['unmatched'] = mm.get('unmatched_true', 0)
-            # PCK gets the same pairing: it reads positionally, so detector boxes need the
-            # aligned rows. NOT shared with MOTA, which reads the raw rows -- aligning them
-            # first would zero `idsw` by construction. Shaped like true (a label row index), not
-            # pred.
             aligned = np.full_like(true, np.nan)
             for t, frame_pairs in enumerate(match_instances(pred, true, max_dist,
                                                             min_kpts_frac)):
@@ -146,22 +154,14 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         m['mode'] = mode
         m['S'] = S
         m['S_pred'], m['S_true'] = Sp, St
-        # Already sliced to (S, T); PCK reuses these.
         m['_pred'], m['_true'] = pred, true
-        # How much the prediction moved vs the animal -- a screen: a carried prompt low-passes the
-        # prediction, which no error/coverage/MOTA column can see. `--vs` pairs it.
         mr = motion_ratio(m.get('_pred_matched', pred), true)
         m['motion_ratio'] = mr['ratio'] if mr['n_steps'] else None
-        # Where the pose landed relative to its own crop box, in units of one box side: a pose
-        # off its crop is not a prediction of that animal.
         if 'box_agree' in out:
             ba = np.asarray(out['box_agree'], float)
             ba = ba[np.isfinite(ba)]
             m['box_agree'] = float(np.median(ba)) if ba.size else None
             m['box_agree_p99'] = float(np.quantile(ba, 0.99)) if ba.size else None
-        # `kpt_agree` is the 2D half of the same check: `box_agree` is structurally bounded in 2D
-        # (the pose is decoded inside its own crop), while the detector's keypoints are regressed
-        # in the full frame, so `kpt_agree` has no ceiling and is the 2D diagnostic.
         if 'kpt_agree' in out:
             ka = np.asarray(out['kpt_agree'], float)
             ka = ka[np.isfinite(ka)]
@@ -181,9 +181,11 @@ def _vis_confusion(out, lab, mode, T):
 
     A `base` near 1.000 means the target has no negatives -- the converter wrote everything
     visible -- so the head cannot be gated on. A guard, not an accuracy figure.
+
+    `conf` is the per-keypoint `vis_pred` logit; the label side is the status channel (`vis3d`,
+    or the first camera's `vis2d`, the same slice `true` came from). UNLABELED is not a
+    negative: counting it as "not visible" manufactures negatives.
     """
-    # `conf` is the per-keypoint `vis_pred` logit; the label side is the status channel (`vis3d`,
-    # or the first camera's `vis2d`, the same slice `true` came from).
     st = lab.vis3d if mode == '3d' else (None if lab.vis2d is None else lab.vis2d[..., 0])
     if 'conf' not in out or st is None:
         return {}
@@ -192,7 +194,6 @@ def _vis_confusion(out, lab, mode, T):
     vp, st = vp[:n, :T, :k], st[:n, :T, :k]
     if vp.shape != st.shape:
         return {}
-    # UNLABELED is not a negative: counting it as "not visible" manufactures negatives.
     ok = np.isfinite(vp) & (st != UNLABELED)
     if not ok.any():
         return {}
@@ -206,33 +207,36 @@ def _vis_confusion(out, lab, mode, T):
 def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_cost='mean'):
     """(radius, mota dict) for one group; the ignore region is built here, from the labels.
 
-    `extent_override` (from `--chunk`) is the whole group's extent, so every chunk shares a radius.
+    `extent_override` (from `--chunk`) is the whole group's extent, so every chunk shares a
+    radius.
+
+    The match radius is the DIAGONAL of the keypoint bounding box, not a per-axis span: a
+    per-axis median ran tighter than the labelling noise and made every instance a miss AND an
+    FP. `is None`, not `or`: `--mota-dist 0` is falsy but a legitimate value.
+
+    Present-but-unannotated animals excuse an unmatched prediction only if it lands on one,
+    where the format carries boxes; without boxes the fallback excuses them all (`fp_ignored`).
+    Boxes are pixels, but in 3D the centroid is world millimetres -- every test fails and the
+    region degrades to the box-free fallback, so presence alone is used (`fp_ignored`); in 2D
+    the boxes are xyxy in the first camera.
     """
     pred, true = m['_pred'], m['_true']
     St, T = true.shape[0], true.shape[1]
-    # Match radius = the diagonal of the keypoint bounding box, not a per-axis span: a per-axis
-    # median ran tighter than the labelling noise and made every instance a miss AND an FP.
     if extent_override is not None:
         extent = float(extent_override)
     else:
         with np.errstate(all='ignore'):
             span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
             extent = np.nanmedian(np.linalg.norm(span, axis=-1))
-    # `is None`, not `or`: `--mota-dist 0` is falsy but a legitimate value.
     radius = float(mota_dist) if mota_dist is not None else float(extent) * 0.5
     if not radius > 0:
         radius = np.inf
         print(f'  MOTA: the labelled extent is {extent}, so the match radius is degenerate -- '
               'scoring without one. Too few labelled keypoints per instance-frame to size it.')
-    # Present-but-unannotated animals: an unmatched prediction is excused only if it lands on one,
-    # where the format carries boxes; without boxes the fallback excuses them all (`fp_ignored`).
     ig = ig_boxes = None
     if lab.instance is not None:
         ig = (lab.instance[:St, :T] == INST_PRESENT).any(-1)
-        # Boxes are pixels, but in 3D the centroid is world millimetres -- every test fails and
-        # the region degrades to the box-free fallback, so presence alone is used (`fp_ignored`).
         if lab.boxes is not None and m['mode'] == '2d':
-            # xyxy in the first camera.
             ig_boxes = lab.boxes[:St, :T, 0]
     return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes,
                         min_kpts_frac=min_kpts_frac, cost=match_cost)
@@ -245,6 +249,29 @@ def main():
             --mota-dist, --vs, --min-match-kpts, --chunk, --match-cost,
             --seed.
     Side effects: prints per-group rows and per-mode aggregates.
+
+    Notes:
+    - One aggregate per mode: a split may hold 2D and 3D sessions, and their units do not mix.
+      No labels in the scored prefix is a diagnosis, not a ZeroDivisionError -- a short
+      prediction over an annotated root gives every group `n_true = 0`. The tail percentiles
+      matter because the mean cannot show one: an arm that declines hard animals has a
+      flattering mean and a p90 that says so. `kpt_agree` is unbounded in 2D where `box_agree`
+      is capped by construction. The vis head's TARGET, not its output, is printed: a `base` at
+      1.000 means there is nothing for `--vis-thresh` to learn. PCK is computed from the same
+      arrays the table was computed from -- re-deriving the slicing from the npz got it wrong
+      whenever pred and true disagreed on S or T. MOTA's FP term splits into `dup` (landed on
+      an already-claimed animal; arbitration removes it) and `none` (no labelled animal; a
+      threshold removes it), and both radii are shown: MPJPE matches at the full box diagonal,
+      MOTA at half of it.
+    - `--vs`: the second file must be chunked the same way or the pairing finds nothing in
+      common; `labels` is already the chunked lookup, so it is reused. Complete-case pairing
+      flatters the arm that failed more, so the drop count is printed. The shared set is the
+      headline: a delta over points only one arm attempted measures which arm declined more.
+      Coverage is paired too -- `err` means nothing without it, and it was the one column `--vs`
+      could not put an interval on. Motion is paired like the error: a path length over an
+      arm's own matched set rewards declining points, so both are measured against the same
+      label path. The FP split is paired as well: a paired `fp_rate` alone cannot say which
+      term an arm moved.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -305,7 +332,6 @@ def main():
         print(f'{m["group"][:48]:48s} {m["S_pred"]:3d}/{m["S_true"]:<3d} {m["err"]:9.3f} '
               f'{m["median"]:8.3f} {m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
 
-    # One aggregate per mode: a split may hold 2D and 3D sessions, and their units do not mix.
     for mode in ('3d', '2d'):
         block = [m for m in rows if m['mode'] == mode]
         if not block:
@@ -316,8 +342,6 @@ def main():
         n_match = sum(m['n_matched'] for m in block)
         print(f'\n[{mode}] MPJPE {boot["mean"]:.3f} {unit}  '
               f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% bootstrap over {boot["n"]} group(s)')
-        # No labels in the scored prefix is a diagnosis, not a ZeroDivisionError: a short
-        # prediction over an annotated root gives every group `n_true = 0`.
         if not n_true:
             print(f'[{mode}] coverage n/a: no labelled points in the scored frames. The prediction '
                   'is shorter than the labels (--max-frames?) and the labelled frames are past '
@@ -330,23 +354,18 @@ def main():
             print(f'[{mode}] motion_ratio {np.mean(mr):.3f}  (predicted path / label path over the '
                   f'steps both have, {len(mr)} group(s) -- UNPAIRED, a screen not a claim; '
                   '--vs pairs it)')
-        # The tail, because the mean cannot show one: an arm that declines hard animals has a
-        # flattering mean and a p90 that says so -- and percentiles are the literature's units.
         pcts = [k for k in _PCT_KEYS if any(np.isfinite(m.get(k, np.nan)) for m in block)]
         if pcts:
             cells = '  '.join(f'{k} {np.nanmean([m.get(k, np.nan) for m in block]):.3f}'
                               for k in pcts)
             print(f'[{mode}] err {cells} {unit}  (mean over {len(block)} group(s))')
         for name, label in (('box_agree', 'pose centroid to its own crop box'),
-                            # Unbounded in 2D where `box_agree` is capped by construction.
                             ('kpt_agree', 'pose to its own detector keypoints')):
             vals = [m[name] for m in block if m.get(name) is not None]
             if vals:
                 p99 = [m[f'{name}_p99'] for m in block if m.get(f'{name}_p99') is not None]
                 print(f'[{mode}] {name} median {np.mean(vals):.3f} box-side(s), p99 '
                       f'{np.mean(p99):.3f}  ({label})')
-        # The head's target, not its output: a `base` at 1.000 means there is nothing for
-        # `--vis-thresh` to learn. Print it wherever `vis_pred` exists.
         vb = [m for m in block if m.get('vis_base') is not None]
         if vb:
             def _mean(k):
@@ -360,8 +379,6 @@ def main():
 
         thresholds = ([float(t) for t in args.pck.split(',')] if args.pck
                       else ([2.0, 5.0, 10.0] if unit == 'mm' else [5.0, 10.0, 20.0]))
-        # The same arrays the table was computed from: re-deriving the slicing from the npz got
-        # it wrong whenever pred and true disagreed on S or T.
         allp = np.concatenate([m.get('_pred_matched', m['_pred']).reshape(-1, m['_pred'].shape[-1])
                                for m in block])
         allt = np.concatenate([m['_true'].reshape(-1, m['_true'].shape[-1]) for m in block])
@@ -373,9 +390,6 @@ def main():
         print()
         for m in multi:
             r, unit = m['mota'], 'mm' if m['mode'] == '3d' else 'px'
-            # The FP term split: `dup` landed on an already-claimed animal (arbitration removes
-            # it), `none` on no labelled animal (a threshold removes it). Both radii too -- MPJPE
-            # matches at the full box diagonal, MOTA at half of it.
             print(f'{m["group"][:40]:40s} MOTA {r["mota"]:.3f}  miss {r["miss_rate"]:.3f}  '
                   f'fp {r["fp_rate"]:.3f} (dup {r["fp_dup_rate"]:.3f} none '
                   f'{r["fp_none_rate"]:.3f})  idsw {r["idsw_rate"]:.4f}  '
@@ -384,8 +398,6 @@ def main():
 
     if args.vs:
         other, ometa = load_predictions(args.vs)
-        # The second file must be chunked the same way or the pairing finds nothing in common;
-        # `labels` is already the chunked lookup, so reuse it.
         if args.chunk:
             other, _ = chunk_frames(other, label_lookup(args.data, args.split), args.chunk)
         print(f'\nPAIRED: {args.predictions} minus {args.vs}')
@@ -413,12 +425,9 @@ def main():
             ci = ('DEGENERATE (one group -- no interval exists)' if d['n'] < 2
                   else f'[{d["lo"]:+.4f}, {d["hi"]:+.4f}]'
                        + ('' if d['lo'] <= 0 <= d['hi'] else '  *'))
-            # Complete-case pairing flatters the arm that failed more; print the drop count.
             drop = f"  ({d['n_dropped']} group(s) DROPPED, one side non-finite)" if d.get(
                 'n_dropped') else ''
             print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}{drop}')
-            # The shared set is the headline: a delta over points only one arm attempted measures
-            # which arm declined more. Degenerate when nothing is labelled in the scored frames.
             frac = f'{shared / nlab:.4f}' if nlab else 'n/a, nothing labelled in the scored frames'
             print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '
                   f'({frac}) in {len(block)} group(s)')
@@ -440,11 +449,7 @@ def main():
                              + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
                 print(f'[{mode}] {name:>13s} {dm["mean"]:+.4f}  {tail}')
 
-            # Coverage is paired too: `err` means nothing without it, and it was the one column
-            # `--vs` could not put an interval on.
             paired('coverage', lambda m: m['coverage'])
-            # Motion is paired like the error: a path length over an arm's own matched set rewards
-            # declining points, so both are measured against the same label path.
             mot = [(_shared_motion(a, b)) for a, b in block]
             mot = [(x, y) for x, y, n in mot if n and np.isfinite(x) and np.isfinite(y)]
             if mot:
@@ -457,7 +462,6 @@ def main():
             paired('kpt_agree', lambda m: m.get('kpt_agree'))
             for _k in _PCT_KEYS:
                 paired(f'err {_k}', (lambda k: lambda m: m.get(k))(_k))
-            # The FP split too: a paired `fp_rate` alone cannot say which term an arm moved.
             for name in ('mota', 'miss_rate', 'fp_rate', 'fp_dup_rate', 'fp_none_rate',
                          'idsw_rate'):
                 paired(name, lambda m, k=name: m['mota'][k] if 'mota' in m else None)

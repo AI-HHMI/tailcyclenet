@@ -28,10 +28,8 @@ def compute_box_prompt(coords: torch.Tensor, cgroup: list[dict], mode: str,
     is_2d = mode == '2d'
     if is_2d:
         assert len(cgroup) == 1
-        # (1,T,K,2)
         p2d = coords[None]
     else:
-        # (C,T,K,2)
         p2d = project_points_torch(cgroup, coords)
     C, T = p2d.shape[0], p2d.shape[1]
     out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)

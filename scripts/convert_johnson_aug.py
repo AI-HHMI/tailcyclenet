@@ -85,7 +85,6 @@ def read_aug(src: Path) -> dict:
             raise RuntimeError(f'image {a["image_id"]} has >1 annotation')
         anns[a['image_id']] = a
 
-    # (trial, variant) -> {source frame: {camera: image_id}}
     clips: dict[tuple[str, str], dict[int, dict[str, int]]] = defaultdict(dict)
     for key, fs in d['framesets'].items():
         trial, frame, variant = split_key(key)
@@ -121,7 +120,6 @@ def fill_2d(d: dict, run: list[int], views: dict[int, dict[str, int]], cams: lis
             if iid is None:
                 continue
             a = d['_anns'].get(iid)
-            # Image exists, nobody labelled it.
             if a is None:
                 continue
             kp = np.asarray(a['keypoints'], dtype=np.float64).reshape(K, 3)
@@ -203,7 +201,6 @@ class Solved:
             if not _same_2d(lab.points2d[0, t], self.pre[k]):
                 self.diverged += 1
                 return False
-        # (T,K,C)
         bad = np.stack([self.rejected[k] for k in keys])
         for t, k in enumerate(keys):
             lab.points3d[0, t] = self.p3d[k]
@@ -235,6 +232,11 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
             dry_run -- report counts, write nothing.
     Outputs: aggregate statistics dict.
     Side effects: writes sessions + symlinked pixels under out/train; prints per-trial lines.
+
+    An UNKNOWN camera raises -- a frameset and a calibration disagreeing about what the rig IS.
+    A frameset holding a SUBSET is dropped loudly: the format wants every camera dir to hold
+    exactly `n_frames` contiguous files, so a 15-of-16 frameset cannot be written. The ORIGINAL
+    variant is processed first -- it is what every other variant carries its 3D from.
     """
     d = read_aug(src)
     names = list(d['keypoint_names'])
@@ -262,9 +264,6 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
             continue
         cal_root = src if all((src / p).exists() for p in cal.values()) else fallback
 
-        # An UNKNOWN camera raises -- a frameset and a calibration disagreeing about what the rig
-        # IS. A frameset holding a SUBSET is dropped loudly: the format wants every camera dir to
-        # hold exactly `n_frames` contiguous files, so a 15-of-16 frameset cannot be written.
         cams = sorted(cal)
         short: list[tuple[str, int]] = []
         for v in variants:
@@ -293,7 +292,6 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
         labels: dict[str, fmt.Labels] = {}
         links: list[tuple[Path, Path]] = []
 
-        # The ORIGINAL variant first: it is what every other variant carries its 3D from.
         for variant in [''] + [v for v in variants if v]:
             clip = d['_clips'][(trial, variant)]
             frames = sorted(clip)
@@ -305,7 +303,6 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
             for run in clips:
                 gid = f'{run[0]:06d}{suffix}'
                 lab = fill_2d(d, run, clip, cams, K)
-                # (T,K,C,2)
                 pre = lab.points2d[0].copy()
                 if variant and solved.carry(trial, run, lab):
                     stats['reused'] += 1

@@ -50,6 +50,15 @@ def main():
             --link-boxes, --n-frames, --overlap, --min-box-frames, --top-k,
             --det-max-frames.
     Side effects: prints the per-group table and bootstrapped aggregates.
+
+    A temporal-input checkpoint's BoxDataset must supply the same stacked-frame shape it was
+    trained on; `model.in_channels` (part of the weights) is the source of truth, not a CLI
+    flag. `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED,
+    and on a single-view root it is close to `1 - r@.5` restated, not an independent quantity;
+    `fp_dup`/`fp_none` come from `box_mota`'s own uncapped pass. Two runs at different
+    `input_wh` are pairable: a letterbox is a uniform scale plus a translation applied to the
+    prediction and the ground truth alike, and IoU is invariant under that. A sign flip inside
+    a paired interval means the arms are not distinguished on that column.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -115,15 +124,10 @@ def main():
     if args.deploy:
         return main_deploy(args, device)
     model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
-    # A tiled checkpoint's `input_wh` is its TILE size, not its deployment input size. `tile_scale`
-    # was unpacked here and never used, so `BoxDataset(input_wh=wh)` letterboxed the WHOLE frame
-    # into one tile -- the 1/scale shift `tiled_input_wh`/`detect_group` exist to prevent.
     _tiled(args.run, tile_scale)
     if trained_on != args.boxes:
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy.')
-    # A temporal-input checkpoint's `BoxDataset` must supply the same stacked-frame shape it was
-    # trained on; `model.in_channels` (part of the weights) is the source of truth, not a CLI flag.
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
                     min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                     max_frames_per_group=args.frames_per_group,
@@ -135,10 +139,6 @@ def main():
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={args.boxes}  '
           f'min_crop_dim={ds.min_crop_dim}  max_animals={args.max_animals or "(GT count)"}\n')
-    # `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED, and on
-    # a single-view root it is close to `1 - r@.5` restated, not an independent quantity. `fp_dup`/
-    # `fp_none` come from `box_mota`'s own uncapped pass and are what CLAUDE.md's standing rule
-    # means by "want opposite fixes" -- never read `fp` alone as an over-detection number.
     print(f'{"group":40s} {"n_gt":>6s} {"r@.5":>7s} {"r@.75":>7s} {"IoU":>7s} {"fp":>7s} '
           f'{"MOTA":>7s} {"fp_ig":>6s} {"fp_dup":>7s} {"fp_none":>8s} {"miss":>7s}')
     for g, r in sorted(rows.items()):
@@ -164,10 +164,6 @@ def main():
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
                   f'{trained_on2!r}. The paired delta below moves TWO keys.')
         if wh2 != wh:
-            # Pairable, and worth saying why: a letterbox is a uniform scale plus a translation
-            # applied to the prediction AND the ground truth alike, and IoU is invariant under
-            # that, so recall, IoU and fp/box compare directly across input sizes (box-MOTA too
-            # -- its radius derives from the median box diagonal in whichever space it measures).
             print(f'note: {args.compare} runs at {wh2[0]}x{wh2[1]} and --run at {wh[0]}x{wh[1]}. '
                   'Each is scored in its own letterbox; IoU is scale-invariant, so the columns '
                   'below are comparable.')
@@ -187,8 +183,6 @@ def main():
             if d['n'] < 2:
                 print(f'{name:>7s} {d["mean"]:+7.4f}  DEGENERATE (one group)')
                 continue
-            # A sign flip inside the interval means the arms are not distinguished on this
-            # column; say so rather than leaving two overlapping intervals to compare.
             star = '' if d['lo'] <= 0 <= d['hi'] else '  *'
             print(f'{name:>7s} {d["mean"]:+7.4f}  [{d["lo"]:+.4f}, {d["hi"]:+.4f}]{star}')
         fp_ig1 = sum(rows[k]['fp_ignored'] for k in keys)
@@ -203,11 +197,15 @@ def main_deploy(args, device):
     Inputs: args -- the parsed CLI args (deploy mode's subset).
             device -- the torch device.
     Side effects: prints per-group det_fill/slot_fill/window_miss and side-quantile rows.
+
+    DEPLOYMENT's detect_raw path handles tile_scale itself: it derives a whole-frame input size
+    per camera while preserving the animal's trained input-pixel scale; `_tiled` belongs only to
+    score_dataset's one-whole-frame loader. `t_scored` is the frame count actually scored, so a
+    `--det-max-frames` prefix does not print as full-length. union/gt side quantiles are pooled
+    per group (each group is already a quantile of many windows/points), so a mean-of-medians is
+    reported rather than bootstrapped a second time.
     """
     model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
-    # DEPLOYMENT's detect_raw path handles tile_scale itself: it derives a whole-frame input size
-    # per camera while preserving the animal's trained input-pixel scale. `_tiled` belongs only to
-    # score_dataset's one-whole-frame loader above, which cannot express that per-camera rule.
     ds = load_datasets(args.data)[0]
     sessions = ds.sessions.get(args.split, [])
     if not sessions:
@@ -229,8 +227,6 @@ def main_deploy(args, device):
                                  overlap=args.overlap, min_box_frames=args.min_box_frames,
                                  iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
             rows.append(r)
-            # The frames `deployment_score` actually scored, not the group's raw length: a
-            # `--det-max-frames` prefix would otherwise print as full-length.
             t_scored = min(group.n_frames, args.det_max_frames) if args.det_max_frames \
                 else group.n_frames
             print(f'{f"{sess.session_id}/{gid}"[:40]:40s} {t_scored:6d} '
@@ -244,8 +240,6 @@ def main_deploy(args, device):
         ci = ('DEGENERATE (one group -- no interval exists)' if b['n'] < 2
               else f'[{b["lo"]:.3f}, {b["hi"]:.3f}] 95% over {b["n"]} groups')
         print(f'{name:>12s} {b["mean"]:7.4f}  {ci}')
-    # union/gt side quantiles are pooled per group (each group already a quantile of many
-    # windows/points), so a mean-of-medians is reported rather than bootstrapped a second time.
     for k in (0.5, 0.9, 0.99):
         us = [r['union_side_px'][k] for r in rows if r['union_side_px'][k] == r['union_side_px'][k]]
         gs = [r['gt_side_px'][k] for r in rows if r['gt_side_px'][k] == r['gt_side_px'][k]]

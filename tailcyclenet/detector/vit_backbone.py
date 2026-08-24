@@ -36,15 +36,19 @@ class ViTBackbone(nn.Module):
 
     def __init__(self, model_name='dinov2_vits14', p2=True, pretrained=True,
                 out_channels=(96, 192, 384, 384), hub_repo='facebookresearch/dinov2'):
-        """Load the hub ViT and build the SFP adapters for each output stride."""
+        """Load the hub ViT and build the SFP adapters for each output stride.
+
+        Notes.
+
+        There is deliberately no `verbose=` kwarg: DINOv2's entrypoint accepts and swallows it,
+        but DINOv3's forwards **kwargs straight into `DinoVisionTransformer.__init__`, which does
+        not. When `p2=False`, p2's own width (`out_channels[0]`) is unused -- p3/p4/p5 take
+        `out_channels[1:4]` to match `self.out_channels`.
+        """
         super().__init__()
         self.p2 = bool(p2)
-        # NOTE: no `verbose=` kwarg -- DINOv2's entrypoint accepts and swallows it, but DINOv3's
-        # forwards **kwargs straight into `DinoVisionTransformer.__init__`, which does not.
         self.vit = torch.hub.load(hub_repo, model_name, pretrained=pretrained, trust_repo=True)
-        # 14 (DINOv2) or 16 (DINOv3)
         self.patch_size = self.vit.patch_size
-        # 384 for the S tier, 768 for B
         self.embed_dim = self.vit.embed_dim
         C = self.embed_dim
 
@@ -64,8 +68,6 @@ class ViTBackbone(nn.Module):
             self.adapt_p5 = conv_norm_act(C, out_channels[3], 3, 2)
             self.out_channels = tuple(out_channels)
         else:
-            # p2's own width (out_channels[0]) is unused here -- p3/p4/p5 take out_channels[1:4]
-            # to match `self.out_channels` below.
             self.adapt_p3 = nn.Sequential(
                 nn.ConvTranspose2d(C, out_channels[1], kernel_size=2, stride=2),
                 nn.GroupNorm(norm_groups(out_channels[1]), out_channels[1]),
@@ -80,13 +82,19 @@ class ViTBackbone(nn.Module):
             p.requires_grad = False
 
     def forward(self, x):
-        """Extract intermediate ViT layers and adapt each to its target stride."""
+        """Extract intermediate ViT layers and adapt each to its target stride.
+
+        Notes.
+
+        The input is padded to a multiple of `patch_size` (required by DINOv2's patch embedding)
+        with ~ImageNet mean grey (0.45). The target size at stride S for the UNPADDED input
+        (H, W) is (H // S, W // S) -- the F.interpolate calls crop/resize the adapter output to
+        that exact size.
+        """
         B, _, H, W = x.shape
-        # Pad input to a multiple of patch_size (required by DINOv2's patch embedding).
         pH = (self.patch_size - H % self.patch_size) % self.patch_size
         pW = (self.patch_size - W % self.patch_size) % self.patch_size
         if pH or pW:
-            # ~ImageNet mean grey
             x = F.pad(x, (0, pW, 0, pH), value=0.45)
 
         Hp, Wp = x.shape[2], x.shape[3]
@@ -96,8 +104,6 @@ class ViTBackbone(nn.Module):
         spatial = [f.reshape(B, h_tok, w_tok, self.embed_dim).permute(0, 3, 1, 2).contiguous()
                   for f in feats]
 
-        # Target size at stride S for the UNPADDED input (H, W) is (H // S, W // S) -- the
-        # F.interpolate calls crop/resize the adapter output to that exact size.
         if self.p2:
             p2 = F.interpolate(self.adapt_p2(spatial[0]), size=(H // 4, W // 4),
                                mode='bilinear', align_corners=False)
@@ -138,7 +144,6 @@ class TransformerBlock(nn.Module):
     def forward(self, x):
         """Tokenised attention path with residual connections."""
         B, C, H, W = x.shape
-        # (B, H*W, C)
         tokens = x.flatten(2).transpose(1, 2)
         t = self.norm1(tokens)
         tokens = tokens + self.attn(t, t, t, need_weights=False)[0]
@@ -162,34 +167,32 @@ class HybridBackbone(nn.Module):
 
     def __init__(self, base_channels=64, n_transformer_blocks=(4, 2), n_heads=8, mlp_ratio=4.0,
                 p2=True, in_channels=3):
-        """Build the hybrid backbone: CNN stages at strides 2/4/8, transformers at 16/32."""
+        """Build the hybrid backbone: CNN stages at strides 2/4/8, transformers at 16/32.
+
+        Notes.
+
+        The transformer stages each start with a stride-2 conv for spatial downsampling -- the
+        stride-16 stage halves to /16, then the stride-32 stage halves to /32 -- followed by
+        `n_transformer_blocks` transformer blocks.
+        """
         super().__init__()
-        # 64 -> out_channels (128, 256, 512, 1024)
         c = base_channels
         self.p2 = bool(p2)
 
-        # CNN stages: stride 2 -> 4 -> 8.
-        # stem: stride /2
         self.stem = nn.Sequential(
             conv_norm_act(in_channels, c, 3, 2),
             conv_norm_act(c, c, 3, 1))
-        # stage2: stride /4
         self.stage2 = nn.Sequential(
             conv_norm_act(c, c * 2, 3, 2),
             conv_norm_act(c * 2, c * 2, 3, 1))
-        # stage3: stride /8
         self.stage3 = nn.Sequential(
             conv_norm_act(c * 2, c * 4, 3, 2),
             conv_norm_act(c * 4, c * 4, 3, 1))
 
-        # Transformer stages: stride 16 -> 32. Each starts with a stride-2 conv for spatial
-        # downsampling, then N transformer blocks.
-        # /16
         self.stage4_down = conv_norm_act(c * 4, c * 8, 3, 2)
         self.stage4_blocks = nn.Sequential(
             *[TransformerBlock(c * 8, n_heads, mlp_ratio)
               for _ in range(n_transformer_blocks[0])])
-        # /32
         self.stage5_down = conv_norm_act(c * 8, c * 16, 3, 2)
         self.stage5_blocks = nn.Sequential(
             *[TransformerBlock(c * 16, n_heads, mlp_ratio)
@@ -200,12 +203,8 @@ class HybridBackbone(nn.Module):
 
     def forward(self, x):
         """Run the CNN stages then the transformer stages; return 4 or 3 pyramid levels."""
-        # stride 4, c*2 channels
         s2 = self.stage2(self.stem(x))
-        # stride 8, c*4 channels
         s3 = self.stage3(s2)
-        # stride 16, c*8 channels
         s4 = self.stage4_blocks(self.stage4_down(s3))
-        # stride 32, c*16 channels
         s5 = self.stage5_blocks(self.stage5_down(s4))
         return (s2, s3, s4, s5) if self.p2 else (s3, s4, s5)

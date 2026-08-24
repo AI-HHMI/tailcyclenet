@@ -107,6 +107,11 @@ def main():
     Inputs: argv (via argparse): --config, --out, --iters, --device.
     Side effects: writes config/provenance and backbone checkpoints under
                   [training].out; prints progress.
+
+    The per-root input size reuses train_detector.py's own sizing rule rather than a second
+    copy. Steps are ROUND-ROBIN -- one batch from EACH root per "super-step", in fixed config
+    order -- so the root-visitation schedule is reproducible from the config alone and every
+    root gets equal wall-clock share regardless of size.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -135,7 +140,6 @@ def main():
     if prov:
         (run / 'provenance.toml').write_text(toml.dumps(prov))
 
-    # PER-ROOT input size: reuses train_detector.py's own sizing rule rather than a second copy.
     import importlib.util
     spec = importlib.util.spec_from_file_location('tcn_train_detector_for_pretrain',
                                                   REPO / 'scripts' / 'train_detector.py')
@@ -188,9 +192,6 @@ def main():
 
     it, t0, running = 0, time.time(), []
     model.train()
-    # ROUND-ROBIN: one batch from EACH root per "super-step", in fixed config order, so a run's
-    # root-visitation schedule is reproducible from the config alone and every root gets equal
-    # wall-clock share regardless of size.
     while it < train_cfg['iters']:
         for loader in loaders:
             if it >= train_cfg['iters']:

@@ -98,22 +98,25 @@ def _summarise(s):
 
     Inputs: s -- per-group dict built by `score_dataset`.
     Outputs: dict with n_gt and per-GT rates (r50, r75, iou, fp, mota, fp_dup, fp_none, miss).
+
+    Notes.
+
+    `fp` is `greedy_match`'s IoU-based count -- ONE scalar that already conflates a real
+    duplicate detection with a real over-detection on empty ground. `box_mota`'s point-distance
+    pass (already run, for `mota`) decomposes the SAME decoded boxes into THREE separate numbers
+    instead of one: `fp_dup` (near an already-claimed GT -- arbitration/NMS removes it), `fp_none`
+    (on no animal -- a detection problem) and `misses` (a real animal with no box claiming it at
+    all -- the OTHER direction, and easy to lose sight of while reading fp). They want DIFFERENT
+    fixes and none of the three should be read off the other two.
+
+    NONE OF THIS ESCAPES THE BUDGET CAP: `box_mota` scores whatever `decode` already returned at
+    `top_k = n_want` (the ground-truth animal count by default, same as `fp`), so raising
+    `--max-animals` moves `fp`/`fp_dup`/`fp_none`/`miss` together, not `fp_dup`/`fp_none` alone.
+    The decomposition is what changes here, not the budget.
     """
     n = max(s['n_gt'], 1)
     m = s.get('mota', [])
     gt = sum(r['gt'] for r in m)
-    # `fp` above is `greedy_match`'s IoU-based count -- ONE scalar that already conflates a real
-    # duplicate detection with a real over-detection on empty ground. `box_mota`'s point-distance
-    # pass (already run, for `mota` above) decomposes the SAME decoded boxes into THREE separate
-    # numbers instead of one: `fp_dup` (near an already-claimed GT -- arbitration/NMS removes it),
-    # `fp_none` (on no animal -- a detection problem) and `misses` (a real animal with no box
-    # claiming it at all -- the OTHER direction, and easy to lose sight of while reading fp). They
-    # want DIFFERENT fixes and none of the three should be read off the other two.
-    #
-    # NONE OF THIS ESCAPES THE BUDGET CAP -- `box_mota` scores whatever `decode` already returned
-    # at `top_k = n_want` (the ground-truth animal count by default, same as `fp`), so raising
-    # `--max-animals` moves `fp`/`fp_dup`/`fp_none`/`miss` together, not `fp_dup`/`fp_none` alone.
-    # The decomposition is what changes here, not the budget.
     return {'n_gt': s['n_gt'], 'r50': s['hit50'] / n, 'r75': s['hit75'] / n,
             'iou': s['iou'] / n, 'fp': s['fp'] / n,
             'mota': (sum(r['mota'] * r['gt'] for r in m if np.isfinite(r['mota'])) / gt
@@ -142,37 +145,41 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     rat-city-combined miss 0.402->0.959 for almost no false-positive benefit
     (`dev/scratch/detscore/*.log`), which is why the shipped default moved to 0.05. Optional so no
     existing caller changes.
+
+    Notes.
+
+    SCORED WITHOUT AUGMENTATION, and that is a correctness fix rather than a preference:
+    `ignore_for` takes no `warp` -- unlike its two siblings `boxes_for` and `regions_for` -- so
+    under `--augment` the predictions and the GT came back warped while the `instances.pq`
+    PRESENT boxes did not, and the train-side FP readout excused the wrong pixels. Turning it off
+    is the right answer anyway: this measures the model on the data, and the train split's number
+    is only comparable to the val split's if both are unaugmented. `ds.augment` is restored at
+    the end, like `was_training`.
+
+    The per-(group, camera) store is keyed by the ITEM index, not by the frame `f`: with tiling
+    one frame yields several views and keying by frame dropped all but the last of them from
+    MOTA. `batch[2:]` is the keypoint target when the loader is emitting one; scoring here is
+    box-only by design -- `n_keypoints` must not change what r@.5 means -- so it is dropped
+    rather than unpacked. The head output is INDEXED, NOT UNPACKED: the head grew extra returns
+    and a fixed-arity unpack crashed the whole eval at the first checkpoint -- after 2,000
+    iterations of training had already happened. Any future branch adds another tail element;
+    this reads the two it needs and ignores the rest.
     """
     was_training = model.training
     model.eval()
     order = list(iter(ChunkShuffle(len(ds), chunk=ds.chunk, seed=seed)))[:batches * batch_size]
 
-    # SCORED WITHOUT AUGMENTATION, and that is a correctness fix rather than a preference.
-    # `ignore_for` takes no `warp` -- unlike its two siblings `boxes_for` and `regions_for` -- so
-    # under `--augment` the predictions and the GT came back warped while the `instances.pq`
-    # PRESENT boxes did not, and the train-side FP readout excused the wrong pixels. Turning it
-    # off is the right answer anyway: this measures the model on the data, and the train split's
-    # number is only comparable to the val split's if both are unaugmented.
     aug_was = ds.augment
-    # Restored at the end, like `was_training` below.
     ds.augment = False
     loader = torch.utils.data.DataLoader(
         ds, batch_size=batch_size, sampler=order, num_workers=num_workers,
         collate_fn=box_collate)
 
     per_group = defaultdict(lambda: {'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0.0, 'fp': 0})
-    # (key, ci) -> frame -> (pred (P,4), gt (S,4)).
     tracks = defaultdict(dict)
     sessions, n_want = {}, {}
-    # `batch[2:]` is the keypoint target when the loader is emitting one. Scoring here is
-    # box-only by design -- `n_keypoints` must not change what r@.5 means -- so it is dropped
-    # rather than unpacked.
     for bi, batch in enumerate(loader):
         x, gt = batch[0], batch[1]
-        # INDEXED, NOT UNPACKED. The head grew extra returns and a fixed-arity unpack crashed the
-        # whole eval at the first checkpoint -- after 2,000 iterations of training had already
-        # happened. Any future branch adds another tail element; this reads the two it needs and
-        # ignores the rest.
         _out = model(x.to(device))
         obj, pred_boxes = _out[0], _out[1]
         for j in range(x.shape[0]):
@@ -189,8 +196,6 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
             g_all = gt[j]
             g = g_all[torch.isfinite(g_all).all(-1)]
             p = p.cpu()
-            # Keyed by the ITEM index, not by `f`: with tiling one frame yields several views
-            # and keying by frame dropped all but the last of them from MOTA.
             tracks[(key, ci)][item] = (p.numpy(), g_all.numpy(), *ds.ignore_for(item))
             if not g.numel():
                 per_group[key]['fp'] += p.shape[0]
@@ -212,7 +217,15 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
 
 
 def overall(rows):
-    """Weight groups by their labelled-box count. The per-group table is the unweighted view."""
+    """Weight groups by their labelled-box count. The per-group table is the unweighted view.
+
+    Notes.
+
+    `fp_ignored` is a raw count, like every other place it is reported -- see `_summarise`.
+    `fp_dup`/`fp_none`/`miss` are already per-GT rates (see `_summarise`), so they are weighted
+    by `n_gt` the same way `mota` is, and the same way a group with none of `box_mota`'s inputs
+    (no `mota` rows at all) drops out rather than contaminating the mean with a NaN.
+    """
     n = sum(r['n_gt'] for r in rows.values()) or 1
     out = {k: sum(r[k] * r['n_gt'] for r in rows.values()) / n
            for k in ('r50', 'r75', 'iou', 'fp')}
@@ -220,11 +233,7 @@ def overall(rows):
     out['mota'] = (sum(r['mota'] * r['n_gt'] for r in m) / sum(r['n_gt'] for r in m)
                    if m else float('nan'))
     out['n_gt'] = sum(r['n_gt'] for r in rows.values())
-    # A raw count, like every other place `fp_ignored` is reported -- see `_summarise`.
     out['fp_ignored'] = sum(r.get('fp_ignored', 0) for r in rows.values())
-    # `fp_dup`/`fp_none`/`miss` are already per-gt rates (see `_summarise`); weight by `n_gt` the
-    # same way `mota` is above, and the same way a group with none of `box_mota`'s inputs (no
-    # `mota` rows at all) drops out rather than contaminating the mean with a NaN.
     for k in ('fp_dup', 'fp_none', 'miss'):
         mk = [r for r in rows.values() if np.isfinite(r.get(k, float('nan')))]
         out[k] = (sum(r[k] * r['n_gt'] for r in mk) / sum(r['n_gt'] for r in mk)
@@ -342,7 +351,6 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     for a in range(S):
         for st in starts:
             frames = np.arange(st, min(st + n_frames, T))
-            # (t, C, 4).
             bb = out[a][frames]
             n_ok = int(np.isfinite(bb).all(-1).sum())
             miss.append(n_ok < min_box_frames)

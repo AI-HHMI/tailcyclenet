@@ -55,13 +55,14 @@ class CrossViewTracker:
                 max_move -- per-frame box-centre displacement gate, in box sides.
                 max_age -- frames without evidence before a slot is retired.
                 min_views -- minimum cameras a birth must be seen in.
+
+        `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}.
         """
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)
-        # slot -> {'point': (3,) float32 tensor, 'age': int}
         self.targets = {}
 
     def step(self, cgroup, boxes_per_cam, scores_per_cam):
@@ -74,6 +75,49 @@ class CrossViewTracker:
 
         `boxes_per_cam` is a list of (n_c, 4) tensors in each camera's own pixels, and
         `scores_per_cam` the matching (n_c,) objectness -- the same pair `associate` takes.
+
+        Notes.
+
+        A TARGET WITH NO 3D POINT CANNOT BE MATCHED, BUT IT MUST STILL BE ABLE TO EXPIRE. It is
+        filtered out of `slots`, so the update loop never touches its `age`, `retire` never
+        fires, and `free` excludes it because it is still in `self.targets` -- the slot is dead
+        for the rest of the clip. `--min-views 1` creates exactly this: a single-view instance's
+        `point` is all-NaN by design (`associate`), and one such birth on frame 0 permanently
+        costs a row. This is NOT the documented immortal one-camera target -- that one HAS a
+        finite point, is in `slots`, and its age is maintained; retiring it was tried and
+        measured worse (+2.72 mm MPJPE). This one is invisible to the matcher entirely.
+
+        The affinity uses THE DETECTION'S OWN SIDE, not the mean of it and the target's last
+        claimed side. `link_rows` uses the mean and making these two consistent was TRIED AND
+        MEASURED WORSE: +1.71 mm MPJPE and -0.038 MOTA, paired over 131,887 points on the two
+        ten-bird clips. The paths are not analogous -- `link_rows` averages two boxes seen in the
+        SAME frame, while a target's remembered side is carried forward, so one oversized box
+        gives it an oversized gate for life. Box slots filled RISE while pose coverage FALLS: the
+        extra boxes are wrong.
+
+        THE GATE IS THE ALGORITHM, not a tie-break: a pair beyond one box side is not the same
+        animal, so it must be unavailable to Hungarian rather than merely expensive -- an optimum
+        over an all-bad cost matrix is an arbitrary permutation. A NaN BOX IS UNAVAILABLE, NOT
+        UNRANKABLE: `unletterbox_boxes` returns NaN for a box with no area, which makes the gap
+        NaN, which `clip` leaves NaN -- and `affinity.any()` is True for NaN, so
+        `linear_sum_assignment` raised `matrix contains invalid numeric entries` and killed the
+        clip. Zero is what the gate already means: unavailable.
+
+        The phases after matching: UPDATE re-triangulates from what a target actually claimed,
+        else holds the point; BIRTHS send whatever nobody claimed through the memoryless
+        pairwise search (`associate`); RETIRE frees a slot with no evidence for a window for
+        whoever is there now. AGE COUNTS FRAMES WITH NO EVIDENCE AT ALL -- one camera is
+        evidence: it cannot move the point, but it says the animal is still there, which is what
+        expiry is about. SO A TARGET CLAIMING EXACTLY ONE CAMERA NEVER EXPIRES AND NEVER UPDATES
+        ITS 3D POINT (since the re-triangulation needs two cameras). That reads like a bug and a
+        second counter retiring it on frames-since-re-triangulation was TRIED AND MEASURED
+        WORSE: +2.72 mm MPJPE and miss +0.021, paired over 132,006 points on the same clips. The
+        frozen point costs nothing, because the output boxes are written from the CLAIMED
+        DETECTION and never from the reprojection -- a one-camera target still emits a real box
+        for a real animal, and expiring it hands its slot to a spurious birth. Leave it immortal.
+
+        `claimed` is the per-camera set of taken detection indices; `got` maps slot -> {cam: det
+        index}.
         """
         from scipy.optimize import linear_sum_assignment
 
@@ -85,47 +129,21 @@ class CrossViewTracker:
         sides = [_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
         slots = [s for s, t in sorted(self.targets.items())
                  if bool(torch.isfinite(t['point']).all())]
-        # A TARGET WITH NO 3D POINT CANNOT BE MATCHED, SO IT MUST STILL BE ABLE TO EXPIRE. It is
-        # filtered out of `slots` above, so the update loop never touches its `age`, `retire` never
-        # fires, and `free` below excludes it because it is still in `self.targets` -- the slot is
-        # dead for the rest of the clip. `--min-views 1` creates exactly this: a single-view
-        # instance's `point` is all-NaN by design (`associate`), and one such birth on frame 0
-        # permanently costs a row.
-        #
-        # This is NOT the documented immortal one-camera target. That one HAS a finite point, is
-        # in `slots`, and its age is maintained; retiring it was tried and measured worse
-        # (+2.72 mm MPJPE). This one is invisible to the matcher entirely.
         for s, t in self.targets.items():
             if s not in slots:
                 t['age'] += 1
         pts = (torch.stack([self.targets[s]['point'] for s in slots]) if slots else None)
         claimed = {c: set() for c in range(C)}
-        # slot -> {cam: det index}
         got = {s: {} for s in slots}
 
         for c in range(C):
             n_det = centres[c].shape[0]
             if not slots or not n_det:
                 continue
-            # Target projections (n_t,2) and their per-detection distances (n_t,n_det).
             proj = _project(cgroup[c], pts)
             d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)
-            # THE DETECTION'S OWN SIDE, not the mean of it and the target's last claimed side.
-            # `link_rows` uses the mean and making these two consistent was TRIED AND MEASURED
-            # WORSE: +1.71 mm MPJPE and -0.038 MOTA, paired over 131,887 points on the two
-            # ten-bird clips. The paths are not analogous -- `link_rows` averages two boxes seen in
-            # the SAME frame, while a target's remembered side is carried forward, so one oversized
-            # box gives it an oversized gate for life. Box slots filled RISE while pose coverage
-            # FALLS: the extra boxes are wrong.
             side = sides[c][None].clamp_min(1e-6)
             gap = (d / (self.max_move * side)).numpy()
-            # THE GATE IS THE ALGORITHM, not a tie-break. A pair beyond one box side is not the same
-            # animal, so it must be unavailable to Hungarian rather than merely expensive -- an
-            # optimum over an all-bad cost matrix is an arbitrary permutation.
-            # A NaN BOX IS UNAVAILABLE, NOT UNRANKABLE. `unletterbox_boxes` returns NaN for a box
-            # with no area, which makes `gap` NaN, which `clip` leaves NaN -- and `affinity.any()`
-            # is True for NaN, so `linear_sum_assignment` raised `matrix contains invalid numeric
-            # entries` and killed the clip. Zero is what the gate already means: unavailable.
             affinity = np.nan_to_num(np.clip(1.0 - gap, 0.0, None), nan=0.0)
             if not affinity.any():
                 continue
@@ -135,7 +153,6 @@ class CrossViewTracker:
                     got[slots[i]][c] = int(j)
                     claimed[c].add(int(j))
 
-        # -- update: re-triangulate from what this target actually claimed, else hold -------
         for s in slots:
             cams = tuple(sorted(got[s]))
             if len(cams) >= 2:
@@ -143,29 +160,12 @@ class CrossViewTracker:
                 new = _triangulate(cgroup, cams, p)
                 if bool(torch.isfinite(new).all()):
                     self.targets[s]['point'] = new
-                # THE KEYPOINT SET, TRIANGULATED THE SAME WAY, so the cues have a 3D thing to
-                # reproject rather than one camera's 2D opinion. HELD, not cleared, when a frame
-                # fails to produce one: the same rule the point follows (no velocity model), and a
-                # shape is a slower-changing quantity than a position. Only keypoints valid in
-                # EVERY claimed camera can be triangulated, which is why this is per keypoint
-                # rather than all-or-nothing.
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
                 sc[s, c] = float(scores_per_cam[c][j])
                 claimed_ix[s, c] = j
-            # AGE COUNTS FRAMES WITH NO EVIDENCE AT ALL. One camera is evidence: it cannot move the
-            # point, but it says the animal is still there, which is what expiry is about.
-            #
-            # SO A TARGET CLAIMING EXACTLY ONE CAMERA NEVER EXPIRES AND NEVER UPDATES ITS 3D POINT,
-            # since `len(cams) >= 2` above never fires. That reads like a bug and a second counter
-            # retiring it on frames-since-re-triangulation was TRIED AND MEASURED WORSE: +2.72 mm
-            # MPJPE and miss +0.021, paired over 132,006 points on the same clips. The frozen point
-            # costs nothing, because `out[s, c]` below is written from the CLAIMED DETECTION and
-            # never from the reprojection -- so a one-camera target is still emitting a real box for
-            # a real animal, and expiring it hands its slot to a spurious birth. Leave it immortal.
             self.targets[s]['age'] = 0 if got[s] else self.targets[s]['age'] + 1
 
-        # -- births: whatever nobody claimed, through the memoryless pairwise search --------
         free = [s for s in range(self.n) if s not in self.targets]
         if free:
             keep = [[j for j in range(centres[c].shape[0]) if j not in claimed[c]]
@@ -184,7 +184,6 @@ class CrossViewTracker:
                         sc[s, c] = float(scores_per_cam[c][det])
                         claimed_ix[s, c] = det
 
-        # -- retire: a slot with no evidence for a window is free for whoever is there now ---
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
             del self.targets[s]
         return out, sc, claimed_ix
@@ -195,6 +194,14 @@ def demo():
 
     `assert`-based and dependency-free so this file can be checked without the test suite:
         pixi run python -m tailcyclenet.detector.track
+
+    The animals CROSS: A walks right, B walks left, and the SCORE ORDER swaps every frame the
+    way `decode` reorders them -- a row that follows one animal must be immune to that. The
+    checks, in order: (1) both slots stay filled in every frame (births on frame 0, matches
+    after); (2) each row's own box moves smoothly -- a swapped row would jump the full
+    separation; (3) a frame with no detections at all ages the targets and returns nothing
+    without dropping them -- a one-frame detector miss must not end a track; (4) they resume in
+    the SAME slots afterwards.
     """
     from aniposelib.cameras import Camera, CameraGroup
 
@@ -230,24 +237,17 @@ def demo():
     tr = CrossViewTracker(2, max_res_px=30.0)
     rows = []
     for t in range(12):
-        # They cross: A walks right, B walks left, and the SCORE ORDER swaps every frame the way
-        # `decode` reorders them. A row that follows one animal must be immune to that.
         w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
         per_cam, scores = boxes_at(w if t % 2 == 0 else w[::-1])
         rows.append(tr.step(cg, per_cam, scores)[0])
 
-    # 1. Both slots are filled in every frame -- births on frame 0, matches after.
     assert all(np.isfinite(r).all(-1).any(-1).sum() == 2 for r in rows), 'an animal was lost'
-    # 2. Each row's own box moves smoothly: a swapped row would jump the full separation.
     for s in (0, 1):
         cx = np.array([r[s, 0, [0, 2]].mean() for r in rows])
         assert np.abs(np.diff(cx)).max() < 30.0, f'row {s} jumped: {np.diff(cx)}'
-    # 3. A frame with no detections at all ages the targets and returns nothing, without dropping
-    #    them -- a one-frame detector miss must not end a track.
     empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
     out, _, _ = tr.step(cg, *empty)
     assert not np.isfinite(out).any() and len(tr.targets) == 2
-    # 4. ...and they resume in the SAME slots afterwards.
     w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
     resumed, _, _ = tr.step(cg, *boxes_at(w))
     assert np.isfinite(resumed).all(-1).any(-1).sum() == 2

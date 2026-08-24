@@ -137,16 +137,16 @@ class CSPNeXtBottleneck(nn.Module):
     `dev/scratch/prototype_cspnext.py`.
     """
     def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
-        """Build the CSPNeXt bottleneck: 3x3 conv, 5x5 depthwise, 1x1 pointwise, SE gate."""
+        """Build the CSPNeXt bottleneck: 3x3 conv, 5x5 depthwise, 1x1 pointwise, SE gate.
+
+        The SE gate is global avg pool -> FC down -> SiLU -> FC up -> Sigmoid, applied to the
+        conv path. The 5x5 depthwise kernel is the CSPNeXt signature, larger than YOLOX's 3x3.
+        """
         super().__init__()
         hidden = int(cout * expansion)
-        # 3x3 standard conv
         self.conv1 = conv_norm_act(cin, hidden, 3)
-        # 5x5 depthwise (the CSPNeXt signature: larger kernel than YOLOX's 3x3)
         self.dw = conv_norm_act(hidden, hidden, 5, groups=hidden)
-        # 1x1 pointwise
         self.pw = conv_norm_act(hidden, cout, 1)
-        # Squeeze-Excitation: global avg pool -> FC down -> SiLU -> FC up -> Sigmoid
         sq = max(1, cout // 4)
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -226,23 +226,20 @@ class CSPDarknetNano(nn.Module):
     """
 
     def __init__(self, w=(24, 48, 96, 192), p2=False, in_channels=3):
-        """Build `trimmed`'s backbone: stem + dark2..dark5 at strides 2/4/8/16/32."""
+        """Build `trimmed`'s backbone: stem + dark2..dark5 at strides 2/4/8/16/32.
+
+        Output widths are (c2, c3, c4, c4) with `p2`, else (c3, c4, c4) -- dark4 and dark5
+        share `c4` in this 4-effective-width net, unlike the canonical 5-stage backbone.
+        """
         super().__init__()
         c1, c2, c3, c4 = w
         self.p2 = bool(p2)
-        # stride /2
         self.stem = conv_norm_act(int(in_channels), c1, 3, 2)
-        # stride /4
         self.dark2 = nn.Sequential(conv3(c1, c2, 3, 2), CSPLayer(c2, c2, 1))
-        # stride /8
         self.dark3 = nn.Sequential(conv3(c2, c3, 3, 2), CSPLayer(c3, c3, 3))
-        # stride /16
         self.dark4 = nn.Sequential(conv3(c3, c4, 3, 2), CSPLayer(c4, c4, 3))
-        # stride /32
         self.dark5 = nn.Sequential(conv3(c4, c4, 3, 2), SPPBottleneck(c4, c4),
                                    CSPLayer(c4, c4, 1, shortcut=False))
-        # p3, p4, p5 output widths -- dark4 and dark5 share `c4` in this 4-effective-width net,
-        # unlike the canonical 5-stage backbone below where all three differ.
         self.out_channels = (c2, c3, c4, c4) if self.p2 else (c3, c4, c4)
 
     def forward(self, x):
@@ -289,34 +286,31 @@ class CSPDarknet(nn.Module):
 
     def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5,
                 p2=False, in_channels=3):
-        """Build the canonical 5-stage backbone at Megvii's official tier multipliers."""
+        """Build the canonical 5-stage backbone at Megvii's official tier multipliers.
+
+        With `p2` the output widths are FOUR distinct values (c*2, c*4, c*8, c*16); the default
+        keeps the 3-tuple contract, matching `CSPDarknetNano`'s own `p2` switch.
+        """
         super().__init__()
         c = round8(64 * width_mul)
         d = max(1, round(3 * depth_mul))
         be = bottleneck_expansion
         self.p2 = bool(p2)
-        # stride /2
         self.stem = Focus(int(in_channels), c, 3, depthwise=depthwise)
-        # stride /4
         self.dark2 = nn.Sequential(conv3(c, c * 2, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 2, c * 2, d, depthwise=depthwise,
                                            bottleneck_expansion=be))
-        # stride /8
         self.dark3 = nn.Sequential(conv3(c * 2, c * 4, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 4, c * 4, d * 3, depthwise=depthwise,
                                            bottleneck_expansion=be))
-        # stride /16
         self.dark4 = nn.Sequential(conv3(c * 4, c * 8, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 8, c * 8, d * 3, depthwise=depthwise,
                                            bottleneck_expansion=be))
-        # stride /32
         self.dark5 = nn.Sequential(
             conv3(c * 8, c * 16, 3, 2, depthwise=depthwise),
             SPPBottleneck(c * 16, c * 16),
             CSPLayer(c * 16, c * 16, d, shortcut=False, depthwise=depthwise,
                     bottleneck_expansion=be))
-        # p2, p3, p4, p5 -- FOUR distinct widths when `p2` (T4.3); the 3-tuple contract is
-        # unchanged at the default, matching `CSPDarknetNano`'s own `p2` switch.
         self.out_channels = (c * 2, c * 4, c * 8, c * 16) if self.p2 else (c * 4, c * 8, c * 16)
 
     def forward(self, x):
@@ -340,30 +334,27 @@ class CSPNeXt(nn.Module):
     """
     def __init__(self, width_mul=0.5, depth_mul=0.33, bottleneck_expansion=1.0,
                 p2=False, in_channels=3):
-        """Build the CSPNeXt backbone (RTMDet-style) at the given width/depth multipliers."""
+        """Build the CSPNeXt backbone (RTMDet-style) at the given width/depth multipliers.
+
+        base_channels = round8(64 * width_mul) (e.g. 32 at 0.5) and
+        base_depth = max(1, round(3 * depth_mul)) (e.g. 1 at 0.33), with the same Focus stem
+        and stage structure as `CSPDarknet`'s canonical tiers.
+        """
         super().__init__()
-        # base_channels, e.g. 32 at width_mul=0.5
         c = round8(64 * width_mul)
-        # base_depth, e.g. 1 at depth_mul=0.33
         d = max(1, round(3 * depth_mul))
         be = bottleneck_expansion
         self.p2 = bool(p2)
-        # Same stem as CSPDarknet canonical tiers
-        # stride /2
         self.stem = Focus(int(in_channels), c, 3, depthwise=False)
-        # stride /4
         self.dark2 = nn.Sequential(
             conv_norm_act(c, c * 2, 3, 2),
             CSPNeXtLayer(c * 2, c * 2, d, bottleneck_expansion=be))
-        # stride /8
         self.dark3 = nn.Sequential(
             conv_norm_act(c * 2, c * 4, 3, 2),
             CSPNeXtLayer(c * 4, c * 4, d * 3, bottleneck_expansion=be))
-        # stride /16
         self.dark4 = nn.Sequential(
             conv_norm_act(c * 4, c * 8, 3, 2),
             CSPNeXtLayer(c * 8, c * 8, d * 3, bottleneck_expansion=be))
-        # stride /32
         self.dark5 = nn.Sequential(
             conv_norm_act(c * 8, c * 16, 3, 2),
             SPPBottleneck(c * 16, c * 16),
@@ -394,21 +385,23 @@ class PAFPN(nn.Module):
 
     def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False,
                 fpn_upsample='nearest', p2_bottomup=False):
-        """Build the PAFPN neck: lateral convs, top-down merges, optional p2 bottom-up."""
+        """Build the PAFPN neck: lateral convs, top-down merges, optional p2 bottom-up.
+
+        `fpn_upsample='nearest'` (default) is byte-identical to every checkpoint on record;
+        `'bilinear'` is RTMDet's own choice (no checkerboard artifacts, no extra params).
+
+        `p2_bottomup=True` gives p2 the same "one more CSPLayer pass after the top-down merge"
+        treatment out3/out4/out5 get, applied to p2 ALONE (self-refinement): p2 is the finest
+        level, so there is no genuinely finer input to draw a bottom-up pass from the way
+        out3/out4/out5 draw from their own finer neighbour. Only constructed when both `p2` and
+        `p2_bottomup` are set; default False is byte-identical to every checkpoint on record.
+        """
         super().__init__()
         self.p2 = bool(p2)
-        # G2: 'nearest' (default) is byte-identical to every checkpoint on record; 'bilinear' is
-        # RTMDet's own choice (no checkerboard artifacts, no extra params).
         self.fpn_upsample = str(fpn_upsample)
         if self.fpn_upsample not in ('nearest', 'bilinear'):
             raise ValueError(f"fpn_upsample must be 'nearest' or 'bilinear', got "
                              f"{fpn_upsample!r}")
-        # G3: p2 is the finest level, so there is no genuinely finer input to draw a bottom-up
-        # pass from the way out3/out4/out5 draw from their own finer neighbour (down2(p2), etc).
-        # `p2_bottomup=True` gives p2 the same "one more CSPLayer pass after the top-down merge"
-        # treatment those levels get, applied to p2 alone (self-refinement) rather than inventing
-        # a level finer than stride 4. Default False is byte-identical to every checkpoint on
-        # record; only constructed when both `p2` and `p2_bottomup` are set.
         self.p2_bottomup = bool(p2_bottomup)
         if self.p2:
             c2, c3, c4, c5 = chans
@@ -475,24 +468,26 @@ class Head(nn.Module):
     """
 
     def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True, shared_head=True):
-        """Build the decoupled head: per-level stems, reg/obj towers, optional kpt branch."""
+        """Build the decoupled head: per-level stems, reg/obj towers, optional kpt branch.
+
+        `shared_head=True` (default) runs obj AND reg through the SAME `reg_convs` tower --
+        byte-identical to every checkpoint on record; `False` builds a SEPARATE `obj_convs`
+        tower (mirroring YOLOX's own decoupled head) so objectness and box regression stop
+        competing for the same features -- ~0.3M extra params on `tiny`.
+
+        The objectness bias is initialised to YOLOX's rare-positive prior (-4.595). A per-anchor
+        identity branch (a softmax over a CLOSED animal set) was built and deleted -- a single
+        class means objectness alone carries all the information.
+        """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
-        # G1: `shared_head=True` (default) runs obj AND reg through the SAME `reg_convs` tower
-        # -- byte-identical to every checkpoint on record. `False` builds a SEPARATE `obj_convs`
-        # tower (mirroring YOLOX's own decoupled head, unlike this net's shared-tower default) so
-        # objectness and box regression stop competing for the same features -- ~0.3M extra
-        # params on `tiny`.
         self.shared_head = bool(shared_head)
-        # THE IDENTITY BRANCH -- a per-anchor softmax over a CLOSED animal set (what rat-city is,
-        # 12 fixed rats) -- was built and deleted; see the module docstring's refutation.
         self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
             [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
                            conv3(cin, cin, 3, depthwise=depthwise)) for _ in range(n_levels)])
         self.reg_pred = nn.ModuleList([nn.Conv2d(cin, 4, 1) for _ in range(n_levels)])
         self.obj_pred = nn.ModuleList([nn.Conv2d(cin, 1, 1) for _ in range(n_levels)])
-        # rare-positive prior, as in YOLOX
         for m in self.obj_pred:
             nn.init.constant_(m.bias, -4.595)
         if not self.shared_head:
@@ -553,7 +548,20 @@ class YOLOXNano(nn.Module):
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
                 p2=False, in_channels=3, head_depthwise=None, pretrained='',
                 shared_head=True, fpn_upsample='nearest', p2_bottomup=False):
-        """Build the box predictor for `version` (see the class docstring for arguments)."""
+        """Build the box predictor for `version` (see the class docstring for arguments).
+
+        `pretrained` selects which hub checkpoint a ViT backbone loads: '' (default) trains from
+        scratch; 'dinov2'/'dinov3' load the matching DINOv2/DINOv3 weights -- only meaningful
+        for a `vit_*` version (`config.py` refuses the combination otherwise).
+
+        Version branches: `vit_*` builds a ViT backbone + Simple Feature Pyramid with a
+        full-conv neck/head at the 's' tier's neck width (128); `in_channels != 3` is refused
+        for it, because a ViT patch embedding is built for RGB and has no wider-stem path.
+        `hybrid` builds a CNN stem (strides 2/4/8) + transformer blocks (strides 16/32) from
+        scratch at neck width 256 (matching c*4 at stride-8). `cspnext_s` builds the RTMDet-style
+        backbone (5x5 depthwise + SE bottleneck) on the existing CSPDarknet stage structure,
+        with full-conv towers at neck width 128.
+        """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
@@ -561,9 +569,6 @@ class YOLOXNano(nn.Module):
         self.p2 = bool(p2)
         self.in_channels = int(in_channels)
         self.head_depthwise = head_depthwise
-        # A2: which pretrained weights (if any) a ViT backbone loads. '' (default) trains from
-        # scratch; 'dinov2' loads the DINOv2 hub checkpoint. Only meaningful for a `vit_*`
-        # version -- `config.py` refuses the combination otherwise.
         self.pretrained_source = str(pretrained) if isinstance(pretrained, str) else ''
         if self.version == 'trimmed':
             if self.bottleneck_expansion != 0.5:
@@ -575,8 +580,6 @@ class YOLOXNano(nn.Module):
             self.backbone = CSPDarknetNano(p2=self.p2, in_channels=self.in_channels)
             neck_out, depthwise = width, True
         elif self.version in VIT_BACKBONES:
-            # A2: DINOv2/DINOv3 ViT backbone + Simple Feature Pyramid. `in_channels != 3` is
-            # refused -- a ViT patch embedding is built for RGB and has no wider-stem path.
             if self.in_channels != 3:
                 raise ValueError(f"in_channels={self.in_channels} was passed alongside "
                                  f"version={version!r}, but the ViT backbone's patch embedding "
@@ -586,27 +589,18 @@ class YOLOXNano(nn.Module):
             use_pretrained = (self.pretrained_source == pretrained_key)
             self.backbone = ViTBackbone(model_name, p2=self.p2, pretrained=use_pretrained,
                                         hub_repo=hub_repo)
-            # 128 -- match the 's' tier's neck width
             neck_out = round8(256 * 0.5)
-            # ViT arms use full-conv neck/head
             depthwise = False
         elif self.version == 'hybrid':
-            # A3: CNN stem (strides 2/4/8) + transformer blocks (strides 16/32), from scratch.
             from .vit_backbone import HybridBackbone
             self.backbone = HybridBackbone(p2=self.p2, in_channels=self.in_channels)
-            # 256, matching the c*4 = 256 at stride-8
             neck_out = round8(256)
-            # full-conv neck/head
             depthwise = False
         elif self.version == 'cspnext_s':
-            # A4: RTMDet-style backbone (5x5 depthwise + SE bottleneck) on the existing
-            # CSPDarknet stage structure.
             self.backbone = CSPNeXt(width_mul=0.5, depth_mul=0.33,
                                     bottleneck_expansion=self.bottleneck_expansion,
                                     p2=self.p2, in_channels=self.in_channels)
-            # 128
             neck_out = round8(256 * 0.5)
-            # CSPNeXt uses full-conv in its towers
             depthwise = False
         else:
             if self.version not in YOLOX_TIERS:
@@ -639,6 +633,14 @@ class YOLOXNano(nn.Module):
         returns a third tensor, keypoints (B, A, K, 3) -- (x, y, score_logit), x/y also in input
         pixels -- and `None` otherwise, so existing two-value callers must be updated but their
         behaviour is unchanged.
+
+        Boxes decode from ltrb distances: exp keeps them strictly positive (YOLOX's own choice),
+        scaled by stride, around each cell centre. Keypoint offsets are NOT exponentiated -- they
+        are SIGNED, and exp would fold every keypoint to one side of its anchor. They are instead
+        bounded at 1.25 box half-widths via tanh (borrowed from RTMO's bin range): a keypoint
+        physically cannot land outside 1.25x its own box, which directly attacks the
+        identity-relevant failure of a keypoint flying onto the NEIGHBOURING animal. The box
+        half-width is `.detach()`ed so the keypoint loss cannot perturb the box branch.
         """
         outs = self.head(self.neck(self.backbone(x)))
         obj_all, box_all, kpt_all = [], [], []
@@ -646,10 +648,8 @@ class YOLOXNano(nn.Module):
             B, _, h, w = obj.shape
             gy, gx = torch.meshgrid(torch.arange(h, device=x.device),
                                     torch.arange(w, device=x.device), indexing='ij')
-            # cell centres in input pixels
             cx = (gx.reshape(-1) + 0.5) * stride
             cy = (gy.reshape(-1) + 0.5) * stride
-            # anchor-free ltrb distances, positive via exp (YOLOX uses exp on wh)
             ltrb = reg.permute(0, 2, 3, 1).reshape(B, -1, 4)
             ltrb = torch.exp(ltrb.clamp(-6, 6)) * stride
             boxes = torch.stack([cx[None] - ltrb[..., 0], cy[None] - ltrb[..., 1],
@@ -658,18 +658,8 @@ class YOLOXNano(nn.Module):
             box_all.append(boxes)
             if kpt is not None:
                 k = kpt.permute(0, 2, 3, 1).reshape(B, -1, self.n_keypoints, 3)
-                # NO `exp` HERE. ltrb distances are positive so the box decode exponentiates;
-                # keypoint offsets are SIGNED, and exponentiating them would fold every keypoint
-                # to one side of its anchor, silently.
-                #
-                # BOUNDED AT 1.25 BOX HALF-WIDTHS via tanh, borrowed from RTMO's bin range: a
-                # keypoint physically cannot land outside 1.25x its own box, which directly
-                # attacks the identity-relevant failure -- a keypoint flying onto the NEIGHBOURING
-                # animal. `.detach()` on the box so the keypoint loss cannot perturb the box
-                # branch.
                 half = torch.stack([(ltrb[..., 0] + ltrb[..., 2]) / 2,
                                     (ltrb[..., 1] + ltrb[..., 3]) / 2], -1).detach()
-                # (1,A,2)
                 ctr = torch.stack([cx, cy], -1)[None]
                 xy = ctr[:, :, None] + 1.25 * half[:, :, None] * torch.tanh(k[..., :2])
                 kpt_all.append(torch.cat([xy, k[..., 2:]], -1))

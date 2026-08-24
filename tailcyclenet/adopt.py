@@ -88,6 +88,12 @@ def _expand(videos) -> list[Path]:
     """Files and/or directories -> the resolved, sorted file list. A directory expands to its
     `VIDEO_EXTS` children, sorted, NOT recursively. Resolved BEFORE it is recorded, so a
     `--videos rec/` that later grows a file does not reconstruct differently.
+
+    An explicitly named file with a foreign extension is a refusal (Refusal 5) -- a directory
+    expansion already filtered. Named and absent is also a refusal: the recorded file list is
+    replayed on render, so a missing file means the prediction lost its pixels. The result is
+    deduplicated with `dict.fromkeys`, not a set: the order is the sorted expansion and must
+    survive recording.
     """
     out: list[Path] = []
     for v in videos:
@@ -96,17 +102,13 @@ def _expand(videos) -> list[Path]:
             out.extend(sorted(q.resolve() for q in p.iterdir()
                               if q.is_file() and q.suffix.lower() in fmt.VIDEO_EXTS))
         else:
-            # Refusal 5, for an EXPLICITLY named file -- a directory expansion already filtered.
             if p.suffix.lower() not in fmt.VIDEO_EXTS:
                 _die(f'--videos {p}: extension {p.suffix!r} is not one of {fmt.VIDEO_EXTS}. '
                      'Nothing downstream distinguishes a container it cannot open from one it '
                      'was never given.')
-            # Named and absent is a refusal: the recorded file list is replayed on render, so a
-            # missing file means the prediction lost its pixels.
             if not p.exists():
                 _die(f'--videos {p}: no such file.')
             out.append(p.resolve())
-    # dict.fromkeys, not set: the order is the sorted expansion and must survive recording.
     return list(dict.fromkeys(out))
 
 
@@ -127,6 +129,21 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
     """PURE GIVEN THE FILESYSTEM'S NAMES. Refusals 1-6. Opens no video, decodes nothing, loads
     no checkpoint. `calibration` is an aniposelib-layout toml -- what `format.load_calibration`
     reads and what anipose itself writes.
+
+    A camera block with no `size` is patched here (Refusal 14, and the one place this path may
+    be generous) and `build` fills it in -- and PRINTS that it did: a size derived from the
+    pixels cannot be wrong about the pixels, and `load_calibration` raises on a block with no
+    `size`, so the document must be patched before the Rig is built. NO MOVING RIGS:
+    `extrinsics.pq` is per-frame geometry no filename can supply, and `labels()` is overridden
+    on this path so nothing downstream would catch it. Refusal 6: `load_calibration` silently
+    turns a matrix-less block into a nominal camera, and with `validate_session` out of the
+    loop nothing downstream would say so. The camera-name filter is REFUSAL 2, all-versus-some:
+    `mouse_2_validate` ships 17 mp4s against 16 calibrated cameras -- a camera with video and
+    no geometry can never join any group, so refusing the whole run is wrong, but silently
+    dropping pixels is worse, so unknown cameras are skipped and printed. An empty group id is
+    about DISAGREEMENT, not emptiness: all empty is one group (a raw rig dump); some empty and
+    some not is a genuine ambiguity (Refusals 3 and 4 cover a duplicate (group, camera) pair
+    and a group missing a calibrated camera's video).
     """
     files = _expand(videos)
     if not files:
@@ -138,9 +155,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
         _die(f'--calibration {cal}: no such file.')
     with open(cal, 'rb') as f:
         doc = tomllib.load(f)
-    # REFUSAL 14, and the one place this path may be generous: a size derived from the pixels
-    # cannot be wrong about the pixels. `load_calibration` raises on a block with no `size`, so
-    # the document is patched here and `build` fills it in -- and PRINTS that it did.
     need_size = []
     for k, block in doc.items():
         if k == 'metadata' or not isinstance(block, dict):
@@ -150,8 +164,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
             block['size'] = [0, 0]
     rig = fmt.rig_from_doc(doc, str(cal))
 
-    # NO MOVING RIGS: `extrinsics.pq` is per-frame geometry no filename can supply, and
-    # `labels()` is overridden on this path so nothing downstream would catch it.
     moving = [n for n in rig.names if rig.moving[n]]
     if moving:
         _die(f'{cal}: cameras {moving} declare moving = true, and --videos cannot supply '
@@ -160,8 +172,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
 
     mode = '3d' if len(rig) > 1 else '2d'
     if mode == '3d':
-        # Refusal 6: `load_calibration` silently turns a matrix-less block into a nominal
-        # camera, and with `validate_session` out of the loop nothing downstream would say so.
         bad = [n for n in rig.names if not rig.calibrated[n]]
         if bad:
             _die(f'{cal}: {len(rig)} cameras means 3D, but {bad} carry no matrix/rotation/'
@@ -175,7 +185,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
              "own `[triangulation] cam_regex`, e.g. 'cam([0-9]+)_'. Only a ONE-camera "
              'calibration may omit it.')
 
-    # THE REGEX, over the basenames.
     parsed: list[tuple[Path, str, str]] = []
     for f in files:
         cam, gid = parse_name(f.stem, cam_regex)
@@ -189,9 +198,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
              f'First basenames: {[f.stem for f in files[:3]]}. `re.search` is used, so the '
              'pattern need not anchor.')
 
-    # REFUSAL 2, all-versus-some. `mouse_2_validate` ships 17 mp4s against 16 calibrated cameras:
-    # a camera with video and no geometry can never join any group, so refusing the whole run is
-    # wrong -- but silently dropping pixels is worse.
     known = set(rig.names)
     keep = [p for p in matched_regex if p[1] in known]
     if not keep:
@@ -206,8 +212,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
         print(f'--videos: camera {name!r} has video but no calibration block; skipping its '
               f'{sum(1 for p in matched_regex if p[1] == name)} file(s).')
 
-    # An empty group id is about DISAGREEMENT, not emptiness: all empty is one group (a raw rig
-    # dump); some empty and some not is a genuine ambiguity.
     empty = [p for p in keep if not p[2]]
     if empty and len(empty) != len(keep):
         _die('--cam-regex leaves some filenames with a group id and some with nothing: '
@@ -223,14 +227,12 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
     where: dict[tuple[str, str], Path] = {}
     for f, cam, gid in keep:
         gid = gid_default if one_group else gid
-        # REFUSAL 3.
         if (gid, cam) in where:
             _die(f'two videos land on group {gid!r} camera {cam!r}: {where[gid, cam]} and {f}. '
                  'Silently keeping one is how a whole trial goes missing.')
         where[gid, cam] = f
         out.setdefault(gid, {})[cam] = f
 
-    # REFUSAL 4.
     for gid in sorted(out):
         miss = [n for n in rig.names if n not in out[gid]]
         if miss:
@@ -253,34 +255,30 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
 def check_flags(args) -> None:
     """Refusals 7-11: the flags that mean something on a labelled session and nothing here. Pure
     argparse arithmetic, so it fires before the checkpoint loads and before anything decodes.
+
+    The numbered checks fire in order and are refusals 7-11. Refusal 10 concerns the DETECTOR
+    path specifically: the fallback animal count is 1 for any footage, a catastrophic miss rate
+    with no labels to make it visible; a `--boxes` npz states its row count in its own first
+    axis, so there is nothing to refuse. `--split` defaults to None so this can tell whether it
+    was PASSED; the directory path resolves `args.split or 'test'`.
     """
-    # 7.
     if args.anchor == 'labels':
         _die('--anchor labels seeds the model with GROUND TRUTH, and --videos has no labels: the '
              'label array is S = 0, so the "oracle" would be an oracle over nothing. Use '
              '--anchor carry (deployment) or --anchor none.')
-    # 8.
     if args.box_prompt == 'labels':
         _die('--box-prompt labels seeds the box from GROUND TRUTH, and --videos has no labels. '
              'Use --box-prompt detector (with --detector/--boxes) or --box-prompt none.')
-    # 9.
     if not args.detector and not args.boxes:
         _die('--videos needs a box source: the default crop comes from the LABELS, and here they '
              'are an S = 0 array, so every window would abort `no points` and the run would '
              'report coverage 0.000 with nothing saying why. Pass --detector <run folder> or '
              '--boxes <npz>.')
-    # 10, the DETECTOR path's refusal specifically: the fallback animal count is 1 for any
-    # footage, a catastrophic miss rate with no labels to make it visible. A `--boxes` npz states
-    # its row count in its own first axis, so there is nothing to refuse.
-    # 10.
     if args.detector and not args.max_animals:
         _die('--videos --detector needs --max-animals: the row count otherwise falls back to the '
              "session's own animal count, which is 0 here and clamps to 1 -- a catastrophic miss "
              'rate on any multi-animal footage, with no labels to make it visible. The animal '
              'count is a fact no file on this path carries, so the operator states it.')
-    # `--split` defaults to None so this can tell whether it was PASSED. The directory path
-    # resolves `args.split or 'test'`.
-    # 11.
     if getattr(args, 'split', None) is not None:
         _die('--split selects among a dataset root\'s sessions and --videos has no root, so it is '
              'inert here. Silently ignoring it would let you believe you selected something.')
@@ -334,10 +332,21 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
 
     Opens video containers in the calling process (the fork deadlock): safe from
     `scripts/infer.py`, which never forks; never call it from `scripts/train.py`.
+
+    The probe runs in PARALLEL and prints progress: a silent pause before the first box looks
+    like a hang. A camera in `plan.need_size` is filled from its own first frame and the fill
+    is printed (Refusal 14 -- a size derived from the pixels cannot be wrong about the pixels).
+    Refusal 13 rejects a calibration at the wrong resolution: `matrix` and `distortions` are in
+    SENSOR pixels and `size` is the image on disk, so a mismatched pair projects to the wrong
+    place with no symptom other than being wrong. Refusal 12 rejects a group whose cameras
+    disagree on length unless `--trim-to-shortest` opts in. `source_video` is the spec's one
+    string per group; left empty for multi-camera rather than picking arbitrarily. `path` is a
+    LABEL, not a location -- the common parent is what makes `session_id` right and error
+    strings name something a human recognises. The probe is where the memory goes, so the
+    process is trimmed and peak-checked afterwards.
     """
     jobs = [(gid, cam, p) for gid, cams in plan.videos.items() for cam, p in cams.items()]
     got: dict[tuple[str, str], tuple] = {}
-    # Parallel AND it says so: a silent pause before the first box looks like a hang.
     workers = probe_workers(len(jobs))
     if verbose:
         print(f'--videos: probing {len(jobs)} video(s) for length and frame size '
@@ -350,7 +359,6 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
             if verbose:
                 print(f'  {gid}/{cam}: {n} frames, {wh[0]}x{wh[1]}, {f:g} fps', flush=True)
 
-    # REFUSAL 14, printed. A size derived from the pixels cannot be wrong about the pixels.
     for name in plan.need_size:
         wh = next((v[1] for (g, c), v in got.items() if c == name), None)
         if wh is None:
@@ -360,8 +368,6 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
             print(f'--calibration: camera {name!r} carried no `size`; filled from its own first '
                   f'frame as {wh[0]}x{wh[1]}.')
 
-    # Refusal 13: `matrix` and `distortions` are in SENSOR pixels and `size` is the image on
-    # disk, so a calibration at the wrong resolution projects to the wrong place, silently.
     for (gid, cam), (n, wh, f) in sorted(got.items()):
         want = plan.rig.size(cam)
         if tuple(wh) != tuple(want):
@@ -375,7 +381,6 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
     K, C = len(names), len(plan.rig)
     for gid, cams in plan.videos.items():
         lens = {cam: got[gid, cam][0] for cam in cams}
-        # REFUSAL 12.
         if len(set(lens.values())) > 1:
             if not trim:
                 _die(f'group {gid!r}: its cameras disagree on length -- {lens}. A one-frame '
@@ -389,15 +394,11 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
             n = next(iter(lens.values()))
         got_fps = [got[gid, cam][2] for cam in cams]
         f = float(fps) if fps else (got_fps[0] if got_fps else float('nan'))
-        # `source_video` is the spec's one string per group; left empty for multi-camera rather
-        # than picking arbitrarily.
         sv = str(next(iter(cams.values()))) if len(cams) == 1 else ''
         groups[gid] = fmt.video_group(gid, n, cams, fps=f, source_video=sv)
         empty[gid] = fmt.empty_labels(0, n, K, C, mode3d=(plan.mode == '3d'))
 
     sess = fmt.VideoSession(
-        # `path` is a LABEL, not a location -- see VideoSession. The common parent is what makes
-        # `session_id` right and error strings name something a human recognises.
         path=_common_parent(list(plan.files)) / plan.session_id,
         mode=plan.mode, units=str(units), label_source='tracked', names=list(names),
         rig=plan.rig, groups=groups, assoc_res_max_px=float(assoc_res_max_px),
@@ -408,7 +409,6 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
         print(f'--videos: session {sess.session_id!r}, mode {sess.mode}, units {sess.units!r} '
               f'(a DECLARATION about the calibration, not a measurement), {len(groups)} group(s), '
               f'{len(plan.rig)} camera(s)')
-    # If the probe is where the memory goes, this is where a reader finds out.
     from . import memory
     memory.trim()
     memory.check_peak('the --videos probe')
@@ -422,16 +422,16 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
 def provenance_of(plan: VideoPlan) -> dict:
     """The CLI INPUTS, and that is the whole record. `source_videos` is the RESOLVED file list --
     not the derived map, which `plan()` re-derives exactly from the list (and a per-(group,
-    camera) key would collide).
+    camera) key would collide). `source_session` is deliberately empty: there is no directory,
+    and a stale-looking path reads as a root. `source_group_id` is load-bearing exactly where
+    the regex leaves every remainder empty -- without it the reconstruction cannot name the
+    group.
     """
     return {
         'source': 'tailcyclenet infer --videos',
-        # Deliberately empty: there is no directory, and a stale-looking path reads as a root.
         'source_session': '',
         'source_calibration': str(plan.calibration),
         'source_cam_regex': str(plan.cam_regex or ''),
-        # Load-bearing exactly where the regex leaves every remainder empty -- without it the
-        # reconstruction cannot name the group.
         'source_group_id': str(plan.group_id),
         'source_videos': [str(p) for p in plan.files],
     }

@@ -137,14 +137,23 @@ def _lsf_limit() -> float | None:
 
 def host_budget(override_gb: float | None = None,
                 fraction: float = DEFAULT_FRACTION) -> Budget:
-    """Resolve the budget. `override_gb` beats the environment, which beats the derivation."""
+    """Resolve the budget. `override_gb` beats the environment, which beats the derivation.
+
+    If `/proc/meminfo` is unavailable, `SC_PHYS_PAGES` is tried and finally a floor, so a
+    weird host degrades rather than dies. The budget is HEADROOM, NOT THE CAP: inside a cgroup
+    what is left is `limit - current`; outside one it is `MemAvailable`, which counts
+    reclaimable page cache and so is the honest number. The smaller is taken -- a cgroup can be
+    nearly empty on a host that is nearly full. `--max-ram N` IS A CEILING ON THE PROCESS, NOT
+    AN ALLOWANCE FOR THE BUFFERS, so the same `fraction` applies to it as to a derived budget.
+    A budget above the hard cap is a request to be OOM-killed, so it is clamped and the clamp
+    is said so.
+    """
     mi = _meminfo()
     total = mi.get('MemTotal')
     if total is None:
         try:
             total = float(os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))
         except (OSError, ValueError, AttributeError):
-            # A floor, so a weird host degrades rather than dies.
             total = 8.0 * GB
     cg_limit, cg_current = _cgroup()
     lsf = _lsf_limit()
@@ -155,16 +164,11 @@ def host_budget(override_gb: float | None = None,
         if val is not None and val < limit:
             limit, source = val, name
 
-    # HEADROOM, NOT THE CAP. Inside a cgroup what is left is `limit - current`; outside one it is
-    # `MemAvailable`, which counts reclaimable page cache and so is the honest number. Take the
-    # smaller: a cgroup can be nearly empty on a host that is nearly full.
     avail = mi.get('MemAvailable', limit)
     if cg_limit is not None:
         avail = min(avail, max(0.0, cg_limit - cg_current))
     avail = min(avail, limit)
 
-    # `--max-ram N` IS A CEILING ON THE PROCESS, NOT AN ALLOWANCE FOR THE BUFFERS, so the same
-    # `fraction` applies to it as to a derived budget.
     stated = False
     if override_gb is not None and override_gb > 0:
         budget = fraction * float(override_gb) * GB
@@ -180,7 +184,6 @@ def host_budget(override_gb: float | None = None,
     else:
         budget = fraction * min(limit, avail)
 
-    # A budget above the hard cap is a request to be OOM-killed. Clamp, and say so.
     if budget > limit:
         source += f' (clamped to the {limit / GB:.1f} GB cap)'
         budget = limit
@@ -215,16 +218,16 @@ def rebudget(override_gb: float | None = None,
 
     The floor (torch, CUDA, checkpoints) sat outside every budget; it is measured as the current
     RSS rather than assumed, since it depends on the workload. The budget is then the smaller of
-    the fraction and `limit - floor`.
+    the fraction and `limit - floor`. An INFERRED budget is already "what was lying around" and
+    already contains the floor, so it is returned unchanged; for a STATED budget the figure the
+    caller actually named is `budget_gb / fraction`, which bounds the result.
     """
     global _cached
     base = host_budget(override_gb, fraction)
     floor = rss_gb()
     if not (floor == floor) or not base.stated:
-        # An INFERRED budget is already "what was lying around" and already contains the floor.
         _cached = base
         return base
-    # The figure the caller actually named.
     ceiling = base.budget_gb / fraction
     _cached = replace(base, budget_gb=max(0.0, min(base.budget_gb, ceiling - floor)),
                       floor_gb=floor,
@@ -316,14 +319,15 @@ def check_peak(phase: str, budget: 'Budget | None' = None) -> float:
 
     Diagnosis, not enforcement: consumers size themselves from the budget and nothing checks the
     total, so an outside-partition allocation is invisible until the node OOMs. Only a STATED
-    budget is a promise an inferred one is not; once per process, at loop boundaries.
+    budget is a promise an inferred one is not; once per process, at loop boundaries. The
+    comparison is against the STATED figure, not the buffer share: `--max-ram` is a ceiling on
+    the PROCESS.
     """
     global _peak_warned
     b = current() if budget is None else budget
     peak = peak_gb()
     if _peak_warned or not b.stated or not (peak == peak):
         return peak
-    # Against the STATED figure, not the buffer share: `--max-ram` is a ceiling on the PROCESS.
     ceiling = b.budget_gb / DEFAULT_FRACTION
     if peak > ceiling:
         _peak_warned = True

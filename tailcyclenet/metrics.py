@@ -67,6 +67,9 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
     """Resample UNITS (windows, groups) -- not points -- and report the interval. With
     `per_unit_b`, the difference is taken inside each resample (paired); points within a window
     are correlated, so resampling points would be several times too tight.
+
+    Pairing is complete-case: a unit where either side is non-finite leaves the comparison,
+    which flatters the arm that failed more -- the count is returned rather than absorbed.
     """
     rng = np.random.default_rng(seed)
     a = np.asarray(per_unit_a, float)
@@ -84,8 +87,6 @@ def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
     idx = rng.integers(0, a.size, size=(n, a.size))
     stat = a[idx].mean(1) if b is None else (a[idx] - b[idx]).mean(1)
     point = float(a.mean() if b is None else (a - b).mean())
-    # Pairing is complete-case: a unit where either side is non-finite leaves the comparison,
-    # which flatters the arm that failed more -- the count is returned rather than absorbed.
     return {'mean': point, 'lo': float(np.quantile(stat, alpha / 2)),
             'hi': float(np.quantile(stat, 1 - alpha / 2)), 'n': int(a.size),
             'n_dropped': dropped}
@@ -95,13 +96,15 @@ def motion_ratio(pred, ref) -> dict:
     """Predicted path length over a reference's, over the steps BOTH sides have. `ref` is the
     labels, or one position per instance-frame (the prediction's centroid then moves); both must
     live in the SAME space. The paired form (`scripts/eval.py --vs`) is what licenses a claim.
+
+    With one reference position per instance-frame, the prediction's CENTROID is what moves: it
+    is kept as a length-1 keypoint axis so the time axis stays at -3 for both shapes, and an
+    all-NaN instance-frame is legal. The comparison runs over (..., T, K) entries where both
+    sides are finite.
     """
     p, r = np.asarray(pred, float), np.asarray(ref, float)
     if r.ndim == p.ndim - 1:
-        # One reference position per instance-frame: the prediction's CENTROID is what moves. Kept
-        # as a length-1 keypoint axis so the time axis stays at -3 for both shapes.
         with warnings.catch_warnings():
-            # An all-NaN instance-frame is legal.
             warnings.simplefilter('ignore', RuntimeWarning)
             p = np.nanmean(p, axis=-2, keepdims=True)
         r = r[..., None, :]
@@ -110,7 +113,6 @@ def motion_ratio(pred, ref) -> dict:
             f'motion_ratio: pred {p.shape} vs ref {r.shape}. The two must be in the same space -- '
             'a 3D world path divided by a 2D pixel path is a number in no unit. Reproject the '
             'prediction before comparing it with a box centre.')
-    # (..., T, K): both sides finite.
     ok = np.isfinite(p).all(-1) & np.isfinite(r).all(-1)
     both = ok[..., :-1, :] & ok[..., 1:, :]
     dp = np.linalg.norm(np.diff(p, axis=-3), axis=-1)
@@ -131,6 +133,10 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
     `'penalised'` charges declined labelled keypoints at max_dist, so a sparse row cannot
     out-bid a dense one (needs finite max_dist). min_kpts_frac: fraction of K a pair must share
     to be scored at all -- a FRACTION, not a count, since K ranges 4..47 across roots.
+
+    Per frame the inputs are (Sp,K,R) vs (St,K,R) with (Sp,St,K) pairwise keypoint distances.
+    Under `'penalised'` the LABEL's own count is the denominator, so a prediction cannot shrink
+    the denominator by declining points -- which is the whole of the 'mean' hazard.
     """
     if cost not in ('mean', 'penalised'):
         raise ValueError(f"match_instances: cost must be 'mean' or 'penalised', got {cost!r}")
@@ -141,15 +147,11 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
     out = []
     with np.errstate(invalid='ignore'):
         for t in range(T):
-            # (Sp,K,R), (St,K,R).
             p, q = pred[:, t], true[:, t]
-            # (Sp,St,K) pairwise keypoint distances.
             d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)
             ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
             n_ok = ok.sum(-1)
             if penalise:
-                # The LABEL's own count is the denominator, so a prediction cannot shrink the
-                # denominator by declining points -- which is the whole of the 'mean' hazard.
                 n_lab = np.broadcast_to(np.isfinite(q).all(-1).sum(-1)[None, :], n_ok.shape)
                 num = np.where(ok, d, 0.0).sum(-1) + max_dist * (n_lab - n_ok)
                 c = np.where(n_ok >= need, num / np.maximum(n_lab, 1), np.nan)
@@ -172,11 +174,15 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
     `ignore_boxes` (St,T,4) an unmatched prediction is excused only inside a box, without them
     presence alone excuses it -- either way the count is `fp_ignored`. The FP term is split into
     `fp_dup` (near an already-claimed GT; arbitration removes it) and `fp_none` (on no animal).
+
+    (St,T) and (Sp,T) record which instances exist at each frame. An instance with no finite
+    keypoint has no centroid, and NaN is the answer -- not a warning; `_in_ignore` and the
+    duplicate test both check for it explicitly. The duplicate test compares (Sp,T,R) and
+    (St,T,R) centroids.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     matches = match_instances(pred, true, max_dist, min_kpts_frac, cost)
     T = true.shape[1]
-    # (St,T) and (Sp,T): which instances exist at each frame.
     true_present = np.isfinite(true).all(-1).any(-1)
     pred_present = np.isfinite(pred).all(-1).any(-1)
     if ignore is not None:
@@ -187,10 +193,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
     misses = fps = switches = gt = ignored = dups = 0
     last = {}
     with np.errstate(invalid='ignore'), warnings.catch_warnings():
-        # An instance with no finite keypoint has no centroid, and NaN is the answer -- not a
-        # warning. `_in_ignore` and the duplicate test below both check for it explicitly.
         warnings.simplefilter('ignore', RuntimeWarning)
-        # (Sp,T,R) and (St,T,R) centroids, for the duplicate test below.
         centroid = np.nanmean(pred, axis=2)
         true_centroid = np.nanmean(true, axis=2)
     for t in range(T):
@@ -246,6 +249,9 @@ def matched_error(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean') -
     """MPJPE over HUNGARIAN-MATCHED instances, for multi-animal predictions. Row index is not
     identity once boxes come from a detector. `unmatched_true` is part of the answer: a method
     that predicts one animal well and ignores nine looks excellent on `err` alone.
+
+    The returned counts are the POINT counts, not just the instance counts -- quote matched
+    error beside its coverage.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     pairs = match_instances(pred, true, max_dist, min_kpts_frac, cost)
@@ -257,7 +263,6 @@ def matched_error(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean') -
         n_matched_inst += len(pairs[t])
         for i, j, _ in pairs[t]:
             dists.append(_dist(pred[i, t], true[j, t]))
-    # The POINT counts, not just the instance counts -- quote matched error beside its coverage.
     n_true = int(np.isfinite(true).all(-1).sum())
     if not dists:
         return {'err': float('nan'), 'median': float('nan'), **_err_pcts([]), 'coverage': 0.0,

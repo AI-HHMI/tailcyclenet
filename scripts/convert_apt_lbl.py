@@ -85,15 +85,14 @@ def movie_labels(entry) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     `occ` is deliberately not returned: APT's occluded-with-a-position points are written
     `visible` (see the module docstring), so the tag changes nothing downstream and returning it
-    would imply it does.
+    would imply it does. `p` is x-block-then-y-block: (2*npts, n) reshapes to (2, npts, n), NOT
+    interleaved pairs -- the interleaved reading puts ~28% of points out of frame.
     """
     if np.size(getattr(entry, 'frm', [])) == 0:
         return (np.zeros(0, int), np.zeros(0, int), np.zeros((0, len(APT_NAMES), 2)))
     frm = np.ravel(entry.frm).astype(int) - 1
     tgt = np.ravel(entry.tgt).astype(int) - 1
     npts = int(np.ravel(entry.npts)[0])
-    # (2*npts, n) -> (2, npts, n) -> (n, npts, 2): a column is a BLOCK of x's then a block of
-    # y's, not interleaved pairs -- the interleaved reading puts ~28% of points out of frame.
     xy = np.asarray(entry.p, float).reshape(2, npts, frm.size) - 1.0
     return frm, tgt, np.transpose(xy, (2, 1, 0))
 
@@ -103,7 +102,7 @@ def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
 
     APT's "Label Box" certifies an area as COMPLETELY LABELLED (not an animal box -- it has no
     target index). Axis-alignment is asserted: a rotated ROI would silently become its bounding
-    box and certify area the annotator did not.
+    box and certify area the annotator did not. Vertices are 1-based, like `p` and `frm`.
     """
     v = getattr(entry, 'verts', None)
     if v is None or np.size(v) == 0:
@@ -111,10 +110,8 @@ def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
     v = np.asarray(v, float)
     if v.ndim == 2:
         v = v[:, :, None]
-    # 1-based, like `p` and `frm`
     v = v - 1.0
     f = np.ravel(entry.f).astype(int) - 1
-    # (2,n) each
     lo, hi = v.min(0), v.max(0)
     corner_on_edge = (np.isclose(v, lo[None]) | np.isclose(v, hi[None])).all()
     if not corner_on_edge:
@@ -286,7 +283,9 @@ def check_seek(movie: str, start: int, fps: float, tmp: Path) -> str:
     """Once per movie: is the time seek frame-EXACT, or merely close?
 
     Demands `start` be the argmin over its neighbours, which no off-by-one survives; `-ss` maps
-    time to frame linearly, so once per movie is enough.
+    time to frame linearly, so once per movie is enough. Ties are accepted, not strictly best:
+    stalled recordings hold byte-identical consecutive frames and it does not matter which came
+    back; tied-for-minimum still rejects every real off-by-one.
     """
     tmp.mkdir(parents=True, exist_ok=True)
     for p in tmp.glob('*.jpg'):
@@ -297,8 +296,6 @@ def check_seek(movie: str, start: int, fps: float, tmp: Path) -> str:
     vr = reader(movie)
     cand = [f for f in (start - 1, start, start + 1) if 0 <= f < len(vr)]
     diffs = {f: _diff(got, vr.get_batch([f])[0]) for f in cand}
-    # Tied, not strictly best: stalled recordings hold byte-identical consecutive frames, and it
-    # does not matter which of them came back. Tied-for-minimum still rejects every real off-by-one.
     if diffs[start] > min(diffs.values()) + 1e-6:
         return f'-ss lands on frame {min(diffs, key=diffs.get)}, not {start} (diffs {diffs})'
     return ''
@@ -336,7 +333,8 @@ def padded_extent(pts: np.ndarray, wh) -> np.ndarray:
     """(K,2) source px -> [x0,y0,x1,y1], the padded extent of the finite points, or NaN.
 
     Steps 1-2 of the crop rule (not step 3), as the tracked root stores it: a consumer re-enters
-    the real rule at `pad=0` and reproduces it.
+    the real rule at `pad=0` and reproduces it. The extent is stored as int32 truncation, as the
+    rule does it -- re-truncating the float is then a no-op.
     """
     finite = np.isfinite(pts).all(-1)
     if not finite.any():
@@ -344,7 +342,6 @@ def padded_extent(pts: np.ndarray, wh) -> np.ndarray:
     p, wh = pts[finite], np.asarray(wh, np.float32)
     lo = np.clip(p.min(0) - PAD, 0, wh)
     hi = np.clip(p.max(0) + PAD, 0, wh)
-    # int32 truncation, as the rule does it -- re-truncating the float is then a no-op.
     return np.concatenate([lo, hi]).astype(np.int32).astype(np.float32)
 
 
@@ -369,7 +366,6 @@ def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels
     lab.instance = np.full((len(lab.animal_ids), n, 1), fmt.INST_NONE, np.int8)
     lf = frame - start
     for r, a in zip(rows, slots):
-        # (K, 2)
         pts = job.xy[r]
         occluded = np.isinf(pts).any(-1)
         positioned = np.isfinite(pts).all(-1)
@@ -386,11 +382,11 @@ def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int
     """Region rows for one group: the ROIs on ITS OWN labelled frame, and no others.
 
     A Label Box certifies one source frame; the claim is only sound in the group carrying that
-    frame's labels. Returns ((M,6) in `Labels.regions` layout, n_clipped_away).
+    frame's labels. Column 0 is the group-local frame index and column 1 the single camera.
+    Returns ((M,6) in `Labels.regions` layout, n_clipped_away).
     """
     r = job.roi_rect[np.flatnonzero(job.roi_f == frame)]
     out = np.zeros((len(r), 6))
-    # Group-local frame index; column 1 is the single camera.
     out[:, 0] = frame - start
     out[:, 1] = 0
     out[:, 2:] = np.clip(r, 0.0, np.tile(np.asarray(wh, float), 2))
@@ -412,6 +408,13 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     Side effects: writes the session (tables + groups/ pixels); removes an
                   existing session dir when args.clean; raises SystemExit on
                   --labels-only with no prior conversion.
+
+    `--labels-only` never re-runs ffmpeg -- the extracted frames are already correct, and the
+    groups on disk stay the authority for `n_frames`/`source_frame_start`. The project file's
+    `nframes` is a claim about the container: groups are truncated to what came out and dropped
+    if the labelled frame is past the end or fewer than two frames. Every group gets a `regions`
+    array, empty or not: absence is the format's claim of exhaustive labelling, and a
+    label-sparse root is the opposite (the GT sessions carry no ROIs).
     """
     names = [RENAME.get(nm, nm) for nm in APT_NAMES]
     dst = out / job.split / job.session
@@ -437,14 +440,11 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
             stat['warnings'].append(err)
 
     groups, labels, extract = {}, {}, None
-    # `--labels-only`: the extracted frames are already correct, so a tables-only change must not
-    # re-run ffmpeg. The groups on disk stay the authority for `n_frames`/`source_frame_start`.
     reuse = args.labels_only and not args.dry_run
     if reuse:
         if not (dst / 'session.toml').exists():
             raise SystemExit(f'{dst}: --labels-only, but this session has not been converted yet')
         old = fmt.Session.load(dst)
-        # How the pixels on disk were really made.
         extract = old.provenance.get('extract')
         for gid, g in old.groups.items():
             groups[gid] = fmt.Group(gid, g.n_frames, fps=g.fps, source_video=g.source_video,
@@ -464,8 +464,6 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
         cdir.mkdir(parents=True, exist_ok=True)
         got, used = write_window(job.movie, start, n, job.fps, cdir, mode)
         stat['decode_fallback'] += used == 'decode' and mode == 'copy'
-        # The project file's `nframes` is a claim about the container; truncate to what came out,
-        # and drop the group if the labelled frame is past the end or fewer than two frames.
         if got < 2 or f - start >= got:
             shutil.rmtree(dst / 'groups' / gid)
             stat['skipped'] += 1
@@ -480,9 +478,6 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     if args.dry_run or not groups:
         return stat
 
-    # Every group gets a `regions` array, empty or not: absence is the format's claim of
-    # exhaustive labelling, and a label-sparse root is the opposite. The GT sessions carry no
-    # ROIs, so they get an empty regions.pq rather than a missing one.
     clipped = 0
     for gid, g in groups.items():
         labels[gid].regions, n = group_regions(job, int(gid[1:]), g.source_frame_start, job.wh)
@@ -580,7 +575,6 @@ def main() -> int:
             budget -= len(j.frames)
         jobs = [j for j in jobs if j.frames]
 
-    # Over the kept frames, not the whole row set: `--max-groups` must report the conversion done.
     def n_inst(j):
         """Instances over the kept frames, not the whole row set."""
         return int(np.isin(j.frm, j.frames).sum())
@@ -609,9 +603,7 @@ def main() -> int:
                   + (f' {stat["decode_fallback"]} fallback' if stat['decode_fallback'] else '')
                   + (f' {stat["skipped"]} skipped' if stat['skipped'] else ''))
 
-    # Both fallback routes reported: a movie-wide `decode` switch is correct but re-encoded.
     reenc = [s for s in stats if s['decode_movie']]
-    # ROIs on no group's labelled frame are dropped (`group_regions`) -- a real loss, reported.
     off = sum(s['roi_off_label'] for s in stats)
     print(f'\nregions: {sum(s["regions"] for s in stats)} written, '
           f'{off} label boxes dropped (on a frame no group is centered on)')

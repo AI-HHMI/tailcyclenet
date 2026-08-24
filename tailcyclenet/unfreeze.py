@@ -27,13 +27,13 @@ def apply_norms_extension(model) -> list[int]:
     """Apply the norms extension to a model whose encoder is ALREADY trainable at build time --
     `true` unfreezes inside the constructor and never reaches `apply_staged_unfreeze`, so without
     this it would train a different parameter set than an int + the same `n_last`. Called before
-    the optimizer is built.
+    the optimizer is built. When `n_last` is absent the whole encoder is trainable and every norm
+    already is.
     """
     if not getattr(model, 'video_encoder_requires_grad', False):
         return []
     n_last = getattr(model, 'video_encoder_finetune_last_n_layers', None)
     if n_last is None:
-        # The whole encoder is trainable; every norm already is.
         return []
     encoder = model.scene_encoder.encoder
     norms = _norms_in_range(encoder, int(n_last))
@@ -48,6 +48,14 @@ def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
     """Fire the staged unfreeze if `iteration` reaches it, and tell the optimizer about it.
     Returns None when nothing fired; idempotent by delegation (upstream flips the flag on the
     first fire and returns False forever after).
+
+    The norms extension is applied AFTER upstream has set `requires_grad` -- upstream re-freezes
+    everything first, so doing this earlier would be undone. Every tensor now trainable and not
+    already held is routed; membership is by `id`, so a param the optimizer already holds is
+    never added twice. Under `optimizer = "schedulefree"` there is ONE AdamW-SF optimizer, so the
+    Muon routes collapse onto it merged BY LR -- otherwise the encoder would arrive as two groups
+    at one identical rate. Only AdamW-SF carries a per-group `train_mode`; the `.get` keeps this
+    usable from a test or probe that builds a plain optimizer.
     """
     if not hasattr(model, 'unfreeze_video_encoder'):
         return None
@@ -59,15 +67,11 @@ def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
     n_blocks = len(getattr(encoder, 'blocks', []))
     n_last = n_blocks if n_last is None else int(n_last)
 
-    # THE NORMS EXTENSION, applied after upstream has set `requires_grad` -- upstream re-freezes
-    # everything first, so doing this earlier would be undone.
     norms = _norms_in_range(encoder, n_last)
     for i in norms:
         for p in encoder.norms_block[i].parameters():
             p.requires_grad_(True)
 
-    # Route every tensor now trainable and not already held; membership is by `id`, so a param
-    # the optimizer already holds is never added twice.
     held = {id(p) for g in opt.param_groups for p in g['params']}
     embed_ids = embedding_ids(model)
     added: dict[str, list] = {}
@@ -88,15 +92,11 @@ def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
                 opt.add_adamw_group(params, lr, wd)
                 n_adamw += 1
     else:
-        # `optimizer = "schedulefree"`: ONE AdamW-SF optimizer, so the Muon routes collapse onto
-        # it merged BY LR, or the encoder would arrive as two groups at one identical rate.
         by_lr: dict[float, list] = {}
         for route, params in sorted(added.items()):
             by_lr.setdefault(group_lr(route, opt_cfg), []).extend(params)
         for lr, params in sorted(by_lr.items()):
             opt.add_param_group({'params': params, 'lr': lr, 'weight_decay': wd})
-            # Only AdamW-SF carries a per-group `train_mode`; `.get` keeps this usable from a
-            # test or probe that builds a plain optimizer.
             if 'train_mode' in opt.param_groups[0]:
                 opt.param_groups[-1]['train_mode'] = opt.param_groups[0]['train_mode']
             n_adamw += 1

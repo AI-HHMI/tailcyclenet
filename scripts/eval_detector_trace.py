@@ -36,7 +36,12 @@ REASONS = ('localization', 'score', 'nms', 'top_k', 'kept')
 
 
 def _gt_boxes(sess, gid, frame, ci, box_source, min_crop_dim):
-    """Return visible/in-view source-pixel GT crop boxes for one frame-camera."""
+    """Return visible/in-view source-pixel GT crop boxes for one frame-camera.
+
+    For 2D, a VISIBLE status is the only positive visibility claim. A 3D projection has no
+    per-camera status in some roots, so finite projected points are the conservative in-view
+    proxy; roots with explicit per-camera visibility use it instead.
+    """
     lab = sess.labels(gid)
     if box_source == 'instances' and lab.boxes is not None:
         b = np.asarray(lab.boxes[:, frame, ci], dtype=np.float32)
@@ -53,9 +58,6 @@ def _gt_boxes(sess, gid, frame, ci, box_source, min_crop_dim):
 
     out = []
     for s, pts in enumerate(points):
-        # For 2D, a VISIBLE status is the only positive visibility claim. A 3D projection has no
-        # per-camera status in some roots, so finite projected points are the conservative in-view
-        # proxy; roots with explicit per-camera visibility use it instead.
         if status is not None and not np.any(status[s] == VISIBLE):
             continue
         finite = np.isfinite(pts).all(-1)

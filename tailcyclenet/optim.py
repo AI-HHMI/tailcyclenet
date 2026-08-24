@@ -39,12 +39,12 @@ def embedding_ids(model) -> set[int]:
 
 def route_param(name: str, p, fresh: set[str], embed_ids: set[int]) -> str:
     """Which of `ROUTES` this parameter belongs to -- the single routing rule, shared by build
-    time and the staged unfreeze so the two cannot drift.
+    time and the staged unfreeze so the two cannot drift. NEW vs the reference: fresh 2D
+    matrices go to Muon at `kpt_lr`.
     """
     is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
     is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
     if is2d and is_fresh:
-        # NEW vs the reference: fresh 2D -> Muon @ kpt_lr.
         return 'muon_fresh'
     if is2d and 'scene_encoder.encoder.blocks' in name:
         return 'muon_enc'
@@ -130,7 +130,9 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
 
     Routing is by NAME and MODULE TYPE, not ndim alone: `nn.Embedding` weights are 2D but each
     row is a keypoint identity; the output heads stay on AdamW; frozen params are filtered first
-    (a frozen param is in no group, which is why the staged unfreeze must add new groups).
+    (a frozen param is in no group, which is why the staged unfreeze must add new groups). The
+    schedule-free wrapper applies decoupled weight decay at the y point; the per-group value
+    drives Muon's own decay -- mirroring the reference's arm.
     """
     from torch.optim import Muon as TorchMuon
     from schedulefree import AdamWScheduleFree, ScheduleFreeWrapper
@@ -169,8 +171,6 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
     opt_adam = AdamWScheduleFree([g for g in adamw_groups if g['params']], lr=lr, weight_decay=wd,
                                  warmup_steps=warmup, betas=betas)
     if sf:
-        # The wrapper applies decoupled weight decay at the y point; the per-group value drives
-        # Muon's own decay -- mirroring the reference's arm.
         base_muon = TorchMuon([g for g in muon_groups if g['params']], lr=lr, weight_decay=0.0,
                               momentum=momentum, adjust_lr_fn=adj)
         opt_muon = ScheduleFreeWrapper(base_muon, momentum=0.9, weight_decay_at_y=wd)

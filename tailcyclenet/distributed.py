@@ -113,17 +113,18 @@ def check_ranks_agree(fabric, model, tol: float = 1e-9) -> float:
     THE GUARD FOR THE DDP HEADCOUNT RULE: weights should be bit-identical, and a tensor that
     stopped being all-reduced drifts silently. `tol` sits between two measured populations
     (correct runs read exactly 0.0, the one real bug ~3e-07), so it must not be loosened toward
-    1e-3. Collective on purpose, so every rank raises together.
+    1e-3. Collective on purpose, so every rank raises together. The signature is compared ON
+    THE CPU: fabric's `broadcast` pickles CUDA tensors to the device index they were sent from,
+    so a GPU signature would land on the wrong device on every non-zero rank. `NaN > tol` is
+    False, so a poisoned parameter would slip through as agreement -- hence the explicit finite
+    check.
     """
     if fabric is None or fabric.world_size <= 1:
         return 0.0
-    # ON THE CPU: fabric's `broadcast` pickles CUDA tensors to the device index they were sent
-    # from, so a GPU signature would land on the wrong device on every non-zero rank.
     sig = param_signature(model).cpu()
     ref = fabric.broadcast(sig, src=0)
     diff = signature_drift(sig, ref.cpu())
     worst = float(fabric.all_reduce(torch.tensor(diff, device=fabric.device), reduce_op="max"))
-    # `NaN > tol` is False, so a poisoned parameter would slip through as agreement.
     if worst > tol or not math.isfinite(worst):
         raise SystemExit(
             f'THE RANKS HOLD DIFFERENT WEIGHTS: worst relative parameter drift {worst:.3e} > '

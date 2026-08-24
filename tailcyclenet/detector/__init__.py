@@ -115,6 +115,16 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     were shaped for (absent = the pre-key default), used only to build the right model internally.
     For a run directory, `checkpoint='latest'` selects and verifies the highest complete
     `detector_it*.pth`; `checkpoint='best'` explicitly selects historical `detector.pth`.
+
+    A ViT backbone's own DINOv2 patch embedding needs both input dims divisible by 14 and the
+    coarsest FPN stride needs 32 -- LCM 224. `train_detector.py` already rounds to this at
+    training time, so the check here only bites an explicit `--det-input-wh` override (or a
+    checkpoint that predates the `input_wh` field). Absent `norm` means BatchNorm: the key only
+    exists since the model became GroupNorm, and there are no running statistics to load into a
+    GroupNorm model. `tile_scale` is meaningless without `tile_wh`, so it is dropped (untiled runs
+    record 1.0). The trailing objectness quantiles describe the distribution this checkpoint
+    produces; `--det-score` is not portable across detector generations, so callers warn rather
+    than guess a threshold.
     """
     import torch
     p = resolve_detector_checkpoint(path, checkpoint=checkpoint)
@@ -124,13 +134,8 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
                          'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
                          'branson-fly 416 416).')
-    # A2.5: a ViT backbone's own DINOv2 patch embedding needs both dims divisible by 14, and the
-    # coarsest FPN stride needs 32 -- LCM 224. `train_detector.py` already rounds to this at
-    # training time, so this only bites an explicit `--det-input-wh` override (or a checkpoint
-    # that predates the `input_wh` field).
     if str(ckpt.get('yolox_version', 'trimmed')).startswith('vit_'):
         wh = tuple(max(64, int(-(-v // 224)) * 224) for v in wh)
-    # Absent `norm` means BatchNorm: the key only exists since the model became GroupNorm.
     norm = str(ckpt.get('norm', 'bn'))
     if norm != 'gn':
         raise ValueError(
@@ -154,13 +159,10 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
             f'{p}: trained on tiles ({ckpt["tile_wh"]}) but carries no `tile_scale`, so the '
             'deployment input size cannot be derived. `input_wh` here is the TILE size, not the '
             'whole-frame size -- running the frame at it is a scale shift, not a smaller input.')
-    # `tile_scale` is meaningless without `tile_wh`, so drop it (untiled runs record 1.0).
     return (model.to(device).eval(), tuple(wh), str(ckpt.get('dataset', '')),
             int(ckpt.get('min_crop_dim', 64)), bool(ckpt.get('reduce', False)),
             str(ckpt.get('box_source', 'keypoints')),
             None if ts is None or ckpt.get('tile_wh') is None else float(ts),
-            # The objectness distribution this checkpoint produces; `--det-score` is not portable
-            # across detector generations, so callers warn rather than guess a threshold.
             dict(ckpt.get('obj_quantiles') or {}))
 
 
@@ -224,6 +226,53 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     `trace_detail=True`, the record also carries source-pixel candidate boxes and scores for all,
     post-score, post-NMS, and final candidates, for an offline GT matcher. It is diagnostic-only;
     the default is `None`, and output arrays/return arity are unchanged.
+
+    Notes.
+
+    `_fetch` (below) always builds a 3-channel `arr` -- one letterboxed RGB frame per (camera,
+    source frame). A `temporal_input='stack2'` checkpoint (`in_channels=6`) trains and
+    `load_detector` reconstructs the wider stem correctly, but this deployment loop has no
+    paired-frame path to fill the other 3 channels -- forwarding it would silently feed
+    zeros/garbage into half the stem, so it is refused instead of guessed.
+
+    The keypoint array is (D,T,C,K,3) of (x, y, score_logit) in SOURCE pixels, or None when this
+    detector has no keypoint branch; it is kept beside the boxes so a caller that indexes
+    `[d, t, ci]` for a box indexes the same way for its keypoints.
+
+    The decode runs ONE THREAD PER CAMERA, which is where this function's wall clock lives: the
+    containers share no state and PyAV releases the GIL, so they overlap ~3.5x. The forward stays
+    serial and in camera order -- it is ~1% of the time.
+
+    WHAT IS BOUNDED IS THE NUMBER OF CAMERAS IN FLIGHT, AND NEVER `batch`. `batch` is not a
+    memory knob because it is not inert: cuDNN selects convolution algorithms per input shape, so
+    a different batch is a different reduction order -- two runs on two machines would produce
+    different boxes with nothing in either output saying so. Chunking CAMERAS is output-neutral by
+    construction: each camera is forwarded on its own and `out`/`sc`/`kp` are indexed by `[.., ci]`;
+    only how much of the decode overlaps changes.
+
+    The /255 divisor is a 0-d TENSOR, NOT THE PYTHON INT 255: on CUDA `x / 255` takes a
+    reciprocal-multiply fast path that is off by 1 ULP on 156 of 256 byte values; dividing by a
+    0-d tensor is correctly rounded. 1 ULP on the input perturbs every objectness score and can
+    reorder NMS ties.
+
+    A SECOND POOL exists for image-directory roots: `read_frames` threads those over their FRAMES
+    (it ignores `pool` for video), so single-camera roots spend their time here. It must NOT be
+    `pool`: `_fetch` runs IN `pool` and waits on these futures, and a pool that waits on itself
+    deadlocks the moment both are full.
+
+    A SLICE MUST LINE UP WITH THE WHOLE-CLIP BATCH PARTITION, or its forwards have shapes the
+    whole-clip pass never produces and cuDNN answers them differently. THE UNIT OF WORK IS
+    (FRAME BATCH, CAMERA CHUNK), which is what makes the peak bounded while every forward keeps
+    its exact shape; indices are LOCAL to `want`, and `_submit` maps them back to source frame
+    numbers, the only place the two ever differ. ONE UNIT OF LOOKAHEAD: submitting unit i+1's
+    decode before unit i's forwards run overlaps the ~120 ms of forward+NMS with the decoder
+    threads; it changes no pixels and no order.
+
+    The head output is INDEXED, not unpacked: the head's return arity grows with each optional
+    branch. The /255 happens on the device off the uint8 `_fetch` handed back. Keypoints go
+    through the same letterbox inverse the box does (`unletterbox_keypoints`). A UNIT'S FRAMES
+    ARE DEAD after the forwards, so the arena is given back (via `memory.trim`) rather than
+    letting RSS ratchet up -- this is the loop that allocates and frees the most.
     """
     import numpy as np
     import torch
@@ -232,12 +281,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     from ..dataset import read_frames
     from .data import letterbox, reduce_factor, unletterbox_boxes, unletterbox_keypoints
 
-    # `_fetch` below always builds a 3-channel `arr` -- one letterboxed RGB frame per (camera,
-    # source frame). A `temporal_input='stack2'` checkpoint (`in_channels=6`) trains and
-    # `load_detector` reconstructs the wider stem correctly (that half is real, see
-    # `YOLOXNano.__init__`'s docstring), but this deployment loop has no paired-frame path to
-    # fill the other 3 channels. Forwarding it here would silently feed zeros/garbage into half
-    # the stem and report ordinary-looking boxes -- refuse instead of guessing.
     if int(getattr(det, 'in_channels', 3)) != 3:
         raise SystemExit(
             f'detect_raw: this checkpoint has in_channels={det.in_channels}, but detection '
@@ -257,36 +300,31 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     D = max(1, int(top_k))
     out = np.full((D, T, C, 4), np.nan, np.float32)
     sc = np.full((D, T, C), np.nan, np.float32)
-    # (D,T,C,K,3) of (x, y, score_logit) in SOURCE pixels, or None when this detector has no
-    # keypoint branch. Kept beside the boxes so a caller that indexes `[d, t, ci]` for a box
-    # indexes the same way for its keypoints.
     K_det = int(getattr(det, 'n_keypoints', 0))
     kp = np.full((D, T, C, K_det, 3), np.nan, np.float32) if K_det else None
 
-    # ONE THREAD PER CAMERA FOR THE DECODE, which is where this function's wall clock lives;
-    # the containers share no state and PyAV releases the GIL, so they overlap ~3.5x. The
-    # forward stays serial and in camera order -- it is ~1% of the time.
     def _fetch(job):
         """Decode, reduce and letterbox one (camera, frame) job into a uint8 batch tensor.
 
         Inputs: job -- (ci, cam_name, src_frames) tuple from `_submit`.
         Outputs: (ci, arr (n,3,H,W) uint8, metas [(scale, pad)], src (W,H)).
+
+        The decode is the SAME one the detector was trained on: `BoxDataset` reduces at decode
+        where the frame is far above the letterbox target, and a detector fed differently-sampled
+        pixels at deployment is off its own training distribution. For a tile-trained detector the
+        input size is a function of the FRAME size. ONE numpy conversion serves the whole batch,
+        not one torch op per frame (a tiny elementwise op through torch's intraop pool is measured
+        ~60x slower than numpy's packed path), and the batch stays uint8 all the way to the device
+        -- the /255 happens there, as the pose loader does, 4x less host, PCIe and device memory
+        than a host-side float32 copy. Bit-identical: uint8 -> float32 is exact and the float32
+        divide by 255 is correctly rounded. A source frame is dead the moment it is letterboxed,
+        so it is released then.
         """
         ci, cam_name, src_frames = job
-        # Same decode the detector was trained on: `BoxDataset` reduces at decode where the frame
-        # is far above the letterbox target, and a detector fed differently-sampled pixels at
-        # deployment is off its own training distribution.
         src = session.rig.size(cam_name)
-        # Per camera: a tile-trained detector's input size is a function of the FRAME size.
         wh = input_wh if tile_scale is None else tiled_input_wh(src, tile_scale)
         r = reduce_factor(src, wh) if reduce else 1
         imgs = _read(ci, cam_name, src_frames, pool=frame_pool, reduce=r)
-        # ONE numpy conversion for the whole batch, not one torch op per frame: a tiny elementwise
-        # op through torch's intraop pool is measured ~60x slower than numpy's packed path.
-        #
-        # uint8 all the way to the device (the /255 happens there, as the pose loader does) --
-        # 4x less host, PCIe and device memory than a host-side float32 copy. Bit-identical:
-        # uint8 -> float32 is exact and the float32 divide by 255 is correctly rounded.
         n = len(imgs)
         metas, arr = [], None
         for i in range(n):
@@ -295,16 +333,9 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                 arr = np.empty((n, 3, lb.shape[0], lb.shape[1]), np.uint8)
             arr[i] = lb.transpose(2, 0, 1)
             metas.append((scale, pad))
-            # The decode is dead the moment it is letterboxed.
             imgs[i] = None
         return ci, torch.from_numpy(arr), metas, src
 
-    # WHAT IS BOUNDED IS THE NUMBER OF CAMERAS IN FLIGHT, AND NEVER `batch`. `batch` is not a
-    # memory knob because it is not inert: cuDNN selects convolution algorithms per input shape, so
-    # a different batch is a different reduction order -- two runs on two machines would produce
-    # different boxes with nothing in either output saying so. Chunking CAMERAS is output-neutral
-    # by construction: each camera is forwarded on its own and `out`/`sc`/`kp` are indexed by
-    # `[.., ci]`; only how much of the decode overlaps changes.
     _per_frame_cam = 0
     for _cam in session.cam_names:
         _src = session.rig.size(_cam)
@@ -314,20 +345,11 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     _budget = _memory.current().share(_memory.FRACTION_DETECT)
     cams_flight = _memory.fits(_budget, _per_frame_cam * max(1, int(batch)) * 2, want=max(1, C))
 
-    # A 0-d TENSOR, NOT THE PYTHON INT 255: on CUDA `x / 255` takes a reciprocal-multiply fast path
-    # that is off by 1 ULP on 156 of 256 byte values; dividing by a 0-d tensor is correctly rounded.
-    # 1 ULP on the input perturbs every objectness score and can reorder NMS ties.
     _div255 = torch.tensor(255.0, device=device)
 
     pool = ThreadPoolExecutor(max_workers=cams_flight)
-    # A SECOND POOL for image-directory roots: `read_frames` threads those over their FRAMES (it
-    # ignores `pool` for video), so single-camera roots spend their time here. It must NOT be
-    # `pool`: `_fetch` runs IN `pool` and waits on these futures, and a pool that waits on itself
-    # deadlocks the moment both are full.
     frame_pool = ThreadPoolExecutor(max_workers=min(16, max(1, batch)))
 
-    # A SLICE MUST LINE UP WITH THE WHOLE-CLIP BATCH PARTITION, or its forwards have shapes the
-    # whole-clip pass never produces and cuDNN answers them differently (see the docstring).
     if frames is not None:
         _aligned = (int(want[0]) % batch == 0
                     and (T % batch == 0 or int(want[-1]) == T_clip - 1))
@@ -338,9 +360,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             'a short leading batch -- a shape the whole-clip pass never sees, and cuDNN selects '
             'algorithms per shape.')
 
-    # THE UNIT OF WORK IS (FRAME BATCH, CAMERA CHUNK), which is what makes the peak bounded while
-    # every forward keeps its exact shape. Indices are LOCAL to `want`; `_submit` maps them back to
-    # source frame numbers, the only place the two ever differ.
     _units = [(list(range(st, min(st + batch, T))), list(range(lo, min(lo + cams_flight, C))))
               for st in range(0, T, batch)
               for lo in range(0, C, cams_flight)]
@@ -354,16 +373,12 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         return [pool.submit(_fetch, (ci, session.cam_names[ci], src_fr)) for ci in cams]
 
     try:
-        # ONE UNIT OF LOOKAHEAD: submitting unit i+1's decode before unit i's forwards run overlaps
-        # the ~120 ms of forward+NMS with the decoder threads. Changes no pixels and no order.
         pending = _submit(0)
         for _u in range(len(_units)):
             unit_ix, _ = _units[_u]
             fetched = [f.result() for f in pending]
             nxt = _submit(_u + 1)
             for ci, x, metas, src in fetched:
-                # Indexed, not unpacked: the head's return arity grows with each optional branch.
-                # The /255 happens here on the device, off the uint8 `_fetch` handed back.
                 _o = det(x.to(device).float().div_(_div255))
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
                 for j, t in enumerate(unit_ix):
@@ -395,11 +410,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                     out[:n, t, ci] = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)[:n].numpy()
                     sc[:n, t, ci] = s.cpu().numpy()[:n]
                     if kp is not None and kpts is not None:
-                        # Same letterbox inverse the box goes through -- see `unletterbox_keypoints`.
                         k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)
                         kp[:n, t, ci] = k[:n].numpy()
-            # A UNIT'S FRAMES ARE DEAD HERE, so give the arena back rather than letting RSS ratchet
-            # up -- see `memory.trim`. This is the loop that allocates and frees the most.
             del fetched
             _memory.trim()
             pending = nxt
@@ -438,6 +450,19 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     tracker and `link_rows`' `last`/`age`. `pose_nms` needs nothing (per-frame pass, `stats`
     accumulates). `state=None` builds a fresh tracker per call and is byte-identical to the
     version before this parameter existed.
+
+    Notes.
+
+    STATIC RIG: the cross-view geometry (`cgroup`) is built once. MOVING RIG: `associate`
+    triangulates per frame from (n,2) centres, so it needs that frame's own (4,4) extrinsic,
+    built inside the loop below. The tracker is ONE CROSS-VIEW TARGET SET instead of `associate`
+    per frame plus `link_rows` after -- it subsumes both, so `link_rows` must not run on top of
+    it. Where keypoints ride along, `claimed[a, c]` is the DETECTION index that slot a took in
+    camera c, or -1; gathering by it is the only way the keypoints follow the same row assignment
+    the boxes did. LEAD 1, AFTER ASSOCIATION: `pose_nms` drops a row that duplicates another
+    row's animal, by maDLC's keypoint-containment overlap rather than by IoU; it runs here, on
+    the finished assignment, because a duplicate is a property of the SEATED rows -- `decode`'s
+    own per-box NMS cannot see it.
     """
     import numpy as np
     import torch
@@ -450,12 +475,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     out = np.full((S, T, C, 4), np.nan, np.float32)
     sc = np.full((S, T, C), np.nan, np.float32)
     kp = None if r_kp is None else np.full((S, T, C) + r_kp.shape[3:], np.nan, np.float32)
-    # Static rig: build once. Moving rig: `associate` triangulates per frame from (n,2) centres,
-    # so it needs that frame's own (4,4) extrinsic -- built inside the loop below.
     moving = any(session.rig.moving.values())
     cgroup = None if moving else session.cgroup(gid)
-    # ONE CROSS-VIEW TARGET SET instead of `associate` per frame plus `link_rows` after -- see
-    # `track.py`. It subsumes both, so `link_rows` must not run on top of it.
     if state is None:
         state = {}
     if 'tracker' not in state:
@@ -495,9 +516,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             out[:, t], sc[:, t], claimed = tracker.step(
                 cams, [p[0] for p in per_cam], [p[1] for p in per_cam])
             if kp is not None:
-                # `claimed[a, c]` is the DETECTION index that slot a took in camera c, or -1;
-                # gathering by it is the only way the keypoints follow the same row assignment
-                # the boxes did.
                 for a in range(S):
                     for c in range(C):
                         d = int(claimed[a, c])
@@ -521,10 +539,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     if stats is not None:
         stats['association_raw_offered'] = stats.get('association_raw_offered', 0) + raw_offered
         stats['association_pre_link'] = stats.get('association_pre_link', 0) + pre_link
-    # LEAD 1, AFTER ASSOCIATION: drop a row that duplicates another row's animal, by maDLC's
-    # keypoint-containment overlap rather than by IoU. It runs here, on the finished assignment,
-    # because a duplicate is a property of the SEATED rows -- `decode`'s own per-box NMS cannot
-    # see it.
     if pose_nms is not None and kp is not None:
         idy.pose_nms(out, kp, scores=sc, thresh=pose_nms, stats=stats)
     if stats is not None:
@@ -568,14 +582,27 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     frame, so with carried state the loop starts at 0 and permutes it against the previous
     block's `last`, exactly as the whole-clip pass does mid-clip. `state=None` restores the
     original single-call behaviour byte for byte.
+
+    Notes.
+
+    The carried state is (S,C,4) each row's most recent known box, frames since each row was last
+    seen, and the start frame -- frame 0 seeds `last` and is not permuted. The gate is IN UNITS
+    OF THE ANIMAL'S OWN SIZE, never pixels: rat-city's rats are ~250 px and branson's flies ~30,
+    so one pixel gate cannot serve both. A detection nobody claimed may still START a row -- a
+    birth -- but only into a slot no live animal is using. `birth_age is None` is the shipped
+    path, byte-identical to the rule before the knob existed; the `sorted` branch only runs when
+    a caller opts in, so the default cannot drift. In that branch, OCCUPIED is `age`, not `last`
+    (`last` is retained for MATCHING), oldest first, because the longest-unseen row is the
+    likeliest to be free rather than mid-blink. `extra` (S,T,C,...) rides the SAME permutation --
+    anything indexed by row has to -- and the score receives the same assignment, or it stops
+    describing the box beside it. EXPIRY IS A FORGET, not just a flag: a stale centre that stays
+    in the cost matrix keeps competing for the detection that belongs to whoever is there now.
     """
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
     S, T, C, _ = boxes.shape
     if state is None or 'last' not in state:
-        # (S,C,4) each row's most recent known box; frames since each row was last seen; and the
-        # start frame -- frame 0 seeds `last` and is not permuted.
         last = boxes[:, 0].copy()
         age = np.zeros(S, int)
         t0 = 1
@@ -596,23 +623,16 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
             sa = 0.5 * ((a[:, 2] - a[:, 0]) + (a[:, 3] - a[:, 1]))
             sb = 0.5 * ((b[:, 2] - b[:, 0]) + (b[:, 3] - b[:, 1]))
             side = 0.5 * (sa[:, None] + sb[None])
-            # IN UNITS OF THE ANIMAL'S OWN SIZE, never pixels: rat-city's rats are ~250 px and
-            # branson's flies ~30, so one pixel gate cannot serve both.
             gap = np.where(side > 0, d / (max_move * np.maximum(side, 1e-6)), np.inf)
             cost[np.ix_(ok_p, ok_c)] += np.clip(1.0 - gap, 0.0, None)
         rows, cols = linear_sum_assignment(-cost)
         taken = {int(r): int(c) for r, c in zip(rows, cols) if cost[r, c] > 0}
-        # A BIRTH, and only into a slot no live animal is using.
         claimed = set(taken.values())
         free_dets = [c for c in range(S)
                      if c not in claimed and np.isfinite(cur[c]).all(-1).any()]
-        # `birth_age is None` is the shipped path, byte-identical to the rule before the knob
-        # existed; the `sorted` branch only runs when a caller opts in, so the default cannot drift.
         open_rows = [r for r in range(S)
                      if r not in taken and not np.isfinite(last[r]).all(-1).any()]
         if birth_age is not None:
-            # OCCUPIED is `age`, not `last`: `last` is retained for MATCHING. Oldest first, because
-            # the longest-unseen row is the likeliest to be free rather than mid-blink.
             open_rows = sorted((r for r in range(S)
                                 if r not in taken and (not np.isfinite(last[r]).all(-1).any()
                                                        or age[r] >= birth_age)),
@@ -621,12 +641,10 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
             taken[r] = c
         out = np.full_like(cur, np.nan)
         sc = None if scores is None else np.full_like(scores[:, t], np.nan)
-        # `extra` (S,T,C,...) rides the SAME permutation. Anything indexed by row has to.
         ex = None if extra is None else np.full_like(extra[:, t], np.nan)
         for r, c in taken.items():
             out[r] = cur[c]
             if sc is not None:
-                # Same assignment, or the score stops describing the box beside it.
                 sc[r] = scores[:, t][c]
             if ex is not None:
                 ex[r] = extra[:, t][c]
@@ -638,8 +656,6 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
         seen = np.isfinite(boxes[:, t]).all(-1)
         last = np.where(seen[..., None], boxes[:, t], last)
         age = np.where(seen.any(-1), 0, age + 1)
-        # EXPIRY IS A FORGET, not just a flag: a stale centre that stays in the cost matrix keeps
-        # competing for the detection that belongs to whoever is there now.
         last[age > max_age] = np.nan
     if state is not None:
         state['last'], state['age'] = last, age

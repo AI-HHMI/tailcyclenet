@@ -84,7 +84,9 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     """An explicit name, else `checkpoint_last.pth`, else the newest by name.
 
     `last` is the default because it is the weight a resume continues from; pass
-    `checkpoint='checkpoint_best.pth'` for the best-val one.
+    `checkpoint='checkpoint_best.pth'` for the best-val one. When picking by name, the HIGHEST
+    ITERATION wins, not the last lexically: 'b' > '0', so a folder holding
+    `checkpoint_00060000.pth` beside `checkpoint_best.pth` must return the numeric one.
     """
     folder = Path(folder)
     if checkpoint:
@@ -98,8 +100,6 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     files = sorted(folder.glob('checkpoint_*.pth'))
     if not files:
         raise FileNotFoundError(f'{folder}: no checkpoint_*.pth')
-    # HIGHEST ITERATION, NOT LAST BY NAME: 'b' > '0', so a folder holding
-    # `checkpoint_00060000.pth` beside `checkpoint_best.pth` must return the numeric one.
     numbered = sorted((int(p.stem.split('_')[-1]), p) for p in files if p.stem.split('_')[-1].isdigit())
     got = numbered[-1][1] if numbered else files[-1]
     print(f'{folder}: no checkpoint_last.pth, using {got.name} of '
@@ -165,6 +165,10 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     `write = False` runs the eval/train toggle but skips the clone and disk write -- correctness,
     not an optimisation: the float32 toggle round trip is not bit-exact, so every rank must pay
     it (only rank 0 writes) or rank 0's weights drift, which `check_ranks_agree` exists to catch.
+    A DualOptimizer exposes eval()/train() even when its Muon half has NO averaged iterate
+    (`muon_schedulefree = false`), in which case `model_state_eval` would be half-averaged;
+    `has_averaged_iterate` reports whether both halves carry an `x`. The eval/train toggle is
+    UNCONDITIONAL -- every rank pays it -- for the same bit-exactness reason.
     """
     state = None
     if write:
@@ -172,17 +176,12 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     eval_state = None
-    # A DualOptimizer exposes eval()/train() even when its Muon half has NO averaged iterate
-    # (`muon_schedulefree = false`), in which case `model_state_eval` would be half-averaged.
-    # `has_averaged_iterate` reports whether both halves carry an `x`.
     averaged = getattr(optimizer, 'has_averaged_iterate',
                        hasattr(optimizer, 'eval') and hasattr(optimizer, 'train'))
     if averaged:
-        # UNCONDITIONAL -- every rank pays the toggle.
         optimizer.eval()
         if write:
             eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        # UNCONDITIONAL, same reason.
         optimizer.train()
     if not write:
         return None
@@ -241,19 +240,17 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
     Base migrations run first and every `strict=False` drop is named. A GROWN REGISTRY KEEPS ITS
     ROWS: the checkpoint's (n0, d) identity table is copied into the first n0 rows of this
     model's (n, d) one -- refused if `base_names`'s length does not match n0, because a
-    mis-applied copy points each row at a different body part.
+    mis-applied copy points each row at a different body part. `_interp_res_params` returns
+    (dict, BOOL): `interpolated` is the flag, not a key list.
     """
     ckpt = torch.load(Path(checkpoint_path), map_location='cpu', weights_only=False)
     state = dict(ckpt.get('model_state_eval') or ckpt['model_state'])
 
     state = _convert_cross_attn(state, model)
-    # Returns (dict, BOOL); `interpolated` is the flag, not a key list.
     state, interpolated = _interp_res_params(state, model)
     if interpolated and verbose:
         print('warm start: resolution-coupled tensors checked; see any res-interp lines above')
 
-    # A GROWN REGISTRY KEEPS ITS ROWS: the checkpoint's (n0, d) identity table is exactly the
-    # first n0 rows of this model's (n, d) one (see the docstring for the refusal rule).
     msd = model.state_dict()
     for k, v in list(state.items()):
         if not k.endswith('kpt_embed.weight') or k not in msd:

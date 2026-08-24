@@ -86,9 +86,12 @@ def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
     MEAN of the per-camera fraction over cameras where the pair co-occurs (`np.nanmean`, since a
     single camera can still return NaN when a row has no valid keypoints there). On C=1 this is
     exactly the old computation -- byte-identical on every 2D single-view root on record.
+    NO dtype CONVERSION is deliberate: `np.asarray(x, float)` on a float32 array returns a COPY,
+    so every in-place drop below would land on a temporary and the caller would see nothing.
+
+    The lower score loses; with no scores, the higher row index loses (stable). `sc[i, t]` is
+    (C,) -- `nanmax` over it is already an all-camera aggregate.
     """
-    # NO dtype CONVERSION. `np.asarray(x, float)` on a float32 array returns a COPY, so every
-    # in-place drop below would land on a temporary and the caller would see nothing.
     b, k = boxes, kpts
     S, T, C = b.shape[0], b.shape[1], b.shape[2]
     sc = scores
@@ -113,8 +116,6 @@ def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
                 pairs += 1
                 if ov <= thresh:
                     continue
-                # Lower score loses; with no scores, the higher row index loses (stable). `sc[i,
-                # t]` is (C,) -- `nanmax` over it is already an all-camera aggregate.
                 si = -np.inf if sc is None else np.nanmax(sc[i, t])
                 sj = -np.inf if sc is None else np.nanmax(sc[j, t])
                 loser = j if (sj < si or (sj == si and j > i)) else i

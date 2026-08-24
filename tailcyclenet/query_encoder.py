@@ -68,6 +68,10 @@ class WideQueryEncoder(nn.Module):
                 time_embed_mode -- 'fourier_rel' or 'learned' time terms.
                 principal_point_embedding / intrinsic_embedding -- rig terms.
                 query_pos_embedding / query_patch_embedding -- build the prior terms.
+
+        The patch CNN is built AT THE PRETRAINED WIDTH and then projected: its MLP is
+        `embed_dim`-bound (~5.4M at 256 vs 93k convs), so building it at `dim` would retrain it
+        from noise.
         """
         super().__init__()
         self.dim = dim
@@ -104,8 +108,6 @@ class WideQueryEncoder(nn.Module):
             self.missing_qpos = nn.Parameter(torch.zeros(dim))
             nn.init.normal_(self.missing_qpos, std=0.02)
         if query_patch_embedding:
-            # AT THE PRETRAINED WIDTH, then projected: the patch CNN's MLP is `embed_dim`-bound
-            # (~5.4M at 256 vs 93k convs), so building it at `dim` would retrain it from noise.
             self.patch_processor = PatchProcessor(
                 in_channels=3, patch_size=self.patch_size, embed_dim=embed_dim,
                 conv_channels=[32, 64, 128])
@@ -183,18 +185,23 @@ class WideQueryEncoder(nn.Module):
         """The fusion terms up to (not including) the gate. `ctx` carries what a box subclass
         needs (`B`, `T_query`, `n_cams`, `sizes`, `uniform`, `qpix`, `qt`); keypoint ids arrive
         on `self._kpt_ids`, stashed by `PoseTrackerEncoder.forward`.
+
+        The terms are built in order: identity, time, then the query (in the pixel frame of THIS
+        window's crop, computed once and shared by the two query terms), then the rig terms. A
+        PER-FRAME OFFSET IS A MOVING CAMERA TOO: every branch the `moving` flag guards is needed
+        for exactly the same reason; no shipped rig builds one, so the guard stays.
+        `sample_patches` gathers with `query_time`, so Z must come from the centres: inference
+        chunks the query axis, and a mismatch surfaces as a grid_sampler error.
         """
         B, T_query, coord_dim = query_coords.shape
         n_cams = len(preprocessed_views)
         is_2d = coord_dim == 2
         if is_2d:
             assert n_cams == 1, f'2D queries are single-camera; got {n_cams}'
-        # (cams, 2)
         sizes = torch.stack([
             torch.tensor([v.shape[-1], v.shape[-2]], dtype=query_coords.dtype,
                          device=query_coords.device) for v in preprocessed_views])
 
-        # -- identity --------------------------------------------------------------------
         ids = getattr(self, '_kpt_ids', None)
         assert ids is not None, (
             'WideQueryEncoder needs keypoint ids; PoseTrackerEncoder.forward must set _kpt_ids.')
@@ -203,7 +210,6 @@ class WideQueryEncoder(nn.Module):
             f'keypoint id out of range [0, {self.n_keypoints}): {int(ids.min())}..{int(ids.max())}'
         embed_kpt = repeat(self.kpt_norm(self.kpt_embed(ids)), 'b t d -> b t cams d', cams=n_cams)
 
-        # -- time ------------------------------------------------------------------------
         embed_gap = None
         if self.time_embed_mode == 'learned':
             n_cur = preprocessed_views[0].shape[1]
@@ -223,12 +229,8 @@ class WideQueryEncoder(nn.Module):
         if embed_gap is not None:
             terms.append(embed_gap)
 
-        # -- the query, in the pixel frame of THIS window's crop --------------------------
-        # Computed once and shared by the two query terms.
         qpix, uniform = None, False
         if self.query_pos_embedding or self.query_patch_embedding:
-            # A PER-FRAME OFFSET IS A MOVING CAMERA TOO: every branch this flag guards is needed
-            # for exactly the same reason. No shipped rig builds one; the guard stays.
             moving = not is_2d and any(c['ext'].ndim == 3 or c['offset'].ndim > 1
                                        for c in camera_group)
             T_clip = preprocessed_views[0].shape[1]
@@ -253,8 +255,6 @@ class WideQueryEncoder(nn.Module):
             terms.append(_sub_unprompted(self, embed_qpos, self.missing_qpos))
 
         if self.query_patch_embedding:
-            # `sample_patches` gathers with `query_time`, so Z must come from the centres:
-            # inference chunks the query axis, and a mismatch surfaces as a grid_sampler error.
             cen = qpix
             Z = cen.shape[2]
             qt = query_time if query_time.dim() > 1 else query_time[:, None]
@@ -272,7 +272,6 @@ class WideQueryEncoder(nn.Module):
         else:
             qt = None
 
-        # -- rig ---------------------------------------------------------------------------
         if self.principal_point_embedding:
             ppt = torch.stack([(c["mat"][:2, 2] - c["offset"]).to(query_coords.dtype)
                                for c in camera_group])
@@ -314,7 +313,6 @@ def _gather_box_by_target_time(box_per_frame, target_time):
     library's own `target_time` (B,T_query), the ACTUAL frame each query slot decodes -- safer
     than re-deriving the t-major tiling by hand."""
     B, T_clip, C, D = box_per_frame.shape
-    # (B,T_query)
     idx = target_time.to(torch.float32).round().long().clamp(0, T_clip - 1)
     idx = repeat(idx, 'b t -> b t c d', c=C, d=D)
     return torch.gather(box_per_frame, 1, idx)
@@ -360,7 +358,8 @@ class BoxFilmEncoder(WideQueryEncoder):
     def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
                 cube_scale, occlusion=None):
         """The base encoder's terms with the box FiLM applied to the identity term, which is
-        always built -- so the box prompt works query-free too."""
+        always built -- so the box prompt works query-free too. `terms[0]` is the identity
+        term."""
         terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
                                        query_time, target_time)
         B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
@@ -373,7 +372,6 @@ class BoxFilmEncoder(WideQueryEncoder):
         else:
             gb = repeat(self.missing_film, 'd -> b t c d', b=B, t=T_query, c=n_cams)
         gamma, beta = gb[..., :self.dim], gb[..., self.dim:]
-        # terms[0] is the identity term.
         terms[0] = terms[0] * (1.0 + gamma) + beta
         return self._gate_and_fuse(terms, ctx)
 

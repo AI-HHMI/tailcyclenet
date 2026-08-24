@@ -48,30 +48,27 @@ def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:
     """One CalMS21 sequence -> dense labels. Returns (labels, fraction of kpts inside their box).
 
     `keypoints` is (T, mouse, xy, part); the format wants (S, T, K, C, 2).
+
+    Every status is `visible`, which is only defensible because a non-finite check guards it:
+    MARS has no occlusion channel, so nothing here is an assessment (kept `visible`, not
+    `projected`, because a tracked session with zero `missing` rows withholds its visibility
+    target anyway). Boxes are [x0,y0,x1,y1] normalised by (W,H), checked rather than assumed
+    because they come from a different MARS run than the keypoints.
     """
     kp = np.asarray(seq['keypoints'], np.float32)
     assert kp.shape == (T, 2, 2, len(NAMES)), f'keypoints {kp.shape}, expected {(T, 2, 2, 7)}'
-    # Every status below is `visible`, which is only defensible if every point has a position.
     assert np.isfinite(kp).all(), 'keypoints carry non-finite values'
 
     lab = fmt.empty_labels(2, T, len(NAMES), 1, mode3d=False, animal_ids=ANIMALS)
     lab.points2d[:, :, :, 0, :] = kp.transpose(1, 0, 3, 2)
-    # MARS has no occlusion channel, so nothing here is an assessment; kept `visible` (not
-    # `projected`) because a tracked session with zero `missing` rows withholds its visibility
-    # target anyway.
     lab.vis2d[:] = fmt.VISIBLE
 
-    # (S, T, 4) normalised
     box = np.asarray(npz['bbox'], np.float32).transpose(0, 2, 1)
     box[..., 0::2] *= W
     box[..., 1::2] *= H
-    # (S, T, C, 4)
     lab.boxes = np.ascontiguousarray(box[:, :, None, :])
     lab.instance = np.full((2, T, 1), fmt.INST_LABELED, np.int8)
 
-    # Box axis order [x0,y0,x1,y1], normalised by (W,H) -- checked rather than assumed, because
-    # the boxes come from a different MARS run than the keypoints.
-    # (S, T, K, 2)
     p = lab.points2d[:, :, :, 0, :]
     lo, hi = box[:, :, None, :2], box[:, :, None, 2:]
     inside = float(((p >= lo - 1.0) & (p <= hi + 1.0)).all(-1).mean())
@@ -85,6 +82,11 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
             dry_run -- report shapes, write nothing.
             max_seqs -- cap sequences per split, or None.
     Side effects: writes sessions + symlinked mp4s; prints per-sequence lines.
+
+    The labelled-frame count is asserted to equal the video frame count (they agree on all 89
+    sequences, so a disagreement is a broken file). Two npz files carry a broken fps (a
+    timestamp regression) and fall back to the container's nominal rate. The 0.90 inside-box
+    floor catches a swapped bbox axis order, which reads near 0% against a 97.5% worst case.
     """
     r = rig()
     val_stems: set[str] = set()
@@ -111,13 +113,9 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
             vr = video.open_reader(str(mp4))
             T = len(vr)
             n_lab = len(seq['keypoints'])
-            # They agree on all 89 sequences, so a disagreement is a broken file.
             assert n_lab == T, f'{stem}: {n_lab} labelled frames, {T} video frames'
 
             lab, inside = build(seq, npz, T)
-            # Two npz files carry a broken fps (a timestamp regression); they fall back to the
-            # container's nominal rate, which is the right answer only where the measured one is
-            # broken.
             fps = float(npz['fps'])
             if not 25.0 <= fps <= 35.0:
                 fps = float(vr.fps)
@@ -128,7 +126,6 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
             vr.close()
             print(f'   {split}/{stem}: {T} frames @ {fps:.2f} fps, '
                   f'{2 * T * len(NAMES)} kpt rows, {inside * 100:.2f}% of kpts inside their box')
-            # A swapped axis order reads near 0% against a 97.5% worst case, so 0.90 catches it.
             if inside < 0.90:
                 print(f'   ! {stem}: only {inside * 100:.2f}% of keypoints fall inside their '
                       'box -- check the bbox axis order')
@@ -155,7 +152,6 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
                                'recoverable from the source json',
                     'animal_id_source': 'readme: mouse 0 = resident (black), 1 = intruder (white)',
                 })
-            # 1.2 GB of json; let it go as we walk.
             del data[f'task1/{src_split}/{stem}']
         del blob, data
 

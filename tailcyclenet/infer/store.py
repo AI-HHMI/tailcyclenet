@@ -25,18 +25,19 @@ class FrameStore:
     """
 
     def __init__(self, group, cam_names):
-        """Bind the group and camera names this store decodes for; opens and decodes nothing."""
+        """Bind the group and camera names this store decodes for; opens and decodes nothing.
+
+        `_busy` holds the in-flight decode claims (see `read`); `_lock` guards both dicts, held
+        only around bookkeeping so decodes still overlap. `decode_s` is wall seconds spent inside
+        `read_frames`, summed across threads -- NOT a duration, because decodes overlap, so it is
+        a measure of decode WORK, bounded by `cam_decode` when reported against wall clock.
+        """
         self.group = group
         self.cam_names = list(cam_names)
         self._f: dict[tuple[int, int], np.ndarray] = {}
-        # `_busy` is the in-flight claim (see `read`); `_lock` guards both dicts, held only around
-        # bookkeeping so decodes still overlap.
         self._busy: dict[tuple[int, int], threading.Event] = {}
         self._lock = threading.Lock()
         self.hits = self.misses = 0
-        # Wall seconds spent inside `read_frames`, summed across threads. NOT a duration --
-        # decodes overlap, so this is a measure of decode WORK, bounded by `cam_decode` when
-        # reported against wall clock.
         self.decode_s = 0.0
 
     def read(self, ci, cam_name=None, frames=(), pool=None, reduce=1):
@@ -45,14 +46,14 @@ class FrameStore:
         `reduce` is NOT stored or served from the store: a reduced decode is libjpeg DCT
         decimation, different pixels from a full decode, so serving a full frame in its place
         would run the detector off its sampling distribution. It goes straight to `read_frames`.
+        The misses are CLAIMED before decoding: detection for the next block overlaps this
+        block's decodes on the seam, and a claim stops both from decoding the same frames --
+        whoever claims a key decodes it, everyone else waits on the event.
         """
         name = cam_name if cam_name is not None else self.cam_names[ci]
         want = [int(t) for t in frames]
         if reduce != 1:
             return read_frames(self.group, name, np.asarray(want), reduce=reduce, pool=pool)
-        # Claim the misses before decoding: detection for the next block overlaps this block's
-        # decodes on the seam, and a claim stops both from decoding the same frames. Whoever
-        # claims a key decodes it; everyone else waits on the event.
         with self._lock:
             need, waits = [], []
             for t in want:

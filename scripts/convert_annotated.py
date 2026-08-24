@@ -123,30 +123,28 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
     `offset` goes back on before triangulating (2D is stored-image px, calibration is sensor px).
     >= 2 views within the residual gate -> visible; over the gate or 1 view -> no row (a
     triangulation failure, not an occlusion); 0 views with every camera assessed -> `missing`.
+
+    aniposelib is on the pytorch branch, so its intrinsics are nn.Parameters and its outputs
+    carry requires_grad.
     """
     import torch
 
     S, T, K, C, _ = lab.points2d.shape
-    # (C,2)
     off = np.array([rig.offset[n] for n in rig.names], np.float64)
     p2 = lab.points2d.astype(np.float64) + off
     lab.points3d = np.full((S, T, K, 3), np.nan, np.float32)
     lab.vis3d = np.full((S, T, K), fmt.UNLABELED, np.int8)
 
-    # (S,T,K)
     nvis = np.isfinite(p2).all(-1).sum(-1)
     idx = np.flatnonzero(nvis.reshape(-1) >= 2)
     flat_vis, flat_p3 = lab.vis3d.reshape(-1), lab.points3d.reshape(-1, 3)
 
     n_vis = n_gated = 0
     if idx.size:
-        # (C,n,2)
         X = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))
         with torch.no_grad():
-            # aniposelib on the pytorch branch holds intrinsics as nn.Parameters.
             p3 = np.asarray(rig.cgroup.triangulate(X, progress=False))
             rep = np.asarray(rig.cgroup.reprojection_error(p3, X, mean=False))
-        # (C,n)
         err = np.linalg.norm(rep, axis=-1)
         seen = np.isfinite(X).all(-1)
         res = np.nanmedian(np.where(seen, err, np.nan), axis=0)
@@ -155,7 +153,6 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
         flat_p3[idx[good]] = p3[good].astype(np.float32)
         n_vis, n_gated = int(good.sum()), int((~good).sum())
 
-    # (S,T,K)
     assessed_all = (lab.vis2d != fmt.UNLABELED).all(-1)
     miss = ((nvis == 0) & assessed_all).reshape(-1)
     flat_vis[miss] = fmt.MISSING

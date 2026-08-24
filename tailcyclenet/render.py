@@ -25,11 +25,13 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, mark
                   label=True):
     """One instance: skeleton (where the session has one) and keypoints, in place. `cross`/
     `label=False` is the overlay style: visually distinct, no halo, no competing id text.
+
+    `isfinite` alone would let a degenerate triangulation (~1e20 px) through and overflow the
+    int32 cast, so points are also bounded to the frame plus a margin. The dot marker draws a
+    dark halo under it -- a marker on a pale rat is otherwise invisible.
     """
     import cv2
 
-    # isfinite alone lets a degenerate triangulation (~1e20 px) through and overflow the int32
-    # cast below; bound to the frame plus a margin.
     margin = 4 * max(img.shape[:2])
     ok = np.isfinite(p2d).all(-1) & (np.abs(p2d[..., 0]) < margin) & (np.abs(p2d[..., 1]) < margin)
     for a, b in skel_ix:
@@ -42,7 +44,6 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, mark
             cv2.line(img, (c[0] - d, c[1] - d), (c[0] + d, c[1] + d), colour, lw, cv2.LINE_AA)
             cv2.line(img, (c[0] - d, c[1] + d), (c[0] + d, c[1] - d), colour, lw, cv2.LINE_AA)
         else:
-            # Dark halo under the coloured dot -- a marker on a pale rat is otherwise invisible.
             cv2.circle(img, c, radius + 1, (20, 20, 20), -1, cv2.LINE_AA)
             cv2.circle(img, c, radius, colour, -1, cv2.LINE_AA)
     if label and ok.any():
@@ -58,6 +59,10 @@ def project(session, pred, cam, gid=None, frames=None):
     aniposelib owns the projection; `offset` is subtracted because `matrix` is in SENSOR
     coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
     `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
+    `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
+    pixels already -- the same call `infer._fill_box_agreement` makes, for the same reason. The
+    projection is PER ANIMAL: `project_points_torch` aligns the (T,4,4) extrinsic against axis
+    -3, so flattening (S,T) would project animal i through frame i's pose.
     """
     import torch
 
@@ -65,12 +70,8 @@ def project(session, pred, cam, gid=None, frames=None):
     if gid is not None and session.rig.moving.get(name):
         from posetail.posetail.cube import project_points_torch
 
-        # `format_camera` folds `offset` into the dict, so this comes back in image pixels
-        # already -- the same call `infer._fill_box_agreement` makes, for the same reason.
         cams = session.cgroup(gid, frames)
         S = pred.shape[0]
-        # PER ANIMAL: `project_points_torch` aligns the (T,4,4) extrinsic against axis -3, so
-        # flattening (S,T) would project animal i through frame i's pose.
         with torch.no_grad():
             p = torch.as_tensor(np.asarray(pred), dtype=torch.float32)
             xy = [project_points_torch([cams[cam]], p[s])[0].cpu().numpy() for s in range(S)]
@@ -113,13 +114,16 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     columns to SOURCE frame indices (a ranged render); `zoom` is a follow window in source
     pixels; `boxes` and `overlay` draw the animal's box and a second point set. A 3D render is a
     REPROJECTION, not a measurement -- draw more than one camera before believing a 3D pose.
+
+    `t` indexes a COLUMN of `pred`; `src[t]` is the frame that column was predicted from -- the
+    same thing only when `frames` is None, i.e. the whole group is rendered. `boxes` is
+    (S,T,C,4) and `overlay` is (S,T,C,K,2), each reduced to this camera's own slice. A box with
+    no keypoints behind it is exactly the disagreement worth seeing.
     """
     import cv2
 
     assert pred.ndim == 4 and pred.shape[-1] in (2, 3), f'bad prediction shape {pred.shape}'
     T = pred.shape[1]
-    # `t` indexes a COLUMN of `pred`; `src[t]` is the frame that column was predicted from. They
-    # are the same thing only when `frames` is None, i.e. the whole group is rendered.
     src = np.asarray(frames) if frames is not None else np.arange(T)
     assert len(src) == T, f'frames has {len(src)} entries for a {T}-frame prediction'
     if pred.shape[-1] == 3:
@@ -127,12 +131,10 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     if boxes is not None:
         boxes = np.asarray(boxes)
         if boxes.ndim == 4:
-            # (S,T,C,4) -> this camera's own boxes.
             boxes = boxes[:, :, cam]
     if overlay is not None:
         overlay = np.asarray(overlay)
         if overlay.ndim == 5:
-            # (S,T,C,K,2) -> this camera's own overlay.
             overlay = overlay[:, :, cam]
     group = session.groups[gid]
     cam_name = session.cam_names[cam]
@@ -170,7 +172,6 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
                 drawn = 0
                 for a in range(pred.shape[0]):
                     colour = PALETTE[a % len(PALETTE)]
-                    # A box with no keypoints behind it is exactly the disagreement worth seeing.
                     if boxes is not None and np.isfinite(boxes[a, t]).all():
                         b = (boxes[a, t].reshape(2, 2) - origin) * s
                         cv2.rectangle(img, tuple(np.int32(b[0])), tuple(np.int32(b[1])),

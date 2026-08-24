@@ -47,7 +47,9 @@ class SessionWriter:
                     values raise.
                 groups -- group ids in run order, recorded in groups.pq.
         Side effects: writes session.toml, calibration.toml and groups.pq, and opens the
-        per-table parquet writers.
+        per-table parquet writers. Provenance values are scalars and lists of strings
+        (`source_videos` is the resolved file list); a duplicate key is a silent loss -- `dict`
+        merges without complaint -- so the caller passes ITEMS and the collision is caught here.
         """
         self.out = Path(out)
         self.src = source
@@ -55,9 +57,6 @@ class SessionWriter:
         self.out.mkdir(parents=True, exist_ok=True)
         self._w = {t: TableWriter(self.out / f'{t}.pq', DICT_COLS) for t in _TABLES}
 
-        # Provenance values are scalars and lists of strings (`source_videos` is the resolved
-        # file list). A duplicate key is a silent loss -- `dict` merges without complaint -- so
-        # the caller passes ITEMS and the collision is caught here.
         if not isinstance(provenance, dict):
             seen = {}
             for k, v in provenance:
@@ -89,7 +88,15 @@ class SessionWriter:
         }, dict_cols=())
 
     def write_block(self, gid: str, blk: dict, f0: int, w0: int) -> None:
-        """One block's rows. `f0`/`w0` are its first frame and window in the WHOLE group."""
+        """One block's rows. `f0`/`w0` are its first frame and window in the WHOLE group.
+
+        The spec's own sparsity rule -- "no row: not labelled" -- applies: a declined point
+        writes nothing, which every consumer reads as absence. `keypoints.pq` holds the
+        per-camera 2D pose: in 2D this is the prediction itself; in 3D it is the overlay a run
+        used to discard. `instances.pq` holds the box, its objectness and the pose-to-box
+        distance, per (animal, frame, camera) -- exactly this table's grain. `windows.pq` holds
+        why a window produced nothing and what box it was given -- deliberately NOT a spec table.
+        """
         ids = [str(x) for x in blk['animal_ids']]
         cams = self.src.cam_names
         kpts = list(self.src.names)
@@ -99,8 +106,6 @@ class SessionWriter:
             return
         a_ix, t_ix, k_ix = (x.ravel() for x in np.meshgrid(np.arange(S), np.arange(T),
                                                            np.arange(K), indexing='ij'))
-        # The spec's own sparsity rule -- "no row: not labelled" -- so a declined point writes
-        # nothing, which every consumer reads as absence.
         if pred.shape[-1] == 3:
             keep = np.isfinite(pred).all(-1).ravel()
             if keep.any():
@@ -116,8 +121,6 @@ class SessionWriter:
                     'score': _sigmoid(conf.ravel()[keep]).astype(np.float32),
                     'score_logit': conf.ravel()[keep].astype(np.float32)})
 
-        # The per-camera 2D pose: in 2D this is the prediction itself; in 3D it is the overlay a
-        # run used to discard.
         p2, c2 = np.asarray(blk['pred2d']), np.asarray(blk['conf2d'])
         C = p2.shape[2]
         a2, t2, c2i, k2 = (x.ravel() for x in np.meshgrid(
@@ -137,8 +140,6 @@ class SessionWriter:
                 'score': _sigmoid(c2.ravel()[keep2]).astype(np.float32),
                 'score_logit': c2.ravel()[keep2].astype(np.float32)})
 
-        # `instances.pq`: the box, its objectness and the pose-to-box distance, per (animal,
-        # frame, camera) -- exactly this table's grain.
         ba = np.asarray(blk['box_agree'])
         det = blk.get('det_box')
         ai, ti, ci = (x.ravel() for x in np.meshgrid(np.arange(S), np.arange(T), np.arange(C),
@@ -161,8 +162,6 @@ class SessionWriter:
                              else np.asarray(ds).ravel()[have].astype(np.float32))
             self._w['instances'].write(rows)
 
-        # `windows.pq`: why a window produced nothing and what box it was given -- deliberately
-        # NOT a spec table.
         oc, cr = np.asarray(blk['outcome']), np.asarray(blk['crop'])
         W = oc.shape[1]
         aw, ww, cw = (x.ravel() for x in np.meshgrid(np.arange(S), np.arange(W), np.arange(C),
@@ -225,6 +224,11 @@ def _load_session(path, groups=None):
     The scatter is `format.Session`'s own (the spec defines how long tables become dense arrays);
     this renames fields and adds the two non-spec tables. No `preload()` -- `Session.labels`
     caches per group, so scattering is already lazy.
+
+    In 2D the prediction IS the per-camera pose at camera 0 (`coords_pred` is `2d_pred[0]`),
+    which is what `keypoints.pq` holds; `pred2d` is transposed `(S,T,K,C,2) -> (S,T,C,K,2)`.
+    `conf` is the LOGIT, from the additive `score_logit` column -- `sigmoid` cannot be inverted
+    in float32 once it saturates, which it does at the medians this repo measures.
     """
     import tomllib
 
@@ -244,16 +248,11 @@ def _load_session(path, groups=None):
         if sess.mode == '3d':
             d['pred'] = lab.points3d
         else:
-            # 2D: the prediction IS the per-camera pose at camera 0 (`coords_pred` is
-            # `2d_pred[0]`), which is what `keypoints.pq` holds.
             d['pred'] = lab.points2d[..., 0, :]
         if lab.points2d is not None:
-            # (S,T,K,C,2) -> (S,T,C,K,2)
             d['pred2d'] = np.moveaxis(lab.points2d, 3, 2)
         if lab.boxes is not None:
             d['boxes'] = lab.boxes
-        # `conf` is the LOGIT, from the additive `score_logit` column -- `sigmoid` cannot be
-        # inverted in float32 once it saturates, which it does at the medians this repo measures.
         d['conf'] = _score_logit(Path(path), gid, sess, lab, 'points3d' if sess.mode == '3d'
                                  else 'keypoints')
         ba = _instances_col(Path(path), gid, sess, lab, 'box_agree')
@@ -273,7 +272,11 @@ def _table(path: Path, stem: str):
 
 
 def _score_logit(path, gid, sess, lab, stem):
-    """`(S,T,K)` of the visibility logit, scattered from the additive `score_logit` column."""
+    """`(S,T,K)` of the visibility logit, scattered from the additive `score_logit` column.
+
+    For the keypoints table there is one row per camera but `conf` is per keypoint, so only
+    camera 0 is kept -- camera 0 is the 2D prediction's own head.
+    """
     t = _table(path, stem)
     S, T, K = len(lab.animal_ids), sess.groups[gid].n_frames, len(sess.names)
     out = np.full((S, T, K), np.nan, np.float32)
@@ -291,7 +294,6 @@ def _score_logit(path, gid, sess, lab, stem):
     sl = np.asarray(t.column('score_logit').to_pylist(), np.float32)
     ok = (ai >= 0) & (ki >= 0) & (ti < T)
     if stem == 'keypoints':
-        # One row per camera; `conf` is per keypoint. Camera 0 is the 2D prediction's own head.
         c0 = str(sess.cam_names[0])
         ok &= np.array([str(v) == c0 for v in t.column('camera').to_pylist()])
     out[ai[ok], ti[ok], ki[ok]] = sl[ok]

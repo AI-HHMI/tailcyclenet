@@ -63,7 +63,6 @@ def _frame_range(prov, n_total, args):
     """The [f0, f1) this call draws: the requested range intersected with the range this
     prediction actually covers (extending past it would draw guaranteed-NaN frames)."""
     pred_start = int(prov.get('frame_start', 0) or 0)
-    # 0 = to the end.
     pred_stop = int(prov.get('frame_stop', 0) or 0) or n_total
     req_start = args.start_frame if args.start_frame is not None else pred_start
     req_stop = (pred_stop if args.end_frame is None
@@ -78,6 +77,10 @@ def main(argv=None):
 
     Inputs: argv -- CLI args (defaults to sys.argv[1:]).
     Side effects: writes mp4 clips under --out; prints per-group lines.
+
+    The source session is resolved BEFORE loading predictions: it is the cheaper and more
+    fundamental check, and reads no pixels. `draw_arr` must be 4D -- `render_group` only
+    auto-slices the camera axis on `overlay` and `boxes`.
     """
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -97,7 +100,6 @@ def main(argv=None):
         cfg = tomllib.load(f)
     prov = cfg.get('provenance', {})
 
-    # The session first: it is the cheaper and more fundamental check, and reads no pixels.
     sess = session_for_prediction(args.pred, data=args.data, split=args.split)
 
     want_groups = [g.strip() for g in args.groups.split(',') if g.strip()] if args.groups else None
@@ -134,8 +136,6 @@ def main(argv=None):
         for ci in cams:
             cam_name = sess.cam_names[ci]
             out_path = args.out / f'{key.replace("/", "__")}__{cam_name}.mp4'
-            # `draw_arr` must be 4D: `render_group` only auto-slices the camera axis on `overlay`
-            # and `boxes`.
             draw_arr, overlay = pred_arr, None
             if args.draw in ('keypoints', 'both'):
                 if p2 is None:
@@ -144,7 +144,6 @@ def main(argv=None):
                 elif args.draw == 'keypoints':
                     draw_arr = p2[:, :, ci]
                 else:
-                    # (S,T,C,K,2); render_group slices camera `ci` itself.
                     overlay = p2
             render_group(sess, gid, draw_arr, out_path, cam=ci, zoom=args.zoom, boxes=boxes,
                         frames=frames, overlay=overlay, fps=args.fps, max_side=args.max_side)

@@ -89,17 +89,18 @@ def movement_scores(data: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def candidate_windows(data: dict[str, np.ndarray]) -> list[tuple[float, int]]:
-    """Return (mean speed, start) for valid, non-jump 100-frame windows."""
+    """Return (mean speed, start) for valid, non-jump 100-frame windows.
+
+    A source-marked jump is not genuine animal movement, so any window touching one is excluded.
+    """
     n = len(data['frame_index'])
     if n < WINDOW:
         return []
     speed = movement_scores(data)
-    # A source-marked jump is not genuine animal movement. Exclude any window touching one.
     jumps = np.asarray(data.get('invalid_jump_timepoint', np.zeros(n, bool)), dtype=bool)
     prefix_jumps = np.concatenate(([0], np.cumsum(jumps, dtype=np.int64)))
     candidates: list[tuple[float, int]] = []
     for start in range(n - WINDOW + 1):
-        # A 100-frame clip contains 99 transitions.
         vals = speed[start:start + WINDOW - 1]
         jump_count = prefix_jumps[start + WINDOW] - prefix_jumps[start]
         if jump_count or not np.isfinite(vals).any():
@@ -183,8 +184,9 @@ class ClipWriter:
 
         Inputs: frame -- the source frame (reformatted to yuv420p).
         Side effects: encodes and muxes the frame; increments the PTS counter.
+
+        Local PTS is set explicitly so the new clip does not carry the source clip's timestamps.
         """
-        # Setting local PTS avoids carrying timestamps from the source clip into the new clip.
         frame = frame.reformat(format='yuv420p')
         frame.pts = self.count
         frame.time_base = Fraction(self.rate.denominator, self.rate.numerator)
@@ -248,12 +250,17 @@ def make_labels(data: dict[str, np.ndarray], start: int, rig: fmt.Rig) -> fmt.La
     finite but sub-threshold 2D coordinate is not an occlusion: it is omitted as UNLABELED.
     Likewise, source-side 3D interpolation and any point whose 3D-to-2D residual exceeds the
     threshold are omitted. Thus this dataset contains only VISIBLE 3D and PROJECTED 2D rows.
+
+    Source 2D is (T, camera, keypoint, xy) and is transposed to the internal (T, keypoint,
+    camera, xy). 3D is projected into stored-image pixels via a harmless finite placeholder on
+    invalid rows, masked before the result is consumed. A 3D point is shared by all cameras: if
+    any trustworthy observed camera disagrees, the shared 3D point and all of its projected
+    camera rows are omitted rather than mixing targets.
     """
     import torch
 
     k = len(KEYPOINTS)
     t_global = np.arange(start, start + WINDOW)
-    # Source 2D is (T, camera, keypoint, xy); internal storage is (T, keypoint, camera, xy).
     source_xy = np.asarray(data['keypoints_2d_px'][start:start + WINDOW], dtype=np.float32)
     source_xy = np.transpose(source_xy, (0, 2, 1, 3))
     source_present = np.isfinite(source_xy).all(axis=-1)
@@ -267,8 +274,6 @@ def make_labels(data: dict[str, np.ndarray], start: int, rig: fmt.Rig) -> fmt.La
     interpolated = np.isin(t_global, interp_frames)
     valid3d &= ~interpolated[:, None]
 
-    # Project 3D into stored-image pixels. Invalid rows use a harmless finite placeholder and
-    # are masked before the result is consumed.
     projected = np.full((WINDOW, k, 6, 2), np.nan, dtype=np.float32)
     for ci, camera in enumerate(rig.names):
         cam = rig.by_name(camera)
@@ -281,8 +286,6 @@ def make_labels(data: dict[str, np.ndarray], start: int, rig: fmt.Rig) -> fmt.La
     pair = source_valid2d & valid3d[:, :, None]
     residual = np.linalg.norm(projected - source_xy, axis=-1)
     bad_pair = pair & (~np.isfinite(residual) | (residual > REPROJECTION_THRESHOLD_PX))
-    # A 3D point is shared by all cameras. If any trustworthy observed camera disagrees, omit
-    # the shared 3D point and all of its projected camera rows rather than mixing targets.
     bad_3d = bad_pair.any(axis=-1)
     accepted3d = valid3d & ~bad_3d
     accepted2d = pair & ~bad_3d[:, :, None] & ~bad_pair
@@ -340,7 +343,6 @@ def write_session_data(source_session: Path, output_session: Path,
             'created': '2025-11-10',
         },
     )
-    # write_session emits metadata before pixels; make the exact refonly clips afterwards.
     if write_videos:
         write_video_clips(source_session, output_session,
                           [(gid, start) for gid, _, start in selected], cameras, rate)

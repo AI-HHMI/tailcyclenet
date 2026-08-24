@@ -173,16 +173,20 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
 
     v4 has no assessed-but-occluded state: finite -> `visible`, NaN -> no row (never `missing`),
     except allen-mouse's own per-camera `vis` array, which is a real assessment.
+
+    `allow_pickle=True` because johnson-mouse writes `keypoints` as dtype('O') where allen
+    writes '<U14'. The stored keypoint-axis check is unconditional -- it makes a keypoint-axis
+    mistake impossible to carry forward and is not part of the column-sort repair. A `vis` array
+    is a per-camera assessment (visible/occluded) with no 2D position -- the position lives in
+    the 3D layer. Animals with no label anywhere are dropped: an all-NaN row is a slot the
+    tracker never filled.
     """
     mode3d = spec['mode'] == '3d'
-    # allow_pickle: johnson-mouse writes `keypoints` as dtype('O') where allen writes '<U14'.
     npz = np.load(trial / ('pose3d.npz' if mode3d else 'pose2d.npz'), allow_pickle=True)
     pose = npz['pose']
     names = list(spec['names'])
     K, C = len(names), len(rig)
 
-    # The one check that makes a keypoint-axis mistake impossible to carry forward -- it is
-    # unconditional, not part of the column-sort repair below.
     if 'keypoints' in npz:
         stored = [str(s) for s in npz['keypoints']]
         assert stored == names, (
@@ -200,7 +204,6 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     S = pose.shape[0]
 
     ids = [str(v) for v in npz['ids']] if 'ids' in npz else [f'a{i:02d}' for i in range(S)]
-    # (S,T,K)
     finite = np.isfinite(pose).all(-1)
 
     lab = fmt.empty_labels(S, T, K, C, mode3d=mode3d, animal_ids=ids)
@@ -208,8 +211,6 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
         lab.vis3d[finite] = fmt.VISIBLE
         lab.points3d[finite] = pose[finite].astype(np.float32)
         if 'vis' in npz:
-            # A real per-camera assessment: visible / occluded, with no 2D position (the position
-            # lives in the 3D layer).
             vis = npz['vis'][:, :T]
             if vis.shape[-1] != C:
                 raise RuntimeError(f'{trial}: vis has {vis.shape[-1]} cameras, expected {C}')
@@ -219,7 +220,6 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
         lab.vis2d[finite, 0] = fmt.VISIBLE
         lab.points2d[finite, 0] = pose[finite].astype(np.float32)
 
-    # Drop animals with no label anywhere: an all-NaN row is a slot the tracker never filled.
     keep = np.flatnonzero((lab.vis3d if mode3d else lab.vis2d).reshape(S, -1).max(1) != fmt.UNLABELED)
     if len(keep) != S:
         lab = fmt.Labels(
@@ -243,6 +243,10 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
             max_groups -- cap groups per v4 session, or None.
             dry_run -- report shapes, write nothing.
     Side effects: writes sessions + symlinked pixels; prints per-session lines.
+
+    Calibration is a session property, so trials whose rigs disagree become separate sessions.
+    Score-cleaning can NaN out an entire trial; a label-free group carries no supervision and is
+    dropped loudly.
     """
     spec = load_spec(name)
     src = src_root / name
@@ -268,7 +272,6 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
             if one_session:
                 buckets = [(v4_session.name, trials, metas, rigs[0])]
             else:
-                # Calibration is a session property; trials that disagree are separate sessions.
                 buckets = [(f'{v4_session.name}__{t.name}', [t], [m], r)
                            for t, m, r in zip(trials, metas, rigs)]
 
@@ -287,8 +290,6 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
                         print(f'   ! {session_id}/{gid}: pose has {n_pose} frames, pixels have '
                               f'{T}; truncated to {T}')
                     if not lab.animal_ids:
-                        # Score-cleaning can NaN out an entire trial; a label-free group carries no
-                        # supervision, so drop it loudly.
                         empty.append(gid)
                         continue
                     ix = _IX.search(gid)

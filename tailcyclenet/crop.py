@@ -20,6 +20,9 @@ def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
     Non-finite entries are dropped (a point behind a camera projects to NaN). `pad = 20` is THE
     rule; `pad = 0` lets a caller holding an already-padded stored extent re-enter the
     floor/clamp arithmetic without padding twice. None is how the detector says "no animal here".
+    Each axis is capped at the image dimension so the crop never exceeds image bounds: without
+    the cap, a wide bbox forces min_dim > size and a negative cam['offset'] that breaks
+    project_cam.
     """
     pflat = p2d.reshape(-1, 2)
     pflat = pflat[torch.all(torch.isfinite(pflat), dim=1)]
@@ -34,8 +37,6 @@ def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
     current_width = high[0] - low[0]
     current_height = high[1] - low[1]
 
-    # Cap each axis at the image dimension so the crop never exceeds image bounds: without the
-    # cap, a wide bbox forces min_dim > size and a negative cam['offset'] that breaks project_cam.
     base = max(min_crop_dim, int(current_width), int(current_height))
     min_dim_x = min(base, int(size[0]))
     min_dim_y = min(base, int(size[1]))
@@ -150,7 +151,8 @@ def jitter_box(rng, shift_frac, scale_frac):
 
         Inputs: box -- xyxy crop box.
                 size -- image (w, h).
-        Outputs: the jittered int32 box, or the input when the result would be degenerate.
+        Outputs: the jittered int32 box, or the input when the result would be degenerate: a
+        degenerate jitter must not produce an empty crop.
         """
         box = box.to(torch.float32)
         w, h = box[2] - box[0], box[3] - box[1]
@@ -162,7 +164,6 @@ def jitter_box(rng, shift_frac, scale_frac):
         out = torch.clamp(out, torch.zeros(4),
                           torch.cat([size, size]).to(torch.float32))
         out = out.to(torch.int32)
-        # a degenerate jitter must not produce an empty crop
         if out[2] - out[0] < 8 or out[3] - out[1] < 8:
             return box.to(torch.int32)
         return out

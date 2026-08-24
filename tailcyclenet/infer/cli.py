@@ -34,12 +34,24 @@ from .window import ANCHORS, CARRY_SOURCES
 
 def build_parser() -> argparse.ArgumentParser:
     """The command line. A function, not a module-level block, so a test can assert against the
-    parser object rather than regex this file."""
+    parser object rather than regex this file.
+
+    The mutual exclusion of `--data`/`--videos` is checked by hand below `parse_args` so the
+    error names BOTH flags rather than argparse's one-sided message. `--split` defaults to None,
+    NOT 'test', because the videos path has to tell whether it was passed (it is inert there and
+    would otherwise be silently ignored). The `--calibration` help uses `%%` because argparse
+    expands every help string as `help % params`, so a bare `%Y` would be a format spec and
+    `--help` would die for every flag at once. `--det-top-k` is a separate detection budget from
+    the row count -- `--max-animals` used to set both, so neither lever could be read alone (0
+    follows `--max-animals`). The keypoint identity cues (`--pose-nms`) are all default-off
+    VETOES over an unchanged centroid cost: each may only remove an edge the centre gate already
+    accepted, and a detection with too few keypoints abstains. The frame-range flags sit outside
+    any input-specific group because the range serves both input paths -- it is a window-loop
+    lever, not an input-format one.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path)
-    # EXACTLY ONE INPUT, and the mutual exclusion is checked by hand below `parse_args` so the
-    # error names BOTH flags rather than argparse's one-sided message.
     src = ap.add_mutually_exclusive_group()
     src.add_argument('--data', type=Path,
                      help='ONE session directory (a dataset root works only if it holds a '
@@ -59,8 +71,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help='with --videos: an ANIPOSELIB-LAYOUT calibration.toml -- what '
                          '`format.load_calibration` reads, which anipose itself writes and this '
                          'repo dumps. "It is a toml" is NOT the same claim as "it is THIS toml": '
-                         # `%%`: argparse expands every help string as `help % params`, so a bare
-                         # `%Y` is a format spec and `--help` dies for every flag at once.
                          'a multiview_calib / OpenCV-YAML rig (`%%YAML:1.0` Cam*.yaml, `rc_ext` '
                          'as '
                          'a rotation MATRIX) needs a conversion script ending in '
@@ -111,8 +121,6 @@ def build_parser() -> argparse.ArgumentParser:
                          '`format.write_session`, pixels symlinked, and carry on -- so '
                          '`validate_session` and your own eyes can be pointed at what the flags '
                          'produced. Not the mechanism, and on no default path.')
-    # DEFAULT None, NOT 'test': the videos path has to tell whether it was PASSED (it is inert
-    # there and would otherwise be silently ignored).
     ap.add_argument('--split', default=None,
                     help='default: test. Inert with --videos, and refused rather than ignored.')
     ap.add_argument('--out', required=True, type=Path,
@@ -212,13 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
                          'dropped); 1 also emits leftover boxes as single-view instances. Whether '
                          'the pose model can use one is [data].prob_2d_only.')
     ap.add_argument('--max-animals', type=int, default=0)
-    # Detection budget, separate from the row count: `--max-animals` used to set both, so neither
-    # lever could be read alone. 0 = follow `--max-animals`.
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')
-    # The keypoint identity cues: all default-off VETOES over an unchanged centroid cost -- each
-    # may only remove an edge the centre gate already accepted, and a detection with too few
-    # keypoints abstains.
     ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
                     help='INSTANCE-LEVEL NMS on the seated rows: drop the lower-scored of two rows '
                          'whose keypoint-containment overlap exceeds FRAC. NOT IoU. QUANTISED by K '
@@ -227,8 +230,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help='predict only the first N frames of each group (a PREFIX, so `carry` '
                          'stays contiguous). = --start-frame 0 --end-frame N; refused together '
                          'with either.')
-    # The frame range serves both input paths: it is a window-loop lever, not an input-format
-    # one, which is why these sit outside any input-specific group.
     ap.add_argument('--start-frame', type=int, default=0,
                     help='first SOURCE frame to predict, per group (half-open [start, end)). The '
                          'output `frame` column is always the source index. A ranged run is not a '
@@ -319,12 +320,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None):
-    """Parse and run; `scripts/infer.py` is a shim onto this."""
+    """Parse and run; `scripts/infer.py` is a shim onto this.
+
+    The `--data`/`--videos` mutual exclusion is checked by hand (not by argparse) so the error
+    names both flags.
+    """
     from .driver import run_dataset
 
     ap = build_parser()
     args = ap.parse_args(argv)
-    # Exactly one of, checked by hand so the error names both flags.
     if bool(args.data) == bool(args.videos):
         ap.error('exactly one of --data (a session directory in docs/annotation_format.md) or '
                  '--videos (raw footage plus --calibration) is required.')

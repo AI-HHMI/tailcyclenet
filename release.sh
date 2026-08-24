@@ -28,7 +28,7 @@ if [[ "$CURRENT_VERSION" != "$VERSION" ]]; then
   git commit -m "bump to version $VERSION"
 fi
 
-git tag "$TAG"
+git tag -a "$TAG" -m "release $TAG"
 
 # build + validate
 rm -rf dist/ build/ ./*.egg-info

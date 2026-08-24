@@ -416,6 +416,12 @@ class YOLOXNano(nn.Module):
                                         hub_repo=hub_repo)
             neck_out = round8(256 * 0.5)   # 128 -- match the 's' tier's neck width
             depthwise = False               # ViT arms use full-conv neck/head
+        elif self.version == 'hybrid':
+            # A3: CNN stem (strides 2/4/8) + transformer blocks (strides 16/32), from scratch.
+            from .vit_backbone import HybridBackbone
+            self.backbone = HybridBackbone(p2=self.p2, in_channels=self.in_channels)
+            neck_out = round8(256)    # 256, matching the c*4 = 256 at stride-8
+            depthwise = False          # full-conv neck/head
         else:
             if self.version not in YOLOX_TIERS:
                 raise ValueError(f"yolox version {version!r}: must be 'trimmed' or one of "

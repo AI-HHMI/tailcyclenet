@@ -36,6 +36,11 @@ TWOD_ROOT = 'motor-observatory-frames-2024-05-12'
 # reading the export
 
 def rows(path: Path) -> list[dict]:
+    """All rows of a CSV as dicts.
+
+    Inputs: path -- a CSV file.
+    Outputs: list of row dicts keyed by header.
+    """
     with open(path) as f:
         return list(csv.DictReader(f))
 
@@ -122,23 +127,27 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
     import torch
 
     S, T, K, C, _ = lab.points2d.shape
-    off = np.array([rig.offset[n] for n in rig.names], np.float64)          # (C,2)
+    # (C,2)
+    off = np.array([rig.offset[n] for n in rig.names], np.float64)
     p2 = lab.points2d.astype(np.float64) + off
     lab.points3d = np.full((S, T, K, 3), np.nan, np.float32)
     lab.vis3d = np.full((S, T, K), fmt.UNLABELED, np.int8)
 
-    nvis = np.isfinite(p2).all(-1).sum(-1)                                  # (S,T,K)
+    # (S,T,K)
+    nvis = np.isfinite(p2).all(-1).sum(-1)
     idx = np.flatnonzero(nvis.reshape(-1) >= 2)
     flat_vis, flat_p3 = lab.vis3d.reshape(-1), lab.points3d.reshape(-1, 3)
 
     n_vis = n_gated = 0
     if idx.size:
-        X = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))   # (C,n,2)
+        # (C,n,2)
+        X = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))
         with torch.no_grad():
             # aniposelib on the pytorch branch holds intrinsics as nn.Parameters.
             p3 = np.asarray(rig.cgroup.triangulate(X, progress=False))
             rep = np.asarray(rig.cgroup.reprojection_error(p3, X, mean=False))
-        err = np.linalg.norm(rep, axis=-1)                                  # (C,n)
+        # (C,n)
+        err = np.linalg.norm(rep, axis=-1)
         seen = np.isfinite(X).all(-1)
         res = np.nanmedian(np.where(seen, err, np.nan), axis=0)
         good = np.isfinite(p3).all(-1) & (res <= gate)
@@ -146,7 +155,8 @@ def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, 
         flat_p3[idx[good]] = p3[good].astype(np.float32)
         n_vis, n_gated = int(good.sum()), int((~good).sum())
 
-    assessed_all = (lab.vis2d != fmt.UNLABELED).all(-1)                     # (S,T,K)
+    # (S,T,K)
+    assessed_all = (lab.vis2d != fmt.UNLABELED).all(-1)
     miss = ((nvis == 0) & assessed_all).reshape(-1)
     flat_vis[miss] = fmt.MISSING
     return n_vis, n_gated, int(miss.sum())
@@ -179,6 +189,18 @@ def created_date(cfg: dict, root: str) -> str:
 
 
 def write_3d(dst: Path, cfg: dict, rig, groups, labels, names, root, sid, gate) -> dict:
+    """Triangulate every group and write the 3D session.
+
+    Inputs: dst -- session directory to write.
+            cfg -- session.toml contents of the source.
+            rig -- the calibrated Rig.
+            groups, labels -- the source groups and their labels.
+            names -- canonical keypoint names.
+            root, sid -- export root and session name, for provenance.
+            gate -- max median reprojection residual (px) for a point to be written.
+    Outputs: {'visible': n, 'gated': n, 'missing': n} counts across all groups.
+    Side effects: writes the session (tables + groups/ pixels).
+    """
     stats = {'visible': 0, 'gated': 0, 'missing': 0}
     for gid, lab in labels.items():
         v, g, m = triangulate_group(rig, lab, gate)
@@ -202,12 +224,24 @@ def write_3d(dst: Path, cfg: dict, rig, groups, labels, names, root, sid, gate) 
 
 
 def sub_rig(rig: fmt.Rig, cam: str) -> fmt.Rig:
+    """A one-camera copy of the rig.
+
+    Inputs: rig -- the full calibrated Rig.
+            cam -- the camera name to keep.
+    Outputs: a new Rig holding just that camera, with its offset and calibration.
+    """
     from aniposelib.cameras import CameraGroup
     return fmt.Rig(CameraGroup([rig.by_name(cam)]), offset={cam: rig.offset[cam]},
                    moving={cam: False}, calibrated={cam: rig.calibrated[cam]})
 
 
 def slice_camera(lab: fmt.Labels, c: int) -> fmt.Labels:
+    """The per-camera view of a Labels: keep only camera index c.
+
+    Inputs: lab -- a Labels array.
+            c -- camera index to keep.
+    Outputs: a new Labels with C=1, no 3D layer, and copies of the camera's arrays.
+    """
     return fmt.Labels(
         animal_ids=list(lab.animal_ids), points3d=None, vis3d=None,
         points2d=lab.points2d[:, :, :, c:c + 1].copy(), vis2d=lab.vis2d[:, :, :, c:c + 1].copy(),
@@ -251,6 +285,14 @@ def write_2d(out_split: Path, cfg, rig, groups, labels, names, root, sid, pixels
 
 
 def write_pixels(dst: Path, groups: dict, pixels: Path, cams: list[str]) -> None:
+    """Symlink each group's pixel dirs into the session, one dir per camera.
+
+    Inputs: dst -- session directory.
+            groups -- group ids to write pixels for.
+            pixels -- source pixel root: <pixels>/<gid>/<cam>.
+            cams -- camera names to link.
+    Side effects: creates dst/groups/<gid>/<cam> symlinks.
+    """
     for gid in groups:
         gdir = dst / 'groups' / gid
         gdir.mkdir(parents=True, exist_ok=True)
@@ -273,6 +315,7 @@ def keypoint_rows(sdir: Path, cams: list[str] | None, keep: set[str]) -> set:
 
 
 def written_rows(path: Path) -> set:
+    """The session's keypoint rows as the same comparable tuples as keypoint_rows."""
     sess = fmt.Session.load(path)
     inv = {v: k for k, v in fmt.KPT_STATUS.items()}
     out = set()
@@ -325,6 +368,14 @@ def canonical_names(src: Path) -> list[str]:
 
 
 def main() -> None:
+    """Convert the anivia export into tailcycle sessions; sys.exit(0/1).
+
+    Inputs: argv (via argparse): --src, --out, --val-root, --twod-root,
+            --max-reproj-px, --dry-run, --clean, --validate, --no-check,
+            --no-image-check.
+    Side effects: writes sessions under --out; prints progress, round-trip,
+                  anatomy, and validation reports.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--src', type=Path, default=SRC)

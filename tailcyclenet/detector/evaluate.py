@@ -94,6 +94,11 @@ def box_mota(store):
 
 
 def _summarise(s):
+    """Reduce one group's raw score dict to its reported metrics (per-GT rates).
+
+    Inputs: s -- per-group dict built by `score_dataset`.
+    Outputs: dict with n_gt and per-GT rates (r50, r75, iou, fp, mota, fp_dup, fp_none, miss).
+    """
     n = max(s['n_gt'], 1)
     m = s.get('mota', [])
     gt = sum(r['gt'] for r in m)
@@ -149,13 +154,15 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     # off is the right answer anyway: this measures the model on the data, and the train split's
     # number is only comparable to the val split's if both are unaugmented.
     aug_was = ds.augment
-    ds.augment = False                      # restored at the end, like `was_training` below
+    # Restored at the end, like `was_training` below.
+    ds.augment = False
     loader = torch.utils.data.DataLoader(
         ds, batch_size=batch_size, sampler=order, num_workers=num_workers,
         collate_fn=box_collate)
 
     per_group = defaultdict(lambda: {'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0.0, 'fp': 0})
-    tracks = defaultdict(dict)                  # (key, ci) -> frame -> (pred (P,4), gt (S,4))
+    # (key, ci) -> frame -> (pred (P,4), gt (S,4)).
+    tracks = defaultdict(dict)
     sessions, n_want = {}, {}
     # `batch[2:]` is the keypoint target when the loader is emitting one. Scoring here is
     # box-only by design -- `n_keypoints` must not change what r@.5 means -- so it is dropped
@@ -335,7 +342,8 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     for a in range(S):
         for st in starts:
             frames = np.arange(st, min(st + n_frames, T))
-            bb = out[a][frames]                                        # (t, C, 4)
+            # (t, C, 4).
+            bb = out[a][frames]
             n_ok = int(np.isfinite(bb).all(-1).sum())
             miss.append(n_ok < min_box_frames)
             if n_ok:
@@ -350,6 +358,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     q = (0.5, 0.9, 0.99)
 
     def _quant(a):
+        """{p: quantile} at q=(0.5, 0.9, 0.99); NaN-filled when `a` is empty."""
         a = np.asarray(a, float)
         return {p: float(np.quantile(a, p)) for p in q} if a.size else {p: float('nan') for p in q}
 

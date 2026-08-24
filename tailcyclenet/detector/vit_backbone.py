@@ -36,13 +36,16 @@ class ViTBackbone(nn.Module):
 
     def __init__(self, model_name='dinov2_vits14', p2=True, pretrained=True,
                 out_channels=(96, 192, 384, 384), hub_repo='facebookresearch/dinov2'):
+        """Load the hub ViT and build the SFP adapters for each output stride."""
         super().__init__()
         self.p2 = bool(p2)
         # NOTE: no `verbose=` kwarg -- DINOv2's entrypoint accepts and swallows it, but DINOv3's
         # forwards **kwargs straight into `DinoVisionTransformer.__init__`, which does not.
         self.vit = torch.hub.load(hub_repo, model_name, pretrained=pretrained, trust_repo=True)
-        self.patch_size = self.vit.patch_size    # 14 (DINOv2) or 16 (DINOv3)
-        self.embed_dim = self.vit.embed_dim      # 384 for the S tier, 768 for B
+        # 14 (DINOv2) or 16 (DINOv3)
+        self.patch_size = self.vit.patch_size
+        # 384 for the S tier, 768 for B
+        self.embed_dim = self.vit.embed_dim
         C = self.embed_dim
 
         if self.p2:
@@ -77,12 +80,14 @@ class ViTBackbone(nn.Module):
             p.requires_grad = False
 
     def forward(self, x):
+        """Extract intermediate ViT layers and adapt each to its target stride."""
         B, _, H, W = x.shape
         # Pad input to a multiple of patch_size (required by DINOv2's patch embedding).
         pH = (self.patch_size - H % self.patch_size) % self.patch_size
         pW = (self.patch_size - W % self.patch_size) % self.patch_size
         if pH or pW:
-            x = F.pad(x, (0, pW, 0, pH), value=0.45)  # ~ImageNet mean grey
+            # ~ImageNet mean grey
+            x = F.pad(x, (0, pW, 0, pH), value=0.45)
 
         Hp, Wp = x.shape[2], x.shape[3]
         h_tok, w_tok = Hp // self.patch_size, Wp // self.patch_size
@@ -121,6 +126,7 @@ class TransformerBlock(nn.Module):
     """
 
     def __init__(self, dim, n_heads, mlp_ratio=4.0):
+        """Build the pre-norm block: layernorm, attention, MLP."""
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
@@ -130,8 +136,10 @@ class TransformerBlock(nn.Module):
             nn.Linear(dim, hidden), nn.SiLU(inplace=True), nn.Linear(hidden, dim))
 
     def forward(self, x):
+        """Tokenised attention path with residual connections."""
         B, C, H, W = x.shape
-        tokens = x.flatten(2).transpose(1, 2)           # (B, H*W, C)
+        # (B, H*W, C)
+        tokens = x.flatten(2).transpose(1, 2)
         t = self.norm1(tokens)
         tokens = tokens + self.attn(t, t, t, need_weights=False)[0]
         tokens = tokens + self.mlp(self.norm2(tokens))
@@ -154,28 +162,35 @@ class HybridBackbone(nn.Module):
 
     def __init__(self, base_channels=64, n_transformer_blocks=(4, 2), n_heads=8, mlp_ratio=4.0,
                 p2=True, in_channels=3):
+        """Build the hybrid backbone: CNN stages at strides 2/4/8, transformers at 16/32."""
         super().__init__()
-        c = base_channels  # 64 -> out_channels (128, 256, 512, 1024)
+        # 64 -> out_channels (128, 256, 512, 1024)
+        c = base_channels
         self.p2 = bool(p2)
 
         # CNN stages: stride 2 -> 4 -> 8.
+        # stem: stride /2
         self.stem = nn.Sequential(
-            conv_norm_act(in_channels, c, 3, 2),         # /2
-            conv_norm_act(c, c, 3, 1))                   # /2 still
+            conv_norm_act(in_channels, c, 3, 2),
+            conv_norm_act(c, c, 3, 1))
+        # stage2: stride /4
         self.stage2 = nn.Sequential(
-            conv_norm_act(c, c * 2, 3, 2),               # /4
+            conv_norm_act(c, c * 2, 3, 2),
             conv_norm_act(c * 2, c * 2, 3, 1))
+        # stage3: stride /8
         self.stage3 = nn.Sequential(
-            conv_norm_act(c * 2, c * 4, 3, 2),           # /8
+            conv_norm_act(c * 2, c * 4, 3, 2),
             conv_norm_act(c * 4, c * 4, 3, 1))
 
         # Transformer stages: stride 16 -> 32. Each starts with a stride-2 conv for spatial
         # downsampling, then N transformer blocks.
-        self.stage4_down = conv_norm_act(c * 4, c * 8, 3, 2)    # /16
+        # /16
+        self.stage4_down = conv_norm_act(c * 4, c * 8, 3, 2)
         self.stage4_blocks = nn.Sequential(
             *[TransformerBlock(c * 8, n_heads, mlp_ratio)
               for _ in range(n_transformer_blocks[0])])
-        self.stage5_down = conv_norm_act(c * 8, c * 16, 3, 2)   # /32
+        # /32
+        self.stage5_down = conv_norm_act(c * 8, c * 16, 3, 2)
         self.stage5_blocks = nn.Sequential(
             *[TransformerBlock(c * 16, n_heads, mlp_ratio)
               for _ in range(n_transformer_blocks[1])])
@@ -184,8 +199,13 @@ class HybridBackbone(nn.Module):
                              else (c * 4, c * 8, c * 16))
 
     def forward(self, x):
-        s2 = self.stage2(self.stem(x))                    # stride 4,  c*2 channels
-        s3 = self.stage3(s2)                              # stride 8,  c*4 channels
-        s4 = self.stage4_blocks(self.stage4_down(s3))     # stride 16, c*8 channels
-        s5 = self.stage5_blocks(self.stage5_down(s4))     # stride 32, c*16 channels
+        """Run the CNN stages then the transformer stages; return 4 or 3 pyramid levels."""
+        # stride 4, c*2 channels
+        s2 = self.stage2(self.stem(x))
+        # stride 8, c*4 channels
+        s3 = self.stage3(s2)
+        # stride 16, c*8 channels
+        s4 = self.stage4_blocks(self.stage4_down(s3))
+        # stride 32, c*16 channels
+        s5 = self.stage5_blocks(self.stage5_down(s4))
         return (s2, s3, s4, s5) if self.p2 else (s3, s4, s5)

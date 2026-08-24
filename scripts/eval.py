@@ -63,7 +63,8 @@ def chunk_frames(preds, labels, n):
         lab_T = int(np.asarray(full).shape[1])
         for t0 in range(0, T, n):
             t1 = min(t0 + n, T)
-            if t1 - t0 < 2:                       # T = 1 is not a usable window
+            # T = 1 is not a usable window.
+            if t1 - t0 < 2:
                 continue
             sub = {}
             for k, v in out.items():
@@ -115,7 +116,8 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             # Row index is not identity under detector boxes: match, then measure, taking the
             # matched counts so coverage describes the same points as the error.
             if '__extent__' in out:
-                extent = float(out['__extent__'])      # the WHOLE group's, carried by --chunk
+                # The WHOLE group's, carried by --chunk.
+                extent = float(out['__extent__'])
             else:
                 with np.errstate(all='ignore'):
                     span = np.nanmax(true, axis=2) - np.nanmin(true, axis=2)
@@ -144,7 +146,8 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         m['mode'] = mode
         m['S'] = S
         m['S_pred'], m['S_true'] = Sp, St
-        m['_pred'], m['_true'] = pred, true      # already sliced to (S, T); PCK reuses these
+        # Already sliced to (S, T); PCK reuses these.
+        m['_pred'], m['_true'] = pred, true
         # How much the prediction moved vs the animal -- a screen: a carried prompt low-passes the
         # prediction, which no error/coverage/MOTA column can see. `--vs` pairs it.
         mr = motion_ratio(m.get('_pred_matched', pred), true)
@@ -229,12 +232,20 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
         # Boxes are pixels, but in 3D the centroid is world millimetres -- every test fails and
         # the region degrades to the box-free fallback, so presence alone is used (`fp_ignored`).
         if lab.boxes is not None and m['mode'] == '2d':
-            ig_boxes = lab.boxes[:St, :T, 0]              # xyxy in the first camera
+            # xyxy in the first camera.
+            ig_boxes = lab.boxes[:St, :T, 0]
     return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes,
                         min_kpts_frac=min_kpts_frac, cost=match_cost)
 
 
 def main():
+    """Score a prediction file; exit via SystemExit on bad config.
+
+    Inputs: argv (via argparse): predictions, --data, --split, --pck,
+            --mota-dist, --vs, --min-match-kpts, --chunk, --match-cost,
+            --seed.
+    Side effects: prints per-group rows and per-mode aggregates.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('predictions', type=Path)
@@ -339,6 +350,7 @@ def main():
         vb = [m for m in block if m.get('vis_base') is not None]
         if vb:
             def _mean(k):
+                """Finite mean of metric `k` across the groups that have it (NaN when none)."""
                 v = [m[k] for m in vb if np.isfinite(m[k])]
                 return np.mean(v) if v else float('nan')
             print(f'[{mode}] vis precision {_mean("vis_precision"):.4f}  recall '
@@ -412,6 +424,12 @@ def main():
                   f'({frac}) in {len(block)} group(s)')
 
             def paired(name, get):
+                """Print the paired bootstrap interval of `get(m)` between the two files.
+
+                Inputs: name -- the label for the row.
+                        get -- m -> metric value (None when the arm lacks it).
+                Side effects: prints one interval line when both arms have the metric.
+                """
                 got = [(get(a), get(b)) for a, b in block]
                 got = [(x, y) for x, y in got if x is not None and y is not None]
                 if not got:

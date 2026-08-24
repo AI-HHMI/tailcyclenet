@@ -22,8 +22,7 @@ names = [
   "TailMid", "TailTip", "WristL", "WristR",
 ]
 
-# Lifted verbatim from the source annotation JSON; both lists are name-indexed, so the ordering
-# difference above does not affect them.
+# Lifted verbatim from the source annotation JSON; both lists are name-indexed, so the ordering difference above does not affect them.
 skeleton = [
   ["Snout", "EarL"],
   ["Snout", "EarR"],

@@ -14,10 +14,7 @@
 # ONE dataset root (train/, optionally val/ and test/); a folder whose children are roots is refused.
 path = ""
 
-# What the regression target bounds: `instances` (the dataset's instances.pq extent) or
-# `keypoints`. Defaults to `instances`, matching dataset.LoaderConfig.box_source so the detector
-# reproduces the crop the pose model was trained on. Set `keypoints` where the shipped boxes
-# disagree with the crop rule (calms21, johnson-mouse).
+# Regression target: `instances` (instances.pq extent, matching LoaderConfig.box_source) or `keypoints` where the shipped boxes disagree with the crop rule (calms21, johnson-mouse).
 boxes = "instances"
 
 # Must equal the pose run's [data].min_crop_dim -- same crop rule; infer.py refuses a mismatch.
@@ -26,186 +23,97 @@ min_crop_dim = 64
 # Explicit input size, overriding min_box_px entirely; omit (or []) to use min_box_px.
 input_wh = []
 
-# Raise the input size until the MEDIAN animal is this many detector pixels across -- 32 is
-# YOLOX's coarsest stride, so the typical animal spans at least one cell at every FPN level.
-# A floor only; 0 restores the plain 416^2 budget. Measured to keep paying past 32; 32 is where
-# it is cheap enough to be the default.
+# Raise input size until the MEDIAN animal is this many detector pixels across -- a floor only; 0 restores the plain 416^2 budget. Measured to keep paying past 32.
 min_box_px = 32
 
-# Ceiling on min_box_px -- the difference between a rule and a blank cheque; reported when it
-# applies.
+# Ceiling on min_box_px -- the difference between a rule and a blank cheque; reported when it applies.
 max_input_px = 692224
 
 # Max frames per group for the TRAIN loader -- a sampling window over the clip, not a cap on it.
 frames_per_group = 40
 
-# A dataset with ONE group gets one group's worth of val: with the default 8, rat-city and
-# branson-fly score just 8 images -- raise it to the group's labelled length.
+# A one-group dataset scores one group's worth of val (default 8) -- raise it to the group's labelled length.
 val_frames_per_group = 8
 
-# P(a TRAIN draw comes from an `annotated` session); the rest go to `tracked`. Absent (or empty)
-# means DO NOT WEIGHT: keeps `ChunkShuffle`, byte-identical to every checkpoint on record. The
-# counterpart to the pose loader's `[data].annot_frac`, and it exists for the same reason --
-# without it the cohort mix is not chosen, it is whatever `frames_per_group` leaves behind.
-# MEASURED implicit share of train views on the three roots holding both cohorts:
-# rat-city-combined 4.3% tracked (ONE 57,594-frame tracked session truncated to 40, against 37
-# annotated sessions), allen-mouse-combined 61.3% tracked, johnson-mouse-combined-aug 0.1%
-# tracked. Nothing chose those numbers.
-#
-# INERT on a single-cohort split -- 3dpop, calms21 and branson-fly are entirely `tracked`, so
-# `BoxDataset.cohort_weights` returns None and the run says so rather than silently ignoring the
-# key. That is also why this is safe for decode locality: calms21 is the ONE root reading video on
-# train and it never reaches the weighted sampler, while the three that do read image directories,
-# where random access measured 30.6 ms/frame against sequential's 30.2. See `CohortSampler`.
-#
-# NOT A MEASURED VALUE -- shipped absent, i.e. unchanged behaviour. Setting it is an arm.
-# annot_frac = 0.5
+# annot_frac = 0.5 -- NOT A MEASURED VALUE, shipped absent (byte-identical to every checkpoint on record); setting it is an arm, inert on single-cohort splits (3dpop, calms21, branson-fly).
 
-# random similarity + brightness on TRAIN. Helps where a dataset fits its training data and lags
-# on val; read the train/val gap first.
+# random similarity + brightness on TRAIN; read the train/val gap first.
 augment = true
 
-# LAYERS a strong appearance/erasure/mosaic-lite suite on top of augment (a no-op without it):
-# color jitter, gaussian noise, salt & pepper, motion blur, cutout (a covered keypoint gets its
-# coordinate NaN'd and score zeroed) and mosaic-lite (a whole crop-rule box copy-pasted from
-# another frame; undefined under use_regions). ONE recipe, not independently validated -- its
-# apparent gap closure was mostly rotate_deg alone. ON BY DEFAULT PER USER INSTRUCTION, not evidence.
+# Strong appearance/erasure/mosaic-lite suite on top of augment (color jitter, noise, blur, cutout, mosaic-lite); ON BY DEFAULT PER USER INSTRUCTION, not evidence.
 augment_strong = true
 
-# random in-plane rotation, +-DEG per visit. Needs augment; 0 is off, byte-identical. DEFAULTS TO
-# 45 PER USER INSTRUCTION, NOT EVIDENCE: 180 was measured significantly worse downstream, and 45
-# itself has never been measured. Set 0 for the pre-default off behaviour.
+# random in-plane rotation (+-DEG per visit); 0 is off, byte-identical. DEFAULTS TO 45 PER USER INSTRUCTION, NOT EVIDENCE.
 rotate_deg = 45.0
 
-# decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target -- changes
-# which source pixels reach the model, replacing a big INTER_LINEAR downscale with a proper box
-# filter. Stored in the checkpoint; no effect on a video root.
+# decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target; stored in the checkpoint; no effect on a video root.
 reduce = false
 
-# train a bottom-up KEYPOINT BRANCH beside the box head. Off means NOT CONSTRUCTED -- the model,
-# loader and loss are byte-identical to every recorded detector. K is derived from the registry.
-# Turning it on also disables the horizontal flip.
+# train a bottom-up KEYPOINT BRANCH beside the box head; off means NOT CONSTRUCTED (byte-identical to every recorded detector), and on also disables the horizontal flip.
 keypoints = false
 
-# the horizontal flip in the augmentation; exists for the box-only control arm, since `keypoints
-# = true` disables it implicitly and the control must differ in exactly one lever.
+# the horizontal flip in the augmentation; exists for the box-only control arm (`keypoints = true` disables it implicitly).
 hflip = true
 
-# train on TILES of this size in INPUT pixels instead of whole frames; empty = whole frames,
-# byte-identical to every recorded detector. The tile's SOURCE extent is tile_wh / tile_scale;
-# inference is one whole-frame forward as before. Its ONE justification is use_regions.
+# train on TILES of this size in INPUT pixels (SOURCE extent = tile_wh / tile_scale); empty = whole frames, byte-identical; its ONE justification is use_regions.
 tile_wh = []
 
-# source -> input scale for tile_wh (1.0 = native). DO NOT ALSO RESIZE THE TILE: the invariant
-# is the animal's size in INPUT pixels. Measured to set the mask's positive rate, because
-# CENTER_RADIUS is 2.5 cells, not a pixel radius.
+# source -> input scale for tile_wh (1.0 = native). DO NOT ALSO RESIZE THE TILE: the invariant is the animal's size in INPUT pixels.
 tile_scale = 1.0
 
 # background tiles per frame, centres inside the certified area
 tile_bg_per_frame = 1
 
-# mask the objectness loss to the area regions.pq certifies as completely labelled; orthogonal to
-# tile_wh. Measured DEAD on whole frames -- use it WITH tiles. A session with no regions.pq
-# claims exhaustive labelling and is unmasked. UNDEFINED under augment_strong (the constructor
-# raises); pick one per root.
+# mask the objectness loss to the area regions.pq certifies as completely labelled; measured DEAD on whole frames -- use it WITH tiles; UNDEFINED under augment_strong.
 use_regions = false
 
-# mask an instances.pq PRESENT box (an in-view animal that was NOT annotated) out of the
-# objectness BACKGROUND target. OPPOSITE polarity from use_regions and MUTUALLY EXCLUSIVE with
-# it for now (the constructor raises rather than let one clobber the other). SHIPPED OFF: one
-# seed on a 64-frame val split is not evidence, and an unmeasured default should not flip ON.
-# The correctness argument justifies keeping the LEVER; a real win justifies the DEFAULT.
+# mask instances.pq PRESENT boxes (in-view but unannotated) out of the objectness BACKGROUND target; OPPOSITE polarity from use_regions and MUTUALLY EXCLUSIVE with it. SHIPPED OFF.
 ignore_present = false
 
 [model]
-# the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, the repo's bespoke
-# ~0.66M-param net). DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE: its apparent lead
-# over `trimmed` was smaller than its own seed-replicate swing, so no tier is distinguishable on
-# the evidence so far. `trimmed` restores the pre-default architecture, byte-identical. The
-# canonical tiers (nano..x) differ from `trimmed` in schedule, depth, conv type and stem at once.
+# the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, byte-identical to every recorded detector). DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE.
 yolox = "tiny"
 
-# stride-4 (P2) FPN level on top of either tier; absent = the 3-level FPN every pre-existing
-# checkpoint was built at. DEFAULTS TO true: confirmed on 3dpop at both seeds -- the extra level
-# gives the smallest animals a stride-4 cell instead of falling below stride 8 entirely.
-# rat-city's single-group test read the opposite way, which is an unmeasurable point, not a
-# refutation. false restores the 3-level FPN, byte-identical to every checkpoint on record.
+# stride-4 (P2) FPN level on top of either tier; DEFAULTS TO true (confirmed on 3dpop at both seeds); false restores the 3-level FPN, byte-identical to every checkpoint on record.
 p2 = true
 
 [training]
-# run folder: checkpoints, metrics.json, effective config.toml + provenance.toml. Overridden by
-# `--out` on the command line.
+# run folder: checkpoints, metrics.json, effective config.toml + provenance.toml; overridden by `--out` on the command line.
 out = ""
 
-# total iterations; prefer the FINAL checkpoint for arm-vs-arm (best-on-val iteration varies
-# widely across identical recipes).
+# total iterations; prefer the FINAL checkpoint for arm-vs-arm (best-on-val iteration varies widely across identical recipes).
 iters = 20000
 
 batch_size = 16
-# STAYS AT 1e-3: a short-run sweep's apparent win for 6e-4 was REVERSED at full length. Do not
-# re-propose a lower `lr` off short-run numbers -- they measure a different schedule length.
+# STAYS AT 1e-3: a short-run win for 6e-4 was REVERSED at full length; do not re-propose a lower `lr` off short-run numbers.
 lr = 1e-3
 num_workers = 8
 seed = 23
-# model init, augmentation draws and the train shuffle order. The median-animal probe stays
-# pinned at seed 0 -- it is a MEASUREMENT of the dataset, not training stochasticity, and letting
-# it vary would make input_wh depend on seed. A same-recipe replicate (different seed) is not
-# optional before trusting a detector arm.
+# model init, augmentation draws and the train shuffle order; a same-recipe replicate (different seed) is not optional before trusting a detector arm.
 device = "cuda:0"
 
 eval_every = 2000
-# batches per split at each checkpoint. TRAIN is scored too: the train/val gap says whether a
-# dataset needs augmentation (a gap) or resolution (no gap, low absolute recall).
+# batches per split at each checkpoint; TRAIN is scored too -- the train/val gap says augmentation (a gap) or resolution (no gap, low absolute recall).
 eval_batches = 25
 
 kpt_weight = 1.0
 kpt_score_weight = 1.0
 
-# Task-aligned assignment (TAL) uses detached objectness x IoU quality to select positives.
-# This is the recommended Wave-0 TAL+CIoU recipe. `center` restores the legacy centre-prior
-# assignment for a matched control.
+# Task-aligned assignment (TAL) -- the recommended Wave-0 TAL+CIoU recipe; `center` restores the legacy centre-prior assignment.
 assignment = "tal"
 
-# Box regression loss. CIoU adds centre-distance and aspect-ratio terms and is paired with TAL
-# in the recommended recipe. `giou` restores the legacy control.
+# Box regression loss: CIoU (paired with TAL in the recommended recipe); `giou` restores the legacy control.
 box_loss = "ciou"
 
-# per-GT positive-anchor cap (k closest anchors by centre distance). 0/absent = uncapped, the
-# shape every pre-existing checkpoint was trained under. DEFAULTS TO 10: confirmed at both seeds
-# with the largest effect sizes in this file -- uncapped, large animals hog ~4.3x the box-loss
-# share and objectness positives of small ones. 0 restores uncapped, byte-identical.
+# per-GT positive-anchor cap (k closest anchors by centre distance); DEFAULTS TO 10 (confirmed at both seeds); 0 restores uncapped, byte-identical.
 max_pos_per_gt = 10
 
-# the BCE objectness target at a positive anchor becomes the DETACHED IoU between predicted and
-# GT box (past iou_aware_warmup) instead of a hard 1.0. DEFAULTS TO true: confirmed at both
-# seeds. Fixes objectness saturation, which gives `--det-score` a live range and lets NMS keep
-# the best-localised box in a huddle. false restores hard-1.0, byte-identical to every
-# pre-existing checkpoint.
+# the BCE objectness target at a positive anchor becomes the DETACHED IoU (past iou_aware_warmup) instead of hard 1.0; DEFAULTS TO true -- fixes objectness saturation, giving `--det-score` a live range.
 iou_aware_obj = true
 iou_aware_warmup = 2000
 
-# weight on the GIoU box term (formerly a hardcoded constant -- 5.0 is what every pre-existing
-# checkpoint used). DEFAULTS TO 15.0: the only lever to survive both a full-length confirmation
-# and a same-recipe replicate, with the effect replicated at both seeds. 5.0 restores the
-# pre-default weight, byte-identical to every checkpoint on record.
+# weight on the GIoU box term (formerly a hardcoded constant -- 5.0); DEFAULTS TO 15.0, the only lever to survive a full-length confirmation AND a same-recipe replicate.
 box_weight = 15.0
 
-# AdamW's DECOUPLED weight decay: p <- p*(1 - lr*wd). The old hardcoded 5e-4 is YOLOX's *SGD*
-# number, where decay is coupled into the gradient and scaled by SGD's much larger step; carried
-# into AdamW at lr=1e-3 it was 5e-7 per step -- a total shrink of x0.995 over the 20000-step
-# cosine, i.e. HALF A PERCENT, on a detector report 28 calls generalisation-limited. 0.01 is a
-# normal AdamW setting (x0.905 total shrink over the same run) and SHIPPED HERE PER USER
-# INSTRUCTION, NOT A CONFIRMED WIN -- report 42 tested exactly this point (`al-wd01`, allen,
-# vs the old 5e-4) and got a real but MIXED trade-off, one seed, never replicated: `fp` SIG
-# better (-0.0223 [-0.0446,-0.0022]) but `r@.75` SIG worse (-0.0394 [-0.0804,-0.0000]), every
-# other metric null. The larger point 0.05 (`al-wd05`) looked like a clean win at one seed
-# (r50/r75/IoU all SIG better) and COMPLETELY REVERSED SIGN on its own seed-1 replicate (r@.75/
-# IoU/MOTA all SIG WORSE instead) -- report 42 §3.5/§5.5, the file's own standing warning against
-# trusting a clean-looking single-seed weight_decay result on this root. 0.01 was chosen over
-# 0.05 specifically because it is the smaller, more conservative step and was never the point that
-# catastrophically reversed -- but it was also never itself replicated, so treat it exactly like
-# `augment_strong`/`rotate_deg=45`/`yolox="tiny"` above: a default set by instruction, not evidence,
-# and the first thing to sweep-with-replicates if a future arm's generalisation gap looks like it
-# might be regularisation-shaped. Absent-key fallback (`tailcyclenet/detector/config.py`) stays at
-# the old hardcoded 5e-4, byte-identical for any config that predates this key.
+# AdamW's DECOUPLED weight decay (p <- p*(1 - lr*wd)); SHIPPED 0.01 PER USER INSTRUCTION, NOT A CONFIRMED WIN (report 42: real but MIXED trade-off, one seed, never replicated); absent-key fallback stays 5e-4, byte-identical.
 weight_decay = 0.01

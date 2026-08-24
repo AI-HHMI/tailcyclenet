@@ -42,20 +42,26 @@ def probe_workers(n_videos: int, budget=None) -> int:
 class VideoPlan:
     """Everything derivable from the FILENAMES plus the calibration. No pixels were opened."""
     session_id: str
-    mode: str                                   # '3d' | '2d'
+    # '3d' | '2d'
+    mode: str
     rig: fmt.Rig
-    videos: dict[str, dict[str, Path]]          # group_id -> camera -> absolute video
+    # group_id -> camera -> absolute video
+    videos: dict[str, dict[str, Path]]
     # The three CLI inputs, kept so `provenance_of` records exactly what a reconstruction needs.
-    files: tuple[Path, ...] = ()                # the RESOLVED --videos list, after dir expansion
+    # The RESOLVED --videos list, after dir expansion.
+    files: tuple[Path, ...] = ()
     calibration: Path | None = None
     cam_regex: str | None = None
-    group_id: str = ''                          # only meaningful when every remainder was empty
+    # Only meaningful when every remainder was empty.
+    group_id: str = ''
     # Cameras whose calibration block carried no `size` and must be filled from the pixels (14).
     need_size: tuple[str, ...] = ()
-    skipped: tuple[str, ...] = field(default=(), compare=False)   # parsed, uncalibrated, dropped
+    # Parsed, uncalibrated, dropped.
+    skipped: tuple[str, ...] = field(default=(), compare=False)
 
 
 def _die(msg: str):
+    """Exit the process with a refusal message. The one way this module says no."""
     raise SystemExit(msg)
 
 
@@ -105,6 +111,11 @@ def _expand(videos) -> list[Path]:
 
 
 def _common_parent(files: list[Path]) -> Path:
+    """The one directory every video's parent shares -- the session root for naming.
+
+    Inputs: files -- resolved, sorted video paths (at least one).
+    Outputs: Path -- the common parent directory.
+    """
     parents = {f.parent for f in files}
     if len(parents) == 1:
         return parents.pop()
@@ -212,13 +223,15 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
     where: dict[tuple[str, str], Path] = {}
     for f, cam, gid in keep:
         gid = gid_default if one_group else gid
-        if (gid, cam) in where:                                   # REFUSAL 3
+        # REFUSAL 3.
+        if (gid, cam) in where:
             _die(f'two videos land on group {gid!r} camera {cam!r}: {where[gid, cam]} and {f}. '
                  'Silently keeping one is how a whole trial goes missing.')
         where[gid, cam] = f
         out.setdefault(gid, {})[cam] = f
 
-    for gid in sorted(out):                                       # REFUSAL 4
+    # REFUSAL 4.
+    for gid in sorted(out):
         miss = [n for n in rig.names if n not in out[gid]]
         if miss:
             _die(f'group {gid!r} has no video for calibrated camera(s) {miss}. The rig is the '
@@ -241,14 +254,17 @@ def check_flags(args) -> None:
     """Refusals 7-11: the flags that mean something on a labelled session and nothing here. Pure
     argparse arithmetic, so it fires before the checkpoint loads and before anything decodes.
     """
-    if args.anchor == 'labels':                                                   # 7
+    # 7.
+    if args.anchor == 'labels':
         _die('--anchor labels seeds the model with GROUND TRUTH, and --videos has no labels: the '
              'label array is S = 0, so the "oracle" would be an oracle over nothing. Use '
              '--anchor carry (deployment) or --anchor none.')
-    if args.box_prompt == 'labels':                                               # 8
+    # 8.
+    if args.box_prompt == 'labels':
         _die('--box-prompt labels seeds the box from GROUND TRUTH, and --videos has no labels. '
              'Use --box-prompt detector (with --detector/--boxes) or --box-prompt none.')
-    if not args.detector and not args.boxes:                                      # 9
+    # 9.
+    if not args.detector and not args.boxes:
         _die('--videos needs a box source: the default crop comes from the LABELS, and here they '
              'are an S = 0 array, so every window would abort `no points` and the run would '
              'report coverage 0.000 with nothing saying why. Pass --detector <run folder> or '
@@ -256,14 +272,16 @@ def check_flags(args) -> None:
     # 10, the DETECTOR path's refusal specifically: the fallback animal count is 1 for any
     # footage, a catastrophic miss rate with no labels to make it visible. A `--boxes` npz states
     # its row count in its own first axis, so there is nothing to refuse.
-    if args.detector and not args.max_animals:                                    # 10
+    # 10.
+    if args.detector and not args.max_animals:
         _die('--videos --detector needs --max-animals: the row count otherwise falls back to the '
              "session's own animal count, which is 0 here and clamps to 1 -- a catastrophic miss "
              'rate on any multi-animal footage, with no labels to make it visible. The animal '
              'count is a fact no file on this path carries, so the operator states it.')
     # `--split` defaults to None so this can tell whether it was PASSED. The directory path
     # resolves `args.split or 'test'`.
-    if getattr(args, 'split', None) is not None:                                  # 11
+    # 11.
+    if getattr(args, 'split', None) is not None:
         _die('--split selects among a dataset root\'s sessions and --videos has no root, so it is '
              'inert here. Silently ignoring it would let you believe you selected something.')
 
@@ -357,7 +375,8 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
     K, C = len(names), len(plan.rig)
     for gid, cams in plan.videos.items():
         lens = {cam: got[gid, cam][0] for cam in cams}
-        if len(set(lens.values())) > 1:                                        # REFUSAL 12
+        # REFUSAL 12.
+        if len(set(lens.values())) > 1:
             if not trim:
                 _die(f'group {gid!r}: its cameras disagree on length -- {lens}. A one-frame '
                      'offset is usually a dropped trigger and usually harmless; a 40,000-frame '

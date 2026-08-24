@@ -88,7 +88,7 @@ av = ">=18.0.0,<19"
 # `-n 8`, default per-test distribution (loadfile pins all 29 model builds to one worker and the
 # wall clock barely moves); each worker re-pays the ~14 s torch import, which is the floor.
 test = "pytest tests/ -q -n 8"
-lint = "ruff check ."
+lint = "ruff check . && python scripts/lint_comments.py"
 
 [tool.ruff]
 line-length = 100

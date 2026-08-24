@@ -32,7 +32,8 @@ SKELETON = [['nose', 'left_ear'], ['nose', 'right_ear'], ['left_ear', 'neck'],
             ['left_hip', 'tail_base'], ['right_hip', 'tail_base']]
 ANIMALS = ['resident', 'intruder']
 W, H = 1024, 570
-N_VAL = 7                       # last 7 of the 70 train videos, by sorted name
+# Last 7 of the 70 train videos, by sorted name.
+N_VAL = 7
 
 
 def rig() -> fmt.Rig:
@@ -60,21 +61,31 @@ def build(seq: dict, npz, T: int) -> tuple[fmt.Labels, float]:
     # target anyway.
     lab.vis2d[:] = fmt.VISIBLE
 
-    box = np.asarray(npz['bbox'], np.float32).transpose(0, 2, 1)          # (S, T, 4) normalised
+    # (S, T, 4) normalised
+    box = np.asarray(npz['bbox'], np.float32).transpose(0, 2, 1)
     box[..., 0::2] *= W
     box[..., 1::2] *= H
-    lab.boxes = np.ascontiguousarray(box[:, :, None, :])                  # (S, T, C, 4)
+    # (S, T, C, 4)
+    lab.boxes = np.ascontiguousarray(box[:, :, None, :])
     lab.instance = np.full((2, T, 1), fmt.INST_LABELED, np.int8)
 
     # Box axis order [x0,y0,x1,y1], normalised by (W,H) -- checked rather than assumed, because
     # the boxes come from a different MARS run than the keypoints.
-    p = lab.points2d[:, :, :, 0, :]                                       # (S, T, K, 2)
+    # (S, T, K, 2)
+    p = lab.points2d[:, :, :, 0, :]
     lo, hi = box[:, :, None, :2], box[:, :, None, 2:]
     inside = float(((p >= lo - 1.0) & (p <= hi + 1.0)).all(-1).mean())
     return lab, inside
 
 
 def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
+    """Convert both CalMS21 task-1 splits: one session per video.
+
+    Inputs: out_root -- output root; sessions land at out_root/<split>/<stem>.
+            dry_run -- report shapes, write nothing.
+            max_seqs -- cap sequences per split, or None.
+    Side effects: writes sessions + symlinked mp4s; prints per-sequence lines.
+    """
     r = rig()
     val_stems: set[str] = set()
 
@@ -144,11 +155,18 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
                                'recoverable from the source json',
                     'animal_id_source': 'readme: mouse 0 = resident (black), 1 = intruder (white)',
                 })
-            del data[f'task1/{src_split}/{stem}']       # 1.2 GB of json; let it go as we walk
+            # 1.2 GB of json; let it go as we walk.
+            del data[f'task1/{src_split}/{stem}']
         del blob, data
 
 
 def main() -> None:
+    """Convert CalMS21 task 1 into the tailcycle dataset; exit 0/1.
+
+    Inputs: argv (via argparse): --out, --max-seqs, --dry-run, --validate,
+            --clean.
+    Side effects: writes the dataset under --out; prints progress and validation.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', type=Path, default=OUT)

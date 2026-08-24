@@ -22,6 +22,7 @@ from tailcyclenet.render import render_group, resolve_camera, session_for_predic
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser for scripts/render.py."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--pred', required=True, type=Path,
@@ -62,7 +63,8 @@ def _frame_range(prov, n_total, args):
     """The [f0, f1) this call draws: the requested range intersected with the range this
     prediction actually covers (extending past it would draw guaranteed-NaN frames)."""
     pred_start = int(prov.get('frame_start', 0) or 0)
-    pred_stop = int(prov.get('frame_stop', 0) or 0) or n_total   # 0 = to the end
+    # 0 = to the end.
+    pred_stop = int(prov.get('frame_stop', 0) or 0) or n_total
     req_start = args.start_frame if args.start_frame is not None else pred_start
     req_stop = (pred_stop if args.end_frame is None
                else (n_total if args.end_frame == 0 else args.end_frame))
@@ -72,6 +74,11 @@ def _frame_range(prov, n_total, args):
 
 
 def main(argv=None):
+    """Render a prediction session's groups over their source pixels.
+
+    Inputs: argv -- CLI args (defaults to sys.argv[1:]).
+    Side effects: writes mp4 clips under --out; prints per-group lines.
+    """
     ap = build_parser()
     args = ap.parse_args(argv)
 
@@ -137,7 +144,8 @@ def main(argv=None):
                 elif args.draw == 'keypoints':
                     draw_arr = p2[:, :, ci]
                 else:
-                    overlay = p2          # (S,T,C,K,2); render_group slices camera `ci` itself
+                    # (S,T,C,K,2); render_group slices camera `ci` itself.
+                    overlay = p2
             render_group(sess, gid, draw_arr, out_path, cam=ci, zoom=args.zoom, boxes=boxes,
                         frames=frames, overlay=overlay, fps=args.fps, max_side=args.max_side)
             print(f'{key}: wrote {out_path}')

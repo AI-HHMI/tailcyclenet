@@ -17,7 +17,8 @@ PALETTE = [(60, 60, 255), (60, 220, 60), (255, 140, 40), (40, 220, 220), (230, 8
            (250, 250, 60), (150, 90, 255), (90, 200, 150), (200, 200, 200), (80, 140, 255),
            (170, 110, 60), (60, 170, 110)]
 
-CHUNK = 32          # frames read per batch. 480 rat-city frames at once is 13.8 GB.
+# Frames read per batch. 480 rat-city frames at once is 13.8 GB.
+CHUNK = 32
 
 
 def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, marker='dot',
@@ -125,11 +126,13 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
         pred = project(session, pred, cam, gid, src)
     if boxes is not None:
         boxes = np.asarray(boxes)
-        if boxes.ndim == 4:                  # (S,T,C,4) -> this camera's own boxes
+        if boxes.ndim == 4:
+            # (S,T,C,4) -> this camera's own boxes.
             boxes = boxes[:, :, cam]
     if overlay is not None:
         overlay = np.asarray(overlay)
-        if overlay.ndim == 5:                # (S,T,C,K,2) -> this camera's own overlay
+        if overlay.ndim == 5:
+            # (S,T,C,K,2) -> this camera's own overlay.
             overlay = overlay[:, :, cam]
     group = session.groups[gid]
     cam_name = session.cam_names[cam]

@@ -12,7 +12,8 @@ the first one keeps the downstream accuracy.
 import torch
 import torch.nn.functional as F
 
-CENTER_RADIUS = 2.5      # in cells; YOLOX's own value
+# In cells; YOLOX's own value.
+CENTER_RADIUS = 2.5
 
 
 def box_iou(a, b, eps=1e-7):
@@ -238,17 +239,20 @@ def keypoint_loss(pred, target, gt_boxes):
     if pred.numel() == 0:
         z = pred.sum() * 0.0
         return z, z, 0, 0
+    # Per-animal normaliser (P,1); the coordinate mask (P,K).
     side = (0.5 * ((gt_boxes[:, 2] - gt_boxes[:, 0]) + (gt_boxes[:, 3] - gt_boxes[:, 1]))
-            ).clamp_min(1.0)[:, None]                                    # (P,1)
-    xy_ok = torch.isfinite(target[..., :2]).all(-1)                      # (P,K)
+            ).clamp_min(1.0)[:, None]
+    xy_ok = torch.isfinite(target[..., :2]).all(-1)
     # SELECT, do not multiply -- see note 1. `target[xy_ok]` is (n_finite, 2) with no NaN in it.
     if xy_ok.any():
         d = (pred[..., :2][xy_ok] - target[..., :2][xy_ok]).abs().sum(-1)
         reg = d / side.expand_as(xy_ok)[xy_ok]
-        reg = reg.sum() / xy_ok.sum()                                    # note 2
+        # note 2: normalise by the finite count, not by K.
+        reg = reg.sum() / xy_ok.sum()
     else:
         reg = pred.sum() * 0.0
-    v_ok = torch.isfinite(target[..., 2])                                # note 3
+    # note 3: the score channel's mask is `status`, not coordinate-finiteness.
+    v_ok = torch.isfinite(target[..., 2])
     if v_ok.any():
         sc = F.binary_cross_entropy_with_logits(
             pred[..., 2][v_ok], target[..., 2][v_ok], reduction='mean')
@@ -371,7 +375,8 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             weight[b] *= cert.to(weight.dtype)
             n_cert += float(cert.float().mean())
         if ignore is not None:
-            ig = certified_anchors(anchors, ignore[b], None)     # anchor inside an ignore box
+            # Anchor inside an ignore box.
+            ig = certified_anchors(anchors, ignore[b], None)
             weight[b] *= (~ig).to(weight.dtype)
             n_ignored += float(ig.float().mean())
         if pos.numel():

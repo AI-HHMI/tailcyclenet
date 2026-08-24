@@ -55,6 +55,7 @@ def column_sort_perm(names):
 # v4 reading
 
 def load_spec(name: str) -> dict:
+    """The dataset's configs/datasets/<name>.toml, parsed."""
     with open(SPECS / f'{name}.toml', 'rb') as f:
         return tomllib.load(f)
 
@@ -65,6 +66,11 @@ def out_dir(name: str, out_root: Path) -> Path:
 
 
 def read_metadata(trial: Path) -> dict | None:
+    """The trial's metadata.yaml, or None when the trial has none.
+
+    Inputs: trial -- a v4 trial directory.
+    Outputs: parsed yaml dict, or None if metadata.yaml does not exist.
+    """
     p = trial / 'metadata.yaml'
     if not p.exists():
         return None
@@ -120,6 +126,7 @@ def rig_from_pixels(trial: Path, spec: dict) -> fmt.Rig:
 def rig_key(rig: fmt.Rig) -> str:
     """Identity of a camera rig, for deciding whether trials belong to one session."""
     def num(t):
+        """Detach and round a v4 tensor to a comparable list (None stays None)."""
         return None if t is None else np.round(np.asarray(
             t.detach().cpu() if hasattr(t, 'detach') else t, dtype=np.float64), 9).tolist()
     return repr([(c.get_name(), rig.cam_type(c.get_name()), tuple(c.get_size()),
@@ -146,6 +153,14 @@ def trial_pixels(trial: Path, cam_names: list[str]) -> dict[str, tuple[str, Path
 
 
 def n_pixel_frames(kind: str, src: Path, meta: dict | None) -> int:
+    """Frame count of a camera's pixels: img-dir length, or metadata num_frames.
+
+    Inputs: kind -- 'frames' or 'video'.
+            src -- the img/ dir or video file path.
+            meta -- the trial's metadata.yaml, if any.
+    Outputs: the number of frames.
+    Side effects: raises RuntimeError for a video group with no num_frames.
+    """
     if kind == 'frames':
         return sum(1 for f in src.iterdir() if f.suffix in fmt.IMAGE_EXTS)
     if meta is None or 'num_frames' not in meta:
@@ -185,7 +200,8 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
     S = pose.shape[0]
 
     ids = [str(v) for v in npz['ids']] if 'ids' in npz else [f'a{i:02d}' for i in range(S)]
-    finite = np.isfinite(pose).all(-1)                       # (S,T,K)
+    # (S,T,K)
+    finite = np.isfinite(pose).all(-1)
 
     lab = fmt.empty_labels(S, T, K, C, mode3d=mode3d, animal_ids=ids)
     if mode3d:
@@ -219,6 +235,15 @@ def build_labels(trial: Path, spec: dict, rig: fmt.Rig, T: int) -> fmt.Labels:
 
 def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int | None,
                     dry_run: bool) -> None:
+    """Convert one v4 dataset: trials become groups, sessions stay sessions.
+
+    Inputs: name -- dataset name (configs/datasets/<name>.toml).
+            src_root -- the v4 root holding <name>/.
+            out_root -- output root; sessions land at out_root/<out_name>/<split>/.
+            max_groups -- cap groups per v4 session, or None.
+            dry_run -- report shapes, write nothing.
+    Side effects: writes sessions + symlinked pixels; prints per-session lines.
+    """
     spec = load_spec(name)
     src = src_root / name
     out = out_dir(name, out_root)
@@ -303,6 +328,12 @@ def convert_dataset(name: str, src_root: Path, out_root: Path, max_groups: int |
 
 
 def main() -> None:
+    """Convert posetail-finetuning-v4 datasets into the tailcycle format; exit 0/1.
+
+    Inputs: argv (via argparse): --dataset, --src, --out, --max-groups,
+            --dry-run, --validate, --no-image-check, --clean.
+    Side effects: writes datasets under --out; prints progress and validation.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dataset', default='all', choices=('all',) + DATASETS, nargs='+')

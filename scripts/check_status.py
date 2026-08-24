@@ -51,6 +51,7 @@ HOLE_EXEMPTIONS = {
 
 
 def _status_counts(table) -> Counter:
+    """Counts of each dictionary-encoded status value in a table's `status` column."""
     arr = table.column('status').combine_chunks()
     codes = arr.indices.to_numpy(zero_copy_only=False)
     vocab = arr.dictionary.to_pylist()
@@ -69,7 +70,8 @@ def _holes(table, key_cols: list[str]) -> int:
 
     df = table.select([*key_cols, 'bodypart']).to_pandas()
     n_kpts = df['bodypart'].nunique()
-    live_keys = df.groupby(key_cols, observed=True).ngroups   # instances with >= 1 row
+    # Instances with >= 1 row.
+    live_keys = df.groupby(key_cols, observed=True).ngroups
     return int(live_keys * n_kpts - len(df))
 
 
@@ -89,6 +91,14 @@ def _is_symlink_farm(root_dir: Path) -> bool:
 
 def audit_session(sess: fmt.Session, root_name: str, hole_totals: Counter,
                   report: list[str]) -> list[str]:
+    """Check one session's status policy, appending table lines to `report`.
+
+    Inputs: sess -- the loaded session.
+            root_name -- the root's folder name (the policy keys on this).
+            hole_totals -- Counter((root, stem)) accumulating hole counts.
+            report -- per-session table lines appended here.
+    Outputs: list of policy problem strings for this session.
+    """
     problems = []
     is_annotated = sess.label_source == 'annotated'
     for stem, key_cols in (('keypoints', ['group_id', 'frame', 'animal_id', 'camera']),
@@ -116,6 +126,12 @@ def audit_session(sess: fmt.Session, root_name: str, hole_totals: Counter,
 
 
 def audit_root(root_dir: Path, report: list[str]) -> list[str]:
+    """Audit every session under a dataset root against the status policy.
+
+    Inputs: root_dir -- the dataset root.
+            report -- per-session table lines appended here.
+    Outputs: list of policy problem strings for the root.
+    """
     name = root_dir.name
     problems = []
     hole_totals: Counter = Counter()
@@ -151,6 +167,12 @@ def audit_root(root_dir: Path, report: list[str]) -> list[str]:
 
 
 def main():
+    """Audit status policy across dataset roots; exit 0/1/2.
+
+    Inputs: argv (via argparse): roots, --data, --report.
+    Side effects: prints the per-session report and any problems; exits 2 on a
+                  missing root, 1 on a violation without --report.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('roots', nargs='*', help='root name(s); default is every non-symlink-farm '

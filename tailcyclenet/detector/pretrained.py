@@ -96,15 +96,17 @@ def load_coco_backbone(model, tier, weights_dir=None):
     own = model.backbone.state_dict()
     to_load, n_loaded, n_total = {}, 0, 0
     for k, v in own.items():
-        if v.dim() != 4:                                       # GroupNorm affine -- no BN source
+        # GroupNorm affine -- no BN source.
+        if v.dim() != 4:
             continue
         n_total += 1
         if k not in remapped or remapped[k].shape != v.shape:
             continue
         w_src = remapped[k].clone()
         if k == 'stem.conv.0.weight':
-            w_src = w_src * 255.0             # Megvii [0,255] -> this repo's [0,1] input
-            w_src = w_src[:, BGR_TO_RGB_FOCUS_PERM]     # Megvii BGR -> this repo's RGB, per group
+            # Megvii [0,255] -> this repo's [0,1] input, then BGR -> RGB per Focus group.
+            w_src = w_src * 255.0
+            w_src = w_src[:, BGR_TO_RGB_FOCUS_PERM]
         to_load[k] = w_src
         n_loaded += 1
 

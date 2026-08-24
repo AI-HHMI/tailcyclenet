@@ -10,10 +10,8 @@
 extends = "base.toml"
 
 [data]
-# 0 -> every camera of a 3D session; the pretrained tracker was trained at [1, 8], so a fixed
-# higher count is out of distribution as well as slow.
+# 0 -> every camera of a 3D session; the pretrained tracker was trained at [1, 8], so a fixed higher count is out of distribution as well as slow.
 cams_to_sample = 0
 val_cams_to_sample = 5      # the reference's [dataset.val] value
-# Rate at which a 3D session is shown a SINGLE camera; 0 turns the 3D-single-view path off --
-# with no triangulation a non-query point has nothing to predict.
+# Rate at which a 3D session is shown a SINGLE camera; 0 turns the 3D-single-view path off -- with no triangulation a non-query point has nothing to predict.
 prob_2d_only = 0

@@ -39,7 +39,8 @@ def draw(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
     """Every overlay for one (frame, camera), on a COPY at native resolution."""
     import cv2
 
-    im = np.ascontiguousarray(im[:, :, ::-1]).copy()          # RGB -> BGR
+    # RGB -> BGR
+    im = np.ascontiguousarray(im[:, :, ::-1]).copy()
     s = _scale((im.shape[1], im.shape[0]))
     ix = {n: i for i, n in enumerate(names)}
 
@@ -62,7 +63,8 @@ def draw(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
         vis, pts = lab.vis2d[a, t, :, ci], lab.points2d[a, t, :, ci]
         for k in np.flatnonzero(np.isin(vis, fmt.POSITIONED)):
             if not np.isfinite(pts[k]).all():
-                continue                      # a coordinate-free visibility observation (§7)
+                # A coordinate-free visibility observation (§7).
+                continue
             cv2.circle(im, (int(pts[k][0]), int(pts[k][1])), 3 * s, PALETTE[k % len(PALETTE)], -1)
         for u, v in skeleton:
             if u not in ix or v not in ix:
@@ -81,6 +83,12 @@ def label_frames(lab: fmt.Labels) -> list[int]:
 
 
 def fit(im: np.ndarray, width: int) -> np.ndarray:
+    """Downscale a frame to at most `width` pixels wide, preserving aspect.
+
+    Inputs: im -- a BGR frame.
+            width -- maximum output width.
+    Outputs: the resized frame (unchanged when already at or below width).
+    """
     import cv2
     if im.shape[1] <= width:
         return im
@@ -89,6 +97,16 @@ def fit(im: np.ndarray, width: int) -> np.ndarray:
 
 
 def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dict:
+    """Render one group: sheets, per-animal crops, and optionally a video.
+
+    Inputs: sess -- the session holding the group.
+            gid -- the group id.
+            out -- output directory.
+            stem -- the file-name stem for this group's renders.
+            args -- parsed CLI args (width, crops, video, fps).
+    Outputs: per-kind render counts for the group.
+    Side effects: writes jpg/mp4 files under out.
+    """
     import cv2
 
     group = sess.groups[gid]
@@ -146,6 +164,13 @@ def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dic
 
 
 def main() -> int:
+    """Render sampled groups across a dataset; 0 on success.
+
+    Inputs: argv (via argparse): --data, --out, --n, --split, --session,
+            --group, --width, --video, --fps, --no-crops, --seed.
+    Outputs: process exit code.
+    Side effects: writes renders under --out; prints a per-group summary.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--data', type=Path, required=True,

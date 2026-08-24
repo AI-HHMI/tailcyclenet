@@ -114,6 +114,7 @@ class Bottleneck(nn.Module):
     second halving).
     """
     def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
+        """Build the bottleneck: 1x1 down-projection, 3x3 conv, optional shortcut."""
         super().__init__()
         hidden = int(cout * expansion)
         self.conv1 = conv_norm_act(cin, hidden, 1)
@@ -121,6 +122,7 @@ class Bottleneck(nn.Module):
         self.add = shortcut and cin == cout
 
     def forward(self, x):
+        """Apply conv1 then conv2, shortcut-added when `self.add`."""
         y = self.conv2(self.conv1(x))
         return x + y if self.add else y
 
@@ -135,12 +137,15 @@ class CSPNeXtBottleneck(nn.Module):
     `dev/scratch/prototype_cspnext.py`.
     """
     def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
+        """Build the CSPNeXt bottleneck: 3x3 conv, 5x5 depthwise, 1x1 pointwise, SE gate."""
         super().__init__()
         hidden = int(cout * expansion)
-        self.conv1 = conv_norm_act(cin, hidden, 3)                    # 3x3 standard
+        # 3x3 standard conv
+        self.conv1 = conv_norm_act(cin, hidden, 3)
         # 5x5 depthwise (the CSPNeXt signature: larger kernel than YOLOX's 3x3)
-        self.dw = conv_norm_act(hidden, hidden, 5, groups=hidden)     # 5x5 depthwise
-        self.pw = conv_norm_act(hidden, cout, 1)                      # 1x1 pointwise
+        self.dw = conv_norm_act(hidden, hidden, 5, groups=hidden)
+        # 1x1 pointwise
+        self.pw = conv_norm_act(hidden, cout, 1)
         # Squeeze-Excitation: global avg pool -> FC down -> SiLU -> FC up -> Sigmoid
         sq = max(1, cout // 4)
         self.se = nn.Sequential(
@@ -150,6 +155,7 @@ class CSPNeXtBottleneck(nn.Module):
         self.add = shortcut and cin == cout
 
     def forward(self, x):
+        """Conv path through conv1/dw/pw, SE-gated, shortcut-added when `self.add`."""
         y = self.pw(self.dw(self.conv1(x)))
         y = y * self.se(y)
         return x + y if self.add else y
@@ -158,6 +164,7 @@ class CSPNeXtBottleneck(nn.Module):
 class CSPNeXtLayer(nn.Module):
     """`CSPLayer` using `CSPNeXtBottleneck` instead of `Bottleneck`."""
     def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True, bottleneck_expansion=0.5):
+        """Build the layer: two 1x1 splits, `n` CSPNeXt bottlenecks, one merge conv."""
         super().__init__()
         hidden = cout // 2
         self.conv1 = conv_norm_act(cin, hidden, 1)
@@ -168,11 +175,14 @@ class CSPNeXtLayer(nn.Module):
                                 expansion=bottleneck_expansion) for _ in range(n)])
 
     def forward(self, x):
+        """CSP merge of the bottleneck path and the shortcut path."""
         return self.conv3(torch.cat([self.m(self.conv1(x)), self.conv2(x)], dim=1))
 
 
 class CSPLayer(nn.Module):
+    """A CSP layer: cross-stage partial split, `n` Bottlenecks on one path, merge conv."""
     def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True, bottleneck_expansion=0.5):
+        """Build the layer: two 1x1 splits, `n` Bottlenecks, one merge conv."""
         super().__init__()
         hidden = cout // 2
         self.conv1 = conv_norm_act(cin, hidden, 1)
@@ -183,11 +193,14 @@ class CSPLayer(nn.Module):
                         expansion=bottleneck_expansion) for _ in range(n)])
 
     def forward(self, x):
+        """CSP merge of the bottleneck path and the shortcut path."""
         return self.conv3(torch.cat([self.m(self.conv1(x)), self.conv2(x)], dim=1))
 
 
 class SPPBottleneck(nn.Module):
+    """Spatial Pyramid Pooling: 1x1 conv, max pools at `sizes`, merge conv."""
     def __init__(self, cin, cout, sizes=(5, 9, 13)):
+        """Build the block: 1x1 projection, `sizes` max pools, 1x1 merge."""
         super().__init__()
         hidden = cin // 2
         self.conv1 = conv_norm_act(cin, hidden, 1)
@@ -195,6 +208,7 @@ class SPPBottleneck(nn.Module):
         self.conv2 = conv_norm_act(hidden * (len(sizes) + 1), cout, 1)
 
     def forward(self, x):
+        """Concat the projection with its multi-scale pool outputs and merge."""
         x = self.conv1(x)
         return self.conv2(torch.cat([x] + [p(x) for p in self.pools], dim=1))
 
@@ -212,20 +226,27 @@ class CSPDarknetNano(nn.Module):
     """
 
     def __init__(self, w=(24, 48, 96, 192), p2=False, in_channels=3):
+        """Build `trimmed`'s backbone: stem + dark2..dark5 at strides 2/4/8/16/32."""
         super().__init__()
         c1, c2, c3, c4 = w
         self.p2 = bool(p2)
-        self.stem = conv_norm_act(int(in_channels), c1, 3, 2)  # /2
-        self.dark2 = nn.Sequential(conv3(c1, c2, 3, 2), CSPLayer(c2, c2, 1))          # /4
-        self.dark3 = nn.Sequential(conv3(c2, c3, 3, 2), CSPLayer(c3, c3, 3))          # /8
-        self.dark4 = nn.Sequential(conv3(c3, c4, 3, 2), CSPLayer(c4, c4, 3))          # /16
+        # stride /2
+        self.stem = conv_norm_act(int(in_channels), c1, 3, 2)
+        # stride /4
+        self.dark2 = nn.Sequential(conv3(c1, c2, 3, 2), CSPLayer(c2, c2, 1))
+        # stride /8
+        self.dark3 = nn.Sequential(conv3(c2, c3, 3, 2), CSPLayer(c3, c3, 3))
+        # stride /16
+        self.dark4 = nn.Sequential(conv3(c3, c4, 3, 2), CSPLayer(c4, c4, 3))
+        # stride /32
         self.dark5 = nn.Sequential(conv3(c4, c4, 3, 2), SPPBottleneck(c4, c4),
-                                   CSPLayer(c4, c4, 1, shortcut=False))               # /32
+                                   CSPLayer(c4, c4, 1, shortcut=False))
         # p3, p4, p5 output widths -- dark4 and dark5 share `c4` in this 4-effective-width net,
         # unlike the canonical 5-stage backbone below where all three differ.
         self.out_channels = (c2, c3, c4, c4) if self.p2 else (c3, c4, c4)
 
     def forward(self, x):
+        """Run stem + dark2..dark5; return (p2,p3,p4,p5) when `p2`, else (p3,p4,p5)."""
         p2 = self.dark2(self.stem(x))
         p3 = self.dark3(p2)
         p4 = self.dark4(p3)
@@ -243,10 +264,12 @@ class Focus(nn.Module):
     """
 
     def __init__(self, cin, cout, k=3, depthwise=False):
+        """Build the space-to-depth stem: one conv over 4 channel-concatenated subsamples."""
         super().__init__()
         self.conv = conv3(cin * 4, cout, k, 1, depthwise=depthwise)
 
     def forward(self, x):
+        """Stack the four 2x2-subsampled copies (tl/tr/bl/br) and apply the conv."""
         tl = x[..., ::2, ::2]
         tr = x[..., ::2, 1::2]
         bl = x[..., 1::2, ::2]
@@ -266,31 +289,38 @@ class CSPDarknet(nn.Module):
 
     def __init__(self, width_mul=1.0, depth_mul=1.0, depthwise=False, bottleneck_expansion=0.5,
                 p2=False, in_channels=3):
+        """Build the canonical 5-stage backbone at Megvii's official tier multipliers."""
         super().__init__()
         c = round8(64 * width_mul)
         d = max(1, round(3 * depth_mul))
         be = bottleneck_expansion
         self.p2 = bool(p2)
-        self.stem = Focus(int(in_channels), c, 3, depthwise=depthwise)                    # /2
+        # stride /2
+        self.stem = Focus(int(in_channels), c, 3, depthwise=depthwise)
+        # stride /4
         self.dark2 = nn.Sequential(conv3(c, c * 2, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 2, c * 2, d, depthwise=depthwise,
-                                           bottleneck_expansion=be))                      # /4
+                                           bottleneck_expansion=be))
+        # stride /8
         self.dark3 = nn.Sequential(conv3(c * 2, c * 4, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 4, c * 4, d * 3, depthwise=depthwise,
-                                           bottleneck_expansion=be))                      # /8
+                                           bottleneck_expansion=be))
+        # stride /16
         self.dark4 = nn.Sequential(conv3(c * 4, c * 8, 3, 2, depthwise=depthwise),
                                    CSPLayer(c * 8, c * 8, d * 3, depthwise=depthwise,
-                                           bottleneck_expansion=be))                      # /16
+                                           bottleneck_expansion=be))
+        # stride /32
         self.dark5 = nn.Sequential(
             conv3(c * 8, c * 16, 3, 2, depthwise=depthwise),
             SPPBottleneck(c * 16, c * 16),
             CSPLayer(c * 16, c * 16, d, shortcut=False, depthwise=depthwise,
-                    bottleneck_expansion=be))                                             # /32
+                    bottleneck_expansion=be))
         # p2, p3, p4, p5 -- FOUR distinct widths when `p2` (T4.3); the 3-tuple contract is
         # unchanged at the default, matching `CSPDarknetNano`'s own `p2` switch.
         self.out_channels = (c * 2, c * 4, c * 8, c * 16) if self.p2 else (c * 4, c * 8, c * 16)
 
     def forward(self, x):
+        """Run stem + dark2..dark5; return (p2,p3,p4,p5) when `p2`, else (p3,p4,p5)."""
         p2 = self.dark2(self.stem(x))
         p3 = self.dark3(p2)
         p4 = self.dark4(p3)
@@ -310,31 +340,40 @@ class CSPNeXt(nn.Module):
     """
     def __init__(self, width_mul=0.5, depth_mul=0.33, bottleneck_expansion=1.0,
                 p2=False, in_channels=3):
+        """Build the CSPNeXt backbone (RTMDet-style) at the given width/depth multipliers."""
         super().__init__()
-        c = round8(64 * width_mul)       # base_channels, e.g. 32 at width_mul=0.5
-        d = max(1, round(3 * depth_mul)) # base_depth, e.g. 1 at depth_mul=0.33
+        # base_channels, e.g. 32 at width_mul=0.5
+        c = round8(64 * width_mul)
+        # base_depth, e.g. 1 at depth_mul=0.33
+        d = max(1, round(3 * depth_mul))
         be = bottleneck_expansion
         self.p2 = bool(p2)
         # Same stem as CSPDarknet canonical tiers
-        self.stem = Focus(int(in_channels), c, 3, depthwise=False)            # /2
+        # stride /2
+        self.stem = Focus(int(in_channels), c, 3, depthwise=False)
+        # stride /4
         self.dark2 = nn.Sequential(
             conv_norm_act(c, c * 2, 3, 2),
-            CSPNeXtLayer(c * 2, c * 2, d, bottleneck_expansion=be))           # /4
+            CSPNeXtLayer(c * 2, c * 2, d, bottleneck_expansion=be))
+        # stride /8
         self.dark3 = nn.Sequential(
             conv_norm_act(c * 2, c * 4, 3, 2),
-            CSPNeXtLayer(c * 4, c * 4, d * 3, bottleneck_expansion=be))       # /8
+            CSPNeXtLayer(c * 4, c * 4, d * 3, bottleneck_expansion=be))
+        # stride /16
         self.dark4 = nn.Sequential(
             conv_norm_act(c * 4, c * 8, 3, 2),
-            CSPNeXtLayer(c * 8, c * 8, d * 3, bottleneck_expansion=be))       # /16
+            CSPNeXtLayer(c * 8, c * 8, d * 3, bottleneck_expansion=be))
+        # stride /32
         self.dark5 = nn.Sequential(
             conv_norm_act(c * 8, c * 16, 3, 2),
             SPPBottleneck(c * 16, c * 16),
             CSPNeXtLayer(c * 16, c * 16, d, shortcut=False,
-                        bottleneck_expansion=be))                            # /32
+                        bottleneck_expansion=be))
         self.out_channels = ((c * 2, c * 4, c * 8, c * 16) if self.p2
                              else (c * 4, c * 8, c * 16))
 
     def forward(self, x):
+        """Run stem + dark2..dark5; return (p2,p3,p4,p5) when `p2`, else (p3,p4,p5)."""
         p2 = self.dark2(self.stem(x))
         p3 = self.dark3(p2)
         p4 = self.dark4(p3)
@@ -355,6 +394,7 @@ class PAFPN(nn.Module):
 
     def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False,
                 fpn_upsample='nearest', p2_bottomup=False):
+        """Build the PAFPN neck: lateral convs, top-down merges, optional p2 bottom-up."""
         super().__init__()
         self.p2 = bool(p2)
         # G2: 'nearest' (default) is byte-identical to every checkpoint on record; 'bilinear' is
@@ -392,11 +432,13 @@ class PAFPN(nn.Module):
                 self.out2 = CSPLayer(out, out, 1, shortcut=True, depthwise=depthwise)
 
     def _upsample(self, x, size):
+        """Upsample `x` to `size` with the configured mode (nearest or bilinear)."""
         if self.fpn_upsample == 'nearest':
             return F.interpolate(x, size=size, mode='nearest')
         return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
 
     def forward(self, feats):
+        """Top-down then bottom-up fusion over the pyramid levels; returns 3 or 4 outputs."""
         if self.p2:
             p2, p3, p4, p5 = feats
         else:
@@ -433,6 +475,7 @@ class Head(nn.Module):
     """
 
     def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True, shared_head=True):
+        """Build the decoupled head: per-level stems, reg/obj towers, optional kpt branch."""
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         # G1: `shared_head=True` (default) runs obj AND reg through the SAME `reg_convs` tower
@@ -449,7 +492,8 @@ class Head(nn.Module):
                            conv3(cin, cin, 3, depthwise=depthwise)) for _ in range(n_levels)])
         self.reg_pred = nn.ModuleList([nn.Conv2d(cin, 4, 1) for _ in range(n_levels)])
         self.obj_pred = nn.ModuleList([nn.Conv2d(cin, 1, 1) for _ in range(n_levels)])
-        for m in self.obj_pred:                      # rare-positive prior, as in YOLOX
+        # rare-positive prior, as in YOLOX
+        for m in self.obj_pred:
             nn.init.constant_(m.bias, -4.595)
         if not self.shared_head:
             self.obj_convs = nn.ModuleList(
@@ -464,6 +508,7 @@ class Head(nn.Module):
                 [nn.Conv2d(cin, 3 * self.n_keypoints, 1) for _ in range(n_levels)])
 
     def forward(self, feats):
+        """Per level: stem -> reg tower -> (obj, reg, kpt) predictions; list of triples."""
         outs = []
         for i, f in enumerate(feats):
             stem = self.stems[i](f)
@@ -508,6 +553,7 @@ class YOLOXNano(nn.Module):
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
                 p2=False, in_channels=3, head_depthwise=None, pretrained='',
                 shared_head=True, fpn_upsample='nearest', p2_bottomup=False):
+        """Build the box predictor for `version` (see the class docstring for arguments)."""
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
@@ -540,22 +586,28 @@ class YOLOXNano(nn.Module):
             use_pretrained = (self.pretrained_source == pretrained_key)
             self.backbone = ViTBackbone(model_name, p2=self.p2, pretrained=use_pretrained,
                                         hub_repo=hub_repo)
-            neck_out = round8(256 * 0.5)   # 128 -- match the 's' tier's neck width
-            depthwise = False               # ViT arms use full-conv neck/head
+            # 128 -- match the 's' tier's neck width
+            neck_out = round8(256 * 0.5)
+            # ViT arms use full-conv neck/head
+            depthwise = False
         elif self.version == 'hybrid':
             # A3: CNN stem (strides 2/4/8) + transformer blocks (strides 16/32), from scratch.
             from .vit_backbone import HybridBackbone
             self.backbone = HybridBackbone(p2=self.p2, in_channels=self.in_channels)
-            neck_out = round8(256)    # 256, matching the c*4 = 256 at stride-8
-            depthwise = False          # full-conv neck/head
+            # 256, matching the c*4 = 256 at stride-8
+            neck_out = round8(256)
+            # full-conv neck/head
+            depthwise = False
         elif self.version == 'cspnext_s':
             # A4: RTMDet-style backbone (5x5 depthwise + SE bottleneck) on the existing
             # CSPDarknet stage structure.
             self.backbone = CSPNeXt(width_mul=0.5, depth_mul=0.33,
                                     bottleneck_expansion=self.bottleneck_expansion,
                                     p2=self.p2, in_channels=self.in_channels)
-            neck_out = round8(256 * 0.5)   # 128
-            depthwise = False               # CSPNeXt uses full-conv in its towers
+            # 128
+            neck_out = round8(256 * 0.5)
+            # CSPNeXt uses full-conv in its towers
+            depthwise = False
         else:
             if self.version not in YOLOX_TIERS:
                 raise ValueError(f"yolox version {version!r}: must be 'trimmed' or one of "
@@ -617,7 +669,8 @@ class YOLOXNano(nn.Module):
                 # branch.
                 half = torch.stack([(ltrb[..., 0] + ltrb[..., 2]) / 2,
                                     (ltrb[..., 1] + ltrb[..., 3]) / 2], -1).detach()
-                ctr = torch.stack([cx, cy], -1)[None]                    # (1,A,2)
+                # (1,A,2)
+                ctr = torch.stack([cx, cy], -1)[None]
                 xy = ctr[:, :, None] + 1.25 * half[:, :, None] * torch.tanh(k[..., :2])
                 kpt_all.append(torch.cat([xy, k[..., 2:]], -1))
         k = torch.cat(kpt_all, 1) if kpt_all else None

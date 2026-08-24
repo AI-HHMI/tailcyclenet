@@ -75,7 +75,8 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416)
     return ow, oh
 
 
-BACKBONE_LR_SCALE = 0.1   # any pretrained backbone gets this x lr; see main()'s own docstring note
+# Any pretrained backbone gets this x lr; see main()'s own docstring note.
+BACKBONE_LR_SCALE = 0.1
 
 
 def build_detector_optimizer(model, train_cfg, model_cfg):
@@ -90,6 +91,7 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     wd = train_cfg['weight_decay']
 
     def _split_decay(params):
+        """Param groups split by weight decay (dim > 1 decays, dim <= 1 does not)."""
         params = list(params)
         if not train_cfg['no_decay_norm_bias']:
             return [{'params': params, 'weight_decay': wd}]
@@ -142,11 +144,12 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
         # Muon routing rule (same as the pose model in tailcyclenet/optim.py): 2D .weight
         # tensors that are NOT nn.Embedding -> Muon. Everything else (4D conv, 1D bias,
         # GroupNorm/LayerNorm affine) -> AdamW-SF. The detector has no nn.Embedding layers.
+        # Decay is applied by the ScheduleFreeWrapper, so the Muon group is decay-free.
         if p.ndim == 2 and name.endswith('.weight'):
             muon_groups.append({
                 'params': [p],
                 'lr': base_lr * train_cfg['muon_lr_scale'],
-                'weight_decay': 0.0,   # decay applied by the ScheduleFreeWrapper
+                'weight_decay': 0.0,
             })
         else:
             adamw_groups.append({
@@ -176,7 +179,8 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     n_adamw = sum(p.numel() for g in adamw_groups for p in g['params'])
     print(f'optimizer: muon | {n_muon/1e6:.2f}M Muon-routed (2D), '
           f'{n_adamw/1e6:.2f}M AdamW-SF (4D conv + bias + norm)')
-    return opt, None   # no scheduler -- schedule-free replaces the cosine
+    # No scheduler -- schedule-free replaces the cosine.
+    return opt, None
 
 
 def _record_run(run: Path, config: dict) -> None:
@@ -199,6 +203,12 @@ def _record_run(run: Path, config: dict) -> None:
 
 
 def main():
+    """Train the box predictor; exit via SystemExit on bad config.
+
+    Inputs: argv (via argparse): --config, --out, --iters, --device.
+    Side effects: writes checkpoints + metrics.json + config/provenance under
+                  the run folder; prints progress and eval lines.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', required=True, type=Path,
@@ -499,8 +509,9 @@ def main():
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
                 # Both splits, every checkpoint, the score stored beside the weights -- a rolling
                 # `detector.pth` with no score cannot be selected on.
+                # Swap in the averaged iterate for scoring.
                 if hasattr(opt, 'eval'):
-                    opt.eval()     # swap in the averaged iterate for scoring
+                    opt.eval()
                 scores, obj_scores = {}, []
                 for name, ds in (('train', train), ('val', val)):
                     if ds is None:
@@ -512,8 +523,9 @@ def main():
                         batches=train_cfg['eval_batches'], num_workers=2,
                         out_scores=obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
                         center_dist_thresh=train_cfg['nms_center_dist_thresh']))
+                # Restore the working iterate for training.
                 if hasattr(opt, 'train'):
-                    opt.train()    # restore the working iterate for training
+                    opt.train()
                 # Record the objectness distribution: saturation is a property of the recipe, not
                 # the dataset, so `--det-score` cannot be a constant.
                 obj_q = {}
@@ -595,7 +607,8 @@ def main():
                     print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
                           f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
                           flush=True)
-                t0 = time.time()               # evaluation is not part of the s/it readout
+                # Evaluation is not part of the s/it readout.
+                t0 = time.time()
     best = max(history, key=lambda h: h.get('val_r50', h['train_r50'])) if history else None
     print(f'done: {it} iterations -> {run}')
     if best:

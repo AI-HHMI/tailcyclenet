@@ -44,7 +44,8 @@ def route_param(name: str, p, fresh: set[str], embed_ids: set[int]) -> str:
     is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
     is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
     if is2d and is_fresh:
-        return 'muon_fresh'                    # NEW vs the reference: fresh 2D -> Muon @ kpt_lr
+        # NEW vs the reference: fresh 2D -> Muon @ kpt_lr.
+        return 'muon_fresh'
     if is2d and 'scene_encoder.encoder.blocks' in name:
         return 'muon_enc'
     if is2d and ('scene_encoder.kv_proj' in name or any(s in name for s in _DEC_SUBSTR)):
@@ -215,12 +216,14 @@ def _refuse_state_shape(opt, state) -> None:
 
 
 def _group_counts(opt) -> tuple[int, int]:
+    """The (Muon, AdamW) param-group counts of the CURRENT optimizer."""
     if isinstance(opt, PoseDualOptimizer):
         return len(opt.opt_muon.param_groups), len(opt.opt_adam.param_groups)
     return 0, len(opt.param_groups)
 
 
 def _state_group_counts(state) -> tuple[int, int]:
+    """The (Muon, AdamW) param-group counts recorded in a saved state dict."""
     if _is_dual_state(state):
         return len(state['muon']['param_groups']), len(state['adam']['param_groups'])
     return 0, len(state['param_groups'])

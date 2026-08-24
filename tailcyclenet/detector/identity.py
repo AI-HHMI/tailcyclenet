@@ -55,7 +55,7 @@ def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
 
     Per frame, for every pair of live rows, the overlap is
 
-        min(#kpts of A inside B's box / |A|,  #kpts of B inside A's box / |B|)
+        min(A's kpts inside B's box / |A|,  B's kpts inside A's box / |B|)
 
     -- `Assembly.intersection_with` in DeepLabCut -- and above `thresh` the LOWER-SCORED row is
     dropped. Modifies `boxes` (and `kpts`) in place; returns the number of rows dropped.

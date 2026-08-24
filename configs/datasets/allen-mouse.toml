@@ -25,8 +25,7 @@ names = [
   "tail-2/3", "tail-base", "tail-end",
 ]
 
-# Follows the anipose `constraints` / `constraints_weak` lists that produced the GT, so the
-# bone-length diagnostic reproduces a constraint the GT genuinely satisfies.
+# Follows the anipose `constraints` / `constraints_weak` lists that produced the GT, so the bone-length diagnostic reproduces a constraint the GT genuinely satisfies.
 skeleton = [
   ["nose", "L-ear"],
   ["nose", "R-ear"],

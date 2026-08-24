@@ -25,6 +25,12 @@ class PyAVReader:
     """
 
     def __init__(self, path: str):
+        """Open one video container for frame-accurate random access.
+
+        Inputs: path -- path to the video file.
+        Side effects: opens the container and sets libav's threading mode from
+        TAILCYCLENET_PYAV_THREADS.
+        """
         import av
 
         self.path = str(path)
@@ -44,11 +50,13 @@ class PyAVReader:
         # derived average drifts to an off-by-one frame when the declared duration is not exactly
         # frames x period.
         self._rate = self._st.guessed_rate or self._st.average_rate
-        self._pos = None                    # next frame index the decoder would yield, if known
+        # Next frame index the decoder would yield, if known.
+        self._pos = None
         self._iter = None
 
     # -- the facts `adopt._probe` needs -------------------------------------------------
     def __len__(self) -> int:
+        """Frame count: from the header, or derived from duration x rate when absent."""
         n = int(self._st.frames or 0)
         if n > 0:
             return n
@@ -60,22 +68,36 @@ class PyAVReader:
 
     @property
     def fps(self) -> float:
+        """The container's frame rate (guessed, not the drifting average)."""
         return float(self._rate)
 
     def frame_shape(self):
+        """(height, width, 3) of decoded frames."""
         return (int(self._st.codec_context.height), int(self._st.codec_context.width), 3)
 
     # -- decoding -----------------------------------------------------------------------
     def _index_of(self, frame) -> int:
+        """The frame index a decoded frame's pts corresponds to."""
         return int(round(float(frame.pts * self._tb) * float(self._rate)))
 
     def _seek(self, idx: int):
+        """Seek to the keyframe at/before `idx` and restart decoding there.
+
+        Inputs: idx -- target frame index.
+        Side effects: replaces the decoder iterator and clears the position marker.
+        """
         self._c.seek(int(round(idx / float(self._rate) / float(self._tb))),
                      stream=self._st, backward=True, any_frame=False)
         self._iter = self._c.decode(self._st)
         self._pos = None
 
     def get_batch(self, indices) -> np.ndarray:
+        """Decode and return the frames at `indices`, in the order asked for.
+
+        Inputs: indices -- iterable of frame indices; repeats are honoured.
+        Outputs: (N, H, W, 3) uint8 array, one row per requested index.
+        Side effects: advances the decoder, seeking once when the request is far ahead.
+        """
         want = [int(i) for i in indices]
         if not want:
             return np.empty((0, *self.frame_shape()), np.uint8)
@@ -122,12 +144,14 @@ class PyAVReader:
         return np.asarray([got[i] for i in want])
 
     def close(self):
+        """Close the underlying container; idempotent and swallows errors."""
         try:
             self._c.close()
         except Exception:
             pass
 
     def __del__(self):
+        """Best-effort close on garbage collection."""
         self.close()
 
 

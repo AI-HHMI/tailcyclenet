@@ -101,7 +101,8 @@ def motion_ratio(pred, ref) -> dict:
         # One reference position per instance-frame: the prediction's CENTROID is what moves. Kept
         # as a length-1 keypoint axis so the time axis stays at -3 for both shapes.
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)   # an all-NaN instance-frame is legal
+            # An all-NaN instance-frame is legal.
+            warnings.simplefilter('ignore', RuntimeWarning)
             p = np.nanmean(p, axis=-2, keepdims=True)
         r = r[..., None, :]
     if p.shape != r.shape:
@@ -109,7 +110,8 @@ def motion_ratio(pred, ref) -> dict:
             f'motion_ratio: pred {p.shape} vs ref {r.shape}. The two must be in the same space -- '
             'a 3D world path divided by a 2D pixel path is a number in no unit. Reproject the '
             'prediction before comparing it with a box centre.')
-    ok = np.isfinite(p).all(-1) & np.isfinite(r).all(-1)          # (..., T, K)
+    # (..., T, K): both sides finite.
+    ok = np.isfinite(p).all(-1) & np.isfinite(r).all(-1)
     both = ok[..., :-1, :] & ok[..., 1:, :]
     dp = np.linalg.norm(np.diff(p, axis=-3), axis=-1)
     dr = np.linalg.norm(np.diff(r, axis=-3), axis=-1)
@@ -139,8 +141,10 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
     out = []
     with np.errstate(invalid='ignore'):
         for t in range(T):
-            p, q = pred[:, t], true[:, t]                # (Sp,K,R), (St,K,R)
-            d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)          # (Sp,St,K)
+            # (Sp,K,R), (St,K,R).
+            p, q = pred[:, t], true[:, t]
+            # (Sp,St,K) pairwise keypoint distances.
+            d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)
             ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
             n_ok = ok.sum(-1)
             if penalise:
@@ -172,8 +176,9 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     matches = match_instances(pred, true, max_dist, min_kpts_frac, cost)
     T = true.shape[1]
-    true_present = np.isfinite(true).all(-1).any(-1)          # (St,T)
-    pred_present = np.isfinite(pred).all(-1).any(-1)          # (Sp,T)
+    # (St,T) and (Sp,T): which instances exist at each frame.
+    true_present = np.isfinite(true).all(-1).any(-1)
+    pred_present = np.isfinite(pred).all(-1).any(-1)
     if ignore is not None:
         ignore = np.asarray(ignore, bool)
     if ignore_boxes is not None:
@@ -185,8 +190,9 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
         # An instance with no finite keypoint has no centroid, and NaN is the answer -- not a
         # warning. `_in_ignore` and the duplicate test below both check for it explicitly.
         warnings.simplefilter('ignore', RuntimeWarning)
-        centroid = np.nanmean(pred, axis=2)                   # (Sp,T,R)
-        true_centroid = np.nanmean(true, axis=2)              # (St,T,R)
+        # (Sp,T,R) and (St,T,R) centroids, for the duplicate test below.
+        centroid = np.nanmean(pred, axis=2)
+        true_centroid = np.nanmean(true, axis=2)
     for t in range(T):
         pairs = matches[t]
         matched_true = {j for _, j, _ in pairs}

@@ -41,6 +41,16 @@ def _tiled(run, tile_scale):
 
 
 def main():
+    """Score a detector run against crop-rule boxes; exit via SystemExit on bad config.
+
+    Inputs: argv (via argparse): --run, --compare, --data, --split, --boxes,
+            --min-crop-dim, --batch-size, --batches, --frames-per-group,
+            --max-animals, --score-thresh, --nms-iou, --nms-center-dist,
+            --num-workers, --seed, --device, --deploy, --track/--no-track,
+            --link-boxes, --n-frames, --overlap, --min-box-frames, --top-k,
+            --det-max-frames.
+    Side effects: prints the per-group table and bootstrapped aggregates.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path, help='detector run folder or .pth')
@@ -188,6 +198,12 @@ def main():
 
 
 def main_deploy(args, device):
+    """The deployment-shaped score: whole groups through detect_raw+associate_group.
+
+    Inputs: args -- the parsed CLI args (deploy mode's subset).
+            device -- the torch device.
+    Side effects: prints per-group det_fill/slot_fill/window_miss and side-quantile rows.
+    """
     model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
     # DEPLOYMENT's detect_raw path handles tile_scale itself: it derives a whole-frame input size
     # per camera while preserving the animal's trained input-pixel scale. `_tiled` belongs only to

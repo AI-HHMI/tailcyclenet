@@ -70,7 +70,8 @@ def build_rig(src: Path, calib_paths: dict[str, str], sizes: dict[str, tuple[int
         # The yaml's own image_width/height is 0 for five trials; the JSON always knows.
         cam.set_size(sizes[name])
         cams.append(cam)
-        offset[name] = (0.0, 0.0)               # full sensor, no crop
+        # Full sensor, no crop.
+        offset[name] = (0.0, 0.0)
         moving[name] = False
         calibrated[name] = True
     return fmt.Rig(CameraGroup(cams), offset=offset, moving=moving, calibrated=calibrated)
@@ -117,6 +118,7 @@ def runs(frames: list[int], max_gap: int) -> list[list[int]]:
 
 
 def modal_step(frames: list[int]) -> int:
+    """The most common frame stride of a run (1 when fewer than two frames)."""
     if len(frames) < 2:
         return 1
     return int(Counter(np.diff(frames).tolist()).most_common(1)[0][0])
@@ -134,11 +136,14 @@ def triangulate_robust(cgroup, p2d: np.ndarray, reject_px: float,
     """
     p2 = p2d.copy()
     p3 = _np(cgroup.triangulate(p2, progress=False))
-    rejected = np.zeros(p2.shape[:2], bool)                                      # (C, N)
+    # (C, N)
+    rejected = np.zeros(p2.shape[:2], bool)
     for _ in range(iters):
-        e = np.linalg.norm(_np(cgroup.reprojection_error(p3, p2)), axis=-1)      # (C, N)
+        # (C, N)
+        e = np.linalg.norm(_np(cgroup.reprojection_error(p3, p2)), axis=-1)
         with np.errstate(invalid='ignore'):
-            med = np.nanmedian(np.where(np.isfinite(e), e, np.nan), axis=0)      # (N,)
+            # (N,)
+            med = np.nanmedian(np.where(np.isfinite(e), e, np.nan), axis=0)
         bad = e > np.maximum(reject_px, 5.0 * med)
         if not bad.any():
             break
@@ -169,7 +174,8 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
             if iid is None:
                 continue
             a = d['_anns'].get(iid)
-            if a is None:                      # image exists, nobody labelled it
+            # Image exists, nobody labelled it.
+            if a is None:
                 continue
             kp = np.asarray(a['keypoints'], dtype=np.float64).reshape(K, 3)
             seen = kp[:, 2] > 0
@@ -193,7 +199,8 @@ def build_labels(d: dict, run: list[int], views: dict[int, dict[str, int]], rig:
 
     # A rejected observation is demonstrably wrong, so it leaves keypoints.pq as NO ROW (not
     # `missing`, which would claim someone judged it occluded).
-    bad = rejected.reshape(C, T, K).transpose(1, 2, 0)                    # (T,K,C)
+    # (T,K,C)
+    bad = rejected.reshape(C, T, K).transpose(1, 2, 0)
     lab.vis2d[0][bad] = fmt.UNLABELED
     lab.points2d[0][bad] = np.nan
     # A view that lost every observation also loses its box -- the box is the keypoint hull, and
@@ -213,6 +220,17 @@ def _np(x) -> np.ndarray:
 
 def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_groups: int | None,
             dry_run: bool, reject_px: float) -> None:
+    """Convert both splits of johnson-mouse/merge into sessions.
+
+    Inputs: src -- merge root.
+            out -- output root; sessions land at out/<split>/<trial>.
+            max_gap -- source-frame gap above which a run is cut.
+            only -- restrict to these trials, or None.
+            max_groups -- cap groups per session, or None.
+            dry_run -- report counts, write nothing.
+            reject_px -- outlier-2D rejection threshold for triangulation.
+    Side effects: writes sessions + symlinked pixels; prints per-session lines.
+    """
     for split in SPLITS:
         d = read_split(src, split)
         names = list(d['keypoint_names'])
@@ -316,6 +334,14 @@ def check_reprojection(out: Path, limit: float) -> int:
 
 
 def main() -> None:
+    """Convert johnson-mouse/merge into the tailcycle dataset; exit 0/1.
+
+    Inputs: argv (via argparse): --src, --out, --max-gap, --trials, --max-groups,
+            --dry-run, --no-check, --no-image-check, --max-reproj-px,
+            --reject-px, --clean.
+    Side effects: writes the dataset; prints progress, validation and
+                  reprojection reports.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--src', type=Path, default=SRC)

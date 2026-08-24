@@ -26,6 +26,7 @@ _TABLES = ('points3d', 'keypoints', 'instances', 'windows')
 
 
 def _sigmoid(x):
+    """The logistic sigmoid, computed in float64 so it does not saturate in float32."""
     return 1.0 / (1.0 + np.exp(-np.asarray(x, np.float64)))
 
 
@@ -37,6 +38,17 @@ class SessionWriter:
     """
 
     def __init__(self, out: Path, source: Session, registry, provenance: dict, groups):
+        """Open a prediction session for writing: header first, parquet writers for every table.
+
+        Inputs: out -- output session directory (created here).
+                source -- the source session (calibration, mode, keypoint axis).
+                registry -- keypoint registry; its `names` win over the session's.
+                provenance -- dict or (key, value) pairs; duplicate keys with differing
+                    values raise.
+                groups -- group ids in run order, recorded in groups.pq.
+        Side effects: writes session.toml, calibration.toml and groups.pq, and opens the
+        per-table parquet writers.
+        """
         self.out = Path(out)
         self.src = source
         self.names = list(registry.names) if hasattr(registry, 'names') else list(source.names)
@@ -174,6 +186,7 @@ class SessionWriter:
         self._w['windows'].write(rows)
 
     def close(self):
+        """Close every open parquet writer."""
         for w in self._w.values():
             w.close()
 
@@ -191,6 +204,7 @@ def load_predictions(path, groups=None):
 
 
 def _load_npz(path, groups=None):
+    """A legacy npz archive -> ({key: {field: ndarray}}, meta); restricted to `groups` when given."""
     z = np.load(path, allow_pickle=True)
     keys = [str(k) for k in z['__keys__']]
     if groups is not None:
@@ -234,7 +248,8 @@ def _load_session(path, groups=None):
             # `2d_pred[0]`), which is what `keypoints.pq` holds.
             d['pred'] = lab.points2d[..., 0, :]
         if lab.points2d is not None:
-            d['pred2d'] = np.moveaxis(lab.points2d, 3, 2)          # (S,T,K,C,2) -> (S,T,C,K,2)
+            # (S,T,K,C,2) -> (S,T,C,K,2)
+            d['pred2d'] = np.moveaxis(lab.points2d, 3, 2)
         if lab.boxes is not None:
             d['boxes'] = lab.boxes
         # `conf` is the LOGIT, from the additive `score_logit` column -- `sigmoid` cannot be
@@ -251,6 +266,7 @@ def _load_session(path, groups=None):
 
 
 def _table(path: Path, stem: str):
+    """`path/{stem}.pq` as a pyarrow table, or None if the file does not exist."""
     import pyarrow.parquet as pq
     f = path / f'{stem}.pq'
     return pq.read_table(f) if f.exists() else None

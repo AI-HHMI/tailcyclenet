@@ -24,6 +24,7 @@ from posetail.posetail.cube import project_points_torch
 
 
 def _centres(boxes):
+    """Box centres: (N,4) xyxy -> (N,2) (cx, cy)."""
     return torch.stack([(boxes[:, 0] + boxes[:, 2]) / 2, (boxes[:, 1] + boxes[:, 3]) / 2], -1)
 
 
@@ -49,6 +50,12 @@ def _triangulate(cgroup, cams, pts):
 
 
 def _residual(cgroup, cams, pts, p3d):
+    """Median reprojection residual in pixels of `p3d` into the given cameras.
+
+    Inputs: cgroup -- the camera group; cams -- camera indices; pts -- (n_views, 2)
+            observed centres; p3d -- (3,) world point.
+    Outputs: float, the median of the per-view pixel distances.
+    """
     proj = project_points_torch([cgroup[c] for c in cams], p3d.reshape(1, 1, 3))[:, 0, 0]
     return float(torch.linalg.norm(proj - pts, dim=-1).median())
 

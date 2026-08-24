@@ -87,6 +87,13 @@ def _matched(gt, pred, threshold):
 
 
 def _attribute(gt, record, threshold):
+    """Assign each GT box a reason for surviving/dying at each decode stage.
+
+    Inputs: gt -- (M, 4) GT crop boxes.
+            record -- one trace record with `{stage}_boxes` candidate lists.
+            threshold -- IoU matching threshold.
+    Outputs: list of reasons, one per GT box, in STAGES' precedence order.
+    """
     matches = {stage: _matched(gt, np.asarray(record[f'{stage}_boxes'], np.float32), threshold)
                for stage in STAGES}
     reasons = []
@@ -105,6 +112,15 @@ def _attribute(gt, record, threshold):
 
 
 def main():
+    """Attribute visible GT box misses to detector decode stages; write the ledger.
+
+    Inputs: argv (via argparse): --run, --data, --split, --boxes,
+            --min-crop-dim, --score-thresh, --nms-iou, --nms-center-dist,
+            --top-k, --max-frames, --start-frame, --end-frame, --iou,
+            --device, --out, --events-out.
+    Side effects: writes the JSON ledger (+ optional events JSONL); prints
+                  per-group lines.
+    """
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--run', required=True, type=Path)
     ap.add_argument('--data', required=True, type=Path)

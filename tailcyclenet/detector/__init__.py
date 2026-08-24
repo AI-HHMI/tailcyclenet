@@ -267,6 +267,11 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     # the containers share no state and PyAV releases the GIL, so they overlap ~3.5x. The
     # forward stays serial and in camera order -- it is ~1% of the time.
     def _fetch(job):
+        """Decode, reduce and letterbox one (camera, frame) job into a uint8 batch tensor.
+
+        Inputs: job -- (ci, cam_name, src_frames) tuple from `_submit`.
+        Outputs: (ci, arr (n,3,H,W) uint8, metas [(scale, pad)], src (W,H)).
+        """
         ci, cam_name, src_frames = job
         # Same decode the detector was trained on: `BoxDataset` reduces at decode where the frame
         # is far above the letterbox target, and a detector fed differently-sampled pixels at
@@ -290,7 +295,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                 arr = np.empty((n, 3, lb.shape[0], lb.shape[1]), np.uint8)
             arr[i] = lb.transpose(2, 0, 1)
             metas.append((scale, pad))
-            imgs[i] = None                 # the decode is dead the moment it is letterboxed
+            # The decode is dead the moment it is letterboxed.
+            imgs[i] = None
         return ci, torch.from_numpy(arr), metas, src
 
     # WHAT IS BOUNDED IS THE NUMBER OF CAMERAS IN FLIGHT, AND NEVER `batch`. `batch` is not a
@@ -568,9 +574,11 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
 
     S, T, C, _ = boxes.shape
     if state is None or 'last' not in state:
-        last = boxes[:, 0].copy()                 # (S,C,4), each row's most recent known box
-        age = np.zeros(S, int)                    # frames since this row was last seen
-        t0 = 1                                    # frame 0 seeds `last` and is not permuted
+        # (S,C,4) each row's most recent known box; frames since each row was last seen; and the
+        # start frame -- frame 0 seeds `last` and is not permuted.
+        last = boxes[:, 0].copy()
+        age = np.zeros(S, int)
+        t0 = 1
     else:
         last, age, t0 = state['last'], state['age'], 0
     for t in range(t0, T):

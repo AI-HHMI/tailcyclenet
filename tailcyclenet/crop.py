@@ -146,6 +146,12 @@ def jitter_box(rng, shift_frac, scale_frac):
     frame, which a detector cannot deliver.
     """
     def apply(box, size):
+        """Jitter one box and clamp it to the image.
+
+        Inputs: box -- xyxy crop box.
+                size -- image (w, h).
+        Outputs: the jittered int32 box, or the input when the result would be degenerate.
+        """
         box = box.to(torch.float32)
         w, h = box[2] - box[0], box[3] - box[1]
         s = 1.0 + float(rng.uniform(-scale_frac, scale_frac))

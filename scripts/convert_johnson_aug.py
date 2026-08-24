@@ -121,7 +121,8 @@ def fill_2d(d: dict, run: list[int], views: dict[int, dict[str, int]], cams: lis
             if iid is None:
                 continue
             a = d['_anns'].get(iid)
-            if a is None:                      # image exists, nobody labelled it
+            # Image exists, nobody labelled it.
+            if a is None:
                 continue
             kp = np.asarray(a['keypoints'], dtype=np.float64).reshape(K, 3)
             seen = kp[:, 2] > 0
@@ -167,13 +168,27 @@ class Solved:
     """
 
     def __init__(self) -> None:
-        self.p3d: dict[tuple[str, int], np.ndarray] = {}       # (K,3)
-        self.rejected: dict[tuple[str, int], np.ndarray] = {}  # (K,C) bool
-        self.pre: dict[tuple[str, int], np.ndarray] = {}       # (K,C,2), before rejection
+        """Empty caches keyed by (trial, source frame).
+
+        Stores per (trial, source frame): p3d (K,3); rejected (K,C) bool; pre
+        (K,C,2) before rejection.
+        """
+        self.p3d: dict[tuple[str, int], np.ndarray] = {}
+        self.rejected: dict[tuple[str, int], np.ndarray] = {}
+        self.pre: dict[tuple[str, int], np.ndarray] = {}
         self.diverged = 0
 
     def store(self, trial: str, run: list[int], lab: fmt.Labels, bad: np.ndarray,
               p2d_pre: np.ndarray) -> None:
+        """Record the solved 3D of an original-variant group for later reuse.
+
+        Inputs: trial -- trial name.
+                run -- source frames of the group.
+                lab -- the fitted group labels (points3d read from here).
+                bad -- (T,K,C) rejection mask.
+                p2d_pre -- (T,K,C,2) 2D before rejection, the `carry` equality key.
+        Side effects: fills the p3d/rejected/pre caches for every frame in run.
+        """
         for t, frame in enumerate(run):
             self.p3d[(trial, frame)] = lab.points3d[0, t].copy()
             self.rejected[(trial, frame)] = bad[t].copy()
@@ -188,7 +203,8 @@ class Solved:
             if not _same_2d(lab.points2d[0, t], self.pre[k]):
                 self.diverged += 1
                 return False
-        bad = np.stack([self.rejected[k] for k in keys])          # (T,K,C)
+        # (T,K,C)
+        bad = np.stack([self.rejected[k] for k in keys])
         for t, k in enumerate(keys):
             lab.points3d[0, t] = self.p3d[k]
         ok = np.isfinite(lab.points3d[0]).all(-1)
@@ -207,6 +223,19 @@ def _same_2d(a: np.ndarray, b: np.ndarray) -> bool:
 
 def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px: float,
                   only: list[str] | None, max_groups: int | None, dry_run: bool) -> dict:
+    """Convert the augmented train split, original variant first.
+
+    Inputs: src -- merge_aug root.
+            fallback -- merge root holding the originals the symlinks point at.
+            out -- output root; sessions land at out/train/<trial>.
+            max_gap -- source-frame gap above which a run is cut.
+            reject_px -- outlier-2D rejection threshold for triangulation.
+            only -- restrict to these trials, or None.
+            max_groups -- cap groups per (trial, variant), or None.
+            dry_run -- report counts, write nothing.
+    Outputs: aggregate statistics dict.
+    Side effects: writes sessions + symlinked pixels under out/train; prints per-trial lines.
+    """
     d = read_aug(src)
     names = list(d['keypoint_names'])
     K = len(names)
@@ -276,7 +305,8 @@ def convert_train(src: Path, fallback: Path, out: Path, max_gap: int, reject_px:
             for run in clips:
                 gid = f'{run[0]:06d}{suffix}'
                 lab = fill_2d(d, run, clip, cams, K)
-                pre = lab.points2d[0].copy()                                  # (T,K,C,2)
+                # (T,K,C,2)
+                pre = lab.points2d[0].copy()
                 if variant and solved.carry(trial, run, lab):
                     stats['reused'] += 1
                 else:
@@ -451,6 +481,11 @@ def _source_frames(sdir: Path, gid: str, n_frames: int) -> list[int]:
 
 
 def check_no_dangling(out: Path) -> int:
+    """Count dangling symlinks anywhere in the output.
+
+    Inputs: out -- output root.
+    Outputs: the number of *.jpg symlinks whose target does not exist.
+    """
     n = sum(1 for p in out.rglob('*.jpg') if p.is_symlink() and not p.exists())
     print(f'\n== dangling symlinks in the output: {n}')
     return n
@@ -459,6 +494,13 @@ def check_no_dangling(out: Path) -> int:
 # main
 
 def main() -> None:
+    """Convert merge_aug into johnson-mouse-annotated-aug; exit 0/1.
+
+    Inputs: argv (via argparse): --src, --fallback, --out, --max-gap, --trials,
+            --max-groups, --no-val, --dry-run, --no-check, --no-image-check,
+            --max-reproj-px, --reject-px, --aug-check-limit, --clean.
+    Side effects: writes the dataset; prints progress, validation and check reports.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--src', type=Path, default=SRC)

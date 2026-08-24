@@ -66,6 +66,15 @@ def scene_center(camera_group):
 class PoseTrackerEncoder(TrackerEncoder):
     def __init__(self, *args, n_keypoints, query='prior', query_encoder='wide',
                  gridresid_offset='query', query_terms=None, box_prompt='none', **kwargs):
+        """Build the pose tracker: the stock `TrackerEncoder` with a pose-shaped query encoder.
+
+        Inputs: n_keypoints -- size of the keypoint registry.
+                query -- 'prior' (per-keypoint prior + missing-query tokens) or 'none'.
+                query_encoder -- 'wide' (the only one left; others raise by name).
+                gridresid_offset -- 'query' or 'triangulated' (see `_query_anchored`).
+                query_terms -- overrides for the pair of prior terms.
+                box_prompt -- 'none', or a `BOX_MODES` box-prompt encoder ('film').
+        """
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
         assert query_encoder in QUERY_ENCODERS, \
             f'query_encoder must be one of {QUERY_ENCODERS}, got {query_encoder!r}'
@@ -122,7 +131,8 @@ class PoseTrackerEncoder(TrackerEncoder):
         if 'f' not in self._shared_scene:
             self._shared_scene['f'] = self.scene_encoder(views_norm)
         kwargs.pop('kpt_chunk', None)
-        kwargs.pop('scene_features', None)      # the upstream forward already passed None/None
+        # The upstream forward already passed None/None.
+        kwargs.pop('scene_features', None)
         return super()._forward_window(views_norm, *args, **kwargs,
                                        scene_features=self._shared_scene['f'])
 
@@ -194,7 +204,8 @@ class PoseTrackerEncoder(TrackerEncoder):
         # key off. Stashed at FULL K; `_decode_from_scene` hands the encoder the chunk's slice.
         query_ok = (torch.isfinite(prior).all(-1) if prior is not None
                     else torch.zeros((B, K), dtype=torch.bool, device=device))
-        self._query_ok_all = query_ok      # local copy survives the `finally` clear below
+        # Local copy survives the `finally` clear below.
+        self._query_ok_all = query_ok
         self._kpt_ids_all = kpt_ids.to(device).long()
         # The box prompt, stashed for `_decode_from_scene`; a plain model ignores it, so passing
         # one is harmless.
@@ -271,7 +282,8 @@ def _rays_fallback(out):
     it lands about halfway from the world origin to the animal. Used wherever a triangulation is
     missing or degenerate.
     """
-    w = torch.sigmoid(out['conf_pred_2d'])                          # (cams,b,t,n)
+    # (cams, b, t, n)
+    w = torch.sigmoid(out['conf_pred_2d'])
     num = einsum(out['3d_pred_cams_rays'], w, 'c b t n r, c b t n -> b t n r')
     return num / w.sum(0)[..., None].clamp_min(1e-6)
 
@@ -310,7 +322,8 @@ def _query_anchored(out, query_ok):
         # and the caller decides what a degenerate frame is worth.
         out['tri_degenerate'] = bad
 
-    m = query_ok[None, :, None, :, None]                    # -> (cams, b, t, n, r)
+    # query_ok -> (cams, b, t, n, r)
+    m = query_ok[None, :, None, :, None]
     direct = torch.where(m, out['3d_pred_cams_direct'], sub.detach()[None])
     conf = torch.softmax(out['conf_3d'], dim=0)
     coords_pred = torch.einsum('cbtnr,cbtn->btnr', direct, conf)
@@ -339,10 +352,12 @@ def _reanchor_per_frame(out, anchor):
     # backward-poisoning reason the detach happens.
     bad = ~torch.isfinite(src).all(-1)
     if not torch.isfinite(src).all():
-        src = src.detach()                    # see `_query_anchored`: the solve's backward NaNs
+        # See `_query_anchored`: the solve's backward NaNs.
+        src = src.detach()
     src = torch.where(torch.isfinite(src), src, _rays_fallback(out))
     out = dict(out)
-    out['tri_degenerate'] = bad                    # see `_query_anchored`
+    # See `_query_anchored`.
+    out['tri_degenerate'] = bad
 
     residual = out['3d_pred_cams_direct'] - anchor[:, None, :, :][None]
     new_direct = src.detach()[None] + residual
@@ -413,7 +428,8 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         raise SystemExit(
             'box_prompt = "term" was removed: no shipped config selected it and `film` matched or '
             'beat it. Set box_prompt = "film" (or "none").')
-    cfg.pop('n_keypoints', None)          # derived from the registry, never configured
+    # Derived from the registry, never configured.
+    cfg.pop('n_keypoints', None)
 
     # The library DEFAULTS to 'direct', so omitting the key is as dangerous as setting it
     # wrong: both gridresid_offset paths need the output query-anchored, which the library only

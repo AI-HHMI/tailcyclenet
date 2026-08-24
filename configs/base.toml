@@ -3,53 +3,35 @@
 # does not). [model] is the ukt14i7c base recipe; `n_keypoints` is derived from data, not configured.
 
 [data]
-n_frames = 12               # a CEILING: a train window is sized to the labelled span it covers;
-                            # must equal [model].stride_length (refused otherwise). 12 keeps the
-                            # full-frame working set across refine passes affordable.
+n_frames = 12               # a CEILING: a train window is sized to the labelled span it covers; must equal [model].stride_length (refused otherwise). 12 keeps the full-frame working set across refine passes affordable.
 image_size = 256
 balance_datasets = true
 aug_prob = 0.25
-crop_jitter = 0.3           # measured: tight crops cut the detector-crop penalty and improve base
-crop_jitter_scale = 0.3     # accuracy, because a tight box teaches the model the animal always
-min_crop_dim = 64           # fills the frame, which no detector delivers
+crop_jitter = 0.3           # measured: tight crops cut the detector-crop penalty and improve base accuracy, because a tight box teaches the model the animal always fills the frame, which no detector delivers
+crop_jitter_scale = 0.3
+min_crop_dim = 64
 prompt_dropout = 0.5        # fraction of steps run fully query-free -> no-query tokens
-prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cube_scale), so one
-                            # setting means the same visual displacement on any rig; ship WITH the
-                            # dropout -- dropout alone is significantly worse
-# A WHOLE-BODY offset, the corruption shaped like a deployment failure: i.i.d. jitter averages to
-# zero over keypoints and teaches trust in the prior's centroid, which a whole-body lag gets wrong.
-# 5.0 is a CONSISTENCY choice, not a measured optimum (the measured value is 8.0, on 3D allen; 2D
-# argues the key is unmeasurable there, not harmful) -- say so when reporting a 3D arm.
+prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cube_scale), so one setting means the same visual displacement on any rig; ship WITH the dropout -- dropout alone is significantly worse
+# A WHOLE-BODY offset, the corruption shaped like a deployment failure; 5.0 is a CONSISTENCY choice, not a measured optimum (measured 8.0, on 3D allen) -- say so when reporting a 3D arm.
 prompt_offset_px = 5.0
 num_workers = 12
 
 [model]
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)
 query_encoder = "wide"      # the only encoder; the two query terms are built iff query = "prior"
-# The BOX PROMPT tells the model which box the target animal occupies, per frame per camera, as
-# a NON-position channel; "film" = FiLM on the identity term, "none" = byte-identical to no key.
-# Live in 2D and 3D, per camera: a camera with nothing finite that frame gets a NaN column -> the
-# encoder's learned no-box token, the regime `[data].box_prompt_dropout` trains. `[data].crop_inflate`
-# is the loader twin of `--crop-inflate`; 1.0 is inert.
+# The BOX PROMPT tells the model which box the target animal occupies, per frame per camera, as a NON-position channel; "film" = FiLM on the identity term, "none" = byte-identical to no key. Live in 2D and 3D, per camera.
 box_prompt = "film"
-# What the 3D residual is an offset FROM. No default: both values load the same tensors, so a
-# checkpoint trained under one and built under the other silently mis-reads -- the key asserts
-# what the weights were trained as (inert in 2D). "triangulated" is refuted with query = "prior".
+# What the 3D residual is an offset FROM. No default: both values load the same tensors, so a mismatch silently mis-reads -- the key asserts what the weights were trained as (inert in 2D); "triangulated" is refuted with query = "prior".
 gridresid_offset = "query"
 
 video_encoder_version = "large"
-# STAGED UNFREEZE, the only statement about the encoder's gradient state (the old
-# `freeze_encoder` is gone). A bool = never / from step 0; an INT = the iteration to unfreeze at.
-# Not measured on this repo's roots: every run on record froze the encoder for its whole life;
-# `false` reproduces the old arm exactly.
+# STAGED UNFREEZE, the only statement about the encoder's gradient state (the old `freeze_encoder` is gone): a bool = never / from step 0; an INT = the iteration to unfreeze at; `false` reproduces the old arm exactly.
 video_encoder_requires_grad = 10000
-# The last 8 of ViT-L's 24 blocks plus (repo-local) the hierarchical output norms inside the
-# range, which upstream would leave frozen behind a trainable block. Omit to train the whole encoder.
+# The last 8 of ViT-L's 24 blocks plus (repo-local) the hierarchical output norms inside the range, which upstream would leave frozen behind a trainable block. Omit to train the whole encoder.
 video_encoder_finetune_last_n_layers = 8
 video_encoder_hierarchical = true
 soft_argmax_temperature_learnable = true
-stride_length = 12          # the same quantity as [data].n_frames -- sizes the temporal pos_embed;
-                            # build_model refuses a config where the two disagree
+stride_length = 12          # the same quantity as [data].n_frames -- sizes the temporal pos_embed; build_model refuses a config where the two disagree
 image_size = 256
 query_patch_size = 9
 per_camera_cube_scale = true
@@ -77,46 +59,34 @@ head_3d_grid_size = 1024
 head_3d_grid_radius = 1.8
 log_3d_output = true
 log_3d_eps = 0.1
-# LOAD-BEARING, do not widen: `_grid_softmax` masks to |argmax - index| <= 60 of 1024 bins;
-# removing the truncation is measured to cost several mm. It suppresses spurious far modes.
+# LOAD-BEARING, do not widen: `_grid_softmax` masks to |argmax - index| <= 60 of 1024 bins; removing the truncation is measured to cost several mm.
 soft_argmax_threshold = 60
-# "head" overshoots through the warp at large motion; "warped" averages in uniform space first.
-# The library defaults to the wrong one.
+# "head" overshoots through the warp at large motion; "warped" averages in uniform space first -- the library defaults to the wrong one.
 grid_decode_space = "warped"
 enable_subpixel_refinement = false
 depth_log_min = -2.5
 depth_log_max = 2.5
 
-# Keys that used to be here and reach nothing were removed (corr_radius, use_volume_embedding,
-# occlusion_embedding, mode_3d, cross_attn_dim); the parameter set is identical without them.
+# Keys that used to be here and reach nothing were removed (corr_radius, use_volume_embedding, occlusion_embedding, mode_3d, cross_attn_dim); the parameter set is identical without them.
 
 [training]
 n_iterations = 60000
 seed = 23
-# The base tracker this finetunes from; this Hugging Face repo is downloaded and cached on first
-# launch. A local checkpoint folder is also accepted. Moving-camera support added zero parameters,
-# so older checkpoints load cleanly.
+# The base tracker this finetunes from; this Hugging Face repo is downloaded and cached on first launch. A local checkpoint folder is also accepted.
 checkpoint_path = "ai-hhmi/posetail-static-animal"
 max_grad_norm = 10.0
 checkpoint_freq = 1000
 val_freq = 200
 val_batches = 20
 print_freq = 20
-# `freeze_encoder` was REMOVED -- [model].video_encoder_requires_grad is the only statement of
-# the encoder's gradient state; naming the old key is refused.
+# `freeze_encoder` was REMOVED -- [model].video_encoder_requires_grad is the only statement of the encoder's gradient state; naming the old key is refused.
 
 [training.optimizer]
-# THE SHIPPED OPTIMIZER, and what an ABSENT key means: Muon on the 2D transformer matrices (and
-# unfrozen encoder blocks) with AdamW-SF on everything else -- heads, norms, biases, and every
-# nn.Embedding, whose rows are keypoint identities and must not be orthogonalized together.
-# Ported from posetail-next; not re-measured on this repo's roots. "schedulefree" restores the
-# previous AdamW-SF recipe and is what an existing run folder needs to resume (train.py refuses
-# the mismatched checkpoint).
+# THE SHIPPED OPTIMIZER and what an ABSENT key means: Muon on the 2D transformer matrices (and unfrozen encoder blocks) with AdamW-SF on everything else; "schedulefree" restores the previous recipe and is what an existing run folder needs to resume (train.py refuses the mismatch).
 optimizer = "muon"
 learning_rate = 1e-4        # the value every run on record used
 kpt_lr = 5e-4               # fresh params (identity table, no-query tokens, gate) learn faster
-# LIVE from the unfreeze iteration, not inert: the encoder groups are created at this scale
-# (1e-5) at the unfreeze, with their own warmup from a fresh k = 0.
+# LIVE from the unfreeze iteration, not inert: the encoder groups are created at this scale (1e-5) at the unfreeze, with their own warmup from a fresh k = 0.
 encoder_lr_scale = 0.1
 weight_decay = 0.002
 warmup_steps = 500          # drives the AdamW-SF half's warmup
@@ -132,20 +102,15 @@ muon_adjust_lr_fn = "match_rms_adamw"
 # Reach the 3D metric Hubers only; the 2D and reprojection losses hardcode delta = 16 and Huber on.
 delta = 6
 use_huber_loss = true
-# The only five TotalLoss keys that fire on a 2D session -- the R == 2 block computes exactly
-# these; everything else below is NaN'd and dropped.
+# The only five TotalLoss keys that fire on a 2D session -- the R == 2 block computes exactly these; everything else below is NaN'd and dropped.
 coords_loss_2d_weight = 1.5
 coords_softmax_2d_weight = 0.6
 smoothness_loss_2d_weight = 0.5
-smoothness_loss_order = 4   # a ceiling: train.py clamps to min(order, T-1) per batch, and the
-smoothness_loss_tolerance = 1.5   # derived-T rule makes T = 2 common, i.e. order 1
-# A REPO-LOCAL term (PoseLoss), the only key here that fires on a 2D session and NOT on a 3D one:
-# the only way a `missing` row reaches the vis_pred head as supervised occlusion in 2D. Default
-# 0.0 so an absent key is bit-identical to every run on record; measure a nonzero arm on
-# allen-mouse-annotated, the one root with a dense, honest 2D occlusion channel.
+smoothness_loss_order = 4   # a ceiling: train.py clamps to min(order, T-1) per batch, and the derived-T rule makes T = 2 common, i.e. order 1
+smoothness_loss_tolerance = 1.5
+# A REPO-LOCAL term (PoseLoss), the only key here that fires on a 2D session and NOT on a 3D one: default 0.0 so an absent key is bit-identical to every run on record; measure a nonzero arm on allen-mouse-annotated.
 vis_loss_2d_weight = 0.0
-# 3D-only from here down. In 2D the vis_pred head gets no gradient from this weight --
-# `vis_loss_2d_weight` above is the 2D channel.
+# 3D-only from here down. In 2D the vis_pred head gets no gradient from this weight -- `vis_loss_2d_weight` above is the 2D channel.
 vis_loss_weight = 5.0
 vis_loss_3d_weight = 1.0
 conf_loss_weight = 0.0            # documented off-switches: the terms exist, the weights are 0
@@ -164,8 +129,7 @@ depth_softmax_weight = 1.5        # the largest CE term, and query-INDEPENDENT
 coords_3d_loss_scale = 50.0
 smoothness_loss_3d_weight = 0.5
 
-# Three keys that used to be here and reach nothing were removed: gamma, feature_loss_weight
-# (both gate on outputs TrackerEncoder never emits) and pixel_thresh (feeds only the conf losses).
+# Three keys that used to be here and reach nothing were removed: gamma, feature_loss_weight (both gate on outputs TrackerEncoder never emits) and pixel_thresh (feeds only the conf losses).
 
 [wandb]
 project_name = "tailcyclenet"

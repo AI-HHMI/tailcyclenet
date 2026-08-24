@@ -65,32 +65,48 @@ class Rig:
     `moving` says per-frame extrinsics live in `extrinsics.pq`; `calibrated` says whether a
     matrix was really carried or `nominal_camera` invented one.
     """
-    cgroup: object                              # aniposelib.cameras.CameraGroup
+    # aniposelib.cameras.CameraGroup
+    cgroup: object
     offset: dict[str, tuple[float, float]]
     moving: dict[str, bool]
     calibrated: dict[str, bool]
 
     @property
     def cameras(self):
+        """The aniposelib cameras of this rig."""
         return self.cgroup.cameras
 
     @property
     def names(self) -> list[str]:
+        """Camera names in rig order."""
         return [c.get_name() for c in self.cgroup.cameras]
 
     def __len__(self) -> int:
+        """Number of cameras in the rig."""
         return len(self.cgroup.cameras)
 
     def size(self, name: str) -> tuple[int, int]:
+        """Pixel size of one camera.
+
+        Inputs: name -- the camera's name.
+        Outputs: (width, height) as ints.
+        """
         return tuple(int(v) for v in self.by_name(name).get_size())
 
     def by_name(self, name: str):
+        """The aniposelib camera for a name.
+
+        Inputs: name -- the camera's name.
+        Outputs: the Camera object.
+        Side effects: raises KeyError if no camera has that name.
+        """
         for c in self.cgroup.cameras:
             if c.get_name() == name:
                 return c
         raise KeyError(f'no camera named {name!r}')
 
     def cam_type(self, name: str) -> str:
+        """'fisheye' or 'pinhole' for one camera."""
         from aniposelib.cameras import FisheyeCamera
         return 'fisheye' if isinstance(self.by_name(name), FisheyeCamera) else 'pinhole'
 
@@ -233,12 +249,14 @@ class TableWriter:
     """
 
     def __init__(self, path: Path, dict_cols: tuple[str, ...] = (), chunk_rows: int = 250_000):
+        """Set the output path, the dictionary-encoded columns and the chunk size."""
         self.path, self.dict_cols, self.chunk_rows = Path(path), dict_cols, int(chunk_rows)
         self._w = None
         self._buf: list[pa.Table] = []
         self._n = 0
 
     def write(self, rows: dict[str, np.ndarray]) -> None:
+        """Buffer one chunk of rows, flushing once `chunk_rows` is reached."""
         t = _arrow(rows, self.dict_cols)
         if not len(t):
             return
@@ -248,6 +266,7 @@ class TableWriter:
             self._flush()
 
     def _flush(self) -> None:
+        """Write the buffered chunks, fixing the file's schema on the first flush."""
         if not self._buf:
             return
         t = pa.concat_tables(self._buf)
@@ -260,15 +279,18 @@ class TableWriter:
         self._buf, self._n = [], 0
 
     def close(self) -> None:
+        """Flush and close the underlying parquet writer."""
         self._flush()
         if self._w is not None:
             self._w.close()
             self._w = None
 
     def __enter__(self):
+        """Return self for use as a context manager."""
         return self
 
     def __exit__(self, *exc):
+        """Close the writer when the `with` block exits."""
         self.close()
 
 
@@ -281,6 +303,7 @@ DICT_COLS = ('group_id', 'animal_id', 'camera', 'bodypart', 'status')
 
 
 def _inv(enum: dict[str, int]) -> dict[int, str]:
+    """Invert an enum dict so int codes map back to their names."""
     return {v: k for k, v in enum.items()}
 
 
@@ -290,19 +313,27 @@ def _inv(enum: dict[str, int]) -> dict[int, str]:
 class Labels:
     """One group's labels as dense arrays. See docs/annotation_format.md §12."""
     animal_ids: list[str]
-    points3d: np.ndarray | None      # (S,T,K,3) float32, NaN where not visible
-    vis3d: np.ndarray | None         # (S,T,K) int8
-    points2d: np.ndarray | None      # (S,T,K,C,2) float32
-    vis2d: np.ndarray | None         # (S,T,K,C) int8
-    boxes: np.ndarray | None         # (S,T,C,4) float32
-    instance: np.ndarray | None      # (S,T,C) int8
-    ext: np.ndarray | None = None    # (C,T,4,4) float64, only when a camera is moving
+    # (S,T,K,3) float32, NaN where not visible
+    points3d: np.ndarray | None
+    # (S,T,K) int8
+    vis3d: np.ndarray | None
+    # (S,T,K,C,2) float32
+    points2d: np.ndarray | None
+    # (S,T,K,C) int8
+    vis2d: np.ndarray | None
+    # (S,T,C,4) float32
+    boxes: np.ndarray | None
+    # (S,T,C) int8
+    instance: np.ndarray | None
+    # (C,T,4,4) float64, only when a camera is moving
+    ext: np.ndarray | None = None
     # (M,6) float64 [frame, camera, x0, y0, x1, y1]. None IFF the session has no regions.pq
     # (its absence claims exhaustive labelling); an empty (0,6) says the file certifies nothing.
     regions: np.ndarray | None = None
 
     @property
     def n_animals(self) -> int:
+        """Number of animals in this group's labels."""
         return len(self.animal_ids)
 
 
@@ -404,6 +435,7 @@ class Group:
 
     @property
     def dir(self) -> Path:
+        """The group's pixels directory under the session."""
         return self.session.path / 'groups' / self.group_id
 
     def source(self, cam: str) -> tuple[str, Path, str]:
@@ -437,6 +469,7 @@ class Group:
         raise FormatError(f'{self.dir}: camera {cam!r} has neither a frame dir nor a video')
 
     def frame_paths(self, cam: str) -> list[Path]:
+        """Sorted frame image paths for one camera; raises if it is a video."""
         kind, p = self.pixels(cam)
         if kind != 'frames':
             raise FormatError(f'{p}: is a video, not a frame directory')
@@ -444,16 +477,20 @@ class Group:
         return files
 
     def labels(self) -> Labels:
+        """This group's dense labels, from the session's cache."""
         return self.session.labels(self.group_id)
 
 
 @dataclass
 class Session:
     path: Path
-    mode: str                       # '2d' | '3d'
+    # '2d' | '3d'
+    mode: str
     units: str
-    label_source: str               # session.toml `labels`: 'annotated' | 'tracked'
-    names: list[str]                # keypoint names, THE authority for the keypoint axis
+    # session.toml `labels`: 'annotated' | 'tracked'
+    label_source: str
+    # keypoint names, THE authority for the keypoint axis
+    names: list[str]
     rig: Rig
     groups: dict[str, Group]
     skeleton: list[list[str]] = field(default_factory=list)
@@ -464,22 +501,27 @@ class Session:
 
     @property
     def session_id(self) -> str:
+        """The session folder's name."""
         return self.path.name
 
     @property
     def split(self) -> str:
+        """The parent folder's name: 'train', 'val' or 'test'."""
         return self.path.parent.name
 
     @property
     def cameras(self):
+        """The aniposelib cameras of the rig."""
         return self.rig.cameras
 
     @property
     def cam_names(self) -> list[str]:
+        """Camera names in rig order."""
         return self.rig.names
 
     @property
     def n_keypoints(self) -> int:
+        """Number of keypoints on the session's axis."""
         return len(self.names)
 
     @cached_property
@@ -502,23 +544,33 @@ class Session:
 
     @cached_property
     def _kpt_vocab(self) -> dict[str, int]:
+        """keypoint name -> global axis index."""
         return {n: i for i, n in enumerate(self.names)}
 
     @cached_property
     def _cam_vocab(self) -> dict[str, int]:
+        """camera name -> rig index."""
         return {n: i for i, n in enumerate(self.rig.names)}
 
     def _table(self, stem: str) -> pa.Table | None:
+        """Read one `{stem}.pq` table, or None when the file does not exist."""
         p = self.path / f'{stem}.pq'
         return pq.read_table(p) if p.exists() else None
 
     @cached_property
     def _tables(self) -> dict[str, pa.Table | None]:
+        """The five label tables keyed by stem; missing files are None."""
         return {s: self._table(s)
                 for s in ('keypoints', 'points3d', 'instances', 'regions', 'extrinsics')}
 
     @classmethod
     def load(cls, path: Path) -> 'Session':
+        """Load a Session from a session directory, validating its session.toml.
+
+        Inputs: path -- the session directory.
+        Outputs: a populated Session whose groups are wired back to it.
+        Side effects: raises FormatError when session.toml or calibration.toml is invalid.
+        """
         path = Path(path)
         cfg_path = path / 'session.toml'
         if not cfg_path.exists():
@@ -592,7 +644,8 @@ class Session:
             return self.rig.posetail()
 
         import torch
-        ext = self.labels(gid).ext                      # (C,T,4,4), coverage already checked
+        # (C,T,4,4), coverage already checked
+        ext = self.labels(gid).ext
         sel = slice(None) if frames is None else frames
         # Every camera gets the per-frame form, not just the moving ones: `_decode_from_scene`
         # stacks `cam['ext']` across cameras, so a mixed rig is a stack error.
@@ -764,6 +817,7 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
     emit_keypoints = any(lab is not None and lab.vis2d is not None for lab in labels.values())
 
     def push(name, **cols):
+        """Append one row's columns to a table's buffers."""
         for k, v in cols.items():
             tables[name][k].extend(v)
 
@@ -855,9 +909,11 @@ class VideoSession(Session):
     empty: dict[str, Labels] = field(default_factory=dict, repr=False, compare=False)
 
     def _table(self, stem: str) -> pa.Table | None:
+        """No directory exists, so no table is ever read: always None."""
         return None
 
     def labels(self, gid: str) -> Labels:
+        """The pre-seeded empty labels for a group."""
         return self.empty[gid]
 
 
@@ -881,7 +937,8 @@ def empty_labels(n_animals: int, T: int, K: int, C: int, *, mode3d: bool,
 class Dataset:
     name: str
     root: Path
-    sessions: dict[str, list[Session]]      # split -> sessions
+    # split -> sessions
+    sessions: dict[str, list[Session]]
 
     @property
     def names(self) -> list[str]:
@@ -903,14 +960,21 @@ class Dataset:
         return names
 
     def all_sessions(self) -> list[Session]:
+        """Every session across every split, in load order."""
         return [s for group in self.sessions.values() for s in group]
 
 
 def _is_dataset_root(path: Path) -> bool:
+    """True when the directory holds at least one train/val/test split."""
     return any((path / s).is_dir() for s in SPLITS)
 
 
 def load_dataset(root: Path) -> Dataset:
+    """Load every session under a dataset root, grouped by split.
+
+    Inputs: root -- the dataset root directory.
+    Outputs: a Dataset; raises FormatError when no split directory exists.
+    """
     root = Path(root)
     sessions: dict[str, list[Session]] = {}
     for split in SPLITS:
@@ -967,6 +1031,7 @@ class Registry:
 
     @property
     def n_keypoints(self) -> int:
+        """Number of global keypoint ids."""
         return len(self.names)
 
     def ids_for_dataset(self, dataset: str) -> np.ndarray:
@@ -1005,6 +1070,13 @@ class Registry:
 
     @classmethod
     def build(cls, datasets: list[Dataset], base: 'Registry | None' = None) -> 'Registry':
+        """Build a registry covering `datasets`, appending to `base` when given.
+
+        Inputs: datasets -- the datasets to cover.
+                base -- an existing registry whose ids must be preserved.
+        Outputs: a Registry whose ids are append-only against `base`.
+        Side effects: raises FormatError if an existing id would move.
+        """
         prefix = len(datasets) > 1 or (base is not None and len(base.datasets) > 1)
         names = list(base.names) if base else []
         index = {n: i for i, n in enumerate(names)}
@@ -1025,6 +1097,7 @@ class Registry:
         return cls(names=tuple(names), datasets=tuple(sorted(out.items())))
 
     def save(self, path: Path) -> None:
+        """Write the registry to a TOML file."""
         import toml
         path.write_text(toml.dumps({
             'names': list(self.names),
@@ -1033,6 +1106,7 @@ class Registry:
 
     @classmethod
     def load(cls, path: Path) -> 'Registry':
+        """Read a registry back from a TOML file."""
         with open(path, 'rb') as f:
             doc = tomllib.load(f)
         return cls(names=tuple(doc['names']),
@@ -1047,6 +1121,7 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     here = str(sess.path)
 
     def bad(rule: int, msg: str) -> None:
+        """Record one rule violation against this session."""
         errs.append(f'{here}: [rule {rule}] {msg}')
 
     # 2. names unique; skeleton/flip_pairs reference known names; flip is an involution
@@ -1196,13 +1271,20 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
                         bad(8, f'group {gid!r} camera {cname!r}: image is {im.size}, '
                                f'calibration size is {want}')
         try:
-            sess.labels(gid)          # raises on unknown bodypart/camera/animal or bad frame
+            # Raises on unknown bodypart/camera/animal or bad frame.
+            sess.labels(gid)
         except FormatError as e:
             errs.append(str(e))
     return errs
 
 
 def validate_dataset(ds: Dataset, check_images: bool = True) -> list[str]:
+    """Validate every session in a dataset, plus the cross-session rules.
+
+    Inputs: ds -- the dataset to validate.
+            check_images -- also verify each frame image's size against calibration.
+    Outputs: a list of rule violations; empty means the dataset is valid.
+    """
     errs: list[str] = []
     sessions = ds.all_sessions()
     if not sessions:

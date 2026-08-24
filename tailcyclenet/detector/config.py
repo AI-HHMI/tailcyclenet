@@ -47,6 +47,12 @@ YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), *sorted(VIT_BACKBONES), 'hybri
 
 
 def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
+    """Exit with a listing of `cfg`'s keys that are not in `known`.
+
+    Inputs: block -- TOML block name for the error message; cfg -- the block's dict;
+            known -- the allowed key set.
+    Side effects: raises SystemExit when any unknown key is present.
+    """
     unknown = set(cfg) - known
     if unknown:
         raise SystemExit(

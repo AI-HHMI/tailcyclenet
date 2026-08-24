@@ -32,6 +32,11 @@ class PoseLoss(TotalLoss):
     """
 
     def __init__(self, vis_loss_2d_weight: float = 0.0, **kwargs):
+        """Set the 2D visibility BCE weight; everything else reaches `TotalLoss` unchanged.
+
+        Inputs: vis_loss_2d_weight -- weight of the 2D visibility term; 0.0 (the default)
+                disables it, bit-identical to a run without the key.
+        """
         super().__init__(**kwargs)
         self.vis_loss_2d_weight = vis_loss_2d_weight
 
@@ -49,8 +54,9 @@ class PoseLoss(TotalLoss):
                 and 'vis_pred_2d' in outputs:
             # outputs['vis_pred_2d'] is (cams,b,t,n); vis_2d_true is (b,t,n,cams,1). Move the
             # target to cams-first and give the prediction a matching trailing singleton.
-            target = vis_2d_true.permute(3, 0, 1, 2, 4)             # -> (cams,b,t,n,1)
-            pred = outputs['vis_pred_2d'][..., None]                # -> (cams,b,t,n,1)
+            # target -> (cams,b,t,n,1); pred -> (cams,b,t,n,1).
+            target = vis_2d_true.permute(3, 0, 1, 2, 4)
+            pred = outputs['vis_pred_2d'][..., None]
             # UNCONDITIONAL: gating on `isfinite` would let a genuinely poisoned prediction
             # silently revert to the detached placeholder instead of reaching the poison check.
             vis_loss_2d = self.vis_loss_2d_weight * masked_bce_with_logits(pred, target)

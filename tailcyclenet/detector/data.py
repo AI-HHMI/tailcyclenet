@@ -311,7 +311,8 @@ def _warp_region(rects, M):
         # through at once.
         long_, short = torch.maximum(w, h), torch.minimum(w, h)
         degen = short <= 2 * sin_a * cos_a * long_
-        if abs(sin_a - cos_a) < 1e-10:      # exactly 45 degrees: the normal branch is singular
+        if abs(sin_a - cos_a) < 1e-10:
+            # exactly 45 degrees: the normal branch is singular
             degen = torch.ones_like(degen)
         x, wide = 0.5 * short, w >= h
         cw_d = torch.where(wide, x / max(sin_a, 1e-12), x / max(cos_a, 1e-12))
@@ -341,6 +342,7 @@ class BoxDataset(Dataset):
                  scale_jitter=None, aug_switch_off_iter=0, negative_frac=None,
                  negative_crop_frac=None, augment_copypaste=False, copypaste_max=3,
                  hard_event_manifest=None, hard_event_frac=None):
+        """Build the per-view/per-frame index of labelled items for one dataset root."""
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -544,7 +546,8 @@ class BoxDataset(Dataset):
                     nlab = nsess.labels(ngid)
                     if nlab.instance is None or nlab.instance.shape[0] == 0:
                         continue
-                    all_absent = (nlab.instance == INST_ABSENT).all(0)     # (T, C)
+                    # (T, C)
+                    all_absent = (nlab.instance == INST_ABSENT).all(0)
                     for nf, nci in zip(*np.nonzero(all_absent)):
                         self.index.append((nsess, ngid, int(nf), int(nci)))
                         self.origins.append(None)
@@ -606,10 +609,12 @@ class BoxDataset(Dataset):
         # ONE CONTAINER'S WORTH OF INDEX POSITIONS, which is what `ChunkShuffle` needs a block to
         # be. Its old hardcoded 512 spanned 13 videos on a session with 40 positions per group,
         # which is not locality at all -- the reader cache thrashed and OOM-killed the workers.
-        n_src = len({(s.session_id, g, c) for s, g, _, c in self.index})   # (group, camera) = file
+        # (group, camera) = file
+        n_src = len({(s.session_id, g, c) for s, g, _, c in self.index})
         self.chunk = max(1, len(self.index) // n_src)
 
     def __len__(self):
+        """Number of indexed items (one camera view of one frame each)."""
         return len(self.index)
 
     def set_iter(self, it):
@@ -878,8 +883,9 @@ class BoxDataset(Dataset):
             else:
                 r = regions[rng.integers(len(regions))]
                 rw, rh = float(r[2] - r[0]), float(r[3] - r[1])
+                # this certified rect is too small for the crop; redraw
                 if rw < tw or rh < th:
-                    continue           # this certified rect is too small for the crop; redraw
+                    continue
                 ox = float(r[0] + rng.uniform(0.0, rw - tw))
                 oy = float(r[1] + rng.uniform(0.0, rh - th))
             if known_boxes.shape[0] == 0:
@@ -924,6 +930,7 @@ class BoxDataset(Dataset):
         out = []
 
         def push(cx, cy):
+            """Append a jittered, edge-clamped tile origin centred on (cx, cy)."""
             jx, jy = rng.uniform(-0.25, 0.25, 2) * np.array([tw, th])
             # Clamped so a tile always overlaps the frame, but NOT forced inside it: a tile at the
             # frame edge is a real thing to train on and `warpAffine`'s grey border is what a
@@ -1121,7 +1128,8 @@ class BoxDataset(Dataset):
         cam = sess.cgroup(gid, f)[ci]
         p2d = self._points_2d(sess, gid, f, ci)
         if sess.mode == '3d':
-            vis = None if lab.vis3d is None else lab.vis3d[:, f]                 # (S,K)
+            # (S,K)
+            vis = None if lab.vis3d is None else lab.vis3d[:, f]
         else:
             vis = None if lab.vis2d is None else lab.vis2d[:, f, :, ci]
 
@@ -1157,7 +1165,8 @@ class BoxDataset(Dataset):
                 vt = torch.as_tensor(np.asarray(vis))
                 v = torch.where(vt == PROJECTED, torch.nan,
                                 (vt == VISIBLE).to(torch.float32))
-            kpts = torch.cat([k, v[..., None].to(k.dtype)], -1)                 # (S,K,3)
+            # (S,K,3)
+            kpts = torch.cat([k, v[..., None].to(k.dtype)], -1)
 
         boxes = []
         for s in range(p2d.shape[0]):
@@ -1177,7 +1186,8 @@ class BoxDataset(Dataset):
                                        torch.stack([x1, y1]), torch.stack([x0, y1])])
                     pad = 0
             if warp is not None:
-                src = _apply_affine(src, (warp, None))   # shared with the pose loader's rotation
+                # shared with the pose loader's rotation
+                src = _apply_affine(src, (warp, None))
                 # A point warped off the frame is not a point. Dropping it shrinks the box to the
                 # visible part, which is what a real crop of a half-out animal looks like; drop
                 # them all and `crop_box_for_points` returns None, i.e. "no animal here".
@@ -1344,6 +1354,7 @@ class BoxDataset(Dataset):
         return boxes, kpts, img
 
     def __getitem__(self, i):
+        """Decode item `i`: letterboxed/tiled pixels, boxes, and optional kpts/regions."""
         import cv2
 
         sess, gid, f, ci = self.index[i]
@@ -1384,13 +1395,17 @@ class BoxDataset(Dataset):
         # A video root IGNORES `reduce`, so the frame comes back full size -- both are legal, and
         # what is not legal is a frame that matches neither: the box transform is derived from the
         # rig's recorded size, so that would letterbox the boxes and the pixels differently.
-        want = tuple(-(-size[a] // r) for a in (0, 1))                  # libjpeg rounds up
+        # libjpeg rounds up
+        want = tuple(-(-size[a] // r) for a in (0, 1))
         assert dec == want or dec == size, \
             f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
             f'or {size} unreduced'
-        d = size[0] / dec[0]                     # decoded pixels -> source pixels, 1.0 for video
-        M = None            # non-None only on the warpAffine branch -- reused below for t-1
-        gain = None         # the ONE photometric draw for this item -- reused below for t-1
+        # decoded pixels -> source pixels, 1.0 for video
+        d = size[0] / dec[0]
+        # non-None only on the warpAffine branch -- reused below for t-1
+        M = None
+        # the ONE photometric draw for this item -- reused below for t-1
+        gain = None
         if warp is None and self.origins[i] is None:
             img, _, _ = letterbox(img, self.input_wh, src_wh=size)
         else:
@@ -1427,7 +1442,8 @@ class BoxDataset(Dataset):
         # so this never has to interact with cutout or mosaic-lite below.
         prev_img = None
         if self.temporal_input != 'none':
-            prev_f = max(f - 1, 0)     # clip start: no t-1 exists, so repeat frame t
+            # clip start: no t-1 exists, so repeat frame t
+            prev_f = max(f - 1, 0)
             prev_raw = read_frames(sess.groups[gid], sess.cam_names[ci], [prev_f], reduce=r)[0]
             if prev_raw is None:
                 raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {prev_f} (t-1 for '
@@ -1501,13 +1517,16 @@ class ChunkShuffle(torch.utils.data.Sampler):
     """
 
     def __init__(self, n, chunk=512, mix=4, seed=23):
+        """Build the block shuffle over `n` items with `chunk`-sized locality blocks."""
         self.n, self.chunk, self.mix, self.seed = n, chunk, mix, seed
         self.epoch = 0
 
     def __len__(self):
+        """Number of items shuffled."""
         return self.n
 
     def __iter__(self):
+        """Yield the epoch's shuffled item order, block-local and `mix`-pooled."""
         rng = np.random.default_rng([self.seed, self.epoch])
         self.epoch += 1
         starts = np.arange(0, self.n, self.chunk)
@@ -1541,6 +1560,7 @@ class CohortSampler(torch.utils.data.Sampler):
     """
 
     def __init__(self, weights, num_samples=None, seed=23):
+        """Build a replacement sampler over the index from `weights` (see class docstring)."""
         w = np.asarray(weights, dtype=np.float64)
         if w.ndim != 1 or not w.size:
             raise ValueError(f'weights must be a non-empty 1-D array, got shape {w.shape}')
@@ -1553,9 +1573,11 @@ class CohortSampler(torch.utils.data.Sampler):
         self.epoch = 0
 
     def __len__(self):
+        """Number of draws per epoch."""
         return self.num_samples
 
     def __iter__(self):
+        """Yield `num_samples` weighted draws with replacement."""
         rng = np.random.default_rng([self.seed, self.epoch])
         self.epoch += 1
         draws = np.searchsorted(self.cum, rng.random(self.num_samples))

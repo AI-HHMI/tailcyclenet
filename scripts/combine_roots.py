@@ -37,7 +37,8 @@ def plan(roots: list[Path]) -> dict[str, dict[str, Path]]:
     per_root = [sessions(r) for r in roots]
     seen: Counter[str] = Counter()
     for s in per_root:
-        seen.update({p.name for ss in s.values() for p in ss})   # a SET: one vote per root
+        # A SET: one vote per root.
+        seen.update({p.name for ss in s.values() for p in ss})
     collide = {n for n, c in seen.items() if c > 1}
 
     out: dict[str, dict[str, Path]] = {s: {} for s in fmt.SPLITS}
@@ -105,6 +106,12 @@ def build(out_root: Path, links_by_split: dict[str, dict[str, Path]], force: boo
 
 
 def main() -> int:
+    """Build a `-combined` root of per-session symlinks; 0 on success.
+
+    Inputs: argv (via argparse): roots, --out, --force, --dry-run.
+    Outputs: process exit code.
+    Side effects: writes symlinks under --out (unless --dry-run); prints the plan.
+    """
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('roots', nargs='+', type=Path, help='source dataset roots')
     ap.add_argument('--out', type=Path, required=True, help='output root, e.g. rat-city-combined')

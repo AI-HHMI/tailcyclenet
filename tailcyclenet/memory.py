@@ -55,6 +55,7 @@ class Budget:
         return max(0.0, self.budget_gb * float(fraction) * GB)
 
     def __str__(self) -> str:
+        """One-line human-readable budget summary, for logs."""
         return (f'buffers {self.budget_gb:.1f} GB, cap {self.limit_gb:.1f} GB '
                 f'({self.available_gb:.1f} GB free, {self.source})')
 
@@ -143,7 +144,8 @@ def host_budget(override_gb: float | None = None,
         try:
             total = float(os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE'))
         except (OSError, ValueError, AttributeError):
-            total = 8.0 * GB                    # a floor, so a weird host degrades rather than dies
+            # A floor, so a weird host degrades rather than dies.
+            total = 8.0 * GB
     cg_limit, cg_current = _cgroup()
     lsf = _lsf_limit()
 
@@ -222,7 +224,8 @@ def rebudget(override_gb: float | None = None,
         # An INFERRED budget is already "what was lying around" and already contains the floor.
         _cached = base
         return base
-    ceiling = base.budget_gb / fraction              # the figure the caller actually named
+    # The figure the caller actually named.
+    ceiling = base.budget_gb / fraction
     _cached = replace(base, budget_gb=max(0.0, min(base.budget_gb, ceiling - floor)),
                       floor_gb=floor,
                       source=f'{base.source} minus a {floor:.1f} GB process floor')
@@ -290,6 +293,11 @@ def peak_gb() -> float:
 
 
 def _proc_status_gb(key: str) -> float:
+    """One /proc/self/status field (VmRSS, VmHWM) in GB.
+
+    Inputs: key -- the field name to read, e.g. 'VmRSS'.
+    Outputs: float GB, or NaN if /proc is unavailable or the field is absent.
+    """
     try:
         with open('/proc/self/status') as f:
             for line in f:

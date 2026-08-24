@@ -25,6 +25,7 @@ class FrameStore:
     """
 
     def __init__(self, group, cam_names):
+        """Bind the group and camera names this store decodes for; opens and decodes nothing."""
         self.group = group
         self.cam_names = list(cam_names)
         self._f: dict[tuple[int, int], np.ndarray] = {}
@@ -90,9 +91,11 @@ class FrameStore:
                 del self._f[k]
 
     def clear(self):
+        """Drop every held frame."""
         with self._lock:
             self._f.clear()
 
     def __len__(self):
+        """The number of frames currently held."""
         with self._lock:
             return len(self._f)

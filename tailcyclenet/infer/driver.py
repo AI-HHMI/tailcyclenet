@@ -77,20 +77,23 @@ def check_frame_range(args) -> None:
     Resolves the ONE quantity the loop reads: `args.frame_start` / `args.frame_stop`, with
     `--max-frames N` folding into `frame_stop = N`. The group-length check lives in the group loop.
     """
-    if args.max_frames and (args.start_frame or args.end_frame):                     # 15
+    # Refusal 15.
+    if args.max_frames and (args.start_frame or args.end_frame):
         raise SystemExit(
             f'--max-frames {args.max_frames} together with --start-frame {args.start_frame} / '
             f'--end-frame {args.end_frame} has two readings of equal force -- "N frames from the '
             'start" and "up to frame N, from the start" -- and no defensible precedence, so a '
             'rule here would make one of them silently wrong. --max-frames N IS --start-frame 0 '
             '--end-frame N; pick one spelling.')
-    if args.start_frame < 0 or args.end_frame < 0:                                   # 16
+    # Refusal 16.
+    if args.start_frame < 0 or args.end_frame < 0:
         raise SystemExit(
             f'--start-frame {args.start_frame} / --end-frame {args.end_frame}: negative frame '
             'indices are not Python negative indexing here. "-1 means the last frame" and "-1 '
             'means one before the end" are both obvious and differ by one, which is the class of '
             'ambiguity that costs a day.')
-    if args.end_frame and args.end_frame <= args.start_frame:                        # 17
+    # Refusal 17.
+    if args.end_frame and args.end_frame <= args.start_frame:
         raise SystemExit(
             f'--end-frame {args.end_frame} is not past --start-frame {args.start_frame}. The '
             'range is half-open [start, end), so this predicts nothing; an empty range is a typo, '
@@ -125,6 +128,11 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
     cursor = args.frame_start - args.frame_start % _DET_BATCH
 
     def boxes_for(store, lo, hi):
+        """Boxes for the frames [lo, hi): detect/associate on demand, served from the buffer.
+
+        Detection advances a group-wide cursor in `_DET_BATCH` runs and overshoots `hi`; the
+        results are buffered by source frame and sliced to the requested range on return.
+        """
         nonlocal cursor
         while cursor < hi:
             end = min(cursor + _DET_BATCH, T)

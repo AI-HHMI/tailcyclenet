@@ -39,6 +39,13 @@ TRAINING_KEYS = frozenset({'out', 'iters', 'batch_size', 'lr', 'num_workers', 's
 
 
 def _raise_unknown(block, cfg, known):
+    """Raise SystemExit listing any keys in `cfg` outside `known`.
+
+    Inputs: block -- the config block's name, for the message.
+            cfg -- the parsed block dict.
+            known -- the allowed key set.
+    Side effects: raises SystemExit when an unknown key is present.
+    """
     unknown = set(cfg) - known
     if unknown:
         raise SystemExit(f'[{block}]: unknown key(s) {sorted(unknown)}. Known: {sorted(known)}')
@@ -95,6 +102,12 @@ def _endless(loader):
 
 
 def main():
+    """Pretrain one detector backbone across several dataset roots.
+
+    Inputs: argv (via argparse): --config, --out, --iters, --device.
+    Side effects: writes config/provenance and backbone checkpoints under
+                  [training].out; prints progress.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', required=True, type=Path)
@@ -160,6 +173,11 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
 
     def _save(it):
+        """Write the backbone checkpoint (numbered snapshot + backbone.pth alias).
+
+        Inputs: it -- the current iteration.
+        Side effects: writes two .pth files under the run folder.
+        """
         ck = {'iteration': it, 'backbone_state': model.backbone.state_dict(),
              'yolox_version': model_cfg['yolox'],
              'bottleneck_expansion': model_cfg['bottleneck_expansion'],

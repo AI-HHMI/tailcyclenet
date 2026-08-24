@@ -9,11 +9,7 @@ name = "rat-city"
 mode = "2d"
 units = "px"
 image_wh = [4696, 2048]
-# THE ONLY DATASET THAT IS NOT A SQUARE 416 DETECTOR INPUT -- the frame is 2.29:1. The square
-# default letterbox pads 56% of the canvas and shrinks the median rat to ~2 x 1.6 cells at the
-# finest FPN stride, unrepresentable at the other two. 896x384 matches the aspect ratio with
-# ~1.7% padding, putting the median rat in the regime the fly detector already works in. Kept
-# out of `sha`: it is a detector input size, not part of the keypoint table.
+# THE ONLY NON-SQUARE DETECTOR INPUT (2.29:1): 896x384 matches the aspect ratio with ~1.7% padding, putting the median rat in the regime the fly detector already works in; kept out of `sha` (a detector input size, not part of the keypoint table).
 names = [
   "nose", "left_ear", "right_ear", "tail_base",
 ]

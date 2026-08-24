@@ -178,10 +178,12 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     averaged = getattr(optimizer, 'has_averaged_iterate',
                        hasattr(optimizer, 'eval') and hasattr(optimizer, 'train'))
     if averaged:
-        optimizer.eval()                    # UNCONDITIONAL -- every rank pays the toggle
+        # UNCONDITIONAL -- every rank pays the toggle.
+        optimizer.eval()
         if write:
             eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        optimizer.train()                   # UNCONDITIONAL, same reason
+        # UNCONDITIONAL, same reason.
+        optimizer.train()
     if not write:
         return None
     path = ckpt_dir / f'checkpoint_{name}.pth'
@@ -281,6 +283,7 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
 def _report(what, missing, unexpected, dropped):
     """Name everything. A silent drop here is a whole training run spent on the wrong weights."""
     def head(xs, n=8):
+        """First `n` names joined, with `… (+k more)` appended when more remain."""
         xs = list(xs)
         return ', '.join(xs[:n]) + (f' … (+{len(xs) - n} more)' if len(xs) > n else '')
 

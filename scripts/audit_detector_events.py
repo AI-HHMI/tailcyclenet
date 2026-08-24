@@ -23,6 +23,7 @@ REASONS = ('localization', 'score', 'nms', 'top_k', 'kept')
 
 
 def _sessions(path: Path, split: str):
+    """{session_id: Session} for a split, whether `path` is a session or a dataset root."""
     if (path / 'session.toml').exists():
         _, sessions = sessions_for(path, split)
         return {s.session_id: s for s in sessions}
@@ -31,6 +32,14 @@ def _sessions(path: Path, split: str):
 
 
 def _read_frame(group, camera, frame, readers):
+    """One source-pixel frame: decoded from video (readers cache) or loaded from img/ dir.
+
+    Inputs: group -- the session's group.
+            camera -- camera name.
+            frame -- source frame index.
+            readers -- {video path: open_reader} cache.
+    Outputs: (H, W, 3) uint8 RGB array.
+    """
     kind, source, _ = group.source(camera)
     if kind == 'video':
         key = str(source)
@@ -42,6 +51,14 @@ def _read_frame(group, camera, frame, readers):
 
 
 def _panel(frame, box, title, size):
+    """A square, box-centred, titled crop of one frame.
+
+    Inputs: frame -- (H, W, 3) uint8 RGB.
+            box -- (x0, y0, x1, y1) source-pixel box to draw.
+            title -- the panel's header text.
+            size -- output side in pixels.
+    Outputs: a PIL image with the box outlined and the title burned in.
+    """
     image = Image.fromarray(frame)
     x0, y0, x1, y1 = [float(v) for v in box]
     side = max(x1 - x0, y1 - y0, 32.0) * 2.0
@@ -62,6 +79,12 @@ def _panel(frame, box, title, size):
 
 
 def main():
+    """Build contact sheets and a labels file for manual detector-event auditing.
+
+    Inputs: argv (via argparse): --events, --data, --split, --out,
+            --labels-out, --per-reason, --columns, --panel-size.
+    Side effects: writes the sheet image and the labels JSONL.
+    """
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--events', required=True, type=Path)
     ap.add_argument('--data', required=True, type=Path)

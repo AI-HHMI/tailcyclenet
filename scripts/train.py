@@ -103,6 +103,7 @@ def init_wandb(config: dict, run: Path, disabled: bool = False):
 
 
 def log(wb, values: dict, step: int) -> None:
+    """Log `values` at `step` if wandb is active."""
     if wb is not None:
         wb.log(values, step=step)
 
@@ -119,6 +120,7 @@ def _gpu_peak_gb(device, reset: bool = False) -> float:
 
 
 def _brief(m: dict) -> str:
+    """The interesting metric keys of a val dict, space-joined for a one-line print."""
     keys = ('mpjpe', 'mte', 'delta_x_avg', 'survival_rate', 'n_nonfinite')
     return ' '.join(f'{k}={m[k]:.4g}' for k in keys if k in m)
 
@@ -151,6 +153,7 @@ def timed(loader, acc):
 
 
 def to_device(batch, device):
+    """Move a batch's views and cgroup onto `device`, non-blocking where safe."""
     views = [v.to(device, non_blocking=True) for v in batch.views]
     cgroup = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
               for c in batch.cgroup]
@@ -165,7 +168,8 @@ def _tune_smoothness(loss_fn, T, stride=1):
     genuinely loosens the term -- a real change of meaning, not a bug.
     """
     for name in ('smoothness_loss_3d', 'smoothness_loss_2d'):
-        sl = getattr(loss_fn, name, None)      # a stub loss in the tests has neither
+        # A stub loss in the tests has neither.
+        sl = getattr(loss_fn, name, None)
         if sl is None:
             continue
         # Latch the configured values on first use: re-derived per batch, so idempotent.
@@ -238,6 +242,7 @@ def evaluate(model, batches, optimizer, device, fabric=None):
             vis_true = (batch.vis.to(device) if batch.vis is not None else get_vis_true(coords))
 
             def score(out):
+                """The scalar eval metrics of one forward, as a plain dict."""
                 m = get_eval_metrics(vis_pred=out['vis_pred'], vis_true=vis_true,
                                      coords_pred=out['coords_pred'], coords_true=coords, prefix='')
                 return {k: float(v) for k, v in m.items() if np.ndim(v) == 0}
@@ -323,6 +328,14 @@ def launch(args):
 
 
 def main():
+    """Finetune a posetail tracker into a pose estimator.
+
+    Inputs: argv (via argparse): --config, --iters, --out, --data, --device,
+            --devices, --strategy, --precision, --num-workers, --no-warm-start,
+            --no-resume, --no-wandb, --no-checkpoints.
+    Side effects: trains; writes checkpoints + log.jsonl under the run folder;
+                  launches Fabric (re-executes per rank).
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', required=True, type=Path)
@@ -604,9 +617,11 @@ def main():
     fabric.barrier()
     fabric.print(f'run folder: {run.resolve()}')
     wb = init_wandb(config, run, disabled=args.no_wandb or not is0)
-    log_path = run / 'log.jsonl'                  # the numbers survive without wandb
+    # The numbers survive without wandb.
+    log_path = run / 'log.jsonl'
 
     def record(rec):
+        """Append one JSON line to log.jsonl -- rank 0 only, reduced metrics."""
         # Rank 0 only: N ranks appending the same reduced metrics would corrupt the history.
         if not is0:
             return

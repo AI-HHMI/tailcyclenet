@@ -56,6 +56,19 @@ class WideQueryEncoder(nn.Module):
                  patch_size=9, time_embed_mode='fourier_rel', principal_point_embedding=False,
                  intrinsic_embedding=False, query_pos_embedding=True,
                  query_patch_embedding=True):
+        """Build the fusion terms and gate.
+
+        Inputs: dim -- fusion width.
+                embed_dim -- pretrained width the patch CNN is built at.
+                decoder_dim -- fused output width.
+                n_keypoints -- registry size for the identity embedding.
+                n_frames -- number of time steps.
+                max_freq -- fourier encoding cutoff.
+                patch_size -- side of the sampled appearance patch.
+                time_embed_mode -- 'fourier_rel' or 'learned' time terms.
+                principal_point_embedding / intrinsic_embedding -- rig terms.
+                query_pos_embedding / query_patch_embedding -- build the prior terms.
+        """
         super().__init__()
         self.dim = dim
         self.decoder_dim = decoder_dim
@@ -127,11 +140,14 @@ class WideQueryEncoder(nn.Module):
         return t
 
     def _fourier_time(self, times, linear):
+        """Fourier-encode relative times and project them through `linear`."""
         s = (times.to(torch.float32) / self.time_norm)[..., None, None]
         feat = torch.cat([s, get_fourier_encoding(s, min_freq=0, max_freq=self.max_freq)], dim=-1)
         return linear(feat)[..., 0, :]
 
     def _interp_time_embed(self, emb, times, n_frames):
+        """Look `times` up in a learned embedding, interpolated when `n_frames` is shorter than
+        the embedding was built for."""
         if n_frames == emb.num_embeddings:
             return emb(times)
         w = torch.nn.functional.interpolate(
@@ -148,6 +164,12 @@ class WideQueryEncoder(nn.Module):
         return self._gate_and_fuse(terms, ctx)
 
     def _gate_and_fuse(self, terms, ctx):
+        """Gate the terms per keypoint, fuse them, and project to `decoder_dim`.
+
+        Inputs: terms -- list of (B, T_query, n_cams, dim) tensors.
+                ctx -- dict carrying B, T_query, n_cams.
+        Outputs: (B, T_query, n_cams, decoder_dim) fused embedding.
+        """
         B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
         assert len(terms) == self.n_fusion_terms, \
             f'built {len(terms)} terms but n_fusion_terms is {self.n_fusion_terms}'
@@ -167,9 +189,10 @@ class WideQueryEncoder(nn.Module):
         is_2d = coord_dim == 2
         if is_2d:
             assert n_cams == 1, f'2D queries are single-camera; got {n_cams}'
+        # (cams, 2)
         sizes = torch.stack([
             torch.tensor([v.shape[-1], v.shape[-2]], dtype=query_coords.dtype,
-                         device=query_coords.device) for v in preprocessed_views])   # (cams, 2)
+                         device=query_coords.device) for v in preprocessed_views])
 
         # -- identity --------------------------------------------------------------------
         ids = getattr(self, '_kpt_ids', None)
@@ -291,7 +314,8 @@ def _gather_box_by_target_time(box_per_frame, target_time):
     library's own `target_time` (B,T_query), the ACTUAL frame each query slot decodes -- safer
     than re-deriving the t-major tiling by hand."""
     B, T_clip, C, D = box_per_frame.shape
-    idx = target_time.to(torch.float32).round().long().clamp(0, T_clip - 1)      # (B,T_query)
+    # (B,T_query)
+    idx = target_time.to(torch.float32).round().long().clamp(0, T_clip - 1)
     idx = repeat(idx, 'b t -> b t c d', c=C, d=D)
     return torch.gather(box_per_frame, 1, idx)
 
@@ -323,6 +347,8 @@ class BoxFilmEncoder(WideQueryEncoder):
     """
 
     def __init__(self, *args, box_max_freq=None, **kwargs):
+        """Add the FiLM box conditioner to a `WideQueryEncoder`. gamma/beta are
+        zero-initialised, so the encoder starts as a bit-identical no-op."""
         super().__init__(*args, **kwargs)
         self.box_max_freq = int(box_max_freq if box_max_freq is not None else self.max_freq)
         self.film = nn.Sequential(nn.Linear(8 * self.box_max_freq + 4, self.dim), nn.GELU(),
@@ -333,6 +359,8 @@ class BoxFilmEncoder(WideQueryEncoder):
 
     def forward(self, preprocessed_views, camera_group, query_coords, query_time, target_time,
                 cube_scale, occlusion=None):
+        """The base encoder's terms with the box FiLM applied to the identity term, which is
+        always built -- so the box prompt works query-free too."""
         terms, ctx = self._build_terms(preprocessed_views, camera_group, query_coords,
                                        query_time, target_time)
         B, T_query, n_cams = ctx['B'], ctx['T_query'], ctx['n_cams']
@@ -345,7 +373,8 @@ class BoxFilmEncoder(WideQueryEncoder):
         else:
             gb = repeat(self.missing_film, 'd -> b t c d', b=B, t=T_query, c=n_cams)
         gamma, beta = gb[..., :self.dim], gb[..., self.dim:]
-        terms[0] = terms[0] * (1.0 + gamma) + beta          # terms[0] is the identity term
+        # terms[0] is the identity term.
+        terms[0] = terms[0] * (1.0 + gamma) + beta
         return self._gate_and_fuse(terms, ctx)
 
 

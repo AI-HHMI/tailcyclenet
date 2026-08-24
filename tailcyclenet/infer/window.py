@@ -44,16 +44,20 @@ class InferConfig:
     image_size: int = 256
     min_crop_dim: int = 64
     anchor: str = 'carry'
-    max_animals: int = 0          # 0 -> every animal the box source offers
-    max_frames: int = 0           # 0 -> the whole group; else its first `max_frames` frames
+    # 0 -> every animal the box source offers
+    max_animals: int = 0
+    # 0 -> the whole group; else its first `max_frames` frames
+    max_frames: int = 0
     # THE FRAME RANGE, half-open [frame_start, frame_stop). A window-loop lever, not an
     # input-format one. `frame` in the output is always the SOURCE index and rows exist only
     # inside the range (the spec's sparsity rule), so `load_predictions` densifies back to a
     # full-length array that is NaN outside it. One quantity with `max_frames` (`--max-frames N`
     # IS `--start-frame 0 --end-frame N`), resolved in `run_blocks`.
     frame_start: int = 0
-    frame_stop: int = 0           # 0 -> to the end of the group
-    kpt_chunk: int = 0            # 0 -> decode every keypoint in one pass
+    # 0 -> to the end of the group
+    frame_stop: int = 0
+    # 0 -> decode every keypoint in one pass
+    kpt_chunk: int = 0
     # None -> report every row. A float withholds a row whose median `vis_pred` logit across
     # keypoints is below it; not portable across roots, so there is no default.
     vis_thresh: float | None = None
@@ -138,7 +142,8 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
     if mode == '3d' and src_pts is not None:
         # Labels, 3D: identical to what `_item` computes at training time -- cgroup here is
         # already this window's cropped+resized camera list.
-        pts = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)      # (T,K,3) world
+        # (T,K,3) world
+        pts = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)
         return bpmod.compute_box_prompt(pts, cgroup, '3d')[None].to(dev)
 
     if mode == '3d':
@@ -148,12 +153,15 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
         C = len(use)
         out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)
         for i, ci in enumerate(use):
-            db = torch.as_tensor(boxes_stc[a][frames][:, ci], dtype=torch.float32)  # (T,4) src px
+            # (T,4) src px
+            db = torch.as_tensor(boxes_stc[a][frames][:, ci], dtype=torch.float32)
             if not torch.isfinite(db).any():
                 continue
-            corners = cropmod.box_corners(db)                                # (T,4,2) src px
+            # (T,4,2) src px
+            corners = cropmod.box_corners(db)
             origin = torch.as_tensor(boxes[i][:2], dtype=torch.float32)
-            cf = (corners - origin) * float(scales[i])                       # (T,4,2) crop px
+            # (T,4,2) crop px
+            cf = (corners - origin) * float(scales[i])
             size = cgroup[i]['size']
             for t in range(T):
                 bx = cropmod.crop_box_for_points(cf[t], size,
@@ -167,7 +175,8 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
               else cropmod.box_corners(torch.as_tensor(boxes_stc[a][frames][:, use[0]],
                                                        dtype=torch.float32)))
     origin = torch.as_tensor(boxes[0][:2], dtype=torch.float32)
-    cf = (source - origin) * float(scales[0])                    # (T,K,2) crop px
+    # (T,K,2) crop px
+    cf = (source - origin) * float(scales[0])
     size = cgroup[0]['size']
     T = cf.shape[0]
     out = torch.full((T, 1, 4), float('nan'), dtype=torch.float32)
@@ -180,6 +189,7 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
 
 
 def _to_device(cgroup, device):
+    """Move each camera's tensors to `device`; non-tensors (e.g. `size`) are left as-is."""
     return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
             for c in cgroup]
 
@@ -217,7 +227,8 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_
     trainer so training and inference report the same number.
     """
     p = first['coords_pred'][0].detach()
-    prior = p[0][None].clone()                         # (1,K,R), the frame-0 pose
+    # (1,K,R), the frame-0 pose
+    prior = p[0][None].clone()
     prior[0, prior_out_of_bounds(prior[0], mode, cgroup)] = float('nan')
     qt = torch.zeros(prior.shape[:2], dtype=torch.int32, device=prior.device)
     # The box prompt carries into the second pass unchanged: the window has not moved.
@@ -345,8 +356,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    for a in range(S)])
 
     # The anchor-free estimate is not an output column but is what `carry` feeds back; it is read
-    # live out of `out` in `forward()` below.
-    carried = [None] * S                      # per-animal prior for the next window
+    # live out of `out` in `forward()` below. Per-animal prior for the next window.
+    carried = [None] * S
     # Diagnostics per (animal, window): why it produced nothing, and what box it was given.
     starts = _window_starts(T_total - frame_start, cfg.n_frames, cfg.overlap, start=frame_start)
 
@@ -357,7 +368,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # from parsed toml (`rig.size`), never by opening a container; `max` over the cameras.
     _frame_bytes = max(int(w) * int(h) for w, h in
                        (session.rig.size(session.cam_names[ci]) for ci in cam_ix)) * 3
-    _frame_cost = len(cam_ix) * _frame_bytes            # one frame INDEX, across the rig
+    # One frame INDEX, across the rig.
+    _frame_cost = len(cam_ix) * _frame_bytes
     _budget = memory.current()
     _one = cfg.n_frames * _frame_cost
     # Spend what the work needs, not what the host happens to have: a bigger block buys only fewer
@@ -370,7 +382,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     # Two blocks are live when detection runs ahead, and both come out of this share. A budget
     # with room for two blocks pipelines; a tighter one detects inline. Output is identical either
     # way -- only the overlap goes.
-    _pipeline_det = _share >= 2 * _one          # room for two blocks of at least one window
+    # Room for two blocks of at least one window.
+    _pipeline_det = _share >= 2 * _one
     _store_bytes = min(_share / (2 if _pipeline_det else 1), _want_store)
     cam_decode = memory.fits(_store_bytes / 2, _frame_bytes * cfg.n_frames,
                              want=min(_CAM_DECODE, len(cam_ix)))
@@ -416,10 +429,12 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         pixels changes no pixel and no order.
         """
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
-        if len(frames) < 2:                   # T=1 hits posetail's gT = T // tubelet = 0 bug
+        # T=1 hits posetail's gT = T // tubelet = 0 bug.
+        if len(frames) < 2:
             # The floor is `frame_start`, not 0: a clamp must not reach below the requested range.
             frames = np.clip(np.arange(start, start + 2), frame_start, T_total - 1)
-        fl = frames - f0                      # into this block's arrays; see `run_blocks`
+        # Into this block's arrays; see `run_blocks`.
+        fl = frames - f0
         wl = wi - w0
         # One camera group per window, carrying per-frame extrinsics where a camera moves; built
         # here rather than per animal (the per-animal build dropped `moving_ext`).
@@ -430,14 +445,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         for a in range(S):
             bb = None
             if boxes_stc is not None:
-                bb = boxes_stc[a][fl]                              # (t, C, 4)
+                # (t, C, 4)
+                bb = boxes_stc[a][fl]
                 # Not `.any()`: one finite box used to fabricate a whole window's crop.
                 if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
                     continue
             elif inst_boxes is not None and a < len(inst_boxes):
                 bb = inst_boxes[a][frames]
                 if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
-                    bb = None                                      # keypoint fallback, per animal
+                    # Keypoint fallback, per animal.
+                    bb = None
             if bb is not None:
                 # One box per camera: the union over the window's frames, so the animal does not
                 # walk out of its own crop. Use the cameras that saw it -- requiring a box in
@@ -516,7 +533,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             scales = []
             # Pass 1, which under `--refine-px` runs at a reduced resolution; the pass distinction
             # lives here rather than in the shared `_resize_camera` helper.
-            uncropped = list(cgroup)      # pre-resize; only read by the refine fallback below
+            # Pre-resize; only read by the refine fallback below.
+            uncropped = list(cgroup)
             for i, cam in enumerate(cgroup):
                 cgroup[i], s = _resize_camera(cam, pass1_res)
                 scales.append(s)
@@ -538,6 +556,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         cams = sorted({c for _, use, *_ in plans for c in use})
 
         def one(ci, pool):
+            """Decode one camera and crop it for every animal whose plan wants it."""
             # `store` is keyed by (camera, SOURCE frame) and holds the FULL decoded frame, which
             # is what lets one decode serve every consumer: refine wants the same pixels under a
             # different crop, and `_crop_views` never mutates what it is given.
@@ -572,7 +591,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         # uint8; the model divides on device. Same contract as the training loader.
         views = [crops[a, ci] for ci in use]
         if any(v is None for v in views):
-            return None                     # already marked 'decode failed' above
+            # Already marked 'decode failed' above.
+            return None
         prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
                                        scales, mode, K, R, cgroup)
         dev = cfg.device
@@ -611,7 +631,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if cfg.anchor == 'self':
                 out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                   kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
-        p = out['coords_pred'][0].detach().cpu().numpy()          # (t,K,R)
+        # (t,K,R)
+        p = out['coords_pred'][0].detach().cpu().numpy()
         # What the next window opens on, and it is not always what this window reports. Under
         # `gridresid_offset = "query"` the reported output is `query + R @ residual`, so feeding
         # it back closes a loop with gain. `3d_pred_triangulate` is the anchor-free estimate,
@@ -637,11 +658,13 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         # reported prediction (a free exact check).
         p2 = v2 = None
         if '2d_pred' in out:
-            p2 = out['2d_pred'][:, 0].detach().cpu().numpy().copy()   # (C_use, t, K, 2)
+            # (C_use, t, K, 2)
+            p2 = out['2d_pred'][:, 0].detach().cpu().numpy().copy()
             for i in range(len(use)):
                 p2[i] = p2[i] / scales[i] + np.asarray(boxes[i][:2], np.float32)
             if out.get('vis_pred_2d') is not None:
-                v2 = out['vis_pred_2d'][:, 0].detach().cpu().numpy()  # (C_use, t, K) logits
+                # (C_use, t, K) logits
+                v2 = out['vis_pred_2d'][:, 0].detach().cpu().numpy()
         return p, q, out, p2, v2
 
     def _process_window(wi, frames, window_cams, plans, crops):
@@ -658,9 +681,12 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             # A failed refinement keeps the first-pass BOX, but NOT its camera under
             # `--refine-px` -- that one is at the reduced resolution; `_at_image_size` rebuilds it.
             def _at_image_size(plan):
+                """The same plan with pass 1 rebuilt at full `image_size` (a no-op when it
+                already is at full resolution)."""
                 a, use, boxes, _, _, uncropped = plan
                 if pass1_res == cfg.image_size:
-                    return plan                          # bit-identical: nothing to rebuild
+                    # Bit-identical: nothing to rebuild.
+                    return plan
                 cg, sc = [], []
                 for cam in uncropped:
                     c, s = _resize_camera(cam, cfg.image_size)
@@ -690,7 +716,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     continue
                 uncropped2, sc2 = list(cg2), []
                 for i, cam in enumerate(cg2):
-                    cg2[i], s = _resize_camera(cam, cfg.image_size)   # PASS 2, always full res
+                    # PASS 2, always full res.
+                    cg2[i], s = _resize_camera(cam, cfg.image_size)
                     sc2.append(s)
                 # `crop` keeps the first-pass box: it is the record of what the detector offered.
                 for i, ci in enumerate(use):
@@ -703,7 +730,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             a, use, boxes, cgroup, scales, *_ = plan
             got = forward(frames, plan, crops, wi)
             if got is None:
-                continue                        # already marked 'decode failed' above
+                # Already marked 'decode failed' above.
+                continue
             p, q, out, p2, v2 = got
             outcome[a, wi - w0] = OUTCOMES.index('ok')
             _fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
@@ -726,7 +754,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             # would be measuring the prompt.
             if cfg.vis_thresh is not None and vlogit is not None:
                 with warnings.catch_warnings(), np.errstate(all='ignore'):
-                    warnings.simplefilter('ignore', RuntimeWarning)       # an all-NaN row is legal
+                    # An all-NaN row is legal.
+                    warnings.simplefilter('ignore', RuntimeWarning)
                     # The MEDIAN over keypoints: a mean lets one confident keypoint carry a row the
                     # model otherwise declined.
                     med = np.nanmedian(vlogit, axis=-1)
@@ -754,6 +783,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     _prefetch_pool = ThreadPoolExecutor(max_workers=1) if n_ahead else None
 
     def _prepare(wi, start):
+        """Build the plans and decode the pixels for window `wi` at source frame `start`."""
         frames, window_cams, plans = _build_plans(wi, start)
         crops = decode_crops(frames, plans)
         return frames, window_cams, plans, crops
@@ -906,13 +936,16 @@ def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
         if not (np.isfinite(b).all() and side > 0):
             continue
         if mode == '2d':
-            q = np.asarray(p, np.float64)                      # already source pixels
+            # Already source pixels.
+            q = np.asarray(p, np.float64)
         else:
             q = project_points_torch([window_cams[ci]],
                                      torch.as_tensor(p, dtype=torch.float32))[0].numpy()
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)    # a frame with no finite keypoint
-            c = np.nanmean(q, axis=-2)                         # (t,2)
+            # A frame with no finite keypoint.
+            warnings.simplefilter('ignore', RuntimeWarning)
+            # (t,2)
+            c = np.nanmean(q, axis=-2)
         centre = np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2])
         box_agree[a, frames, ci] = np.linalg.norm(c - centre, axis=-1) / side
 
@@ -1040,12 +1073,14 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
         return None, None
     if cfg.anchor == 'labels':
         # ORACLE. Ground truth as the prior; not a deployment number.
-        if src is None or a >= n_lab:             # a detector row with no label row behind it
+        if src is None or a >= n_lab:
+            # A detector row with no label row behind it.
             return None, None
         p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales)
         if p is None:
             return None, None
-    else:                                    # 'carry'
+    else:
+        # 'carry'
         if carried is None:
             return None, None
         p = carried[0].clone().float()

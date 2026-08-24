@@ -36,7 +36,7 @@ def _sides(boxes):
 def _project(cam, points):
     """(n,3) world -> (n,2) pixels in one camera. Batched: this is the per-frame inner loop."""
     p = torch.as_tensor(np.asarray(points, np.float32)).reshape(-1, 1, 3)
-    return project_points_torch([cam], p)[0, :, 0]                      # (n,2)
+    return project_points_torch([cam], p)[0, :, 0]
 
 
 class CrossViewTracker:
@@ -48,6 +48,14 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.0, max_age=24, min_views=2):
+        """Create an empty tracker with `n_slots` rows.
+
+        Inputs: n_slots -- number of animal rows (slots).
+                max_res_px -- max reprojection residual (px) for a birth's triangulation.
+                max_move -- per-frame box-centre displacement gate, in box sides.
+                max_age -- frames without evidence before a slot is retired.
+                min_views -- minimum cameras a birth must be seen in.
+        """
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
@@ -92,14 +100,16 @@ class CrossViewTracker:
                 t['age'] += 1
         pts = (torch.stack([self.targets[s]['point'] for s in slots]) if slots else None)
         claimed = {c: set() for c in range(C)}
-        got = {s: {} for s in slots}                    # slot -> {cam: det index}
+        # slot -> {cam: det index}
+        got = {s: {} for s in slots}
 
         for c in range(C):
             n_det = centres[c].shape[0]
             if not slots or not n_det:
                 continue
-            proj = _project(cgroup[c], pts)                                  # (n_t,2)
-            d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)  # (n_t,n_det)
+            # Target projections (n_t,2) and their per-detection distances (n_t,n_det).
+            proj = _project(cgroup[c], pts)
+            d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)
             # THE DETECTION'S OWN SIDE, not the mean of it and the target's last claimed side.
             # `link_rows` uses the mean and making these two consistent was TRIED AND MEASURED
             # WORSE: +1.71 mm MPJPE and -0.038 MOTA, paired over 131,887 points on the two
@@ -203,6 +213,11 @@ def demo():
              calibrated=dict.fromkeys(names, True)).posetail()
 
     def boxes_at(worlds, side=40.0):
+        """Project `worlds` into every camera as fixed-size square boxes.
+
+        Outputs: (per_cam, scores): per_cam is a list of (n,4) xyxy tensors and scores
+        a list of (n,) ones.
+        """
         per_cam, scores = [], []
         for cam in cg:
             uv = _project(cam, np.asarray(worlds, np.float32))

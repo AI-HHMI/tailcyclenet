@@ -33,7 +33,8 @@ def apply_norms_extension(model) -> list[int]:
         return []
     n_last = getattr(model, 'video_encoder_finetune_last_n_layers', None)
     if n_last is None:
-        return []                      # the whole encoder is trainable; every norm already is
+        # The whole encoder is trainable; every norm already is.
+        return []
     encoder = model.scene_encoder.encoder
     norms = _norms_in_range(encoder, int(n_last))
     for i in norms:

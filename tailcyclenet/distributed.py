@@ -153,9 +153,19 @@ class RankPrefix:
     """
 
     def __init__(self, stream, rank: int):
+        """Wrap `stream` so every line written through this object carries `[rank N]`.
+
+        Inputs: stream -- the text stream to wrap; rank -- this process's rank.
+        """
         self._stream, self._tag, self._at_line_start = stream, f'[rank {rank}] ', True
 
     def write(self, text: str) -> int:
+        """Write `text` to the wrapped stream, tagging each new line with the rank prefix.
+
+        Inputs: text -- the string to write.
+        Outputs: int -- the number of characters accepted (len(text)).
+        Side effects: writes to the wrapped stream.
+        """
         if not text:
             return 0
         out = []
@@ -168,7 +178,9 @@ class RankPrefix:
         return len(text)
 
     def flush(self) -> None:
+        """Flush the wrapped stream."""
         self._stream.flush()
 
     def isatty(self) -> bool:
+        """Whether the wrapped stream is a terminal."""
         return self._stream.isatty()

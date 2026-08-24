@@ -31,11 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt, video
 
 CAM = 'cam0'
-PAD = 20                    # the crop rule's pad; instances.pq stores the PADDED extent.
+# The crop rule's pad; instances.pq stores the PADDED extent.
+PAD = 20
 APT_NAMES = ['nose', 'left_ear', 'right_ear', 'tail']
 RENAME = {'tail': 'tail_base'}
 LBL_MEMBER = 'label_file.lbl'
-ALIGN_TOL = 1.0             # mean |diff| vs PyAV's decode: ~0.016 right, 2.9+ for a neighbour.
+# Mean |diff| vs PyAV's decode: ~0.016 right, 2.9+ for a neighbour.
+ALIGN_TOL = 1.0
 
 
 # reading the .lbl
@@ -57,6 +59,7 @@ def read_lbl(path: Path, tmp: Path) -> dict:
 
 
 def _strs(v) -> list[str]:
+    """Flatten a MATLAB cell array into a list of strings."""
     return [str(x) for x in np.ravel(v)]
 
 
@@ -108,9 +111,11 @@ def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
     v = np.asarray(v, float)
     if v.ndim == 2:
         v = v[:, :, None]
-    v = v - 1.0                                  # 1-based, like `p` and `frm`
+    # 1-based, like `p` and `frm`
+    v = v - 1.0
     f = np.ravel(entry.f).astype(int) - 1
-    lo, hi = v.min(0), v.max(0)                  # (2,n) each
+    # (2,n) each
+    lo, hi = v.min(0), v.max(0)
     corner_on_edge = (np.isclose(v, lo[None]) | np.isclose(v, hi[None])).all()
     if not corner_on_edge:
         raise SystemExit('labelsRoi holds a rotated rectangle; the format stores axis-aligned '
@@ -164,6 +169,13 @@ class Job:
 
 
 def build_jobs(d: dict) -> list[Job]:
+    """One Job per labelled movie across both label sets (regular and GT).
+
+    Inputs: d -- the APT project's variables from read_lbl.
+    Outputs: one Job per movie with at least one labelled frame, with split and
+             session assigned.
+    Side effects: raises SystemExit if one session would land in two splits.
+    """
     jobs = []
     for is_gt in (False, True):
         movies = _strs(d['movieFilesAllGT' if is_gt else 'movieFilesAll'])
@@ -208,6 +220,12 @@ def reader(movie: str):
 
 
 def _rgb(path: Path) -> np.ndarray:
+    """Read a JPEG as RGB (cv2 reads BGR by default).
+
+    Inputs: path -- a JPEG on disk.
+    Outputs: (H, W, 3) uint8 array in RGB order.
+    Side effects: raises RuntimeError if the file is unreadable.
+    """
     import cv2
     im = cv2.imread(str(path))
     if im is None:
@@ -216,6 +234,11 @@ def _rgb(path: Path) -> np.ndarray:
 
 
 def _diff(a, b) -> float:
+    """Mean absolute pixel difference between two images.
+
+    Inputs: a, b -- same-shape uint8 arrays.
+    Outputs: float mean |a - b|.
+    """
     return float(np.abs(a.astype(np.float32) - b.astype(np.float32)).mean())
 
 
@@ -346,7 +369,8 @@ def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels
     lab.instance = np.full((len(lab.animal_ids), n, 1), fmt.INST_NONE, np.int8)
     lf = frame - start
     for r, a in zip(rows, slots):
-        pts = job.xy[r]                                             # (K, 2)
+        # (K, 2)
+        pts = job.xy[r]
         occluded = np.isinf(pts).any(-1)
         positioned = np.isfinite(pts).all(-1)
         lab.vis2d[a, lf, occluded, 0] = fmt.MISSING
@@ -366,8 +390,9 @@ def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int
     """
     r = job.roi_rect[np.flatnonzero(job.roi_f == frame)]
     out = np.zeros((len(r), 6))
-    out[:, 0] = frame - start                    # group-local frame index
-    out[:, 1] = 0                                # the single camera
+    # Group-local frame index; column 1 is the single camera.
+    out[:, 0] = frame - start
+    out[:, 1] = 0
     out[:, 2:] = np.clip(r, 0.0, np.tile(np.asarray(wh, float), 2))
     keep = (out[:, 4] > out[:, 2]) & (out[:, 5] > out[:, 3])
     return out[keep], int((~keep).sum())
@@ -376,6 +401,18 @@ def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int
 # one movie -> one session
 
 def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
+    """Convert one movie into one session directory under `out/<split>/<session>`.
+
+    Inputs: job -- the Job describing the movie and its labels.
+            out -- dataset root; the session lands at out/<split>/<session>.
+            context -- frames per group, label centered.
+            mode -- 'copy' (lossless ffmpeg lift) or 'decode' (PyAV + JPEG).
+            args -- parsed CLI args (dry_run, labels_only, clean, ...).
+    Outputs: a statistics dict for the summary line.
+    Side effects: writes the session (tables + groups/ pixels); removes an
+                  existing session dir when args.clean; raises SystemExit on
+                  --labels-only with no prior conversion.
+    """
     names = [RENAME.get(nm, nm) for nm in APT_NAMES]
     dst = out / job.split / job.session
     if dst.exists() and args.clean:
@@ -407,7 +444,8 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
         if not (dst / 'session.toml').exists():
             raise SystemExit(f'{dst}: --labels-only, but this session has not been converted yet')
         old = fmt.Session.load(dst)
-        extract = old.provenance.get('extract')      # how the pixels on disk were really made
+        # How the pixels on disk were really made.
+        extract = old.provenance.get('extract')
         for gid, g in old.groups.items():
             groups[gid] = fmt.Group(gid, g.n_frames, fps=g.fps, source_video=g.source_video,
                                     source_frame_start=g.source_frame_start,
@@ -493,6 +531,14 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
 
 
 def main() -> int:
+    """Convert an APT project into a tailcycle dataset; 0 on success.
+
+    Inputs: argv (via argparse): --lbl, --out, --context, --extract, --jobs,
+            --max-groups, --only, --labels-only, --dry-run, --clean,
+            --validate, --no-image-check.
+    Outputs: process exit code (0 ok; 1 when --validate finds hard errors).
+    Side effects: writes sessions under --out; prints progress and summaries.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--lbl', type=Path, required=True)
@@ -536,6 +582,7 @@ def main() -> int:
 
     # Over the kept frames, not the whole row set: `--max-groups` must report the conversion done.
     def n_inst(j):
+        """Instances over the kept frames, not the whole row set."""
         return int(np.isin(j.frm, j.frames).sum())
 
     print(f'{args.projname} v{args.version}: {len(jobs)} labelled movies, '

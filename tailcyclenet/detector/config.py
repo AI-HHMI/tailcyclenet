@@ -39,6 +39,8 @@ TRAINING_KEYS = frozenset({
     'max_pos_per_gt', 'box_weight', 'weight_decay', 'no_decay_norm_bias', 'nms_iou_thresh',
     'nms_center_dist_thresh', 'neg_loss_weight', 'assignment', 'box_loss', 'focal_obj',
     'focal_gamma', 'tal_topk', 'tal_alpha', 'tal_beta', 'head_depthwise',
+    'optimizer', 'muon_momentum', 'muon_lr_scale', 'warmup_steps', 'beta1', 'beta2',
+    'freeze_backbone', 'shared_head', 'fpn_upsample', 'p2_bottomup', 'tal_soft_prior',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
@@ -347,4 +349,37 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     train['head_depthwise'] = train.get('head_depthwise', None)
     if train['head_depthwise'] not in (None, True, False):
         raise SystemExit('[training].head_depthwise must be true, false, or absent')
+
+    # A1: 'adamw' (default, byte-identical to every checkpoint on record) or 'muon' (SF-Muon for
+    # 2D .weight tensors, AdamW-ScheduleFree for the rest -- see optim.py's pose-model precedent).
+    train['optimizer'] = str(train.get('optimizer', 'adamw'))
+    if train['optimizer'] not in ('adamw', 'muon'):
+        raise SystemExit(f"[training].optimizer must be 'adamw' or 'muon', got "
+                         f"{train['optimizer']!r}")
+    train['muon_momentum'] = float(train.get('muon_momentum', 0.95))
+    train['muon_lr_scale'] = float(train.get('muon_lr_scale', 1.0))
+    train['warmup_steps'] = int(train.get('warmup_steps', 500))
+    train['beta1'] = float(train.get('beta1', 0.9))
+    train['beta2'] = float(train.get('beta2', 0.95))
+
+    # A2.6: freeze the ViT backbone (only its SFP adapters + PAFPN + Head train). Default false,
+    # inert on a backbone with no `freeze_backbone` method (every CNN tier).
+    train['freeze_backbone'] = bool(train.get('freeze_backbone', False))
+
+    # G1: separate obj/reg towers in the head instead of sharing one. Default true (shared) is
+    # byte-identical to every checkpoint on record.
+    train['shared_head'] = bool(train.get('shared_head', True))
+    # G2: PAFPN top-down upsample mode. 'nearest' (default) is byte-identical to every checkpoint
+    # on record.
+    train['fpn_upsample'] = str(train.get('fpn_upsample', 'nearest'))
+    if train['fpn_upsample'] not in ('nearest', 'bilinear'):
+        raise SystemExit(f"[training].fpn_upsample must be 'nearest' or 'bilinear', got "
+                         f"{train['fpn_upsample']!r}")
+    # G3: bottom-up refinement for the p2 PAFPN level. Default false is byte-identical to every
+    # checkpoint on record; only meaningful alongside [model].p2 = true.
+    train['p2_bottomup'] = bool(train.get('p2_bottomup', False))
+    # G4: soften assign_tal's strict `inside` candidacy mask to `inside | near` (reuses the
+    # existing CENTER_RADIUS=2.5 cell radius `assign()` already computes). Default false is
+    # byte-identical to every checkpoint on record.
+    train['tal_soft_prior'] = bool(train.get('tal_soft_prior', False))
     return cfg

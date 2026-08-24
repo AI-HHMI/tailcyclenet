@@ -75,6 +75,110 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416)
     return ow, oh
 
 
+BACKBONE_LR_SCALE = 0.1   # any pretrained backbone gets this x lr; see main()'s own docstring note
+
+
+def build_detector_optimizer(model, train_cfg, model_cfg):
+    """Build the detector's optimizer + optional LR scheduler.
+
+    Returns (optimizer, scheduler_or_None). Under 'adamw' the pair is byte-identical to the
+    pre-existing AdamW + CosineAnnealingLR path. Under 'muon' the scheduler is None
+    (schedule-free replaces it).
+    """
+    kind = train_cfg['optimizer']
+    lr = train_cfg['lr']
+    wd = train_cfg['weight_decay']
+
+    def _split_decay(params):
+        params = list(params)
+        if not train_cfg['no_decay_norm_bias']:
+            return [{'params': params, 'weight_decay': wd}]
+        decay = [p for p in params if p.dim() > 1]
+        no_decay = [p for p in params if p.dim() <= 1]
+        out = []
+        if decay:
+            out.append({'params': decay, 'weight_decay': wd})
+        if no_decay:
+            out.append({'params': no_decay, 'weight_decay': 0.0})
+        return out
+
+    if kind == 'adamw':
+        groups = []
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        if model_cfg['pretrained']:
+            backbone_ids = {id(p) for p in model.backbone.parameters()}
+            backbone_params = [p for p in trainable if id(p) in backbone_ids]
+            other_params = [p for p in trainable if id(p) not in backbone_ids]
+            for g in _split_decay(backbone_params):
+                groups.append({**g, 'lr': lr * BACKBONE_LR_SCALE})
+            for g in _split_decay(other_params):
+                groups.append({**g, 'lr': lr})
+        else:
+            for g in _split_decay(trainable):
+                groups.append({**g, 'lr': lr})
+        opt = torch.optim.AdamW(groups, weight_decay=wd)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
+        return opt, sched
+
+    # === kind == 'muon' ===
+    # Route: 2D .weight -> Muon (wrapped in ScheduleFree), everything else -> AdamW-SF.
+    # `torch.optim.Muon` ONLY ACCEPTS 2D TENSORS and raises on 4D conv weights. For a pure CNN
+    # (tiny/nano/s/cspnext), every conv weight is 4D, so Muon gets NOTHING and the optimizer is
+    # just AdamW-ScheduleFree (no cosine schedule). For a ViT backbone, ~96% of params are 2D
+    # and Muon routes them all -- confirmed by `dev/scratch/prototype_muon_detector.py`.
+    from torch.optim import Muon as TorchMuon
+    from schedulefree import AdamWScheduleFree, ScheduleFreeWrapper
+
+    backbone_ids = ({id(p) for p in model.backbone.parameters()}
+                    if model_cfg['pretrained'] else set())
+    muon_groups, adamw_groups = [], []
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_backbone = id(p) in backbone_ids
+        base_lr = lr * (BACKBONE_LR_SCALE if is_backbone and model_cfg['pretrained'] else 1.0)
+
+        # Muon routing rule (same as the pose model in tailcyclenet/optim.py): 2D .weight
+        # tensors that are NOT nn.Embedding -> Muon. Everything else (4D conv, 1D bias,
+        # GroupNorm/LayerNorm affine) -> AdamW-SF. The detector has no nn.Embedding layers.
+        if p.ndim == 2 and name.endswith('.weight'):
+            muon_groups.append({
+                'params': [p],
+                'lr': base_lr * train_cfg['muon_lr_scale'],
+                'weight_decay': 0.0,   # decay applied by the ScheduleFreeWrapper
+            })
+        else:
+            adamw_groups.append({
+                'params': [p],
+                'lr': base_lr,
+                'weight_decay': (wd if p.dim() > 1 or not train_cfg['no_decay_norm_bias']
+                                 else 0.0),
+            })
+
+    betas = (train_cfg['beta1'], train_cfg['beta2'])
+    opt_adam = AdamWScheduleFree(
+        [g for g in adamw_groups if g['params']], lr=lr, weight_decay=wd,
+        warmup_steps=train_cfg['warmup_steps'], betas=betas)
+
+    if muon_groups:
+        base_muon = TorchMuon(
+            [g for g in muon_groups if g['params']], lr=lr, weight_decay=0.0,
+            momentum=train_cfg['muon_momentum'], adjust_lr_fn='match_rms_adamw')
+        opt_muon = ScheduleFreeWrapper(base_muon, momentum=0.9, weight_decay_at_y=wd)
+        from posetail.posetail.muon import DualOptimizer
+        opt = DualOptimizer(opt_muon, opt_adam)
+    else:
+        # Pure CNN path: no 2D .weight params exist, Muon has nothing to route.
+        opt = opt_adam
+
+    n_muon = sum(p.numel() for g in muon_groups for p in g['params'])
+    n_adamw = sum(p.numel() for g in adamw_groups for p in g['params'])
+    print(f'optimizer: muon | {n_muon/1e6:.2f}M Muon-routed (2D), '
+          f'{n_adamw/1e6:.2f}M AdamW-SF (4D conv + bias + norm)')
+    return opt, None   # no scheduler -- schedule-free replaces the cosine
+
+
 def _record_run(run: Path, config: dict) -> None:
     """Write the run folder's reproducibility record: the effective config + provenance.
 
@@ -276,6 +380,8 @@ def main():
     if model_cfg['pretrained'] == 'coco':
         n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'])
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors', flush=True)
+    elif model_cfg['pretrained'] == 'dinov2':
+        print('  loaded DINOv2 hub weights into the ViT backbone', flush=True)
     elif model_cfg['pretrained']:
         # In-domain backbone from scripts/pretrain_detector_backbone.py; no scale/channel
         # correction -- it already speaks this repo's [0,1] RGB convention.
@@ -283,51 +389,27 @@ def main():
         print(f'  loaded in-domain backbone: {n_loaded} conv tensors from '
               f'{model_cfg["pretrained"]}', flush=True)
 
+    # A2.6: freeze the ViT backbone BEFORE the optimizer is built -- a frozen param must be
+    # excluded from every param group, not merely left with a grad-less one.
+    if train_cfg['freeze_backbone'] and hasattr(model.backbone, 'freeze_backbone'):
+        model.backbone.freeze_backbone()
+        n_frozen = sum(1 for p in model.parameters() if not p.requires_grad)
+        n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
+        print(f'freeze_backbone: {n_frozen} frozen, {n_trainable} trainable')
+
     # Differential LR: any pretrained backbone gets BACKBONE_LR_SCALE x lr, the fresh neck/head
     # lr. The lower backbone rate is because COCO conv weights trained under BatchNorm land in a
     # fresh GroupNorm net; the same scale is reused for in-domain backbones. With no pretraining
     # this builds one param group, byte-identical to every optimizer on record.
-    BACKBONE_LR_SCALE = 0.1
-
-    def _split_decay(params):
-        # C3 (detector_v2 plan SS2.4): every dim<=1 tensor (GroupNorm affine + every bias) goes to
-        # weight_decay=0; everything else keeps the configured decay. RTMDet's own
-        # norm_decay_mult=0, bias_decay_mult=0, paired with a real wd -- report 42's C1 tested
-        # wd=0.05 WITH norm and bias decayed, a materially different configuration. Returns 1 or 2
-        # param-group dicts (missing 'lr', filled in by the caller).
-        params = list(params)
-        if not train_cfg['no_decay_norm_bias']:
-            return [{'params': params, 'weight_decay': train_cfg['weight_decay']}]
-        decay = [p for p in params if p.dim() > 1]
-        no_decay = [p for p in params if p.dim() <= 1]
-        out = []
-        if decay:
-            out.append({'params': decay, 'weight_decay': train_cfg['weight_decay']})
-        if no_decay:
-            out.append({'params': no_decay, 'weight_decay': 0.0})
-        return out
-
-    groups = []
-    if model_cfg['pretrained']:
-        backbone_ids = {id(p) for p in model.backbone.parameters()}
-        backbone_params = [p for p in model.parameters() if id(p) in backbone_ids]
-        other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
-        for g in _split_decay(backbone_params):
-            groups.append({**g, 'lr': train_cfg['lr'] * BACKBONE_LR_SCALE})
-        for g in _split_decay(other_params):
-            groups.append({**g, 'lr': train_cfg['lr']})
+    opt, sched = build_detector_optimizer(model, train_cfg, model_cfg)
+    if model_cfg['pretrained'] and train_cfg['optimizer'] == 'adamw':
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
               f'neck/head {train_cfg["lr"]:g}', flush=True)
-    else:
-        for g in _split_decay(model.parameters()):
-            groups.append({**g, 'lr': train_cfg['lr']})
-    if train_cfg['no_decay_norm_bias']:
-        n_no_decay = sum(p.numel() for g in groups if g['weight_decay'] == 0.0
-                         for p in g['params'])
+    if train_cfg['no_decay_norm_bias'] and train_cfg['optimizer'] == 'adamw':
+        n_no_decay = sum(p.numel() for p in model.parameters()
+                         if p.requires_grad and p.dim() <= 1)
         print(f'  no_decay_norm_bias: {n_no_decay} params (dim<=1) excluded from weight decay',
               flush=True)
-    opt = torch.optim.AdamW(groups, weight_decay=train_cfg['weight_decay'])
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
 
     history = []
     # `detector.pth` is the BEST checkpoint, not the last one -- recall peaks early and falls
@@ -336,6 +418,8 @@ def main():
     best_score = -float('inf')
     it, t0, running = 0, time.time(), []
     model.train()
+    if hasattr(opt, 'train'):
+        opt.train()
     while it < train_cfg['iters']:
         for batch in loader:
             if it >= train_cfg['iters']:
@@ -368,9 +452,20 @@ def main():
                                         tal_beta=train_cfg['tal_beta'])
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+            if train_cfg['optimizer'] == 'muon':
+                # Clip only AdamW-routed params (biases, norms, 4D conv weights) -- Muon
+                # orthogonalises its own gradients via Newton-Schulz inside step(), so clipping
+                # them fights the orthogonalisation (see CLAUDE.md's pose-model precedent).
+                adamw_groups = (opt.opt_adam.param_groups if hasattr(opt, 'opt_adam')
+                                else opt.param_groups)
+                adamw_ps = [p for g in adamw_groups for p in g['params'] if p.grad is not None]
+                if adamw_ps:
+                    torch.nn.utils.clip_grad_norm_(adamw_ps, 10.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             opt.step()
-            sched.step()
+            if sched is not None:
+                sched.step()
             running.append(float(loss.detach()))
             it += 1
             # D3: shared-memory value a forked worker reads at its own __getitem__ time -- see
@@ -391,6 +486,8 @@ def main():
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
                 # Both splits, every checkpoint, the score stored beside the weights -- a rolling
                 # `detector.pth` with no score cannot be selected on.
+                if hasattr(opt, 'eval'):
+                    opt.eval()     # swap in the averaged iterate for scoring
                 scores, obj_scores = {}, []
                 for name, ds in (('train', train), ('val', val)):
                     if ds is None:
@@ -402,6 +499,8 @@ def main():
                         batches=train_cfg['eval_batches'], num_workers=2,
                         out_scores=obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
                         center_dist_thresh=train_cfg['nms_center_dist_thresh']))
+                if hasattr(opt, 'train'):
+                    opt.train()    # restore the working iterate for training
                 # Record the objectness distribution: saturation is a property of the recipe, not
                 # the dataset, so `--det-score` cannot be a constant.
                 obj_q = {}
@@ -417,6 +516,7 @@ def main():
                 # weights, and absent reads as a fact about the file (0 / 'trimmed'), not a guess.
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
                         'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': model_cfg['yolox'],
+                        'optimizer_kind': train_cfg['optimizer'],
                         # Part of the weights; absent means 0.5, a fact about old checkpoints.
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],
                         'pretrained': model_cfg['pretrained'],

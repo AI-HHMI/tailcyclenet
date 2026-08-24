@@ -4853,3 +4853,173 @@ eval_batches = 1
     assert ckpt['pretrained'] == str(backbone_path)
     model, *_ = load_detector(finetune_out / 'detector.pth')
     assert model.bottleneck_expansion == 0.5
+
+
+# --- A1: SF-Muon optimizer -------------------------------------------------------------------
+
+def test_detector_config_optimizer_default_adamw(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['training']['optimizer'] == 'adamw'
+    assert cfg['training']['muon_momentum'] == 0.95
+    assert cfg['training']['muon_lr_scale'] == 1.0
+    assert cfg['training']['warmup_steps'] == 500
+    assert cfg['training']['beta1'] == 0.9 and cfg['training']['beta2'] == 0.95
+    assert cfg['training']['freeze_backbone'] is False
+
+
+def test_detector_config_optimizer_invalid_raises(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+[training]
+out = "/tmp/run"
+optimizer = "sgd"
+""")
+    with pytest.raises(SystemExit, match='optimizer'):
+        load_detector_config(p)
+
+
+def test_detector_config_optimizer_muon_keys(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+[training]
+out = "/tmp/run"
+optimizer = "muon"
+muon_momentum = 0.9
+muon_lr_scale = 2.0
+warmup_steps = 10
+""")
+    cfg = load_detector_config(p)
+    assert cfg['training']['optimizer'] == 'muon'
+    assert cfg['training']['muon_momentum'] == 0.9
+    assert cfg['training']['muon_lr_scale'] == 2.0
+    assert cfg['training']['warmup_steps'] == 10
+
+
+def test_build_detector_optimizer_pure_cnn_routes_nothing_to_muon():
+    """A pure-CNN detector (every conv weight is 4D) has nothing for Muon to route -- the
+    resulting optimizer must be plain AdamWScheduleFree, matching
+    `dev/scratch/prototype_muon_detector.py`."""
+    from schedulefree import AdamWScheduleFree
+
+    from tailcyclenet.detector.yolox import YOLOXNano
+    train_mod = _load_train_detector_script()
+    model = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
+    train_cfg = {'optimizer': 'muon', 'lr': 1e-3, 'weight_decay': 5e-4,
+                'no_decay_norm_bias': False, 'muon_lr_scale': 1.0, 'muon_momentum': 0.95,
+                'warmup_steps': 0, 'beta1': 0.9, 'beta2': 0.95}
+    model_cfg = {'pretrained': ''}
+    opt, sched = train_mod.build_detector_optimizer(model, train_cfg, model_cfg)
+    assert sched is None
+    assert isinstance(opt, AdamWScheduleFree)
+
+
+def test_build_detector_optimizer_adamw_matches_param_count():
+    train_mod = _load_train_detector_script()
+    from tailcyclenet.detector.yolox import YOLOXNano
+    model = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
+    train_cfg = {'optimizer': 'adamw', 'lr': 1e-3, 'weight_decay': 5e-4,
+                'no_decay_norm_bias': False, 'iters': 10}
+    model_cfg = {'pretrained': ''}
+    opt, sched = train_mod.build_detector_optimizer(model, train_cfg, model_cfg)
+    n_opt = sum(p.numel() for g in opt.param_groups for p in g['params'])
+    n_model = sum(p.numel() for p in model.parameters())
+    assert n_opt == n_model
+    assert isinstance(sched, torch.optim.lr_scheduler.CosineAnnealingLR)
+
+
+def _load_train_detector_script():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_for_optim',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_train_detector_muon_optimizer_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A short run with `[training].optimizer = "muon"` through the real CLI entry point: must
+    train to completion with no error, and the checkpoint must record `optimizer_kind`."""
+    import sys
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+optimizer = "muon"
+""")
+    mod = _load_train_detector_script()
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+    ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
+    assert ckpt['optimizer_kind'] == 'muon'
+
+
+def test_train_detector_adamw_optimizer_is_default_end_to_end(tmp_path, dense_root, monkeypatch):
+    """Default optimizer stays 'adamw' and the checkpoint records it -- output-neutral change."""
+    import sys
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+""")
+    mod = _load_train_detector_script()
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+    ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
+    assert ckpt['optimizer_kind'] == 'adamw'

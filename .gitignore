@@ -4,6 +4,8 @@ runs/
 .pi/
 .pi-tasks/
 *.egg-info/
+dist/
+build/
 __pycache__/
 *.pyc
 

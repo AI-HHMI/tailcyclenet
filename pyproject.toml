@@ -4,13 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tailcyclenet"
-version = "0.1.0"
+version = "0.0.1"
 description = "finetune a posetail tracker into an animal pose estimator (3D multiview, 3D single-view, 2D single-view)"
 requires-python = ">=3.11"
-dependencies = []
+readme = "README.md"
+license = "BSD-3-Clause"
+keywords = ["animal pose estimation", "3d tracking", "multi-view", "posetail"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "posetail==0.4.1",
+    "torch>=2,<3",
+    "einops",
+    "numpy>=1.26",
+    "scipy",
+    "pyarrow",
+    "av>=12",
+    "tqdm",
+]
 
-[tool.setuptools.packages.find]
-include = ["tailcyclenet*"]
+[project.urls]
+Repository = "https://github.com/AI-HHMI/tailcyclenet"
+
+[tool.setuptools]
+packages = ["tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer"]
 
 [tool.pixi.system-requirements]
 libc = { family = "glibc", version = "2.34" }
@@ -54,8 +74,13 @@ torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
 # can even build the module tree.
 termcolor = "*"
 
+[tool.pixi.feature.dev.dependencies]
+python-build = "*"
+twine = "*"
+
 [tool.pixi.environments]
 default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.dependencies]
 python = "3.11.*"

@@ -381,7 +381,10 @@ def main():
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
                       p2=model_cfg['p2'], in_channels=in_channels,
                       head_depthwise=train_cfg['head_depthwise'],
-                      pretrained=model_cfg['pretrained']).to(device)
+                      pretrained=model_cfg['pretrained'],
+                      shared_head=train_cfg['shared_head'],
+                      fpn_upsample=train_cfg['fpn_upsample'],
+                      p2_bottomup=train_cfg['p2_bottomup']).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g}, '
@@ -458,7 +461,8 @@ def main():
                                         focal_gamma=train_cfg['focal_gamma'],
                                         tal_topk=train_cfg['tal_topk'],
                                         tal_alpha=train_cfg['tal_alpha'],
-                                        tal_beta=train_cfg['tal_beta'])
+                                        tal_beta=train_cfg['tal_beta'],
+                                        tal_soft_prior=train_cfg['tal_soft_prior'])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if train_cfg['optimizer'] == 'muon':
@@ -537,6 +541,16 @@ def main():
                         'tal_topk': train_cfg['tal_topk'],
                         'tal_alpha': train_cfg['tal_alpha'],
                         'tal_beta': train_cfg['tal_beta'],
+                        'tal_soft_prior': train_cfg['tal_soft_prior'],
+                        # G1/G3: `shared_head=False`/`p2_bottomup=True` each add tensors
+                        # (`obj_convs`/`out2`) that `load_detector` must reconstruct before
+                        # `load_state_dict` can match keys -- both part of the weights, not just
+                        # provenance. `fpn_upsample` adds no params (an interpolate mode) but
+                        # rides beside them for the same reason `box_loss` does. Absent means the
+                        # byte-identical default for each.
+                        'shared_head': train_cfg['shared_head'],
+                        'fpn_upsample': train_cfg['fpn_upsample'],
+                        'p2_bottomup': train_cfg['p2_bottomup'],
                         # Same shape: absent means False, a fact about old checkpoints.
                         'p2': model_cfg['p2'],
                         # `in_channels` is what `load_detector` needs to rebuild the stem (absent

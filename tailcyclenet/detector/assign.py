@@ -60,12 +60,19 @@ def giou_loss(pred, target, eps=1e-7):
     return 1.0 - (iou - (carea - union) / carea)
 
 
-def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.0):
+def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.0,
+               soft_prior=False):
     """Task-aligned assignment (YOLOv8/RTMDet style).
 
     Candidate anchors are inside each finite GT box, then the detached prediction quality
     ``sigmoid(obj)**alpha * IoU**beta`` selects up to ``topk`` anchors per GT.  An anchor that
     appears in several GT top-k sets is assigned to the GT with the greatest alignment score.
+
+    G4 (`soft_prior=True`, detector_architecture_sweep plan): the strict `inside` candidacy mask
+    is relaxed to `inside | near`, reusing `assign()`'s own `CENTER_RADIUS=2.5`-cell radius --
+    an anchor near (but outside) the box can still be a candidate, which helps edge-truncated
+    animals where the GT box centre sits near the frame border and few anchors land inside.
+    Default `False` is byte-identical to every checkpoint on record.
     """
     empty = (torch.zeros(0, dtype=torch.long, device=anchors.device),) * 2
     finite = torch.isfinite(gt_boxes).all(-1)
@@ -76,16 +83,25 @@ def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.
     cx, cy = anchors[:, 0], anchors[:, 1]
     inside = ((cx[:, None] > gt[None, :, 0]) & (cx[:, None] < gt[None, :, 2]) &
               (cy[:, None] > gt[None, :, 1]) & (cy[:, None] < gt[None, :, 3]))
-    if not inside.any():
+    if soft_prior:
+        stride = anchors[:, 2]
+        gcx = (gt[:, 0] + gt[:, 2]) / 2
+        gcy = (gt[:, 1] + gt[:, 3]) / 2
+        r = CENTER_RADIUS * stride[:, None]
+        near = ((cx[:, None] - gcx[None]).abs() < r) & ((cy[:, None] - gcy[None]).abs() < r)
+        candidate = inside | near
+    else:
+        candidate = inside
+    if not candidate.any():
         return empty
     with torch.no_grad():
         quality = (obj_logits.sigmoid()[:, None].pow(alpha) *
                    box_iou(boxes, gt).clamp_min(0).pow(beta))
-        quality = torch.where(inside, quality, torch.zeros_like(quality))
+        quality = torch.where(candidate, quality, torch.zeros_like(quality))
         k = min(max(int(topk), 1), anchors.shape[0])
         _, top_idx = quality.topk(k, dim=0)
-        pos_mask = torch.zeros_like(inside)
-        pos_mask.scatter_(0, top_idx, inside.gather(0, top_idx))
+        pos_mask = torch.zeros_like(candidate)
+        pos_mask.scatter_(0, top_idx, candidate.gather(0, top_idx))
         if not pos_mask.any():
             return empty
         multi = pos_mask.sum(1) > 1
@@ -281,7 +297,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   regions=None, ignore=None, iou_aware=False, iou_aware_warmup=2000, it=None,
                   max_pos_per_gt=None, assignment='center', box_loss_fn='giou',
                   focal_obj=False, focal_gamma=2.0, tal_topk=13, tal_alpha=1.0,
-                  tal_beta=6.0):
+                  tal_beta=6.0, tal_soft_prior=False):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Objectness is the whole classification signal: with one class, "is there an animal here"
@@ -347,7 +363,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         if assignment == 'tal':
             pos, gix = assign_tal(anchors, gt_boxes[b], obj_logits[b].detach(),
                                   boxes[b].detach(), topk=tal_topk, alpha=tal_alpha,
-                                  beta=tal_beta)
+                                  beta=tal_beta, soft_prior=tal_soft_prior)
         else:
             pos, gix = assign(anchors, gt_boxes[b], max_pos_per_gt=max_pos_per_gt)
         if regions is not None:

@@ -143,7 +143,10 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
                       p2=bool(ckpt.get('p2', False)),
                       in_channels=int(ckpt.get('in_channels', 3)),
                       head_depthwise=ckpt.get('head_depthwise', None),
-                      pretrained=str(ckpt.get('pretrained', '') or ''))
+                      pretrained=str(ckpt.get('pretrained', '') or ''),
+                      shared_head=bool(ckpt.get('shared_head', True)),
+                      fpn_upsample=str(ckpt.get('fpn_upsample', 'nearest') or 'nearest'),
+                      p2_bottomup=bool(ckpt.get('p2_bottomup', False)))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

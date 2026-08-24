@@ -353,9 +353,23 @@ class PAFPN(nn.Module):
     `down3`'s WEIGHTS are unchanged from the 3-level case; only what feeds it changes.
     """
 
-    def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False):
+    def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False,
+                fpn_upsample='nearest', p2_bottomup=False):
         super().__init__()
         self.p2 = bool(p2)
+        # G2: 'nearest' (default) is byte-identical to every checkpoint on record; 'bilinear' is
+        # RTMDet's own choice (no checkerboard artifacts, no extra params).
+        self.fpn_upsample = str(fpn_upsample)
+        if self.fpn_upsample not in ('nearest', 'bilinear'):
+            raise ValueError(f"fpn_upsample must be 'nearest' or 'bilinear', got "
+                             f"{fpn_upsample!r}")
+        # G3: p2 is the finest level, so there is no genuinely finer input to draw a bottom-up
+        # pass from the way out3/out4/out5 draw from their own finer neighbour (down2(p2), etc).
+        # `p2_bottomup=True` gives p2 the same "one more CSPLayer pass after the top-down merge"
+        # treatment those levels get, applied to p2 alone (self-refinement) rather than inventing
+        # a level finer than stride 4. Default False is byte-identical to every checkpoint on
+        # record; only constructed when both `p2` and `p2_bottomup` are set.
+        self.p2_bottomup = bool(p2_bottomup)
         if self.p2:
             c2, c3, c4, c5 = chans
         else:
@@ -374,6 +388,13 @@ class PAFPN(nn.Module):
             self.mrg2 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
             self.down2 = conv3(out, out, 3, 2, depthwise=depthwise)
             self.out3 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
+            if self.p2_bottomup:
+                self.out2 = CSPLayer(out, out, 1, shortcut=True, depthwise=depthwise)
+
+    def _upsample(self, x, size):
+        if self.fpn_upsample == 'nearest':
+            return F.interpolate(x, size=size, mode='nearest')
+        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
 
     def forward(self, feats):
         if self.p2:
@@ -381,13 +402,12 @@ class PAFPN(nn.Module):
         else:
             p3, p4, p5 = feats
         p5 = self.lat5(p5)
-        p4 = self.mrg4(torch.cat([F.interpolate(p5, size=p4.shape[-2:], mode='nearest'),
-                                  self.lat4(p4)], 1))
-        p3 = self.mrg3(torch.cat([F.interpolate(p4, size=p3.shape[-2:], mode='nearest'),
-                                  self.lat3(p3)], 1))
+        p4 = self.mrg4(torch.cat([self._upsample(p5, p4.shape[-2:]), self.lat4(p4)], 1))
+        p3 = self.mrg3(torch.cat([self._upsample(p4, p3.shape[-2:]), self.lat3(p3)], 1))
         if self.p2:
-            p2 = self.mrg2(torch.cat([F.interpolate(p3, size=p2.shape[-2:], mode='nearest'),
-                                      self.lat2(p2)], 1))
+            p2 = self.mrg2(torch.cat([self._upsample(p3, p2.shape[-2:]), self.lat2(p2)], 1))
+            if self.p2_bottomup:
+                p2 = self.out2(p2)
             n3 = self.out3(torch.cat([self.down2(p2), p3], 1))
             n4 = self.out4(torch.cat([self.down3(n3), p4], 1))
             n5 = self.out5(torch.cat([self.down4(n4), p5], 1))
@@ -412,9 +432,15 @@ class Head(nn.Module):
     `tiny` and up use full convolutions.
     """
 
-    def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True):
+    def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True, shared_head=True):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
+        # G1: `shared_head=True` (default) runs obj AND reg through the SAME `reg_convs` tower
+        # -- byte-identical to every checkpoint on record. `False` builds a SEPARATE `obj_convs`
+        # tower (mirroring YOLOX's own decoupled head, unlike this net's shared-tower default) so
+        # objectness and box regression stop competing for the same features -- ~0.3M extra
+        # params on `tiny`.
+        self.shared_head = bool(shared_head)
         # THE IDENTITY BRANCH -- a per-anchor softmax over a CLOSED animal set (what rat-city is,
         # 12 fixed rats) -- was built and deleted; see the module docstring's refutation.
         self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
@@ -425,6 +451,10 @@ class Head(nn.Module):
         self.obj_pred = nn.ModuleList([nn.Conv2d(cin, 1, 1) for _ in range(n_levels)])
         for m in self.obj_pred:                      # rare-positive prior, as in YOLOX
             nn.init.constant_(m.bias, -4.595)
+        if not self.shared_head:
+            self.obj_convs = nn.ModuleList(
+                [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
+                               conv3(cin, cin, 3, depthwise=depthwise)) for _ in range(n_levels)])
         if self.n_keypoints:
             self.kpt_convs = nn.ModuleList(
                 [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
@@ -438,8 +468,9 @@ class Head(nn.Module):
         for i, f in enumerate(feats):
             stem = self.stems[i](f)
             x = self.reg_convs[i](stem)
+            obj_x = x if self.shared_head else self.obj_convs[i](stem)
             kpt = self.kpt_pred[i](self.kpt_convs[i](stem)) if self.n_keypoints else None
-            outs.append((self.obj_pred[i](x), self.reg_pred[i](x), kpt))
+            outs.append((self.obj_pred[i](obj_x), self.reg_pred[i](x), kpt))
         return outs
 
 
@@ -467,11 +498,16 @@ class YOLOXNano(nn.Module):
     decodes single frames, so passing `in_channels != 3` today builds a model that trains on
     garbage unless the CALLER also supplies genuinely wider `x`. This constructor argument is
     scaffolding for that follow-on, not a complete feature.
+
+    `shared_head` (default `True`), `fpn_upsample` (default `'nearest'`) and `p2_bottomup`
+    (default `False`) are §2's implementation-gap levers (`Head`/`PAFPN`'s own docstrings) --
+    every default is byte-identical to every checkpoint on record.
     """
     STRIDES = (8, 16, 32)
 
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
-                p2=False, in_channels=3, head_depthwise=None, pretrained=''):
+                p2=False, in_channels=3, head_depthwise=None, pretrained='',
+                shared_head=True, fpn_upsample='nearest', p2_bottomup=False):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
@@ -534,11 +570,11 @@ class YOLOXNano(nn.Module):
                                        p2=self.p2, in_channels=self.in_channels)
             neck_out = round8(256 * width_mul)
         self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise,
-                          p2=self.p2)
+                          p2=self.p2, fpn_upsample=fpn_upsample, p2_bottomup=p2_bottomup)
         n_levels = 4 if self.p2 else 3
         head_dw = depthwise if head_depthwise is None else bool(head_depthwise)
         self.head = Head(neck_out, n_levels=n_levels, n_keypoints=self.n_keypoints,
-                         depthwise=head_dw)
+                         depthwise=head_dw, shared_head=shared_head)
         if self.p2:
             self.STRIDES = (4, 8, 16, 32)
 

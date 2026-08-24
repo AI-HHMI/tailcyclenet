@@ -5334,3 +5334,167 @@ out = "/tmp/run"
 """)
     with pytest.raises(SystemExit, match="no counterpart"):
         load_detector_config(p)
+
+
+# --- §2 implementation-gap levers (G1-G4) ------------------------------------------------------
+
+def test_detector_config_gap_lever_defaults(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['training']['shared_head'] is True
+    assert cfg['training']['fpn_upsample'] == 'nearest'
+    assert cfg['training']['p2_bottomup'] is False
+    assert cfg['training']['tal_soft_prior'] is False
+
+
+def test_detector_config_fpn_upsample_invalid_raises(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+[training]
+out = "/tmp/run"
+fpn_upsample = "bicubic"
+""")
+    with pytest.raises(SystemExit, match='fpn_upsample'):
+        load_detector_config(p)
+
+
+def test_g1_shared_head_false_adds_separate_obj_tower():
+    shared = YOLOXNano(version='tiny', p2=True, shared_head=True)
+    unshared = YOLOXNano(version='tiny', p2=True, shared_head=False)
+    assert not hasattr(shared.head, 'obj_convs')
+    assert hasattr(unshared.head, 'obj_convs')
+    n_shared = sum(p.numel() for p in shared.parameters())
+    n_unshared = sum(p.numel() for p in unshared.parameters())
+    assert n_unshared > n_shared
+
+
+def test_g1_shared_head_default_forward_matches_reg_tower_output():
+    """`shared_head=True` (default) must route obj through the SAME tensor as reg -- a
+    regression guard against `Head.forward` accidentally building `obj_convs` unconditionally."""
+    model = YOLOXNano(version='tiny', p2=False, shared_head=True)
+    x = torch.rand(1, 3, 128, 128)
+    obj, boxes, kpt = model(x)
+    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
+
+
+def test_g2_fpn_upsample_bilinear_forwards():
+    model = YOLOXNano(version='tiny', p2=True, fpn_upsample='bilinear')
+    assert model.neck.fpn_upsample == 'bilinear'
+    x = torch.rand(1, 3, 128, 128)
+    obj, boxes, kpt = model(x)
+    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
+
+
+def test_g2_fpn_upsample_default_is_nearest():
+    model = YOLOXNano(version='tiny', p2=True)
+    assert model.neck.fpn_upsample == 'nearest'
+
+
+def test_g3_p2_bottomup_adds_out2_and_forwards():
+    with_bu = YOLOXNano(version='tiny', p2=True, p2_bottomup=True)
+    without_bu = YOLOXNano(version='tiny', p2=True, p2_bottomup=False)
+    assert hasattr(with_bu.neck, 'out2')
+    assert not hasattr(without_bu.neck, 'out2')
+    x = torch.rand(1, 3, 128, 128)
+    obj, boxes, kpt = with_bu(x)
+    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
+
+
+def test_g3_p2_bottomup_inert_without_p2():
+    """`p2_bottomup=True` alongside `p2=False` has no finest level to refine -- inert, not an
+    error, matching the "not built and ignored" contract other p2-only modules use."""
+    model = YOLOXNano(version='tiny', p2=False, p2_bottomup=True)
+    assert not hasattr(model.neck, 'out2')
+
+
+def test_g4_tal_soft_prior_never_shrinks_the_candidate_set():
+    """`inside | near` is a superset of `inside` alone, so the soft prior can only add positives,
+    never remove them, for the same GT box and quality surface."""
+    from tailcyclenet.detector.assign import assign_tal
+
+    torch.manual_seed(0)
+    anchors = torch.stack([torch.arange(0, 200, 20, dtype=torch.float32),
+                           torch.arange(0, 200, 20, dtype=torch.float32),
+                           torch.full((10,), 20.0)], dim=-1)
+    gt = torch.tensor([[5., 5., 15., 15.]])            # near anchor 0's cell, mostly OUTSIDE
+    obj_logits = torch.zeros(10)
+    boxes = anchors[:, :2].repeat(1, 2)
+    pos_strict, _ = assign_tal(anchors, gt, obj_logits, boxes, topk=13, soft_prior=False)
+    pos_soft, _ = assign_tal(anchors, gt, obj_logits, boxes, topk=13, soft_prior=True)
+    assert set(pos_strict.tolist()) <= set(pos_soft.tolist())
+    assert len(pos_soft) >= len(pos_strict)
+
+
+def test_detector_loss_threads_tal_soft_prior():
+    from tailcyclenet.detector.assign import detector_loss
+
+    model = YOLOXNano(version='tiny', p2=False)
+    x = torch.rand(1, 3, 128, 128)
+    obj, boxes, kpt = model(x)
+    anchors = model.anchor_points(128, 128, x.device)
+    gt = torch.tensor([[[2., 2., 10., 10.]]])           # a tiny, edge-adjacent box
+    _, parts_strict = detector_loss(obj, boxes, anchors, gt, assignment='tal',
+                                    tal_soft_prior=False)
+    _, parts_soft = detector_loss(obj, boxes, anchors, gt, assignment='tal',
+                                  tal_soft_prior=True)
+    assert parts_soft['n_pos'] >= parts_strict['n_pos']
+
+
+def test_train_detector_gap_levers_end_to_end(tmp_path, dense_root, monkeypatch):
+    """A short run with every §2 lever flipped on, through the real CLI entry point."""
+    import sys
+
+    out = tmp_path / 'run'
+    cfg = _write_config(tmp_path, f"""
+[data]
+path = "{dense_root}"
+boxes = "keypoints"
+min_crop_dim = 16
+input_wh = [48, 48]
+min_box_px = 0
+frames_per_group = 8
+val_frames_per_group = 4
+augment = false
+augment_strong = false
+rotate_deg = 0.0
+[model]
+yolox = "tiny"
+p2 = true
+[training]
+out = "{out}"
+iters = 2
+batch_size = 2
+lr = 1e-3
+num_workers = 0
+seed = 0
+device = "cpu"
+eval_every = 2
+eval_batches = 1
+assignment = "tal"
+shared_head = false
+fpn_upsample = "bilinear"
+p2_bottomup = true
+tal_soft_prior = true
+""")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('tcn_train_detector_gap_levers',
+                                                  REPO / 'scripts' / 'train_detector.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
+    mod.main()
+    assert (out / 'detector.pth').exists()
+
+    from tailcyclenet.detector import load_detector
+    model, *_ = load_detector(out / 'detector.pth')
+    assert hasattr(model.head, 'obj_convs')
+    assert model.neck.fpn_upsample == 'bilinear'
+    assert hasattr(model.neck, 'out2')

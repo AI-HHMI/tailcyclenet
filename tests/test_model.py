@@ -277,6 +277,35 @@ def test_mismatched_image_size_is_rejected():
         check_image_size({'model': {'image_size': 256}, 'data': {'image_size': 128}})
 
 
+def test_hf_repo_id_detection(tmp_path):
+    from tailcyclenet.checkpoints import is_hf_repo_id
+
+    assert is_hf_repo_id('org/model')
+    assert is_hf_repo_id('user/repo-name')
+    assert not is_hf_repo_id('/absolute/path')
+    assert not is_hf_repo_id('./relative/path')
+    assert not is_hf_repo_id('no-slash')
+    assert not is_hf_repo_id('too/many/slashes')
+    local = tmp_path / 'local' / 'checkpoint'
+    local.mkdir(parents=True)
+    assert not is_hf_repo_id(str(local))
+
+
+def test_resolve_hf_checkpoint_downloads_model(monkeypatch):
+    import huggingface_hub
+    from tailcyclenet.checkpoints import resolve_hf_checkpoint
+
+    calls = []
+
+    def fake_download(**kwargs):
+        calls.append(kwargs)
+        return '/tmp/model.pth'
+
+    monkeypatch.setattr(huggingface_hub, 'hf_hub_download', fake_download)
+    assert resolve_hf_checkpoint('org/model', revision='main') == Path('/tmp/model.pth')
+    assert calls == [{'repo_id': 'org/model', 'filename': 'model.pth', 'revision': 'main'}]
+
+
 def test_resolve_checkpoint_prefers_last(tmp_path):
     """`last` is the default by name, not by sort order, and old numbered folders still resolve."""
     from tailcyclenet.checkpoints import resolve_checkpoint

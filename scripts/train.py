@@ -27,9 +27,9 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import distributed as dist_utils
-from tailcyclenet.checkpoints import (check_image_size, load_config, prior_provenance,
-                                      resolve_checkpoint, save_checkpoint, save_run_meta,
-                                      warm_start)
+from tailcyclenet.checkpoints import (check_image_size, is_hf_repo_id, load_config,
+                                      prior_provenance, resolve_checkpoint, resolve_hf_checkpoint,
+                                      save_checkpoint, save_run_meta, warm_start)
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
                                   worker_init)
 from tailcyclenet.format import Registry
@@ -371,8 +371,9 @@ def main():
     # val_freq = 0: no validation, no `checkpoint_best.pth`, and a run that prints fine for 60,000
     # iterations. The sub-blocks are guarded on their own (`[training.optimizer]` by name below,
     # `[training.losses]` by `TotalLoss(**losses)`), so they are allowed through here as blocks.
-    known_training = {'n_iterations', 'seed', 'checkpoint_path', 'max_grad_norm', 'checkpoint_freq',
-                      'val_freq', 'val_batches', 'print_freq', 'out', 'optimizer', 'losses'}
+    known_training = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision',
+                      'max_grad_norm', 'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq',
+                      'out', 'optimizer', 'losses'}
     unknown_training = set(train_cfg) - known_training - {'freeze_encoder'}
     if unknown_training:
         raise SystemExit(
@@ -476,8 +477,13 @@ def main():
     model = build_model(config['model'], n_keypoints=registry.n_keypoints)
     fresh: set[str] = set()
     if not args.no_warm_start and train_cfg.get('checkpoint_path'):
-        fresh = warm_start(model, resolve_checkpoint(Path(train_cfg['checkpoint_path'])),
-                           base_names=base_reg.names if base_reg else None)
+        checkpoint_ref = train_cfg['checkpoint_path']
+        if is_hf_repo_id(checkpoint_ref):
+            checkpoint = resolve_hf_checkpoint(checkpoint_ref,
+                                               revision=train_cfg.get('checkpoint_revision'))
+        else:
+            checkpoint = resolve_checkpoint(Path(checkpoint_ref))
+        fresh = warm_start(model, checkpoint, base_names=base_reg.names if base_reg else None)
     # The encoder's gradient state is `[model].video_encoder_requires_grad` and nothing else;
     # `[training].freeze_encoder` was removed (it silently overrode the model key).
     if 'freeze_encoder' in train_cfg:

@@ -93,9 +93,10 @@ depth_log_max = 2.5
 [training]
 n_iterations = 60000
 seed = 23
-# The base tracker this finetunes from; moving-camera support added zero parameters, so older
-# checkpoints load cleanly.
-checkpoint_path = "/groups/karashchuk/home/karashchukl/results/posetail-finetuning-v3/wandb/run-20260727_113457-ukt14i7c/files/checkpoints"
+# The base tracker this finetunes from; this Hugging Face repo is downloaded and cached on first
+# launch. A local checkpoint folder is also accepted. Moving-camera support added zero parameters,
+# so older checkpoints load cleanly.
+checkpoint_path = "ai-hhmi/posetail-static-animal"
 max_grad_norm = 10.0
 checkpoint_freq = 1000
 val_freq = 200

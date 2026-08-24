@@ -36,9 +36,10 @@ MALLOC_ARENA_MAX = "2"
 
 [tool.pixi.pypi-dependencies]
 # posetail is a LIBRARY here, never modified: pinned to the PyPI release (a checkout lives at
-# ../posetail-next for READING only). 0.3.5 lands every workaround this repo carried -- the
-# cube.py patches, crop_box_for_points, input_size=/scene_features=, T=1 guard, occlusion/vis guards.
-posetail = "==0.3.5"
+# ../posetail-next for READING only). 0.4.1 lands every workaround this repo carried -- the
+# cube.py patches, crop_box_for_points, input_size=/scene_features=, T=1 guard, occlusion/vis guards --
+# and adds loading packaged TrackerEncoder weights from Hugging Face.
+posetail = "==0.4.1"
 # The pytorch branch, not PyPI's 0.8.0: its Camera is an nn.Module whose projection,
 # triangulation and Jacobians are torch ops, so camera geometry runs on GPU with the model.
 # Declares itself 0.7.2, satisfying posetail's `aniposelib>=0.7.0`.

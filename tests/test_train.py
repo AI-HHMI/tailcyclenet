@@ -204,8 +204,9 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
 
 # -- config guards -----------------------------------------------------------------------------
 
-KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'max_grad_norm', 'checkpoint_freq',
-                  'val_freq', 'val_batches', 'print_freq', 'out', 'optimizer', 'losses'}
+KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision', 'max_grad_norm',
+                  'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq', 'out', 'optimizer',
+                  'losses'}
 
 
 def test_known_training_keys_match_the_guard_in_main():

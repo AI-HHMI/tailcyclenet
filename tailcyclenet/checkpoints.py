@@ -62,6 +62,24 @@ def check_image_size(config: dict) -> None:
         f'scaling the 3D residual by {int(model_px) / int(data_px):g}.')
 
 
+def is_hf_repo_id(value: str) -> bool:
+    """Whether ``value`` is a Hugging Face repo id rather than a local path.
+
+    Hub repo ids are ``namespace/name``. Existing paths always win, so a relative local
+    checkpoint directory can still be used when it exists on disk.
+    """
+    value = str(value)
+    return (value.count('/') == 1 and not value.startswith(('/', '.'))
+            and not Path(value).exists())
+
+
+def resolve_hf_checkpoint(repo_id: str, revision: str | None = None) -> Path:
+    """Download a packaged posetail checkpoint and return its local cached path."""
+    from huggingface_hub import hf_hub_download
+
+    return Path(hf_hub_download(repo_id=repo_id, filename='model.pth', revision=revision))
+
+
 def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     """An explicit name, else `checkpoint_last.pth`, else the newest by name.
 

@@ -51,7 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--run', required=True, type=Path)
+    ap.add_argument('--run', required=True, type=Path,
+                    help='pose run folder or a self-contained pose checkpoint .pth')
     src = ap.add_mutually_exclusive_group()
     src.add_argument('--data', type=Path,
                      help='ONE session directory (a dataset root works only if it holds a '
@@ -138,13 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--boxes', type=Path, default=None,
                     help='npz of crop points per group; default is to crop from the labels')
     ap.add_argument('--detector', type=Path, default=None,
-                    help='a detector run folder. THE deployment path: boxes come from pixels, '
-                         'not from labels. A run folder defaults to its latest complete '
-                         'detector_it*.pth; pass --detector-checkpoint best for historical '
+                    help='a detector run folder or a single packaged .pth file. THE deployment '
+                         'path: boxes come from pixels, not from labels. A run folder defaults to '
+                         'detector_last.pth; pass --detector-checkpoint best for historical '
                          'detector.pth or pass an explicit checkpoint filename.')
-    ap.add_argument('--detector-checkpoint', default='latest',
-                    help="detector checkpoint selector when --detector is a run folder: 'latest' "
-                         '(default), \'best\' (historical detector.pth), or an explicit filename.')
+    ap.add_argument('--detector-checkpoint', default='last',
+                    help="detector checkpoint selector when --detector is a run folder: 'last' "
+                         "(default detector_last.pth), 'best' (historical detector.pth), "
+                         "'latest' (highest complete iteration), or an explicit filename.")
     ap.add_argument('--det-trace', type=Path, default=None,
                     help='write output-neutral per-frame/camera detector decode-stage counts as '
                          'JSON for coverage attribution (scratch diagnostic, not a prediction '

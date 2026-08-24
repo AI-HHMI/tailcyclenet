@@ -4139,7 +4139,7 @@ def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
     assert obj.shape[1] == boxes.shape[1]
 
 
-def test_detector_run_directory_defaults_to_latest_complete_checkpoint(tmp_path):
+def test_detector_run_directory_defaults_to_last_checkpoint(tmp_path):
     from tailcyclenet.detector import resolve_detector_checkpoint
 
     run = tmp_path / 'run'
@@ -4149,8 +4149,10 @@ def test_detector_run_directory_defaults_to_latest_complete_checkpoint(tmp_path)
     (run / 'config.toml').write_text('[training]\niters = 4\n')
     (run / 'metrics.json').write_text('[{"iteration": 2}, {"iteration": 4}]')
     torch.save({'iteration': 2}, run / 'detector.pth')
+    torch.save({'iteration': 4}, run / 'detector_last.pth')
 
-    assert resolve_detector_checkpoint(run) == run / 'detector_it000004.pth'
+    assert resolve_detector_checkpoint(run) == run / 'detector_last.pth'
+    assert resolve_detector_checkpoint(run, checkpoint='latest') == run / 'detector_it000004.pth'
     assert resolve_detector_checkpoint(run, checkpoint='best') == run / 'detector.pth'
 
 
@@ -4160,13 +4162,47 @@ def test_detector_run_directory_refuses_incomplete_latest_by_default(tmp_path):
     run = tmp_path / 'run'
     run.mkdir()
     torch.save({'iteration': 2}, run / 'detector_it000002.pth')
+    torch.save({'iteration': 2}, run / 'detector_last.pth')
     (run / 'config.toml').write_text('[training]\niters = 4\n')
     (run / 'metrics.json').write_text('[{"iteration": 2}]')
     with pytest.raises(ValueError, match='no complete latest'):
-        resolve_detector_checkpoint(run)
+        resolve_detector_checkpoint(run, checkpoint='latest')
     # Explicit filename is the deliberate incomplete-run override.
     assert resolve_detector_checkpoint(run, checkpoint='detector_it000002.pth') == \
         run / 'detector_it000002.pth'
+
+
+def test_detector_cli_defaults_to_last():
+    from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
+    from tailcyclenet.infer.cli import build_parser
+
+    assert build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o']).detector_checkpoint == 'last'
+    assert load_detector.__defaults__[-1] == 'last'
+    assert resolve_detector_checkpoint.__defaults__[-1] == 'last'
+
+
+def test_detector_packaging_preserves_config(tmp_path):
+    from scripts.package_checkpoint import package_detector
+    from tailcyclenet.detector import load_detector
+
+    run = tmp_path / 'run'
+    run.mkdir()
+    config = {'data': {'input_wh': [96, 96]}, 'model': {'yolox': 'tiny'},
+              'training': {'iters': 2, 'seed': 7}}
+    (run / 'config.toml').write_text('[training]\niters = 2\n')
+    model = YOLOXNano(version='tiny')
+    source = {'iteration': 2, 'model_state': model.state_dict(), 'input_wh': [96, 96],
+              'n_keypoints': 0, 'norm': 'gn', 'yolox_version': 'tiny',
+              'bottleneck_expansion': 0.5, 'p2': False, 'in_channels': 3, 'config': config}
+    torch.save(source, run / 'detector_last.pth')
+    out = tmp_path / 'detector.pth'
+    package_detector(run, out)
+    loaded, wh, *_ = load_detector(out)
+    packaged = torch.load(out, map_location='cpu', weights_only=False)
+    assert wh == (96, 96)
+    assert packaged['config'] == config
+    assert packaged['kind'] == 'detector'
+    assert loaded.in_channels == 3
 
 
 def test_load_detector_absent_in_channels_means_3(tmp_path):

@@ -306,6 +306,40 @@ def test_resolve_hf_checkpoint_downloads_model(monkeypatch):
     assert calls == [{'repo_id': 'org/model', 'filename': 'model.pth', 'revision': 'main'}]
 
 
+def test_self_contained_pose_checkpoint_round_trips(tmp_path):
+    from scripts.package_checkpoint import package_pose
+    from tailcyclenet.checkpoints import load_run
+    from tailcyclenet.format import Registry
+
+    registry = Registry(names=('nose',), datasets=(('ds', (0,)),))
+    config = {'model': SMALL, 'data': {'image_size': 64, 'n_frames': 4,
+                                      'min_crop_dim': 16, 'box_source': 'keypoints'},
+              'training': {'seed': 7}}
+    run = tmp_path / 'run'
+    (run / 'checkpoints').mkdir(parents=True)
+    (run / 'config.toml').write_text('''[data]\nimage_size = 64\nn_frames = 4\nmin_crop_dim = 16\nbox_source = "keypoints"\n[model]\n''')
+    # Use the real TOML writer for the model's nested config and registry sidecar.
+    import toml
+    (run / 'config.toml').write_text(toml.dumps(config))
+    registry.save(run / 'keypoint_registry.toml')
+    model = build_model(SMALL, n_keypoints=1).eval()
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    torch.save({'iteration': 12, 'model_state': state, 'model_state_eval': state,
+                'config': config, 'model_config': SMALL,
+                'keypoint_registry': registry.to_dict()},
+               run / 'checkpoints' / 'checkpoint_last.pth')
+
+    raw, raw_cfg, raw_reg, _ = load_run(run / 'checkpoints' / 'checkpoint_last.pth')
+    packaged_path = tmp_path / 'pose.pth'
+    package_pose(run, packaged_path)
+    packaged, packaged_cfg, packaged_reg, _ = load_run(packaged_path)
+    assert raw_cfg == packaged_cfg == config
+    assert raw_reg == packaged_reg == registry
+    for name, value in state.items():
+        assert torch.equal(packaged.state_dict()[name], value)
+        assert torch.equal(raw.state_dict()[name], value)
+
+
 def test_resolve_checkpoint_prefers_last(tmp_path):
     """`last` is the default by name, not by sort order, and old numbered folders still resolve."""
     from tailcyclenet.checkpoints import resolve_checkpoint

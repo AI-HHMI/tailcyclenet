@@ -16,18 +16,24 @@ from .pretrained import load_coco_backbone, load_pretrained_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 
-def resolve_detector_checkpoint(path, checkpoint='latest'):
+def resolve_detector_checkpoint(path, checkpoint='last'):
     """Resolve a detector file from a run directory.
 
-    Directory deployment defaults to the highest complete ``detector_it*.pth`` checkpoint, not
-    historical ``detector.pth`` (which is the validation-selected *best* checkpoint). ``best``
-    remains an explicit compatibility selector; an explicit filename is also an override and is
-    therefore not subjected to the latest-completeness check.
+    Directory deployment defaults to ``detector_last.pth``, not historical ``detector.pth``
+    (which is the validation-selected *best* checkpoint). ``best`` remains an explicit
+    compatibility selector; ``latest`` is an explicit completeness-checked selector; an explicit
+    filename is also an override and is therefore not subjected to the latest-completeness check.
     """
     p = Path(path)
     if not p.is_dir():
         return p
-    selector = str(checkpoint or 'latest')
+    selector = str(checkpoint or 'last')
+    if selector == 'last':
+        out = p / 'detector_last.pth'
+        if not out.exists():
+            raise ValueError(f'{p}: --detector-checkpoint last requested, but detector_last.pth '
+                             'is absent')
+        return out
     if selector == 'best':
         out = p / 'detector.pth'
         if not out.exists():
@@ -76,7 +82,7 @@ def resolve_detector_checkpoint(path, checkpoint='latest'):
             raise ValueError(
                 f'{p}: cannot establish that {candidate.name} is complete because neither '
                 'config.toml [training].iters nor metrics.json is present; pass '
-                '--detector-checkpoint best or an explicit filename')
+                '--detector-checkpoint best, latest, or an explicit filename')
         return candidate
 
     details = []
@@ -87,7 +93,7 @@ def resolve_detector_checkpoint(path, checkpoint='latest'):
     state = ', '.join(details) if details else 'missing completion metadata'
     raise ValueError(
         f'{p}: no complete latest detector checkpoint found ({state}); pass '
-        '--detector-checkpoint best or an explicit filename to override')
+        '--detector-checkpoint best, latest, or an explicit filename to override')
 
 
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
@@ -104,7 +110,7 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
 # so the detections' dependencies are recorded in the prediction's own provenance instead.
 
 
-def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
+def load_detector(path, device='cpu', input_wh=None, checkpoint='last'):
     """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source, tile_scale, obj_q).
 
     The input size, min_crop_dim, box_source and tile_scale are recorded in the checkpoint because
@@ -113,8 +119,9 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     supplies the size for checkpoints that predate the field. `yolox_version`,
     `bottleneck_expansion`, `p2` and `in_channels` similarly record the architecture the weights
     were shaped for (absent = the pre-key default), used only to build the right model internally.
-    For a run directory, `checkpoint='latest'` selects and verifies the highest complete
-    `detector_it*.pth`; `checkpoint='best'` explicitly selects historical `detector.pth`.
+    For a run directory, `checkpoint='last'` selects `detector_last.pth`; `checkpoint='latest'`
+    explicitly selects and verifies the highest complete `detector_it*.pth`; `checkpoint='best'`
+    explicitly selects historical `detector.pth`.
 
     A ViT backbone's own DINOv2 patch embedding needs both input dims divisible by 14 and the
     coarsest FPN stride needs 32 -- LCM 224. `train_detector.py` already rounds to this at

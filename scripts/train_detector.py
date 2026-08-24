@@ -501,8 +501,9 @@ def main():
                           f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}'
                           + ('   <-- NOT saturated: --det-score 0.99 would drop most of these'
                              if obj_q['q50'] < 0.99 else ''), flush=True)
-                ckpt = {'iteration': it, 'model_state': model.state_dict(), 'input_wh': wh,
-                        'n_keypoints': n_kpts, 'norm': 'gn', 'yolox_version': model_cfg['yolox'],
+                ckpt = {'iteration': it, 'model_state': model.state_dict(), 'config': config,
+                        'input_wh': wh, 'n_keypoints': n_kpts, 'norm': 'gn',
+                        'yolox_version': model_cfg['yolox'],
                         'optimizer_kind': train_cfg['optimizer'],
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],
                         'pretrained': model_cfg['pretrained'],

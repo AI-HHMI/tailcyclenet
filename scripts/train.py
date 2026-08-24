@@ -731,10 +731,10 @@ def main():
                 t_ck = time.time()
                 drift, p = dist_utils.check_ranks_agree(fabric, raw), None
                 if not args.no_checkpoints:
-                    p = save_checkpoint(run, it, raw, opt, config, write=is0)
+                    p = save_checkpoint(run, it, raw, opt, config, write=is0, registry=registry)
                     if latest[1] == it and latest[0] < saved_mpjpe:
                         saved_mpjpe = latest[0]
-                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0)
+                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0, registry=registry)
                         fabric.print(f'  new best: mpjpe {saved_mpjpe:.4g} -> '
                                      f'checkpoint_best.pth')
                         record({'iter': it, 'saved_mpjpe': saved_mpjpe})

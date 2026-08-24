@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..checkpoints import load_run, provenance
+from ..checkpoints import load_run, peek_registry, provenance
 from ..dataset import LoaderConfig
 from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
@@ -247,10 +247,8 @@ def run_dataset(args):
 
     if args.videos:
         from .. import adopt
-        from ..format import Registry
-
         adopt.check_flags(args)
-        reg = Registry.load(Path(args.run) / 'keypoint_registry.toml')
+        reg = peek_registry(args.run)
         vplan = adopt.plan(args.videos, args.calibration, args.cam_regex,
                           session_id=args.session_id, group_id=args.group_id)
         ds_name = adopt.dataset_name(reg, args.dataset_name)

@@ -155,7 +155,8 @@ def save_run_meta(run: Path, config: dict, registry: Registry,
 
 
 def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
-                    name: str = 'last', write: bool = True) -> Path | None:
+                    name: str = 'last', write: bool = True,
+                    registry: Registry | None = None) -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
     `model_state` is the raw training weight (resume); `model_state_eval` is the averaged weight
@@ -189,20 +190,72 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     tmp = path.with_suffix('.tmp')
     torch.save({'iteration': iteration, 'model_state': state,
                 'model_state_eval': eval_state,
-                'optimizer_state': optimizer.state_dict(), 'model_config': config.get('model')},
-               tmp)
+                'optimizer_state': optimizer.state_dict(),
+                'config': config,
+                'model_config': config.get('model'),
+                'keypoint_registry': None if registry is None else registry.to_dict()}, tmp)
     tmp.replace(path)
     return path
 
 
+def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None = None):
+    """Load a self-contained pose checkpoint, whether packaged or copied from training."""
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f'{path}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
+    if ckpt.get('kind', 'pose') != 'pose':
+        raise ValueError(f'{path}: expected a pose checkpoint, got kind={ckpt.get("kind")!r}')
+    registry_doc = ckpt.get('keypoint_registry')
+    if not isinstance(registry_doc, dict):
+        raise ValueError(f'{path}: pose checkpoint has no embedded keypoint_registry; '
+                         'use a checkpoint written after registry embedding or a run folder')
+    registry = Registry.from_dict(registry_doc)
+
+    config = ckpt.get('config')
+    if not isinstance(config, dict):
+        config = {'model': ckpt.get('model_config'), 'data': ckpt.get('data_config', {})}
+    if not isinstance(config.get('model'), dict):
+        raise ValueError(f'{path}: pose checkpoint has no dictionary model config')
+    config = dict(config)
+    check_image_size(config)
+    if model_overrides:
+        config['model'] = {**config.get('model', {}), **model_overrides}
+        print(f'load_run: [model] OVERRIDDEN {model_overrides} -- this is an assertion about what '
+              'the checkpoint was trained with, not something read from it')
+
+    state = ckpt.get('model_state_eval') or ckpt.get('model_state')
+    if not isinstance(state, dict):
+        raise ValueError(f'{path}: pose checkpoint has no model_state dictionary')
+    source = ckpt.get('source_run', '?')
+    selected = ckpt.get('source_checkpoint', path.name)
+    print(f'packaged pose checkpoint: {selected} from {source} '
+          f'(iteration {ckpt.get("iteration", "?")})')
+    model = build_model(config['model'], n_keypoints=registry.n_keypoints)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    _report('load_run', missing, unexpected, [])
+    return model.to(device).eval(), config, registry, path
+
+
+def peek_registry(run: Path) -> Registry:
+    """Read the keypoint registry from a run folder or a self-contained pose checkpoint."""
+    run = Path(run)
+    if run.is_file():
+        ckpt = torch.load(run, map_location='cpu', weights_only=False)
+        if not isinstance(ckpt, dict) or not isinstance(ckpt.get('keypoint_registry'), dict):
+            raise ValueError(f'{run}: pose checkpoint has no embedded keypoint_registry')
+        return Registry.from_dict(ckpt['keypoint_registry'])
+    return Registry.load(run / 'keypoint_registry.toml')
+
+
 def load_run(run: Path, checkpoint: str | None = None, device='cpu',
              model_overrides: dict | None = None):
-    """(model, config, registry, checkpoint_path) from a run folder. Nothing else is needed.
-
-    `model_overrides` patches `[model]` before build, for a run folder written before a key
-    existed; it is echoed loudly because it is an assertion about weights nobody recorded.
-    """
+    """(model, config, registry, checkpoint_path) from a run folder or pose checkpoint."""
     run = Path(run)
+    if run.is_file():
+        if checkpoint is not None:
+            raise ValueError(f'{run}: --checkpoint selects a file inside a run folder, but --run '
+                             'already names a checkpoint file')
+        return _load_packaged_pose(run, device=device, model_overrides=model_overrides)
     with open(run / 'config.toml', 'rb') as f:
         config = tomllib.load(f)
     check_image_size(config)

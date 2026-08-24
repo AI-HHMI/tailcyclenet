@@ -1098,21 +1098,27 @@ class Registry:
             out[ds.name] = tuple(ids)
         return cls(names=tuple(names), datasets=tuple(sorted(out.items())))
 
+    def to_dict(self) -> dict:
+        """Return the registry's portable, TOML-compatible representation."""
+        return {'names': list(self.names),
+                'datasets': {name: list(ids) for name, ids in self.datasets}}
+
+    @classmethod
+    def from_dict(cls, doc: dict) -> 'Registry':
+        """Build a registry from its portable dictionary representation."""
+        return cls(names=tuple(doc['names']),
+                   datasets=tuple(sorted((k, tuple(v)) for k, v in doc['datasets'].items())))
+
     def save(self, path: Path) -> None:
         """Write the registry to a TOML file."""
         import toml
-        path.write_text(toml.dumps({
-            'names': list(self.names),
-            'datasets': {name: list(ids) for name, ids in self.datasets},
-        }))
+        path.write_text(toml.dumps(self.to_dict()))
 
     @classmethod
     def load(cls, path: Path) -> 'Registry':
         """Read a registry back from a TOML file."""
         with open(path, 'rb') as f:
-            doc = tomllib.load(f)
-        return cls(names=tuple(doc['names']),
-                   datasets=tuple(sorted((k, tuple(v)) for k, v in doc['datasets'].items())))
+            return cls.from_dict(tomllib.load(f))
 
 
 # validation -- docs/annotation_format.md §11

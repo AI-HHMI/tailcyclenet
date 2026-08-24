@@ -172,6 +172,7 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     from schedulefree import AdamWScheduleFree
 
     from tailcyclenet.checkpoints import save_checkpoint
+    from tailcyclenet.format import Registry
 
     torch.manual_seed(0)
     model = torch.nn.Linear(4, 4)
@@ -183,11 +184,15 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
         opt.zero_grad()
         model(torch.randn(2, 4)).sum().backward()
         opt.step()
-    save_checkpoint(tmp_path / 'run', 1234, model, opt, {'model': {}})
+    config = {'model': {}, 'data': {'image_size': 64}, 'training': {'seed': 23}}
+    registry = Registry(names=('nose',), datasets=(('ds', (0,)),))
+    save_checkpoint(tmp_path / 'run', 1234, model, opt, config, registry=registry)
 
     ck = torch.load(tmp_path / 'run' / 'checkpoints' / 'checkpoint_last.pth',
                     map_location='cpu', weights_only=False)
     assert int(ck['iteration']) == 1234, 'the iteration is what a resume restarts at'
+    assert ck['config'] == config
+    assert ck['keypoint_registry'] == registry.to_dict()
     # The two iterates are genuinely different, or "resume from the raw one" is a distinction
     # without a difference and this test would pass on the wrong weights.
     assert not torch.equal(ck['model_state']['weight'], ck['model_state_eval']['weight'])

@@ -238,6 +238,14 @@ def main():
         _wh0 = wh
         wh = tuple(max(64, int(round(v * data_cfg['det_scale'] / 32)) * 32) for v in wh)
         print(f'det_scale={data_cfg["det_scale"]:g}: input {_wh0[0]}x{_wh0[1]} -> {wh[0]}x{wh[1]}')
+    # A2.5: DINOv2's patch embedding requires both dimensions divisible by patch_size=14; the
+    # coarsest FPN stride (32) requires divisibility by 32 too. LCM(14, 32) = 224.
+    if model_cfg['yolox'].startswith('vit_'):
+        _wh0 = wh
+        wh = tuple(max(64, int(-(-v // 224)) * 224) for v in wh)
+        if wh != _wh0:
+            print(f'ViT input rounded to a multiple of 224: {_wh0[0]}x{_wh0[1]} -> '
+                  f'{wh[0]}x{wh[1]}')
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
@@ -372,7 +380,8 @@ def main():
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
                       p2=model_cfg['p2'], in_channels=in_channels,
-                      head_depthwise=train_cfg['head_depthwise']).to(device)
+                      head_depthwise=train_cfg['head_depthwise'],
+                      pretrained=model_cfg['pretrained']).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g}, '

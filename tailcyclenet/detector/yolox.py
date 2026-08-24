@@ -43,6 +43,18 @@ YOLOX_TIERS = {
     'x':    (1.33, 1.25, False),
 }
 
+# A2: ViT backbone versions -> (hub repo, hub entrypoint, the [model].pretrained value that loads
+# real weights for it). DINOv2's checkpoints are fully public; DINOv3's are GATED behind Meta's
+# own license-request form -- `pretrained="dinov3"` still builds the architecture and attempts
+# the download, but 403s from `dl.fbaipublicfiles.com/dinov3` without an approved request. Both
+# hub repos expose the identical interface `vit_backbone.ViTBackbone` reads.
+VIT_BACKBONES = {
+    'vit_s14':    ('facebookresearch/dinov2', 'dinov2_vits14', 'dinov2'),
+    'vit_b14':    ('facebookresearch/dinov2', 'dinov2_vitb14', 'dinov2'),
+    'vit_s16_v3': ('facebookresearch/dinov3', 'dinov3_vits16', 'dinov3'),
+    'vit_b16_v3': ('facebookresearch/dinov3', 'dinov3_vitb16', 'dinov3'),
+}
+
 
 def round8(v):
     """Round to the nearest multiple of 8 (floor 8) -- keeps `norm_groups` clean at any width."""
@@ -369,7 +381,7 @@ class YOLOXNano(nn.Module):
     STRIDES = (8, 16, 32)
 
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
-                p2=False, in_channels=3, head_depthwise=None):
+                p2=False, in_channels=3, head_depthwise=None, pretrained=''):
         super().__init__()
         self.n_keypoints = int(n_keypoints)
         self.version = str(version)
@@ -377,6 +389,10 @@ class YOLOXNano(nn.Module):
         self.p2 = bool(p2)
         self.in_channels = int(in_channels)
         self.head_depthwise = head_depthwise
+        # A2: which pretrained weights (if any) a ViT backbone loads. '' (default) trains from
+        # scratch; 'dinov2' loads the DINOv2 hub checkpoint. Only meaningful for a `vit_*`
+        # version -- `config.py` refuses the combination otherwise.
+        self.pretrained_source = str(pretrained) if isinstance(pretrained, str) else ''
         if self.version == 'trimmed':
             if self.bottleneck_expansion != 0.5:
                 raise ValueError(
@@ -386,6 +402,20 @@ class YOLOXNano(nn.Module):
                     "to fix). Use a canonical tier for a COCO-compatible backbone.")
             self.backbone = CSPDarknetNano(p2=self.p2, in_channels=self.in_channels)
             neck_out, depthwise = width, True
+        elif self.version in VIT_BACKBONES:
+            # A2: DINOv2/DINOv3 ViT backbone + Simple Feature Pyramid. `in_channels != 3` is
+            # refused -- a ViT patch embedding is built for RGB and has no wider-stem path.
+            if self.in_channels != 3:
+                raise ValueError(f"in_channels={self.in_channels} was passed alongside "
+                                 f"version={version!r}, but the ViT backbone's patch embedding "
+                                 "only accepts 3-channel RGB.")
+            from .vit_backbone import ViTBackbone
+            hub_repo, model_name, pretrained_key = VIT_BACKBONES[self.version]
+            use_pretrained = (self.pretrained_source == pretrained_key)
+            self.backbone = ViTBackbone(model_name, p2=self.p2, pretrained=use_pretrained,
+                                        hub_repo=hub_repo)
+            neck_out = round8(256 * 0.5)   # 128 -- match the 's' tier's neck width
+            depthwise = False               # ViT arms use full-conv neck/head
         else:
             if self.version not in YOLOX_TIERS:
                 raise ValueError(f"yolox version {version!r}: must be 'trimmed' or one of "

@@ -124,6 +124,12 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
                          'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
                          'branson-fly 416 416).')
+    # A2.5: a ViT backbone's own DINOv2 patch embedding needs both dims divisible by 14, and the
+    # coarsest FPN stride needs 32 -- LCM 224. `train_detector.py` already rounds to this at
+    # training time, so this only bites an explicit `--det-input-wh` override (or a checkpoint
+    # that predates the `input_wh` field).
+    if str(ckpt.get('yolox_version', 'trimmed')).startswith('vit_'):
+        wh = tuple(max(64, int(-(-v // 224)) * 224) for v in wh)
     # Absent `norm` means BatchNorm: the key only exists since the model became GroupNorm.
     norm = str(ckpt.get('norm', 'bn'))
     if norm != 'gn':
@@ -136,7 +142,8 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
                       bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)),
                       p2=bool(ckpt.get('p2', False)),
                       in_channels=int(ckpt.get('in_channels', 3)),
-                      head_depthwise=ckpt.get('head_depthwise', None))
+                      head_depthwise=ckpt.get('head_depthwise', None),
+                      pretrained=str(ckpt.get('pretrained', '') or ''))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

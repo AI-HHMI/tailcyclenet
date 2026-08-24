@@ -47,6 +47,11 @@ tailcyclenet = { path = ".", editable = true }
 torch = { version = "<3", index = "https://download.pytorch.org/whl/cu128" }
 torchvision = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
 torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
+# A2: the DINOv3 torch.hub repo's own logging module imports this unconditionally
+# (dinov3/logging/__init__.py) -- not a DINOv3 model dependency per se, just a hard import in
+# the hub checkout, so it has to be present before `torch.hub.load('facebookresearch/dinov3', ...)`
+# can even build the module tree.
+termcolor = "*"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }

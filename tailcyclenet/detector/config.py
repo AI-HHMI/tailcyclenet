@@ -19,7 +19,7 @@ from pathlib import Path
 
 from ..crop import BOX_SOURCES
 from .data import TEMPORAL_INPUTS
-from .yolox import YOLOX_TIERS
+from .yolox import VIT_BACKBONES, YOLOX_TIERS
 
 # THE ALLOWED KEYS, PER BLOCK. Anything else raises -- see module docstring. These are the
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
@@ -43,7 +43,7 @@ TRAINING_KEYS = frozenset({
     'freeze_backbone', 'shared_head', 'fpn_upsample', 'p2_bottomup', 'tal_soft_prior',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
-YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS))
+YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), *sorted(VIT_BACKBONES), 'hybrid', 'cspnext_s')
 
 
 def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
@@ -309,17 +309,31 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         if model['yolox'] == 'trimmed':
             raise SystemExit("[model].pretrained='coco' requires a canonical yolox tier -- "
                              "'trimmed' has no COCO counterpart to load.")
+        if model['yolox'] in VIT_BACKBONES or model['yolox'] in ('hybrid', 'cspnext_s'):
+            raise SystemExit(f"[model].pretrained='coco' has no counterpart for "
+                             f"yolox={model['yolox']!r} -- use 'dinov2'/'dinov3' for a ViT "
+                             "backbone or '' (from scratch) for hybrid/cspnext_s.")
         if model['bottleneck_expansion'] != 1.0:
             raise SystemExit(
                 "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
                 "every bottleneck conv is half Megvii's width and the load would silently take "
                 "only 19 of 35 backbone tensors.")
+    elif model['pretrained'] in ('dinov2', 'dinov3'):
+        # A2: DINOv2 hub weights are fully public; DINOv3's are GATED behind Meta's own
+        # license-request form -- this only builds the architecture and attempts the download,
+        # which 403s from dl.fbaipublicfiles.com/dinov3 without an approved request (see
+        # `dev/plans/detector_architecture_sweep.md` A2.7). Only the matching ViT family may
+        # request it -- DINOv2 weights cannot load into a DINOv3-shaped backbone or vice versa.
+        matching = {v for v, (_, _, key) in VIT_BACKBONES.items() if key == model['pretrained']}
+        if model['yolox'] not in matching:
+            raise SystemExit(f"[model].pretrained={model['pretrained']!r} requires yolox to be "
+                             f"one of {sorted(matching)}, got {model['yolox']!r}.")
     elif model['pretrained'] not in ('', 'coco'):
         if not Path(model['pretrained']).exists():
             raise SystemExit(
                 f"[model].pretrained={model['pretrained']!r}: no such file -- expected '' (from "
-                "scratch), 'coco', or a path to a T4.1b in-domain backbone checkpoint from "
-                "scripts/pretrain_detector_backbone.py.")
+                "scratch), 'coco', 'dinov2'/'dinov3' (ViT only), or a path to a T4.1b in-domain "
+                "backbone checkpoint from scripts/pretrain_detector_backbone.py.")
 
     # T4.3: a stride-4 FPN level, on top of EITHER backbone (canonical tier or `trimmed`) --
     # unlike `bottleneck_expansion`, not tier-restricted. Default `false` is byte-identical to

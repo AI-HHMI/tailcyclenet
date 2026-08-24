@@ -5023,3 +5023,176 @@ eval_batches = 1
     assert (out / 'detector.pth').exists()
     ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
     assert ckpt['optimizer_kind'] == 'adamw'
+
+
+# --- A2: ViT backbone + Simple Feature Pyramid ------------------------------------------------
+
+@pytest.mark.parametrize('p2', [True, False])
+def test_vit_backbone_shape_contract(p2):
+    """`ViTBackbone` must satisfy the same (p2,p3,p4,p5) contract as every CNN backbone, at
+    strides (4,8,16,32) or (8,16,32). `pretrained=False` avoids a network call."""
+    from tailcyclenet.detector.vit_backbone import ViTBackbone
+
+    bb = ViTBackbone('dinov2_vits14', p2=p2, pretrained=False)
+    H, W = 224, 448
+    x = torch.rand(1, 3, H, W)
+    feats = bb(x)
+    strides = (4, 8, 16, 32) if p2 else (8, 16, 32)
+    assert len(feats) == len(strides) == len(bb.out_channels)
+    for f, s, c in zip(feats, strides, bb.out_channels):
+        assert f.shape == (1, c, H // s, W // s)
+
+
+def test_vit_backbone_pads_non_multiple_of_14_input():
+    from tailcyclenet.detector.vit_backbone import ViTBackbone
+
+    bb = ViTBackbone('dinov2_vits14', p2=True, pretrained=False)
+    H, W = 229, 451           # not a multiple of 14
+    x = torch.rand(1, 3, H, W)
+    feats = bb(x)
+    for f, s in zip(feats, (4, 8, 16, 32)):
+        assert f.shape[-2:] == (H // s, W // s)
+
+
+def test_vit_backbone_freeze_backbone_stops_vit_grad():
+    from tailcyclenet.detector.vit_backbone import ViTBackbone
+
+    bb = ViTBackbone('dinov2_vits14', p2=True, pretrained=False)
+    bb.freeze_backbone()
+    assert all(not p.requires_grad for p in bb.vit.parameters())
+    assert any(p.requires_grad for p in bb.adapt_p2.parameters())
+
+
+def test_yolox_nano_vit_version_builds_and_forwards():
+    """`YOLOXNano(version='vit_s14')` must build through PAFPN + Head and forward end to end,
+    matching the (obj, boxes, kpt) contract every other version returns."""
+    model = YOLOXNano(version='vit_s14', p2=True, n_keypoints=0)
+    assert model.STRIDES == (4, 8, 16, 32)
+    x = torch.rand(1, 3, 224, 224)
+    obj, boxes, kpt = model(x)
+    anchors = model.anchor_points(224, 224, x.device)
+    assert obj.shape[0] == 1 and boxes.shape[-1] == 4
+    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
+    assert kpt is None
+
+
+def test_yolox_nano_vit_rejects_wide_in_channels():
+    with pytest.raises(ValueError, match='in_channels'):
+        YOLOXNano(version='vit_s14', in_channels=6)
+
+
+def test_detector_config_yolox_choices_include_new_architectures(tmp_path):
+    from tailcyclenet.detector.config import YOLOX_CHOICES
+    assert set(('vit_s14', 'vit_b14', 'hybrid', 'cspnext_s')) <= set(YOLOX_CHOICES)
+
+
+def test_detector_config_pretrained_dinov2_requires_vit(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "tiny"
+pretrained = "dinov2"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='dinov2'):
+        load_detector_config(p)
+
+
+def test_detector_config_pretrained_dinov2_with_vit_is_accepted(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "vit_s14"
+pretrained = "dinov2"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['model']['pretrained'] == 'dinov2'
+    assert cfg['model']['yolox'] == 'vit_s14'
+
+
+def test_detector_config_pretrained_coco_rejects_vit(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "vit_s14"
+bottleneck_expansion = 1.0
+pretrained = "coco"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match="no counterpart"):
+        load_detector_config(p)
+
+
+def test_load_detector_vit_checkpoint_rounds_input_wh_to_224(tmp_path):
+    """A ViT checkpoint's `input_wh` must round to a multiple of 224 at load time, even if it
+    predates the field or a caller passes an explicit override that is not one."""
+    from tailcyclenet.detector import load_detector
+
+    model = YOLOXNano(version='vit_s14', p2=True, n_keypoints=0)
+    ckpt_path = tmp_path / 'det.pth'
+    torch.save({'model_state': model.state_dict(), 'input_wh': (100, 100), 'norm': 'gn',
+               'yolox_version': 'vit_s14', 'p2': True, 'n_keypoints': 0}, ckpt_path)
+    loaded, wh, *_ = load_detector(ckpt_path)
+    assert wh == (224, 224)
+    assert loaded.version == 'vit_s14'
+
+
+# --- A2.7: DINOv3 (gated weights, architecture usable from scratch) --------------------------
+
+def test_dinov3_backbone_shape_contract():
+    """DINOv3 exposes the identical .patch_size/.embed_dim/.get_intermediate_layers() surface
+    DINOv2 does (patch_size=16, not 14), so the same `ViTBackbone` class serves it --
+    `pretrained=False` avoids the network call (DINOv3's real weights are GATED behind Meta's
+    license-request form; see `dev/scratch/prototype_vit_backbone.py`)."""
+    from tailcyclenet.detector.vit_backbone import ViTBackbone
+
+    bb = ViTBackbone('dinov3_vits16', p2=True, pretrained=False,
+                     hub_repo='facebookresearch/dinov3')
+    assert bb.patch_size == 16
+    H, W = 224, 448
+    feats = bb(torch.rand(1, 3, H, W))
+    for f, s, c in zip(feats, (4, 8, 16, 32), bb.out_channels):
+        assert f.shape == (1, c, H // s, W // s)
+
+
+def test_yolox_nano_dinov3_version_builds_and_forwards():
+    model = YOLOXNano(version='vit_s16_v3', p2=True)
+    assert model.STRIDES == (4, 8, 16, 32)
+    obj, boxes, kpt = model(torch.rand(1, 3, 224, 224))
+    anchors = model.anchor_points(224, 224, 'cpu')
+    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
+
+
+def test_detector_config_pretrained_dinov3_requires_matching_vit_version(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "vit_s14"
+pretrained = "dinov3"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='dinov3'):
+        load_detector_config(p)
+
+
+def test_detector_config_pretrained_dinov3_with_v3_version_is_accepted(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "vit_s16_v3"
+pretrained = "dinov3"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['model']['pretrained'] == 'dinov3'

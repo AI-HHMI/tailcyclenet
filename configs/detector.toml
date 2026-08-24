@@ -1,7 +1,8 @@
 # The detector training config (`scripts/train_detector.py --config configs/detector.toml`).
-# One shipped recipe: every key is the current default of a former CLI flag, so a run with no
-# overrides is byte-identical to the old invocation. Per-root differences are key overrides in
-# YOUR config, not a second shipped file -- `extends` works one level deep.
+# One shipped recommended recipe. Per-root differences are key overrides in YOUR config, not a
+# second shipped file -- `extends` works one level deep. The recall-v2 assignment/loss defaults
+# below are the selected rat-city training recommendation; set assignment="center" and
+# box_loss="giou" explicitly only when reproducing a legacy control.
 #
 # Blocks: [data] (loader + regression target), [model] (architecture), [training] (schedule).
 # An UNKNOWN KEY IN ANY BLOCK RAISES -- a typo must not silently train at defaults.
@@ -159,6 +160,15 @@ eval_batches = 25
 
 kpt_weight = 1.0
 kpt_score_weight = 1.0
+
+# Task-aligned assignment (TAL) uses detached objectness x IoU quality to select positives.
+# This is the recommended Wave-0 TAL+CIoU recipe. `center` restores the legacy centre-prior
+# assignment for a matched control.
+assignment = "tal"
+
+# Box regression loss. CIoU adds centre-distance and aspect-ratio terms and is paired with TAL
+# in the recommended recipe. `giou` restores the legacy control.
+box_loss = "ciou"
 
 # per-GT positive-anchor cap (k closest anchors by centre distance). 0/absent = uncapped, the
 # shape every pre-existing checkpoint was trained under. DEFAULTS TO 10: confirmed at both seeds

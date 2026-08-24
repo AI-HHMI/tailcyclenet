@@ -3186,7 +3186,7 @@ out = "/tmp/run"
     cfg = load_detector_config(p)
     t = cfg['training']
     d = cfg['data']
-    assert (t['assignment'], t['box_loss'], t['focal_obj']) == ('center', 'giou', False)
+    assert (t['assignment'], t['box_loss'], t['focal_obj']) == ('tal', 'ciou', False)
     assert t['focal_gamma'] == 2.0 and t['tal_topk'] == 13
     assert t['head_depthwise'] is None
     assert d['augment_copypaste'] is False and d['copypaste_max'] == 3

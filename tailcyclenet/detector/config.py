@@ -324,13 +324,14 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     # every checkpoint on record (`YOLOXNano`'s own default).
     model['p2'] = bool(model.get('p2', False))
 
-    # Recall-v2 training switches. Defaults deliberately preserve the centre-prior/GIoU/BCE/
-    # depthwise recipe byte-for-byte; each alternative is explicit in the effective config.
-    train['assignment'] = str(train.get('assignment', 'center'))
+    # Recall-v2 training switches. The recommended shipped training recipe is TAL + CIoU,
+    # selected from the rat-city Wave-0 result. Explicit legacy configs can still request the
+    # centre-prior/GIoU path; absent keys now resolve to the recommended recipe.
+    train['assignment'] = str(train.get('assignment', 'tal'))
     if train['assignment'] not in ('center', 'tal'):
         raise SystemExit(f"[training].assignment must be 'center' or 'tal', got "
                          f"{train['assignment']!r}")
-    train['box_loss'] = str(train.get('box_loss', 'giou'))
+    train['box_loss'] = str(train.get('box_loss', 'ciou'))
     if train['box_loss'] not in ('giou', 'ciou'):
         raise SystemExit(f"[training].box_loss must be 'giou' or 'ciou', got "
                          f"{train['box_loss']!r}")

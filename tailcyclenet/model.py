@@ -174,36 +174,20 @@ class PoseTrackerEncoder(TrackerEncoder):
             prompt_time: (B,K) int or None -- the frame each prior describes
             kpt_chunk: decode in slices of this size, reusing one scene encode (INFERENCE ONLY)
 
-        The loader hands over uint8 -- 4x fewer bytes to queue from the worker and to pin -- and
-        the divide to [0,1] happens here, after the transfer, where it is free. A no-op for
-        anything that already arrives as float. In 2D there is ONE camera and the query is a
-        PIXEL: the library asserts len(views) == 1 for R==2 and routes through its separate 2D
-        head bank (mode_idx = 0), pretrained at full size in the base checkpoint.
+        The loader hands over uint8 (4x fewer bytes to queue and pin); the divide to [0,1]
+        happens here after the transfer, where it is free. In 2D there is ONE camera and the
+        query is a PIXEL: the library asserts len(views) == 1 for R==2 and uses its 2D head bank.
 
-        The query-validity mask comes from the PRIOR's own finiteness, not from `coords_q`
-        (absent priors are already replaced by the derived point) -- what the no-query tokens key
-        off. It is stashed at FULL K (the local copy survives the `finally` clear below), with
-        `_decode_from_scene` handed the chunk's slice. The box prompt is stashed for
-        `_decode_from_scene`; a plain model ignores it, so passing one is harmless.
+        The query-validity mask comes from the PRIOR's own finiteness, not `coords_q` (what
+        the no-query tokens key off); stashed at FULL K with the box prompt, both handed to
+        `_decode_from_scene`. The prompt frame is INT and CLAMPED (a torch.gather index): a
+        stale prompt clamps to 0; a KEYPOINT WITH NO PRIOR HAS NO QUERY TIME (time terms
+        carry no no-query token), so `prompt_dropout` NaNs the prior but leaves `prompt_t` set.
 
-        The frame the prompt describes is INT and CLAMPED: the library uses it as a
-        `torch.gather` index, so an out-of-range or floating value is an index error; a prompt
-        from BEFORE this window (deployment staleness) cannot be expressed and clamps to 0. A
-        KEYPOINT WITH NO PRIOR HAS NO QUERY TIME: the time terms carry no no-query token, so an
-        unprompted keypoint still reporting a frame index trains a forward no deployment path
-        produces. `prompt_dropout` NaNs the prior but leaves `prompt_t` set -- exactly this case.
-        Fixed here, at the seam every caller routes through.
-
-        The kpt-cursor assertion runs after the call, not in the `finally`, because an assertion
-        there would mask the real error. The stash is always cleared: a leaked stash would apply
-        one item's ids to the next forward, silently, on multi-call paths like eval and the
-        windowed driver.
-
-        In 2D there is no re-anchoring: triangulation is None at one camera and the 2D grid head
-        decodes ABSOLUTE pixel bins. `coords_pred` is rebound so every consumer can say "the
-        prediction" without a mode branch; at R==2 it is in PIXELS, not mm. In 3D single-view
-        there is nothing to re-anchor onto, so the library's query-anchored residual stands --
-        this is the path `prob_2d_only` trains.
+        The kpt-cursor assertion runs after the call, not in the `finally`; the stash is
+        always cleared (a leak would apply one item's ids to the next forward). In 2D the
+        grid head decodes ABSOLUTE pixel bins (`coords_pred` in PIXELS); 3D single-view
+        keeps the query-anchored residual (the `prob_2d_only` path).
         """
         assert mode in ('2d', '3d'), mode
         B, K = kpt_ids.shape

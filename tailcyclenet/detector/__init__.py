@@ -182,97 +182,31 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
-    -> (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None) with `D = top_k`, where index
-    `d` is the d-th highest-scoring detection IN THAT CAMERA AT THAT FRAME and means nothing across
-    cameras or across frames. Rows become an animal axis in `associate_group`, not here.
-
-    The split exists so every association arm shares one detection pass: detection is the
-    decode-bound expensive half of a run, and identity levers change only what happens after it.
-
-    `score_thresh` defaults to 0.01 -- NOT the 0.99 an older, saturated-near-1.0 objectness
-    distribution (hard-1.0 target, pre-`iou_aware_obj`) would have tolerated, and lower than
-    `decode`/`score_dataset`'s own 0.05 "as-trained" convention. Measured directly against the
-    current default recipe (`iou_aware_obj=true`, COCO-pretrained): rat-city-combined's MOTA
-    peaks AT 0.01 (0.795 vs 0.640 at 0.05 vs 0.747 at 0.0 -- 0.0 buys no MOTA over 0.01, just more
-    false positives); allen-mouse-combined and 3dpop are BYTE-IDENTICAL between 0.01 and 0.05 (no
-    detections score in that band). Deliberate choice: a false negative costs more than the extra
-    false positives a looser floor invites, and those extra candidates still pass through NMS
-    (IoU + centre-distance) and, in 3D multiview, `associate`/`CrossViewTracker`'s own
-    reprojection-residual gate (`assoc_res_max_px`, default 30px) before they can become a kept
-    detection -- this is not an unfiltered flood, it is more candidates for filters that already
-    exist. Still sweep per checkpoint -- this is a measured DEFAULT, not a universal constant.
-
-    `iou_thresh` / `center_dist_thresh` are `decode`'s own NMS knobs, threaded through so a caller
-    (a CLI flag, a config key) can move them -- `decode`'s Python defaults are now 0.5 / 0.5
-    (detector_v2 plan A1's `iou_thresh` unchanged; A5's `center_dist_thresh` CONFIRMED and made
-    the default, a deliberate break from every checkpoint trained before this landed). Pass
-    `center_dist_thresh=None` explicitly to restore the pre-A5 byte-identical behaviour.
-
-    `max_frames` is the same PREFIX `infer.run_group` takes, so the two agree about the clip.
-
-    `frames` detects a SLICE of the clip, so detection advances alongside the window loop. The
-    returned arrays are `len(frames)` long and index `t` is a position in `frames`, not a source
-    frame number. `None` is `range(T)`.
-
-    A slice must START ON A GLOBAL `batch` BOUNDARY: `_units` partitions on `range(0, T, batch)`, so
-    a misaligned slice forwards a short leading batch -- a different input shape, and cuDNN selects
-    convolution algorithms per shape. Aligned slices are byte-identical to one whole-clip pass.
-
-    `read` REPLACES THE DECODE with `(ci, cam_name, frames, pool) -> imgs`, so a caller that
-    already holds these frames does not decode them a second time. `None` is `read_frames`.
-
-    `trace`, when a list is supplied, receives one compact decode-stage record per
-    (source-frame, camera): score survivors, post-NMS survivors, and final top-k survivors. With
-    `trace_detail=True`, the record also carries source-pixel candidate boxes and scores for all,
-    post-score, post-NMS, and final candidates, for an offline GT matcher. It is diagnostic-only;
-    the default is `None`, and output arrays/return arity are unchanged.
-
-    Notes.
-
-    `_fetch` (below) always builds a 3-channel `arr` -- one letterboxed RGB frame per (camera,
-    source frame). A `temporal_input='stack2'` checkpoint (`in_channels=6`) trains and
-    `load_detector` reconstructs the wider stem correctly, but this deployment loop has no
-    paired-frame path to fill the other 3 channels -- forwarding it would silently feed
-    zeros/garbage into half the stem, so it is refused instead of guessed.
-
-    The keypoint array is (D,T,C,K,3) of (x, y, score_logit) in SOURCE pixels, or None when this
-    detector has no keypoint branch; it is kept beside the boxes so a caller that indexes
-    `[d, t, ci]` for a box indexes the same way for its keypoints.
-
-    The decode runs ONE THREAD PER CAMERA, which is where this function's wall clock lives: the
-    containers share no state and PyAV releases the GIL, so they overlap ~3.5x. The forward stays
-    serial and in camera order -- it is ~1% of the time.
-
-    WHAT IS BOUNDED IS THE NUMBER OF CAMERAS IN FLIGHT, AND NEVER `batch`. `batch` is not a
-    memory knob because it is not inert: cuDNN selects convolution algorithms per input shape, so
-    a different batch is a different reduction order -- two runs on two machines would produce
-    different boxes with nothing in either output saying so. Chunking CAMERAS is output-neutral by
-    construction: each camera is forwarded on its own and `out`/`sc`/`kp` are indexed by `[.., ci]`;
-    only how much of the decode overlaps changes.
-
-    The /255 divisor is a 0-d TENSOR, NOT THE PYTHON INT 255: on CUDA `x / 255` takes a
-    reciprocal-multiply fast path that is off by 1 ULP on 156 of 256 byte values; dividing by a
-    0-d tensor is correctly rounded. 1 ULP on the input perturbs every objectness score and can
-    reorder NMS ties.
-
-    A SECOND POOL exists for image-directory roots: `read_frames` threads those over their FRAMES
-    (it ignores `pool` for video), so single-camera roots spend their time here. It must NOT be
-    `pool`: `_fetch` runs IN `pool` and waits on these futures, and a pool that waits on itself
-    deadlocks the moment both are full.
-
-    A SLICE MUST LINE UP WITH THE WHOLE-CLIP BATCH PARTITION, or its forwards have shapes the
-    whole-clip pass never produces and cuDNN answers them differently. THE UNIT OF WORK IS
-    (FRAME BATCH, CAMERA CHUNK), which is what makes the peak bounded while every forward keeps
-    its exact shape; indices are LOCAL to `want`, and `_submit` maps them back to source frame
-    numbers, the only place the two ever differ. ONE UNIT OF LOOKAHEAD: submitting unit i+1's
-    decode before unit i's forwards run overlaps the ~120 ms of forward+NMS with the decoder
-    threads; it changes no pixels and no order.
-
-    The head output is INDEXED, not unpacked: the head's return arity grows with each optional
-    branch. The /255 happens on the device off the uint8 `_fetch` handed back. Keypoints go
-    through the same letterbox inverse the box does (`unletterbox_keypoints`). A UNIT'S FRAMES
-    ARE DEAD after the forwards, so the arena is given back (via `memory.trim`) rather than
-    letting RSS ratchet up -- this is the loop that allocates and frees the most.
+    Inputs:
+        det, input_wh, session, gid, top_k -- the detector, its input size, the session, the
+            group, and `D`, the per-camera detection cap.
+        score_thresh -- default 0.01 (measured, not universal): a looser floor trades a few
+            extra false positives for materially fewer false negatives, and every survivor
+            still passes the existing NMS and (3D) reprojection gates. Sweep per checkpoint.
+        iou_thresh / center_dist_thresh -- `decode`'s NMS knobs, threaded through so a caller
+            can move them; `center_dist_thresh=None` restores the pre-A5 byte-identical NMS.
+        max_frames -- the same PREFIX `infer.run_group` takes.
+        frames -- detect a SLICE of the clip; arrays are `len(frames)` long and must START ON A
+            GLOBAL `batch` BOUNDARY (aligned slices are byte-identical to one whole-clip pass).
+        read -- replaces the decode with `(ci, cam_name, frames, pool) -> imgs`.
+        trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
+    Outputs:
+        (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None): `d` is the d-th
+        highest-scoring detection in that camera at that frame; rows become an animal axis in
+        `associate_group`, not here.
+    Side effects:
+        Decode runs one thread per camera (where the wall clock lives; the forward is serial).
+        Cameras in flight are bounded, never `batch` -- a different batch is a different cuDNN
+        reduction order, so outputs would not be reproducible across runs. The /255 divisor is
+        a 0-d tensor, not the int 255 (off by 1 ULP on CUDA).
+    Notes:
+        A `temporal_input='stack2'` checkpoint is refused (no paired-frame path). Keypoints are
+        (x, y, score_logit) in SOURCE pixels, or None without a keypoint branch.
     """
     import numpy as np
     import torch
@@ -425,44 +359,30 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.0, stats=None, pose_nms=None, state=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
-    `raw` is `detect_raw`'s `(boxes, scores, kpts)`. Returns the same triple re-indexed so row `a`
-    is one animal -- across cameras always, and across frames wherever a tracker or `link_rows` ran.
-
-    2D / single camera: instances are the NMS survivors, ordered by score; the row index is the
-    only identity there is and is NOT tracked, so row `a` at frame t and t+1 need not be the same
-    animal. `link=True` adds the minimal tracker (`link_rows`); note the two levers do not overlap
-    -- the tracker below is built when `track and C > 1`, and `link_rows` runs only when it was
-    not.
-
-    3D multiview: `track=True` (the DEFAULT) runs `track.CrossViewTracker` -- one cross-view target
-    set carried across frames -- and `link_rows` is not run on top of it. `track=False` restores
-    the memoryless per-frame `associate`.
-
-    `pose_nms` is the one keypoint identity lever that survived measurement -- maDLC's
-    instance-level NMS by keypoint containment. Six coarser cues spent as a veto, a permutation or
-    a Hungarian cost were each built, measured and refuted; the ranking a K = 4 body axis supplies
-    is too noisy to spend in any of those forms.
-
-    `stats` collects `pose_nms`' fire count: a rejection rate is what its rate-matched random
-    control has to be matched TO.
-
-    `state` MAKES A SEQUENCE OF CALLS EQUAL TO ONE CALL OVER THE CONCATENATION: it holds the
-    tracker and `link_rows`' `last`/`age`. `pose_nms` needs nothing (per-frame pass, `stats`
-    accumulates). `state=None` builds a fresh tracker per call and is byte-identical to the
-    version before this parameter existed.
-
-    Notes.
-
-    STATIC RIG: the cross-view geometry (`cgroup`) is built once. MOVING RIG: `associate`
-    triangulates per frame from (n,2) centres, so it needs that frame's own (4,4) extrinsic,
-    built inside the loop below. The tracker is ONE CROSS-VIEW TARGET SET instead of `associate`
-    per frame plus `link_rows` after -- it subsumes both, so `link_rows` must not run on top of
-    it. Where keypoints ride along, `claimed[a, c]` is the DETECTION index that slot a took in
-    camera c, or -1; gathering by it is the only way the keypoints follow the same row assignment
-    the boxes did. LEAD 1, AFTER ASSOCIATION: `pose_nms` drops a row that duplicates another
-    row's animal, by maDLC's keypoint-containment overlap rather than by IoU; it runs here, on
-    the finished assignment, because a duplicate is a property of the SEATED rows -- `decode`'s
-    own per-box NMS cannot see it.
+    Inputs:
+        raw -- `detect_raw`'s (boxes, scores, kpts); session, gid, max_instances (the row
+            count S).
+        track -- 3D multiview default: `CrossViewTracker`, one cross-view target set carried
+            across frames; `False` restores the memoryless per-frame `associate`.
+        link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`, so the
+            two levers do not overlap).
+        min_views / max_move -- passed through to the tracker / `associate`.
+        pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
+            measurement); `stats` collects its fire count for a rate-matched random control.
+        state -- makes a sequence of calls equal to one call over the concatenation (holds the
+            tracker and `link_rows`' `last`/`age`); `None` builds a fresh tracker per call and
+            is byte-identical to the version before the parameter existed.
+    Outputs:
+        The same triple re-indexed so row `a` is one animal -- across cameras always, and across
+        frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity
+        there is and is NOT tracked.
+    Side effects:
+        `pose_nms` runs on the finished assignment and may NaN whole rows in place; `stats`
+        accumulates association counters.
+    Notes:
+        Cross-view geometry is built once for a static rig, per frame for a moving one.
+        `claimed` -- the detection index each slot took per camera -- is the only way keypoints
+        follow the same row assignment the boxes did.
     """
     import numpy as np
     import torch
@@ -552,51 +472,28 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
               state=None):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
-    WITHOUT THIS THE ROWS ARE NOT AN ANIMAL AXIS: `decode` orders by score, so row 0 at frame t
-    and row 0 at frame t+1 are unrelated, and `run_group` crops each window to the union of its
-    frames' boxes -- an unlinked union is many animals squeezed into one crop.
-
-    Matching is against each row's LAST KNOWN box (not frame t-1, so a one-frame detector miss
-    does not break the chain), expiring after `max_age` frames. The cost is CENTRE DISTANCE OVER
-    THE MEAN BOX SIDE, gated at one side -- deliberately not IoU, which ranks by shape agreement
-    (not identity) and is exactly zero under fast motion. The gate has 10-16x headroom over real
-    motion.
-
-    AN UNMATCHED ROW STAYS EMPTY rather than taking an arbitrary leftover: a force-assigned row
-    TELEPORTS across the frame, and `run_group` then crops the window to the union of those
-    positions -- measured at 1924x1924 against a 244 px rat. A detection nobody claimed may still
-    START a row, but only an empty or expired one -- a birth, not a swap.
-
-    THIS DROPS A THIRD OF rat-city's DETECTIONS, AND SPARE ROWS ARE THE FIX -- NOT `birth_age`.
-    Relaxing eligibility (`birth_age`) buys coverage at exactly the price the strict rule exists
-    to prevent: a row that changes animal mid-window spans both. Raising the ROW COUNT instead
-    seats nearly everything and tightens the union, because no row has to hold two animals.
-    `birth_age` defaults to None, off and byte-identical to the rule before it existed.
-
-    `state` CARRIES THE MATCHER ACROSS A CALL BOUNDARY, so a clip processed in blocks links
-    exactly as the whole clip does; without it, every block would restart identity from its own
-    frame 0 -- a silent identity break at a boundary chosen by the RAM budget.
-
-    THE ASYMMETRY IN `t0` IS THE WHOLE OF IT. Frame 0 of the CLIP is the only frame nothing is
-    matched against: it seeds `last` and is left unpermuted. A block's own frame 0 is not that
-    frame, so with carried state the loop starts at 0 and permutes it against the previous
-    block's `last`, exactly as the whole-clip pass does mid-clip. `state=None` restores the
-    original single-call behaviour byte for byte.
-
-    Notes.
-
-    The carried state is (S,C,4) each row's most recent known box, frames since each row was last
-    seen, and the start frame -- frame 0 seeds `last` and is not permuted. The gate is IN UNITS
-    OF THE ANIMAL'S OWN SIZE, never pixels: rat-city's rats are ~250 px and branson's flies ~30,
-    so one pixel gate cannot serve both. A detection nobody claimed may still START a row -- a
-    birth -- but only into a slot no live animal is using. `birth_age is None` is the shipped
-    path, byte-identical to the rule before the knob existed; the `sorted` branch only runs when
-    a caller opts in, so the default cannot drift. In that branch, OCCUPIED is `age`, not `last`
-    (`last` is retained for MATCHING), oldest first, because the longest-unseen row is the
-    likeliest to be free rather than mid-blink. `extra` (S,T,C,...) rides the SAME permutation --
-    anything indexed by row has to -- and the score receives the same assignment, or it stops
-    describing the box beside it. EXPIRY IS A FORGET, not just a flag: a stale centre that stays
-    in the cost matrix keeps competing for the detection that belongs to whoever is there now.
+    Inputs:
+        boxes (S,T,C,4), scores, extra (S,T,C,...) -- `extra` rides the same permutation.
+        max_move -- the identity gate, in units of the animal's own mean box side (never
+            pixels), gated at one side.
+        max_age -- frames without evidence before a row's last box is forgotten.
+        birth_age -- None (default, shipped): off and byte-identical to the rule before the
+            knob existed. Relaxing eligibility buys coverage at exactly the price the strict
+            rule exists to prevent.
+        state -- carries the matcher across a call boundary so a clip processed in blocks links
+            exactly as the whole clip does.
+    Outputs:
+        boxes (and scores/extra when given), reordered so row `a` follows one animal.
+    Side effects:
+        In place on `boxes`, `scores`, `extra`. An unmatched row stays EMPTY rather than taking
+        an arbitrary leftover (a force-assigned row teleports across the frame and widens the
+        crop union); an unclaimed detection may still START a row, but only an empty or expired
+        one.
+    Notes:
+        Matching is against each row's LAST KNOWN box (not frame t-1), so a one-frame
+        detector miss does not break the chain. Frame 0 of the clip is the only frame
+        nothing is matched against; with carried state a block's frame 0 is permuted
+        against the previous block's `last`, exactly as the whole-clip pass does mid-clip.
     """
     import numpy as np
     from scipy.optimize import linear_sum_assignment

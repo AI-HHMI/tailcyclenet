@@ -53,44 +53,26 @@ def kpt_in_box_frac(kpts, box):
 def pose_nms(boxes, kpts, scores=None, thresh=0.8, stats=None):
     """INSTANCE-LEVEL NMS on the pose rows. maDLC's rule, not IoU.
 
-    Per frame, for every pair of live rows, the overlap is
-
-        min(A's kpts inside B's box / |A|,  B's kpts inside A's box / |B|)
-
-    -- `Assembly.intersection_with` in DeepLabCut -- and above `thresh` the LOWER-SCORED row is
-    dropped. Modifies `boxes` (and `kpts`) in place; returns the number of rows dropped.
-
-    WHY NOT IoU, WHICH IS THE OBVIOUS CHOICE: two touching animals overlap almost equally by IoU,
-    and it is exactly zero under fast motion where it cannot rank at all. A keypoint-containment
-    fraction asks a different question -- "is this row's animal the same animal as that row's" --
-    and degrades gracefully under occlusion, where a box shrinks and IoU falls off a cliff.
-
-    WHAT IT IS FOR. `fp_dup` is a second prediction on an animal something else already claimed,
-    and nothing in this repo addresses duplicates at the INSTANCE level: the detector's own NMS is
-    per-box IoU inside `decode`, before any row assignment. The two roots want opposite fixes
-    (crowded-overlap vs sparse), so this is aimed at the crowded-overlap case and should be a
-    near-no-op on the sparse one.
-
-    ASYMMETRIC BY CONSTRUCTION, and the `min` is what makes it safe: a small animal wholly inside a
-    large animal's box scores 1.0 one way and a small fraction the other, so `min` keeps it -- two
-    animals, one occluding the other, are not duplicates. Only a genuine double-detection scores
-    high BOTH ways.
-
-    **3D-AWARE (detector_v2 plan C1).** `boxes`/`kpts` carry a CAMERA axis (S,T,C,4) / (S,T,C,K,3)
-    -- true even for 2D single-view, where C=1. This used to read camera 0 ONLY
-    (`b[i, t, 0]`/`k[i, t, 0]`) for BOTH liveness and the containment fraction, while the actual
-    drop (`b[loser, t] = np.nan`) already spans every camera -- so on a multiview root a row alive
-    only in cameras 1..C-1 was invisible to this function entirely, and the overlap it did compute
-    ignored every other view's evidence. Fixed by aggregating over every camera where BOTH rows
-    have a finite box: liveness is "finite in ANY camera", and the per-pair overlap fraction is the
-    MEAN of the per-camera fraction over cameras where the pair co-occurs (`np.nanmean`, since a
-    single camera can still return NaN when a row has no valid keypoints there). On C=1 this is
-    exactly the old computation -- byte-identical on every 2D single-view root on record.
-    NO dtype CONVERSION is deliberate: `np.asarray(x, float)` on a float32 array returns a COPY,
-    so every in-place drop below would land on a temporary and the caller would see nothing.
-
-    The lower score loses; with no scores, the higher row index loses (stable). `sc[i, t]` is
-    (C,) -- `nanmax` over it is already an all-camera aggregate.
+    Inputs:
+        boxes (S,T,C,4), kpts (S,T,C,K,3) -- the seated pose rows; kpts=None is a no-op.
+        scores -- per-row scores (S,T,C), or None (higher row index loses on ties).
+        thresh -- minimum pairwise containment overlap to drop the lower-scored row.
+        stats -- optional dict; accumulates `nms_pairs` / `nms_dropped`.
+    Outputs:
+        Number of rows dropped.
+    Side effects:
+        Modifies `boxes` and `kpts` in place. No dtype conversion is deliberate:
+        `np.asarray(x, float)` on float32 returns a COPY, so a conversion would drop onto a
+        temporary and the caller would see nothing.
+    Notes:
+        Overlap is min(A's kpts inside B's box / |A|, B's kpts inside A's box / |B|) -- a
+        keypoint-containment fraction, not IoU: IoU is ~equal for touching animals and exactly
+        zero under fast motion. The `min` makes it safe: a small animal wholly inside a large
+        one scores high only one way, so occlusion is not a duplicate. It addresses INSTANCE-
+        level `fp_dup` (the detector's own NMS is per-box, before any row assignment); aimed at
+        crowded-overlap roots, near-no-op on sparse ones. 3D-aware: liveness is "finite in ANY
+        camera" and the pair overlap is the mean of the per-camera fractions over co-occurring
+        cameras; on C=1 byte-identical to the old camera-0-only computation.
     """
     b, k = boxes, kpts
     S, T, C = b.shape[0], b.shape[1], b.shape[2]

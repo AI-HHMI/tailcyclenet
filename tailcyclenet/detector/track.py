@@ -68,56 +68,28 @@ class CrossViewTracker:
     def step(self, cgroup, boxes_per_cam, scores_per_cam):
         """Match, update, birth, retire. -> (boxes (S,C,4), scores (S,C), claimed (S,C)) numpy.
 
-        `claimed[s, c]` is the DETECTION INDEX slot `s` took in camera `c`, or -1. It is returned
-        rather than recomputed because any per-detection quantity a caller wants to carry along
-        (the keypoint branch's output, for one) has to follow the SAME assignment the boxes did,
-        and matching boxes back to detections afterwards is ambiguous wherever two overlap.
-
-        `boxes_per_cam` is a list of (n_c, 4) tensors in each camera's own pixels, and
-        `scores_per_cam` the matching (n_c,) objectness -- the same pair `associate` takes.
-
-        Notes.
-
-        A TARGET WITH NO 3D POINT CANNOT BE MATCHED, BUT IT MUST STILL BE ABLE TO EXPIRE. It is
-        filtered out of `slots`, so the update loop never touches its `age`, `retire` never
-        fires, and `free` excludes it because it is still in `self.targets` -- the slot is dead
-        for the rest of the clip. `--min-views 1` creates exactly this: a single-view instance's
-        `point` is all-NaN by design (`associate`), and one such birth on frame 0 permanently
-        costs a row. This is NOT the documented immortal one-camera target -- that one HAS a
-        finite point, is in `slots`, and its age is maintained; retiring it was tried and
-        measured worse (+2.72 mm MPJPE). This one is invisible to the matcher entirely.
-
-        The affinity uses THE DETECTION'S OWN SIDE, not the mean of it and the target's last
-        claimed side. `link_rows` uses the mean and making these two consistent was TRIED AND
-        MEASURED WORSE: +1.71 mm MPJPE and -0.038 MOTA, paired over 131,887 points on the two
-        ten-bird clips. The paths are not analogous -- `link_rows` averages two boxes seen in the
-        SAME frame, while a target's remembered side is carried forward, so one oversized box
-        gives it an oversized gate for life. Box slots filled RISE while pose coverage FALLS: the
-        extra boxes are wrong.
-
-        THE GATE IS THE ALGORITHM, not a tie-break: a pair beyond one box side is not the same
-        animal, so it must be unavailable to Hungarian rather than merely expensive -- an optimum
-        over an all-bad cost matrix is an arbitrary permutation. A NaN BOX IS UNAVAILABLE, NOT
-        UNRANKABLE: `unletterbox_boxes` returns NaN for a box with no area, which makes the gap
-        NaN, which `clip` leaves NaN -- and `affinity.any()` is True for NaN, so
-        `linear_sum_assignment` raised `matrix contains invalid numeric entries` and killed the
-        clip. Zero is what the gate already means: unavailable.
-
-        The phases after matching: UPDATE re-triangulates from what a target actually claimed,
-        else holds the point; BIRTHS send whatever nobody claimed through the memoryless
-        pairwise search (`associate`); RETIRE frees a slot with no evidence for a window for
-        whoever is there now. AGE COUNTS FRAMES WITH NO EVIDENCE AT ALL -- one camera is
-        evidence: it cannot move the point, but it says the animal is still there, which is what
-        expiry is about. SO A TARGET CLAIMING EXACTLY ONE CAMERA NEVER EXPIRES AND NEVER UPDATES
-        ITS 3D POINT (since the re-triangulation needs two cameras). That reads like a bug and a
-        second counter retiring it on frames-since-re-triangulation was TRIED AND MEASURED
-        WORSE: +2.72 mm MPJPE and miss +0.021, paired over 132,006 points on the same clips. The
-        frozen point costs nothing, because the output boxes are written from the CLAIMED
-        DETECTION and never from the reprojection -- a one-camera target still emits a real box
-        for a real animal, and expiring it hands its slot to a spurious birth. Leave it immortal.
-
-        `claimed` is the per-camera set of taken detection indices; `got` maps slot -> {cam: det
-        index}.
+        Inputs:
+            cgroup -- posetail camera dicts for this frame.
+            boxes_per_cam -- list of (n_c, 4) tensors in each camera's own pixels.
+            scores_per_cam -- matching (n_c,) objectness.
+        Outputs:
+            (boxes, scores, claimed): `claimed[s, c]` is the DETECTION INDEX slot `s` took in
+            camera `c`, or -1 -- returned rather than recomputed so any per-detection quantity
+            (keypoints) follows the same assignment.
+        Side effects:
+            Mutates `self.targets`: points re-triangulated from what each target claimed,
+            ages advanced, births and retirements applied.
+        Notes:
+            A target with no 3D point cannot be matched but must still expire; it is filtered
+            out of `slots`, so its age is never touched and its row goes dead for the clip
+            (`--min-views 1` creates exactly this). The gate is the algorithm, not a tie-break:
+            a pair beyond one box side is not the same animal, so it must be unavailable to
+            Hungarian rather than merely expensive; a NaN box is unavailable, not unrankable
+            (NaN affinity made `linear_sum_assignment` raise). The affinity uses the detection's
+            own side (not the mean with the target's remembered side -- measured worse). A
+            one-camera target never expires or updates its 3D point; retiring it was measured
+            worse (+2.72 mm MPJPE) because output boxes come from the claimed detection, never
+            the reprojection.
         """
         from scipy.optimize import linear_sum_assignment
 

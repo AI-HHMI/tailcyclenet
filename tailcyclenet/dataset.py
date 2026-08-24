@@ -711,25 +711,19 @@ class PoseDataset(Dataset):
                 registry_base -- a base registry whose ids must be preserved (warm start).
         Side effects: reads every label table; prints the box_source coverage per dataset.
 
-        `n_frames` must be >= 2: T = 1 gives posetail `gT = T // tubelet_size = 0` and a
-        zero-length pos_embed, and the clamp-pad in `_frames` does NOT cover it when
-        `cfg.n_frames` is itself 1. `box_source` is asserted against `BOX_SOURCES`: a typo
-        would silently mean `keypoints` -- same shapes, same losses, a run that just quietly
-        ignored the boxes. `registry_base` makes the ids APPEND-ONLY against a run that already
-        exists, so the embedding rows behind them survive a warm start; `Registry.build` raises
-        if an old id would move. Appearance augmentation is train-only, and `None` is also the
-        flag the pixel path reads. The parquet is scattered HERE, in the parent process, so
-        forked workers share the dense arrays copy-on-write instead of each holding its own
-        copy. Keypoint ids are per SESSION, not per dataset: a session may reorder or subset
-        the root's names, and its dense K axis follows its OWN names; resolving them here makes
-        a root that cannot be mapped fail at construction rather than mid-epoch. A mode/table
-        mismatch is refused HERE too: `_item` picks its target table off `sess.mode` alone, but
-        the spec allows a 3d session carrying only keypoints.pq -- which would crash mid-epoch
-        as an uncaught TypeError. With `box_source = 'instances'`, the roots the switch actually
-        reached are printed: a root with no `instances.pq` silently falls back to keypoints per
-        view, invisible in a loss curve. Sampling pools are a set of index positions plus an
-        optional cumulative weight array; balancing across datasets is train-only so a window's
-        identity stays tied to its index.
+        `n_frames` must be >= 2 (T = 1 gives posetail `gT = 0` and a zero-length
+        pos_embed, which the clamp-pad does NOT cover); `box_source` is asserted against
+        `BOX_SOURCES` (a typo would silently mean `keypoints`). `registry_base` makes the
+        ids APPEND-ONLY so embedding rows survive warm start; `Registry.build` raises if
+        an old id would move. The parquet is scattered HERE, in the parent process, so
+        forked workers share the dense arrays copy-on-write. Keypoint ids are per SESSION,
+        not per dataset (a session may reorder or subset the root's names), so an
+        unmappable root fails at construction rather than mid-epoch; a mode/table mismatch
+        is refused here too (`_item` picks its target off `sess.mode` alone, and a 3d
+        session carrying only keypoints.pq would crash mid-epoch). With
+        `box_source = 'instances'` the roots the switch actually reached are printed (a
+        root with no `instances.pq` silently falls back to keypoints). Balancing across
+        datasets is train-only, so a window's identity stays tied to its index.
         """
         assert cfg.n_frames >= 2, (
             f'n_frames = {cfg.n_frames} is not usable: posetail computes gT = T // tubelet_size '
@@ -996,81 +990,33 @@ class PoseDataset(Dataset):
     def _item(self, idx, rng, shape=None):
         """Build one window's tensors, or None when the item cannot be built.
 
-        Applies the whole data path for one item: camera selection, rotation/crop/resize,
-        pixels, the query prior (with its corruptions) and the visibility targets.
-
         Inputs: idx -- the index to pick.
                 rng -- the item's RNG stream.
                 shape -- a pre-drawn cost-determining shape dict (see `_shape`).
         Outputs: the 13- or 14-field item tuple `__getitem__` hands to the collate, or None.
 
-        The `prompt_swap_animal` neighbour is picked here, before any geometry -- the corruption
-        itself is a PER-KEYPOINT probability against ONE neighbour, and the Bernoulli lives in the
-        query-prior section below. The crop-inflate draw is one per item, not per camera, so a
-        multi-camera window is one consistent geometry; the camera draw is sorted (the reference
-        leaves it unsorted) so a window is comparable to itself across runs.
+        Visibility: `vis` (3D noisy-OR) is unused at R == 2; `vis_2d` is the per-camera
+        THREE-STATE target (NaN = "not assessed", masked out of the BCE; `projected` joins
+        UNLABELED), withheld when `sess.has_visibility_assessment` is False or every
+        assessed row is projected/unlabeled; both-or-neither.
 
-        Visibility targets: `vis` (the 3D noisy-OR) has nothing to describe at R == 2. `vis_2d`
-        is the per-camera THREE-STATE target -- NaN means "not assessed" and is masked out of the
-        BCE so those entries produce no gradient; `projected` joins UNLABELED on the NaN side (a
-        POSITION with no visibility claim). It is withheld when `sess.has_visibility_assessment`
-        is False so the head is not trained toward "always visible", and also when every assessed
-        row in the window is projected/unlabeled. The 3D noisy-OR is bool, two-state by
-        construction (the loss inverts it with `~`); with no per-camera assessment both masks
-        are derived geometrically, and `vis`/`vis_2d` are both-or-neither -- one without the
-        other dies inside einops.
+        Geometry: camera and crop-inflate draws are one per item (camera draw sorted).
+        Points outside the source frame or the FINAL crop are flipped out of `vis_2d`;
+        a rotation that loses the animal to the inscribed crop is REVERTED, not retried.
 
-        Rotation/crop/resize: the rotation rate draw with `aug_rotation_prob = None` reproduces
-        the old expression exactly (same value, same number of draws, same order). Points outside
-        the source frame or the FINAL crop are not visible in the pixels the model sees and are
-        flipped out of `vis_2d` (only real positives, `== 1`, which is NaN-safe); `_rotate_2d`
-        keeps the WHOLE expanded canvas, so nothing there pushes a point outside `cam['size']`.
-        The neighbour's raw pose is threaded through the SAME rotate/crop/resize steps and only
-        the final `prior_out_of_bounds` mask applies -- never `_mask_outside` against the source
-        frame. In 3D, single-view differs ONLY in how many cameras are shown (targets stay
-        world-metric); the library's inscribed crop can take the animal with it (~0.416 of the
-        frame), so a rotation that loses the animal is REVERTED rather than retried (a retry
-        perturbs the sampling stream; reverting consumes identical draws) -- the `2 <=` half is
-        load-bearing. The neighbour's RAW WORLD POSES ride the same two world-rotation draws
-        (points AND cameras rotate together, so the model cannot learn a fixed world gauge) and
-        never reach `crop_to_points_3d`, so the crop and `cube_scale` cannot move. Stored boxes
-        live in SOURCE pixels, so they follow each camera's in-plane rotation.
+        Pixels: appearance augmentation runs on the final ~256 px crops; views are
+        UINT8 (4x fewer bytes to collate/queue/pin; the model divides on device).
 
-        Pixels: appearance augmentation runs on the final ~256 px crops, not source frames (the
-        same augmentation for a fraction of the work); `read_frames` IGNORES `pool` on the video
-        path, so the pool is gated on the group's kind. Views are UINT8, not float32/255 -- the
-        model divides on device (free), and this is 4x fewer bytes to collate, queue and pin.
+        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training,
+        the previous window's own prediction at deployment); `prompt_t` is the first
+        labelled frame; `prompt_dropout` is PER ITEM, not per keypoint. Corruptions,
+        in order: exposure bias, noise/offset in PIXELS, stale priors,
+        `prompt_swap_animal`, `prompt_swap_kpt_pairs` (finite entries independently
+        replaced by another keypoint's ORIGINAL position), and a whole-body offset --
+        ONE vector per item.
 
-        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training, the
-        previous window's own prediction at deployment) and `prompt_t` is the first frame each
-        keypoint is labelled at (not always 0). `prompt_dropout` is drawn PER ITEM, not per
-        keypoint -- per-keypoint draws put P(fully unprompted) at ~1e-19, so the query-free
-        forward val scores was never trained. Corruptions, in the order applied: exposure bias
-        (the prior deploys as the model's own prediction; NaN + noise stays NaN); noise/offset in
-        PIXELS with 3D converted by `cube_scale` (a scalar in the session's own units cannot
-        serve roots mixing px and mm), where the px scale comes from the projection jacobian
-        (`get_camera_scale`), which is offset-invariant; STALE priors from a different frame than
-        `prompt_t` claims -- swapped in only where the other frame has a point too (a stale prior
-        is a wrong position, not a withdrawn one); B, `prompt_swap_animal`, the prior jumps to a
-        nearby animal's point at exactly the configured per-keypoint rate, CONDITIONAL on the
-        neighbour's point being in bounds there (same rule `--anchor carry` uses), so the
-        configured rate is an upper bound; A, `prompt_swap_kpt_pairs`, each finite entry
-        independently draws Bernoulli(p) to be replaced by another finite keypoint's ORIGINAL
-        position, drawn uniformly (NOT a permutation -- duplicates allowed, so the prior set is
-        not preserved), read from a snapshot so no point lands on an already-corrupted value,
-        with `prompt_t` deliberately untouched; and a whole-body offset (ONE vector for the whole
-        pose, per item -- i.i.d. jitter is not the shape of the deployed `carry` error, which is
-        a WHOLE-BODY LAG).
-
-        The stride is read back off `frames` rather than threaded out of `_frames`:
-        `SmoothnessLoss` has no dt and its k-th difference grows like s^k, so `run_batch` has to
-        undo that -- MEDIAN, not `frames[1] - frames[0]`, because a window clipped at a group
-        edge repeats its last frame and those zero gaps must not be read as stride 1. The final
-        3D noisy-OR is taken over the *FINAL* `vis_2d` (rotation and cutout zeroed points the
-        crop provably does not contain); `== 1` is NaN-safe and stays bool. The box prompt field
-        is emitted only when a box model is training, so a plain run keeps its 13-field item and
-        is byte-identical; the box is the target's extent in THIS window's crop frame, not a
-        second copy of the crop geometry.
+        The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
+        last frame); the final 3D noisy-OR is over the FINAL `vis_2d`.
         """
         shape = shape or self._shape(rng)
         item = self._pick(idx, rng)

@@ -175,75 +175,32 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
 def run_dataset(args):
     """One inference run.
 
-    Every pure-argument check runs before the checkpoint loads: a typo should not cost a multi-GB
-    load, and it makes the checks testable without a GPU. The frame range is not an input-format
-    lever, so it is checked above the input branch. The RAM budget is resolved once, above both
-    input branches, before anything allocates: the `--videos` probe opens containers, and
-    `memory.current` caches process-wide, so `--max-ram` cannot be a ceiling on a phase that runs
-    before it is read. It is printed rather than inferred -- a run that does not say which budget
-    it had cannot have its wall clock compared -- and re-resolved after the weights are resident,
-    since nothing before then has subtracted what torch, CUDA and the checkpoints hold.
+    Every pure-argument check runs before the checkpoint loads (a typo should not cost a
+    multi-GB load). The RAM budget is resolved once, before anything allocates, printed
+    rather than inferred, and re-resolved after the weights are resident.
 
-    An oracle prior (`--anchor labels`) is incompatible with detector/boxes rows: `run_group`
-    seeds row `a` from LABEL row `a`, but a detector row `a` is a score- or association-ordered
-    slot that is not label row `a` -- the oracle would be handed a different animal's ground
-    truth. `--refine-px` contradicts an explicit `--no-refine` (`--refine` is tri-state: None
-    means derive from mode), and has a structural floor: at patch_size 16 a 16 px input gives a
-    1x1 token grid and the forward returns all-NaN with no exception -- two patches is the
-    smallest input that can carry a spatial relation, and the measured floor is far above it.
+    `--anchor labels` (an oracle prior) is incompatible with detector/boxes rows;
+    `--refine-px` contradicts `--no-refine` and has a 1x1-token-grid floor at 16 px.
 
-    The input: both branches contribute the same provenance KEYS with different values --
-    `SessionWriter` raises on a key given twice. The videos branch builds a `format.VideoSession`
-    in memory (no staging directory, no symlink farm) and states `ds_name` outright via
-    `--dataset-name`, since there is no staged directory tree to recover it from; the dataset
-    branch is one session per run, a pure-argument check (`sessions_for` reads toml and opens no
-    pixels). Window-length knobs are ceilings, not free levers: `--n-frames` longer than the
-    trained window is not the same model (`n_frames` sizes the temporal pos_embed the checkpoint
-    carries; shorter is safe, since val/test already enumerate fixed windows), and `--refine-px`
-    larger than the trained `image_size` reaches the 2D head's fixed canvas as an out-of-range
-    position (`PadToSize` only pads UP).
+    Both input branches contribute the same provenance KEYS with different values --
+    `SessionWriter` raises on a key given twice. The videos branch builds a
+    `format.VideoSession` in memory, stating `ds_name` via `--dataset-name`; the dataset
+    branch is one session per run. `--n-frames` longer than the trained window is not
+    the same model; `--refine-px` larger than the trained `image_size` hits the 2D head.
 
-    The box deployment recipe is the default for a box model and inert otherwise: `--box-prompt
-    auto` resolves to `detector` when a detector/boxes file is given, never falls back to the GT
-    `labels` oracle on its own, and pulls crop_inflate -> 1.5, refine -> on, refine_px -> 128
-    unless the user set them (explicit flags always win); a box on a plain model resolves to
-    none. `--det-score` is not portable across detector generations, and this is the only place
-    that can tell (saturation is a property of the recipe, not the dataset), so a warning fires,
-    never an automatic threshold -- the right value depends on whether coverage or identity is
-    the objective. A tile-trained detector deploys on the whole frame at its training scale and
-    `det_wh` is its TILE size: `detect_group` derives the per-camera input from `det_tile`, so
-    `det_wh` is only a fallback. Detector-vs-session dataset matching is by FAMILY
-    (`_dataset_family`), not exact string, because the repo routinely runs differently-suffixed
-    roots of one dataset; `''` (a checkpoint predating the `dataset` key) refuses only where a
-    real name is recorded and the family disagrees, and `--allow-detector-transfer` states an
-    explicit transfer arm. The detector regresses the crop rule's box, so its `min_crop_dim`
-    floor must equal the pose model's; a detector trained on `instances` boxes is a legitimate
-    arm, just not a detector-quality comparison (the npz records which). A detector with no
-    keypoint branch cannot serve `--crop-source keypoints`, and the failure would be SILENT
-    (`run_group` switches on `det_kpts_stc is not None` and would quietly crop from the boxes),
-    so it is refused rather than warned.
+    The box deployment recipe is the default for a box model and inert otherwise:
+    `--box-prompt auto` resolves to `detector` with a detector/boxes file, never falls
+    back to the GT `labels` oracle, and pulls crop_inflate -> 1.5, refine -> on,
+    refine_px -> 128 unless set. `--det-score` is not portable across detector
+    generations: a warning fires, never an automatic threshold.
 
-    `--dataset-name` overrides the registry key safely because it is CHECKED: a registry is keyed
-    by DATASET NAME, so deploying on a root the run was not trained on -- the point of a shared
-    keypoint vocabulary -- would otherwise die on the folder name alone; `Registry.ids_for`
-    aligns to the session's own names and raises on any name the registry does not hold. A group
-    shorter than `--start-frame` is skipped by name (a ragged root must still be runnable), but a
-    run that predicts NOTHING is a mistyped range, and an empty session with exit 0 is the worst
-    of both. The writer's provenance is a LIST OF PAIRS, not a dict, because `SessionWriter`
-    raises on a duplicate key where a dict would silently keep the last one; run/checkpoint paths
-    are absolute like `source_session` (a relative path names nothing later) and `checkpoint` is
-    the resolved FILE, and the commit + dirty flag ride along since a config is not a provenance
-    record.
+    `--dataset-name` overrides the registry key safely because it is CHECKED; a group
+    shorter than `--start-frame` is skipped by name, but a run that predicts NOTHING is
+    a mistyped range. Provenance is a LIST OF PAIRS (a dict would drop duplicates).
 
-    The group loop is STREAMED: each block is written as it finishes, so nothing is proportional
-    to the clip's length. `f0` is a SOURCE frame index opening at `frame_start`; it is redundant
-    by construction (`f0 == blk['window_start'][0]`), which is asserted rather than trusted.
-    Detector handles are initialised outside the branch because they all reach
-    `_box_provenance` unconditionally. Decode's share is printed beside the wall clock rather
-    than as a percentage because `decode_s` sums across threads and can exceed the elapsed time;
-    the store's hit rate is the other half. Detector telemetry is reported after the run because
-    detection happens block by block inside it -- the fire rate cannot be recovered from the
-    output afterwards, so it is printed, not derived.
+    The group loop is STREAMED: each block is written as it finishes, so nothing is
+    proportional to the clip's length; `f0` is a SOURCE frame index, asserted rather
+    than trusted. Decode's share is printed beside the wall clock.
     """
 
     if args.anchor == 'labels':

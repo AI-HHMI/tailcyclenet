@@ -341,71 +341,25 @@ def main():
                   launches Fabric (re-executes per rank).
 
     Notes:
-    - Unknown `[training]`/`[data]` keys are refused: nothing reads them, so a typo would train
-      at the defaults and report as the arm it is not. A missing `val/` split is the only error
-      swallowed. `val_frequency` misspelled for `val_freq` yields val_freq = 0: no validation,
-      no `checkpoint_best.pth`, and a run that prints fine for 60,000 iterations. The
-      sub-blocks are guarded on their own (`[training.optimizer]` by name, `[training.losses]`
-      by `TotalLoss(**losses)`), so they pass the top-level filter as blocks. `[data]` is
-      filtered because `path`/`num_workers` live in that block but are not `LoaderConfig`
-      fields; the loader's `box_prompt` is set from `[model].box_prompt`. `[data].path` is a
-      dataset root OR a folder of them, both shapes checked.
-    - Every rank must build the same registry -- an independently ordered filesystem listing
-      would point embedding rows at different body parts -- and `warm_start` reuses it to prove
-      the checkpoint's keypoint table is a prefix of this run's.
-    - One epoch for the whole run: sampling is with replacement, so iterator resets are pure
-      overhead. `num_workers` and the RAM ceiling are per rank (`world * nw` is the real process
-      count); workers spawn (a forked worker inherits a live CUDA context) with one generator per
-      rank. `batch_size` is structurally 1 per rank. The sampling mix, not the window count, is
-      what is logged: an index entry is one (session, group, animal) whatever the group's length.
-      The missing-`val/` case is tested for rather than caught -- config errors in
-      `PoseDataset.__init__` are meant to fail loud; val gets its own (smaller) camera count.
-    - Val windows are fixed by index and spread across the index (the index is ordered
-      dataset -> session -> group, so a prefix would under-represent later sessions), a list not
-      an ndarray (used as a truth value), and decoded in a one-worker child -- forking the train
-      workers while the parent holds an open video container deadlocks them in a futex. The
-      shard `idxs[rank::world]` is gathered back in `evaluate`; `idxs`, not `val_batches`, gates
-      the eval because an empty shard must still enter the collective gather.
-    - The checkpoint is read before the optimizer is built (`start_it` decides whether the staged
-      unfreeze has fired, which changes the param groups the state is keyed to by position) and
-      the unfreeze is replayed before `load_state_dict`. Resume restores `model_state` (the raw
-      iterate), not `model_state_eval`; the sampler position is deliberately not restored. The
-      scaled optimizer config copy is what every consumer reads (`optim.group_lr` re-reads it at
-      the unfreeze); `config` keeps the configured rate or every resume would re-scale it. A
-      mismatched optimizer state is refused by name, not left as a bare KeyError. Resume into
-      the same --out is the documented restart path: re-running must not destroy what the
-      previous run earned, since it would overwrite `checkpoint_last.pth` and reset
-      `saved_mpjpe = inf`. `true` unfreezes in the constructor, so the norms extension is applied
-      before `build_optimizer` to match the int path's parameter set.
-      `per_camera_cube_scale` is derived from `[model]` so the model and loss cannot disagree;
-      `PoseLoss` adds only the 2D visibility term, and an unset weight (0.0) is bit-identical to
-      no term.
-    - DDP registers parameters at wrap time and never re-checks, so the module is wrapped after
-      the resume replay and re-wrapped after an unfreeze (drop the old wrapper first: its
-      Reducer's destructor removes the hooks); `raw` stays the handle for everything that is not
-      the forward.
-    - The resolved `box_source`, optimizer kind (absent means "muon"), and world size are
-      recorded in `provenance.toml`: the world size moves batch and lr together, so a 4-gpu and
-      a 1-gpu number are not one lever apart. Metrics always go to log.jsonl (they survive
-      without wandb, and the mix is not recoverable from config.toml); on resume `saved_mpjpe`
-      is read back from the log or a good `checkpoint_best.pth` gets replaced by the first val
-      of the resumed run.
-    - Every frequency is a total across ranks and becomes a local step count; `step` is this
-      rank's local count, `it = step * world` is global (on resume the local position is
-      `ceil_div(start_it, world)`), and a skipped step is a collective decision
-      (`all_ranks_finite` first) -- counted, not hidden. The loader workers spawn on the first
-      `next()`, after the parent freed its scratch with `malloc_trim` -- the parent they inherit
-      is the smallest possible. `s/it` is the training step with eval and checkpointing taken
-      out, `wait` the fraction of the step the GPU spent blocked on pixels (the loader
-      starvation signal), and `clipped` the running fraction of steps hitting max_grad_norm.
-      `grad_norm` is the clipped AdamW half only; the Muon half is stepped unclipped and checked
-      separately (a raw pre-orthogonalisation norm, not a step size); the gpu peak is read
-      before the log call and reset inside it, so both show the same peak. `best_mpjpe` is the
-      best val at any step while `saved_mpjpe` is the metric of `checkpoint_best.pth` on disk
-      (only its write costs a checkpoint), and `latest` is the most recent val. `best` is
-      decided only at checkpoint boundaries against the metric of the file on disk, and
-      `write=is0` runs on every rank (the schedule-free eval/train toggle is not float-exact).
-      The `best` file's metric goes in the log because the file does not record it.
+    - Unknown `[training]`/`[data]` keys are refused (a typo would train at the
+      defaults and report as the arm it is not); a missing `val/` split is the
+      only error swallowed.
+    - Every rank builds the same registry; `warm_start` reuses it to prove the
+      checkpoint's keypoint table is a prefix of this run's.
+    - One epoch for the whole run (sampling is with replacement); `num_workers` and
+      the RAM ceiling are per rank. Val windows are decoded in a one-worker child --
+      forking the train workers while the parent holds an open video container deadlocks.
+    - The checkpoint is read before the optimizer is built (`start_it` decides
+      whether the staged unfreeze has fired); resume restores `model_state`, not
+      `model_state_eval`.
+    - DDP registers parameters at wrap time, so the module is re-wrapped after
+      the resume replay and after an unfreeze.
+    - The resolved `box_source`, optimizer kind and world size are recorded in
+      `provenance.toml`; metrics always go to log.jsonl.
+    - Every frequency is a total across ranks; `step` is this rank's local count,
+      `it = step * world` global; a skipped step is a collective decision.
+      `grad_norm` is the clipped AdamW half only; `saved_mpjpe` is the metric of
+      `checkpoint_best.pth` on disk.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

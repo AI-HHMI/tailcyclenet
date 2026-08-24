@@ -345,48 +345,32 @@ class BoxDataset(Dataset):
         Every opt-in lever defaults to OFF, and off is byte-identical to every recorded
         detector, so an arm moves one key at a time.
 
-        Tiling (`tile_wh`, off by default = the whole frame): the tile is the model's INPUT
-        size and REPLACES `input_wh`; `tile_scale` is the source -> input scale and the only
-        scale there is (the tile's source extent is `tile_wh / tile_scale`). No second resize:
-        the scheme rests on an animal's size in INPUT pixels at train == deployment.
-
-        `use_regions` masks the objectness loss to `regions.pq`-certified area (orthogonal to
-        tiling, MEASURED DEAD on full-frame input where tiling is what fixes it);
-        `ignore_present` (T2.1) masks `instances.pq` PRESENT boxes -- animals in view that were
-        NOT annotated -- out of the objectness BACKGROUND target. They are MUTUALLY EXCLUSIVE:
-        both are the one opt-in (M,4) tuple slot `box_collate`/`split_batch` dispatch by RANK,
-        which cannot tell two rank-2 tensors apart -- raised here, not clobbered.
-
-        `keypoints` additionally emits per-keypoint targets and kills the horizontal flip (see
-        `random_affine`); `hflip=None` means "decide from `keypoints`", separable only so a
-        box-only CONTROL arm can match the keypoint arm's augmentation exactly. `scale_jitter`
-        (D1) overrides `random_affine`'s `scale=` OUTRIGHT, not composed. `aug_switch_off_iter`
-        (D3) switches `strong` off from that iteration on, stored in a `multiprocessing.Value`
-        created here BEFORE any DataLoader forks a worker -- a plain attribute mutated in the
-        main process would never reach the forked copies. `temporal_input` (T4.2) stacks frame
-        t-1 beside frame t on the channel axis and is refused under `strong` at construction
-        (mosaic-lite would need the pasted source item's own t-1 frame). `reduce` is a KEY
-        rather than a loader detail: it changes which source pixels reach the model, rides in
-        the checkpoint, and `detect_group` reads it back.
-
-        `origins` is a parallel list to `index` (tile origin, or None), deliberately NOT a fifth
-        tuple element because `index` is unpacked as a 4-tuple in `evaluate.py` too. B1a:
-        `max_frames_per_group` 0 (falsy) drops the per-group cap; hard-event frames always
-        survive the cap's random draw.
-
-        Negatives (A6/A6c): `negative_frac` appends (frame, camera) rows where `instances.pq`
-        explicitly marks EVERY animal INST_ABSENT -- a real assessment, never bare silence; no
-        converter in this repo emits that status yet, so it is a verified no-op on every root on
-        record. `negative_crop_frac` draws ONE crop-level negative per ORIGINAL labelled entry
-        (never from an A6 entry, which has zero animals by construction), under the regions
-        contract: `regions is None` permits anywhere, non-empty restricts to the certified
-        rect(s), empty means no safe area and the entry is skipped. Both raise rather than
-        silently no-op when nothing qualifies; `n_positive` is snapshotted before either appends.
-
-        `chunk` is ONE CONTAINER'S WORTH of index positions -- one (group, camera) file --
-        which is the locality block `ChunkShuffle` needs (the old hardcoded 512 spanned 13
-        videos and thrashed the reader cache).
+        Inputs:
+            path, split -- dataset root and split directory.
+            input_wh -- model input size; replaced by the tile size under tiling.
+            tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
+                size; `tile_scale` is the source -> input scale and the only scale there is.
+            use_regions / ignore_present -- mask objectness supervision to `regions.pq`
+                CERTIFIED area / out of `instances.pq` PRESENT boxes. MUTUALLY EXCLUSIVE: both
+                occupy the one opt-in (M,4) tuple slot `box_collate` dispatches by rank.
+            keypoints -- also emit per-keypoint targets and kill the horizontal flip (hflip=None
+                decides from `keypoints`); scale_jitter overrides `random_affine`'s `scale=`
+                outright; aug_switch_off_iter switches `strong` off from that iteration on
+                (stored in a `multiprocessing.Value` before any worker forks); temporal_input
+                stacks frame t-1 on the channel axis, refused under `strong`.
+            reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
+            negative_frac / negative_crop_frac -- A6/A6c negatives: (frame, camera) rows marked
+                INST_ABSENT for every animal, and crop-level negatives under the regions
+                contract. Both raise when nothing qualifies.
+            max_frames_per_group -- per-group cap (0 = uncapped).
+        Outputs:
+            Builds `self.index`, `self.origins` (tile origin or None -- parallel to `index`,
+            not a fifth tuple element), and `self.chunk` (one (group, camera) file's worth of
+            positions -- the locality block `ChunkShuffle` needs).
+        Side effects:
+            None.
         """
+
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
@@ -1275,43 +1259,26 @@ class BoxDataset(Dataset):
     def __getitem__(self, i):
         """Decode item `i`: letterboxed/tiled pixels, boxes, and optional kpts/regions.
 
-        FRESH ENTROPY PER VISIT on train, none on eval: `default_rng(None)` draws from OS
-        entropy per call, so there is no shared stream for workers to share (exactly as the pose
-        loader does); the old per-item seeding delivered one frozen pre-augmented copy of the
-        dataset. `strong` is read ONCE per item -- `_it.value` is shared-memory state a training
-        loop may be mutating concurrently in another process, and every use below must agree on
-        one answer.
-
-        Under tiling the pixel target is the frame at `tile_scale`, NOT `self.input_wh` (the tile
-        size): comparing the whole frame against `input_wh` gave r=2-4 and the tile became an
-        UPSAMPLE of a decimated frame, while deployment letterboxes at `tiled_input_wh`. A video
-        root IGNORES `reduce`, so its frame comes back full size -- both are legal, and what is
-        not legal is a frame matching neither, because the box transform derives from the rig's
-        recorded size. One warpAffine composes the decode scale, the augmentation AND the
-        letterbox-or-tile (`L @ W @ D`) -- three resamples would make the loader the expensive
-        half of an iteration -- and its grey `borderValue` is already what a tile hanging off the
-        frame edge should see.
-
-        The strong suite runs in FIXED ORDER, one independent per-op draw each (color jitter ->
-        additive noise -> salt & pepper -> motion blur), appearance-only so no box or keypoint
-        target moves through it. Cutout is an ERASURE: a keypoint it covers loses BOTH its
-        coordinate (NaN) and its score target (0). Mosaic-lite is the only op here that ADDS a
-        box; it cannot coexist with `regions` or `temporal_input` (raised at construction on the
-        STATIC flags -- D3's runtime switch-off does not reopen that). Copy-paste is a separate
-        opt-in arm, gated on augment/train so validation and the output-neutral default never
-        draw it.
-
-        `temporal_input` stacks (t-1, t), oldest first, warped by the EXACT SAME `M` so both
-        frames are in register and given the SAME photometric gain so no fake per-frame
-        brightness "motion" enters the stack; at clip start (no t-1) frame t is repeated.
-
-        `regions` rides along as its own tuple element rather than being folded into `boxes`: a
-        region is not an animal and must never reach `assign`. `regions_for` returning None means
-        the session claims exhaustive labelling, faithfully encoded as ONE rect covering the
-        whole input so the masked loss equals the unmasked one. `ignore_boxes` shares the ONE
-        opt-in (M,4) tuple slot with `regions` -- at most one is non-None. Unlike regions, None
-        and empty mean the same thing for an ignore box -- "nothing to mask here" either way --
-        so an empty (0,4) is already correct.
+        Inputs:
+            i -- index into `self.index` ((group, frame, camera) entry).
+        Outputs:
+            (img, boxes, [kpts], [regions|ignore_boxes]): the letterboxed/tiled frame at the
+            input size, boxes in input pixels, optional per-keypoint targets, and the opt-in
+            (M,4) mask tuple element -- at most one of regions/ignore_boxes is non-None.
+            `regions` is never folded into `boxes`: a region is not an animal and must never
+            reach `assign`.
+        Side effects:
+            None (reads the frame from disk).
+        Notes:
+            Fresh entropy per visit on train (`default_rng(None)`), none on eval; `strong` is
+            read once per item via shared-memory `_it`. Under tiling the pixel target is the
+            frame at `tile_scale`, NOT `self.input_wh`; a video root ignores `reduce`. One
+            warpAffine composes decode scale + augmentation + letterbox-or-tile (L @ W @ D).
+            The strong suite runs in fixed order, appearance-only (cutout is an erasure: a
+            covered keypoint loses both coordinate and score target); mosaic-lite is the only
+            op that adds a box and cannot coexist with `regions`/`temporal_input`.
+            `temporal_input` stacks (t-1, t) under the same warp and photometric gain; at clip
+            start frame t is repeated.
         """
         import cv2
 

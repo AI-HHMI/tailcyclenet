@@ -288,62 +288,25 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
     A block owns a bounded frame span, so nothing is proportional to the clip's length. A block's
     frames are exactly `[starts[w0], starts[w1])`, partitioning the clip -- a frame in an overlap
-    belongs to the last window containing it, so the seam frames are dropped here and block output
-    is byte-identical to whole-clip output. `boxes_for` is a callback so the caller detects only
-    the frames this block needs; `n_rows` is `S` on that path since the boxes do not exist yet.
+    belongs to the last window containing it, so seam frames are dropped here and block output is
+    byte-identical to whole-clip output. `boxes_for` is a callback so the caller detects only the
+    frames it needs; `n_rows` is `S` on that path.
 
-    `refine` defaults by dimensionality and is resolved here, folded into `cfg` so every consumer
-    sees one concrete value instead of a tri-state; a reduced pass-1 resolution (`refine_px`)
-    matters only when there IS a second pass. The frame range is resolved once: `T_total` is the
-    SOURCE STOP INDEX (a bound, not a count) and `max_frames` folds in here and nowhere else.
-    `ids_for` aligns the per-session keypoint axis to the registry's by name, so a session that
-    reorders or subsets the root's keypoints is not silently relabelled. The GT-crop path applies
-    the run's own crop rule (`lab.boxes` is already the `boxes_stc` shape) and is kept separate
-    from `boxes_stc`: a tracker that lost an animal falls back to the keypoints, where folding
-    into `boxes_stc` would drop it -- lost coverage, silently. `n_rows` is `S` on the box path,
-    where the boxes (and their row count) do not exist yet. 2D uses one camera exactly as the
-    loader picks it (a 2D session may still ship a multi-camera rig; the library asserts a single
-    view for R == 2). A detector row is not a label row: `S` can exceed the label count and rows
-    are score- or association-ordered, so every row wears an invented id and `eval.py`
-    Hungarian-matches. `carried` holds the per-animal prior for the next window (the anchor-free
-    estimate, read live out of `out` in `forward()` -- not an output column); `outcome` holds the
-    per-(animal, window) diagnostics of why a row produced nothing.
+    `refine` defaults by dimensionality, resolved and folded into `cfg` here; `T_total` is the
+    SOURCE STOP INDEX (a bound, not a count). `ids_for` aligns the per-session keypoint axis to
+    the registry by name. Detector rows are not label rows (score- or association-ordered), so
+    every row wears an invented id. `carried` holds the per-animal prior for the next window
+    (read live out of `out` in `forward()`); `outcome` holds per-(animal, window) diagnostics.
 
-    The pixel budget is a ceiling, sized from parsed toml (`rig.size`), never by opening a
-    container: a bigger block buys only fewer boundaries (each worth one prefetch stall; seam
-    frames are not re-decoded). A STATED budget (--max-ram) is a grant -- the work-derived cap
-    does not apply and the share is spent; an inferred one is spare machine memory and the cap
-    stands. `cam_decode` bounds concurrent camera decodes (each task holds one camera's whole
-    window of FULL frames). The store does NOT degrade: a block is sized so its frames FIT, and a
-    budget too small for ONE window is refused -- there is no re-decode fallback (refine pass 2
-    crops from the same frames). Two blocks are live when detection runs ahead, and both come out
-    of the store share: a budget with room for two blocks pipelines; a tighter one detects
-    inline. Output is identical either way -- only the overlap goes.
-
-    Block-local state is rebound once per block: the nested functions close over these names, so
-    rebinding makes them block-scoped, and every array is indexed `[a, frame - f0]` or
-    `[a, wi - w0]`. `_boxes_from` records which crop source produced the pixels. The driver
-    decodes window wi+1 while window wi forwards on the GPU, bounded by `cfg.prefetch_windows`:
-    bit-exact because `_build_plans`/`decode_crops` never touch `carried` and `_process_window`
-    runs strictly in window order -- only the wall-clock overlap is new, at the memory cost of
-    one extra small `crops` buffer. Detection runs one block ahead on its own worker (a decode
-    overlap, not a compute one; the decode is I/O bound); order is preserved, which keeps it
-    output-neutral.
-
-    Within a block, `f_read` is the frame span its windows TOUCH and `f_own` is what it KEEPS:
-    they differ by the seam -- a frame belongs to the last window containing it, so the seam
-    frames belong to the next block and are not emitted here. The store is evicted by window
-    position, not LRU: `starts` is monotone, so a frame below the oldest still-live window's
-    start can never be asked for again, bounding the store at one window plus the prefetch depth.
-    `memory.trim()` runs at window boundaries so freed blocks do not stay in glibc's arena (RSS
-    ratchets otherwise); the peak is checked at block boundaries after the trim (working set, not
-    arena) -- it warns once and never kills. `outcome` counts accumulate without double-counting
-    overlap seams because each block owns disjoint windows; this is the terminal window-stage
-    ledger (detector/association loss is separate telemetry). Telemetry goes in `stats`, never in
-    the block dict: the block dict is the prediction, and every key of it must be deterministic
-    across budgets. In the yielded dict, `n_frames` is a COUNT, not the stop index
-    (`frame_start`/`frame_stop` ride along so a ranged run is distinguishable from a whole-clip
-    one), and `refine` is the resolved value, not the tri-state the caller passed.
+    The pixel budget is a ceiling sized from parsed toml, never by opening a container: a STATED
+    budget (--max-ram) is a grant, an inferred one is spare memory and the cap stands; a budget
+    too small for ONE window is refused (no re-decode fallback). Block-local state is rebound
+    once per block; arrays are indexed `[a, frame - f0]` or `[a, wi - w0]`. The driver decodes
+    window wi+1 while wi forwards, bounded by `cfg.prefetch_windows` -- bit-exact, only
+    wall-clock overlap is new. The store is evicted by window position, not LRU; `memory.trim()`
+    runs at window boundaries (peak checked at block boundaries; warns once, never kills).
+    Telemetry goes in `stats`, never the block dict. In the yielded dict, `n_frames` is a COUNT,
+    not the stop index, and `refine` is the resolved value.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     assert cfg.carry_source in CARRY_SOURCES, \
@@ -431,44 +394,30 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
         Returns (frames, window_cams, plans). Writes into `outcome`/`crop` pre-allocated and
         indexed by `wi`; different windows touch disjoint slices, so it may run for window wi+1
-        on a background thread. Never reads `carried` -- `carried` is read only inside
-        `forward()`, on the main thread, in window order -- so preparing a future window's
-        pixels changes no pixel and no order.
+        on a background thread. Never reads `carried` -- read only inside `forward()`, on the
+        main thread, in window order -- so preparing a future window's pixels changes no pixel
+        and no order.
 
-        T=1 hits posetail's gT = T // tubelet = 0 bug, so a too-short window is clamped to 2
-        frames; the clamp floor is `frame_start`, not 0, so it never reaches below the requested
-        range. `window_cams` is one camera group per window carrying per-frame extrinsics where
-        a camera moves -- built here rather than per animal, because the per-animal build
-        dropped `moving_ext`. Geometry first, pixels second: every animal's crop boxes are
-        settled before anything decodes, so each (camera, frame) is read once and shared by
-        every animal.
+        A too-short window is clamped to 2 frames (T=1 hits posetail's gT = 0 bug), floored at
+        `frame_start`; `window_cams` is one camera group per window carrying per-frame
+        extrinsics where a camera moves. Geometry first, pixels second: every animal's crop
+        boxes are settled before anything decodes, so each (camera, frame) is read once and
+        shared by every animal.
 
-        A row needs `min_box_frames` finite boxes; the test is a count of all-finite frames, not
-        `.any()` -- one finite box must not fabricate a whole window's crop. For a row with
-        boxes, one box per camera is the UNION over the window's frames, so the animal does not
-        walk out of its own crop; only the cameras that saw it are used (requiring a box in
-        every camera would drop the whole animal). The union extent is NOT re-squared through
-        `crop_box_for_points`: re-squaring an already near-square union grows the box area and
-        costs accuracy, and a detector box is already a crop-rule box. The result is int32 and
-        clamped into the image -- a float or off-frame box breaks `project_cam` downstream.
-        Stored (instances.pq) boxes differ: the loader squares them through
-        `crop_box_for_points(..., pad=0)`, so serving a tight unfloored box would put the animal
-        at a different scale than any crop it trained on (`pad=0` because the stored extent is
-        already padded). Under `crop_source = 'keypoints'`, detector keypoints supply the
-        per-frame extents a union cannot recover, so the training crop rule is applied once over
-        the whole window -- union the points, then square once -- with the same bound `--refine`
-        carries: the rule squares the extent, so a wandering keypoint set lands somewhere else,
-        and falling back to the union is the conservative direction. The camera must describe the
-        box the pixels were cut with: `apply_crop` sets `size`, `_resize_camera` makes it
-        `scales`, and `forward` divides by that -- a mismatch scales every keypoint.
+        A row needs `min_box_frames` all-finite boxes (one finite box must not fabricate a whole
+        window's crop); with boxes, one box per camera is the UNION over the window's frames
+        (only the cameras that saw the row), NOT re-squared through `crop_box_for_points`
+        (a near-square union only grows); results are int32 and clamped. Stored (instances.pq)
+        boxes ARE squared through the rule (`pad=0`); under `crop_source = 'keypoints'` the
+        detector keypoints are unioned then squared once. The camera must describe the box the
+        pixels were cut with: `apply_crop` sets `size`, `_resize_camera` makes it `scales`,
+        and `forward` divides by that -- a mismatch scales every keypoint.
 
-        Wide-crop deployment (crop_inflate != 1.0) inflates each crop about its centre before
-        the resize, so the target sits off-centre in a wider crop -- the regime where the box
-        prompt is load-bearing; 1.0 leaves `boxes`/`cgroup` untouched. Pass 1 runs at a reduced
-        resolution under `--refine-px`; the pass distinction lives here rather than in the
-        shared `_resize_camera` helper, and `uncropped` (the pre-resize cgroup) is only read by
-        the refine fallback. The crop box is recorded BEFORE the pixels, so a decode failure
-        still shows what it was reaching for.
+        Wide-crop deployment (`crop_inflate != 1.0`) inflates each crop about its centre before
+        the resize -- the regime where the box prompt is load-bearing; 1.0 leaves
+        `boxes`/`cgroup` untouched. Pass 1 runs at a reduced resolution under `--refine-px`;
+        `uncropped` is only read by the refine fallback. The crop box is recorded BEFORE the
+        pixels, so a decode failure still shows what it was reaching for.
         """
         frames = np.arange(start, min(start + cfg.n_frames, T_total))
         if len(frames) < 2:

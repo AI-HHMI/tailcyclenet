@@ -208,74 +208,28 @@ def main():
                   the run folder; prints progress and eval lines.
 
     Notes:
-    - The camera-size probe needs just the discovery -- building a BoxDataset would densify
-      parquet. D2 (detector_v2 plan SS2.6) is a HALF-RESOLUTION detector stage (SLEAP's
-      `scale: 0.5`): it scales whatever `wh` the two branches above resolved to (explicit
-      `input_wh` or the min_box_px-derived size) with no new geometry path -- every box target
-      is RE-DERIVED by `crop_box_for_points` at whatever `input_wh` BoxDataset is built with,
-      so scaling `wh` here is the whole of it. Rounded to a multiple of 32 (the coarsest FPN
-      stride, the same rounding `default_input_wh`/`input_wh_for` already use), floored at 64.
-      1.0 (default) is byte-identical to every checkpoint on record. A2.5: DINOv2's patch
-      embedding requires both dimensions divisible by patch_size=14, and the coarsest FPN
-      stride (32) requires divisibility by 32 too -- LCM(14, 32) = 224. The checkpoint's
-      `input_wh` must be the size the model saw: when tiling, it is read back from `BoxDataset`,
-      which resolved it to the tile.
-    - `n_keypoints` is derived from the registry, never configured: a K that disagreed would
-      mis-index targets. A masked keypoint gets zero gradient but still emits a number at
-      inference (conv bias), so the labelled fraction must be visible in the log (sampled, not
-      exhaustive).
-    - THE COHORT MIX IS A CONFIGURED NUMBER OR IT IS AN ACCIDENT: without `annot_frac` the
-      annotated:tracked ratio is whatever `frames_per_group` happens to leave behind -- on
-      rat-city-combined the cap truncates the one tracked session (57,594 labelled frames) to
-      40 and hands 95.7% of train views to 37 annotated sessions, a ratio no key names.
-      `annot_frac` names it. None (the default), or a single-cohort split, keeps `ChunkShuffle`
-      and is byte-identical to every detector on record -- see `BoxDataset.cohort_weights`.
-      B1b/B1c (detector_v2 plan SS2.7): `alpha` reweights WITHIN whatever `cohort_w` already
-      set up (or within the whole index, if `cohort_w` is None) by group size -- elementwise
-      product, renormalised. W1.1: audited hard-event draw share, composed with the existing
-      cohort/alpha controls. A6 (detector_v2 plan SS2.3): negative-frame draw share, composed
-      the same elementwise way. A6c: crop-level negative draw share is its OWN independent
-      fraction -- `source='crop'` keeps this from also pulling A6's INST_ABSENT entries into
-      the same target share.
-    - No `val/` is the only thing swallowed here; `BoxDataset.__init__`'s config errors are
-      meant to fail at construction rather than degrade to a note. The stem's input width
-      derives from `[data].temporal_input`, and `TEMPORAL_INPUT_CHANNELS` is the one place that
-      map lives, so loader and model cannot disagree. An in-domain backbone comes from
-      scripts/pretrain_detector_backbone.py with no scale/channel correction -- it already
-      speaks this repo's [0,1] RGB convention. A2.6: the ViT backbone is frozen BEFORE the
-      optimizer is built -- a frozen param must be excluded from every param group, not merely
-      left with a grad-less one. Differential LR: any pretrained backbone gets
-      BACKBONE_LR_SCALE x lr, the fresh neck/head lr; the lower backbone rate is because COCO
-      conv weights trained under BatchNorm land in a fresh GroupNorm net (the same scale is
-      reused for in-domain backbones). With no pretraining this builds one param group,
-      byte-identical to every optimizer on record.
-    - `detector.pth` is the BEST checkpoint, not the last one -- recall peaks early and falls
-      monotonically on a root whose labels name only some of the animals; every
-      `detector_it*.pth` is still written. The 4th collate slot is split by rank, not tuple
-      length: it is `regions` OR `ignore_present` boxes, and only this dataset's own two flags
-      say which (never both true). On a Muon run only AdamW-routed params (biases, norms, 4D
-      conv weights) are clipped -- Muon orthogonalises its own gradients via Newton-Schulz
-      inside step(), so clipping them fights the orthogonalisation. `train.set_iter` is a
-      shared-memory value a forked worker reads at its own __getitem__ time (D3) -- see
-      `BoxDataset.set_iter`'s own docstring for why this cannot be a plain attribute.
-    - Every evaluation scores both splits, stores the score beside the weights -- a rolling
-      `detector.pth` with no score cannot be selected on -- and swaps in the averaged iterate
-      for scoring (`obj_scores` is from the last split scored, val where there is one), then
-      restores the working iterate for training. The objectness distribution is recorded
-      because saturation is a property of the recipe, not the dataset, so `--det-score` cannot
-      be a constant. `n_keypoints` and `yolox_version` ride in the checkpoint: they are part of
-      the weights, and absent reads as a fact about the file (0 / 'trimmed'), not a guess.
-      `bottleneck_expansion`, `shared_head`, `fpn_upsample`, `p2_bottomup`, `in_channels` and
-      `tile_wh`/`tile_scale` ride for the same reason -- each is either needed to rebuild the
-      model before `load_state_dict` can match keys (G1/G3; `fpn_upsample` adds no params, an
-      interpolate mode) or part of the recipe (two checkpoints trained at different cohort
-      mixes are not the same arm, and nothing else in the file would say so); absent means the
-      byte-identical default. `detector_last.pth` is an explicit latest alias for humans and
-      downstream tooling; it is overwritten at each evaluation, so an interrupted run's alias
-      may be incomplete and the loader's default does NOT trust it (it verifies
-      detector_it*.pth against config.toml/metrics.json instead). `detector.pth` is selected on
-      `val` where there is one, `train` otherwise -- the same key the end-of-run `best` line
-      reports. Evaluation is not part of the s/it readout.
+    - D2 is a HALF-RESOLUTION stage: `det_scale` rescales whatever `wh` the
+      branches resolved to, rounded to a multiple of 32 and floored at 64 (1.0
+      is byte-identical to every checkpoint on record); A2.5 needs input
+      divisible by LCM(14, 32) = 224. A tiled checkpoint's `input_wh` is its
+      TILE size, read back from `BoxDataset`.
+    - `n_keypoints` is derived from the registry, never configured; a masked
+      keypoint still emits a number (conv bias), so the labelled fraction is
+      logged (sampled, not exhaustive).
+    - THE COHORT MIX IS A CONFIGURED NUMBER OR IT IS AN ACCIDENT: `annot_frac`
+      names the annotated:tracked ratio (without it, rat-city-combined hands
+      95.7% of train views to 37 annotated sessions); None keeps `ChunkShuffle`
+      byte-identical to every detector on record. `alpha` reweights within
+      `cohort_w` by group size; W1.1/A6/A6c are separate draw shares.
+    - No `val/` is the only thing swallowed; config errors fail at construction.
+      A2.6 freezes the ViT backbone BEFORE the optimizer is built; a pretrained
+      backbone gets BACKBONE_LR_SCALE x lr (COCO conv weights land in a fresh
+      GroupNorm net).
+    - `detector.pth` is the BEST checkpoint, not the last one (recall peaks
+      early on partially-labelled roots); every `detector_it*.pth` is still
+      written. Evaluation scores both splits, stores the score beside the
+      weights, and selects on `val` where there is one (`train` otherwise);
+      the loader does NOT trust `detector_last.pth`.
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)

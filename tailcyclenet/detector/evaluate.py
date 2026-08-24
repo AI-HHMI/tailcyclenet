@@ -133,37 +133,29 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
                   center_dist_thresh=0.5):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
-    Sampled with `ChunkShuffle` rather than read off the front of an unshuffled loader: the index
-    is built session by session, so the first 800 views ARE the first session.
-
-    `out_scores`, when given a list, collects every DECODED objectness this pass saw. That is the
-    distribution `--det-score` cuts, and it has to be recorded at training time because it is a
-    property of the CHECKPOINT: an OLD, hard-1.0-objectness-target checkpoint (pre-`iou_aware_obj`)
-    saturates near 1.0 and can tolerate a threshold near 0.99, while the CURRENT default recipe
-    (`iou_aware_obj=true`, COCO-pretrained) does not saturate that way -- measured directly,
-    `--det-score 0.5` on this recipe loses allen-mouse-combined miss 0.032->0.285 and collapses
-    rat-city-combined miss 0.402->0.959 for almost no false-positive benefit
-    (`dev/scratch/detscore/*.log`), which is why the shipped default moved to 0.05. Optional so no
-    existing caller changes.
-
-    Notes.
-
-    SCORED WITHOUT AUGMENTATION, and that is a correctness fix rather than a preference:
-    `ignore_for` takes no `warp` -- unlike its two siblings `boxes_for` and `regions_for` -- so
-    under `--augment` the predictions and the GT came back warped while the `instances.pq`
-    PRESENT boxes did not, and the train-side FP readout excused the wrong pixels. Turning it off
-    is the right answer anyway: this measures the model on the data, and the train split's number
-    is only comparable to the val split's if both are unaugmented. `ds.augment` is restored at
-    the end, like `was_training`.
-
-    The per-(group, camera) store is keyed by the ITEM index, not by the frame `f`: with tiling
-    one frame yields several views and keying by frame dropped all but the last of them from
-    MOTA. `batch[2:]` is the keypoint target when the loader is emitting one; scoring here is
-    box-only by design -- `n_keypoints` must not change what r@.5 means -- so it is dropped
-    rather than unpacked. The head output is INDEXED, NOT UNPACKED: the head grew extra returns
-    and a fixed-arity unpack crashed the whole eval at the first checkpoint -- after 2,000
-    iterations of training had already happened. Any future branch adds another tail element;
-    this reads the two it needs and ignores the rest.
+    Inputs:
+        model, ds, device -- the detector, dataset, and compute device.
+        batch_size, batches, num_workers -- loader shape; `seed` drives the `ChunkShuffle`
+            sample (never read off the front of an unshuffled loader -- the index is built
+            session by session, so the first 800 views ARE the first session).
+        score_thresh, iou_thresh, center_dist_thresh -- the `decode` thresholds the sample is
+            scored at.
+        max_animals -- per-group detection cap (default: the group's labelled animal count).
+        out_scores -- when a list is given, collects every decoded objectness this pass saw:
+            the distribution `--det-score` cuts, recorded at training time because it is a
+            property of the CHECKPOINT (an old hard-1.0-target checkpoint saturates near 1.0;
+            the current `iou_aware_obj` recipe does not -- why the shipped default moved to
+            0.05).
+    Outputs:
+        {group_key: {n_gt, r50, r75, iou, fp, mota, fp_ignored, fp_dup, fp_none, miss}}.
+    Side effects:
+        Sets the model to eval and `ds.augment` to False, restoring both at the end. Scoring
+        is deliberately unaugmented: `ignore_for` takes no warp, so augmented scoring would
+        compare warped predictions against unwarped `instances.pq` boxes.
+    Notes:
+        Per-(group, camera) state is keyed by the ITEM index, not the frame `f` (tiling makes
+        one frame several views). The head output is INDEXED, not unpacked -- fixed-arity
+        unpacking crashed eval when the head grew an extra return.
     """
     was_training = model.training
     model.eval()

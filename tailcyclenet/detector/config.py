@@ -95,138 +95,27 @@ def _float_pair(key: str, value):
 def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     """Load + validate a detector config; return the effective dict (blocks nested).
 
-    Inputs: path -- the TOML config file; out / iters / device -- CLI overrides for [training].
-    Outputs: the effective dict (blocks nested), which is what the run folder records as
-    `config.toml`, so the record is the effective recipe.
-
-    The CLI override must land BEFORE the required-field check, or it cannot rescue anything:
-    `configs/detector.toml` ships `out = ""` on the promise that `--out` fills it in; checking
-    `train.get('out')` before that runs the promise into the requirement. `path` has no CLI
-    override to rescue it, so its check stays where it is.
-
-    Required fields are never defaulted: a config that forgot the dataset would otherwise train
-    on whatever the CWD happened to be, silently. Choice guards, the same class as the pose
-    side's `build_model` raise: a bad value must fail at load, not train a different recipe than
-    the one the config names. TOML has no null, so an "absent" pair is an empty list; it is
-    normalised to None for the code that has always taken None-or-pair.
-
-    The remaining steps normalise one key each. The notes are in the repo's plan/report
-    shorthand (T2.3, C3, A1/A5, ... reference `dev/plans/detector_v2.md` / report sections):
-
-    - T2.3: `iou_aware_obj` -- the BCE objectness target at a positive anchor becomes the
-      detached IoU between its predicted and GT box, instead of a hard 1.0, once past
-      `iou_aware_warmup` iterations. Default OFF -- byte-identical to every checkpoint on record.
-    - T2.4: `box_weight` was `detector_loss`'s own hardcoded default (5.0), never exposed to a
-      config or CLI flag -- "the two untuned scalars" alongside `lr`. 5.0 here is BYTE-IDENTICAL
-      to every checkpoint on record, since that is also `detector_loss`'s own Python default;
-      this key only matters once a config states something else.
-    - `weight_decay` is AdamW's DECOUPLED decay: p <- p*(1 - lr*wd). 5e-4 was hardcoded and is
-      YOLOX's *SGD* number, where decay is coupled into the gradient; carried into AdamW at
-      lr=1e-3 it is 5e-7 per step, i.e. a total shrink of x0.995 over a 20000-step cosine --
-      half a percent, on a detector every capacity sweep calls generalisation-limited (report
-      28). 5e-4 stays the DEFAULT and is byte-identical to every checkpoint on record; this key
-      only matters once a config says else.
-    - C3 (detector_v2 plan SS2.4): `no_decay_norm_bias` excludes every dim<=1 tensor (GroupNorm
-      affine + every bias -- 176 tensors, 14,300 params, 0.44%, measured on this repo's own
-      YOLOXNano) from weight decay, RTMDet's `norm_decay_mult=0, bias_decay_mult=0` paired with
-      a real `wd`. Default False, byte-identical to every checkpoint on record -- report 42's C1
-      tested `wd=0.05` WITH norm and bias decayed, a materially different configuration this key
-      now makes reachable.
-    - A1/A5 (detector_v2 plan SS2.1): `nms_iou_thresh` / `nms_center_dist_thresh` are read by
-      `train_detector.py`'s own periodic `score_dataset` eval so a config can sweep the SAME NMS
-      thresholds `scripts/eval_detector.py`/`infer.py` do, instead of always scoring checkpoints
-      at `decode`'s Python defaults. 0.5 / 0.5 are exactly those defaults --
-      `nms_center_dist_thresh`'s unset value CHANGED from None to 0.5 once A5 was CONFIRMED
-      (2 seeds, 2 roots): every checkpoint trained before that landed was scored (during
-      training) without centre-distance NMS; every one trained after is scored with it on by
-      default, matching `decode`'s own new default. Set explicitly to '' to restore the old off
-      behaviour for a config that wants to reproduce a pre-A5 number.
-    - `neg_loss_weight` is the negative-frame objectness BCE's own weight relative to the
-      ordinary positive-frame `obj` term -- SLEAP's `negative_loss_weight`. 1.0 (default) weighs
-      a negative-frame item exactly like a positive-frame one; only reachable once
-      `[data].negative_frac` draws any. DEAD KEY: `scripts/train_detector.py`'s `detector_loss`
-      call never receives it or any negative-item identity, so a non-default value trains
-      byte-identically to 1.0 while a run folder records the arm as though it differed. Refuse
-      rather than accept a config that would silently measure nothing
-      (dev/plans/detector_false_negative_coverage.md W0.4).
-    - D2 (detector_v2 plan SS2.6): `det_scale` scales whatever [data].input_wh resolves to
-      (explicit or min_box_px-derived). 1.0 (default) is byte-identical to every checkpoint on
-      record.
-    - T4.2: `temporal_input` stacks frame t-1 beside frame t. Default `'none'` is
-      byte-identical to every checkpoint on record. See `TEMPORAL_INPUT_CHANNELS`
-      (`tailcyclenet/detector/data.py`) for what each mode does to the stem's input width.
-    - `annot_frac` is P(a training draw comes from an `annotated` session), the detector's
-      counterpart to `LoaderConfig.annot_frac`. TOML has no null: absent (or an empty string)
-      means "do not weight", which keeps `ChunkShuffle` and is byte-identical to every
-      checkpoint on record. Also INERT on a single-cohort split -- `BoxDataset.cohort_weights`
-      returns None there, so 3dpop/calms21/branson-fly are unaffected whatever this says.
-    - B1b (detector_v2 plan SS2.7): `alpha` is the per-GROUP draw weight exponent,
-      `n_views ** alpha`. `None` (default) does not weight by group size and is byte-identical
-      to every checkpoint on record. Composes with `annot_frac` (SS2.7 B1c) -- see
-      `train_detector.py`'s own sampler construction. NOT restricted to [0, 1]: 0.5/1.0/0.0 are
-      the plan's own sweep points but nothing about the maths requires the exponent stay in that
-      range.
-    - A6 (detector_v2 plan SS2.3): `negative_frac` is P(a train draw is a NEGATIVE frame -- an
-      (frame, camera) an `instances.pq` row explicitly marks INST_ABSENT for EVERY animal, a
-      real per-camera assessment, not silence). `None`/unset (default) draws no negative frames
-      and is byte-identical to every checkpoint on record; see `BoxDataset.negative_index` for
-      why only `INST_ABSENT` qualifies (not merely "not in the labelled-frame index", which
-      would risk training false negatives wherever a frame holds an unannotated-but-present
-      animal).
-    - A6c (detector_v2 plan, delegated investigation): `negative_crop_frac` is CROP-LEVEL
-      negatives -- a sub-region of an ordinary LABELLED frame, far from every known animal,
-      drawn without needing INST_ABSENT at all. `None`/unset (default) draws none and is
-      byte-identical to every checkpoint on record. Complementary to `negative_frac`, not a
-      replacement -- see `BoxDataset._crop_negative_origin` and dev/plans/detector_v2.md's A6c
-      section for the full design and per-root feasibility.
-    - D1 (detector_v2 plan SS2.6): `scale_jitter` is scale-jitter augmentation, layered into
-      `random_affine`'s own `scale=` draw range. `None`/unset (default) keeps the shipped
-      `(0.8, 1.25)` range and is byte-identical to every checkpoint on record. A `[lo, hi]` pair
-      overrides it outright rather than composing (composing two ranges is not obviously either
-      range, and the plan's own instruction is 'sweep, don't adopt' -- one explicit range per
-      arm keeps that legible).
-    - D3 (detector_v2 plan SS2.6): `aug_switch_off_iter` is the ITERATION `[data].augment_strong`
-      (mosaic-lite, colour jitter, additive noise, salt & pepper, motion blur, cutout) switches
-      OFF for the remainder of the run -- RTMDet's `PipelineSwitchHook`, and this repo's own
-      precedent for "an int means the step to change at" (`[model].video_encoder_requires_grad`).
-      0 (default) never switches off and is byte-identical to every checkpoint on record.
-    - T4.1: `bottleneck_expansion` -- 0.5 (default) is byte-identical to every checkpoint on
-      record; 1.0 is the shape a Megvii COCO backbone actually loads into (see `yolox.Bottleneck`).
-      `pretrained` -- '' (default, from scratch, every run on record), 'coco' (load the tier's
-      COCO backbone -- `detector.load_coco_backbone`), or ANY OTHER non-empty string is a PATH
-      to an in-domain backbone-only checkpoint (`scripts/pretrain_detector_backbone.py` ->
-      `detector.load_pretrained_backbone`). Unlike 'coco', a path has no tier or
-      bottleneck_expansion restriction -- the pretrain script builds whatever architecture its
-      own config names, so the two just need to AGREE, and `load_pretrained_backbone` is what
-      checks that agreement. Required to exist NOW, at config load: a typo'd path should fail
-      before 20000 iterations of training a randomly-initialised "pretrained" backbone, not
-      after.
-    - A2: DINOv2 hub weights are fully public; DINOv3's are GATED behind Meta's own
-      license-request form -- this only builds the architecture and attempts the download, which
-      403s from dl.fbaipublicfiles.com/dinov3 without an approved request (see
-      `dev/plans/detector_architecture_sweep.md` A2.7). Only the matching ViT family may request
-      it -- DINOv2 weights cannot load into a DINOv3-shaped backbone or vice versa.
-    - T4.3: `p2` is a stride-4 FPN level, on top of EITHER backbone (canonical tier or
-      `trimmed`) -- unlike `bottleneck_expansion`, not tier-restricted. Default `false` is
-      byte-identical to every checkpoint on record (`YOLOXNano`'s own default).
-    - Recall-v2 training switches: the recommended shipped training recipe is TAL + CIoU,
-      selected from the rat-city Wave-0 result. Explicit legacy configs can still request the
-      centre-prior/GIoU path; absent keys now resolve to the recommended recipe.
-    - `optimizer`: 'adamw' (default, byte-identical to every checkpoint on record) or 'muon'
-      (SF-Muon for 2D .weight tensors, AdamW-ScheduleFree for the rest -- see optim.py's
-      pose-model precedent).
-    - A2.6: `freeze_backbone` freezes the ViT backbone (only its SFP adapters + PAFPN + Head
-      train). Default false, inert on a backbone with no `freeze_backbone` method (every CNN
-      tier).
-    - G1: `shared_head` gives the head separate obj/reg towers instead of sharing one. Default
-      true (shared) is byte-identical to every checkpoint on record.
-    - G2: `fpn_upsample` is the PAFPN top-down upsample mode. 'nearest' (default) is
-      byte-identical to every checkpoint on record.
-    - G3: `p2_bottomup` is bottom-up refinement for the p2 PAFPN level. Default false is
-      byte-identical to every checkpoint on record; only meaningful alongside [model].p2 = true.
-    - G4: `tal_soft_prior` softens assign_tal's strict `inside` candidacy mask to
-      `inside | near` (reuses the existing CENTER_RADIUS=2.5 cell radius `assign()` already
-      computes). Default false is byte-identical to every checkpoint on record.
+    Inputs:
+        path -- the TOML config file.
+        out / iters / device -- CLI overrides for [training], applied BEFORE the
+            required-field check (`configs/detector.toml` ships `out = ""` on the promise
+            that `--out` fills it in).
+    Outputs:
+        The effective dict (blocks nested) -- exactly what the run folder records as
+        `config.toml`. Required fields are never defaulted (a missing dataset must fail at
+        load, not silently train on the CWD); unknown keys and choice violations raise. An
+        "absent" TOML pair (empty list -- TOML has no null) is normalised to None.
+    Notes:
+        Every optional key defaults to OFF, byte-identical to every checkpoint on record, so
+        an arm moves one key at a time; shorthand references `dev/plans/detector_v2.md`.
+        Highlights: `neg_loss_weight` is a DEAD KEY, REFUSED (the training call never
+        receives it); `nms_center_dist_thresh` defaults ON (A5, '' restores the old off);
+        `pretrained` accepts 'coco' or a path (required to exist NOW); the recommended
+        shipped recipe is TAL + CIoU. The remaining keys (iou_aware_obj, box_weight,
+        weight_decay, no_decay_norm_bias, det_scale, temporal_input, annot_frac, alpha,
+        negative_frac, negative_crop_frac, scale_jitter, aug_switch_off_iter,
+        bottleneck_expansion, p2, optimizer, freeze_backbone, shared_head, fpn_upsample,
+        p2_bottomup, tal_soft_prior) each only matter once a config states something else.
     """
     from tailcyclenet.checkpoints import load_config
 

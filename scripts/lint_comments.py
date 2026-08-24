@@ -13,8 +13,10 @@ Python (.py):
      comment lines inside function/method bodies. Comments are only allowed at module level
      (outside any function). Exceptions: type: ignore, noqa, fmt: skip, pragma directives.
 
+  3. Docstrings and module-level comment blocks must be at most 30 lines.
+
 TOML (.toml) under configs/:
-  3. At most 1 comment line per parameter. Multi-line comment blocks are violations except
+  4. At most 1 comment line per parameter. Multi-line comment blocks are violations except
      for the file-level header.
 """
 
@@ -165,6 +167,11 @@ def _check_python(path: Path) -> list[str]:
         return diagnostics
 
     for node in ast.walk(tree):
+        if isinstance(node, ast.Module):
+            doc = ast.get_docstring(node)
+            if doc and len(doc.splitlines()) > 30:
+                diagnostics.append(
+                    f'{path}:1: module docstring is {len(doc.splitlines())} lines (max 30)')
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         name = node.name
@@ -172,6 +179,36 @@ def _check_python(path: Path) -> list[str]:
         if doc is None:
             diagnostics.append(
                 f'{path}:{node.lineno}: function `{name}` has no docstring')
+        elif len(doc.splitlines()) > 30:
+            diagnostics.append(
+                f'{path}:{node.lineno}: `{name}` docstring is '
+                f'{len(doc.splitlines())} lines (max 30)')
+
+    lines_list = source.splitlines()
+    func_line_set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for ln in range(node.lineno, node.end_lineno + 1):
+                func_line_set.add(ln)
+    i = 0
+    while i < len(lines_list):
+        lineno = i + 1
+        if lineno in func_line_set:
+            i += 1
+            continue
+        if lines_list[i].lstrip().startswith('#'):
+            run_start = i
+            while (i < len(lines_list)
+                   and (i + 1) not in func_line_set
+                   and lines_list[i].lstrip().startswith('#')):
+                i += 1
+            run_len = i - run_start
+            if run_len > 30:
+                diagnostics.append(
+                    f'{path}:{run_start + 1}: module-level comment block is '
+                    f'{run_len} lines (max 30)')
+        else:
+            i += 1
     return diagnostics
 
 

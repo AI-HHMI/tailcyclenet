@@ -49,7 +49,7 @@ def _write_frames(group_dir, cam, n_frames, size):
 
 
 def _video_colour(cam_ix, i):
-    """The RGB a `_write_video` frame should decode to. decord returns RGB; cv2 writes BGR."""
+    """The RGB a `_write_video` frame should decode to. PyAV returns RGB; cv2 writes BGR."""
     return (7 * i) % 256, (200 - 10 * i) % 256, (30 * i + 11 * cam_ix) % 256
 
 

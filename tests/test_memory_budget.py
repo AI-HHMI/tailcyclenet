@@ -229,7 +229,7 @@ def test_reader_cache_is_pure_given_ram_and_shrinks_under_a_cap():
     from tailcyclenet.dataset import _reader_cache_size
 
     # johnson's rig: 16 cameras of 3208x2200. The price is LINEAR in the count on PyAV; the
-    # quadratic law this test used to assert was decord's, measured without a trim on an
+    # quadratic law this test used to assert came from the old decoder, measured without a trim on an
     # unconstrained host (i.e. it measured allocator arena).
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1024) == 16     # room -> the whole rig
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=1) == 1         # never zero

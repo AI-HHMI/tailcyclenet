@@ -1081,7 +1081,7 @@ def test_reader_cache_does_not_multiply_by_worker_count():
 def test_reader_cache_degrades_instead_of_oom_on_a_small_host():
     """The count is a wish and RAM is the constraint; the clamp binds before the OOM killer does.
     The numbers here moved with the backend: PyAV's readers are linear (~0.053 GB per megapixel),
-    so budgets that decord's quadratic price could not hold now fit, and a genuinely small budget
+    so budgets that the old quadratic decoder price could not hold now fit, and a genuinely small budget
     still degrades.
     """
     from tailcyclenet.dataset import _reader_cache_size

@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet import format as fmt
+from tailcyclenet import format as fmt, video
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/CalMS21')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/calms21')
@@ -97,8 +97,7 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
             npz = np.load(SRC / 'task1_MARS_features' / 'calms21_task1_features' / src_split /
                           f'{stem}.npz', allow_pickle=True)
 
-            from decord import VideoReader
-            vr = VideoReader(str(mp4))
+            vr = video.open_reader(str(mp4))
             T = len(vr)
             n_lab = len(seq['keypoints'])
             # They agree on all 89 sequences, so a disagreement is a broken file.
@@ -110,11 +109,12 @@ def convert(out_root: Path, dry_run: bool, max_seqs: int | None) -> None:
             # broken.
             fps = float(npz['fps'])
             if not 25.0 <= fps <= 35.0:
-                fps = float(vr.get_avg_fps())
+                fps = float(vr.fps)
                 print(f'   ! {stem}: npz fps is {float(npz["fps"]):.2f}; using the container\'s '
                       f'nominal {fps:.2f}')
             group = fmt.Group(stem, T, fps=fps, source_video=str(mp4), source_frame_start=0,
                               source_frame_step=1, notes=str(npz['vid_name']))
+            vr.close()
             print(f'   {split}/{stem}: {T} frames @ {fps:.2f} fps, '
                   f'{2 * T * len(NAMES)} kpt rows, {inside * 100:.2f}% of kpts inside their box')
             # A swapped axis order reads near 0% against a 97.5% worst case, so 0.90 catches it.

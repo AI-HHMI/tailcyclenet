@@ -302,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
     ap.add_argument('--max-ram', type=float, default=None, metavar='GB',
-                    help='HOST RAM this run may spend on its own pixel buffers -- the decord '
+                    help='HOST RAM this run may spend on its own pixel buffers -- the video '
                          'reader cache, how many CAMERAS the detector decodes at once, and the '
                          "window loop's camera concurrency and frame cache. DEFAULT: derived, as "
                          'the smallest of the cgroup limit (walked up EVERY ancestor), LSF\'s own '

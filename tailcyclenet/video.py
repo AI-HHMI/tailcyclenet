@@ -1,10 +1,8 @@
 """THE ONE PLACE A VIDEO CONTAINER IS OPENED AND DECODED.
 
-PyAV, not decord (which buffers whole containers in memory and is unmaintained); the swap is
-output-neutral on every video root, so no recorded number moves. Frame accuracy is by
-construction: seek to the preceding KEYFRAME and decode forward counting frames -- OpenCV's
-`CAP_PROP_POS_FRAMES` is documented 8 to -3 frames off on MP4/AVC1, silently.
-`TAILCYCLENET_VIDEO_BACKEND=decord` restores the old reader for bisecting.
+PyAV provides bounded-memory, frame-accurate decoding. Frame accuracy is by construction: seek to
+ the preceding KEYFRAME and decode forward counting frames -- OpenCV's `CAP_PROP_POS_FRAMES` is
+ documented 8 to -3 frames off on MP4/AVC1, silently.
 """
 from __future__ import annotations
 
@@ -12,26 +10,18 @@ import os
 
 import numpy as np
 
-BACKENDS = ('pyav', 'decord')
-# libav's threading modes; 'NONE' is decord's old single-threaded behaviour.
+# libav's threading modes.
 THREAD_TYPES = ('AUTO', 'FRAME', 'SLICE', 'NONE')
 # Decode forward instead of re-seeking when the decoder is within this many frames: a seek lands
 # on the preceding keyframe, so re-seeking would throw away a partly-decoded GOP.
 _FORWARD_LIMIT = 256
 
 
-def backend_name() -> str:
-    name = os.environ.get('TAILCYCLENET_VIDEO_BACKEND', 'pyav').strip().lower()
-    if name not in BACKENDS:
-        raise ValueError(f'TAILCYCLENET_VIDEO_BACKEND={name!r} is not one of {BACKENDS}')
-    return name
-
-
 class PyAVReader:
     """Frame-accurate random access over one container, with bounded memory.
 
-    `get_batch` mirrors `decord.VideoReader.get_batch` -- an arbitrary list of indices, returned
-    in the ORDER ASKED FOR -- so it is a drop-in for the one call site that used it.
+    `get_batch` accepts an arbitrary list of indices and returns them in the ORDER ASKED FOR,
+    including repeats.
     """
 
     def __init__(self, path: str):
@@ -42,8 +32,8 @@ class PyAVReader:
         self._st = self._c.streams.video[0]
         # `thread_type` is NOT settable once the codec is open, which a reader CACHE guarantees
         # on every hit after the first -- so it is set here, once, and never in `get_batch`.
-        # PyAV threads WITHIN a container (decord did not), competing with the window loop's
-        # cross-container concurrency for the same cores. It is a PyAV ENUM, not a count.
+        # PyAV threads WITHIN a container, competing with the window loop's cross-container
+        # concurrency for the same cores. It is a PyAV ENUM, not a count.
         _tt = os.environ.get('TAILCYCLENET_PYAV_THREADS', 'AUTO').strip().upper()
         if _tt not in THREAD_TYPES:
             raise ValueError(f'TAILCYCLENET_PYAV_THREADS={_tt!r} is not one of {THREAD_TYPES}. '
@@ -127,8 +117,8 @@ class PyAVReader:
                 f'{self.path}: frames {missing[:5]} did not decode (asked for '
                 f'{need[0]}..{need[-1]} of {len(self)}). A frame index that does not decode is a '
                 'broken promise about n_frames, not a pixel to substitute.')
-        # In the ORDER ASKED FOR, repeats included -- decord's contract, and `read_frames` relies
-        # on it when a clamp-padded window repeats its last frame.
+        # Preserve the ORDER ASKED FOR, including repeats: `read_frames` relies on this when a
+        # clamp-padded window repeats its last frame.
         return np.asarray([got[i] for i in want])
 
     def close(self):
@@ -141,32 +131,6 @@ class PyAVReader:
         self.close()
 
 
-class DecordReader:
-    """The old path, kept for bisecting via `TAILCYCLENET_VIDEO_BACKEND=decord`."""
-
-    def __init__(self, path: str):
-        from decord import VideoReader
-
-        self.path = str(path)
-        self._vr = VideoReader(self.path, num_threads=1)
-
-    def __len__(self):
-        return len(self._vr)
-
-    @property
-    def fps(self):
-        return float(self._vr.get_avg_fps())
-
-    def frame_shape(self):
-        return tuple(self._vr[0].shape)
-
-    def get_batch(self, indices) -> np.ndarray:
-        return self._vr.get_batch([int(i) for i in indices]).asnumpy()
-
-    def close(self):
-        self._vr = None
-
-
 def open_reader(path: str):
-    """One reader over one container. `num_threads=1` on decord for the reason it always was."""
-    return PyAVReader(path) if backend_name() == 'pyav' else DecordReader(path)
+    """Open one bounded-memory reader over one container."""
+    return PyAVReader(path)

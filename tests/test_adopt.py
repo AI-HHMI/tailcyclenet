@@ -338,15 +338,16 @@ def test_frame_counts_come_from_the_decoder(tmp_path):
     """`n_frames` is a promise that every index in [0, T) decodes; a metadata count that disagrees
     would fail deep inside the window loop, after the checkpoint has loaded.
     """
-    from decord import VideoReader
-
+    from tailcyclenet import video
     from tailcyclenet.dataset import read_frames
 
     cal = _two_cam(tmp_path, T=7)
     sess = adopt.build(adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_'),
                        names=KPTS_3D, verbose=False)
     g = sess.groups['t']
-    assert g.n_frames == len(VideoReader(str(tmp_path / 'rec' / 'cam0_t.mp4'), num_threads=1))
+    reader = video.open_reader(str(tmp_path / 'rec' / 'cam0_t.mp4'))
+    assert g.n_frames == len(reader)
+    reader.close()
     for cam in sess.cam_names:
         imgs = read_frames(g, cam, np.arange(g.n_frames))
         assert len(imgs) == g.n_frames and all(im is not None for im in imgs)

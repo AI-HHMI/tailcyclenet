@@ -354,8 +354,8 @@ class _ReaderCache:
             return got
         self.misses += 1
         if len(self._d) >= self.maxsize:
-            # Dropping the last reference is what frees decord's frame pool (~2.5 GB on a
-            # 3208x2200 container), which is why this is a memory budget and not a handle count.
+            # Dropping the last reference frees the decoder's frame pool, which is why this is a
+            # memory budget and not a handle count.
             del self._d[self._rng.choice(list(self._d))]
         got = self._d[path] = _open_reader(path)
         return got
@@ -369,11 +369,11 @@ def _open_reader(path: str):
     per-window work, but `read_frames` is called once per window per camera -- so a windowed pass
     over 3dpop's test videos paid it hundreds of times.
 
-    **THE BACKEND IS `tailcyclenet/video.py`'s, NOT decord's, AND THAT IS A MEMORY FIX.** decord
-    loads the whole container into memory (dmlc/decord#80), which is survivable on a 600-frame
-    clip and fatal on a 21 GB recording -- a 16-camera `--videos` run peaked at 456 GB under
-    `--max-ram 24`. PyAV is bit-identical on every video root here, so nothing downstream moves;
-    see `video.py` for the parity table and `TAILCYCLENET_VIDEO_BACKEND=decord` to bisect.
+    **THE BACKEND IS `tailcyclenet/video.py`, AND THAT IS A MEMORY FIX.** PyAV keeps decoded
+    frames bounded instead of loading whole containers into memory, which is survivable on a
+    600-frame clip but matters on a 21 GB recording -- a 16-camera `--videos` run peaked at
+    456 GB under `--max-ram 24`. PyAV is bit-identical on every video root here, so nothing
+    downstream moves.
     """
     from . import video
 
@@ -409,7 +409,7 @@ def _reader(path: str, group, cam: str):
             # PyAV over 12 windows of a 16-camera 3208x2200 rig, 3 replicates: cache 4 runs 7.4 s
             # against cache 16's 1.5 s -- **5.1x**, and it is a THRESHOLD rather than a curve
             # (1 -> 8 buys 24%, 8 -> 16 buys 4.2x), because a cycle only pays off once the whole
-            # cycle fits. The 2.5x this comment used to quote was decord's.
+            # cycle fits. The old 2.5x figure came from a different decoder.
             #
             # A run that is silently 5x slower for a legitimate reason should still say so rather
             # than being diagnosed from a stopwatch -- and the evidence lives HERE rather than in
@@ -436,14 +436,14 @@ def _reader(path: str, group, cam: str):
 
 # ONE LOCK PER CONTAINER AROUND THE DECODE, because `_readers` is a module-level cache of STATEFUL
 # readers. `VideoReader.get_batch` seeks, so two threads reading the SAME container interleave their
-# seeks and get each other's frames -- or crash inside decord. That did not matter while every caller
-# was sequential; `scripts/infer.py` renders one group on a background thread while the loop predicts
-# the next, and on a video-backed root both touch the same reader.
+# seeks and get each other's frames -- or crash inside the decoder. That did not matter while every
+# caller was sequential; `scripts/infer.py` renders one group on a background thread while the loop
+# predicts the next, and on a video-backed root both touch the same reader.
 #
 # IT USED TO BE ONE GLOBAL LOCK, WHICH ALSO SERIALISED DIFFERENT FILES -- and different files share
 # no state at all, so that was a bound nothing needed. It cost the whole of the multi-camera win:
 # 3dpop's four 3840x2160 cameras decode at ~62 ms/frame each on one thread and at ~18 ms/frame-camera
-# when the four containers run concurrently (3.5x, measured; decord releases the GIL inside
+# when the four containers run concurrently (3.5x, measured; PyAV releases the GIL inside
 # `get_batch`). A 16-camera rig is the same argument four times over. The per-path dict is guarded by
 # `_lock_lock`, which is held only for the dict lookup and never across a decode.
 _lock_lock = threading.Lock()
@@ -499,7 +499,7 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
                 pool: ThreadPoolExecutor | None = None, reduce=1):
     """(T,H,W,3) uint8 RGB for one camera, from an image directory or a video.
 
-    `reduce` is honoured for image directories and IGNORED for video: decord has no
+    `reduce` is honoured for image directories and IGNORED for video: the video decoder has no
     decode-time decimation, so a video root silently returns full-size frames. The caller must
     therefore letterbox with `src_wh` and never assume the returned size.
     """

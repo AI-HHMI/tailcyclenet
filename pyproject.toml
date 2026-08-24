@@ -77,10 +77,11 @@ pytest-timeout = "*"
 # the note below is about.
 ruff = "*"
 av = ">=18.0.0,<19"
-# Deliberately NOT listed: toml, opencv, pillow, wandb, schedulefree, decord. posetail pins them
+# Deliberately NOT listed: toml, opencv, pillow, wandb, schedulefree. posetail pins them
 # EXACTLY and is itself pinned, so the versions are already determined in pixi.lock; re-declaring
 # duplicates a pin that conflicts the moment posetail moves, or asks for `*` and conflicts
-# immediately. If posetail ever drops one, add it here at posetail's own version.
+# immediately. If posetail ever drops one, add it here at posetail's own version. Video decoding
+# is provided directly by PyAV above.
 
 [tool.pixi.tasks]
 # `-n 8`, default per-test distribution (loadfile pins all 29 model builds to one worker and the

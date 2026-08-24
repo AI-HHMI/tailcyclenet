@@ -28,14 +28,14 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet import format as fmt
+from tailcyclenet import format as fmt, video
 
 CAM = 'cam0'
 PAD = 20                    # the crop rule's pad; instances.pq stores the PADDED extent.
 APT_NAMES = ['nose', 'left_ear', 'right_ear', 'tail']
 RENAME = {'tail': 'tail_base'}
 LBL_MEMBER = 'label_file.lbl'
-ALIGN_TOL = 1.0             # mean |diff| vs decord's decode: ~0.016 right, 2.9+ for a neighbour.
+ALIGN_TOL = 1.0             # mean |diff| vs PyAV's decode: ~0.016 right, 2.9+ for a neighbour.
 
 
 # reading the .lbl
@@ -200,11 +200,10 @@ _readers_lock = threading.Lock()
 
 
 def reader(movie: str):
-    """One decord `VideoReader` per movie, reused. Opening one costs 2-5 s on a 70k-frame AVI."""
+    """One PyAV reader per movie, reused. Opening one costs 2-5 s on a 70k-frame AVI."""
     with _readers_lock:
         if movie not in _readers:
-            from decord import VideoReader
-            _readers[movie] = VideoReader(movie, num_threads=1)
+            _readers[movie] = video.open_reader(movie)
         return _readers[movie]
 
 
@@ -230,11 +229,11 @@ def copy_window(movie: str, start: int, n: int, fps: float, out: Path) -> int:
 
 
 def decode_window(movie: str, start: int, n: int, out: Path) -> int:
-    """Fallback: decode with decord and re-encode. Index-exact by construction, and lossy."""
+    """Fallback: decode with PyAV and re-encode. Index-exact by construction, and lossy."""
     import cv2
     vr = reader(movie)
     n = min(n, len(vr) - start)
-    imgs = vr.get_batch(list(range(start, start + n))).asnumpy()
+    imgs = vr.get_batch(list(range(start, start + n)))
     for i, im in enumerate(imgs):
         cv2.imwrite(str(out / f'{i:06d}.jpg'), im[:, :, ::-1],
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -253,7 +252,7 @@ def write_window(movie: str, start: int, n: int, fps: float, out: Path, mode: st
     if mode == 'copy':
         got = copy_window(movie, start, n, fps, out)
         if got and _diff(_rgb(out / '000000.jpg'),
-                         reader(movie).get_batch([start]).asnumpy()[0]) < ALIGN_TOL:
+                         reader(movie).get_batch([start])[0]) < ALIGN_TOL:
             return got, 'copy'
         for p in out.glob('*.jpg'):
             p.unlink()
@@ -274,7 +273,7 @@ def check_seek(movie: str, start: int, fps: float, tmp: Path) -> str:
     got = _rgb(tmp / '000000.jpg')
     vr = reader(movie)
     cand = [f for f in (start - 1, start, start + 1) if 0 <= f < len(vr)]
-    diffs = {f: _diff(got, vr.get_batch([f]).asnumpy()[0]) for f in cand}
+    diffs = {f: _diff(got, vr.get_batch([f])[0]) for f in cand}
     # Tied, not strictly best: stalled recordings hold byte-identical consecutive frames, and it
     # does not matter which of them came back. Tied-for-minimum still rejects every real off-by-one.
     if diffs[start] > min(diffs.values()) + 1e-6:
@@ -484,7 +483,7 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
                                 'so no cross-frame identity is asserted',
             'context_frames': context,
             'extract': extract or ('ffmpeg -c:v copy -bsf:v mjpeg2jpeg (lossless)'
-                                   if mode == 'copy' else 'decord decode + JPEG q95'),
+                                   if mode == 'copy' else 'PyAV decode + JPEG q95'),
             'regions_source': "APT labelsRoi (Label Box), axis-aligned, kept only on each group's "
                               'own labelled frame -- a certificate is sound only where that '
                               "frame's labels live. An empty regions.pq means nothing in the "

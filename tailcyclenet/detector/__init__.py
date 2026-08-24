@@ -264,7 +264,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     kp = np.full((D, T, C, K_det, 3), np.nan, np.float32) if K_det else None
 
     # ONE THREAD PER CAMERA FOR THE DECODE, which is where this function's wall clock lives;
-    # the containers share no state and decord releases the GIL, so they overlap ~3.5x. The
+    # the containers share no state and PyAV releases the GIL, so they overlap ~3.5x. The
     # forward stays serial and in camera order -- it is ~1% of the time.
     def _fetch(job):
         ci, cam_name, src_frames = job

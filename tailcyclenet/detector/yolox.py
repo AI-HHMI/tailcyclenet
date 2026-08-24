@@ -125,6 +125,52 @@ class Bottleneck(nn.Module):
         return x + y if self.add else y
 
 
+class CSPNeXtBottleneck(nn.Module):
+    """5x5 depthwise + SE channel attention, RTMDet's own bottleneck block.
+
+    Same __init__ signature as `Bottleneck` so `CSPNeXtLayer` can substitute it without changing
+    any other code. At `bottleneck_expansion=0.5` (this net's own default) the SE block's two 1x1
+    convs push CSPNeXt noticeably past a plain-Bottleneck param estimate for the same width/depth
+    -- confirmed against `Bottleneck`+`CSPLayer` at the same `width_mul`/`depth_mul` by
+    `dev/scratch/prototype_cspnext.py`.
+    """
+    def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
+        super().__init__()
+        hidden = int(cout * expansion)
+        self.conv1 = conv_norm_act(cin, hidden, 3)                    # 3x3 standard
+        # 5x5 depthwise (the CSPNeXt signature: larger kernel than YOLOX's 3x3)
+        self.dw = conv_norm_act(hidden, hidden, 5, groups=hidden)     # 5x5 depthwise
+        self.pw = conv_norm_act(hidden, cout, 1)                      # 1x1 pointwise
+        # Squeeze-Excitation: global avg pool -> FC down -> SiLU -> FC up -> Sigmoid
+        sq = max(1, cout // 4)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(cout, sq, 1), nn.SiLU(inplace=True),
+            nn.Conv2d(sq, cout, 1), nn.Sigmoid())
+        self.add = shortcut and cin == cout
+
+    def forward(self, x):
+        y = self.pw(self.dw(self.conv1(x)))
+        y = y * self.se(y)
+        return x + y if self.add else y
+
+
+class CSPNeXtLayer(nn.Module):
+    """`CSPLayer` using `CSPNeXtBottleneck` instead of `Bottleneck`."""
+    def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True, bottleneck_expansion=0.5):
+        super().__init__()
+        hidden = cout // 2
+        self.conv1 = conv_norm_act(cin, hidden, 1)
+        self.conv2 = conv_norm_act(cin, hidden, 1)
+        self.conv3 = conv_norm_act(2 * hidden, cout, 1)
+        self.m = nn.Sequential(
+            *[CSPNeXtBottleneck(hidden, hidden, shortcut, depthwise=depthwise,
+                                expansion=bottleneck_expansion) for _ in range(n)])
+
+    def forward(self, x):
+        return self.conv3(torch.cat([self.m(self.conv1(x)), self.conv2(x)], dim=1))
+
+
 class CSPLayer(nn.Module):
     def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True, bottleneck_expansion=0.5):
         super().__init__()
@@ -243,6 +289,50 @@ class CSPDarknet(nn.Module):
         # p2, p3, p4, p5 -- FOUR distinct widths when `p2` (T4.3); the 3-tuple contract is
         # unchanged at the default, matching `CSPDarknetNano`'s own `p2` switch.
         self.out_channels = (c * 2, c * 4, c * 8, c * 16) if self.p2 else (c * 4, c * 8, c * 16)
+
+    def forward(self, x):
+        p2 = self.dark2(self.stem(x))
+        p3 = self.dark3(p2)
+        p4 = self.dark4(p3)
+        p5 = self.dark5(p4)
+        return (p2, p3, p4, p5) if self.p2 else (p3, p4, p5)
+
+
+class CSPNeXt(nn.Module):
+    """CSPNeXt backbone (RTMDet-style). Same stage structure as `CSPDarknet` but with
+    `CSPNeXtBottleneck` (5x5 depthwise + SE) instead of the standard `Bottleneck`.
+
+    Uses the `Focus` stem. Width/depth controlled by multipliers, same as `CSPDarknet`. At
+    `width_mul=0.5, depth_mul=0.33` (this net's own `cspnext_s` tier) the SE blocks push this
+    past a same-shape `CSPDarknet`'s param count -- confirmed by
+    `dev/scratch/prototype_cspnext.py`: 3.65M at `bottleneck_expansion=0.5` (this net's default),
+    not the plan doc's original ~2.5M estimate.
+    """
+    def __init__(self, width_mul=0.5, depth_mul=0.33, bottleneck_expansion=1.0,
+                p2=False, in_channels=3):
+        super().__init__()
+        c = round8(64 * width_mul)       # base_channels, e.g. 32 at width_mul=0.5
+        d = max(1, round(3 * depth_mul)) # base_depth, e.g. 1 at depth_mul=0.33
+        be = bottleneck_expansion
+        self.p2 = bool(p2)
+        # Same stem as CSPDarknet canonical tiers
+        self.stem = Focus(int(in_channels), c, 3, depthwise=False)            # /2
+        self.dark2 = nn.Sequential(
+            conv_norm_act(c, c * 2, 3, 2),
+            CSPNeXtLayer(c * 2, c * 2, d, bottleneck_expansion=be))           # /4
+        self.dark3 = nn.Sequential(
+            conv_norm_act(c * 2, c * 4, 3, 2),
+            CSPNeXtLayer(c * 4, c * 4, d * 3, bottleneck_expansion=be))       # /8
+        self.dark4 = nn.Sequential(
+            conv_norm_act(c * 4, c * 8, 3, 2),
+            CSPNeXtLayer(c * 8, c * 8, d * 3, bottleneck_expansion=be))       # /16
+        self.dark5 = nn.Sequential(
+            conv_norm_act(c * 8, c * 16, 3, 2),
+            SPPBottleneck(c * 16, c * 16),
+            CSPNeXtLayer(c * 16, c * 16, d, shortcut=False,
+                        bottleneck_expansion=be))                            # /32
+        self.out_channels = ((c * 2, c * 4, c * 8, c * 16) if self.p2
+                             else (c * 4, c * 8, c * 16))
 
     def forward(self, x):
         p2 = self.dark2(self.stem(x))
@@ -422,6 +512,14 @@ class YOLOXNano(nn.Module):
             self.backbone = HybridBackbone(p2=self.p2, in_channels=self.in_channels)
             neck_out = round8(256)    # 256, matching the c*4 = 256 at stride-8
             depthwise = False          # full-conv neck/head
+        elif self.version == 'cspnext_s':
+            # A4: RTMDet-style backbone (5x5 depthwise + SE bottleneck) on the existing
+            # CSPDarknet stage structure.
+            self.backbone = CSPNeXt(width_mul=0.5, depth_mul=0.33,
+                                    bottleneck_expansion=self.bottleneck_expansion,
+                                    p2=self.p2, in_channels=self.in_channels)
+            neck_out = round8(256 * 0.5)   # 128
+            depthwise = False               # CSPNeXt uses full-conv in its towers
         else:
             if self.version not in YOLOX_TIERS:
                 raise ValueError(f"yolox version {version!r}: must be 'trimmed' or one of "

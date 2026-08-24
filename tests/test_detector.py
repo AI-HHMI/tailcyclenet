@@ -5259,3 +5259,78 @@ out = "/tmp/run"
 """)
     with pytest.raises(SystemExit, match="no counterpart"):
         load_detector_config(p)
+
+
+# --- A4: CSPNeXt backbone ------------------------------------------------------------------
+
+@pytest.mark.parametrize('p2', [True, False])
+def test_cspnext_shape_contract(p2):
+    from tailcyclenet.detector.yolox import CSPNeXt
+
+    bb = CSPNeXt(width_mul=0.5, depth_mul=0.33, bottleneck_expansion=1.0, p2=p2)
+    H, W = 256, 384
+    feats = bb(torch.rand(1, 3, H, W))
+    strides = (4, 8, 16, 32) if p2 else (8, 16, 32)
+    assert len(feats) == len(strides) == len(bb.out_channels)
+    for f, s, c in zip(feats, strides, bb.out_channels):
+        assert f.shape == (1, c, H // s, W // s)
+
+
+def test_cspnext_bottleneck_backward_produces_finite_grads():
+    from tailcyclenet.detector.yolox import CSPNeXt
+
+    bb = CSPNeXt(width_mul=0.5, depth_mul=0.33, bottleneck_expansion=0.5, p2=True)
+    feats = bb(torch.rand(1, 3, 128, 128))
+    loss = sum(f.float().sum() for f in feats)
+    loss.backward()
+    for name, p in bb.named_parameters():
+        assert p.grad is None or torch.isfinite(p.grad).all(), f'{name}: non-finite grad'
+
+
+def test_cspnext_bottleneck_se_gate_forward_is_finite():
+    """The SE gate is a sigmoid in (0,1); `CSPNeXtBottleneck`'s residual add must stay finite on
+    a random forward pass."""
+    from tailcyclenet.detector.yolox import CSPNeXtBottleneck
+
+    block = CSPNeXtBottleneck(32, 32, shortcut=True, expansion=0.5)
+    x = torch.rand(2, 32, 16, 16)
+    y = block(x)
+    assert y.shape == x.shape
+    assert torch.isfinite(y).all()
+
+
+def test_yolox_nano_cspnext_version_builds_and_forwards():
+    model = YOLOXNano(version='cspnext_s', p2=True)
+    assert model.STRIDES == (4, 8, 16, 32)
+    obj, boxes, kpt = model(torch.rand(1, 3, 128, 192))
+    anchors = model.anchor_points(128, 192, 'cpu')
+    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
+    assert kpt is None
+
+
+def test_detector_config_yolox_cspnext_default_pretrained_empty(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "cspnext_s"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['model']['pretrained'] == ''
+
+
+def test_detector_config_pretrained_coco_rejects_cspnext(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "x"
+[model]
+yolox = "cspnext_s"
+bottleneck_expansion = 1.0
+pretrained = "coco"
+[training]
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match="no counterpart"):
+        load_detector_config(p)

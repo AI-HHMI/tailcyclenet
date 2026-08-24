@@ -323,7 +323,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     weight = None if regions is None and ignore is None else torch.ones_like(obj_logits)
     n_cert, n_ignored = 0.0, 0.0
     losses_box, n_pos = [], 0
-    kpt_reg, kpt_sc, n_kpt, n_vis = [], 0, 0, 0
+    kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
         if assignment == 'tal':
             pos, gix = assign_tal(anchors, gt_boxes[b], obj_logits[b].detach(),

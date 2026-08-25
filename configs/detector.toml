@@ -70,8 +70,8 @@ use_regions = false
 ignore_present = false
 
 [model]
-# the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, byte-identical to every recorded detector). DEFAULTS TO `tiny` PER USER INSTRUCTION, NOT EVIDENCE.
-yolox = "tiny"
+# the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, byte-identical to every recorded detector). DEFAULTS TO `hybrid` (CNN backbone + a from-scratch ViT stage + Simple Feature Pyramid) -- confirmed the detector-architecture-sweep winner (report 47): large wins on rat-city-combined and allen-mouse-combined, ties elsewhere, no significant loss on any of the 6 training roots. `tiny` (COCO-pretrained) is the prior default, still available by name.
+yolox = "hybrid"
 
 # stride-4 (P2) FPN level on top of either tier; DEFAULTS TO true (confirmed on 3dpop at both seeds); false restores the 3-level FPN, byte-identical to every checkpoint on record.
 p2 = true
@@ -116,3 +116,11 @@ box_weight = 15.0
 
 # AdamW's DECOUPLED weight decay (p <- p*(1 - lr*wd)); SHIPPED 0.01 PER USER INSTRUCTION, NOT A CONFIRMED WIN (report 42: real but MIXED trade-off, one seed, never replicated); absent-key fallback stays 5e-4, byte-identical.
 weight_decay = 0.01
+
+# the detector-architecture-sweep winning recipe (report 47), confirmed against a matched-iteration tiny+COCO control on all 6 training roots: separate obj/reg head towers (not shared), bilinear FPN upsampling, and a wider TAL positive-anchor pool. Ship together -- measured as one recipe, not swept independently past Wave 1.
+shared_head = false
+fpn_upsample = "bilinear"
+tal_topk = 20
+
+# AdamW over Muon -- confirmed Wave 0 (report 47); Muon showed no advantage on this detector's architecture (a CNN has few/no 2D weight matrices for Muon to route).
+optimizer = "adamw"

@@ -3233,7 +3233,7 @@ out = "/tmp/run-det"
     assert d['use_regions'] is False
     assert d['input_wh'] is None and d['tile_wh'] is None       # absent pair -> None
     assert d['tile_scale'] == 1.0 and d['tile_bg_per_frame'] == 1
-    assert m['yolox'] == 'tiny'
+    assert m['yolox'] == 'hybrid'
     assert t['out'] == '/tmp/run-det'
     assert t['iters'] == 7
     assert t['batch_size'] == 16 and t['lr'] == 1e-3
@@ -3241,6 +3241,10 @@ out = "/tmp/run-det"
     assert t['device'] == 'cpu'
     assert t['eval_every'] == 2000 and t['eval_batches'] == 25
     assert t['kpt_weight'] == 1.0 and t['kpt_score_weight'] == 1.0
+    assert t['shared_head'] is False
+    assert t['fpn_upsample'] == 'bilinear'
+    assert t['tal_topk'] == 20
+    assert t['optimizer'] == 'adamw'
 
 
 def test_detector_config_unknown_key_raises_in_every_block(tmp_path):

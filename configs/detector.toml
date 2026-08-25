@@ -122,5 +122,5 @@ shared_head = false
 fpn_upsample = "bilinear"
 tal_topk = 20
 
-# AdamW over Muon -- confirmed Wave 0 (report 47); Muon showed no advantage on this detector's architecture (a CNN has few/no 2D weight matrices for Muon to route).
-optimizer = "adamw"
+# DEFAULTS TO `muon` PER USER INSTRUCTION (consistency with the pose side), NOT YET EVIDENCE for THIS pairing: Wave 0 (report 47) found adamw beat muon clearly, but only on the `tiny` CNN backbone (few/no 2D weight matrices for Muon to route) -- untested against `hybrid`'s ViT stage, which has plenty. A same-protocol muon-vs-adamw recheck on hybrid is running now (`dev/scratch/optsweep/`); roll this back to `adamw` if it comes back significantly worse.
+optimizer = "muon"

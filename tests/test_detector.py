@@ -3244,7 +3244,7 @@ out = "/tmp/run-det"
     assert t['shared_head'] is False
     assert t['fpn_upsample'] == 'bilinear'
     assert t['tal_topk'] == 20
-    assert t['optimizer'] == 'adamw'
+    assert t['optimizer'] == 'muon'
 
 
 def test_detector_config_unknown_key_raises_in_every_block(tmp_path):

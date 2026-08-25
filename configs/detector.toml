@@ -84,7 +84,8 @@ out = ""
 # total iterations; prefer the FINAL checkpoint for arm-vs-arm (best-on-val iteration varies widely across identical recipes).
 iters = 20000
 
-batch_size = 16
+# DEFAULTS TO 8 PER USER INSTRUCTION, NOT A MEASURED VALUE -- lower memory headroom for smaller GPUs (16 GB class): the hybrid recipe's worst-case root (3dpop, the largest resolved input of the six at 736x448) measured ~21.1 GB at batch_size=16 on an L4's 23 GB, an ESTIMATE (not measured) that batch_size=8 would land around 10-12 GB. Was 16.
+batch_size = 8
 # STAYS AT 1e-3: a short-run win for 6e-4 was REVERSED at full length; do not re-propose a lower `lr` off short-run numbers.
 lr = 1e-3
 num_workers = 8

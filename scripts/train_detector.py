@@ -495,9 +495,7 @@ def main():
                     obj_q = {f'q{int(q * 100):02d}': float(np.quantile(a, q))
                              for q in (0.01, 0.10, 0.50, 0.90)}
                     print(f'   objectness q01 {obj_q["q01"]:.4f}  q10 {obj_q["q10"]:.4f}  '
-                          f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}'
-                          + ('   <-- NOT saturated: --det-score 0.99 would drop most of these'
-                             if obj_q['q50'] < 0.99 else ''), flush=True)
+                          f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}', flush=True)
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'config': config,
                         'input_wh': wh, 'n_keypoints': n_kpts, 'norm': 'gn',
                         'yolox_version': model_cfg['yolox'],

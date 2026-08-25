@@ -1,6 +1,4 @@
-import json
 import re
-import tomllib
 from pathlib import Path
 
 import torch
@@ -18,10 +16,13 @@ from .yolox import YOLOX_TIERS, YOLOXNano
 def resolve_detector_checkpoint(path, checkpoint='latest'):
     """Resolve a detector file from a run directory.
 
-    Directory deployment defaults to the highest complete numbered checkpoint, not historical
+    Directory deployment defaults to the highest numbered checkpoint, not historical
     ``detector.pth`` (which is the validation-selected *best* checkpoint). ``last`` and ``best``
-    remain explicit selectors; an explicit filename is also an override and is therefore not
-    subjected to the latest-completeness check.
+    remain explicit selectors; an explicit filename is also an override. ``latest`` only checks
+    that the filename's iteration matches the checkpoint's own saved iteration -- it does not
+    require the run's configured iteration count or metrics log to claim training completed, so
+    a stopped run's highest numbered checkpoint still resolves. Only ``last`` requires
+    ``detector_last.pth`` to exist.
     """
     p = Path(path)
     if not p.is_dir():
@@ -54,45 +55,13 @@ def resolve_detector_checkpoint(path, checkpoint='latest'):
             f'{p}: latest detector checkpoint requested, but no detector_it*.pth files exist; '
             'pass --detector-checkpoint best or an explicit filename for a legacy run')
     files.sort(reverse=True)
-    expected = None
-    config_path = p / 'config.toml'
-    if config_path.exists():
-        with config_path.open('rb') as f:
-            expected = tomllib.load(f).get('training', {}).get('iters')
-        expected = None if expected is None else int(expected)
-    metrics_last = None
-    metrics_path = p / 'metrics.json'
-    if metrics_path.exists():
-        with metrics_path.open() as f:
-            history = json.load(f)
-        if history:
-            metrics_last = int(history[-1]['iteration'])
-
     for iteration, candidate in files:
         ckpt = torch.load(candidate, map_location='cpu', weights_only=False)
         saved_iteration = ckpt.get('iteration')
-        if saved_iteration is None or int(saved_iteration) != iteration:
-            continue
-        if expected is not None and iteration != expected:
-            continue
-        if metrics_last is not None and iteration != metrics_last:
-            continue
-        if expected is None and metrics_last is None:
-            raise ValueError(
-                f'{p}: cannot establish that {candidate.name} is complete because neither '
-                'config.toml [training].iters nor metrics.json is present; pass '
-                '--detector-checkpoint best, latest, or an explicit filename')
-        return candidate
+        if saved_iteration is not None and int(saved_iteration) == iteration:
+            return candidate
 
-    details = []
-    if expected is not None:
-        details.append(f'config iters={expected}')
-    if metrics_last is not None:
-        details.append(f'metrics last iteration={metrics_last}')
-    state = ', '.join(details) if details else 'missing completion metadata'
-    raise ValueError(
-        f'{p}: no complete latest detector checkpoint found ({state}); pass '
-        '--detector-checkpoint best, latest, or an explicit filename to override')
+    raise ValueError(f'{p}: no numbered detector checkpoint has matching iteration metadata')
 
 
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',

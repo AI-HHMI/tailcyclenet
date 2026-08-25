@@ -3288,7 +3288,9 @@ def test_detector_run_directory_defaults_to_latest_checkpoint(tmp_path):
     assert resolve_detector_checkpoint(run, checkpoint='best') == run / 'detector.pth'
 
 
-def test_detector_run_directory_refuses_incomplete_latest_by_default(tmp_path):
+def test_detector_run_directory_latest_accepts_incomplete_training(tmp_path):
+    """An incomplete run (config iters=4, only iteration 2 written) still resolves `latest` to
+    its highest numbered checkpoint -- only the `last` selector demands `detector_last.pth`."""
     from tailcyclenet.detector import resolve_detector_checkpoint
 
     run = tmp_path / 'run'
@@ -3297,11 +3299,21 @@ def test_detector_run_directory_refuses_incomplete_latest_by_default(tmp_path):
     torch.save({'iteration': 2}, run / 'detector_last.pth')
     (run / 'config.toml').write_text('[training]\niters = 4\n')
     (run / 'metrics.json').write_text('[{"iteration": 2}]')
-    with pytest.raises(ValueError, match='no complete latest'):
-        resolve_detector_checkpoint(run, checkpoint='latest')
-    # Explicit filename is the deliberate incomplete-run override.
+    assert resolve_detector_checkpoint(run, checkpoint='latest') == run / 'detector_it000002.pth'
     assert resolve_detector_checkpoint(run, checkpoint='detector_it000002.pth') == \
         run / 'detector_it000002.pth'
+
+
+def test_detector_run_directory_last_still_requires_detector_last(tmp_path):
+    """`last` is unaffected by the latest-selector relaxation: it still errors when
+    `detector_last.pth` is absent."""
+    from tailcyclenet.detector import resolve_detector_checkpoint
+
+    run = tmp_path / 'run'
+    run.mkdir()
+    torch.save({'iteration': 2}, run / 'detector_it000002.pth')
+    with pytest.raises(ValueError, match='detector_last.pth'):
+        resolve_detector_checkpoint(run, checkpoint='last')
 
 
 def test_detector_cli_defaults_to_last():

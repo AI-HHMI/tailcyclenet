@@ -8,7 +8,6 @@ for a dataset whose stored keypoints are too sparse to bound the animal.
 """
 from __future__ import annotations
 
-import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -17,16 +16,7 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
-from ..format import INST_ABSENT, INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
-
-# The stem's `in_channels` for each loader mode. `'none'` (default) is 3 channels, no second
-# frame. Kept as ONE dict so the training and eval scripts derive `in_channels` from the same
-# rule instead of each hardcoding it and one of them drifting.
-TEMPORAL_INPUT_CHANNELS = {'none': 3, 'stack2': 6}
-TEMPORAL_INPUTS = tuple(TEMPORAL_INPUT_CHANNELS)
-# The inverse: a loaded model only carries `in_channels`, so a caller that needs the matching
-# `BoxDataset(temporal_input=...)` to score it reads it off this map.
-TEMPORAL_INPUT_BY_CHANNELS = {v: k for k, v in TEMPORAL_INPUT_CHANNELS.items()}
+from ..format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
 
 
 def reduce_factor(size, out_wh):
@@ -275,8 +265,7 @@ def _drop_outside(x, bounds):
 
     A point warped off the region it belongs to is not that point any more: dropping it shrinks a
     box to its visible part, and `crop_box_for_points` returns None when every point of an animal
-    is gone. Shared by `boxes_for` and `present_ignore_boxes_for` so there is one copy of this
-    rule.
+    is gone. `boxes_for` uses one shared copy of this rule for keypoints and box geometry.
     """
     lo_x, lo_y, hi_x, hi_y = bounds
     out = ((x[..., 0] < lo_x) | (x[..., 0] > hi_x) |
@@ -336,10 +325,7 @@ class BoxDataset(Dataset):
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
-                 strong=False, ignore_present=False, temporal_input='none',
-                 scale_jitter=None, aug_switch_off_iter=0, negative_frac=None,
-                 negative_crop_frac=None, augment_copypaste=False, copypaste_max=3,
-                 hard_event_manifest=None, hard_event_frac=None):
+                 strong=False):
         """Build the per-view/per-frame index of labelled items for one dataset root.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time.
@@ -349,18 +335,11 @@ class BoxDataset(Dataset):
             input_wh -- model input size; replaced by the tile size under tiling.
             tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
                 size; `tile_scale` is the source -> input scale and the only scale there is.
-            use_regions / ignore_present -- mask objectness supervision to `regions.pq`
-                CERTIFIED area / out of `instances.pq` PRESENT boxes. MUTUALLY EXCLUSIVE: both
-                occupy the one opt-in (M,4) tuple slot `box_collate` dispatches by rank.
+            use_regions -- mask objectness supervision to `regions.pq` CERTIFIED area; the
+                opt-in (M,4) tuple slot `box_collate` dispatches by rank.
             keypoints -- also emit per-keypoint targets and kill the horizontal flip (hflip=None
-                decides from `keypoints`); scale_jitter overrides `random_affine`'s `scale=`
-                outright; aug_switch_off_iter switches `strong` off from that iteration on
-                (stored in a `multiprocessing.Value` before any worker forks); temporal_input
-                stacks frame t-1 on the channel axis, refused under `strong`.
+                decides from `keypoints`).
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
-            negative_frac / negative_crop_frac -- A6/A6c negatives: (frame, camera) rows marked
-                INST_ABSENT for every animal, and crop-level negatives under the regions
-                contract. Both raise when nothing qualifies.
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
                 draw instead; the parameter survives to carry `val_frames_per_group`.
@@ -381,36 +360,13 @@ class BoxDataset(Dataset):
         if self.tile_wh is not None and self.tile_scale <= 0:
             raise ValueError(f'tile_scale must be > 0, got {tile_scale}')
         self.use_regions = bool(use_regions)
-        self.ignore_present = bool(ignore_present)
-        if self.ignore_present and self.use_regions:
-            raise ValueError('ignore_present and use_regions cannot both be set: both are the '
-                             'one opt-in (M,4) tuple slot box_collate/split_batch dispatch by '
-                             'rank, and that dispatch cannot tell two rank-2 tensors apart. See '
-                             'BoxDataset.__init__.')
         self.keypoints = bool(keypoints)
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
         self.rotate_deg = float(rotate_deg)
-        self.scale_jitter = None if scale_jitter is None else tuple(float(v) for v in scale_jitter)
-        self.aug_switch_off_iter = int(aug_switch_off_iter or 0)
-        self._it = None
-        if self.aug_switch_off_iter > 0:
-            from multiprocessing import Value
-            self._it = Value('l', 0)
         self.augment = augment
         self.strong = bool(strong)
-        self.copypaste = bool(augment_copypaste)
-        self.copypaste_max = int(copypaste_max)
-        if self.copypaste and self.copypaste_max < 1:
-            raise ValueError(f'copypaste_max must be >= 1, got {copypaste_max}')
         if self.strong and self.use_regions:
             raise ValueError('--augment-strong (mosaic-lite) is undefined under --use-regions')
-        if temporal_input not in TEMPORAL_INPUTS:
-            raise ValueError(f'temporal_input must be one of {TEMPORAL_INPUTS}, got '
-                             f'{temporal_input!r}')
-        self.temporal_input = str(temporal_input)
-        if self.temporal_input != 'none' and self.strong:
-            raise ValueError('temporal_input is undefined under --augment-strong (mosaic-lite): '
-                             'the pasted source item needs its own t-1 frame too, not built yet')
         self.reduce = reduce
         self.seed = seed
         self.datasets = load_datasets(path)
@@ -423,20 +379,6 @@ class BoxDataset(Dataset):
         self.min_crop_dim = min_crop_dim
         self.train = split == 'train'
         rng = np.random.default_rng(seed)
-        self.hard_event_mask = []
-        hard_events = {}
-        if hard_event_manifest:
-            with open(hard_event_manifest) as f:
-                for line in f:
-                    event = json.loads(line)
-                    if event.get('reason') != 'kept':
-                        key = (event['session'], event['group'], int(event['frame']),
-                               event['camera'])
-                        hard_events[key] = event.get('audit_label', 'visible')
-        self.hard_event_frac = (None if hard_event_frac in (None, '')
-                                else float(hard_event_frac))
-        if self.hard_event_frac is not None and not 0.0 <= self.hard_event_frac <= 1.0:
-            raise ValueError(f'hard_event_frac must be in [0, 1], got {hard_event_frac}')
 
         self.origins: list = []
         self.index = []
@@ -449,14 +391,9 @@ class BoxDataset(Dataset):
                     continue
                 v = vis.reshape(vis.shape[0], vis.shape[1], -1)
                 frames = np.flatnonzero((v != UNLABELED).any((0, 2)))
-                event_frames = sorted({f for (s, g, f, _), _label in hard_events.items()
-                                       if s == sess.session_id and g == gid and 0 <= f < group.n_frames})
-                if event_frames:
-                    frames = np.unique(np.concatenate([frames, np.asarray(event_frames)]))
                 if max_frames_per_group and frames.size > max_frames_per_group:
-                    keep = set(rng.choice(frames, max_frames_per_group, replace=False).tolist())
-                    keep.update(event_frames)
-                    frames = np.asarray(sorted(keep), dtype=np.int64)
+                    keep = rng.choice(frames, max_frames_per_group, replace=False)
+                    frames = np.asarray(sorted(keep.tolist()), dtype=np.int64)
                 for f in sorted(frames):
                     for ci in range(len(sess.rig)):
                         origins = ([None] if self.tile_wh is None
@@ -464,95 +401,14 @@ class BoxDataset(Dataset):
                         for o in origins:
                             self.index.append((sess, gid, int(f), ci))
                             self.origins.append(o)
-                            self.hard_event_mask.append(
-                                (sess.session_id, gid, int(f), sess.cam_names[ci]) in hard_events)
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
-        n_positive = len(self.index)
-        self.is_negative = np.zeros(len(self.index), dtype=bool)
-        self.negative_source = np.full(len(self.index), '', dtype=object)
-        self.negative_frac = None if negative_frac is None else float(negative_frac)
-        if self.negative_frac is not None:
-            if not 0.0 <= self.negative_frac <= 1.0:
-                raise ValueError(f'negative_frac must be in [0, 1], got {negative_frac}')
-            neg_flags = []
-            for nsess in self.ds.sessions.get(split, []):
-                for ngid in nsess.groups:
-                    nlab = nsess.labels(ngid)
-                    if nlab.instance is None or nlab.instance.shape[0] == 0:
-                        continue
-                    all_absent = (nlab.instance == INST_ABSENT).all(0)
-                    for nf, nci in zip(*np.nonzero(all_absent)):
-                        self.index.append((nsess, ngid, int(nf), int(nci)))
-                        self.origins.append(None)
-                        neg_flags.append(True)
-            if neg_flags:
-                self.is_negative = np.concatenate(
-                    [self.is_negative, np.ones(len(neg_flags), dtype=bool)])
-                self.negative_source = np.concatenate(
-                    [self.negative_source, np.full(len(neg_flags), 'absent', dtype=object)])
-                self.hard_event_mask.extend([False] * len(neg_flags))
-            if not self.is_negative.any():
-                raise ValueError(
-                    f'{path}: negative_frac={negative_frac} was set but split {split!r} has no '
-                    '(frame, camera) where instances.pq marks EVERY animal INST_ABSENT -- no '
-                    "converter in this repo writes that status yet (see BoxDataset.__init__'s own "
-                    'comment). negative_frac cannot be a silent no-op: unset it instead.')
-        self.negative_crop_frac = None if negative_crop_frac is None else float(negative_crop_frac)
-        if self.negative_crop_frac is not None:
-            if not 0.0 <= self.negative_crop_frac <= 1.0:
-                raise ValueError(
-                    f'negative_crop_frac must be in [0, 1], got {negative_crop_frac}')
-            crop_rng = np.random.default_rng([seed, 0xA6C])
-            crop_flags = []
-            for ci_pos in range(n_positive):
-                csess, cgid, cf, cci = self.index[ci_pos]
-                known = self._known_boxes_source_px(csess, cgid, cf, cci)
-                origin = self._crop_negative_origin(csess, cgid, cf, cci, crop_rng, known)
-                if origin is None:
-                    continue
-                self.index.append((csess, cgid, cf, cci))
-                self.origins.append(origin)
-                crop_flags.append(True)
-            if crop_flags:
-                self.is_negative = np.concatenate(
-                    [self.is_negative, np.ones(len(crop_flags), dtype=bool)])
-                self.negative_source = np.concatenate(
-                    [self.negative_source, np.full(len(crop_flags), 'crop', dtype=object)])
-                self.hard_event_mask.extend([False] * len(crop_flags))
-            if not crop_flags:
-                raise ValueError(
-                    f'{path}: negative_crop_frac={negative_crop_frac} was set but no (frame, '
-                    f'camera) in split {split!r} yielded a crop clearing the margin from every '
-                    'known animal within a bounded certified area -- negative_crop_frac cannot '
-                    'be a silent no-op: unset it instead, or check regions.pq coverage for this '
-                    'root/split (see dev/plans/detector_v2.md A6c.5 for measured per-root pools).')
-        self.hard_event_mask = np.asarray(self.hard_event_mask, dtype=bool)
-        if self.hard_event_mask.shape != (len(self.index),):
-            raise RuntimeError('hard-event mask and dataset index diverged')
         n_src = len({(s.session_id, g, c) for s, g, _, c in self.index})
         self.chunk = max(1, len(self.index) // n_src)
 
     def __len__(self):
         """Number of indexed items (one camera view of one frame each)."""
         return len(self.index)
-
-    def set_iter(self, it):
-        """D3: tell this dataset the training loop's current step, so `_strong_now` can switch
-        `strong` off past `aug_switch_off_iter`. A no-op when the key is unset (`self._it is
-        None`), so a caller may call this unconditionally every step with no byte-identity risk.
-        """
-        if self._it is not None:
-            self._it.value = int(it)
-
-    def _strong_now(self):
-        """D3: whether the strong augmentation suite is live THIS ITEM. `self.strong` alone
-        (unset `aug_switch_off_iter`) is the whole answer and is byte-identical to every
-        checkpoint on record; past `aug_switch_off_iter` it reads False for the rest of the run.
-        """
-        if self._it is None:
-            return self.strong
-        return self.strong and self._it.value < self.aug_switch_off_iter
 
     def default_train_weights(self, annot_frac=None):
         """THE default train sampling weight. Always an array, never None.
@@ -566,15 +422,14 @@ class BoxDataset(Dataset):
         - **View-uniform within a cohort.** A "view" is one (session, group, camera); every view in
           a cohort carries the same TOTAL probability whatever its frame count, and a view's frames
           split it equally. This is what the cap was approximating -- badly, and by discarding.
-        - **Cohort share.** `annot_frac` sets P(a draw comes from an `annotated` session) exactly,
-          the same contract `cohort_weights` documents. Absent (the default), each cohort keeps its
-          NATURAL share of index entries, i.e. its labelled-frame share -- no cross-cohort
-          correction unless the user asks for one. Only the WITHIN-cohort uniformity is always on.
+        - **Cohort share.** `annot_frac` sets P(a draw comes from an `annotated` session) exactly.
+          Absent (the default), each cohort keeps its NATURAL share of index entries, i.e. its
+          labelled-frame share -- no cross-cohort correction unless the user asks for one. Only
+          the WITHIN-cohort uniformity is always on.
           Inert on a single-cohort split (3dpop, calms21, branson-fly): the cohort factor is 1 and
           this reduces to plain view-uniform.
 
-        Composes multiplicatively with the opt-in levers (`alpha_weights`, `hard_event_weights`,
-        `negative_weights`) exactly as `cohort_weights` did -- see `train_detector.py`. NOTE that
+        Composes multiplicatively with `alpha_weights` -- see `train_detector.py`. NOTE that
         `alpha_weights`' exponent is now measured against a view-uniform base rather than a
         frame-uniform one, so its `alpha = 0` / `alpha = 1` landmarks shift by one; it is opt-in and
         no shipped recipe sets it.
@@ -605,38 +460,6 @@ class BoxDataset(Dataset):
             raise ValueError('default_train_weights: weights are all zero or non-finite')
         return w / w.sum()
 
-    def cohort_weights(self, annot_frac):
-        """Per-entry sampling weights giving `annotated` sessions probability `annot_frac`.
-
-        The detector analogue of `PoseDataset._pool_weights`, and it exists for the same reason:
-        WITHOUT it the cohort mix is whatever `frames_per_group` happens to produce. On
-        rat-city-combined the cap leaves the one tracked session (57,594 labelled frames,
-        truncated to 40) at 4.3% of train views against 37 annotated sessions' 95.7% -- a ratio
-        nothing in the config names and nobody chose. `annot_frac` names it.
-
-        Uniform WITHIN a cohort, so a group's weight does not scale with how many frames survived
-        the cap; the two cohort totals are then set to `annot_frac` / `1 - annot_frac`. Returns
-        None when the question does not arise -- `annot_frac` unset, or the split holds one
-        cohort (3dpop, calms21 and branson-fly are entirely `tracked`) -- and None means the
-        caller uses `ChunkShuffle`, byte-identical to every detector on record.
-        """
-        if annot_frac is None:
-            return None
-        if not 0.0 <= float(annot_frac) <= 1.0:
-            raise ValueError(f'annot_frac must be in [0, 1], got {annot_frac}')
-        src = np.array([s.label_source for s, _, _, _ in self.index])
-        present = [c for c in ('annotated', 'tracked') if (src == c).any()]
-        if len(present) < 2:
-            return None
-        w = np.zeros(len(self.index), dtype=np.float64)
-        for cohort in present:
-            m = src == cohort
-            p = float(annot_frac) if cohort == 'annotated' else 1.0 - float(annot_frac)
-            w[m] = p / int(m.sum())
-        if w.sum() <= 0:
-            raise ValueError('sampling weights are all zero -- check annot_frac')
-        return w
-
     def cohort_mix(self, weights=None):
         """Realised share of train draws per cohort. Reporting only -- the mix is invisible in
         the loss curve, so `train_detector.py` prints it, exactly as `PoseDataset.mix` is.
@@ -658,8 +481,7 @@ class BoxDataset(Dataset):
         views survived B1a's cap -- the naive "weight by group" scheme SS2.7's own B1 section
         warns is a trap on its own: it would starve rat-city's one 57,594-view tracked group down
         to 1/886 of draws). `alpha = 0.5` sqrt-damps between the two. `None` (default) does not
-        weight and returns None, matching `cohort_weights`' own convention -- the caller falls
-        back to `ChunkShuffle`.
+        weight and returns None.
 
         PROVABLY A NO-OP wherever every group has the SAME `n_views` -- `n_views ** (alpha - 1)`
         is then a single constant, and any constant array normalises away. **This is NOT 3dpop as
@@ -672,7 +494,7 @@ class BoxDataset(Dataset):
         assumed from group-count tables alone. branson-fly was never re-measured this session --
         do not assume its uniformity claim still holds either without checking.
 
-        Composes with `cohort_weights` by elementwise product (renormalised) -- see
+        Composes with the default train weights by elementwise product (renormalised) -- see
         `train_detector.py`'s own composition, SS2.7 B1c.
         """
         if alpha is None:
@@ -687,67 +509,6 @@ class BoxDataset(Dataset):
                              'check alpha')
         return w
 
-    def hard_event_weights(self, hard_event_frac):
-        """Give curated, source-pixel-audited hard events a configured draw share.
-
-        The manifest only marks non-kept visible GT events; kept controls and crop/absent negatives
-        are not hard events. ``None`` leaves the historical sampler unchanged. A non-None fraction
-        with no eligible event raises instead of silently training the control recipe.
-        """
-        if hard_event_frac is None:
-            return None
-        frac = float(hard_event_frac)
-        if not 0.0 <= frac <= 1.0:
-            raise ValueError(f'hard_event_frac must be in [0, 1], got {hard_event_frac}')
-        hard = self.hard_event_mask
-        if not hard.any():
-            raise ValueError('hard_event_frac was set but the manifest contributed no hard events')
-        ordinary = ~hard
-        if frac < 1.0 and not ordinary.any():
-            raise ValueError('hard_event_frac < 1 requires at least one ordinary dataset item')
-        w = np.zeros(len(self.index), dtype=np.float64)
-        w[hard] = frac / int(hard.sum())
-        if ordinary.any():
-            w[ordinary] = (1.0 - frac) / int(ordinary.sum())
-        return w
-
-    def negative_weights(self, negative_frac, source=None):
-        """A6/A6c (detector_v2 plan SS2.3): per-entry weights giving negative items a total draw
-        probability of `negative_frac`, ordinary (positive) items the rest, uniform within each
-        half -- the same shape `cohort_weights` gives `annot_frac`. `None` (default) does not
-        weight and returns None. Raises if this split holds no qualifying negative items at all
-        (see `__init__`'s own raise for why that must never be a silent no-op).
-
-        `source`, one of `None` (either source, the default), `'absent'` (A6's INST_ABSENT
-        negatives only) or `'crop'` (A6c's crop-level negatives only) -- lets an arm sweep ONE
-        source's share without also pulling in the other. The sampling MATH is identical
-        regardless of source (both get their `negative_frac` share, split uniformly among
-        whichever entries qualify); only which entries count as "negative" for this call changes.
-        """
-        if negative_frac is None:
-            return None
-        if not 0.0 <= float(negative_frac) <= 1.0:
-            raise ValueError(f'negative_frac must be in [0, 1], got {negative_frac}')
-        if source is None:
-            neg = self.is_negative
-        else:
-            if source not in ('absent', 'crop'):
-                raise ValueError(f"source must be one of (None, 'absent', 'crop'), got {source!r}")
-            neg = self.is_negative & (self.negative_source == source)
-        if not neg.any():
-            raise ValueError('negative_weights: no negative frames in this split -- build the '
-                             'dataset with negative_frac/negative_crop_frac set (see '
-                             'BoxDataset.__init__), or check `source` matches what was drawn.')
-        w = np.zeros(len(self.index), dtype=np.float64)
-        n_neg, n_pos = int(neg.sum()), int((~neg).sum())
-        w[neg] = float(negative_frac) / n_neg
-        if n_pos:
-            w[~neg] = (1.0 - float(negative_frac)) / n_pos
-        if w.sum() <= 0:
-            raise ValueError('negative_weights: sampling weights are all zero -- check '
-                             'negative_frac')
-        return w
-
     # ------------------------------------------------------------------------------------------
     # tiling
     # ------------------------------------------------------------------------------------------
@@ -755,12 +516,7 @@ class BoxDataset(Dataset):
     def _tile_extent(self):
         """The tile's extent in SOURCE pixels. `input_wh / tile_scale`, and nothing else.
 
-        A6c (crop-level negatives): also the extent a CROP-NEGATIVE's origin represents when
-        `self.tile_wh is None` -- `tile_transform(origin, tile_scale)`/`_transform` already treat
-        any non-None origin identically regardless of whether tiling is on, so this falls back to
-        `self.input_wh` (the item's own resolved output size) rather than raising on `None[0]`.
-        Every caller of this method is already gated on `self.origins[i] is not None`, and a
-        crop-negative sets exactly that -- see `_crop_negative_origin`.
+        Every caller that needs a tile origin is gated on `self.origins[i] is not None`.
         """
         wh = self.tile_wh if self.tile_wh is not None else self.input_wh
         return (wh[0] / self.tile_scale, wh[1] / self.tile_scale)
@@ -777,95 +533,6 @@ class BoxDataset(Dataset):
         ox, oy = self.origins[i]
         tw, th = self._tile_extent()
         return (ox + tw / 2, oy + th / 2)
-
-    def _known_boxes_source_px(self, sess, gid, f, ci):
-        """(N,4) SOURCE-pixel crop-rule boxes for every KNOWN animal at (frame, camera): the
-        ordinary labelled GT boxes (`boxes_for`'s own per-animal loop) UNION `instances.pq`
-        PRESENT boxes (`present_ignore_boxes_for`'s population) -- an animal known to be in view
-        but not annotated with keypoints/a box still counts as "known", and a crop-negative
-        candidate must clear it too (A6c.3: 3dpop's own PRESENT rows, ~a quarter of frames, have
-        no box target but ARE a real, located animal). NO warp, NO tile-clipping, NO letterbox
-        scale/pad -- this is deliberately the SAME crop-rule geometry `boxes_for`/
-        `present_ignore_boxes_for` compute, evaluated once at index-build time in plain SOURCE
-        pixels, because a crop-negative's margin test and its origin are both SOURCE-pixel
-        quantities.
-        """
-        lab = sess.labels(gid)
-        cam = sess.cgroup(gid, f)[ci]
-        p2d = self._points_2d(sess, gid, f, ci)
-        out = []
-        for s in range(p2d.shape[0]):
-            src, pad = p2d[s], 20
-            if self.box_source == 'instances' and lab.boxes is not None:
-                b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
-                if torch.isfinite(b).all():
-                    x0, y0, x1, y1 = b
-                    src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
-                                       torch.stack([x1, y1]), torch.stack([x0, y1])])
-                    pad = 0
-            box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
-            if box is not None:
-                out.append(box.float())
-        if lab.instance is not None and lab.boxes is not None:
-            present = np.flatnonzero(lab.instance[:, f, ci] == INST_PRESENT)
-            for s in present.tolist():
-                b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
-                if not torch.isfinite(b).all():
-                    continue
-                x0, y0, x1, y1 = b
-                src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
-                                   torch.stack([x1, y1]), torch.stack([x0, y1])])
-                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad=0)
-                if box is not None:
-                    out.append(box.float())
-        if not out:
-            return torch.zeros((0, 4), dtype=torch.float32)
-        return torch.stack(out)
-
-    def _crop_negative_origin(self, sess, gid, f, ci, rng, known_boxes, margin_sides=2.5,
-                              max_tries=12):
-        """A6c: one `(ox, oy)` SOURCE-pixel origin for a crop-level negative at (frame, camera),
-        or `None` if no candidate clears the margin within `max_tries` draws, the crop does not
-        fit in the frame at all, or the frame has NO certified area to draw from (`regions.pq`
-        present but empty -- A6c.1's "no safe area" case). NEVER forces a placement: matching
-        A6's own `negative_frac` raise-on-no-op guard, a crop-negative index must never contain an
-        unverified entry either, so an exhausted retry budget means this (frame, camera) simply
-        contributes no crop-negative, not a false one.
-
-        The candidate's extent is `_tile_extent()` -- the SAME source-pixel size a tile (or, when
-        untiled, this item's own `input_wh`) already represents, so a negative trains at the same
-        appearance scale a positive does. The margin is `box_center_dist` (`assign.py`), this
-        repo's own scale-free (units of box side) convention, applied between the candidate's own
-        box and EVERY known box -- ALL must clear `margin_sides`, not just the nearest. A
-        certified rect too small for the crop is skipped and redrawn.
-        """
-        from .assign import box_center_dist
-
-        W, H = (float(v) for v in sess.rig.size(sess.cam_names[ci]))
-        tw, th = self._tile_extent()
-        if tw > W or th > H:
-            return None
-        regions = self._region_rects(sess, gid, f, ci)
-        if regions is not None and not len(regions):
-            return None
-        for _ in range(max_tries):
-            if regions is None:
-                ox = float(rng.uniform(0.0, W - tw))
-                oy = float(rng.uniform(0.0, H - th))
-            else:
-                r = regions[rng.integers(len(regions))]
-                rw, rh = float(r[2] - r[0]), float(r[3] - r[1])
-                if rw < tw or rh < th:
-                    continue
-                ox = float(r[0] + rng.uniform(0.0, rw - tw))
-                oy = float(r[1] + rng.uniform(0.0, rh - th))
-            if known_boxes.shape[0] == 0:
-                return (ox, oy)
-            cand = torch.tensor([[ox, oy, ox + tw, oy + th]], dtype=torch.float32)
-            d = box_center_dist(cand, known_boxes)[0]
-            if bool((d >= margin_sides).all()):
-                return (ox, oy)
-        return None
 
     def _region_rects(self, sess, gid, f, ci):
         """(M,4) certified rects in SOURCE px for one (frame, camera), or None if no regions.pq.
@@ -987,63 +654,6 @@ class BoxDataset(Dataset):
         out[:, 1::2] = out[:, 1::2] * scale + pad[1]
         return out
 
-    def present_ignore_boxes_for(self, i, warp=None):
-        """Crop-rule boxes for `instances.pq` PRESENT rows -- an animal in this view that was NOT
-        annotated -- in INPUT pixels, `(M,4)`, or None.
-
-        These rows are trained as background by DEFAULT (`boxes_for` never sees them, so
-        `detector_loss`'s zeros-target treats every anchor inside one as "no animal here"). This
-        is the training-side counterpart of `ignore_for`, which reports the SAME population as a
-        scoring exclusion but takes no `warp`; the loss needs the boxes warped exactly as the GT
-        boxes beside them are, or a rotated ignore box masks the wrong pixels.
-
-        FOUR corners through the warp, then RE-DERIVED by `crop_box_for_points` -- the same
-        `box_source = 'instances'` geometry `boxes_for` uses -- not `_warp_region`'s inscribed
-        rectangle: a certified region is a claim that must shrink toward safety, but an ignore box
-        exists to keep covering an animal that might not be annotated.
-
-        None when the session ships no `instances.pq` boxes at all; empty `(0,4)` when it does but
-        nothing in this view is PRESENT -- the same None/empty distinction `regions_for` keeps.
-        """
-        sess, gid, f, ci = self.index[i]
-        lab = sess.labels(gid)
-        if lab.instance is None or lab.boxes is None:
-            return None
-        present = np.flatnonzero(lab.instance[:, f, ci] == INST_PRESENT)
-        if not present.size:
-            return torch.zeros((0, 4), dtype=torch.float32)
-        cam = sess.cgroup(gid, f)[ci]
-        tile_box = None
-        if self.origins[i] is not None:
-            ox, oy = self.origins[i]
-            tw, th = self._tile_extent()
-            tile_box = (ox, oy, ox + tw, oy + th)
-
-        out = []
-        for s in present.tolist():
-            b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
-            if not torch.isfinite(b).all():
-                continue
-            x0, y0, x1, y1 = b
-            src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
-                               torch.stack([x1, y1]), torch.stack([x0, y1])])
-            if warp is not None:
-                src = _apply_affine(src, (warp, None))
-                src = _drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
-            if tile_box is not None:
-                src = _drop_outside(src, tile_box)
-            box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad=0)
-            if box is not None:
-                out.append(box.float())
-        if not out:
-            return torch.zeros((0, 4), dtype=torch.float32)
-        boxes = torch.stack(out)
-        scale, pad = self._transform(i, cam['size'])
-        boxes = boxes.clone()
-        boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
-        boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
-        return boxes
-
     def ignore_for(self, i):
         """`(ig (S,) bool, ig_boxes (S,4))` for item `i`, in INPUT pixels. Or `(None, None)`.
 
@@ -1086,11 +696,8 @@ class BoxDataset(Dataset):
         image but the `min_crop_dim` floor would not, so a floored box scaled by 0.8 is a box the
         rule can never emit.
 
-        A negative item (A6) is a VERIFIED-EMPTY (frame, camera) -- `instances.pq` marks every
-        animal INST_ABSENT -- so it returns S=0 rows and the whole anchor field trains as
-        background, never NaN-padded rows for animals that might still be there. `pts` is
-        frame-indexed (axis -3 is the ANIMAL, so a moving camera's (T,4,4) extrinsic would
-        project animal `i` through frame `i`'s pose). A point outside the TILE is dropped exactly
+        `pts` is frame-indexed (axis -3 is the ANIMAL, so a moving camera's (T,4,4) extrinsic
+        projects animal `i` through frame `i`'s pose). A point outside the TILE is dropped exactly
         like an out-of-frame point, in SOURCE pixels and AFTER the warp (`__getitem__` composes
         `tile @ warp @ decode`); drop them all and `crop_box_for_points` returns None, i.e. "no
         animal here". An `instances.pq` stored box is an ALREADY-PADDED extent that re-enters the
@@ -1098,11 +705,6 @@ class BoxDataset(Dataset):
         animal the box exists to enclose), per animal rather than per session because rat-city's
         tracker loses animals and its keypoints are then the only source left.
         """
-        if self.is_negative[i]:
-            boxes = torch.zeros((0, 4), dtype=torch.float32)
-            if not with_keypoints:
-                return boxes
-            return boxes, torch.zeros((0, len(self.ds.names), 3), dtype=torch.float32)
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
         cam = sess.cgroup(gid, f)[ci]
@@ -1245,107 +847,24 @@ class BoxDataset(Dataset):
             break
         return boxes, kpts, img
 
-    def _copy_paste(self, i, boxes, kpts, img, rng):
-        """Paste whole donor crop-rule boxes into clear space in the rendered image.
-
-        This is deliberately a rectangular alpha crop: the detector target is a rectangular crop
-        rule, and an opaque interior keeps the donor's pixels and target exactly aligned. A one
-        pixel feather at the crop boundary supplies the alpha blend without inventing a
-        segmentation mask that the annotation format does not contain.
-        """
-        if not self.copypaste or not self.augment or not self.train or len(self) < 2:
-            return boxes, kpts, img
-        sess = self.index[i][0]
-        donors = [j for j, (dsess, _g, _f, _c) in enumerate(self.index)
-                  if dsess.session_id == sess.session_id and j != i]
-        if not donors:
-            return boxes, kpts, img
-        n = int(rng.integers(1, self.copypaste_max + 1))
-        for _ in range(n):
-            j = int(rng.choice(donors))
-            src_img, src_boxes, src_kpts = self._load_letterbox(j, with_keypoints=self.keypoints)
-            finite = torch.isfinite(src_boxes).all(-1)
-            for s in rng.permutation(torch.nonzero(finite).flatten().cpu().numpy()).tolist():
-                b = src_boxes[int(s)]
-                x0, y0, x1, y1 = (int(v) for v in b.round().tolist())
-                if x1 <= x0 or y1 <= y0 or x0 < 0 or y0 < 0 or \
-                        x1 > self.input_wh[0] or y1 > self.input_wh[1]:
-                    continue
-                bw, bh = x1 - x0, y1 - y0
-                placed = False
-                for _try in range(16):
-                    dx = int(rng.integers(0, self.input_wh[0] - bw + 1))
-                    dy = int(rng.integers(0, self.input_wh[1] - bh + 1))
-                    candidate = torch.tensor([[dx, dy, dx + bw, dy + bh]],
-                                             dtype=boxes.dtype, device=boxes.device)
-                    known = boxes[torch.isfinite(boxes).all(-1)]
-                    if known.numel():
-                        from .assign import box_center_dist
-                        if bool((box_center_dist(candidate, known)[0] < 2.5).any()):
-                            continue
-                    placed = True
-                    break
-                if not placed:
-                    continue
-                patch = src_img[y0:y1, x0:x1]
-                alpha = np.ones((bh, bw, 1), dtype=np.float32)
-                if bw > 2 and bh > 2:
-                    alpha[[0, -1], :, :] *= 0.5
-                    alpha[:, [0, -1], :] *= 0.5
-                dst = img[dy:dy + bh, dx:dx + bw].astype(np.float32)
-                img[dy:dy + bh, dx:dx + bw] = np.round(
-                    dst * (1.0 - alpha) + patch.astype(np.float32) * alpha).astype(np.uint8)
-                offset = torch.tensor([dx - x0, dy - y0, dx - x0, dy - y0],
-                                      dtype=boxes.dtype, device=boxes.device)
-                boxes = torch.cat([boxes, (b + offset).to(boxes.dtype)[None]], 0)
-                if self.keypoints and kpts is not None:
-                    k = src_kpts[int(s)].clone()
-                    k[..., :2] += offset[:2]
-                    outside = ((k[..., 0] < dx) | (k[..., 0] >= dx + bw) |
-                               (k[..., 1] < dy) | (k[..., 1] >= dy + bh))
-                    k[..., :2] = torch.where(outside[..., None], torch.nan, k[..., :2])
-                    kpts = torch.cat([kpts, k[None]], 0)
-                break
-        return boxes, kpts, img
-
     def __getitem__(self, i):
         """Decode item `i`: letterboxed/tiled pixels, boxes, and optional kpts/regions.
 
-        Inputs:
-            i -- index into `self.index` ((group, frame, camera) entry).
-        Outputs:
-            (img, boxes, [kpts], [regions|ignore_boxes]): the letterboxed/tiled frame at the
-            input size, boxes in input pixels, optional per-keypoint targets, and the opt-in
-            (M,4) mask tuple element -- at most one of regions/ignore_boxes is non-None.
-            `regions` is never folded into `boxes`: a region is not an animal and must never
-            reach `assign`.
-        Side effects:
-            None (reads the frame from disk).
-        Notes:
-            Fresh entropy per visit on train (`default_rng(None)`), none on eval; `strong` is
-            read once per item via shared-memory `_it`. Under tiling the pixel target is the
-            frame at `tile_scale`, NOT `self.input_wh`; a video root ignores `reduce`. One
-            warpAffine composes decode scale + augmentation + letterbox-or-tile (L @ W @ D).
-            The strong suite runs in fixed order, appearance-only (cutout is an erasure: a
-            covered keypoint loses both coordinate and score target); mosaic-lite is the only
-            op that adds a box and cannot coexist with `regions`/`temporal_input`.
-            `temporal_input` stacks (t-1, t) under the same warp and photometric gain; at clip
-            start frame t is repeated.
+        Fresh entropy is drawn per train visit; evaluation is deterministic. Under tiling the
+        input is the frame at `tile_scale`, not the tile size. One warpAffine composes decode
+        scale, augmentation and letterbox-or-tile geometry. The strong suite is appearance-only
+        except cutout, which withholds targets it covers; mosaic-lite is incompatible with regions.
         """
         import cv2
 
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
-        rng = (np.random.default_rng(None) if self.augment and self.train else None)
-        strong = self._strong_now()
-        _affine_kw = {} if self.scale_jitter is None else {'scale': self.scale_jitter}
+        rng = np.random.default_rng(None) if self.augment and self.train else None
         warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
-                              centre=self._warp_centre(i), **_affine_kw) if rng is not None
-               else None)
+                              centre=self._warp_centre(i)) if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
         regions = self.regions_for(i, warp) if self.use_regions else None
-        ignore_boxes = self.present_ignore_boxes_for(i, warp) if self.ignore_present else None
 
         out_wh = (self.input_wh if self.tile_wh is None
                   else (size[0] * self.tile_scale, size[1] * self.tile_scale))
@@ -1358,22 +877,18 @@ class BoxDataset(Dataset):
         assert dec == want or dec == size, \
             f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
             f'or {size} unreduced'
-        d = size[0] / dec[0]
-        M = None
-        gain = None
         if warp is None and self.origins[i] is None:
             img, _, _ = letterbox(img, self.input_wh, src_wh=size)
         else:
             scale, pad = self._transform(i, size)
+            d = size[0] / dec[0]
             L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
             D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
             W = np.vstack([warp, [0, 0, 1]]) if warp is not None else np.eye(3, dtype=np.float32)
-            M = (L @ W @ D)[:2]
-            img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
+            img = cv2.warpAffine(img, (L @ W @ D)[:2], self.input_wh, borderValue=(114, 114, 114))
             if warp is not None:
-                gain = rng.uniform(0.7, 1.3)
-                img = _photometric(img, rng, gain=gain)
-                if strong:
+                img = _photometric(img, rng)
+                if self.strong:
                     if rng.random() < 0.5:
                         img = _color_jitter(img, rng)
                     if rng.random() < 0.3:
@@ -1382,20 +897,7 @@ class BoxDataset(Dataset):
                         img = _salt_pepper(img, rng)
                     if rng.random() < 0.2:
                         img = _motion_blur(img, rng)
-        prev_img = None
-        if self.temporal_input != 'none':
-            prev_f = max(f - 1, 0)
-            prev_raw = read_frames(sess.groups[gid], sess.cam_names[ci], [prev_f], reduce=r)[0]
-            if prev_raw is None:
-                raise RuntimeError(f'{gid}/{sess.cam_names[ci]}: frame {prev_f} (t-1 for '
-                                   'temporal_input) unreadable')
-            if M is None:
-                prev_img, _, _ = letterbox(prev_raw, self.input_wh, src_wh=size)
-            else:
-                prev_img = cv2.warpAffine(prev_raw, M, self.input_wh, borderValue=(114, 114, 114))
-                if gain is not None:
-                    prev_img = _photometric(prev_img, rng, gain=gain)
-        if strong and rng is not None:
+        if self.strong and rng is not None:
             if rng.random() < 0.5:
                 rects = _cutout_rects(self.input_wh, rng)
                 img = _apply_cutout(img, rects)
@@ -1406,16 +908,8 @@ class BoxDataset(Dataset):
                     kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
-        if self.copypaste and rng is not None:
-            boxes, kpts, img = self._copy_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        if prev_img is not None:
-            xp = torch.as_tensor(prev_img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-            x = torch.cat([xp, x], dim=0)
         out = (x, boxes) if kpts is None else (x, boxes, kpts)
-        if self.ignore_present:
-            return (*out, ignore_boxes if ignore_boxes is not None
-                   else torch.zeros((0, 4), dtype=torch.float32))
         if not self.use_regions:
             return out
         if regions is None:
@@ -1460,24 +954,14 @@ class ChunkShuffle(torch.utils.data.Sampler):
 
 
 class CohortSampler(torch.utils.data.Sampler):
-    """Draw index positions WITH REPLACEMENT at fixed per-cohort probability.
+    """Draw weighted index positions with replacement.
 
-    Built from `BoxDataset.cohort_weights(annot_frac)`, which is None unless the split actually
-    holds both an `annotated` and a `tracked` session -- so this sampler is constructed only on
-    the roots where the question exists (rat-city-combined, allen-mouse-combined,
-    johnson-mouse-combined-aug). On the other three `train_detector.py` keeps `ChunkShuffle` and
-    the run is byte-identical to every detector on record.
+    `default_train_weights` always returns a view-uniform base and `alpha_weights` may modify it.
+    Replacement makes a configured cohort share a property of each draw rather than of a finite
+    epoch. `__len__` remains the index length so `iters` keeps its existing meaning.
 
-    REPLACEMENT, and therefore no epoch boundary, for `StepSampler`'s reason on the pose side: a
-    fixed cohort share is a property of the STEP, and an epoch that must contain each entry once
-    cannot hold one. `__len__` stays at `n` so `iters` keeps meaning what it meant.
-
-    LOCALITY IS DELIBERATELY DROPPED HERE, and only here. `ChunkShuffle` exists to keep a worker
-    inside a few video containers; all three roots that reach this sampler read IMAGE
-    DIRECTORIES on train (`Group.source` -> 'frames'), where random access is free -- measured on
-    rat-city-combined at 30.6 ms/frame random against 30.2 ms/frame sequential. calms21, the one
-    train-time video root, is single-cohort and never gets here. If that ever changes, this is
-    the line that has to be revisited, not `ChunkShuffle`.
+    Locality is deliberately traded for the weighted draw. Train inputs for the multi-cohort roots
+    are frame directories; calms21 is the video-backed root and has one cohort.
     """
 
     def __init__(self, weights, num_samples=None, seed=23):

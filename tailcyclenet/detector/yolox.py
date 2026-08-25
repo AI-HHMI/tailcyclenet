@@ -43,18 +43,6 @@ YOLOX_TIERS = {
     'x':    (1.33, 1.25, False),
 }
 
-# A2: ViT backbone versions -> (hub repo, hub entrypoint, the [model].pretrained value that loads
-# real weights for it). DINOv2's checkpoints are fully public; DINOv3's are GATED behind Meta's
-# own license-request form -- `pretrained="dinov3"` still builds the architecture and attempts
-# the download, but 403s from `dl.fbaipublicfiles.com/dinov3` without an approved request. Both
-# hub repos expose the identical interface `vit_backbone.ViTBackbone` reads.
-VIT_BACKBONES = {
-    'vit_s14':    ('facebookresearch/dinov2', 'dinov2_vits14', 'dinov2'),
-    'vit_b14':    ('facebookresearch/dinov2', 'dinov2_vitb14', 'dinov2'),
-    'vit_s16_v3': ('facebookresearch/dinov3', 'dinov3_vits16', 'dinov3'),
-    'vit_b16_v3': ('facebookresearch/dinov3', 'dinov3_vitb16', 'dinov3'),
-}
-
 
 def round8(v):
     """Round to the nearest multiple of 8 (floor 8) -- keeps `norm_groups` clean at any width."""
@@ -126,57 +114,6 @@ class Bottleneck(nn.Module):
         y = self.conv2(self.conv1(x))
         return x + y if self.add else y
 
-
-class CSPNeXtBottleneck(nn.Module):
-    """5x5 depthwise + SE channel attention, RTMDet's own bottleneck block.
-
-    Same __init__ signature as `Bottleneck` so `CSPNeXtLayer` can substitute it without changing
-    any other code. At `bottleneck_expansion=0.5` (this net's own default) the SE block's two 1x1
-    convs push CSPNeXt noticeably past a plain-Bottleneck param estimate for the same width/depth
-    -- confirmed against `Bottleneck`+`CSPLayer` at the same `width_mul`/`depth_mul` by
-    `dev/scratch/prototype_cspnext.py`.
-    """
-    def __init__(self, cin, cout, shortcut=True, depthwise=True, expansion=0.5):
-        """Build the CSPNeXt bottleneck: 3x3 conv, 5x5 depthwise, 1x1 pointwise, SE gate.
-
-        The SE gate is global avg pool -> FC down -> SiLU -> FC up -> Sigmoid, applied to the
-        conv path. The 5x5 depthwise kernel is the CSPNeXt signature, larger than YOLOX's 3x3.
-        """
-        super().__init__()
-        hidden = int(cout * expansion)
-        self.conv1 = conv_norm_act(cin, hidden, 3)
-        self.dw = conv_norm_act(hidden, hidden, 5, groups=hidden)
-        self.pw = conv_norm_act(hidden, cout, 1)
-        sq = max(1, cout // 4)
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(cout, sq, 1), nn.SiLU(inplace=True),
-            nn.Conv2d(sq, cout, 1), nn.Sigmoid())
-        self.add = shortcut and cin == cout
-
-    def forward(self, x):
-        """Conv path through conv1/dw/pw, SE-gated, shortcut-added when `self.add`."""
-        y = self.pw(self.dw(self.conv1(x)))
-        y = y * self.se(y)
-        return x + y if self.add else y
-
-
-class CSPNeXtLayer(nn.Module):
-    """`CSPLayer` using `CSPNeXtBottleneck` instead of `Bottleneck`."""
-    def __init__(self, cin, cout, n=1, shortcut=True, depthwise=True, bottleneck_expansion=0.5):
-        """Build the layer: two 1x1 splits, `n` CSPNeXt bottlenecks, one merge conv."""
-        super().__init__()
-        hidden = cout // 2
-        self.conv1 = conv_norm_act(cin, hidden, 1)
-        self.conv2 = conv_norm_act(cin, hidden, 1)
-        self.conv3 = conv_norm_act(2 * hidden, cout, 1)
-        self.m = nn.Sequential(
-            *[CSPNeXtBottleneck(hidden, hidden, shortcut, depthwise=depthwise,
-                                expansion=bottleneck_expansion) for _ in range(n)])
-
-    def forward(self, x):
-        """CSP merge of the bottleneck path and the shortcut path."""
-        return self.conv3(torch.cat([self.m(self.conv1(x)), self.conv2(x)], dim=1))
 
 
 class CSPLayer(nn.Module):
@@ -322,55 +259,6 @@ class CSPDarknet(nn.Module):
         return (p2, p3, p4, p5) if self.p2 else (p3, p4, p5)
 
 
-class CSPNeXt(nn.Module):
-    """CSPNeXt backbone (RTMDet-style). Same stage structure as `CSPDarknet` but with
-    `CSPNeXtBottleneck` (5x5 depthwise + SE) instead of the standard `Bottleneck`.
-
-    Uses the `Focus` stem. Width/depth controlled by multipliers, same as `CSPDarknet`. At
-    `width_mul=0.5, depth_mul=0.33` (this net's own `cspnext_s` tier) the SE blocks push this
-    past a same-shape `CSPDarknet`'s param count -- confirmed by
-    `dev/scratch/prototype_cspnext.py`: 3.65M at `bottleneck_expansion=0.5` (this net's default),
-    not the plan doc's original ~2.5M estimate.
-    """
-    def __init__(self, width_mul=0.5, depth_mul=0.33, bottleneck_expansion=1.0,
-                p2=False, in_channels=3):
-        """Build the CSPNeXt backbone (RTMDet-style) at the given width/depth multipliers.
-
-        base_channels = round8(64 * width_mul) (e.g. 32 at 0.5) and
-        base_depth = max(1, round(3 * depth_mul)) (e.g. 1 at 0.33), with the same Focus stem
-        and stage structure as `CSPDarknet`'s canonical tiers.
-        """
-        super().__init__()
-        c = round8(64 * width_mul)
-        d = max(1, round(3 * depth_mul))
-        be = bottleneck_expansion
-        self.p2 = bool(p2)
-        self.stem = Focus(int(in_channels), c, 3, depthwise=False)
-        self.dark2 = nn.Sequential(
-            conv_norm_act(c, c * 2, 3, 2),
-            CSPNeXtLayer(c * 2, c * 2, d, bottleneck_expansion=be))
-        self.dark3 = nn.Sequential(
-            conv_norm_act(c * 2, c * 4, 3, 2),
-            CSPNeXtLayer(c * 4, c * 4, d * 3, bottleneck_expansion=be))
-        self.dark4 = nn.Sequential(
-            conv_norm_act(c * 4, c * 8, 3, 2),
-            CSPNeXtLayer(c * 8, c * 8, d * 3, bottleneck_expansion=be))
-        self.dark5 = nn.Sequential(
-            conv_norm_act(c * 8, c * 16, 3, 2),
-            SPPBottleneck(c * 16, c * 16),
-            CSPNeXtLayer(c * 16, c * 16, d, shortcut=False,
-                        bottleneck_expansion=be))
-        self.out_channels = ((c * 2, c * 4, c * 8, c * 16) if self.p2
-                             else (c * 4, c * 8, c * 16))
-
-    def forward(self, x):
-        """Run stem + dark2..dark5; return (p2,p3,p4,p5) when `p2`, else (p3,p4,p5)."""
-        p2 = self.dark2(self.stem(x))
-        p3 = self.dark3(p2)
-        p4 = self.dark4(p3)
-        p5 = self.dark5(p4)
-        return (p2, p3, p4, p5) if self.p2 else (p3, p4, p5)
-
 
 class PAFPN(nn.Module):
     """`p2`: a 4th, finer level (stride 4). `False` (default) is the original 3-level PAFPN,
@@ -384,17 +272,11 @@ class PAFPN(nn.Module):
     """
 
     def __init__(self, chans=(96, 192, 192), out=96, depthwise=True, p2=False,
-                fpn_upsample='nearest', p2_bottomup=False):
-        """Build the PAFPN neck: lateral convs, top-down merges, optional p2 bottom-up.
+                fpn_upsample='nearest'):
+        """Build the PAFPN neck: lateral convs, top-down merges.
 
         `fpn_upsample='nearest'` (default) is byte-identical to every checkpoint on record;
         `'bilinear'` is RTMDet's own choice (no checkerboard artifacts, no extra params).
-
-        `p2_bottomup=True` gives p2 the same "one more CSPLayer pass after the top-down merge"
-        treatment out3/out4/out5 get, applied to p2 ALONE (self-refinement): p2 is the finest
-        level, so there is no genuinely finer input to draw a bottom-up pass from the way
-        out3/out4/out5 draw from their own finer neighbour. Only constructed when both `p2` and
-        `p2_bottomup` are set; default False is byte-identical to every checkpoint on record.
         """
         super().__init__()
         self.p2 = bool(p2)
@@ -402,7 +284,7 @@ class PAFPN(nn.Module):
         if self.fpn_upsample not in ('nearest', 'bilinear'):
             raise ValueError(f"fpn_upsample must be 'nearest' or 'bilinear', got "
                              f"{fpn_upsample!r}")
-        self.p2_bottomup = bool(p2_bottomup)
+
         if self.p2:
             c2, c3, c4, c5 = chans
         else:
@@ -421,8 +303,7 @@ class PAFPN(nn.Module):
             self.mrg2 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
             self.down2 = conv3(out, out, 3, 2, depthwise=depthwise)
             self.out3 = CSPLayer(2 * out, out, 1, shortcut=False, depthwise=depthwise)
-            if self.p2_bottomup:
-                self.out2 = CSPLayer(out, out, 1, shortcut=True, depthwise=depthwise)
+
 
     def _upsample(self, x, size):
         """Upsample `x` to `size` with the configured mode (nearest or bilinear)."""
@@ -441,8 +322,6 @@ class PAFPN(nn.Module):
         p3 = self.mrg3(torch.cat([self._upsample(p4, p3.shape[-2:]), self.lat3(p3)], 1))
         if self.p2:
             p2 = self.mrg2(torch.cat([self._upsample(p3, p2.shape[-2:]), self.lat2(p2)], 1))
-            if self.p2_bottomup:
-                p2 = self.out2(p2)
             n3 = self.out3(torch.cat([self.down2(p2), p3], 1))
             n4 = self.out4(torch.cat([self.down3(n3), p4], 1))
             n5 = self.out5(torch.cat([self.down4(n4), p5], 1))
@@ -539,28 +418,20 @@ class YOLOXNano(nn.Module):
     garbage unless the CALLER also supplies genuinely wider `x`. This constructor argument is
     scaffolding for that follow-on, not a complete feature.
 
-    `shared_head` (default `True`), `fpn_upsample` (default `'nearest'`) and `p2_bottomup`
-    (default `False`) are §2's implementation-gap levers (`Head`/`PAFPN`'s own docstrings) --
-    every default is byte-identical to every checkpoint on record.
+    `shared_head` (default `True`) and `fpn_upsample` (default `'nearest'`) are §2's
+    implementation-gap levers (`Head`/`PAFPN`'s own docstrings) -- every default is byte-identical
+    to every checkpoint on record.
     """
     STRIDES = (8, 16, 32)
 
     def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
-                p2=False, in_channels=3, head_depthwise=None, pretrained='',
-                shared_head=True, fpn_upsample='nearest', p2_bottomup=False):
+                p2=False, in_channels=3, pretrained='',
+                shared_head=True, fpn_upsample='nearest'):
         """Build the box predictor for `version` (see the class docstring for arguments).
 
-        `pretrained` selects which hub checkpoint a ViT backbone loads: '' (default) trains from
-        scratch; 'dinov2'/'dinov3' load the matching DINOv2/DINOv3 weights -- only meaningful
-        for a `vit_*` version (`config.py` refuses the combination otherwise).
-
-        Version branches: `vit_*` builds a ViT backbone + Simple Feature Pyramid with a
-        full-conv neck/head at the 's' tier's neck width (128); `in_channels != 3` is refused
-        for it, because a ViT patch embedding is built for RGB and has no wider-stem path.
-        `hybrid` builds a CNN stem (strides 2/4/8) + transformer blocks (strides 16/32) from
-        scratch at neck width 256 (matching c*4 at stride-8). `cspnext_s` builds the RTMDet-style
-        backbone (5x5 depthwise + SE bottleneck) on the existing CSPDarknet stage structure,
-        with full-conv towers at neck width 128.
+        `pretrained` selects which hub checkpoint loads: '' (default) trains from scratch; 'coco'
+        loads Megvii's COCO backbone (canonical tiers only). `hybrid` builds a CNN stem
+        (strides 2/4/8) + transformer blocks (strides 16/32) from scratch at neck width 256.
         """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
@@ -568,7 +439,6 @@ class YOLOXNano(nn.Module):
         self.bottleneck_expansion = float(bottleneck_expansion)
         self.p2 = bool(p2)
         self.in_channels = int(in_channels)
-        self.head_depthwise = head_depthwise
         self.pretrained_source = str(pretrained) if isinstance(pretrained, str) else ''
         if self.version == 'trimmed':
             if self.bottleneck_expansion != 0.5:
@@ -579,28 +449,10 @@ class YOLOXNano(nn.Module):
                     "to fix). Use a canonical tier for a COCO-compatible backbone.")
             self.backbone = CSPDarknetNano(p2=self.p2, in_channels=self.in_channels)
             neck_out, depthwise = width, True
-        elif self.version in VIT_BACKBONES:
-            if self.in_channels != 3:
-                raise ValueError(f"in_channels={self.in_channels} was passed alongside "
-                                 f"version={version!r}, but the ViT backbone's patch embedding "
-                                 "only accepts 3-channel RGB.")
-            from .vit_backbone import ViTBackbone
-            hub_repo, model_name, pretrained_key = VIT_BACKBONES[self.version]
-            use_pretrained = (self.pretrained_source == pretrained_key)
-            self.backbone = ViTBackbone(model_name, p2=self.p2, pretrained=use_pretrained,
-                                        hub_repo=hub_repo)
-            neck_out = round8(256 * 0.5)
-            depthwise = False
         elif self.version == 'hybrid':
             from .vit_backbone import HybridBackbone
             self.backbone = HybridBackbone(p2=self.p2, in_channels=self.in_channels)
             neck_out = round8(256)
-            depthwise = False
-        elif self.version == 'cspnext_s':
-            self.backbone = CSPNeXt(width_mul=0.5, depth_mul=0.33,
-                                    bottleneck_expansion=self.bottleneck_expansion,
-                                    p2=self.p2, in_channels=self.in_channels)
-            neck_out = round8(256 * 0.5)
             depthwise = False
         else:
             if self.version not in YOLOX_TIERS:
@@ -616,11 +468,10 @@ class YOLOXNano(nn.Module):
                                        p2=self.p2, in_channels=self.in_channels)
             neck_out = round8(256 * width_mul)
         self.neck = PAFPN(chans=self.backbone.out_channels, out=neck_out, depthwise=depthwise,
-                          p2=self.p2, fpn_upsample=fpn_upsample, p2_bottomup=p2_bottomup)
+                          p2=self.p2, fpn_upsample=fpn_upsample)
         n_levels = 4 if self.p2 else 3
-        head_dw = depthwise if head_depthwise is None else bool(head_depthwise)
         self.head = Head(neck_out, n_levels=n_levels, n_keypoints=self.n_keypoints,
-                         depthwise=head_dw, shared_head=shared_head)
+                         depthwise=depthwise, shared_head=shared_head)
         if self.p2:
             self.STRIDES = (4, 8, 16, 32)
 

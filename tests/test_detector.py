@@ -9,13 +9,11 @@ import torch
 from pathlib import Path
 
 from tailcyclenet.crop import box_corners, crop_box_for_points
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler,
-                                   TEMPORAL_INPUT_BY_CHANNELS,
-                                   TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, YOLOXNano, assign,
+from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler, YOLOXNano, assign,
                                    assign_tal, box_collate, box_iou, ciou_loss, decode,
                                    detector_loss, giou_loss, letterbox, paired_iou,
-                                   quality_focal_loss, unletterbox_boxes)
-from tailcyclenet.detector.config import (DATA_KEYS, MODEL_KEYS, TRAINING_KEYS,
+                                   unletterbox_boxes)
+from tailcyclenet.detector.config import (MODEL_KEYS, TRAINING_KEYS,
                                            load_detector_config)
 from tailcyclenet.detector.data import (_cutout_rects, _keypoints_in_rects, _photometric,
                                         random_affine)
@@ -98,7 +96,8 @@ def _two_cohort_root(tmp_path, n_annot_frames=2, n_tracked_frames=30):
 def test_annot_frac_absent_means_no_weighting(tmp_path):
     """Absent must stay byte-identical: None weights => the caller keeps `ChunkShuffle`."""
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    assert ds.cohort_weights(None) is None
+    w = ds.default_train_weights(None)
+    assert w is not None and len(w) == len(ds)
 
 
 def test_annot_frac_is_inert_on_a_single_cohort_split(dense_root):
@@ -108,8 +107,11 @@ def test_annot_frac_is_inert_on_a_single_cohort_split(dense_root):
     """
     ds = BoxDataset(dense_root, 'train', input_wh=(64, 64))
     assert len(ds.cohort_mix()) == 1, 'fixture must be single-cohort for this test to mean anything'
+    base = ds.default_train_weights(None)
     for frac in (0.0, 0.25, 0.5, 1.0):
-        assert ds.cohort_weights(frac) is None
+        w = ds.default_train_weights(frac)
+        np.testing.assert_allclose(w, base, err_msg=f'annot_frac={frac} must be inert on a '
+                                   'single-cohort split')
 
 
 def test_annot_frac_sets_the_cohort_share(tmp_path):
@@ -119,7 +121,7 @@ def test_annot_frac_sets_the_cohort_share(tmp_path):
     natural = ds.cohort_mix()
     assert natural['annotated'] < 0.2, 'fixture must be lopsided or this proves nothing'
     for frac in (0.25, 0.5, 0.75):
-        mix = ds.cohort_mix(ds.cohort_weights(frac))
+        mix = ds.cohort_mix(ds.default_train_weights(frac))
         assert mix['annotated'] == pytest.approx(frac)
         assert mix['tracked'] == pytest.approx(1.0 - frac)
 
@@ -130,7 +132,7 @@ def test_annot_frac_weights_are_uniform_within_a_cohort(tmp_path):
     bug one level down.
     """
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    w = ds.cohort_weights(0.5)
+    w = ds.default_train_weights(0.5)
     src = np.array([s.label_source for s, _, _, _ in ds.index])
     for cohort in ('annotated', 'tracked'):
         assert len(np.unique(w[src == cohort])) == 1
@@ -140,13 +142,13 @@ def test_annot_frac_out_of_range_raises(tmp_path):
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
     for bad in (-0.1, 1.5):
         with pytest.raises(ValueError, match='annot_frac'):
-            ds.cohort_weights(bad)
+            ds.default_train_weights(bad)
 
 
 def test_cohort_sampler_realises_the_requested_share(tmp_path):
     """The weights are only a claim until the sampler is drawn from -- this is the live check."""
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    w = ds.cohort_weights(0.5)
+    w = ds.default_train_weights(0.5)
     src = np.array([s.label_source for s, _, _, _ in ds.index])
     s = CohortSampler(w, num_samples=20000, seed=0)
     drawn = src[np.array(list(iter(s)))]
@@ -155,7 +157,7 @@ def test_cohort_sampler_realises_the_requested_share(tmp_path):
 
 def test_cohort_sampler_reshuffles_and_stays_in_range(tmp_path):
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    s = CohortSampler(ds.cohort_weights(0.5), num_samples=256, seed=0)
+    s = CohortSampler(ds.default_train_weights(0.5), num_samples=256, seed=0)
     first = list(iter(s))
     assert len(first) == len(s) == 256
     assert min(first) >= 0 and max(first) < len(ds), 'a draw must be a valid index position'
@@ -235,256 +237,7 @@ def test_alpha_is_a_free_noop_on_uniform_group_sizes(tmp_path):
             f'uniform group sizes must make alpha=({alpha}) a no-op, got {w}'
 
 
-def test_scale_jitter_overrides_random_affines_default_range(tmp_path, monkeypatch):
-    """detector_v2 D1: `scale_jitter` REPLACES `random_affine`'s own `(0.8, 1.25)` default
-    outright (not composed with it), and is simply absent from the call when unset."""
-    import tailcyclenet.detector.data as ddata
 
-    calls = []
-    orig = ddata.random_affine
-
-    def spy(*a, **kw):
-        calls.append(kw)
-        return orig(*a, **kw)
-
-    monkeypatch.setattr(ddata, 'random_affine', spy)
-    root = _two_group_root(tmp_path, n1=8, n2=8)
-
-    ds = ddata.BoxDataset(root, 'train', input_wh=(64, 64), augment=True, scale_jitter=(0.5, 0.5))
-    _ = ds[0]
-    assert calls and calls[-1].get('scale') == (0.5, 0.5)
-
-    calls.clear()
-    ds2 = ddata.BoxDataset(root, 'train', input_wh=(64, 64), augment=True)
-    _ = ds2[0]
-    assert calls and 'scale' not in calls[-1], \
-        'unset scale_jitter must not override random_affine\'s own default'
-
-
-def test_aug_switch_off_iter_disables_strong_after_the_named_step(tmp_path):
-    """detector_v2 D3: an int names the STEP the strong suite switches off at, mirroring
-    `video_encoder_requires_grad`'s own precedent."""
-    root = _two_group_root(tmp_path, n1=8, n2=8)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), augment=True, strong=True,
-                    aug_switch_off_iter=5)
-    assert ds._strong_now() is True
-    ds.set_iter(4)
-    assert ds._strong_now() is True
-    ds.set_iter(5)
-    assert ds._strong_now() is False, 'at or past the named step, strong must be OFF'
-    ds.set_iter(1000)
-    assert ds._strong_now() is False
-
-
-def test_aug_switch_off_iter_default_is_a_noop(tmp_path):
-    root = _two_group_root(tmp_path, n1=8, n2=8)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), augment=True, strong=True)
-    assert ds._it is None, 'unset aug_switch_off_iter must not even allocate the shared counter'
-    ds.set_iter(999999)   # must be a harmless no-op, not an error
-    assert ds._strong_now() is True
-
-
-def _absent_frames_root(tmp_path, T=10, n_absent=3, n_labelled=3):
-    """A session whose `instances.pq` marks the LAST `n_absent` frames INST_ABSENT for every
-    animal (a genuine per-camera assessment) and the FIRST `n_labelled` frames normally labelled
-    -- so the ordinary index is non-empty AND the negative-frame index has real material.
-    """
-    from tailcyclenet import format as fmt
-    from tests.conftest import KPTS_3D, _rig, _write_frames
-
-    W = H = 48
-    K = len(KPTS_3D)
-    root = tmp_path / 'absent'
-    path = root / 'train' / 's'
-    lab = fmt.empty_labels(1, T, K, 1, mode3d=False)
-    labelled = list(range(n_labelled))
-    lab.vis2d[0, labelled, :, 0] = fmt.VISIBLE
-    lab.points2d[0, labelled, :, 0] = 10.0
-    lab.instance = np.full((1, T, 1), fmt.INST_NONE, np.int8)
-    lab.boxes = np.full((1, T, 1, 4), np.nan, np.float32)
-    lab.instance[0, labelled, 0] = fmt.INST_LABELED
-    absent = list(range(T - n_absent, T))
-    lab.instance[0, absent, 0] = fmt.INST_ABSENT
-    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_3D,
-                      rig=_rig([('cam0', W, H, False, False, 0)]),
-                      groups={'g0': fmt.Group('g0', T)}, labels={'g0': lab})
-    _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
-    return root, absent
-
-
-def test_negative_frac_absent_means_no_weighting(tmp_path):
-    root, _ = _absent_frames_root(tmp_path)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64))
-    assert not ds.is_negative.any(), 'unset negative_frac must index NO negative frames at all'
-    assert ds.negative_frac is None
-
-
-def test_negative_frac_indexes_only_verified_absent_frames(tmp_path):
-    """detector_v2 A6: only a real per-camera INST_ABSENT assessment qualifies -- never bare
-    absence from the labelled-frame index (that would risk a false negative on an
-    unannotated-but-present animal)."""
-    root, absent = _absent_frames_root(tmp_path, T=10, n_absent=3, n_labelled=3)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.3)
-    assert int(ds.is_negative.sum()) == len(absent)
-    neg_frames = sorted(ds.index[i][2] for i in np.flatnonzero(ds.is_negative))
-    assert neg_frames == absent
-
-
-def test_negative_frame_yields_an_empty_box_target(tmp_path):
-    """S=0: no animal rows at all, so `assign` finds no positives and the whole anchor field
-    trains as background."""
-    root, _ = _absent_frames_root(tmp_path)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.3)
-    neg_i = int(np.flatnonzero(ds.is_negative)[0])
-    boxes = ds.boxes_for(neg_i)
-    assert boxes.shape == (0, 4)
-    x, b = ds[neg_i]
-    assert b.shape == (0, 4)
-
-
-def test_negative_frac_out_of_range_raises(tmp_path):
-    root, _ = _absent_frames_root(tmp_path)
-    for bad in (-0.1, 1.5):
-        with pytest.raises(ValueError, match='negative_frac'):
-            BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=bad)
-
-
-def test_negative_frac_raises_when_no_root_has_absent_rows(tmp_path):
-    """THE VERIFIED-NO-OP CASE: no converter in this repo writes INST_ABSENT today (checked
-    against rat-city-combined/3dpop), so `negative_frac` must FAIL LOUDLY on ordinary data rather
-    than silently doing nothing -- CLAUDE.md's STATUS POLICY standing rule."""
-    root = _two_group_root(tmp_path, n1=4, n2=4)     # no instances.pq at all
-    with pytest.raises(ValueError, match='negative_frac'):
-        BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.5)
-
-
-def test_negative_weights_realises_the_requested_share(tmp_path):
-    root, absent = _absent_frames_root(tmp_path, T=20, n_absent=10, n_labelled=10)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), negative_frac=0.4)
-    w = ds.negative_weights(0.4)
-    from tailcyclenet.detector import CohortSampler
-    s = CohortSampler(w, num_samples=20000, seed=0)
-    drawn = ds.is_negative[np.array(list(iter(s)))]
-    assert drawn.mean() == pytest.approx(0.4, abs=0.02)
-
-
-# ----------------------------------------------------------------------------------------------
-# A6c -- crop-level negatives (dev/plans/detector_v2.md, delegated investigation)
-# ----------------------------------------------------------------------------------------------
-
-def _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T=6,
-                               regions=None):
-    """ONE animal tightly clustered near a corner of a large-ish frame, every frame VISIBLE --
-    exhaustively labelled (no regions.pq) unless `regions` is given (an (M,6) array of
-    `[frame, camera, x0, y0, x1, y1]` rows, `_session_2d`-style), so there is plenty of room
-    elsewhere in the frame for a crop-negative candidate to clear the animal's margin.
-    """
-    from tailcyclenet import format as fmt
-    from tests.conftest import KPTS_2D, _rig, _write_frames
-
-    root = tmp_path / 'corner'
-    path = root / 'train' / 's'
-    K = len(KPTS_2D)
-    lab = fmt.empty_labels(1, T, K, 1, mode3d=False)
-    lab.vis2d[:] = fmt.VISIBLE
-    ax, ay = animal_xy
-    # A tight cluster (a few px spread) so the animal's own crop box stays small and near a corner.
-    rng = np.random.default_rng(0)
-    lab.points2d[0, :, :, 0] = np.stack(
-        [ax + rng.uniform(-2, 2, (T, K)), ay + rng.uniform(-2, 2, (T, K))], -1)
-    if regions is not None:
-        lab.regions = np.asarray(regions, dtype=np.float64)
-    fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=KPTS_2D,
-                      rig=_rig([('cam0', W, H, False, False, 0)]),
-                      groups={'g0': fmt.Group('g0', T)}, labels={'g0': lab})
-    _write_frames(path / 'groups' / 'g0', 'cam0', T, (W, H))
-    return root
-
-
-def test_copypaste_adds_a_donor_box_without_changing_image_shape(tmp_path):
-    root = _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T=6)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), min_crop_dim=8,
-                    augment=True, augment_copypaste=True, copypaste_max=1, seed=0)
-    x, boxes = ds[0]
-    assert x.shape == (3, 64, 64)
-    assert boxes.shape[0] >= 1
-    assert torch.isfinite(boxes).all()
-
-
-def test_negative_crop_frac_absent_means_no_weighting(tmp_path):
-    root = _session_one_corner_animal(tmp_path)
-    ds = BoxDataset(root, 'train', input_wh=(32, 32))
-    assert not ds.is_negative.any()
-    assert ds.negative_crop_frac is None
-
-
-def test_negative_crop_frac_draws_a_margin_clearing_crop_on_a_whole_frame_exhaustive_session(
-        tmp_path):
-    """detector_v2 A6c: no regions.pq at all (the 3dpop/calms21 shape) -- a crop negative may be
-    drawn from anywhere in the frame, subject to the margin from the one known animal."""
-    from tailcyclenet.detector.assign import box_center_dist
-
-    root = _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0))
-    ds = BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5, seed=0)
-    crop_ix = np.flatnonzero((ds.is_negative) & (ds.negative_source == 'crop'))
-    assert crop_ix.size > 0, 'a 200x150 frame with one small corner animal must yield crops'
-    for i in crop_ix.tolist():
-        sess, gid, f, ci = ds.index[i]
-        ox, oy = ds.origins[i]
-        assert ds.origins[i] is not None, 'a crop negative must carry its own sub-frame origin'
-        known = ds._known_boxes_source_px(sess, gid, f, ci)
-        tw, th = ds._tile_extent()
-        cand = torch.tensor([[ox, oy, ox + tw, oy + th]], dtype=torch.float32)
-        d = box_center_dist(cand, known)[0]
-        assert bool((d >= 2.5).all()), f'crop at ({ox},{oy}) did not clear the margin: {d}'
-        boxes = ds.boxes_for(i)
-        assert boxes.shape == (0, 4)
-
-
-def test_negative_crop_frac_restricted_to_a_certified_region(tmp_path):
-    """detector_v2 A6c: with `regions.pq` present and non-empty, every candidate must land INSIDE
-    the certified rect(s) -- never in the (formally unknown) area outside them."""
-    T = 6
-    # Certify a small rect on one side of the frame, far from the animal's own corner -- big
-    # enough to hold a 32x32 crop but nowhere near covering the whole 200x150 frame.
-    rows = [[float(f), 0.0, 120.0, 10.0, 190.0, 140.0] for f in range(T)]
-    root = _session_one_corner_animal(tmp_path, W=200, H=150, animal_xy=(20.0, 20.0), T=T,
-                                      regions=rows)
-    ds = BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5, seed=0)
-    crop_ix = np.flatnonzero((ds.is_negative) & (ds.negative_source == 'crop'))
-    assert crop_ix.size > 0
-    for i in crop_ix.tolist():
-        ox, oy = ds.origins[i]
-        tw, th = ds._tile_extent()
-        assert ox >= 120.0 - 1e-6 and oy >= 10.0 - 1e-6
-        assert ox + tw <= 190.0 + 1e-6 and oy + th <= 140.0 + 1e-6
-
-
-def test_negative_crop_frac_raises_when_regions_certify_no_safe_area(tmp_path):
-    """detector_v2 A6c: `regions.pq` present but EMPTY for every frame means there is NO safe area
-    at all (outside the animal's own box) -- must raise, never silently draw zero crops."""
-    root = _session_one_corner_animal(tmp_path, regions=np.zeros((0, 6)))
-    with pytest.raises(ValueError, match='negative_crop_frac'):
-        BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5)
-
-
-def test_negative_crop_frac_out_of_range_raises(tmp_path):
-    root = _session_one_corner_animal(tmp_path)
-    for bad in (-0.1, 1.5):
-        with pytest.raises(ValueError, match='negative_crop_frac'):
-            BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=bad)
-
-
-def test_negative_source_distinguishes_absent_from_crop(tmp_path):
-    """`negative_weights(source=...)` must be able to sweep ONE source without pulling in the
-    other -- the two are orthogonal claims (A6c.4)."""
-    root = _session_one_corner_animal(tmp_path)
-    ds = BoxDataset(root, 'train', input_wh=(32, 32), negative_crop_frac=0.5, seed=0)
-    assert (ds.negative_source[ds.is_negative] == 'crop').all()
-    w = ds.negative_weights(0.5, source='crop')
-    assert w is not None
-    with pytest.raises(ValueError, match='no negative frames'):
-        ds.negative_weights(0.5, source='absent')   # this session has no INST_ABSENT rows at all
 
 
 def test_detector_config_weight_decay_default_is_5e_4(tmp_path):
@@ -516,61 +269,8 @@ weight_decay = -0.1
         load_detector_config(p)
 
 
-def test_detector_config_neg_loss_weight_defaults_to_1(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    assert load_detector_config(p)['training']['neg_loss_weight'] == 1.0
 
 
-def test_detector_config_neg_loss_weight_rejects_non_default(tmp_path):
-    """DEAD KEY: `scripts/train_detector.py`'s `detector_loss` call never receives
-    `neg_loss_weight` or any negative-item identity, so a non-default value would train
-    byte-identically to 1.0 and report as an arm it is not -- refuse rather than silently no-op
-    (dev/plans/detector_false_negative_coverage.md W0.4).
-    """
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-neg_loss_weight = 2.0
-""")
-    with pytest.raises(SystemExit, match='neg_loss_weight'):
-        load_detector_config(p)
-
-
-def test_detector_config_det_scale_defaults_to_1(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    assert load_detector_config(p)['data']['det_scale'] == 1.0
-
-
-def test_detector_config_det_scale_rejects_non_positive(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-det_scale = 0.0
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='det_scale'):
-        load_detector_config(p)
 
 
 def test_detector_config_annot_frac_defaults_to_none(tmp_path):
@@ -645,7 +345,7 @@ def test_recall_v2_loss_switches_are_live_together():
     boxes[..., 2:] = boxes[..., :2] + boxes[..., 2:].abs() + 1.0
     gt = torch.tensor([[[8., 8., 96., 96.]]])
     loss, parts = detector_loss(obj, boxes, anchors, gt, assignment='tal', box_loss_fn='ciou',
-                                focal_obj=True)
+)
     loss.backward()
     assert torch.isfinite(loss) and torch.isfinite(obj.grad).all() and parts['n_pos'] > 0
 
@@ -661,21 +361,6 @@ def test_detector_loss_giou_path_is_byte_identical():
     assert torch.equal(a, b) and ap == bp
 
 
-def test_qfl_gamma_zero_is_bce():
-    logits = torch.tensor([-2., 0.3, 4.])
-    targets = torch.tensor([0., 0.2, 1.])
-    got = quality_focal_loss(logits, targets, gamma=0.0)
-    want = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    torch.testing.assert_close(got, want)
-
-
-def test_head_depthwise_none_keeps_tier_default():
-    default = YOLOXNano(version='nano')
-    explicit = YOLOXNano(version='nano', head_depthwise=None)
-    dconv = default.head.reg_convs[0][0][0][0]
-    econv = explicit.head.reg_convs[0][0][0][0]
-    assert dconv.groups == econv.groups
-    assert dconv.groups == dconv.in_channels
 
 
 def test_assign_ignores_nan_boxes():
@@ -880,154 +565,7 @@ box_weight = {box_weight}
         'reaching detector_loss'
 
 
-def test_train_detector_det_scale_halves_the_input_end_to_end(tmp_path, dense_root, monkeypatch):
-    """detector_v2 D2: `det_scale=0.5` must actually shrink the model's input, not just parse."""
-    import importlib.util
-    import re
-    import sys
 
-    def run(det_scale):
-        out = tmp_path / f'run_ds_{det_scale}'
-        cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [128, 128]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-det_scale = {det_scale}
-[model]
-yolox = "tiny"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""", f'cfg_ds_{det_scale}.toml')
-        spec = importlib.util.spec_from_file_location(f'tcn_train_detector_det_scale_{det_scale}',
-                                                      REPO / 'scripts' / 'train_detector.py')
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-        import io
-        from contextlib import redirect_stdout
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            mod.main()
-        m = re.search(r'input (\d+)x(\d+)  \(frame', buf.getvalue())
-        assert m, f'no input line found:\n{buf.getvalue()}'
-        return int(m.group(1)), int(m.group(2))
-
-    full = run(1.0)
-    half = run(0.5)
-    assert full == (128, 128)
-    assert half == (64, 64), f'det_scale=0.5 of 128x128 rounded to a multiple of 32 is 64x64, got {half}'
-
-
-def test_train_detector_no_decay_norm_bias_end_to_end(tmp_path, dense_root, monkeypatch):
-    """detector_v2 C3: `no_decay_norm_bias = true` must train to completion and its own printed
-    line must report a NONZERO count of excluded (dim<=1) params -- GroupNorm affine + every bias
-    -- proving the split actually ran, not just parsed.
-    """
-    import importlib.util
-    import re
-    import sys
-
-    out = tmp_path / 'run_ndnb'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "tiny"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-no_decay_norm_bias = true
-weight_decay = 0.01
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_no_decay_norm_bias',
-                                                  REPO / 'scripts' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    import io
-    from contextlib import redirect_stdout
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        mod.main()
-    assert (out / 'detector.pth').exists()
-    m = re.search(r'no_decay_norm_bias: (\d+) params', buf.getvalue())
-    assert m and int(m.group(1)) > 0, \
-        f'expected a nonzero no_decay_norm_bias count in the log:\n{buf.getvalue()}'
-
-
-def test_no_decay_norm_bias_default_is_a_single_flat_group(tmp_path, dense_root, monkeypatch):
-    """Default False must build the exact one-group AdamW call every optimizer on record used --
-    the same proof pattern as `test_train_detector_box_weight_is_actually_wired_through`."""
-    import importlib.util
-    import sys
-
-    out = tmp_path / 'run_default'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "tiny"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_ndnb_default',
-                                                  REPO / 'scripts' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    import io
-    from contextlib import redirect_stdout
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        mod.main()
-    assert 'no_decay_norm_bias: ' not in buf.getvalue(), \
-        'default False must not print the split line at all'
 
 
 def test_train_detector_max_pos_per_gt_end_to_end(tmp_path, dense_root, monkeypatch):
@@ -2397,35 +1935,6 @@ def test_detector_loss_without_regions_is_unchanged():
     assert 0.0 < np_['certified'] < 1.0
 
 
-def test_detector_loss_without_ignore_is_unchanged():
-    """T2.1's BACKWARD-COMPATIBILITY PROOF, the same shape as the `regions=None` one above.
-
-    `ignore_present` ships OFF (`configs/detector.toml`) and is meant to stay a free, always-on
-    lever regardless of what any single measurement reads: nobody who does not opt in pays for
-    it. That promise is this equality, not a comment -- if `ignore=None` ever stopped taking the
-    exact pre-T2.1 code path, every existing detector number would be silently invalid.
-    """
-    torch.manual_seed(1)
-    anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    boxes = torch.rand(2, anchors.shape[0], 4) * 64
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    base, bp = detector_loss(obj, boxes, anchors, gt)
-    same, sp = detector_loss(obj, boxes, anchors, gt, ignore=None)
-    assert float(base) == float(same) and 'ignored' not in bp and 'ignored' not in sp
-
-    # An ignore box that covers NOTHING near any anchor is the same loss as no ignore box at all.
-    nowhere = torch.tensor([[[9000.0, 9000.0, 9010.0, 9010.0]]] * 2)
-    noop, np_ = detector_loss(obj, boxes, anchors, gt, ignore=nowhere)
-    torch.testing.assert_close(noop, base)
-    assert np_['ignored'] == 0.0
-
-
-# T2.3 -- IoU-aware objectness. The BCE target at a positive anchor becomes the detached
-# predicted-vs-GT IoU instead of a hard 1.0, once past a warmup. Off by default (`iou_aware=False`)
-# and byte-identical to every checkpoint on record either way.
-# ----------------------------------------------------------------------------------------------
-
 def test_paired_iou_matches_box_iou_diagonal():
     """`paired_iou` is the SAME maths as `box_iou`, just elementwise instead of all-pairs -- the
     diagonal of the cross-product form must equal it exactly, on both perfect and partial overlap.
@@ -3179,12 +2688,9 @@ out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
     t = cfg['training']
-    d = cfg['data']
-    assert (t['assignment'], t['box_loss'], t['focal_obj']) == ('tal', 'ciou', False)
-    assert t['focal_gamma'] == 2.0 and t['tal_topk'] == 13
-    assert t['head_depthwise'] is None
-    assert d['augment_copypaste'] is False and d['copypaste_max'] == 3
-    assert 'assignment' in TRAINING_KEYS and 'augment_copypaste' in DATA_KEYS
+    assert (t['assignment'], t['box_loss']) == ('tal', 'ciou')
+    assert t['tal_topk'] == 13
+    assert 'assignment' in TRAINING_KEYS
 
 
 @pytest.mark.parametrize(('key', 'value'), [('assignment', 'bad'), ('box_loss', 'bad')])
@@ -3236,7 +2742,7 @@ out = "/tmp/run-det"
     assert m['yolox'] == 'hybrid'
     assert t['out'] == '/tmp/run-det'
     assert t['iters'] == 7
-    assert t['batch_size'] == 16 and t['lr'] == 1e-3
+    assert t['batch_size'] == 8 and t['lr'] == 1e-3
     assert t['num_workers'] == 8 and t['seed'] == 23
     assert t['device'] == 'cpu'
     assert t['eval_every'] == 2000 and t['eval_batches'] == 25
@@ -3643,162 +3149,10 @@ kpt_score_weight = 1.0
 # T2.1: instances.pq PRESENT boxes as an objectness ignore mask
 # ----------------------------------------------------------------------------------------------
 
-def test_present_ignore_boxes_for_matches_ignore_for_when_unwarped(tmp_path):
-    """`present_ignore_boxes_for` (training-side, warp-aware) must agree EXACTLY with
-    `ignore_for` (eval-side, no warp) at `warp=None` -- they read the same table."""
-    from .conftest import _session_2d
-
-    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
-    ds = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
-                    max_frames_per_group=4)
-    for i, (sess, gid, f, ci) in enumerate(ds.index):
-        b = ds.present_ignore_boxes_for(i)
-        ig, ig_boxes = ds.ignore_for(i)
-        if f == 1:                                    # the fixture's one PRESENT row
-            assert b.shape == (1, 4)
-            torch.testing.assert_close(b[0], torch.as_tensor(ig_boxes[1], dtype=torch.float32))
-        else:
-            assert b.shape == (0, 4)
 
 
-def test_present_ignore_boxes_for_moves_under_a_warp(tmp_path):
-    """The training-side version must actually be warped, or the loss masks the wrong pixels
-    under `--augment`/`--rotate-deg` -- the exact bug `ignore_for`'s own docstring names as the
-    reason it lives beside `boxes_for`/`regions_for` and takes item `i`'s own transform."""
-    from .conftest import _session_2d
-
-    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
-    ds = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
-                    max_frames_per_group=4)
-    rng = np.random.default_rng(0)
-    warp = random_affine((64, 48), rng, hflip=0.0, rotate_deg=30.0)
-    for i, (sess, gid, f, ci) in enumerate(ds.index):
-        if f == 1:
-            unwarped = ds.present_ignore_boxes_for(i)
-            warped = ds.present_ignore_boxes_for(i, warp=warp)
-            assert not torch.allclose(unwarped, warped)
 
 
-def test_ignore_present_and_use_regions_raise_together(tmp_path):
-    """Both are the ONE opt-in (M,4) tuple slot `box_collate`/`split_batch` dispatch by rank;
-    combining them would silently misroute one as the other rather than fail loudly."""
-    from .conftest import _session_2d
-
-    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
-    with pytest.raises(ValueError, match='ignore_present and use_regions'):
-        BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
-                  ignore_present=True, use_regions=True)
-
-
-def test_getitem_emits_ignore_boxes_as_the_fourth_element(tmp_path):
-    from .conftest import _session_2d
-
-    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
-    ds = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
-                    max_frames_per_group=4, ignore_present=True)
-    for i, (sess, gid, f, ci) in enumerate(ds.index):
-        item = ds[i]
-        assert len(item) == 3                          # (x, boxes, ignore_boxes): no keypoints
-        assert item[2].dim() == 2 and item[2].shape[-1] == 4
-        assert (item[2].shape[0] == 1) == (f == 1)      # only frame 1 carries the PRESENT row
-
-    # A dataset WITHOUT ignore_present stays exactly 2 elements -- byte-identical shape.
-    plain = BoxDataset(tmp_path / 'r', 'test', input_wh=(64, 64), min_crop_dim=8,
-                       max_frames_per_group=4)
-    assert len(plain[0]) == 2
-
-
-def test_detector_loss_ignore_masks_present_but_unannotated_anchors():
-    """The polarity that matters: `ignore` REMOVES anchors from the background target (opposite
-    of `regions`, which RESTRICTS which anchors may be supervised at all), and a real positive
-    is protected even where it geometrically overlaps an ignore box (two animals can overlap)."""
-    torch.manual_seed(0)
-    anchors = torch.tensor([[10.0, 10.0, 8.0], [50.0, 50.0, 8.0]])
-    gt = torch.tensor([[[0.0, 0.0, 20.0, 20.0]]])          # anchor 0 is the sole positive
-    overlapping_ignore = torch.tensor([[[0.0, 0.0, 20.0, 20.0]]])   # same footprint
-    obj = torch.randn(1, 2)
-    boxes = torch.zeros(1, 2, 4)
-
-    _, parts = detector_loss(obj, boxes, anchors, gt, ignore=overlapping_ignore)
-    assert parts['n_pos'] == 1, 'a positive anchor must never be masked by an ignore box'
-    assert parts['ignored'] > 0
-
-    # A pure hard negative (no nearby GT) DOES get masked, and that measurably moves the loss --
-    # the direction that fixes T2.1's false negative.
-    far_gt = torch.tensor([[[1000.0, 1000.0, 1001.0, 1001.0]]])
-    covering_ignore = torch.tensor([[[0.0, 0.0, 20.0, 20.0]]])     # covers anchor 0 only
-    base, _ = detector_loss(obj, boxes, anchors, far_gt)
-    masked, mp = detector_loss(obj, boxes, anchors, far_gt, ignore=covering_ignore)
-    assert float(masked) < float(base), \
-        'masking a hard negative out of the BCE sum must lower the objectness loss'
-    assert mp['n_pos'] == 0 and 'certified' not in mp
-
-
-def test_train_detector_ignore_present_end_to_end(tmp_path, monkeypatch):
-    """A 2-iteration run with `[data].ignore_present = true` on the fixture's own PRESENT row
-    (frame 1) must not raise, must print the 'ign' fraction (the hook `train_detector.py` already
-    had), and the checkpoint must round-trip the flag."""
-    import importlib.util
-    import sys
-
-    from .conftest import _session_2d
-
-    root = tmp_path / 'root'
-    _session_2d(root / 'train' / 's0', T=4, S=2)
-
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{root}"
-boxes = "keypoints"
-min_crop_dim = 8
-input_wh = [64, 64]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-reduce = false
-keypoints = false
-hflip = true
-tile_wh = []
-tile_scale = 1.0
-tile_bg_per_frame = 1
-use_regions = false
-ignore_present = true
-[model]
-yolox = "trimmed"
-[training]
-out = "{tmp_path / 'run'}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-kpt_weight = 1.0
-kpt_score_weight = 1.0
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector3',
-                                                  REPO / 'scripts' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-
-    ckpt = torch.load(tmp_path / 'run' / 'detector_it000002.pth', map_location='cpu',
-                      weights_only=False)
-    assert ckpt['ignore_present'] is True
-
-
-# T4.1 -- pretrained COCO backbone. `bottleneck_expansion` is an architecture SHAPE key
-# (yolox.py); `pretrained` is the config-level switch. Both must be inert at their defaults --
-# every checkpoint on record was built at bottleneck_expansion=0.5, pretrained=''.
-# ----------------------------------------------------------------------------------------------
-
-WEIGHTS_DIR = REPO / 'scratch' / 'weights'
-_HAVE_COCO_WEIGHTS = (WEIGHTS_DIR / 'yolox_tiny.pth').exists()
 
 
 def test_bottleneck_expansion_default_matches_the_shipped_shape():
@@ -3871,50 +3225,12 @@ def test_in_channels_default_is_byte_identical_to_no_key():
             assert a[k].shape == b[k].shape, (version, k)
 
 
-def test_in_channels_widens_only_the_stem():
-    """A wider `in_channels` must change ONLY the stem's own first conv -- every other tensor's
-    shape (backbone, neck, head) is unaffected, since nothing downstream of the stem cares what
-    the input channels MEAN."""
-    base = YOLOXNano(version='tiny')
-    wide = YOLOXNano(version='tiny', in_channels=6)
-    a, b = base.state_dict(), wide.state_dict()
-    assert set(a) == set(b)
-    stem_key = 'backbone.stem.conv.0.weight'
-    assert stem_key in a
-    diff = {k for k in a if a[k].shape != b[k].shape}
-    assert diff == {stem_key}, f'unexpected shape changes outside the stem: {diff}'
-    assert b[stem_key].shape[1] == 6 * 4    # Focus: cin=6 -> conv sees 6*4 after the space-to-depth split
-    assert a[stem_key].shape[1] == 3 * 4
-
-
-def test_in_channels_forwards_at_a_wider_input_on_both_backbones():
-    m_tiny = YOLOXNano(version='tiny', in_channels=6)
-    obj, boxes, _ = m_tiny(torch.zeros(1, 6, 96, 96))
-    assert obj.shape[1] == boxes.shape[1]
-
-    m_trimmed = YOLOXNano(version='trimmed', in_channels=4)
-    obj2, boxes2, _ = m_trimmed(torch.zeros(1, 4, 96, 96))
-    assert obj2.shape[1] == boxes2.shape[1]
-    # trimmed's stem is a plain conv, not Focus -- its weight's input-channel dim is `in_channels`
-    # directly, no x4 space-to-depth multiply.
-    assert m_trimmed.backbone.stem[0].weight.shape[1] == 4
 
 
 def test_in_channels_still_has_no_model_config_key():
-    """`in_channels` stays DERIVED from `[data].temporal_input`
-    (`TEMPORAL_INPUT_CHANNELS[temporal_input]`, `train_detector.py`), never independently
-    configured -- a `[model].in_channels` key could disagree with what the loader actually
-    supplies, which is exactly the class of bug `TEMPORAL_INPUT_CHANNELS` being the ONE place
-    that map lives exists to prevent."""
+    """`in_channels` is always 3 (RGB); it must not be a model config key."""
     assert 'in_channels' not in MODEL_KEYS
 
-
-def test_temporal_input_key_now_exists_and_defaults_to_none():
-    assert 'temporal_input' in DATA_KEYS
-    assert TEMPORAL_INPUT_CHANNELS['none'] == 3
-    assert TEMPORAL_INPUT_CHANNELS['stack2'] == 6
-    assert TEMPORAL_INPUT_BY_CHANNELS == {3: 'none', 6: 'stack2'}
-    assert set(TEMPORAL_INPUTS) == set(TEMPORAL_INPUT_CHANNELS)
 
 
 def test_photometric_gain_none_is_byte_identical_to_before():
@@ -3943,194 +3259,16 @@ def test_photometric_explicit_gain_does_not_redraw():
     assert before == after
 
 
-def test_boxdataset_temporal_input_invalid_value_raises(dense_root):
-    with pytest.raises(ValueError, match='temporal_input'):
-        BoxDataset(dense_root, 'train', temporal_input='bogus')
 
 
-def test_boxdataset_temporal_input_stack2_raises_with_strong(dense_root):
-    """FAILS AT CONSTRUCTION, the same discipline `strong`+`use_regions` follows: mosaic-lite
-    would need the pasted source item's own t-1 frame too, which is not built yet."""
-    with pytest.raises(ValueError, match='augment-strong'):
-        BoxDataset(dense_root, 'train', augment=True, strong=True, temporal_input='stack2')
 
 
-def test_boxdataset_temporal_input_none_is_byte_identical(dense_root):
-    """The default arg and an explicit `temporal_input='none'` must decode the identical item --
-    proof `__getitem__`'s new branch is a true no-op at the default, not just untaken by luck."""
-    a = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16)
-    b = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
-                   temporal_input='none')
-    xa, ba = a[0][0], a[0][1]
-    xb, bb = b[0][0], b[0][1]
-    assert xa.shape[0] == 3
-    torch.testing.assert_close(xa, xb)
-    torch.testing.assert_close(ba, bb)
 
 
-def test_boxdataset_temporal_input_stack2_doubles_channels(dense_root):
-    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
-                    temporal_input='stack2')
-    x, boxes = ds[0]
-    assert x.shape[0] == 6
-    assert torch.isfinite(boxes).any()          # the box target itself is untouched by this
 
 
-def test_boxdataset_temporal_input_stack2_repeats_frame_at_clip_start(dense_root):
-    """The documented policy for a clip's first frame (no real t-1 exists): repeat frame t. Item 0
-    of `dense_root`'s dense group IS frame 0 (frames are indexed in ascending order per session),
-    so its stacked pair must be two IDENTICAL copies of the same decoded pixels -- no augmentation
-    in play (default `augment=False`), so this is exact, not approximate."""
-    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
-                    temporal_input='stack2')
-    sess, gid, f, ci = ds.index[0]
-    assert f == 0, 'this test assumes item 0 is frame 0 -- if the index order changed, so must this'
-    x, _ = ds[0]
-    torch.testing.assert_close(x[:3], x[3:])
 
 
-def test_boxdataset_temporal_input_stack2_differs_from_frame_t_alone_mid_clip(dense_root):
-    """A non-zero frame's t-1 half must be genuine PIXELS FROM A DIFFERENT FRAME, not another
-    silent repeat -- catches an implementation that always fetches frame `f` twice."""
-    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
-                    temporal_input='stack2')
-    mid = next(i for i, (_, _, f, _) in enumerate(ds.index) if f > 0)
-    x, _ = ds[mid]
-    assert not torch.allclose(x[:3], x[3:])
-
-
-def test_train_detector_temporal_input_stack2_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A short run with `[data].temporal_input = "stack2"` through the real CLI entry point: must
-    train to completion with no error, and the saved checkpoint must reload with `in_channels=6`
-    and score through `eval_detector.py`'s own `BoxDataset` construction (T4.2's whole point --
-    the loader and the reloaded model must agree on the shape without the caller stating it
-    twice)."""
-    import importlib.util
-    import sys
-
-    from tailcyclenet.detector import load_detector
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-temporal_input = "stack2"
-[model]
-yolox = "tiny"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_temporal',
-                                                  REPO / 'scripts' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
-    model, *_ = load_detector(out / 'detector.pth')
-    assert model.in_channels == 6
-
-    ds = BoxDataset(dense_root, 'train', input_wh=(48, 48), min_crop_dim=16,
-                    temporal_input=TEMPORAL_INPUT_BY_CHANNELS[model.in_channels])
-    x, boxes = ds[0]
-    obj, pred_boxes, _ = model(x[None])
-    assert obj.shape[1] == pred_boxes.shape[1]
-
-
-def test_detector_config_temporal_input_default_none(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['data']['temporal_input'] == 'none'
-
-
-def test_detector_config_temporal_input_invalid_raises(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-temporal_input = "bogus"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='temporal_input'):
-        load_detector_config(p)
-
-
-def test_detector_config_temporal_input_raises_under_default_augment_strong(tmp_path):
-    """`augment_strong` DEFAULTS true (`config.py`), so a config that sets `temporal_input` and
-    says nothing about `augment_strong` must still raise -- the cross-key guard has to fire off
-    the RESOLVED value, not just an explicitly-written one."""
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-temporal_input = "stack2"
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='augment_strong'):
-        load_detector_config(p)
-
-
-def test_detector_config_temporal_input_with_augment_strong_off_is_fine(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-temporal_input = "stack2"
-augment_strong = false
-[model]
-yolox = "tiny"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['data']['temporal_input'] == 'stack2'
-    assert cfg['data']['augment_strong'] is False
-
-
-def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
-    """A `temporal_input='stack2'` checkpoint (`in_channels=6`) must reconstruct an
-    `in_channels=6` model through `load_detector` -- absent means 3, so this proves a SAVED fact
-    survives, not just that the constructor kwarg works alone."""
-    from tailcyclenet.detector import load_detector
-
-    m = YOLOXNano(version='tiny', in_channels=6)
-    ckpt = {
-        'model_state': m.state_dict(), 'input_wh': (96, 96), 'n_keypoints': 0, 'norm': 'gn',
-        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': False,
-        'in_channels': 6, 'temporal_input': 'stack2',
-    }
-    p = tmp_path / 'detector.pth'
-    torch.save(ckpt, p)
-    loaded, *_ = load_detector(p)
-    assert loaded.in_channels == 6
-    obj, boxes, _ = loaded(torch.zeros(1, 6, 96, 96))
-    assert obj.shape[1] == boxes.shape[1]
 
 
 def test_detector_run_directory_defaults_to_latest_checkpoint(tmp_path):
@@ -4494,6 +3632,10 @@ out = "/tmp/run"
         load_detector_config(p)
 
 
+WEIGHTS_DIR = REPO / 'scratch' / 'weights'
+_HAVE_COCO_WEIGHTS = (WEIGHTS_DIR / 'yolox_tiny.pth').exists()
+
+
 @pytest.mark.skipif(not _HAVE_COCO_WEIGHTS, reason='scratch/weights/yolox_*.pth is untracked '
                     'and may not be cached on this machine')
 def test_load_coco_backbone_transfers_every_backbone_tensor():
@@ -4595,164 +3737,11 @@ eval_batches = 1
     assert model.bottleneck_expansion == 1.0
 
 
-# T4.1b -- in-domain backbone pretraining, T4.1's control.
-# `scripts/pretrain_detector_backbone.py` + `detector.pretrained.load_pretrained_backbone` +
-# `[model].pretrained` accepting an arbitrary path.
-# ----------------------------------------------------------------------------------------------
-
-def _load_pretrain_script():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('tcn_pretrain_detector_backbone',
-                                                  REPO / 'scripts' / 'pretrain_detector_backbone.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
-def test_pretrain_config_requires_at_least_one_root(tmp_path):
-    mod = _load_pretrain_script()
-    p = _write_config(tmp_path, """
-[training]
-out = "/tmp/run"
-""", name='pretrain.toml')
-    with pytest.raises(SystemExit, match='roots'):
-        mod.load_pretrain_config(p)
 
 
-def test_pretrain_config_unknown_root_key_raises(tmp_path):
-    mod = _load_pretrain_script()
-    p = _write_config(tmp_path, """
-[[roots]]
-path = "/tmp/ds"
-bogus = 1
-[training]
-out = "/tmp/run"
-""", name='pretrain.toml')
-    with pytest.raises(SystemExit, match='unknown key'):
-        mod.load_pretrain_config(p)
 
-
-def test_pretrain_config_defaults(tmp_path):
-    mod = _load_pretrain_script()
-    p = _write_config(tmp_path, """
-[[roots]]
-path = "/tmp/a"
-[[roots]]
-path = "/tmp/b"
-boxes = "instances"
-[training]
-out = "/tmp/run"
-""", name='pretrain.toml')
-    roots, model, train = mod.load_pretrain_config(p)
-    assert len(roots) == 2
-    assert roots[0]['boxes'] == 'keypoints'
-    assert roots[1]['boxes'] == 'instances'
-    assert model['yolox'] == 'tiny'
-    assert model['bottleneck_expansion'] == 0.5
-    assert train['iters'] == 20000
-    assert train['out'] == '/tmp/run'
-
-
-def test_pretrain_detector_backbone_end_to_end_two_roots(tmp_path, dense_root, centred_root,
-                                                          monkeypatch):
-    """A short round-robin run across TWO synthetic roots through the real CLI entry point: must
-    train to completion with no error and save a `backbone.pth` that
-    `load_pretrained_backbone` can load into a freshly-built model of the SAME architecture."""
-    import sys
-
-    from tailcyclenet.detector import load_pretrained_backbone
-
-    out = tmp_path / 'pretrain_run'
-    cfg = _write_config(tmp_path, f"""
-[[roots]]
-path = "{dense_root}"
-boxes = "keypoints"
-input_wh = [64, 64]
-[[roots]]
-path = "{centred_root}"
-boxes = "keypoints"
-input_wh = [64, 64]
-[model]
-yolox = "tiny"
-bottleneck_expansion = 0.5
-[training]
-out = "{out}"
-iters = 4
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-snapshot_every = 4
-""", name='pretrain.toml')
-    mod = _load_pretrain_script()
-    monkeypatch.setattr(sys, 'argv', ['pretrain_detector_backbone.py', '--config', str(cfg)])
-    mod.main()
-
-    assert (out / 'backbone.pth').exists()
-    ck = torch.load(out / 'backbone.pth', map_location='cpu', weights_only=False)
-    assert ck['yolox_version'] == 'tiny'
-    assert ck['bottleneck_expansion'] == 0.5
-    assert ck['in_channels'] == 3
-    assert len(ck['roots']) == 2
-
-    m = YOLOXNano(n_keypoints=0, version='tiny', bottleneck_expansion=0.5)
-    n_loaded = load_pretrained_backbone(m, out / 'backbone.pth')
-    assert n_loaded == len(ck['backbone_state'])
-    obj, boxes, _ = m(torch.zeros(1, 3, 64, 64))
-    assert obj.shape[1] == boxes.shape[1]
-
-
-def test_load_pretrained_backbone_tier_mismatch_raises(tmp_path):
-    from tailcyclenet.detector import load_pretrained_backbone
-
-    src = YOLOXNano(version='tiny', bottleneck_expansion=0.5)
-    ck = {'backbone_state': src.backbone.state_dict(), 'yolox_version': 'tiny',
-         'bottleneck_expansion': 0.5, 'in_channels': 3}
-    p = tmp_path / 'backbone.pth'
-    torch.save(ck, p)
-    dst = YOLOXNano(version='s', bottleneck_expansion=0.5)
-    with pytest.raises(ValueError, match='yolox'):
-        load_pretrained_backbone(dst, p)
-
-
-def test_load_pretrained_backbone_expansion_mismatch_raises(tmp_path):
-    from tailcyclenet.detector import load_pretrained_backbone
-
-    src = YOLOXNano(version='tiny', bottleneck_expansion=0.5)
-    ck = {'backbone_state': src.backbone.state_dict(), 'yolox_version': 'tiny',
-         'bottleneck_expansion': 0.5, 'in_channels': 3}
-    p = tmp_path / 'backbone.pth'
-    torch.save(ck, p)
-    dst = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
-    with pytest.raises(ValueError, match='bottleneck_expansion'):
-        load_pretrained_backbone(dst, p)
-
-
-def test_load_pretrained_backbone_missing_key_raises(tmp_path):
-    from tailcyclenet.detector import load_pretrained_backbone
-
-    p = tmp_path / 'backbone.pth'
-    torch.save({'not_a_backbone_checkpoint': True}, p)
-    dst = YOLOXNano(version='tiny')
-    with pytest.raises(ValueError, match='backbone_state'):
-        load_pretrained_backbone(dst, p)
-
-
-def test_load_pretrained_backbone_is_p2_agnostic(tmp_path):
-    """The backbone's own tensors are identical regardless of `p2` -- p2 only changes the NECK,
-    so a backbone pretrained at p2=False (the only value this script ever builds) must load
-    unchanged into a p2=True fine-tune model."""
-    from tailcyclenet.detector import load_pretrained_backbone
-
-    src = YOLOXNano(version='tiny', bottleneck_expansion=0.5, p2=False)
-    ck = {'backbone_state': src.backbone.state_dict(), 'yolox_version': 'tiny',
-         'bottleneck_expansion': 0.5, 'in_channels': 3}
-    p = tmp_path / 'backbone.pth'
-    torch.save(ck, p)
-    dst = YOLOXNano(version='tiny', bottleneck_expansion=0.5, p2=True)
-    n_loaded = load_pretrained_backbone(dst, p)
-    assert n_loaded == len(ck['backbone_state'])
 
 
 def test_detector_config_pretrained_path_default_and_coco_unaffected(tmp_path):
@@ -4781,107 +3770,10 @@ pretrained = "/nonexistent/backbone.pth"
 [training]
 out = "/tmp/run"
 """)
-    with pytest.raises(SystemExit, match='no such file'):
+    with pytest.raises(SystemExit, match='expected'):
         load_detector_config(p)
 
 
-def test_detector_config_pretrained_path_no_tier_or_expansion_restriction(tmp_path):
-    """Unlike `pretrained = "coco"`, a path has no `bottleneck_expansion=1.0` or
-    canonical-tier requirement -- an in-domain backbone can be pretrained at any shape, and only
-    `load_pretrained_backbone` (which reads the checkpoint's OWN recorded shape) can check
-    agreement."""
-    backbone_path = tmp_path / 'backbone.pth'
-    backbone_path.write_bytes(b'not a real checkpoint, just needs to exist')
-    p = _write_config(tmp_path, f"""
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "trimmed"
-pretrained = "{backbone_path}"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['model']['pretrained'] == str(backbone_path)
-
-
-def test_train_detector_pretrained_path_end_to_end(tmp_path, dense_root, monkeypatch):
-    """Pretrain a tiny backbone on `dense_root`, then fine-tune through the real
-    `train_detector.py` CLI with `[model].pretrained` pointing at it -- the whole T4.1b loop, not
-    just the loader in isolation."""
-    import sys
-
-    from tailcyclenet.detector import load_detector
-
-    pretrain_out = tmp_path / 'pretrain_run'
-    pretrain_cfg = _write_config(tmp_path, f"""
-[[roots]]
-path = "{dense_root}"
-boxes = "keypoints"
-input_wh = [64, 64]
-[model]
-yolox = "tiny"
-bottleneck_expansion = 0.5
-[training]
-out = "{pretrain_out}"
-iters = 2
-batch_size = 2
-num_workers = 0
-seed = 0
-device = "cpu"
-snapshot_every = 2
-""", name='pretrain.toml')
-    pretrain_mod = _load_pretrain_script()
-    monkeypatch.setattr(sys, 'argv', ['pretrain_detector_backbone.py', '--config',
-                                      str(pretrain_cfg)])
-    pretrain_mod.main()
-    backbone_path = pretrain_out / 'backbone.pth'
-    assert backbone_path.exists()
-
-    finetune_out = tmp_path / 'finetune_run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [64, 64]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "tiny"
-bottleneck_expansion = 0.5
-pretrained = "{backbone_path}"
-[training]
-out = "{finetune_out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""")
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_for_t41b',
-                                                  REPO / 'scripts' / 'train_detector.py')
-    finetune_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(finetune_mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    finetune_mod.main()
-
-    assert (finetune_out / 'detector.pth').exists()
-    ckpt = torch.load(finetune_out / 'detector_it000002.pth', map_location='cpu',
-                      weights_only=False)
-    assert ckpt['pretrained'] == str(backbone_path)
-    model, *_ = load_detector(finetune_out / 'detector.pth')
-    assert model.bottleneck_expansion == 0.5
-
-
-# --- A1: SF-Muon optimizer -------------------------------------------------------------------
 
 def test_detector_config_optimizer_default_adamw(tmp_path):
     p = _write_config(tmp_path, """
@@ -4897,7 +3789,6 @@ out = "/tmp/run"
     assert cfg['training']['muon_lr_scale'] == 1.0
     assert cfg['training']['warmup_steps'] == 500
     assert cfg['training']['beta1'] == 0.9 and cfg['training']['beta2'] == 0.95
-    assert cfg['training']['freeze_backbone'] is False
 
 
 def test_detector_config_optimizer_invalid_raises(tmp_path):
@@ -4942,7 +3833,7 @@ def test_build_detector_optimizer_pure_cnn_routes_nothing_to_muon():
     train_mod = _load_train_detector_script()
     model = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
     train_cfg = {'optimizer': 'muon', 'lr': 1e-3, 'weight_decay': 5e-4,
-                'no_decay_norm_bias': False, 'muon_lr_scale': 1.0, 'muon_momentum': 0.95,
+                'muon_lr_scale': 1.0, 'muon_momentum': 0.95,
                 'warmup_steps': 0, 'beta1': 0.9, 'beta2': 0.95}
     model_cfg = {'pretrained': ''}
     opt, sched = train_mod.build_detector_optimizer(model, train_cfg, model_cfg)
@@ -4955,7 +3846,7 @@ def test_build_detector_optimizer_adamw_matches_param_count():
     from tailcyclenet.detector.yolox import YOLOXNano
     model = YOLOXNano(version='tiny', bottleneck_expansion=1.0)
     train_cfg = {'optimizer': 'adamw', 'lr': 1e-3, 'weight_decay': 5e-4,
-                'no_decay_norm_bias': False, 'iters': 10}
+                'iters': 10}
     model_cfg = {'pretrained': ''}
     opt, sched = train_mod.build_detector_optimizer(model, train_cfg, model_cfg)
     n_opt = sum(p.numel() for g in opt.param_groups for p in g['params'])
@@ -5049,180 +3940,21 @@ eval_batches = 1
     assert ckpt['optimizer_kind'] == 'adamw'
 
 
-# --- A2: ViT backbone + Simple Feature Pyramid ------------------------------------------------
-
-@pytest.mark.parametrize('p2', [True, False])
-def test_vit_backbone_shape_contract(p2):
-    """`ViTBackbone` must satisfy the same (p2,p3,p4,p5) contract as every CNN backbone, at
-    strides (4,8,16,32) or (8,16,32). `pretrained=False` avoids a network call."""
-    from tailcyclenet.detector.vit_backbone import ViTBackbone
-
-    bb = ViTBackbone('dinov2_vits14', p2=p2, pretrained=False)
-    H, W = 224, 448
-    x = torch.rand(1, 3, H, W)
-    feats = bb(x)
-    strides = (4, 8, 16, 32) if p2 else (8, 16, 32)
-    assert len(feats) == len(strides) == len(bb.out_channels)
-    for f, s, c in zip(feats, strides, bb.out_channels):
-        assert f.shape == (1, c, H // s, W // s)
 
 
-def test_vit_backbone_pads_non_multiple_of_14_input():
-    from tailcyclenet.detector.vit_backbone import ViTBackbone
-
-    bb = ViTBackbone('dinov2_vits14', p2=True, pretrained=False)
-    H, W = 229, 451           # not a multiple of 14
-    x = torch.rand(1, 3, H, W)
-    feats = bb(x)
-    for f, s in zip(feats, (4, 8, 16, 32)):
-        assert f.shape[-2:] == (H // s, W // s)
-
-
-def test_vit_backbone_freeze_backbone_stops_vit_grad():
-    from tailcyclenet.detector.vit_backbone import ViTBackbone
-
-    bb = ViTBackbone('dinov2_vits14', p2=True, pretrained=False)
-    bb.freeze_backbone()
-    assert all(not p.requires_grad for p in bb.vit.parameters())
-    assert any(p.requires_grad for p in bb.adapt_p2.parameters())
-
-
-def test_yolox_nano_vit_version_builds_and_forwards():
-    """`YOLOXNano(version='vit_s14')` must build through PAFPN + Head and forward end to end,
-    matching the (obj, boxes, kpt) contract every other version returns."""
-    model = YOLOXNano(version='vit_s14', p2=True, n_keypoints=0)
-    assert model.STRIDES == (4, 8, 16, 32)
-    x = torch.rand(1, 3, 224, 224)
-    obj, boxes, kpt = model(x)
-    anchors = model.anchor_points(224, 224, x.device)
-    assert obj.shape[0] == 1 and boxes.shape[-1] == 4
-    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
-    assert kpt is None
-
-
-def test_yolox_nano_vit_rejects_wide_in_channels():
-    with pytest.raises(ValueError, match='in_channels'):
-        YOLOXNano(version='vit_s14', in_channels=6)
 
 
 def test_detector_config_yolox_choices_include_new_architectures(tmp_path):
     from tailcyclenet.detector.config import YOLOX_CHOICES
-    assert set(('vit_s14', 'vit_b14', 'hybrid', 'cspnext_s')) <= set(YOLOX_CHOICES)
+    assert 'hybrid' in YOLOX_CHOICES
 
 
-def test_detector_config_pretrained_dinov2_requires_vit(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "tiny"
-pretrained = "dinov2"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='dinov2'):
-        load_detector_config(p)
 
 
-def test_detector_config_pretrained_dinov2_with_vit_is_accepted(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "vit_s14"
-pretrained = "dinov2"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['model']['pretrained'] == 'dinov2'
-    assert cfg['model']['yolox'] == 'vit_s14'
 
 
-def test_detector_config_pretrained_coco_rejects_vit(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "vit_s14"
-bottleneck_expansion = 1.0
-pretrained = "coco"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match="no counterpart"):
-        load_detector_config(p)
 
 
-def test_load_detector_vit_checkpoint_rounds_input_wh_to_224(tmp_path):
-    """A ViT checkpoint's `input_wh` must round to a multiple of 224 at load time, even if it
-    predates the field or a caller passes an explicit override that is not one."""
-    from tailcyclenet.detector import load_detector
-
-    model = YOLOXNano(version='vit_s14', p2=True, n_keypoints=0)
-    ckpt_path = tmp_path / 'det.pth'
-    torch.save({'model_state': model.state_dict(), 'input_wh': (100, 100), 'norm': 'gn',
-               'yolox_version': 'vit_s14', 'p2': True, 'n_keypoints': 0}, ckpt_path)
-    loaded, wh, *_ = load_detector(ckpt_path)
-    assert wh == (224, 224)
-    assert loaded.version == 'vit_s14'
-
-
-# --- A2.7: DINOv3 (gated weights, architecture usable from scratch) --------------------------
-
-def test_dinov3_backbone_shape_contract():
-    """DINOv3 exposes the identical .patch_size/.embed_dim/.get_intermediate_layers() surface
-    DINOv2 does (patch_size=16, not 14), so the same `ViTBackbone` class serves it --
-    `pretrained=False` avoids the network call (DINOv3's real weights are GATED behind Meta's
-    license-request form; see `dev/scratch/prototype_vit_backbone.py`)."""
-    from tailcyclenet.detector.vit_backbone import ViTBackbone
-
-    bb = ViTBackbone('dinov3_vits16', p2=True, pretrained=False,
-                     hub_repo='facebookresearch/dinov3')
-    assert bb.patch_size == 16
-    H, W = 224, 448
-    feats = bb(torch.rand(1, 3, H, W))
-    for f, s, c in zip(feats, (4, 8, 16, 32), bb.out_channels):
-        assert f.shape == (1, c, H // s, W // s)
-
-
-def test_yolox_nano_dinov3_version_builds_and_forwards():
-    model = YOLOXNano(version='vit_s16_v3', p2=True)
-    assert model.STRIDES == (4, 8, 16, 32)
-    obj, boxes, kpt = model(torch.rand(1, 3, 224, 224))
-    anchors = model.anchor_points(224, 224, 'cpu')
-    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
-
-
-def test_detector_config_pretrained_dinov3_requires_matching_vit_version(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "vit_s14"
-pretrained = "dinov3"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='dinov3'):
-        load_detector_config(p)
-
-
-def test_detector_config_pretrained_dinov3_with_v3_version_is_accepted(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "vit_s16_v3"
-pretrained = "dinov3"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['model']['pretrained'] == 'dinov3'
-
-
-# --- A3: hybrid CNN-ViT backbone ---------------------------------------------------------------
 
 @pytest.mark.parametrize('p2', [True, False])
 def test_hybrid_backbone_shape_contract(p2):
@@ -5285,82 +4017,12 @@ out = "/tmp/run"
         load_detector_config(p)
 
 
-# --- A4: CSPNeXt backbone ------------------------------------------------------------------
-
-@pytest.mark.parametrize('p2', [True, False])
-def test_cspnext_shape_contract(p2):
-    from tailcyclenet.detector.yolox import CSPNeXt
-
-    bb = CSPNeXt(width_mul=0.5, depth_mul=0.33, bottleneck_expansion=1.0, p2=p2)
-    H, W = 256, 384
-    feats = bb(torch.rand(1, 3, H, W))
-    strides = (4, 8, 16, 32) if p2 else (8, 16, 32)
-    assert len(feats) == len(strides) == len(bb.out_channels)
-    for f, s, c in zip(feats, strides, bb.out_channels):
-        assert f.shape == (1, c, H // s, W // s)
 
 
-def test_cspnext_bottleneck_backward_produces_finite_grads():
-    from tailcyclenet.detector.yolox import CSPNeXt
-
-    bb = CSPNeXt(width_mul=0.5, depth_mul=0.33, bottleneck_expansion=0.5, p2=True)
-    feats = bb(torch.rand(1, 3, 128, 128))
-    loss = sum(f.float().sum() for f in feats)
-    loss.backward()
-    for name, p in bb.named_parameters():
-        assert p.grad is None or torch.isfinite(p.grad).all(), f'{name}: non-finite grad'
 
 
-def test_cspnext_bottleneck_se_gate_forward_is_finite():
-    """The SE gate is a sigmoid in (0,1); `CSPNeXtBottleneck`'s residual add must stay finite on
-    a random forward pass."""
-    from tailcyclenet.detector.yolox import CSPNeXtBottleneck
-
-    block = CSPNeXtBottleneck(32, 32, shortcut=True, expansion=0.5)
-    x = torch.rand(2, 32, 16, 16)
-    y = block(x)
-    assert y.shape == x.shape
-    assert torch.isfinite(y).all()
 
 
-def test_yolox_nano_cspnext_version_builds_and_forwards():
-    model = YOLOXNano(version='cspnext_s', p2=True)
-    assert model.STRIDES == (4, 8, 16, 32)
-    obj, boxes, kpt = model(torch.rand(1, 3, 128, 192))
-    anchors = model.anchor_points(128, 192, 'cpu')
-    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
-    assert kpt is None
-
-
-def test_detector_config_yolox_cspnext_default_pretrained_empty(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "cspnext_s"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['model']['pretrained'] == ''
-
-
-def test_detector_config_pretrained_coco_rejects_cspnext(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "cspnext_s"
-bottleneck_expansion = 1.0
-pretrained = "coco"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match="no counterpart"):
-        load_detector_config(p)
-
-
-# --- §2 implementation-gap levers (G1-G4) ------------------------------------------------------
 
 def test_detector_config_gap_lever_defaults(tmp_path):
     p = _write_config(tmp_path, """
@@ -5373,8 +4035,6 @@ out = "/tmp/run"
     cfg = load_detector_config(p)
     assert cfg['training']['shared_head'] is True
     assert cfg['training']['fpn_upsample'] == 'nearest'
-    assert cfg['training']['p2_bottomup'] is False
-    assert cfg['training']['tal_soft_prior'] is False
 
 
 def test_detector_config_fpn_upsample_invalid_raises(tmp_path):
@@ -5422,54 +4082,8 @@ def test_g2_fpn_upsample_default_is_nearest():
     assert model.neck.fpn_upsample == 'nearest'
 
 
-def test_g3_p2_bottomup_adds_out2_and_forwards():
-    with_bu = YOLOXNano(version='tiny', p2=True, p2_bottomup=True)
-    without_bu = YOLOXNano(version='tiny', p2=True, p2_bottomup=False)
-    assert hasattr(with_bu.neck, 'out2')
-    assert not hasattr(without_bu.neck, 'out2')
-    x = torch.rand(1, 3, 128, 128)
-    obj, boxes, kpt = with_bu(x)
-    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
 
 
-def test_g3_p2_bottomup_inert_without_p2():
-    """`p2_bottomup=True` alongside `p2=False` has no finest level to refine -- inert, not an
-    error, matching the "not built and ignored" contract other p2-only modules use."""
-    model = YOLOXNano(version='tiny', p2=False, p2_bottomup=True)
-    assert not hasattr(model.neck, 'out2')
-
-
-def test_g4_tal_soft_prior_never_shrinks_the_candidate_set():
-    """`inside | near` is a superset of `inside` alone, so the soft prior can only add positives,
-    never remove them, for the same GT box and quality surface."""
-    from tailcyclenet.detector.assign import assign_tal
-
-    torch.manual_seed(0)
-    anchors = torch.stack([torch.arange(0, 200, 20, dtype=torch.float32),
-                           torch.arange(0, 200, 20, dtype=torch.float32),
-                           torch.full((10,), 20.0)], dim=-1)
-    gt = torch.tensor([[5., 5., 15., 15.]])            # near anchor 0's cell, mostly OUTSIDE
-    obj_logits = torch.zeros(10)
-    boxes = anchors[:, :2].repeat(1, 2)
-    pos_strict, _ = assign_tal(anchors, gt, obj_logits, boxes, topk=13, soft_prior=False)
-    pos_soft, _ = assign_tal(anchors, gt, obj_logits, boxes, topk=13, soft_prior=True)
-    assert set(pos_strict.tolist()) <= set(pos_soft.tolist())
-    assert len(pos_soft) >= len(pos_strict)
-
-
-def test_detector_loss_threads_tal_soft_prior():
-    from tailcyclenet.detector.assign import detector_loss
-
-    model = YOLOXNano(version='tiny', p2=False)
-    x = torch.rand(1, 3, 128, 128)
-    obj, boxes, kpt = model(x)
-    anchors = model.anchor_points(128, 128, x.device)
-    gt = torch.tensor([[[2., 2., 10., 10.]]])           # a tiny, edge-adjacent box
-    _, parts_strict = detector_loss(obj, boxes, anchors, gt, assignment='tal',
-                                    tal_soft_prior=False)
-    _, parts_soft = detector_loss(obj, boxes, anchors, gt, assignment='tal',
-                                  tal_soft_prior=True)
-    assert parts_soft['n_pos'] >= parts_strict['n_pos']
 
 
 def test_train_detector_gap_levers_end_to_end(tmp_path, dense_root, monkeypatch):
@@ -5504,8 +4118,6 @@ eval_batches = 1
 assignment = "tal"
 shared_head = false
 fpn_upsample = "bilinear"
-p2_bottomup = true
-tal_soft_prior = true
 """)
     import importlib.util
     spec = importlib.util.spec_from_file_location('tcn_train_detector_gap_levers',
@@ -5520,4 +4132,4 @@ tal_soft_prior = true
     model, *_ = load_detector(out / 'detector.pth')
     assert hasattr(model.head, 'obj_convs')
     assert model.neck.fpn_upsample == 'bilinear'
-    assert hasattr(model.neck, 'out2')
+

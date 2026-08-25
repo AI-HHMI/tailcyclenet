@@ -40,10 +40,10 @@ annot_frac = 0.6
 # random similarity + brightness on TRAIN; read the train/val gap first.
 augment = true
 
-# Strong appearance/erasure/mosaic-lite suite on top of augment (color jitter, noise, blur, cutout, mosaic-lite); ON BY DEFAULT PER USER INSTRUCTION, not evidence.
+# Strong appearance/erasure/mosaic-lite suite on top of augment (color jitter, noise, blur, cutout, mosaic-lite).
 augment_strong = true
 
-# random in-plane rotation (+-DEG per visit); 0 is off, byte-identical. DEFAULTS TO 45 PER USER INSTRUCTION, NOT EVIDENCE.
+# random in-plane rotation (+-DEG per visit); 0 is off, byte-identical.
 rotate_deg = 45.0
 
 # decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target; stored in the checkpoint; no effect on a video root.
@@ -66,9 +66,6 @@ tile_bg_per_frame = 1
 
 # mask the objectness loss to the area regions.pq certifies as completely labelled; measured DEAD on whole frames -- use it WITH tiles; UNDEFINED under augment_strong.
 use_regions = false
-
-# mask instances.pq PRESENT boxes (in-view but unannotated) out of the objectness BACKGROUND target; OPPOSITE polarity from use_regions and MUTUALLY EXCLUSIVE with it. SHIPPED OFF.
-ignore_present = false
 
 [model]
 # the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, byte-identical to every recorded detector). DEFAULTS TO `hybrid` (CNN backbone + a from-scratch ViT stage + Simple Feature Pyramid) -- confirmed the detector-architecture-sweep winner (report 47): large wins on rat-city-combined and allen-mouse-combined, ties elsewhere, no significant loss on any of the 6 training roots. `tiny` (COCO-pretrained) is the prior default, still available by name.
@@ -124,5 +121,4 @@ shared_head = false
 fpn_upsample = "bilinear"
 tal_topk = 20
 
-# DEFAULTS TO `muon` PER USER INSTRUCTION (consistency with the pose side), NOT YET EVIDENCE for THIS pairing: Wave 0 (report 47) found adamw beat muon clearly, but only on the `tiny` CNN backbone (few/no 2D weight matrices for Muon to route) -- untested against `hybrid`'s ViT stage, which has plenty. A same-protocol muon-vs-adamw recheck on hybrid is running now (`dev/scratch/optsweep/`); roll this back to `adamw` if it comes back significantly worse.
 optimizer = "muon"

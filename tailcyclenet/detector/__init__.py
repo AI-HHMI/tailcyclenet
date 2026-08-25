@@ -6,13 +6,12 @@ from pathlib import Path
 import torch
 
 from .assign import (assign, assign_tal, box_iou, certified_anchors, ciou_loss, decode,
-                     detector_loss, giou_loss, paired_iou, quality_focal_loss)
+                     detector_loss, giou_loss, paired_iou)
 from .associate import associate
-from .data import (BoxDataset, ChunkShuffle, CohortSampler, TEMPORAL_INPUT_BY_CHANNELS,
-                   TEMPORAL_INPUT_CHANNELS, TEMPORAL_INPUTS, box_collate, letterbox,
+from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
                    letterbox_transform, reduce_factor, split_batch, tile_transform,
                    unletterbox_boxes, unletterbox_keypoints)
-from .pretrained import load_coco_backbone, load_pretrained_backbone
+from .pretrained import load_coco_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 
@@ -101,10 +100,9 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'assign_tal', 'box_iou',
            'certified_anchors', 'ciou_loss', 'decode', 'detector_loss', 'giou_loss',
-           'quality_focal_loss', 'associate', 'TEMPORAL_INPUT_CHANNELS',
-           'TEMPORAL_INPUTS', 'TEMPORAL_INPUT_BY_CHANNELS',
+           'associate',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone',
-           'load_pretrained_backbone', 'paired_iou', 'resolve_detector_checkpoint']
+           'paired_iou', 'resolve_detector_checkpoint']
 
 # The `--det-cache` version constants lived here; detection and the pose loop are one pass now,
 # so the detections' dependencies are recorded in the prediction's own provenance instead.
@@ -141,8 +139,6 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
                          'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
                          'branson-fly 416 416).')
-    if str(ckpt.get('yolox_version', 'trimmed')).startswith('vit_'):
-        wh = tuple(max(64, int(-(-v // 224)) * 224) for v in wh)
     norm = str(ckpt.get('norm', 'bn'))
     if norm != 'gn':
         raise ValueError(
@@ -154,11 +150,9 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
                       bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)),
                       p2=bool(ckpt.get('p2', False)),
                       in_channels=int(ckpt.get('in_channels', 3)),
-                      head_depthwise=ckpt.get('head_depthwise', None),
                       pretrained=str(ckpt.get('pretrained', '') or ''),
                       shared_head=bool(ckpt.get('shared_head', True)),
-                      fpn_upsample=str(ckpt.get('fpn_upsample', 'nearest') or 'nearest'),
-                      p2_bottomup=bool(ckpt.get('p2_bottomup', False)))
+                      fpn_upsample=str(ckpt.get('fpn_upsample', 'nearest') or 'nearest'))
     model.load_state_dict(ckpt['model_state'])
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:

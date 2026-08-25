@@ -320,8 +320,8 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     target = torch.zeros_like(obj_logits)
     pos_mask = torch.zeros_like(obj_logits, dtype=torch.bool)
     use_iou_target = iou_aware and (it is None or it >= iou_aware_warmup)
-    weight = None if regions is None and ignore is None else torch.ones_like(obj_logits)
-    n_cert, n_ignored = 0.0, 0.0
+    weight = None if regions is None else torch.ones_like(obj_logits)
+    n_cert = 0.0
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
@@ -335,16 +335,9 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             cert = certified_anchors(anchors, regions[b], gt_boxes[b])
             weight[b] *= cert.to(weight.dtype)
             n_cert += float(cert.float().mean())
-        if ignore is not None:
-            ig = certified_anchors(anchors, ignore[b], None)
-            weight[b] *= (~ig).to(weight.dtype)
-            n_ignored += float(ig.float().mean())
         if pos.numel():
             pos_mask[b, pos] = True
-
-
-
-            if focal_obj or use_iou_target:
+            if use_iou_target:
                 with torch.no_grad():
                     target[b, pos] = paired_iou(boxes[b, pos], gt_boxes[b][gix]).clamp(0.0, 1.0)
             else:
@@ -358,12 +351,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                 kpt_sc.append(s)
                 n_kpt += nk
                 n_vis += nv
-    if focal_obj:
-        obj_all = quality_focal_loss(obj_logits, target, gamma=focal_gamma)
-        if weight is not None:
-            obj_all = obj_all * weight
-        obj_all = obj_all.sum()
-    elif weight is None:
+    if weight is None:
         obj_all = F.binary_cross_entropy_with_logits(obj_logits, target, reduction='sum')
     else:
         weight = torch.maximum(weight, pos_mask.to(weight.dtype))
@@ -376,8 +364,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     parts = {'obj': float(obj.detach()), 'box': float(box.detach()), 'n_pos': n_pos}
     if regions is not None:
         parts['certified'] = n_cert / max(B, 1)
-    if ignore is not None:
-        parts['ignored'] = n_ignored / max(B, 1)
     if iou_aware:
         parts['iou_target'] = float(target[pos_mask].mean()) if bool(pos_mask.any()) else 0.0
     if kpts is not None and gt_kpts is not None:

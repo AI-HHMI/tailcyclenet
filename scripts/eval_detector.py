@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import BOX_SOURCES
-from tailcyclenet.detector import BoxDataset, TEMPORAL_INPUT_BY_CHANNELS, load_detector
+from tailcyclenet.detector import BoxDataset, load_detector
 from tailcyclenet.detector.evaluate import deployment_score, score_dataset
 from tailcyclenet.format import load_datasets
 from tailcyclenet.metrics import paired_bootstrap
@@ -131,7 +131,7 @@ def main():
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
                     min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                     max_frames_per_group=args.frames_per_group,
-                    temporal_input=TEMPORAL_INPUT_BY_CHANNELS[model.in_channels])
+)
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=args.score_thresh,
                          num_workers=args.num_workers, max_animals=args.max_animals,
@@ -170,7 +170,7 @@ def main():
         ds2 = BoxDataset(args.data, args.split, input_wh=wh2, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
                          max_frames_per_group=args.frames_per_group,
-                         temporal_input=TEMPORAL_INPUT_BY_CHANNELS[m2.in_channels])
+)
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
                               seed=args.seed, score_thresh=args.score_thresh,
                               num_workers=args.num_workers, max_animals=args.max_animals,

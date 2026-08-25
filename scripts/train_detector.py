@@ -23,12 +23,11 @@ import toml
 
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, CohortSampler,
-                                   TEMPORAL_INPUT_CHANNELS, YOLOXNano, box_collate,
+from tailcyclenet.detector import (BoxDataset, CohortSampler, YOLOXNano, box_collate,
                                    detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
-from tailcyclenet.detector.pretrained import load_coco_backbone, load_pretrained_backbone
+from tailcyclenet.detector.pretrained import load_coco_backbone
 from tailcyclenet.format import load_datasets
 
 
@@ -100,20 +99,6 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     lr = train_cfg['lr']
     wd = train_cfg['weight_decay']
 
-    def _split_decay(params):
-        """Param groups split by weight decay (dim > 1 decays, dim <= 1 does not)."""
-        params = list(params)
-        if not train_cfg['no_decay_norm_bias']:
-            return [{'params': params, 'weight_decay': wd}]
-        decay = [p for p in params if p.dim() > 1]
-        no_decay = [p for p in params if p.dim() <= 1]
-        out = []
-        if decay:
-            out.append({'params': decay, 'weight_decay': wd})
-        if no_decay:
-            out.append({'params': no_decay, 'weight_decay': 0.0})
-        return out
-
     if kind == 'adamw':
         groups = []
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -121,13 +106,11 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
             backbone_ids = {id(p) for p in model.backbone.parameters()}
             backbone_params = [p for p in trainable if id(p) in backbone_ids]
             other_params = [p for p in trainable if id(p) not in backbone_ids]
-            for g in _split_decay(backbone_params):
-                groups.append({**g, 'lr': lr * BACKBONE_LR_SCALE})
-            for g in _split_decay(other_params):
-                groups.append({**g, 'lr': lr})
+            groups.append({'params': backbone_params, 'lr': lr * BACKBONE_LR_SCALE,
+                           'weight_decay': wd})
+            groups.append({'params': other_params, 'lr': lr, 'weight_decay': wd})
         else:
-            for g in _split_decay(trainable):
-                groups.append({**g, 'lr': lr})
+            groups.append({'params': trainable, 'lr': lr, 'weight_decay': wd})
         opt = torch.optim.AdamW(groups, weight_decay=wd)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_cfg['iters'])
         return opt, sched
@@ -155,8 +138,7 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
             adamw_groups.append({
                 'params': [p],
                 'lr': base_lr,
-                'weight_decay': (wd if p.dim() > 1 or not train_cfg['no_decay_norm_bias']
-                                 else 0.0),
+                'weight_decay': wd,
             })
 
     betas = (train_cfg['beta1'], train_cfg['beta2'])
@@ -208,11 +190,7 @@ def main():
                   the run folder; prints progress and eval lines.
 
     Notes:
-    - D2 is a HALF-RESOLUTION stage: `det_scale` rescales whatever `wh` the
-      branches resolved to, rounded to a multiple of 32 and floored at 64 (1.0
-      is byte-identical to every checkpoint on record); A2.5 needs input
-      divisible by LCM(14, 32) = 224. A tiled checkpoint's `input_wh` is its
-      TILE size, read back from `BoxDataset`.
+    - A tiled checkpoint's `input_wh` is its TILE size, read back from `BoxDataset`.
     - `n_keypoints` is derived from the registry, never configured; a masked
       keypoint still emits a number (conv bias), so the labelled fraction is
       logged (sampled, not exhaustive).
@@ -224,8 +202,8 @@ def main():
       train fallback, `annot_frac` overrides the otherwise-natural cohort share,
       and `alpha`/W1.1/A6/A6c compose on top. The realised mix is PRINTED.
     - No `val/` is the only thing swallowed; config errors fail at construction.
-      A2.6 freezes the ViT backbone BEFORE the optimizer is built; a pretrained
-      backbone gets BACKBONE_LR_SCALE x lr (COCO convs, fresh GroupNorm net).
+      A COCO-pretrained backbone gets BACKBONE_LR_SCALE x lr (COCO convs, fresh
+      GroupNorm net).
     - `detector.pth` is the BEST checkpoint, not the last one (recall peaks
       early on partially-labelled roots); every `detector_it*.pth` is still
       written. Evaluation scores both splits, stores the score beside the
@@ -259,22 +237,11 @@ def main():
     wh = (tuple(data_cfg['input_wh']) if data_cfg['input_wh']
           else input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
                             data_cfg['min_box_px'], data_cfg['max_input_px']))
-    if data_cfg['det_scale'] != 1.0:
-        _wh0 = wh
-        wh = tuple(max(64, int(round(v * data_cfg['det_scale'] / 32)) * 32) for v in wh)
-        print(f'det_scale={data_cfg["det_scale"]:g}: input {_wh0[0]}x{_wh0[1]} -> {wh[0]}x{wh[1]}')
-    if model_cfg['yolox'].startswith('vit_'):
-        _wh0 = wh
-        wh = tuple(max(64, int(-(-v // 224)) * 224) for v in wh)
-        if wh != _wh0:
-            print(f'ViT input rounded to a multiple of 224: {_wh0[0]}x{_wh0[1]} -> '
-                  f'{wh[0]}x{wh[1]}')
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
                   tile_bg_per_frame=data_cfg['tile_bg_per_frame'],
-                  use_regions=data_cfg['use_regions'],
-                  ignore_present=data_cfg['ignore_present'])
+                  use_regions=data_cfg['use_regions'])
     train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
                        box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
                        augment=data_cfg['augment'], reduce=data_cfg['reduce'],
@@ -282,15 +249,6 @@ def main():
                        keypoints=data_cfg['keypoints'],
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
-                       temporal_input=data_cfg['temporal_input'],
-                       scale_jitter=data_cfg['scale_jitter'],
-                       aug_switch_off_iter=data_cfg['aug_switch_off_iter'],
-                       negative_frac=data_cfg['negative_frac'],
-                       negative_crop_frac=data_cfg['negative_crop_frac'],
-                       augment_copypaste=data_cfg['augment_copypaste'],
-                       copypaste_max=data_cfg['copypaste_max'],
-                       hard_event_manifest=data_cfg['hard_event_manifest'],
-                       hard_event_frac=data_cfg['hard_event_frac'],
                        seed=train_cfg['seed'], **tiling)
     wh = train.input_wh
     if data_cfg['tile_wh']:
@@ -319,16 +277,7 @@ def main():
         print(f'  thinnest: {", ".join(thin)}', flush=True)
     base_w = train.default_train_weights(data_cfg['annot_frac'])
     alpha_w = train.alpha_weights(data_cfg['alpha'])
-    hard_w = train.hard_event_weights(data_cfg['hard_event_frac'])
-    if hard_w is not None:
-        print(f'hard_event_frac={data_cfg["hard_event_frac"]:g}: '
-              f'{int(train.hard_event_mask.sum())} hard-event views / {len(train)} total')
-    neg_w = (train.negative_weights(data_cfg['negative_frac'], source='absent')
-             if data_cfg['negative_frac'] is not None else None)
-    neg_crop_w = (train.negative_weights(data_cfg['negative_crop_frac'], source='crop')
-                 if data_cfg['negative_crop_frac'] is not None else None)
-    weights = [w for w in (base_w, alpha_w, hard_w, neg_w, neg_crop_w)
-               if w is not None]
+    weights = [w for w in (base_w, alpha_w) if w is not None]
     combined_w = None
     for w in weights:
         combined_w = w if combined_w is None else combined_w * w
@@ -344,14 +293,6 @@ def main():
     if data_cfg['alpha'] is not None:
         print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied on top of the '
               'view-uniform base (its 0/1 landmarks shift by one -- see alpha_weights)')
-    if data_cfg['negative_frac'] is not None:
-        n_neg = int((train.is_negative & (train.negative_source == 'absent')).sum())
-        print(f'negative_frac={data_cfg["negative_frac"]:g}: {n_neg} verified-empty '
-              f'(frame, camera) view(s) in the index, drawn at that share')
-    if data_cfg['negative_crop_frac'] is not None:
-        n_neg_crop = int((train.is_negative & (train.negative_source == 'crop')).sum())
-        print(f'negative_crop_frac={data_cfg["negative_crop_frac"]:g}: {n_neg_crop} '
-              f'crop-level negative view(s) in the index, drawn at that share')
     loader = torch.utils.data.DataLoader(
         train, batch_size=train_cfg['batch_size'],
         sampler=sampler,
@@ -370,47 +311,26 @@ def main():
                          reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
-                         temporal_input=data_cfg['temporal_input'], **tiling)
+                         **tiling)
         print(f'val:   {len(val)} views')
 
-    in_channels = TEMPORAL_INPUT_CHANNELS[data_cfg['temporal_input']]
     model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
-                      p2=model_cfg['p2'], in_channels=in_channels,
-                      head_depthwise=train_cfg['head_depthwise'],
+                      p2=model_cfg['p2'],
                       pretrained=model_cfg['pretrained'],
                       shared_head=train_cfg['shared_head'],
-                      fpn_upsample=train_cfg['fpn_upsample'],
-                      p2_bottomup=train_cfg['p2_bottomup']).to(device)
+                      fpn_upsample=train_cfg['fpn_upsample']).to(device)
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
-          f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g}, '
-          f'temporal_input={data_cfg["temporal_input"]!r}, in_channels={in_channels})')
+          f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
     if model_cfg['pretrained'] == 'coco':
         n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'])
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors', flush=True)
-    elif model_cfg['pretrained'] == 'dinov2':
-        print('  loaded DINOv2 hub weights into the ViT backbone', flush=True)
-    elif model_cfg['pretrained']:
-        n_loaded = load_pretrained_backbone(model, model_cfg['pretrained'])
-        print(f'  loaded in-domain backbone: {n_loaded} conv tensors from '
-              f'{model_cfg["pretrained"]}', flush=True)
-
-    if train_cfg['freeze_backbone'] and hasattr(model.backbone, 'freeze_backbone'):
-        model.backbone.freeze_backbone()
-        n_frozen = sum(1 for p in model.parameters() if not p.requires_grad)
-        n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
-        print(f'freeze_backbone: {n_frozen} frozen, {n_trainable} trainable')
 
     opt, sched = build_detector_optimizer(model, train_cfg, model_cfg)
     if model_cfg['pretrained'] and train_cfg['optimizer'] == 'adamw':
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
               f'neck/head {train_cfg["lr"]:g}', flush=True)
-    if train_cfg['no_decay_norm_bias'] and train_cfg['optimizer'] == 'adamw':
-        n_no_decay = sum(p.numel() for p in model.parameters()
-                         if p.requires_grad and p.dim() <= 1)
-        print(f'  no_decay_norm_bias: {n_no_decay} params (dim<=1) excluded from weight decay',
-              flush=True)
 
     history = []
     best_score = -float('inf')
@@ -427,26 +347,22 @@ def main():
             gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
             gt_tail = None if gt_tail is None else gt_tail.to(device)
             gt_regions = gt_tail if data_cfg['use_regions'] else None
-            gt_ignore = gt_tail if data_cfg['ignore_present'] else None
             out = model(x)
             obj, boxes, kpt = out[0], out[1], out[2]
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=train_cfg['kpt_weight'],
                                         kpt_score_weight=train_cfg['kpt_score_weight'],
-                                        regions=gt_regions, ignore=gt_ignore,
+                                        regions=gt_regions,
                                         iou_aware=train_cfg['iou_aware_obj'],
                                         iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it,
                                         max_pos_per_gt=train_cfg['max_pos_per_gt'] or None,
                                         box_weight=train_cfg['box_weight'],
                                         assignment=train_cfg['assignment'],
                                         box_loss_fn=train_cfg['box_loss'],
-                                        focal_obj=train_cfg['focal_obj'],
-                                        focal_gamma=train_cfg['focal_gamma'],
                                         tal_topk=train_cfg['tal_topk'],
                                         tal_alpha=train_cfg['tal_alpha'],
-                                        tal_beta=train_cfg['tal_beta'],
-                                        tal_soft_prior=train_cfg['tal_soft_prior'])
+                                        tal_beta=train_cfg['tal_beta'])
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if train_cfg['optimizer'] == 'muon':
@@ -462,7 +378,7 @@ def main():
                 sched.step()
             running.append(float(loss.detach()))
             it += 1
-            train.set_iter(it)
+
             if it % 50 == 0:
                 kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
                       if 'kpt' in parts else '')
@@ -502,25 +418,17 @@ def main():
                         'optimizer_kind': train_cfg['optimizer'],
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],
                         'pretrained': model_cfg['pretrained'],
-                        'head_depthwise': train_cfg['head_depthwise'],
                         'assignment': train_cfg['assignment'],
                         'box_loss': train_cfg['box_loss'],
-                        'focal_obj': train_cfg['focal_obj'],
-                        'focal_gamma': train_cfg['focal_gamma'],
                         'tal_topk': train_cfg['tal_topk'],
                         'tal_alpha': train_cfg['tal_alpha'],
                         'tal_beta': train_cfg['tal_beta'],
-                        'tal_soft_prior': train_cfg['tal_soft_prior'],
                         'shared_head': train_cfg['shared_head'],
                         'fpn_upsample': train_cfg['fpn_upsample'],
-                        'p2_bottomup': train_cfg['p2_bottomup'],
                         'p2': model_cfg['p2'],
-                        'in_channels': in_channels,
-                        'temporal_input': data_cfg['temporal_input'],
                         'seed': train_cfg['seed'],
                         'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
                         'use_regions': data_cfg['use_regions'],
-                        'ignore_present': data_cfg['ignore_present'],
                         'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
                         'annot_frac': data_cfg['annot_frac'],
                         'weight_decay': train_cfg['weight_decay'],

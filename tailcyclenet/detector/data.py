@@ -342,8 +342,7 @@ class BoxDataset(Dataset):
                  hard_event_manifest=None, hard_event_frac=None):
         """Build the per-view/per-frame index of labelled items for one dataset root.
 
-        Every opt-in lever defaults to OFF, and off is byte-identical to every recorded
-        detector, so an arm moves one key at a time.
+        Every opt-in lever defaults to OFF, so an arm moves one key at a time.
 
         Inputs:
             path, split -- dataset root and split directory.
@@ -362,7 +361,9 @@ class BoxDataset(Dataset):
             negative_frac / negative_crop_frac -- A6/A6c negatives: (frame, camera) rows marked
                 INST_ABSENT for every animal, and crop-level negatives under the regions
                 contract. Both raise when nothing qualifies.
-            max_frames_per_group -- per-group cap (0 = uncapped).
+            max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
+                `[data].frames_per_group` is deleted and `default_train_weights` weights the
+                draw instead; the parameter survives to carry `val_frames_per_group`.
         Outputs:
             Builds `self.index`, `self.origins` (tile origin or None -- parallel to `index`,
             not a fifth tuple element), and `self.chunk` (one (group, camera) file's worth of
@@ -552,6 +553,57 @@ class BoxDataset(Dataset):
         if self._it is None:
             return self.strong
         return self.strong and self._it.value < self.aug_switch_off_iter
+
+    def default_train_weights(self, annot_frac=None):
+        """THE default train sampling weight. Always an array, never None.
+
+        `frames_per_group` is gone (`dev/plans/detector_iteration_budget.md` SS3.1b): the train
+        index now holds EVERY labelled (frame, camera), so a frame-uniform draw is no longer a
+        neutral default -- it is SS3.1b trap 1's failure mode. On rat-city-combined it would hand
+        98.5% of draws to the ONE tracked session (57,594 frames) and drown 37 annotated sessions
+        that used to hold 95.7%. So the draw is weighted here instead of being capped there:
+
+        - **View-uniform within a cohort.** A "view" is one (session, group, camera); every view in
+          a cohort carries the same TOTAL probability whatever its frame count, and a view's frames
+          split it equally. This is what the cap was approximating -- badly, and by discarding.
+        - **Cohort share.** `annot_frac` sets P(a draw comes from an `annotated` session) exactly,
+          the same contract `cohort_weights` documents. Absent (the default), each cohort keeps its
+          NATURAL share of index entries, i.e. its labelled-frame share -- no cross-cohort
+          correction unless the user asks for one. Only the WITHIN-cohort uniformity is always on.
+          Inert on a single-cohort split (3dpop, calms21, branson-fly): the cohort factor is 1 and
+          this reduces to plain view-uniform.
+
+        Composes multiplicatively with the opt-in levers (`alpha_weights`, `hard_event_weights`,
+        `negative_weights`) exactly as `cohort_weights` did -- see `train_detector.py`. NOTE that
+        `alpha_weights`' exponent is now measured against a view-uniform base rather than a
+        frame-uniform one, so its `alpha = 0` / `alpha = 1` landmarks shift by one; it is opt-in and
+        no shipped recipe sets it.
+
+        Inputs: annot_frac -- explicit annotated-cohort draw share, or None for the natural share.
+        Outputs: float64 weights, one per index entry, summing to 1.
+        """
+        n = len(self.index)
+        src = np.array([s.label_source for s, _, _, _ in self.index])
+        keys = np.array([f'{s.session_id}/{g}/{c}' for s, g, _, c in self.index])
+        _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
+        per_entry = 1.0 / counts[inv].astype(np.float64)
+        present = [c for c in sorted(set(src.tolist()))]
+        if annot_frac is not None:
+            if not 0.0 <= float(annot_frac) <= 1.0:
+                raise ValueError(f'annot_frac must be in [0, 1], got {annot_frac}')
+        w = np.zeros(n, dtype=np.float64)
+        for cohort in present:
+            m = src == cohort
+            if annot_frac is not None and len(present) > 1 and cohort in ('annotated', 'tracked'):
+                share = float(annot_frac) if cohort == 'annotated' else 1.0 - float(annot_frac)
+            else:
+                share = float(m.sum()) / n
+            tot = per_entry[m].sum()
+            if tot > 0:
+                w[m] = per_entry[m] * (share / tot)
+        if not np.isfinite(w).all() or w.sum() <= 0:
+            raise ValueError('default_train_weights: weights are all zero or non-finite')
+        return w / w.sum()
 
     def cohort_weights(self, annot_frac):
         """Per-entry sampling weights giving `annotated` sessions probability `annot_frac`.

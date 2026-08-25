@@ -23,7 +23,7 @@ import toml
 
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler,
+from tailcyclenet.detector import (BoxDataset, CohortSampler,
                                    TEMPORAL_INPUT_CHANNELS, YOLOXNano, box_collate,
                                    detector_loss, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
@@ -216,15 +216,16 @@ def main():
     - `n_keypoints` is derived from the registry, never configured; a masked
       keypoint still emits a number (conv bias), so the labelled fraction is
       logged (sampled, not exhaustive).
-    - THE COHORT MIX IS A CONFIGURED NUMBER OR IT IS AN ACCIDENT: `annot_frac`
-      names the annotated:tracked ratio (without it, rat-city-combined hands
-      95.7% of train views to 37 annotated sessions); None keeps `ChunkShuffle`
-      byte-identical to every detector on record. `alpha` reweights within
-      `cohort_w` by group size; W1.1/A6/A6c are separate draw shares.
+    - THE TRAIN LOADER IS UNCAPPED AND WEIGHTED, NEVER SUBSAMPLED.
+      `[data].frames_per_group` is DELETED: every labelled frame is indexed and
+      `BoxDataset.default_train_weights` draws view-uniformly WITHIN a cohort, so
+      a 57,594-frame tracked group neither freezes to 40 images nor swamps the
+      split. `CohortSampler` therefore ALWAYS runs, `ChunkShuffle` is no longer a
+      train fallback, `annot_frac` overrides the otherwise-natural cohort share,
+      and `alpha`/W1.1/A6/A6c compose on top. The realised mix is PRINTED.
     - No `val/` is the only thing swallowed; config errors fail at construction.
       A2.6 freezes the ViT backbone BEFORE the optimizer is built; a pretrained
-      backbone gets BACKBONE_LR_SCALE x lr (COCO conv weights land in a fresh
-      GroupNorm net).
+      backbone gets BACKBONE_LR_SCALE x lr (COCO convs, fresh GroupNorm net).
     - `detector.pth` is the BEST checkpoint, not the last one (recall peaks
       early on partially-labelled roots); every `detector_it*.pth` is still
       written. Evaluation scores both splits, stores the score beside the
@@ -277,7 +278,7 @@ def main():
     train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
                        box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
                        augment=data_cfg['augment'], reduce=data_cfg['reduce'],
-                       max_frames_per_group=data_cfg['frames_per_group'],
+                       max_frames_per_group=0,
                        keypoints=data_cfg['keypoints'],
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
@@ -316,7 +317,7 @@ def main():
         print(f'  labelled fraction per keypoint over {seen} sampled instances: '
               f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
         print(f'  thinnest: {", ".join(thin)}', flush=True)
-    cohort_w = train.cohort_weights(data_cfg['annot_frac'])
+    base_w = train.default_train_weights(data_cfg['annot_frac'])
     alpha_w = train.alpha_weights(data_cfg['alpha'])
     hard_w = train.hard_event_weights(data_cfg['hard_event_frac'])
     if hard_w is not None:
@@ -326,35 +327,31 @@ def main():
              if data_cfg['negative_frac'] is not None else None)
     neg_crop_w = (train.negative_weights(data_cfg['negative_crop_frac'], source='crop')
                  if data_cfg['negative_crop_frac'] is not None else None)
-    weights = [w for w in (cohort_w, alpha_w, hard_w, neg_w, neg_crop_w)
+    weights = [w for w in (base_w, alpha_w, hard_w, neg_w, neg_crop_w)
                if w is not None]
     combined_w = None
     for w in weights:
         combined_w = w if combined_w is None else combined_w * w
-    if combined_w is None:
-        sampler = ChunkShuffle(len(train), chunk=train.chunk, seed=train_cfg['seed'])
-        if data_cfg['annot_frac'] is not None:
-            print(f'annot_frac={data_cfg["annot_frac"]:g} is INERT here: '
-                  f'{train.ds.name} train holds one cohort '
-                  f'({", ".join(train.cohort_mix())}) -- keeping ChunkShuffle')
-    else:
-        sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
-        if cohort_w is not None:
-            was = train.cohort_mix()
-            now = train.cohort_mix(combined_w)
-            print(f'annot_frac={data_cfg["annot_frac"]:g}: cohort mix '
-                  + '  '.join(f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
-        if data_cfg['alpha'] is not None:
-            print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied '
-                  f'({"composed with annot_frac" if cohort_w is not None else "alone"})')
-        if data_cfg['negative_frac'] is not None:
-            n_neg = int((train.is_negative & (train.negative_source == 'absent')).sum())
-            print(f'negative_frac={data_cfg["negative_frac"]:g}: {n_neg} verified-empty '
-                  f'(frame, camera) view(s) in the index, drawn at that share')
-        if data_cfg['negative_crop_frac'] is not None:
-            n_neg_crop = int((train.is_negative & (train.negative_source == 'crop')).sum())
-            print(f'negative_crop_frac={data_cfg["negative_crop_frac"]:g}: {n_neg_crop} '
-                  f'crop-level negative view(s) in the index, drawn at that share')
+    sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
+    was = train.cohort_mix()
+    now = train.cohort_mix(combined_w)
+    af = ('natural' if data_cfg['annot_frac'] is None
+          else f'annot_frac={data_cfg["annot_frac"]:g}')
+    print(f'sampling: view-uniform within cohort, cohort share {af}; mix (frame-uniform -> '
+          f'realised) ' + '  '.join(f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
+    if data_cfg['annot_frac'] is not None and len(now) < 2:
+        print(f'  annot_frac is INERT here: {train.ds.name} train holds one cohort')
+    if data_cfg['alpha'] is not None:
+        print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied on top of the '
+              'view-uniform base (its 0/1 landmarks shift by one -- see alpha_weights)')
+    if data_cfg['negative_frac'] is not None:
+        n_neg = int((train.is_negative & (train.negative_source == 'absent')).sum())
+        print(f'negative_frac={data_cfg["negative_frac"]:g}: {n_neg} verified-empty '
+              f'(frame, camera) view(s) in the index, drawn at that share')
+    if data_cfg['negative_crop_frac'] is not None:
+        n_neg_crop = int((train.is_negative & (train.negative_source == 'crop')).sum())
+        print(f'negative_crop_frac={data_cfg["negative_crop_frac"]:g}: {n_neg_crop} '
+              f'crop-level negative view(s) in the index, drawn at that share')
     loader = torch.utils.data.DataLoader(
         train, batch_size=train_cfg['batch_size'],
         sampler=sampler,

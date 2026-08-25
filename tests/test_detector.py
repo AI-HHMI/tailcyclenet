@@ -841,7 +841,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -896,7 +895,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [128, 128]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -952,7 +950,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -1002,7 +999,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -1049,7 +1045,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -2594,7 +2589,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -3231,7 +3225,7 @@ out = "/tmp/run-det"
     assert d['min_crop_dim'] == 64
     assert d['min_box_px'] == 32
     assert d['max_input_px'] == 4 * 416 * 416
-    assert d['frames_per_group'] == 40
+    assert 'frames_per_group' not in d      # DELETED: the train draw is weighted, not capped
     assert d['val_frames_per_group'] == 8
     assert d['augment'] is True and d['augment_strong'] is True
     assert d['rotate_deg'] == 45.0
@@ -3387,7 +3381,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -3589,7 +3582,6 @@ boxes = "keypoints"
 min_crop_dim = 8
 input_wh = [64, 64]
 min_box_px = 0
-frames_per_group = 4
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -3757,7 +3749,6 @@ boxes = "keypoints"
 min_crop_dim = 8
 input_wh = [64, 64]
 min_box_px = 0
-frames_per_group = 4
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -4023,7 +4014,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -4344,7 +4334,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -4564,7 +4553,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [96, 96]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -4675,12 +4663,10 @@ def test_pretrain_detector_backbone_end_to_end_two_roots(tmp_path, dense_root, c
 [[roots]]
 path = "{dense_root}"
 boxes = "keypoints"
-frames_per_group = 8
 input_wh = [64, 64]
 [[roots]]
 path = "{centred_root}"
 boxes = "keypoints"
-frames_per_group = 8
 input_wh = [64, 64]
 [model]
 yolox = "tiny"
@@ -4828,7 +4814,6 @@ def test_train_detector_pretrained_path_end_to_end(tmp_path, dense_root, monkeyp
 [[roots]]
 path = "{dense_root}"
 boxes = "keypoints"
-frames_per_group = 8
 input_wh = [64, 64]
 [model]
 yolox = "tiny"
@@ -4857,7 +4842,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [64, 64]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -4998,7 +4982,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -5037,7 +5020,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false
@@ -5498,7 +5480,6 @@ boxes = "keypoints"
 min_crop_dim = 16
 input_wh = [48, 48]
 min_box_px = 0
-frames_per_group = 8
 val_frames_per_group = 4
 augment = false
 augment_strong = false

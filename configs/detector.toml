@@ -29,10 +29,9 @@ min_box_px = 32
 # Ceiling on min_box_px -- the difference between a rule and a blank cheque; reported when it applies.
 max_input_px = 692224
 
-# Max frames per group for the TRAIN loader -- a sampling window over the clip, not a cap on it.
-frames_per_group = 40
+# `frames_per_group` IS DELETED (raises as an unknown key): the TRAIN loader indexes EVERY labelled frame and draws view-uniformly within a cohort. The cap froze a random subsample for the whole run and set the cohort mix as a side effect.
 
-# A one-group dataset scores one group's worth of val (default 8) -- raise it to the group's labelled length.
+# A one-group dataset scores one group's worth of val (default 8) -- raise it to the group's labelled length. TRAIN-side only was deleted; val/test keep the deterministic cap.
 val_frames_per_group = 8
 
 # annot_frac = 0.5 -- NOT A MEASURED VALUE, shipped absent (byte-identical to every checkpoint on record); setting it is an arm, inert on single-cohort splits (3dpop, calms21, branson-fly).

@@ -12,6 +12,13 @@ Blocks:
     [training]  schedule, run folder, device
 
 `weight_decay` (5e-4) and the cosine schedule are not configurable: they were never flags.
+
+`frames_per_group` is DELETED and now RAISES as an unknown key. The train loader indexes every
+labelled frame and weights the draw view-uniformly within a cohort (`BoxDataset
+.default_train_weights`), so the per-group frame cap no longer exists to be configured -- it was an
+implicit, uncontrolled cohort-mixing knob (`dev/plans/detector_iteration_budget.md` SS3.1b).
+`val_frames_per_group` STAYS: val/test keep the deterministic capped enumeration so every existing
+val number stays comparable.
 """
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ from .yolox import VIT_BACKBONES, YOLOX_TIERS
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
 # `--boxes`' dash), so a config value means exactly what the flag meant.
 DATA_KEYS = frozenset({    'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
-    'frames_per_group', 'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong',
+    'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong',
     'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'ignore_present', 'temporal_input', 'negative_frac', 'negative_crop_frac',
@@ -164,10 +171,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                                      'seed': 0, 'eval_every': 2000, 'eval_batches': 25,
                                      'iou_aware_warmup': 2000, 'max_pos_per_gt': 0}[k]))
     train['iou_aware_obj'] = bool(train.get('iou_aware_obj', False))
-    for k in ('min_crop_dim', 'min_box_px', 'max_input_px', 'frames_per_group',
+    for k in ('min_crop_dim', 'min_box_px', 'max_input_px',
               'val_frames_per_group', 'tile_bg_per_frame'):
         data[k] = int(data.get(k, {'min_crop_dim': 64, 'min_box_px': 32,
-                                   'max_input_px': 4 * 416 * 416, 'frames_per_group': 40,
+                                   'max_input_px': 4 * 416 * 416,
                                    'val_frames_per_group': 8,
                                    'tile_bg_per_frame': 1}[k]))
     for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight', 'weight_decay'):

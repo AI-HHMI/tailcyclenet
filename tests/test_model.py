@@ -340,8 +340,8 @@ def test_self_contained_pose_checkpoint_round_trips(tmp_path):
         assert torch.equal(raw.state_dict()[name], value)
 
 
-def test_resolve_checkpoint_prefers_last(tmp_path):
-    """`last` is the default by name, not by sort order, and old numbered folders still resolve."""
+def test_resolve_checkpoint_prefers_latest(tmp_path):
+    """The default is the highest training iteration, not validation-best or lexical order."""
     from tailcyclenet.checkpoints import resolve_checkpoint
 
     with pytest.raises(FileNotFoundError):
@@ -355,8 +355,13 @@ def test_resolve_checkpoint_prefers_last(tmp_path):
     # A run folder: `last` is the default, and no sort order gets a say in it.
     (tmp_path / 'checkpoint_best.pth').touch()
     (tmp_path / 'checkpoint_last.pth').touch()
-    assert resolve_checkpoint(tmp_path).name == 'checkpoint_last.pth'
+    assert resolve_checkpoint(tmp_path).name == 'checkpoint_00002000.pth'
     assert resolve_checkpoint(tmp_path, 'checkpoint_best.pth').name == 'checkpoint_best.pth'
+
+    only_last = tmp_path / 'only-last'
+    only_last.mkdir()
+    (only_last / 'checkpoint_last.pth').touch()
+    assert resolve_checkpoint(only_last).name == 'checkpoint_last.pth'
 
 
 def test_moving_camera_query_projects_per_frame(moving_batch):

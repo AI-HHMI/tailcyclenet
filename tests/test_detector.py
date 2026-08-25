@@ -4139,7 +4139,7 @@ def test_temporal_input_checkpoint_round_trips_through_load_detector(tmp_path):
     assert obj.shape[1] == boxes.shape[1]
 
 
-def test_detector_run_directory_defaults_to_last_checkpoint(tmp_path):
+def test_detector_run_directory_defaults_to_latest_checkpoint(tmp_path):
     from tailcyclenet.detector import resolve_detector_checkpoint
 
     run = tmp_path / 'run'
@@ -4151,8 +4151,8 @@ def test_detector_run_directory_defaults_to_last_checkpoint(tmp_path):
     torch.save({'iteration': 2}, run / 'detector.pth')
     torch.save({'iteration': 4}, run / 'detector_last.pth')
 
-    assert resolve_detector_checkpoint(run) == run / 'detector_last.pth'
-    assert resolve_detector_checkpoint(run, checkpoint='latest') == run / 'detector_it000004.pth'
+    assert resolve_detector_checkpoint(run) == run / 'detector_it000004.pth'
+    assert resolve_detector_checkpoint(run, checkpoint='last') == run / 'detector_last.pth'
     assert resolve_detector_checkpoint(run, checkpoint='best') == run / 'detector.pth'
 
 
@@ -4176,9 +4176,9 @@ def test_detector_cli_defaults_to_last():
     from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
     from tailcyclenet.infer.cli import build_parser
 
-    assert build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o']).detector_checkpoint == 'last'
-    assert load_detector.__defaults__[-1] == 'last'
-    assert resolve_detector_checkpoint.__defaults__[-1] == 'last'
+    assert build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o']).detector_checkpoint == 'latest'
+    assert load_detector.__defaults__[-1] == 'latest'
+    assert resolve_detector_checkpoint.__defaults__[-1] == 'latest'
 
 
 def test_detector_packaging_preserves_config(tmp_path):
@@ -4195,6 +4195,8 @@ def test_detector_packaging_preserves_config(tmp_path):
               'n_keypoints': 0, 'norm': 'gn', 'yolox_version': 'tiny',
               'bottleneck_expansion': 0.5, 'p2': False, 'in_channels': 3, 'config': config}
     torch.save(source, run / 'detector_last.pth')
+    torch.save(source, run / 'detector_it000002.pth')
+    (run / 'metrics.json').write_text('[{"iteration": 2}]')
     out = tmp_path / 'detector.pth'
     package_detector(run, out)
     loaded, wh, *_ = load_detector(out)

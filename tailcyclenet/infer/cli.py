@@ -141,12 +141,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--detector', type=Path, default=None,
                     help='a detector run folder or a single packaged .pth file. THE deployment '
                          'path: boxes come from pixels, not from labels. A run folder defaults to '
-                         'detector_last.pth; pass --detector-checkpoint best for historical '
-                         'detector.pth or pass an explicit checkpoint filename.')
-    ap.add_argument('--detector-checkpoint', default='last',
-                    help="detector checkpoint selector when --detector is a run folder: 'last' "
-                         "(default detector_last.pth), 'best' (historical detector.pth), "
-                         "'latest' (highest complete iteration), or an explicit filename.")
+                         'detector_it*.pth; pass --detector-checkpoint last for the rolling '
+                         'detector_last.pth, best for historical detector.pth, or an explicit '
+                         'checkpoint filename.')
+    ap.add_argument('--detector-checkpoint', default='latest',
+                    help="detector checkpoint selector when --detector is a run folder: 'latest' "
+                         "(default, highest complete iteration), 'last' (detector_last.pth), "
+                         "'best' (historical detector.pth), or an explicit filename.")
     ap.add_argument('--det-trace', type=Path, default=None,
                     help='write output-neutral per-frame/camera detector decode-stage counts as '
                          'JSON for coverage attribution (scratch diagnostic, not a prediction '

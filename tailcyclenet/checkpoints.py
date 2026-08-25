@@ -81,12 +81,11 @@ def resolve_hf_checkpoint(repo_id: str, revision: str | None = None) -> Path:
 
 
 def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
-    """An explicit name, else `checkpoint_last.pth`, else the newest by name.
+    """Resolve the latest training checkpoint, or an explicit checkpoint name.
 
-    `last` is the default because it is the weight a resume continues from; pass
-    `checkpoint='checkpoint_best.pth'` for the best-val one. When picking by name, the HIGHEST
-    ITERATION wins, not the last lexically: 'b' > '0', so a folder holding
-    `checkpoint_00060000.pth` beside `checkpoint_best.pth` must return the numeric one.
+    The validation-selected ``checkpoint_best.pth`` is never implicit. Numbered checkpoints are
+    preferred because they identify the highest training iteration; a ``checkpoint_last.pth`` is
+    the fallback for runs that only maintain the rolling last file.
     """
     folder = Path(folder)
     if checkpoint:
@@ -94,17 +93,21 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
         if not p.exists():
             raise FileNotFoundError(p)
         return p
+    files = sorted(folder.glob('checkpoint_*.pth'))
+    numbered = sorted((int(p.stem.split('_')[-1]), p) for p in files
+                      if p.stem.split('_')[-1].isdigit())
+    if numbered:
+        got = numbered[-1][1]
+        if (folder / 'checkpoint_last.pth').exists():
+            print(f'{folder}: using latest numbered checkpoint {got.name}')
+        return got
     last = folder / 'checkpoint_last.pth'
     if last.exists():
         return last
-    files = sorted(folder.glob('checkpoint_*.pth'))
     if not files:
         raise FileNotFoundError(f'{folder}: no checkpoint_*.pth')
-    numbered = sorted((int(p.stem.split('_')[-1]), p) for p in files if p.stem.split('_')[-1].isdigit())
-    got = numbered[-1][1] if numbered else files[-1]
-    print(f'{folder}: no checkpoint_last.pth, using {got.name} of '
-          f'{[p.name for p in files]}')
-    return got
+    raise FileNotFoundError(f'{folder}: no numbered checkpoint or checkpoint_last.pth; '
+                            'checkpoint_best.pth is validation-selected and must be explicit')
 
 
 def provenance() -> dict:

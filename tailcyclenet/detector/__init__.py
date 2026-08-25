@@ -16,18 +16,18 @@ from .pretrained import load_coco_backbone, load_pretrained_backbone
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 
-def resolve_detector_checkpoint(path, checkpoint='last'):
+def resolve_detector_checkpoint(path, checkpoint='latest'):
     """Resolve a detector file from a run directory.
 
-    Directory deployment defaults to ``detector_last.pth``, not historical ``detector.pth``
-    (which is the validation-selected *best* checkpoint). ``best`` remains an explicit
-    compatibility selector; ``latest`` is an explicit completeness-checked selector; an explicit
-    filename is also an override and is therefore not subjected to the latest-completeness check.
+    Directory deployment defaults to the highest complete numbered checkpoint, not historical
+    ``detector.pth`` (which is the validation-selected *best* checkpoint). ``last`` and ``best``
+    remain explicit selectors; an explicit filename is also an override and is therefore not
+    subjected to the latest-completeness check.
     """
     p = Path(path)
     if not p.is_dir():
         return p
-    selector = str(checkpoint or 'last')
+    selector = str(checkpoint or 'latest')
     if selector == 'last':
         out = p / 'detector_last.pth'
         if not out.exists():
@@ -110,7 +110,7 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
 # so the detections' dependencies are recorded in the prediction's own provenance instead.
 
 
-def load_detector(path, device='cpu', input_wh=None, checkpoint='last'):
+def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     """(model, input_wh, dataset_name, min_crop_dim, reduce, box_source, tile_scale, obj_q).
 
     The input size, min_crop_dim, box_source and tile_scale are recorded in the checkpoint because
@@ -119,8 +119,8 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='last'):
     supplies the size for checkpoints that predate the field. `yolox_version`,
     `bottleneck_expansion`, `p2` and `in_channels` similarly record the architecture the weights
     were shaped for (absent = the pre-key default), used only to build the right model internally.
-    For a run directory, `checkpoint='last'` selects `detector_last.pth`; `checkpoint='latest'`
-    explicitly selects and verifies the highest complete `detector_it*.pth`; `checkpoint='best'`
+    For a run directory, `checkpoint='latest'` selects and verifies the highest complete
+    `detector_it*.pth`; `checkpoint='last'` explicitly selects `detector_last.pth`; `checkpoint='best'`
     explicitly selects historical `detector.pth`.
 
     A ViT backbone's own DINOv2 patch embedding needs both input dims divisible by 14 and the

@@ -8,7 +8,7 @@ Examples:
     pixi run python scripts/package_checkpoint.py --kind detector \
         --run runs/detector --out packaged/detector.pth
 
-Both commands select the LAST training checkpoint by default. Pass ``--checkpoint best`` only
+Both commands select the LATEST training checkpoint by default. Pass ``--checkpoint best`` only
 when the validation-selected checkpoint is explicitly wanted.
 """
 from __future__ import annotations
@@ -125,7 +125,7 @@ def package_pose(run: str | Path, output: str | Path,
 
 
 def package_detector(run: str | Path, output: str | Path,
-                     checkpoint: str | None = 'last') -> Path:
+                     checkpoint: str | None = 'latest') -> Path:
     """Write a self-describing detector checkpoint and return its output path."""
     run = Path(run)
     output = Path(output).expanduser().resolve()
@@ -156,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--out', required=True, type=Path, help='destination .pth path')
     parser.add_argument('--checkpoint', default=None,
                         help='checkpoint filename or selector. Defaults to the LAST checkpoint: '
-                             'checkpoint_last.pth for pose, detector_last.pth for detector.')
+                             'the latest numbered checkpoint for pose/detector.')
     return parser
 
 
@@ -166,7 +166,7 @@ def main() -> None:
     if args.kind == 'pose':
         package_pose(args.run, args.out, args.checkpoint)
     else:
-        package_detector(args.run, args.out, args.checkpoint or 'last')
+        package_detector(args.run, args.out, args.checkpoint or 'latest')
 
 
 if __name__ == '__main__':

@@ -10,11 +10,20 @@ aug_prob = 0.25
 crop_jitter = 0.3           # measured: tight crops cut the detector-crop penalty and improve base accuracy, because a tight box teaches the model the animal always fills the frame, which no detector delivers
 crop_jitter_scale = 0.3
 min_crop_dim = 64
+crop_inflate = [0.9, 1.5]   # wide-crop regime (reports 27/33): a RANGE, not the fixed 1.5 the first generation ran
 prompt_dropout = 0.5        # fraction of steps run fully query-free -> no-query tokens
 prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cube_scale), so one setting means the same visual displacement on any rig; ship WITH the dropout -- dropout alone is significantly worse
 # A WHOLE-BODY offset, the corruption shaped like a deployment failure; 5.0 is a CONSISTENCY choice, not a measured optimum (measured 8.0, on 3D allen) -- say so when reporting a 3D arm.
 prompt_offset_px = 5.0
-num_workers = 12
+# Distractor-prompt corruptions (dev/plans/prompt_prior_corruptions.md), both PER-KEYPOINT probabilities, both aimed at --anchor carry:
+prompt_swap_kpt_pairs = 0.07 # P(per keypoint) replaced by another finite keypoint's original position, drawn uniformly and independently -- NOT a permutation
+prompt_swap_animal = 0.1     # P(per keypoint) prior becomes the neighbour animal's corresponding point; structurally INERT on single-animal roots (n_animals < 2)
+box_prompt_dropout = 0.3    # fraction of steps where the box prompt is zeroed (exposure-bias recipe)
+box_prompt_jitter = 0.1     # box centre jitter as a fraction of box side
+box_prompt_scale_jitter = 0.1 # box scale jitter as a fraction of box side
+annot_frac = 0.6            # sampling weight for annotated vs tracked sessions
+mode_3d_frac = 0.7          # fraction of items shown in 3D mode (inert on 2D-only roots)
+num_workers = 8
 
 [model]
 query = "prior"             # "prior" (per-keypoint prior + no-query tokens) | "none" (query-free)

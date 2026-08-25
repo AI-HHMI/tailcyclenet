@@ -34,7 +34,8 @@ max_input_px = 692224
 # A one-group dataset scores one group's worth of val (default 8) -- raise it to the group's labelled length. TRAIN-side only was deleted; val/test keep the deterministic cap.
 val_frames_per_group = 8
 
-# annot_frac = 0.5 -- NOT A MEASURED VALUE, shipped absent (byte-identical to every checkpoint on record); setting it is an arm, inert on single-cohort splits (3dpop, calms21, branson-fly).
+# cohort share (probability a train draw comes from an `annotated` session, vs `tracked`); DEFAULTS TO 0.6 PER USER INSTRUCTION, NOT A MEASURED VALUE -- a moderate, root-independent middle ground, not any one root's old implicit `frames_per_group=40` ratio (those varied wildly: ~96% annotated on rat-city-combined, ~39% on allen-mouse-combined, ~100% on johnson-mouse-combined-aug -- see dev/plans/detector_iteration_budget.md's own table). Inert on single-cohort splits (3dpop, calms21, branson-fly). Still group-uniform WITHIN each cohort under the frames_per_group fix, so this differs from any of those old ratios even where the NUMBER matches: the tracked cohort's share now spans its full frame pool instead of a frozen subsample.
+annot_frac = 0.6
 
 # random similarity + brightness on TRAIN; read the train/val gap first.
 augment = true

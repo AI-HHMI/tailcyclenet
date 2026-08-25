@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tailcyclenet"
-version = "0.0.1"
+version = "0.0.2"
 description = "finetune a posetail tracker into an animal pose estimator (3D multiview, 3D single-view, 2D single-view)"
 requires-python = ">=3.11"
 readme = "README.md"

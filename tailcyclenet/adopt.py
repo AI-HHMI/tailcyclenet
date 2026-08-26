@@ -85,20 +85,27 @@ def parse_name(stem: str, cam_regex: str | None) -> tuple[str, str]:
 
 
 def _stable_path(q: Path) -> Path:
-    """Absolute, with the PARENT directory canonicalized but the file's own name kept as-is.
+    """Absolute, WITHOUT resolving any symlink -- at the leaf or anywhere in the parent chain.
 
-    `Path.resolve()` on the file itself would also follow a symlink LEAF to its target's own
-    path -- fine for an ordinary symlink, but silently wrong for one whose own name carries
-    meaning, e.g. a per-camera video symlink renamed to a normalized trial timestamp while its
-    target (elsewhere, out of this package's control) keeps the pre-normalization name.
-    `parse_name` reads camera/trial-group identity from THIS basename (see `plan`'s Refusal 3/4
-    just below it), so resolving through a renamed symlink's target silently reverts the rename
-    and splits one trial into mismatched groups with no error until the missing-camera refusal
-    fires downstream, naming a group id that matches no file anyone actually passed in. Resolving
-    only the parent keeps the SAME stability `_expand`'s docstring is about (a `--videos rec/`
-    that later grows a file does not reconstruct differently) without that failure mode.
+    `Path.resolve()` follows every symlink it encounters, including the file itself, to its
+    real target's own path -- fine for an ordinary symlink, but silently wrong for one whose
+    own name carries meaning, e.g. a per-camera video symlink renamed to a normalized trial
+    timestamp while its target (elsewhere, out of this package's control) keeps the
+    pre-normalization name. `parse_name` reads camera/trial-group identity from THIS basename
+    (see `plan`'s Refusal 3/4 just below it), so resolving through a renamed symlink's target
+    silently reverts the rename and splits one trial into mismatched groups with no error until
+    the missing-camera refusal fires downstream, naming a group id that matches no file anyone
+    actually passed in. `Path.absolute()` (no filesystem access, unlike `.resolve()`) prepends
+    the working directory without touching any symlink at all, so a renamed symlink's OWN path
+    -- not its target's -- is what gets recorded, matching what was actually passed on the
+    command line or found in a directory listing. This still gives `_expand`'s docstring the
+    stability it wants (a `--videos rec/` that later grows a file does not reconstruct
+    differently) as long as the same working directory is used across a run and any later
+    replay of its provenance -- the one case `.resolve()`'s extra `..`/symlink normalization
+    would have additionally covered, traded away here because it is exactly the same mechanism
+    that caused this bug.
     """
-    return q.parent.resolve() / q.name
+    return q.absolute()
 
 
 def _expand(videos) -> list[Path]:

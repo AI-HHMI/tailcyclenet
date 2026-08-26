@@ -218,10 +218,10 @@ class PoseTrackerEncoder(TrackerEncoder):
         self._kpt_cursor = 0
 
         if prompt_time is None or self.query == 'none':
-            qt = torch.zeros((B, K), dtype=torch.int32, device=device)
+            qt = torch.zeros((B, K), dtype=torch.int64, device=device)
         else:
             T_win = int(views[0].shape[1])
-            qt = prompt_time.to(device).round().long().clamp_(0, T_win - 1).to(torch.int32)
+            qt = prompt_time.to(device).round().long().clamp_(0, T_win - 1).to(torch.int64)
             assert qt.shape == (B, K), f'prompt_time {tuple(qt.shape)} != {(B, K)}'
             qt = torch.where(query_ok, qt, torch.zeros_like(qt))
 

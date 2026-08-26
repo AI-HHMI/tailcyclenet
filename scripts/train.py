@@ -15,6 +15,7 @@ import os
 import sys
 import time
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet.checkpoints import (check_image_size, is_hf_repo_id, load_config,
                                       prior_provenance, resolve_checkpoint, resolve_hf_checkpoint,
-                                      save_checkpoint, save_run_meta, warm_start)
+                                      save_checkpoint, save_run_meta, skip_video_encoder_download,
+                                      warm_start)
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
                                   worker_init)
 from tailcyclenet.format import Registry
@@ -351,7 +353,8 @@ def main():
       forking the train workers while the parent holds an open video container deadlocks.
     - The checkpoint is read before the optimizer is built (`start_it` decides
       whether the staged unfreeze has fired); resume restores `model_state`, not
-      `model_state_eval`.
+      `model_state_eval`. `build_model()` skips the VJEPA2 download whenever a warm start or
+      that resume checkpoint is about to overwrite the encoder anyway.
     - DDP registers parameters at wrap time, so the module is re-wrapped after
       the resume replay and after an unfreeze.
     - The resolved `box_source`, optimizer kind and world size are recorded in
@@ -480,7 +483,11 @@ def main():
         for sid, n in sorted(seen.items()):
             fabric.print(f'         {n:3d}  {sid}')
 
-    model = build_model(config['model'], n_keypoints=registry.n_keypoints)
+    resumed = run / 'checkpoints' / 'checkpoint_last.pth'
+    will_load_full_checkpoint = ((resumed.exists() and not args.no_resume)
+                                  or (not args.no_warm_start and bool(train_cfg.get('checkpoint_path'))))
+    with skip_video_encoder_download() if will_load_full_checkpoint else nullcontext():
+        model = build_model(config['model'], n_keypoints=registry.n_keypoints)
     fresh: set[str] = set()
     if not args.no_warm_start and train_cfg.get('checkpoint_path'):
         checkpoint_ref = train_cfg['checkpoint_path']
@@ -524,7 +531,7 @@ def main():
             f'[training.optimizer]: unknown key(s) {sorted(opt_unknown)}. Nothing reads them, so '
             f'this run would train at the defaults and report as the arm it is not. Known keys: '
             f'{sorted(KNOWN_OPTIMIZER_KEYS)}')
-    start_it, ck, resumed = 0, None, run / 'checkpoints' / 'checkpoint_last.pth'
+    start_it, ck = 0, None
     if resumed.exists() and not args.no_resume:
         ck = torch.load(resumed, map_location=device, weights_only=False)
         start_it = int(ck['iteration'])

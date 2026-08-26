@@ -7,6 +7,8 @@ and `model_state_eval` (averaged, evaluate) -- so both are saved explicitly.
 from __future__ import annotations
 
 import tomllib
+from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -16,6 +18,49 @@ from posetail.posetail.train_utils import (_convert_cross_attn, _filter_shape_mi
 
 from .format import Registry
 from .model import build_model
+
+# Names `posetail.posetail.encoder_decoder.SceneRepresentation.__init__` resolves in its own
+# module namespace to build the video backbone; see `skip_video_encoder_download`.
+_VJEPA_BUILDER_NAMES = ('vjepa2_1_vit_base_384', 'vjepa2_1_vit_large_384',
+                        'vjepa2_1_vit_giant_384', 'vjepa2_1_vit_gigantic_384')
+
+
+@contextmanager
+def skip_video_encoder_download():
+    """Build the next `TrackerEncoder` without fetching VJEPA2 weights over the network.
+
+    `SceneRepresentation.__init__` (posetail.posetail.encoder_decoder) always calls
+    `vjepa2_1_vit_{base,large,giant,gigantic}_384()` with no arguments, so every
+    `TrackerEncoder()` construction downloads the multi-GB backbone checkpoint from
+    dl.fbaipublicfiles.com -- even here, where the caller (`load_run`, `_load_packaged_pose`,
+    a warm start, a training resume) is about to overwrite EVERY one of those tensors with its
+    own checkpoint's `model_state`/`model_state_eval` via `load_state_dict`. The download is
+    also the one place this repo's inference path silently needs internet access, which a
+    deployment host need not have (see `dev/plans/infer_from_videos_and_calibration.md`).
+
+    The four builders (`posetail.posetail.vjepa2`) already take `pretrained: bool` for exactly
+    this; `SceneRepresentation` just never forwards it upward. This substitutes which
+    already-public builder function `encoder_decoder`'s own module namespace resolves to, for
+    the scope of ONE `build_model()` call, then restores it -- it drives an option the library
+    itself defines but never exposes, rather than reproducing behaviour posetail is missing (the
+    no-monkeypatch invariant in `tailcyclenet/__init__.py` is about the latter: workarounds for
+    library bugs, deleted once 0.4.1 landed them upstream).
+
+    Never wrap a `build_model()` call that will NOT immediately load a full checkpoint --
+    training from scratch has nothing else to supply those weights, and skipping the download
+    there would silently start the encoder from noise instead of VJEPA2.
+    """
+    from posetail.posetail import encoder_decoder as _ed
+    from posetail.posetail import vjepa2 as _vj
+
+    saved = {name: getattr(_ed, name) for name in _VJEPA_BUILDER_NAMES}
+    try:
+        for name in _VJEPA_BUILDER_NAMES:
+            setattr(_ed, name, partial(getattr(_vj, name), pretrained=False))
+        yield
+    finally:
+        for name, fn in saved.items():
+            setattr(_ed, name, fn)
 
 
 def load_config(path) -> dict:
@@ -233,7 +278,8 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
     selected = ckpt.get('source_checkpoint', path.name)
     print(f'packaged pose checkpoint: {selected} from {source} '
           f'(iteration {ckpt.get("iteration", "?")})')
-    model = build_model(config['model'], n_keypoints=registry.n_keypoints)
+    with skip_video_encoder_download():
+        model = build_model(config['model'], n_keypoints=registry.n_keypoints)
     missing, unexpected = model.load_state_dict(state, strict=False)
     _report('load_run', missing, unexpected, [])
     return model.to(device).eval(), config, registry, path
@@ -279,7 +325,8 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
     path = resolve_checkpoint(run / 'checkpoints', checkpoint)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
 
-    model = build_model(config['model'], n_keypoints=registry.n_keypoints)
+    with skip_video_encoder_download():
+        model = build_model(config['model'], n_keypoints=registry.n_keypoints)
     state = ckpt.get('model_state_eval')
     if state is None:
         print(f'{path.name}: no model_state_eval; falling back to the raw training weights')

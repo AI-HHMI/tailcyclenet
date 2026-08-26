@@ -340,6 +340,66 @@ def test_self_contained_pose_checkpoint_round_trips(tmp_path):
         assert torch.equal(raw.state_dict()[name], value)
 
 
+def test_skip_video_encoder_download_patches_and_restores(monkeypatch):
+    """The four vjepa2 builders `SceneRepresentation` resolves in `encoder_decoder`'s own module
+    namespace are swapped for `pretrained=False` partials for the context's duration only, and
+    the actual download function is never reached from inside it.
+    """
+    from posetail.posetail import encoder_decoder as ed
+
+    from tailcyclenet.checkpoints import skip_video_encoder_download
+
+    def boom(*a, **k):
+        raise AssertionError('a pretrained VJEPA2 checkpoint was fetched from the network')
+
+    monkeypatch.setattr(torch.hub, 'load_state_dict_from_url', boom)
+    before = ed.vjepa2_1_vit_base_384
+    with skip_video_encoder_download():
+        assert ed.vjepa2_1_vit_base_384 is not before
+        encoder, decoder = ed.vjepa2_1_vit_base_384()
+        assert decoder is None
+        assert encoder.embed_dim > 0
+    assert ed.vjepa2_1_vit_base_384 is before, 'the patch must not outlive the context'
+
+
+def test_load_run_skips_the_video_encoder_download(tmp_path, monkeypatch):
+    """`load_run` rebuilds a model only to immediately overwrite it with the checkpoint's own
+    `model_state`/`model_state_eval`, on both branches it can take: a raw or packaged pose
+    checkpoint FILE (`_load_packaged_pose`) and a run FOLDER. Neither may reach `torch.hub` for
+    the VJEPA2 backbone -- a compute node loading a finetuned checkpoint need not have internet.
+    """
+    import toml
+
+    from scripts.package_checkpoint import package_pose
+    from tailcyclenet.checkpoints import load_run
+    from tailcyclenet.format import Registry
+
+    registry = Registry(names=('nose',), datasets=(('ds', (0,)),))
+    config = {'model': SMALL, 'data': {'image_size': 64, 'n_frames': 4,
+                                      'min_crop_dim': 16, 'box_source': 'keypoints'},
+              'training': {'seed': 7}}
+    run = tmp_path / 'run'
+    (run / 'checkpoints').mkdir(parents=True)
+    (run / 'config.toml').write_text(toml.dumps(config))
+    registry.save(run / 'keypoint_registry.toml')
+    model = build_model(SMALL, n_keypoints=1).eval()
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    torch.save({'iteration': 12, 'model_state': state, 'model_state_eval': state,
+                'config': config, 'model_config': SMALL,
+                'keypoint_registry': registry.to_dict()},
+               run / 'checkpoints' / 'checkpoint_last.pth')
+    packaged_path = tmp_path / 'pose.pth'
+    package_pose(run, packaged_path)
+
+    def boom(*a, **k):
+        raise AssertionError('a pretrained VJEPA2 checkpoint was fetched from the network')
+
+    monkeypatch.setattr(torch.hub, 'load_state_dict_from_url', boom)
+    load_run(run / 'checkpoints' / 'checkpoint_last.pth')
+    load_run(packaged_path)
+    load_run(run)
+
+
 def test_resolve_checkpoint_prefers_latest(tmp_path):
     """The default is the highest training iteration, not validation-best or lexical order."""
     from tailcyclenet.checkpoints import resolve_checkpoint

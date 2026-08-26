@@ -214,6 +214,18 @@ KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revisio
                   'losses'}
 
 
+def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overwrite_it():
+    """`main()`'s first `build_model()` call must skip the VJEPA2 download exactly when a resume
+    or a warm-start checkpoint is about to overwrite every tensor it produces; a fresh run (with
+    neither) still needs the real pretrained weights, since nothing else supplies them.
+    """
+    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    assert 'skip_video_encoder_download' in src
+    assert 'will_load_full_checkpoint' in src
+    assert "resumed.exists() and not args.no_resume" in src
+    assert "not args.no_warm_start and bool(train_cfg.get('checkpoint_path'))" in src
+
+
 def test_known_training_keys_match_the_guard_in_main():
     """The `[training]` allow-list must stay in step with what `main()` actually reads: a typo'd
     key yields a silent default (no validation, no `checkpoint_best.pth`) -- an arm reporting its

@@ -70,6 +70,53 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
 _DET_BATCH = 16
 
 
+def _fmt_hms(seconds: float) -> str:
+    """`H:MM:SS`, or `?` for a not-yet-observed rate (`seconds` is NaN or negative)."""
+    if not seconds == seconds or seconds < 0:
+        return '?'
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h:d}:{m:02d}:{s:02d}'
+
+
+class _Progress:
+    """Frames processed/remaining across the WHOLE run (every group), throttled to print no more
+    than once per `min_interval` seconds so it can be called from inside the per-block loop
+    without spamming stdout on a fast run. `total` is frames, not windows or blocks -- the same
+    unit the per-group summary line already reports, so the two are directly comparable.
+
+    The rate is a running average from the run's own start, not an instantaneous one: block sizes
+    vary (memory-derived), and per-block timing would make the ETA jitter with the block boundary
+    rather than the actual pace of the run.
+    """
+
+    def __init__(self, total: int, min_interval: float = 15.0):
+        """Start the clock. `total` is the frame count the run expects to process overall;
+        `min_interval` is the minimum wall-clock gap between printed lines."""
+        self.total = max(int(total), 0)
+        self.done = 0
+        self.t0 = time.time()
+        self._last_print = self.t0
+        self.min_interval = min_interval
+
+    def update(self, n: int, force: bool = False) -> None:
+        """Add `n` finished frames and print a progress line if `min_interval` has elapsed
+        since the last one, the run just completed, or `force` says to print unconditionally."""
+        self.done += int(n)
+        now = time.time()
+        if not force and (now - self._last_print) < self.min_interval and self.done < self.total:
+            return
+        self._last_print = now
+        elapsed = now - self.t0
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        remaining = (self.total - self.done) / rate if rate > 0 else float('nan')
+        frac = self.done / self.total if self.total else 1.0
+        print(f'progress: {self.done}/{self.total} frames ({frac:.1%})  '
+              f'elapsed {_fmt_hms(elapsed)}  remaining {_fmt_hms(remaining)}  '
+              f'({rate:.1f} frames/s)', flush=True)
+
+
 def check_frame_range(args) -> None:
     """Refusals on `--start-frame` / `--end-frame`; pure argument arithmetic, so it fires above
     both input branches and before the checkpoint loads.
@@ -417,6 +464,10 @@ def run_dataset(args):
                             *_box_provenance(args, det_tile, det_red, det_boxsrc).items()],
                            gids)
     sess.preload()
+    _total_frames = sum(max(0, min(sess.groups[g].n_frames,
+                                  cfg.frame_stop or cfg.max_frames or sess.groups[g].n_frames)
+                            - cfg.frame_start) for g in gids)
+    progress = _Progress(_total_frames)
     det_trace_groups = {}
     try:
         for gid in gids:
@@ -449,6 +500,7 @@ def run_dataset(args):
                 n_frames += blk['pred'].shape[1]
                 n_fin += int(np.isfinite(blk['pred']).all(-1).sum())
                 n_pt += int(np.isfinite(blk['pred']).all(-1).size)
+                progress.update(blk['pred'].shape[1])
             span = ('' if not (cfg.frame_start or cfg.frame_stop)
                     else f' [{cfg.frame_start}, {f0})')
             print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
@@ -484,6 +536,7 @@ def run_dataset(args):
 
     finally:
         writer.close()
+    progress.update(0, force=True)
     if args.det_trace:
         import json
         args.det_trace.parent.mkdir(parents=True, exist_ok=True)

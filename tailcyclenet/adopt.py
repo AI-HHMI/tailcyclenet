@@ -84,6 +84,23 @@ def parse_name(stem: str, cam_regex: str | None) -> tuple[str, str]:
     return cam, re.sub(cam_regex, '', stem).strip()
 
 
+def _stable_path(q: Path) -> Path:
+    """Absolute, with the PARENT directory canonicalized but the file's own name kept as-is.
+
+    `Path.resolve()` on the file itself would also follow a symlink LEAF to its target's own
+    path -- fine for an ordinary symlink, but silently wrong for one whose own name carries
+    meaning, e.g. a per-camera video symlink renamed to a normalized trial timestamp while its
+    target (elsewhere, out of this package's control) keeps the pre-normalization name.
+    `parse_name` reads camera/trial-group identity from THIS basename (see `plan`'s Refusal 3/4
+    just below it), so resolving through a renamed symlink's target silently reverts the rename
+    and splits one trial into mismatched groups with no error until the missing-camera refusal
+    fires downstream, naming a group id that matches no file anyone actually passed in. Resolving
+    only the parent keeps the SAME stability `_expand`'s docstring is about (a `--videos rec/`
+    that later grows a file does not reconstruct differently) without that failure mode.
+    """
+    return q.parent.resolve() / q.name
+
+
 def _expand(videos) -> list[Path]:
     """Files and/or directories -> the resolved, sorted file list. A directory expands to its
     `VIDEO_EXTS` children, sorted, NOT recursively. Resolved BEFORE it is recorded, so a
@@ -99,7 +116,7 @@ def _expand(videos) -> list[Path]:
     for v in videos:
         p = Path(v)
         if p.is_dir():
-            out.extend(sorted(q.resolve() for q in p.iterdir()
+            out.extend(sorted(_stable_path(q) for q in p.iterdir()
                               if q.is_file() and q.suffix.lower() in fmt.VIDEO_EXTS))
         else:
             if p.suffix.lower() not in fmt.VIDEO_EXTS:
@@ -108,7 +125,7 @@ def _expand(videos) -> list[Path]:
                      'was never given.')
             if not p.exists():
                 _die(f'--videos {p}: no such file.')
-            out.append(p.resolve())
+            out.append(_stable_path(p))
     return list(dict.fromkeys(out))
 
 

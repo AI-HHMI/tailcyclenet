@@ -28,10 +28,10 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import distributed as dist_utils
-from tailcyclenet.checkpoints import (check_image_size, is_hf_repo_id, load_config,
-                                      prior_provenance, resolve_checkpoint, resolve_hf_checkpoint,
-                                      save_checkpoint, save_run_meta, skip_video_encoder_download,
-                                      warm_start)
+from tailcyclenet.checkpoints import (check_image_size, full_training_state, is_hf_repo_id,
+                                      load_config, prior_provenance, resolve_checkpoint,
+                                      resolve_hf_checkpoint, save_checkpoint, save_run_meta,
+                                      skip_video_encoder_download, warm_start)
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
                                   worker_init)
 from tailcyclenet.format import Registry
@@ -137,7 +137,9 @@ def base_registry(run: Path, checkpoint_path):
     checkpoint's folder. Renumbering would point embedding rows at different body parts."""
     candidates = [run / 'keypoint_registry.toml']
     if checkpoint_path:
-        candidates.append(Path(checkpoint_path).parent / 'keypoint_registry.toml')
+        ref = Path(checkpoint_path)
+        ref = ref.parent.parent if ref.is_file() else ref
+        candidates.append(ref / 'keypoint_registry.toml')
     for p in candidates:
         if p.exists():
             print(f'keypoint registry: appending to {p}')
@@ -285,7 +287,10 @@ def launch(args):
     """The Fabric, launched. Everything after this call runs once PER RANK.
 
     `--devices 1` is strategy `auto` (no wrapper); above it, `ddp_find_unused_parameters_true`
-    because 2D and 3D items genuinely drive different parameters. Fabric re-executes this script
+    because 2D and 3D items genuinely drive different parameters. `--devices -1` (the default)
+    means every visible GPU and resolves to the visible count first, so a one-GPU box takes the
+    exact `--devices 1` path instead of wrapping one rank in DDP; `--device cpu` resolves to
+    the one-process CPU path the same way. Fabric re-executes this script
     per rank, so everything above `launch()` runs on every rank -- keep it video-free (forked
     workers deadlock on an open container). CPU is still CPU even when CUDA is available, and
     `--device cuda:2` still selects that gpu at one device. Non-zero ranks TAG their stdout
@@ -296,6 +301,9 @@ def launch(args):
     from lightning.fabric import Fabric
 
     devices = int(args.devices)
+    if devices == -1:
+        devices = (1 if str(args.device).startswith('cpu') or not torch.cuda.is_available()
+                   else torch.cuda.device_count())
     if args.precision == '16-mixed':
         raise SystemExit(
             '--precision 16-mixed needs a GradScaler applied to the optimizer, and this loop steps\n'
@@ -336,11 +344,8 @@ def launch(args):
 def main():
     """Finetune a posetail tracker into a pose estimator.
 
-    Inputs: argv (via argparse): --config, --iters, --out, --data, --device,
-            --devices, --strategy, --precision, --num-workers, --no-warm-start,
-            --no-resume, --no-wandb, --no-checkpoints.
-    Side effects: trains; writes checkpoints + log.jsonl under the run folder;
-                  launches Fabric (re-executes per rank).
+    Side effects: trains; writes checkpoints + log.jsonl under the run folder; launches Fabric
+                  (re-executes per rank).
 
     Notes:
     - Unknown `[training]`/`[data]` keys are refused (a typo would train at the
@@ -348,13 +353,16 @@ def main():
       only error swallowed.
     - Every rank builds the same registry; `warm_start` reuses it to prove the
       checkpoint's keypoint table is a prefix of this run's.
-    - One epoch for the whole run (sampling is with replacement); `num_workers` and
-      the RAM ceiling are per rank. Val windows are decoded in a one-worker child --
-      forking the train workers while the parent holds an open video container deadlocks.
-    - The checkpoint is read before the optimizer is built (`start_it` decides
-      whether the staged unfreeze has fired); resume restores `model_state`, not
-      `model_state_eval`. `build_model()` skips the VJEPA2 download whenever a warm start or
-      that resume checkpoint is about to overwrite the encoder anyway.
+    - One epoch for the whole run (sampling is with replacement); `num_workers` and the RAM
+      ceiling are per rank. Val windows decode in a one-worker child, not the parent.
+    - The checkpoint is read before the optimizer is built (`start_it` decides whether the
+      staged unfreeze has fired); resume restores `model_state`, not `model_state_eval`.
+      `build_model()` skips the VJEPA2 download when a warm start or that resume is pending.
+    - `[training].checkpoint_path` resumes when it can: a checkpoint carrying `optimizer_state`
+      and `iteration` whose optimizer kind and param-group layout match this config continues
+      at its recorded iteration; otherwise it prints why and warm-starts from iteration 0. The
+      run folder's own `checkpoints/checkpoint_last.pth` still wins when present; its warm
+      start still runs, because `fresh` must route the optimizer as the checkpoint's run did.
     - DDP registers parameters at wrap time, so the module is re-wrapped after
       the resume replay and after an unfreeze.
     - The resolved `box_source`, optimizer kind and world size are recorded in
@@ -373,10 +381,10 @@ def main():
     ap.add_argument('--device', default='cuda:0',
                     help='which gpu, at --devices 1. Refused with --devices != 1, where placement '
                          'is the launcher\'s job')
-    ap.add_argument('--devices', default=1,
-                    help='gpus to train on: a count, or -1 for every visible one. Above 1, one '
-                         'rank per gpu and DDP averages their gradients, so the effective batch '
-                         'is the world size (default: 1)')
+    ap.add_argument('--devices', default=-1,
+                    help='gpus to train on: a count, or -1 for every visible one (the default). '
+                         'Above 1, one rank per gpu and DDP averages their gradients, so the '
+                         'effective batch is the world size')
     ap.add_argument('--strategy', default=None,
                     help='lightning strategy. Default `auto` at one device -- no wrapper at all, '
                          'so a 1-gpu run is unchanged -- and `ddp_find_unused_parameters_true` '
@@ -484,18 +492,42 @@ def main():
             fabric.print(f'         {n:3d}  {sid}')
 
     resumed = run / 'checkpoints' / 'checkpoint_last.pth'
-    will_load_full_checkpoint = ((resumed.exists() and not args.no_resume)
-                                  or (not args.no_warm_start and bool(train_cfg.get('checkpoint_path'))))
-    with skip_video_encoder_download() if will_load_full_checkpoint else nullcontext():
-        model = build_model(config['model'], n_keypoints=registry.n_keypoints)
-    fresh: set[str] = set()
+    opt_kind = str(config['training']['optimizer'].get('optimizer', 'muon'))
+    from tailcyclenet.optim import (optimizer_layout_matches, state_matches_optimizer_kind)
+    checkpoint = None
     if not args.no_warm_start and train_cfg.get('checkpoint_path'):
         checkpoint_ref = train_cfg['checkpoint_path']
         if is_hf_repo_id(checkpoint_ref):
             checkpoint = resolve_hf_checkpoint(checkpoint_ref,
                                                revision=train_cfg.get('checkpoint_revision'))
         else:
-            checkpoint = resolve_checkpoint(Path(checkpoint_ref))
+            ref = Path(checkpoint_ref)
+            checkpoint = ref if ref.is_file() else resolve_checkpoint(ref)
+    will_load_full_checkpoint = ((resumed.exists() and not args.no_resume)
+                                  or checkpoint is not None)
+    with skip_video_encoder_download() if will_load_full_checkpoint else nullcontext():
+        model = build_model(config['model'], n_keypoints=registry.n_keypoints)
+    fresh: set[str] = set()
+    start_it, ck, resume_from = 0, None, None
+    if resumed.exists() and not args.no_resume:
+        resume_from = resumed
+        ck = torch.load(resumed, map_location=device, weights_only=False)
+        start_it = int(ck['iteration'])
+    elif checkpoint is not None and not args.no_resume:
+        ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
+        if full_training_state(ck) and state_matches_optimizer_kind(ck['optimizer_state'],
+                                                                    opt_kind):
+            resume_from = checkpoint
+            start_it = int(ck['iteration'])
+    if ck is not None and resume_from != resumed:
+        try:
+            model.load_state_dict(ck['model_state'])
+        except RuntimeError as e:
+            print(f'checkpoint_path: {resume_from} does not resume -- weights do not load '
+                  f'into this model ({type(e).__name__}: {str(e).splitlines()[0]}); '
+                  'continuing as a warm start')
+            ck, start_it, resume_from = None, 0, None
+    if checkpoint is not None and (ck is None or resume_from == resumed):
         fresh = warm_start(model, checkpoint, base_names=base_reg.names if base_reg else None)
     if 'freeze_encoder' in train_cfg:
         raise SystemExit(
@@ -531,10 +563,6 @@ def main():
             f'[training.optimizer]: unknown key(s) {sorted(opt_unknown)}. Nothing reads them, so '
             f'this run would train at the defaults and report as the arm it is not. Known keys: '
             f'{sorted(KNOWN_OPTIMIZER_KEYS)}')
-    start_it, ck = 0, None
-    if resumed.exists() and not args.no_resume:
-        ck = torch.load(resumed, map_location=device, weights_only=False)
-        start_it = int(ck['iteration'])
     opt_cfg_scaled = dist_utils.scale_optimizer_cfg(opt_cfg, world)
     if world > 1:
         fabric.print(f'lr: scaled by sqrt({world}) -> learning_rate '
@@ -549,19 +577,26 @@ def main():
     loss_fn = PoseLoss(**losses)
 
     if ck is not None:
-        model.load_state_dict(ck['model_state'])
+        if resume_from == resumed:
+            model.load_state_dict(ck['model_state'])
         info = replay_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh)
         if info:
             print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
                   f'norms {info["norms"]}, {info["n_params"]:,} params)')
         from tailcyclenet.optim import refuse_mismatched_optimizer_state
         refuse_mismatched_optimizer_state(
-            opt, ck['optimizer_state'], resumed,
-            resolved=str(config['training']['optimizer'].get('optimizer', 'muon')),
+            opt, ck['optimizer_state'], resume_from,
+            resolved=opt_kind,
             explicit='optimizer' in config['training']['optimizer'])
-        opt.load_state_dict(ck['optimizer_state'])
-        print(f'resuming {resumed} at iteration {start_it} of {n_iter} '
-              '(--no-resume to start over, which OVERWRITES both checkpoints)')
+        if resume_from != resumed and not optimizer_layout_matches(opt, ck['optimizer_state']):
+            print(f'checkpoint_path: {resume_from} was trained with a different optimizer '
+                  'param-group layout than this config builds (group count or per-group lr); '
+                  'the weights stand, the optimizer starts fresh at iteration 0')
+            ck, start_it = None, 0
+        else:
+            opt.load_state_dict(ck['optimizer_state'])
+            print(f'resuming {resume_from} at iteration {start_it} of {n_iter} '
+                  '(--no-resume to start over, which OVERWRITES both checkpoints)')
     elif resumed.exists():
         print(f'--no-resume: {resumed} and any checkpoint_best.pth beside it WILL be overwritten')
 

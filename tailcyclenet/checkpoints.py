@@ -63,25 +63,35 @@ def skip_video_encoder_download():
             setattr(_ed, name, fn)
 
 
-def load_config(path) -> dict:
-    """A run config, with `extends = "<file>"` resolved once against the config's own directory.
+_BASE_CONFIG = Path(__file__).resolve().parent.parent / 'configs' / 'base.toml'
 
-    One level deep, so `configs/2d.toml` vs `configs/3d.toml` show their whole difference in one
-    file. The merge is per BLOCK, key by key, so an overlay need not restate the base's blocks.
+
+def load_config(path, implicit_base: bool = True) -> dict:
+    """A run config layered over the repo's `configs/base.toml` -- the pose defaults.
+
+    A config that names no base layers over `configs/base.toml` automatically, so the `extends`
+    line is gone from pose configs: the overlay IS the whole difference. An `extends` key still
+    resolves one level deep against the config's own directory, so configs written before the
+    implicit base keep working. `implicit_base=False` restores "no base" for the detector's own
+    loader, whose contract is "an absent key is the code default (OFF), not the shipped recipe"
+    -- there an overlay must say `extends` to inherit `configs/detector.toml`. The merge is per
+    BLOCK, key by key, so an overlay need not restate the base's blocks.
     """
-    import tomllib
-
     path = Path(path)
     with open(path, 'rb') as f:
         cfg = tomllib.load(f)
     base_name = cfg.pop('extends', None)
-    if base_name is None:
-        return cfg
-    with open(path.parent / base_name, 'rb') as f:
-        base = tomllib.load(f)
-    if 'extends' in base:
-        raise SystemExit(f'{base_name}: `extends` is one level deep; {path.name} extends it and '
-                         'it may not extend anything further.')
+    if base_name is not None:
+        with open(path.parent / base_name, 'rb') as f:
+            base = tomllib.load(f)
+        if 'extends' in base:
+            raise SystemExit(f'{base_name}: `extends` is one level deep; {path.name} extends it '
+                             'and it may not extend anything further.')
+    elif implicit_base:
+        with open(_BASE_CONFIG, 'rb') as f:
+            base = tomllib.load(f)
+    else:
+        base = {}
     for block, over in cfg.items():
         if isinstance(over, dict) and isinstance(base.get(block), dict):
             base[block].update(over)
@@ -200,6 +210,18 @@ def save_run_meta(run: Path, config: dict, registry: Registry,
     prov = {**provenance(), **(extra or {})}
     if prov:
         (run / 'provenance.toml').write_text(toml.dumps(prov))
+
+
+def full_training_state(ck: dict) -> bool:
+    """Whether `ck` is a full training checkpoint -- raw weights, optimizer state and the
+    iteration -- rather than a packaged pose checkpoint (weights only). `save_checkpoint` and
+    the reference repo's train loop write the former; `package_checkpoint.py` writes the latter.
+    Only a full training checkpoint can be resumed from; anything else is a warm start.
+    """
+    return (isinstance(ck, dict)
+            and isinstance(ck.get('model_state'), dict)
+            and isinstance(ck.get('optimizer_state'), dict)
+            and 'iteration' in ck)
 
 
 def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,

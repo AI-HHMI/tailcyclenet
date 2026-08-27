@@ -223,7 +223,60 @@ def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overw
     assert 'skip_video_encoder_download' in src
     assert 'will_load_full_checkpoint' in src
     assert "resumed.exists() and not args.no_resume" in src
-    assert "not args.no_warm_start and bool(train_cfg.get('checkpoint_path'))" in src
+    assert "not args.no_warm_start and train_cfg.get('checkpoint_path')" in src
+    assert 'or checkpoint is not None' in src
+
+
+def test_checkpoint_path_is_a_resume_only_for_full_training_state():
+    """`main()` resumes from `[training].checkpoint_path` only when the checkpoint carries the
+    full training state -- raw weights + optimizer state + iteration (what `save_checkpoint`
+    and the reference repo's train loop write). A packaged pose checkpoint (weights only) can
+    never resume; it is a warm start. The predicates `main()` gates on are wired into it."""
+    from tailcyclenet.checkpoints import full_training_state
+
+    assert full_training_state({'model_state': {}, 'optimizer_state': {}, 'iteration': 5})
+    assert not full_training_state({'model_state': {}, 'iteration': 5}), \
+        'weights without optimizer state is a warm start, not a resume'
+    assert not full_training_state({'model_state': {}}), 'no iteration means no resume'
+    assert not full_training_state({})
+    assert not full_training_state(None)
+
+    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    for name in ('full_training_state', 'state_matches_optimizer_kind',
+                 'optimizer_layout_matches'):
+        assert name in src, f'main() must gate the checkpoint_path resume on {name}'
+
+
+def test_load_config_layers_over_the_repo_base_by_default(tmp_path):
+    """A pose config that names no base still gets `configs/base.toml` as its defaults -- the
+    `extends` line is gone, not needed: the overlay IS the whole difference."""
+    from tailcyclenet.checkpoints import load_config
+
+    overlay = tmp_path / 'overlay.toml'
+    overlay.write_text('[data]\npath = "/some/root"\n')
+    cfg = load_config(overlay)
+    assert cfg['data']['path'] == '/some/root'
+    assert cfg['model']['query'] == 'prior', 'the model defaults must come from base.toml'
+    assert cfg['training']['n_iterations'] == 60000
+    assert cfg['training']['optimizer']['optimizer'] == 'muon'
+    assert cfg['training']['losses']['delta'] == 6
+
+    # An explicit `extends` naming the same base is bit-identical (old configs keep working).
+    repo_base = Path(__file__).resolve().parent.parent / 'configs' / 'base.toml'
+    explicit = tmp_path / 'explicit.toml'
+    explicit.write_text(f'extends = "{repo_base}"\n\n[data]\npath = "/some/root"\n')
+    assert load_config(explicit) == cfg
+
+
+def test_load_config_implicit_base_can_be_disabled(tmp_path):
+    """The detector loader keeps "absent key = code default (OFF)" as its contract, so it
+    calls `load_config(..., implicit_base=False)`: a bare detector config must not inherit
+    the pose base's blocks (or any shipped recipe)."""
+    from tailcyclenet.checkpoints import load_config
+
+    p = tmp_path / 'bare.toml'
+    p.write_text('[training]\niters = 4\n')
+    assert load_config(p, implicit_base=False) == {'training': {'iters': 4}}
 
 
 def test_known_training_keys_match_the_guard_in_main():

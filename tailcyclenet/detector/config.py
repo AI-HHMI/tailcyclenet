@@ -2,8 +2,12 @@
 
 The detector is trained from a TOML config, the same way the pose side is (`scripts/train.py` +
 `checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml`; a user overlay
-may `extends` it one level deep. Every key is validated against an explicit allowed set -- an
-unknown key is a typo, not a comment, and must not silently train at defaults.
+may `extends` it one level deep. Unlike the pose side, `load_config`'s implicit
+`configs/base.toml` base is DISABLED here (`implicit_base=False`): the detector loader's
+contract is "an absent key is the code default (OFF), byte-identical to every checkpoint on
+record", so a bare config must NOT inherit a shipped recipe. Every key is validated against an
+explicit allowed set -- an unknown key is a typo, not a comment, and must not silently train at
+defaults.
 
 Blocks:
     [data]      the loader and what the regression target bounds
@@ -107,7 +111,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     """
     from tailcyclenet.checkpoints import load_config
 
-    cfg = load_config(Path(path))
+    cfg = load_config(Path(path), implicit_base=False)
     missing = [b for b, _ in BLOCKS if b not in cfg]
     if missing:
         raise SystemExit(f'{path}: missing block(s) {missing}. A detector config needs '

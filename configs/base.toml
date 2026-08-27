@@ -1,6 +1,7 @@
-# Everything 2D and 3D agree on; 2d.toml / 3d.toml `extends` this and the overlay IS the whole
-# difference (a key repeated in an overlay stops the layout from answering what 3D needs that 2D
-# does not). [model] is the ukt14i7c base recipe; `n_keypoints` is derived from data, not configured.
+# Everything 2D and 3D agree on; EVERY config layers over this file by default (no `extends`
+# line needed) and the overlay IS the whole difference (a key repeated in an overlay stops the
+# layout from answering what 3D needs that 2D does not). [model] is the ukt14i7c base recipe;
+# `n_keypoints` is derived from data, not configured.
 
 [data]
 n_frames = 12               # a CEILING: a train window is sized to the labelled span it covers; must equal [model].stride_length (refused otherwise). 12 keeps the full-frame working set across refine passes affordable.

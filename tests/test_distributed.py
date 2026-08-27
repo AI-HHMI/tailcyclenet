@@ -485,6 +485,51 @@ def test_one_device_and_many_devices_together_are_refused():
         _train_module().launch(_args(device='cuda:1', devices=4))
 
 
+def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
+    """`--devices -1` (the default) means "every visible GPU", so it must resolve to the visible
+    count BEFORE the strategy is chosen: with ONE visible GPU it takes the exact `--devices 1`
+    path (strategy auto, no DDP wrapper), and `--device cpu` resolves to the one-process CPU
+    path rather than tripping the multi-device refusal."""
+    import lightning.fabric as lf
+
+    seen = {}
+
+    def spy(self, *a, **k):
+        seen.update(k)
+        raise SystemExit('stop-before-fabric-launch')
+
+    monkeypatch.setattr(lf.Fabric, '__init__', spy)
+    tr = _train_module()
+
+    monkeypatch.setattr('torch.cuda.device_count', lambda: 1)
+    monkeypatch.setattr('torch.cuda.is_available', lambda: True)
+    with pytest.raises(SystemExit, match='stop-before-fabric-launch'):
+        tr.launch(_args(devices=-1))
+    assert seen['devices'] == [0] and seen['strategy'] == 'auto' \
+        and seen['accelerator'] == 'gpu', 'one visible GPU must be the --devices 1 path'
+
+    seen.clear()
+    monkeypatch.setattr('torch.cuda.device_count', lambda: 4)
+    with pytest.raises(SystemExit, match='stop-before-fabric-launch'):
+        tr.launch(_args(devices=-1))
+    assert seen['devices'] == 4 and seen['strategy'] == 'ddp_find_unused_parameters_true', \
+        'many visible GPUs must stay on the DDP path'
+
+    seen.clear()
+    monkeypatch.setattr('torch.cuda.is_available', lambda: False)
+    with pytest.raises(SystemExit, match='stop-before-fabric-launch'):
+        tr.launch(_args(devices=-1))
+    assert seen['devices'] == 1 and seen['strategy'] == 'auto' \
+        and seen['accelerator'] == 'cpu', 'no CUDA must resolve to the one-process CPU path'
+
+    seen.clear()
+    monkeypatch.setattr('torch.cuda.is_available', lambda: True)
+    with pytest.raises(SystemExit, match='stop-before-fabric-launch'):
+        tr.launch(_args(devices=-1, device='cpu'))
+    assert seen['devices'] == 1 and seen['strategy'] == 'auto' \
+        and seen['accelerator'] == 'cpu', '--device cpu must not trip the multi-device refusal'
+
+
 # -- the two handles -----------------------------------------------------------------------
 
 def test_run_batch_gives_the_loss_the_unwrapped_module():

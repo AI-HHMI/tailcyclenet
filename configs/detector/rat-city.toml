@@ -6,6 +6,7 @@
 # keypoint-trained on rat-city, but every SHIPPED rat-city POSE run is keypoint-trained, so this
 # pair serves two different crop rules and any delta off it is not detector accuracy alone until
 # that is resolved on the pose side.
+
 extends = "../detector.toml"
 
 [data]

@@ -266,3 +266,34 @@ def refuse_mismatched_optimizer_state(opt, state, path, resolved: str, explicit:
         f'{why_default}. The model tensors load either way, so nothing else can tell you. Set '
         f'optimizer = "{fix}" in the config to resume this run as it was trained, or --no-resume '
         f'to start over (which OVERWRITES both checkpoints).')
+
+
+def state_matches_optimizer_kind(state, kind: str) -> bool:
+    """Whether `state` is the optimizer_state a config with `optimizer = kind` builds: Muon
+    checkpoints carry the dual {'muon', 'adam'} structure, AdamW-SF ones a plain one. The soft
+    half of the resume decision -- a kind mismatch is a warm start, not an error
+    (`refuse_mismatched_optimizer_state` keeps the hard version for the run folder's own
+    checkpoint).
+    """
+    return _is_dual_state(state) == (str(kind) == 'muon')
+
+
+def optimizer_layout_matches(opt, state) -> bool:
+    """Whether `state`'s param-group layout equals what `opt` currently holds: the same number
+    of groups and the same lr per group, on both halves. `load_state_dict` matches groups BY
+    POSITION, so counts alone cannot tell a kpt group from an encoder group -- the per-group lr
+    sequence can. A checkpoint whose layout differs cannot be resumed (its state would land on
+    the wrong groups), so it is a warm start instead.
+    """
+    def lrs(groups):
+        """The per-group lr sequence of a param_groups list."""
+        return [float(g['lr']) for g in groups]
+
+    if _is_dual_state(state):
+        if not isinstance(opt, PoseDualOptimizer):
+            return False
+        return (lrs(opt.opt_muon.param_groups) == lrs(state['muon']['param_groups'])
+                and lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
+    if isinstance(opt, PoseDualOptimizer):
+        return False
+    return lrs(opt.param_groups) == lrs(state['param_groups'])

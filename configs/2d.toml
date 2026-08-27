@@ -1,6 +1,6 @@
-# 2D single-view. Everything shared lives in base.toml; THIS FILE IS THE DIFFERENCE -- and it is
-# empty of [data] overrides on purpose: 3d.toml's three keys are camera-count questions a
-# one-camera root cannot ask.
+# 2D single-view. Everything shared lives in base.toml (layered over automatically); THIS FILE
+# IS THE DIFFERENCE -- and it is empty of [data] overrides on purpose: 3d.toml's three keys are
+# camera-count questions a one-camera root cannot ask.
 #
 # The deployment recipe lives in `scripts/infer.py`, not config:
 #   --anchor carry --overlap 8 --crop-source boxes
@@ -14,5 +14,3 @@
 #
 # `[model].gridresid_offset` is inherited and inert in 2D but still required -- it asserts what
 # the weights were trained as, not what this run does.
-
-extends = "base.toml"

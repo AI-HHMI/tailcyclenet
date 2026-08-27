@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 
 from tailcyclenet.optim import (KNOWN_OPTIMIZER_KEYS, PoseDualOptimizer, build_muon,
-                                refuse_group_count_mismatch, refuse_mismatched_optimizer_state)
+                                optimizer_layout_matches, refuse_group_count_mismatch,
+                                refuse_mismatched_optimizer_state, state_matches_optimizer_kind)
 from tailcyclenet.unfreeze import apply_staged_unfreeze, replay_staged_unfreeze
 
 REPO = Path(__file__).resolve().parent.parent
@@ -437,6 +438,57 @@ def test_resume_without_replay_raises_a_named_group_count_error():
         refuse_group_count_mismatch(fresh_opt, sd)
     with pytest.raises(SystemExit, match='video_encoder_finetune_last_n_layers'):
         fresh_opt.load_state_dict(sd)
+
+
+def test_state_matches_optimizer_kind_is_the_soft_resume_gate():
+    """A checkpoint_path resume is only possible when the checkpoint's optimizer KIND matches
+    what the config builds: Muon checkpoints carry the dual {'muon','adam'} structure, AdamW-SF
+    ones a plain one. A kind mismatch is a warm start, not an error -- the hard refusal is for
+    the run folder's own checkpoint, where a mismatch is a real bug."""
+    dual = {'muon': {'param_groups': []}, 'adam': {'param_groups': []}}
+    plain = {'param_groups': []}
+    assert state_matches_optimizer_kind(dual, 'muon')
+    assert not state_matches_optimizer_kind(dual, 'schedulefree')
+    assert state_matches_optimizer_kind(plain, 'schedulefree')
+    assert not state_matches_optimizer_kind(plain, 'muon')
+
+
+def test_optimizer_layout_matches_compares_groups_by_position():
+    """`load_state_dict` matches groups BY POSITION, so counts alone cannot tell a kpt group
+    from an encoder group: the per-group lr sequence must match too, on both halves. A
+    checkpoint whose layout differs is a warm start, never a silently mis-routed resume."""
+    torch.manual_seed(0)
+    m, opt, cfg = _staged()
+    apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
+    sd = opt.state_dict()
+    assert optimizer_layout_matches(opt, sd)
+
+    # The replay reproduces the layout a run at the same unfreeze point would have.
+    m2 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
+    opt2 = build_muon(m2, fresh=set(), cfg=cfg)
+    replay_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
+    assert optimizer_layout_matches(opt2, sd)
+
+    # A different lr is a different layout: loading would put the state on the wrong groups.
+    m3 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
+    cfg3 = {**cfg, 'learning_rate': 2e-4}
+    opt3 = build_muon(m3, fresh=set(), cfg=cfg3)
+    replay_staged_unfreeze(m3, opt3, cfg3, UNFREEZE_AT + 10)
+    assert not optimizer_layout_matches(opt3, sd)
+
+    # A run that never fired the unfreeze cannot resume one that did.
+    m4 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
+    opt4 = build_muon(m4, fresh=set(), cfg=cfg)
+    assert not optimizer_layout_matches(opt4, sd)
+
+    # Same rule on the plain AdamW-SF optimizer.
+    tr = _train_module()
+    opt5 = tr.build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
+                              {**cfg, 'optimizer': 'schedulefree'})
+    assert optimizer_layout_matches(opt5, opt5.state_dict())
+    opt6 = tr.build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
+                              {**cfg, 'optimizer': 'schedulefree', 'kpt_lr': 9e-4})
+    assert not optimizer_layout_matches(opt6, opt5.state_dict())
 
 
 def test_schedulefree_optimizer_takes_the_same_staged_path():

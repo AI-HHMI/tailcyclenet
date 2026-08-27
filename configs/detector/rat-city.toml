@@ -7,7 +7,6 @@
 # pair serves two different crop rules and any delta off it is not detector accuracy alone until
 # that is resolved on the pose side.
 
-extends = "../detector.toml"
 
 [data]
 path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/rat-city"

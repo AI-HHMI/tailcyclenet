@@ -1,6 +1,5 @@
 # 3dpop: ONE val session, 16 labelled frames. Raised to the group's own labelled length (the
 # shipped 8 sampled only half of it).
-extends = "../detector.toml"
 
 [data]
 path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/3dpop"

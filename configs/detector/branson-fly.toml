@@ -1,6 +1,5 @@
 # branson-fly: ONE val group, 32 labelled frames; raised to the group's own labelled length (the
 # shipped 8 sampled only a quarter -- cheap here).
-extends = "../detector.toml"
 
 [data]
 path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/branson-fly"

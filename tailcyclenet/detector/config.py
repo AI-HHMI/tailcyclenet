@@ -1,13 +1,12 @@
 """Detector training config: load, validate, apply CLI overrides.
 
 The detector is trained from a TOML config, the same way the pose side is (`scripts/train.py` +
-`checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml`; a user overlay
-may `extends` it one level deep. Unlike the pose side, `load_config`'s implicit
-`configs/base.toml` base is DISABLED here (`implicit_base=False`): the detector loader's
-contract is "an absent key is the code default (OFF), byte-identical to every checkpoint on
-record", so a bare config must NOT inherit a shipped recipe. Every key is validated against an
-explicit allowed set -- an unknown key is a typo, not a comment, and must not silently train at
-defaults.
+`checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml` and EVERY
+detector config layers over it automatically: this module passes it as `load_config`'s `base`
+(the pose side defaults to `configs/base.toml` the same way), so an absent key inherits the
+shipped recipe's value, and the `extends` key is deleted -- it RAISES by name. Every key is
+validated against an explicit allowed set -- an unknown key is a typo, not a comment, and must
+not silently train at defaults.
 
 Blocks:
     [data]      the loader and what the regression target bounds
@@ -101,8 +100,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         load, not silently train on the CWD); unknown keys and choice violations raise. An
         "absent" TOML pair (empty list -- TOML has no null) is normalised to None.
     Notes:
-        Every optional key defaults to OFF, byte-identical to every checkpoint on record, so
-        an arm moves one key at a time; shorthand references `dev/plans/detector_v2.md`.
+        An ABSENT key inherits the shipped recipe's value (`configs/detector.toml`, the
+        implicit base), so a bare config already runs the recommended arm and an experiment
+        moves one key at a time; the code-level fallbacks only apply to keys the shipped file
+        does not state. Shorthand references `dev/plans/detector_v2.md`.
         `nms_center_dist_thresh` defaults ON (A5, '' restores the old off); `pretrained`
         accepts 'coco' (required to exist NOW); the recommended shipped recipe is TAL + CIoU.
         The remaining keys (iou_aware_obj, box_weight, weight_decay, annot_frac, alpha,
@@ -111,7 +112,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     """
     from tailcyclenet.checkpoints import load_config
 
-    cfg = load_config(Path(path), implicit_base=False)
+    detector_base = Path(__file__).resolve().parents[2] / 'configs' / 'detector.toml'
+    cfg = load_config(Path(path), base=detector_base)
     missing = [b for b, _ in BLOCKS if b not in cfg]
     if missing:
         raise SystemExit(f'{path}: missing block(s) {missing}. A detector config needs '

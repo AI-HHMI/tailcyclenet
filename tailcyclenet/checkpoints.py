@@ -66,38 +66,30 @@ def skip_video_encoder_download():
 _BASE_CONFIG = Path(__file__).resolve().parent.parent / 'configs' / 'base.toml'
 
 
-def load_config(path, implicit_base: bool = True) -> dict:
-    """A run config layered over the repo's `configs/base.toml` -- the pose defaults.
+def load_config(path, base: Path | None = None) -> dict:
+    """A run config layered over a base file -- the pose default is the repo's
+    `configs/base.toml`; the detector loader passes `configs/detector.toml`.
 
-    A config that names no base layers over `configs/base.toml` automatically, so the `extends`
-    line is gone from pose configs: the overlay IS the whole difference. An `extends` key still
-    resolves one level deep against the config's own directory, so configs written before the
-    implicit base keep working. `implicit_base=False` restores "no base" for the detector's own
-    loader, whose contract is "an absent key is the code default (OFF), not the shipped recipe"
-    -- there an overlay must say `extends` to inherit `configs/detector.toml`. The merge is per
-    BLOCK, key by key, so an overlay need not restate the base's blocks.
+    EVERY config layers over its family's base automatically: the `extends` key is deleted and
+    RAISES by name, and the overlay IS the whole difference. The merge is per BLOCK, key by
+    key, so an overlay need not restate the base's blocks.
     """
     path = Path(path)
     with open(path, 'rb') as f:
         cfg = tomllib.load(f)
-    base_name = cfg.pop('extends', None)
-    if base_name is not None:
-        with open(path.parent / base_name, 'rb') as f:
-            base = tomllib.load(f)
-        if 'extends' in base:
-            raise SystemExit(f'{base_name}: `extends` is one level deep; {path.name} extends it '
-                             'and it may not extend anything further.')
-    elif implicit_base:
-        with open(_BASE_CONFIG, 'rb') as f:
-            base = tomllib.load(f)
-    else:
-        base = {}
+    if 'extends' in cfg:
+        raise SystemExit(
+            f'{path.name}: `extends` is deleted -- every config layers over '
+            f'`{(base or _BASE_CONFIG).name}` automatically, so the key is not needed. '
+            'Delete the line and the recipe is unchanged.')
+    with open(base or _BASE_CONFIG, 'rb') as f:
+        base_cfg = tomllib.load(f)
     for block, over in cfg.items():
-        if isinstance(over, dict) and isinstance(base.get(block), dict):
-            base[block].update(over)
+        if isinstance(over, dict) and isinstance(base_cfg.get(block), dict):
+            base_cfg[block].update(over)
         else:
-            base[block] = over
-    return base
+            base_cfg[block] = over
+    return base_cfg
 
 
 def check_image_size(config: dict) -> None:

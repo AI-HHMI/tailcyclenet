@@ -261,22 +261,30 @@ def test_load_config_layers_over_the_repo_base_by_default(tmp_path):
     assert cfg['training']['optimizer']['optimizer'] == 'muon'
     assert cfg['training']['losses']['delta'] == 6
 
-    # An explicit `extends` naming the same base is bit-identical (old configs keep working).
-    repo_base = Path(__file__).resolve().parent.parent / 'configs' / 'base.toml'
-    explicit = tmp_path / 'explicit.toml'
-    explicit.write_text(f'extends = "{repo_base}"\n\n[data]\npath = "/some/root"\n')
-    assert load_config(explicit) == cfg
 
-
-def test_load_config_implicit_base_can_be_disabled(tmp_path):
-    """The detector loader keeps "absent key = code default (OFF)" as its contract, so it
-    calls `load_config(..., implicit_base=False)`: a bare detector config must not inherit
-    the pose base's blocks (or any shipped recipe)."""
+def test_load_config_extends_is_deleted_and_raises(tmp_path):
+    """`extends` is deleted from the config language: EVERY config layers over its family's
+    base automatically (pose -> `configs/base.toml`, detector -> `configs/detector.toml`), so
+    the key is not needed and naming it is refused by name."""
     from tailcyclenet.checkpoints import load_config
 
-    p = tmp_path / 'bare.toml'
+    p = tmp_path / 'old.toml'
+    p.write_text('extends = "base.toml"\n[data]\npath = "/x"\n')
+    with pytest.raises(SystemExit, match='extends'):
+        load_config(p)
+
+
+def test_load_config_layers_over_an_explicit_base(tmp_path):
+    """The detector loader passes `configs/detector.toml` as `base`; a config layered over a
+    non-pose base must not inherit the pose base's blocks."""
+    from tailcyclenet.checkpoints import load_config
+
+    base = tmp_path / 'det_base.toml'
+    base.write_text('[data]\nboxes = "instances"\n')
+    p = tmp_path / 'overlay.toml'
     p.write_text('[training]\niters = 4\n')
-    assert load_config(p, implicit_base=False) == {'training': {'iters': 4}}
+    cfg = load_config(p, base=base)
+    assert cfg == {'data': {'boxes': 'instances'}, 'training': {'iters': 4}}
 
 
 def test_known_training_keys_match_the_guard_in_main():

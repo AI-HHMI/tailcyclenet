@@ -240,10 +240,10 @@ def test_alpha_is_a_free_noop_on_uniform_group_sizes(tmp_path):
 
 
 
-def test_detector_config_weight_decay_default_is_5e_4(tmp_path):
-    """5e-4 was hardcoded in `train_detector.py`'s AdamW call. The config default must be the SAME
-    number, or every checkpoint on record stops being reproducible from its own config.
-    """
+def test_detector_config_weight_decay_inherits_the_shipped_0_01(tmp_path):
+    """The implicit base is `configs/detector.toml`, so an absent key inherits its shipped
+    value (0.01) rather than the old AdamW hardcoded 5e-4 -- a bare config now runs the
+    shipped recipe."""
     p = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
@@ -252,7 +252,7 @@ yolox = "tiny"
 [training]
 out = "/tmp/run"
 """)
-    assert load_detector_config(p)['training']['weight_decay'] == 5e-4
+    assert load_detector_config(p)['training']['weight_decay'] == 0.01
 
 
 def test_detector_config_weight_decay_rejects_negative(tmp_path):
@@ -273,8 +273,9 @@ weight_decay = -0.1
 
 
 
-def test_detector_config_annot_frac_defaults_to_none(tmp_path):
-    """Absent means unchanged behaviour -- the key must not acquire a numeric default."""
+def test_detector_config_annot_frac_inherits_the_shipped_0_6(tmp_path):
+    """Absent annot_frac inherits the shipped recipe's 0.6 (the implicit detector.toml base),
+    not the old None -- a bare config now runs the shipped recipe."""
     p = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
@@ -283,7 +284,7 @@ yolox = "tiny"
 [training]
 out = "/tmp/run"
 """)
-    assert load_detector_config(p)['data']['annot_frac'] is None
+    assert load_detector_config(p)['data']['annot_frac'] == 0.6
 
 
 def test_detector_config_annot_frac_rejects_out_of_range(tmp_path):
@@ -480,7 +481,7 @@ def test_detector_loss_max_pos_per_gt_reduces_n_pos_for_a_large_box():
     assert cp['n_pos'] < up['n_pos']
 
 
-def test_detector_config_max_pos_per_gt_default_is_zero(tmp_path):
+def test_detector_config_max_pos_per_gt_inherits_the_shipped_ten(tmp_path):
     p = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
@@ -490,12 +491,13 @@ yolox = "tiny"
 out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
-    assert cfg['training']['max_pos_per_gt'] == 0
+    assert cfg['training']['max_pos_per_gt'] == 10
 
 
-def test_detector_config_box_weight_default_is_five(tmp_path):
+def test_detector_config_box_weight_inherits_the_shipped_fifteen(tmp_path):
     """`box_weight` used to be `detector_loss`'s own hardcoded default (5.0), never exposed to a
-    config. The new config-level default is the SAME number, so an absent key stays byte-identical.
+    config. With the implicit detector.toml base an absent key now inherits the shipped 15.0
+    instead.
     """
     p = _write_config(tmp_path, """
 [data]
@@ -506,7 +508,7 @@ yolox = "tiny"
 out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
-    assert cfg['training']['box_weight'] == 5.0
+    assert cfg['training']['box_weight'] == 15.0
 
 
 def test_train_detector_box_weight_is_actually_wired_through(tmp_path, dense_root, monkeypatch):
@@ -2079,7 +2081,7 @@ yolox = "tiny"
 out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
-    assert cfg['training']['iou_aware_obj'] is False
+    assert cfg['training']['iou_aware_obj'] is True
     assert cfg['training']['iou_aware_warmup'] == 2000
 
 
@@ -2689,7 +2691,7 @@ out = "/tmp/run"
     cfg = load_detector_config(p)
     t = cfg['training']
     assert (t['assignment'], t['box_loss']) == ('tal', 'ciou')
-    assert t['tal_topk'] == 13
+    assert t['tal_topk'] == 20
     assert 'assignment' in TRAINING_KEYS
 
 
@@ -2709,21 +2711,15 @@ out = "/tmp/run"
 
 
 def test_detector_config_loads_with_shipped_defaults(tmp_path):
-    """The shipped config is the old CLI defaults, one key per flag -- and `--out`/`--iters`/
-    `--device` overrides land in [training]. Path/out are placeholders in the shipped file, so
-    the user flow is exercised: a one-key overlay `extends` it."""
-    import shutil
-    from tailcyclenet.detector.config import load_detector_config
-
-    # `extends` resolves against the config's OWN directory, so base and overlay share tmp_path.
-    shutil.copy(SHIPPED_DETECTOR_CONFIG, tmp_path / 'base.toml')
+    """The implicit base is the shipped `configs/detector.toml`: a bare overlay inherits the
+    whole recommended recipe, and `--out`/`--iters`/`--device` overrides land in [training].
+    Path is still required (a missing dataset must fail at load, not train on the CWD)."""
     overlay = _write_config(tmp_path, """
-extends = "base.toml"
 [data]
 path = "/tmp/ds"
 [training]
 out = "/tmp/run-det"
-""", 'overlay.toml')
+""")
     cfg = load_detector_config(overlay, out='/tmp/run-det', iters=7, device='cpu')
     d, m, t = cfg['data'], cfg['model'], cfg['training']
     assert d['path'] == '/tmp/ds'
@@ -2812,36 +2808,21 @@ iters = 1
         load_detector_config(p)
 
 
-def test_detector_config_extends_one_level(tmp_path):
-    """User overlays can `extends` the shipped file; the merge is per BLOCK (pose rule)."""
+def test_detector_config_extends_is_deleted_and_raises(tmp_path):
+    """`extends` is deleted from the config language: EVERY config layers over its family's
+    base automatically (detector -> `configs/detector.toml`), so the key is not needed and
+    naming it is refused by name."""
     from tailcyclenet.detector.config import load_detector_config
 
-    # writes base.toml, which the overlay below reaches by `extends` -- the call is the point,
-    # the path is not used here.
-    _write_config(tmp_path, """
+    overlay = _write_config(tmp_path, """
+extends = "../detector.toml"
 [data]
 path = "/tmp/ds"
-boxes = "instances"
-min_crop_dim = 64
-[model]
-yolox = "tiny"
 [training]
-out = "/tmp/base-run"
-iters = 20000
-""", 'base.toml')
-    overlay = _write_config(tmp_path, """
-extends = "base.toml"
-[data]
-boxes = "keypoints"
-[training]
-iters = 3
-""", 'overlay.toml')
-    cfg = load_detector_config(overlay)
-    assert cfg['data']['boxes'] == 'keypoints'
-    assert cfg['data']['min_crop_dim'] == 64          # base value survived the block merge
-    assert cfg['model']['yolox'] == 'tiny'            # untouched block carried over
-    assert cfg['training']['iters'] == 3
-    assert cfg['training']['out'] == '/tmp/base-run'
+out = "/tmp/run"
+""")
+    with pytest.raises(SystemExit, match='extends'):
+        load_detector_config(overlay)
 
 
 def test_detector_config_round_trips_through_the_run_folder(tmp_path):
@@ -3459,7 +3440,7 @@ def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
     assert obj.shape[1] == boxes.shape[1]
 
 
-def test_detector_config_p2_default_false(tmp_path):
+def test_detector_config_p2_inherits_the_shipped_true(tmp_path):
     p = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
@@ -3469,7 +3450,7 @@ yolox = "tiny"
 out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
-    assert cfg['model']['p2'] is False
+    assert cfg['model']['p2'] is True
 
 
 def test_train_detector_p2_end_to_end(tmp_path, dense_root, monkeypatch):
@@ -3787,7 +3768,7 @@ out = "/tmp/run"
 
 
 
-def test_detector_config_optimizer_default_adamw(tmp_path):
+def test_detector_config_optimizer_inherits_the_shipped_muon(tmp_path):
     p = _write_config(tmp_path, """
 [data]
 path = "x"
@@ -3796,7 +3777,7 @@ path = "x"
 out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
-    assert cfg['training']['optimizer'] == 'adamw'
+    assert cfg['training']['optimizer'] == 'muon'
     assert cfg['training']['muon_momentum'] == 0.95
     assert cfg['training']['muon_lr_scale'] == 1.0
     assert cfg['training']['warmup_steps'] == 500
@@ -3915,8 +3896,8 @@ optimizer = "muon"
     assert ckpt['optimizer_kind'] == 'muon'
 
 
-def test_train_detector_adamw_optimizer_is_default_end_to_end(tmp_path, dense_root, monkeypatch):
-    """Default optimizer stays 'adamw' and the checkpoint records it -- output-neutral change."""
+def test_train_detector_muon_optimizer_is_default_end_to_end(tmp_path, dense_root, monkeypatch):
+    """The implicit base makes the shipped muon the default; the checkpoint records it."""
     import sys
 
     out = tmp_path / 'run'
@@ -3949,7 +3930,7 @@ eval_batches = 1
     mod.main()
     assert (out / 'detector.pth').exists()
     ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
-    assert ckpt['optimizer_kind'] == 'adamw'
+    assert ckpt['optimizer_kind'] == 'muon'
 
 
 
@@ -4036,7 +4017,7 @@ out = "/tmp/run"
 
 
 
-def test_detector_config_gap_lever_defaults(tmp_path):
+def test_detector_config_gap_lever_inherits_the_shipped_values(tmp_path):
     p = _write_config(tmp_path, """
 [data]
 path = "x"
@@ -4045,8 +4026,8 @@ path = "x"
 out = "/tmp/run"
 """)
     cfg = load_detector_config(p)
-    assert cfg['training']['shared_head'] is True
-    assert cfg['training']['fpn_upsample'] == 'nearest'
+    assert cfg['training']['shared_head'] is False
+    assert cfg['training']['fpn_upsample'] == 'bilinear'
 
 
 def test_detector_config_fpn_upsample_invalid_raises(tmp_path):

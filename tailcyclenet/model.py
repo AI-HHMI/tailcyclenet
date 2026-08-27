@@ -83,6 +83,9 @@ class PoseTrackerEncoder(TrackerEncoder):
         "prior" means the encoder ignores `query_coords` entirely -- a declared prior is a silent
         no-op. A box prompt swaps in a `WideQueryEncoder` subclass consuming a per-frame animal
         box as a non-position channel, stashed as `_box_prompt` by `_decode_from_scene`.
+        The inference levers `scene_precision`/`camera_batch` default to the historical training
+        path; `scripts/infer.py` opts into the measured deployment defaults with
+        `set_scene_speed()`.
         """
         assert query in QUERY_MODES, f'query must be one of {QUERY_MODES}, got {query!r}'
         assert query_encoder in QUERY_ENCODERS, \
@@ -97,8 +100,6 @@ class PoseTrackerEncoder(TrackerEncoder):
         self.gridresid_offset = gridresid_offset
         self.box_prompt = box_prompt
         self._shared_scene = None
-        # Runtime inference levers. Keep direct model callers and training on the historical path;
-        # scripts/infer.py opts into the measured deployment defaults with set_scene_speed().
         self.scene_precision = 'fp32'
         self.camera_batch = False
 
@@ -145,7 +146,9 @@ class PoseTrackerEncoder(TrackerEncoder):
         ``SceneRepresentation.forward`` is intentionally left untouched: its operations after
         the encoder are batch-agnostic, so camera inputs can be concatenated on the batch axis and
         the returned ``[1, C*B, N, D]`` tensor reshaped back to ``[C, B, N, D]``. Single-camera
-        windows use the original list unchanged, making that case an exact no-op.
+        windows use the original list unchanged, making that case an exact no-op. Under an
+        autocast precision the encoder's output is cast back to float32: the decoder and all
+        geometry must see the historical FP32 boundary.
         """
         batched = self.camera_batch and len(views_norm) > 1
         if batched:
@@ -167,7 +170,6 @@ class PoseTrackerEncoder(TrackerEncoder):
             dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}[self.scene_precision]
             with torch.autocast(views[0].device.type, dtype=dtype):
                 features = self.scene_encoder(views)
-            # The decoder and all geometry must see the historical FP32 boundary.
             features = features.float()
 
         if batched:

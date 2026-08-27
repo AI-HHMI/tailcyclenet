@@ -191,6 +191,65 @@ def test_share_scene_matches_encoding_every_time(moving_batch):
     assert not torch.allclose(free, prior, equal_nan=True)
 
 
+@pytest.mark.parametrize('pos_mode', ('learned', 'sincos', 'none', 'rope', 'ropepos'))
+def test_camera_batch_scene_encode_is_bit_identical(pos_mode):
+    """Batching cameras must not duplicate posetail's SceneRepresentation implementation."""
+    cfg = small(scene_pos_embed_mode=pos_mode)
+    torch.manual_seed(0)
+    model = build_model(cfg, n_keypoints=5).eval()
+    views = [torch.randn(2, 4, 3, 64, 64) for _ in range(3)]
+
+    with torch.no_grad():
+        model.set_scene_speed(precision='fp32', camera_batch=False)
+        loop = model.encode_scene(views)
+        model.set_scene_speed(precision='fp32', camera_batch=True)
+        batched = model.encode_scene(views)
+
+    torch.testing.assert_close(batched, loop, rtol=0, atol=0)
+
+
+def test_camera_batch_single_camera_is_an_exact_noop():
+    """The single-camera path avoids even the concat/reshape, preserving the old call exactly."""
+    torch.manual_seed(0)
+    model = build_model(SMALL, n_keypoints=5).eval()
+    views = [torch.randn(1, 4, 3, 64, 64)]
+    with torch.no_grad():
+        model.set_scene_speed(camera_batch=False)
+        loop = model.encode_scene(views)
+        model.set_scene_speed(camera_batch=True)
+        batched = model.encode_scene(views)
+    torch.testing.assert_close(batched, loop, rtol=0, atol=0)
+
+
+def test_bf16_scene_encode_returns_fp32():
+    """Autocast ends at the scene feature boundary; the decoder never receives bf16 features."""
+    torch.manual_seed(0)
+    model = build_model(SMALL, n_keypoints=5).eval()
+    views = [torch.randn(1, 4, 3, 64, 64)]
+    with torch.no_grad():
+        model.set_scene_speed(precision='bf16')
+        features = model.encode_scene(views)
+    assert features.dtype == torch.float32
+
+
+def test_scene_speed_setter_rejects_unknown_precision():
+    model = build_model(SMALL, n_keypoints=5).eval()
+    with pytest.raises(ValueError, match='precision'):
+        model.set_scene_speed(precision='not-a-dtype')
+
+
+def test_speed_path_runs_end_to_end(moving_batch):
+    """The composed production settings must reach the decoder on a multiview window."""
+    b = moving_batch
+    model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    model.set_scene_speed(precision='bf16', camera_batch=True)
+    with torch.no_grad():
+        out = model(b.views, b.kpt_ids, b.cgroup, mode='3d',
+                    kpt_prior=b.kpt_prior, prompt_time=b.prompt_t)
+    assert out['coords_pred'].shape == (1, CFG.n_frames, b.kpt_ids.shape[1], 3)
+    assert torch.isfinite(out['coords_pred']).all()
+
+
 def test_kpt_chunk_leaves_no_stash_behind(moving_batch):
     """A leaked stash applies one forward's identities to the next, silently."""
     b = moving_batch

@@ -319,6 +319,10 @@ def run_dataset(args):
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
                                              model_overrides=over)
+    precision = getattr(args, 'precision', 'bf16')
+    camera_batch = getattr(args, 'camera_batch', True)
+    model.set_scene_speed(precision=precision, camera_batch=camera_batch)
+    print(f'speed: precision={precision} camera_batch={camera_batch}')
     print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)  '
           f'query={config["model"].get("query", "prior")}  '
           f'gridresid_offset={config["model"]["gridresid_offset"]}')
@@ -454,6 +458,7 @@ def run_dataset(args):
                             'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
                             'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
                             'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
+                            'precision': precision, 'camera_batch': bool(camera_batch),
                             'crop_source': cfg.crop_source,
                             'boxes': (str(args.detector) if args.detector else
                                       (str(args.boxes) if args.boxes else 'labels')),

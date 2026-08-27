@@ -21,6 +21,16 @@ from tailcyclenet.model import build_model
 from test_model import SMALL
 
 
+def test_inference_speed_options_default_to_measured_path():
+    from tailcyclenet.infer.cli import build_parser
+
+    parser = build_parser()
+    assert parser.get_default('precision') == 'bf16'
+    assert parser.get_default('camera_batch') is True
+    options = {option for action in parser._actions for option in action.option_strings}
+    assert '--camera-batch' in options and '--no-camera-batch' in options
+
+
 @pytest.fixture(scope='module', params=['rat', 'mv'])
 def scene(request):
     """A 2D multi-animal session and a 3D session on a moving rig."""
@@ -1214,6 +1224,8 @@ def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp
     # They were one name once, and the splat order silently decided which survived.
     assert prov['box_source'] == 'keypoints'
     assert prov['det_box_source'] == '' and prov['detector'] == ''
+    assert prov['precision'] == 'bf16'
+    assert prov['camera_batch'] is True
 
 
 def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path):

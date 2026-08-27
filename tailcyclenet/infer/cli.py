@@ -259,6 +259,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help='decode keypoints in slices of this size, reusing one scene encode. '
                          'Lowers peak memory on large keypoint sets; the prediction is '
                          'unchanged. 0 = one pass.')
+    ap.add_argument('--precision', choices=('fp32', 'bf16', 'fp16'), default='bf16',
+                    help='autocast dtype for the scene encode only. The query encoder, decoder, '
+                         'camera geometry and triangulation stay at their existing precision. '
+                         'Default bf16 is the measured deployment path; --precision fp32 restores '
+                         'the historical path.')
+    ap.add_argument('--camera-batch', action=argparse.BooleanOptionalAction, default=True,
+                    help='encode all cameras in one batched scene-encoder call per window. '
+                         'Default on; single-camera windows are unchanged. --no-camera-batch '
+                         'restores one encoder call per camera.')
     ap.add_argument('--prefetch-windows', type=int, default=1,
                     help='decode this many windows AHEAD of the one forwarding. BIT-EXACT: the '
                          'prediction is unchanged at any value. 0 restores the serial loop.')

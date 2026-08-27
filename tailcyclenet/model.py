@@ -21,6 +21,7 @@ QUERY_MODES = ('prior', 'none')
 QUERY_ENCODERS = ('wide',)
 # What the gridresid residual is an offset FROM. See `_query_anchored` / `_reanchor_per_frame`.
 GRIDRESID_OFFSETS = ('query', 'triangulated')
+SCENE_PRECISIONS = ('fp32', 'bf16', 'fp16')
 
 
 # the query-free scene point
@@ -96,6 +97,10 @@ class PoseTrackerEncoder(TrackerEncoder):
         self.gridresid_offset = gridresid_offset
         self.box_prompt = box_prompt
         self._shared_scene = None
+        # Runtime inference levers. Keep direct model callers and training on the historical path;
+        # scripts/infer.py opts into the measured deployment defaults with set_scene_speed().
+        self.scene_precision = 'fp32'
+        self.camera_batch = False
 
         old = self.query_encoder
         terms = dict.fromkeys(('query_pos_embedding', 'query_patch_embedding'),
@@ -121,20 +126,71 @@ class PoseTrackerEncoder(TrackerEncoder):
               f'dim {self.latent_dim}, {self.query_encoder.n_fusion_terms} terms '
               f'({", ".join(self.query_encoder.term_names())})')
 
-    def _forward_window(self, views_norm, *args, **kwargs):
-        """Reuse one scene encode across several decodes over the SAME pixels. Inside
-        `share_scene` the first call computes `scene_features` and the rest pass it in; only the
-        encode is shareable (the decode derives geometry from the prior-changed `coords_q`). The
-        upstream forward already passed None/None, so popping the key here is a no-op there.
+    def set_scene_speed(self, precision='fp32', camera_batch=False):
+        """Configure the inference-only scene encoding optimizations.
+
+        Precision autocast is deliberately scoped to the scene encoder in ``encode_scene``;
+        decoding, camera geometry, triangulation and their intentional float64 solves remain on
+        their existing paths. These attributes are runtime state rather than model config because
+        they change no weights and are recorded on prediction-session provenance by the CLI.
         """
-        if self._shared_scene is None or kwargs.get('kpt_chunk'):
-            return super()._forward_window(views_norm, *args, **kwargs)
-        if 'f' not in self._shared_scene:
-            self._shared_scene['f'] = self.scene_encoder(views_norm)
-        kwargs.pop('kpt_chunk', None)
-        kwargs.pop('scene_features', None)
-        return super()._forward_window(views_norm, *args, **kwargs,
-                                       scene_features=self._shared_scene['f'])
+        if precision not in SCENE_PRECISIONS:
+            raise ValueError(f'precision must be one of {SCENE_PRECISIONS}, got {precision!r}')
+        self.scene_precision = precision
+        self.camera_batch = bool(camera_batch)
+
+    def encode_scene(self, views_norm):
+        """Encode a window, optionally batching cameras and autocasting only this call.
+
+        ``SceneRepresentation.forward`` is intentionally left untouched: its operations after
+        the encoder are batch-agnostic, so camera inputs can be concatenated on the batch axis and
+        the returned ``[1, C*B, N, D]`` tensor reshaped back to ``[C, B, N, D]``. Single-camera
+        windows use the original list unchanged, making that case an exact no-op.
+        """
+        batched = self.camera_batch and len(views_norm) > 1
+        if batched:
+            ref_shape = views_norm[0].shape[1:]
+            if not all(view.shape[1:] == ref_shape for view in views_norm):
+                shapes = [tuple(view.shape[1:]) for view in views_norm]
+                raise ValueError(
+                    'camera batching requires every camera to have the same (T,C,H,W) shape; '
+                    f'got {shapes}. Use --no-camera-batch while the upstream resize is fixed.')
+            n_cams = len(views_norm)
+            batch_size = views_norm[0].shape[0]
+            views = [torch.cat(views_norm, dim=0)]
+        else:
+            views = views_norm
+
+        if self.scene_precision == 'fp32':
+            features = self.scene_encoder(views)
+        else:
+            dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}[self.scene_precision]
+            with torch.autocast(views[0].device.type, dtype=dtype):
+                features = self.scene_encoder(views)
+            # The decoder and all geometry must see the historical FP32 boundary.
+            features = features.float()
+
+        if batched:
+            features = features[0].reshape(n_cams, batch_size, *features.shape[2:])
+        return features
+
+    def _forward_window(self, views_norm, *args, **kwargs):
+        """Route every scene encode through ``encode_scene``.
+
+        Inside ``share_scene`` the first call computes ``scene_features`` and later calls reuse it;
+        only the encode is shareable because decoding derives geometry from the prior-changed
+        query. Keypoint chunking retains the upstream decode loop while sharing one encode.
+        """
+        if self._shared_scene is not None and not kwargs.get('kpt_chunk'):
+            if 'f' not in self._shared_scene:
+                self._shared_scene['f'] = self.encode_scene(views_norm)
+            kwargs.pop('kpt_chunk', None)
+            kwargs.pop('scene_features', None)
+            return super()._forward_window(views_norm, *args, **kwargs,
+                                           scene_features=self._shared_scene['f'])
+        if kwargs.get('scene_features') is None:
+            kwargs['scene_features'] = self.encode_scene(views_norm)
+        return super()._forward_window(views_norm, *args, **kwargs)
 
     def _decode_from_scene(self, scene_features, views_norm, coords, *args, **kwargs):
         """Hand the query encoder the keypoint slice belonging to THIS chunk. Ids must not ride

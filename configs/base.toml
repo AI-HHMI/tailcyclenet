@@ -24,6 +24,10 @@ box_prompt_jitter = 0.1     # box centre jitter as a fraction of box side
 box_prompt_scale_jitter = 0.1 # box scale jitter as a fraction of box side
 annot_frac = 0.6            # sampling weight for annotated vs tracked sessions
 mode_3d_frac = 0.7          # fraction of items shown in 3D mode (inert on 2D-only roots)
+# [1, 8] is the pretrained tracker's own camera-count range (0 = every camera; a fixed higher count is out of distribution as well as slow); a one-camera root samples to 1, so this is harmless in 2D.
+cams_to_sample = [ 1, 8,]
+# rate at which a 3D session is shown a SINGLE camera; inert on 2D-only roots; 0 turns the 3D-single-view path off -- with no triangulation a non-query point has nothing to predict.
+prob_2d_only = 0.2
 num_workers = 8
 
 [model]

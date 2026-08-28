@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Finetune a posetail tracker into a pose estimator.
 
-    pixi run python scripts/train.py --config configs/3d.toml [--devices N]
+    pixi run python scripts/train.py --config configs/base.toml [--devices N]
 """
 # E402: the tailcyclenet imports below must follow this file's sys.path.insert.
 # ruff: noqa: E402

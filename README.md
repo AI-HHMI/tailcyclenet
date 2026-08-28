@@ -35,7 +35,7 @@ pixi run lint                                        # ruff
 ```
 tailcyclenet/     library: format, dataset, crop rule, model, inference, metrics, detector
 scripts/          train.py  train_detector.py  infer.py  eval.py  convert_*.py
-configs/          base.toml + 2d.toml + 3d.toml + detector.toml (extends one level deep)
+configs/          base.toml + detector.toml + detector/<root>.toml (every config layers over its family's base)
 configs/datasets/ per-dataset keypoint and skeleton definitions
 docs/             annotation_format.md — the data format spec (human-owned)
 tests/            invariants (crop rule, converters, geometry)
@@ -49,14 +49,12 @@ One estimator trains across every dataset root under `[data].path`; a keypoint e
 what lets roots with different keypoint sets share a model.
 
 ```bash
-# 3D (multiview / single-view)
-pixi run python scripts/train.py --config configs/3d.toml --data <root>
-
-# 2D (single-view)
-pixi run python scripts/train.py --config configs/2d.toml --data <root>
+# 3D (multiview / single-view) or 2D (single-view) -- the camera-count keys in base.toml are
+# harmless on a one-camera root, so one config serves both
+pixi run python scripts/train.py --config configs/base.toml --data <root>
 
 # one node, N gpus: one item per rank, gradients averaged by DDP
-pixi run python scripts/train.py --config configs/3d.toml --data <root> --devices 4
+pixi run python scripts/train.py --config configs/base.toml --data <root> --devices 4
 ```
 
 Facts that are easy to get wrong:

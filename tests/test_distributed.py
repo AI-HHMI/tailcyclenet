@@ -30,7 +30,7 @@ def _module(path, name):
 
 
 def _train_module():
-    return _module(REPO / 'scripts' / 'train.py', 'tcn_train')
+    return _module(REPO / 'tailcyclenet' / 'train.py', 'tcn_train')
 
 
 def _optim_tests():
@@ -123,7 +123,7 @@ def test_train_hands_the_scaled_config_to_both_unfreeze_entry_points():
     """The build, the live unfreeze and the resume replay must all read ONE dict. Checked on the
     source because the alternative -- noticing at iteration 10,000 of a 60,000-iteration job -- is
     the failure this test exists to prevent."""
-    src = (REPO / 'scripts' / 'train.py').read_text()
+    src = (REPO / 'tailcyclenet' / 'train.py').read_text()
     for call in ('build_optimizer(model, fresh, opt_cfg_scaled)',
                  'apply_staged_unfreeze(raw, opt, opt_cfg_scaled',
                  'replay_staged_unfreeze(model, opt, opt_cfg_scaled'):

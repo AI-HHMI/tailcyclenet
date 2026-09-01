@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 def _eval_module():
     """Import scripts/eval.py without running main()."""
-    spec = importlib.util.spec_from_file_location('tcn_eval', REPO / 'scripts' / 'eval.py')
+    spec = importlib.util.spec_from_file_location('tcn_eval', REPO / 'tailcyclenet' / 'eval.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

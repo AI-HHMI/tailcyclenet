@@ -29,8 +29,25 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/AI-HHMI/tailcyclenet"
 
+[project.scripts]
+tailcyclenet = "tailcyclenet.__main__:main"
+
 [tool.setuptools]
-packages = ["tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer"]
+# `tailcyclenet.configs`/`.configs.datasets` map the repo-root `configs/` directory into the
+# wheel under a dotted name (package-dir below) -- configs/ itself does not move, stays
+# human-edited and git-tracked exactly where CLAUDE.md's layout section says it lives.
+packages = [
+    "tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer",
+    "tailcyclenet.configs", "tailcyclenet.configs.datasets",
+]
+
+[tool.setuptools.package-dir]
+"tailcyclenet.configs" = "configs"
+"tailcyclenet.configs.datasets" = "configs/datasets"
+
+[tool.setuptools.package-data]
+"tailcyclenet.configs" = ["*.toml"]
+"tailcyclenet.configs.datasets" = ["*.toml"]
 
 [tool.pixi.system-requirements]
 libc = { family = "glibc", version = "2.34" }

@@ -9,6 +9,7 @@ from __future__ import annotations
 import tomllib
 from contextlib import contextmanager
 from functools import partial
+from importlib.resources import files as _pkg_files
 from pathlib import Path
 
 import torch
@@ -63,12 +64,19 @@ def skip_video_encoder_download():
             setattr(_ed, name, fn)
 
 
-_BASE_CONFIG = Path(__file__).resolve().parent.parent / 'configs' / 'base.toml'
+# Packaged, not repo-relative (`Path(__file__).resolve().parent.parent / 'configs' / ...` broke
+# under a pip install, whose site-packages tree has no `configs/` two levels up): `configs/` is
+# mapped into the wheel as `tailcyclenet.configs` (pyproject.toml `[tool.setuptools.package-dir]`)
+# and read back via importlib.resources, which resolves correctly under both an editable install
+# (reads the real repo-root `configs/` directly) and a built wheel (reads the packaged copy).
+_BASE_CONFIG = _pkg_files('tailcyclenet.configs') / 'base.toml'
+_DETECTOR_CONFIG = _pkg_files('tailcyclenet.configs') / 'detector.toml'
 
 
 def load_config(path, base: Path | None = None) -> dict:
-    """A run config layered over a base file -- the pose default is the repo's
-    `configs/base.toml`; the detector loader passes `configs/detector.toml`.
+    """A run config layered over a base file -- the pose default is the packaged
+    `configs/base.toml`; the detector loader passes `configs/detector.toml` (both via
+    `_BASE_CONFIG`/`_DETECTOR_CONFIG`, never a repo-relative path).
 
     EVERY config layers over its family's base automatically: the `extends` key is deleted and
     RAISES by name, and the overlay IS the whole difference. The merge is per BLOCK, key by

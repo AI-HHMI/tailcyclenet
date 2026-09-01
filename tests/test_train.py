@@ -15,7 +15,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 def _train_module():
     """Import scripts/train.py without running main()."""
-    spec = importlib.util.spec_from_file_location('tcn_train', REPO / 'scripts' / 'train.py')
+    spec = importlib.util.spec_from_file_location('tcn_train', REPO / 'tailcyclenet' / 'train.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -219,7 +219,7 @@ def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overw
     or a warm-start checkpoint is about to overwrite every tensor it produces; a fresh run (with
     neither) still needs the real pretrained weights, since nothing else supplies them.
     """
-    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
     assert 'skip_video_encoder_download' in src
     assert 'will_load_full_checkpoint' in src
     assert "resumed.exists() and not args.no_resume" in src
@@ -241,7 +241,7 @@ def test_checkpoint_path_is_a_resume_only_for_full_training_state():
     assert not full_training_state({})
     assert not full_training_state(None)
 
-    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
     for name in ('full_training_state', 'state_matches_optimizer_kind',
                  'optimizer_layout_matches'):
         assert name in src, f'main() must gate the checkpoint_path resume on {name}'
@@ -292,7 +292,7 @@ def test_known_training_keys_match_the_guard_in_main():
     key yields a silent default (no validation, no `checkpoint_best.pth`) -- an arm reporting its
     own control.
     """
-    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
     assert 'known_training = {' in src, 'the [training] unknown-key guard is gone'
     # every key the guard allows is either read from train_cfg or is a sub-block
     for key in KNOWN_TRAINING - {'optimizer', 'losses', 'out'}:
@@ -304,7 +304,7 @@ def test_val_is_skipped_only_for_a_missing_split_not_a_config_error():
     """`no val/` may be swallowed; a config error inside `PoseDataset` may NOT. The old bare
     except caught both, so a broken session printed one line and then trained with no validation.
     """
-    src = (Path(__file__).parent.parent / 'scripts' / 'train.py').read_text()
+    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
     body = src[src.index('    val_ds = None'):src.index('    nw = args.num_workers')]
     assert 'except' not in body, 'val construction must not be wrapped in a bare except again'
     assert "'val').is_dir()" in body, 'the missing-split case must be TESTED for, not caught'

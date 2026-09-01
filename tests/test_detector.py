@@ -547,7 +547,7 @@ eval_batches = 1
 box_weight = {box_weight}
 """, f'cfg_{box_weight}.toml')
         spec = importlib.util.spec_from_file_location(f'tcn_train_detector_box_weight_{box_weight}',
-                                                      REPO / 'scripts' / 'train_detector.py')
+                                                      REPO / 'tailcyclenet' / 'train_detector.py')
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
@@ -604,7 +604,7 @@ eval_batches = 1
 max_pos_per_gt = 2
 """)
     spec = importlib.util.spec_from_file_location('tcn_train_detector_max_pos_per_gt',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
@@ -2120,7 +2120,7 @@ iou_aware_obj = true
 iou_aware_warmup = 0
 """)
     spec = importlib.util.spec_from_file_location('tcn_train_detector_iou_aware',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
@@ -2511,7 +2511,7 @@ def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
     best = max(history, key=lambda h: h.get('val_r50', h.get('train_r50')))
     assert best['iteration'] == kept
 
-    src = (Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py').read_text()
+    src = (Path(__file__).resolve().parent.parent / 'tailcyclenet' / 'train_detector.py').read_text()
     assert "torch.save(ckpt, run / 'detector.pth')" in src
     assert 'if sel >= best_score:' in src, 'the unconditional overwrite is back'
 
@@ -2899,7 +2899,7 @@ kpt_weight = 1.0
 kpt_score_weight = 1.0
 """)
     spec = importlib.util.spec_from_file_location('tcn_train_detector',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
@@ -3101,7 +3101,7 @@ kpt_score_weight = 1.0
 """, name='train.toml')
 
     spec = importlib.util.spec_from_file_location('tcn_train_detector2',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     train_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(train_mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(train_cfg)])
@@ -3488,7 +3488,7 @@ eval_every = 2
 eval_batches = 1
 """)
     spec = importlib.util.spec_from_file_location('tcn_train_detector_p2',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
@@ -3712,12 +3712,12 @@ eval_every = 2
 eval_batches = 1
 """)
     spec = importlib.util.spec_from_file_location('tcn_train_detector_pretrained',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
     monkeypatch.setattr(mod, 'load_coco_backbone',
-                        lambda model, tier: __import__(
+                        lambda model, tier, weights_dir=None: __import__(
                             'tailcyclenet.detector.pretrained', fromlist=['load_coco_backbone']
                         ).load_coco_backbone(model, tier, weights_dir=WEIGHTS_DIR))
     mod.main()
@@ -3851,7 +3851,7 @@ def test_build_detector_optimizer_adamw_matches_param_count():
 def _load_train_detector_script():
     import importlib.util
     spec = importlib.util.spec_from_file_location('tcn_train_detector_for_optim',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -4114,7 +4114,7 @@ fpn_upsample = "bilinear"
 """)
     import importlib.util
     spec = importlib.util.spec_from_file_location('tcn_train_detector_gap_levers',
-                                                  REPO / 'scripts' / 'train_detector.py')
+                                                  REPO / 'tailcyclenet' / 'train_detector.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])

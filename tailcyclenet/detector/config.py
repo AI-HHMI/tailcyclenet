@@ -108,12 +108,14 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         accepts 'coco' (required to exist NOW); the recommended shipped recipe is TAL + CIoU.
         The remaining keys (iou_aware_obj, box_weight, weight_decay, annot_frac, alpha,
         bottleneck_expansion, p2, optimizer, shared_head, fpn_upsample) each only matter
-        once a config states something else.
+        once a config states something else. The implicit base is `checkpoints._DETECTOR_CONFIG`
+        (one source of truth with the pose side's `_BASE_CONFIG`, both resolved via
+        `importlib.resources` rather than a repo-relative path recomputed here, so a pip install
+        works too), not a path this module computes on its own.
     """
-    from tailcyclenet.checkpoints import load_config
+    from tailcyclenet.checkpoints import _DETECTOR_CONFIG, load_config
 
-    detector_base = Path(__file__).resolve().parents[2] / 'configs' / 'detector.toml'
-    cfg = load_config(Path(path), base=detector_base)
+    cfg = load_config(Path(path), base=_DETECTOR_CONFIG)
     missing = [b for b, _ in BLOCKS if b not in cfg]
     if missing:
         raise SystemExit(f'{path}: missing block(s) {missing}. A detector config needs '

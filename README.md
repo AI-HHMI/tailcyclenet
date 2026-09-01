@@ -13,7 +13,9 @@ contributor must not break.
 
 ## Setup
 
-Dependencies are managed with [pixi](https://pixi.sh). `posetail==0.3.5` is pinned from PyPI.
+### From a checkout (contributors)
+
+Dependencies are managed with [pixi](https://pixi.sh). `posetail==0.4.1` is pinned from PyPI.
 
 ```bash
 pixi install
@@ -24,9 +26,55 @@ pixi run lint                                        # ruff
 
 - The `LD_LIBRARY_PATH` prepend in `pyproject.toml` is load-bearing — the env ships a newer
   `libstdc++` than some hosts, and without it `import scipy.optimize` dies naming only `CXXABI`.
-- posetail >= 0.3.5 ships every behaviour this repo once monkeypatched (per-frame camera offsets,
+- posetail >= 0.4.1 ships every behaviour this repo once monkeypatched (per-frame camera offsets,
   `crop_box_for_points`, `scene_features=`/`input_size=` on the tracker forward); there is no patch
   layer anymore.
+
+### From pip (training on your own machine)
+
+`tailcyclenet` is [on PyPI](https://pypi.org/project/tailcyclenet/), but two more things are
+needed before it can train — read both notes, they are not optional extras:
+
+```bash
+# 1. torch, with the CUDA build matching your host -- the plain PyPI wheel is often CPU-only
+#    or the wrong CUDA version. cu128 matches what this repo's own pixi env pins; use whatever
+#    matches your driver.
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# 2. tailcyclenet itself
+pip install tailcyclenet
+
+# 3. aniposelib's PYTORCH branch, not the plain PyPI release posetail's own dependency pulls in.
+#    tailcyclenet.format/crop.py/the detector's cross-view association all construct
+#    aniposelib.cameras.Camera and need the pytorch branch's nn.Module version (GPU
+#    projection/triangulation/Jacobians) for training and inference in EVERY setting -- 2D,
+#    3D single-view, 3D multiview -- not just multiview. This is a live dependency on
+#    lambdaloop/anipose-lib's `pytorch` branch continuing to exist at this URL, not a pinned
+#    release; a known fragility, not an oversight.
+pip install "aniposelib @ git+https://github.com/lambdaloop/anipose-lib.git@pytorch"
+```
+
+Then:
+
+```bash
+tailcyclenet train --data /path/to/your/dataset-root
+```
+
+`configs/base.toml` (2D and 3D alike) ships inside the package, so `--config` is optional and
+defaults to the shipped recipe unmodified; `--data` must already be in the format
+`docs/annotation_format.md` specifies. `tailcyclenet train-detector`, `tailcyclenet infer`, and
+`tailcyclenet eval` are the pip equivalents of the `scripts/*.py` invocations documented below —
+same flags, same defaults, no repo checkout required. `scripts/convert_*.py` (turning a labelling
+tool's own export into that format) stay repo-only; there is no pip-installed onboarding path
+for unconverted data yet.
+
+A COCO-pretrained detector backbone (`[model].pretrained = "coco"`, not the shipped default) is
+fetched once from a tagged Megvii GitHub release and cached at `~/.cache/tailcyclenet/weights/`
+(override with `--weights-dir` or `$TAILCYCLENET_CACHE_DIR`) — pre-populate that directory
+yourself on a host with no internet access.
+
+A CPU-only torch install still imports and runs the test suite / tiny smoke checks, just not
+real training — don't install CUDA torch expecting speed you then don't need for that.
 
 ---
 
@@ -34,8 +82,12 @@ pixi run lint                                        # ruff
 
 ```
 tailcyclenet/     library: format, dataset, crop rule, model, inference, metrics, detector
-scripts/          train.py  train_detector.py  infer.py  eval.py  convert_*.py
-configs/          base.toml + detector.toml + detector/<root>.toml (every config layers over its family's base)
+                  train.py/train_detector.py/eval.py are the CLI bodies (`tailcyclenet <cmd>`)
+scripts/          train.py  train_detector.py  infer.py  eval.py  convert_*.py -- thin
+                  dispatchers into tailcyclenet/ for train/train_detector/infer/eval; the
+                  convert_*.py/combine_roots.py/render*.py family stays repo-only
+configs/          base.toml + detector.toml + detector/<root>.toml (every config layers over its
+                  family's base); shipped inside the pip package too (`tailcyclenet.configs`)
 configs/datasets/ per-dataset keypoint and skeleton definitions
 docs/             annotation_format.md — the data format spec (human-owned)
 tests/            invariants (crop rule, converters, geometry)
@@ -55,6 +107,9 @@ pixi run python scripts/train.py --config configs/base.toml --data <root>
 
 # one node, N gpus: one item per rank, gradients averaged by DDP
 pixi run python scripts/train.py --config configs/base.toml --data <root> --devices 4
+
+# pip install (see Setup): --config is optional, defaults to the packaged base.toml
+tailcyclenet train --data <root> [--devices 4]
 ```
 
 Facts that are easy to get wrong:
@@ -80,6 +135,9 @@ Facts that are easy to get wrong:
 
 ```bash
 pixi run python scripts/train_detector.py --config configs/detector.toml
+
+# pip install: --config is optional, defaults to the packaged detector.toml
+tailcyclenet train-detector --out runs/det-<name>
 ```
 
 The recipe lives in the config, not on the CLI — every default is there with its evidence, and an
@@ -107,6 +165,11 @@ pixi run python scripts/infer.py --run runs/<name> --out pred/ \
     --detector runs/det-<name> --max-animals 4
 
 pixi run python scripts/eval.py pred/ --data <root> --split test --chunk 500
+
+# pip install: `tailcyclenet infer`/`tailcyclenet eval` take identical flags
+tailcyclenet infer --run runs/<name> --data <session-dir> --split test \
+    --detector runs/det-<name> --out pred/
+tailcyclenet eval pred/ --data <root> --split test --chunk 500
 ```
 
 - **`--out` is a prediction session directory** (`session.toml`, `calibration.toml`, `groups.pq`,

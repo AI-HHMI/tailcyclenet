@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _train_module():
-    spec = importlib.util.spec_from_file_location('tcn_train', REPO / 'scripts' / 'train.py')
+    spec = importlib.util.spec_from_file_location('tcn_train', REPO / 'tailcyclenet' / 'train.py')
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

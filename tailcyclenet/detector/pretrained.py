@@ -21,6 +21,8 @@ partial `strict=False` load.
 because this repo unifies all three FPN levels to one output width where Megvii's neck has three
 per-level widths.
 """
+import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -35,7 +37,49 @@ from .yolox import YOLOX_TIERS
 # channel carries which colour as long as weight and input agree.
 BGR_TO_RGB_FOCUS_PERM = [i for g in range(4) for i in (g * 3 + 2, g * 3 + 1, g * 3 + 0)]
 
-DEFAULT_WEIGHTS_DIR = Path(__file__).resolve().parents[2] / 'scratch' / 'weights'
+# NOT scratch/weights (repo-relative -- doesn't exist under a pip install, and site-packages is
+# typically unwritable even in a checkout). A per-user cache, overridable for HPC/air-gapped
+# nodes via $TAILCYCLENET_CACHE_DIR or `weights_dir=`/`--weights-dir`.
+_DEFAULT_CACHE_DIR = Path(os.environ.get('TAILCYCLENET_CACHE_DIR',
+                                         Path.home() / '.cache' / 'tailcyclenet')) / 'weights'
+
+# Megvii's own tagged 0.1.1rc0 GitHub release assets -- a versioned URL (unlike aniposelib's
+# branch HEAD), named yolox_<tier>.pth for exactly the tier names YOLOX_TIERS already uses.
+_COCO_RELEASE = 'https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0'
+
+
+def resolve_coco_weights(tier: str, cache_dir: Path | None = None) -> Path:
+    """A local, cached Megvii COCO YOLOX checkpoint for `tier`, downloading once if absent.
+
+    Checked first: `cache_dir` (or $TAILCYCLENET_CACHE_DIR/weights, or ~/.cache/tailcyclenet/
+    weights) already has `yolox_<tier>.pth` -- an admin can pre-populate this once on an
+    air-gapped/no-internet compute node and every later run is untouched, byte-identical to the
+    explicit `weights_dir=` contract `load_coco_backbone` has always had. Otherwise, download it
+    from Megvii's own tagged 0.1.1rc0 GitHub release (the exact release this module's docstring
+    already names) into a `.part` file, then atomic-rename -- so a killed job never leaves a
+    truncated checkpoint that silently loads. Uses `urlopen(timeout=30)`, not `urlretrieve`
+    (which has no timeout and can hang indefinitely on a routable-but-filtered host -- the
+    common HPC shape, unlike a DNS failure, which fails fast on its own).
+    """
+    cache = Path(cache_dir) if cache_dir is not None else _DEFAULT_CACHE_DIR
+    cache.mkdir(parents=True, exist_ok=True)
+    p = cache / f'yolox_{tier}.pth'
+    if p.exists():
+        return p
+    import urllib.request
+    url = f'{_COCO_RELEASE}/yolox_{tier}.pth'
+    tmp = p.with_suffix('.part')
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp, open(tmp, 'wb') as f:
+            shutil.copyfileobj(resp, f)
+    except (OSError, TimeoutError) as e:
+        tmp.unlink(missing_ok=True)
+        raise FileNotFoundError(
+            f'{p}: no cached Megvii COCO checkpoint, and fetching {url} failed ({e}). On a host '
+            f'with no internet access, pre-populate {p} yourself (copy it from a host that has '
+            f'one, or pass weights_dir= / --weights-dir explicitly).') from e
+    tmp.rename(p)
+    return p
 
 
 def _remap_backbone_key(k):
@@ -61,6 +105,10 @@ def load_coco_backbone(model, tier, weights_dir=None):
     bottleneck_expansion=1.0)`) -- this function only corrects SCALE and CHANNEL ORDER, never
     SHAPE, and raises rather than accepting a partial load if the shape is wrong.
 
+    An explicit `weights_dir` means "only ever read from here" -- byte-identical to the contract
+    this function has always had, raising if the checkpoint is not already there. Only the
+    default (`weights_dir=None`) path auto-fetches, via `resolve_coco_weights`.
+
     Returns `(n_loaded, n_total)` backbone conv tensors (GroupNorm affine is never touched -- it
     stays at its fresh `nn.GroupNorm` init, weight 1 / bias 0, which is deliberate: conv weights
     trained under BatchNorm statistics landing in a GroupNorm net is exactly why the backbone
@@ -82,12 +130,14 @@ def load_coco_backbone(model, tier, weights_dir=None):
             f'COCO backbone, got {got!r}. At 0.5 every bottleneck conv is half Megvii\'s width and '
             'a strict=False load would silently take only 19 of 35 backbone tensors -- build the '
             "model with bottleneck_expansion=1.0 first.")
-    w = Path(weights_dir) if weights_dir is not None else DEFAULT_WEIGHTS_DIR
-    p = w / f'yolox_{tier}.pth'
-    if not p.exists():
-        raise FileNotFoundError(
-            f'{p}: no cached Megvii COCO checkpoint. Fetch it and cache it at this path (see '
-            'scratch/check_coco_transfer.py for the ones already cached), or pass weights_dir=.')
+    if weights_dir is not None:
+        p = Path(weights_dir) / f'yolox_{tier}.pth'
+        if not p.exists():
+            raise FileNotFoundError(
+                f'{p}: no cached Megvii COCO checkpoint at the given weights_dir. Fetch it and '
+                'cache it at this path, or omit weights_dir to auto-fetch it.')
+    else:
+        p = resolve_coco_weights(tier)
     ck = torch.load(p, map_location='cpu', weights_only=False)
     src = ck['model'] if 'model' in ck else ck
     remapped = {}

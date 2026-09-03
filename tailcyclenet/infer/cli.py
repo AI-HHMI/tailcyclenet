@@ -295,6 +295,11 @@ def build_parser() -> argparse.ArgumentParser:
                          'by the 3D --track backstop (always on) and 2D --duplicate-suppress '
                          '(opt-in). Measured default 5 on 3dpop Sequence 59 (report 53); not yet '
                          'swept on a second root.')
+    ap.add_argument('--duplicate-birth-radius', type=float, default=None,
+                    help='3D --track only. Radius for the birth refusal against a shielded '
+                         'duplicate memory; None (default) follows --duplicate-radius. Widening '
+                         'only this radius trades one frame of coverage for closing the '
+                         'retire-rebirth cycle a noisy frame can otherwise reopen (report 53).')
     ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
                     help='INSTANCE-LEVEL NMS on the seated rows: drop the lower-scored of two rows '
                          'whose keypoint-containment overlap exceeds FRAC. NOT IoU. QUANTISED by K '

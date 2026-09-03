@@ -167,7 +167,7 @@ class CrossViewTracker:
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
                  assoc_mode='joint', claim_residual_gate=False, velocity=False,
                  view_arbitration=False, duplicate_radius=DUPLICATE_RADIUS,
-                 duplicate_persist=5):
+                 duplicate_persist=5, duplicate_birth_radius=None):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -186,9 +186,10 @@ class CrossViewTracker:
                 view_arbitration -- lever 4: discount a camera whose detections are crowded.
                 duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
                     scale-free default (measured band, report 53).
-                duplicate_persist -- consecutive in-band frames before a seated duplicate pair
-                    is retired; 5 measured on 3dpop Sequence 59, where the seated duplicate's
-                    in-band runs were 5-35+ frames and every genuine contact stayed under 4.
+                duplicate_persist -- consecutive in-band frames (5-35+ measured, contact <=4)
+                    before a seated duplicate pair is retired; 5 is the measured default.
+                duplicate_birth_radius -- birth-refusal-only radius; None follows
+                    `duplicate_radius`, wider trades birth coverage to close a refire cycle.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}, plus
         'velocity' -- a (3,) tensor -- under lever 3 only. 'point' and 'age' keep their meaning
@@ -214,6 +215,8 @@ class CrossViewTracker:
         if duplicate_radius < 0:
             raise ValueError('duplicate_radius must be non-negative')
         self.duplicate_radius = float(duplicate_radius)
+        self.duplicate_birth_radius = float(duplicate_radius if duplicate_birth_radius is None
+                                            else duplicate_birth_radius)
         self.duplicate_persist = int(duplicate_persist)
         self._residuals = {}
         self._dup_contact = {}
@@ -498,12 +501,14 @@ class CrossViewTracker:
             if len(claimed) < 1:
                 continue
             seated = {'point': t['point'], 'boxes': claimed}
-            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_radius, min_shared=1):
+            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_birth_radius,
+                                     min_shared=1):
                 return True
         for anchor in self._dup_anchor.values():
             if len(anchor['boxes']) < 1:
                 continue
-            if _groups_are_duplicate(cgroup, anchor, group, self.duplicate_radius, min_shared=1):
+            if _groups_are_duplicate(cgroup, anchor, group, self.duplicate_birth_radius,
+                                     min_shared=1):
                 return True
         return False
 

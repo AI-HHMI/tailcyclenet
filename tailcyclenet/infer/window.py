@@ -261,19 +261,59 @@ def _capture_overlap_agreement(stats, a, frames, f0, pred, p):
     `carried` context, with zero extra forward passes.  Opt-in
     (`stats['capture_overlap_agreement']`) since the comparison is cheap but the accumulated
     list is not needed on a normal run.
+
+    BOTH VALUES are recorded, not only their distance (plan 7.0): the seam rule always keeps the
+    LATER window's estimate, and asking whether that is the better choice (plan 7.1) requires
+    scoring each against the labels separately, which a distance cannot support.  `pos` is the
+    frame's position WITHIN the overlap region, counted from the later window's own start -- 0 is
+    that window's anchor frame, where `carried` was read, so disagreement as a function of `pos`
+    reads out prior influence directly on unlabelled footage (plan 7.3, the echo coefficient).
+
+    A census is accumulated beside the rows because several plan-7 ideas can die on population
+    size alone, and that is the cheapest possible refutation: `pairs_seen` counts (row, seam)
+    pairs actually compared, `pairs_no_prev` those skipped because the earlier window wrote
+    nothing finite for that row, and `pairs_no_shared` those where the two estimates share no
+    finite keypoint.  The last two are a SELECTION BIAS toward easy rows -- the hook only ever
+    sees a seam where the earlier window already succeeded -- so they are counted rather than
+    silently dropped.
     """
+    census = stats.setdefault('overlap_census', {'pairs_seen': 0, 'pairs_no_prev': 0,
+                                                'pairs_no_shared': 0})
     prev = pred[a, frames - f0]
     had_prev = np.isfinite(prev).all(-1).any(-1)
+    census['pairs_no_prev'] += int((~had_prev).sum())
     if not had_prev.any():
         return
     shared = np.isfinite(p[had_prev]).all(-1) & np.isfinite(prev[had_prev]).all(-1)
-    if not shared.any():
-        return
     d = np.linalg.norm(p[had_prev] - prev[had_prev], axis=-1)
     rows = stats.setdefault('overlap_agreement', [])
-    for t, dist in zip(frames[had_prev], np.where(shared, d, np.nan).mean(-1)):
-        if np.isfinite(dist):
-            rows.append((int(a), int(t), float(dist)))
+    where = np.flatnonzero(had_prev)
+    for row, t, dist, n_sh in zip(where, frames[had_prev],
+                                  np.where(shared, d, np.nan).mean(-1), shared.sum(-1)):
+        if not np.isfinite(dist):
+            census['pairs_no_shared'] += 1
+            continue
+        census['pairs_seen'] += 1
+        rows.append({'animal': int(a), 'frame': int(t), 'pos': int(row),
+                     'dist': float(dist), 'n_shared': int(n_sh),
+                     'prev': prev[row].copy(), 'new': p[row].copy()})
+
+
+def _census_block_boundary(stats, f_read, f_own):
+    """Count the seam a block boundary makes uncomparable, so the census cannot overstate itself.
+
+    `_capture_overlap_agreement` is BLIND HERE, and silence would look exactly like clean
+    coverage. A block emits only `[f0, f_own)`; the frames in `[f_own, f_read)` were predicted by
+    this block's last window and are re-predicted from scratch by the NEXT block's first window,
+    so that seam's two estimates never coexist in one array and no comparison is possible at all.
+    Plan 7.0 asks for this number by name -- a census that reported only what it managed to see
+    would understate how much of the overlap population is structurally invisible.
+    """
+    c = stats.setdefault('overlap_census', {'pairs_seen': 0, 'pairs_no_prev': 0,
+                                            'pairs_no_shared': 0})
+    if f_read > f_own:
+        c['block_boundary_seams'] = c.get('block_boundary_seams', 0) + 1
+        c['block_boundary_frames'] = c.get('block_boundary_frames', 0) + int(f_read - f_own)
 
 
 def merge_blocks(blocks):
@@ -824,6 +864,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 stats['decode_hits'], stats['decode_misses'] = store.hits, store.misses
             memory.check_peak(f'the window loop ({session.session_id}/{gid})')
             keep = f_own - f0
+            if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
+                _census_block_boundary(stats, f_read, f_own)
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
                    'pred2d': pred2d[:, :keep], 'conf2d': conf2d[:, :keep],
                    'box_agree': box_agree[:, :keep],

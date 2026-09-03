@@ -312,10 +312,50 @@ def test_capture_overlap_agreement_records_the_discarded_seam_prediction(multiwi
     merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats))
     rows = stats.get('overlap_agreement', [])
     assert rows, 'a multi-window run with overlap > 0 must record at least one seam comparison'
-    for a, t, dist in rows:
-        assert isinstance(a, int) and isinstance(t, int)
-        assert dist >= 0.0 and np.isfinite(dist)
-        assert 0 <= t < 16, 'a recorded frame must be a real source frame of this clip'
+    for r in rows:
+        assert isinstance(r['animal'], int) and isinstance(r['frame'], int)
+        assert r['dist'] >= 0.0 and np.isfinite(r['dist'])
+        assert 0 <= r['frame'] < 16, 'a recorded frame must be a real source frame of this clip'
+        # BOTH values, not just their distance (plan 7.0): 7.1 has to score each against the
+        # labels separately, which a distance cannot support.
+        assert r['prev'].shape == r['new'].shape and r['prev'].ndim == 2
+        assert not np.array_equal(r['prev'], r['new']) or r['dist'] == 0.0
+        # `pos` is the frame's index within the later window's own frame list -- 0 is that
+        # window's anchor frame, which is what makes the echo profile (plan 7.3) readable.
+        assert 0 <= r['pos'] < cfg.overlap, f"pos {r['pos']} outside the overlap region"
+        assert 1 <= r['n_shared'], 'a recorded pair must share at least one finite keypoint'
+
+    # The distance must be reproducible from the two recorded values, or they are not the values
+    # the distance was computed from.
+    r = rows[0]
+    shared = np.isfinite(r['prev']).all(-1) & np.isfinite(r['new']).all(-1)
+    d = np.linalg.norm(r['new'] - r['prev'], axis=-1)
+    np.testing.assert_allclose(np.where(shared, d, np.nan)[shared].mean(), r['dist'], rtol=1e-6)
+
+
+def test_overlap_census_counts_what_the_hook_could_not_see(multiwindow_scene):
+    """Several plan-7 ideas can die on population size alone, which is the cheapest possible
+    refutation -- so the census has to be trustworthy about its own blind spots rather than
+    reporting only the pairs it managed to see (plan 7.0).
+
+    Three of them are counted: a row the earlier window left non-finite (`pairs_no_prev`), a pair
+    sharing no finite keypoint (`pairs_no_shared`), and the BLOCK BOUNDARY -- where this block's
+    last window's overlap frames are re-predicted from scratch by the next block's first window,
+    so the two estimates never coexist in one array and no comparison is possible at all. Silence
+    there would look exactly like a clean census.
+    """
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+
+    model, sess, registry, name = multiwindow_scene
+    cfg = _cfg(anchor='carry')
+    stats = {'capture_overlap_agreement': True}
+    merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats))
+    census = stats['overlap_census']
+    for k in ('pairs_seen', 'pairs_no_prev', 'pairs_no_shared'):
+        assert k in census and census[k] >= 0, census
+    assert census['pairs_seen'] == len(stats['overlap_agreement']), \
+        'the census must agree with the rows it claims to have recorded'
+    assert census['pairs_seen'] > 0
 
 
 def test_carry_requires_overlap(scene):

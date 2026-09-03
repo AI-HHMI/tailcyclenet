@@ -605,7 +605,9 @@ class CrossViewTracker:
             loser = min((first, second), key=strength)
             winner = first if loser == second else second
             self.events.append({'frame': self._t, 'slot': loser, 'event': 'retired_duplicate',
-                                'detail': {'winner': winner, 'persisted': int(count)}})
+                                'detail': {'winner': winner, 'persisted': int(count),
+                                           'loser_age': int(self.targets[loser].get('age', 0)),
+                                           'winner_age': int(self.targets[winner].get('age', 0))}})
             self.events.append({'frame': self._t, 'slot': winner, 'event': 'shielded',
                                 'detail': {'loser': loser}})
             out[loser] = np.nan

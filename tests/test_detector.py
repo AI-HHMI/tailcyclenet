@@ -1077,6 +1077,13 @@ def test_identity_events_record_what_the_tracker_did_without_changing_it():
     assert len(shielded) == 1 and shielded[0]['slot'] == retired[0]['detail']['winner'], \
         'the retirement must name its winner and that winner must be the slot shielded'
     assert retired[0]['detail']['persisted'] >= 2, 'the persistence count that fired is the reason'
+    # The two ages are what plan 6.9 needs: an idle-slot policy targets a slot that stopped
+    # getting evidence and then drifted onto another animal, and `age` (frames since the last
+    # evidence) is the only thing that separates that from a slot retired while actively tracked.
+    # Without it the log can only report how long ago a slot was BORN, which is a different
+    # question and answers 6.9's only wrongly.
+    assert retired[0]['detail']['loser_age'] >= 0
+    assert retired[0]['detail']['winner_age'] >= 0
     assert by_event.get('birth_refused'), \
         'the freed slot is offered the same duplicate every later frame and must be refused'
 

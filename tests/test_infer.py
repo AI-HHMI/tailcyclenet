@@ -1803,6 +1803,45 @@ def test_identity_events_reach_the_written_session(cli, monkeypatch, tmp_path):
         json.loads(d)
 
 
+def test_identity_events_are_absent_not_fatal_on_a_2d_run(cli, monkeypatch, tmp_path):
+    """A 2D single-camera run has NO `CrossViewTracker` -- `associate_group` sets
+    `state['tracker'] = None` because the tracker only builds when `track and C > 1` -- so there
+    are no identity events to write, and the run must simply not write the table.
+
+    THIS TEST EXISTS BECAUSE ITS ABSENCE CRASHED A REAL 2D ARM. The event-log wiring tested
+    `'tracker' in state`, which is True on the 2D path with a None VALUE, and every 2D inference
+    died with `AttributeError: 'NoneType' object has no attribute 'events'`. The 3D test passed
+    throughout: it exercised the only path the author was thinking about. C > 1 and C == 1 are
+    different code paths through this line and both need covering.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.format import load_dataset
+    from tailcyclenet.model import build_model
+
+    root = tmp_path / 'ds2d'
+    cf._session_2d(root / 'test' / 's', T=8)
+    registry = Registry.build([load_dataset(root)])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out = tmp_path / 'pred2d'
+    monkeypatch.setattr(sys, 'argv', [
+        'infer.py', '--data', str(root / 'test' / 's'), '--out', str(out),
+        '--run', str(run), '--detector', str(_detector_ckpt(tmp_path, 'ds2d')),
+        '--device', 'cpu', '--split', 'test', '--overlap', '2', '--max-animals', '2',
+        '--anchor', 'none'])
+    cli.main()               # must not raise
+
+    assert (out / 'keypoints.pq').exists(), 'the 2D run itself must still produce a prediction'
+    assert not (out / 'identity_events.pq').exists(), \
+        'a run with no tracker has no identity events; an empty table would imply it had some'
+
+
 def test_overlap_trace_flag_actually_reaches_the_capture_hook(cli, monkeypatch, tmp_path):
     """`--overlap-trace` must arm the hook, not merely write a file.
 

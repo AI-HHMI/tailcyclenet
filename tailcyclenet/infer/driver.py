@@ -319,7 +319,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             if stats is not None:
                 stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
                 stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
-                if 'tracker' in assoc_state:
+                if assoc_state.get('tracker') is not None:
                     stats['identity_events'] = assoc_state['tracker'].events
             cursor = end
         want = range(lo, min(hi, T))

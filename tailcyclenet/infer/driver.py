@@ -605,6 +605,8 @@ def run_dataset(args):
             f0, w0 = cfg.frame_start, 0
             n_frames = n_fin = n_pt = 0
             _t_group, _stats = time.time(), {}
+            if getattr(args, 'overlap_trace', None):
+                _stats['capture_overlap_agreement'] = True
             for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
                                   box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want,
                                   stats=_stats):
@@ -621,6 +623,9 @@ def run_dataset(args):
             print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
             if args.det_trace and det is not None:
                 det_trace_groups[key] = det_stats.get('decode_trace', [])
+            if getattr(args, 'overlap_trace', None):
+                overlap_rows[key] = (_stats.get('overlap_agreement', []),
+                                     _stats.get('overlap_census', {}))
             _wall = time.time() - _t_group
             _dec, _h, _m = (_stats.get('decode_s', 0.0), _stats.get('decode_hits', 0),
                             _stats.get('decode_misses', 0))

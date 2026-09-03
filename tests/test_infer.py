@@ -1741,6 +1741,47 @@ def _videos_run(tmp_path, names):
     return run, registry
 
 
+def test_overlap_trace_flag_actually_reaches_the_capture_hook(cli, monkeypatch, tmp_path):
+    """`--overlap-trace` must arm the hook, not merely write a file.
+
+    THIS TEST EXISTS BECAUSE ITS ABSENCE COST A GPU RUN. A unit test covered the npz writer and a
+    separate one covered the hook, but nothing covered the WIRING between them -- the driver line
+    that sets `stats['capture_overlap_agreement']`. That line was missing, so a real 240-frame
+    probe ran to completion and wrote a well-formed trace containing zero rows and an all-zero
+    census, which reads exactly like a legitimate "no seams here" result rather than like a bug.
+    An all-zero census is therefore asserted against directly: the failure mode is silence, and
+    silence is what a census is supposed to distinguish from absence.
+    """
+    import json
+
+    import conftest as cf
+
+    rig, vids, sdir = _videos_fixture(tmp_path)
+    run, registry = _videos_run(tmp_path, cf.KPTS_3D)
+    pts = np.random.default_rng(0).uniform(-20, 20,
+                                           size=(2, 8, len(cf.KPTS_3D), 3)).astype(np.float32)
+    np.savez(tmp_path / 'boxes.npz', **{'rec/t': pts})
+
+    trace = tmp_path / 'ovl' / 'trace.npz'
+    monkeypatch.setattr(sys, 'argv', [
+        'infer.py', '--data', str(sdir), '--out', str(tmp_path / 'o'),
+        '--run', str(run), '--boxes', str(tmp_path / 'boxes.npz'), '--anchor', 'carry',
+        '--device', 'cpu', '--overlap', '2', '--dataset-name', 'ds',
+        '--overlap-trace', str(trace)])
+    cli.main()
+
+    assert trace.exists(), '--overlap-trace must write its file'
+    z = np.load(trace, allow_pickle=True)
+    census = json.loads(str(z['census']))
+    assert census, 'the census must name the group(s) that ran'
+    seen = sum(c.get('pairs_seen', 0) for c in census.values())
+    assert seen > 0, (
+        f'the hook never fired: census {census}. A multi-window run at --overlap 2 has seams, so '
+        'zero pairs means the flag did not reach `stats`, not that there was nothing to see.')
+    assert len(z['dist']) == seen, 'the rows and the census must describe the same population'
+    assert z['prev'].shape == z['new'].shape and z['prev'].shape[0] == seen
+
+
 def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch, tmp_path):
     """THE ASSERTION THAT `--videos` IS NOT A SECOND INFERENCE PATH: same weights, same crop
     points, same pixels -- reached once through a hand-authored session directory and once through

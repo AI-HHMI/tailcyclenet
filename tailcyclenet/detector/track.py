@@ -209,7 +209,7 @@ class CrossViewTracker:
         self.duplicate_persist = int(duplicate_persist)
         self._residuals = {}
         self._dup_contact = {}
-        self._dup_shield = set()
+        self._dup_anchor = {}
         self._last_claims = {}
         self.vel_blend = 0.5
         self.vel_decay = 0.5
@@ -404,6 +404,7 @@ class CrossViewTracker:
             del self.targets[s]
             self._residuals.pop(s, None)
             self._last_claims.pop(s, None)
+            self._dup_anchor.pop(s, None)
         for s in list(self._last_claims):
             if s not in self.targets:
                 del self._last_claims[s]
@@ -425,18 +426,43 @@ class CrossViewTracker:
         needs (measured 3dpop Sequence 59, report 53).  A target's remembered claim sits on its
         own track, so the fill cannot fabricate agreement with another animal.
         """
-        a = {'point': self.targets[first]['point'],
-             'boxes': {c: torch.as_tensor(out[first, c])
-                       for c in range(out.shape[1]) if np.isfinite(out[first, c]).all()}}
-        b = {'point': self.targets[second]['point'],
-             'boxes': {c: torch.as_tensor(out[second, c])
-                       for c in range(out.shape[1]) if np.isfinite(out[second, c]).all()}}
-        last_a, last_b = self._last_claims.get(first, {}), self._last_claims.get(second, {})
-        for c, box in last_a.items():
-            a['boxes'].setdefault(c, torch.as_tensor(box))
-        for c, box in last_b.items():
-            b['boxes'].setdefault(c, torch.as_tensor(box))
+        a = {'point': self.targets[first]['point'], 'boxes': self._claim_evidence(out, first)}
+        b = {'point': self.targets[second]['point'], 'boxes': self._claim_evidence(out, second)}
         return _groups_are_duplicate(cgroup, a, b, self.duplicate_radius)
+
+    def _claim_evidence(self, out, slot):
+        """One target's duplicate evidence: this frame's claims, filled from its last claims."""
+        claimed = {c: torch.as_tensor(out[slot, c]) for c in range(out.shape[1])
+                   if np.isfinite(out[slot, c]).all()}
+        for c, box in self._last_claims.get(slot, {}).items():
+            claimed.setdefault(c, torch.as_tensor(box))
+        return claimed
+
+    def _refresh_anchors(self, cgroup, out):
+        """Follow each shield's animal, or freeze the anchor while its winner is elsewhere.
+
+        A shield exists to stop the retired duplicate's detection set from re-seating. Keying it
+        to the winner's CURRENT claims made it blind for exactly the frames crowding swapped the
+        winner's Hungarian assignment onto another animal -- the duplicate re-seated in that one
+        frame and the backstop paid a matched-row flip five frames later (report 53, ~3 refires
+        per 160 frames). The anchor is the animal, not the slot: it tracks the winner while the
+        winner stays on it, freezes when the winner departs, and expires after `max_age` frozen
+        frames or when the winner's target dies.
+        """
+        for s in list(self._dup_anchor):
+            if s not in self.targets or not bool(torch.isfinite(self.targets[s]['point']).all()):
+                del self._dup_anchor[s]
+                continue
+            anchor = self._dup_anchor[s]
+            current = {'point': self.targets[s]['point'], 'boxes': self._claim_evidence(out, s)}
+            if len(current['boxes']) >= 2 and _groups_are_duplicate(
+                    cgroup, anchor, current, self.duplicate_radius):
+                self._dup_anchor[s] = {'point': current['point'].clone(),
+                                       'boxes': dict(current['boxes']), 'stale': 0}
+                continue
+            anchor['stale'] += 1
+            if anchor['stale'] > self.max_age:
+                del self._dup_anchor[s]
 
     def _birth_duplicates_target(self, cgroup, group, out):
         """Whether a newborn group re-creates a duplicate the backstop already retired.
@@ -444,25 +470,18 @@ class CrossViewTracker:
         The backstop retires a seated duplicate, but without this its freed slot is re-born from
         the same leftover detection set on the next frame -- retire-and-rebirth every frame was
         what made the duplicate immortal (3dpop Sequence 59, report 53).  This refuses that
-        birth, but ONLY against a shielded survivor: a group is refused when it duplicates a
-        seated target that won a REAL duplicate retirement (``duplicate_persist`` consecutive
-        in-band frames).  A bare per-frame duplicate test is not enough -- a genuine crossing is
-        geometrically a duplicate for a few frames -- so an unshielded seated target never
+        birth, but ONLY against a shield anchor: a group is refused when it duplicates the
+        animal that won a REAL duplicate retirement (``duplicate_persist`` consecutive in-band
+        frames).  A bare per-frame duplicate test is not enough -- a genuine crossing is
+        geometrically a duplicate for a few frames -- so an unanchored seated target never
         blocks a birth.
         """
         if not bool(torch.isfinite(group.get('point', torch.tensor(float('nan')))).all()):
             return False
-        for s, t in self.targets.items():
-            if s not in self._dup_shield or not bool(torch.isfinite(t['point']).all()):
+        for anchor in self._dup_anchor.values():
+            if len(anchor['boxes']) < 2:
                 continue
-            claimed = {c: torch.as_tensor(out[s, c]) for c in range(out.shape[1])
-                       if np.isfinite(out[s, c]).all()}
-            for c, box in self._last_claims.get(s, {}).items():
-                claimed.setdefault(c, torch.as_tensor(box))
-            if len(claimed) < 2:
-                continue
-            seated = {'point': t['point'], 'boxes': claimed}
-            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_radius):
+            if _groups_are_duplicate(cgroup, anchor, group, self.duplicate_radius):
                 return True
         return False
 
@@ -479,14 +498,12 @@ class CrossViewTracker:
         ``duplicate_persist`` (5) is that gate: the counter accumulates only while the pair is
         in-band and resets on any gap.  The output row is cleared together with the target, so
         a retired duplicate cannot still become a false positive in this frame; its slot is
-        available for a real birth on the next frame, and the winner is SHIELDED for its own
-        lifetime so the same leftover set cannot re-seat it (see `_birth_duplicates_target`).
-        A time expiry was measured and removed: on the clip the detector's double-fire pauses
-        for up to ~50 frames, and a 40-frame shield expiry let the duplicate re-seat at the
-        next double-fire return, restarting the retire-and-rebirth cycle every few seconds
-        (report 53).  While the winner lives, any birth near it IS a duplicate (or a crossing
-        transient, bounded by the contact's in-band frames); when the winner's own target dies
-        the shield dies with it and births near the spot are legitimate again.
+        available for a real birth on the next frame, and the winner's ANIMAL is anchored so
+        the same leftover set cannot re-seat it (see `_refresh_anchors` and
+        `_birth_duplicates_target`).  A time-expiring shield was measured and removed: the
+        detector's double-fire pauses for up to ~50 frames, so a 40-frame expiry let the
+        duplicate re-seat at the next return and restarted the retire-and-rebirth cycle
+        (report 53).
         """
         live = sorted(s for s, t in self.targets.items()
                       if bool(torch.isfinite(t['point']).all()))
@@ -497,8 +514,7 @@ class CrossViewTracker:
                     self._dup_contact[key] = self._dup_contact.get(key, 0) + 1
                 elif key in self._dup_contact:
                     del self._dup_contact[key]
-        for s in [s for s in self._dup_shield if s not in self.targets]:
-            self._dup_shield.discard(s)
+        self._refresh_anchors(cgroup, out)
         for key, count in sorted(self._dup_contact.items(), key=lambda kv: (kv[0],)):
             if count < self.duplicate_persist:
                 continue
@@ -520,7 +536,8 @@ class CrossViewTracker:
             claimed_ix[loser] = -1
             del self.targets[loser]
             self._residuals.pop(loser, None)
-            self._dup_shield.add(winner)
+            self._dup_anchor[winner] = {'point': self.targets[winner]['point'].clone(),
+                                        'boxes': self._claim_evidence(out, winner), 'stale': 0}
             for k in [k for k in self._dup_contact if loser in k or winner in k]:
                 del self._dup_contact[k]
 

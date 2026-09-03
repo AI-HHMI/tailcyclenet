@@ -1038,6 +1038,40 @@ def test_freed_slot_does_not_rebirth_the_retired_duplicate():
     assert first_row == second_row, 'the surviving row must keep the animal'
 
 
+def test_shield_survives_the_winner_vacating_for_one_frame():
+    """The shield is anchored to the ANIMAL, not to the winner's current claims.
+
+    Keying the refusal to the winner's this-frame claims made it blind for exactly the frames
+    crowding swapped the winner's assignment off its animal: the duplicate re-seated in that
+    one frame and the backstop paid a matched-row flip five frames later (~3 refires per 160
+    frames, 3dpop Sequence 59, report 53).  Here the winner is dragged away for a single frame
+    (a second animal appears where it sits) and the anchor must freeze rather than follow, so
+    the duplicate set still cannot re-seat.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
+    dup_scores = [torch.ones(2) for _ in scores]
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
+    for _ in range(2):
+        tr.step(cg, duplicate, dup_scores)
+    assert len(tr.targets) == 1 and tr._dup_anchor, 'a retirement must anchor its winner'
+    anchored = dict(tr._dup_anchor)
+    far = torch.tensor([600.0, 0.0, 0.0])
+    far_cam, far_scores = _lever_boxes(cg, [far.numpy()], side=100.0)
+    tr.step(cg, far_cam, far_scores)          # the winner's only work this frame is elsewhere
+    assert tr._dup_anchor.keys() == anchored.keys(), 'the anchor must outlive a one-frame vacate'
+    for _ in range(4):
+        boxes, _, _ = tr.step(cg, duplicate, dup_scores)
+    seated = [t['point'] for t in tr.targets.values()
+              if float(torch.linalg.norm(t['point'] - point)) < 300.0]
+    assert len(seated) == 1, 'the duplicate must not re-seat on the anchored animal'
+    assert int(np.isfinite(boxes).all(-1).any(-1).sum()) == 1
+
+
 def test_age_stickiness_resolves_two_slots_on_one_group():
     """Two targets stranded on one animal (one stale) must stop alternating on near-ties: the
     fresher slot keeps the group, the stale one starves out.  Before the fix the Hungarian

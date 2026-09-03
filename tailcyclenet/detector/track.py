@@ -48,6 +48,23 @@ def _box_side(box):
     return 0.5 * (float(box[2] - box[0]) + float(box[3] - box[1]))
 
 
+# The Hungarian cost below packs age into `affinity * 16 + AGE_STICKY_CAP - age` so a fresher
+# slot wins a near-tie (report 53). That ordering holds only while `AGE_STICKY_CAP - age >= 0`;
+# past it the term can go negative for a genuinely available, high-affinity cell, which the
+# post-hoc `affinity > 0` check then reads as UNAVAILABLE -- a real match loses to nothing
+# (independent review, identity_review_followthrough plan A3). The shipped default `max_age=8`
+# never reaches age 9, so clamping the age USED IN THIS TERM at the cap changes nothing there;
+# it only stops ages above it (an old `max_age=24` reproduction, or any future config raising
+# `max_age`) from inverting the sign. Do not raise the cap without re-deriving `* 16.0` beside it
+# -- they are the same invariant.
+AGE_STICKY_CAP = 9.0
+
+
+def _age_term(age):
+    """The `9 - age` half of the sticky-tie cost, clamped so it can never go negative."""
+    return AGE_STICKY_CAP - min(float(age), AGE_STICKY_CAP)
+
+
 def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_shared=2):
     """Whether two finite cross-view claim sets are the same animal.
 
@@ -624,8 +641,8 @@ class CrossViewTracker:
                 continue
             affinity = np.where(
                 affinity > 0,
-                affinity * 16.0 + 9.0 - np.array([[float(self.targets[s].get('age', 0))
-                                                   for s in slots]]).T,
+                affinity * 16.0 + np.array([[_age_term(self.targets[s].get('age', 0))
+                                             for s in slots]]).T,
                 0.0)
             ri, ci = linear_sum_assignment(-affinity)
             for i, j in zip(ri, ci):
@@ -768,7 +785,8 @@ class CrossViewTracker:
             for k, g in enumerate(groups):
                 aff[i, k] = self._group_affinity(proj, centres, sides, weights, i, g)
         if aff.any():
-            aff = np.where(aff > 0, aff * 16.0 + 9.0 - np.array([[ages[s] for s in slots]]).T, 0.0)
+            aff = np.where(aff > 0,
+                          aff * 16.0 + np.array([[_age_term(ages[s]) for s in slots]]).T, 0.0)
         updated, taken, matched = set(), set(), {}
         if aff.size and aff.any():
             ri, ci = linear_sum_assignment(-aff)

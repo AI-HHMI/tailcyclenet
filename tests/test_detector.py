@@ -1163,6 +1163,33 @@ def test_age_stickiness_resolves_two_slots_on_one_group():
     assert np.isfinite(rows[-1]).all(-1).any(-1).sum() == 1
 
 
+@pytest.mark.parametrize('assoc_mode', ['joint', 'per-camera'])
+def test_age_sticky_term_never_inverts_a_real_match(assoc_mode):
+    """The Hungarian cost packs age into `affinity * 16 + AGE_STICKY_CAP - age`, which stays
+    positive for any positive affinity only through `age <= AGE_STICKY_CAP`. Past it the term
+    can go negative for a genuinely available, high-affinity cell -- the post-hoc `affinity > 0`
+    check then treats a real, well-supported match as UNAVAILABLE and the slot starves instead
+    of matching (independent review; identity_review_followthrough plan A3). Zero at the shipped
+    default (`max_age = 8`, so age never reaches 9) -- this fires only for a reproduction that
+    raises `max_age` past the cap, e.g. the legacy `per-camera max_age=24` path.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    # An 80mm offset against a 200px box side is a real, well-supported match (well inside the
+    # `max_move` gate) but not a perfect one -- affinity comfortably short of 1.0, exactly the
+    # regime the inverted sign discards.
+    per_cam, scores = _lever_boxes(cg, [(point + torch.tensor([80.0, 0.0, 0.0])).numpy()],
+                                   side=200.0)
+    tr = CrossViewTracker(1, max_res_px=30.0, max_age=30, assoc_mode=assoc_mode)
+    tr.targets[0] = {'point': point.clone(), 'age': 24}
+    out, sc, claimed = tr.step(cg, per_cam, scores)
+    assert np.isfinite(out).all(-1).any(), \
+        f'{assoc_mode}: a stale (age 24) slot lost its own high-affinity candidate to nothing'
+    assert tr.targets[0]['age'] == 0, 'a real match must reset age, not leave the slot starving'
+
+
 def test_claim_residual_gate_is_rejected_for_joint_association():
     """The old gate cannot be silently advertised as live in the whole-group path."""
     from tailcyclenet.detector.track import CrossViewTracker
@@ -1200,6 +1227,36 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
     extra = one[len(two)]
     assert list(extra['boxes']) == [2] and torch.isnan(extra['point']).all(), \
         'a single ray has no triangulated point, and inventing a depth would be a lie'
+
+
+def test_min_views_1_target_ages_out_through_the_slots_filter():
+    """A `min_views=1` birth has an all-NaN point BY DESIGN (a single ray has no depth). An
+    independent review claimed the resulting slot never dies, contradicting `_birth`'s own
+    docstring ("it ages out through the `slots` filter in `step`") -- settled here directly
+    rather than by argument (identity_review_followthrough plan C4): an all-NaN-point target is
+    excluded from `slots`, so `step` ages it every frame with no evidence and it must be gone
+    well before `max_age + 2` frames of silence.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    max_age = 5
+    tr = CrossViewTracker(1, max_res_px=30.0, max_age=max_age, min_views=1)
+    box = torch.tensor([[100.0, 100.0, 140.0, 140.0]])
+    group = {'point': torch.full((3,), float('nan')), 'residual': float('inf'), 'members': {0: 0}}
+    out = np.full((1, len(cg), 4), np.nan, np.float32)
+    sc = np.full((1, len(cg)), np.nan, np.float32)
+    claimed_ix = np.full((1, len(cg)), -1, np.int32)
+    boxes_per_cam = [box] + [torch.zeros((0, 4)) for _ in cg[1:]]
+    scores_per_cam = [torch.ones(1)] + [torch.zeros(0) for _ in cg[1:]]
+    tr._birth(0, group, out, sc, claimed_ix, boxes_per_cam, scores_per_cam, lambda c, j: j)
+    assert 0 in tr.targets and torch.isnan(tr.targets[0]['point']).all()
+
+    empty = [torch.zeros((0, 4)) for _ in cg]
+    empty_scores = [s.new_zeros(0) for s in empty]
+    for _ in range(max_age + 2):
+        tr.step(cg, empty, empty_scores)
+    assert not tr.targets, 'a min_views=1 slot with no evidence must age out, not leak forever'
 
 
 def test_link_rows_follows_one_animal():

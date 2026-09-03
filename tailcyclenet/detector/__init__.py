@@ -386,7 +386,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        assoc_mode=assoc_mode,
                                        claim_residual_gate=claim_residual_gate,
                                        velocity=velocity,
-                                       view_arbitration=view_arbitration)
+                                       view_arbitration=view_arbitration,
+                                       duplicate_radius=duplicate_radius,
+                                       duplicate_persist=duplicate_persist)
         state['tracker'] = tracker
     tracker = state['tracker']
 

@@ -282,15 +282,19 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')
     ap.add_argument('--duplicate-suppress', action=argparse.BooleanOptionalAction, default=False,
-                    help='2D identity safety switch: after --duplicate-persist consecutive frames '
-                         'with two rows within --duplicate-radius box sides, blank the lower-scored '
-                         'row instead of risking a permanent identity switch. Default off pending a '
-                         'root-specific sweep; prefer a missing prediction to a switch.')
+                    help='2D identity safety switch (--link-boxes only): after --duplicate-persist '
+                         'consecutive frames with two rows within --duplicate-radius box sides, '
+                         'blank the lower-scored row instead of risking a permanent identity '
+                         'switch. Default off pending a root-specific sweep; prefer a missing '
+                         'prediction to a switch.')
     ap.add_argument('--duplicate-radius', type=float, default=0.75,
-                    help='2D duplicate proximity in box sides; used only with --duplicate-suppress.')
+                    help='duplicate proximity in box sides, shared by the 3D --track backstop '
+                         '(always on there) and 2D --duplicate-suppress (opt-in).')
     ap.add_argument('--duplicate-persist', type=int, default=5,
-                    help='2D duplicate persistence in consecutive frames; used only with '
-                         '--duplicate-suppress.')
+                    help='consecutive in-band frames before a duplicate pair is resolved, shared '
+                         'by the 3D --track backstop (always on) and 2D --duplicate-suppress '
+                         '(opt-in). Measured default 5 on 3dpop Sequence 59 (report 53); not yet '
+                         'swept on a second root.')
     ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
                     help='INSTANCE-LEVEL NMS on the seated rows: drop the lower-scored of two rows '
                          'whose keypoint-containment overlap exceeds FRAC. NOT IoU. QUANTISED by K '

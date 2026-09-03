@@ -48,17 +48,25 @@ def _box_side(box):
     return 0.5 * (float(box[2] - box[0]) + float(box[3] - box[1]))
 
 
-def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS):
+def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_shared=2):
     """Whether two finite cross-view claim sets are the same animal.
 
     The comparison stays in the tracker's one unit system: the distance between the two
     triangulated points is measured after projection and divided by the boxes' own pixel side.
     Requiring the test in every SHARED camera rejects two animals that happen to be close in
-    one view but separate in another; at least two shared cameras must agree.  The two sets are
-    not required to be equal: on the measured clip the duplicate pair spends most frames in
-    unequal claim states (one row 4 cameras, the other 3 -- or one row a decode ghost with no
-    fresh claims at all), and a strict set-equality gate meant the persistence counter only
-    ever saw the rare all-equal frames and never accumulated (report 53).
+    one view but separate in another; at least two shared cameras must agree by default.  The
+    two sets are not required to be equal: on the measured clip the duplicate pair spends most
+    frames in unequal claim states (one row 4 cameras, the other 3 -- or one row a decode ghost
+    with no fresh claims at all), and a strict set-equality gate meant the persistence counter
+    only ever saw the rare all-equal frames and never accumulated (report 53).
+
+    ``min_shared=1`` is a SEPARATE, laxer mode used only for the birth refusal against a
+    shielded anchor (report 53 follow-up): a birth whose leftover group only overlaps the
+    anchor's memory in ONE camera (the double-fire's second box momentarily invisible in every
+    other view) was passing this test unrefused at 2-camera agreement, letting the freed slot
+    re-seat and drift back onto the same animal over subsequent frames -- the observed refire
+    cycle. A false-positive refusal here only costs one birth's coverage; the retirement
+    predicate that can actually MERGE two crossing animals keeps the 2-camera floor.
     """
     p, q = first.get('point'), second.get('point')
     if p is None or q is None or not bool(torch.isfinite(p).all()) \
@@ -66,7 +74,7 @@ def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS):
         return False
     first_cams, second_cams = set(first.get('boxes', {})), set(second.get('boxes', {}))
     shared = sorted(first_cams & second_cams)
-    if len(shared) < 2:
+    if len(shared) < min_shared:
         return False
     proj = project_points_torch([cgroup[c] for c in shared], torch.stack([p, q]).reshape(2, 1, 3))
     gaps, identical = [], True
@@ -475,7 +483,11 @@ class CrossViewTracker:
         animal that won a REAL duplicate retirement (``duplicate_persist`` consecutive in-band
         frames).  A bare per-frame duplicate test is not enough -- a genuine crossing is
         geometrically a duplicate for a few frames -- so an unanchored seated target never
-        blocks a birth.
+        blocks a birth.  The test uses ``min_shared=1``: a traced refire (report 53 follow-up)
+        showed the double-fire's second box sometimes visible in only ONE camera at the moment
+        of rebirth, which slipped through the 2-camera floor unrefused and then drifted back
+        onto the same animal through ordinary tracking.  A false refusal here costs one birth's
+        coverage, not an identity, so the laxer floor is safe only in this direction.
         """
         if not bool(torch.isfinite(group.get('point', torch.tensor(float('nan')))).all()):
             return False
@@ -483,15 +495,15 @@ class CrossViewTracker:
             if s not in self._dup_shield or not bool(torch.isfinite(t['point']).all()):
                 continue
             claimed = self._claim_evidence(out, s)
-            if len(claimed) < 2:
+            if len(claimed) < 1:
                 continue
             seated = {'point': t['point'], 'boxes': claimed}
-            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_radius):
+            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_radius, min_shared=1):
                 return True
         for anchor in self._dup_anchor.values():
-            if len(anchor['boxes']) < 2:
+            if len(anchor['boxes']) < 1:
                 continue
-            if _groups_are_duplicate(cgroup, anchor, group, self.duplicate_radius):
+            if _groups_are_duplicate(cgroup, anchor, group, self.duplicate_radius, min_shared=1):
                 return True
         return False
 

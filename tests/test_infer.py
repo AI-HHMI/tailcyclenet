@@ -365,8 +365,13 @@ def test_capture_overlap_agreement_records_the_discarded_seam_prediction(multiwi
         assert r['prev'].shape == r['new'].shape and r['prev'].ndim == 2
         assert not np.array_equal(r['prev'], r['new']) or r['dist'] == 0.0
         # `pos` is the frame's index within the later window's own frame list -- 0 is that
-        # window's anchor frame, which is what makes the echo profile (plan 7.3) readable.
-        assert 0 <= r['pos'] < cfg.overlap, f"pos {r['pos']} outside the overlap region"
+        # window's anchor frame, which is what makes the echo profile (plan 7.3) readable. It
+        # equals the overlap position in the ordinary case, but is NOT bounded by `cfg.overlap`:
+        # a window following a gap (a `no box` window, or the clip's last, shorter window) can
+        # find a previous finite value further into its own frames. Measured on 3dpop Sequence 59
+        # at overlap 4, most rows sit at pos 0..3 and a small tail sits at 4..7. Asserting the
+        # tighter bound would encode a coincidence of this fixture as an invariant.
+        assert 0 <= r['pos'] < cfg.n_frames, f"pos {r['pos']} outside the window"
         assert 1 <= r['n_shared'], 'a recorded pair must share at least one finite keypoint'
 
     # The distance must be reproducible from the two recorded values, or they are not the values

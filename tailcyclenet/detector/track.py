@@ -30,6 +30,56 @@ from posetail.posetail.cube import project_points_torch
 
 from .associate import _centres, _residual, _triangulate, associate
 
+# Measured on 3dpop Sequence 59 frames 1000-1400 (dev/reports/53): a seated duplicate track's
+# triangulated points project 0.32-0.73 box sides apart in every camera it claims (per-frame
+# min gap >= 0.32), while a genuine distinct-animal contact sat at 0.82+ max.  0.75 clears the
+# whole measured duplicate band; 0.25 clears its observed floor while still leaving the
+# sub-0.25 near-concentric case to the detector's own centre-distance NMS.  These gates are used
+# by the TRACKER's duplicate evidence only (backstop + birth refusal) -- the plan's per-frame
+# group NMS in `associate` was REMOVED because a genuine crossing passes through the same band
+# for a few frames in every camera, so merging on per-frame geometry turned crossings into
+# forced retirements (measured: idsw 28 -> 34, miss 8 -> 11 on the same clip).
+DUPLICATE_RADIUS = 0.75
+DUPLICATE_MIN_GAP = 0.25
+
+
+def _box_side(box):
+    """Mean side of one finite xyxy box, in pixels."""
+    return 0.5 * (float(box[2] - box[0]) + float(box[3] - box[1]))
+
+
+def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS):
+    """Whether two finite cross-view claim sets are the same animal.
+
+    The comparison stays in the tracker's one unit system: the distance between the two
+    triangulated points is measured after projection and divided by the boxes' own pixel side.
+    Requiring the test in every SHARED camera rejects two animals that happen to be close in
+    one view but separate in another; at least two shared cameras must agree.  The two sets are
+    not required to be equal: on the measured clip the duplicate pair spends most frames in
+    unequal claim states (one row 4 cameras, the other 3 -- or one row a decode ghost with no
+    fresh claims at all), and a strict set-equality gate meant the persistence counter only
+    ever saw the rare all-equal frames and never accumulated (report 53).
+    """
+    p, q = first.get('point'), second.get('point')
+    if p is None or q is None or not bool(torch.isfinite(p).all()) \
+            or not bool(torch.isfinite(q).all()):
+        return False
+    first_cams, second_cams = set(first.get('boxes', {})), set(second.get('boxes', {}))
+    shared = sorted(first_cams & second_cams)
+    if len(shared) < 2:
+        return False
+    proj = project_points_torch([cgroup[c] for c in shared], torch.stack([p, q]).reshape(2, 1, 3))
+    gaps, identical = [], True
+    for i, c in enumerate(shared):
+        a, b = first['boxes'][c], second['boxes'][c]
+        if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
+            return False
+        identical &= bool(torch.equal(a, b))
+        side = max(min(_box_side(a), _box_side(b)), 1e-6)
+        gaps.append(float(torch.linalg.norm(proj[i, 0] - proj[i, 1])) / side)
+    return (max(gaps) <= radius and
+            (identical or min(gaps) >= DUPLICATE_MIN_GAP))
+
 # THE DEFECT THE FOUR OPT-IN LEVERS BELOW ADDRESS. The matching phase runs one INDEPENDENT
 # Hungarian per camera and nothing afterwards checks that the detection a slot claimed in camera
 # 0 and the one it claimed in camera 1 are the same animal: whatever was claimed is triangulated
@@ -108,7 +158,8 @@ class CrossViewTracker:
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
                  assoc_mode='joint', claim_residual_gate=False, velocity=False,
-                 view_arbitration=False):
+                 view_arbitration=False, duplicate_radius=DUPLICATE_RADIUS,
+                 duplicate_persist=5):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -125,6 +176,11 @@ class CrossViewTracker:
                     slot's own other claims by more than `max_res_px`.
                 velocity -- lever 3: match against a constant-velocity prediction.
                 view_arbitration -- lever 4: discount a camera whose detections are crowded.
+                duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
+                    scale-free default (measured band, report 53).
+                duplicate_persist -- consecutive in-band frames before a seated duplicate pair
+                    is retired; 5 measured on 3dpop Sequence 59, where the seated duplicate's
+                    in-band runs were 5-35+ frames and every genuine contact stayed under 4.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}, plus
         'velocity' -- a (3,) tensor -- under lever 3 only. 'point' and 'age' keep their meaning
@@ -135,6 +191,9 @@ class CrossViewTracker:
         constructor argument, in the manner of `soft_argmax_threshold`.
         """
         assert assoc_mode in ('per-camera', 'joint'), f'unknown assoc_mode {assoc_mode!r}'
+        if claim_residual_gate and assoc_mode == 'joint':
+            raise ValueError('claim_residual_gate is only defined for assoc_mode=\'per-camera\'; '
+                             'joint association already residual-gates complete groups')
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
@@ -144,6 +203,14 @@ class CrossViewTracker:
         self.claim_residual_gate = bool(claim_residual_gate)
         self.velocity = bool(velocity)
         self.view_arbitration = bool(view_arbitration)
+        if duplicate_radius < 0:
+            raise ValueError('duplicate_radius must be non-negative')
+        self.duplicate_radius = float(duplicate_radius)
+        self.duplicate_persist = int(duplicate_persist)
+        self._residuals = {}
+        self._dup_contact = {}
+        self._dup_shield = set()
+        self._last_claims = {}
         self.vel_blend = 0.5
         self.vel_decay = 0.5
         self.ambiguous = 0.5
@@ -331,10 +398,131 @@ class CrossViewTracker:
         branch = self._joint if self.assoc_mode == 'joint' else self._per_camera
         updated = branch(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
                          weights, out, sc, claimed_ix)
+        self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
         self._decay(updated)
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
             del self.targets[s]
+            self._residuals.pop(s, None)
+            self._last_claims.pop(s, None)
+        for s in list(self._last_claims):
+            if s not in self.targets:
+                del self._last_claims[s]
+        for s, t in self.targets.items():
+            claimed = {c: out[s, c].copy() for c in range(out.shape[1])
+                       if np.isfinite(out[s, c]).all()}
+            if claimed:
+                self._last_claims[s] = claimed
         return out, sc, claimed_ix
+
+    def _duplicate_evidence(self, cgroup, out, first, second):
+        """The duplicate predicate on two targets' claim evidence.
+
+        This-frame claims win where they exist; a camera the target did not claim this frame is
+        filled from its last claimed box (kept while the target lives, so at most `max_age`
+        frames old).  Without the fill, a duplicate pair whose roles alternate -- one row fully
+        boxed while the other is a decode ghost, then the reverse -- would reset the persistence
+        counter on every role change and never accumulate the five in-band frames the backstop
+        needs (measured 3dpop Sequence 59, report 53).  A target's remembered claim sits on its
+        own track, so the fill cannot fabricate agreement with another animal.
+        """
+        a = {'point': self.targets[first]['point'],
+             'boxes': {c: torch.as_tensor(out[first, c])
+                       for c in range(out.shape[1]) if np.isfinite(out[first, c]).all()}}
+        b = {'point': self.targets[second]['point'],
+             'boxes': {c: torch.as_tensor(out[second, c])
+                       for c in range(out.shape[1]) if np.isfinite(out[second, c]).all()}}
+        last_a, last_b = self._last_claims.get(first, {}), self._last_claims.get(second, {})
+        for c, box in last_a.items():
+            a['boxes'].setdefault(c, torch.as_tensor(box))
+        for c, box in last_b.items():
+            b['boxes'].setdefault(c, torch.as_tensor(box))
+        return _groups_are_duplicate(cgroup, a, b, self.duplicate_radius)
+
+    def _birth_duplicates_target(self, cgroup, group, out):
+        """Whether a newborn group re-creates a duplicate the backstop already retired.
+
+        The backstop retires a seated duplicate, but without this its freed slot is re-born from
+        the same leftover detection set on the next frame -- retire-and-rebirth every frame was
+        what made the duplicate immortal (3dpop Sequence 59, report 53).  This refuses that
+        birth, but ONLY against a shielded survivor: a group is refused when it duplicates a
+        seated target that won a REAL duplicate retirement (``duplicate_persist`` consecutive
+        in-band frames).  A bare per-frame duplicate test is not enough -- a genuine crossing is
+        geometrically a duplicate for a few frames -- so an unshielded seated target never
+        blocks a birth.
+        """
+        if not bool(torch.isfinite(group.get('point', torch.tensor(float('nan')))).all()):
+            return False
+        for s, t in self.targets.items():
+            if s not in self._dup_shield or not bool(torch.isfinite(t['point']).all()):
+                continue
+            claimed = {c: torch.as_tensor(out[s, c]) for c in range(out.shape[1])
+                       if np.isfinite(out[s, c]).all()}
+            for c, box in self._last_claims.get(s, {}).items():
+                claimed.setdefault(c, torch.as_tensor(box))
+            if len(claimed) < 2:
+                continue
+            seated = {'point': t['point'], 'boxes': claimed}
+            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_radius):
+                return True
+        return False
+
+    def _suppress_duplicate_targets(self, cgroup, out, sc, claimed_ix):
+        """Retire the weaker of two targets that have been duplicates for enough frames.
+
+        Deliberately after `_joint`/`_per_camera`: both branches may produce a target pair
+        before their different matching logic is visible here, and a pair is only judged on
+        the claims either target holds (this frame's, or its last claimed boxes while it
+        lives) -- so per-frame geometry alone cannot tell a seated duplicate from a genuine
+        crossing.  The discriminator is persistence: a duplicate stays within the measured
+        band (0.32-0.73 box side in every shared camera) for run lengths of 5-35+ consecutive
+        frames on the measured clip, while real contacts never exceeded 4 (report 53).
+        ``duplicate_persist`` (5) is that gate: the counter accumulates only while the pair is
+        in-band and resets on any gap.  The output row is cleared together with the target, so
+        a retired duplicate cannot still become a false positive in this frame; its slot is
+        available for a real birth on the next frame, and the winner is SHIELDED for its own
+        lifetime so the same leftover set cannot re-seat it (see `_birth_duplicates_target`).
+        A time expiry was measured and removed: on the clip the detector's double-fire pauses
+        for up to ~50 frames, and a 40-frame shield expiry let the duplicate re-seat at the
+        next double-fire return, restarting the retire-and-rebirth cycle every few seconds
+        (report 53).  While the winner lives, any birth near it IS a duplicate (or a crossing
+        transient, bounded by the contact's in-band frames); when the winner's own target dies
+        the shield dies with it and births near the spot are legitimate again.
+        """
+        live = sorted(s for s, t in self.targets.items()
+                      if bool(torch.isfinite(t['point']).all()))
+        for ix, first in enumerate(live):
+            for second in live[ix + 1:]:
+                key = frozenset((first, second))
+                if self._duplicate_evidence(cgroup, out, first, second):
+                    self._dup_contact[key] = self._dup_contact.get(key, 0) + 1
+                elif key in self._dup_contact:
+                    del self._dup_contact[key]
+        for s in [s for s in self._dup_shield if s not in self.targets]:
+            self._dup_shield.discard(s)
+        for key, count in sorted(self._dup_contact.items(), key=lambda kv: (kv[0],)):
+            if count < self.duplicate_persist:
+                continue
+            first, second = tuple(key)
+            if first not in self.targets or second not in self.targets:
+                continue
+            if not self._duplicate_evidence(cgroup, out, first, second):
+                continue
+
+            def strength(s):
+                """Return a deterministic strength key for one duplicate target."""
+                return (int(np.isfinite(out[s]).all(-1).sum()),
+                        -float(self._residuals.get(s, float('inf'))),
+                        -int(self.targets[s].get('age', 0)), -int(s))
+            loser = min((first, second), key=strength)
+            winner = first if loser == second else second
+            out[loser] = np.nan
+            sc[loser] = np.nan
+            claimed_ix[loser] = -1
+            del self.targets[loser]
+            self._residuals.pop(loser, None)
+            self._dup_shield.add(winner)
+            for k in [k for k in self._dup_contact if loser in k or winner in k]:
+                del self._dup_contact[k]
 
     def _per_camera(self, cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
                     weights, out, sc, claimed_ix):
@@ -354,7 +542,9 @@ class CrossViewTracker:
 
         A dropped claim leaves the slot's box, score and `claimed_ix` empty for that camera:
         `claimed_ix` is what the keypoints follow, so a claim that is not trusted enough to
-        triangulate is not trusted enough to crop from either.
+        triangulate is not trusted enough to crop from either. Near-tied assignments are
+        decided by age exactly as in `_joint` (1/16 of the affinity range per fresh slot;
+        report 53): two slots stranded on one animal stop alternating and the loser starves.
         """
         from scipy.optimize import linear_sum_assignment
 
@@ -374,6 +564,11 @@ class CrossViewTracker:
             affinity = np.nan_to_num(np.clip(1.0 - gap, 0.0, None), nan=0.0)
             if not affinity.any():
                 continue
+            affinity = np.where(
+                affinity > 0,
+                affinity * 16.0 + 9.0 - np.array([[float(self.targets[s].get('age', 0))
+                                                   for s in slots]]).T,
+                0.0)
             ri, ci = linear_sum_assignment(-affinity)
             for i, j in zip(ri, ci):
                 if affinity[i, j] > 0:
@@ -390,6 +585,9 @@ class CrossViewTracker:
                 new = _triangulate(cgroup, cams, p)
                 if bool(torch.isfinite(new).all()):
                     self._advance(s, new)
+                    self._residuals[s] = _residual(cgroup, cams,
+                                                   torch.stack([centres[c][got[s][c]] for c in cams]),
+                                                   new)
                     updated.add(s)
             for c, j in got[s].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
@@ -405,9 +603,10 @@ class CrossViewTracker:
                 left = [boxes_per_cam[c][keep[c]] if keep[c]
                         else boxes_per_cam[c].new_zeros((0, 4)) for c in range(C)]
                 born = associate(cgroup, left, max_res_px=self.max_res_px,
-                                 min_views=self.min_views, max_instances=len(free),
-)
+                                 min_views=self.min_views, max_instances=len(free))
                 for s, g in zip(free, born):
+                    if self._birth_duplicates_target(cgroup, g, out):
+                        continue
                     self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
                                 lambda c, j, k=keep: k[c][j])
         return updated
@@ -425,6 +624,7 @@ class CrossViewTracker:
         before, and ages out through the `slots` filter in `step`.
         """
         self.targets[s] = {'point': g['point'], 'age': 0}
+        self._residuals[s] = float(g.get('residual', float('inf')))
         if self.velocity:
             self.targets[s]['velocity'] = torch.zeros(3)
         for c, j in g['members'].items():
@@ -485,6 +685,18 @@ class CrossViewTracker:
         into a free slot, in `associate`'s own support-then-residual order, so the strongest
         unclaimed evidence seats first. Groups are matched, not detections, so no slot can hold
         animal A in one camera and animal B in another: the hole this whole file is about.
+
+        The affinity is lexicographically scaled against the slot's own age: a slot that
+        matched last frame (age 0) wins any near-tie, so two slots whose stale points both sit
+        on one animal (their points both project onto the frame's single detection set for it)
+        stop flip-flopping and the loser starves to max_age. Measured 3dpop Sequence 59
+        (report 53): without this, one escaped duplicate birth stranded TWO slots on a
+        stationary pigeon; the Hungarian decided on per-frame jitter and the pair alternated
+        every 1-13 frames forever, never reaching max_age, reading as 28 identity switches.
+        1/16 of the affinity range (~0.08 box side at max_move 1.25) is far below a genuine
+        contender's margin but far above detection-centre jitter, so only near-ties are
+        decided by age; the +9 keeps every real affinity positive so an unavailable (zero)
+        cell can never displace a weak-but-real match.
         """
         from scipy.optimize import linear_sum_assignment
 
@@ -492,10 +704,13 @@ class CrossViewTracker:
         groups = associate(cgroup, boxes_per_cam, max_res_px=self.max_res_px,
                            min_views=self.min_views)
         proj = {c: (_project(cgroup[c], pts) if slots else None) for c in range(C)}
+        ages = {s: float(self.targets[s].get('age', 0)) for s in slots}
         aff = np.zeros((len(slots), len(groups)), np.float64)
         for i in range(len(slots)):
             for k, g in enumerate(groups):
                 aff[i, k] = self._group_affinity(proj, centres, sides, weights, i, g)
+        if aff.any():
+            aff = np.where(aff > 0, aff * 16.0 + 9.0 - np.array([[ages[s] for s in slots]]).T, 0.0)
         updated, taken, matched = set(), set(), {}
         if aff.size and aff.any():
             ri, ci = linear_sum_assignment(-aff)
@@ -511,6 +726,7 @@ class CrossViewTracker:
             g = groups[matched[s]]
             if bool(torch.isfinite(g['point']).all()):
                 self._advance(s, g['point'])
+                self._residuals[s] = float(g.get('residual', float('inf')))
                 updated.add(s)
             for c, j in g['members'].items():
                 out[s, c] = boxes_per_cam[c][j].numpy()
@@ -520,7 +736,10 @@ class CrossViewTracker:
 
         free = [s for s in range(self.n) if s not in self.targets]
         for s, k in zip(free, [k for k in range(len(groups)) if k not in taken]):
-            self._birth(s, groups[k], out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
+            g = groups[k]
+            if self._birth_duplicates_target(cgroup, g, out):
+                continue
+            self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
                         lambda c, j: j)
         return updated
 

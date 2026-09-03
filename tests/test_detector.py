@@ -984,6 +984,93 @@ def test_collate_pads_uneven_animal_counts():
     assert torch.isnan(boxes[0, 2:]).all()
 
 
+def test_tracker_retires_the_weaker_duplicate_target():
+    """The post-branch invariant catches duplicates born by occupied-slot drift too.
+
+    Two targets with identical claim sets on one animal: after ``duplicate_persist`` consecutive
+    in-band frames the backstop retires the weaker so the clip keeps ONE row on the animal.
+    (The plan's per-frame group NMS in `associate` was removed -- a genuine crossing passes
+    through the same measured band for a few frames in every camera, so per-frame merging
+    turned crossings into retirements; the duplicate evidence lives in the tracker and is
+    gated on persistence.)
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    per_cam = [torch.cat([b, b.clone()]) for b in per_cam]
+    scores = [torch.ones(2) for _ in scores]
+    tr = CrossViewTracker(2, assoc_mode='per-camera', max_res_px=30.0, duplicate_persist=3)
+    tr.targets[0] = {'point': point.clone(), 'age': 0}
+    tr.targets[1] = {'point': point.clone(), 'age': 0}
+    boxes = None
+    for _ in range(3):
+        boxes, _, claimed = tr.step(cg, per_cam, scores)
+    assert len(tr.targets) == 1
+    assert np.isfinite(boxes).all(-1).any(-1).sum() == 1
+    assert (claimed >= 0).any() and (claimed[1] == -1).all()
+
+
+def test_freed_slot_does_not_rebirth_the_retired_duplicate():
+    """The backstop retires a duplicate, but its freed slot must not be re-born from the same
+    leftover detection set next frame -- retire-and-rebirth every frame was what made the
+    duplicate immortal on 3dpop Sequence 59 (report 53).  Once the winner is SHIELDED by a real
+    retirement, a birth whose group duplicates it is refused.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
+    dup_scores = [torch.ones(2) for _ in scores]
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
+    boxes = None
+    for _ in range(2):                       # both sets seated each frame; backstop fires on 2
+        boxes, _, _ = tr.step(cg, duplicate, dup_scores)
+    assert len(tr.targets) == 1
+    first_row = int(np.isfinite(boxes).all(-1).any(-1).argmax())
+    for _ in range(4):                        # freed slot must NOT rebirth the duplicate
+        boxes2, _, _ = tr.step(cg, duplicate, dup_scores)
+    assert len(tr.targets) == 1, 'the retired duplicate must stay retired'
+    second_row = int(np.isfinite(boxes2).all(-1).any(-1).argmax())
+    assert first_row == second_row, 'the surviving row must keep the animal'
+
+
+def test_age_stickiness_resolves_two_slots_on_one_group():
+    """Two targets stranded on one animal (one stale) must stop alternating on near-ties: the
+    fresher slot keeps the group, the stale one starves out.  Before the fix the Hungarian
+    decided such ties on per-frame jitter and the pair flip-flopped forever, never reaching
+    max_age (3dpop Sequence 59, report 53).
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    tr = CrossViewTracker(2, max_res_px=30.0, max_age=4)
+    # Seat both targets on the same animal, one stale (age 2) and one fresh (age 0).
+    tr.targets[0] = {'point': point.clone(), 'age': 0}
+    tr.targets[1] = {'point': point.clone(), 'age': 2}
+    rows = []
+    for _ in range(8):
+        boxes, _, _ = tr.step(cg, per_cam, scores)
+        rows.append(boxes)
+    assert all(np.isfinite(boxes).all(-1).any(-1).sum() == 1 for boxes in rows), \
+        'two slots must never both claim one group'
+    assert len(tr.targets) == 1, 'the stale duplicate must starve out'
+    assert np.isfinite(rows[-1]).all(-1).any(-1).sum() == 1
+
+
+def test_claim_residual_gate_is_rejected_for_joint_association():
+    """The old gate cannot be silently advertised as live in the whole-group path."""
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    with pytest.raises(ValueError, match='assoc_mode'):
+        CrossViewTracker(1, assoc_mode='joint', claim_residual_gate=True)
+
+
 def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
     """`min_views = 2` is the ALGORITHM, not a threshold: every group starts from a cross-camera
     pair, so the floor never fires. `min_views = 1` emits each leftover box as a single-view

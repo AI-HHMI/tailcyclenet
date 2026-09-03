@@ -1719,3 +1719,167 @@ def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, caps
         cli.main()
     err = capsys.readouterr().err
     assert expect in err, f'wanted {expect!r}, got: {err}'
+
+
+# The four cross-view association levers: CLI -> driver -> `associate_group` -> `CrossViewTracker`.
+#
+# `track.py` itself is tested in tests/test_detector.py; what is defended here is only the THREAD,
+# because every one of these is inert unless the value actually arrives, and a dropped keyword
+# argument reads exactly like a lever that did not help.
+
+
+def _assoc_kwargs_for(sess, monkeypatch, extra_argv):
+    """The kwargs `associate_group` was called with, for a command line parsed by the REAL parser.
+
+    Inputs: a session fixture, monkeypatch, and the argv tail under test.
+    Outputs: the captured kwargs dict.
+    Side effects: patches `detect_raw`/`associate_group` on `tailcyclenet.detector` for the test.
+    """
+    import tailcyclenet.detector as detmod
+    from tailcyclenet.infer import driver
+    from tailcyclenet.infer.cli import build_parser
+
+    args = build_parser().parse_args(['--run', 'r', '--out', 'o', *extra_argv])
+    driver.check_frame_range(args)
+    seen = {}
+
+    def fake_detect_raw(det, wh, session, gid, top_k, **kw):
+        fr = np.asarray(kw['frames'])
+        C, D = len(session.rig), max(1, top_k)
+        return (np.full((D, len(fr), C, 4), np.nan, np.float32),
+                np.full((D, len(fr), C), np.nan, np.float32), None)
+
+    def spy_associate_group(raw, session, gid, n, **kw):
+        seen.update(kw)
+        return raw[0][:n], raw[1][:n], None
+
+    monkeypatch.setattr(detmod, 'detect_raw', fake_detect_raw)
+    monkeypatch.setattr(detmod, 'associate_group', spy_associate_group)
+
+    class _Store:
+        def read(self, ci, cam, fr, pool=None, reduce=1):
+            return [None] * len(fr)
+
+    driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
+                           None, 2, 2)(_Store(), 0, 16)
+    assert seen, 'associate_group was never called, so the test proves nothing'
+    return seen
+
+
+def test_the_cross_view_evidence_flags_are_opt_in_and_default_to_todays_behaviour():
+    """The four cross-view levers exist on the parser and every default is the behaviour that was
+    already there, so an unflagged command is byte-identical to the version before they existed.
+
+    Each boolean ships BOTH spellings: `--no-...` is how this parser turns a lever off everywhere
+    else (`--no-track`, `--no-link-boxes`), and a default-off lever still needs its negative
+    spelling so a sweep script can state the value rather than rely on omission meaning off.
+    `--assoc-mode` is closed over its two documented modes -- a typo must be refused, not
+    silently fall through to the per-camera path and be reported as a `joint` arm.
+    """
+    from tailcyclenet.infer.cli import build_parser
+
+    parser = build_parser()
+    assert parser.get_default('assoc_mode') == 'per-camera'
+    assert parser.get_default('claim_residual_gate') is False
+    assert parser.get_default('track_velocity') is False
+    assert parser.get_default('view_arbitration') is False
+
+    options = {option for action in parser._actions for option in action.option_strings}
+    for flag in ('--claim-residual-gate', '--track-velocity', '--view-arbitration'):
+        assert flag in options and flag.replace('--', '--no-', 1) in options, \
+            f'{flag} must ship both spellings'
+    assert '--assoc-mode' in options
+    modes = next(a.choices for a in parser._actions if a.dest == 'assoc_mode')
+    assert list(modes) == ['per-camera', 'joint']
+    with pytest.raises(SystemExit):
+        parser.parse_args(['--run', 'r', '--out', 'o', '--assoc-mode', 'joint-ish'])
+
+
+def test_the_cross_view_evidence_flags_reach_associate_group(tmp_path, monkeypatch):
+    """CLI -> driver -> `associate_group`: all four values arrive, and omitted they arrive as the
+    defaults rather than as nothing at all.
+
+    `--track-velocity` is spelled for the user's benefit (it is a `--track` lever) but the tracker
+    parameter is `velocity`, so the rename is asserted in both directions -- a name that survives
+    only on one side of the call is exactly the silent drop this defends against. The defaults are
+    asserted POSITIVELY: `associate_group` has to be told 'per-camera'/False, because a caller
+    that quietly stops passing them is indistinguishable from a lever that did not help.
+    """
+    _, sess, _, _ = _range_scene(tmp_path)
+
+    default = _assoc_kwargs_for(sess, monkeypatch, [])
+    assert default['assoc_mode'] == 'per-camera'
+    assert default['claim_residual_gate'] is False
+    assert default['velocity'] is False
+    assert default['view_arbitration'] is False
+
+    on = _assoc_kwargs_for(sess, monkeypatch,
+                           ['--assoc-mode', 'joint', '--claim-residual-gate',
+                            '--track-velocity', '--view-arbitration'])
+    assert on['assoc_mode'] == 'joint'
+    assert on['claim_residual_gate'] is True
+    assert on['velocity'] is True, '--track-velocity must arrive as the tracker\'s `velocity`'
+    assert on['view_arbitration'] is True
+
+    off = _assoc_kwargs_for(sess, monkeypatch,
+                            ['--no-claim-residual-gate', '--no-track-velocity',
+                             '--no-view-arbitration'])
+    assert off == {**on, 'assoc_mode': 'per-camera', 'claim_residual_gate': False,
+                   'velocity': False, 'view_arbitration': False}, \
+        'the negative spellings must restore exactly the default association'
+
+
+def test_associate_group_hands_the_four_levers_to_the_tracker_and_ignores_them_in_2d(
+        tmp_path, monkeypatch):
+    """`associate_group` names all four in its `CrossViewTracker(...)` call, and is inert where no
+    tracker is built.
+
+    The construction is spied rather than the built tracker inspected, so this defends the THREAD
+    (which is this change) and not the tracker's own attribute names (which are `track.py`'s).
+    The 2D / single-camera path builds no tracker at all (`track and C > 1`) and is reached by
+    every 2D deployment, which wants none of these: the same call carrying them must run there
+    unchanged rather than raise, which is what makes the options tracker-only.
+    """
+    import conftest as cf
+    import tailcyclenet.detector.track as trackmod
+    from tailcyclenet.detector import associate_group
+
+    seen = {}
+
+    class _SpyTracker:
+        def __init__(self, n_slots, **kw):
+            seen.update(kw)
+
+        def step(self, cams, boxes, scores):
+            S, C = 1, len(boxes)
+            return (np.full((S, C, 4), np.nan, np.float32),
+                    np.full((S, C), np.nan, np.float32),
+                    np.full((S, C), -1, np.int64))
+
+    monkeypatch.setattr(trackmod, 'CrossViewTracker', _SpyTracker)
+
+    cf._session_3d(tmp_path / 'mv' / 'test' / 's', moving=False)
+    sess = load_dataset(tmp_path / 'mv').sessions['test'][0]
+    sess.preload()
+    C = len(sess.rig)
+    assert C > 1, 'the fixture must actually build a tracker'
+    raw = (np.full((1, 2, C, 4), np.nan, np.float32),
+           np.full((1, 2, C), np.nan, np.float32), None)
+    associate_group(raw, sess, 'g000', 1, track=True, assoc_mode='joint',
+                    claim_residual_gate=True, velocity=True, view_arbitration=True)
+    assert seen.get('assoc_mode') == 'joint'
+    assert seen.get('claim_residual_gate') is True
+    assert seen.get('velocity') is True
+    assert seen.get('view_arbitration') is True
+    assert seen.get('max_res_px') == sess.assoc_res_max_px, \
+        'the existing keywords must survive the four new ones'
+
+    cf._session_2d(tmp_path / 'rat' / 'test' / 's')
+    flat = load_dataset(tmp_path / 'rat').sessions['test'][0]
+    flat.preload()
+    raw_2d = (np.full((1, 2, 1, 4), np.nan, np.float32),
+              np.full((1, 2, 1), np.nan, np.float32), None)
+    state_2d = {}
+    associate_group(raw_2d, flat, 'g000', 1, track=True, state=state_2d, assoc_mode='joint',
+                    claim_residual_gate=True, velocity=True, view_arbitration=True)
+    assert state_2d['tracker'] is None, 'the options must be inert where no tracker is built'

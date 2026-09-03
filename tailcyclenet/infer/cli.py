@@ -235,6 +235,50 @@ def build_parser() -> argparse.ArgumentParser:
                          'identity loss for a longer-lived stale anchor that a nearby animal can '
                          'be wrongly matched onto. 24 is the shipped default, UNMEASURED; sweep '
                          'per root.')
+    ap.add_argument('--assoc-mode', default='per-camera', choices=['per-camera', 'joint'],
+                    help='3D multiview, --track only. HOW a slot decides which detection is its '
+                         'animal. `per-camera` (default, and what every number on record was '
+                         'produced under) runs one INDEPENDENT Hungarian per camera against each '
+                         "slot's reprojected 3D point, and never checks that what a slot claimed "
+                         'in camera 0 is the same animal it claimed in camera 1 -- two crossing '
+                         'animals can be settled by two 2D decisions that disagree, and nothing '
+                         'downstream can tell. `joint` instead forms cross-view candidate groups '
+                         'over ALL detections first (the residual-gated `associate`, so '
+                         '--assoc-res-max-px governs it) and then runs a SINGLE Hungarian over '
+                         'slots x groups, so identity is decided on multi-view evidence rather '
+                         'than on two independent 2D ones. Costs a triangulation pass per frame '
+                         'and can withhold a slot whose cameras never agreed. Opt-in and '
+                         'UNMEASURED; sweep per root.')
+    ap.add_argument('--claim-residual-gate', action=argparse.BooleanOptionalAction, default=False,
+                    help='3D multiview, --track only. After per-camera matching, triangulate what '
+                         'each slot actually CLAIMED and drop any individual camera claim whose '
+                         'reprojection residual exceeds --assoc-res-max-px. That threshold is '
+                         'today consulted only when a slot is BIRTHED, and births are 0.041%% of '
+                         'associations, so with every slot occupied -- essentially all of a long '
+                         'clip -- it never runs at all; this is what makes the existing gate live '
+                         'in steady state. Trades coverage for identity: a dropped claim is a '
+                         'missing box, so it can only lower `filled`, and the pixel threshold is '
+                         'a per-rig quantity (sweep it, exactly as --assoc-res-max-px says). '
+                         'Default off, which reproduces current behaviour exactly.')
+    ap.add_argument('--track-velocity', action=argparse.BooleanOptionalAction, default=False,
+                    help='3D multiview, --track only. Match each slot against a CONSTANT-VELOCITY '
+                         'predicted 3D point instead of its last known one. The tracker records a '
+                         'velocity model as measured-not-worth-it, which is why this is an option '
+                         'and not the default -- but that was measured over the whole population, '
+                         'where the centroid alone already settles the association, and motion is '
+                         'the one cue that separates two animals crossing when no appearance cue '
+                         'exists. Costs a stale slot extrapolating AWAY from its animal, so it '
+                         'interacts with --max-age. Default off = match the last known point, '
+                         'byte-identical to today.')
+    ap.add_argument('--view-arbitration', action=argparse.BooleanOptionalAction, default=False,
+                    help='3D multiview, --track only. Down-weight a camera whose OWN detections '
+                         'are mutually crowded: a view whose boxes sit on top of each other says '
+                         'little about which animal is which, so a view that cleanly separates '
+                         'them dominates the match instead. Without it every camera counts '
+                         'equally and one ambiguous view can out-vote two clean ones. It is a '
+                         'weighting, not a rejection -- no camera is dropped, only discounted -- '
+                         'so it moves identity without moving coverage. Default off; the flat '
+                         'weighting is what every number on record used.')
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')

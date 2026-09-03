@@ -203,7 +203,13 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                       min_views=args.min_views, track=args.track,
                                       max_move=args.max_move,
                                       max_age=getattr(args, 'max_age', 24), stats=stats,
-                                      pose_nms=args.pose_nms, state=assoc_state)
+                                      pose_nms=args.pose_nms, state=assoc_state,
+                                      assoc_mode=getattr(args, 'assoc_mode', 'per-camera'),
+                                      claim_residual_gate=getattr(
+                                          args, 'claim_residual_gate', False),
+                                      velocity=getattr(args, 'track_velocity', False),
+                                      view_arbitration=getattr(
+                                          args, 'view_arbitration', False))
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
             if stats is not None:

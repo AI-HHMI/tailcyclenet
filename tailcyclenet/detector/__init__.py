@@ -327,36 +327,38 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.0, max_age=24, stats=None, pose_nms=None,
-                    state=None):
+                    state=None, assoc_mode='per-camera', claim_residual_gate=False,
+                    velocity=False, view_arbitration=False):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
-        raw -- `detect_raw`'s (boxes, scores, kpts); session, gid, max_instances (the row
-            count S).
+        raw -- `detect_raw`'s (boxes, scores, kpts); session, gid, max_instances (row count S).
         track -- 3D multiview default: `CrossViewTracker`, one cross-view target set carried
             across frames; `False` restores the memoryless per-frame `associate`.
-        link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`, so the
-            two levers do not overlap).
+        link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`).
         min_views / max_move -- passed through to the tracker / `associate`.
-        max_age -- passed through to the tracker / `link_rows` as their SHARED patience window:
-            frames without evidence before a slot (`CrossViewTracker`) or row (`link_rows`) is
-            retired. 24 in both, unless overridden.
+        max_age -- the tracker's and `link_rows`' SHARED patience window: frames without
+            evidence before a slot or row is retired. 24 in both, unless overridden.
+        assoc_mode / claim_residual_gate / velocity / view_arbitration -- TRACKER-ONLY cross-view
+            evidence levers, every one default-off and INERT wherever no tracker is built (2D,
+            or `--no-track`), so the defaults reproduce today's behaviour exactly. 'joint'
+            decides identity over cross-view candidate groups instead of one independent
+            Hungarian per camera; the claim gate drops a per-camera claim whose reprojection
+            residual exceeds `max_res_px`, which otherwise fires only at a birth; `velocity`
+            matches a constant-velocity prediction; `view_arbitration` down-weights a camera
+            whose own detections are mutually crowded.
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
         state -- makes a sequence of calls equal to one call over the concatenation (holds the
-            tracker and `link_rows`' `last`/`age`); `None` builds a fresh tracker per call and
-            is byte-identical to the version before the parameter existed.
+            tracker and `link_rows`' `last`/`age`); `None` builds a fresh tracker per call.
     Outputs:
         The same triple re-indexed so row `a` is one animal -- across cameras always, and across
-        frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity
-        there is and is NOT tracked.
+        frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
     Side effects:
-        `pose_nms` runs on the finished assignment and may NaN whole rows in place; `stats`
-        accumulates association counters.
+        `pose_nms` may NaN whole rows in place; `stats` accumulates association counters.
     Notes:
-        Cross-view geometry is built once for a static rig, per frame for a moving one.
-        `claimed` -- the detection index each slot took per camera -- is the only way keypoints
-        follow the same row assignment the boxes did.
+        Cross-view geometry is built once for a static rig, per frame for a moving one; `claimed`
+        -- the detection index each slot took per camera -- keeps keypoints on the boxes' row.
     """
     import numpy as np
     import torch
@@ -379,7 +381,11 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             from .track import CrossViewTracker
             tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
                                        min_views=min_views,
-                                       max_move=max_move, max_age=max_age)
+                                       max_move=max_move, max_age=max_age,
+                                       assoc_mode=assoc_mode,
+                                       claim_residual_gate=claim_residual_gate,
+                                       velocity=velocity,
+                                       view_arbitration=view_arbitration)
         state['tracker'] = tracker
     tracker = state['tracker']
 

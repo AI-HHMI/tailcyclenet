@@ -88,14 +88,19 @@ def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_sh
     return (max(gaps) <= radius and
             (identical or min(gaps) >= DUPLICATE_MIN_GAP))
 
-# THE DEFECT THE FOUR OPT-IN LEVERS BELOW ADDRESS. The matching phase runs one INDEPENDENT
-# Hungarian per camera and nothing afterwards checks that the detection a slot claimed in camera
-# 0 and the one it claimed in camera 1 are the same animal: whatever was claimed is triangulated
-# and accepted if merely finite. `max_res_px` is spent in exactly one place -- the birth branch
-# for unoccupied slots -- so with every slot occupied the residual gate never executes at all
-# (sweeping `--assoc-res-max-px` 15/20/40/50 produced byte-identical output at baseline). A slot
-# can therefore bind animal A in one view to animal B in another, and the only symptom is a 3D
-# point that silently drifts between the two.
+# THE DEFECT THE FOUR OPT-IN LEVERS BELOW ADDRESS, under the legacy `assoc_mode='per-camera'`
+# path specifically. That path runs one INDEPENDENT Hungarian per camera and nothing afterwards
+# checks that the detection a slot claimed in camera 0 and the one it claimed in camera 1 are the
+# same animal: whatever was claimed is triangulated and accepted if merely finite. `max_res_px`
+# is spent in exactly one place there -- the birth branch for unoccupied slots -- so with every
+# slot occupied the residual gate never executes at all under `per-camera`
+# (sweeping `--assoc-res-max-px` 15/20/40/50 produced byte-identical output at baseline, measured
+# on that path). UNDER THE NOW-DEFAULT `joint` MODE THIS IS STALE (independent review, report 53
+# follow-up): `_joint` calls `associate()` over the WHOLE detection pool every frame, so
+# `max_res_px` gates every candidate group in every frame, not only births. Do not read the
+# byte-identical sweep result above as evidence `--assoc-res-max-px` is inert under `joint` --
+# it has not been re-swept there. Under `per-camera`, a slot can still bind animal A in one view
+# to animal B in another, and the only symptom is a 3D point that silently drifts between the two.
 #
 # The measurement that says this matters: on a 5-fish 2-camera clip (846 frames, ONE keypoint per
 # animal, so geometry is the only identity cue) the tracker reads MPJPE 0.291 mm / MOTA 0.962

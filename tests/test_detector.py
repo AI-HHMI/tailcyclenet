@@ -1001,7 +1001,7 @@ def test_tracker_retires_the_weaker_duplicate_target():
     per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
     per_cam = [torch.cat([b, b.clone()]) for b in per_cam]
     scores = [torch.ones(2) for _ in scores]
-    tr = CrossViewTracker(2, assoc_mode='per-camera', max_res_px=30.0, duplicate_persist=3)
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=3)   # shipped default: joint
     tr.targets[0] = {'point': point.clone(), 'age': 0}
     tr.targets[1] = {'point': point.clone(), 'age': 0}
     boxes = None

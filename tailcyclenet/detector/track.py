@@ -209,6 +209,7 @@ class CrossViewTracker:
         self.duplicate_persist = int(duplicate_persist)
         self._residuals = {}
         self._dup_contact = {}
+        self._dup_shield = set()
         self._dup_anchor = {}
         self._last_claims = {}
         self.vel_blend = 0.5
@@ -478,6 +479,15 @@ class CrossViewTracker:
         """
         if not bool(torch.isfinite(group.get('point', torch.tensor(float('nan')))).all()):
             return False
+        for s, t in self.targets.items():
+            if s not in self._dup_shield or not bool(torch.isfinite(t['point']).all()):
+                continue
+            claimed = self._claim_evidence(out, s)
+            if len(claimed) < 2:
+                continue
+            seated = {'point': t['point'], 'boxes': claimed}
+            if _groups_are_duplicate(cgroup, seated, group, self.duplicate_radius):
+                return True
         for anchor in self._dup_anchor.values():
             if len(anchor['boxes']) < 2:
                 continue
@@ -514,6 +524,8 @@ class CrossViewTracker:
                     self._dup_contact[key] = self._dup_contact.get(key, 0) + 1
                 elif key in self._dup_contact:
                     del self._dup_contact[key]
+        for s in [s for s in self._dup_shield if s not in self.targets]:
+            self._dup_shield.discard(s)
         self._refresh_anchors(cgroup, out)
         for key, count in sorted(self._dup_contact.items(), key=lambda kv: (kv[0],)):
             if count < self.duplicate_persist:
@@ -536,6 +548,7 @@ class CrossViewTracker:
             claimed_ix[loser] = -1
             del self.targets[loser]
             self._residuals.pop(loser, None)
+            self._dup_shield.add(winner)
             self._dup_anchor[winner] = {'point': self.targets[winner]['point'].clone(),
                                         'boxes': self._claim_evidence(out, winner), 'stale': 0}
             for k in [k for k in self._dup_contact if loser in k or winner in k]:

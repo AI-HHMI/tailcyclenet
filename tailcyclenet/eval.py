@@ -40,6 +40,13 @@ def chunk_frames(preds, labels, n):
     usable n. Chunks of one clip are more alike than independent clips, so the interval is
     WITHIN-clip uncertainty and optimistic against the between-clip kind.
 
+    Each output chunk also carries `__chunk_of__` (the original group key) and `__t0__` (its
+    start frame) -- metadata only, never printed, ignored by every other reader of a prediction
+    dict. `score()` uses them to visit a group's chunks in TEMPORAL order and thread `mota`'s
+    cross-frame correspondence state across them: the `{key}#{t0}` strings alone cannot give
+    that order, since `t0` is not zero-padded and `'s/g#1000'` sorts before `'s/g#500'`
+    lexically.
+
     The match radius comes from the whole group, not the chunk: chunks scored under different
     radii are not exchangeable, which a bootstrap needs them to be. The labels' time axis is not
     the prediction's -- a `--max-frames` prefix must slice labels by the LABELS' own length, or
@@ -79,6 +86,8 @@ def chunk_frames(preds, labels, n):
                 r = fields['regions']
                 fields['regions'] = r[(r[:, 0] >= t0) & (r[:, 0] < t1)]
             sub['__extent__'] = np.float64(extent)
+            sub['__chunk_of__'] = key
+            sub['__t0__'] = t0
             out_p[f'{key}#{t0}'] = sub
             out_l[f'{key}#{t0}'] = (dataclasses.replace(lab, **fields), sess)
     return out_p, out_l
@@ -110,9 +119,18 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
     same check: `box_agree` is structurally bounded in 2D (the pose is decoded inside its own
     crop), while the detector's keypoints are regressed in the full frame, so `kpt_agree` has no
     ceiling and is the 2D diagnostic.
+
+    Groups are visited in each group's own TEMPORAL order (`__chunk_of__`/`__t0__`, not the
+    lexical `{key}#{t0}` string -- `t0` is unpadded, so `'s/g#1000'` sorts before `'s/g#500'`),
+    so `mota`'s threaded `last` correspondence dict (one per group, in `mota_state`) sees each
+    chunk in the order it happened; unchunked input sorts by key alone, as before.
     """
     rows = []
-    for key, out in sorted(preds.items()):
+    mota_state = {}
+    order = sorted(preds.items(),
+                   key=lambda kv: (kv[1].get('__chunk_of__', kv[0]), kv[1].get('__t0__', 0),
+                                    kv[0]))
+    for key, out in order:
         if key not in labels:
             if not quiet:
                 print(f'{key}: no labels, skipped')
@@ -167,9 +185,10 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             m['kpt_agree_p99'] = float(np.quantile(ka, 0.99)) if ka.size else None
         m.update(_vis_confusion(out, lab, mode, T))
         if S > 1:
+            state = mota_state.setdefault(out.get('__chunk_of__', key), {})
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
                                                extent_override=out.get('__extent__'),
-                                               match_cost=match_cost)
+                                               match_cost=match_cost, last=state)
         rows.append(m)
     return rows
 
@@ -202,11 +221,13 @@ def _vis_confusion(out, lab, mode, T):
             'vis_base': float(y.mean()), 'vis_n': int(y.size)}
 
 
-def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_cost='mean'):
+def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_cost='mean',
+              last=None):
     """(radius, mota dict) for one group; the ignore region is built here, from the labels.
 
     `extent_override` (from `--chunk`) is the whole group's extent, so every chunk shares a
-    radius.
+    radius. `last` (optional) is forwarded to `mota()` unchanged -- `score()`'s own per-group
+    correspondence state, so a switch straddling a `--chunk` seam is counted once.
 
     The match radius is the DIAGONAL of the keypoint bounding box, not a per-axis span: a
     per-axis median ran tighter than the labelling noise and made every instance a miss AND an
@@ -237,7 +258,7 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
         if lab.boxes is not None and m['mode'] == '2d':
             ig_boxes = lab.boxes[:St, :T, 0]
     return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes,
-                        min_kpts_frac=min_kpts_frac, cost=match_cost)
+                        min_kpts_frac=min_kpts_frac, cost=match_cost, last=last)
 
 
 def main():
@@ -393,6 +414,7 @@ def main():
                   f'{r["fp_none_rate"]:.3f})  idsw {r["idsw_rate"]:.4f}  '
                   f'fp_ignored {r["fp_ignored"]:d}  '
                   f'(mota r={m["mota_r"]:.1f}, mpjpe r={m["mpjpe_r"]:.1f} {unit})')
+
 
     if args.vs:
         other, ometa = load_predictions(args.vs)

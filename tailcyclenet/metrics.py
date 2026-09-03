@@ -176,7 +176,7 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
 
 
 def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0,
-         cost='mean') -> dict:
+         cost='mean', last=None) -> dict:
     """MOTA and its three components, with an explicit ignore region.
 
     MOTA = 1 - (misses + fp + idsw) / labelled instances; report the components, since a split
@@ -189,6 +189,14 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
     keypoint has no centroid, and NaN is the answer -- not a warning; `_in_ignore` and the
     duplicate test both check for it explicitly. The duplicate test compares (Sp,T,R) and
     (St,T,R) centroids.
+
+    `last` is the GT-index -> pred-index correspondence dict, in the same in/out shape
+    `link_rows`/`CrossViewTracker` already thread across block calls: pass a dict and it is
+    MUTATED in place so a caller can carry it into the next call over the CONTINUATION of this
+    same sequence (e.g. the next `--chunk` unit of one group) -- a switch straddling that seam is
+    then counted once, not lost to each call's own reset. `None` (the default) is byte-identical
+    to every published number: a fresh dict is used and discarded, exactly as before this
+    parameter existed.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     matches = match_instances(pred, true, max_dist, min_kpts_frac, cost)
@@ -201,7 +209,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
         ignore_boxes = np.asarray(ignore_boxes, float)
 
     misses = fps = switches = gt = ignored = dups = 0
-    last = {}
+    last = {} if last is None else last
     with np.errstate(invalid='ignore'), warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         centroid = np.nanmean(pred, axis=2)

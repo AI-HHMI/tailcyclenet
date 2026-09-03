@@ -284,6 +284,67 @@ def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path
         'the shared radius must be the one the unchunked scoring used'
 
 
+def test_mota_last_state_threads_across_chunk_calls_bit_identical_by_default():
+    """`mota(last=...)` is opt-in plumbing (identity_review_followthrough plan 3.1): with no
+    `last` passed, behaviour is exactly the pre-existing one (a fresh dict per call, discarded).
+    """
+    rng = np.random.default_rng(0)
+    true = rng.normal(size=(3, 20, 5, 2)) * 10
+    pred = true + rng.normal(size=true.shape)
+    plain = mota(pred, true, 8.0)
+    explicit_none = mota(pred, true, 8.0, last=None)
+    assert plain == explicit_none
+    # A caller-owned dict is MUTATED, not just read: the same one reused across two calls carries
+    # correspondence forward -- exactly what `eval.py::score` needs across a `--chunk` seam.
+    state = {}
+    r1 = mota(pred[:, :10], true[:, :10], 8.0, last=state)
+    assert state, 'a correspondence dict must be populated after a call that matched anything'
+    r2 = mota(pred[:, 10:], true[:, 10:], 8.0, last=state)
+    assert isinstance(r1['idsw'], int) and isinstance(r2['idsw'], int)
+
+
+def test_chunk_seam_switch_is_lost_without_threaded_state_and_recovered_with_it():
+    """The exact reproduction from identity_review_followthrough plan 3.1: two animals held
+    still and far apart, with their PREDICTED identity swapped only across the chunk boundary.
+    That is a real, single seam switch -- `idsw = 2` (both correspondences flip at once) scored
+    over the whole 4-frame clip in one `mota()` call. Split into two `--chunk 2` units, each
+    `score()` call used to reset `mota`'s correspondence history, so the switch fell between two
+    calls that never compared notes and both chunks read `idsw = 0` -- an undercount, not a
+    missing feature: it affects every `--chunk`-scored identity number in the repo. `score()`
+    now threads one `last` dict per GROUP (not per chunk) in the chunks' own temporal order, so
+    the second chunk sees the first chunk's final correspondence and the switch is counted once,
+    in the chunk where it is first observed.
+    """
+    from tailcyclenet import format as fmt
+
+    ev = _eval_module()
+    S, T, K = 2, 4, 1
+    lab = fmt.empty_labels(S, T, K, 1, mode3d=False)
+    lab.vis2d[:] = fmt.VISIBLE
+    lab.points2d[0, :, 0, 0, :] = [0.0, 0.0]
+    lab.points2d[1, :, 0, 0, :] = [100.0, 100.0]     # far enough apart that radius=1.0 cannot
+                                                       # confuse them
+
+    true = lab.points2d[..., 0, :].copy()
+    pred = true.copy()
+    pred[:, 2:] = true[::-1, 2:]                      # a real seam switch: rows swap at t=2
+
+    preds = {'s/g0': {'pred': pred, 'mode': np.array('2d')}}
+    labels = {'s/g0': (lab, None)}
+
+    whole = ev.score(preds, labels, mota_dist=1.0, quiet=True)
+    assert whole[0]['mota']['idsw'] == 2, 'the whole-clip reading is the ground truth here'
+
+    cp, cl = ev.chunk_frames(preds, labels, 2)
+    chunked = ev.score(cp, cl, mota_dist=1.0, quiet=True)
+    assert len(chunked) == 2
+    by_t0 = {r['group']: r['mota']['idsw'] for r in chunked}
+    assert by_t0 == {'s/g0#0': 0, 's/g0#2': 2}, \
+        'the switch must be attributed to the chunk it is first observed in, not lost at the seam'
+    assert sum(by_t0.values()) == whole[0]['mota']['idsw'] == 2, \
+        'a chunked idsw total must equal the whole-clip idsw, or the debt this test guards is back'
+
+
 def test_err_percentiles_describe_the_tail_the_mean_hides():
     """p75..p99 come from the same matched vector as `err`, and outlast a flattering mean: every
     localisation failure this repo has found was found in a quantile and reported in one.

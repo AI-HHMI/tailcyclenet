@@ -105,6 +105,53 @@ def _identity_provenance(args):
     }
 
 
+def _write_overlap_trace(path, per_group):
+    """Write the overlap test-retest capture as one npz. Output-neutral, a scratch diagnostic.
+
+    Inputs: path -- destination npz; per_group -- {group key: (rows, census)} as accumulated in
+        `stats` by `window._capture_overlap_agreement`.
+    Outputs: None.
+    Side effects: writes `path`.
+
+    Flat parallel arrays rather than one object array per row, because the consumer is an offline
+    join against labels and `windows.pq` (plan 7.1/7.2/7.5) and a structured npz is what pandas
+    and numpy both read without unpickling. `prev`/`new` are the two estimates of the SAME frame
+    -- the earlier window's discarded one and the later window's kept one -- stacked as
+    `(n, K, R)`; keeping both is the whole point of the capture, since asking which the seam rule
+    SHOULD keep needs each scored against labels separately.
+
+    The census travels with the rows, not in a separate file: a coverage figure separated from
+    the population it describes is how a selection bias gets quoted as a result.
+    """
+    import json
+
+    keys, animal, frame, pos, dist, n_shared, prev, new = [], [], [], [], [], [], [], []
+    for key, (rows, _census) in sorted(per_group.items()):
+        for r in rows:
+            keys.append(key)
+            animal.append(r['animal'])
+            frame.append(r['frame'])
+            pos.append(r['pos'])
+            dist.append(r['dist'])
+            n_shared.append(r['n_shared'])
+            prev.append(r['prev'])
+            new.append(r['new'])
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        group=np.array(keys, dtype=object), animal=np.asarray(animal, np.int32),
+        frame=np.asarray(frame, np.int32), pos=np.asarray(pos, np.int32),
+        dist=np.asarray(dist, np.float32), n_shared=np.asarray(n_shared, np.int32),
+        prev=(np.stack(prev) if prev else np.zeros((0, 0, 0), np.float32)),
+        new=(np.stack(new) if new else np.zeros((0, 0, 0), np.float32)),
+        census=np.array(json.dumps({k: c for k, (_r, c) in sorted(per_group.items())})))
+    total = {k: sum(c.get(k, 0) for _r, c in per_group.values())
+             for k in ('pairs_seen', 'pairs_no_prev', 'pairs_no_shared',
+                       'block_boundary_seams', 'block_boundary_frames')}
+    print(f'wrote overlap trace {path}: {len(dist)} (row, seam) pair(s); census {total}')
+
+
 _DET_BATCH = 16
 
 
@@ -536,6 +583,7 @@ def run_dataset(args):
                             - cfg.frame_start) for g in gids)
     progress = _Progress(_total_frames)
     det_trace_groups = {}
+    overlap_rows = {}
     try:
         for gid in gids:
             key = f'{sess.session_id}/{gid}'
@@ -609,5 +657,7 @@ def run_dataset(args):
         args.det_trace.parent.mkdir(parents=True, exist_ok=True)
         args.det_trace.write_text(json.dumps(det_trace_groups, indent=1) + '\\n')
         print(f'wrote detector trace {args.det_trace}')
+    if getattr(args, 'overlap_trace', None):
+        _write_overlap_trace(args.overlap_trace, overlap_rows)
     print(f'wrote {args.out} ({len(gids)} group(s))')
 

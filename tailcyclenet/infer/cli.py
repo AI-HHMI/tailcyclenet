@@ -154,6 +154,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help='write output-neutral per-frame/camera detector decode-stage counts as '
                          'JSON for coverage attribution (scratch diagnostic, not a prediction '
                          'session file).')
+    ap.add_argument('--overlap-trace', type=Path, default=None,
+                    help='write the OUTPUT-NEUTRAL overlap test-retest capture as an npz: for '
+                         'every seam frame, the earlier window\'s discarded estimate and the '
+                         'later window\'s kept one, their distance, the frame\'s position within '
+                         'the overlap, plus a census of the pairs the hook could NOT see. Costs '
+                         'nothing when unset and changes no prediction either way (scratch '
+                         'diagnostic, not a prediction session file).')
     ap.add_argument('--allow-detector-transfer', action='store_true', default=False,
                     help='permit a detector checkpoint whose recorded [dataset] does not match '
                          'this session\'s own dataset root. A detector is trained per dataset '

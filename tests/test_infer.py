@@ -269,6 +269,50 @@ def test_prefetch_windows_default_matches_the_old_serial_loop(multiwindow_scene)
             assert str(va) == str(vb), k
 
 
+def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
+    """`--overlap-trace` is the plan-7.0 capture's only exit from the process, so what it writes
+    has to be exactly what the hook recorded -- both estimates, not a distance, and the census
+    travelling WITH the rows.
+
+    The census is written into the same file deliberately: a coverage figure separated from the
+    population it describes is how a selection bias ends up quoted as a result. `prev`/`new` stack
+    to `(n, K, R)` so the offline join in 7.1 (score each against labels) and 7.5 (regress against
+    `windows.pq` crop geometry) can read them with numpy alone.
+    """
+    import json
+
+    from tailcyclenet.infer.driver import _write_overlap_trace
+
+    rows = [{'animal': 0, 'frame': 12, 'pos': 0, 'dist': 1.5, 'n_shared': 3,
+             'prev': np.arange(6, dtype=np.float32).reshape(3, 2),
+             'new': np.arange(6, dtype=np.float32).reshape(3, 2) + 1.5},
+            {'animal': 1, 'frame': 13, 'pos': 1, 'dist': 0.25, 'n_shared': 2,
+             'prev': np.zeros((3, 2), np.float32),
+             'new': np.full((3, 2), 0.25, np.float32)}]
+    census = {'pairs_seen': 2, 'pairs_no_prev': 7, 'pairs_no_shared': 1,
+              'block_boundary_seams': 3, 'block_boundary_frames': 12}
+    out = tmp_path / 'sub' / 'ovl.npz'
+    _write_overlap_trace(out, {'s/g000': (rows, census)})
+
+    z = np.load(out, allow_pickle=True)
+    assert list(z['animal']) == [0, 1] and list(z['frame']) == [12, 13]
+    assert list(z['pos']) == [0, 1] and list(z['n_shared']) == [3, 2]
+    np.testing.assert_allclose(z['dist'], [1.5, 0.25])
+    assert z['prev'].shape == (2, 3, 2) and z['new'].shape == (2, 3, 2)
+    np.testing.assert_allclose(z['new'][0] - z['prev'][0], 1.5)
+    # The census must survive the trip, including the counters describing what was NOT seen.
+    got = json.loads(str(z['census']))['s/g000']
+    assert got == census, got
+
+    # An empty capture is a legal outcome (a one-window group has no seam) and must not crash or
+    # write a ragged array -- it must still carry its census, which is the informative part.
+    empty = tmp_path / 'empty.npz'
+    _write_overlap_trace(empty, {'s/g000': ([], {'pairs_seen': 0, 'pairs_no_prev': 4})})
+    ze = np.load(empty, allow_pickle=True)
+    assert ze['dist'].size == 0 and ze['prev'].size == 0
+    assert json.loads(str(ze['census']))['s/g000']['pairs_no_prev'] == 4
+
+
 def test_capture_overlap_agreement_is_off_by_default_and_never_moves_a_prediction(
         multiwindow_scene):
     """The opt-in overlap-agreement diagnostic (report 53 follow-up) must be a pure side channel:

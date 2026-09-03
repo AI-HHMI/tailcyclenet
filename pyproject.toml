@@ -49,12 +49,11 @@ packages = [
 "tailcyclenet.configs" = ["*.toml"]
 "tailcyclenet.configs.datasets" = ["*.toml"]
 
-[tool.pixi.system-requirements]
-libc = { family = "glibc", version = "2.34" }
-
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["linux-64"]
+platforms = [
+    { name = "linux-64-glibc-2-34", platform = "linux-64", glibc = "2.34" },
+]
 
 [tool.pixi.activation.env]
 # The env ships libstdc++.so.6.0.35, the host may ship 6.0.29 with no CXXABI_1.3.15 -- without

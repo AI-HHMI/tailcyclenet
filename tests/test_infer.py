@@ -292,7 +292,7 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     census = {'pairs_seen': 2, 'pairs_no_prev': 7, 'pairs_no_shared': 1,
               'block_boundary_seams': 3, 'block_boundary_frames': 12}
     out = tmp_path / 'sub' / 'ovl.npz'
-    _write_overlap_trace(out, {"s/g000": (rows, census, [(0, 8, 2, 17)])})
+    _write_overlap_trace(out, {"s/g000": (rows, census, [(0, 8, 2, 17)], [(0, 8, -0.5, -0.9, 3)])})
 
     z = np.load(out, allow_pickle=True)
     assert list(z['animal']) == [0, 1] and list(z['frame']) == [12, 13]
@@ -308,11 +308,17 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     # to come out of the same probe rather than needing a second run.
     assert list(z['oob_animal']) == [0] and list(z['oob_frame']) == [8]
     assert list(z['oob_nan']) == [2] and list(z['oob_k']) == [17]
+    # And the model's own per-camera confidence (plan 5.1, B2), which the window loop otherwise
+    # discards -- a DIFFERENT quantity from the refuted geometric cues, and the one thing on that
+    # axis a better model can change.
+    assert list(z['conf_animal']) == [0] and list(z['conf_frame']) == [8]
+    np.testing.assert_allclose(z['conf_mean'], [-0.5])
+    np.testing.assert_allclose(z['conf_min'], [-0.9])
 
     # An empty capture is a legal outcome (a one-window group has no seam) and must not crash or
     # write a ragged array -- it must still carry its census, which is the informative part.
     empty = tmp_path / 'empty.npz'
-    _write_overlap_trace(empty, {'s/g000': ([], {'pairs_seen': 0, 'pairs_no_prev': 4}, [])})
+    _write_overlap_trace(empty, {'s/g000': ([], {'pairs_seen': 0, 'pairs_no_prev': 4}, [], [])})
     ze = np.load(empty, allow_pickle=True)
     assert ze['dist'].size == 0 and ze['prev'].size == 0
     assert json.loads(str(ze['census']))['s/g000']['pairs_no_prev'] == 4

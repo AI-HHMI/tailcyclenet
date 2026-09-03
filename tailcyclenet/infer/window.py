@@ -299,6 +299,40 @@ def _capture_overlap_agreement(stats, a, frames, f0, pred, p):
                      'prev': prev[row].copy(), 'new': p[row].copy()})
 
 
+def _capture_model_confidence(stats, a, frames, out):
+    """Record the model's OWN per-camera confidence, which the window loop otherwise discards.
+
+    Plan 5.1 (B2). `window.py` reads `coords_pred`, `2d_pred`, `vis_pred`, `vis_pred_2d` and
+    `3d_pred_triangulate` and throws the rest away; `conf_pred_2d` is a per-(camera, frame,
+    keypoint) logit the model already computed. It is a different QUANTITY from everything the
+    refuted geometric identity levers spent (`--kpt-affinity`, `--kpt-centre`, `--axis-*`,
+    `--dup-res-px`), all of which derive from output COORDINATES: this is the model's own
+    uncertainty, and it is the one thing on that axis a better model can actually change -- the
+    standing objection to spending a weak cue.
+
+    `conf_pred_2d` is `(C, B, T, K)` logits; `v` takes batch 0 to `(C, T, K)` and `per_cam` is its
+    per-keypoint median, `(C, T)`. Recorded per (animal, frame) as the mean and min over cameras,
+    plus the camera count, so the offline question (is confidence depressed on the
+    duplicate-implicated rows during the known episode, relative to the same rows outside it AND
+    to non-implicated rows in the same frames?) can be asked without keeping a (C, T, K) tensor
+    per window. Opt-in under the same flag as the overlap capture, and read-only.
+    """
+    c2 = out.get('conf_pred_2d')
+    if c2 is None:
+        return
+    v = c2[:, 0].detach().float().cpu().numpy()
+    if v.ndim != 3 or v.shape[1] != len(frames):
+        return
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        per_cam = np.nanmedian(v, axis=-1)
+        mean_t = np.nanmean(per_cam, axis=0)
+        min_t = np.nanmin(per_cam, axis=0)
+    rows = stats.setdefault('model_conf', [])
+    for i, t in enumerate(frames):
+        rows.append((int(a), int(t), float(mean_t[i]), float(min_t[i]), int(v.shape[0])))
+
+
 def _count_prior_oob(stats, a, f0, prior):
     """Count the prior keypoints `prior_out_of_bounds` NaN'd for this (animal, window).
 
@@ -684,6 +718,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if cfg.anchor == 'self':
                 out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                   kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
+        if stats is not None and stats.get('capture_overlap_agreement'):
+            _capture_model_confidence(stats, a, frames, out)
         p = out['coords_pred'][0].detach().cpu().numpy()
         q = None
         if mode == '2d':

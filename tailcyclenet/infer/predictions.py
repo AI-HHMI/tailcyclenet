@@ -20,9 +20,10 @@ import numpy as np
 
 from ..format import DICT_COLS, Session, TableWriter, dump_calibration, sessions_for, write_table
 
-# The tables a prediction writes; `windows.pq` is per (animal, window, camera) diagnostics,
-# deliberately NOT a spec table.
-_TABLES = ('points3d', 'keypoints', 'instances', 'windows')
+# The tables a prediction writes; `windows.pq` is per (animal, window, camera) diagnostics and
+# `identity_events.pq` is the tracker's own record of what it did to identity -- both deliberately
+# NOT spec tables.
+_TABLES = ('points3d', 'keypoints', 'instances', 'windows', 'identity_events')
 
 
 def _sigmoid(x):
@@ -183,6 +184,38 @@ class SessionWriter:
         rows['box_prompt_cams'] = (np.full(len(aw), -1, np.int32) if bp is None
                                    else np.asarray(bp)[aw, ww].astype(np.int32))
         self._w['windows'].write(rows)
+
+    def write_identity_events(self, gid: str, events) -> None:
+        """One group's tracker identity events -> `identity_events.pq`. Non-spec, like `windows`.
+
+        Inputs: gid -- group id; events -- `CrossViewTracker.events`, a list of
+            `{frame, slot, event, detail}`.
+        Outputs: None.
+        Side effects: appends to the `identity_events` writer; a no-op on an empty list.
+
+        `detail` is a small per-event dict whose KEYS DIFFER BY EVENT TYPE (a retirement names
+        its winner, a birth names its cameras), so it is stored as one JSON string column rather
+        than exploded into sparse typed columns that would be null for most rows. The consumer is
+        a diagnostic join, not a query engine, and a schema that changes shape per row is the
+        thing parquet handles worst.
+
+        Written once per group rather than per block: the event count is bounded by identity
+        DECISIONS, not by clip length, so it does not reintroduce the proportionality the block
+        loop exists to avoid. A pathological refire cycle is the one case that could grow it, and
+        that is itself the bug such a log is for.
+        """
+        import json
+
+        if not events:
+            return
+        n = len(events)
+        self._w['identity_events'].write({
+            'group_id': np.array([gid] * n, dtype=object),
+            'frame': np.array([int(e['frame']) for e in events], np.int32),
+            'slot': np.array([int(e['slot']) for e in events], np.int32),
+            'event': np.array([str(e['event']) for e in events], dtype=object),
+            'detail': np.array([json.dumps(e.get('detail', {}), sort_keys=True)
+                                for e in events], dtype=object)})
 
     def close(self):
         """Close every open parquet writer."""

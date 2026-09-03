@@ -1741,6 +1741,58 @@ def _videos_run(tmp_path, names):
     return run, registry
 
 
+def test_identity_events_reach_the_written_session(cli, monkeypatch, tmp_path):
+    """C6's other half: the tracker's event log has to leave the process, or it is only a
+    debugger's convenience and every question still costs a traced re-run.
+
+    END TO END through `cli.main()` with a real detector, because the wiring is the part that
+    breaks -- the same lesson `--overlap-trace` taught an hour earlier, where a unit-tested writer
+    and a unit-tested hook were joined by two lines that never applied and a GPU run produced a
+    well-formed empty artifact. Here the assertion is that `identity_events.pq` exists and holds
+    at least one `born` for the animal the fixture actually tracks; an empty table would mean the
+    tracker's list never reached the writer.
+
+    `detail` is asserted to be JSON-decodable because its keys differ per event type, which is
+    exactly why it is one string column rather than sparse typed ones.
+    """
+    import json
+
+    import pyarrow.parquet as pq
+
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.format import load_dataset
+    from tailcyclenet.model import build_model
+
+    root = tmp_path / 'ds'
+    cf._session_3d(root / 'test' / 's', T=8)
+    registry = Registry.build([load_dataset(root)])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    det = _detector_ckpt(tmp_path, 'ds')
+
+    out = tmp_path / 'pred'
+    monkeypatch.setattr(sys, 'argv', [
+        'infer.py', '--data', str(root / 'test' / 's'), '--out', str(out),
+        '--run', str(run), '--detector', str(det), '--device', 'cpu',
+        '--split', 'test', '--overlap', '2', '--max-animals', '2', '--anchor', 'none'])
+    cli.main()
+
+    path = out / 'identity_events.pq'
+    assert path.exists(), 'a tracked multiview run must write identity_events.pq'
+    t = pq.read_table(path).to_pydict()
+    assert t['event'], 'the table exists but is empty: the events never reached the writer'
+    assert set(t) == {'group_id', 'frame', 'slot', 'event', 'detail'}, sorted(t)
+    assert 'born' in set(t['event']), f"no birth recorded, events were {set(t['event'])}"
+    assert all(f >= 0 for f in t['frame']) and all(s >= 0 for s in t['slot'])
+    for d in t['detail']:
+        json.loads(d)
+
+
 def test_overlap_trace_flag_actually_reaches_the_capture_hook(cli, monkeypatch, tmp_path):
     """`--overlap-trace` must arm the hook, not merely write a file.
 

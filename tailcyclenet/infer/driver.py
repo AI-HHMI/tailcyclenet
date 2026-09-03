@@ -308,6 +308,8 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             if stats is not None:
                 stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
                 stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
+                if 'tracker' in assoc_state:
+                    stats['identity_events'] = assoc_state['tracker'].events
             cursor = end
         want = range(lo, min(hi, T))
         out = tuple(np.stack([buf[t][i] for t in want], 1) if buf[lo][i] is not None else None
@@ -626,6 +628,7 @@ def run_dataset(args):
             if getattr(args, 'overlap_trace', None):
                 overlap_rows[key] = (_stats.get('overlap_agreement', []),
                                      _stats.get('overlap_census', {}))
+            writer.write_identity_events(gid, det_stats.get('identity_events', []))
             _wall = time.time() - _t_group
             _dec, _h, _m = (_stats.get('decode_s', 0.0), _stats.get('decode_hits', 0),
                             _stats.get('decode_misses', 0))

@@ -137,6 +137,15 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
     Per frame the inputs are (Sp,K,R) vs (St,K,R) with (Sp,St,K) pairwise keypoint distances.
     Under `'penalised'` the LABEL's own count is the denominator, so a prediction cannot shrink
     the denominator by declining points -- which is the whole of the 'mean' hazard.
+
+    Admissibility (`c <= max_dist`) is enforced BEFORE the Hungarian solve, not just after: a
+    rectangular `linear_sum_assignment` always returns `min(Sp, St)` pairs regardless of cost,
+    so leaving an inadmissible-but-cheap edge in the matrix lets the solver's SUM-minimisation
+    pick it over a valid, individually-more-expensive edge that was available -- discarding it
+    afterward then reports a miss+fp where a real match existed. `big` is a cost above the SUM
+    of every admissible cost this frame, the standard bound that makes the solver prefer ANY
+    achievable all-admissible matching over one using even a single inadmissible edge, so
+    admissible edges are used whenever a feasible matching can use them, on cost second.
     """
     if cost not in ('mean', 'penalised'):
         raise ValueError(f"match_instances: cost must be 'mean' or 'penalised', got {cost!r}")
@@ -158,10 +167,11 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
             else:
                 c = np.where(n_ok >= need,
                              np.where(ok, d, 0.0).sum(-1) / np.maximum(n_ok, 1), np.nan)
-            big = np.nanmax(c) + 1 if np.isfinite(c).any() else 1.0
-            ri, ci = linear_sum_assignment(np.where(np.isfinite(c), c, big))
+            admissible = np.isfinite(c) & (c <= max_dist)
+            big = float(np.sum(c, where=admissible)) + 1.0 if admissible.any() else 1.0
+            ri, ci = linear_sum_assignment(np.where(admissible, c, big))
             out.append([(int(i), int(j), float(c[i, j])) for i, j in zip(ri, ci)
-                        if np.isfinite(c[i, j]) and c[i, j] <= max_dist])
+                        if admissible[i, j]])
     return out
 
 

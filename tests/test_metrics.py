@@ -25,7 +25,16 @@ def _eval_module():
 
 
 def _naive_match(pred, true, max_dist=np.inf):
-    """The double Python loop `match_instances` replaced. Kept as an independent derivation."""
+    """The double Python loop `match_instances` replaced. Kept as an independent derivation.
+
+    Admissibility (`cost <= max_dist`) is applied to the SOLVER, not just to the output list: a
+    rectangular Hungarian solve always returns `min(Sp, St)` pairs regardless of cost, so an
+    inadmissible-but-cheap edge left in the matrix can be chosen over a valid, individually
+    pricier edge that was available, and filtering afterward then reports a false miss+fp where
+    a real match existed (report 53 follow-up). `big` exceeds the SUM of every admissible cost
+    this frame, the standard bound making the solver prefer any all-admissible matching over one
+    using even a single inadmissible edge.
+    """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     out = []
     for t in range(true.shape[1]):
@@ -35,10 +44,11 @@ def _naive_match(pred, true, max_dist=np.inf):
             for j in range(q.shape[0]):
                 d = _dist(p[i], q[j])
                 cost[i, j] = np.nanmean(d) if np.isfinite(d).any() else np.nan
-        big = np.nanmax(cost) + 1 if np.isfinite(cost).any() else 1.0
-        ri, ci = linear_sum_assignment(np.where(np.isfinite(cost), cost, big))
+        admissible = np.isfinite(cost) & (cost <= max_dist)
+        big = float(np.sum(cost, where=admissible)) + 1.0 if admissible.any() else 1.0
+        ri, ci = linear_sum_assignment(np.where(admissible, cost, big))
         out.append([(int(i), int(j), float(cost[i, j])) for i, j in zip(ri, ci)
-                    if np.isfinite(cost[i, j]) and cost[i, j] <= max_dist])
+                    if admissible[i, j]])
     return out
 
 
@@ -57,6 +67,27 @@ def test_vectorised_matching_equals_the_loop_it_replaced():
         for got, want in zip(match_instances(pred, true, md), _naive_match(pred, true, md)):
             assert [(i, j) for i, j, _ in got] == [(i, j) for i, j, _ in want]
             assert np.allclose([d for *_, d in got], [d for *_, d in want])
+
+
+def test_an_inadmissible_edge_cannot_displace_an_available_admissible_match():
+    """A rectangular Hungarian solve always returns min(Sp, St) pairs regardless of cost, so
+    filtering `cost > max_dist` only AFTER the solve lets an inadmissible-but-cheap edge win the
+    sum-cost optimisation over a valid, individually pricier edge that was available -- turning
+    one real match into a miss AND a false positive (report 53 follow-up, independent review).
+
+    cost matrix [[1, 2], [2, 5]] at max_dist=1.5: (0,0)+(1,1) totals 6 and only (0,0) <= 1.5 --
+    the one available admissible match; (0,1)+(1,0) totals 4 and both entries exceed max_dist.
+    The un-gated solver picks the cheaper-but-wholly-inadmissible pairing and both are then
+    discarded, reporting zero matches where one real match existed.
+    """
+    pred = np.array([[[[0.0]]], [[[3.0]]]])
+    true = np.array([[[[1.0]]], [[[-2.0]]]])
+    d = np.linalg.norm(pred[:, 0, :, 0][:, None] - true[:, 0, :, 0][None, :], axis=-1)
+    assert np.allclose(d, [[1.0, 2.0], [2.0, 5.0]])
+    got = match_instances(pred, true, max_dist=1.5)
+    assert [(i, j) for i, j, _ in got[0]] == [(0, 0)]
+    m = mota(pred, true, max_dist=1.5)
+    assert (m['misses'], m['fp'], m['idsw']) == (1, 1, 0)
 
 
 def test_ignore_boxes_excuse_only_what_they_cover():

@@ -67,6 +67,44 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
     }
 
 
+def _identity_provenance(args):
+    """Every lever that decides which ROW a detection lands in, recorded beside its numbers.
+
+    The sibling of `_box_provenance`, and it exists for the same reason one frame later in the
+    pipeline: detection provenance answers "which boxes", this answers "whose". Without it two
+    runs differing only in `--pose-nms` or `--link-boxes` are distinguishable **only by their
+    directory name**, which is how the two stored 2D suppression arms in `scratch/dupfollow/pred`
+    ended up unmatched -- their `[provenance]` records the detector, the crop and the checkpoint,
+    and says nothing about the identity mechanism whose effect they were built to measure. Eval
+    rule 4 (match the controls) and rule 12 (a same-recipe replicate) both need these keys to be
+    checkable from the artifact rather than assumed.
+
+    Unconditional and always complete, exactly as `_box_provenance` is: the same keys at every
+    value, since conditional membership is what makes a record lie. `tests/test_detector.py`
+    walks `associate_group`'s signature against this dict, so a new identity-affecting parameter
+    must land here too.
+    """
+    return {
+        'track': bool(args.track),
+        'link_boxes': bool(args.link_boxes),
+        'min_views': int(args.min_views),
+        'max_move': float(args.max_move),
+        'max_age': int(getattr(args, 'max_age', 8)),
+        'assoc_mode': str(getattr(args, 'assoc_mode', 'joint')),
+        'pose_nms': (float(args.pose_nms) if getattr(args, 'pose_nms', None) is not None
+                     else 0.0),
+        'claim_residual_gate': bool(getattr(args, 'claim_residual_gate', False)),
+        'track_velocity': bool(getattr(args, 'track_velocity', False)),
+        'view_arbitration': bool(getattr(args, 'view_arbitration', False)),
+        'duplicate_suppress': bool(getattr(args, 'duplicate_suppress', False)),
+        'duplicate_radius': float(getattr(args, 'duplicate_radius', 0.75)),
+        'duplicate_persist': int(getattr(args, 'duplicate_persist', 5)),
+        'duplicate_birth_radius': (
+            float(args.duplicate_birth_radius)
+            if getattr(args, 'duplicate_birth_radius', None) is not None else 0.0),
+    }
+
+
 _DET_BATCH = 16
 
 
@@ -489,7 +527,8 @@ def run_dataset(args):
                                            else cfg.box_source),
                             'vis_thresh': float(cfg.vis_thresh) if cfg.vis_thresh else 0.0,
                             **provenance()}.items(),
-                            *_box_provenance(args, det_tile, det_red, det_boxsrc).items()],
+                            *_box_provenance(args, det_tile, det_red, det_boxsrc).items(),
+                            *_identity_provenance(args).items()],
                            gids)
     sess.preload()
     _total_frames = sum(max(0, min(sess.groups[g].n_frames,

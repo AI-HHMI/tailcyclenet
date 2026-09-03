@@ -2728,6 +2728,56 @@ def test_provenance_records_every_box_affecting_option():
         'the same keys at every value -- conditional membership is what makes a record lie'
 
 
+def test_every_identity_lever_is_recorded_in_the_prediction():
+    """The sibling of the box-provenance guard above, one pipeline stage later: detection
+    provenance answers "which boxes", identity provenance answers "whose".
+
+    This gap was found, not hypothesised: the two stored 2D suppression arms in
+    `scratch/dupfollow/pred/` record their detector, crop, checkpoint and commit and say NOTHING
+    about `pose_nms` or `duplicate_suppress` -- the exact levers they were built to measure -- so
+    the only thing distinguishing a suppression-on run from a suppression-off one is the
+    directory name. Eval rule 4 (match the controls) and rule 12 (a same-recipe replicate) both
+    need these checkable from the artifact. Table-driven against `associate_group`'s own
+    signature, asserted on the VALUE `_identity_provenance` returns.
+    """
+    import argparse
+    import inspect
+
+    from tailcyclenet.detector import associate_group
+    from tailcyclenet.infer.driver import _identity_provenance
+
+    args = argparse.Namespace(track=True, link_boxes=True, min_views=2, max_move=1.25,
+                              max_age=8, assoc_mode='joint', pose_nms=None)
+    prov = _identity_provenance(args)
+
+    # Everything `associate_group` takes that can change which row a detection lands in. The rest
+    # is plumbing: `raw`/`session`/`gid` are the inputs themselves, `max_instances` is already
+    # recorded as `max_animals` by `_box_provenance`, `stats` is a diagnostic sink, and `state` is
+    # the block-boundary carry (recorded nowhere because it is derived, not chosen).
+    plumbing = {'raw', 'session', 'gid', 'max_instances', 'stats', 'state'}
+    params = set(inspect.signature(associate_group).parameters) - plumbing
+    # How each is spelled in the record, where the CLI name differs from the parameter name.
+    alias = {'link': 'link_boxes', 'velocity': 'track_velocity'}
+    missing = [p for p in sorted(params) if alias.get(p, p) not in prov]
+    assert not missing, (
+        f'these change which row a detection lands in and are not recorded in the prediction: '
+        f'{missing}. Two runs differing in one of them would be indistinguishable from their '
+        'output alone, which is exactly how the stored 2D suppression arms became unmatchable.')
+
+    # UNCONDITIONAL, every key, always -- same rule as `_box_provenance`: conditional membership
+    # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
+    args2 = argparse.Namespace(track=False, link_boxes=False, min_views=1, max_move=2.0,
+                               max_age=24, assoc_mode='per-camera', pose_nms=0.6,
+                               claim_residual_gate=True, track_velocity=True,
+                               view_arbitration=True, duplicate_suppress=True,
+                               duplicate_radius=0.9, duplicate_persist=8,
+                               duplicate_birth_radius=1.25)
+    assert set(_identity_provenance(args2)) == set(prov), \
+        'the same keys at every value -- conditional membership is what makes a record lie'
+    assert _identity_provenance(args2)['pose_nms'] == 0.6
+    assert prov['pose_nms'] == 0.0, 'an unset --pose-nms must record as 0.0, never as absent'
+
+
 def test_summarise_exposes_fp_dup_and_fp_none_as_rates():
     """D1: `box_mota`'s own fp_dup/fp_none split (already computed for `mota` above) must survive
     into the per-group summary, not just `fp_ignored`. Rates, matching `mota()`'s own

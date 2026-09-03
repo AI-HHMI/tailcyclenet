@@ -417,6 +417,9 @@ class CrossViewTracker:
             self._residuals.pop(s, None)
             self._last_claims.pop(s, None)
             self._dup_anchor.pop(s, None)
+            self._dup_shield.discard(s)
+            for k in [k for k in self._dup_contact if s in k]:
+                del self._dup_contact[k]
         for s in list(self._last_claims):
             if s not in self.targets:
                 del self._last_claims[s]
@@ -541,10 +544,12 @@ class CrossViewTracker:
                     self._dup_contact[key] = self._dup_contact.get(key, 0) + 1
                 elif key in self._dup_contact:
                     del self._dup_contact[key]
+        for key in [k for k in self._dup_contact if not set(k) <= self.targets.keys()]:
+            del self._dup_contact[key]
         for s in [s for s in self._dup_shield if s not in self.targets]:
             self._dup_shield.discard(s)
         self._refresh_anchors(cgroup, out)
-        for key, count in sorted(self._dup_contact.items(), key=lambda kv: (kv[0],)):
+        for key, count in sorted(self._dup_contact.items(), key=lambda kv: sorted(kv[0])):
             if count < self.duplicate_persist:
                 continue
             first, second = tuple(key)
@@ -565,6 +570,7 @@ class CrossViewTracker:
             claimed_ix[loser] = -1
             del self.targets[loser]
             self._residuals.pop(loser, None)
+            self._dup_shield.discard(loser)
             self._dup_shield.add(winner)
             self._dup_anchor[winner] = {'point': self.targets[winner]['point'].clone(),
                                         'boxes': self._claim_evidence(out, winner), 'stale': 0}

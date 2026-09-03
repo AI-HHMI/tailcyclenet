@@ -1072,6 +1072,72 @@ def test_shield_survives_the_winner_vacating_for_one_frame():
     assert int(np.isfinite(boxes).all(-1).any(-1).sum()) == 1
 
 
+def test_shield_dies_when_the_winners_own_target_dies():
+    """The shield must not outlive the winner it protects (independent review, report 53).
+
+    A winner shielded by a real retirement can later die of ordinary neglect (no claims for
+    `max_age` frames), not just be beaten in a second retirement. Before this fix `_dup_shield`
+    was discarded only inside `_suppress_duplicate_targets`'s own cleanup pass, which runs
+    BEFORE the age-based death loop each frame -- so a winner that aged out inherited a shield
+    entry for one extra frame, exactly long enough for the very next frame's birth (an unrelated
+    animal happening to appear in the same place) to be wrongly refused.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
+    dup_scores = [torch.ones(2) for _ in scores]
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2, max_age=2)
+    for _ in range(2):
+        tr.step(cg, duplicate, dup_scores)
+    assert tr._dup_shield, 'a retirement must shield its winner'
+    empty = [b.new_zeros((0, 4)) for b in per_cam]
+    empty_scores = [s.new_zeros(0) for s in scores]
+    for _ in range(4):                        # starve the winner past max_age: it must die
+        tr.step(cg, empty, empty_scores)
+    assert not tr.targets, 'the winner must have aged out'
+    assert not tr._dup_shield, 'the shield must die with the target it protects'
+    boxes, _, _ = tr.step(cg, per_cam, scores)  # an unrelated single-set birth at the same spot
+    assert int(np.isfinite(boxes).all(-1).any(-1).sum()) == 1, \
+        'a dead shield must not refuse an unrelated birth'
+
+
+def test_duplicate_persistence_does_not_survive_a_members_death():
+    """A `_dup_contact` counter must not resume across a slot's death (independent review).
+
+    Before this fix the counter for a pair was pruned only when BOTH slots were re-examined as
+    still-live in `_suppress_duplicate_targets`'s own accumulation loop; a slot that died via
+    ordinary ageing (the loop AFTER `_suppress_duplicate_targets` in `step`) left its counters
+    stale, so a same-slot rebirth on a DIFFERENT animal could resume counting toward retirement
+    with a head start instead of starting at zero -- risking a genuine new animal being merged
+    with an unrelated neighbour sooner than `duplicate_persist` frames of real evidence.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
+    dup_scores = [torch.ones(2) for _ in scores]
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=5, max_age=2)
+    for _ in range(3):                        # 3 of 5 in-band frames: short of retirement
+        tr.step(cg, duplicate, dup_scores)
+    key = frozenset(tr.targets)
+    assert tr._dup_contact.get(key, 0) == 3
+    empty = [b.new_zeros((0, 4)) for b in per_cam]
+    empty_scores = [s.new_zeros(0) for s in scores]
+    for _ in range(4):                        # both slots starve past max_age and die together
+        tr.step(cg, empty, empty_scores)
+    assert not tr.targets
+    assert not tr._dup_contact, 'a dead pair must not leave a stale counter behind'
+    for _ in range(3):                        # rebirth: must count from 0, not resume at 3
+        boxes, _, _ = tr.step(cg, duplicate, dup_scores)
+    assert int(np.isfinite(boxes).all(-1).any(-1).sum()) == 2, \
+        'a rebirth must not inherit a stale persistence count and retire early'
+
+
 def test_age_stickiness_resolves_two_slots_on_one_group():
     """Two targets stranded on one animal (one stale) must stop alternating on near-ties: the
     fresher slot keeps the group, the stale one starves out.  Before the fix the Hungarian

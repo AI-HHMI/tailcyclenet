@@ -252,6 +252,30 @@ _FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'box_agree', 'det_box', 'det_
 _WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
 
 
+def _capture_overlap_agreement(stats, a, frames, f0, pred, p):
+    """Compare this window's overlap-region prediction against the PREVIOUS window's, before it
+    is overwritten by the seam rule (report 53 follow-up, independent review's overlap-reuse
+    idea).  A frame in `frames` may already hold a finite prediction from the window before this
+    one -- the exact quantity the seam rule discards -- so this is a free test-retest signal: the
+    same physical frame predicted from two different crop framings and partially different
+    `carried` context, with zero extra forward passes.  Opt-in
+    (`stats['capture_overlap_agreement']`) since the comparison is cheap but the accumulated
+    list is not needed on a normal run.
+    """
+    prev = pred[a, frames - f0]
+    had_prev = np.isfinite(prev).all(-1).any(-1)
+    if not had_prev.any():
+        return
+    shared = np.isfinite(p[had_prev]).all(-1) & np.isfinite(prev[had_prev]).all(-1)
+    if not shared.any():
+        return
+    d = np.linalg.norm(p[had_prev] - prev[had_prev], axis=-1)
+    rows = stats.setdefault('overlap_agreement', [])
+    for t, dist in zip(frames[had_prev], np.where(shared, d, np.nan).mean(-1)):
+        if np.isfinite(dist):
+            rows.append((int(a), int(t), float(dist)))
+
+
 def merge_blocks(blocks):
     """Every block of `run_blocks` stitched into the one dict `run_group` used to return.
 
@@ -714,6 +738,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 p[drop] = np.nan
                 conf[a, frames[drop] - f0] = np.nan
                 box_agree[a, frames[drop] - f0] = np.nan
+            if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
+                _capture_overlap_agreement(stats, a, frames, f0, pred, p)
             pred[a, frames - f0] = p
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),

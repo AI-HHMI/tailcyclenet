@@ -269,6 +269,55 @@ def test_prefetch_windows_default_matches_the_old_serial_loop(multiwindow_scene)
             assert str(va) == str(vb), k
 
 
+def test_capture_overlap_agreement_is_off_by_default_and_never_moves_a_prediction(
+        multiwindow_scene):
+    """The opt-in overlap-agreement diagnostic (report 53 follow-up) must be a pure side channel:
+    off by default, and its presence or absence in `stats` must never change a single predicted
+    value, whether or not the flag is set.
+    """
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+
+    model, sess, registry, name = multiwindow_scene
+    cfg = _cfg(anchor='carry')
+    base = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg))
+    stats_off = {}
+    off = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats_off))
+    assert 'overlap_agreement' not in stats_off, 'the flag defaults off'
+    stats_on = {'capture_overlap_agreement': True}
+    on = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats_on))
+    for out in (off, on):
+        for k in base:
+            va, vb = base[k], out[k]
+            if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
+                assert np.array_equal(np.isnan(va), np.isnan(vb))
+                fin = ~np.isnan(va)
+                np.testing.assert_array_equal(va[fin], vb[fin], err_msg=k)
+            elif isinstance(va, np.ndarray):
+                np.testing.assert_array_equal(va, vb, err_msg=k)
+            else:
+                assert str(va) == str(vb), k
+
+
+def test_capture_overlap_agreement_records_the_discarded_seam_prediction(multiwindow_scene):
+    """When enabled, the hook must record one entry per (row, overlap frame) BEFORE the later
+    window's write overwrites it -- the exact value the seam rule discards today (report 53
+    follow-up, the overlap-reuse idea). `multiwindow_scene` (T=16, n_frames=4, overlap=2) gives
+    several overlapping windows, so every non-edge window contributes overlap frames.
+    """
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+
+    model, sess, registry, name = multiwindow_scene
+    cfg = _cfg(anchor='carry')
+    stats = {'capture_overlap_agreement': True}
+    merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats))
+    rows = stats.get('overlap_agreement', [])
+    assert rows, 'a multi-window run with overlap > 0 must record at least one seam comparison'
+    for a, t, dist in rows:
+        assert isinstance(a, int) and isinstance(t, int)
+        assert dist >= 0.0 and np.isfinite(dist)
+        assert 0 <= t < 16, 'a recorded frame must be a real source frame of this clip'
+
+
 def test_carry_requires_overlap(scene):
     model, sess, registry, name = scene
     with pytest.raises(ValueError, match='overlap'):

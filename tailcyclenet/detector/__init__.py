@@ -326,7 +326,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
-                    track=True, max_move=1.0, max_age=24, stats=None, pose_nms=None,
+                    track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
                     state=None, assoc_mode='per-camera', claim_residual_gate=False,
                     velocity=False, view_arbitration=False):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
@@ -336,17 +336,16 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         track -- 3D multiview default: `CrossViewTracker`, one cross-view target set carried
             across frames; `False` restores the memoryless per-frame `associate`.
         link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`).
-        min_views / max_move -- passed through to the tracker / `associate`.
+        min_views / max_move -- passed through to the tracker / `associate`; max_move defaults
+            to the measured 1.25 box-side gate.
         max_age -- the tracker's and `link_rows`' SHARED patience window: frames without
-            evidence before a slot or row is retired. 24 in both, unless overridden.
+            evidence before a slot or row is retired. The measured default is 8.
         assoc_mode / claim_residual_gate / velocity / view_arbitration -- TRACKER-ONLY cross-view
-            evidence levers, every one default-off and INERT wherever no tracker is built (2D,
-            or `--no-track`), so the defaults reproduce today's behaviour exactly. 'joint'
-            decides identity over cross-view candidate groups instead of one independent
-            Hungarian per camera; the claim gate drops a per-camera claim whose reprojection
-            residual exceeds `max_res_px`, which otherwise fires only at a birth; `velocity`
-            matches a constant-velocity prediction; `view_arbitration` down-weights a camera
-            whose own detections are mutually crowded.
+            evidence levers. `joint` is now the measured default: it decides identity over
+            cross-view candidate groups instead of one independent Hungarian per camera. The
+            legacy path is explicit `assoc_mode='per-camera'`; the claim gate drops a per-camera
+            claim whose residual exceeds `max_res_px`, `velocity` predicts constant velocity,
+            and `view_arbitration` down-weights crowded cameras. The latter three remain off.
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
         state -- makes a sequence of calls equal to one call over the concatenation (holds the

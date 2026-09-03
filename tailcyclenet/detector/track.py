@@ -45,11 +45,12 @@ from .associate import _centres, _residual, _triangulate, associate
 # DOES gate on a residual -- reads 0.081 mm / 0.997. The memoryless observation model wins
 # decisively, which is what licenses spending code on getting it back into the tracker.
 #
-# EVERY LEVER IS DEFAULT-OFF AND THE DEFAULT PATH IS BYTE-IDENTICAL TO THE SHIPPED ONE. That is
-# the repo convention, not timidity: none of the four has been scored on a second root yet, and a
-# lever that moves the shipped number before it is measured makes every previous number
-# unreproducible. They are independently toggleable on purpose -- `joint` and the claim gate are
-# two different repairs of the same hole and their interaction is itself a measurement.
+# THE MEASURED CONFIGURATION IS NOW THE DEFAULT: `joint`, max-age 8, and max-move 1.25. On the
+# 3dzef 5-fish clip it has zero identity switches, full coverage, 0.100 mm MPJPE, and 0.309 mm
+# p99. The old per-camera path remains explicitly selectable for reproduction
+# (`assoc_mode='per-camera'`, max-age 24, max-move 1.0). Claim gating, velocity, and view arbitration remain
+# opt-in because they did not improve this two-camera clip; each is independently toggleable so
+# a different rig can measure its own trade-off.
 
 
 def _sides(boxes):
@@ -105,19 +106,21 @@ class CrossViewTracker:
     side has 10-16x headroom and rejects essentially nothing legitimate.
     """
 
-    def __init__(self, n_slots, max_res_px=30.0, max_move=1.0, max_age=24, min_views=2,
-                 assoc_mode='per-camera', claim_residual_gate=False, velocity=False,
+    def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
+                 assoc_mode='joint', claim_residual_gate=False, velocity=False,
                  view_arbitration=False):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
                 max_res_px -- max reprojection residual (px) for a birth's triangulation, and
                     (lever 1 only) for an individual per-camera claim.
-                max_move -- per-frame box-centre displacement gate, in box sides.
-                max_age -- frames without evidence before a slot is retired.
+                max_move -- per-frame box-centre displacement gate, in box sides; 1.25 is the
+                    measured default.
+                max_age -- frames without evidence before a slot is retired; 8 is the measured
+                    default.
                 min_views -- minimum cameras a birth must be seen in.
-                assoc_mode -- 'per-camera' (shipped: one independent Hungarian per camera) or
-                    'joint' (lever 2: cross-view candidate groups, then ONE Hungarian).
+                assoc_mode -- 'joint' (measured default: cross-view candidate groups, then ONE
+                    Hungarian) or 'per-camera' (the legacy independent-Hungarian path).
                 claim_residual_gate -- lever 1: drop a per-camera claim that disagrees with the
                     slot's own other claims by more than `max_res_px`.
                 velocity -- lever 3: match against a constant-velocity prediction.
@@ -125,7 +128,8 @@ class CrossViewTracker:
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}, plus
         'velocity' -- a (3,) tensor -- under lever 3 only. 'point' and 'age' keep their meaning
-        in every mode: the last TRIANGULATED point and frames since the last evidence.
+        in every mode: the last TRIANGULATED point and frames since the last evidence. The
+        measured 3dzef defaults are `assoc_mode='joint'`, `max_age=8`, `max_move=1.25`.
 
         `vel_blend` / `vel_decay` / `ambiguous` are plain attributes, sweepable without a
         constructor argument, in the manner of `soft_argmax_threshold`.

@@ -211,10 +211,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "detector's per-frame boxes; 'keypoints' runs THE CROP RULE on the "
                          'detector\'s own keypoints (needs a keypoint-trained detector, ignored '
                          'without one).')
-    ap.add_argument('--max-move', type=float, default=1.0,
+    ap.add_argument('--max-move', type=float, default=1.25,
                     help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a pair '
-                         'further apart than this is not the same animal. 1.0 is ~10x headroom on '
-                         'every multi-animal root.')
+                         'further apart than this is not the same animal. 1.25 is the measured '
+                         'default on 3dzef and retains ~10x headroom on every multi-animal root.')
     ap.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
                     help='3D multiview only, ON BY DEFAULT: ONE cross-view target set with one '
                          'affinity and one Hungarian, replacing per-frame `associate` plus '
@@ -224,31 +224,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help='3D only. 2 builds every instance from a camera PAIR (single-view animals '
                          'dropped); 1 also emits leftover boxes as single-view instances. Whether '
                          'the pose model can use one is [data].prob_2d_only.')
-    ap.add_argument('--max-age', type=int, default=24,
+    ap.add_argument('--max-age', type=int, default=8,
                     help='frames without evidence before a lost identity is retired: '
                          '`CrossViewTracker` (3D, `--track`) and `link_rows` (2D, `--link-boxes`) '
                          'both read this as the SAME patience window. Past it a reappearing '
                          'animal is a new birth, not a resumed row -- but a slot held LONGER is a '
                          'STALER point (a one-camera `CrossViewTracker` target never '
                          're-triangulates while idle, and `link_rows` matches a row against its '
-                         'own last-known box, not frame t-1), so raising this trades a hard '
-                         'identity loss for a longer-lived stale anchor that a nearby animal can '
-                         'be wrongly matched onto. 24 is the shipped default, UNMEASURED; sweep '
-                         'per root.')
-    ap.add_argument('--assoc-mode', default='per-camera', choices=['per-camera', 'joint'],
+                         'own last-known box, not frame t-1). The measured default is 8; raising '
+                         'it trades a hard identity loss for a longer-lived stale anchor that a '
+                         'nearby animal can be wrongly matched onto.')
+    ap.add_argument('--assoc-mode', default='joint', choices=['per-camera', 'joint'],
                     help='3D multiview, --track only. HOW a slot decides which detection is its '
-                         'animal. `per-camera` (default, and what every number on record was '
-                         'produced under) runs one INDEPENDENT Hungarian per camera against each '
-                         "slot's reprojected 3D point, and never checks that what a slot claimed "
-                         'in camera 0 is the same animal it claimed in camera 1 -- two crossing '
-                         'animals can be settled by two 2D decisions that disagree, and nothing '
-                         'downstream can tell. `joint` instead forms cross-view candidate groups '
+                         'animal. `joint` (measured default) forms cross-view candidate groups '
                          'over ALL detections first (the residual-gated `associate`, so '
                          '--assoc-res-max-px governs it) and then runs a SINGLE Hungarian over '
                          'slots x groups, so identity is decided on multi-view evidence rather '
-                         'than on two independent 2D ones. Costs a triangulation pass per frame '
-                         'and can withhold a slot whose cameras never agreed. Opt-in and '
-                         'UNMEASURED; sweep per root.')
+                         'than on two independent 2D ones. `per-camera` is the legacy path: it '
+                         'runs one INDEPENDENT Hungarian per camera against each slot\'s '
+                         'reprojected 3D point and never checks that claims across cameras are '
+                         'the same animal. Joint costs a triangulation pass per frame and can '
+                         'withhold a slot whose cameras never agreed.')
     ap.add_argument('--claim-residual-gate', action=argparse.BooleanOptionalAction, default=False,
                     help='3D multiview, --track only. After per-camera matching, triangulate what '
                          'each slot actually CLAIMED and drop any individual camera claim whose '

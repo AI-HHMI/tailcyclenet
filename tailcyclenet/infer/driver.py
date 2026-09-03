@@ -202,9 +202,9 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             b, s, k = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
                                       min_views=args.min_views, track=args.track,
                                       max_move=args.max_move,
-                                      max_age=getattr(args, 'max_age', 24), stats=stats,
+                                      max_age=getattr(args, 'max_age', 8), stats=stats,
                                       pose_nms=args.pose_nms, state=assoc_state,
-                                      assoc_mode=getattr(args, 'assoc_mode', 'per-camera'),
+                                      assoc_mode=getattr(args, 'assoc_mode', 'joint'),
                                       claim_residual_gate=getattr(
                                           args, 'claim_residual_gate', False),
                                       velocity=getattr(args, 'track_velocity', False),

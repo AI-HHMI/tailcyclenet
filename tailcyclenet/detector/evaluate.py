@@ -291,7 +291,7 @@ def _gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
 
 
 def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_animals=None,
-                     det_score=0.01, track=True, link=False, min_views=2, max_move=1.0,
+                     det_score=0.01, track=True, link=False, min_views=2, max_move=1.25,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
                      n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
                      center_dist_thresh=0.5):

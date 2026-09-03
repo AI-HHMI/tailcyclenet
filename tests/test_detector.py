@@ -4270,7 +4270,7 @@ def test_the_claim_residual_gate_rejects_a_cross_view_inconsistent_claim():
 
     cg, per_cam, scores, a = _lost_in_one_camera()
 
-    tr = CrossViewTracker(1, max_res_px=30.0)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     out, _, claimed = tr.step(cg, per_cam, scores)
     assert claimed[0].tolist() == [0, 0, 0], \
@@ -4278,7 +4278,8 @@ def test_the_claim_residual_gate_rejects_a_cross_view_inconsistent_claim():
     drift = float(np.linalg.norm(tr.targets[0]['point'].numpy() - a))
     assert drift > 50.0, f'the wrong claim must actually move the 3D point, moved {drift:.1f}'
 
-    tr = CrossViewTracker(1, max_res_px=30.0, claim_residual_gate=True)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera',
+                         claim_residual_gate=True)
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     out, sc, claimed = tr.step(cg, per_cam, scores)
     assert claimed[0].tolist() == [0, 0, -1], 'camera 2s claim must be dropped, and only it'
@@ -4306,13 +4307,14 @@ def test_the_claim_residual_gate_holds_the_point_when_two_cameras_disagree():
     wrong, _ = _lever_boxes(cg, [b])
     per_cam[1] = wrong[1]
 
-    tr = CrossViewTracker(1, max_res_px=30.0)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     tr.step(cg, per_cam, scores)
     assert float(np.linalg.norm(tr.targets[0]['point'].numpy() - a)) > 50.0, \
         'the ungated tracker must swallow the skew pair, or the gated arm proves nothing'
 
-    tr = CrossViewTracker(1, max_res_px=30.0, claim_residual_gate=True)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera',
+                         claim_residual_gate=True)
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     out, _, claimed = tr.step(cg, per_cam, scores)
     assert claimed[0].tolist() == [-1, -1], 'neither ray of an inconsistent pair may be trusted'
@@ -4320,7 +4322,8 @@ def test_the_claim_residual_gate_holds_the_point_when_two_cameras_disagree():
     assert tr.targets[0]['age'] == 1, 'a slot that kept no claim has no evidence and must age'
 
     good, good_sc = _lever_boxes(cg, [a])
-    tr = CrossViewTracker(1, max_res_px=30.0, claim_residual_gate=True)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera',
+                         claim_residual_gate=True)
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     _, _, claimed = tr.step(cg, good, good_sc)
     assert claimed[0].tolist() == [0, 0], 'a consistent pair must pass the gate untouched'
@@ -4341,7 +4344,7 @@ def test_joint_association_refuses_a_binding_the_per_camera_hungarian_accepts():
 
     cg, per_cam, scores, a = _lost_in_one_camera()
 
-    tr = CrossViewTracker(1, max_res_px=30.0)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     tr.step(cg, per_cam, scores)
     assert float(np.linalg.norm(tr.targets[0]['point'].numpy() - a)) > 50.0
@@ -4406,7 +4409,7 @@ def test_velocity_follows_two_animals_through_a_crossing_that_the_last_point_los
 
     ends = {}
     for velocity in (False, True):
-        tr = CrossViewTracker(2, max_res_px=30.0, velocity=velocity)
+        tr = CrossViewTracker(2, max_res_px=30.0, assoc_mode='per-camera', velocity=velocity)
         for xa, xb in track:
             w = [np.array([xa, 0.0, 0.0]), np.array([xb, 0.0, 0.0])]
             tr.step(cg, *_lever_boxes(cg, w, side=90.0))
@@ -4428,7 +4431,7 @@ def test_velocity_leaves_point_and_age_alone_and_decays_when_evidence_stops():
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    tr = CrossViewTracker(1, max_res_px=30.0, velocity=True)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera', velocity=True)
     for x in (0.0, 20.0, 40.0):
         tr.step(cg, *_lever_boxes(cg, [np.array([x, 0.0, 0.0])], side=200.0))
 
@@ -4445,7 +4448,7 @@ def test_velocity_leaves_point_and_age_alone_and_decays_when_evidence_stops():
     torch.testing.assert_close(tr.targets[0]['point'], before)
     assert tr.targets[0]['age'] == 1, "'age' must keep meaning frames since evidence"
 
-    off = CrossViewTracker(1, max_res_px=30.0)
+    off = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
     off.step(cg, *_lever_boxes(cg, [np.array([0.0, 0.0, 0.0])], side=200.0))
     assert set(off.targets[0]) == {'point', 'age'}, \
         'with the lever off the state dict must be exactly what it always was'
@@ -4471,14 +4474,15 @@ def test_view_arbitration_keeps_a_crowded_camera_out_of_the_triangulation():
     per_cam[2], scores[2] = crowded[2], torch.ones(2)
     stale = torch.as_tensor(np.array([16.0, 0.0, 0.0], np.float32))
 
-    tr = CrossViewTracker(1, max_res_px=30.0)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
     tr.targets[0] = {'point': stale.clone(), 'age': 0}
     _, _, claimed = tr.step(cg, per_cam, scores)
     assert claimed[0, 2] == 1, 'the crowded camera must claim the WRONG neighbour here'
     assert float(np.linalg.norm(tr.targets[0]['point'].numpy() - a)) > 10.0, \
         'and that claim must drag the 3D point, or there is nothing to arbitrate'
 
-    tr = CrossViewTracker(1, max_res_px=30.0, view_arbitration=True)
+    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera',
+                         view_arbitration=True)
     tr.targets[0] = {'point': stale.clone(), 'age': 0}
     out, _, claimed = tr.step(cg, per_cam, scores)
     np.testing.assert_allclose(tr.targets[0]['point'].numpy(), a, atol=1e-3)
@@ -4496,7 +4500,8 @@ def test_view_arbitration_is_inert_where_no_camera_is_crowded():
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     got = {}
     for arb in (False, True):
-        tr = CrossViewTracker(2, max_res_px=30.0, view_arbitration=arb)
+        tr = CrossViewTracker(2, max_res_px=30.0, assoc_mode='per-camera',
+                             view_arbitration=arb)
         rows = []
         for t in range(6):
             w = [np.array([-60.0 + 8.0 * t, 0.0, 0.0]), np.array([90.0, 20.0 * t, 0.0])]
@@ -4509,22 +4514,18 @@ def test_view_arbitration_is_inert_where_no_camera_is_crowded():
         np.testing.assert_array_equal(x, y)
 
 
-def test_every_tracker_lever_is_off_by_default_and_the_default_path_does_not_move():
-    """THE PINNED INVARIANT. Four opt-in levers landed on `CrossViewTracker` and the shipped
-    number may not move for any of them: every previously published detector/inference figure was
-    produced by the default path, and a lever that shifts it silently makes all of them
-    unreproducible.
-
-    Checked two ways: the constructor's own defaults, and byte-identity of the whole output
-    triple over a scene where EACH lever demonstrably changes the answer when switched on (the
-    other tests above show that, so this one is not vacuous).
-    """
+def test_measured_tracker_configuration_is_the_default():
+    """The measured zero-switch configuration is the upstream default, while the legacy
+    per-camera configuration remains explicitly reproducible. Pinning both prevents an accidental
+    drift in the public constructor from silently changing either deployment or reproduction."""
     import inspect
 
     from tailcyclenet.detector.track import CrossViewTracker
 
     sig = inspect.signature(CrossViewTracker.__init__).parameters
-    assert sig['assoc_mode'].default == 'per-camera'
+    assert sig['assoc_mode'].default == 'joint'
+    assert sig['max_age'].default == 8
+    assert sig['max_move'].default == 1.25
     for name in ('claim_residual_gate', 'velocity', 'view_arbitration'):
         assert sig[name].default is False, f'{name} must ship off'
 
@@ -4541,8 +4542,8 @@ def test_every_tracker_lever_is_off_by_default_and_the_default_path_does_not_mov
         return rows
 
     base = run()
-    explicit = run(assoc_mode='per-camera', claim_residual_gate=False, velocity=False,
-                   view_arbitration=False)
+    explicit = run(assoc_mode='joint', max_age=8, max_move=1.25,
+                   claim_residual_gate=False, velocity=False, view_arbitration=False)
     for t, (want, got) in enumerate(zip(base, explicit)):
         for i, name in enumerate(('boxes', 'scores', 'claimed')):
             np.testing.assert_array_equal(

@@ -1766,20 +1766,17 @@ def _assoc_kwargs_for(sess, monkeypatch, extra_argv):
     return seen
 
 
-def test_the_cross_view_evidence_flags_are_opt_in_and_default_to_todays_behaviour():
-    """The four cross-view levers exist on the parser and every default is the behaviour that was
-    already there, so an unflagged command is byte-identical to the version before they existed.
-
-    Each boolean ships BOTH spellings: `--no-...` is how this parser turns a lever off everywhere
-    else (`--no-track`, `--no-link-boxes`), and a default-off lever still needs its negative
-    spelling so a sweep script can state the value rather than rely on omission meaning off.
-    `--assoc-mode` is closed over its two documented modes -- a typo must be refused, not
-    silently fall through to the per-camera path and be reported as a `joint` arm.
-    """
+def test_cross_view_defaults_select_the_measured_configuration():
+    """The parser defaults to the measured zero-switch tracker configuration, while every
+    experimental boolean remains opt-in and both spellings stay available for explicit sweeps.
+    `--assoc-mode` is closed over its two documented modes so a typo cannot silently select the
+    legacy per-camera path."""
     from tailcyclenet.infer.cli import build_parser
 
     parser = build_parser()
-    assert parser.get_default('assoc_mode') == 'per-camera'
+    assert parser.get_default('assoc_mode') == 'joint'
+    assert parser.get_default('max_age') == 8
+    assert parser.get_default('max_move') == 1.25
     assert parser.get_default('claim_residual_gate') is False
     assert parser.get_default('track_velocity') is False
     assert parser.get_default('view_arbitration') is False
@@ -1802,13 +1799,15 @@ def test_the_cross_view_evidence_flags_reach_associate_group(tmp_path, monkeypat
     `--track-velocity` is spelled for the user's benefit (it is a `--track` lever) but the tracker
     parameter is `velocity`, so the rename is asserted in both directions -- a name that survives
     only on one side of the call is exactly the silent drop this defends against. The defaults are
-    asserted POSITIVELY: `associate_group` has to be told 'per-camera'/False, because a caller
-    that quietly stops passing them is indistinguishable from a lever that did not help.
+    asserted POSITIVELY: `associate_group` has to be told 'joint'/8/1.25, because a caller that
+    quietly stops passing them is indistinguishable from a wrong upstream default.
     """
     _, sess, _, _ = _range_scene(tmp_path)
 
     default = _assoc_kwargs_for(sess, monkeypatch, [])
-    assert default['assoc_mode'] == 'per-camera'
+    assert default['assoc_mode'] == 'joint'
+    assert default['max_age'] == 8
+    assert default['max_move'] == 1.25
     assert default['claim_residual_gate'] is False
     assert default['velocity'] is False
     assert default['view_arbitration'] is False
@@ -1824,7 +1823,7 @@ def test_the_cross_view_evidence_flags_reach_associate_group(tmp_path, monkeypat
     off = _assoc_kwargs_for(sess, monkeypatch,
                             ['--no-claim-residual-gate', '--no-track-velocity',
                              '--no-view-arbitration'])
-    assert off == {**on, 'assoc_mode': 'per-camera', 'claim_residual_gate': False,
+    assert off == {**on, 'assoc_mode': 'joint', 'claim_residual_gate': False,
                    'velocity': False, 'view_arbitration': False}, \
         'the negative spellings must restore exactly the default association'
 

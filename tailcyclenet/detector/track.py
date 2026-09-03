@@ -184,6 +184,18 @@ class CrossViewTracker:
     `max_move` is in box sides, exactly as in `link_rows`: real consecutive-frame box-centre
     displacement is p90 0.06-0.11 body lengths on the shipped multi-animal roots, so one full
     side has 10-16x headroom and rejects essentially nothing legitimate.
+
+    `self.events` is a per-slot identity-EVENT log, always recorded: an append-only list of
+    `{frame, slot, event, detail}` over `born`, `died`, `retired_duplicate`, `shielded` and
+    `birth_refused`. Without it every question about a duplicate episode needs a monkeypatched
+    traced re-run reproducing a whole GPU pass to learn what the first pass already knew. Always
+    on because a few dict appends per frame are negligible behind the video decode this sits
+    after, and an opt-in diagnostic is never on when the surprise happens. `frame` is
+    TRACKER-LOCAL -- 0 at construction, +1 per `step()` -- which is the absolute frame within
+    the group whenever one tracker lives for the whole group, as the `state` dict
+    `associate_group` threads across block boundaries ensures. Recording cannot change `step()`'s
+    returned arrays or `self.targets`; a byte-identity test asserts it. Writing the log into a
+    prediction session (`identity_events.pq`) is a separate step, NOT built here.
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
@@ -249,6 +261,8 @@ class CrossViewTracker:
         self.vel_decay = 0.5
         self.ambiguous = 0.5
         self.targets = {}
+        self.events = []
+        self._t = -1
 
     def _predict(self, s):
         """Where slot `s` is expected to be THIS frame -- lever 3's whole surface.
@@ -415,6 +429,7 @@ class CrossViewTracker:
             which slots are matchable and how the unmatchable ones age, so the four levers can
             only change which detections a slot ends up holding -- never the state machine.
         """
+        self._t += 1
         C = len(cgroup)
         out = np.full((self.n, C, 4), np.nan, np.float32)
         sc = np.full((self.n, C), np.nan, np.float32)
@@ -435,6 +450,8 @@ class CrossViewTracker:
         self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
         self._decay(updated)
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
+            self.events.append({'frame': self._t, 'slot': s, 'event': 'died',
+                                'detail': {'age': self.targets[s]['age']}})
             del self.targets[s]
             self._residuals.pop(s, None)
             self._last_claims.pop(s, None)
@@ -587,6 +604,10 @@ class CrossViewTracker:
                         -int(self.targets[s].get('age', 0)), -int(s))
             loser = min((first, second), key=strength)
             winner = first if loser == second else second
+            self.events.append({'frame': self._t, 'slot': loser, 'event': 'retired_duplicate',
+                                'detail': {'winner': winner, 'persisted': int(count)}})
+            self.events.append({'frame': self._t, 'slot': winner, 'event': 'shielded',
+                                'detail': {'loser': loser}})
             out[loser] = np.nan
             sc[loser] = np.nan
             claimed_ix[loser] = -1
@@ -681,6 +702,9 @@ class CrossViewTracker:
                                  min_views=self.min_views, max_instances=len(free))
                 for s, g in zip(free, born):
                     if self._birth_duplicates_target(cgroup, g, out):
+                        self.events.append({'frame': self._t, 'slot': s,
+                                            'event': 'birth_refused',
+                                            'detail': {'cameras': sorted(g.get('members', {}))}})
                         continue
                     self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
                                 lambda c, j, k=keep: k[c][j])
@@ -700,6 +724,9 @@ class CrossViewTracker:
         """
         self.targets[s] = {'point': g['point'], 'age': 0}
         self._residuals[s] = float(g.get('residual', float('inf')))
+        self.events.append({'frame': self._t, 'slot': s, 'event': 'born',
+                            'detail': {'cameras': sorted(g['members']),
+                                       'residual': float(g.get('residual', float('inf')))}})
         if self.velocity:
             self.targets[s]['velocity'] = torch.zeros(3)
         for c, j in g['members'].items():
@@ -814,6 +841,8 @@ class CrossViewTracker:
         for s, k in zip(free, [k for k in range(len(groups)) if k not in taken]):
             g = groups[k]
             if self._birth_duplicates_target(cgroup, g, out):
+                self.events.append({'frame': self._t, 'slot': s, 'event': 'birth_refused',
+                                    'detail': {'cameras': sorted(g.get('members', {}))}})
                 continue
             self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
                         lambda c, j: j)

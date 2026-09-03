@@ -1038,6 +1038,84 @@ def test_freed_slot_does_not_rebirth_the_retired_duplicate():
     assert first_row == second_row, 'the surviving row must keep the animal'
 
 
+def test_identity_events_record_what_the_tracker_did_without_changing_it():
+    """There is no record anywhere in the output of what the tracker did to identity, so every
+    question about a duplicate episode has required a monkeypatched traced re-run that reproduces
+    a whole GPU pass to learn something the first pass already knew
+    (identity_review_followthrough plan C6). `CrossViewTracker.events` is that record: an
+    append-only list of `{frame, slot, event, detail}`.
+
+    Two things are asserted, and the second is the load-bearing one. First, the log actually sees
+    the mechanism -- this is the same duplicate scene
+    `test_freed_slot_does_not_rebirth_the_retired_duplicate` uses, so it must show births, a
+    retirement naming its winner, that winner being shielded, and the subsequent birth refusals
+    that keep the duplicate retired. Second, RECORDING CHANGES NOTHING: an identical tracker run
+    on the identical scene produces byte-identical boxes/scores/claims, so the log can never be
+    suspected of having moved a number it was added to explain.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
+    dup_scores = [torch.ones(2) for _ in scores]
+
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
+    outs = [tr.step(cg, duplicate, dup_scores) for _ in range(6)]
+
+    by_event = {}
+    for e in tr.events:
+        assert set(e) == {'frame', 'slot', 'event', 'detail'}, e
+        assert 0 <= e['frame'] < 6, f'frame must be tracker-local and in range: {e}'
+        by_event.setdefault(e['event'], []).append(e)
+
+    assert len(by_event.get('born', [])) == 2, 'both slots seat on frame 0'
+    retired = by_event.get('retired_duplicate', [])
+    assert len(retired) == 1, f'exactly one backstop retirement in this scene, got {retired}'
+    shielded = by_event.get('shielded', [])
+    assert len(shielded) == 1 and shielded[0]['slot'] == retired[0]['detail']['winner'], \
+        'the retirement must name its winner and that winner must be the slot shielded'
+    assert retired[0]['detail']['persisted'] >= 2, 'the persistence count that fired is the reason'
+    assert by_event.get('birth_refused'), \
+        'the freed slot is offered the same duplicate every later frame and must be refused'
+
+    # RECORDING IS INERT. A second, independent run of the identical scene must agree byte for
+    # byte on all three returned arrays -- if it does not, the log changed the algorithm.
+    tr2 = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
+    for t, (boxes, sc, claimed) in enumerate(outs):
+        b2, s2, c2 = tr2.step(cg, duplicate, dup_scores)
+        np.testing.assert_array_equal(np.nan_to_num(b2, nan=-9e9),
+                                      np.nan_to_num(boxes, nan=-9e9), err_msg=f'boxes at t={t}')
+        np.testing.assert_array_equal(np.nan_to_num(s2, nan=-9e9),
+                                      np.nan_to_num(sc, nan=-9e9), err_msg=f'scores at t={t}')
+        np.testing.assert_array_equal(c2, claimed, err_msg=f'claimed at t={t}')
+
+
+def test_identity_events_record_a_slot_dying_of_old_age():
+    """`died` is the other half of a slot's life story: without it the log shows a birth and then
+    silence, and a later reader cannot tell a slot that starved out from one still alive but
+    unclaimed. The event carries the age that crossed `max_age`.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    point = torch.tensor([0.0, 0.0, 0.0])
+    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
+    tr = CrossViewTracker(1, max_res_px=30.0, max_age=3)
+    tr.step(cg, per_cam, scores)
+    assert [e['event'] for e in tr.events] == ['born']
+
+    empty = [torch.zeros((0, 4)) for _ in cg]
+    empty_scores = [s.new_zeros(0) for s in empty]
+    for _ in range(6):
+        tr.step(cg, empty, empty_scores)
+    died = [e for e in tr.events if e['event'] == 'died']
+    assert len(died) == 1 and died[0]['slot'] == 0, tr.events
+    assert died[0]['detail']['age'] > tr.max_age, died[0]
+    assert not tr.targets
+
+
 def test_shield_survives_the_winner_vacating_for_one_frame():
     """The shield is anchored to the ANIMAL, not to the winner's current claims.
 

@@ -15,6 +15,7 @@ COMMANDS = {
     'train-detector': ('tailcyclenet.train_detector', 'train a YOLOX-Nano box detector'),
     'infer': ('tailcyclenet.infer', 'run a trained model'),
     'eval': ('tailcyclenet.eval', 'score predictions against labels'),
+    'render': ('tailcyclenet.render', 'draw a prediction over its own pixels'),
 }
 
 

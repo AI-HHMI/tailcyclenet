@@ -326,7 +326,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
-                    track=True, max_move=1.0, stats=None, pose_nms=None, state=None):
+                    track=True, max_move=1.0, max_age=24, stats=None, pose_nms=None,
+                    state=None):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -337,6 +338,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`, so the
             two levers do not overlap).
         min_views / max_move -- passed through to the tracker / `associate`.
+        max_age -- passed through to the tracker / `link_rows` as their SHARED patience window:
+            frames without evidence before a slot (`CrossViewTracker`) or row (`link_rows`) is
+            retired. 24 in both, unless overridden.
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
         state -- makes a sequence of calls equal to one call over the concatenation (holds the
@@ -375,7 +379,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             from .track import CrossViewTracker
             tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
                                        min_views=min_views,
-                                       max_move=max_move)
+                                       max_move=max_move, max_age=max_age)
         state['tracker'] = tracker
     tracker = state['tracker']
 
@@ -424,7 +428,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     kp[a, t, c] = r_kp[per_cam[c][2][d], t, c]
     pre_link = int(np.isfinite(out).all(-1).sum())
     if link and tracker is None:
-        out, sc = link_rows(out, sc, max_move=max_move, extra=kp,
+        out, sc = link_rows(out, sc, max_move=max_move, max_age=max_age, extra=kp,
                             state=state.setdefault('link', {}))
     if stats is not None:
         stats['association_raw_offered'] = stats.get('association_raw_offered', 0) + raw_offered

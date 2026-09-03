@@ -201,7 +201,8 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                  ci, cam, fr, pool=pool, reduce=reduce))
             b, s, k = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
                                       min_views=args.min_views, track=args.track,
-                                      max_move=args.max_move, stats=stats,
+                                      max_move=args.max_move,
+                                      max_age=getattr(args, 'max_age', 24), stats=stats,
                                       pose_nms=args.pose_nms, state=assoc_state)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
@@ -234,6 +235,8 @@ def run_dataset(args):
     `format.VideoSession` in memory, stating `ds_name` via `--dataset-name`; the dataset
     branch is one session per run. `--n-frames` longer than the trained window is not
     the same model; `--refine-px` larger than the trained `image_size` hits the 2D head.
+    `--assoc-res-max-px` defaults to None so a `--data` session's OWN stored value survives
+    unless given explicitly; an absent flag under `--videos` resolves to the format default.
 
     The box deployment recipe is the default for a box model and inert otherwise:
     `--box-prompt auto` resolves to `detector` with a detector/boxes file, never falls
@@ -292,6 +295,8 @@ def run_dataset(args):
     _budget = _memory.current(override_gb=args.max_ram)
     print(f'ram: {_budget}')
 
+    assoc_res_max_px = (args.assoc_res_max_px if args.assoc_res_max_px is not None else 30.0)
+
     if args.videos:
         from .. import adopt
         adopt.check_flags(args)
@@ -300,7 +305,7 @@ def run_dataset(args):
                           session_id=args.session_id, group_id=args.group_id)
         ds_name = adopt.dataset_name(reg, args.dataset_name)
         sess = adopt.build(vplan, names=reg.local_names(ds_name), units=args.units,
-                           fps=args.fps, assoc_res_max_px=args.assoc_res_max_px,
+                           fps=args.fps, assoc_res_max_px=assoc_res_max_px,
                            trim=args.trim_to_shortest)
         src_prov = adopt.provenance_of(vplan)
         src_prov['source_split'] = ''
@@ -309,6 +314,10 @@ def run_dataset(args):
     else:
         args.split = args.split or 'test'
         ds_name, sess = refuse_multi_session(args.data, args.split)
+        if args.assoc_res_max_px is not None:
+            print(f'assoc_res_max_px: overriding the session\'s own '
+                  f'{sess.assoc_res_max_px:g}px with {assoc_res_max_px:g}px')
+            sess.assoc_res_max_px = float(assoc_res_max_px)
         src_prov = {'source': 'tailcyclenet infer',
                     'source_session': str(Path(args.data).resolve()),
                     'source_split': args.split,

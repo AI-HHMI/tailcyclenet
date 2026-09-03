@@ -1228,6 +1228,54 @@ def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp
     assert prov['camera_batch'] is True
 
 
+def test_assoc_res_max_px_overrides_a_data_session_but_defaults_to_its_own(cli, monkeypatch,
+                                                                           tmp_path):
+    """`--assoc-res-max-px` given explicitly overrides a `--data` session's own stored value;
+    omitted, the session's own value survives untouched. The CLI default is None, not 30.0, so
+    an omitted flag cannot silently clobber a dataset converted under a different assumption --
+    the session here is built at 17.5px specifically so "still 17.5" and "reset to the format
+    default" are distinguishable outcomes, not the same number by coincidence.
+    """
+    import tomllib
+
+    import toml
+
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    root = tmp_path / 'rat'
+    session_dir = root / 'test' / 's'
+    cf._session_2d(session_dir)
+    toml_path = session_dir / 'session.toml'
+    cfg = toml.loads(toml_path.read_text())
+    cfg['assoc_res_max_px'] = 17.5
+    toml_path.write_text(toml.dumps(cfg))
+
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL,
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    def _run(out, *extra):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                          '--data', str(session_dir), '--split', 'test',
+                                          '--anchor', 'none', '--device', 'cpu',
+                                          '--overlap', '2', '--out', str(out), *extra])
+        cli.main()
+        with open(out / 'session.toml', 'rb') as f:
+            return tomllib.load(f)['assoc_res_max_px']
+
+    assert _run(tmp_path / 'default') == 17.5, \
+        "an omitted flag must not clobber the session's own value"
+    assert _run(tmp_path / 'override', '--assoc-res-max-px', '12') == 12.0, \
+        'given explicitly, it must override'
+
+
 def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path):
     """Two facts under one name lost one of them, and nothing said so.
 

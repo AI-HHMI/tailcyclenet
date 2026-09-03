@@ -105,13 +105,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--fps', type=float, default=None,
                     help="with --videos: override the container's own fps. Reaches groups.pq "
                          'only; nothing in inference reads it.')
-    ap.add_argument('--assoc-res-max-px', type=float, default=30.0,
-                    help='with --videos, 3D only: `Session.assoc_res_max_px`, which '
-                         '`CrossViewTracker` and `associate` both read as their reprojection '
-                         "gate. The format's default, and it was measured on NO ad-hoc rig -- it "
-                         'is a PIXEL gate on a reprojection residual, so a 4K rig and a 640x480 '
-                         'rig should not share it. Sweep per rig, exactly as --det-score is swept '
-                         'per checkpoint.')
+    ap.add_argument('--assoc-res-max-px', type=float, default=None,
+                    help='`Session.assoc_res_max_px`, which `CrossViewTracker` and `associate` '
+                         "both read as their reprojection gate. Default: the session's own "
+                         'value -- 30.0 (the format default) for a fresh --videos build, or '
+                         "whatever --data's session.toml already carries. Given explicitly, "
+                         'OVERRIDES either path: it is a PIXEL gate on a reprojection residual, '
+                         'so a 4K rig and a 640x480 rig should not share it, and a dataset '
+                         'converted under one assumption should not be stuck at it forever. '
+                         'Sweep per rig, exactly as --det-score is swept per checkpoint.')
     ap.add_argument('--trim-to-shortest', action='store_true',
                     help="with --videos: opt in to n_frames = min over a group's cameras. "
                          'Without it a length disagreement is REFUSED, because a one-frame offset '
@@ -222,6 +224,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help='3D only. 2 builds every instance from a camera PAIR (single-view animals '
                          'dropped); 1 also emits leftover boxes as single-view instances. Whether '
                          'the pose model can use one is [data].prob_2d_only.')
+    ap.add_argument('--max-age', type=int, default=24,
+                    help='frames without evidence before a lost identity is retired: '
+                         '`CrossViewTracker` (3D, `--track`) and `link_rows` (2D, `--link-boxes`) '
+                         'both read this as the SAME patience window. Past it a reappearing '
+                         'animal is a new birth, not a resumed row -- but a slot held LONGER is a '
+                         'STALER point (a one-camera `CrossViewTracker` target never '
+                         're-triangulates while idle, and `link_rows` matches a row against its '
+                         'own last-known box, not frame t-1), so raising this trades a hard '
+                         'identity loss for a longer-lived stale anchor that a nearby animal can '
+                         'be wrongly matched onto. 24 is the shipped default, UNMEASURED; sweep '
+                         'per root.')
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')

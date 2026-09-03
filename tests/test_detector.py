@@ -1144,6 +1144,71 @@ def test_associate_group_state_carries_across_a_split(tmp_path):
             'scene does not exercise the carry at all'
 
 
+def test_associate_group_threads_max_age_into_the_tracker(tmp_path):
+    """`--max-age` is the SAME patience window `CrossViewTracker` and `link_rows` share; passing
+    it through `associate_group` (C > 1) must land on `CrossViewTracker.max_age`, not silently
+    stay at the class's own default of 24. Read back off the CALLER's own `state` dict, which
+    `associate_group` populates in place -- the one place the constructed tracker is visible
+    without reaching into a private attribute.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    import numpy as np
+
+    from tailcyclenet.detector import associate_group
+    from tailcyclenet.format import Session
+
+    T, C = 4, 3
+    d = tmp_path / 'test' / 's'
+    cf._session_3d(d, T=T)
+    sess = Session.load(d)
+    sess.preload()
+
+    box = np.full((1, T, C, 4), np.nan, np.float32)
+    sc = np.full((1, T, C), np.nan, np.float32)
+    raw = (box, sc, None)
+
+    state = {}
+    associate_group(raw, sess, 'g000', 1, track=True, max_age=5, state=state)
+    assert state['tracker'].max_age == 5, \
+        '--max-age must reach CrossViewTracker, not be dropped on the way in'
+
+
+def test_associate_group_threads_max_age_into_link_rows(monkeypatch):
+    """Same claim, 2D (C == 1): `associate_group` builds no tracker there, so identity runs
+    through `link_rows` instead, and `max_age` must reach IT.
+    """
+    import numpy as np
+
+    import tailcyclenet.detector as detmod
+
+    seen = {}
+
+    def spy_link_rows(boxes, scores=None, **kw):
+        seen.update(kw)
+        return boxes, scores
+
+    monkeypatch.setattr(detmod, 'link_rows', spy_link_rows)
+
+    class _FakeSession:
+        assoc_res_max_px = 30.0
+
+        def cgroup(self, gid, t=None):
+            return []
+
+        rig = type('Rig', (), {'moving': {}})()
+
+    box = np.full((1, 2, 1, 4), np.nan, np.float32)
+    sc = np.full((1, 2, 1), np.nan, np.float32)
+    detmod.associate_group((box, sc, None), _FakeSession(), 'g000', 1, link=True, track=False,
+                           max_age=7)
+    assert seen.get('max_age') == 7, \
+        '--max-age must reach link_rows in the 2D (C == 1) path too'
+
+
 def test_link_rows_survives_a_dropped_frame():
     """Matching is against each row's LAST KNOWN box, so a one-frame miss cannot break the chain."""
     import numpy as np

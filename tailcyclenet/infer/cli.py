@@ -281,6 +281,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')
+    ap.add_argument('--duplicate-suppress', action=argparse.BooleanOptionalAction, default=False,
+                    help='2D identity safety switch: after --duplicate-persist consecutive frames '
+                         'with two rows within --duplicate-radius box sides, blank the lower-scored '
+                         'row instead of risking a permanent identity switch. Default off pending a '
+                         'root-specific sweep; prefer a missing prediction to a switch.')
+    ap.add_argument('--duplicate-radius', type=float, default=0.75,
+                    help='2D duplicate proximity in box sides; used only with --duplicate-suppress.')
+    ap.add_argument('--duplicate-persist', type=int, default=5,
+                    help='2D duplicate persistence in consecutive frames; used only with '
+                         '--duplicate-suppress.')
     ap.add_argument('--pose-nms', type=float, default=None, metavar='FRAC',
                     help='INSTANCE-LEVEL NMS on the seated rows: drop the lower-scored of two rows '
                          'whose keypoint-containment overlap exceeds FRAC. NOT IoU. QUANTISED by K '

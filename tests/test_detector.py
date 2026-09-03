@@ -1166,6 +1166,25 @@ def test_link_rows_follows_one_animal():
     assert np.isfinite(linked).all()
 
 
+def test_link_rows_duplicate_suppression_prefers_empty_row():
+    """A persistent same-animal pair is safer as one prediction than as a switched pair."""
+    import numpy as np
+
+    from tailcyclenet.detector import link_rows
+
+    boxes = np.full((2, 5, 1, 4), np.nan, np.float32)
+    boxes[:, :, 0] = np.array([100, 100, 200, 200], np.float32)
+    scores = np.full((2, 5, 1), np.nan, np.float32)
+    scores[0, :, 0] = 0.8
+    scores[1, :, 0] = 0.7
+    linked, linked_scores = link_rows(
+        boxes, scores, max_move=2.0, duplicate_suppress=True,
+        duplicate_radius=0.75, duplicate_persist=2)
+    assert np.isfinite(linked[0, -1, 0]).all()
+    assert not np.isfinite(linked[1, -1, 0]).any()
+    assert np.isnan(linked_scores[1, -1, 0])
+
+
 def test_link_rows_state_carries_across_a_split():
     """N calls with `state=` must equal ONE call over the concatenation, byte for byte.
 

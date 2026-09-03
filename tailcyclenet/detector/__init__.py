@@ -328,7 +328,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
                     state=None, assoc_mode='joint', claim_residual_gate=False,
-                    velocity=False, view_arbitration=False):
+                    velocity=False, view_arbitration=False, duplicate_suppress=False,
+                    duplicate_radius=0.75, duplicate_persist=5):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -348,8 +349,9 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             and `view_arbitration` down-weights crowded cameras. The latter three remain off.
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
-        state -- makes a sequence of calls equal to one call over the concatenation (holds the
-            tracker and `link_rows`' `last`/`age`); `None` builds a fresh tracker per call.
+        duplicate_suppress -- 2D only, blank persistent near-coincident rows rather than risk an
+            identity switch. Off until a root-specific sweep supports enabling it.
+        state -- makes calls equal to one concatenated call; `None` builds fresh state.
     Outputs:
         The same triple re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -434,7 +436,10 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     pre_link = int(np.isfinite(out).all(-1).sum())
     if link and tracker is None:
         out, sc = link_rows(out, sc, max_move=max_move, max_age=max_age, extra=kp,
-                            state=state.setdefault('link', {}))
+                            state=state.setdefault('link', {}),
+                            duplicate_suppress=duplicate_suppress,
+                            duplicate_radius=duplicate_radius,
+                            duplicate_persist=duplicate_persist)
     if stats is not None:
         stats['association_raw_offered'] = stats.get('association_raw_offered', 0) + raw_offered
         stats['association_pre_link'] = stats.get('association_pre_link', 0) + pre_link
@@ -447,8 +452,62 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
     return out, sc, kp
 
 
+def _suppress_duplicate_rows(out, scores, extra, state, radius, persist):
+    """Blank persistent same-animal 2D rows instead of allowing identity to switch.
+
+    `link_rows` has no cross-view triangulation, so it cannot use the 3D tracker's shared-camera
+    predicate. It instead uses the same dimensionless box-side geometry as its matching gate and
+    requires persistence to avoid deleting a genuine crossing that is briefly close. Once the
+    evidence reaches `persist`, the lower-scored row is deliberately made empty: this policy
+    values an unassigned prediction over a permanent row-to-animal switch. The pair counter is
+    stored in the caller's state, so block-wise inference has the same result as one clip pass.
+    """
+    import numpy as np
+
+    counters = state.setdefault('duplicate_pairs', {})
+    _, C, _ = out.shape
+    live = [r for r in range(out.shape[0]) if np.isfinite(out[r]).all(-1).any()]
+    seen = set()
+    for ia, first in enumerate(live):
+        for second in live[ia + 1:]:
+            gaps = []
+            for c in range(C):
+                a, b = out[first, c], out[second, c]
+                if not (np.isfinite(a).all() and np.isfinite(b).all()):
+                    continue
+                ac = np.array([(a[0] + a[2]) * 0.5, (a[1] + a[3]) * 0.5])
+                bc = np.array([(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5])
+                side = 0.25 * ((a[2] - a[0]) + (a[3] - a[1]) +
+                                (b[2] - b[0]) + (b[3] - b[1]))
+                if side > 0:
+                    gaps.append(float(np.linalg.norm(ac - bc)) / side)
+            key = (first, second)
+            if gaps and max(gaps) <= radius:
+                counters[key] = counters.get(key, 0) + 1
+                seen.add(key)
+            else:
+                counters.pop(key, None)
+            if counters.get(key, 0) < persist:
+                continue
+            strength = []
+            for row in (first, second):
+                valid = np.isfinite(out[row]).all(-1)
+                strength.append((float(np.nanmean(scores[row][valid])) if scores is not None and valid.any()
+                                 else 0.0, -row))
+            loser = first if strength[0] < strength[1] else second
+            out[loser] = np.nan
+            if scores is not None:
+                scores[loser] = np.nan
+            if extra is not None:
+                extra[loser] = np.nan
+    for key in list(counters):
+        if key not in seen:
+            counters.pop(key, None)
+
+
 def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extra=None,
-              state=None):
+              state=None, duplicate_suppress=False, duplicate_radius=0.75,
+              duplicate_persist=5):
     """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
 
     Inputs:
@@ -461,6 +520,10 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
             rule exists to prevent.
         state -- carries the matcher across a call boundary so a clip processed in blocks links
             exactly as the whole clip does.
+        duplicate_suppress -- if true, blank the weaker row after a persistent near-coincident
+            pair. The distance is normalized by the pair's box side, not pixels.
+        duplicate_radius / duplicate_persist -- the dimensionless proximity and consecutive-frame
+            gate for duplicate suppression. They are opt-in until measured on each 2D root.
     Outputs:
         boxes (and scores/extra when given), reordered so row `a` follows one animal.
     Side effects:
@@ -478,6 +541,8 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
     from scipy.optimize import linear_sum_assignment
 
     S, T, C, _ = boxes.shape
+    if state is None and duplicate_suppress:
+        state = {}
     if state is None or 'last' not in state:
         last = boxes[:, 0].copy()
         age = np.zeros(S, int)
@@ -524,6 +589,8 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, birth_age=None, extr
                 sc[r] = scores[:, t][c]
             if ex is not None:
                 ex[r] = extra[:, t][c]
+        if duplicate_suppress:
+            _suppress_duplicate_rows(out, sc, ex, state, duplicate_radius, duplicate_persist)
         boxes[:, t] = out
         if ex is not None:
             extra[:, t] = ex

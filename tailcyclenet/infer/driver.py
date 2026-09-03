@@ -209,7 +209,13 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                           args, 'claim_residual_gate', False),
                                       velocity=getattr(args, 'track_velocity', False),
                                       view_arbitration=getattr(
-                                          args, 'view_arbitration', False))
+                                          args, 'view_arbitration', False),
+                                      duplicate_suppress=getattr(
+                                          args, 'duplicate_suppress', False),
+                                      duplicate_radius=getattr(
+                                          args, 'duplicate_radius', 0.75),
+                                      duplicate_persist=getattr(
+                                          args, 'duplicate_persist', 5))
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
             if stats is not None:

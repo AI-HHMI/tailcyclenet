@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
-from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, match_instances,
-                                  matched_error, mota, motion_ratio)
+from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, idsw_stability_band,
+                                  match_instances, matched_error, mota, motion_ratio)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -244,6 +244,40 @@ def test_mota_dist_zero_is_not_read_as_unset():
             assert old == new
 
 
+def test_idsw_band_flag_reaches_the_cli_end_to_end(tmp_path, capsys):
+    """`--idsw-band` through `eval.py::main()`, not just the library function: a tiny two-animal
+    npz prediction against a synthetic session, with an exact-crossing tie in the middle so the
+    band actually has width and the flag is proven wired, not merely present in argparse.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    from tailcyclenet.format import Session
+
+    ev = _eval_module()
+    cf._session_3d_multi(tmp_path / 'ds' / 'test' / 's', T=3, sep=20.0)
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    gid = next(iter(sess.groups))
+    true = sess.labels(gid).points3d.copy()
+    pred = true.copy()
+    mid = 0.5 * (true[0, 1] + true[1, 1])
+    pred[0, 1], pred[1, 1] = mid, mid            # an exact tie at frame 1
+
+    npz = tmp_path / 'pred.npz'
+    np.savez(npz, __keys__=np.array([f's/{gid}']), __run__=np.array('r'),
+             __anchor__=np.array('carry'), __boxes__=np.array('none'),
+             **{f's/{gid}|pred': pred, f's/{gid}|mode': np.array('3d')})
+
+    sys.argv = ['eval.py', str(npz), '--data', str(tmp_path / 'ds'), '--split', 'test',
+               '--idsw-band', '8', '--mota-dist', '5.0']
+    ev.main()
+    out = capsys.readouterr().out
+    assert 'idsw band (n=8)' in out, out
+
+
 def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path):
     """`--chunk` gives a one-group clip something for the bootstrap to resample: the chunks
     PARTITION the frames (nothing scored twice, nothing dropped) and the match radius is the whole
@@ -343,6 +377,32 @@ def test_chunk_seam_switch_is_lost_without_threaded_state_and_recovered_with_it(
         'the switch must be attributed to the chunk it is first observed in, not lost at the seam'
     assert sum(by_t0.values()) == whole[0]['mota']['idsw'] == 2, \
         'a chunked idsw total must equal the whole-clip idsw, or the debt this test guards is back'
+
+
+def test_idsw_stability_band_is_wide_at_an_exact_crossing_and_zero_without_one():
+    """An exact crossing -- both predicted points sit exactly at the two ground-truth points'
+    midpoint for one frame, then resolve back to the correct identities -- is a genuine tie: the
+    Hungarian solver's choice for that one frame depends only on row/column order, not on any
+    prediction or label content, so the resulting `idsw` for a PERFECTLY tracked crossing can
+    read 0 or a full round-trip swap depending on storage order alone (identity_review_followthrough
+    plan 3.2). A clean, unambiguous two-animal sequence with no tie anywhere must show none of
+    that sensitivity -- the band collapses to a point.
+    """
+    true = np.zeros((2, 3, 1, 2))
+    true[0, :, 0] = [0.0, 0.0]
+    true[1, :, 0] = [10.0, 10.0]
+
+    tie = true.copy()
+    tie[0, 1, 0] = tie[1, 1, 0] = [5.0, 5.0]     # frame 1: an exact tie at the crossing
+
+    band = idsw_stability_band(tie, true, max_dist=100.0, n=64, seed=0)
+    assert band['min'] == 0, 'a crossing that resolves back must be readable as zero switches'
+    assert band['max'] > band['min'], \
+        f'no tie sensitivity found at an exact crossing: {band}'
+
+    clean = idsw_stability_band(true, true, max_dist=100.0, n=64, seed=0)
+    assert clean['min'] == clean['max'] == 0, \
+        f'an unambiguous sequence must have a zero-width band, got {clean}'
 
 
 def test_err_percentiles_describe_the_tail_the_mean_hides():

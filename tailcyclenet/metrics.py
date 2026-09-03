@@ -247,6 +247,54 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
             'idsw_rate': switches / gt if gt else float('nan')}
 
 
+def idsw_stability_band(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0,
+                        cost='mean', n=32, seed=0) -> dict:
+    """`idsw` under N deterministic row-order permutations of `pred`/`true`, reporting a band
+    instead of a bare count (identity_review_followthrough plan 3.2). MOTA has had a noise floor
+    of +-0.023 since CLAUDE.md's eval rule 8; `idsw` has never had one, and it needs one for a
+    structural reason no amount of code fixing can remove: at an EXACT crossing (two predicted
+    points equidistant from two ground-truth points) every permutation of instances is an
+    equally optimal Hungarian solution, and `linear_sum_assignment` picks one deterministically
+    FROM THE MATRIX'S OWN ROW/COLUMN ORDER -- a real, physical crossing that resolves back to the
+    correct identities can therefore read as 0 switches or as a full round-trip swap (2 * S
+    switches) depending only on which order the instances happened to be stored in, with no
+    change to any prediction, label, or gate. This is not a bug `match_instances`/`mota` can fix
+    (any frame-independent Hungarian identity metric has the identical tie), so the actionable
+    response is to quote `idsw` as this band rather than as an exact integer whenever ties are a
+    live possibility (crowded, multi-animal footage).
+
+    Each of the `n` trials independently permutes the S (instance) axis of BOTH `pred` and `true`
+    -- `ignore`/`ignore_boxes`, when given, are permuted along `true`'s axis to stay aligned with
+    it -- and re-scores with a fresh `mota()` call (no `last` carried between trials: each trial
+    is an independent draw of "what if the rows had been stored in this order", not a
+    continuation of the previous one). A permutation changes no pairwise COST, only which
+    equal-cost assignment the solver returns, so this targets exactly the mechanism above and
+    nothing else (it is not a general robustness check).
+
+    Returns `{median, min, max, p5, p95, n, values}` over the `n` draws' `idsw` counts. A band of
+    `{min: k, max: k}` (zero width) means no tie in this clip/arm is close enough to be resolved
+    by order alone -- report it as zero and move on, per the plan's own acceptance rule.
+    """
+    pred, true = np.asarray(pred, float), np.asarray(true, float)
+    Sp, St = pred.shape[0], true.shape[0]
+    ig = None if ignore is None else np.asarray(ignore, bool)
+    igb = None if ignore_boxes is None else np.asarray(ignore_boxes, float)
+    rng = np.random.default_rng(seed)
+    vals = []
+    for _ in range(n):
+        pi, ti = rng.permutation(Sp), rng.permutation(St)
+        r = mota(pred[pi], true[ti], max_dist,
+                ignore=None if ig is None else ig[ti],
+                ignore_boxes=None if igb is None else igb[ti],
+                min_kpts_frac=min_kpts_frac, cost=cost)
+        vals.append(r['idsw'])
+    vals = np.asarray(vals, float)
+    return {'median': float(np.median(vals)), 'min': float(vals.min()), 'max': float(vals.max()),
+            'p5': float(np.percentile(vals, 5)), 'p95': float(np.percentile(vals, 95)),
+            'n': int(n), 'values': [int(v) for v in vals]}
+
+
+
 def _in_ignore(centroid, rows, t, ignore_boxes) -> bool:
     """Does this prediction land on a present-but-unannotated animal? No boxes -> presence alone
     excuses it; that is the blanket rule and why `fp_ignored` is reported.

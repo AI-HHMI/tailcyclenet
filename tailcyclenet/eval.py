@@ -16,8 +16,9 @@ import numpy as np
 
 from tailcyclenet.format import INST_PRESENT, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.infer.predictions import load_predictions
-from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, match_instances, matched_error,
-                                  mota, motion_ratio, paired_bootstrap, pck)
+from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, idsw_stability_band,
+                                  match_instances, matched_error, mota, motion_ratio,
+                                  paired_bootstrap, pck)
 
 _PCT_KEYS = tuple(f'p{p}' for p in ERR_PCTS)
 
@@ -229,6 +230,11 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
     radius. `last` (optional) is forwarded to `mota()` unchanged -- `score()`'s own per-group
     correspondence state, so a switch straddling a `--chunk` seam is counted once.
 
+    The `ignore`/`ignore_boxes` region built below is stashed onto `m` (`_mota_ignore`,
+    `_mota_ignore_boxes`), not printed, so `--idsw-band` can re-score under the identical ignore
+    region -- the same underscore-prefixed side-channel convention as `_pred`/`_true`/
+    `_pred_matched`.
+
     The match radius is the DIAGONAL of the keypoint bounding box, not a per-axis span: a
     per-axis median ran tighter than the labelling noise and made every instance a miss AND an
     FP. `is None`, not `or`: `--mota-dist 0` is falsy but a legitimate value.
@@ -257,6 +263,7 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
         ig = (lab.instance[:St, :T] == INST_PRESENT).any(-1)
         if lab.boxes is not None and m['mode'] == '2d':
             ig_boxes = lab.boxes[:St, :T, 0]
+    m['_mota_ignore'], m['_mota_ignore_boxes'] = ig, ig_boxes
     return radius, mota(pred, true, radius, ignore=ig, ignore_boxes=ig_boxes,
                         min_kpts_frac=min_kpts_frac, cost=match_cost, last=last)
 
@@ -323,6 +330,13 @@ def main():
                          'because it degrades continuously instead of rejecting the pair. An arm, '
                          'not a correction -- it moves every number in this repo.')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--idsw-band', type=int, default=0, metavar='N',
+                    help='report idsw as a band over N deterministic row-order permutations '
+                         '(identity_review_followthrough plan 3.2), beside the plain count. 0 '
+                         '(default) skips it -- an exact-crossing tie can manufacture switches '
+                         'from a perfectly-tracked pair depending only on row storage order, and '
+                         'idsw has no other documented noise floor; MOTA has had one (+-0.023) '
+                         'since CLAUDE.md eval rule 8. 32 is the plan\'s own suggested N.')
     args = ap.parse_args()
 
     preds, meta = load_predictions(args.predictions)
@@ -414,7 +428,14 @@ def main():
                   f'{r["fp_none_rate"]:.3f})  idsw {r["idsw_rate"]:.4f}  '
                   f'fp_ignored {r["fp_ignored"]:d}  '
                   f'(mota r={m["mota_r"]:.1f}, mpjpe r={m["mpjpe_r"]:.1f} {unit})')
-
+            if args.idsw_band:
+                band = idsw_stability_band(
+                    m['_pred'], m['_true'], m['mota_r'], ignore=m.get('_mota_ignore'),
+                    ignore_boxes=m.get('_mota_ignore_boxes'), min_kpts_frac=args.min_match_kpts,
+                    cost=args.match_cost, n=args.idsw_band, seed=args.seed)
+                print(f'{"":40s} idsw band (n={band["n"]}): median {band["median"]:.1f}  '
+                      f'[{band["min"]:.0f}, {band["max"]:.0f}]  p5-p95 '
+                      f'[{band["p5"]:.1f}, {band["p95"]:.1f}]  raw idsw={r["idsw"]:d}')
 
     if args.vs:
         other, ometa = load_predictions(args.vs)

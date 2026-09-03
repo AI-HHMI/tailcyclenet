@@ -327,7 +327,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
-                    state=None, assoc_mode='per-camera', claim_residual_gate=False,
+                    state=None, assoc_mode='joint', claim_residual_gate=False,
                     velocity=False, view_arbitration=False):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 

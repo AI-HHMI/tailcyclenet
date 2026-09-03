@@ -10,6 +10,7 @@ posetail offers, and everything downstream of it is shrunk to the minimum that s
 every branch. This is a SHAPE-AND-IDENTITY test, not an accuracy test; the weights are random.
 """
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
@@ -86,9 +87,12 @@ def test_moving_camera_forward(moving_batch, enc):
     assert len({c['ext'].ndim for c in b.cgroup}) == 1, 'every camera needs the same ext rank'
 
     model = build_model(small(enc), n_keypoints=int(b.kpt_ids.max()) + 1).eval()
-    with torch.no_grad():
-        out = model(b.views, b.kpt_ids, b.cgroup, mode='3d',
-                    kpt_prior=b.kpt_prior, prompt_time=b.prompt_t)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always', FutureWarning)
+        with torch.no_grad():
+            out = model(b.views, b.kpt_ids, b.cgroup, mode='3d',
+                        kpt_prior=b.kpt_prior, prompt_time=b.prompt_t)
+    assert not [w for w in caught if 'torch.backends.cuda.sdp_kernel()' in str(w.message)]
     p = out['coords_pred']
     assert p.shape == (1, CFG.n_frames, b.kpt_ids.shape[1], 3)
     assert torch.isfinite(p).all()

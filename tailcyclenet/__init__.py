@@ -1,6 +1,7 @@
 """tailcyclenet -- posetail finetuned into an animal pose estimator.
 
-No monkeypatching: posetail >= 0.3.5 ships every behaviour this repo once had to patch in.
+The pinned posetail release still needs one scoped PyTorch SDPA compatibility shim; it is applied
+only during pose-model scene encoding in ``tailcyclenet.model``.
 """
 
 from importlib.metadata import PackageNotFoundError, version as _pkg_version

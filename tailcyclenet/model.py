@@ -8,6 +8,7 @@ dedicated fusion term. (2) What the 3D residual is an offset FROM is a switch
 `"triangulated"` re-adds the residual to each frame's own triangulation.
 """
 from contextlib import contextmanager
+import threading
 
 import torch
 from einops import einsum, repeat
@@ -22,6 +23,76 @@ QUERY_ENCODERS = ('wide',)
 # What the gridresid residual is an offset FROM. See `_query_anchored` / `_reanchor_per_frame`.
 GRIDRESID_OFFSETS = ('query', 'triangulated')
 SCENE_PRECISIONS = ('fp32', 'bf16', 'fp16')
+
+# posetail==0.4.1 still uses the deprecated `torch.backends.cuda.sdp_kernel()` around its
+# V-JEPA attention. Keep the dependency pinned, but replace that module's no-argument call with
+# the equivalent current API while the scene encoder is running. The lock matters because both
+# `torch` and the dependency's module globals are process-wide even though the replacement is
+# scoped to this encoder call.
+_SDPA_COMPAT_LOCK = threading.RLock()
+
+
+@contextmanager
+def _posetail_sdpa_compat():
+    """Use the non-deprecated SDPA context for posetail's legacy attention calls.
+
+    The dependency calls the old context with its defaults, which enable every available backend.
+    Preserve that contract (including explicit flags for any future posetail caller) by translating
+    the flags to the backend enum list expected by ``torch.nn.attention.sdpa_kernel``. Very old
+    PyTorch releases without the new API retain the dependency's original behavior.
+    """
+    from posetail.posetail import vjepa2
+
+    attention = getattr(torch.nn, 'attention', None)
+    sdpa_kernel = getattr(attention, 'sdpa_kernel', None)
+    if sdpa_kernel is None:
+        yield
+        return
+
+    backend_enum = getattr(attention, 'SDPBackend', None)
+    if backend_enum is None:
+        yield
+        return
+
+    def compat_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True,
+                      enable_cudnn=True):
+        """Translate the legacy backend flags to the current enum-based API."""
+        flags = (
+            (enable_flash, 'FLASH_ATTENTION'),
+            (enable_mem_efficient, 'EFFICIENT_ATTENTION'),
+            (enable_math, 'MATH'),
+            (enable_cudnn, 'CUDNN_ATTENTION'),
+        )
+        backends = [getattr(backend_enum, name) for enabled, name in flags
+                    if enabled and hasattr(backend_enum, name)]
+        return sdpa_kernel(backends)
+
+    with _SDPA_COMPAT_LOCK:
+        old_kernel = vjepa2.torch.backends.cuda.sdp_kernel
+        vjepa2.torch.backends.cuda.sdp_kernel = compat_kernel
+        try:
+            yield
+        finally:
+            vjepa2.torch.backends.cuda.sdp_kernel = old_kernel
+
+
+def _wrap_posetail_forward(module):
+    """Run one posetail module under the SDPA compatibility shim."""
+    original_forward = module.forward
+
+    def forward(*args, **kwargs):
+        """Call the original module forward with legacy SDPA translated."""
+        with _posetail_sdpa_compat():
+            return original_forward(*args, **kwargs)
+
+    module.forward = forward
+
+
+def _wrap_posetail_encoder(encoder):
+    """Keep the SDPA shim active when activation checkpointing recomputes encoder blocks."""
+    _wrap_posetail_forward(encoder)
+    for block in encoder.blocks:
+        _wrap_posetail_forward(block)
 
 
 # the query-free scene point
@@ -95,6 +166,7 @@ class PoseTrackerEncoder(TrackerEncoder):
         assert box_prompt == 'none' or box_prompt in BOX_MODES, \
             f'box_prompt must be "none" or one of {BOX_MODES}, got {box_prompt!r}'
         super().__init__(*args, **kwargs)
+        _wrap_posetail_encoder(self.scene_encoder.encoder)
         self.n_keypoints = n_keypoints
         self.query = query
         self.gridresid_offset = gridresid_offset

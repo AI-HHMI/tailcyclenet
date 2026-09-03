@@ -299,6 +299,25 @@ def _capture_overlap_agreement(stats, a, frames, f0, pred, p):
                      'prev': prev[row].copy(), 'new': p[row].copy()})
 
 
+def _count_prior_oob(stats, a, f0, prior):
+    """Count the prior keypoints `prior_out_of_bounds` NaN'd for this (animal, window).
+
+    THE CHEAPER ALTERNATIVE plan 7.2 says must be beaten before its overlap mechanism is built:
+    "count how many prior keypoints `prior_out_of_bounds` NaN'd per window -- a free
+    identity-discontinuity smoke alarm needing no overlap mechanism at all. If that alone finds
+    the known switches, this idea is redundant and should not be built."
+
+    The reasoning is that a carried prior lands outside its own crop exactly when the slot's crop
+    and its remembered pose stopped describing the same animal -- which is what an identity
+    discontinuity IS, seen from inside the pipeline and needing no second forward pass. Recorded
+    under the same opt-in flag as the overlap capture so one probe answers both questions, and
+    counted rather than acted on: rule 12 makes this a smoke alarm, never an arm-ranker.
+    """
+    n_nan = int(torch.isnan(prior[0]).all(-1).sum())
+    stats.setdefault('prior_oob', []).append((int(a), int(f0), n_nan,
+                                              int(prior.shape[1])))
+
+
 def _census_block_boundary(stats, f_read, f_own):
     """Count the seam a block boundary makes uncomparable, so the census cannot overstate itself.
 
@@ -634,6 +653,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             return None
         prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
                                        scales, mode, K, R, cgroup)
+        if stats is not None and stats.get('capture_overlap_agreement') and prior is not None:
+            _count_prior_oob(stats, a, int(frames[0]), prior)
         dev = cfg.device
         chunk = cfg.kpt_chunk or None
         views = [v.to(dev) for v in views]

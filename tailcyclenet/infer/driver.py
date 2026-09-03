@@ -126,7 +126,15 @@ def _write_overlap_trace(path, per_group):
     import json
 
     keys, animal, frame, pos, dist, n_shared, prev, new = [], [], [], [], [], [], [], []
-    for key, (rows, _census) in sorted(per_group.items()):
+    ob_key, ob_animal, ob_frame, ob_nan, ob_k = [], [], [], [], []
+    for key, (_rows, _census, oob) in sorted(per_group.items()):
+        for a, f0, n_nan, n_k in oob:
+            ob_key.append(key)
+            ob_animal.append(a)
+            ob_frame.append(f0)
+            ob_nan.append(n_nan)
+            ob_k.append(n_k)
+    for key, (rows, _census, _oob) in sorted(per_group.items()):
         for r in rows:
             keys.append(key)
             animal.append(r['animal'])
@@ -145,8 +153,11 @@ def _write_overlap_trace(path, per_group):
         dist=np.asarray(dist, np.float32), n_shared=np.asarray(n_shared, np.int32),
         prev=(np.stack(prev) if prev else np.zeros((0, 0, 0), np.float32)),
         new=(np.stack(new) if new else np.zeros((0, 0, 0), np.float32)),
-        census=np.array(json.dumps({k: c for k, (_r, c) in sorted(per_group.items())})))
-    total = {k: sum(c.get(k, 0) for _r, c in per_group.values())
+        oob_group=np.array(ob_key, dtype=object), oob_animal=np.asarray(ob_animal, np.int32),
+        oob_frame=np.asarray(ob_frame, np.int32), oob_nan=np.asarray(ob_nan, np.int32),
+        oob_k=np.asarray(ob_k, np.int32),
+        census=np.array(json.dumps({k: c for k, (_r, c, _o) in sorted(per_group.items())})))
+    total = {k: sum(c.get(k, 0) for _r, c, _o in per_group.values())
              for k in ('pairs_seen', 'pairs_no_prev', 'pairs_no_shared',
                        'block_boundary_seams', 'block_boundary_frames')}
     print(f'wrote overlap trace {path}: {len(dist)} (row, seam) pair(s); census {total}')
@@ -627,7 +638,8 @@ def run_dataset(args):
                 det_trace_groups[key] = det_stats.get('decode_trace', [])
             if getattr(args, 'overlap_trace', None):
                 overlap_rows[key] = (_stats.get('overlap_agreement', []),
-                                     _stats.get('overlap_census', {}))
+                                     _stats.get('overlap_census', {}),
+                                     _stats.get('prior_oob', []))
             writer.write_identity_events(gid, det_stats.get('identity_events', []))
             _wall = time.time() - _t_group
             _dec, _h, _m = (_stats.get('decode_s', 0.0), _stats.get('decode_hits', 0),

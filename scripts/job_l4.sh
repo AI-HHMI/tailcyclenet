@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# One tailcyclenet process executed on an LSF L4 compute host. Pattern copied from
+# ../comparison/models/deeplabcut/job_l4.sh (dev/plans/identity_bridge_and_reid.md §8.4).
+#
+#   bsub -q gpu_l4 -gpu "num=1" -n 8 -R "span[hosts=1] rusage[mem=122880]" \
+#        -J tcn-infer-<clip> -o ~/logs/tailcyclenet/<clip>.out \
+#        bash scripts/job_l4.sh infer --data <session> --run <run> --out <pred-dir>
+#
+# `KIND` selects the script; everything after it is forwarded verbatim. Pass `--max-ram`
+# explicitly on every LSF invocation (CLAUDE.md: an under-detected cgroup/LSF memory limit
+# silently re-sizes the reader cache and the block store -- verify the `ram:` line in the first
+# job's log before submitting the rest). Never request `-n 16`: the L4 limit is `-n 8` per GPU.
+set -euo pipefail
+
+REPO=/groups/karashchuk/home/karashchukl/projects/tailcycle/tailcyclenet
+KIND=$1
+shift
+
+case "$KIND" in
+    infer)           SCRIPT=scripts/infer.py ;;
+    train)           SCRIPT=scripts/train.py ;;
+    train_detector)  SCRIPT=scripts/train_detector.py ;;
+    eval)            SCRIPT=scripts/eval.py ;;
+    *) echo "FATAL: expected infer|train|train_detector|eval, got $KIND" >&2
+       exit 2 ;;
+esac
+
+cd "$REPO"
+source /etc/profile.d/modules.sh 2>/dev/null || true
+module load cuda/12.8 2>/dev/null || true
+export PATH="/groups/karashchuk/home/karashchukl/bin:/home/karashchukl@hhmi.org/.pixi/bin:$PATH"
+
+nvidia-smi
+exec pixi run python "$SCRIPT" "$@"

@@ -17,11 +17,12 @@ KIND=$1
 shift
 
 case "$KIND" in
-    infer)           SCRIPT=scripts/infer.py ;;
-    train)           SCRIPT=scripts/train.py ;;
-    train_detector)  SCRIPT=scripts/train_detector.py ;;
-    eval)            SCRIPT=scripts/eval.py ;;
-    *) echo "FATAL: expected infer|train|train_detector|eval, got $KIND" >&2
+    infer)             SCRIPT=scripts/infer.py ;;
+    train)             SCRIPT=scripts/train.py ;;
+    train_detector)    SCRIPT=scripts/train_detector.py ;;
+    train_crop_reid)   SCRIPT=scripts/train_crop_reid.py ;;
+    eval)              SCRIPT=scripts/eval.py ;;
+    *) echo "FATAL: expected infer|train|train_detector|train_crop_reid|eval, got $KIND" >&2
        exit 2 ;;
 esac
 

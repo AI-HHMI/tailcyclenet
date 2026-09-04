@@ -230,6 +230,34 @@ def test_a_low_margin_release_is_refused_at_the_shipped_default_but_not_at_the_o
     assert plan_old['mapping'] is not None
 
 
+def test_backward_agrees_is_a_diagnostic_that_never_changes_the_arrays():
+    """plan §7.1 / report 64: an independent backward confirmation, stored on the decision dict
+    only -- it must never affect which frames are quarantined or how they are permuted.
+    """
+    pred = _two_animals_crossing(n_frames=400)
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    rows = {'pred': pred.copy(), 'group_id': 'g'}
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+    out, decisions = bridge.bridge_group(rows, _windows(40, 10), ev, 'g', 400, 10,
+                                         bridge.BridgeConfig())
+    plan = decisions[0]
+    assert 'backward_agrees' in plan
+    assert plan['backward_agrees'] in (True, False, None)
+    # an involution (2-row swap) is its own inverse, so a real repair with room for a backward
+    # anchor must agree with itself here
+    assert plan['backward_agrees'] is True
+
+    # identity and refused outcomes carry the key too (unconditional membership), always None
+    out_id, dec_id = bridge.bridge_group(
+        {'pred': _two_animals_crossing(), 'group_id': 'g'}, _windows(24, 10),
+        _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]), 'g', 240, 10,
+        bridge.BridgeConfig())
+    assert dec_id[0]['identity'] is True and dec_id[0]['backward_agrees'] is None
+
+
 def test_rewrite_tables_deletes_quarantine_and_relabels_the_release(tmp_path):
     """A permutation IS an `animal_id` relabel and a quarantine IS a row deletion.
 

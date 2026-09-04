@@ -207,6 +207,33 @@ def solve_mapping(pred: np.ndarray, component: tuple[int, ...], anchor: np.ndarr
     return state, best, second - best
 
 
+def _backward_agrees(pred: np.ndarray, segments: dict[int, np.ndarray], order: list[int],
+                     component: tuple[int, ...], mapping: tuple[int, ...], release: int,
+                     start: int, missing_cost: float, span: int = 8) -> bool | None:
+    """Independent confirmation (plan §7.1, report 64): re-solve the SAME identity question
+    anchored on a clean segment WELL AFTER the release (trusted because the forward pass already
+    resolved everything up to there), resolving BACKWARD toward the pre-episode segment, and
+    check the composed permutation (forward then backward) returns every row to itself.
+
+    DIAGNOSTIC ONLY -- never gates a release; the caller stores this for later analysis. `None`
+    means there was no room for a backward anchor (near the end of the clip), not disagreement.
+
+    An involution (a 2-row swap, alone or beside fixed points) is its own inverse, so agreement
+    there means `bwd_state == mapping` exactly; a longer cycle's true inverse is a DIFFERENT
+    permutation from the forward one, and report 64 confirmed the composition check (not a raw
+    equality) is what correctly distinguishes real agreement from coincidental restatement.
+    """
+    anchor_ws = [w for w in order if release + span <= w < release + span + 4]
+    if not anchor_ws or start - 1 not in segments:
+        return None
+    bwd_anchor = np.concatenate([segments[w] for w in anchor_ws])
+    bwd_post = segments[start - 1]
+    bwd_state, _, _ = solve_mapping(pred, component, bwd_anchor, bwd_post, missing_cost)
+    fwd_map = dict(zip(component, mapping))
+    bwd_map = dict(zip(component, bwd_state))
+    return all(bwd_map[fwd_map[c]] == c for c in component)
+
+
 def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dict,
                  cfg: BridgeConfig) -> dict | None:
     """Decide one episode's quarantine range, release window, and mapping. Reads no labels.
@@ -279,14 +306,17 @@ def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dic
     if best is not None and tuple(best['mapping']) == tuple(component):
         return {'component': list(component), 'windows': [], 'release': None, 'mapping': None,
                 'mean_margin': best['mean_margin'], 'refused': False, 'identity': True,
+                'backward_agrees': None,
                 'event_frames': [episode['first_frame'], episode['last_frame']]}
     if best is None:
         return {'component': list(component), 'windows': windows, 'release': None,
-                'mapping': None, 'mean_margin': None, 'refused': True,
+                'mapping': None, 'mean_margin': None, 'refused': True, 'backward_agrees': None,
                 'event_frames': [episode['first_frame'], episode['last_frame']]}
+    backward_agrees = _backward_agrees(pred, segments, order, component, tuple(best['mapping']),
+                                       best['release'], start, cfg.missing_cost)
     return {'component': list(component), 'windows': windows, 'release': best['release'],
             'mapping': list(best['mapping']), 'mean_margin': best['mean_margin'],
-            'refused': False,
+            'refused': False, 'backward_agrees': backward_agrees,
             'event_frames': [episode['first_frame'], episode['last_frame']]}
 
 

@@ -258,6 +258,37 @@ def test_backward_agrees_is_a_diagnostic_that_never_changes_the_arrays():
     assert dec_id[0]['identity'] is True and dec_id[0]['backward_agrees'] is None
 
 
+def test_all_candidates_are_recorded_sorted_by_margin_and_change_nothing():
+    """plan §7 item 2 / report 73: every horizon-invariant candidate is logged, not just the
+    winner -- a pure diagnostic, sorted descending by margin, that must never change WHICH
+    candidate wins or any array output.
+    """
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    rows = {'pred': pred.copy(), 'group_id': 'g'}
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+                                         bridge.BridgeConfig())
+    plan = decisions[0]
+    assert 'all_candidates' in plan
+    assert len(plan['all_candidates']) >= 1
+    margins = [c['mean_margin'] for c in plan['all_candidates']]
+    assert margins == sorted(margins, reverse=True), 'must be sorted descending by margin'
+    winner = plan['all_candidates'][0]
+    assert winner['release'] == plan['release']
+    assert winner['mapping'] == plan['mapping']
+
+    # identity and refused outcomes carry the field too (unconditional membership)
+    _, dec_id = bridge.bridge_group(
+        {'pred': _two_animals_crossing(), 'group_id': 'g'}, _windows(24, 10),
+        _events([(100, 0, 'retired_duplicate'), (100, 1, 'shielded')]), 'g', 240, 10,
+        bridge.BridgeConfig())
+    assert dec_id[0]['identity'] is True and 'all_candidates' in dec_id[0]
+
+
 def test_rewrite_tables_deletes_quarantine_and_relabels_the_release(tmp_path):
     """A permutation IS an `animal_id` relabel and a quarantine IS a row deletion.
 

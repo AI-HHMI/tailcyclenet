@@ -246,6 +246,13 @@ def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dic
     horizon is off-by-one fragile (moving it one window flips Sequence 59 between 0 and 2
     switches), which is why agreement is required before confidence is consulted at all.
 
+    Every horizon-invariant candidate (not just the winner) is recorded on the returned plan as
+    `all_candidates`, sorted by margin -- a pure diagnostic, gates nothing, same rule
+    `backward_agrees` follows. Report 73: on the one clip this repo has independently verified
+    frame-by-frame (Sequence 59), the CORRECT release is the runner-up by margin, not absent
+    from the candidate set -- so the ranking rule, not candidate generation, is where the
+    remaining error lives, and this field is what a future selection-rule attempt would need.
+
     Three outcomes, and the two non-repairing ones are deliberate:
     * `identity` -- the best map is the identity, so no rows were exchanged and there is nothing
       to repair. Quarantining anyway would spend coverage for no identity gain; skipping these
@@ -285,6 +292,7 @@ def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dic
     horizons = sorted({min(hi + 1, stop + k * cfg.horizon_stride)
                        for k in range(cfg.horizon_steps)})
     best = None
+    all_candidates = []
     for w in candidates:
         seen, margins = set(), []
         for h in horizons:
@@ -298,25 +306,29 @@ def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dic
         if len(seen) != 1 or len(margins) != len(horizons):
             continue
         mean_margin = float(np.mean(margins))
+        all_candidates.append({'release': w, 'mapping': list(next(iter(seen))),
+                               'mean_margin': mean_margin})
         if mean_margin <= cfg.min_margin:
             continue
         if best is None or mean_margin > best['mean_margin']:
             best = {'release': w, 'mapping': next(iter(seen)), 'mean_margin': mean_margin}
+    all_candidates.sort(key=lambda c: c['mean_margin'], reverse=True)
     windows = [w for w in order if start <= w < stop]
     if best is not None and tuple(best['mapping']) == tuple(component):
         return {'component': list(component), 'windows': [], 'release': None, 'mapping': None,
                 'mean_margin': best['mean_margin'], 'refused': False, 'identity': True,
-                'backward_agrees': None,
+                'backward_agrees': None, 'all_candidates': all_candidates,
                 'event_frames': [episode['first_frame'], episode['last_frame']]}
     if best is None:
         return {'component': list(component), 'windows': windows, 'release': None,
                 'mapping': None, 'mean_margin': None, 'refused': True, 'backward_agrees': None,
+                'all_candidates': all_candidates,
                 'event_frames': [episode['first_frame'], episode['last_frame']]}
     backward_agrees = _backward_agrees(pred, segments, order, component, tuple(best['mapping']),
                                        best['release'], start, cfg.missing_cost)
     return {'component': list(component), 'windows': windows, 'release': best['release'],
             'mapping': list(best['mapping']), 'mean_margin': best['mean_margin'],
-            'refused': False, 'backward_agrees': backward_agrees,
+            'refused': False, 'backward_agrees': backward_agrees, 'all_candidates': all_candidates,
             'event_frames': [episode['first_frame'], episode['last_frame']]}
 
 

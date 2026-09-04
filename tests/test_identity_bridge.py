@@ -183,6 +183,51 @@ def test_an_impossible_margin_refuses_and_quarantines_instead_of_guessing():
     assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
 
 
+def test_rewrite_tables_deletes_quarantine_and_relabels_the_release(tmp_path):
+    """A permutation IS an `animal_id` relabel and a quarantine IS a row deletion.
+
+    Rebuilding the tables from arrays would drop `conf2d`, which does not survive a
+    `load_predictions` round trip, so the bridge edits rows instead. This pins that contract.
+    """
+    from tailcyclenet.format import DICT_COLS, write_table
+    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
+    animals = np.array(['a0', 'a1', 'a0', 'a1', 'a0', 'a1'], dtype=object)
+    write_table(tmp_path / 'points3d.pq', {
+        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
+        'animal_id': animals, 'bodypart': np.array(['n'] * 6, dtype=object),
+        'status': np.array(['visible'] * 6, dtype=object),
+        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
+        'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
+    segments = {0: np.arange(0, 10), 1: np.arange(10, 30)}
+    plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
+            'refused': False}
+    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], segments, [plan], n_frames=30)
+    out = pd.read_parquet(tmp_path / 'points3d.pq')
+    # window 0 (frames 0..9) is quarantined, so its rows are gone entirely
+    assert set(out.frame.tolist()) == {20}
+    # window 1 onward is released under [1, 0], so the two ids are exchanged
+    got = dict(zip(out.animal_id.astype(str), out.x))
+    assert got['a0'] == pytest.approx(5.0) and got['a1'] == pytest.approx(4.0)
+
+
+def test_rewrite_tables_leaves_other_groups_byte_exact(tmp_path):
+    from tailcyclenet.format import DICT_COLS, write_table
+    write_table(tmp_path / 'points3d.pq', {
+        'group_id': np.array(['g', 'g', 'other', 'other'], dtype=object),
+        'frame': np.array([0, 0, 0, 0], np.int32),
+        'animal_id': np.array(['a0', 'a1', 'a0', 'a1'], dtype=object),
+        'bodypart': np.array(['n'] * 4, dtype=object),
+        'status': np.array(['visible'] * 4, dtype=object),
+        'x': np.arange(4, dtype=np.float32), 'y': np.zeros(4, np.float32),
+        'z': np.zeros(4, np.float32)}, dict_cols=DICT_COLS)
+    plan = {'component': [0, 1], 'windows': [0], 'release': None, 'mapping': None,
+            'refused': True}
+    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10)}, [plan], 10)
+    out = pd.read_parquet(tmp_path / 'points3d.pq')
+    assert out.group_id.astype(str).tolist() == ['other', 'other']
+    assert out.x.tolist() == [2.0, 3.0]
+
+
 def test_provenance_lists_every_lever_unconditionally():
     """A partial record lies: an absent key reads as 'not used' when it means 'unknown'."""
     keys = {k for k, _ in bridge.config_provenance(bridge.BridgeConfig())}

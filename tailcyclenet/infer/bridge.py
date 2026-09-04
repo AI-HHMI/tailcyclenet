@@ -37,6 +37,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .predictions import load_predictions
+
 # Every per-row field a permutation must carry, so a repaired session stays self-consistent.
 ROW_FIELDS = ('pred', 'pred2d', 'boxes', 'conf', 'box_agree', 'kpt_agree')
 
@@ -382,6 +384,111 @@ def bridge_predictions(predictions: dict, path: Path, cfg: BridgeConfig,
                                            window_length, cfg)
         predictions[gid] = new_rows
         out[gid] = decisions
+    return out
+
+
+def _plan_frames(segments: dict[int, np.ndarray], plan: dict, n_frames: int):
+    """The (quarantined, released) frame index arrays this plan implies."""
+    quarantined = [w for w in plan['windows']
+                   if plan['release'] is None or w < plan['release']]
+    quarantine = (np.concatenate([segments[w] for w in quarantined])
+                  if quarantined else np.empty(0, int))
+    if plan['release'] is None:
+        return quarantine, np.empty(0, int)
+    tail = [segments[w] for w in plan['windows'] if w >= plan['release']]
+    if not tail:
+        return quarantine, np.empty(0, int)
+    last = int(np.concatenate(tail)[-1])
+    return quarantine, np.concatenate(tail + [np.arange(last + 1, n_frames, dtype=int)])
+
+
+def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndarray],
+                   plans: list[dict], n_frames: int) -> dict[str, int]:
+    """Apply plans to the stored parquet tables as row deletions and `animal_id` relabels.
+
+    A permutation IS a relabel and a quarantine IS a deletion, so the tables are edited at row
+    level rather than rebuilt from arrays. That matters: `write_block` needs `conf2d`, which does
+    not survive a `load_predictions` round trip, so rebuilding would silently drop the per-camera
+    scores. Editing rows preserves every column this module does not explicitly touch.
+
+    Only rows of THIS group are considered, so a multi-group session keeps the others byte-exact.
+    Plans are applied latest-first for the same reason `bridge_group` does: each release persists
+    to the end of the clip.
+    """
+    from ..format import DICT_COLS, write_table
+    counts = {}
+    for stem in ('points3d', 'keypoints', 'instances'):
+        f = path / f'{stem}.pq'
+        if not f.exists():
+            continue
+        table = pd.read_parquet(f)
+        if not {'animal_id', 'frame', 'group_id'}.issubset(table.columns):
+            continue
+        gcol = table['group_id'].astype(str).to_numpy()
+        frame = table['frame'].astype(np.int64).to_numpy()
+        animal = table['animal_id'].astype(str).to_numpy().astype(object)
+        mine = gcol == str(gid)
+        drop = np.zeros(len(frame), bool)
+        new_animal = animal.copy()
+        for plan in sorted(plans, key=lambda p: (p['windows'] or [0])[0], reverse=True):
+            if plan.get('skipped') or plan.get('identity'):
+                continue
+            names = [str(animal_ids[i]) for i in plan['component']]
+            quarantine, released = _plan_frames(segments, plan, n_frames)
+            if len(quarantine):
+                inq = np.isin(frame, quarantine) & np.isin(animal, names) & mine
+                drop |= inq
+            if len(released) and plan['mapping'] is not None:
+                inr = np.isin(frame, released) & mine
+                source = new_animal.copy()
+                for logical, local in zip(plan['component'], plan['mapping']):
+                    sel = inr & (source == str(animal_ids[local]))
+                    new_animal[sel] = str(animal_ids[logical])
+        keep = ~drop
+        out = {c: table[c].to_numpy()[keep] for c in table.columns}
+        out['animal_id'] = new_animal[keep]
+        write_table(f, out, dict_cols=DICT_COLS)
+        counts[stem] = int(drop.sum())
+    return counts
+
+
+def bridge_session(path: Path, cfg: BridgeConfig, window_length: int) -> dict:
+    """Bridge a written prediction session IN PLACE, editing its parquet tables. Reads no labels.
+
+    This is what `--identity-bridge` runs after the writer closes. It re-reads the session it just
+    wrote, decides per episode from the stored pose, and edits the tables. Re-running it on an
+    already-bridged session is NOT a no-op and is not supported -- the events that defined the
+    episodes are still in the log, but the rows they describe have already moved.
+    """
+    cfg.validate()
+    path = Path(path)
+    predictions, _ = load_predictions(path)
+    windows = pd.read_parquet(path / 'windows.pq')
+    epath = path / 'identity_events.pq'
+    if not epath.exists():
+        return {}
+    events = pd.read_parquet(epath)
+    if events.empty:
+        return {}
+    out = {}
+    for key, rows in predictions.items():
+        pred = rows.get('pred')
+        if not isinstance(pred, np.ndarray) or pred.ndim != 4:
+            continue
+        gid = str(rows.get('group_id', key))
+        n_frames = int(pred.shape[1])
+        segments = owned_segments(windows, gid, n_frames, window_length)
+        plans = []
+        for ep in sorted(episodes(events, gid, cfg.max_event_gap),
+                         key=lambda e: e['first_frame'], reverse=True):
+            plan = plan_episode(pred, segments, ep, cfg)
+            plans.append(plan if plan is not None else
+                         {'component': list(ep['component']), 'skipped': True, 'windows': [],
+                          'event_frames': [ep['first_frame'], ep['last_frame']]})
+        real = [p for p in plans if not p.get('skipped') and not p.get('identity')]
+        if real:
+            rewrite_tables(path, gid, rows['animal_ids'], segments, real, n_frames)
+        out[key] = list(reversed(plans))
     return out
 
 

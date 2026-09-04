@@ -154,6 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help='write output-neutral per-frame/camera detector decode-stage counts as '
                          'JSON for coverage attribution (scratch diagnostic, not a prediction '
                          'session file).')
+    ap.add_argument('--identity-bridge', action='store_true',
+                    help='OPT-IN post-pass that repairs the slot PERMUTATION a hard interaction '
+                         'leaves behind: quarantine the rows a duplicate episode implicates, then '
+                         're-release them under a one-to-one mapping chosen by reciprocal motion. '
+                         'TRADES MISSES FOR IDENTITY -- measured 3dpop Sequence 59 idsw 16 -> 2 '
+                         'at 11 -> 563 misses, Sequence 29 9 -> 4 at 32 -> 250. Worth it only '
+                         'when identity outranks coverage; quote miss and coverage with any idsw '
+                         'from it. Edits the written session in place, after it is written.')
     ap.add_argument('--overlap-trace', type=Path, default=None,
                     help='write the OUTPUT-NEUTRAL overlap test-retest capture as an npz: for '
                          'every seam frame, the earlier window\'s discarded estimate and the '

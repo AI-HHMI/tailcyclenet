@@ -91,6 +91,7 @@ def _identity_provenance(args):
         'max_move': float(args.max_move),
         'max_age': int(getattr(args, 'max_age', 8)),
         'assoc_mode': str(getattr(args, 'assoc_mode', 'joint')),
+        'identity_bridge': bool(getattr(args, 'identity_bridge', False)),
         'pose_nms': (float(args.pose_nms) if getattr(args, 'pose_nms', None) is not None
                      else 0.0),
         'claim_residual_gate': bool(getattr(args, 'claim_residual_gate', False)),
@@ -688,5 +689,10 @@ def run_dataset(args):
         print(f'wrote detector trace {args.det_trace}')
     if getattr(args, 'overlap_trace', None):
         _write_overlap_trace(args.overlap_trace, overlap_rows)
+    if getattr(args, 'identity_bridge', False):
+        from . import bridge as _bridge
+        _cfg = _bridge.BridgeConfig()
+        _decisions = _bridge.bridge_session(args.out, _cfg, int(cfg.n_frames))
+        print(_bridge.summarise(_decisions))
     print(f'wrote {args.out} ({len(gids)} group(s))')
 

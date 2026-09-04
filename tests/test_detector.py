@@ -5084,3 +5084,83 @@ def test_measured_tracker_configuration_is_the_default():
             np.testing.assert_array_equal(
                 np.nan_to_num(want[i], nan=-9e9), np.nan_to_num(got[i], nan=-9e9),
                 err_msg=f'frame {t}: {name} moved with every lever at its default')
+
+
+def _multi_animal_root(tmp_path, T=6, sep=5.0):
+    """A root with ONE 3-camera, 2-animal session -- `CropReidDataset` needs >=2 real animal
+    identities and >1 camera to be worth testing at all.
+    """
+    from tests.conftest import _session_3d_multi
+
+    root = tmp_path / 'multi_animal'
+    _session_3d_multi(root / 'train' / 'sess', T=T, sep=sep)
+    return root
+
+
+def test_crop_reid_net_forward_shape():
+    """`CropReidNet` maps a batch of crops straight to (B, embed_dim) raw vectors."""
+    from tailcyclenet.detector import CropReidNet
+
+    net = CropReidNet(embed_dim=16)
+    x = torch.rand(5, 3, 96, 96)
+    out = net(x)
+    assert out.shape == (5, 16)
+    assert torch.isfinite(out).all()
+
+
+def test_crop_reid_dataset_labels_persist_across_frames_and_cameras(tmp_path):
+    """The whole point of a crop-level net: `(session, group, row)` must be the SAME label for
+    the SAME animal across every frame and camera it appears in, and DIFFERENT animals must get
+    DIFFERENT labels -- otherwise `contrastive_loss`'s positives are meaningless.
+    """
+    from tailcyclenet.detector import BoxDataset, CropReidDataset
+
+    boxes_ds = BoxDataset(_multi_animal_root(tmp_path), 'train', input_wh=(64, 64))
+    crop_ds = CropReidDataset(boxes_ds, crop_wh=(32, 32))
+
+    assert len(crop_ds) > 0
+    assert crop_ds.n_labels == 2, 'exactly the two animals `_session_3d_multi` writes'
+
+    labels_seen = {int(crop_ds.entries[k][2]) for k in range(len(crop_ds))}
+    assert labels_seen == {0, 1}
+
+    # every entry with row 0 shares one label, every entry with row 1 shares the other, and the
+    # two are DIFFERENT -- across every (frame, camera) draw, not just within one.
+    by_row = {}
+    for i, row, label in crop_ds.entries:
+        by_row.setdefault(row, set()).add(label)
+    assert all(len(s) == 1 for s in by_row.values()), 'one row must map to exactly one label'
+    assert by_row[0] != by_row[1], 'the two animals must not share a label'
+
+    crop, label = crop_ds[0]
+    assert crop.shape == (3, 32, 32)
+    assert crop.dtype == torch.float32
+    assert 0.0 <= float(crop.min()) and float(crop.max()) <= 1.0
+    assert label in (0, 1)
+
+
+def test_crop_reid_dataset_feeds_contrastive_loss(tmp_path):
+    """End-to-end sanity: real crops through a real net through the SAME `contrastive_loss` the
+    dense head uses (report 55: it is deliberately anchor-agnostic) produce a finite, non-negative
+    loss, and it is exactly zero only when the batch holds no same-label pair.
+    """
+    from tailcyclenet.detector import (BoxDataset, CropReidDataset, CropReidNet,
+                                       contrastive_loss)
+
+    boxes_ds = BoxDataset(_multi_animal_root(tmp_path), 'train', input_wh=(64, 64))
+    crop_ds = CropReidDataset(boxes_ds, crop_wh=(32, 32))
+    net = CropReidNet(embed_dim=8)
+
+    n = min(8, len(crop_ds))
+    crops = torch.stack([crop_ds[k][0] for k in range(n)])
+    labels = torch.tensor([crop_ds[k][1] for k in range(n)])
+    assert len(set(labels.tolist())) == 2, 'the batch must actually mix both animals'
+
+    vectors = net(crops)
+    loss = contrastive_loss(vectors, labels)
+    assert torch.isfinite(loss)
+    assert float(loss.detach()) >= 0.0
+
+    # a batch with every label distinct costs nothing (no positive pair exists to contrast)
+    solo_labels = torch.arange(n)
+    assert float(contrastive_loss(vectors, solo_labels)) == 0.0

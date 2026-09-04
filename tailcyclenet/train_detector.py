@@ -291,7 +291,8 @@ def main():
     sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
     reid = int(model_cfg['embed_dim']) > 0 and float(train_cfg['reid_weight']) > 0.0
     if reid:
-        sampler = (CrossCameraPairedSampler(sampler, train) if len(train.ds.rig) > 1
+        _n_cams = max(len(s.rig) for s in train.ds.sessions.get('train', []))
+        sampler = (CrossCameraPairedSampler(sampler, train) if _n_cams > 1
                    else PairedSampler(sampler))
         if not data_cfg['augment']:
             raise SystemExit('reid_weight > 0 requires [data].augment = true: the positive '

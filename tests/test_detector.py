@@ -42,7 +42,7 @@ def _infer_window_source():
 def test_forward_shapes_and_anchor_order():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 160)
-    obj, boxes, _ = m(x)
+    obj, boxes, _, _ = m(x)
     anchors = m.anchor_points(128, 160, x.device)
     assert obj.shape[1] == boxes.shape[1] == anchors.shape[0], \
         'anchor_points must match forward()s flattening order exactly'
@@ -619,7 +619,7 @@ max_pos_per_gt = 2
 def test_loss_is_finite_with_no_animal_anywhere():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 128)
-    obj, boxes, _ = m(x)
+    obj, boxes, _, _ = m(x)
     anchors = m.anchor_points(128, 128, x.device)
     gt = torch.full((2, 1, 4), float('nan'))
     loss, parts = detector_loss(obj, boxes, anchors, gt)
@@ -1923,8 +1923,55 @@ def test_keypoint_head_is_off_by_default():
     assert not any('kpt' in k for k in plain.state_dict())
     assert sum(p.numel() for p in plain.parameters()) \
         < sum(p.numel() for p in kp.parameters())
-    obj, boxes, kpts = plain(torch.zeros(1, 3, 64, 64))
+    obj, boxes, kpts, _ = plain(torch.zeros(1, 3, 64, 64))
     assert kpts is None, 'a keypoint-free model must return None, not zeros'
+
+
+def test_embed_head_is_off_by_default():
+    """`embed_dim = 0` must be BYTE-identical to the head before the branch existed.
+
+    Same contract as `n_keypoints`: not built and ignored, not constructed at all, so an
+    existing checkpoint's `state_dict` gains no new keys and loads unmodified. The embed branch
+    is independent of the keypoint branch (open-set ReID, not a per-anchor identity class), so
+    both must be checkable in isolation from each other.
+    """
+    import torch
+
+    from tailcyclenet.detector import YOLOXNano
+
+    plain, emb = YOLOXNano(), YOLOXNano(embed_dim=32)
+    assert set(plain.state_dict()) == {k for k in emb.state_dict() if 'embed' not in k}
+    assert not any('embed' in k for k in plain.state_dict())
+    assert sum(p.numel() for p in plain.parameters()) \
+        < sum(p.numel() for p in emb.parameters())
+    obj, boxes, kpt, e = plain(torch.zeros(1, 3, 64, 64))
+    assert e is None, 'an embed-free model must return None, not zeros'
+    obj, boxes, kpt, e = emb(torch.zeros(1, 3, 64, 64))
+    anchors = emb.anchor_points(64, 64, torch.device('cpu'))
+    assert e.shape == (1, anchors.shape[0], 32)
+
+
+def test_embed_and_keypoint_heads_are_independent():
+    """Building one branch must not silently build, size, or disturb the other."""
+    import torch
+
+    from tailcyclenet.detector import YOLOXNano
+
+    kpt_only = YOLOXNano(n_keypoints=5)
+    assert not any('embed' in k for k in kpt_only.state_dict())
+    _, _, kpt, e = kpt_only(torch.zeros(1, 3, 64, 64))
+    assert kpt is not None and e is None
+
+    embed_only = YOLOXNano(embed_dim=16)
+    assert not any('kpt' in k for k in embed_only.state_dict())
+    _, _, kpt, e = embed_only(torch.zeros(1, 3, 64, 64))
+    assert kpt is None and e is not None
+
+    both = YOLOXNano(n_keypoints=5, embed_dim=16)
+    _, _, kpt, e = both(torch.zeros(1, 3, 64, 64))
+    assert kpt is not None and e is not None
+    assert kpt.shape[-2:] == (5, 3)
+    assert e.shape[-1] == 16
 
 
 def test_keypoint_decode_is_signed_and_bounded():
@@ -1944,7 +1991,7 @@ def test_keypoint_decode_is_signed_and_bounded():
             p.bias.zero_()
             p.bias[0::3] = +4.0          # dx large positive -> saturates tanh
             p.bias[1::3] = -4.0          # dy large negative
-        _, boxes, kpts = m(torch.zeros(1, 3, 64, 64))
+        _, boxes, kpts, _ = m(torch.zeros(1, 3, 64, 64))
         anchors = m.anchor_points(64, 64, torch.device('cpu'))
     cx, cy = anchors[:, 0], anchors[:, 1]
     assert (kpts[0, :, 0, 0] > cx).all(), 'positive dx must move RIGHT (an exp decode cannot)'
@@ -2095,7 +2142,7 @@ def test_every_yolox_tier_builds_and_forwards():
     for v in sorted(YOLOX_TIERS, key=lambda k: YOLOX_TIERS[k][1]):     # by width_mul, ascending
         m = YOLOXNano(n_keypoints=5, version=v)
         x = torch.rand(1, 3, 96, 128)
-        obj, boxes, kpt = m(x)
+        obj, boxes, kpt, _ = m(x)
         anchors = m.anchor_points(96, 128, x.device)
         assert obj.shape[1] == boxes.shape[1] == anchors.shape[0] == kpt.shape[1]
         assert kpt.shape[2] == 5
@@ -3619,7 +3666,7 @@ def test_bottleneck_expansion_one_matches_the_canonical_shape():
     w = m.backbone.dark3[1].m[0].conv1[0].weight
     assert tuple(w.shape) == (48, 48, 1, 1)
     # And the net still forwards at the wider shape.
-    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _, _ = m(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -3864,7 +3911,7 @@ def test_p2_true_adds_a_stride_4_level():
     assert m.STRIDES == (4, 8, 16, 32)
     assert base.STRIDES == (8, 16, 32), 'the OTHER instance must be unaffected'
     x = torch.zeros(1, 3, 128, 160)
-    obj, boxes, _ = m(x)
+    obj, boxes, _, _ = m(x)
     anchors = m.anchor_points(128, 160, x.device)
     assert obj.shape[1] == boxes.shape[1] == anchors.shape[0]
     assert set(anchors[:, 2].tolist()) == {4.0, 8.0, 16.0, 32.0}
@@ -3879,7 +3926,7 @@ def test_p2_works_on_trimmed_too():
     `bottleneck_expansion` does alongside `trimmed`."""
     m = YOLOXNano(version='trimmed', p2=True)          # must not raise
     assert m.STRIDES == (4, 8, 16, 32)
-    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _, _ = m(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -3899,7 +3946,7 @@ def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
     loaded, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(p)
     assert loaded.p2 is True
     assert loaded.STRIDES == (4, 8, 16, 32)
-    obj, boxes, _ = loaded(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _, _ = loaded(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -4103,7 +4150,7 @@ def test_load_coco_backbone_transfers_every_backbone_tensor():
     n_loaded, n_total = load_coco_backbone(m, 'tiny', weights_dir=WEIGHTS_DIR)
     assert (n_loaded, n_total) == (35, 35)
     # And the loaded weights actually forward without shape errors.
-    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _, _ = m(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -4439,7 +4486,7 @@ def test_hybrid_backbone_backward_produces_finite_grads():
 def test_yolox_nano_hybrid_version_builds_and_forwards():
     model = YOLOXNano(version='hybrid', p2=True)
     assert model.STRIDES == (4, 8, 16, 32)
-    obj, boxes, kpt = model(torch.rand(1, 3, 128, 192))
+    obj, boxes, kpt, _ = model(torch.rand(1, 3, 128, 192))
     anchors = model.anchor_points(128, 192, 'cpu')
     assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
     assert kpt is None
@@ -4521,7 +4568,7 @@ def test_g1_shared_head_default_forward_matches_reg_tower_output():
     regression guard against `Head.forward` accidentally building `obj_convs` unconditionally."""
     model = YOLOXNano(version='tiny', p2=False, shared_head=True)
     x = torch.rand(1, 3, 128, 128)
-    obj, boxes, kpt = model(x)
+    obj, boxes, kpt, _ = model(x)
     assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
 
 
@@ -4529,7 +4576,7 @@ def test_g2_fpn_upsample_bilinear_forwards():
     model = YOLOXNano(version='tiny', p2=True, fpn_upsample='bilinear')
     assert model.neck.fpn_upsample == 'bilinear'
     x = torch.rand(1, 3, 128, 128)
-    obj, boxes, kpt = model(x)
+    obj, boxes, kpt, _ = model(x)
     assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
 
 

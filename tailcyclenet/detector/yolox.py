@@ -338,6 +338,21 @@ class Head(nn.Module):
     `(dx, dy, score)` per keypoint. At the default 0 nothing is constructed -- not built and
     ignored -- so an existing checkpoint's `state_dict` is unchanged.
 
+    `embed_dim > 0` adds a third, independent branch (own tower, own 1x1) emitting a `D`-dim
+    metric-embedding vector per anchor -- open-set ReID, per
+    `dev/plans/identity_bridge_and_reid.md` §5.2: the question this answers is "are these two
+    boxes the same animal" (a DISTANCE between two detections), not "which of a closed training
+    set is this" (the deleted identity-classification branch this docstring's own history
+    warned against -- a per-anchor softmax over a CLOSED animal set, built and deleted because a
+    single class means objectness alone carries all the information). This is a different
+    question in kind: it must generalise to animals never seen in training, so it is scored by
+    distance, never by class index. At the default 0, exactly like `n_keypoints`, nothing is
+    constructed and every existing checkpoint's `state_dict` is unchanged.
+
+    NOT YET WIRED to a loss or a training recipe -- this is the architecture half only, the same
+    staged-scaffolding pattern `YOLOXNano.__init__`'s own `in_channels` docstring already uses:
+    the branch exists and is provably a no-op at `embed_dim=0`, but nothing trains it yet.
+
     DECOUPLED, not shared, and that is a measured choice: the second tower costs ~1.15x the whole
     network against 1.01x for a shared one, which is a rounding error on a real run's wall clock
     (the forward is <1% of it). Compute is not the constraint here; accuracy is.
@@ -346,7 +361,8 @@ class Head(nn.Module):
     `tiny` and up use full convolutions.
     """
 
-    def __init__(self, cin=96, n_levels=3, n_keypoints=0, depthwise=True, shared_head=True):
+    def __init__(self, cin=96, n_levels=3, n_keypoints=0, embed_dim=0, depthwise=True,
+                shared_head=True):
         """Build the decoupled head: per-level stems, reg/obj towers, optional kpt branch.
 
         `shared_head=True` (default) runs obj AND reg through the SAME `reg_convs` tower --
@@ -360,6 +376,7 @@ class Head(nn.Module):
         """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
+        self.embed_dim = int(embed_dim)
         self.shared_head = bool(shared_head)
         self.stems = nn.ModuleList([conv_norm_act(cin, cin, 1) for _ in range(n_levels)])
         self.reg_convs = nn.ModuleList(
@@ -380,16 +397,24 @@ class Head(nn.Module):
                  for _ in range(n_levels)])
             self.kpt_pred = nn.ModuleList(
                 [nn.Conv2d(cin, 3 * self.n_keypoints, 1) for _ in range(n_levels)])
+        if self.embed_dim:
+            self.embed_convs = nn.ModuleList(
+                [nn.Sequential(conv3(cin, cin, 3, depthwise=depthwise),
+                               conv3(cin, cin, 3, depthwise=depthwise))
+                 for _ in range(n_levels)])
+            self.embed_pred = nn.ModuleList(
+                [nn.Conv2d(cin, self.embed_dim, 1) for _ in range(n_levels)])
 
     def forward(self, feats):
-        """Per level: stem -> reg tower -> (obj, reg, kpt) predictions; list of triples."""
+        """Per level: stem -> reg tower -> (obj, reg, kpt, embed) predictions; list of 4-tuples."""
         outs = []
         for i, f in enumerate(feats):
             stem = self.stems[i](f)
             x = self.reg_convs[i](stem)
             obj_x = x if self.shared_head else self.obj_convs[i](stem)
             kpt = self.kpt_pred[i](self.kpt_convs[i](stem)) if self.n_keypoints else None
-            outs.append((self.obj_pred[i](obj_x), self.reg_pred[i](x), kpt))
+            embed = self.embed_pred[i](self.embed_convs[i](stem)) if self.embed_dim else None
+            outs.append((self.obj_pred[i](obj_x), self.reg_pred[i](x), kpt, embed))
         return outs
 
 
@@ -424,8 +449,8 @@ class YOLOXNano(nn.Module):
     """
     STRIDES = (8, 16, 32)
 
-    def __init__(self, width=96, n_keypoints=0, version='trimmed', bottleneck_expansion=0.5,
-                p2=False, in_channels=3, pretrained='',
+    def __init__(self, width=96, n_keypoints=0, embed_dim=0, version='trimmed',
+                bottleneck_expansion=0.5, p2=False, in_channels=3, pretrained='',
                 shared_head=True, fpn_upsample='nearest'):
         """Build the box predictor for `version` (see the class docstring for arguments).
 
@@ -435,6 +460,7 @@ class YOLOXNano(nn.Module):
         """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
+        self.embed_dim = int(embed_dim)
         self.version = str(version)
         self.bottleneck_expansion = float(bottleneck_expansion)
         self.p2 = bool(p2)
@@ -471,7 +497,7 @@ class YOLOXNano(nn.Module):
                           p2=self.p2, fpn_upsample=fpn_upsample)
         n_levels = 4 if self.p2 else 3
         self.head = Head(neck_out, n_levels=n_levels, n_keypoints=self.n_keypoints,
-                         depthwise=depthwise, shared_head=shared_head)
+                         embed_dim=self.embed_dim, depthwise=depthwise, shared_head=shared_head)
         if self.p2:
             self.STRIDES = (4, 8, 16, 32)
 
@@ -483,7 +509,9 @@ class YOLOXNano(nn.Module):
         the total number of anchor points across the three levels. With `n_keypoints > 0` it
         returns a third tensor, keypoints (B, A, K, 3) -- (x, y, score_logit), x/y also in input
         pixels -- and `None` otherwise, so existing two-value callers must be updated but their
-        behaviour is unchanged.
+        behaviour is unchanged. With `embed_dim > 0` a fourth tensor, embed (B, A, D) -- a raw
+        (un-normalised) metric-embedding vector per anchor, `None` otherwise -- is ALWAYS
+        returned regardless of `n_keypoints`, so a caller must index rather than assume arity 3.
 
         Boxes decode from ltrb distances: exp keeps them strictly positive (YOLOX's own choice),
         scaled by stride, around each cell centre. Keypoint offsets are NOT exponentiated -- they
@@ -494,8 +522,8 @@ class YOLOXNano(nn.Module):
         half-width is `.detach()`ed so the keypoint loss cannot perturb the box branch.
         """
         outs = self.head(self.neck(self.backbone(x)))
-        obj_all, box_all, kpt_all = [], [], []
-        for (obj, reg, kpt), stride in zip(outs, self.STRIDES):
+        obj_all, box_all, kpt_all, embed_all = [], [], [], []
+        for (obj, reg, kpt, embed), stride in zip(outs, self.STRIDES):
             B, _, h, w = obj.shape
             gy, gx = torch.meshgrid(torch.arange(h, device=x.device),
                                     torch.arange(w, device=x.device), indexing='ij')
@@ -514,8 +542,11 @@ class YOLOXNano(nn.Module):
                 ctr = torch.stack([cx, cy], -1)[None]
                 xy = ctr[:, :, None] + 1.25 * half[:, :, None] * torch.tanh(k[..., :2])
                 kpt_all.append(torch.cat([xy, k[..., 2:]], -1))
+            if embed is not None:
+                embed_all.append(embed.permute(0, 2, 3, 1).reshape(B, -1, self.embed_dim))
         k = torch.cat(kpt_all, 1) if kpt_all else None
-        return torch.cat(obj_all, 1), torch.cat(box_all, 1), k
+        e = torch.cat(embed_all, 1) if embed_all else None
+        return torch.cat(obj_all, 1), torch.cat(box_all, 1), k, e
 
     def anchor_points(self, h, w, device):
         """(A, 3) of (cx, cy, stride) matching forward()'s flattening order."""

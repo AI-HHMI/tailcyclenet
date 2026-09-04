@@ -781,7 +781,8 @@ def test_a_video_read_locks_per_container_not_globally():
 def test_targets_are_the_crop_rule(tiny_root):
     """The regression target must BE crop_box_for_points, not something similar to it."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2)
-    x, boxes = ds[0]
+    item = ds[0]
+    x, boxes = item['x'], item['boxes']
     assert x.shape == (3, 128, 128)
     sess, gid, f, ci = ds.index[0]
     lab = sess.labels(gid)
@@ -854,7 +855,8 @@ def test_augment_decodes_real_pixels_through_getitem(tiny_root):
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
                     max_frames_per_group=2, augment=True)
     for i in range(min(3, len(ds))):
-        x, boxes = ds[i]
+        item = ds[i]
+        x, boxes = item['x'], item['boxes']
         assert x.shape == (3, 48, 64)
         assert torch.isfinite(x).all()
         assert float(x.min()) >= 0.0 and float(x.max()) <= 1.0, \
@@ -977,11 +979,11 @@ def test_chunk_is_one_containers_worth_of_index(tiny_root):
 
 
 def test_collate_pads_uneven_animal_counts():
-    a = (torch.zeros(3, 8, 8), torch.zeros(2, 4))
-    b = (torch.zeros(3, 8, 8), torch.zeros(5, 4))
-    x, boxes = box_collate([a, b])
-    assert x.shape == (2, 3, 8, 8) and boxes.shape == (2, 5, 4)
-    assert torch.isnan(boxes[0, 2:]).all()
+    a = {'x': torch.zeros(3, 8, 8), 'boxes': torch.zeros(2, 4)}
+    b = {'x': torch.zeros(3, 8, 8), 'boxes': torch.zeros(5, 4)}
+    got = box_collate([a, b])
+    assert got['x'].shape == (2, 3, 8, 8) and got['boxes'].shape == (2, 5, 4)
+    assert torch.isnan(got['boxes'][0, 2:]).all()
 
 
 def test_tracker_retires_the_weaker_duplicate_target():
@@ -1587,8 +1589,8 @@ def test_box_source_instances_retargets_only_where_a_box_exists(tiny_root):
                       max_frames_per_group=4)
     # the fixture's one stored box is a02 on frame 1
     i = next(i for i, (_, _, f, _) in enumerate(ds.index) if f == 1)
-    _, boxes = ds[i]
-    _, plain = base[i]
+    boxes = ds[i]['boxes']
+    plain = base[i]['boxes']
     sess, gid, f, ci = ds.index[i]
     lab = sess.labels(gid)
     cam = sess.rig.posetail()[ci]
@@ -2314,7 +2316,7 @@ def test_an_off_frame_tile_is_grey_not_wrapped(tiny_root):
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
                     tile_wh=(16, 16), tile_scale=1.0)
     ds.origins[0] = (-16.0, -16.0)          # wholly outside, up and left
-    x = ds[0][0]
+    x = ds[0]['x']
     assert x.shape == (3, 16, 16)
     torch.testing.assert_close(x, torch.full_like(x, 114 / 255.0))
 
@@ -2347,8 +2349,8 @@ def test_use_regions_emits_a_full_frame_rect_when_the_session_has_none(tiny_root
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
                     use_regions=True)
     item = ds[0]
-    assert len(item) == 3
-    torch.testing.assert_close(item[2], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
+    assert set(item) == {'x', 'boxes', 'regions'}
+    torch.testing.assert_close(item['regions'], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
 
 
 def test_certified_anchors_unions_the_boxes_in():
@@ -2363,14 +2365,16 @@ def test_certified_anchors_unions_the_boxes_in():
                                  torch.full((1, 4), float('nan'))).any()
 
 
-def test_split_batch_tells_keypoints_from_regions_by_rank():
+def test_split_batch_reads_explicit_keys_not_ranks():
     from tailcyclenet.detector import split_batch
     x, b = torch.zeros(2, 3, 8, 8), torch.zeros(2, 1, 4)
     k, r = torch.zeros(2, 1, 5, 3), torch.zeros(2, 3, 4)
-    assert split_batch((x, b)) == (x, b, None, None)
-    assert split_batch((x, b, k))[2] is k and split_batch((x, b, k))[3] is None
-    assert split_batch((x, b, r))[2] is None and split_batch((x, b, r))[3] is r
-    got = split_batch((x, b, k, r))
+    assert split_batch({'x': x, 'boxes': b}) == (x, b, None, None)
+    assert split_batch({'x': x, 'boxes': b, 'kpts': k})[2] is k \
+        and split_batch({'x': x, 'boxes': b, 'kpts': k})[3] is None
+    assert split_batch({'x': x, 'boxes': b, 'regions': r})[2] is None \
+        and split_batch({'x': x, 'boxes': b, 'regions': r})[3] is r
+    got = split_batch({'x': x, 'boxes': b, 'kpts': k, 'regions': r})
     assert got[2] is k and got[3] is r
 
 
@@ -3067,9 +3071,11 @@ def test_strong_augment_off_is_byte_identical(tiny_root):
                      max_frames_per_group=2, augment=True, seed=0)   # strong defaults False
     for i in range(min(3, len(ds_a))):
         np.random.seed(0)
-        xa, ba = ds_a[i]
+        item_a = ds_a[i]
+        xa, ba = item_a['x'], item_a['boxes']
         np.random.seed(0)
-        xb, bb = ds_b[i]
+        item_b = ds_b[i]
+        xb, bb = item_b['x'], item_b['boxes']
         # Pixels drawn from a fresh rng each visit (`default_rng(None)`) are not literally
         # reproducible call-to-call under the augmented path -- what must hold is that the two
         # CONSTRUCTIONS (with and without the explicit strong=False) are the same object, i.e.
@@ -3100,7 +3106,7 @@ def test_strong_augment_preserves_box_targets(tiny_root):
     for i in range(min(4, len(ds))):
         base = ds.boxes_for(i)     # the animal count before any strong op ran
         for _ in range(8):
-            _, boxes = ds[i]
+            boxes = ds[i]['boxes']
             # Appearance ops and cutout never touch `boxes_for`'s output -- only mosaic-lite
             # appends a row -- so the box count for this item can only stay the same or GROW,
             # never shrink or resize below what `boxes_for` alone would produce.

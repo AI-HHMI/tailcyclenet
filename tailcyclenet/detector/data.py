@@ -336,7 +336,7 @@ class BoxDataset(Dataset):
             tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
                 size; `tile_scale` is the source -> input scale and the only scale there is.
             use_regions -- mask objectness supervision to `regions.pq` CERTIFIED area; the
-                opt-in (M,4) tuple slot `box_collate` dispatches by rank.
+                opt-in (M,4) named-dict slot `box_collate` reads by key (never by rank).
             keypoints -- also emit per-keypoint targets and kill the horizontal flip (hflip=None
                 decides from `keypoints`).
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
@@ -909,12 +909,14 @@ class BoxDataset(Dataset):
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        out = (x, boxes) if kpts is None else (x, boxes, kpts)
-        if not self.use_regions:
-            return out
-        if regions is None:
-            regions = torch.tensor([[0.0, 0.0, float(self.input_wh[0]), float(self.input_wh[1])]])
-        return (*out, regions)
+        item = {'x': x, 'boxes': boxes}
+        if kpts is not None:
+            item['kpts'] = kpts
+        if self.use_regions:
+            item['regions'] = (regions if regions is not None else
+                               torch.tensor([[0.0, 0.0, float(self.input_wh[0]),
+                                              float(self.input_wh[1])]]))
+        return item
 
 
 class ChunkShuffle(torch.utils.data.Sampler):
@@ -996,54 +998,52 @@ class CohortSampler(torch.utils.data.Sampler):
 
 
 def box_collate(batch):
-    """Pad the box axis with NaN so a batch can hold different animal counts.
+    """Collate `BoxDataset` items (named dicts) into one named-dict batch.
 
-    NaN, not zero, and that carries all the way to the loss: a padded row is "no animal", which is
-    the same signal a real animal with no finite point in this view sends. Keypoints pad the same
-    way, so a padded (S,K,3) slice is non-finite in every channel and every mask drops it.
+    Pad the box axis with NaN so a batch can hold different animal counts. NaN, not zero, and
+    that carries all the way to the loss: a padded row is "no animal", which is the same signal
+    a real animal with no finite point in this view sends. Keypoints pad the same way, so a
+    padded (S,K,3) slice is non-finite in every channel and every mask drops it.
 
-    An item is `(x, boxes[, kpts][, regions])` and the optional tails are told apart BY RANK --
-    keypoints are (S,K,3) and regions (M,4). Dispatching on tuple length alone is ambiguous at
-    three elements, which is the kind of thing that silently feeds regions to the keypoint loss.
+    Items are explicit named dicts (`x`, `boxes`, optional `kpts`/`regions`) -- dispatched BY
+    NAME, not by rank or tuple length. The old rank-based dispatch was what let the docstring's
+    own "ambiguous at three elements" failure silently feed regions to the keypoint loss; a
+    named contract cannot.
 
     Regions NaN-pad the same way, and for the same reason: `certified_anchors` drops a
     non-finite rect, so a padded row certifies nothing rather than certifying the origin.
     """
-    xs = torch.stack([b[0] for b in batch])
-    n = max(b[1].shape[0] for b in batch)
+    xs = torch.stack([b['x'] for b in batch])
+    n = max(b['boxes'].shape[0] for b in batch)
     boxes = torch.full((len(batch), n, 4), float('nan'))
     for i, b in enumerate(batch):
-        boxes[i, :b[1].shape[0]] = b[1]
-    tails = [t for t in batch[0][2:]]
-    out = [xs, boxes]
+        boxes[i, :b['boxes'].shape[0]] = b['boxes']
+    out = {'x': xs, 'boxes': boxes}
 
-    if any(t.dim() == 3 for t in tails):
-        K = next(t for t in tails if t.dim() == 3).shape[1]
+    if any('kpts' in b for b in batch):
+        K = next(b['kpts'] for b in batch if 'kpts' in b).shape[1]
         kpts = torch.full((len(batch), n, K, 3), float('nan'))
         for i, b in enumerate(batch):
-            k = next(t for t in b[2:] if t.dim() == 3)
+            k = b['kpts']
             kpts[i, :k.shape[0]] = k
-        out.append(kpts)
+        out['kpts'] = kpts
 
-    if any(t.dim() == 2 for t in tails):
-        rs = [next(t for t in b[2:] if t.dim() == 2) for b in batch]
+    if any('regions' in b for b in batch):
+        rs = [b['regions'] for b in batch if 'regions' in b]
         m = max(1, max(r.shape[0] for r in rs))
         regions = torch.full((len(batch), m, 4), float('nan'))
-        for i, r in enumerate(rs):
+        for i, b in enumerate(batch):
+            r = b['regions']
             regions[i, :r.shape[0]] = r
-        out.append(regions)
-    return tuple(out)
+        out['regions'] = regions
+    return out
 
 
 def split_batch(batch):
-    """A collated batch -> `(x, boxes, kpts_or_None, regions_or_None)`.
+    """A collated batch dict -> `(x, boxes, kpts_or_None, regions_or_None)`.
 
-    THE one place the optional tails are told apart, by RANK: keypoints are (B,S,K,3) and regions
-    (B,M,4). `len(batch) > 2` cannot do it -- with keypoints off and regions on, a three-element
-    batch's third element is regions, and reading it as `gt_kpts` would feed rectangles to the
-    keypoint loss and train the branch against them.
+    Keys, not ranks: the old rank-based version could not tell keypoints (B,S,K,3) from regions
+    (B,M,4) without the shape gamble that fed rectangles to the keypoint loss when the optional
+    tails were built from a three-element tuple.
     """
-    x, boxes = batch[0], batch[1]
-    kpts = next((t for t in batch[2:] if t.dim() == 4), None)
-    regions = next((t for t in batch[2:] if t.dim() == 3), None)
-    return x, boxes, kpts, regions
+    return batch['x'], batch['boxes'], batch.get('kpts'), batch.get('regions')

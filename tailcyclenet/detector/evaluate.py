@@ -171,7 +171,7 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     tracks = defaultdict(dict)
     sessions, n_want = {}, {}
     for bi, batch in enumerate(loader):
-        x, gt = batch[0], batch[1]
+        x, gt = batch['x'], batch['boxes']
         _out = model(x.to(device))
         obj, pred_boxes = _out[0], _out[1]
         for j in range(x.shape[0]):

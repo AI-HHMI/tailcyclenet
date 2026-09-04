@@ -21,7 +21,8 @@ import toml
 
 from tailcyclenet.checkpoints import _DETECTOR_CONFIG, provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, CohortSampler, PairedSampler, YOLOXNano,
+from tailcyclenet.detector import (BoxDataset, CohortSampler, CrossCameraPairedSampler,
+                                   PairedSampler, YOLOXNano,
                                    box_collate, contrastive_loss, detector_loss,
                                    pool_embeddings_per_box, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
@@ -290,12 +291,14 @@ def main():
     sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
     reid = int(model_cfg['embed_dim']) > 0 and float(train_cfg['reid_weight']) > 0.0
     if reid:
-        sampler = PairedSampler(sampler)
+        sampler = (CrossCameraPairedSampler(sampler, train) if len(train.ds.rig) > 1
+                   else PairedSampler(sampler))
         if not data_cfg['augment']:
             raise SystemExit('reid_weight > 0 requires [data].augment = true: the positive '
-                             'pair is two AUGMENTED views of the same index, and without '
-                             'augmentation the pair is two identical images, which teaches '
-                             'nothing and quietly wastes half the batch.')
+                             'pair is two INDEPENDENTLY AUGMENTED views (same frame, same or '
+                             'different camera), and without augmentation the pair is two '
+                             'identical images, which teaches nothing and quietly wastes half '
+                             'the batch.')
         if data_cfg['augment_strong']:
             raise SystemExit('reid_weight > 0 requires [data].augment_strong = false: '
                              'mosaic-lite appends a box row to ONE draw of a pair and not '

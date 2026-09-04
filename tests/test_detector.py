@@ -1000,6 +1000,45 @@ def test_paired_sampler_emits_each_draw_twice_adjacent():
     assert list(iter(p)) == [7, 7, 3, 3, 9, 9]
 
 
+def test_cross_camera_paired_sampler_pairs_same_frame_different_camera():
+    """The Cam2 failure (report 55): same-camera augmentation pairs never teach viewpoint
+    invariance, so each pair must be a DIFFERENT camera of the SAME frame. GT rows are the same
+    animals in every camera, so the camera-free `(src, row)` label already treats the pair as
+    one animal -- this sampler only controls WHICH two views reach the loss.
+    """
+    from tailcyclenet.detector import CrossCameraPairedSampler
+
+    class FakeDS:
+        class S:
+            def __init__(self, sid):
+                self.session_id = sid
+
+        # index entries (sess, gid, frame, cam): 2 frames x 2 cameras
+        index = [(S('s'), 'g', 0, 0), (S('s'), 'g', 0, 1),
+                 (S('s'), 'g', 1, 0), (S('s'), 'g', 1, 1)]
+
+    class Base:
+        def __init__(self, draws):
+            self.draws = draws
+
+        def __len__(self):
+            return len(self.draws)
+
+        def __iter__(self):
+            yield from self.draws
+
+    ds = FakeDS()
+    p = CrossCameraPairedSampler(Base([0, 1, 2, 3]), ds)
+    out = list(iter(p))
+    assert len(out) == 8
+    for k in range(0, len(out), 2):
+        i, j = out[k], out[k + 1]
+        si, sj = ds.index[i], ds.index[j]
+        assert (si[1], si[2]) == (sj[1], sj[2]), 'pair must share (group, frame)'
+        assert si[3] != sj[3], 'pair must be a DIFFERENT camera'
+
+
+
 def test_collate_pads_uneven_animal_counts():
     a = {'x': torch.zeros(3, 8, 8), 'boxes': torch.zeros(2, 4)}
     b = {'x': torch.zeros(3, 8, 8), 'boxes': torch.zeros(5, 4)}

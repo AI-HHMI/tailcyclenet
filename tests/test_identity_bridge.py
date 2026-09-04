@@ -44,7 +44,7 @@ def _two_animals_crossing(n_frames=240, k=3):
 def test_config_refuses_nonsense_by_name():
     for kw in ({'recovery_windows': 0}, {'horizon_steps': 0}, {'horizon_stride': 0},
                {'min_margin': -1}, {'missing_cost': 0}, {'pre_event_windows': -1},
-               {'max_event_gap': -1}):
+               {'max_event_gap': -1}, {'hold_down_windows': -1}):
         with pytest.raises(ValueError):
             bridge.BridgeConfig(**kw).validate()
     bridge.BridgeConfig().validate()
@@ -396,3 +396,73 @@ def test_interpolate_without_a_release_still_falls_back_to_nan():
     plan = decisions[0]
     assert plan['refused'] is True and plan['release'] is None
     assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
+
+
+def test_hold_down_release_commits_earlier_than_the_default_max_margin_rule():
+    """Section 2.2: on a clean scene where every post-episode candidate agrees on the same
+    mapping, `hold_down_windows=1` must find an EARLIER (or equal) release than the default
+    max-margin rule -- margin grows with elapsed motion (CLAUDE.md), so the highest-margin
+    candidate is never the earliest one when many agree, and hold-down exists to commit sooner.
+    The mapping must still be correct, not merely early.
+    """
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+    rows_default = {'pred': pred.copy(), 'group_id': 'g'}
+    out_default, decisions_default = bridge.bridge_group(rows_default, _windows(24, 10), ev, 'g',
+                                                          240, 10, bridge.BridgeConfig())
+    plan_default = decisions_default[0]
+
+    rows_hold = {'pred': pred.copy(), 'group_id': 'g'}
+    cfg_hold = bridge.BridgeConfig(hold_down_windows=1)
+    out_hold, decisions_hold = bridge.bridge_group(rows_hold, _windows(24, 10), ev, 'g', 240, 10,
+                                                    cfg_hold)
+    plan_hold = decisions_hold[0]
+
+    assert not plan_hold.get('refused'), 'a clean, fully-agreeing scene must not refuse'
+    assert plan_hold['mapping'] == [1, 0], 'hold-down must still find the correct mapping'
+    assert plan_hold['release'] <= plan_default['release'], \
+        'hold-down must commit at or before the max-margin release on a fully-agreeing scene'
+    # the frame right at the early release must already carry the CORRECT (permuted) identity,
+    # not an exposed-wrong one -- section 2.1's exact failure mode, avoided by construction here.
+    early_frame = 10 * plan_hold['release']
+    assert out_hold['pred'][0, early_frame, 0, 0] == pytest.approx(float(early_frame), abs=1.0)
+
+
+def test_hold_down_release_refuses_when_no_run_of_consecutive_agreement_exists():
+    """An impossibly long hold-down requirement can never be satisfied -- must refuse (quarantine
+    held), never silently fall back to the old max-margin rule.
+    """
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    rows = {'pred': pred, 'group_id': 'g'}
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+    cfg = bridge.BridgeConfig(hold_down_windows=1000)  # far more candidates than exist
+    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10, cfg)
+    plan = decisions[0]
+    assert plan['refused'] is True and plan['release'] is None
+    assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
+
+
+def test_hold_down_windows_zero_is_byte_identical_to_the_default_rule():
+    """The flag must be additive: `hold_down_windows=0` is not just semantically 'off', it must
+    take the SAME code path as omitting it entirely.
+    """
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+    rows_a = {'pred': pred.copy(), 'group_id': 'g'}
+    out_a, _ = bridge.bridge_group(rows_a, _windows(24, 10), ev, 'g', 240, 10,
+                                   bridge.BridgeConfig())
+    rows_b = {'pred': pred.copy(), 'group_id': 'g'}
+    out_b, _ = bridge.bridge_group(rows_b, _windows(24, 10), ev, 'g', 240, 10,
+                                   bridge.BridgeConfig(hold_down_windows=0))
+    assert np.array_equal(out_a['pred'], out_b['pred'], equal_nan=True)

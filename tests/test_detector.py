@@ -979,6 +979,27 @@ def test_chunk_is_one_containers_worth_of_index(tiny_root):
     assert ds.chunk < len(ds.index) or n_src == 1
 
 
+def test_paired_sampler_emits_each_draw_twice_adjacent():
+    """The ReID positive-pair contract: batch slots 2k and 2k+1 are the SAME index, fetched
+    twice (two independently-augmented views under `augment and train`).
+    """
+    from tailcyclenet.detector import PairedSampler
+
+    class Base:
+        def __init__(self, draws):
+            self.draws = draws
+
+        def __len__(self):
+            return len(self.draws)
+
+        def __iter__(self):
+            yield from self.draws
+
+    p = PairedSampler(Base([7, 3, 9]))
+    assert len(p) == 6
+    assert list(iter(p)) == [7, 7, 3, 3, 9, 9]
+
+
 def test_collate_pads_uneven_animal_counts():
     a = {'x': torch.zeros(3, 8, 8), 'boxes': torch.zeros(2, 4)}
     b = {'x': torch.zeros(3, 8, 8), 'boxes': torch.zeros(5, 4)}
@@ -2350,7 +2371,7 @@ def test_use_regions_emits_a_full_frame_rect_when_the_session_has_none(tiny_root
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
                     use_regions=True)
     item = ds[0]
-    assert set(item) == {'x', 'boxes', 'regions'}
+    assert set(item) == {'x', 'boxes', 'src', 'regions'}
     torch.testing.assert_close(item['regions'], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
 
 

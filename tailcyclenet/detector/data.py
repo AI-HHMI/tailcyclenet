@@ -909,7 +909,7 @@ class BoxDataset(Dataset):
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        item = {'x': x, 'boxes': boxes}
+        item = {'x': x, 'boxes': boxes, 'src': (sess.session_id, str(gid), int(f))}
         if kpts is not None:
             item['kpts'] = kpts
         if self.use_regions:
@@ -997,6 +997,36 @@ class CohortSampler(torch.utils.data.Sampler):
         yield from (int(j) for j in np.minimum(draws, len(self.cum) - 1))
 
 
+class PairedSampler(torch.utils.data.Sampler):
+    """Emit each of a base sampler's draws TWICE, adjacently.
+
+    The ReID positive-pair trick (report 55): two DataLoader fetches of the SAME index are two
+    independently-augmented views of the same item (fresh `default_rng(None)` per `__getitem__`
+    call under `augment and train`), so batch slots `2k` and `2k+1` are guaranteed same-animal
+    views of the same frame -- a positive pair with NO tracking, NO registry, and NO cross-
+    session identity, for one frame and one camera.
+
+    NOT a separate sampling policy: `base` decides WHICH indices are visited and with what
+    weights; this only interleaves a duplicate next to each draw so the loader's batch stays
+    pair-aligned. `__len__` doubles so `drop_last` and the loader's epoch math see an even
+    count and the same number of MODEL steps per epoch as the unpaired base.
+    """
+
+    def __init__(self, base):
+        """Wrap `base`; its draws become adjacent duplicate pairs."""
+        self.base = base
+
+    def __len__(self):
+        """Double the base length so epoch math sees even, pair-aligned batches."""
+        return 2 * len(self.base)
+
+    def __iter__(self):
+        """Yield each base draw twice in a row: the two views of one positive pair."""
+        for i in self.base:
+            yield i
+            yield i
+
+
 def box_collate(batch):
     """Collate `BoxDataset` items (named dicts) into one named-dict batch.
 
@@ -1019,6 +1049,9 @@ def box_collate(batch):
     for i, b in enumerate(batch):
         boxes[i, :b['boxes'].shape[0]] = b['boxes']
     out = {'x': xs, 'boxes': boxes}
+    srcs = [b.get('src') for b in batch]
+    if any(s is not None for s in srcs):
+        out['src'] = srcs
 
     if any('kpts' in b for b in batch):
         K = next(b['kpts'] for b in batch if 'kpts' in b).shape[1]

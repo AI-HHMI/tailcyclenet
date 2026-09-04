@@ -21,8 +21,9 @@ import toml
 
 from tailcyclenet.checkpoints import _DETECTOR_CONFIG, provenance
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, CohortSampler, YOLOXNano, box_collate,
-                                   detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector import (BoxDataset, CohortSampler, PairedSampler, YOLOXNano,
+                                   box_collate, contrastive_loss, detector_loss,
+                                   pool_embeddings_per_box, split_batch, tiled_input_wh)
 from tailcyclenet.detector.config import load_detector_config
 from tailcyclenet.detector.evaluate import overall, score_dataset
 from tailcyclenet.detector.pretrained import load_coco_backbone
@@ -287,6 +288,25 @@ def main():
     for w in weights:
         combined_w = w if combined_w is None else combined_w * w
     sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
+    reid = int(model_cfg['embed_dim']) > 0 and float(train_cfg['reid_weight']) > 0.0
+    if reid:
+        sampler = PairedSampler(sampler)
+        if not data_cfg['augment']:
+            raise SystemExit('reid_weight > 0 requires [data].augment = true: the positive '
+                             'pair is two AUGMENTED views of the same index, and without '
+                             'augmentation the pair is two identical images, which teaches '
+                             'nothing and quietly wastes half the batch.')
+        if data_cfg['augment_strong']:
+            raise SystemExit('reid_weight > 0 requires [data].augment_strong = false: '
+                             'mosaic-lite appends a box row to ONE draw of a pair and not '
+                             'the other, which silently breaks the row-index correspondence '
+                             'the positive-pair labels rely on. The geometric + photometric '
+                             'suite (hflip/rotate/scale + photometric) is unaffected and '
+                             'still provides the two independent views.')
+        if train_cfg['batch_size'] % 2:
+            raise SystemExit(f"reid_weight > 0 requires an even [training].batch_size so a "
+                             f'positive pair never straddles a batch boundary, got '
+                             f'{train_cfg["batch_size"]}.')
     was = train.cohort_mix()
     now = train.cohort_mix(combined_w)
     af = ('natural' if data_cfg['annot_frac'] is None
@@ -319,7 +339,8 @@ def main():
                          **tiling)
         print(f'val:   {len(val)} views')
 
-    model = YOLOXNano(n_keypoints=n_kpts, version=model_cfg['yolox'],
+    model = YOLOXNano(n_keypoints=n_kpts, embed_dim=int(model_cfg['embed_dim']),
+                      version=model_cfg['yolox'],
                       bottleneck_expansion=model_cfg['bottleneck_expansion'],
                       p2=model_cfg['p2'],
                       pretrained=model_cfg['pretrained'],
@@ -354,6 +375,7 @@ def main():
             gt_regions = gt_tail if data_cfg['use_regions'] else None
             out = model(x)
             obj, boxes, kpt = out[0], out[1], out[2]
+            embed = out[3] if len(out) > 3 else None
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=train_cfg['kpt_weight'],
@@ -368,6 +390,27 @@ def main():
                                         tal_topk=train_cfg['tal_topk'],
                                         tal_alpha=train_cfg['tal_alpha'],
                                         tal_beta=train_cfg['tal_beta'])
+            if reid and embed is not None:
+                srcs = batch.get('src')
+                vectors, labels = [], []
+                label_of = {}
+                if srcs is not None:
+                    for bi in range(x.shape[0]):
+                        if srcs[bi] is None:
+                            continue
+                        vecs = pool_embeddings_per_box(embed[bi], anchors, gt[bi])
+                        for s in range(vecs.shape[0]):
+                            if not torch.isfinite(vecs[s]).all():
+                                continue
+                            key = (srcs[bi], s)
+                            label_of.setdefault(key, len(label_of))
+                            vectors.append(vecs[s])
+                            labels.append(label_of[key])
+                if vectors and len(label_of) < len(vectors):
+                    reid_loss = contrastive_loss(
+                        torch.stack(vectors), torch.tensor(labels, device=device))
+                    loss = loss + float(train_cfg['reid_weight']) * reid_loss
+                    parts['reid'] = float(reid_loss.detach())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if train_cfg['optimizer'] == 'muon':
@@ -391,6 +434,7 @@ def main():
                 kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
                 kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
                 kp += f'  iouT {parts["iou_target"]:5.3f}' if 'iou_target' in parts else ''
+                kp += f'  reid {parts["reid"]:6.3f}' if 'reid' in parts else ''
                 print(f'{it:7d}/{train_cfg["iters"]}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
                       f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)

@@ -7,9 +7,9 @@ from .assign import (assign, assign_tal, box_iou, certified_anchors, ciou_loss, 
 
                      detector_loss, giou_loss, paired_iou)
 from .associate import associate
-from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
-                   letterbox_transform, reduce_factor, split_batch, tile_transform,
-                   unletterbox_boxes, unletterbox_keypoints)
+from .data import (BoxDataset, ChunkShuffle, CohortSampler, PairedSampler, box_collate,
+                   letterbox, letterbox_transform, reduce_factor, split_batch,
+                   tile_transform, unletterbox_boxes, unletterbox_keypoints)
 from .pretrained import load_coco_backbone
 from .reid_loss import contrastive_loss, pool_embeddings_per_box
 from .yolox import YOLOX_TIERS, YOLOXNano
@@ -67,7 +67,7 @@ def resolve_detector_checkpoint(path, checkpoint='latest'):
 
 
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
-           'box_collate', 'letterbox',
+           'PairedSampler', 'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'assign_tal', 'box_iou',
            'certified_anchors', 'ciou_loss', 'decode', 'detector_loss', 'giou_loss',

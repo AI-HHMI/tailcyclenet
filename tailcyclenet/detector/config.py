@@ -43,10 +43,11 @@ DATA_KEYS = frozenset({
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'use_regions', 'alpha',
 })
-MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
+MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2', 'embed_dim'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
     'eval_batches', 'kpt_weight', 'kpt_score_weight', 'iou_aware_obj', 'iou_aware_warmup',
+    'reid_weight',
     'max_pos_per_gt', 'box_weight', 'weight_decay', 'nms_iou_thresh',
     'nms_center_dist_thresh', 'assignment', 'box_loss',
     'tal_topk', 'tal_alpha', 'tal_beta',
@@ -161,9 +162,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                                    'max_input_px': 4 * 416 * 416,
                                    'val_frames_per_group': 8,
                                    'tile_bg_per_frame': 1}[k]))
-    for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight', 'weight_decay'):
+    for k in ('lr', 'kpt_weight', 'kpt_score_weight', 'box_weight', 'weight_decay', 'reid_weight'):
         train[k] = float(train.get(k, {'lr': 1e-3, 'kpt_weight': 1.0, 'kpt_score_weight': 1.0,
-                                       'box_weight': 5.0, 'weight_decay': 5e-4}[k]))
+                                       'box_weight': 5.0, 'weight_decay': 5e-4,
+                                       'reid_weight': 0.0}[k]))
     if train['weight_decay'] < 0:
         raise SystemExit(f"[training].weight_decay must be >= 0, got {train['weight_decay']}.")
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
@@ -188,6 +190,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
 
     model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))
     model['pretrained'] = str(model.get('pretrained', ''))
+    model['embed_dim'] = int(model.get('embed_dim', 0))
     if model['yolox'] == 'trimmed' and model['bottleneck_expansion'] != 0.5:
         raise SystemExit(
             f"[model].bottleneck_expansion={model['bottleneck_expansion']} was set alongside "

@@ -77,15 +77,6 @@ class BridgeConfig:
     is that a confident wrong answer is worse than an absence. A caller whose downstream metric is
     trajectory continuity rather than per-frame pose accuracy may want it on; MPJPE on the
     interpolated frames should be reported separately from the clip's normal error whenever it is.
-    Measured (Sequence59 11.76x, Sequence29 3.65x the clip's own normal MPJPE): both EXCEED the
-    ~2x bar, confirming the default stays OFF.
-
-    `hold_down_windows` (plan section 2.2, default 0 = OFF, unchanged selection rule): when > 0,
-    REPLACES 'highest mean margin among horizon-invariant candidates' with 'earliest candidate
-    whose mapping holds for `hold_down_windows` CONSECUTIVE candidate windows' -- see
-    `_hold_down_release`. Refuses (component stays quarantined) rather than falling back to the
-    old rule when nothing holds, the same "refuse rather than guess" posture `min_margin` already
-    has.
     """
 
     max_event_gap: int = 64
@@ -96,7 +87,6 @@ class BridgeConfig:
     min_margin: float = 60.0
     missing_cost: float = 200.0
     interpolate: bool = False
-    hold_down_windows: int = 0
 
     def validate(self) -> None:
         """Refuse a nonsensical config by name rather than producing quiet nonsense."""
@@ -110,8 +100,6 @@ class BridgeConfig:
             raise ValueError('horizon_steps and horizon_stride must be >= 1')
         if self.min_margin < 0:
             raise ValueError('min_margin must be >= 0')
-        if self.hold_down_windows < 0:
-            raise ValueError('hold_down_windows must be >= 0')
         if not self.missing_cost > 0:
             raise ValueError('missing_cost must be > 0')
 
@@ -256,32 +244,6 @@ def _backward_agrees(pred: np.ndarray, segments: dict[int, np.ndarray], order: l
     return all(bwd_map[fwd_map[c]] == c for c in component)
 
 
-def _hold_down_release(all_candidates: list[dict], cfg: BridgeConfig) -> dict | None:
-    """Section 2.2: the earliest candidate whose mapping holds for `hold_down_windows`
-    CONSECUTIVE candidate windows, or None if nothing does (refuse rather than guess).
-
-    This decouples WHEN to trust a release from HOW MUCH to throw away, and is structurally
-    different from section 2.1's refuted mechanism: the frames between the first agreeing
-    candidate and its confirmation are never exposed un-permuted, because a HOLD-DOWN release
-    still commits the WHOLE quarantine to the earliest confirmed window's mapping in one step
-    (via the normal `release`/`mapping` fields `apply_plan` already understands) -- there is no
-    retroactive REVEAL of a still-wrong identity, only a retroactive CHOICE of which correct
-    mapping to commit to and how early.
-    """
-    by_window = {c['release']: c for c in all_candidates}
-    for w in sorted(by_window):
-        c0 = by_window[w]
-        if c0['mean_margin'] <= cfg.min_margin:
-            continue
-        run = [w + j for j in range(cfg.hold_down_windows)]
-        if not all(r in by_window for r in run):
-            continue
-        if not all(tuple(by_window[r]['mapping']) == tuple(c0['mapping']) for r in run):
-            continue
-        return {'release': w, 'mapping': c0['mapping'], 'mean_margin': c0['mean_margin']}
-    return None
-
-
 def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dict,
                  cfg: BridgeConfig) -> dict | None:
     """Decide one episode's quarantine range, release window, and mapping. Reads no labels.
@@ -361,8 +323,6 @@ def plan_episode(pred: np.ndarray, segments: dict[int, np.ndarray], episode: dic
         if best is None or mean_margin > best['mean_margin']:
             best = {'release': w, 'mapping': next(iter(seen)), 'mean_margin': mean_margin}
     all_candidates.sort(key=lambda c: c['mean_margin'], reverse=True)
-    if cfg.hold_down_windows > 0:
-        best = _hold_down_release(all_candidates, cfg)
     windows = [w for w in order if start <= w < stop]
     if best is not None and tuple(best['mapping']) == tuple(component):
         return {'component': list(component), 'windows': [], 'release': None, 'mapping': None,

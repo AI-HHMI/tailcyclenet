@@ -338,3 +338,61 @@ def test_provenance_lists_every_lever_unconditionally():
     """A partial record lies: an absent key reads as 'not used' when it means 'unknown'."""
     keys = {k for k, _ in bridge.config_provenance(bridge.BridgeConfig())}
     assert keys == {f'bridge_{f}' for f in bridge.BridgeConfig.__dataclass_fields__}
+
+
+def test_interpolate_fills_the_quarantine_with_a_linear_ramp_between_true_anchors():
+    """Section 2.3: with `interpolate=True` and a real release, the quarantine gap is filled
+    instead of NaN'd, and on rows whose true trajectory IS linear (this fixture), interpolation
+    must recover it almost exactly -- the strongest test a linear interpolator can pass.
+    """
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    rows = {'pred': pred, 'group_id': 'g'}
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+    cfg = bridge.BridgeConfig(interpolate=True)
+    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10, cfg)
+    plan = decisions[0]
+    quarantined = [w for w in plan['windows'] if w < plan['release']]
+    assert quarantined, 'a repaired episode must still have something to fill'
+    frame = 10 * quarantined[0]
+    assert not np.isnan(out['pred'][0, frame]).any(), 'interpolate=True must not leave NaN here'
+    # row 0's true track is x=frame, y=0 -- a linear interpolator on a linear track is exact
+    # up to the boundary anchors' own frame spacing.
+    assert out['pred'][0, frame, 0, 0] == pytest.approx(float(frame), abs=2.0)
+    assert out['pred'][0, frame, 0, 1] == pytest.approx(0.0, abs=2.0)
+    # row 2, outside the component, must still be byte-untouched
+    assert not np.isnan(out['pred'][2, frame]).any()
+
+
+def test_interpolate_defaults_off_and_is_byte_identical_to_before():
+    """The flag must be additive: unset, behaviour is exactly the pre-2.3 NaN quarantine."""
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+    rows_a = {'pred': pred.copy(), 'group_id': 'g'}
+    out_a, _ = bridge.bridge_group(rows_a, _windows(24, 10), ev, 'g', 240, 10,
+                                   bridge.BridgeConfig())
+    rows_b = {'pred': pred.copy(), 'group_id': 'g'}
+    out_b, _ = bridge.bridge_group(rows_b, _windows(24, 10), ev, 'g', 240, 10,
+                                   bridge.BridgeConfig(interpolate=False))
+    assert np.array_equal(out_a['pred'], out_b['pred'], equal_nan=True)
+
+
+def test_interpolate_without_a_release_still_falls_back_to_nan():
+    """A refused release has no right-hand anchor, so interpolate=True must NOT invent one."""
+    pred = _two_animals_crossing()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    rows = {'pred': pred, 'group_id': 'g'}
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+    cfg = bridge.BridgeConfig(min_margin=1e12, interpolate=True)  # nothing can clear this
+    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10, cfg)
+    plan = decisions[0]
+    assert plan['refused'] is True and plan['release'] is None
+    assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()

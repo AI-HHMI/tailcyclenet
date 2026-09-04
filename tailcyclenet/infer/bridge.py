@@ -68,6 +68,15 @@ class BridgeConfig:
     Sequence53's correct identity resolutions: 82.99/435.51; Sequence58's release: 1379.84).
     60.0 sits strictly between the one bad case and every good one, refuses Sequence42 at ZERO
     added miss cost, and changes nothing else measured so far.
+
+    `interpolate` (plan section 2.3, default OFF): once a release mapping is known, the
+    pre-episode and post-episode tracks are both identified, so the quarantined gap CAN be linearly
+    interpolated instead of NaN'd -- converting misses into (possibly wrong) detections. Default
+    OFF is a deliberate position, not an oversight: interpolated pose during a fight is likely
+    wrong in a way indistinguishable downstream from a real observation, and this repo's culture
+    is that a confident wrong answer is worse than an absence. A caller whose downstream metric is
+    trajectory continuity rather than per-frame pose accuracy may want it on; MPJPE on the
+    interpolated frames should be reported separately from the clip's normal error whenever it is.
     """
 
     max_event_gap: int = 64
@@ -77,6 +86,7 @@ class BridgeConfig:
     horizon_stride: int = 4
     min_margin: float = 60.0
     missing_cost: float = 200.0
+    interpolate: bool = False
 
     def validate(self) -> None:
         """Refuse a nonsensical config by name rather than producing quiet nonsense."""
@@ -337,9 +347,48 @@ def _is_noop(plan: dict) -> bool:
     return not plan.get('windows') and plan.get('release') is None
 
 
+def _interpolate_gap(changed: np.ndarray, component: np.ndarray,
+                     quarantine: np.ndarray) -> np.ndarray:
+    """Section 2.3: linearly interpolate COMPONENT rows across `quarantine`'s frame span,
+    in place, between the frame just before it and the frame just after it.
+
+    Must run AFTER the release permutation has already written `changed`'s post-gap frames, so
+    the right-hand anchor is the CORRECTLY IDENTIFIED position, not the pre-repair one -- an
+    interpolation from the wrong anchor would connect two different animals' trajectories.
+
+    Falls back to NaN (this frame's ordinary quarantine behaviour) wherever an anchor is missing:
+    off the edge of the clip (no `lo`/`hi` frame exists), or the anchor itself is non-finite
+    (the animal was not observed right at the boundary either) -- two real endpoints are
+    required, not one, and per-ELEMENT (not per-row), so a partially-visible keypoint still
+    interpolates the keypoints that DO have both anchors.
+
+    The CALLER must gate this on `plan['release'] is not None` -- an in-bounds `hi` frame is not
+    by itself proof of a verified anchor: a REFUSED episode still quarantines only up to
+    `recovery_windows`, and the raw prediction just past that boundary is whatever the tracker
+    originally wrote (possibly still the very swap this episode exists because of), never
+    validated by a release decision. Interpolating toward that would invent a good-looking but
+    wrong trajectory, worse than the NaN it would otherwise be.
+    """
+    if not len(quarantine):
+        return changed
+    lo, hi = int(quarantine.min()) - 1, int(quarantine.max()) + 1
+    if lo < 0 or hi >= changed.shape[1]:
+        changed[component[:, None], quarantine] = np.nan
+        return changed
+    left = changed[component, lo]
+    right = changed[component, hi]
+    alpha = (quarantine.astype(np.float64) - lo) / (hi - lo)
+    a = alpha.reshape((1, -1) + (1,) * (left.ndim - 1))
+    interp = left[:, None, ...] * (1.0 - a) + right[:, None, ...] * a
+    valid = np.broadcast_to(np.isfinite(left[:, None, ...]) & np.isfinite(right[:, None, ...]),
+                            interp.shape)
+    changed[component[:, None], quarantine] = np.where(valid, interp, np.nan)
+    return changed
+
+
 def apply_plan(rows: dict, segments: dict[int, np.ndarray], plan: dict,
-               n_frames: int) -> dict:
-    """Apply one episode's plan to the row arrays: NaN the quarantine, permute from the release.
+               n_frames: int, interpolate: bool = False) -> dict:
+    """Apply one episode's plan to the row arrays: fill the quarantine, permute from the release.
 
     The permutation is applied to EVERY per-row field together, so a bridged session cannot end
     up with pose from one animal and boxes from another. Rows outside the component are
@@ -348,6 +397,9 @@ def apply_plan(rows: dict, segments: dict[int, np.ndarray], plan: dict,
     The release PERSISTS to the end of the clip, not just to the end of the bridged range: a
     resolved identity holds until something else changes it, and stopping at the range edge would
     re-introduce the very swap this just repaired, one window later.
+
+    `interpolate` (section 2.3, default OFF at the caller) fills the quarantine by linear
+    interpolation between its boundary frames instead of NaN-ing it; see `_interpolate_gap`.
     """
     component = np.asarray(plan['component'])
     quarantined = [w for w in plan['windows']
@@ -367,12 +419,15 @@ def apply_plan(rows: dict, segments: dict[int, np.ndarray], plan: dict,
             out[key] = value
             continue
         changed = value.copy()
-        if len(quarantine):
-            changed[component[:, None], quarantine] = np.nan
         if len(released):
             original = value[:, released]
             for logical, local in zip(plan['component'], plan['mapping']):
                 changed[logical, released] = original[local]
+        if len(quarantine):
+            if interpolate and plan['release'] is not None:
+                changed = _interpolate_gap(changed, component, quarantine)
+            else:
+                changed[component[:, None], quarantine] = np.nan
         out[key] = changed
     return out
 
@@ -399,7 +454,7 @@ def bridge_group(rows: dict, windows: pd.DataFrame, events: pd.DataFrame, gid: s
                               'event_frames': [ep['first_frame'], ep['last_frame']]})
             continue
         if not _is_noop(plan):
-            rows = apply_plan(rows, segments, plan, n_frames)
+            rows = apply_plan(rows, segments, plan, n_frames, interpolate=cfg.interpolate)
         decisions.append(plan)
     return rows, list(reversed(decisions))
 

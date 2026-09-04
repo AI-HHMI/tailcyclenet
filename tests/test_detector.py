@@ -856,7 +856,8 @@ def test_augment_decodes_real_pixels_through_getitem(tiny_root):
                     max_frames_per_group=2, augment=True)
     for i in range(min(3, len(ds))):
         item = ds[i]
-        x, boxes = item['x'], item['boxes']
+        x = item['x']
+        _boxes = item['boxes']
         assert x.shape == (3, 48, 64)
         assert torch.isfinite(x).all()
         assert float(x.min()) >= 0.0 and float(x.max()) <= 1.0, \

@@ -4,12 +4,14 @@ from pathlib import Path
 import torch
 
 from .assign import (assign, assign_tal, box_iou, certified_anchors, ciou_loss, decode,
+
                      detector_loss, giou_loss, paired_iou)
 from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
                    letterbox_transform, reduce_factor, split_batch, tile_transform,
                    unletterbox_boxes, unletterbox_keypoints)
 from .pretrained import load_coco_backbone
+from .reid_loss import contrastive_loss, pool_embeddings_per_box
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 
@@ -69,6 +71,7 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'assign_tal', 'box_iou',
            'certified_anchors', 'ciou_loss', 'decode', 'detector_loss', 'giou_loss',
+           'contrastive_loss', 'pool_embeddings_per_box',
            'associate',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone',
            'paired_iou', 'resolve_detector_checkpoint']

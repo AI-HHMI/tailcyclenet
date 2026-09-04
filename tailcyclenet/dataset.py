@@ -115,6 +115,15 @@ class LoaderConfig:
     box_prompt_frames: str = 'all'
     # fraction of STEPS the box is withheld (no-box token)
     box_prompt_dropout: float = 0.0
+    # plan section 6.3: of the items ALREADY box-dropped (a subset of box_prompt_dropout, not an
+    # additional draw -- REPLACES some of that fraction's corrupted priors with clean ones,
+    # keeping the total box-free fraction unchanged), the fraction that ALSO get a CLEAN pose
+    # prior (no prompt_dropout / prompt_offset_px / prompt_noise_px corruption applied), so the
+    # model has a genuine pose-only training signal instead of one where every box-free item is
+    # ALSO independently pose-corrupted by chance. Default 0.0 = OFF = today's behaviour,
+    # BYTE-IDENTICAL: the coupling logic below is entered only when this is > 0, so at 0.0 not one
+    # extra `rng` call is made and every corruption site draws exactly where it always has.
+    pose_only_prob: float = 0.0
     # exposure bias: the deployed box is a DETECTOR box
     box_prompt_jitter: float = 0.0
     box_prompt_scale_jitter: float = 0.0
@@ -1000,20 +1009,21 @@ class PoseDataset(Dataset):
         UNLABELED), withheld when `sess.has_visibility_assessment` is False or every
         assessed row is projected/unlabeled; both-or-neither.
 
-        Geometry: camera and crop-inflate draws are one per item (camera draw sorted).
-        Points outside the source frame or the FINAL crop are flipped out of `vis_2d`;
-        a rotation that loses the animal to the inscribed crop is REVERTED, not retried.
+        Geometry: camera and crop-inflate draws are one per item (camera draw sorted). Points
+        outside the source frame or the FINAL crop are flipped out of `vis_2d`; a rotation that
+        loses the animal to the inscribed crop is REVERTED, not retried.
 
-        Pixels: appearance augmentation runs on the final ~256 px crops; views are
-        UINT8 (4x fewer bytes to collate/queue/pin; the model divides on device).
+        Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
+        fewer bytes to collate/queue/pin; the model divides on device).
 
-        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training,
-        the previous window's own prediction at deployment); `prompt_t` is the first
-        labelled frame; `prompt_dropout` is PER ITEM, not per keypoint. Corruptions,
-        in order: exposure bias, noise/offset in PIXELS, stale priors,
-        `prompt_swap_animal`, `prompt_swap_kpt_pairs` (finite entries independently
-        replaced by another keypoint's ORIGINAL position), and a whole-body offset --
-        ONE vector per item.
+        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training, the
+        previous window's own prediction at deployment); `prompt_t` is the first labelled frame;
+        `prompt_dropout` is PER ITEM, not per keypoint. Corruptions, in order: exposure bias,
+        noise/offset in PIXELS, stale priors, `prompt_swap_animal`, `prompt_swap_kpt_pairs`
+        (finite entries independently replaced by another keypoint's ORIGINAL position), and a
+        whole-body offset -- ONE vector per item. `pose_only_prob` (0 = byte-identical) hoists
+        the box-dropout coin EARLY so a box-dropped item can also skip these corruptions,
+        REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
 
         The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
         last frame); the final 3D noisy-OR is over the FINAL `vis_2d`.
@@ -1173,12 +1183,20 @@ class PoseDataset(Dataset):
                                          gray, rng)
                 views.append(torch.from_numpy(np.asarray(imgs)))
 
+        box_dropped_early = None
+        pose_only_active = False
+        if self.train and self.cfg.pose_only_prob > 0 and self.cfg.box_prompt != 'none' \
+                and self.cfg.box_prompt_dropout > 0:
+            box_dropped_early = rng.random() < self.cfg.box_prompt_dropout
+            if box_dropped_early:
+                pose_only_active = rng.random() < self.cfg.pose_only_prob
+
         finite = torch.isfinite(coords).all(-1)
         prompt_t = torch.where(finite.any(0), finite.float().argmax(0), torch.zeros(K).long())
         prompt_t = prompt_t.to(torch.int32)
         kpt_prior = coords[prompt_t, torch.arange(K)].clone()
         kpt_prior[~finite.any(0)] = float('nan')
-        if self.train and rng.random() < self.cfg.prompt_dropout:
+        if self.train and not pose_only_active and rng.random() < self.cfg.prompt_dropout:
             kpt_prior[:] = float('nan')
         px = 1.0
         if R == 3 and (self.cfg.prompt_noise_px > 0 or self.cfg.prompt_offset_px > 0) \
@@ -1214,11 +1232,13 @@ class PoseDataset(Dataset):
                     original = kpt_prior
                     kpt_prior = kpt_prior.clone()
                     kpt_prior[finite_idx[sel]] = original[src_idx]
-        if self.train and self.cfg.prompt_offset_px > 0 and bool(torch.isfinite(kpt_prior).any()):
+        if self.train and not pose_only_active and self.cfg.prompt_offset_px > 0 \
+                and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(
                 rng.normal(0.0, float(self.cfg.prompt_offset_px) * px, (1, R)),
                 dtype=kpt_prior.dtype)
-        if self.train and self.cfg.prompt_noise_px > 0 and bool(torch.isfinite(kpt_prior).any()):
+        if self.train and not pose_only_active and self.cfg.prompt_noise_px > 0 \
+                and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(
                 rng.normal(0.0, float(self.cfg.prompt_noise_px) * px, kpt_prior.shape),
                 dtype=kpt_prior.dtype)
@@ -1243,7 +1263,10 @@ class PoseDataset(Dataset):
             box = bpmod.compute_box_prompt(coords, cgroup, '2d' if R == 2 else '3d')
             box = bpmod.apply_frames_mode(box, self.cfg.box_prompt_frames)
             if self.train:
-                if self.cfg.box_prompt_dropout > 0 and rng.random() < self.cfg.box_prompt_dropout:
+                dropped = (box_dropped_early if box_dropped_early is not None
+                          else (self.cfg.box_prompt_dropout > 0
+                                and rng.random() < self.cfg.box_prompt_dropout))
+                if dropped:
                     box = torch.full_like(box, float('nan'))
                 elif self.cfg.box_prompt_jitter > 0 or self.cfg.box_prompt_scale_jitter > 0:
                     box = bpmod.apply_jitter(box, rng, self.cfg.box_prompt_jitter,

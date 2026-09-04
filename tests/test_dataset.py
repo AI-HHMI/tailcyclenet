@@ -1529,3 +1529,88 @@ def test_kpt_swap_pairs_is_a_per_keypoint_rate(tiny_root):
         assert int(moved.sum()) == n_finite, \
             (f'{root.name} (K={b.kpt_prior.shape[1]}): expected every one of the {n_finite} '
              f'finite keypoints to move at p = 1.0, not a fixed pair count')
+
+
+def test_pose_only_prob_default_is_byte_identical_to_pre_change_code(tiny_root):
+    """Section 6.3's own required guard: `pose_only_prob = 0.0` (default) must reproduce the
+    EXACT pre-change code, rng draw for rng draw -- not merely "look the same", since a hoisted
+    coin-flip that fires even when unused would silently shift every LATER draw in the item
+    (camera pick, augmentation, corruption sites) without changing any config value visibly.
+
+    Loads the actual PRE-CHANGE `tailcyclenet/dataset.py` straight from git HEAD (this feature's
+    own commit has not landed yet, so HEAD is the real pre-change source, not a hand-written
+    stand-in) into an isolated module, builds the identical item with the identical seed through
+    BOTH the old and the new code, and compares every tensor field.
+    """
+    import importlib.util
+    import subprocess
+    import sys
+
+    root = tiny_root / 'mouselike'
+    src = subprocess.run(['git', 'show', 'HEAD:tailcyclenet/dataset.py'],
+                         capture_output=True, text=True, check=True, cwd=Path(__file__).parent.parent).stdout
+    assert 'pose_only_prob' not in src, \
+        'HEAD already has this key -- point this test at the commit before it landed'
+
+    spec = importlib.util.spec_from_loader('tailcyclenet._dataset_pre_change', loader=None)
+    old_mod = importlib.util.module_from_spec(spec)
+    old_mod.__package__ = 'tailcyclenet'
+    sys.modules['tailcyclenet._dataset_pre_change'] = old_mod
+    try:
+        exec(compile(src, 'dataset.py (HEAD)', 'exec'), old_mod.__dict__)
+
+        cfg_kwargs = dict(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                          crop_jitter=0.0, prompt_dropout=0.3, prompt_offset_px=2.0,
+                          prompt_noise_px=1.5, box_prompt='film', box_prompt_dropout=0.5)
+
+        old_ds = old_mod.PoseDataset(root, 'train', old_mod.LoaderConfig(**cfg_kwargs), train=True)
+        new_ds = PoseDataset(root, 'train', LoaderConfig(**cfg_kwargs, pose_only_prob=0.0),
+                             train=True)
+
+        for seed in range(5):
+            np.random.seed(seed)
+            old_item = old_ds._item(0, np.random.default_rng(seed))
+            np.random.seed(seed)
+            new_item = new_ds._item(0, np.random.default_rng(seed))
+            assert (old_item is None) == (new_item is None), f'seed {seed}: presence mismatch'
+            if old_item is None:
+                continue
+            assert len(old_item) == len(new_item), f'seed {seed}: field count mismatch'
+            for k, (o, n) in enumerate(zip(old_item, new_item)):
+                if isinstance(o, torch.Tensor):
+                    assert torch.equal(torch.nan_to_num(o, nan=-9e9),
+                                       torch.nan_to_num(n, nan=-9e9)), \
+                        f'seed {seed} field {k}: pose_only_prob=0.0 diverged from pre-change code'
+    finally:
+        del sys.modules['tailcyclenet._dataset_pre_change']
+
+
+def test_pose_only_prob_gives_box_dropped_items_a_clean_prior(tiny_root):
+    """The feature itself, not just its OFF guard: at `pose_only_prob = 1.0` (every box-dropped
+    item is ALSO pose-only), a box-dropped item's `kpt_prior` must carry NONE of
+    `prompt_dropout`/`prompt_offset_px`/`prompt_noise_px`'s corruption -- exactly the GT-quality
+    prior a `box_prompt = 'none'` deployment item would need to learn from.
+    """
+    root = tiny_root / 'mouselike'
+    clean_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                             crop_jitter=0.0, prompt_dropout=0.0, prompt_offset_px=0.0,
+                             prompt_noise_px=0.0)
+    clean_ds = PoseDataset(root, 'train', clean_cfg, train=True)
+
+    corrupt_cfg = replace(clean_cfg, prompt_dropout=1.0, prompt_offset_px=5.0,
+                         prompt_noise_px=5.0, box_prompt='film', box_prompt_dropout=1.0,
+                         pose_only_prob=1.0)
+    pose_only_ds = PoseDataset(root, 'train', corrupt_cfg, train=True)
+
+    np.random.seed(0)
+    clean_item = clean_ds._item(0, np.random.default_rng(0))
+    np.random.seed(0)
+    pose_only_item = pose_only_ds._item(0, np.random.default_rng(0))
+    assert clean_item is not None and pose_only_item is not None
+
+    # kpt_prior is field index 11 in the `_item` output tuple (see its own docstring's ordering)
+    clean_prior, pose_only_prior = clean_item[11], pose_only_item[11]
+    assert torch.equal(torch.nan_to_num(clean_prior, nan=-9e9),
+                       torch.nan_to_num(pose_only_prior, nan=-9e9)), \
+        'box_prompt_dropout=1.0, pose_only_prob=1.0 must give the SAME clean prior prompt_' \
+        'dropout=0 would, not the corrupted one prompt_dropout=1.0 alone would produce'

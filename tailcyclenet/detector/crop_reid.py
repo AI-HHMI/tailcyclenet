@@ -76,10 +76,20 @@ class CropReidDataset(torch.utils.data.Dataset):
     shared across every split, so a label is never asked to mean anything past its own dataset).
     """
 
-    def __init__(self, boxes_ds, crop_wh=(96, 96)):
-        """`boxes_ds` -- a constructed `BoxDataset`. `crop_wh` -- this net's own square input."""
+    def __init__(self, boxes_ds, crop_wh=(96, 96), augment=False):
+        """`boxes_ds` -- a constructed `BoxDataset`. `crop_wh` -- this net's own square input.
+
+        `augment` -- random horizontal flip + brightness/contrast jitter applied to the extracted
+        crop. `_load_letterbox` (the frame source this dataset re-crops out of) is deliberately
+        UNAUGMENTED -- it exists only to give mosaic-lite a stable source frame -- so without this
+        flag every view of one animal is otherwise raw pixels; the only diversity would then come
+        from genuinely different frames/cameras. This augmentation is self-contained (no
+        keypoint/box geometry to keep in sync, unlike `BoxDataset`'s own warp pipeline) so it
+        lives here rather than routing through `_load_letterbox`.
+        """
         self.ds = boxes_ds
         self.crop_wh = crop_wh
+        self.augment = bool(augment)
         label_ids = {}
         entries = []
         for i, (sess, gid, f, ci) in enumerate(boxes_ds.index):
@@ -115,5 +125,71 @@ class CropReidDataset(torch.utils.data.Dataset):
             crop = np.full((self.crop_wh[1], self.crop_wh[0], 3), 114, np.uint8)
         else:
             crop, _, _ = letterbox(img[y0:y1, x0:x1], self.crop_wh)
+        if self.augment:
+            crop = _augment_crop(crop)
         t = torch.from_numpy(np.ascontiguousarray(crop)).permute(2, 0, 1).float() / 255.0
         return t, label
+
+
+def _augment_crop(crop):
+    """Random horizontal flip + brightness/contrast jitter on one uint8 (H, W, 3) crop.
+
+    Fresh `default_rng(None)` per call, the same "single-frame trick" report 55 already uses for
+    the dense head's positive pairs: two draws of the SAME entry are then two INDEPENDENTLY
+    augmented views, which is what makes them a real positive pair rather than one image copied.
+    """
+    rng = np.random.default_rng()
+    out = crop
+    if rng.random() < 0.5:
+        out = out[:, ::-1]
+    contrast = float(rng.uniform(0.8, 1.2))
+    brightness = float(rng.uniform(-20.0, 20.0))
+    out = np.clip(out.astype(np.float32) * contrast + brightness, 0.0, 255.0).astype(np.uint8)
+    return out
+
+
+class PKSampler(torch.utils.data.Sampler):
+    """The standard ReID batch recipe: each batch holds `p` identities x `k` crops each (batch
+    size `p * k`), so every batch is GUARANTEED to contain same-label pairs. A plain random draw
+    over `CropReidDataset` -- whose per-label counts are wildly uneven (one long-labelled group
+    gives an animal hundreds of crops, a short one very few) -- could easily produce batches with
+    no positive pair by chance, on which `contrastive_loss` costs nothing and wastes the step.
+
+    Indices are yielded in `p`-then-`k` blocks; used with `batch_size = p * k, shuffle=False` so
+    each DataLoader batch is exactly one block, the same convention `PairedSampler` already uses
+    for its own two-per-pair blocks.
+    """
+
+    def __init__(self, dataset, p=8, k=4, batches_per_epoch=None, seed=None):
+        """`dataset` -- a `CropReidDataset` (only `.entries` is read). `p`/`k` -- identities and
+        crops-per-identity per batch, clamped to what the dataset actually has. `seed=None` draws
+        fresh entropy every epoch, matching train-time randomness elsewhere in this repo.
+        """
+        by_label = {}
+        for idx, (_, _, label) in enumerate(dataset.entries):
+            by_label.setdefault(label, []).append(idx)
+        if len(by_label) < 2:
+            raise ValueError(f'PKSampler needs >=2 identities to contrast, got {len(by_label)}')
+        self.by_label = {lab: np.asarray(ix) for lab, ix in by_label.items()}
+        self.labels = np.asarray(sorted(self.by_label))
+        self.p = min(int(p), len(self.labels))
+        self.k = int(k)
+        self.batches_per_epoch = (int(batches_per_epoch) if batches_per_epoch
+                                  else max(1, len(dataset) // (self.p * self.k)))
+        self.seed = seed
+
+    def __len__(self):
+        """Total INDICES yielded (`batches_per_epoch` blocks of `p * k`), not batch count."""
+        return self.batches_per_epoch * self.p * self.k
+
+    def __iter__(self):
+        """One block of `p` labels x `k` draws each per batch; draws WITH replacement whenever a
+        label has fewer than `k` entries (a short-lived identity should not shrink the batch).
+        """
+        rng = np.random.default_rng(self.seed)
+        for _ in range(self.batches_per_epoch):
+            chosen = rng.choice(self.labels, size=self.p, replace=False)
+            for lab in chosen:
+                pool = self.by_label[int(lab)]
+                draw = rng.choice(pool, size=self.k, replace=len(pool) < self.k)
+                yield from (int(v) for v in draw)

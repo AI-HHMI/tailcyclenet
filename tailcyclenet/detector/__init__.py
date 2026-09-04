@@ -7,7 +7,7 @@ from .assign import (assign, assign_tal, box_iou, certified_anchors, ciou_loss, 
 
                      detector_loss, giou_loss, paired_iou)
 from .associate import associate
-from .crop_reid import CropReidDataset, CropReidNet
+from .crop_reid import CropReidDataset, CropReidNet, PKSampler
 from .data import (BoxDataset, ChunkShuffle, CohortSampler, CrossCameraPairedSampler,
                    PairedSampler, box_collate, letterbox, letterbox_transform, reduce_factor, split_batch,
                    tile_transform, unletterbox_boxes, unletterbox_keypoints)
@@ -73,6 +73,7 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'assign_tal', 'box_iou',
            'certified_anchors', 'ciou_loss', 'decode', 'detector_loss', 'giou_loss',
            'contrastive_loss', 'pool_embeddings_per_box', 'CropReidNet', 'CropReidDataset',
+           'PKSampler',
            'associate',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone',
            'paired_iou', 'resolve_detector_checkpoint']

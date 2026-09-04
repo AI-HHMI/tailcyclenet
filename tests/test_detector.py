@@ -5164,3 +5164,68 @@ def test_crop_reid_dataset_feeds_contrastive_loss(tmp_path):
     # a batch with every label distinct costs nothing (no positive pair exists to contrast)
     solo_labels = torch.arange(n)
     assert float(contrastive_loss(vectors, solo_labels)) == 0.0
+
+
+def test_crop_reid_augment_flips_or_jitters_independently(tmp_path):
+    """`augment=True` must make two draws of the SAME entry genuinely different pixels most of
+    the time (the positive-pair contract), while `augment=False` (the default) must be
+    byte-identical across repeats -- `_load_letterbox` itself has no randomness.
+    """
+    from tailcyclenet.detector import BoxDataset, CropReidDataset
+
+    boxes_ds = BoxDataset(_multi_animal_root(tmp_path), 'train', input_wh=(64, 64))
+    plain = CropReidDataset(boxes_ds, crop_wh=(32, 32), augment=False)
+    aug = CropReidDataset(boxes_ds, crop_wh=(32, 32), augment=True)
+
+    a0, _ = plain[0]
+    a1, _ = plain[0]
+    assert torch.equal(a0, a1), 'no augmentation must be deterministic'
+
+    draws = [aug[0][0] for _ in range(8)]
+    assert any(not torch.equal(draws[0], d) for d in draws[1:]), \
+        'augmentation must vary across independent draws of the same entry'
+
+
+def test_pk_sampler_every_batch_has_p_labels_times_k_each():
+    """Every yielded block of `p * k` indices must resolve to exactly `p` distinct labels, each
+    appearing exactly `k` times -- the guarantee the contrastive loss needs from every batch.
+    """
+    from tailcyclenet.detector import PKSampler
+
+    class FakeDS:
+        # 5 labels, uneven counts: one label has only 1 entry (< k), forcing replacement.
+        entries = ([(0, 0, 0)] * 1 + [(0, 0, 1)] * 6 + [(0, 0, 2)] * 6 +
+                  [(0, 0, 3)] * 6 + [(0, 0, 4)] * 6)
+
+        def __len__(self):
+            return len(self.entries)
+
+    ds = FakeDS()
+    p, k = 3, 4
+    sampler = PKSampler(ds, p=p, k=k, batches_per_epoch=5, seed=0)
+    assert len(sampler) == 5 * p * k
+
+    out = list(iter(sampler))
+    assert len(out) == 5 * p * k
+    for b in range(5):
+        block = out[b * p * k:(b + 1) * p * k]
+        labels = [ds.entries[i][2] for i in block]
+        counts = {lab: labels.count(lab) for lab in set(labels)}
+        assert len(counts) == p, f'batch {b} must hold exactly {p} distinct labels'
+        assert all(c == k for c in counts.values()), f'batch {b} must hold {k} of each label'
+
+
+def test_pk_sampler_rejects_a_single_identity():
+    """Cannot contrast with fewer than 2 identities -- fail loudly, not with a silent zero loss
+    forever.
+    """
+    from tailcyclenet.detector import PKSampler
+
+    class FakeDS:
+        entries = [(0, 0, 0)] * 10
+
+        def __len__(self):
+            return len(self.entries)
+
+    with pytest.raises(ValueError, match='2'):
+        PKSampler(FakeDS(), p=2, k=2)

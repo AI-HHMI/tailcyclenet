@@ -153,7 +153,8 @@ def tiled_input_wh(src_wh, tile_scale):
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
-               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False):
+               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False,
+               embed_out=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     Inputs:
@@ -162,13 +163,16 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         score_thresh -- default 0.01 (measured, not universal): a looser floor trades a few
             extra false positives for materially fewer false negatives, and every survivor
             still passes the existing NMS and (3D) reprojection gates. Sweep per checkpoint.
-        iou_thresh / center_dist_thresh -- `decode`'s NMS knobs, threaded through so a caller
-            can move them; `center_dist_thresh=None` restores the pre-A5 byte-identical NMS.
+        iou_thresh / center_dist_thresh -- NMS knobs threaded through so a caller can move
+            them; `center_dist_thresh=None` restores the pre-A5 byte-identical NMS.
         max_frames -- the same PREFIX `infer.run_group` takes.
         frames -- detect a SLICE of the clip; arrays are `len(frames)` long and must START ON A
             GLOBAL `batch` BOUNDARY (aligned slices are byte-identical to one whole-clip pass).
         read -- replaces the decode with `(ci, cam_name, frames, pool) -> imgs`.
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
+        embed_out -- optional (D,T,C,DIM), filled in step with `out`: each detection's row is
+            its OWNING ANCHOR's embedding (`embed[ix]`); embed_dim>0 checkpoints only.
+            A side-output, never part of the returned tuple.
     Outputs:
         (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None): `d` is the d-th
         highest-scoring detection in that camera at that frame; rows become an animal axis in
@@ -210,6 +214,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     sc = np.full((D, T, C), np.nan, np.float32)
     K_det = int(getattr(det, 'n_keypoints', 0))
     kp = np.full((D, T, C, K_det, 3), np.nan, np.float32) if K_det else None
+    D_embed = int(getattr(det.head, 'embed_dim', 0))
+    have_embed = embed_out is not None and D_embed > 0
 
     def _fetch(job):
         """Decode, reduce and letterbox one (camera, frame) job into a uint8 batch tensor.
@@ -289,6 +295,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             for ci, x, metas, src in fetched:
                 _o = det(x.to(device).float().div_(_div255))
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
+                embeds = _o[3] if have_embed else None
                 for j, t in enumerate(unit_ix):
                     decoded = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
                                      iou_thresh=iou_thresh,
@@ -317,6 +324,10 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                     n = min(D, b.shape[0])
                     out[:n, t, ci] = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)[:n].numpy()
                     sc[:n, t, ci] = s.cpu().numpy()[:n]
+                    if have_embed and embeds is not None:
+                        e = embeds[j][ix[:n]].cpu().numpy()
+                        embed_out[:n, t, ci] = e / (np.linalg.norm(e, axis=-1, keepdims=True)
+                                                    + 1e-8)
                     if kp is not None and kpts is not None:
                         k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)
                         kp[:n, t, ci] = k[:n].numpy()

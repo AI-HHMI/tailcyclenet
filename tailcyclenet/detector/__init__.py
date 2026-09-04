@@ -118,6 +118,7 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
             'running statistics to load into). Retrain this detector -- see '
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
     model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
+                      embed_dim=int(ckpt.get('embed_dim', 0)),
                       version=str(ckpt.get('yolox_version', 'trimmed')),
                       bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)),
                       p2=bool(ckpt.get('p2', False)),

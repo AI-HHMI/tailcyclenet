@@ -2222,6 +2222,29 @@ def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
     assert loaded2.version == 'trimmed'
 
 
+def test_embed_dim_round_trips_through_the_checkpoint(tmp_path):
+    """A ReID-trained checkpoint records `embed_dim` and `load_detector` rebuilds the branch,
+    so an existing checkpoint without the key stays `embed_dim=0` (byte-identical load).
+    """
+    from tailcyclenet.detector import load_detector
+
+    p = tmp_path / 'detector.pth'
+    m = YOLOXNano(embed_dim=16)
+    torch.save({'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
+               'yolox_version': 'trimmed', 'embed_dim': 16}, p)
+    loaded, *_ = load_detector(p)
+    assert loaded.head.embed_dim == 16
+    torch.testing.assert_close(
+        loaded.state_dict()['head.embed_pred.0.weight'],
+        m.state_dict()['head.embed_pred.0.weight'])
+
+    p2 = tmp_path / 'old.pth'
+    old = YOLOXNano()
+    torch.save({'model_state': old.state_dict(), 'input_wh': [416, 416], 'norm': 'gn'}, p2)
+    loaded2, *_ = load_detector(p2)
+    assert loaded2.head.embed_dim == 0
+
+
 def test_norm_groups_divides_every_canonical_tier_channel_count():
     """The channel counts a canonical tier actually produces, not just `trimmed`'s."""
     from tailcyclenet.detector.yolox import YOLOX_TIERS, norm_groups, round8

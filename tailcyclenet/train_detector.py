@@ -462,7 +462,8 @@ def main():
                     print(f'   objectness q01 {obj_q["q01"]:.4f}  q10 {obj_q["q10"]:.4f}  '
                           f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}', flush=True)
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'config': config,
-                        'input_wh': wh, 'n_keypoints': n_kpts, 'norm': 'gn',
+                        'input_wh': wh, 'n_keypoints': n_kpts, 'embed_dim': int(model_cfg['embed_dim']),
+                        'norm': 'gn',
                         'yolox_version': model_cfg['yolox'],
                         'optimizer_kind': train_cfg['optimizer'],
                         'bottleneck_expansion': model_cfg['bottleneck_expansion'],

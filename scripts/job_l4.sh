@@ -30,6 +30,11 @@ cd "$REPO"
 source /etc/profile.d/modules.sh 2>/dev/null || true
 module load cuda/12.8 2>/dev/null || true
 export PATH="/groups/karashchuk/home/karashchukl/bin:/home/karashchukl@hhmi.org/.pixi/bin:$PATH"
+# Unbuffered stdout: a redirected `bsub -o` pipe is fully (not line-) buffered, so a script that
+# logs a short line every N iterations can sit invisible in the log for minutes even though it is
+# actively running -- a real hang and a buffered-but-alive process are then indistinguishable
+# from the log alone. This makes every job's progress line land as soon as it is printed.
+export PYTHONUNBUFFERED=1
 
 nvidia-smi
 exec pixi run python "$SCRIPT" "$@"

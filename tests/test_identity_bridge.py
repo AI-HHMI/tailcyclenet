@@ -183,6 +183,53 @@ def test_an_impossible_margin_refuses_and_quarantines_instead_of_guessing():
     assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
 
 
+def _nearly_parallel_tracks(n_frames=240, k=3):
+    """Two rows moving in almost the same direction -- an AMBIGUOUS case, unlike the cleanly
+    separated opposite-direction crossing every other test in this file uses. A swap here scores
+    a real but LOW margin, the shape that damaged a perfectly clean clip in dev/reports/57.
+    """
+    pred = np.full((2, n_frames, k, 3), np.nan, np.float32)
+    t = np.arange(n_frames, dtype=np.float32)
+    for j in range(k):
+        pred[0, :, j, 0] = t
+        pred[0, :, j, 1] = 0.0 + j
+        pred[1, :, j, 0] = t * 1.02 + 5.0
+        pred[1, :, j, 1] = 2.0 + j
+    pred[..., 2] = 0.0
+    return pred
+
+
+def test_a_low_margin_release_is_refused_at_the_shipped_default_but_not_at_the_old_one():
+    """dev/reports/57: min_margin=1.0 (report 54's arm) released a real permutation on a
+    PERFECTLY CLEAN 3dpop clip (Sequence42) at margin 43.08, turning idsw 0 into 2 -- CLAUDE.md's
+    own kill condition for the whole mechanism. min_margin=60.0 (the shipped default since) must
+    refuse this shape of low-margin release; the OLD default must still apply it, so this test
+    would have caught the regression before it shipped.
+    """
+    pred = _nearly_parallel_tracks()
+    swap_at = 120
+    tail = pred[:, swap_at:].copy()
+    pred[0, swap_at:], pred[1, swap_at:] = tail[1], tail[0]
+    rows = {'pred': pred, 'group_id': 'g'}
+    ev = _events([(swap_at, 0, 'retired_duplicate'), (swap_at, 1, 'shielded')])
+
+    out, decisions = bridge.bridge_group(rows, _windows(24, 10), ev, 'g', 240, 10,
+                                         bridge.BridgeConfig())
+    plan = decisions[0]
+    assert plan['refused'] is True, 'the shipped default must refuse a low-margin release'
+    assert plan['mapping'] is None
+    assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all(), 'refused means quarantined'
+
+    pred_old = _nearly_parallel_tracks()
+    pred_old[0, swap_at:], pred_old[1, swap_at:] = tail[1], tail[0]
+    rows_old = {'pred': pred_old, 'group_id': 'g'}
+    _, decisions_old = bridge.bridge_group(rows_old, _windows(24, 10), ev, 'g', 240, 10,
+                                           bridge.BridgeConfig(min_margin=1.0))
+    plan_old = decisions_old[0]
+    assert not plan_old.get('refused'), 'the OLD default applied this release -- reproduces the bug'
+    assert plan_old['mapping'] is not None
+
+
 def test_rewrite_tables_deletes_quarantine_and_relabels_the_release(tmp_path):
     """A permutation IS an `animal_id` relabel and a quarantine IS a row deletion.
 

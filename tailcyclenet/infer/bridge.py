@@ -59,6 +59,15 @@ class BridgeConfig:
     `min_margin` refuses a release whose mean margin is at or below it -- refusing leaves the
     component quarantined rather than guessing. `missing_cost` is what an unobservable pairing
     pays, in the same units as the pose (mm in 3D, px in 2D).
+
+    `min_margin = 60.0` (raised from report 54's 1.0): on a 10-clip 3dpop Wave 1 population
+    (dev/reports/57), 1.0 released a real permutation on Sequence42 at margin 43.08 on a clip
+    whose baseline was PERFECTLY CLEAN, turning idsw 0 into 2 -- CLAUDE.md's own kill condition
+    for the whole mechanism (damaging a clean clip). Every known-good outcome in the same
+    population sits far above that (Sequence29's real repair: 140.21/220.86; Sequence10 and
+    Sequence53's correct identity resolutions: 82.99/435.51; Sequence58's release: 1379.84).
+    60.0 sits strictly between the one bad case and every good one, refuses Sequence42 at ZERO
+    added miss cost, and changes nothing else measured so far.
     """
 
     max_event_gap: int = 64
@@ -66,7 +75,7 @@ class BridgeConfig:
     recovery_windows: int = 8
     horizon_steps: int = 4
     horizon_stride: int = 4
-    min_margin: float = 1.0
+    min_margin: float = 60.0
     missing_cost: float = 200.0
 
     def validate(self) -> None:

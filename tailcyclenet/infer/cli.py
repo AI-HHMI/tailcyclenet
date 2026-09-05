@@ -162,6 +162,18 @@ def build_parser() -> argparse.ArgumentParser:
                          'at 11 -> 563 misses, Sequence 29 9 -> 4 at 32 -> 250. Worth it only '
                          'when identity outranks coverage; quote miss and coverage with any idsw '
                          'from it. Edits the written session in place, after it is written.')
+    ap.add_argument('--fill-from', type=Path, default=None,
+                    help="fill the bridged quarantine from a fill pass's prediction session "
+                         '(plan section 6.4) instead of dropping those rows: run infer.py again '
+                         'over the same clip with --anchor carry --box-prompt none, pass its --out '
+                         'here, and each quarantined row the fill pass observed is kept with the '
+                         "fill pass's measurements, mapped onto this session's rows at the "
+                         'quarantine boundary by centre distance. The fill session is bridged in '
+                         'place first; a frame it did not observe stays dropped. Measured '
+                         '0.71-1.15x clip-normal accuracy on 3 episodes (report 55) with NO '
+                         'automatic gate that separates fill-good from fill-harmful episodes -- '
+                         'user-opt-in only, and actively harmful on crowd-ambiguity shapes. '
+                         'Requires --identity-bridge.')
     ap.add_argument('--overlap-trace', type=Path, default=None,
                     help='write the OUTPUT-NEUTRAL overlap test-retest capture as an npz: for '
                          'every seam frame, the earlier window\'s discarded estimate and the '

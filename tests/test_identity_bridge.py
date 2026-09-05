@@ -396,3 +396,85 @@ def test_interpolate_without_a_release_still_falls_back_to_nan():
     plan = decisions[0]
     assert plan['refused'] is True and plan['release'] is None
     assert np.isnan(out['pred'][0, 10 * plan['windows'][0]]).all()
+
+
+def test_boundary_fill_map_matches_one_to_one_by_centre_distance():
+    """The fill map is a Hungarian on 3D centroids at the boundary frame, one-to-one."""
+    pred = np.zeros((2, 4, 3, 3))
+    pred[0, :, :, 0] = 0.0
+    pred[1, :, :, 0] = 100.0
+    fill_pred = np.zeros((2, 4, 3, 3))
+    fill_pred[0, :, :, 0] = 90.0
+    fill_pred[1, :, :, 0] = 10.0
+    m = bridge.boundary_fill_map(pred, fill_pred, 2, (0, 1))
+    assert m == {0: 1, 1: 0}
+
+
+def test_boundary_fill_map_refuses_a_boundary_it_cannot_compute():
+    """A boundary the map cannot be computed at is a refusal, not a guess (section 6.4)."""
+    pred = np.zeros((2, 4, 3, 3))
+    pred[1, :, :] = np.nan
+    fill_pred = np.zeros((2, 4, 3, 3))
+    assert bridge.boundary_fill_map(pred, fill_pred, 2, (0, 1)) is None
+    assert bridge.boundary_fill_map(pred, fill_pred, 99, (0,)) is None
+    assert bridge.boundary_fill_map(pred, fill_pred, -1, (0,)) is None
+
+
+def test_fill_keeps_a_quarantined_row_with_the_fill_pass_measurements(tmp_path):
+    """A quarantined row with a fill observation is KEPT and its measurement columns are the
+    fill pass's own values wholesale; a row with no fill observation stays dropped, exactly as
+    the quarantine would leave it (section 6.4). Identity columns are never replaced."""
+    from tailcyclenet.format import DICT_COLS, write_table
+    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
+    animals = np.array(['a0', 'a1', 'a0', 'a1', 'a0', 'a1'], dtype=object)
+    write_table(tmp_path / 'points3d.pq', {
+        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
+        'animal_id': animals, 'bodypart': np.array(['n'] * 6, dtype=object),
+        'status': np.array(['visible'] * 6, dtype=object),
+        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
+        'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
+    fill_table = pd.DataFrame({
+        'group_id': np.array(['g'] * 4, dtype=object),
+        'frame': np.array([0, 0, 5, 20], np.int32),
+        'animal_id': np.array(['f0', 'f1', 'f0', 'f0'], dtype=object),
+        'bodypart': np.array(['n'] * 4, dtype=object),
+        'status': np.array(['visible', 'projected', 'visible', 'visible'], dtype=object),
+        'x': np.array([90.0, 91.0, 92.0, 93.0], np.float32), 'y': np.zeros(4, np.float32),
+        'z': np.zeros(4, np.float32)})
+    segments = {0: np.arange(0, 10), 1: np.arange(10, 30)}
+    plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
+            'refused': False, 'fill_map': {0: 0, 1: 1}}
+    fill = {'tables': {'points3d': fill_table}, 'animal_ids': ['f0', 'f1']}
+    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], segments, [plan], n_frames=30, fill=fill)
+    out = pd.read_parquet(tmp_path / 'points3d.pq')
+    got = {(str(r.animal_id), int(r.frame)): (float(r.x), str(r.status))
+           for r in out.itertuples()}
+    # both quarantined a0 rows observed by fill slot f0: kept with the fill's measurements
+    assert got[('a0', 0)][0] == pytest.approx(90.0)
+    assert got[('a0', 5)][0] == pytest.approx(92.0)
+    # the (0, a1) row is observed by fill slot f1: kept, and the fill's STATUS replaces the
+    # standard's own -- status is a measurement column the fill borrows wholesale
+    assert got[('a1', 0)] == (pytest.approx(91.0), 'projected')
+    # the (5, a1) row has no fill observation: it stays dropped
+    assert ('a1', 5) not in got
+    # released rows keep the standard session's own relabel and are never filled
+    assert got[('a0', 20)][0] == pytest.approx(5.0) and got[('a1', 20)][0] == pytest.approx(4.0)
+
+
+def test_fill_defaults_off_and_is_byte_identical_to_before(tmp_path):
+    """rewrite_tables without `fill` is byte-identical to the pre-fill contract."""
+    from tailcyclenet.format import DICT_COLS, write_table
+    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
+    animals = np.array(['a0', 'a1', 'a0', 'a1', 'a0', 'a1'], dtype=object)
+    write_table(tmp_path / 'points3d.pq', {
+        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
+        'animal_id': animals, 'bodypart': np.array(['n'] * 6, dtype=object),
+        'status': np.array(['visible'] * 6, dtype=object),
+        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
+        'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
+    plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
+            'refused': False}
+    bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10), 1: np.arange(10, 30)},
+                          [plan], n_frames=30)
+    out = pd.read_parquet(tmp_path / 'points3d.pq')
+    assert set(out.frame.tolist()) == {20}

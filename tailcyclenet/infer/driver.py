@@ -692,7 +692,9 @@ def run_dataset(args):
     if getattr(args, 'identity_bridge', False):
         from . import bridge as _bridge
         _cfg = _bridge.BridgeConfig()
-        _decisions = _bridge.bridge_session(args.out, _cfg, int(cfg.n_frames))
+        _fill_dir = getattr(args, 'fill_from', None)
+        _decisions = _bridge.bridge_session(args.out, _cfg, int(cfg.n_frames),
+                                            fill_dir=_fill_dir)
         print(_bridge.summarise(_decisions))
     print(f'wrote {args.out} ({len(gids)} group(s))')
 

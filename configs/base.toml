@@ -17,8 +17,8 @@ prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cub
 # A WHOLE-BODY offset, the corruption shaped like a deployment failure; 5.0 is a CONSISTENCY choice, not a measured optimum (measured 8.0, on 3D allen) -- say so when reporting a 3D arm.
 prompt_offset_px = 5.0
 # Distractor-prompt corruptions (dev/plans/prompt_prior_corruptions.md), both PER-KEYPOINT probabilities, both aimed at --anchor carry:
-prompt_swap_kpt_pairs = 0.07 # P(per keypoint) replaced by another finite keypoint's original position, drawn uniformly and independently -- NOT a permutation
-prompt_swap_animal = 0.1     # P(per keypoint) prior becomes the neighbour animal's corresponding point; structurally INERT on single-animal roots (n_animals < 2)
+prompt_swap_kpt_pairs = 0.03 # P(per keypoint) replaced by another finite keypoint's original position, drawn uniformly and independently -- NOT a permutation; owner-set, not measured (was 0.07)
+prompt_swap_animal = 0.05    # P(per keypoint) prior becomes the neighbour animal's corresponding point; structurally INERT on single-animal roots (n_animals < 2); owner-set, not measured (was 0.1)
 box_prompt_dropout = 0.3    # fraction of steps where the box prompt is zeroed (exposure-bias recipe)
 box_prompt_jitter = 0.1     # box centre jitter as a fraction of box side
 box_prompt_scale_jitter = 0.1 # box scale jitter as a fraction of box side

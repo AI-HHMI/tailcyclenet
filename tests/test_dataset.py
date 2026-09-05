@@ -1537,27 +1537,27 @@ def test_pose_only_prob_default_is_byte_identical_to_pre_change_code(tiny_root):
     coin-flip that fires even when unused would silently shift every LATER draw in the item
     (camera pick, augmentation, corruption sites) without changing any config value visibly.
 
-    Loads the actual PRE-CHANGE `tailcyclenet/dataset.py` straight from git HEAD (this feature's
-    own commit has not landed yet, so HEAD is the real pre-change source, not a hand-written
-    stand-in) into an isolated module, builds the identical item with the identical seed through
-    BOTH the old and the new code, and compares every tensor field.
+    Loads the actual PRE-CHANGE `tailcyclenet/dataset.py` straight from git (the commit before
+    `pose_only_prob` landed, `57b5350^` -- HEAD has carried the key since, so the pre-change
+    source must be named, not assumed) into an isolated module, builds the identical item with
+    the identical seed through BOTH the old and the new code, and compares every tensor field.
     """
     import importlib.util
     import subprocess
     import sys
 
     root = tiny_root / 'mouselike'
-    src = subprocess.run(['git', 'show', 'HEAD:tailcyclenet/dataset.py'],
+    src = subprocess.run(['git', 'show', '57b5350^:tailcyclenet/dataset.py'],
                          capture_output=True, text=True, check=True, cwd=Path(__file__).parent.parent).stdout
     assert 'pose_only_prob' not in src, \
-        'HEAD already has this key -- point this test at the commit before it landed'
+        'the pre-landing source already has this key -- point this test at an earlier commit'
 
     spec = importlib.util.spec_from_loader('tailcyclenet._dataset_pre_change', loader=None)
     old_mod = importlib.util.module_from_spec(spec)
     old_mod.__package__ = 'tailcyclenet'
     sys.modules['tailcyclenet._dataset_pre_change'] = old_mod
     try:
-        exec(compile(src, 'dataset.py (HEAD)', 'exec'), old_mod.__dict__)
+        exec(compile(src, 'dataset.py (57b5350^)', 'exec'), old_mod.__dict__)
 
         cfg_kwargs = dict(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                           crop_jitter=0.0, prompt_dropout=0.3, prompt_offset_px=2.0,

@@ -589,6 +589,34 @@ def test_box_prompt_none_is_byte_identical_on_2d_and_3d(scene):
     assert 'box_prompt_cams' not in off
 
 
+def test_box_prompt_first_only_gives_it_at_window_0_and_withholds_it_once_carried(multiwindow_scene):
+    """`box_prompt_first_only` (owner-set default, 2026-09-05): the box prompt fires at each
+    animal's first window and is withheld once `carried[a]` holds a carry -- give the identity
+    signal while first-detecting, then let carry hold it. `multiwindow_scene` (T=16,
+    n_frames=4/overlap=2, 7 windows) is what a single-window `scene` cannot exercise at all.
+    """
+    model, sess, registry, name = multiwindow_scene
+    out = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='carry', box_prompt='labels', box_prompt_first_only=True))
+    cams = out['box_prompt_cams']
+    assert cams.shape[1] > 1
+    assert (cams[:, 0] >= 1).any()
+    assert (cams[:, 1:] == -1).all()
+
+
+def test_box_prompt_first_only_off_gives_it_every_window(multiwindow_scene):
+    """`box_prompt_first_only = False` (the field's own default) must reduce to the pre-existing
+    unconditional gate: the box prompt fires every window `box_prompt` is on for, not just the
+    first -- the contrast that pins the flag actually does something when turned on.
+    """
+    model, sess, registry, name = multiwindow_scene
+    out = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='carry', box_prompt='labels', box_prompt_first_only=False))
+    cams = out['box_prompt_cams']
+    assert cams.shape[1] > 1
+    assert (cams[:, 1:] >= 1).any()
+
+
 def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
     """The shipped box recipe is WIDE pass 1 + TIGHT pass 2: pass 1's box is inflated about its
     centre by `crop_inflate`, but pass 2 is rebuilt from pass 1's own PREDICTION via

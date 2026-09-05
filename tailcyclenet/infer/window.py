@@ -89,6 +89,12 @@ class InferConfig:
     # 'detector'. 'none' + crop_inflate 1.0 is byte-identical to a run without these keys. A
     # camera with no finite point gets a NaN column, which the learned no-box token substitutes.
     box_prompt: str = 'none'
+    # Owner-set default (2026-09-05): give the box prompt at each animal's FIRST window only,
+    # withholding it once `carried[a]` holds a carry -- give it while first-detecting, then let
+    # carry hold identity. False (the pre-existing behaviour) gives the box prompt every window
+    # `box_prompt` is on for; the gate is `not box_prompt_first_only or carried[a] is None`, which
+    # reduces to the old unconditional check when this is False.
+    box_prompt_first_only: bool = False
     # Inflate every crop about its centre (the wide pass-1 regime); 1.0 is the unchanged behaviour.
     crop_inflate: float = 1.0
     # How many windows ahead to decode while the current one forwards. Bit-exact at any value:
@@ -694,7 +700,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         views = [v.to(dev) for v in views]
         cgroup_d = _to_device(cgroup, dev)
         mkw = {}
-        if cfg.box_prompt != 'none':
+        give_box = (cfg.box_prompt != 'none'
+                   and (not cfg.box_prompt_first_only or carried[a] is None))
+        if give_box:
             if cfg.box_prompt == 'labels':
                 if src is None or a >= n_lab:
                     box_t = None

@@ -225,11 +225,17 @@ def build_parser() -> argparse.ArgumentParser:
                          'on centre distance in units of the box side, gated at one side. The '
                          'whole of 2D single-view identity; `--no-link-boxes` restores the '
                          'memoryless pass.')
-    ap.add_argument('--box-prompt', default='auto', choices=('auto', 'none', 'labels', 'detector'),
+    ap.add_argument('--box-prompt', default='auto',
+                    choices=('auto', 'firstonly', 'none', 'labels', 'detector'),
                     help='DEPLOYMENT box prompt, 2D single-camera. `auto` deploys a box model with '
                          'the detector box (--crop-inflate 1.5 + --refine) and REFUSES to run a '
-                         'box model without a detector/boxes file; `labels` is an explicit ORACLE; '
-                         '`none` forces the box off.')
+                         "box model without a detector/boxes file; `firstonly` (DEFAULT, owner-set "
+                         '2026-09-05) resolves the source the same way `auto` does but gives it '
+                         "only at each animal's FIRST window, withholding it once a carry is "
+                         "available -- give the identity signal while first-detecting, then let "
+                         "carry hold it; unmeasured to help beyond the one clip tested (report 55) "
+                         "but measured not to HURT there either; `labels` is an explicit ORACLE; "
+                         "`none` forces the box off.")
     ap.add_argument('--crop-inflate', type=float, default=None,
                     help='inflate every crop about its centre. DEFAULT 1.5 when the box is on, '
                          'else 1.0.')

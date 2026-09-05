@@ -469,26 +469,32 @@ def run_dataset(args):
                          'different model.')
     model_is_box = config.get('model', {}).get('box_prompt', 'none') != 'none'
     box_prompt = args.box_prompt
-    if box_prompt == 'auto':
+    box_prompt_first_only = (box_prompt == 'firstonly')
+    if box_prompt in ('auto', 'firstonly'):
         if model_is_box and (args.detector or args.boxes):
             box_prompt = 'detector'
         elif model_is_box:
             raise SystemExit(
-                'this run is a box model ([model].box_prompt != "none") and --box-prompt auto '
-                'must source the box from pixels, but no --detector or --boxes file was given. '
-                'Pass --detector/--boxes (deployment), --box-prompt labels to EXPLICITLY use the '
-                'GROUND-TRUTH oracle, or --box-prompt none to run the box model with the box '
-                'withheld.')
+                f'this run is a box model ([model].box_prompt != "none") and --box-prompt '
+                f'{args.box_prompt} must source the box from pixels, but no --detector or '
+                '--boxes file was given. Pass --detector/--boxes (deployment), --box-prompt '
+                'labels to EXPLICITLY use the GROUND-TRUTH oracle, or --box-prompt none to run '
+                'the box model with the box withheld.')
         else:
             box_prompt = 'none'
+            box_prompt_first_only = False
     if box_prompt != 'none' and not model_is_box:
-        print(f'--box-prompt {box_prompt}: this run is not a box model '
+        print(f'--box-prompt {args.box_prompt}: this run is not a box model '
               '([model].box_prompt = "none"), so the box is ignored.')
         box_prompt = 'none'
+        box_prompt_first_only = False
     if box_prompt == 'labels':
         print('WARNING: --box-prompt labels seeds the box from GROUND TRUTH. This is an oracle '
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
     box_on = box_prompt != 'none'
+    if box_prompt_first_only:
+        print("box prompt: FIRSTONLY -- given at each animal's first window, withheld once a "
+              'carry is available (owner-set default, 2026-09-05; report 55).')
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
     refine = args.refine if args.refine is not None else (True if box_on else None)
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
@@ -508,7 +514,8 @@ def run_dataset(args):
         carry_source=args.carry_source, min_box_frames=args.min_box_frames,
         oracle_corrupt=args.oracle_corrupt, device=device,
         crop_source=args.crop_source,
-        box_prompt=box_prompt, crop_inflate=crop_inflate,
+        box_prompt=box_prompt, box_prompt_first_only=box_prompt_first_only,
+        crop_inflate=crop_inflate,
         prefetch_windows=args.prefetch_windows)
     if cfg.box_source != 'keypoints':
         print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '

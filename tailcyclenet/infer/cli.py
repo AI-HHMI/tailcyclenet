@@ -225,7 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
                          'on centre distance in units of the box side, gated at one side. The '
                          'whole of 2D single-view identity; `--no-link-boxes` restores the '
                          'memoryless pass.')
-    ap.add_argument('--box-prompt', default='auto',
+    ap.add_argument('--box-prompt', default='firstonly',
                     choices=('auto', 'firstonly', 'none', 'labels', 'detector'),
                     help='DEPLOYMENT box prompt, 2D single-camera. `auto` deploys a box model with '
                          'the detector box (--crop-inflate 1.5 + --refine) and REFUSES to run a '

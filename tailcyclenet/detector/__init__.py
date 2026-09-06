@@ -407,7 +407,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             if kp is not None:
                 kp[:n, t, 0] = r_kp[ok[:n], t, 0]
             continue
-        cams = session.cgroup(gid, t) if moving else cgroup
+        cams = session.cgroup(gid, frame_base + t) if moving else cgroup
         if tracker is not None:
             out[:, t], sc[:, t], claimed = tracker.step(
                 cams, [p[0] for p in per_cam], [p[1] for p in per_cam])

@@ -4784,3 +4784,55 @@ def test_refused_duplicate_does_not_consume_the_free_slot():
         'the genuine birth must seat in the freed slot -- the refusal must not consume it'
     assert any(e['event'] == 'birth_refused' for e in tr.events), \
         'the duplicate refusals must still be recorded'
+
+
+def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path):
+    """D1.1 (dev/plans/multianimal_system_improvements.md): a moving rig's per-frame extrinsics
+    are fetched by SOURCE frame. `associate_group`'s raw is a batch-local slice whose own frame 0
+    is `frame_base` (the aligned detection cursor on a ranged run) -- asking the session for the
+    extrinsics at the batch-LOCAL index would silently use the wrong camera pose for every
+    triangulation on a ranged moving-rig run, the same class of bug A6a fixed for the tracker's
+    event timestamps. `frame_base=0` (the default) must stay byte-identical to every whole-clip
+    run on record.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    import numpy as np
+
+    from tailcyclenet.detector import associate_group
+    from tailcyclenet.format import Session
+
+    class _RecordingSession:
+        """Delegate to a real Session but record every `cgroup` frame argument."""
+
+        def __init__(self, real):
+            self._real = real
+            self.frames = []
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def cgroup(self, gid, frames=None):
+            self.frames.append(frames)
+            return self._real.cgroup(gid, frames)
+
+    d = tmp_path / 'test' / 's'
+    cf._session_3d(d, T=12, moving=True)
+    sess = Session.load(d)
+
+    T, C = 4, 3
+    raw = (np.full((1, T, C, 4), np.nan, np.float32),
+           np.full((1, T, C), np.nan, np.float32), None)
+
+    whole = _RecordingSession(sess)
+    associate_group(raw, whole, 'g000', 1, track=True)
+    assert whole.frames == [0, 1, 2, 3], \
+        'frame_base=0 (the default) must keep the whole-clip behaviour byte-identical'
+
+    ranged = _RecordingSession(sess)
+    associate_group(raw, ranged, 'g000', 1, track=True, frame_base=6)
+    assert ranged.frames == [6, 7, 8, 9], \
+        "a moving rig's extrinsics must be fetched at SOURCE frames, not batch-local ones"

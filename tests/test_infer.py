@@ -2086,11 +2086,10 @@ def test_cross_view_defaults_select_the_measured_configuration():
     assert parser.get_default('assoc_mode') == 'joint'
     assert parser.get_default('max_age') == 8
     assert parser.get_default('max_move') == 1.25
-    assert parser.get_default('claim_residual_gate') is False
     assert parser.get_default('view_arbitration') is False
 
     options = {option for action in parser._actions for option in action.option_strings}
-    for flag in ('--claim-residual-gate', '--view-arbitration'):
+    for flag in ('--view-arbitration',):
         assert flag in options and flag.replace('--', '--no-', 1) in options, \
             f'{flag} must ship both spellings'
     assert '--assoc-mode' in options
@@ -2101,7 +2100,7 @@ def test_cross_view_defaults_select_the_measured_configuration():
 
 
 def test_the_cross_view_evidence_flags_reach_associate_group(tmp_path, monkeypatch):
-    """CLI -> driver -> `associate_group`: all three values arrive, and omitted they arrive as
+    """CLI -> driver -> `associate_group`: both values arrive, and omitted they arrive as
     the defaults rather than as nothing at all. The defaults are asserted POSITIVELY:
     `associate_group` has to be told 'joint'/8/1.25, because a caller that quietly stops passing
     them is indistinguishable from a wrong upstream default.
@@ -2112,27 +2111,22 @@ def test_the_cross_view_evidence_flags_reach_associate_group(tmp_path, monkeypat
     assert default['assoc_mode'] == 'joint'
     assert default['max_age'] == 8
     assert default['max_move'] == 1.25
-    assert default['claim_residual_gate'] is False
     assert default['view_arbitration'] is False
 
     on = _assoc_kwargs_for(sess, monkeypatch,
-                           ['--assoc-mode', 'joint', '--claim-residual-gate',
-                            '--view-arbitration'])
+                           ['--assoc-mode', 'joint', '--view-arbitration'])
     assert on['assoc_mode'] == 'joint'
-    assert on['claim_residual_gate'] is True
     assert on['view_arbitration'] is True
 
-    off = _assoc_kwargs_for(sess, monkeypatch,
-                            ['--no-claim-residual-gate', '--no-view-arbitration'])
-    assert off == {**on, 'assoc_mode': 'joint', 'claim_residual_gate': False,
-                   'view_arbitration': False}, \
+    off = _assoc_kwargs_for(sess, monkeypatch, ['--no-view-arbitration'])
+    assert off == {**on, 'assoc_mode': 'joint', 'view_arbitration': False}, \
         'the negative spellings must restore exactly the default association'
 
 
-def test_associate_group_hands_the_three_levers_to_the_tracker_and_ignores_them_in_2d(
+def test_associate_group_hands_the_two_levers_to_the_tracker_and_ignores_them_in_2d(
         tmp_path, monkeypatch):
-    """`associate_group` names all three in its `CrossViewTracker(...)` call, and is inert where
-    no tracker is built.
+    """`associate_group` names both in its `CrossViewTracker(...)` call, and is inert where
+    no tracker is built."
 
     The construction is spied rather than the built tracker inspected, so this defends the THREAD
     (which is this change) and not the tracker's own attribute names (which are `track.py`'s).
@@ -2166,9 +2160,8 @@ def test_associate_group_hands_the_three_levers_to_the_tracker_and_ignores_them_
     raw = (np.full((1, 2, C, 4), np.nan, np.float32),
            np.full((1, 2, C), np.nan, np.float32), None)
     associate_group(raw, sess, 'g000', 1, track=True, assoc_mode='joint',
-                    claim_residual_gate=True, view_arbitration=True)
+                    view_arbitration=True)
     assert seen.get('assoc_mode') == 'joint'
-    assert seen.get('claim_residual_gate') is True
     assert seen.get('view_arbitration') is True
     assert seen.get('max_res_px') == sess.assoc_res_max_px, \
         'the existing keywords must survive the new ones'
@@ -2180,5 +2173,5 @@ def test_associate_group_hands_the_three_levers_to_the_tracker_and_ignores_them_
               np.full((1, 2, 1), np.nan, np.float32), None)
     state_2d = {}
     associate_group(raw_2d, flat, 'g000', 1, track=True, state=state_2d, assoc_mode='joint',
-                    claim_residual_gate=True, view_arbitration=True)
+                    view_arbitration=True)
     assert state_2d['tracker'] is None, 'the options must be inert where no tracker is built'

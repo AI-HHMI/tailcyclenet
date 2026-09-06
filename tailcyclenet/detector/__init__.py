@@ -344,7 +344,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
-                    state=None, assoc_mode='joint', claim_residual_gate=False,
+                    state=None, assoc_mode='joint',
                     view_arbitration=False, duplicate_radius=0.75, duplicate_persist=5):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
@@ -357,12 +357,11 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             to the measured 1.25 box-side gate.
         max_age -- the tracker's and `link_rows`' SHARED patience window: frames without
             evidence before a slot or row is retired. The measured default is 8.
-        assoc_mode / claim_residual_gate / view_arbitration -- TRACKER-ONLY cross-view
-            evidence levers. `joint` is now the measured default: it decides identity over
-            cross-view candidate groups instead of one independent Hungarian per camera. The
-            legacy path is explicit `assoc_mode='per-camera'`; the claim gate drops a per-camera
-            claim whose residual exceeds `max_res_px`, and `view_arbitration` down-weights
-            crowded cameras. The latter two remain off.
+        assoc_mode / view_arbitration -- TRACKER-ONLY cross-view evidence levers. `joint` is now
+            the measured default: it decides identity over cross-view candidate groups instead
+            of one independent Hungarian per camera. The legacy path is explicit
+            `assoc_mode='per-camera'`; `view_arbitration` down-weights crowded cameras and
+            remains off.
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
         state -- makes calls equal to one concatenated call; `None` builds fresh state.
@@ -400,7 +399,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        min_views=min_views,
                                        max_move=max_move, max_age=max_age,
                                        assoc_mode=assoc_mode,
-                                       claim_residual_gate=claim_residual_gate,
                                        view_arbitration=view_arbitration,
                                        duplicate_radius=duplicate_radius,
                                        duplicate_persist=duplicate_persist)

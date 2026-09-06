@@ -278,20 +278,6 @@ def build_parser() -> argparse.ArgumentParser:
                          'reprojected 3D point and never checks that claims across cameras are '
                          'the same animal. Joint costs a triangulation pass per frame and can '
                          'withhold a slot whose cameras never agreed.')
-    ap.add_argument('--claim-residual-gate', action=argparse.BooleanOptionalAction, default=False,
-                    help='3D multiview, --track only, and only with --assoc-mode per-camera. '
-                         'The constructor refuses this flag with joint association because joint '
-                         'already residual-gates complete groups. After per-camera matching, '
-                         'triangulate what each slot actually CLAIMED and drop any individual '
-                         'camera claim whose reprojection residual exceeds --assoc-res-max-px. '
-                         'That threshold is '
-                         'today consulted only when a slot is BIRTHED, and births are 0.041%% of '
-                         'associations, so with every slot occupied -- essentially all of a long '
-                         'clip -- it never runs at all; this is what makes the existing gate live '
-                         'in steady state. Trades coverage for identity: a dropped claim is a '
-                         'missing box, so it can only lower `filled`, and the pixel threshold is '
-                         'a per-rig quantity (sweep it, exactly as --assoc-res-max-px says). '
-                         'Default off, which reproduces current behaviour exactly.')
     ap.add_argument('--view-arbitration', action=argparse.BooleanOptionalAction, default=False,
                     help='3D multiview, --track only. Down-weight a camera whose OWN detections '
                          'are mutually crowded: a view whose boxes sit on top of each other says '

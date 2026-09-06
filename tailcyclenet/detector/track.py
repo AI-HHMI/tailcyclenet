@@ -20,7 +20,6 @@ rat. It is also the same gate, in the same units, that `link_rows` uses.
 """
 from __future__ import annotations
 
-import itertools
 
 import numpy as np
 import torch
@@ -198,7 +197,7 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
-                 assoc_mode='joint', claim_residual_gate=False,
+                 assoc_mode='joint',
                  view_arbitration=False, duplicate_radius=DUPLICATE_RADIUS,
                  duplicate_persist=5):
         """Create an empty tracker with `n_slots` rows.
@@ -213,8 +212,6 @@ class CrossViewTracker:
                 min_views -- minimum cameras a birth must be seen in.
                 assoc_mode -- 'joint' (measured default: cross-view candidate groups, then ONE
                     Hungarian) or 'per-camera' (the legacy independent-Hungarian path).
-                claim_residual_gate -- lever 1: drop a per-camera claim that disagrees with the
-                    slot's own other claims by more than `max_res_px`.
                 view_arbitration -- lever 4: discount a camera whose detections are crowded.
                 duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
                     scale-free default (measured band, report 53).
@@ -230,16 +227,12 @@ class CrossViewTracker:
         of `soft_argmax_threshold`.
         """
         assert assoc_mode in ('per-camera', 'joint'), f'unknown assoc_mode {assoc_mode!r}'
-        if claim_residual_gate and assoc_mode == 'joint':
-            raise ValueError('claim_residual_gate is only defined for assoc_mode=\'per-camera\'; '
-                             'joint association already residual-gates complete groups')
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)
         self.assoc_mode = str(assoc_mode)
-        self.claim_residual_gate = bool(claim_residual_gate)
         self.view_arbitration = bool(view_arbitration)
         if duplicate_radius < 0:
             raise ValueError('duplicate_radius must be non-negative')
@@ -274,61 +267,15 @@ class CrossViewTracker:
         self.targets[s]['point'] = new
 
     def _trim(self, cgroup, centres, got_s):
-        """Lever 1: drop the per-camera claims that disagree with the rest. -> (kept, dropped).
+        """Every camera a slot claimed this frame survives untrimmed. -> (kept, dropped).
 
         Inputs: cgroup -- camera dicts; centres -- per-camera (n,2) detection centres;
                 got_s -- {camera: detection index} one slot claimed this frame.
-        Outputs: two camera tuples: the ones that survive, and the ones dropped.
-        Side effects: none.
-
-        THE OBVIOUS RULE DOES NOT WORK and the failure is not subtle: triangulating everything
-        and reprojecting condemns the majority, because `_triangulate` minimises DLT ALGEBRAIC
-        error -- on three claims where two rays intersect exactly and the third is 32 px off, the
-        fit slides down the odd ray until IT reads 0.00 px and the two honest cameras read 11.41
-        px each. Leave-one-out is no better: with one bad claim in three, every leave-one-out set
-        of the honest cameras is itself contaminated.
-
-        So the rule is a consensus, which is what `associate` already does one level up: SEED
-        FROM EVERY PAIR of claims, count how many of the slot's other claims land within
-        `max_res_px` of that pair's point, and keep the largest consistent set, breaking ties on
-        the mean residual (which is what separates a pair that really intersects from two skew
-        rays the DLT split the difference between). The full set is checked first and exits
-        immediately when it is already consistent, so the common case costs ONE triangulation.
-        If no pair supports two cameras, every claim is dropped and the slot holds its point.
-
-        A slot claiming fewer than two cameras is untouched: with one ray there is nothing to be
-        inconsistent with, and retiring one-camera targets was measured worse (+2.72 mm).
-        """
-        cams = tuple(sorted(got_s))
-        if not self.claim_residual_gate or len(cams) < 2:
-            return cams, ()
-        best, best_key = (), None
-        for seed in [cams] + list(itertools.combinations(cams, 2)):
-            res = self._claim_residuals(cgroup, centres, got_s, cams, seed)
-            if res is None:
-                continue
-            inl = tuple(c for c in cams if res[c] <= self.max_res_px)
-            key = (len(inl), -sum(res[c] for c in inl) / max(len(inl), 1))
-            if len(inl) >= 2 and (best_key is None or key > best_key):
-                best, best_key = inl, key
-            if len(inl) == len(cams):
-                break
-        return best, tuple(c for c in cams if c not in best)
-
-    def _claim_residuals(self, cgroup, centres, got_s, cams, seed):
-        """Reproject the point `seed`'s claims triangulate to, into every camera in `cams`.
-
-        Inputs: cgroup; centres; got_s -- {camera: detection index}; cams -- every camera to
-            score; seed -- the cameras the point is triangulated FROM.
-        Outputs: {camera: float pixels}, or None when the triangulation is non-finite (that seed
-            simply does not vote).
+        Outputs: two camera tuples: the ones that survive (all of them), and the ones dropped
+            (always empty).
         Side effects: none.
         """
-        pt = {c: centres[c][got_s[c]].reshape(1, 2) for c in cams}
-        p3d = _triangulate(cgroup, seed, torch.cat([pt[c] for c in seed]))
-        if not bool(torch.isfinite(p3d).all()):
-            return None
-        return {c: _residual(cgroup, (c,), pt[c], p3d) for c in cams}
+        return tuple(sorted(got_s)), ()
 
     def _voters(self, kept, got_s, weights):
         """Lever 4, per-camera mode: which of a slot's claims may vote on its 3D point.

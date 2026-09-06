@@ -584,6 +584,19 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     return out
 
 
+def _vis2d_target(v2):
+    """The visibility TARGET from a raw per-camera `vis2d` status array. STATUS POLICY (CLAUDE.md):
+    `projected` is a position with no visibility claim and must never reach a visibility target,
+    so `unlabeled`/`projected` both NaN out; only `visible` reads as a positive 1.0.
+
+    Inputs: v2 -- per-camera status codes, any shape.
+    Outputs: a float32 tensor of the same shape, NaN where the status makes no visibility claim.
+    Side effects: none.
+    """
+    return torch.as_tensor(np.where(np.isin(v2, (UNLABELED, PROJECTED)), np.nan,
+                                    (v2 == VISIBLE).astype(np.float32)))
+
+
 # appearance augmentation
 
 def _crop_inflate(cfg, rng, train):
@@ -1066,16 +1079,14 @@ class PoseDataset(Dataset):
             vis = vis_2d = None
             if lab.vis2d is not None and sess.has_visibility_assessment:
                 v2 = lab.vis2d[a][frames][:, :, cam_ix]
-                vis_2d = torch.as_tensor(np.where(np.isin(v2, (UNLABELED, PROJECTED)), np.nan,
-                                                  (v2 == VISIBLE).astype(np.float32)))
+                vis_2d = _vis2d_target(v2)
                 if not torch.isfinite(vis_2d).any():
                     vis_2d = None
         else:
             coords = torch.as_tensor(lab.points3d[a][frames], dtype=torch.float32)
             if lab.vis2d is not None and sess.has_visibility_assessment:
                 v2 = lab.vis2d[a][frames][:, :, cam_ix]
-                vis_2d = torch.as_tensor(np.where(np.isin(v2, (UNLABELED, PROJECTED)), np.nan,
-                                                  (v2 == VISIBLE).astype(np.float32)))
+                vis_2d = _vis2d_target(v2)
                 vis = torch.as_tensor((v2 == VISIBLE).any(-1))
                 if not torch.isfinite(vis_2d).any():
                     vis = vis_2d = None

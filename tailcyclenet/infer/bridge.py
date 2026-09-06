@@ -31,11 +31,13 @@ episode, and a post-pass re-runs on stored output without paying for inference a
 from __future__ import annotations
 
 import itertools
+import tomllib
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import toml
 
 from .predictions import load_predictions
 
@@ -611,6 +613,7 @@ def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
     """
     cfg.validate()
     path = Path(path)
+    _write_bridge_provenance(path, cfg)
     if fill_dir is not None:
         fill_dir = Path(fill_dir)
         if not (fill_dir / 'windows.pq').exists():
@@ -689,3 +692,21 @@ def config_provenance(cfg: BridgeConfig) -> list[tuple[str, float]]:
     partial record lie.
     """
     return [(f'bridge_{k}', float(v)) for k, v in asdict(cfg).items()]
+
+
+def _write_bridge_provenance(path: Path, cfg: BridgeConfig) -> None:
+    """Merge the bridge's config into an already-written session's `[provenance]`, in place.
+
+    `--identity-bridge` runs AFTER `SessionWriter.close()` (`session.toml` is frozen by then, so
+    `_box_provenance`/`_identity_provenance` never see it), which otherwise leaves a bridged
+    prediction indistinguishable from an unbridged one in its own provenance -- exactly the gap
+    CLAUDE.md's "record every identity lever in the prediction" rule exists to close. Called
+    unconditionally at the top of `bridge_session`, before any early return, so a run that found
+    nothing to bridge still records that the bridge was asked to look -- the same unconditional-
+    membership rule `config_provenance` itself follows.
+    """
+    cfg_path = Path(path) / 'session.toml'
+    with open(cfg_path, 'rb') as f:
+        doc = tomllib.load(f)
+    doc.setdefault('provenance', {}).update(dict(config_provenance(cfg)))
+    cfg_path.write_text(toml.dumps(doc))

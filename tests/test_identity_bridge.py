@@ -340,6 +340,48 @@ def test_provenance_lists_every_lever_unconditionally():
     assert keys == {f'bridge_{f}' for f in bridge.BridgeConfig.__dataclass_fields__}
 
 
+def test_write_bridge_provenance_merges_into_an_existing_session_toml(tmp_path):
+    """`--identity-bridge` runs after `SessionWriter.close()`, so `session.toml` is already
+    frozen with the run's other provenance -- this must ADD the bridge's keys, not replace them,
+    and every key must be recorded unconditionally (same rule as `config_provenance` itself).
+    """
+    import toml
+    import tomllib
+
+    cfg_path = tmp_path / 'session.toml'
+    cfg_path.write_text(toml.dumps({
+        'mode': '3d', 'units': 'mm', 'labels': 'tracked', 'names': ['a', 'b'],
+        'assoc_res_max_px': 30.0,
+        'provenance': {'run': 'r', 'checkpoint': 'c', 'anchor': 'carry'},
+    }))
+    bridge._write_bridge_provenance(tmp_path, bridge.BridgeConfig())
+
+    with open(cfg_path, 'rb') as f:
+        doc = tomllib.load(f)
+    prov = doc['provenance']
+    # the pre-existing keys survive untouched
+    assert prov['run'] == 'r' and prov['checkpoint'] == 'c' and prov['anchor'] == 'carry'
+    # every bridge lever is added, unconditionally, matching config_provenance's own key set
+    want = {f'bridge_{f}' for f in bridge.BridgeConfig.__dataclass_fields__}
+    assert want <= set(prov)
+    assert prov['bridge_min_margin'] == bridge.BridgeConfig().min_margin
+    # the rest of the document (not just provenance) survives untouched
+    assert doc['mode'] == '3d' and doc['names'] == ['a', 'b']
+
+
+def test_bridge_session_writes_provenance_before_any_early_return():
+    """`bridge_session` must record the bridge's config even when there is nothing to bridge --
+    an absent identity_events.pq (no tracker events at all) is the FIRST early-return point in
+    the function, so the write must happen before it, not after.
+    """
+    import inspect
+
+    src = inspect.getsource(bridge.bridge_session)
+    write_at = src.index('_write_bridge_provenance(')
+    first_return = src.index("if not epath.exists():")
+    assert write_at < first_return, \
+        'provenance must be written before the first early return, not after'
+
 
 def test_boundary_fill_map_matches_one_to_one_by_centre_distance():
     """The fill map is a Hungarian on 3D centroids at the boundary frame, one-to-one."""

@@ -2167,3 +2167,42 @@ def test_a_nonbox_3d_run_records_refine_resolved_true_in_provenance(cli, monkeyp
     assert prov['box_prompt_requested'] == 'firstonly'   # the shipped --box-prompt default
     assert isinstance(prov['crop_inflate'], float)
     assert 'gridresid_offset' in prov and 'gridresid_offset_override' in prov
+
+
+def test_a_moving_rig_prediction_round_trips_its_extrinsics(cli, monkeypatch, tmp_path):
+    """D1.2 (dev/plans/multianimal_system_improvements.md): a moving-rig prediction session must
+    carry its own extrinsics.pq, or `Session.load(out).labels(gid)` raises (format rule 13) and
+    `validate_session` fails -- on the one rig type this repo explicitly keeps moving support
+    for. The copied extrinsics must equal the source's own, frame for frame.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.format import Session, validate_session
+
+    root = tmp_path / 'mv'
+    cf._session_3d(root / 'test' / 's', T=6, moving=True)
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL,
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out = tmp_path / 'pred'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--split', 'test',
+                                      '--anchor', 'none', '--device', 'cpu', '--overlap', '2',
+                                      '--out', str(out)])
+    cli.main()
+
+    assert (out / 'extrinsics.pq').exists(), 'a moving-rig prediction must write extrinsics.pq'
+    got = Session.load(out)
+    lab = got.labels('g000')
+    src = Session.load(root / 'test' / 's').labels('g000')
+    np.testing.assert_array_equal(lab.ext, src.ext)
+
+    errs = [e for e in validate_session(got) if '[rule 7]' not in e]
+    assert not errs, f'a moving prediction session must validate apart from missing pixels: {errs}'

@@ -34,8 +34,9 @@ def _sigmoid(x):
 class SessionWriter:
     """One prediction session, appended a block at a time.
 
-    The header (`session.toml`, `calibration.toml`, `groups.pq`) is written up front, so a run
-    that dies half way leaves a directory that says what it was.
+    The header (`session.toml`, `calibration.toml`, `groups.pq`, and `extrinsics.pq` when the
+    source rig has a moving camera) is written up front, so a run that dies half way leaves a
+    directory that says what it was.
     """
 
     def __init__(self, out: Path, source: Session, registry, provenance: dict, groups):
@@ -47,8 +48,11 @@ class SessionWriter:
                 provenance -- dict or (key, value) pairs; duplicate keys with differing
                     values raise.
                 groups -- group ids in run order, recorded in groups.pq.
-        Side effects: writes session.toml, calibration.toml and groups.pq, and opens the
-        per-table parquet writers. Provenance values are scalars and lists of strings
+        Side effects: writes session.toml, calibration.toml, groups.pq and (D1.2, a moving
+        source) extrinsics.pq, and opens the per-table parquet writers. Extrinsics are copied
+        for the FULL group, not just the range this run predicted -- rule 13 needs every frame
+        of every moving camera regardless, and `groups.pq` already keeps the group's full
+        `n_frames` on a ranged run. Provenance values are scalars and lists of strings
         (`source_videos` is the resolved file list); a duplicate key is a silent loss -- `dict`
         merges without complaint -- so the caller passes ITEMS and the collision is caught here.
         """
@@ -87,6 +91,24 @@ class SessionWriter:
                                           np.int32),
             'notes': np.array([source.groups[g].notes for g in order], dtype=object),
         }, dict_cols=())
+        if any(source.rig.moving.values()):
+            ext_group, ext_frame, ext_camera, ext_vals = [], [], [], []
+            for gid in order:
+                lab = source.labels(gid)
+                T = lab.ext.shape[1]
+                for ci, name in enumerate(source.cam_names):
+                    if not source.rig.moving[name]:
+                        continue
+                    ext_group.extend([gid] * T)
+                    ext_frame.extend(range(T))
+                    ext_camera.extend([name] * T)
+                    ext_vals.extend(e.ravel().tolist() for e in lab.ext[ci])
+            write_table(self.out / 'extrinsics.pq', {
+                'group_id': np.array(ext_group, dtype=object),
+                'frame': np.array(ext_frame, np.int32),
+                'camera': np.array(ext_camera, dtype=object),
+                'ext': ext_vals,
+            }, dict_cols=('group_id', 'camera'))
 
     def write_block(self, gid: str, blk: dict, f0: int, w0: int) -> None:
         """One block's rows. `f0`/`w0` are its first frame and window in the WHOLE group.

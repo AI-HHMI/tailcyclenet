@@ -565,9 +565,30 @@ def test_mota_detail_is_additive_and_matches_the_idsw_count():
     detailed = mota(pred, true, max_dist=10.0, detail=True)
 
     assert 'idsw_detail' not in plain, 'detail=False (the default) must not add the key'
+    assert 'fp_detail' not in plain
     for k in plain:
         assert detailed[k] == plain[k] or (np.isnan(detailed[k]) and np.isnan(plain[k])), \
             f'{k} differs between detail=False and detail=True -- not additive'
 
     assert plain['idsw'] == 1
     assert detailed['idsw_detail'] == [{'frame': 1, 'gt_row': 0, 'from_row': 0, 'to_row': 1}]
+
+
+def test_mota_fp_detail_labels_dup_and_none_consistently_with_the_counts():
+    """B1 step 5: `fp_detail`'s per-item `kind` ('dup' vs 'none') must sum to the SAME
+    `fp_dup`/`fp_none` counts `mota()` already reports -- one false positive near an already-
+    claimed GT (a duplicate) and one on no animal at all (none), in the same frame.
+    """
+    # St=1 GT row at (0,0); Sp=2 predictions: row 0 matches the GT, row 1 is a near-duplicate
+    # (within max_dist of the claimed GT), row 2 is far from everything (a bare false positive).
+    pred = np.array([[[[0.0, 0.0]]], [[[5.0, 0.0]]], [[[500.0, 500.0]]]])  # (Sp=3, T=1, K=1, R=2)
+    true = np.array([[[[0.0, 0.0]]]])                                     # (St=1, T=1, K=1, R=2)
+
+    d = mota(pred, true, max_dist=10.0, detail=True)
+    assert d['fp'] == 2 and d['fp_dup'] == 1 and d['fp_none'] == 1
+
+    by_kind = {'dup': [], 'none': []}
+    for item in d['fp_detail']:
+        by_kind[item['kind']].append(item['pred_row'])
+    assert by_kind['dup'] == [1], 'the near-duplicate row must be classified dup'
+    assert by_kind['none'] == [2], 'the bare false positive must be classified none'

@@ -179,10 +179,11 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
          cost='mean', last=None, detail=False) -> dict:
     """MOTA and its three components, with an explicit ignore region.
 
-    `detail=True` (default False, byte-identical) adds an `idsw_detail` key: a list of
-    `{frame, gt_row, from_row, to_row}` dicts, one per switch, walking the SAME per-frame
-    correspondence this function already builds -- an ADDITIVE diagnostic, not a second
-    matcher, so it can never disagree with the `idsw` count above it.
+    `detail=True` (default False, byte-identical) adds `idsw_detail` (a list of `{frame,
+    gt_row, from_row, to_row}` per switch) and `fp_detail` (a list of `{frame, pred_row, kind}`,
+    kind in `('dup', 'none')`, per false positive) -- both walk the SAME per-frame
+    correspondence this function already builds, an ADDITIVE diagnostic that can never disagree
+    with the `idsw`/`fp_dup`/`fp_none` counts above it.
 
     MOTA = 1 - (misses + fp + idsw) / labelled instances; report the components, since a split
     is not a method. `ignore` (St,T) marks PRESENT-but-unannotated instances: with
@@ -214,7 +215,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
         ignore_boxes = np.asarray(ignore_boxes, float)
 
     misses = fps = switches = gt = ignored = dups = 0
-    switch_detail = []
+    switch_detail, fp_detail = [], []
     last = {} if last is None else last
     with np.errstate(invalid='ignore'), warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
@@ -236,9 +237,14 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
                 ignored += 1
                 continue
             fps += 1
+            is_dup = False
             if len(claimed) and np.isfinite(centroid[i, t]).all():
                 d = np.linalg.norm(true_centroid[claimed, t] - centroid[i, t], axis=-1)
-                dups += int(np.nanmin(d) <= max_dist) if np.isfinite(d).any() else 0
+                is_dup = bool(np.nanmin(d) <= max_dist) if np.isfinite(d).any() else False
+            dups += int(is_dup)
+            if detail:
+                fp_detail.append({'frame': t, 'pred_row': int(i),
+                                  'kind': 'dup' if is_dup else 'none'})
         for i, j, _ in pairs:
             if last.get(j) is not None and last[j] != i:
                 switches += 1
@@ -256,6 +262,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
            'idsw_rate': switches / gt if gt else float('nan')}
     if detail:
         out['idsw_detail'] = switch_detail
+        out['fp_detail'] = fp_detail
     return out
 
 

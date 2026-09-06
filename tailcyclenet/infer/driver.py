@@ -490,7 +490,9 @@ def run_dataset(args):
         print("box prompt: FIRSTONLY -- given at each animal's first window, withheld once a "
               'carry is available (owner-set default, 2026-09-05; report 55).')
     crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
-    refine = args.refine if args.refine is not None else (True if box_on else None)
+    # resolved HERE, not left None for `run_blocks` to fill in later: a config that never states
+    # `--refine` must still tell provenance what actually ran, and `sess.mode` is already known.
+    refine = args.refine if args.refine is not None else (True if box_on else sess.mode == '3d')
     refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
     if box_on:
         print(f'box deployment recipe: --box-prompt {box_prompt} '
@@ -596,6 +598,14 @@ def run_dataset(args):
                             'box_source': ((det_boxsrc or 'keypoints') if args.detector
                                            else cfg.box_source),
                             'vis_thresh': float(cfg.vis_thresh) if cfg.vis_thresh else 0.0,
+                            # resolved pose-inference recipe (A4): the requested and the
+                            # resolved value are both recorded when a CLI default resolved them
+                            'box_prompt': cfg.box_prompt,
+                            'box_prompt_requested': str(args.box_prompt),
+                            'box_prompt_first_only': bool(cfg.box_prompt_first_only),
+                            'crop_inflate': float(cfg.crop_inflate),
+                            'gridresid_offset': str(config['model']['gridresid_offset']),
+                            'gridresid_offset_override': str(args.gridresid_offset or ''),
                             **provenance()}.items(),
                             *_box_provenance(args, det_tile, det_red, det_boxsrc).items(),
                             *_identity_provenance(args).items()],

@@ -2128,3 +2128,42 @@ def test_out_may_not_name_the_source_session(cli, monkeypatch, tmp_path):
                                       '--device', 'cpu', '--out', str(root / 'test' / 's')])
     with pytest.raises(SystemExit, match='SOURCE session'):
         cli.main()
+
+
+def test_a_nonbox_3d_run_records_refine_resolved_true_in_provenance(cli, monkeypatch, tmp_path):
+    """A4 (dev/plans/multianimal_system_improvements.md): a non-box 3D run leaves `--refine`
+    unset, and `run_blocks` resolves `cfg.refine=None` to `mode == '3d'` (True) -- but the
+    provenance record used to be written from the UNRESOLVED `cfg.refine` (None -> `bool(None)`
+    = False), so a run that actually refined recorded `refine=false`. The resolution must happen
+    before provenance is written, and the new pose-recipe keys must be present.
+    """
+    import tomllib
+
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.format import load_dataset
+
+    root = tmp_path / 'ds'
+    cf._session_3d(root / 'test' / 's', T=8)
+    registry = Registry.build([load_dataset(root)])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out = tmp_path / 'pred'
+    monkeypatch.setattr(sys, 'argv', [
+        'infer.py', '--data', str(root / 'test' / 's'), '--out', str(out), '--run', str(run),
+        '--device', 'cpu', '--split', 'test', '--overlap', '2', '--anchor', 'none'])
+    cli.main()
+
+    with open(out / 'session.toml', 'rb') as f:
+        prov = tomllib.load(f)['provenance']
+    assert prov['refine'] is True, \
+        f'a non-box 3D run must resolve --refine to True before provenance is written: {prov}'
+    assert prov['box_prompt'] == 'none'
+    assert prov['box_prompt_requested'] == 'firstonly'   # the shipped --box-prompt default
+    assert isinstance(prov['crop_inflate'], float)
+    assert 'gridresid_offset' in prov and 'gridresid_offset_override' in prov

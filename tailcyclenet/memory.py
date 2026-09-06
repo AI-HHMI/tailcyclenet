@@ -235,28 +235,6 @@ def rebudget(override_gb: float | None = None,
     return _cached
 
 
-def result_array_gb(n_frames: int, n_cams: int, n_kpts: int, n_animals: int,
-                    top_k: int, det_kpts: bool, dims: int = 3) -> dict[str, float]:
-    """GB of RESULT arrays a group will allocate up front, by name. Nothing to do with pixels.
-
-    THE TERM THE RAM BUDGET DOES NOT COVER: these are whole-clip `np.full` allocations made
-    before any decode, so no budget can shrink them. Callers use this to fail loudly BEFORE the
-    work rather than be OOM-killed hours into it.
-    """
-    f4 = 4.0
-    T, C, K, S, D = (max(int(n_frames), 0), max(int(n_cams), 1), max(int(n_kpts), 1),
-                     max(int(n_animals), 1), max(int(top_k), 1))
-    out = {
-        'detect boxes': D * T * C * 4 * f4,
-        'detect scores': D * T * C * f4,
-        'detect keypoints': (D * T * C * K * 3 * f4) if det_kpts else 0.0,
-        'pred': S * T * K * dims * f4,
-        'conf': S * T * K * f4,
-        'box_agree': S * T * C * f4,
-    }
-    return {k: v / GB for k, v in out.items() if v}
-
-
 _libc = None
 _TRIM_OFF = os.environ.get('TAILCYCLENET_NO_MALLOC_TRIM')
 

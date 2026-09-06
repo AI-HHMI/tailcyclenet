@@ -61,19 +61,12 @@ def giou_loss(pred, target, eps=1e-7):
     return 1.0 - (iou - (carea - union) / carea)
 
 
-def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.0,
-               soft_prior=False):
+def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.0):
     """Task-aligned assignment (YOLOv8/RTMDet style).
 
     Candidate anchors are inside each finite GT box, then the detached prediction quality
     ``sigmoid(obj)**alpha * IoU**beta`` selects up to ``topk`` anchors per GT.  An anchor that
     appears in several GT top-k sets is assigned to the GT with the greatest alignment score.
-
-    G4 (`soft_prior=True`, detector_architecture_sweep plan): the strict `inside` candidacy mask
-    is relaxed to `inside | near`, reusing `assign()`'s own `CENTER_RADIUS=2.5`-cell radius --
-    an anchor near (but outside) the box can still be a candidate, which helps edge-truncated
-    animals where the GT box centre sits near the frame border and few anchors land inside.
-    Default `False` is byte-identical to every checkpoint on record.
     """
     empty = (torch.zeros(0, dtype=torch.long, device=anchors.device),) * 2
     finite = torch.isfinite(gt_boxes).all(-1)
@@ -82,17 +75,8 @@ def assign_tal(anchors, gt_boxes, obj_logits, boxes, topk=13, alpha=1.0, beta=6.
     gt = gt_boxes[finite]
     gt_ix = torch.nonzero(finite, as_tuple=True)[0]
     cx, cy = anchors[:, 0], anchors[:, 1]
-    inside = ((cx[:, None] > gt[None, :, 0]) & (cx[:, None] < gt[None, :, 2]) &
-              (cy[:, None] > gt[None, :, 1]) & (cy[:, None] < gt[None, :, 3]))
-    if soft_prior:
-        stride = anchors[:, 2]
-        gcx = (gt[:, 0] + gt[:, 2]) / 2
-        gcy = (gt[:, 1] + gt[:, 3]) / 2
-        r = CENTER_RADIUS * stride[:, None]
-        near = ((cx[:, None] - gcx[None]).abs() < r) & ((cy[:, None] - gcy[None]).abs() < r)
-        candidate = inside | near
-    else:
-        candidate = inside
+    candidate = ((cx[:, None] > gt[None, :, 0]) & (cx[:, None] < gt[None, :, 2]) &
+                 (cy[:, None] > gt[None, :, 1]) & (cy[:, None] < gt[None, :, 3]))
     if not candidate.any():
         return empty
     with torch.no_grad():
@@ -272,19 +256,11 @@ def ciou_loss(pred, target, eps=1e-7):
     return 1.0 - iou + rho2 / c2 + a * v
 
 
-def quality_focal_loss(logits, targets, gamma=2.0):
-    """Quality Focal Loss per element for continuous quality targets in ``[0, 1]``."""
-    sigmoid = logits.sigmoid()
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    return (targets - sigmoid).abs().pow(gamma) * bce
-
-
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
                   regions=None, ignore=None, iou_aware=False, iou_aware_warmup=2000, it=None,
                   max_pos_per_gt=None, assignment='center', box_loss_fn='giou',
-                  focal_obj=False, focal_gamma=2.0, tal_topk=13, tal_alpha=1.0,
-                  tal_beta=6.0, tal_soft_prior=False):
+                  tal_topk=13, tal_alpha=1.0, tal_beta=6.0):
     """BCE(objectness) over every anchor + GIoU over the positives.
 
     Inputs:
@@ -301,8 +277,8 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             the opposite polarity (`instances.pq` PRESENT boxes). Independent; both reported in
             `parts` (`certified`/`ignored`).
         box_weight / kpt_weight / kpt_score_weight -- term weights; max_pos_per_gt -- `assign`'s
-            cap, passed straight through; assignment / box_loss_fn / focal_* / tal_* -- assigner
-            and loss selection.
+            cap, passed straight through; assignment / box_loss_fn / tal_* -- assigner and loss
+            selection.
     Outputs:
         (total, parts): total = obj + box_weight*box (+ keypoint terms); parts carries obj,
         box, n_pos and any optional diagnostics (certified, ignored, iou_target, kpt, kpt_score).
@@ -328,7 +304,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         if assignment == 'tal':
             pos, gix = assign_tal(anchors, gt_boxes[b], obj_logits[b].detach(),
                                   boxes[b].detach(), topk=tal_topk, alpha=tal_alpha,
-                                  beta=tal_beta, soft_prior=tal_soft_prior)
+                                  beta=tal_beta)
         else:
             pos, gix = assign(anchors, gt_boxes[b], max_pos_per_gt=max_pos_per_gt)
         if regions is not None:

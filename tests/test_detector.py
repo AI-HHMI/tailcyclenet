@@ -3059,35 +3059,6 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
     assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'
 
 
-def test_ema_off_builds_nothing_and_on_tracks_the_weights_it_averages():
-    """`--ema-decay 0` must not construct an averaged model; on, it must actually average -- the
-    one optimiser lever that yields both arms from a single run.
-    """
-    from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
-
-    model = YOLOXNano(n_keypoints=0)
-    decay = 0.9
-    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay))
-
-    p = next(model.parameters())
-
-    # THE FIRST `update_parameters` IS A COPY, NOT AN AVERAGE: `AveragedModel` seeds itself from
-    # the model on the first call; only from the second does `avg_fn` run.
-    ema.update_parameters(model)
-    seeded = next(ema.module.parameters()).detach().clone()
-    torch.testing.assert_close(seeded, p.detach())
-
-    # From the second update it is a real average: a +1.0 jump moves it by exactly (1 - decay).
-    with torch.no_grad():
-        p.add_(1.0)
-    ema.update_parameters(model)
-    e1 = next(ema.module.parameters()).detach().clone()
-
-    assert not torch.allclose(e1, seeded), 'the EMA never moved -- it is not tracking the weights'
-    assert not torch.allclose(e1, p.detach()), 'the EMA copied the weights instead of averaging'
-    torch.testing.assert_close(e1, seeded + (1.0 - decay), rtol=1e-4, atol=1e-6)
-
-
 def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
     """The run measured its own peak and then overwrote it -- worth up to -28% recall: on a root
     whose labelled frame names 2 of ~10 rats, recall peaks at 4-8k and falls by 20k, so "last" is

@@ -135,16 +135,6 @@ def allocate_train_counts(sessions: list[Path], total: int) -> dict[str, int]:
     return counts
 
 
-def source_cameras(session: Path) -> list[str]:
-    """The session's camera names, from the npz view_names.
-
-    Inputs: session -- a source session directory.
-    Outputs: list of camera name strings.
-    """
-    with np.load(session / 'labels' / 'keypoint_annotations.npz', allow_pickle=True) as data:
-        return [str(v) for v in data['view_names']]
-
-
 def source_fps(video: Path) -> Fraction:
     """The source video's frame rate as an exact Fraction.
 

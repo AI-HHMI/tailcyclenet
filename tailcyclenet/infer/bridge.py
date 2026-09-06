@@ -459,40 +459,6 @@ def bridge_group(rows: dict, windows: pd.DataFrame, events: pd.DataFrame, gid: s
     return rows, list(reversed(decisions))
 
 
-def bridge_predictions(predictions: dict, path: Path, cfg: BridgeConfig,
-                       window_length: int) -> dict:
-    """Bridge a whole loaded prediction set in place-of-copy. Returns per-group decisions.
-
-    `predictions` is mutated to hold the bridged rows, matching `load_predictions`' own shape so
-    a caller can score or write it with no further translation. A session with no event log has
-    no episode to bridge, which is a no-op rather than an error.
-    """
-    cfg.validate()
-    path = Path(path)
-    wpath, epath = path / 'windows.pq', path / 'identity_events.pq'
-    if not wpath.exists():
-        raise FileNotFoundError(
-            f'{wpath} is required: the bridge decides per OWNED window segment, and without the '
-            'window table it cannot tell which frames each window actually kept.')
-    windows = pd.read_parquet(wpath)
-    events = pd.read_parquet(epath) if epath.exists() else None
-    if events is None or events.empty:
-        return {gid: [] for gid in predictions}
-    out = {}
-    for gid, rows in predictions.items():
-        pred = rows.get('pred')
-        n_frames = int(pred.shape[1]) if isinstance(pred, np.ndarray) and pred.ndim == 4 else 0
-        if not n_frames:
-            out[gid] = []
-            continue
-        key = str(rows.get('group_id', gid))
-        new_rows, decisions = bridge_group(rows, windows, events, key, n_frames,
-                                           window_length, cfg)
-        predictions[gid] = new_rows
-        out[gid] = decisions
-    return out
-
-
 def _plan_frames(segments: dict[int, np.ndarray], plan: dict, n_frames: int):
     """The (quarantined, released) frame index arrays this plan implies."""
     quarantined = [w for w in plan['windows']

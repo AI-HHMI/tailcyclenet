@@ -399,10 +399,6 @@ class _ReaderCache:
         got = self._d[path] = _open_reader(path)
         return got
 
-    def cache_clear(self):
-        """Drop every cached reader."""
-        self._d.clear()
-
 
 def _open_reader(path: str):
     """One reader per file per process. Opening the container and building its frame index is not

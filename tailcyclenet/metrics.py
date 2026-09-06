@@ -176,8 +176,13 @@ def match_instances(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean')
 
 
 def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0,
-         cost='mean', last=None) -> dict:
+         cost='mean', last=None, detail=False) -> dict:
     """MOTA and its three components, with an explicit ignore region.
+
+    `detail=True` (default False, byte-identical) adds an `idsw_detail` key: a list of
+    `{frame, gt_row, from_row, to_row}` dicts, one per switch, walking the SAME per-frame
+    correspondence this function already builds -- an ADDITIVE diagnostic, not a second
+    matcher, so it can never disagree with the `idsw` count above it.
 
     MOTA = 1 - (misses + fp + idsw) / labelled instances; report the components, since a split
     is not a method. `ignore` (St,T) marks PRESENT-but-unannotated instances: with
@@ -209,6 +214,7 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
         ignore_boxes = np.asarray(ignore_boxes, float)
 
     misses = fps = switches = gt = ignored = dups = 0
+    switch_detail = []
     last = {} if last is None else last
     with np.errstate(invalid='ignore'), warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
@@ -236,15 +242,21 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
         for i, j, _ in pairs:
             if last.get(j) is not None and last[j] != i:
                 switches += 1
+                if detail:
+                    switch_detail.append({'frame': t, 'gt_row': int(j),
+                                          'from_row': int(last[j]), 'to_row': int(i)})
             last[j] = i
-    return {'mota': 1.0 - (misses + fps + switches) / gt if gt else float('nan'),
-            'misses': misses, 'fp': fps, 'idsw': switches, 'gt': gt,
-            'fp_ignored': ignored, 'fp_dup': dups, 'fp_none': fps - dups,
-            'miss_rate': misses / gt if gt else float('nan'),
-            'fp_rate': fps / gt if gt else float('nan'),
-            'fp_dup_rate': dups / gt if gt else float('nan'),
-            'fp_none_rate': (fps - dups) / gt if gt else float('nan'),
-            'idsw_rate': switches / gt if gt else float('nan')}
+    out = {'mota': 1.0 - (misses + fps + switches) / gt if gt else float('nan'),
+           'misses': misses, 'fp': fps, 'idsw': switches, 'gt': gt,
+           'fp_ignored': ignored, 'fp_dup': dups, 'fp_none': fps - dups,
+           'miss_rate': misses / gt if gt else float('nan'),
+           'fp_rate': fps / gt if gt else float('nan'),
+           'fp_dup_rate': dups / gt if gt else float('nan'),
+           'fp_none_rate': (fps - dups) / gt if gt else float('nan'),
+           'idsw_rate': switches / gt if gt else float('nan')}
+    if detail:
+        out['idsw_detail'] = switch_detail
+    return out
 
 
 def idsw_stability_band(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0,

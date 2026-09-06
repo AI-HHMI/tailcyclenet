@@ -548,3 +548,26 @@ def test_vis_confusion_excludes_projected_from_the_assessed_count():
     m = ev._vis_confusion(out, lab, '3d', 1)
     assert m['vis_n'] == 1, 'the PROJECTED keypoint must not be counted as assessed'
     assert m['vis_precision'] == pytest.approx(1.0)
+
+
+def test_mota_detail_is_additive_and_matches_the_idsw_count():
+    """B1 step 4 (dev/plans/multianimal_system_improvements.md): `detail=True` must not change
+    a single existing field (byte-identical to `detail=False`/omitted), and its `idsw_detail`
+    list must record exactly the switch the plain `idsw` count already found -- same frame, same
+    GT row, same from/to prediction rows -- since it walks the SAME per-frame correspondence,
+    never a second matcher.
+    """
+    pred = np.array([[[[0.0, 0.0]], [[100.0, 100.0]]],
+                     [[[100.0, 100.0]], [[0.0, 0.0]]]])   # (Sp=2, T=2, K=1, R=2)
+    true = np.array([[[[0.0, 0.0]], [[0.0, 0.0]]]])       # (St=1, T=2, K=1, R=2)
+
+    plain = mota(pred, true, max_dist=10.0)
+    detailed = mota(pred, true, max_dist=10.0, detail=True)
+
+    assert 'idsw_detail' not in plain, 'detail=False (the default) must not add the key'
+    for k in plain:
+        assert detailed[k] == plain[k] or (np.isnan(detailed[k]) and np.isnan(plain[k])), \
+            f'{k} differs between detail=False and detail=True -- not additive'
+
+    assert plain['idsw'] == 1
+    assert detailed['idsw_detail'] == [{'frame': 1, 'gt_row': 0, 'from_row': 0, 'to_row': 1}]

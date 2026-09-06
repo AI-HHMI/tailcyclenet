@@ -10,6 +10,27 @@ from PIL import Image
 
 from tailcyclenet import format as fmt
 
+
+def _detector_checkpoint(model=None, **overrides):
+    """A minimal but genuinely loadable detector checkpoint dict -- `load_detector` needs real
+    tensors and every key it reads, not a stub. NOT written to disk (the caller decides whether
+    to `torch.save` it as-is or merge in more overrides first, e.g. `{**cf._detector_checkpoint(), 'tile_wh': [640, 640]}`).
+
+    Inputs: model -- a built `YOLOXNano`, or `None` for a fresh default one; overrides -- any
+        checkpoint key, replacing the default.
+    Outputs: a checkpoint dict with `model_state`/`input_wh`/`norm` at their shipped-recipe
+        defaults, plus every override.
+    Side effects: none.
+
+    Deliberately malformed checkpoints (missing keys, an empty `model_state`, wrong dtypes -- the
+    refusal tests) stay as explicit inline dict literals at their call sites: a shared factory
+    would obscure exactly what each of those tests omits.
+    """
+    from tailcyclenet.detector.yolox import YOLOXNano
+
+    m = model if model is not None else YOLOXNano(n_keypoints=0)
+    return {'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn', **overrides}
+
 # Cap the intraop pool, or `-n` makes the suite slower: `nproc`-wide torch pool vs many xdist workers.
 torch.set_num_threads(4)
 

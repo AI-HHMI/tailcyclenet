@@ -1820,10 +1820,12 @@ def test_a_detector_records_its_objectness_and_load_detector_hands_it_back(tmp_p
 
     A checkpoint written before the field returns `{}` rather than a guess.
     """
-    from tailcyclenet.detector import YOLOXNano, load_detector
+    import conftest as cf
+
+    from tailcyclenet.detector import load_detector
 
     p = tmp_path / 'detector.pth'
-    base = dict(model_state=YOLOXNano(n_keypoints=0).state_dict(), input_wh=[416, 416], norm='gn')
+    base = cf._detector_checkpoint()
     torch.save(base, p)
     assert load_detector(p)[-1] == {}, 'an unrecorded distribution must not be invented'
 
@@ -2107,12 +2109,13 @@ def test_width_only_applies_to_trimmed():
 
 def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
     """The fifth instance of the absent-key rule: absent means `trimmed`, never a guess."""
+    import conftest as cf
+
     from tailcyclenet.detector import load_detector
 
     p = tmp_path / 'detector.pth'
     m = YOLOXNano(n_keypoints=0, version='s')
-    torch.save({'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
-               'yolox_version': 's'}, p)
+    torch.save(cf._detector_checkpoint(m, yolox_version='s'), p)
     loaded, *_ = load_detector(p)
     assert loaded.version == 's'
     torch.testing.assert_close(
@@ -2121,7 +2124,7 @@ def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
     # absent -> 'trimmed', a fact about every checkpoint written before this switch existed
     p2 = tmp_path / 'old.pth'
     old = YOLOXNano()
-    torch.save({'model_state': old.state_dict(), 'input_wh': [416, 416], 'norm': 'gn'}, p2)
+    torch.save(cf._detector_checkpoint(old), p2)
     loaded2, *_ = load_detector(p2)
     assert loaded2.version == 'trimmed'
 
@@ -2131,12 +2134,13 @@ def test_load_detector_ignores_a_stale_embed_dim_key(tmp_path):
     an old checkpoint dict may still carry `embed_dim: 0` (or any value) from before the branch
     was removed, and `load_detector` must load it exactly as if the key were absent.
     """
+    import conftest as cf
+
     from tailcyclenet.detector import load_detector
 
     p = tmp_path / 'detector.pth'
     m = YOLOXNano()
-    torch.save({'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
-               'yolox_version': 'trimmed', 'embed_dim': 0}, p)
+    torch.save(cf._detector_checkpoint(m, yolox_version='trimmed', embed_dim=0), p)
     loaded, *_ = load_detector(p)
     assert not hasattr(loaded.head, 'embed_dim'), 'the embed branch must not be rebuilt'
     torch.testing.assert_close(
@@ -2200,9 +2204,11 @@ def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
     `tile_scale = 1.0` -- and `detect_group` reads any non-None value as "letterbox the whole frame
     at `frame_wh * scale`", which for branson-fly is 1024x1024 against the 416x416 it trained at.
     """
-    from tailcyclenet.detector import YOLOXNano, load_detector
+    import conftest as cf
+
+    from tailcyclenet.detector import load_detector
     p = tmp_path / 'detector.pth'
-    base = dict(model_state=YOLOXNano(n_keypoints=0).state_dict(), input_wh=[416, 416], norm='gn')
+    base = cf._detector_checkpoint()
     torch.save({**base, 'tile_wh': None, 'tile_scale': 1.0}, p)
     assert load_detector(p)[-2] is None
     # ...and a genuinely tiled one still keeps it, or the tiled path loses its whole point.
@@ -3762,13 +3768,13 @@ def test_load_detector_absent_in_channels_means_3(tmp_path):
     """Every checkpoint written before this key existed carries no `in_channels` at all -- absent
     is a FACT about those files (3, the only stem width they were ever built at), not a guess.
     """
+    import conftest as cf
+
     from tailcyclenet.detector import load_detector
 
     m = YOLOXNano(version='tiny')
-    ckpt = {
-        'model_state': m.state_dict(), 'input_wh': (96, 96), 'n_keypoints': 0, 'norm': 'gn',
-        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': False,
-    }
+    ckpt = cf._detector_checkpoint(m, input_wh=(96, 96), n_keypoints=0,
+                                   yolox_version='tiny', bottleneck_expansion=0.5, p2=False)
     p = tmp_path / 'detector.pth'
     torch.save(ckpt, p)
     loaded, *_ = load_detector(p)
@@ -3850,13 +3856,13 @@ def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
     """A `p2=True` checkpoint must reconstruct a `p2=True` model through `load_detector` -- absent
     means `False`, so this proves a SAVED `p2=True` fact survives, not just that the constructor
     kwarg works in isolation."""
+    import conftest as cf
+
     from tailcyclenet.detector import load_detector
 
     m = YOLOXNano(version='tiny', p2=True)
-    ckpt = {
-        'model_state': m.state_dict(), 'input_wh': (96, 96), 'n_keypoints': 0, 'norm': 'gn',
-        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': True,
-    }
+    ckpt = cf._detector_checkpoint(m, input_wh=(96, 96), n_keypoints=0,
+                                   yolox_version='tiny', bottleneck_expansion=0.5, p2=True)
     p = tmp_path / 'detector.pth'
     torch.save(ckpt, p)
     loaded, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(p)

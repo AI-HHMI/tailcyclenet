@@ -1008,14 +1008,13 @@ def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeyp
 def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
     """A minimal but genuinely loadable detector checkpoint -- `load_detector` needs real
     tensors and every key it reads, not a stub."""
+    import conftest as cf
     from tailcyclenet.detector.yolox import YOLOXNano
 
     m = YOLOXNano(version='tiny')
-    ckpt = {
-        'model_state': m.state_dict(), 'input_wh': (64, 48), 'n_keypoints': 0, 'norm': 'gn',
-        'yolox_version': 'tiny', 'bottleneck_expansion': 0.5, 'p2': False,
-        'dataset': dataset, 'min_crop_dim': min_crop_dim, 'box_source': box_source,
-    }
+    ckpt = cf._detector_checkpoint(
+        m, input_wh=(64, 48), n_keypoints=0, yolox_version='tiny', bottleneck_expansion=0.5,
+        p2=False, dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
     p = tmp_path / 'det.pth'
     torch.save(ckpt, p)
     return p

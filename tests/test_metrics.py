@@ -504,3 +504,47 @@ def test_chunking_slices_the_labels_when_the_prediction_is_a_prefix(tmp_path):
     for r in rows:
         assert r['coverage'] == pytest.approx(1.0), f'{r["coverage"]} -- exact prediction, full labels'
         assert r['err'] == pytest.approx(0.0, abs=1e-6), r['err']
+
+
+def test_vis_confusion_aligns_by_the_matched_correspondence_not_row_position():
+    """A5 (dev/plans/multianimal_system_improvements.md): under detector boxes the prediction's
+    row order is score/association order, not label identity -- `_vis_confusion` must score a
+    row's confidence against the GT row it was actually MATCHED to (`score()`'s own per-frame
+    Hungarian correspondence), not whatever sits at the same row index.
+    """
+    from types import SimpleNamespace
+
+    from tailcyclenet import format as fmt
+
+    ev = _eval_module()
+    conf = np.array([[[5.0, -5.0]], [[-5.0, 5.0]]])       # (Sp=2, T=1, K=2)
+    out = {'conf': conf}
+    vis3d = np.array([[[fmt.VISIBLE, fmt.MISSING]], [[fmt.MISSING, fmt.VISIBLE]]])
+    lab = SimpleNamespace(vis3d=vis3d, vis2d=None)
+
+    identity = ev._vis_confusion(out, lab, '3d', 1, frame_pairs=[[(0, 0, 0.0), (1, 1, 0.0)]])
+    assert identity['vis_precision'] == pytest.approx(1.0)
+    assert identity['vis_recall'] == pytest.approx(1.0)
+
+    swapped = ev._vis_confusion(out, lab, '3d', 1, frame_pairs=[[(0, 1, 0.0), (1, 0, 0.0)]])
+    assert swapped['vis_precision'] == pytest.approx(0.0), \
+        'the wrong correspondence must score as wrong, not as the row-position accident'
+    assert swapped['vis_recall'] == pytest.approx(0.0)
+
+
+def test_vis_confusion_excludes_projected_from_the_assessed_count():
+    """A5: `PROJECTED` is a position with no visibility claim (the format's own rule) -- it must
+    not count as an assessed negative, the way the pre-fix code's UNLABELED-only mask let it.
+    """
+    from types import SimpleNamespace
+
+    from tailcyclenet import format as fmt
+
+    ev = _eval_module()
+    out = {'conf': np.array([[[5.0, 5.0]]])}                      # (Sp=1, T=1, K=2)
+    vis3d = np.array([[[fmt.VISIBLE, fmt.PROJECTED]]])
+    lab = SimpleNamespace(vis3d=vis3d, vis2d=None)
+
+    m = ev._vis_confusion(out, lab, '3d', 1)
+    assert m['vis_n'] == 1, 'the PROJECTED keypoint must not be counted as assessed'
+    assert m['vis_precision'] == pytest.approx(1.0)

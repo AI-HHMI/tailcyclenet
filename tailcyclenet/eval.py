@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tailcyclenet.format import INST_PRESENT, UNLABELED, VISIBLE, sessions_for
+from tailcyclenet.format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.infer.predictions import load_predictions
 from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, idsw_stability_band,
                                   match_instances, matched_error, mota, motion_ratio,
@@ -147,8 +147,6 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
 
         m = error_and_coverage(pred[:min(Sp, St)], true[:min(Sp, St)])
         if Sp == 0 and St:
-            # a zero-row prediction misses every GT point; the GT denominator is retained, not
-            # truncated to "no labelled points" (dev/plans/multianimal_system_improvements.md A3)
             m = error_and_coverage(np.full_like(true[:St], np.nan), true[:St])
         if S > 1 or (Sp == 0 and St >= 1):
             if '__extent__' in out:
@@ -165,11 +163,13 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
                       or k in _PCT_KEYS})
             m['unmatched'] = mm.get('unmatched_true', 0)
             aligned = np.full_like(true, np.nan)
-            for t, frame_pairs in enumerate(match_instances(pred, true, max_dist,
-                                                            min_kpts_frac)):
+            pairs_by_frame = list(enumerate(match_instances(pred, true, max_dist, min_kpts_frac,
+                                                            cost=match_cost)))
+            for t, frame_pairs in pairs_by_frame:
                 for i, j, _ in frame_pairs:
                     aligned[j, t] = pred[i, t]
             m['_pred_matched'] = aligned
+            m['_vis_pairs'] = [fp for _, fp in pairs_by_frame]
             m['mpjpe_r'] = max_dist
         m['group'] = key
         m['mode'] = mode
@@ -188,7 +188,7 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             ka = ka[np.isfinite(ka)]
             m['kpt_agree'] = float(np.median(ka)) if ka.size else None
             m['kpt_agree_p99'] = float(np.quantile(ka, 0.99)) if ka.size else None
-        m.update(_vis_confusion(out, lab, mode, T))
+        m.update(_vis_confusion(out, lab, mode, T, frame_pairs=m.pop('_vis_pairs', None)))
         if S > 1 or (Sp == 0 and St >= 1):
             state = mota_state.setdefault(out.get('__chunk_of__', key), {})
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
@@ -198,25 +198,42 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
     return rows
 
 
-def _vis_confusion(out, lab, mode, T):
+def _vis_confusion(out, lab, mode, T, frame_pairs=None):
     """Score the DECISION to omit a keypoint, separately from where the kept ones landed.
 
     A `base` near 1.000 means the target has no negatives -- the converter wrote everything
     visible -- so the head cannot be gated on. A guard, not an accuracy figure.
 
-    `conf` is the per-keypoint `vis_pred` logit; the label side is the status channel (`vis3d`,
-    or the first camera's `vis2d`, the same slice `true` came from). UNLABELED is not a
-    negative: counting it as "not visible" manufactures negatives.
+    `conf` is the per-keypoint `vis_pred` logit, indexed by PREDICTION row -- a label row only
+    under `--anchor labels`/GT crops, never under detector boxes (score- or association-
+    ordered). `frame_pairs` is `score()`'s own per-frame Hungarian correspondence (the SAME one,
+    at the SAME `--match-cost`, that aligns the pose), so a detector run's confidence is scored
+    against the GT row it was actually matched to, not whatever sits at the same row index.
+    `None` (the S<=1 case) falls back to row 0 against row 0 -- there is nothing else to align.
+    UNLABELED and PROJECTED are not negatives: PROJECTED is a position with no visibility claim
+    (the format's own rule), so counting either as "not visible" manufactures negatives.
     """
     st = lab.vis3d if mode == '3d' else (None if lab.vis2d is None else lab.vis2d[..., 0])
     if 'conf' not in out or st is None:
         return {}
     vp, st = np.asarray(out['conf'], float), np.asarray(st, int)
-    n, k = min(vp.shape[0], st.shape[0]), min(vp.shape[2], st.shape[2])
-    vp, st = vp[:n, :T, :k], st[:n, :T, :k]
+    k = min(vp.shape[2], st.shape[2])
+    st = st[:, :T, :k]
+    if frame_pairs is not None:
+        aligned = np.full((st.shape[0], T, k), np.nan)
+        for t, pairs in enumerate(frame_pairs):
+            if t >= vp.shape[1]:
+                break
+            for i, j, _ in pairs:
+                if i < vp.shape[0] and j < aligned.shape[0]:
+                    aligned[j, t] = vp[i, t, :k]
+        vp = aligned
+    else:
+        n = min(vp.shape[0], st.shape[0])
+        vp, st = vp[:n, :T, :k], st[:n]
     if vp.shape != st.shape:
         return {}
-    ok = np.isfinite(vp) & (st != UNLABELED)
+    ok = np.isfinite(vp) & (st != UNLABELED) & (st != PROJECTED)
     if not ok.any():
         return {}
     yhat, y = vp[ok] > 0.0, st[ok] == VISIBLE

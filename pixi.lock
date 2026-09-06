@@ -434,7 +434,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/66/b1/af3142c4a85cba6da9f4ebb5ff4e21e2616309552caca5e8acefe9840622/imgaug-0.4.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/66/ca/95aa4d0e5b7ea4f20e4d577c42d001ed9df207569fdb063cc5ed4ebb496b/yarl-1.24.5-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/67/4e/a28359bf1c1ecf11eba22123168c138698f7cb576ac678f5a2e16cd5da08/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-      - pypi: https://files.pythonhosted.org/packages/67/f0/fffd558579a4737a5713904ae63e666b1f9a0cbef2dda06070be6bbb7d3b/posetail-0.4.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/71/43/1947f06babed6b3f1d7f38b0c767f52df66bfb2bc10b468c4a7de9eceff2/aiohappyeyeballs-2.7.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/71/60/917329f640924b18ff085ab889a11c763e0b573da888e8404ff486657602/pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/74/4f/256aca690709e9b008b7108bc85fba619a2bc37c6d80743d18abad16ee09/uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
@@ -448,6 +447,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/8c/99/33a6ed9c1a0b5e42efa98eb0edf617d61dca576c82625947377b1d4540c9/numba-0.66.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/8e/37/efad0257dc6e593a18957422533ff0f87ede7c9c6ea010a2177d738fb82f/pure_eval-0.2.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8e/c2/8fec8e8e2eb920cc2280f569144080cd58622a2eda83bfa4c0c354a63264/anywidget-0.11.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/92/54/d32544ea8ec3ceea85dd707bd205da367c6f091948919352634ae0f923b4/posetail-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/55/be532372738cc4f4e5ce653c381241dade44194bf54d022ad28ec2887d61/jupyter_ui_poll-1.1.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/ef/aac74263f0252806b46f0fd5a52566ee06129744572d0958cd0a77d22b0a/schedulefree-1.4.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/96/42/3e5985a0a7e57de470b320c6d6a1a67c844f6737a587f3d44dd13d1819e7/wcwidth-0.8.2-py3-none-any.whl
@@ -960,7 +960,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/66/b1/af3142c4a85cba6da9f4ebb5ff4e21e2616309552caca5e8acefe9840622/imgaug-0.4.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/66/ca/95aa4d0e5b7ea4f20e4d577c42d001ed9df207569fdb063cc5ed4ebb496b/yarl-1.24.5-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/67/4e/a28359bf1c1ecf11eba22123168c138698f7cb576ac678f5a2e16cd5da08/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-      - pypi: https://files.pythonhosted.org/packages/67/f0/fffd558579a4737a5713904ae63e666b1f9a0cbef2dda06070be6bbb7d3b/posetail-0.4.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/71/43/1947f06babed6b3f1d7f38b0c767f52df66bfb2bc10b468c4a7de9eceff2/aiohappyeyeballs-2.7.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/71/60/917329f640924b18ff085ab889a11c763e0b573da888e8404ff486657602/pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/74/4f/256aca690709e9b008b7108bc85fba619a2bc37c6d80743d18abad16ee09/uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
@@ -974,6 +973,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/8c/99/33a6ed9c1a0b5e42efa98eb0edf617d61dca576c82625947377b1d4540c9/numba-0.66.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/8e/37/efad0257dc6e593a18957422533ff0f87ede7c9c6ea010a2177d738fb82f/pure_eval-0.2.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8e/c2/8fec8e8e2eb920cc2280f569144080cd58622a2eda83bfa4c0c354a63264/anywidget-0.11.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/92/54/d32544ea8ec3ceea85dd707bd205da367c6f091948919352634ae0f923b4/posetail-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/55/be532372738cc4f4e5ce653c381241dade44194bf54d022ad28ec2887d61/jupyter_ui_poll-1.1.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/ef/aac74263f0252806b46f0fd5a52566ee06129744572d0958cd0a77d22b0a/schedulefree-1.4.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/96/42/3e5985a0a7e57de470b320c6d6a1a67c844f6737a587f3d44dd13d1819e7/wcwidth-0.8.2-py3-none-any.whl
@@ -7418,7 +7418,7 @@ packages:
 - pypi: ./
   name: tailcyclenet
   requires_dist:
-  - posetail==0.4.1
+  - posetail==0.4.2
   - torch>=2,<3
   - einops
   - numpy>=1.26
@@ -8035,33 +8035,6 @@ packages:
   requires_dist:
   - pytest ; extra == 'tests'
   requires_python: '>=3.8'
-- pypi: https://files.pythonhosted.org/packages/67/f0/fffd558579a4737a5713904ae63e666b1f9a0cbef2dda06070be6bbb7d3b/posetail-0.4.1-py3-none-any.whl
-  name: posetail
-  version: 0.4.1
-  sha256: 8456223d2dfa09edf8e9b19e65363fad9e77166d3afd5433fe9c1e6ee279cf0b
-  requires_dist:
-  - aniposelib>=0.7.0
-  - easydict==1.13
-  - einops==0.7.0
-  - opencv-python==4.9.0.80
-  - toml==0.10.2
-  - tomlkit>=0.12
-  - wandb==0.19.5
-  - lightning>=2.5.6,<3
-  - rerun-sdk[notebook]<=0.22.1
-  - numpy==1.26
-  - imgaug
-  - imagecorruptions
-  - setuptools<81
-  - schedulefree
-  - decord
-  - tqdm
-  - fastapi>=0.111
-  - uvicorn[standard]>=0.29
-  - python-multipart>=0.0.9
-  - requests>=2.31
-  - huggingface-hub>=0.30
-  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/71/43/1947f06babed6b3f1d7f38b0c767f52df66bfb2bc10b468c4a7de9eceff2/aiohappyeyeballs-2.7.1-py3-none-any.whl
   name: aiohappyeyeballs
   version: 2.7.1
@@ -8383,6 +8356,33 @@ packages:
   - typing-extensions>=4.2.0
   - watchfiles>=1.1.0 ; extra == 'dev'
   requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/92/54/d32544ea8ec3ceea85dd707bd205da367c6f091948919352634ae0f923b4/posetail-0.4.2-py3-none-any.whl
+  name: posetail
+  version: 0.4.2
+  sha256: e2ad9046ce9e22c7521451f93a2c0db2fbbda11d65e1c3cc9dea8262859c5473
+  requires_dist:
+  - aniposelib>=0.7.0
+  - easydict==1.13
+  - einops==0.7.0
+  - opencv-python==4.9.0.80
+  - toml==0.10.2
+  - tomlkit>=0.12
+  - wandb==0.19.5
+  - lightning>=2.5.6,<3
+  - rerun-sdk[notebook]<=0.22.1
+  - numpy==1.26
+  - imgaug
+  - imagecorruptions
+  - setuptools<81
+  - schedulefree
+  - decord
+  - tqdm
+  - fastapi>=0.111
+  - uvicorn[standard]>=0.29
+  - python-multipart>=0.0.9
+  - requests>=2.31
+  - huggingface-hub>=0.30
+  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/93/55/be532372738cc4f4e5ce653c381241dade44194bf54d022ad28ec2887d61/jupyter_ui_poll-1.1.0-py3-none-any.whl
   name: jupyter-ui-poll
   version: 1.1.0

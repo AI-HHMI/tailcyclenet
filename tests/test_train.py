@@ -218,9 +218,13 @@ def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overw
     """`main()`'s first `build_model()` call must skip the VJEPA2 download exactly when a resume
     or a warm-start checkpoint is about to overwrite every tensor it produces; a fresh run (with
     neither) still needs the real pretrained weights, since nothing else supplies them.
+
+    posetail 0.4.2 exposes this as `video_encoder_pretrained` on `TrackerEncoder`/`build_model`
+    directly (report 50's `skip_video_encoder_download` monkeypatch is retired) -- so this now
+    asserts the cfg-merge expression instead of the old context-manager name.
     """
     src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
-    assert 'skip_video_encoder_download' in src
+    assert "'video_encoder_pretrained': False" in src
     assert 'will_load_full_checkpoint' in src
     assert "resumed.exists() and not args.no_resume" in src
     assert "not args.no_warm_start and train_cfg.get('checkpoint_path')" in src

@@ -14,7 +14,6 @@ import os
 import sys
 import time
 from collections import Counter
-from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from tailcyclenet import distributed as dist_utils
 from tailcyclenet.checkpoints import (_BASE_CONFIG, check_image_size, full_training_state,
                                       is_hf_repo_id, load_config, prior_provenance,
                                       resolve_checkpoint, resolve_hf_checkpoint, save_checkpoint,
-                                      save_run_meta, skip_video_encoder_download, warm_start)
+                                      save_run_meta, warm_start)
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
                                   worker_init)
 from tailcyclenet.format import Registry
@@ -504,8 +503,9 @@ def main():
             checkpoint = ref if ref.is_file() else resolve_checkpoint(ref)
     will_load_full_checkpoint = ((resumed.exists() and not args.no_resume)
                                   or checkpoint is not None)
-    with skip_video_encoder_download() if will_load_full_checkpoint else nullcontext():
-        model = build_model(config['model'], n_keypoints=registry.n_keypoints)
+    model_cfg = ({**config['model'], 'video_encoder_pretrained': False} if will_load_full_checkpoint
+                else config['model'])
+    model = build_model(model_cfg, n_keypoints=registry.n_keypoints)
     fresh: set[str] = set()
     start_it, ck, resume_from = 0, None, None
     if resumed.exists() and not args.no_resume:

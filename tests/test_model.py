@@ -403,28 +403,6 @@ def test_self_contained_pose_checkpoint_round_trips(tmp_path):
         assert torch.equal(raw.state_dict()[name], value)
 
 
-def test_skip_video_encoder_download_patches_and_restores(monkeypatch):
-    """The four vjepa2 builders `SceneRepresentation` resolves in `encoder_decoder`'s own module
-    namespace are swapped for `pretrained=False` partials for the context's duration only, and
-    the actual download function is never reached from inside it.
-    """
-    from posetail.posetail import encoder_decoder as ed
-
-    from tailcyclenet.checkpoints import skip_video_encoder_download
-
-    def boom(*a, **k):
-        raise AssertionError('a pretrained VJEPA2 checkpoint was fetched from the network')
-
-    monkeypatch.setattr(torch.hub, 'load_state_dict_from_url', boom)
-    before = ed.vjepa2_1_vit_base_384
-    with skip_video_encoder_download():
-        assert ed.vjepa2_1_vit_base_384 is not before
-        encoder, decoder = ed.vjepa2_1_vit_base_384()
-        assert decoder is None
-        assert encoder.embed_dim > 0
-    assert ed.vjepa2_1_vit_base_384 is before, 'the patch must not outlive the context'
-
-
 def test_load_run_skips_the_video_encoder_download(tmp_path, monkeypatch):
     """`load_run` rebuilds a model only to immediately overwrite it with the checkpoint's own
     `model_state`/`model_state_eval`, on both branches it can take: a raw or packaged pose

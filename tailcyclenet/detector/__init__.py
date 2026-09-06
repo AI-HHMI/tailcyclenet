@@ -327,7 +327,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
-                    state=None, duplicate_radius=0.75, duplicate_persist=5):
+                    state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -344,6 +344,10 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         state -- makes calls equal to one concatenated call; `None` builds fresh state.
         duplicate_radius / duplicate_persist -- the 3D --track backstop's duplicate-retirement
             geometry; inert without a tracker (2D or track=False).
+        frame_base -- the SOURCE frame of `raw`'s own frame 0, threaded to a freshly built
+            tracker so its `identity_events` are source-absolute even on a ranged run whose
+            tracker is first built on an aligned lead-in batch; inert once `state` already
+            holds one (the tracker is built exactly once).
     Outputs:
         The same triple re-indexed so row `a` is one animal -- across cameras always, and across
         frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
@@ -376,7 +380,8 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        min_views=min_views,
                                        max_move=max_move, max_age=max_age,
                                        duplicate_radius=duplicate_radius,
-                                       duplicate_persist=duplicate_persist)
+                                       duplicate_persist=duplicate_persist,
+                                       frame_base=frame_base)
         state['tracker'] = tracker
     tracker = state['tracker']
 

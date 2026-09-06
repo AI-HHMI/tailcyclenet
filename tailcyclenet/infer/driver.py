@@ -304,7 +304,8 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                       duplicate_radius=getattr(
                                           args, 'duplicate_radius', 0.75),
                                       duplicate_persist=getattr(
-                                          args, 'duplicate_persist', 5))
+                                          args, 'duplicate_persist', 5),
+                                      frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
             if stats is not None:

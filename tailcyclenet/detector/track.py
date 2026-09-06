@@ -157,7 +157,7 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
-                 duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5):
+                 duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5, frame_base=0):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -172,12 +172,18 @@ class CrossViewTracker:
                     scale-free default (measured band, report 53).
                 duplicate_persist -- consecutive in-band frames (5-35+ measured, contact <=4)
                     before a seated duplicate pair is retired; 5 is the measured default.
+                frame_base -- the SOURCE frame of this tracker's own step 0; 0 (default) is
+                    byte-identical to every run on record. A ranged run's tracker is first built
+                    on an aligned lead-in batch below `--start-frame`, so its step count alone is
+                    not the source frame -- events must add this back, or a bridge/consumer that
+                    reads them as source-absolute silently misreads a ranged run.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}. 'point' and 'age'
         keep their meaning throughout: the last TRIANGULATED point and frames since the last
         evidence. The measured 3dzef defaults are `max_age=8`, `max_move=1.25`.
         """
         self.n = int(n_slots)
+        self._frame_base = int(frame_base)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
@@ -256,7 +262,7 @@ class CrossViewTracker:
                    out, sc, claimed_ix)
         self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
-            self.events.append({'frame': self._t, 'slot': s, 'event': 'died',
+            self.events.append({'frame': self._t + self._frame_base, 'slot': s, 'event': 'died',
                                 'detail': {'age': self.targets[s]['age']}})
             del self.targets[s]
             self._residuals.pop(s, None)
@@ -410,11 +416,13 @@ class CrossViewTracker:
                         -int(self.targets[s].get('age', 0)), -int(s))
             loser = min((first, second), key=strength)
             winner = first if loser == second else second
-            self.events.append({'frame': self._t, 'slot': loser, 'event': 'retired_duplicate',
+            self.events.append({'frame': self._t + self._frame_base, 'slot': loser,
+                                'event': 'retired_duplicate',
                                 'detail': {'winner': winner, 'persisted': int(count),
                                            'loser_age': int(self.targets[loser].get('age', 0)),
                                            'winner_age': int(self.targets[winner].get('age', 0))}})
-            self.events.append({'frame': self._t, 'slot': winner, 'event': 'shielded',
+            self.events.append({'frame': self._t + self._frame_base, 'slot': winner,
+                                'event': 'shielded',
                                 'detail': {'loser': loser}})
             out[loser] = np.nan
             sc[loser] = np.nan
@@ -442,7 +450,7 @@ class CrossViewTracker:
         """
         self.targets[s] = {'point': g['point'], 'age': 0}
         self._residuals[s] = float(g.get('residual', float('inf')))
-        self.events.append({'frame': self._t, 'slot': s, 'event': 'born',
+        self.events.append({'frame': self._t + self._frame_base, 'slot': s, 'event': 'born',
                             'detail': {'cameras': sorted(g['members']),
                                        'residual': float(g.get('residual', float('inf')))}})
         for c, j in g['members'].items():
@@ -559,7 +567,8 @@ class CrossViewTracker:
                 gi += 1
                 g = groups[k]
                 if self._birth_duplicates_target(cgroup, g, out):
-                    self.events.append({'frame': self._t, 'slot': s, 'event': 'birth_refused',
+                    self.events.append({'frame': self._t + self._frame_base, 'slot': s,
+                                        'event': 'birth_refused',
                                         'detail': {'cameras': sorted(g.get('members', {}))}})
                     continue
                 self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,

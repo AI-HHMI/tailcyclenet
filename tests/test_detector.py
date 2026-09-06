@@ -1500,6 +1500,50 @@ def test_associate_group_threads_max_age_into_the_tracker(tmp_path):
         '--max-age must reach CrossViewTracker, not be dropped on the way in'
 
 
+def test_identity_events_are_source_frames_not_tracker_local_ones(tmp_path):
+    """A6a (dev/plans/multianimal_system_improvements.md): a ranged run's tracker is first
+    built on the aligned lead-in batch BELOW `--start-frame` (`driver._detector_boxes`'s own
+    cursor), so its step count alone is not the source frame the event happened at --
+    `frame_base` (the cursor at construction) must be added back, or a bridge/consumer reading
+    events as source-absolute silently misreads any ranged run.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    import numpy as np
+
+    from tailcyclenet.detector import associate_group
+    from tailcyclenet.format import Session
+
+    T, C = 4, 3
+    d = tmp_path / 'test' / 's'
+    cf._session_3d(d, T=T)
+    sess = Session.load(d)
+    sess.preload()
+    cg = sess.cgroup('g000')
+    assert len(cg) == C, 'the fixture rig must have more than one camera for a tracker to build'
+
+    per_cam, scores = _lever_boxes(cg, [np.array([0.0, 0.0, 0.0])], side=100.0)
+    box_c = np.stack([b[0].numpy() for b in per_cam], axis=0)          # (C,4)
+    sc_c = np.stack([s[0].numpy() for s in scores], axis=0)            # (C,)
+    box = np.tile(box_c[None, None], (1, T, 1, 1)).astype(np.float32)  # (D=1,T,C,4)
+    sc = np.tile(sc_c[None, None], (1, T, 1)).astype(np.float32)       # (D=1,T,C)
+    raw = (box, sc, None)
+
+    whole_state = {}
+    associate_group(raw, sess, 'g000', 1, track=True, state=whole_state)
+    assert whole_state['tracker'].events, 'the scene must actually birth something'
+    assert whole_state['tracker'].events[0]['frame'] == 0, \
+        'the default (frame_base=0) must stay byte-identical to every run on record'
+
+    ranged_state = {}
+    associate_group(raw, sess, 'g000', 1, track=True, state=ranged_state, frame_base=32)
+    assert ranged_state['tracker'].events[0]['frame'] == 32, \
+        "a ranged run's tracker must record the SOURCE frame, not its own local step 0"
+
+
 def test_associate_group_threads_max_age_into_link_rows(monkeypatch):
     """Same claim, 2D (C == 1): `associate_group` builds no tracker there, so identity runs
     through `link_rows` instead, and `max_age` must reach IT.
@@ -2758,9 +2802,12 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
 
     # Everything `associate_group` takes that can change which row a detection lands in. The rest
     # is plumbing: `raw`/`session`/`gid` are the inputs themselves, `max_instances` is already
-    # recorded as `max_animals` by `_box_provenance`, `stats` is a diagnostic sink, and `state` is
-    # the block-boundary carry (recorded nowhere because it is derived, not chosen).
-    plumbing = {'raw', 'session', 'gid', 'max_instances', 'stats', 'state'}
+    # recorded as `max_animals` by `_box_provenance`, `stats` is a diagnostic sink, `state` is
+    # the block-boundary carry (recorded nowhere because it is derived, not chosen), and
+    # `frame_base` is derived from `--start-frame`, already recorded as `frame_start` by
+    # `_box_provenance` -- it does not choose which row a detection lands in, only which
+    # SOURCE frame the tracker's own step 0 is (A6a).
+    plumbing = {'raw', 'session', 'gid', 'max_instances', 'stats', 'state', 'frame_base'}
     params = set(inspect.signature(associate_group).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
     alias = {'link': 'link_boxes'}

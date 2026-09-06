@@ -262,6 +262,52 @@ def _plan_blocks(starts, n_frames, T_total, frame_cost, store_bytes):
     return blocks
 
 
+def _plan_windows(session_id, gid, cam_sizes, n_frames, overlap, T_total, frame_start,
+                 budget=None):
+    """Pure prefix of `run_blocks`: window starts, the frame/store budget, and the block
+    partition. -> (starts, blocks, cam_decode, pipeline_det). Raises `SystemExit` when one
+    window's frames do not fit the budget -- there is no re-decode fallback.
+
+    Inputs: session_id/gid -- named only in the refusal message; cam_sizes -- (w, h) per camera
+        actually in use this run; n_frames/overlap -- `cfg.n_frames`/`cfg.overlap`; T_total/
+        frame_start -- the source frame range; budget -- a `memory.Budget`, `memory.current()`
+        when omitted (the production path; a caller injects one to test this function without
+        reading the real machine).
+    Side effects: none. Never allocates, decodes, or opens a container -- this only does
+    arithmetic on sizes already known from parsed config and the rig.
+    """
+    starts = _window_starts(T_total - frame_start, n_frames, overlap, start=frame_start)
+    _frame_bytes = max(int(w) * int(h) for w, h in cam_sizes) * 3
+    _frame_cost = len(cam_sizes) * _frame_bytes
+    _budget = memory.current() if budget is None else budget
+    _one = n_frames * _frame_cost
+    _want_store = (float('inf') if _budget.stated else max(2 * _one, _MIN_STORE_BYTES))
+    _share = _budget.share(memory.FRACTION_STORE)
+    _pipeline_det = _share >= 2 * _one
+    _store_bytes = min(_share / (2 if _pipeline_det else 1), _want_store)
+    cam_decode = memory.fits(_store_bytes / 2, _frame_bytes * n_frames,
+                             want=min(_CAM_DECODE, len(cam_sizes)))
+    if _one > _store_bytes:
+        raise SystemExit(
+            f'{session_id}/{gid}: one window of frames does not fit, and there is no '
+            're-decode fallback.\n'
+            f'    {n_frames} frames x {len(cam_sizes)} camera(s) x {_frame_bytes / 1e6:.1f} MB '
+            f'= {_one / (1 << 30):.2f} GB\n'
+            f'    frame store {_store_bytes / (1 << 30):.2f} GB  '
+            f'({_budget.budget_gb:.1f} GB budget x {memory.FRACTION_STORE:g}, {_budget.source})\n'
+            f'  --max-ram {_one / (memory.FRACTION_STORE * memory.DEFAULT_FRACTION) / (1 << 30):.0f}'
+            '   holds one window. The flag is a ceiling on the PROCESS, not an allowance for the '
+            'buffers, so the budget is a fraction of it.\n'
+            f'  --n-frames N     a shorter window needs proportionally less -- but it is NOT '
+            f'output-neutral: this run was trained at {n_frames} and a shorter window is a '
+            'different prediction.\n'
+            'Refine pass 2 crops from the SAME frames pass 1 did, so a window\'s frames cannot be '
+            'dropped and re-read: re-decoding would double the wall clock, and re-cropping from '
+            'the stored crop double-resamples and is not output-neutral.')
+    blocks = _plan_blocks(starts, n_frames, T_total, _frame_cost, _store_bytes)
+    return starts, blocks, cam_decode, _pipeline_det
+
+
 # Frame/window-indexed columns stitched by `merge_blocks`; anything else is a per-group constant.
 _FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'box_agree', 'det_box', 'det_score')
 _WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
@@ -480,37 +526,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    for a in range(S)])
 
     carried = [None] * S
-    starts = _window_starts(T_total - frame_start, cfg.n_frames, cfg.overlap, start=frame_start)
-
-    _frame_bytes = max(int(w) * int(h) for w, h in
-                       (session.rig.size(session.cam_names[ci]) for ci in cam_ix)) * 3
-    _frame_cost = len(cam_ix) * _frame_bytes
-    _budget = memory.current()
-    _one = cfg.n_frames * _frame_cost
-    _want_store = (float('inf') if _budget.stated else max(2 * _one, _MIN_STORE_BYTES))
-    _share = _budget.share(memory.FRACTION_STORE)
-    _pipeline_det = _share >= 2 * _one
-    _store_bytes = min(_share / (2 if _pipeline_det else 1), _want_store)
-    cam_decode = memory.fits(_store_bytes / 2, _frame_bytes * cfg.n_frames,
-                             want=min(_CAM_DECODE, len(cam_ix)))
-    if _one > _store_bytes:
-        raise SystemExit(
-            f'{session.session_id}/{gid}: one window of frames does not fit, and there is no '
-            're-decode fallback.\n'
-            f'    {cfg.n_frames} frames x {len(cam_ix)} camera(s) x {_frame_bytes / 1e6:.1f} MB '
-            f'= {_one / (1 << 30):.2f} GB\n'
-            f'    frame store {_store_bytes / (1 << 30):.2f} GB  '
-            f'({_budget.budget_gb:.1f} GB budget x {memory.FRACTION_STORE:g}, {_budget.source})\n'
-            f'  --max-ram {_one / (memory.FRACTION_STORE * memory.DEFAULT_FRACTION) / (1 << 30):.0f}'
-            '   holds one window. The flag is a ceiling on the PROCESS, not an allowance for the '
-            'buffers, so the budget is a fraction of it.\n'
-            f'  --n-frames N     a shorter window needs proportionally less -- but it is NOT '
-            f'output-neutral: this run was trained at {cfg.n_frames} and a shorter window is a '
-            'different prediction.\n'
-            'Refine pass 2 crops from the SAME frames pass 1 did, so a window\'s frames cannot be '
-            'dropped and re-read: re-decoding would double the wall clock, and re-cropping from '
-            'the stored crop double-resamples and is not output-neutral.')
-    blocks = _plan_blocks(starts, cfg.n_frames, T_total, _frame_cost, _store_bytes)
+    cam_sizes = [session.rig.size(session.cam_names[ci]) for ci in cam_ix]
+    starts, blocks, cam_decode, _pipeline_det = _plan_windows(
+        session.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, T_total, frame_start)
     store = FrameStore(group, session.cam_names)
 
     f0, w0 = 0, 0

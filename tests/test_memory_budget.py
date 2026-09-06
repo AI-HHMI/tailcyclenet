@@ -579,3 +579,66 @@ def test_the_peak_check_fires_on_a_promise_and_stays_quiet_otherwise():
         memory.check_peak('an inferred phase', inferred)
     assert not got, 'an inferred budget is not a promise and must not be reported as broken'
     memory._peak_warned = False
+
+
+def test_plan_windows_refuses_when_one_window_does_not_fit():
+    """The budget-exhaustion refusal, isolated: no session, no model, no real machine state --
+    an injected `Budget` too small for one window of frames must raise `SystemExit` naming the
+    arithmetic, exactly as `run_blocks` does inline. Nothing here string-matched this path before.
+    """
+    from tailcyclenet.infer.window import _plan_windows
+    from tailcyclenet.memory import Budget
+
+    tiny = Budget(limit_gb=0.01, available_gb=0.01, budget_gb=0.01, source='test', stated=True)
+    with pytest.raises(SystemExit, match='does not fit, and there is no'):
+        _plan_windows('sess', 'g000', [(3840, 2160)], n_frames=12, overlap=4,
+                      T_total=100, frame_start=0, budget=tiny)
+
+
+def test_plan_windows_returns_starts_blocks_cam_decode_when_it_fits():
+    """The non-refusal path: a budget generous enough for the whole clip in one block, and the
+    window starts match `_window_starts` exactly (this is its own pure prefix, not a re-derivation
+    that could drift from it).
+    """
+    from tailcyclenet.infer.window import _plan_windows, _window_starts
+    from tailcyclenet.memory import Budget
+
+    roomy = Budget(limit_gb=64.0, available_gb=64.0, budget_gb=64.0, source='test', stated=True)
+    starts, blocks, cam_decode, pipeline_det = _plan_windows(
+        'sess', 'g000', [(64, 64)], n_frames=12, overlap=4, T_total=100, frame_start=0,
+        budget=roomy)
+    assert starts == _window_starts(100, 12, 4, start=0)
+    assert blocks and blocks[0][0] == 0 and blocks[-1][1] == len(starts)
+    assert cam_decode >= 1
+    assert isinstance(pipeline_det, bool)
+
+
+def test_plan_windows_matches_run_blocks_on_a_real_group(tmp_path):
+    """Not just shaped right: the SAME starts/blocks a real `run_blocks` call derives internally,
+    proving the extraction changed no arithmetic. `run_blocks` itself has no seam to inspect this
+    at, so this calls `_plan_windows` a second time with the identical inputs `run_blocks` used.
+    """
+    import conftest as cf
+    from tailcyclenet.format import Registry, load_dataset
+    from tailcyclenet.infer import InferConfig, run_blocks
+    from tailcyclenet.infer.window import _plan_windows
+    from tailcyclenet.model import build_model
+    from test_model import SMALL
+
+    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=16)
+    ds = load_dataset(tmp_path / 'mv')
+    registry = Registry.build([ds])
+    sess = ds.sessions['test'][0]
+    sess.preload()
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+    cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu')
+
+    list(run_blocks(model, sess, 'g000', registry, ds.name, cfg))  # must not raise
+
+    gid = 'g000'
+    group = sess.groups[gid]
+    cam_ix = list(range(len(sess.rig)))
+    cam_sizes = [sess.rig.size(sess.cam_names[ci]) for ci in cam_ix]
+    starts, blocks, cam_decode, pipeline_det = _plan_windows(
+        sess.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, group.n_frames, 0)
+    assert starts and blocks

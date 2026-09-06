@@ -146,7 +146,11 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         S = max(Sp, St)
 
         m = error_and_coverage(pred[:min(Sp, St)], true[:min(Sp, St)])
-        if S > 1:
+        if Sp == 0 and St:
+            # a zero-row prediction misses every GT point; the GT denominator is retained, not
+            # truncated to "no labelled points" (dev/plans/multianimal_system_improvements.md A3)
+            m = error_and_coverage(np.full_like(true[:St], np.nan), true[:St])
+        if S > 1 or (Sp == 0 and St >= 1):
             if '__extent__' in out:
                 extent = float(out['__extent__'])
             else:
@@ -185,7 +189,7 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             m['kpt_agree'] = float(np.median(ka)) if ka.size else None
             m['kpt_agree_p99'] = float(np.quantile(ka, 0.99)) if ka.size else None
         m.update(_vis_confusion(out, lab, mode, T))
-        if S > 1:
+        if S > 1 or (Sp == 0 and St >= 1):
             state = mota_state.setdefault(out.get('__chunk_of__', key), {})
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
                                                extent_override=out.get('__extent__'),

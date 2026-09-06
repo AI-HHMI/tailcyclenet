@@ -1437,25 +1437,6 @@ def test_link_rows_follows_one_animal():
     assert np.isfinite(linked).all()
 
 
-def test_link_rows_duplicate_suppression_prefers_empty_row():
-    """A persistent same-animal pair is safer as one prediction than as a switched pair."""
-    import numpy as np
-
-    from tailcyclenet.detector import link_rows
-
-    boxes = np.full((2, 5, 1, 4), np.nan, np.float32)
-    boxes[:, :, 0] = np.array([100, 100, 200, 200], np.float32)
-    scores = np.full((2, 5, 1), np.nan, np.float32)
-    scores[0, :, 0] = 0.8
-    scores[1, :, 0] = 0.7
-    linked, linked_scores = link_rows(
-        boxes, scores, max_move=2.0, duplicate_suppress=True,
-        duplicate_radius=0.75, duplicate_persist=2)
-    assert np.isfinite(linked[0, -1, 0]).all()
-    assert not np.isfinite(linked[1, -1, 0]).any()
-    assert np.isnan(linked_scores[1, -1, 0])
-
-
 def test_link_rows_state_carries_across_a_split():
     """N calls with `state=` must equal ONE call over the concatenation, byte for byte.
 
@@ -2874,10 +2855,9 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     """The sibling of the box-provenance guard above, one pipeline stage later: detection
     provenance answers "which boxes", identity provenance answers "whose".
 
-    This gap was found, not hypothesised: the two stored 2D suppression arms in
-    `scratch/dupfollow/pred/` record their detector, crop, checkpoint and commit and say NOTHING
-    about `pose_nms` or `duplicate_suppress` -- the exact levers they were built to measure -- so
-    the only thing distinguishing a suppression-on run from a suppression-off one is the
+    This gap was found, not hypothesised: two stored 2D suppression arms once recorded their
+    detector, crop, checkpoint and commit and said NOTHING about `pose_nms` -- the exact lever
+    they were built to measure -- so the only thing distinguishing one arm from another was the
     directory name. Eval rule 4 (match the controls) and rule 12 (a same-recipe replicate) both
     need these checkable from the artifact. Table-driven against `associate_group`'s own
     signature, asserted on the VALUE `_identity_provenance` returns.
@@ -2911,7 +2891,7 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     args2 = argparse.Namespace(track=False, link_boxes=False, min_views=1, max_move=2.0,
                                max_age=24, assoc_mode='per-camera', pose_nms=0.6,
                                claim_residual_gate=True,
-                               view_arbitration=True, duplicate_suppress=True,
+                               view_arbitration=True,
                                duplicate_radius=0.9, duplicate_persist=8)
     assert set(_identity_provenance(args2)) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'

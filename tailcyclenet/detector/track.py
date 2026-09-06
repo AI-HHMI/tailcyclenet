@@ -551,14 +551,24 @@ class CrossViewTracker:
             self.targets[s]['age'] = 0
 
         free = [s for s in range(self.n) if s not in self.targets]
-        for s, k in zip(free, [k for k in range(len(groups)) if k not in taken]):
-            g = groups[k]
-            if self._birth_duplicates_target(cgroup, g, out):
-                self.events.append({'frame': self._t, 'slot': s, 'event': 'birth_refused',
-                                    'detail': {'cameras': sorted(g.get('members', {}))}})
-                continue
-            self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
-                        lambda c, j: j)
+        unclaimed = [k for k in range(len(groups)) if k not in taken]
+        gi = 0
+        for s in free:
+            # a refusal must not consume the slot: the next unclaimed group tries the SAME
+            # slot, so a duplicate-refire cannot crowd a genuine birth out of this frame.
+            # Byte-identical when nothing is refused: the first non-refused group seats in
+            # free[0], the next in free[1], exactly as the old zip paired them.
+            while gi < len(unclaimed):
+                k = unclaimed[gi]
+                gi += 1
+                g = groups[k]
+                if self._birth_duplicates_target(cgroup, g, out):
+                    self.events.append({'frame': self._t, 'slot': s, 'event': 'birth_refused',
+                                        'detail': {'cameras': sorted(g.get('members', {}))}})
+                    continue
+                self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
+                            lambda c, j: j)
+                break
         return updated
 
 

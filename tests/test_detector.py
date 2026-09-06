@@ -4706,3 +4706,34 @@ def test_measured_tracker_configuration_is_the_default():
                 np.nan_to_num(want[i], nan=-9e9), np.nan_to_num(got[i], nan=-9e9),
                 err_msg=f'frame {t}: {name} moved with every lever at its default')
 
+
+
+def test_refused_duplicate_does_not_consume_the_free_slot():
+    """A6b (dev/plans/multianimal_system_improvements.md): the birth loop advanced BOTH the free
+    slot and the group list on a refusal, so with one free slot and [duplicate-of-shield,
+    genuine] the genuine group was never tried -- a duplicate-refire crowded a real birth out of
+    the frame. The fix retries the SAME slot; byte-identical when nothing is refused.
+    """
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    pointA = np.array([0.0, 0.0, 0.0])
+    pointB = np.array([250.0, 0.0, 0.0])    # far from A: a distinct animal, not a duplicate
+    per_cam, scores = _lever_boxes(cg, [pointA, pointB], side=100.0)
+    dupA = [torch.cat([b[:1], b[:1].clone()]) for b in per_cam]      # A twice per camera
+    dup_scores = [torch.ones(2) for _ in scores]
+    genuine = [b[1:2] for b in per_cam]                              # B, one box per camera
+
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
+    for _ in range(2):                       # both slots seat at A; the backstop retires one
+        boxes, _, _ = tr.step(cg, dupA, dup_scores)
+    assert len(tr.targets) == 1, 'the backstop must retire exactly one slot here'
+    survivor = int(np.isfinite(boxes).all(-1).any(-1).argmax())
+
+    frames23 = [torch.cat([d, g]) for d, g in zip(dupA, genuine)]    # [A, A, B] per camera
+    boxes3, _, _ = tr.step(cg, frames23, [torch.ones(3) for _ in scores])
+    other = 1 - survivor
+    assert np.isfinite(boxes3[other]).all(-1).any(), \
+        'the genuine birth must seat in the freed slot -- the refusal must not consume it'
+    assert any(e['event'] == 'birth_refused' for e in tr.events), \
+        'the duplicate refusals must still be recorded'

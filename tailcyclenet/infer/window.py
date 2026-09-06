@@ -800,7 +800,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         a passing row, because `NaN < thresh` is False. It is applied to `p` before recording (a
         gated frame must be left out of the mean, not blanked once and averaged back in); `q` is
         untouched, so the carried prompt is unaffected, and `conf`/`box_agree` follow the same
-        rule as `p`.
+        rule as `p`. In 2D `p` IS the per-camera pose, so `pred2d`/`conf2d` are masked the same
+        way or `keypoints.pq` would disagree with what `pred` reports; 3D leaves its per-camera
+        overlay untouched, a diagnostic rather than the primary output.
         """
         if cfg.refine:
             def _at_image_size(plan):
@@ -871,10 +873,6 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 conf[a, frames[drop] - f0] = np.nan
                 box_agree[a, frames[drop] - f0] = np.nan
                 if mode == '2d' and p2 is not None:
-                    # the 2D prediction IS the per-camera pose, and keypoints.pq is what
-                    # `load_predictions` reads back as the primary prediction -- the gate must
-                    # mask it too, or a declined row resurrects in the saved session. 3D keeps
-                    # its per-camera rows as raw diagnostics (a separate policy decision).
                     for i, ci in enumerate(use):
                         pred2d[a, frames[drop] - f0, ci] = np.nan
                         if v2 is not None:

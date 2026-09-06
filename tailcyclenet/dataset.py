@@ -1230,8 +1230,6 @@ class PoseDataset(Dataset):
             jump = (torch.as_tensor(rng.random(K)) < self.cfg.prompt_swap_animal) \
                 & torch.isfinite(neighbour_prior).all(-1)
             if not dropped_fully:
-                # the draw above still happens: the RNG stream is untouched. A whole-item
-                # dropout stays query-free -- the swap cannot repopulate a dropped prior.
                 kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
         if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
             finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]

@@ -554,10 +554,6 @@ class CrossViewTracker:
         unclaimed = [k for k in range(len(groups)) if k not in taken]
         gi = 0
         for s in free:
-            # a refusal must not consume the slot: the next unclaimed group tries the SAME
-            # slot, so a duplicate-refire cannot crowd a genuine birth out of this frame.
-            # Byte-identical when nothing is refused: the first non-refused group seats in
-            # free[0], the next in free[1], exactly as the old zip paired them.
             while gi < len(unclaimed):
                 k = unclaimed[gi]
                 gi += 1

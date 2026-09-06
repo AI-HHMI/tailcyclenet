@@ -99,9 +99,6 @@ def _identity_provenance(args):
         'duplicate_suppress': bool(getattr(args, 'duplicate_suppress', False)),
         'duplicate_radius': float(getattr(args, 'duplicate_radius', 0.75)),
         'duplicate_persist': int(getattr(args, 'duplicate_persist', 5)),
-        'duplicate_birth_radius': (
-            float(args.duplicate_birth_radius)
-            if getattr(args, 'duplicate_birth_radius', None) is not None else 0.0),
     }
 
 
@@ -318,9 +315,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                       duplicate_radius=getattr(
                                           args, 'duplicate_radius', 0.75),
                                       duplicate_persist=getattr(
-                                          args, 'duplicate_persist', 5),
-                                      duplicate_birth_radius=getattr(
-                                          args, 'duplicate_birth_radius', None))
+                                          args, 'duplicate_persist', 5))
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
             if stats is not None:

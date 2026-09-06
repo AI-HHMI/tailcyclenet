@@ -346,7 +346,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
                     state=None, assoc_mode='joint', claim_residual_gate=False,
                     view_arbitration=False, duplicate_suppress=False,
-                    duplicate_radius=0.75, duplicate_persist=5, duplicate_birth_radius=None):
+                    duplicate_radius=0.75, duplicate_persist=5):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -367,7 +367,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
         duplicate_suppress -- 2D only, blank persistent near-coincident rows. Off pending a sweep.
-        duplicate_birth_radius -- 3D only birth-refusal radius; None follows `duplicate_radius`.
         state -- makes calls equal to one concatenated call; `None` builds fresh state.
     Outputs:
         The same triple re-indexed so row `a` is one animal -- across cameras always, and across
@@ -404,8 +403,7 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                                        claim_residual_gate=claim_residual_gate,
                                        view_arbitration=view_arbitration,
                                        duplicate_radius=duplicate_radius,
-                                       duplicate_persist=duplicate_persist,
-                                       duplicate_birth_radius=duplicate_birth_radius)
+                                       duplicate_persist=duplicate_persist)
         state['tracker'] = tracker
     tracker = state['tracker']
 

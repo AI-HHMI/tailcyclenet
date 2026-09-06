@@ -2912,8 +2912,7 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
                                max_age=24, assoc_mode='per-camera', pose_nms=0.6,
                                claim_residual_gate=True,
                                view_arbitration=True, duplicate_suppress=True,
-                               duplicate_radius=0.9, duplicate_persist=8,
-                               duplicate_birth_radius=1.25)
+                               duplicate_radius=0.9, duplicate_persist=8)
     assert set(_identity_provenance(args2)) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
     assert _identity_provenance(args2)['pose_nms'] == 0.6

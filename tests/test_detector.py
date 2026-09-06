@@ -2899,7 +2899,7 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     plumbing = {'raw', 'session', 'gid', 'max_instances', 'stats', 'state'}
     params = set(inspect.signature(associate_group).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
-    alias = {'link': 'link_boxes', 'velocity': 'track_velocity'}
+    alias = {'link': 'link_boxes'}
     missing = [p for p in sorted(params) if alias.get(p, p) not in prov]
     assert not missing, (
         f'these change which row a detection lands in and are not recorded in the prediction: '
@@ -2910,7 +2910,7 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
     args2 = argparse.Namespace(track=False, link_boxes=False, min_views=1, max_move=2.0,
                                max_age=24, assoc_mode='per-camera', pose_nms=0.6,
-                               claim_residual_gate=True, track_velocity=True,
+                               claim_residual_gate=True,
                                view_arbitration=True, duplicate_suppress=True,
                                duplicate_radius=0.9, duplicate_persist=8,
                                duplicate_birth_radius=1.25)
@@ -4897,69 +4897,6 @@ def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path()
             f'row {s} resumed on the other animal'
 
 
-def test_velocity_follows_two_animals_through_a_crossing_that_the_last_point_loses():
-    """The module docstring's "no velocity model -- measured as not worth it" holds for the easy
-    frames and fails at exactly the frame that matters. Two animals approach and cross: at the
-    crossing each slot's LAST KNOWN point is nearer the other animal's new position than its own,
-    so the Hungarian confidently swaps them and never recovers -- with one keypoint per animal
-    and no appearance cue there is nothing else to decide on.
-
-    A one-frame constant-velocity prediction puts each slot where its own animal actually is.
-    Both arms are asserted: the default must swap (or this scene tests nothing) and `velocity`
-    must not.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    track = [(-60.0, 60.0), (-20.0, 20.0), (20.0, -20.0), (60.0, -60.0)]
-
-    ends = {}
-    for velocity in (False, True):
-        tr = CrossViewTracker(2, max_res_px=30.0, assoc_mode='per-camera', velocity=velocity)
-        for xa, xb in track:
-            w = [np.array([xa, 0.0, 0.0]), np.array([xb, 0.0, 0.0])]
-            tr.step(cg, *_lever_boxes(cg, w, side=90.0))
-        ends[velocity] = [float(tr.targets[s]['point'][0]) for s in (0, 1)]
-
-    assert ends[False][0] < 0 and ends[False][1] > 0, \
-        'the shipped matcher must swap here, or the velocity arm is not being tested'
-    assert ends[True][0] > 0 and ends[True][1] < 0, \
-        'a constant-velocity prediction must carry each slot through the crossing'
-
-
-def test_velocity_leaves_point_and_age_alone_and_decays_when_evidence_stops():
-    """The state dict is a contract: `link_rows`, `associate_group`'s `state` carry and the
-    existing tests all read `'point'` and `'age'`, so lever 3 may only ADD a key. And a held
-    target must not keep extrapolating: it holds its POINT, so its prediction is one step ahead
-    however long it has been missing, and that step must shrink or a target that vanishes behind
-    an occluder comes back predicting a position it was never measured at.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera', velocity=True)
-    for x in (0.0, 20.0, 40.0):
-        tr.step(cg, *_lever_boxes(cg, [np.array([x, 0.0, 0.0])], side=200.0))
-
-    t = tr.targets[0]
-    assert set(t) == {'point', 'age', 'velocity'}, f'unexpected target state: {sorted(t)}'
-    assert t['age'] == 0 and bool(torch.isfinite(t['point']).all())
-    assert float(t['velocity'][0]) > 1.0, 'the velocity must have picked up the motion'
-
-    before = t['point'].clone()
-    v0 = float(t['velocity'][0])
-    empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
-    tr.step(cg, *empty)
-    assert float(tr.targets[0]['velocity'][0]) < v0, 'a held velocity must decay, not persist'
-    torch.testing.assert_close(tr.targets[0]['point'], before)
-    assert tr.targets[0]['age'] == 1, "'age' must keep meaning frames since evidence"
-
-    off = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
-    off.step(cg, *_lever_boxes(cg, [np.array([0.0, 0.0, 0.0])], side=200.0))
-    assert set(off.targets[0]) == {'point', 'age'}, \
-        'with the lever off the state dict must be exactly what it always was'
-
-
 def test_view_arbitration_keeps_a_crowded_camera_out_of_the_triangulation():
     """Several views with different occlusion geometry is the thing a multiview rig actually
     buys, and the shipped tracker spends none of it: a camera where two animals sit on top of
@@ -5032,7 +4969,7 @@ def test_measured_tracker_configuration_is_the_default():
     assert sig['assoc_mode'].default == 'joint'
     assert sig['max_age'].default == 8
     assert sig['max_move'].default == 1.25
-    for name in ('claim_residual_gate', 'velocity', 'view_arbitration'):
+    for name in ('claim_residual_gate', 'view_arbitration'):
         assert sig[name].default is False, f'{name} must ship off'
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
@@ -5049,7 +4986,7 @@ def test_measured_tracker_configuration_is_the_default():
 
     base = run()
     explicit = run(assoc_mode='joint', max_age=8, max_move=1.25,
-                   claim_residual_gate=False, velocity=False, view_arbitration=False)
+                   claim_residual_gate=False, view_arbitration=False)
     for t, (want, got) in enumerate(zip(base, explicit)):
         for i, name in enumerate(('boxes', 'scores', 'claimed')):
             np.testing.assert_array_equal(

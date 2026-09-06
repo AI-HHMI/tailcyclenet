@@ -95,7 +95,6 @@ def _identity_provenance(args):
         'pose_nms': (float(args.pose_nms) if getattr(args, 'pose_nms', None) is not None
                      else 0.0),
         'claim_residual_gate': bool(getattr(args, 'claim_residual_gate', False)),
-        'track_velocity': bool(getattr(args, 'track_velocity', False)),
         'view_arbitration': bool(getattr(args, 'view_arbitration', False)),
         'duplicate_suppress': bool(getattr(args, 'duplicate_suppress', False)),
         'duplicate_radius': float(getattr(args, 'duplicate_radius', 0.75)),
@@ -312,7 +311,6 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                       assoc_mode=getattr(args, 'assoc_mode', 'joint'),
                                       claim_residual_gate=getattr(
                                           args, 'claim_residual_gate', False),
-                                      velocity=getattr(args, 'track_velocity', False),
                                       view_arbitration=getattr(
                                           args, 'view_arbitration', False),
                                       duplicate_suppress=getattr(

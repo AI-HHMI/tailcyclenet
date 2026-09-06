@@ -10,8 +10,7 @@ from scratch, a real animal starved of a slot because a greedy pass consumed its
 target reprojects into every camera and is matched, per camera, against that camera's detections;
 whatever nobody claims goes to `associate` as a BIRTH, which is the one place a memoryless
 pairwise search is the right algorithm. A target that claimed two or more cameras re-triangulates;
-one that claimed fewer HOLDS its point (no velocity model by default -- measured as not worth
-it, until a crossing with no appearance cue; lever 3 below).
+one that claimed fewer HOLDS its point (no velocity model -- measured not worth it, report 53/54).
 
 **THE AFFINITY IS IN PIXELS, over the detection's own box side**, a deliberate simplification of
 world-space point-to-ray distance: a point-to-ray distance is its reprojection error times depth
@@ -128,7 +127,7 @@ def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_sh
 # THE MEASURED CONFIGURATION IS NOW THE DEFAULT: `joint`, max-age 8, and max-move 1.25. On the
 # 3dzef 5-fish clip it has zero identity switches, full coverage, 0.100 mm MPJPE, and 0.309 mm
 # p99. The old per-camera path remains explicitly selectable for reproduction
-# (`assoc_mode='per-camera'`, max-age 24, max-move 1.0). Claim gating, velocity, and view arbitration remain
+# (`assoc_mode='per-camera'`, max-age 24, max-move 1.0). Claim gating and view arbitration remain
 # opt-in because they did not improve this two-camera clip; each is independently toggleable so
 # a different rig can measure its own trade-off.
 
@@ -199,7 +198,7 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
-                 assoc_mode='joint', claim_residual_gate=False, velocity=False,
+                 assoc_mode='joint', claim_residual_gate=False,
                  view_arbitration=False, duplicate_radius=DUPLICATE_RADIUS,
                  duplicate_persist=5, duplicate_birth_radius=None):
         """Create an empty tracker with `n_slots` rows.
@@ -216,7 +215,6 @@ class CrossViewTracker:
                     Hungarian) or 'per-camera' (the legacy independent-Hungarian path).
                 claim_residual_gate -- lever 1: drop a per-camera claim that disagrees with the
                     slot's own other claims by more than `max_res_px`.
-                velocity -- lever 3: match against a constant-velocity prediction.
                 view_arbitration -- lever 4: discount a camera whose detections are crowded.
                 duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
                     scale-free default (measured band, report 53).
@@ -225,13 +223,13 @@ class CrossViewTracker:
                 duplicate_birth_radius -- birth-refusal-only radius; None follows
                     `duplicate_radius`, wider trades birth coverage to close a refire cycle.
 
-        `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}, plus
-        'velocity' -- a (3,) tensor -- under lever 3 only. 'point' and 'age' keep their meaning
-        in every mode: the last TRIANGULATED point and frames since the last evidence. The
-        measured 3dzef defaults are `assoc_mode='joint'`, `max_age=8`, `max_move=1.25`.
+        `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}. 'point' and 'age'
+        keep their meaning in every mode: the last TRIANGULATED point and frames since the last
+        evidence. The measured 3dzef defaults are `assoc_mode='joint'`, `max_age=8`,
+        `max_move=1.25`.
 
-        `vel_blend` / `vel_decay` / `ambiguous` are plain attributes, sweepable without a
-        constructor argument, in the manner of `soft_argmax_threshold`.
+        `ambiguous` is a plain attribute, sweepable without a constructor argument, in the manner
+        of `soft_argmax_threshold`.
         """
         assert assoc_mode in ('per-camera', 'joint'), f'unknown assoc_mode {assoc_mode!r}'
         if claim_residual_gate and assoc_mode == 'joint':
@@ -244,7 +242,6 @@ class CrossViewTracker:
         self.min_views = int(min_views)
         self.assoc_mode = str(assoc_mode)
         self.claim_residual_gate = bool(claim_residual_gate)
-        self.velocity = bool(velocity)
         self.view_arbitration = bool(view_arbitration)
         if duplicate_radius < 0:
             raise ValueError('duplicate_radius must be non-negative')
@@ -257,69 +254,28 @@ class CrossViewTracker:
         self._dup_shield = set()
         self._dup_anchor = {}
         self._last_claims = {}
-        self.vel_blend = 0.5
-        self.vel_decay = 0.5
         self.ambiguous = 0.5
         self.targets = {}
         self.events = []
         self._t = -1
 
     def _predict(self, s):
-        """Where slot `s` is expected to be THIS frame -- lever 3's whole surface.
+        """Where slot `s` is expected to be THIS frame.
 
         Inputs: s -- slot id, present in `self.targets`.
-        Outputs: a (3,) tensor: the remembered point, or point + velocity under lever 3.
+        Outputs: a (3,) tensor: the remembered point.
         Side effects: none.
-
-        The module docstring's "no velocity model -- measured as not worth it" was measured on
-        roots where the animals rarely swap sides within one box side; it is NOT true of a clip
-        where two animals cross, because at the crossing the last known point is equidistant from
-        both and the Hungarian is deciding on nothing. A one-frame constant-velocity extrapolation
-        is the only cue left when appearance is unavailable (one keypoint per animal, identical
-        fish), so this is the lever aimed squarely at the crossing, not at the easy frames.
-        A target that has never re-triangulated has no velocity and predicts its own point.
         """
-        t = self.targets[s]
-        v = t.get('velocity')
-        if not self.velocity or v is None:
-            return t['point']
-        return t['point'] + v
+        return self.targets[s]['point']
 
     def _advance(self, s, new):
         """Accept a fresh triangulation for slot `s`.
 
         Inputs: s -- slot id; new -- (3,) finite world point.
         Outputs: None.
-        Side effects: sets `targets[s]['point']`, and under lever 3 blends the velocity.
-
-        The velocity is an EMA of the per-frame displacement at `vel_blend`, not the raw
-        difference: the raw difference is one triangulation's noise against another's and would
-        make the prediction noisier than the point it corrects.
+        Side effects: sets `targets[s]['point']`.
         """
-        t = self.targets[s]
-        if self.velocity:
-            v, step = t.get('velocity'), new - t['point']
-            t['velocity'] = (step if v is None
-                             else self.vel_blend * v + (1.0 - self.vel_blend) * step)
-        t['point'] = new
-
-    def _decay(self, updated):
-        """Age the velocity of every target that did not re-triangulate this frame.
-
-        Inputs: updated -- the set of slots `_advance` was called on.
-        Outputs: None.
-        Side effects: scales the stored velocities by `vel_decay`.
-
-        A held target keeps its POINT, so its prediction is one step ahead however long it has
-        been missing; the honest thing is for that step to shrink. Decay rather than hold, or a
-        target that vanishes behind an occluder for a second comes back predicting a position it
-        was never measured at and steals whichever animal happens to be there.
-        """
-        if not self.velocity:
-            return
-        for s, t in self.targets.items():
-            if s not in updated and t.get('velocity') is not None:
-                t['velocity'] = t['velocity'] * self.vel_decay
+        self.targets[s]['point'] = new
 
     def _trim(self, cgroup, centres, got_s):
         """Lever 1: drop the per-camera claims that disagree with the rest. -> (kept, dropped).
@@ -445,10 +401,9 @@ class CrossViewTracker:
         weights = (_crowd_weights(centres, sides, self.max_move)
                    if self.view_arbitration else None)
         branch = self._joint if self.assoc_mode == 'joint' else self._per_camera
-        updated = branch(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
-                         weights, out, sc, claimed_ix)
+        branch(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
+              weights, out, sc, claimed_ix)
         self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
-        self._decay(updated)
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
             self.events.append({'frame': self._t, 'slot': s, 'event': 'died',
                                 'detail': {'age': self.targets[s]['age']}})
@@ -729,8 +684,6 @@ class CrossViewTracker:
         self.events.append({'frame': self._t, 'slot': s, 'event': 'born',
                             'detail': {'cameras': sorted(g['members']),
                                        'residual': float(g.get('residual', float('inf')))}})
-        if self.velocity:
-            self.targets[s]['velocity'] = torch.zeros(3)
         for c, j in g['members'].items():
             det = remap(c, j)
             out[s, c] = boxes_per_cam[c][det].numpy()

@@ -292,16 +292,6 @@ def build_parser() -> argparse.ArgumentParser:
                          'missing box, so it can only lower `filled`, and the pixel threshold is '
                          'a per-rig quantity (sweep it, exactly as --assoc-res-max-px says). '
                          'Default off, which reproduces current behaviour exactly.')
-    ap.add_argument('--track-velocity', action=argparse.BooleanOptionalAction, default=False,
-                    help='3D multiview, --track only. Match each slot against a CONSTANT-VELOCITY '
-                         'predicted 3D point instead of its last known one. The tracker records a '
-                         'velocity model as measured-not-worth-it, which is why this is an option '
-                         'and not the default -- but that was measured over the whole population, '
-                         'where the centroid alone already settles the association, and motion is '
-                         'the one cue that separates two animals crossing when no appearance cue '
-                         'exists. Costs a stale slot extrapolating AWAY from its animal, so it '
-                         'interacts with --max-age. Default off = match the last known point, '
-                         'byte-identical to today.')
     ap.add_argument('--view-arbitration', action=argparse.BooleanOptionalAction, default=False,
                     help='3D multiview, --track only. Down-weight a camera whose OWN detections '
                          'are mutually crowded: a view whose boxes sit on top of each other says '

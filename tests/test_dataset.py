@@ -1614,3 +1614,45 @@ def test_pose_only_prob_gives_box_dropped_items_a_clean_prior(tiny_root):
                        torch.nan_to_num(pose_only_prior, nan=-9e9)), \
         'box_prompt_dropout=1.0, pose_only_prob=1.0 must give the SAME clean prior prompt_' \
         'dropout=0 would, not the corrupted one prompt_dropout=1.0 alone would produce'
+
+
+# ----------------------------------------------------------------------------------------------
+# A1 (dev/plans/multianimal_system_improvements.md): a whole-item dropout stays query-free
+# ----------------------------------------------------------------------------------------------
+
+def test_whole_item_dropout_survives_the_neighbour_swap(tmp_path):
+    """`prompt_dropout = 1.0` runs the item fully query-free; a later `prompt_swap_animal` draw
+    must NOT repopulate the dropped prior from the neighbour -- the swap can only move entries of
+    a prior that is still there. The RNG stream is untouched: the swap's coin is still drawn.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    root = tmp_path / 'mv'
+    cf._session_3d_multi(root / 'train' / 's', T=6)
+
+    dropped_ds = PoseDataset(root, 'train',
+                             replace(CFG, prompt_dropout=1.0, prompt_swap_animal=0.9),
+                             train=True)
+    item = pose_collate([_train_item(dropped_ds)])
+    assert int(torch.isfinite(item.kpt_prior).sum()) == 0, \
+        'dropout=1.0 must stay query-free: the neighbour swap cannot resurrect a dropped prior'
+
+    # the swap itself is unchanged on a prior that was never dropped
+    swap_ds = PoseDataset(root, 'train', replace(CFG, prompt_swap_animal=0.9), train=True)
+    kept = pose_collate([_train_item(swap_ds)])
+    assert int(torch.isfinite(kept.kpt_prior).sum()) > 0, \
+        'the swap must still fire on a nondropped prior'
+
+
+def test_whole_item_dropout_survives_the_neighbour_swap_2d(tiny_root):
+    """2D half of the same claim, on the multi-animal root: a dropped 2D prior stays all-NaN
+    even with an eligible neighbour and a maximal swap coin.
+    """
+    root = tiny_root / 'ratlike'
+    cfg = replace(CFG, prompt_dropout=1.0, prompt_swap_animal=0.9)
+    ds = PoseDataset(root, 'train', cfg, train=True)
+    item = pose_collate([_train_item(ds)])
+    assert int(torch.isfinite(item.kpt_prior).sum()) == 0, \
+        'dropout=1.0 must stay query-free in 2D too'

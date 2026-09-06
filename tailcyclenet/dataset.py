@@ -1204,8 +1204,10 @@ class PoseDataset(Dataset):
         prompt_t = prompt_t.to(torch.int32)
         kpt_prior = coords[prompt_t, torch.arange(K)].clone()
         kpt_prior[~finite.any(0)] = float('nan')
+        dropped_fully = False
         if self.train and not pose_only_active and rng.random() < self.cfg.prompt_dropout:
             kpt_prior[:] = float('nan')
+            dropped_fully = True
         px = 1.0
         if R == 3 and (self.cfg.prompt_noise_px > 0 or self.cfg.prompt_offset_px > 0) \
                 and bool(torch.isfinite(kpt_prior).any()):
@@ -1227,7 +1229,10 @@ class PoseDataset(Dataset):
             neighbour_prior[prior_out_of_bounds(neighbour_prior, mode_str, cgroup)] = float('nan')
             jump = (torch.as_tensor(rng.random(K)) < self.cfg.prompt_swap_animal) \
                 & torch.isfinite(neighbour_prior).all(-1)
-            kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
+            if not dropped_fully:
+                # the draw above still happens: the RNG stream is untouched. A whole-item
+                # dropout stays query-free -- the swap cannot repopulate a dropped prior.
+                kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
         if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
             finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]
             m = len(finite_idx)

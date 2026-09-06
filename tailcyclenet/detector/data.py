@@ -909,7 +909,7 @@ class BoxDataset(Dataset):
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        item = {'x': x, 'boxes': boxes, 'src': (sess.session_id, str(gid), int(f))}
+        item = {'x': x, 'boxes': boxes}
         if kpts is not None:
             item['kpts'] = kpts
         if self.use_regions:
@@ -997,78 +997,6 @@ class CohortSampler(torch.utils.data.Sampler):
         yield from (int(j) for j in np.minimum(draws, len(self.cum) - 1))
 
 
-class PairedSampler(torch.utils.data.Sampler):
-    """Emit each of a base sampler's draws TWICE, adjacently.
-
-    The ReID positive-pair trick (report 55): two DataLoader fetches of the SAME index are two
-    independently-augmented views of the same item (fresh `default_rng(None)` per `__getitem__`
-    call under `augment and train`), so batch slots `2k` and `2k+1` are guaranteed same-animal
-    views of the same frame -- a positive pair with NO tracking, NO registry, and NO cross-
-    session identity, for one frame and one camera.
-
-    NOT a separate sampling policy: `base` decides WHICH indices are visited and with what
-    weights; this only interleaves a duplicate next to each draw so the loader's batch stays
-    pair-aligned. `__len__` doubles so `drop_last` and the loader's epoch math see an even
-    count and the same number of MODEL steps per epoch as the unpaired base.
-    """
-
-    def __init__(self, base):
-        """Wrap `base`; its draws become adjacent duplicate pairs."""
-        self.base = base
-
-    def __len__(self):
-        """Double the base length so epoch math sees even, pair-aligned batches."""
-        return 2 * len(self.base)
-
-    def __iter__(self):
-        """Yield each base draw twice in a row: the two views of one positive pair."""
-        for i in self.base:
-            yield i
-            yield i
-
-
-class CrossCameraPairedSampler(torch.utils.data.Sampler):
-    """Pair each draw with a DIFFERENT CAMERA of the SAME frame, not the same index twice.
-
-    Report 55's 10k-run probe found the embedding is NOT camera-robust (Cam2 collapsed animals 2
-    and 3 onto animal 8) because the training positives were dominated by SAME-CAMERA
-    augmentation pairs (two augments of one index) -- the model never had to learn viewpoint
-    invariance. This sampler fixes that at the source: each base draw `i = (sess, gid, f, ci)`
-    emits `(i, j)` where `j` is the same `(sess, gid, f)` at a DIFFERENT camera. The label
-    construction already keys on `(src, row)` with `src = (session, gid, frame)` -- camera-free
-    -- so slots `2k`/`2k+1` share a label when their GT rows match, and now those pixels differ
-    by VIEWPOINT plus each index's own fresh augmentation. GT rows are the same animals in every
-    camera view, so this is free and exact, no tracking, no registry.
-
-    Falls back to the same-index augmentation pair on a single-camera root (nothing else
-    exists to pair with). `__len__` doubles, as `PairedSampler` does.
-    """
-
-    def __init__(self, base, dataset):
-        """Wrap `base`; each draw's pair is a same-frame sibling at a different camera."""
-        self.base = base
-        by_frame = {}
-        for i, (sess, gid, f, ci) in enumerate(dataset.index):
-            by_frame.setdefault((sess.session_id, str(gid), int(f)), []).append(i)
-        self._same_frame = {i: [j for j in ix if j != i]
-                            for i, (sess, gid, f, ci) in enumerate(dataset.index)
-                            for ix in [by_frame[(sess.session_id, str(gid), int(f))]]}
-        self._single = all(len(v) == 0 for v in self._same_frame.values())
-
-    def __len__(self):
-        """Double the base length so epoch math sees even, pair-aligned batches."""
-        return 2 * len(self.base)
-
-    def __iter__(self):
-        """Emit (draw, same-frame-different-camera) pairs; self-pair only on one-camera roots."""
-        rng = np.random.default_rng()
-        for i in self.base:
-            siblings = self._same_frame.get(i, [])
-            j = int(rng.choice(siblings)) if siblings else i
-            yield i
-            yield j
-
-
 def box_collate(batch):
     """Collate `BoxDataset` items (named dicts) into one named-dict batch.
 
@@ -1091,9 +1019,6 @@ def box_collate(batch):
     for i, b in enumerate(batch):
         boxes[i, :b['boxes'].shape[0]] = b['boxes']
     out = {'x': xs, 'boxes': boxes}
-    srcs = [b.get('src') for b in batch]
-    if any(s is not None for s in srcs):
-        out['src'] = srcs
 
     if any('kpts' in b for b in batch):
         K = next(b['kpts'] for b in batch if 'kpts' in b).shape[1]

@@ -4,15 +4,12 @@ from pathlib import Path
 import torch
 
 from .assign import (assign, assign_tal, box_iou, certified_anchors, ciou_loss, decode,
-
                      detector_loss, giou_loss, paired_iou)
 from .associate import associate
-from .crop_reid import CropReidDataset, CropReidNet, PKSampler
-from .data import (BoxDataset, ChunkShuffle, CohortSampler, CrossCameraPairedSampler,
-                   PairedSampler, box_collate, letterbox, letterbox_transform, reduce_factor, split_batch,
-                   tile_transform, unletterbox_boxes, unletterbox_keypoints)
+from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
+                   letterbox_transform, reduce_factor, split_batch, tile_transform,
+                   unletterbox_boxes, unletterbox_keypoints)
 from .pretrained import load_coco_backbone
-from .reid_loss import contrastive_loss, pool_embeddings_per_box
 from .yolox import YOLOX_TIERS, YOLOXNano
 
 
@@ -68,12 +65,10 @@ def resolve_detector_checkpoint(path, checkpoint='latest'):
 
 
 __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
-           'PairedSampler', 'CrossCameraPairedSampler', 'box_collate', 'letterbox',
+           'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'assign_tal', 'box_iou',
            'certified_anchors', 'ciou_loss', 'decode', 'detector_loss', 'giou_loss',
-           'contrastive_loss', 'pool_embeddings_per_box', 'CropReidNet', 'CropReidDataset',
-           'PKSampler',
            'associate',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone',
            'paired_iou', 'resolve_detector_checkpoint']
@@ -120,7 +115,6 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
             'running statistics to load into). Retrain this detector -- see '
             '`tailcyclenet/detector/yolox.py:conv_norm_act` for why the switch was made.')
     model = YOLOXNano(n_keypoints=int(ckpt.get('n_keypoints', 0)),
-                      embed_dim=int(ckpt.get('embed_dim', 0)),
                       version=str(ckpt.get('yolox_version', 'trimmed')),
                       bottleneck_expansion=float(ckpt.get('bottleneck_expansion', 0.5)),
                       p2=bool(ckpt.get('p2', False)),
@@ -155,8 +149,7 @@ def tiled_input_wh(src_wh, tile_scale):
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
-               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False,
-               embed_out=None):
+               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     Inputs:
@@ -172,9 +165,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             GLOBAL `batch` BOUNDARY (aligned slices are byte-identical to one whole-clip pass).
         read -- replaces the decode with `(ci, cam_name, frames, pool) -> imgs`.
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
-        embed_out -- optional (D,T,C,DIM), filled in step with `out`: each detection's row is
-            its OWNING ANCHOR's embedding (`embed[ix]`); embed_dim>0 checkpoints only.
-            A side-output, never part of the returned tuple.
     Outputs:
         (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None): `d` is the d-th
         highest-scoring detection in that camera at that frame; rows become an animal axis in
@@ -216,8 +206,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
     sc = np.full((D, T, C), np.nan, np.float32)
     K_det = int(getattr(det, 'n_keypoints', 0))
     kp = np.full((D, T, C, K_det, 3), np.nan, np.float32) if K_det else None
-    D_embed = int(getattr(det.head, 'embed_dim', 0))
-    have_embed = embed_out is not None and D_embed > 0
 
     def _fetch(job):
         """Decode, reduce and letterbox one (camera, frame) job into a uint8 batch tensor.
@@ -297,7 +285,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             for ci, x, metas, src in fetched:
                 _o = det(x.to(device).float().div_(_div255))
                 obj, boxes, kpts = _o[0], _o[1], _o[2]
-                embeds = _o[3] if have_embed else None
                 for j, t in enumerate(unit_ix):
                     decoded = decode(obj[j], boxes[j], top_k=D, score_thresh=score_thresh,
                                      iou_thresh=iou_thresh,
@@ -326,10 +313,6 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                     n = min(D, b.shape[0])
                     out[:n, t, ci] = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)[:n].numpy()
                     sc[:n, t, ci] = s.cpu().numpy()[:n]
-                    if have_embed and embeds is not None:
-                        e = embeds[j][ix[:n]].cpu().numpy()
-                        embed_out[:n, t, ci] = e / (np.linalg.norm(e, axis=-1, keepdims=True)
-                                                    + 1e-8)
                     if kp is not None and kpts is not None:
                         k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)
                         kp[:n, t, ci] = k[:n].numpy()

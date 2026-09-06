@@ -42,7 +42,7 @@ def _infer_window_source():
 def test_forward_shapes_and_anchor_order():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 160)
-    obj, boxes, _, _ = m(x)
+    obj, boxes, _ = m(x)
     anchors = m.anchor_points(128, 160, x.device)
     assert obj.shape[1] == boxes.shape[1] == anchors.shape[0], \
         'anchor_points must match forward()s flattening order exactly'
@@ -619,7 +619,7 @@ max_pos_per_gt = 2
 def test_loss_is_finite_with_no_animal_anywhere():
     m = YOLOXNano()
     x = torch.zeros(2, 3, 128, 128)
-    obj, boxes, _, _ = m(x)
+    obj, boxes, _ = m(x)
     anchors = m.anchor_points(128, 128, x.device)
     gt = torch.full((2, 1, 4), float('nan'))
     loss, parts = detector_loss(obj, boxes, anchors, gt)
@@ -977,66 +977,6 @@ def test_chunk_is_one_containers_worth_of_index(tiny_root):
     n_src = len({(s.session_id, g, c) for s, g, _, c in ds.index})
     assert ds.chunk == len(ds.index) // n_src
     assert ds.chunk < len(ds.index) or n_src == 1
-
-
-def test_paired_sampler_emits_each_draw_twice_adjacent():
-    """The ReID positive-pair contract: batch slots 2k and 2k+1 are the SAME index, fetched
-    twice (two independently-augmented views under `augment and train`).
-    """
-    from tailcyclenet.detector import PairedSampler
-
-    class Base:
-        def __init__(self, draws):
-            self.draws = draws
-
-        def __len__(self):
-            return len(self.draws)
-
-        def __iter__(self):
-            yield from self.draws
-
-    p = PairedSampler(Base([7, 3, 9]))
-    assert len(p) == 6
-    assert list(iter(p)) == [7, 7, 3, 3, 9, 9]
-
-
-def test_cross_camera_paired_sampler_pairs_same_frame_different_camera():
-    """The Cam2 failure (report 55): same-camera augmentation pairs never teach viewpoint
-    invariance, so each pair must be a DIFFERENT camera of the SAME frame. GT rows are the same
-    animals in every camera, so the camera-free `(src, row)` label already treats the pair as
-    one animal -- this sampler only controls WHICH two views reach the loss.
-    """
-    from tailcyclenet.detector import CrossCameraPairedSampler
-
-    class FakeDS:
-        class S:
-            def __init__(self, sid):
-                self.session_id = sid
-
-        # index entries (sess, gid, frame, cam): 2 frames x 2 cameras
-        index = [(S('s'), 'g', 0, 0), (S('s'), 'g', 0, 1),
-                 (S('s'), 'g', 1, 0), (S('s'), 'g', 1, 1)]
-
-    class Base:
-        def __init__(self, draws):
-            self.draws = draws
-
-        def __len__(self):
-            return len(self.draws)
-
-        def __iter__(self):
-            yield from self.draws
-
-    ds = FakeDS()
-    p = CrossCameraPairedSampler(Base([0, 1, 2, 3]), ds)
-    out = list(iter(p))
-    assert len(out) == 8
-    for k in range(0, len(out), 2):
-        i, j = out[k], out[k + 1]
-        si, sj = ds.index[i], ds.index[j]
-        assert (si[1], si[2]) == (sj[1], sj[2]), 'pair must share (group, frame)'
-        assert si[3] != sj[3], 'pair must be a DIFFERENT camera'
-
 
 
 def test_collate_pads_uneven_animal_counts():
@@ -1958,55 +1898,8 @@ def test_keypoint_head_is_off_by_default():
     assert not any('kpt' in k for k in plain.state_dict())
     assert sum(p.numel() for p in plain.parameters()) \
         < sum(p.numel() for p in kp.parameters())
-    obj, boxes, kpts, _ = plain(torch.zeros(1, 3, 64, 64))
+    obj, boxes, kpts = plain(torch.zeros(1, 3, 64, 64))
     assert kpts is None, 'a keypoint-free model must return None, not zeros'
-
-
-def test_embed_head_is_off_by_default():
-    """`embed_dim = 0` must be BYTE-identical to the head before the branch existed.
-
-    Same contract as `n_keypoints`: not built and ignored, not constructed at all, so an
-    existing checkpoint's `state_dict` gains no new keys and loads unmodified. The embed branch
-    is independent of the keypoint branch (open-set ReID, not a per-anchor identity class), so
-    both must be checkable in isolation from each other.
-    """
-    import torch
-
-    from tailcyclenet.detector import YOLOXNano
-
-    plain, emb = YOLOXNano(), YOLOXNano(embed_dim=32)
-    assert set(plain.state_dict()) == {k for k in emb.state_dict() if 'embed' not in k}
-    assert not any('embed' in k for k in plain.state_dict())
-    assert sum(p.numel() for p in plain.parameters()) \
-        < sum(p.numel() for p in emb.parameters())
-    obj, boxes, kpt, e = plain(torch.zeros(1, 3, 64, 64))
-    assert e is None, 'an embed-free model must return None, not zeros'
-    obj, boxes, kpt, e = emb(torch.zeros(1, 3, 64, 64))
-    anchors = emb.anchor_points(64, 64, torch.device('cpu'))
-    assert e.shape == (1, anchors.shape[0], 32)
-
-
-def test_embed_and_keypoint_heads_are_independent():
-    """Building one branch must not silently build, size, or disturb the other."""
-    import torch
-
-    from tailcyclenet.detector import YOLOXNano
-
-    kpt_only = YOLOXNano(n_keypoints=5)
-    assert not any('embed' in k for k in kpt_only.state_dict())
-    _, _, kpt, e = kpt_only(torch.zeros(1, 3, 64, 64))
-    assert kpt is not None and e is None
-
-    embed_only = YOLOXNano(embed_dim=16)
-    assert not any('kpt' in k for k in embed_only.state_dict())
-    _, _, kpt, e = embed_only(torch.zeros(1, 3, 64, 64))
-    assert kpt is None and e is not None
-
-    both = YOLOXNano(n_keypoints=5, embed_dim=16)
-    _, _, kpt, e = both(torch.zeros(1, 3, 64, 64))
-    assert kpt is not None and e is not None
-    assert kpt.shape[-2:] == (5, 3)
-    assert e.shape[-1] == 16
 
 
 def test_keypoint_decode_is_signed_and_bounded():
@@ -2026,7 +1919,7 @@ def test_keypoint_decode_is_signed_and_bounded():
             p.bias.zero_()
             p.bias[0::3] = +4.0          # dx large positive -> saturates tanh
             p.bias[1::3] = -4.0          # dy large negative
-        _, boxes, kpts, _ = m(torch.zeros(1, 3, 64, 64))
+        _, boxes, kpts = m(torch.zeros(1, 3, 64, 64))
         anchors = m.anchor_points(64, 64, torch.device('cpu'))
     cx, cy = anchors[:, 0], anchors[:, 1]
     assert (kpts[0, :, 0, 0] > cx).all(), 'positive dx must move RIGHT (an exp decode cannot)'
@@ -2177,7 +2070,7 @@ def test_every_yolox_tier_builds_and_forwards():
     for v in sorted(YOLOX_TIERS, key=lambda k: YOLOX_TIERS[k][1]):     # by width_mul, ascending
         m = YOLOXNano(n_keypoints=5, version=v)
         x = torch.rand(1, 3, 96, 128)
-        obj, boxes, kpt, _ = m(x)
+        obj, boxes, kpt = m(x)
         anchors = m.anchor_points(96, 128, x.device)
         assert obj.shape[1] == boxes.shape[1] == anchors.shape[0] == kpt.shape[1]
         assert kpt.shape[2] == 5
@@ -2233,27 +2126,21 @@ def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
     assert loaded2.version == 'trimmed'
 
 
-def test_embed_dim_round_trips_through_the_checkpoint(tmp_path):
-    """A ReID-trained checkpoint records `embed_dim` and `load_detector` rebuilds the branch,
-    so an existing checkpoint without the key stays `embed_dim=0` (byte-identical load).
+def test_load_detector_ignores_a_stale_embed_dim_key(tmp_path):
+    """The deleted ReID branch's `embed_dim` checkpoint key must be tolerated, not raised on:
+    an old checkpoint dict may still carry `embed_dim: 0` (or any value) from before the branch
+    was removed, and `load_detector` must load it exactly as if the key were absent.
     """
     from tailcyclenet.detector import load_detector
 
     p = tmp_path / 'detector.pth'
-    m = YOLOXNano(embed_dim=16)
+    m = YOLOXNano()
     torch.save({'model_state': m.state_dict(), 'input_wh': [416, 416], 'norm': 'gn',
-               'yolox_version': 'trimmed', 'embed_dim': 16}, p)
+               'yolox_version': 'trimmed', 'embed_dim': 0}, p)
     loaded, *_ = load_detector(p)
-    assert loaded.head.embed_dim == 16
+    assert not hasattr(loaded.head, 'embed_dim'), 'the embed branch must not be rebuilt'
     torch.testing.assert_close(
-        loaded.state_dict()['head.embed_pred.0.weight'],
-        m.state_dict()['head.embed_pred.0.weight'])
-
-    p2 = tmp_path / 'old.pth'
-    old = YOLOXNano()
-    torch.save({'model_state': old.state_dict(), 'input_wh': [416, 416], 'norm': 'gn'}, p2)
-    loaded2, *_ = load_detector(p2)
-    assert loaded2.head.embed_dim == 0
+        loaded.state_dict()['head.obj_pred.0.bias'], m.state_dict()['head.obj_pred.0.bias'])
 
 
 def test_norm_groups_divides_every_canonical_tier_channel_count():
@@ -2405,7 +2292,7 @@ def test_use_regions_emits_a_full_frame_rect_when_the_session_has_none(tiny_root
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
                     use_regions=True)
     item = ds[0]
-    assert set(item) == {'x', 'boxes', 'src', 'regions'}
+    assert set(item) == {'x', 'boxes', 'regions'}
     torch.testing.assert_close(item['regions'], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
 
 
@@ -3696,7 +3583,7 @@ def test_bottleneck_expansion_one_matches_the_canonical_shape():
     w = m.backbone.dark3[1].m[0].conv1[0].weight
     assert tuple(w.shape) == (48, 48, 1, 1)
     # And the net still forwards at the wider shape.
-    obj, boxes, _, _ = m(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -3941,7 +3828,7 @@ def test_p2_true_adds_a_stride_4_level():
     assert m.STRIDES == (4, 8, 16, 32)
     assert base.STRIDES == (8, 16, 32), 'the OTHER instance must be unaffected'
     x = torch.zeros(1, 3, 128, 160)
-    obj, boxes, _, _ = m(x)
+    obj, boxes, _ = m(x)
     anchors = m.anchor_points(128, 160, x.device)
     assert obj.shape[1] == boxes.shape[1] == anchors.shape[0]
     assert set(anchors[:, 2].tolist()) == {4.0, 8.0, 16.0, 32.0}
@@ -3956,7 +3843,7 @@ def test_p2_works_on_trimmed_too():
     `bottleneck_expansion` does alongside `trimmed`."""
     m = YOLOXNano(version='trimmed', p2=True)          # must not raise
     assert m.STRIDES == (4, 8, 16, 32)
-    obj, boxes, _, _ = m(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -3976,7 +3863,7 @@ def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
     loaded, wh, ds_name, mcd, reduce, box_src, ts, obj_q = load_detector(p)
     assert loaded.p2 is True
     assert loaded.STRIDES == (4, 8, 16, 32)
-    obj, boxes, _, _ = loaded(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _ = loaded(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -4180,7 +4067,7 @@ def test_load_coco_backbone_transfers_every_backbone_tensor():
     n_loaded, n_total = load_coco_backbone(m, 'tiny', weights_dir=WEIGHTS_DIR)
     assert (n_loaded, n_total) == (35, 35)
     # And the loaded weights actually forward without shape errors.
-    obj, boxes, _, _ = m(torch.zeros(1, 3, 96, 96))
+    obj, boxes, _ = m(torch.zeros(1, 3, 96, 96))
     assert obj.shape[1] == boxes.shape[1]
 
 
@@ -4516,7 +4403,7 @@ def test_hybrid_backbone_backward_produces_finite_grads():
 def test_yolox_nano_hybrid_version_builds_and_forwards():
     model = YOLOXNano(version='hybrid', p2=True)
     assert model.STRIDES == (4, 8, 16, 32)
-    obj, boxes, kpt, _ = model(torch.rand(1, 3, 128, 192))
+    obj, boxes, kpt = model(torch.rand(1, 3, 128, 192))
     anchors = model.anchor_points(128, 192, 'cpu')
     assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
     assert kpt is None
@@ -4598,7 +4485,7 @@ def test_g1_shared_head_default_forward_matches_reg_tower_output():
     regression guard against `Head.forward` accidentally building `obj_convs` unconditionally."""
     model = YOLOXNano(version='tiny', p2=False, shared_head=True)
     x = torch.rand(1, 3, 128, 128)
-    obj, boxes, kpt, _ = model(x)
+    obj, boxes, kpt = model(x)
     assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
 
 
@@ -4606,7 +4493,7 @@ def test_g2_fpn_upsample_bilinear_forwards():
     model = YOLOXNano(version='tiny', p2=True, fpn_upsample='bilinear')
     assert model.neck.fpn_upsample == 'bilinear'
     x = torch.rand(1, 3, 128, 128)
-    obj, boxes, kpt, _ = model(x)
+    obj, boxes, kpt = model(x)
     assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
 
 
@@ -4838,147 +4725,3 @@ def test_measured_tracker_configuration_is_the_default():
                 np.nan_to_num(want[i], nan=-9e9), np.nan_to_num(got[i], nan=-9e9),
                 err_msg=f'frame {t}: {name} moved with every lever at its default')
 
-
-def _multi_animal_root(tmp_path, T=6, sep=5.0):
-    """A root with ONE 3-camera, 2-animal session -- `CropReidDataset` needs >=2 real animal
-    identities and >1 camera to be worth testing at all.
-    """
-    from tests.conftest import _session_3d_multi
-
-    root = tmp_path / 'multi_animal'
-    _session_3d_multi(root / 'train' / 'sess', T=T, sep=sep)
-    return root
-
-
-def test_crop_reid_net_forward_shape():
-    """`CropReidNet` maps a batch of crops straight to (B, embed_dim) raw vectors."""
-    from tailcyclenet.detector import CropReidNet
-
-    net = CropReidNet(embed_dim=16)
-    x = torch.rand(5, 3, 96, 96)
-    out = net(x)
-    assert out.shape == (5, 16)
-    assert torch.isfinite(out).all()
-
-
-def test_crop_reid_dataset_labels_persist_across_frames_and_cameras(tmp_path):
-    """The whole point of a crop-level net: `(session, group, row)` must be the SAME label for
-    the SAME animal across every frame and camera it appears in, and DIFFERENT animals must get
-    DIFFERENT labels -- otherwise `contrastive_loss`'s positives are meaningless.
-    """
-    from tailcyclenet.detector import BoxDataset, CropReidDataset
-
-    boxes_ds = BoxDataset(_multi_animal_root(tmp_path), 'train', input_wh=(64, 64))
-    crop_ds = CropReidDataset(boxes_ds, crop_wh=(32, 32))
-
-    assert len(crop_ds) > 0
-    assert crop_ds.n_labels == 2, 'exactly the two animals `_session_3d_multi` writes'
-
-    labels_seen = {int(crop_ds.entries[k][2]) for k in range(len(crop_ds))}
-    assert labels_seen == {0, 1}
-
-    # every entry with row 0 shares one label, every entry with row 1 shares the other, and the
-    # two are DIFFERENT -- across every (frame, camera) draw, not just within one.
-    by_row = {}
-    for i, row, label in crop_ds.entries:
-        by_row.setdefault(row, set()).add(label)
-    assert all(len(s) == 1 for s in by_row.values()), 'one row must map to exactly one label'
-    assert by_row[0] != by_row[1], 'the two animals must not share a label'
-
-    crop, label = crop_ds[0]
-    assert crop.shape == (3, 32, 32)
-    assert crop.dtype == torch.float32
-    assert 0.0 <= float(crop.min()) and float(crop.max()) <= 1.0
-    assert label in (0, 1)
-
-
-def test_crop_reid_dataset_feeds_contrastive_loss(tmp_path):
-    """End-to-end sanity: real crops through a real net through the SAME `contrastive_loss` the
-    dense head uses (report 55: it is deliberately anchor-agnostic) produce a finite, non-negative
-    loss, and it is exactly zero only when the batch holds no same-label pair.
-    """
-    from tailcyclenet.detector import (BoxDataset, CropReidDataset, CropReidNet,
-                                       contrastive_loss)
-
-    boxes_ds = BoxDataset(_multi_animal_root(tmp_path), 'train', input_wh=(64, 64))
-    crop_ds = CropReidDataset(boxes_ds, crop_wh=(32, 32))
-    net = CropReidNet(embed_dim=8)
-
-    n = min(8, len(crop_ds))
-    crops = torch.stack([crop_ds[k][0] for k in range(n)])
-    labels = torch.tensor([crop_ds[k][1] for k in range(n)])
-    assert len(set(labels.tolist())) == 2, 'the batch must actually mix both animals'
-
-    vectors = net(crops)
-    loss = contrastive_loss(vectors, labels)
-    assert torch.isfinite(loss)
-    assert float(loss.detach()) >= 0.0
-
-    # a batch with every label distinct costs nothing (no positive pair exists to contrast)
-    solo_labels = torch.arange(n)
-    assert float(contrastive_loss(vectors, solo_labels)) == 0.0
-
-
-def test_crop_reid_augment_flips_or_jitters_independently(tmp_path):
-    """`augment=True` must make two draws of the SAME entry genuinely different pixels most of
-    the time (the positive-pair contract), while `augment=False` (the default) must be
-    byte-identical across repeats -- `_load_letterbox` itself has no randomness.
-    """
-    from tailcyclenet.detector import BoxDataset, CropReidDataset
-
-    boxes_ds = BoxDataset(_multi_animal_root(tmp_path), 'train', input_wh=(64, 64))
-    plain = CropReidDataset(boxes_ds, crop_wh=(32, 32), augment=False)
-    aug = CropReidDataset(boxes_ds, crop_wh=(32, 32), augment=True)
-
-    a0, _ = plain[0]
-    a1, _ = plain[0]
-    assert torch.equal(a0, a1), 'no augmentation must be deterministic'
-
-    draws = [aug[0][0] for _ in range(8)]
-    assert any(not torch.equal(draws[0], d) for d in draws[1:]), \
-        'augmentation must vary across independent draws of the same entry'
-
-
-def test_pk_sampler_every_batch_has_p_labels_times_k_each():
-    """Every yielded block of `p * k` indices must resolve to exactly `p` distinct labels, each
-    appearing exactly `k` times -- the guarantee the contrastive loss needs from every batch.
-    """
-    from tailcyclenet.detector import PKSampler
-
-    class FakeDS:
-        # 5 labels, uneven counts: one label has only 1 entry (< k), forcing replacement.
-        entries = ([(0, 0, 0)] * 1 + [(0, 0, 1)] * 6 + [(0, 0, 2)] * 6 +
-                  [(0, 0, 3)] * 6 + [(0, 0, 4)] * 6)
-
-        def __len__(self):
-            return len(self.entries)
-
-    ds = FakeDS()
-    p, k = 3, 4
-    sampler = PKSampler(ds, p=p, k=k, batches_per_epoch=5, seed=0)
-    assert len(sampler) == 5 * p * k
-
-    out = list(iter(sampler))
-    assert len(out) == 5 * p * k
-    for b in range(5):
-        block = out[b * p * k:(b + 1) * p * k]
-        labels = [ds.entries[i][2] for i in block]
-        counts = {lab: labels.count(lab) for lab in set(labels)}
-        assert len(counts) == p, f'batch {b} must hold exactly {p} distinct labels'
-        assert all(c == k for c in counts.values()), f'batch {b} must hold {k} of each label'
-
-
-def test_pk_sampler_rejects_a_single_identity():
-    """Cannot contrast with fewer than 2 identities -- fail loudly, not with a silent zero loss
-    forever.
-    """
-    from tailcyclenet.detector import PKSampler
-
-    class FakeDS:
-        entries = [(0, 0, 0)] * 10
-
-        def __len__(self):
-            return len(self.entries)
-
-    with pytest.raises(ValueError, match='2'):
-        PKSampler(FakeDS(), p=2, k=2)

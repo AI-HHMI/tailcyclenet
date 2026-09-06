@@ -99,10 +99,13 @@ class InferConfig:
     # camera with no finite point gets a NaN column, which the learned no-box token substitutes.
     box_prompt: str = 'none'
     # Owner-set default (2026-09-05): give the box prompt at each animal's FIRST window only,
-    # withholding it once `carried[a]` holds a carry -- give it while first-detecting, then let
-    # carry hold identity. False (the pre-existing behaviour) gives the box prompt every window
-    # `box_prompt` is on for; the gate is `not box_prompt_first_only or carried[a] is None`, which
-    # reduces to the old unconditional check when this is False.
+    # withholding it once a carry is ACTUALLY USED as this window's prior -- give it while
+    # first-detecting, then let carry hold identity. False (the pre-existing behaviour) gives the
+    # box prompt every window `box_prompt` is on for; the gate is `not box_prompt_first_only or
+    # carried[a] is None or prior is None` (fixed: a stale/out-of-bounds carry that `_build_prior`
+    # itself declined to use no longer silently withholds the box too -- report 56 Session 9/13's
+    # cross-clip-replicated finding), which reduces to the old unconditional check when this is
+    # False.
     box_prompt_first_only: bool = False
     # Inflate every crop about its centre (the wide pass-1 regime); 1.0 is the unchanged behaviour.
     crop_inflate: float = 1.0
@@ -140,6 +143,20 @@ def boxes_from_points(points, cgroup, min_crop_dim, mode):
         return (cg, boxes) if cg is not None else (None, None)
     cam, box, _ = cropmod.crop_to_points_2d(cgroup[0], points, min_crop_dim)
     return ([cam], [box]) if cam is not None else (None, None)
+
+
+def _give_box_this_window(cfg, carried_a, prior):
+    """Whether this animal's window should receive a box prompt this call.
+
+    `box_prompt_first_only` withholds the box once a carry EXISTS and IS ACTUALLY USED as this
+    window's prior -- `carried_a is None` alone under-withholds: `_build_prior` can ALSO decline
+    a non-None carry as stale (a skipped window, `qt < 0`) or shape-mismatched, in which case no
+    identity signal reached the model at all and the box should compensate, exactly as it would
+    at the animal's true first window. `prior is None` is `_build_prior`'s own verdict for THIS
+    window, so this can never disagree with what the model actually received.
+    """
+    return (cfg.box_prompt != 'none'
+            and (not cfg.box_prompt_first_only or carried_a is None or prior is None))
 
 
 def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, cgroup, dev):
@@ -727,8 +744,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         views = [v.to(dev) for v in views]
         cgroup_d = _to_device(cgroup, dev)
         mkw = {}
-        give_box = (cfg.box_prompt != 'none'
-                   and (not cfg.box_prompt_first_only or carried[a] is None))
+        give_box = _give_box_this_window(cfg, carried[a], prior)
         if give_box:
             if cfg.box_prompt == 'labels':
                 if src is None or a >= n_lab:

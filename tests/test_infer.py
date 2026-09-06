@@ -2243,3 +2243,30 @@ def test_box_prompt_labels_refuses_a_detector_or_boxes_source(cli, monkeypatch, 
     with pytest.raises(SystemExit) as e:
         cli.main()
     assert 'not label rows' in str(e.value), f'got: {e.value}'
+
+
+def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_one():
+    """The gate used to read `carried[a] is None`, which under-withholds: `_build_prior` can ALSO
+    decline a non-None carry as stale (a skipped window) or shape-mismatched, and in either case
+    no identity signal reached the model that window. Fixed (report 56 Session 9/13's
+    cross-clip-replicated finding, `window.py`): the gate now also compensates whenever
+    `_build_prior`'s own verdict for THIS window (`prior`) is None, not just when there was never
+    a carry at all.
+    """
+    from tailcyclenet.infer.window import _give_box_this_window
+
+    cfg = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=True)
+    fake_carry = (torch.zeros(2, 2), 0)
+
+    assert _give_box_this_window(cfg, None, None), \
+        'no carry at all (the true first window) must still give the box'
+    assert not _give_box_this_window(cfg, fake_carry, torch.zeros(2, 2)), \
+        'a carry that WAS used as this window\'s prior must still withhold the box'
+    assert _give_box_this_window(cfg, fake_carry, None), \
+        'a carry that existed but was declined (stale/shape-mismatched) must give the box back'
+
+    off = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=False)
+    assert _give_box_this_window(off, fake_carry, None), \
+        'box_prompt_first_only=False must give the box every window regardless of carry/prior'
+    assert not _give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
+        'box_prompt="none" must never give the box'

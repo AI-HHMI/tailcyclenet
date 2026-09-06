@@ -279,9 +279,13 @@ def _load_session(path, groups=None):
         d = {'mode': sess.mode, 'group_id': gid, 'session': src_id,
              'animal_ids': np.asarray(list(lab.animal_ids), object)}
         if sess.mode == '3d':
-            d['pred'] = lab.points3d
+            d['pred'] = (lab.points3d if lab.points3d is not None
+                         else np.full((len(lab.animal_ids), sess.groups[gid].n_frames,
+                                       len(sess.names), 3), np.nan, np.float32))
         else:
-            d['pred'] = lab.points2d[..., 0, :]
+            d['pred'] = (lab.points2d[..., 0, :] if lab.points2d is not None
+                         else np.full((len(lab.animal_ids), sess.groups[gid].n_frames,
+                                       len(sess.names), 2), np.nan, np.float32))
         if lab.points2d is not None:
             d['pred2d'] = np.moveaxis(lab.points2d, 3, 2)
         if lab.boxes is not None:

@@ -2038,3 +2038,46 @@ def test_cross_view_defaults_select_the_measured_configuration():
     assert parser.get_default('max_move') == 1.25
 
 
+
+
+def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
+    """A2 (dev/plans/multianimal_system_improvements.md): the 2D vis-thresh gate masked p/conf/
+    box_agree but the writer saved pred2d/conf2d before it -- and `load_predictions` reads the
+    saved keypoints.pq back as the primary prediction, so a declined row resurrected in the
+    saved session. The fix masks pred2d/conf2d too; 3D keeps its per-camera rows as diagnostics.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.infer.predictions import load_predictions
+    from tailcyclenet.model import build_model
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL,
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    out_hi = tmp_path / 'hi'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--split', 'test',
+                                      '--anchor', 'none', '--device', 'cpu', '--overlap', '2',
+                                      '--vis-thresh=1e9', '--out', str(out_hi)])
+    cli.main()
+    preds_hi, _ = load_predictions(out_hi)
+    assert not np.isfinite(preds_hi['s/g000']['pred']).any(), \
+        'the gated 2D prediction must be empty after the round trip, not resurrected'
+
+    out_lo = tmp_path / 'lo'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--split', 'test',
+                                      '--anchor', 'none', '--device', 'cpu', '--overlap', '2',
+                                      '--vis-thresh=-1e9', '--out', str(out_lo)])
+    cli.main()
+    preds_lo, _ = load_predictions(out_lo)
+    assert np.isfinite(preds_lo['s/g000']['pred']).any(), 'the ungated control must be unchanged'

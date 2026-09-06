@@ -8,6 +8,7 @@ needs `overlap >= 1`; `labels` is a GT oracle, not a deployment number.
 from __future__ import annotations
 
 import warnings
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -26,6 +27,14 @@ from .store import FrameStore
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 CARRY_SOURCES = ('triangulate', 'pred')
+
+# One animal's crop plan for one window: `use` is the camera indices the crop touched, `boxes`
+# their (int32) crop boxes, `cgroup` the resized cameras the forward reads, `scales` each
+# camera's resize factor, `uncropped` the pre-resize cameras `--refine`'s fallback rebuilds from.
+# A plain tuple here would let a future field insertion silently reorder at one of the several
+# construction sites without the others noticing; unpacking a WindowPlan is unchanged from
+# unpacking a tuple, so every existing positional unpack site is untouched.
+WindowPlan = namedtuple('WindowPlan', 'animal use boxes cgroup scales uncropped')
 
 # Why an (animal, window) produced nothing -- separate codes so coverage loss is attributable.
 OUTCOMES = ('ok', 'no box', 'no camera', 'no points', 'crop failed', 'decode failed')
@@ -617,7 +626,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             for i, ci in enumerate(use):
                 crop[a, wl, ci] = np.asarray(boxes[i], np.float32)
             outcome[a, wl] = OUTCOMES.index('decode failed')
-            plans.append((a, use, boxes, cgroup, scales, uncropped))
+            plans.append(WindowPlan(a, use, boxes, cgroup, scales, uncropped))
         return frames, window_cams, plans
 
     def decode_crops(frames, plans):
@@ -787,7 +796,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     c, s = _resize_camera(cam, cfg.image_size)
                     cg.append(c)
                     sc.append(s)
-                return (a, use, boxes, cg, sc, uncropped)
+                return WindowPlan(a, use, boxes, cg, sc, uncropped)
 
             refined = []
             for plan in plans:
@@ -811,7 +820,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     sc2.append(s)
                 for i, ci in enumerate(use):
                     crop_refined[a, wi - w0, ci] = np.asarray(b2[i], np.float32)
-                refined.append((a, use, b2, cg2, sc2, uncropped2))
+                refined.append(WindowPlan(a, use, b2, cg2, sc2, uncropped2))
             plans = refined
             crops = decode_crops(frames, plans)
 

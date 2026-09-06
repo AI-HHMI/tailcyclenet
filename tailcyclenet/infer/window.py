@@ -870,6 +870,15 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 p[drop] = np.nan
                 conf[a, frames[drop] - f0] = np.nan
                 box_agree[a, frames[drop] - f0] = np.nan
+                if mode == '2d' and p2 is not None:
+                    # the 2D prediction IS the per-camera pose, and keypoints.pq is what
+                    # `load_predictions` reads back as the primary prediction -- the gate must
+                    # mask it too, or a declined row resurrects in the saved session. 3D keeps
+                    # its per-camera rows as raw diagnostics (a separate policy decision).
+                    for i, ci in enumerate(use):
+                        pred2d[a, frames[drop] - f0, ci] = np.nan
+                        if v2 is not None:
+                            conf2d[a, frames[drop] - f0, ci] = np.nan
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
                 _capture_overlap_agreement(stats, a, frames, f0, pred, p)
             pred[a, frames - f0] = p

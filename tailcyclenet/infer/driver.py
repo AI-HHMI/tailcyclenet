@@ -484,6 +484,14 @@ def run_dataset(args):
         box_prompt = 'none'
         box_prompt_first_only = False
     if box_prompt == 'labels':
+        if args.detector or args.boxes:
+            raise SystemExit(
+                '--box-prompt labels seeds the box from LABEL row `a`, but --detector/--boxes '
+                'rows are score- or association-ordered and are not label rows. That is a '
+                "different animal's ground truth, not an oracle -- the same reason --anchor "
+                'labels refuses this combination. Use --box-prompt labels with the label crop '
+                'path (no --detector, no --boxes), or --box-prompt detector/none with a box '
+                'source.')
         print('WARNING: --box-prompt labels seeds the box from GROUND TRUTH. This is an oracle '
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
     box_on = box_prompt != 'none'

@@ -2206,3 +2206,40 @@ def test_a_moving_rig_prediction_round_trips_its_extrinsics(cli, monkeypatch, tm
 
     errs = [e for e in validate_session(got) if '[rule 7]' not in e]
     assert not errs, f'a moving prediction session must validate apart from missing pixels: {errs}'
+
+
+@pytest.mark.parametrize('argv', [
+    ['--box-prompt', 'labels', '--detector', 'nope'],
+    ['--box-prompt', 'labels', '--boxes', 'nope.npz'],
+])
+def test_box_prompt_labels_refuses_a_detector_or_boxes_source(cli, monkeypatch, tmp_path, argv):
+    """The same bug `--anchor labels` already refuses: `run_blocks` seeds the box-prompt term's
+    row `a` from LABEL row `a` (`window.py`'s `src[a]`), but a detector's or `--boxes` npz's rows
+    are score- or association-ordered, not label rows -- a different animal's ground truth fed
+    in as an oracle. Found empirically (report 56, dev/reports/56_..., Session 20): the
+    detector-slot-to-GT-row correspondence flips over a real clip, so the previously-unguarded
+    combination silently fed the wrong animal's exact position for roughly half of it. Needs a
+    real box-model run (not a bare `--run nope`, unlike the analogous `--anchor labels` test)
+    since the refusal only fires once `model_is_box` is known.
+    """
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    ds = load_dataset(root)
+    registry = Registry.build([ds])
+    model = build_model({**SMALL, 'box_prompt': 'film'}, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': {**SMALL, 'box_prompt': 'film'},
+              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--split', 'test',
+                                      '--device', 'cpu', '--out', str(tmp_path / 'out')] + argv)
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert 'not label rows' in str(e.value), f'got: {e.value}'

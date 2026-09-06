@@ -347,8 +347,9 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     want = 4 if workers else max(int(n_cams), 4)
     k = _READER_GB_PER_MP * max(int(wh[0]) * int(wh[1]) / 1e6, 1e-3)
     share = max(workers or 1, 1) * max(int(procs), 1)
-    n = int(max(_memory.FRACTION_READERS * ram_gb, 0.0) / share / k)
-    return max(1, min(want, n))
+    budget_bytes = max(0.0, ram_gb * _memory.FRACTION_READERS) * _memory.GB
+    per_reader_bytes = k * share * _memory.GB
+    return _memory.fits(budget_bytes, per_reader_bytes, want, floor=1)
 
 
 # Built at the FIRST video read, not at import: the size is a function of the rig, and the rig is

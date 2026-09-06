@@ -267,15 +267,6 @@ def build_parser() -> argparse.ArgumentParser:
                          'own last-known box, not frame t-1). The measured default is 8; raising '
                          'it trades a hard identity loss for a longer-lived stale anchor that a '
                          'nearby animal can be wrongly matched onto.')
-    ap.add_argument('--view-arbitration', action=argparse.BooleanOptionalAction, default=False,
-                    help='3D multiview, --track only. Down-weight a camera whose OWN detections '
-                         'are mutually crowded: a view whose boxes sit on top of each other says '
-                         'little about which animal is which, so a view that cleanly separates '
-                         'them dominates the match instead. Without it every camera counts '
-                         'equally and one ambiguous view can out-vote two clean ones. It is a '
-                         'weighting, not a rejection -- no camera is dropped, only discounted -- '
-                         'so it moves identity without moving coverage. Default off; the flat '
-                         'weighting is what every number on record used.')
     ap.add_argument('--max-animals', type=int, default=0)
     ap.add_argument('--det-top-k', type=int, default=0,
                     help='detections kept per frame-camera; 0 follows --max-animals')

@@ -93,7 +93,6 @@ def _identity_provenance(args):
         'identity_bridge': bool(getattr(args, 'identity_bridge', False)),
         'pose_nms': (float(args.pose_nms) if getattr(args, 'pose_nms', None) is not None
                      else 0.0),
-        'view_arbitration': bool(getattr(args, 'view_arbitration', False)),
         'duplicate_radius': float(getattr(args, 'duplicate_radius', 0.75)),
         'duplicate_persist': int(getattr(args, 'duplicate_persist', 5)),
     }
@@ -302,8 +301,6 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                       max_move=args.max_move,
                                       max_age=getattr(args, 'max_age', 8), stats=stats,
                                       pose_nms=args.pose_nms, state=assoc_state,
-                                      view_arbitration=getattr(
-                                          args, 'view_arbitration', False),
                                       duplicate_radius=getattr(
                                           args, 'duplicate_radius', 0.75),
                                       duplicate_persist=getattr(

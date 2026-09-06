@@ -2768,7 +2768,6 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
     args2 = argparse.Namespace(track=False, link_boxes=False, min_views=1, max_move=2.0,
                                max_age=24, pose_nms=0.6,
-                               view_arbitration=True,
                                duplicate_radius=0.9, duplicate_persist=8)
     assert set(_identity_provenance(args2)) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
@@ -4670,29 +4669,6 @@ def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path()
             f'row {s} resumed on the other animal'
 
 
-def test_view_arbitration_is_inert_where_no_camera_is_crowded():
-    """The rate-matched control for lever 4: a rejection rule must be scored against the
-    population it governs, so it has to be provably silent everywhere else. With one detection
-    per camera there is nobody to be confused with and every claim votes, byte for byte.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    got = {}
-    for arb in (False, True):
-        tr = CrossViewTracker(2, max_res_px=30.0, view_arbitration=arb)
-        rows = []
-        for t in range(6):
-            w = [np.array([-60.0 + 8.0 * t, 0.0, 0.0]), np.array([90.0, 20.0 * t, 0.0])]
-            rows.append(tr.step(cg, *_lever_boxes(cg, w, side=60.0)))
-        got[arb] = ([r[0] for r in rows],
-                    [tr.targets[s]['point'].numpy() for s in sorted(tr.targets)])
-    for x, y in zip(got[False][0], got[True][0]):
-        np.testing.assert_array_equal(np.nan_to_num(x, nan=-9e9), np.nan_to_num(y, nan=-9e9))
-    for x, y in zip(got[False][1], got[True][1]):
-        np.testing.assert_array_equal(x, y)
-
-
 def test_measured_tracker_configuration_is_the_default():
     """The measured zero-switch configuration is the only one the public constructor ships;
     pinning it prevents an accidental drift silently changing deployment."""
@@ -4703,7 +4679,6 @@ def test_measured_tracker_configuration_is_the_default():
     sig = inspect.signature(CrossViewTracker.__init__).parameters
     assert sig['max_age'].default == 8
     assert sig['max_move'].default == 1.25
-    assert sig['view_arbitration'].default is False, 'view_arbitration must ship off'
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
@@ -4718,7 +4693,7 @@ def test_measured_tracker_configuration_is_the_default():
         return rows
 
     base = run()
-    explicit = run(max_age=8, max_move=1.25, view_arbitration=False)
+    explicit = run(max_age=8, max_move=1.25)
     for t, (want, got) in enumerate(zip(base, explicit)):
         for i, name in enumerate(('boxes', 'scores', 'claimed')):
             np.testing.assert_array_equal(

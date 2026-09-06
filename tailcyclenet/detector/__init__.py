@@ -327,8 +327,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
 def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
                     track=True, max_move=1.25, max_age=8, stats=None, pose_nms=None,
-                    state=None,
-                    view_arbitration=False, duplicate_radius=0.75, duplicate_persist=5):
+                    state=None, duplicate_radius=0.75, duplicate_persist=5):
     """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
 
     Inputs:
@@ -340,8 +339,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             to the measured 1.25 box-side gate.
         max_age -- the tracker's and `link_rows`' SHARED patience window: frames without
             evidence before a slot or row is retired. The measured default is 8.
-        view_arbitration -- TRACKER-ONLY cross-view evidence lever, down-weighting crowded
-            cameras; remains off.
         pose_nms -- keypoint-containment instance NMS (the one identity lever that survived
             measurement); `stats` collects its fire count for a rate-matched random control.
         state -- makes calls equal to one concatenated call; `None` builds fresh state.
@@ -378,7 +375,6 @@ def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
             tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
                                        min_views=min_views,
                                        max_move=max_move, max_age=max_age,
-                                       view_arbitration=view_arbitration,
                                        duplicate_radius=duplicate_radius,
                                        duplicate_persist=duplicate_persist)
         state['tracker'] = tracker

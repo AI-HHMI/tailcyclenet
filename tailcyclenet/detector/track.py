@@ -136,40 +136,6 @@ def _project(cam, points):
     return project_points_torch([cam], p)[0, :, 0]
 
 
-def _crowd_weights(centres, sides, max_move):
-    """Per-camera, per-detection ambiguity weight -- lever 4's one measurement of a view.
-
-    Inputs: centres -- list of (n_c,2) detection centres; sides -- list of (n_c,) box sides;
-            max_move -- the same gate width every other distance in this file is divided by.
-    Outputs: list of (n_c,) float32 arrays, `clip(d_nearest_other / (max_move * side), 0, 1)`.
-    Side effects: none.
-
-    THE RULE: a detection is ambiguous exactly to the extent that ANOTHER detection in the same
-    camera is near it, measured in that detection's own box sides -- the file's one unit system.
-    1.0 means the nearest rival is a full gate width away, so nothing in this view could be
-    confused with it; 0.0 means a twin sits on top of it and this camera's evidence about which
-    animal is which is worth nothing. A camera holding a single detection scores 1.0: there is
-    no one to confuse it with. A NaN centre is not a rival (it is `unletterbox_boxes`' "no
-    detection here"), so its distance is infinite rather than undefined.
-
-    This is the cue that having several views with different occlusion geometry actually buys:
-    two animals overlapping in one camera are usually well separated in another, and the old code
-    let the crowded camera vote on the 3D point exactly as loudly as the clean one.
-    """
-    out = []
-    for cen, side in zip(centres, sides):
-        n = int(cen.shape[0])
-        if n < 2:
-            out.append(np.ones(n, np.float32))
-            continue
-        d = torch.linalg.norm(cen[:, None] - cen[None], dim=-1).numpy().astype(np.float64)
-        d = np.where(np.isnan(d), np.inf, d)
-        np.fill_diagonal(d, np.inf)
-        w = d.min(1) / np.maximum(max_move * side.numpy().astype(np.float64), 1e-6)
-        out.append(np.clip(w, 0.0, 1.0).astype(np.float32))
-    return out
-
-
 class CrossViewTracker:
     """Stateful across frames. One instance per group; `step` once per frame, in order.
 
@@ -191,8 +157,7 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
-                 view_arbitration=False, duplicate_radius=DUPLICATE_RADIUS,
-                 duplicate_persist=5):
+                 duplicate_radius=DUPLICATE_RADIUS, duplicate_persist=5):
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
@@ -203,7 +168,6 @@ class CrossViewTracker:
                 max_age -- frames without evidence before a slot is retired; 8 is the measured
                     default.
                 min_views -- minimum cameras a birth must be seen in.
-                view_arbitration -- lever 4: discount a camera whose detections are crowded.
                 duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
                     scale-free default (measured band, report 53).
                 duplicate_persist -- consecutive in-band frames (5-35+ measured, contact <=4)
@@ -218,7 +182,6 @@ class CrossViewTracker:
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)
-        self.view_arbitration = bool(view_arbitration)
         if duplicate_radius < 0:
             raise ValueError('duplicate_radius must be non-negative')
         self.duplicate_radius = float(duplicate_radius)
@@ -289,10 +252,8 @@ class CrossViewTracker:
             if s not in slots:
                 t['age'] += 1
         pts = (torch.stack([self._predict(s) for s in slots]) if slots else None)
-        weights = (_crowd_weights(centres, sides, self.max_move)
-                   if self.view_arbitration else None)
         self._joint(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
-                   weights, out, sc, claimed_ix)
+                   out, sc, claimed_ix)
         self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
             self.events.append({'frame': self._t, 'slot': s, 'event': 'died',
@@ -490,12 +451,12 @@ class CrossViewTracker:
             sc[s, c] = float(scores_per_cam[c][det])
             claimed_ix[s, c] = det
 
-    def _group_affinity(self, proj, centres, sides, weights, i, g):
+    def _group_affinity(self, proj, centres, sides, i, g):
         """Lever 2's cost: how well slot `i`'s prediction explains candidate group `g`.
 
         Inputs: proj -- per-camera (n_slots,2) projections of every slot's predicted point;
-            centres / sides -- per-camera detection centres and box sides; weights --
-            `_crowd_weights` or None; i -- the slot's row in `proj`; g -- one `associate` group.
+            centres / sides -- per-camera detection centres and box sides; i -- the slot's row
+            in `proj`; g -- one `associate` group.
         Outputs: a float affinity in [0, 1]; 0 means UNAVAILABLE to the Hungarian.
         Side effects: none.
 
@@ -506,25 +467,22 @@ class CrossViewTracker:
         compared against that group's own detection centre in box sides -- the same number the
         per-camera path computes, just averaged over the group instead of decided per camera.
 
-        The average is over cameras, weighted by lever 4's ambiguity when it is on, so a crowded
-        view contributes proportionally less to the decision than a view that separates the
-        animals cleanly. One camera beyond the gate therefore does not by itself veto the match,
-        but it does drag the mean; a pair whose weighted mean gap exceeds one box side scores 0
+        The average is over cameras: one camera beyond the gate therefore does not by itself veto
+        the match, but it does drag the mean; a pair whose mean gap exceeds one box side scores 0
         and is UNAVAILABLE, not merely expensive -- the gate is the algorithm, as ever.
         """
-        num, den = 0.0, 0.0
+        num, den = 0.0, 0
         for c, j in g['members'].items():
             side = max(float(sides[c][j]), 1e-6)
             d = float(torch.linalg.norm(proj[c][i] - centres[c][j]))
-            w = 1.0 if weights is None else float(weights[c][j])
-            num += w * d / (self.max_move * side)
-            den += w
-        if den <= 0.0 or not np.isfinite(num):
+            num += d / (self.max_move * side)
+            den += 1
+        if den <= 0 or not np.isfinite(num):
             return 0.0
         return float(np.clip(1.0 - num / den, 0.0, None))
 
     def _joint(self, cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
-               weights, out, sc, claimed_ix):
+               out, sc, claimed_ix):
         """Lever 2: cross-view groups first, then ONE Hungarian over slots x groups.
 
         Inputs and outputs: as `_per_camera`.
@@ -565,7 +523,7 @@ class CrossViewTracker:
         aff = np.zeros((len(slots), len(groups)), np.float64)
         for i in range(len(slots)):
             for k, g in enumerate(groups):
-                aff[i, k] = self._group_affinity(proj, centres, sides, weights, i, g)
+                aff[i, k] = self._group_affinity(proj, centres, sides, i, g)
         if aff.any():
             aff = np.where(aff > 0,
                           aff * 16.0 + np.array([[_age_term(ages[s]) for s in slots]]).T, 0.0)

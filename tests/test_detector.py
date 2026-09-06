@@ -1311,15 +1311,14 @@ def test_age_stickiness_resolves_two_slots_on_one_group():
     assert np.isfinite(rows[-1]).all(-1).any(-1).sum() == 1
 
 
-@pytest.mark.parametrize('assoc_mode', ['joint', 'per-camera'])
-def test_age_sticky_term_never_inverts_a_real_match(assoc_mode):
+def test_age_sticky_term_never_inverts_a_real_match():
     """The Hungarian cost packs age into `affinity * 16 + AGE_STICKY_CAP - age`, which stays
     positive for any positive affinity only through `age <= AGE_STICKY_CAP`. Past it the term
     can go negative for a genuinely available, high-affinity cell -- the post-hoc `affinity > 0`
     check then treats a real, well-supported match as UNAVAILABLE and the slot starves instead
     of matching (independent review; identity_review_followthrough plan A3). Zero at the shipped
     default (`max_age = 8`, so age never reaches 9) -- this fires only for a reproduction that
-    raises `max_age` past the cap, e.g. the legacy `per-camera max_age=24` path.
+    raises `max_age` past the cap.
     """
     from tailcyclenet.detector.track import CrossViewTracker
 
@@ -1330,11 +1329,11 @@ def test_age_sticky_term_never_inverts_a_real_match(assoc_mode):
     # regime the inverted sign discards.
     per_cam, scores = _lever_boxes(cg, [(point + torch.tensor([80.0, 0.0, 0.0])).numpy()],
                                    side=200.0)
-    tr = CrossViewTracker(1, max_res_px=30.0, max_age=30, assoc_mode=assoc_mode)
+    tr = CrossViewTracker(1, max_res_px=30.0, max_age=30)
     tr.targets[0] = {'point': point.clone(), 'age': 24}
     out, sc, claimed = tr.step(cg, per_cam, scores)
     assert np.isfinite(out).all(-1).any(), \
-        f'{assoc_mode}: a stale (age 24) slot lost its own high-affinity candidate to nothing'
+        'a stale (age 24) slot lost its own high-affinity candidate to nothing'
     assert tr.targets[0]['age'] == 0, 'a real match must reset age, not leave the slot starving'
 
 
@@ -2861,7 +2860,7 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     from tailcyclenet.infer.driver import _identity_provenance
 
     args = argparse.Namespace(track=True, link_boxes=True, min_views=2, max_move=1.25,
-                              max_age=8, assoc_mode='joint', pose_nms=None)
+                              max_age=8, pose_nms=None)
     prov = _identity_provenance(args)
 
     # Everything `associate_group` takes that can change which row a detection lands in. The rest
@@ -2881,7 +2880,7 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     # UNCONDITIONAL, every key, always -- same rule as `_box_provenance`: conditional membership
     # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
     args2 = argparse.Namespace(track=False, link_boxes=False, min_views=1, max_move=2.0,
-                               max_age=24, assoc_mode='per-camera', pose_nms=0.6,
+                               max_age=24, pose_nms=0.6,
                                view_arbitration=True,
                                duplicate_radius=0.9, duplicate_persist=8)
     assert set(_identity_provenance(args2)) == set(prov), \
@@ -4732,26 +4731,17 @@ def _lost_in_one_camera():
 
 
 def test_joint_association_refuses_a_binding_the_per_camera_hungarian_accepts():
-    """`assoc_mode = "joint"` is the second, independent repair: form cross-view candidate groups
-    over the WHOLE detection pool with `associate` -- which triangulates and gates on the
-    residual already -- and run ONE Hungarian over slots x groups. Today `associate` only ever
-    sees the LEFTOVERS the tracker did not want, so the one routine in the repo that checks
-    cross-view consistency never gets a look at the detections that matter.
-
-    Same scene as the claim-gate test, so the two repairs are measured against one defect: the
-    per-camera path binds animal B's box in camera 2 to the slot holding animal A; joint cannot,
-    because a group is the unit of matching and no group contains both animals.
+    """Cross-view candidate groups first, over the WHOLE detection pool via `associate` -- which
+    triangulates and gates on the residual already -- then ONE Hungarian over slots x groups.
+    On this scene (animal A visible in cameras 0/1, missed in camera 2 where the only detection
+    belongs to animal B) joint must not bind B's box in camera 2 to the slot holding A, because a
+    group is the unit of matching and no group contains both animals.
     """
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg, per_cam, scores, a = _lost_in_one_camera()
 
-    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
-    tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
-    tr.step(cg, per_cam, scores)
-    assert float(np.linalg.norm(tr.targets[0]['point'].numpy() - a)) > 50.0
-
-    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='joint')
+    tr = CrossViewTracker(1, max_res_px=30.0)
     tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
     out, _, claimed = tr.step(cg, per_cam, scores)
     assert claimed[0].tolist() == [0, 0, -1], 'the joint decision must not reach into camera 2'
@@ -4770,7 +4760,7 @@ def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path()
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
-    tr = CrossViewTracker(2, max_res_px=30.0, assoc_mode='joint')
+    tr = CrossViewTracker(2, max_res_px=30.0)
     rows = []
     for t in range(12):
         w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
@@ -4793,42 +4783,6 @@ def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path()
             f'row {s} resumed on the other animal'
 
 
-def test_view_arbitration_keeps_a_crowded_camera_out_of_the_triangulation():
-    """Several views with different occlusion geometry is the thing a multiview rig actually
-    buys, and the shipped tracker spends none of it: a camera where two animals sit on top of
-    each other votes on the 3D point exactly as loudly as one that separates them cleanly.
-
-    `view_arbitration` measures each detection's distance to the nearest OTHER detection in its
-    own camera, in box sides, and a camera under half a gate width does not triangulate provided
-    two unambiguous cameras remain. Its box is still emitted -- crowding is uncertainty, not
-    proof of a wrong claim, which is precisely what separates this lever from lever 1.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    a = np.array([0.0, 0.0, 0.0], np.float32)
-    near = np.array([26.0, 0.0, 0.0], np.float32)
-    per_cam, scores = _lever_boxes(cg, [a])
-    crowded, _ = _lever_boxes(cg, [a, near])
-    per_cam[2], scores[2] = crowded[2], torch.ones(2)
-    stale = torch.as_tensor(np.array([16.0, 0.0, 0.0], np.float32))
-
-    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera')
-    tr.targets[0] = {'point': stale.clone(), 'age': 0}
-    _, _, claimed = tr.step(cg, per_cam, scores)
-    assert claimed[0, 2] == 1, 'the crowded camera must claim the WRONG neighbour here'
-    assert float(np.linalg.norm(tr.targets[0]['point'].numpy() - a)) > 10.0, \
-        'and that claim must drag the 3D point, or there is nothing to arbitrate'
-
-    tr = CrossViewTracker(1, max_res_px=30.0, assoc_mode='per-camera',
-                         view_arbitration=True)
-    tr.targets[0] = {'point': stale.clone(), 'age': 0}
-    out, _, claimed = tr.step(cg, per_cam, scores)
-    np.testing.assert_allclose(tr.targets[0]['point'].numpy(), a, atol=1e-3)
-    assert claimed[0, 2] == 1 and np.isfinite(out[0, 2]).all(), \
-        'the discounted camera still reports its box -- only its vote is withheld'
-
-
 def test_view_arbitration_is_inert_where_no_camera_is_crowded():
     """The rate-matched control for lever 4: a rejection rule must be scored against the
     population it governs, so it has to be provably silent everywhere else. With one detection
@@ -4839,8 +4793,7 @@ def test_view_arbitration_is_inert_where_no_camera_is_crowded():
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     got = {}
     for arb in (False, True):
-        tr = CrossViewTracker(2, max_res_px=30.0, assoc_mode='per-camera',
-                             view_arbitration=arb)
+        tr = CrossViewTracker(2, max_res_px=30.0, view_arbitration=arb)
         rows = []
         for t in range(6):
             w = [np.array([-60.0 + 8.0 * t, 0.0, 0.0]), np.array([90.0, 20.0 * t, 0.0])]
@@ -4854,15 +4807,13 @@ def test_view_arbitration_is_inert_where_no_camera_is_crowded():
 
 
 def test_measured_tracker_configuration_is_the_default():
-    """The measured zero-switch configuration is the upstream default, while the legacy
-    per-camera configuration remains explicitly reproducible. Pinning both prevents an accidental
-    drift in the public constructor from silently changing either deployment or reproduction."""
+    """The measured zero-switch configuration is the only one the public constructor ships;
+    pinning it prevents an accidental drift silently changing deployment."""
     import inspect
 
     from tailcyclenet.detector.track import CrossViewTracker
 
     sig = inspect.signature(CrossViewTracker.__init__).parameters
-    assert sig['assoc_mode'].default == 'joint'
     assert sig['max_age'].default == 8
     assert sig['max_move'].default == 1.25
     assert sig['view_arbitration'].default is False, 'view_arbitration must ship off'
@@ -4880,7 +4831,7 @@ def test_measured_tracker_configuration_is_the_default():
         return rows
 
     base = run()
-    explicit = run(assoc_mode='joint', max_age=8, max_move=1.25, view_arbitration=False)
+    explicit = run(max_age=8, max_move=1.25, view_arbitration=False)
     for t, (want, got) in enumerate(zip(base, explicit)):
         for i, name in enumerate(('boxes', 'scores', 'claimed')):
             np.testing.assert_array_equal(

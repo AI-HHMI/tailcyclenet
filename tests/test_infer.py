@@ -2076,14 +2076,12 @@ def _assoc_kwargs_for(sess, monkeypatch, extra_argv):
 
 
 def test_cross_view_defaults_select_the_measured_configuration():
-    """The parser defaults to the measured zero-switch tracker configuration, while every
-    experimental boolean remains opt-in and both spellings stay available for explicit sweeps.
-    `--assoc-mode` is closed over its two documented modes so a typo cannot silently select the
-    legacy per-camera path."""
+    """The parser defaults to the measured zero-switch tracker configuration, while the
+    remaining experimental boolean stays opt-in and both spellings stay available for explicit
+    sweeps."""
     from tailcyclenet.infer.cli import build_parser
 
     parser = build_parser()
-    assert parser.get_default('assoc_mode') == 'joint'
     assert parser.get_default('max_age') == 8
     assert parser.get_default('max_move') == 1.25
     assert parser.get_default('view_arbitration') is False
@@ -2092,41 +2090,33 @@ def test_cross_view_defaults_select_the_measured_configuration():
     for flag in ('--view-arbitration',):
         assert flag in options and flag.replace('--', '--no-', 1) in options, \
             f'{flag} must ship both spellings'
-    assert '--assoc-mode' in options
-    modes = next(a.choices for a in parser._actions if a.dest == 'assoc_mode')
-    assert list(modes) == ['per-camera', 'joint']
-    with pytest.raises(SystemExit):
-        parser.parse_args(['--run', 'r', '--out', 'o', '--assoc-mode', 'joint-ish'])
 
 
 def test_the_cross_view_evidence_flags_reach_associate_group(tmp_path, monkeypatch):
-    """CLI -> driver -> `associate_group`: both values arrive, and omitted they arrive as
-    the defaults rather than as nothing at all. The defaults are asserted POSITIVELY:
-    `associate_group` has to be told 'joint'/8/1.25, because a caller that quietly stops passing
-    them is indistinguishable from a wrong upstream default.
+    """CLI -> driver -> `associate_group`: `view_arbitration` arrives, and omitted it arrives as
+    the default rather than as nothing at all. The defaults are asserted POSITIVELY:
+    `associate_group` has to be told 8/1.25, because a caller that quietly stops passing them is
+    indistinguishable from a wrong upstream default.
     """
     _, sess, _, _ = _range_scene(tmp_path)
 
     default = _assoc_kwargs_for(sess, monkeypatch, [])
-    assert default['assoc_mode'] == 'joint'
     assert default['max_age'] == 8
     assert default['max_move'] == 1.25
     assert default['view_arbitration'] is False
 
-    on = _assoc_kwargs_for(sess, monkeypatch,
-                           ['--assoc-mode', 'joint', '--view-arbitration'])
-    assert on['assoc_mode'] == 'joint'
+    on = _assoc_kwargs_for(sess, monkeypatch, ['--view-arbitration'])
     assert on['view_arbitration'] is True
 
     off = _assoc_kwargs_for(sess, monkeypatch, ['--no-view-arbitration'])
-    assert off == {**on, 'assoc_mode': 'joint', 'view_arbitration': False}, \
+    assert off == {**on, 'view_arbitration': False}, \
         'the negative spellings must restore exactly the default association'
 
 
-def test_associate_group_hands_the_two_levers_to_the_tracker_and_ignores_them_in_2d(
+def test_associate_group_hands_the_lever_to_the_tracker_and_ignores_it_in_2d(
         tmp_path, monkeypatch):
-    """`associate_group` names both in its `CrossViewTracker(...)` call, and is inert where
-    no tracker is built."
+    """`associate_group` names it in its `CrossViewTracker(...)` call, and is inert where
+    no tracker is built.
 
     The construction is spied rather than the built tracker inspected, so this defends the THREAD
     (which is this change) and not the tracker's own attribute names (which are `track.py`'s).
@@ -2159,9 +2149,7 @@ def test_associate_group_hands_the_two_levers_to_the_tracker_and_ignores_them_in
     assert C > 1, 'the fixture must actually build a tracker'
     raw = (np.full((1, 2, C, 4), np.nan, np.float32),
            np.full((1, 2, C), np.nan, np.float32), None)
-    associate_group(raw, sess, 'g000', 1, track=True, assoc_mode='joint',
-                    view_arbitration=True)
-    assert seen.get('assoc_mode') == 'joint'
+    associate_group(raw, sess, 'g000', 1, track=True, view_arbitration=True)
     assert seen.get('view_arbitration') is True
     assert seen.get('max_res_px') == sess.assoc_res_max_px, \
         'the existing keywords must survive the new ones'
@@ -2172,6 +2160,6 @@ def test_associate_group_hands_the_two_levers_to_the_tracker_and_ignores_them_in
     raw_2d = (np.full((1, 2, 1, 4), np.nan, np.float32),
               np.full((1, 2, 1), np.nan, np.float32), None)
     state_2d = {}
-    associate_group(raw_2d, flat, 'g000', 1, track=True, state=state_2d, assoc_mode='joint',
+    associate_group(raw_2d, flat, 'g000', 1, track=True, state=state_2d,
                     view_arbitration=True)
     assert state_2d['tracker'] is None, 'the options must be inert where no tracker is built'

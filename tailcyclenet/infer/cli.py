@@ -267,17 +267,6 @@ def build_parser() -> argparse.ArgumentParser:
                          'own last-known box, not frame t-1). The measured default is 8; raising '
                          'it trades a hard identity loss for a longer-lived stale anchor that a '
                          'nearby animal can be wrongly matched onto.')
-    ap.add_argument('--assoc-mode', default='joint', choices=['per-camera', 'joint'],
-                    help='3D multiview, --track only. HOW a slot decides which detection is its '
-                         'animal. `joint` (measured default) forms cross-view candidate groups '
-                         'over ALL detections first (the residual-gated `associate`, so '
-                         '--assoc-res-max-px governs it) and then runs a SINGLE Hungarian over '
-                         'slots x groups, so identity is decided on multi-view evidence rather '
-                         'than on two independent 2D ones. `per-camera` is the legacy path: it '
-                         'runs one INDEPENDENT Hungarian per camera against each slot\'s '
-                         'reprojected 3D point and never checks that claims across cameras are '
-                         'the same animal. Joint costs a triangulation pass per frame and can '
-                         'withhold a slot whose cameras never agreed.')
     ap.add_argument('--view-arbitration', action=argparse.BooleanOptionalAction, default=False,
                     help='3D multiview, --track only. Down-weight a camera whose OWN detections '
                          'are mutually crowded: a view whose boxes sit on top of each other says '

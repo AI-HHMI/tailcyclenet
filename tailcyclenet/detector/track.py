@@ -26,7 +26,7 @@ import torch
 
 from posetail.posetail.cube import project_points_torch
 
-from .associate import _centres, _residual, _triangulate, associate
+from .associate import _centres, associate
 
 # Measured on 3dpop Sequence 59 frames 1000-1400 (dev/reports/53): a seated duplicate track's
 # triangulated points project 0.32-0.73 box sides apart in every camera it claims (per-frame
@@ -103,32 +103,26 @@ def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_sh
     return (max(gaps) <= radius and
             (identical or min(gaps) >= DUPLICATE_MIN_GAP))
 
-# THE DEFECT THE FOUR OPT-IN LEVERS BELOW ADDRESS, under the legacy `assoc_mode='per-camera'`
-# path specifically. That path runs one INDEPENDENT Hungarian per camera and nothing afterwards
-# checks that the detection a slot claimed in camera 0 and the one it claimed in camera 1 are the
-# same animal: whatever was claimed is triangulated and accepted if merely finite. `max_res_px`
-# is spent in exactly one place there -- the birth branch for unoccupied slots -- so with every
-# slot occupied the residual gate never executes at all under `per-camera`
-# (sweeping `--assoc-res-max-px` 15/20/40/50 produced byte-identical output at baseline, measured
-# on that path). UNDER THE NOW-DEFAULT `joint` MODE THIS IS STALE (independent review, report 53
-# follow-up): `_joint` calls `associate()` over the WHOLE detection pool every frame, so
-# `max_res_px` gates every candidate group in every frame, not only births. Do not read the
-# byte-identical sweep result above as evidence `--assoc-res-max-px` is inert under `joint` --
-# it has not been re-swept there. Under `per-camera`, a slot can still bind animal A in one view
-# to animal B in another, and the only symptom is a 3D point that silently drifts between the two.
+# HISTORICAL CONTEXT (the legacy `assoc_mode='per-camera'` path, deleted -- reports 53/54 measured
+# `joint` strictly better and no consumer of `per-camera` survived it). That path ran one
+# INDEPENDENT Hungarian per camera and nothing afterwards checked that the detection a slot
+# claimed in camera 0 and the one it claimed in camera 1 were the same animal: whatever was
+# claimed was triangulated and accepted if merely finite. `max_res_px` was spent in exactly one
+# place there -- the birth branch for unoccupied slots -- so with every slot occupied the residual
+# gate never executed at all under `per-camera`. Under `joint` (`_joint` below) this does not
+# apply: `associate()` runs over the WHOLE detection pool every frame, so `max_res_px` gates every
+# candidate group in every frame, not only births.
 #
-# The measurement that says this matters: on a 5-fish 2-camera clip (846 frames, ONE keypoint per
-# animal, so geometry is the only identity cue) the tracker reads MPJPE 0.291 mm / MOTA 0.962
+# The measurement that motivated `joint`: on a 5-fish 2-camera clip (846 frames, ONE keypoint per
+# animal, so geometry is the only identity cue) the OLD tracker read MPJPE 0.291 mm / MOTA 0.962
 # while `--no-track` -- the memoryless per-frame `associate`, which DOES group across views and
-# DOES gate on a residual -- reads 0.081 mm / 0.997. The memoryless observation model wins
-# decisively, which is what licenses spending code on getting it back into the tracker.
+# DOES gate on a residual -- read 0.081 mm / 0.997. The memoryless observation model won
+# decisively, which is what licensed spending code on getting it back into the tracker.
 #
-# THE MEASURED CONFIGURATION IS NOW THE DEFAULT: `joint`, max-age 8, and max-move 1.25. On the
+# THE MEASURED CONFIGURATION IS THE ONLY ONE NOW: `joint`, max-age 8, and max-move 1.25. On the
 # 3dzef 5-fish clip it has zero identity switches, full coverage, 0.100 mm MPJPE, and 0.309 mm
-# p99. The old per-camera path remains explicitly selectable for reproduction
-# (`assoc_mode='per-camera'`, max-age 24, max-move 1.0). Claim gating and view arbitration remain
-# opt-in because they did not improve this two-camera clip; each is independently toggleable so
-# a different rig can measure its own trade-off.
+# p99. View arbitration remains opt-in because it did not improve this two-camera clip; it is
+# independently toggleable so a different rig can measure its own trade-off.
 
 
 def _sides(boxes):
@@ -197,7 +191,6 @@ class CrossViewTracker:
     """
 
     def __init__(self, n_slots, max_res_px=30.0, max_move=1.25, max_age=8, min_views=2,
-                 assoc_mode='joint',
                  view_arbitration=False, duplicate_radius=DUPLICATE_RADIUS,
                  duplicate_persist=5):
         """Create an empty tracker with `n_slots` rows.
@@ -210,8 +203,6 @@ class CrossViewTracker:
                 max_age -- frames without evidence before a slot is retired; 8 is the measured
                     default.
                 min_views -- minimum cameras a birth must be seen in.
-                assoc_mode -- 'joint' (measured default: cross-view candidate groups, then ONE
-                    Hungarian) or 'per-camera' (the legacy independent-Hungarian path).
                 view_arbitration -- lever 4: discount a camera whose detections are crowded.
                 duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
                     scale-free default (measured band, report 53).
@@ -219,20 +210,14 @@ class CrossViewTracker:
                     before a seated duplicate pair is retired; 5 is the measured default.
 
         `self.targets` maps slot -> {'point': (3,) float32 tensor, 'age': int}. 'point' and 'age'
-        keep their meaning in every mode: the last TRIANGULATED point and frames since the last
-        evidence. The measured 3dzef defaults are `assoc_mode='joint'`, `max_age=8`,
-        `max_move=1.25`.
-
-        `ambiguous` is a plain attribute, sweepable without a constructor argument, in the manner
-        of `soft_argmax_threshold`.
+        keep their meaning throughout: the last TRIANGULATED point and frames since the last
+        evidence. The measured 3dzef defaults are `max_age=8`, `max_move=1.25`.
         """
-        assert assoc_mode in ('per-camera', 'joint'), f'unknown assoc_mode {assoc_mode!r}'
         self.n = int(n_slots)
         self.max_res_px = float(max_res_px)
         self.max_move = float(max_move)
         self.max_age = int(max_age)
         self.min_views = int(min_views)
-        self.assoc_mode = str(assoc_mode)
         self.view_arbitration = bool(view_arbitration)
         if duplicate_radius < 0:
             raise ValueError('duplicate_radius must be non-negative')
@@ -243,7 +228,6 @@ class CrossViewTracker:
         self._dup_shield = set()
         self._dup_anchor = {}
         self._last_claims = {}
-        self.ambiguous = 0.5
         self.targets = {}
         self.events = []
         self._t = -1
@@ -265,40 +249,6 @@ class CrossViewTracker:
         Side effects: sets `targets[s]['point']`.
         """
         self.targets[s]['point'] = new
-
-    def _trim(self, cgroup, centres, got_s):
-        """Every camera a slot claimed this frame survives untrimmed. -> (kept, dropped).
-
-        Inputs: cgroup -- camera dicts; centres -- per-camera (n,2) detection centres;
-                got_s -- {camera: detection index} one slot claimed this frame.
-        Outputs: two camera tuples: the ones that survive (all of them), and the ones dropped
-            (always empty).
-        Side effects: none.
-        """
-        return tuple(sorted(got_s)), ()
-
-    def _voters(self, kept, got_s, weights):
-        """Lever 4, per-camera mode: which of a slot's claims may vote on its 3D point.
-
-        Inputs: kept -- the cameras surviving `_trim`; got_s -- {camera: detection index};
-                weights -- `_crowd_weights` output, or None when the lever is off.
-        Outputs: a camera tuple, a subset of `kept`.
-        Side effects: none.
-
-        THE RULE: a camera whose claimed detection sits closer than `ambiguous` (half a gate
-        width) to another detection in the SAME camera does not triangulate, provided at least
-        two unambiguous cameras remain; otherwise there is nothing better to fall back on and
-        every claim votes as before. Its box is still emitted -- crowding is uncertainty, not
-        proof of a wrong claim, and that box is still the best crop that camera has to offer,
-        so the discount is spent where a mistake is permanent (the carried 3D point) and not
-        where it costs a frame of pose. That asymmetry is the whole difference between this
-        lever and lever 1, which has a residual PROVING the claim wrong and therefore withholds
-        the box too.
-        """
-        if weights is None or len(kept) < 2:
-            return kept
-        good = tuple(c for c in kept if float(weights[c][got_s[c]]) >= self.ambiguous)
-        return good if len(good) >= 2 else kept
 
     def step(self, cgroup, boxes_per_cam, scores_per_cam):
         """Match, update, birth, retire. -> (boxes (S,C,4), scores (S,C), claimed (S,C)) numpy.
@@ -324,9 +274,7 @@ class CrossViewTracker:
             own side (not the mean with the target's remembered side -- measured worse). A
             one-camera target never expires or updates its 3D point; retiring it was measured
             worse (+2.72 mm MPJPE) because output boxes come from the claimed detection, never
-            the reprojection. Everything above `_per_camera` / `_joint` is SHARED, including
-            which slots are matchable and how the unmatchable ones age, so the four levers can
-            only change which detections a slot ends up holding -- never the state machine.
+            the reprojection.
         """
         self._t += 1
         C = len(cgroup)
@@ -343,9 +291,8 @@ class CrossViewTracker:
         pts = (torch.stack([self._predict(s) for s in slots]) if slots else None)
         weights = (_crowd_weights(centres, sides, self.max_move)
                    if self.view_arbitration else None)
-        branch = self._joint if self.assoc_mode == 'joint' else self._per_camera
-        branch(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
-              weights, out, sc, claimed_ix)
+        self._joint(cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
+                   weights, out, sc, claimed_ix)
         self._suppress_duplicate_targets(cgroup, out, sc, claimed_ix)
         for s in [s for s, t in self.targets.items() if t['age'] > self.max_age]:
             self.events.append({'frame': self._t, 'slot': s, 'event': 'died',
@@ -519,96 +466,6 @@ class CrossViewTracker:
                                         'boxes': self._claim_evidence(out, winner), 'stale': 0}
             for k in [k for k in self._dup_contact if loser in k or winner in k]:
                 del self._dup_contact[k]
-
-    def _per_camera(self, cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
-                    weights, out, sc, claimed_ix):
-        """The shipped matching phase: one INDEPENDENT Hungarian per camera. -> updated slots.
-
-        Inputs: the frame's cameras, boxes, scores, precomputed centres/sides, the matchable
-            `slots` with their predicted points `pts`, `weights` from `_crowd_weights` or None,
-            and the three output arrays, written in place.
-        Outputs: the set of slots whose 3D point was re-triangulated (for `_decay`).
-        Side effects: mutates `self.targets` (points, ages, births) and the output arrays.
-
-        With both levers off this is byte-for-byte the historical path: `_trim` returns every
-        claim, `_voters` returns every kept camera, and the slot triangulates over exactly what
-        it claimed. Lever 1 releases a dropped detection back into the leftover pool the birth
-        branch draws from -- it was decided NOT to be this animal, so it is a candidate to be
-        another one, and holding it hostage would turn one bad claim into a missed animal.
-
-        A dropped claim leaves the slot's box, score and `claimed_ix` empty for that camera:
-        `claimed_ix` is what the keypoints follow, so a claim that is not trusted enough to
-        triangulate is not trusted enough to crop from either. Near-tied assignments are
-        decided by age exactly as in `_joint` (1/16 of the affinity range per fresh slot;
-        report 53): two slots stranded on one animal stop alternating and the loser starves.
-        """
-        from scipy.optimize import linear_sum_assignment
-
-        C = len(cgroup)
-        claimed = {c: set() for c in range(C)}
-        got = {s: {} for s in slots}
-        updated = set()
-
-        for c in range(C):
-            n_det = centres[c].shape[0]
-            if not slots or not n_det:
-                continue
-            proj = _project(cgroup[c], pts)
-            d = torch.linalg.norm(proj[:, None] - centres[c][None], dim=-1)
-            side = sides[c][None].clamp_min(1e-6)
-            gap = (d / (self.max_move * side)).numpy()
-            affinity = np.nan_to_num(np.clip(1.0 - gap, 0.0, None), nan=0.0)
-            if not affinity.any():
-                continue
-            affinity = np.where(
-                affinity > 0,
-                affinity * 16.0 + np.array([[_age_term(self.targets[s].get('age', 0))
-                                             for s in slots]]).T,
-                0.0)
-            ri, ci = linear_sum_assignment(-affinity)
-            for i, j in zip(ri, ci):
-                if affinity[i, j] > 0:
-                    got[slots[i]][c] = int(j)
-                    claimed[c].add(int(j))
-
-        for s in slots:
-            kept, dropped = self._trim(cgroup, centres, got[s])
-            for c in dropped:
-                claimed[c].discard(got[s].pop(c))
-            cams = self._voters(kept, got[s], weights)
-            if len(cams) >= 2:
-                p = torch.stack([centres[c][got[s][c]] for c in cams])
-                new = _triangulate(cgroup, cams, p)
-                if bool(torch.isfinite(new).all()):
-                    self._advance(s, new)
-                    self._residuals[s] = _residual(cgroup, cams,
-                                                   torch.stack([centres[c][got[s][c]] for c in cams]),
-                                                   new)
-                    updated.add(s)
-            for c, j in got[s].items():
-                out[s, c] = boxes_per_cam[c][j].numpy()
-                sc[s, c] = float(scores_per_cam[c][j])
-                claimed_ix[s, c] = j
-            self.targets[s]['age'] = 0 if got[s] else self.targets[s]['age'] + 1
-
-        free = [s for s in range(self.n) if s not in self.targets]
-        if free:
-            keep = [[j for j in range(centres[c].shape[0]) if j not in claimed[c]]
-                    for c in range(C)]
-            if any(keep):
-                left = [boxes_per_cam[c][keep[c]] if keep[c]
-                        else boxes_per_cam[c].new_zeros((0, 4)) for c in range(C)]
-                born = associate(cgroup, left, max_res_px=self.max_res_px,
-                                 min_views=self.min_views, max_instances=len(free))
-                for s, g in zip(free, born):
-                    if self._birth_duplicates_target(cgroup, g, out):
-                        self.events.append({'frame': self._t, 'slot': s,
-                                            'event': 'birth_refused',
-                                            'detail': {'cameras': sorted(g.get('members', {}))}})
-                        continue
-                    self._birth(s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam,
-                                lambda c, j, k=keep: k[c][j])
-        return updated
 
     def _birth(self, s, g, out, sc, claimed_ix, boxes_per_cam, scores_per_cam, remap):
         """Seat one `associate` group in free slot `s`.

@@ -505,7 +505,8 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
         trim_to_shortest=False, dump_session=None, data=None, split=None,
         anchor='none', oracle_corrupt=None, refine_px=None, refine=None,
         max_frames=0, start_frame=0, end_frame=0, max_ram=17.0, dataset_name=None,
-        box_prompt='none', detector=None, boxes='b.npz', max_animals=1)
+        box_prompt='none', detector=None, boxes='b.npz', max_animals=1,
+        out=tmp_path / 'out')
     try:
         with pytest.raises(SystemExit, match='the budget has been observed'):
             driver.run_dataset(args)

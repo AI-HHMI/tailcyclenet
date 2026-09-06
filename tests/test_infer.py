@@ -2081,3 +2081,50 @@ def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
     cli.main()
     preds_lo, _ = load_predictions(out_lo)
     assert np.isfinite(preds_lo['s/g000']['pred']).any(), 'the ungated control must be unchanged'
+
+
+def test_a_nonempty_out_directory_is_refused_before_the_checkpoint_loads(cli, monkeypatch,
+                                                                         tmp_path):
+    """A3 (dev/plans/multianimal_system_improvements.md): reusing an output session directory
+    would silently mix an old table (or an old `identity_events.pq`) into the new session, since
+    a table with no NEW rows is never (re)created. Refused BEFORE `load_run`, same as the
+    multi-session refusal.
+    """
+    import conftest as cf
+
+    root = tmp_path / 'ds'
+    cf._session_2d(root / 'test' / 's')
+
+    out = tmp_path / 'pred'
+    out.mkdir()
+    (out / 'stale.pq').write_bytes(b'not really parquet, just needs to exist')
+
+    def boom(*a, **k):
+        raise AssertionError('the refusal must fire before the checkpoint loads')
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
+                                      '--data', str(root / 'test' / 's'), '--split', 'test',
+                                      '--device', 'cpu', '--out', str(out)])
+    with pytest.raises(SystemExit, match='not empty'):
+        cli.main()
+
+
+def test_out_may_not_name_the_source_session(cli, monkeypatch, tmp_path):
+    """A3: `--out` pointed at `--data` would write a prediction into the labels it is scored
+    against -- refused before the checkpoint loads.
+    """
+    import conftest as cf
+
+    root = tmp_path / 'ds'
+    cf._session_2d(root / 'test' / 's')
+
+    def boom(*a, **k):
+        raise AssertionError('the refusal must fire before the checkpoint loads')
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
+                                      '--data', str(root / 'test' / 's'), '--split', 'test',
+                                      '--device', 'cpu', '--out', str(root / 'test' / 's')])
+    with pytest.raises(SystemExit, match='SOURCE session'):
+        cli.main()

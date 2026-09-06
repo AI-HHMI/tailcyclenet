@@ -398,6 +398,18 @@ def run_dataset(args):
     _budget = _memory.current(override_gb=args.max_ram)
     print(f'ram: {_budget}')
 
+    if not args.videos and args.data is not None and Path(args.data).resolve() == args.out.resolve():
+        raise SystemExit(
+            f'--out {args.out} names the SOURCE session itself (--data). Writing a prediction '
+            "into the labels it is scored against is not a run -- point --out somewhere else.")
+    if args.out.exists() and any(args.out.iterdir()):
+        raise SystemExit(
+            f'{args.out}: the output session directory is not empty. A run writes a block at a '
+            'time and a table with no NEW rows is never created, so reusing a directory would '
+            'silently mix an old table (or an old identity_events.pq) into the new session as '
+            'if this run had written it. Point --out at a fresh directory; nothing is deleted '
+            'automatically.')
+
     assoc_res_max_px = (args.assoc_res_max_px if args.assoc_res_max_px is not None else 30.0)
 
     if args.videos:

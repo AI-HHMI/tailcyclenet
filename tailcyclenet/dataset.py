@@ -1021,9 +1021,10 @@ class PoseDataset(Dataset):
 
         Geometry: camera and crop-inflate draws are one per item (camera draw sorted). Points
         outside the source frame or the FINAL crop are flipped out of `vis_2d`; a rotation that
-        loses the animal to the inscribed crop is REVERTED, not retried. Pixels: appearance
-        augmentation runs on the final ~256 px crops; views are UINT8 (4x fewer bytes to
-        collate/queue/pin; the model divides on device).
+        loses the animal to the inscribed crop is REVERTED, not retried.
+
+        Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
+        fewer bytes to collate/queue/pin; the model divides on device).
 
         The query prior: `kpt_prior` is the pose at the prompt frame (GT at training, the
         previous window's own prediction at deployment); `prompt_t` is the first labelled frame;
@@ -1031,9 +1032,8 @@ class PoseDataset(Dataset):
         noise/offset in PIXELS, stale priors, `prompt_swap_animal`, `prompt_swap_kpt_pairs`
         (finite entries independently replaced by another keypoint's ORIGINAL position), and a
         whole-body offset -- ONE vector per item. `pose_only_prob` (0 = byte-identical) hoists
-        the box-dropout coin EARLY so a box-dropped item can also skip EVERY corruption below
-        (offset/noise/both swaps; RNG draws still fire, untouched otherwise), REPLACING not
-        adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
+        the box-dropout coin EARLY so a box-dropped item can also skip these corruptions,
+        REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
 
         The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
         last frame); the final 3D noisy-OR is over the FINAL `vis_2d`.
@@ -1229,7 +1229,7 @@ class PoseDataset(Dataset):
             neighbour_prior[prior_out_of_bounds(neighbour_prior, mode_str, cgroup)] = float('nan')
             jump = (torch.as_tensor(rng.random(K)) < self.cfg.prompt_swap_animal) \
                 & torch.isfinite(neighbour_prior).all(-1)
-            if not dropped_fully and not pose_only_active:
+            if not dropped_fully:
                 kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
         if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
             finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]
@@ -1240,10 +1240,9 @@ class PoseDataset(Dataset):
                     local = torch.arange(m)[sel]
                     offset = torch.from_numpy(rng.integers(1, m, size=int(sel.sum())))
                     src_idx = finite_idx[(local + offset) % m]
-                    if not pose_only_active:
-                        original = kpt_prior
-                        kpt_prior = kpt_prior.clone()
-                        kpt_prior[finite_idx[sel]] = original[src_idx]
+                    original = kpt_prior
+                    kpt_prior = kpt_prior.clone()
+                    kpt_prior[finite_idx[sel]] = original[src_idx]
         if self.train and not pose_only_active and self.cfg.prompt_offset_px > 0 \
                 and bool(torch.isfinite(kpt_prior).any()):
             kpt_prior += torch.as_tensor(

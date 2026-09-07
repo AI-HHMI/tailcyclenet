@@ -1616,36 +1616,6 @@ def test_pose_only_prob_gives_box_dropped_items_a_clean_prior(tiny_root):
         'dropout=0 would, not the corrupted one prompt_dropout=1.0 alone would produce'
 
 
-def test_pose_only_active_items_are_never_swapped(tiny_root):
-    """L-34 (dev/reports/56_multianimal_system_improvements_plan.md Session 23): a pose-only
-    item's prior must ALSO carry NONE of `prompt_swap_animal`/`prompt_swap_kpt_pairs`'s
-    corruption -- both RNG draws still fire (a non-pose-only item's stream is untouched, matching
-    the existing offset/noise gate's own discipline), only the swap APPLICATION is gated.
-    """
-    root = tiny_root / 'ratlike'
-    clean_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
-                             crop_jitter=0.0, prompt_dropout=0.0, prompt_offset_px=0.0,
-                             prompt_noise_px=0.0, prompt_swap_animal=0.0,
-                             prompt_swap_kpt_pairs=0.0)
-    clean_ds = PoseDataset(root, 'train', clean_cfg, train=True)
-
-    corrupt_cfg = replace(clean_cfg, prompt_swap_animal=1.0, prompt_swap_kpt_pairs=1.0,
-                         box_prompt='film', box_prompt_dropout=1.0, pose_only_prob=1.0)
-    pose_only_ds = PoseDataset(root, 'train', corrupt_cfg, train=True)
-
-    np.random.seed(0)
-    clean_item = clean_ds._item(0, np.random.default_rng(0))
-    np.random.seed(0)
-    pose_only_item = pose_only_ds._item(0, np.random.default_rng(0))
-    assert clean_item is not None and pose_only_item is not None
-
-    clean_prior, pose_only_prior = clean_item[11], pose_only_item[11]
-    assert torch.equal(torch.nan_to_num(clean_prior, nan=-9e9),
-                       torch.nan_to_num(pose_only_prior, nan=-9e9)), \
-        'prompt_swap_animal=1.0, prompt_swap_kpt_pairs=1.0 must NOT touch a pose-only item\'s ' \
-        'prior, even though both corruptions are guaranteed to fire on a non-pose-only item'
-
-
 # ----------------------------------------------------------------------------------------------
 # A1 (dev/plans/multianimal_system_improvements.md): a whole-item dropout stays query-free
 # ----------------------------------------------------------------------------------------------

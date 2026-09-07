@@ -304,12 +304,13 @@ def main():
       matter because the mean cannot show one: an arm that declines hard animals has a
       flattering mean and a p90 that says so. `kpt_agree` is unbounded in 2D where `box_agree`
       is capped by construction. The vis head's TARGET, not its output, is printed: a `base` at
-      1.000 means there is nothing for `--vis-thresh` to learn. PCK is computed from the same
-      arrays the table was computed from -- re-deriving the slicing from the npz got it wrong
-      whenever pred and true disagreed on S or T. MOTA's FP term splits into `dup` (landed on
-      an already-claimed animal; arbitration removes it) and `none` (no labelled animal; a
-      threshold removes it), and both radii are shown: MPJPE matches at the full box diagonal,
-      MOTA at half of it.
+      1.000 means there is nothing for `--vis-thresh` to learn. PCK reuses the table's own
+      arrays (re-deriving the slicing from the npz got it wrong whenever pred and true
+      disagreed on S or T), excluding `St == 0` groups -- nothing to measure PCK against, and
+      the point COUNT, not just the content, would otherwise disagree. MOTA's FP term splits
+      into `dup` (an already-claimed animal; arbitration removes it) and `none` (no labelled
+      animal; a threshold removes it); both radii show: MPJPE at the full box diagonal, MOTA at
+      half of it.
     - `--vs`: the second file must be chunked the same way or the pairing finds nothing in
       common; `labels` is already the chunked lookup, so it is reused. Complete-case pairing
       flatters the arm that failed more, so the drop count is printed. The shared set is the
@@ -433,11 +434,13 @@ def main():
 
         thresholds = ([float(t) for t in args.pck.split(',')] if args.pck
                       else ([2.0, 5.0, 10.0] if unit == 'mm' else [5.0, 10.0, 20.0]))
-        allp = np.concatenate([m.get('_pred_matched', m['_pred']).reshape(-1, m['_pred'].shape[-1])
-                               for m in block])
-        allt = np.concatenate([m['_true'].reshape(-1, m['_true'].shape[-1]) for m in block])
-        for k, v in pck(allp, allt, thresholds).items():
-            print(f'[{mode}] {k} ({unit})  {v:.4f}')
+        pck_block = [m for m in block if m['_true'].shape[0] > 0]
+        if pck_block:
+            allp = np.concatenate([m.get('_pred_matched', m['_pred']).reshape(-1, m['_pred'].shape[-1])
+                                   for m in pck_block])
+            allt = np.concatenate([m['_true'].reshape(-1, m['_true'].shape[-1]) for m in pck_block])
+            for k, v in pck(allp, allt, thresholds).items():
+                print(f'[{mode}] {k} ({unit})  {v:.4f}')
 
     multi = [m for m in rows if m['S'] > 1]
     if multi:

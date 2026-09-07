@@ -592,3 +592,31 @@ def test_mota_fp_detail_labels_dup_and_none_consistently_with_the_counts():
         by_kind[item['kind']].append(item['pred_row'])
     assert by_kind['dup'] == [1], 'the near-duplicate row must be classified dup'
     assert by_kind['none'] == [2], 'the bare false positive must be classified none'
+
+
+def test_score_skips_motion_ratio_rather_than_crashing_when_a_group_has_zero_true_instances():
+    """A tracked-only clip with no keypoint labels at all (S_true=0) still gets a real prediction
+    row (S_pred=1) -- e.g. facemap's `cam0_D*` sessions, included for tracking/visual inspection,
+    not pose scoring. Neither existing guard in `score()` catches this: `S = max(Sp, St) = 1` is
+    not `> 1`, and `Sp == 0 and St >= 1` is false (Sp is 1, not 0). Before this fix, the
+    unconditional `motion_ratio(pred, true)` call hit a hard shape mismatch -- (1,T,K,2) vs
+    (0,T,K,2) -- and raised, taking down the whole batch. motion_ratio is undefined with zero
+    reference instances (there is no path to compare against), so it must be skipped exactly as
+    MPJPE already is for zero labelled points elsewhere in this module -- not silently zeroed,
+    not crashed on.
+    """
+    from tailcyclenet.format import Labels
+
+    T, K = 12, 4
+    true = np.full((0, T, K, 1, 2), np.nan, np.float32)
+    lab = Labels(animal_ids=[], points3d=None, vis3d=None, points2d=true, vis2d=None,
+                boxes=None, instance=None)
+    pred = np.random.default_rng(0).normal(size=(1, T, K, 2)).astype(np.float32)
+    preds = {'s/g': {'pred': pred, 'mode': np.array('2d')}}
+    labels = {'s/g': (lab, None)}
+
+    ev = _eval_module()
+    rows = ev.score(preds, labels, quiet=True)
+    assert len(rows) == 1
+    assert rows[0]['S_pred'] == 1 and rows[0]['S_true'] == 0
+    assert rows[0]['motion_ratio'] is None

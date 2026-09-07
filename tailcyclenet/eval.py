@@ -96,35 +96,35 @@ def chunk_frames(preds, labels, n):
 
 def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_cost='mean'):
     """One row per group: error, the coverage behind it, MOTA where there are instances.
-
     Factored out so `--vs` scores the second file through the identical path.
 
     Surplus predicted rows are not discardable: truncating `pred` to `true`'s row count deletes
     them as coverage, not as false positives -- the matchers all take Sp != St; only
     `error_and_coverage` needs equal shapes, and row-indexed error is meaningless under detector
-    boxes. Row index is not identity under detector boxes: match first, then measure, taking the
-    matched counts so coverage describes the same points as the error. The `__extent__` carried
-    by `--chunk` is the WHOLE group's. Zero is a finite, valid radius: one finite labelled
-    keypoint gives a 0 diagonal, so a sparse root can read as a catastrophic failure that is an
-    artefact of the radius.
+    boxes. Row index is not identity there either: match first, then measure, taking the matched
+    counts so coverage describes the same points as the error. The `__extent__` carried by
+    `--chunk` is the WHOLE group's; zero is a finite, valid radius (one finite labelled keypoint
+    gives a 0 diagonal), so a sparse root can read as a catastrophic failure that is an artefact
+    of the radius.
 
     PCK gets the same pairing as the error: it reads positionally, so detector boxes need the
     aligned rows. NOT shared with MOTA, which reads the raw rows -- aligning them first would
-    zero `idsw` by construction. The alignment is shaped like true (a label row index), not
-    pred.
+    zero `idsw` by construction. The alignment is shaped like true (a label row index), not pred.
 
     `motion_ratio` screens how much the prediction moved vs the animal -- a carried prompt
-    low-passes the prediction, which no error/coverage/MOTA column can see; `--vs` pairs it.
+    low-passes the prediction, which no error/coverage/MOTA column can see; `--vs` pairs it. `St
+    == 0` (a tracked-only clip with a real prediction but no labels) skips it as `None`: zero true
+    instances is an undefined reference path, past both guards above, not merely an unmatched one.
+
     `box_agree` is where the pose landed relative to its own crop box, in units of one box side:
     a pose off its crop is not a prediction of that animal. `kpt_agree` is the 2D half of the
-    same check: `box_agree` is structurally bounded in 2D (the pose is decoded inside its own
-    crop), while the detector's keypoints are regressed in the full frame, so `kpt_agree` has no
-    ceiling and is the 2D diagnostic.
+    same check, unbounded (the detector's keypoints are regressed in the full frame, unlike a
+    pose decoded inside its own crop), so it is the 2D diagnostic.
 
     Groups are visited in each group's own TEMPORAL order (`__chunk_of__`/`__t0__`, not the
-    lexical `{key}#{t0}` string -- `t0` is unpadded, so `'s/g#1000'` sorts before `'s/g#500'`),
-    so `mota`'s threaded `last` correspondence dict (one per group, in `mota_state`) sees each
-    chunk in the order it happened; unchunked input sorts by key alone, as before.
+    lexical `{key}#{t0}` string, which sorts `'s/g#1000'` before `'s/g#500'`), so `mota`'s
+    threaded `last` dict (one per group, in `mota_state`) sees each chunk in order; unchunked
+    input sorts by key alone, as before.
     """
     rows = []
     mota_state = {}
@@ -176,8 +176,8 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
         m['S'] = S
         m['S_pred'], m['S_true'] = Sp, St
         m['_pred'], m['_true'] = pred, true
-        mr = motion_ratio(m.get('_pred_matched', pred), true)
-        m['motion_ratio'] = mr['ratio'] if mr['n_steps'] else None
+        mr = motion_ratio(m.get('_pred_matched', pred), true) if St else None
+        m['motion_ratio'] = mr['ratio'] if mr and mr['n_steps'] else None
         if 'box_agree' in out:
             ba = np.asarray(out['box_agree'], float)
             ba = ba[np.isfinite(ba)]

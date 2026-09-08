@@ -16,9 +16,9 @@ import numpy as np
 
 from tailcyclenet.format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.infer.predictions import load_predictions
-from tailcyclenet.metrics import (ERR_PCTS, error_and_coverage, idsw_stability_band,
-                                  match_instances, matched_error, mota, motion_ratio,
-                                  paired_bootstrap, pck)
+from tailcyclenet.metrics import (ERR_PCTS, _per_frame_means, error_and_coverage,
+                                  idsw_stability_band, match_instances, matched_error, mota,
+                                  motion_ratio, paired_bootstrap, pck)
 
 _PCT_KEYS = tuple(f'p{p}' for p in ERR_PCTS)
 
@@ -159,7 +159,8 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             mm = matched_error(pred, true, max_dist=max_dist,
                                min_kpts_frac=min_kpts_frac, cost=match_cost)
             m.update({k: v for k, v in mm.items()
-                      if k in ('err', 'median', 'coverage', 'n_true', 'n_matched')
+                      if k in ('err', 'median', 'coverage', 'n_true', 'n_matched',
+                               'frame_err', 'frame_sum', 'frame_n')
                       or k in _PCT_KEYS})
             m['unmatched'] = mm.get('unmatched_true', 0)
             aligned = np.full_like(true, np.nan)
@@ -341,6 +342,15 @@ def main():
                     help='split each group into N-frame scoring units (the bootstrap resamples '
                          'groups, so a long clip is one group and reads DEGENERATE). Chunks of one '
                          'clip are within-clip uncertainty; say which a number is.')
+    ap.add_argument('--agg', choices=('frame', 'group'), default='frame',
+                    help='which unit the headline MPJPE averages over. `frame` (the DEFAULT) '
+                         'gives every labelled frame equal weight; `group` is the HISTORICAL '
+                         'convention every number published before 2026-09-08 used, where one '
+                         'clip is one unit however many frames it holds. They differ only on '
+                         'roots with unequal group sizes -- on a root with one labelled frame per '
+                         'group (crim13, facemap) they are identical. BOTH are always printed; '
+                         'this only selects which is the headline. The resampling unit is the '
+                         'GROUP either way.')
     ap.add_argument('--match-cost', choices=('mean', 'penalised'), default='mean',
                     help="how a candidate pair's per-keypoint distances become one number. "
                          "'mean' (the default, and what every published number here used) divides "
@@ -392,11 +402,23 @@ def main():
         if not block:
             continue
         unit = 'mm' if mode == '3d' else 'px'
-        boot = paired_bootstrap([m['err'] for m in block], seed=args.seed)
+        boot_group = paired_bootstrap([m['err'] for m in block], seed=args.seed)
+        boot_frame = paired_bootstrap([m.get('frame_err', float('nan')) for m in block],
+                                      seed=args.seed,
+                                      weights=[m.get('frame_n', 0) for m in block])
+        boot = boot_frame if args.agg == 'frame' else boot_group
+        other, other_name = ((boot_group, 'per-group') if args.agg == 'frame'
+                             else (boot_frame, 'per-frame'))
+        n_frames = sum(m.get('frame_n', 0) for m in block)
         n_true = sum(m['n_true'] for m in block)
         n_match = sum(m['n_matched'] for m in block)
         print(f'\n[{mode}] MPJPE {boot["mean"]:.3f} {unit}  '
-              f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% bootstrap over {boot["n"]} group(s)')
+              f'[{boot["lo"]:.3f}, {boot["hi"]:.3f}] 95% bootstrap over {boot["n"]} group(s)'
+              f'  --agg {args.agg}'
+              + (f', {n_frames} frame(s)' if args.agg == 'frame' else ''))
+        print(f'[{mode}] MPJPE {other_name} {other["mean"]:.3f} {unit}  '
+              f'[{other["lo"]:.3f}, {other["hi"]:.3f}]  (the other aggregation, printed so a '
+              'number is never compared across conventions by accident)')
         if not n_true:
             print(f'[{mode}] coverage n/a: no labelled points in the scored frames. The prediction '
                   'is shorter than the labels (--max-frames?) and the labelled frames are past '
@@ -480,13 +502,18 @@ def main():
                 continue
             unit = 'mm' if mode == '3d' else 'px'
             ea, eb, shared, nlab = [], [], 0, 0
+            fa_, fb_, fn_ = [], [], []
             for a, b in block:
-                da, db, n, nl = _shared_error(a, b)
+                da, db, n, nl, fa, fb, fn = _shared_error(a, b)
                 ea.append(da)
                 eb.append(db)
+                fa_.append(fa)
+                fb_.append(fb)
+                fn_.append(fn)
                 shared += n
                 nlab += nl
-            d = paired_bootstrap(ea, eb, seed=args.seed)
+            d = (paired_bootstrap(fa_, fb_, seed=args.seed, weights=fn_)
+                 if args.agg == 'frame' else paired_bootstrap(ea, eb, seed=args.seed))
             ci = ('DEGENERATE (one group -- no interval exists)' if d['n'] < 2
                   else f'[{d["lo"]:+.4f}, {d["hi"]:+.4f}]'
                        + ('' if d['lo'] <= 0 <= d['hi'] else '  *'))
@@ -533,9 +560,14 @@ def main():
 
 
 def _shared_error(a, b):
-    """(err_a, err_b, n_shared, n_labelled) over the points BOTH arms matched.
+    """(err_a, err_b, n_shared, n_labelled, frame_a, frame_b, frame_n) over the points BOTH arms
+    matched.
 
     Restricting to the intersection makes the delta about accuracy, not coverage.
+
+    The per-FRAME figures use that same shared mask, so both arms are averaged over EXACTLY the
+    same frames and `frame_n` is one weight valid for the paired difference -- which is what lets
+    `--agg frame` weight the delta without breaking the pairing.
     """
     pa = a.get('_pred_matched', a['_pred'])
     pb = b.get('_pred_matched', b['_pred'])
@@ -546,10 +578,16 @@ def _shared_error(a, b):
     ok = (np.isfinite(pa).all(-1) & np.isfinite(pb).all(-1) & np.isfinite(true).all(-1))
     n_lab = int(np.isfinite(true).all(-1).sum())
     if not ok.any():
-        return float('nan'), float('nan'), 0, n_lab
+        return float('nan'), float('nan'), 0, n_lab, float('nan'), float('nan'), 0
     da = np.linalg.norm(pa[ok] - true[ok], axis=-1)
     db = np.linalg.norm(pb[ok] - true[ok], axis=-1)
-    return float(da.mean()), float(db.mean()), int(ok.sum()), n_lab
+    fa = np.where(ok, np.linalg.norm(pa - true, axis=-1), np.nan)
+    fb = np.where(ok, np.linalg.norm(pb - true, axis=-1), np.nan)
+    ma, mb = _per_frame_means(fa), _per_frame_means(fb)
+    keep = np.isfinite(ma) & np.isfinite(mb)
+    return (float(da.mean()), float(db.mean()), int(ok.sum()), n_lab,
+            float(ma[keep].mean()) if keep.any() else float('nan'),
+            float(mb[keep].mean()) if keep.any() else float('nan'), int(keep.sum()))
 
 
 def _shared_motion(a, b):

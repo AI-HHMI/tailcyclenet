@@ -34,9 +34,51 @@ def _err_pcts(d) -> dict:
     return {f'p{p}': float(np.percentile(d, p)) for p in ERR_PCTS}
 
 
+def _frame_stats(frame_means) -> dict:
+    """Per-FRAME aggregation of a matched-distance array -> the two numbers a ratio estimator
+    needs. `frame_means` is one mean per frame, NaN where the frame matched nothing.
+
+    Inputs: frame_means -- 1-D per-frame mean distances (NaN = frame contributed no matched
+            point).
+    Outputs: {'frame_err', 'frame_sum', 'frame_n'} -- the group's per-frame mean error, the sum
+            of its per-frame means, and the number of frames behind it.
+
+    Two numbers rather than one because the cross-group estimand is a RATIO --
+    `sum(frame_sum) / sum(frame_n)` -- so that every labelled frame counts once regardless of how
+    long its clip is. A plain mean of per-group `frame_err` values would re-introduce exactly the
+    group weighting this is meant to remove (report 57 sections 22/24: on horse10, 696 short
+    groups outvote the 19 holding 73.5% of all labelled keypoints).
+
+    Frames that matched nothing are EXCLUDED rather than scored as zero or infinity, which keeps
+    `err`'s standing contract -- a mean over matched points, read beside `coverage` (eval rule 6).
+    """
+    fm = np.asarray(frame_means, float)
+    ok = np.isfinite(fm)
+    return {'frame_err': float(fm[ok].mean()) if ok.any() else float('nan'),
+            'frame_sum': float(fm[ok].sum()), 'frame_n': int(ok.sum())}
+
+
+def _per_frame_means(d):
+    """Mean matched distance per frame. `d` is `(..., T, K)`; the frame axis is -2.
+
+    A frame that matched nothing is an all-NaN slice, which `nanmean` answers with NaN and a
+    RuntimeWarning; the NaN is the wanted answer (`_frame_stats` drops it), so the warning is
+    suppressed rather than the frame being special-cased.
+    """
+    d = np.asarray(d, float)
+    axes = tuple(i for i in range(d.ndim) if i != d.ndim - 2)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        return np.nanmean(d, axis=axes)
+
+
 def error_and_coverage(pred, true) -> dict:
     """MPJPE over points BOTH sides have, plus the coverage that produced it. `n_true` is the
     denominator that matters -- coverage = n_matched / n_true.
+
+    Also returns `frame_err`/`frame_sum`/`frame_n` (see `_frame_stats`): `err` weights every
+    matched POINT equally, so a frame with more visible keypoints counts for more. The per-frame
+    figures are what `--agg frame` aggregates.
     """
     d = _dist(np.asarray(pred, float), np.asarray(true, float))
     labelled = np.isfinite(np.asarray(true, float)).all(-1)
@@ -46,6 +88,7 @@ def error_and_coverage(pred, true) -> dict:
         'err': float(np.nanmean(d)) if matched.any() else float('nan'),
         'median': float(np.nanmedian(d)) if matched.any() else float('nan'),
         **_err_pcts(d),
+        **_frame_stats(_per_frame_means(d)),
         'n_true': n_true,
         'n_matched': int(matched.sum()),
         'coverage': float(matched.sum() / n_true) if n_true else float('nan'),
@@ -63,30 +106,50 @@ def pck(pred, true, thresholds) -> dict:
     return {f'pck@{t:g}': float(np.nansum(d <= t) / n_true) for t in thresholds}
 
 
-def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05):
+def paired_bootstrap(per_unit_a, per_unit_b=None, n=10000, seed=0, alpha=0.05, weights=None):
     """Resample UNITS (windows, groups) -- not points -- and report the interval. With
     `per_unit_b`, the difference is taken inside each resample (paired); points within a window
     are correlated, so resampling points would be several times too tight.
 
     Pairing is complete-case: a unit where either side is non-finite leaves the comparison,
     which flatters the arm that failed more -- the count is returned rather than absorbed.
+
+    `weights` (optional, one per unit) switches the statistic from a plain mean of unit values to
+    the RATIO `sum(w*a)/sum(w)`, recomputed inside every resample. That is what `--agg frame`
+    needs: the estimand is per-frame but the resampling unit stays the GROUP, because frames
+    within a clip are correlated and resampling frames would give an interval several times too
+    tight (report 57 section 24). A unit whose weight is non-finite or <= 0 leaves the
+    comparison like a non-finite value. With `weights=None` this function is unchanged, down to
+    the RNG draw.
     """
     rng = np.random.default_rng(seed)
     a = np.asarray(per_unit_a, float)
     keep = np.isfinite(a)
     b = None
+    w = None
     if per_unit_b is not None:
         b = np.asarray(per_unit_b, float)
         keep &= np.isfinite(b)
+    if weights is not None:
+        w = np.asarray(weights, float)
+        keep &= np.isfinite(w) & (w > 0)
+    if b is not None:
         b = b[keep]
+    if w is not None:
+        w = w[keep]
     a = a[keep]
     dropped = int((~keep).sum())
     if a.size == 0:
         return {'mean': float('nan'), 'lo': float('nan'), 'hi': float('nan'), 'n': 0,
                 'n_dropped': dropped}
     idx = rng.integers(0, a.size, size=(n, a.size))
-    stat = a[idx].mean(1) if b is None else (a[idx] - b[idx]).mean(1)
-    point = float(a.mean() if b is None else (a - b).mean())
+    v = a if b is None else a - b
+    if w is None:
+        stat = v[idx].mean(1)
+        point = float(v.mean())
+    else:
+        stat = (v[idx] * w[idx]).sum(1) / w[idx].sum(1)
+        point = float((v * w).sum() / w.sum())
     return {'mean': point, 'lo': float(np.quantile(stat, alpha / 2)),
             'hi': float(np.quantile(stat, 1 - alpha / 2)), 'n': int(a.size),
             'n_dropped': dropped}
@@ -337,25 +400,39 @@ def matched_error(pred, true, max_dist=np.inf, min_kpts_frac=0.0, cost='mean') -
 
     The returned counts are the POINT counts, not just the instance counts -- quote matched
     error beside its coverage.
+
+    `frame_err`/`frame_sum`/`frame_n` are the per-FRAME aggregation (see `_frame_stats`). A frame
+    is one unit however many instances it holds, so a frame with two matched animals counts once
+    -- the mean is taken over every matched point in that frame, across instances.
     """
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     pairs = match_instances(pred, true, max_dist, min_kpts_frac, cost)
     T = true.shape[1]
     dists, n_true_inst, n_matched_inst = [], 0, 0
+    frame_means = np.full(T, np.nan)
     for t in range(T):
         present = np.isfinite(true[:, t]).all(-1).any(-1)
         n_true_inst += int(present.sum())
         n_matched_inst += len(pairs[t])
+        per_frame = []
         for i, j, _ in pairs[t]:
-            dists.append(_dist(pred[i, t], true[j, t]))
+            dt = _dist(pred[i, t], true[j, t])
+            dists.append(dt)
+            per_frame.append(dt)
+        if per_frame:
+            arr = np.concatenate(per_frame)
+            if np.isfinite(arr).any():
+                frame_means[t] = float(np.nanmean(arr))
     n_true = int(np.isfinite(true).all(-1).sum())
     if not dists:
-        return {'err': float('nan'), 'median': float('nan'), **_err_pcts([]), 'coverage': 0.0,
+        return {'err': float('nan'), 'median': float('nan'), **_err_pcts([]),
+                **_frame_stats(frame_means), 'coverage': 0.0,
                 'n_true': n_true, 'n_matched': 0,
                 'n_true_inst': n_true_inst, 'n_matched_inst': 0,
                 'unmatched_true': n_true_inst}
     d = np.concatenate(dists)
     return {'err': float(np.nanmean(d)), 'median': float(np.nanmedian(d)), **_err_pcts(d),
+            **_frame_stats(frame_means),
             'coverage': float(np.isfinite(d).sum() / max(1, n_true)),
             'n_true': n_true, 'n_matched': int(np.isfinite(d).sum()),
             'n_true_inst': n_true_inst, 'n_matched_inst': n_matched_inst,

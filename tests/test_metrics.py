@@ -148,10 +148,12 @@ def test_a_paired_delta_uses_only_the_points_both_arms_matched():
     picky = np.full((1, 4, 1, 2), np.nan)
     picky[0, :2] = 0.0                                        # attempts only the two easy frames
 
-    ea, eb, n, nlab = ev._shared_error({'_pred': good, '_true': true}, {'_pred': picky,
-                                                                       '_true': true})
+    ea, eb, n, nlab, fa, fb, fn = ev._shared_error({'_pred': good, '_true': true},
+                                                   {'_pred': picky, '_true': true})
     assert (n, nlab) == (2, 4)
     assert ea == eb == 0.0, 'over the shared points the two are identical, and the delta is 0'
+    assert fn == 2, 'the per-frame weight counts the frames BOTH arms matched, not all four'
+    assert fa == fb == 0.0, 'the per-frame delta is 0 for the same reason as the pointwise one'
     # ...where a whole-set comparison would have made the picky arm look better by 3/4 of a unit.
     assert np.nanmean(np.linalg.norm(good - true, axis=-1)) > 0
 
@@ -620,3 +622,49 @@ def test_score_skips_motion_ratio_rather_than_crashing_when_a_group_has_zero_tru
     assert len(rows) == 1
     assert rows[0]['S_pred'] == 1 and rows[0]['S_true'] == 0
     assert rows[0]['motion_ratio'] is None
+
+
+def test_per_frame_aggregation_equals_per_group_only_when_groups_are_equal_sized():
+    """`--agg frame` weights every labelled FRAME equally; `--agg group` weights every CLIP
+    equally. They must coincide when each group holds one frame and diverge when they do not --
+    which is the whole reason the default moved (report 57 sections 22/24: on horse10, 696 short
+    groups outvote the 19 holding 73.5% of all labelled keypoints).
+    """
+    from tailcyclenet.metrics import error_and_coverage, paired_bootstrap
+
+    one_frame = []
+    for err in (1.0, 5.0, 9.0):
+        true = np.zeros((1, 1, 4, 2))
+        pred = np.zeros((1, 1, 4, 2))
+        pred[..., 0] = err
+        one_frame.append(error_and_coverage(pred, true))
+    grp = paired_bootstrap([m['err'] for m in one_frame], n=200, seed=0)
+    frm = paired_bootstrap([m['frame_err'] for m in one_frame], n=200, seed=0,
+                           weights=[m['frame_n'] for m in one_frame])
+    assert grp['mean'] == frm['mean'], 'one frame per group leaves no weighting freedom'
+
+    long_true, long_pred = np.zeros((1, 100, 4, 2)), np.zeros((1, 100, 4, 2))
+    long_pred[..., 0] = 10.0
+    short_true, short_pred = np.zeros((1, 1, 4, 2)), np.zeros((1, 1, 4, 2))
+    short_pred[..., 0] = 0.0
+    uneven = [error_and_coverage(long_pred, long_true), error_and_coverage(short_pred, short_true)]
+    grp2 = paired_bootstrap([m['err'] for m in uneven], n=200, seed=0)
+    frm2 = paired_bootstrap([m['frame_err'] for m in uneven], n=200, seed=0,
+                            weights=[m['frame_n'] for m in uneven])
+    assert grp2['mean'] == 5.0, 'per-group gives the 1-frame clip the same vote as the 100-frame'
+    assert abs(frm2['mean'] - 1000 / 101) < 1e-9, 'per-frame weights by the frames behind it'
+
+
+def test_paired_bootstrap_is_unchanged_without_weights():
+    """The weighted path is opt-in: `weights=None` must not perturb a single published interval,
+    down to the RNG draw.
+    """
+    from tailcyclenet.metrics import paired_bootstrap
+
+    rng = np.random.default_rng(7)
+    a, b = rng.normal(10, 2, 30), rng.normal(9, 2, 30)
+    assert paired_bootstrap(a, seed=5) == paired_bootstrap(a, seed=5, weights=None)
+    assert paired_bootstrap(a, b, seed=5) == paired_bootstrap(a, b, seed=5, weights=None)
+    flat = paired_bootstrap(a, seed=5)
+    ones = paired_bootstrap(a, seed=5, weights=np.ones(a.size))
+    assert np.isclose(flat['mean'], ones['mean']) and np.isclose(flat['lo'], ones['lo'])

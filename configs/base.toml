@@ -17,13 +17,13 @@ prompt_noise_px = 2.5       # sigma on the prior, in PIXELS (3D converts via cub
 # A WHOLE-BODY offset, the corruption shaped like a deployment failure; 5.0 is a CONSISTENCY choice, not a measured optimum (measured 8.0, on 3D allen) -- say so when reporting a 3D arm.
 prompt_offset_px = 5.0
 # Distractor-prompt corruptions (dev/plans/prompt_prior_corruptions.md), both PER-KEYPOINT probabilities, both aimed at --anchor carry:
-prompt_swap_kpt_pairs = 0.03 # P(per keypoint) replaced by another finite keypoint's original position, drawn uniformly and independently -- NOT a permutation; owner-set, not measured (was 0.07)
-prompt_swap_animal = 0.05    # P(per keypoint) prior becomes the neighbour animal's corresponding point; structurally INERT on single-animal roots (n_animals < 2); owner-set, not measured (was 0.1)
+prompt_swap_kpt_pairs = 0.07 # P(per keypoint) replaced by another finite keypoint's original position, drawn uniformly and independently -- NOT a permutation; owner-set, not measured. Restored to 0.07 on 2026-09-08: 0.03 was one of the three keys that changed together in the 2026-09-07 crim13 run, whose weights regressed badly (report 57 §8.1c).
+prompt_swap_animal = 0.05    # P(per keypoint) prior becomes the neighbour animal's corresponding point; structurally INERT on single-animal roots (n_animals < 2); owner-set, not measured. NOT reverted with the line above -- the 2026-09-02 recipe ran 0.1, so this config is a THIRD combination, not a revert to either.
 box_prompt_dropout = 0.3    # fraction of steps where the box prompt is zeroed (exposure-bias recipe)
 box_prompt_jitter = 0.1     # box centre jitter as a fraction of box side
 box_prompt_scale_jitter = 0.1 # box scale jitter as a fraction of box side
-# COUPLED to box_prompt_dropout: of the already-box-dropped items, the fraction that also get a genuinely clean pose prior instead of an independently pose-corrupted one (the coin is hoisted, not redrawn). Owner-set default, not measured; the code default stays 0.0 = bit-identical to every run on record. Measured at 0.5 on Seq59 (report 55 §6.3): 64% fewer propagation switches, no accuracy cost.
-pose_only_prob = 0.5
+# COUPLED to box_prompt_dropout: of the already-box-dropped items, the fraction that also get a genuinely clean pose prior instead of an independently pose-corrupted one (the coin is hoisted, not redrawn); code default stays 0.0 = bit-identical to every run on record. THE EVIDENCE CONFLICTS ACROSS SETTINGS and 0.2 is measured at NEITHER end: 0.5 is FAVOURABLE in 3D (3dpop Seq59, 64% fewer propagation switches at no accuracy cost, report 55 §6.3) but UNFAVOURABLE in 2D (the 2026-09-07 crim13 run carried it and read 12.499 px --anchor none vs 09-02's 9.791, and its carry penalty was amplified 32x -- exactly what raising prior-TRUST predicts -- though THREE keys moved together there, so only the 32x carry amplification fits this key specifically, report 57 §8.1c); 0.2 (2026-09-08) is an owner compromise that may also weaken the 3D gain -- sweep it before quoting either benefit.
+pose_only_prob = 0.2
 annot_frac = 0.6            # sampling weight for annotated vs tracked sessions
 mode_3d_frac = 0.7          # fraction of items shown in 3D mode (inert on 2D-only roots)
 # [1, 8] is the pretrained tracker's own camera-count range (0 = every camera; a fixed higher count is out of distribution as well as slow); a one-camera root samples to 1, so this is harmless in 2D.

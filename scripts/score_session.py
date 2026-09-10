@@ -27,12 +27,23 @@ def main(argv=None):
     parser.add_argument('--window-offset', type=int, default=None,
                         help='shift the window lattice by N frames, so a track is judged under a '
                              'framing other than the one that produced it')
+    parser.add_argument('--spans-csv', default=None,
+                        help='CSV of session,group,animal,span_start,span_len: score only windows '
+                             'starting inside each span (a targeted look at a clip bad stretch)')
     parser.add_argument('--val-stride', type=int, default=None,
                         help='window spacing; default is the run n_frames (non-overlapping)')
     args = parser.parse_args(argv)
+    spans = None
+    if args.spans_csv:
+        import csv as _csv
+        spans = {}
+        with open(args.spans_csv) as f:
+            for r in _csv.DictReader(f):
+                lo = int(r['span_start'])
+                spans[(r['session'], r['group'], str(r['animal']))] = (lo, lo + int(r['span_len']))
     table, _registry, _config = score_root(Path(args.run), args.data, args.split,
                                           args.device, args.limit,
-                                          args.window_offset, args.val_stride)
+                                          args.window_offset, args.val_stride, spans)
     report = rank(table, args.top)
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report)

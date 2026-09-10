@@ -102,7 +102,8 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
 
 
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
-               window_offset: int | None = None, val_stride: int | None = None) -> tuple:
+               window_offset: int | None = None, val_stride: int | None = None,
+               spans: dict | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
@@ -110,7 +111,9 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             is thousands of them, and a first look must not need the whole split);
             window_offset -- shift the window lattice by this many frames, so the scorer judges a
             track under a framing other than the one that produced it; val_stride -- window
-            spacing, defaulting to the run's `n_frames` (non-overlapping).
+            spacing, defaulting to the run's `n_frames` (non-overlapping); spans -- restrict
+            scoring to windows starting inside a frame range, as {(session, group, animal):
+            (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable.
     Outputs: (DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
@@ -131,6 +134,10 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             break
         views, coords, _vis, _frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
             item[:13]
+        if spans is not None:
+            rng = spans.get((row['session'], row['group'], str(row['animal'])))
+            if rng is None or not (rng[0] <= int(row['start']) <= rng[1]):
+                continue
         views, coords, cgroup, kpt_ids = _to_device(
             views, coords, cgroup, kpt_ids, device)
         with torch.no_grad():

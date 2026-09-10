@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from dataclasses import replace
 
 from ..checkpoints import load_scorer_run, provenance
 from ..dataset import LoaderConfig, PoseDataset
@@ -100,17 +101,25 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
     return views, coords, cgroup, kpt_ids
 
 
-def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None) -> tuple:
+def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
+               window_offset: int | None = None, val_stride: int | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
             device -- where to run the model; limit -- stop after this many windows (a long clip
-            is thousands of them, and a first look must not need the whole split).
+            is thousands of them, and a first look must not need the whole split);
+            window_offset -- shift the window lattice by this many frames, so the scorer judges a
+            track under a framing other than the one that produced it; val_stride -- window
+            spacing, defaulting to the run's `n_frames` (non-overlapping).
     Outputs: (DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
     model, config, registry, ckpt = load_scorer_run(Path(run), device=device)
     lc = _loader_config(config)
+    if window_offset is not None:
+        lc = replace(lc, val_offset=int(window_offset))
+    if val_stride is not None:
+        lc = replace(lc, val_stride=int(val_stride))
     ds = PoseDataset(data, split, lc, registry_base=registry, train=False)
     _check_names(registry, ds.registry, data)
     print(f'scoring {len(ds)} windows from {data}/{split} with {ckpt.name}')

@@ -24,9 +24,15 @@ def main(argv=None):
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--top', type=int, default=10)
     parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--window-offset', type=int, default=None,
+                        help='shift the window lattice by N frames, so a track is judged under a '
+                             'framing other than the one that produced it')
+    parser.add_argument('--val-stride', type=int, default=None,
+                        help='window spacing; default is the run n_frames (non-overlapping)')
     args = parser.parse_args(argv)
     table, _registry, _config = score_root(Path(args.run), args.data, args.split,
-                                          args.device, args.limit)
+                                          args.device, args.limit,
+                                          args.window_offset, args.val_stride)
     report = rank(table, args.top)
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report)

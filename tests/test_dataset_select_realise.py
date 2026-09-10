@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 import torch
 
+from tailcyclenet.format import VISIBLE
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
 
 from .legacy_item import LegacyItemMixin
@@ -447,3 +448,34 @@ def test_select_is_deterministic_given_idx_rng_and_shape(seam_root):
     _same(a.coords, b.coords, 'coords')
     assert a.cam_names == b.cam_names and a.cam_ix == b.cam_ix
     assert a.animal == b.animal and a.inflate == b.inflate
+
+
+def test_val_offset_shifts_the_window_lattice_and_defaults_to_no_shift(seam_root):
+    """`val_offset` moves WHERE val/test windows start; 0 must reproduce the historical framing.
+
+    The offset exists so the scorer can judge a stored track under a framing other than the one
+    that produced it -- a prediction's own window seams are invisible to a scorer whose windows
+    sit on the same lattice. Getting the default wrong would silently move every published val and
+    test number, so the no-op half of this test is the load-bearing half.
+
+    Driven through `_starts` on a synthetic label array rather than through the fixture sessions:
+    those groups are shorter than T, so `limit = n_frames - T` is 0 and every start clamps to 0,
+    which would make the shift unobservable and the test vacuous.
+    """
+    ds = PoseDataset(seam_root, 'val', _L(n_frames=12), train=False)
+    vis = np.full((1, 200, 3), VISIBLE, dtype=np.int8)
+    plain = ds._starts(vis, 0, 200)
+    assert len(plain) > 3
+    assert ds._starts(vis, 0, 200, 0) == plain
+
+    for off in (1, 4, 6):
+        moved = ds._starts(vis, 0, 200, off)
+        assert moved[:3] == [s + off for s in plain[:3]]
+        assert len(moved) <= len(plain)
+
+
+def test_val_offset_does_not_touch_the_training_path(seam_root):
+    """Train items choose their start inside `_getitem__`; the option must not reach them."""
+    a = PoseDataset(seam_root, 'train', _L(n_frames=4), train=True)
+    b = PoseDataset(seam_root, 'train', _L(n_frames=4, val_offset=7), train=True)
+    assert [it.start for it in a.index] == [it.start for it in b.index]

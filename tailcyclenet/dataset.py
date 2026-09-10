@@ -711,6 +711,65 @@ class _Item:
     start: int = -1
 
 
+@dataclass
+class Selection:
+    """Everything about a window that does NOT depend on how it is viewed.
+
+    Exists so one selection can be realised into MORE than one view. A track-quality triplet
+    needs the same track under two independent views, and calling `_item` twice would not give
+    that: `_pick` re-draws the pool entry and `_frames` re-draws the anchor and stride, so the
+    second call is a different sample. Deterministic given `(idx, rng, shape)`.
+
+    `coords` is the CLEAN, pre-transform track (NaN where unlabelled), so a crop computed from
+    it is the clean track's crop -- the one thing a corrupted view must NOT re-derive.
+    """
+    item: _Item
+    sess: object
+    group: object
+    lab: object
+    frames: np.ndarray
+    animal: int
+    n_keypoints: int
+    shape: dict
+    true_2d: bool
+    single_view: bool
+    cam_ix: list
+    cam_names: list
+    cgroup: list                       # already subset to `cam_ix`, pre-transform
+    crop_pts: object
+    coords: torch.Tensor
+    vis: object
+    vis_2d: object
+    attempt_swap_animal: bool
+    neighbour_row: object
+    inflate: float
+
+
+@dataclass
+class View:
+    """One realisation of a `Selection`: pixels, cameras and coords in ONE view's frame.
+
+    `rotation`/`box`/`scale` are the raw pieces of the source->view affine, kept because a 2D
+    consumer has to move coordinates BETWEEN two realisations of the same selection and the
+    composed matrix is the only correct way to do it (re-deriving it from the camera dicts is
+    how the two frames come to disagree).
+    """
+    views: list
+    coords: torch.Tensor
+    vis: object
+    vis_2d: object
+    cgroup: list
+    boxes: object
+    cam_names: list
+    r: int
+    single_view: bool
+    p2d: object
+    p2d_all: object
+    neighbour_full: object
+    rotation: list                     # per-camera `rotation_info`; 2D has one entry
+    scale: list                        # per-camera resize scale; 2D has one entry
+
+
 class PoseDataset(Dataset):
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
                  train: bool | None = None, seed: int = 23,
@@ -1007,36 +1066,43 @@ class PoseDataset(Dataset):
         return torch.as_tensor(cropmod.box_corners(b), dtype=torch.float32)
 
     def _item(self, idx, rng, shape=None):
-        """Build one window's tensors, or None when the item cannot be built.
+        """One window, built as `_select` -> `_realise` -> `_targets`.
+
+        The three-way split is a SEAM, not a tidy-up: a view-independent selection can be
+        realised into more than one view (`tailcyclenet/scorer/`), which a fused `_item` cannot
+        express. The three parts share ONE `rng` stream and consume it in the same order they
+        did when this was a single function, so the pose path is byte-identical -- asserted by
+        `tests/test_dataset_select_realise.py`, which is the condition the split was approved
+        on, not a nicety.
+        """
+        sel = self._select(idx, rng, shape)
+        if sel is None:
+            return None
+        view = self._realise(sel, rng)
+        if view is None:
+            return None
+        return self._targets(sel, view, rng)
+
+    def _select(self, idx, rng, shape=None) -> Selection | None:
+        """Draw the view-independent part of a window, or None when the item cannot be built.
 
         Inputs: idx -- the index to pick.
                 rng -- the item's RNG stream.
                 shape -- a pre-drawn cost-determining shape dict (see `_shape`).
-        Outputs: the 13- or 14-field item tuple `__getitem__` hands to the collate, or None.
+        Outputs: the `Selection`, or None (an index that resolves to no labelled frames, or a
+        track with fewer than 2 finite coordinates).
+
+        Consumes the shape/cell draw, the camera-count and single-view draws, the crop-inflate
+        draw, the swap-animal neighbour draw and the frame draw -- everything whose value is a
+        property of WHICH window this is rather than of how it is shown.
 
         Visibility: `vis` (3D noisy-OR) is unused at R == 2; `vis_2d` is the per-camera
         THREE-STATE target (NaN = "not assessed", masked out of the BCE; `projected` joins
         UNLABELED), withheld when `sess.has_visibility_assessment` is False or every
         assessed row is projected/unlabeled; both-or-neither.
 
-        Geometry: camera and crop-inflate draws are one per item (camera draw sorted). Points
-        outside the source frame or the FINAL crop are flipped out of `vis_2d`; a rotation that
-        loses the animal to the inscribed crop is REVERTED, not retried.
-
-        Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
-        fewer bytes to collate/queue/pin; the model divides on device).
-
-        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training, the
-        previous window's own prediction at deployment); `prompt_t` is the first labelled frame;
-        `prompt_dropout` is PER ITEM, not per keypoint. Corruptions, in order: exposure bias,
-        noise/offset in PIXELS, stale priors, `prompt_swap_animal`, `prompt_swap_kpt_pairs`
-        (finite entries independently replaced by another keypoint's ORIGINAL position), and a
-        whole-body offset -- ONE vector per item. `pose_only_prob` (0 = byte-identical) hoists
-        the box-dropout coin EARLY so a box-dropped item can also skip these corruptions,
-        REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
-
-        The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
-        last frame); the final 3D noisy-OR is over the FINAL `vis_2d`.
+        `coords` here is the CLEAN track at the stored coordinates -- untransformed, NaN where
+        unlabelled. Every view-dependent coordinate lives in the `View`.
         """
         shape = shape or self._shape(rng)
         item = self._pick(idx, rng)
@@ -1096,6 +1162,43 @@ class PoseDataset(Dataset):
         if torch.isfinite(coords).all(-1).sum() < 2:
             return None
 
+        return Selection(item=item, sess=sess, group=group, lab=lab, frames=frames, animal=a,
+                         n_keypoints=K, shape=shape, true_2d=true_2d, single_view=single_view,
+                         cam_ix=cam_ix, cam_names=cam_names, cgroup=cgroup, crop_pts=crop_pts,
+                         coords=coords, vis=vis, vis_2d=vis_2d,
+                         attempt_swap_animal=attempt_swap_animal, neighbour_row=neighbour_row,
+                         inflate=inflate)
+
+    def _realise(self, sel, rng) -> View | None:
+        """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
+
+        Consumes the rotation draw (one per camera), the crop jitter, the grayscale coin and the
+        appearance augmenters -- everything whose value is a property of HOW the window is shown.
+        Returns the `View`, or None when the crop or the decode fails.
+
+        `sel` is NOT mutated: `vis_2d` is cloned on entry and no library helper in this path
+        writes through a camera dict or through `coords`, so the same selection may be realised
+        repeatedly (the scorer's independently-viewed anchor) without the first view
+        contaminating the second. That property is what makes the seam worth having; it is
+        asserted in `tests/test_dataset_select_realise.py`.
+
+        Geometry: camera and crop-inflate draws are one per item (camera draw sorted). Points
+        outside the source frame or the FINAL crop are flipped out of `vis_2d`; a rotation that
+        loses the animal to the inscribed crop is REVERTED, not retried.
+
+        Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
+        fewer bytes to collate/queue/pin; the model divides on device).
+        """
+        sess, group, lab = sel.sess, sel.group, sel.lab
+        frames, a, K = sel.frames, sel.animal, sel.n_keypoints
+        true_2d, single_view = sel.true_2d, sel.single_view
+        cam_names, crop_pts, inflate = sel.cam_names, sel.crop_pts, sel.inflate
+        attempt_swap_animal, neighbour_row = sel.attempt_swap_animal, sel.neighbour_row
+        coords, vis = sel.coords, sel.vis
+        vis_2d = None if sel.vis_2d is None else sel.vis_2d.clone()
+        cgroup = [dict(c) for c in sel.cgroup]
+        scales = [None] * len(cgroup)
+
         rot_p = (self.cfg.aug_prob if self.cfg.aug_rotation_prob is None
                  else self.cfg.aug_rotation_prob)
         rot_deg = self.cfg.aug_rotation_deg
@@ -1119,6 +1222,7 @@ class PoseDataset(Dataset):
             if cam is None:
                 return None
             cam, scale = _resize_camera(cam, self.cfg.image_size)
+            scales = [scale]
             coords = coords * scale
             coords = _mask_outside(coords, cam['size'])
             if vis_2d is not None:
@@ -1165,7 +1269,9 @@ class PoseDataset(Dataset):
                                                       inflate=inflate)
             if cgroup is None:
                 return None
-            cgroup = [_resize_camera(c, self.cfg.image_size)[0] for c in cgroup]
+            resized = [_resize_camera(c, self.cfg.image_size) for c in cgroup]
+            cgroup = [c for c, _ in resized]
+            scales = [s for _, s in resized]
             if self.train:
                 cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
@@ -1190,6 +1296,38 @@ class PoseDataset(Dataset):
                     imgs = self._augment(imgs, cnum, cgroup[cnum]['size'], p2d_all, vis_2d,
                                          gray, rng)
                 views.append(torch.from_numpy(np.asarray(imgs)))
+
+        if vis is not None and vis_2d is not None:
+            vis = (vis_2d == 1).any(-1)
+
+        return View(views=views, coords=coords, vis=vis, vis_2d=vis_2d, cgroup=cgroup,
+                    boxes=boxes, cam_names=cam_names, r=2 if true_2d else 3,
+                    single_view=single_view, p2d=p2d, p2d_all=p2d_all,
+                    neighbour_full=neighbour_full, rotation=rotation_info, scale=scales)
+
+    def _targets(self, sel, view, rng):
+        """Turn a realised `View` into the pose training targets and the item tuple.
+
+        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training, the
+        previous window's own prediction at deployment); `prompt_t` is the first labelled frame;
+        `prompt_dropout` is PER ITEM, not per keypoint. Corruptions, in order: exposure bias,
+        noise/offset in PIXELS, stale priors, `prompt_swap_animal`, `prompt_swap_kpt_pairs`
+        (finite entries independently replaced by another keypoint's ORIGINAL position), and a
+        whole-body offset -- ONE vector per item. `pose_only_prob` (0 = byte-identical) hoists
+        the box-dropout coin EARLY so a box-dropped item can also skip these corruptions,
+        REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
+
+        The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
+        last frame); the final 3D noisy-OR is over the FINAL `vis_2d` (done in `_realise`).
+        The scorer never calls this: it supplies no prior and no box.
+        """
+        item, sess, lab, frames = sel.item, sel.sess, sel.lab, sel.frames
+        a, K = sel.animal, sel.n_keypoints
+        views, coords, cgroup = view.views, view.coords, view.cgroup
+        vis, vis_2d = view.vis, view.vis_2d
+        cam_names, single_view = view.cam_names, view.single_view
+        p2d, p2d_all = view.p2d, view.p2d_all
+        neighbour_full, R = view.neighbour_full, view.r
 
         box_dropped_early = None
         pose_only_active = False

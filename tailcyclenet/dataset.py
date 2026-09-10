@@ -721,7 +721,8 @@ class Selection:
     second call is a different sample. Deterministic given `(idx, rng, shape)`.
 
     `coords` is the CLEAN, pre-transform track (NaN where unlabelled), so a crop computed from
-    it is the clean track's crop -- the one thing a corrupted view must NOT re-derive.
+    it is the clean track's crop -- the one thing a corrupted view must NOT re-derive. `cgroup`
+    is already subset to `cam_ix` and is pre-transform.
     """
     item: _Item
     sess: object
@@ -735,7 +736,7 @@ class Selection:
     single_view: bool
     cam_ix: list
     cam_names: list
-    cgroup: list                       # already subset to `cam_ix`, pre-transform
+    cgroup: list
     crop_pts: object
     coords: torch.Tensor
     vis: object
@@ -749,10 +750,10 @@ class Selection:
 class View:
     """One realisation of a `Selection`: pixels, cameras and coords in ONE view's frame.
 
-    `rotation`/`box`/`scale` are the raw pieces of the source->view affine, kept because a 2D
+    `rotation`/`boxes`/`scale` are the raw pieces of the source->view affine, kept because a 2D
     consumer has to move coordinates BETWEEN two realisations of the same selection and the
-    composed matrix is the only correct way to do it (re-deriving it from the camera dicts is
-    how the two frames come to disagree).
+    composed matrix is the only correct way to do it (re-deriving it from the camera dicts is how
+    the two frames come to disagree). `rotation` and `scale` are per camera; 2D has one entry.
     """
     views: list
     coords: torch.Tensor
@@ -764,10 +765,9 @@ class View:
     r: int
     single_view: bool
     p2d: object
-    p2d_all: object
     neighbour_full: object
-    rotation: list                     # per-camera `rotation_info`; 2D has one entry
-    scale: list                        # per-camera resize scale; 2D has one entry
+    rotation: list
+    scale: list
 
 
 class PoseDataset(Dataset):
@@ -1189,8 +1189,8 @@ class PoseDataset(Dataset):
         Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
         fewer bytes to collate/queue/pin; the model divides on device).
         """
-        sess, group, lab = sel.sess, sel.group, sel.lab
-        frames, a, K = sel.frames, sel.animal, sel.n_keypoints
+        group, lab = sel.group, sel.lab
+        frames = sel.frames
         true_2d, single_view = sel.true_2d, sel.single_view
         cam_names, crop_pts, inflate = sel.cam_names, sel.crop_pts, sel.inflate
         attempt_swap_animal, neighbour_row = sel.attempt_swap_animal, sel.neighbour_row
@@ -1234,7 +1234,6 @@ class PoseDataset(Dataset):
                 neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
             cgroup, boxes = [cam], [box]
             p2d = p2d_all = coords[None]
-            R = 2
         else:
             if self.train:
                 rotated = []
@@ -1280,7 +1279,6 @@ class PoseDataset(Dataset):
             p2d_all = (project_points_torch(cgroup, coords)
                        if single_view or self._aug is not None else None)
             p2d = p2d_all if single_view else None
-            R = 3
 
         gray = self._aug is not None and rng.random() < self.cfg.grayscale_prob
         use_pool = group.source(cam_names[0])[0] != 'video'
@@ -1302,7 +1300,7 @@ class PoseDataset(Dataset):
 
         return View(views=views, coords=coords, vis=vis, vis_2d=vis_2d, cgroup=cgroup,
                     boxes=boxes, cam_names=cam_names, r=2 if true_2d else 3,
-                    single_view=single_view, p2d=p2d, p2d_all=p2d_all,
+                    single_view=single_view, p2d=p2d,
                     neighbour_full=neighbour_full, rotation=rotation_info, scale=scales)
 
     def _targets(self, sel, view, rng):
@@ -1326,7 +1324,7 @@ class PoseDataset(Dataset):
         views, coords, cgroup = view.views, view.coords, view.cgroup
         vis, vis_2d = view.vis, view.vis_2d
         cam_names, single_view = view.cam_names, view.single_view
-        p2d, p2d_all = view.p2d, view.p2d_all
+        p2d = view.p2d
         neighbour_full, R = view.neighbour_full, view.r
 
         box_dropped_early = None

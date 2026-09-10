@@ -37,7 +37,7 @@ tailcyclenet = "tailcyclenet.__main__:main"
 # wheel under a dotted name (package-dir below) -- configs/ itself does not move, stays
 # human-edited and git-tracked exactly where CLAUDE.md's layout section says it lives.
 packages = [
-    "tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer",
+    "tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer", "tailcyclenet.scorer",
     "tailcyclenet.configs", "tailcyclenet.configs.datasets",
 ]
 

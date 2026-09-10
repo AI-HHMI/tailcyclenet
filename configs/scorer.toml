@@ -1,0 +1,167 @@
+# The track-quality scorer's family base. Layered over automatically, like `base.toml` (pose) and
+# `detector.toml` (detector): `checkpoints.load_config(path, base=_SCORER_CONFIG)`; the `extends`
+# key is deleted and raises by name.
+#
+# Two kinds of key live here and they are NOT alike:
+#
+#   [model]  -- the REUSED encoder/decoder architecture, copied VERBATIM from the warm-start run
+#               (runs/boxwidenf12distractor-20260820_1840/), because these keys define tensor
+#               shapes the warm start must match. Changing one breaks the load. The ONE deliberate
+#               override is `video_encoder_requires_grad = false`: the reference freezes the V-JEPA
+#               backbone, where the pose run staged an unfreeze at iteration 10000.
+#
+#   [scorer] -- the scorer's OWN heads and corruption menu. Tune these freely; they are FRESH
+#               parameters at warm start (`checkpoints.warm_start` returns them as `missing`).
+#
+# `stride_length` is 12, not the warm-start run's 24, and that costs nothing. VERIFIED without
+# loss: built at 12 and warm-started from that run's 24-frame checkpoint, ALL 620 tensors load and
+# exactly the 22 scorer heads are fresh -- no shape mismatch, nothing dropped. It is free because
+# of two config choices the pose runs already made: `scene_pos_embed_mode = "ropepos"` COMPUTES
+# positions instead of learning an (n_frames, d) table, and `time_embed_mode = "fourier_rel"`
+# builds its time terms as `Linear(2*max_freq+1, dim)` over relative-time Fourier features.
+# `time_embed_mode = "learned"` would reintroduce a T-shaped tensor and break the load;
+# `tests/test_scorer_model.py` pins the shape invariance so a config change cannot do that
+# silently.
+#
+# The scorer supplies NO PRIOR and NO BOX. Every prompt-corruption lever in [data] is stated as 0
+# rather than deleted, so an overlay cannot switch one on by accident, and `box_prompt = "none"`
+# here would fight `[model].box_prompt = "film"` -- the model keeps `film` so the warm start is an
+# exact tensor match and `missing_film` stands in for the absent box. `box_prompt` under [data]
+# is the LOADER's copy (the pose loader reads the two from the same place); the scorer never asks
+# it for a box.
+#
+# The reference's corruption magnitudes are a STARTING POINT, not a default: they were tuned for
+# its 128 generic points on a different data distribution. Phase 5 measures the realised
+# displacement and the out-of-view fraction per type before any long run.
+#
+# `annot_frac` is inert on a 100%-tracked root (3dpop and calms21 have an EMPTY annotated cell
+# before any filtering reaches it); allen-mouse-combined is where it is exercised, with 76
+# annotated sessions plus 1 tracked and K = 47. `min_valid_frames` counts DISTINCT OBSERVED source
+# frames per keypoint, NOT finite slots -- `_frames` clamp-pads at group edges, so repeats would
+# otherwise pass a finiteness floor. It selects the corruption MENU rather than whether a window
+# trains: below it a window still trains, on the reduced sparse menu of section 3.8b.
+
+[run]
+kind = "scorer"
+
+[data]
+n_frames = 12
+image_size = 256
+cams_to_sample = [1, 8]
+val_cams_to_sample = 5
+prob_2d_only = 0.2
+crop_jitter = 0.3
+crop_jitter_scale = 0.3
+min_crop_dim = 64
+aug_prob = 0.25
+per_image_aug_prob = 0.25
+grayscale_prob = 0.2
+crop_inflate = [0.9, 1.5]
+num_workers = 8
+box_prompt = "none"
+frame_strides = [1]
+balance_datasets = true
+annot_frac = 0.5           # INERT on a 100%-tracked root; allen-mouse-combined is where it runs
+# Every prompt-corruption lever, off: the scorer supplies no prior and no box, so these are inert.
+prompt_dropout = 0.0
+prompt_noise_px = 0.0
+prompt_offset_px = 0.0
+prompt_stale_frames = 0
+prompt_swap_kpt_pairs = 0.0
+prompt_swap_animal = 0.0
+box_prompt_dropout = 0.0
+box_prompt_jitter = 0.0
+box_prompt_scale_jitter = 0.0
+box_source = "keypoints"
+
+[scorer]
+pool_num_heads = 8
+score_hidden = 64
+use_precision = true
+triplet_margin = 0.25
+precision_reg_weight = 0.15
+score_reg_weight = 0.001
+min_valid_frames = 6       # DISTINCT OBSERVED frames per keypoint; selects the corruption menu
+
+[scorer.corruption]
+const_offset_prob = 0.5
+frame_noise_prob = 0.5
+gradual_drift_prob = 0.5
+sinusoid_prob = 0.5
+point_drop_prob = 0.3
+point_drop_max_frac = 0.4
+point_drop_bernoulli_rate = 0.2
+
+[scorer.corruption.mag_3d]
+# cube-scale units (~pixel-equivalent: world shift = mag * cube_scale)
+const_offset = 15.0
+frame_noise = 10.0
+gradual_drift = 24.0
+sinusoid = 16.0
+
+[scorer.corruption.mag_2d]
+# pixels at image_size 256
+const_offset = 10.0
+frame_noise = 8.0
+gradual_drift = 12.0
+sinusoid = 10.0
+
+[training]
+# A POSE run folder or checkpoint: a warm start, not a resume. Required.
+checkpoint_path = ""
+n_iterations = 10000
+seed = 23
+max_grad_norm = 10.0
+checkpoint_freq = 1000
+val_freq = 200
+val_batches = 20
+print_freq = 20
+
+[model]
+query = "prior"
+query_encoder = "wide"
+box_prompt = "film"
+gridresid_offset = "query"
+mode_3d = "encoder"
+video_encoder_version = "large"
+video_encoder_requires_grad = false
+video_encoder_finetune_last_n_layers = 8
+video_encoder_hierarchical = true
+soft_argmax_temperature_learnable = true
+stride_length = 12
+image_size = 256
+query_patch_size = 9
+per_camera_cube_scale = true
+max_freq = 10
+embedding_dim = 256
+use_volume_embedding = false
+corr_radius = 2
+principal_point_embedding = true
+intrinsic_embedding = true
+metric_ray_translation = true
+occlusion_embedding = true
+latent_dim = 512
+n_heads = 8
+n_time_space_blocks = 6
+embedding_factor = 4
+use_camera_self_attention = true
+use_temporal_self_attention = true
+f_eff_scale = true
+scene_encoder_proj = true
+cross_attn_dim = 512
+scene_proj_dim = 512
+scene_proj_prenorm = false
+scene_proj_mlp = false
+scene_pos_embed_mode = "ropepos"
+rope_base = 100.0
+time_embed_mode = "fourier_rel"
+output_mode = "gridresid"
+head_3d_grid_size = 1024
+head_3d_grid_radius = 1.8
+log_3d_output = true
+log_3d_eps = 0.1
+soft_argmax_threshold = 60
+grid_decode_space = "warped"
+enable_subpixel_refinement = false
+depth_log_min = -2.5
+depth_log_max = 2.5

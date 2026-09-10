@@ -25,16 +25,49 @@ from .model import build_model
 # (reads the real repo-root `configs/` directly) and a built wheel (reads the packaged copy).
 _BASE_CONFIG = _pkg_files('tailcyclenet.configs') / 'base.toml'
 _DETECTOR_CONFIG = _pkg_files('tailcyclenet.configs') / 'detector.toml'
+_SCORER_CONFIG = _pkg_files('tailcyclenet.configs') / 'scorer.toml'
+
+# What a checkpoint or run folder is a checkpoint OF. A run folder's kind lives in its config as
+# `[run] kind`; a checkpoint's lives in the file. Both are written by `save_run_meta` /
+# `save_checkpoint` rather than declared in the config file, so a family cannot forget to say.
+KINDS = ('pose', 'detector', 'scorer')
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    """Merge `over` into `base`, RECURSING when both sides are dicts.
+
+    The merge used to be one level per block (`base[block].update(over)`), so an overlay that set
+    `[training.optimizer] learning_rate` replaced the whole `optimizer` sub-dict and silently
+    wiped `muon_schedulefree`, `beta1`, `beta2` and both warmup keys -- the run then trained under
+    Muon's defaults with nothing saying so. The scorer's `[scorer.corruption.mag_3d]` is where it
+    would have bitten next: setting one magnitude replaced `corruption` entirely.
+
+    A DELIBERATE semantic change: a block can no longer be replaced wholesale, only merged into.
+    A config that wants replacement has to say so another way.
+
+    Blast radius was VERIFIED zero for everything shipped: the detector overlays use only flat
+    top-level blocks, `configs/datasets/*.toml` are `DatasetSpec` files that never reach
+    `load_config`, and run folders store their already-merged config.
+    """
+    out = dict(base)
+    for key, val in over.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = val
+    return out
 
 
 def load_config(path, base: Path | None = None) -> dict:
     """A run config layered over a base file -- the pose default is the packaged
-    `configs/base.toml`; the detector loader passes `configs/detector.toml` (both via
-    `_BASE_CONFIG`/`_DETECTOR_CONFIG`, never a repo-relative path).
+    `configs/base.toml`; the detector loader passes `configs/detector.toml` and the scorer loader
+    `configs/scorer.toml` (all via `_BASE_CONFIG`/`_DETECTOR_CONFIG`/`_SCORER_CONFIG`, never a
+    repo-relative path).
 
     EVERY config layers over its family's base automatically: the `extends` key is deleted and
-    RAISES by name, and the overlay IS the whole difference. The merge is per BLOCK, key by
-    key, so an overlay need not restate the base's blocks.
+    RAISES by name, and the overlay IS the whole difference. The merge RECURSES when both sides
+    of a key are dicts (see `_deep_merge`), so an overlay may set one key deep inside a block
+    without restating its siblings.
     """
     path = Path(path)
     with open(path, 'rb') as f:
@@ -46,12 +79,7 @@ def load_config(path, base: Path | None = None) -> dict:
             'Delete the line and the recipe is unchanged.')
     with open(base or _BASE_CONFIG, 'rb') as f:
         base_cfg = tomllib.load(f)
-    for block, over in cfg.items():
-        if isinstance(over, dict) and isinstance(base_cfg.get(block), dict):
-            base_cfg[block].update(over)
-        else:
-            base_cfg[block] = over
-    return base_cfg
+    return _deep_merge(base_cfg, cfg)
 
 
 def check_image_size(config: dict) -> None:
@@ -153,12 +181,18 @@ def prior_provenance(run: Path) -> dict:
 
 
 def save_run_meta(run: Path, config: dict, registry: Registry,
-                  extra: dict | None = None) -> None:
+                  extra: dict | None = None, kind: str = 'pose') -> None:
     """`config.toml`, the keypoint registry and `provenance.toml`. `extra` joins the provenance
     with how the run was launched (world size, effective rates) -- a config cannot state these.
+
+    `kind` is stamped into the config as `[run] kind` by the WRITER, not declared by the config
+    file: a family that forgot the key would otherwise produce a run folder indistinguishable
+    from a pose run. `load_run` guards on it.
     """
     import toml
+    assert kind in KINDS, f'kind must be one of {KINDS}, got {kind!r}'
     run.mkdir(parents=True, exist_ok=True)
+    config = {**config, 'run': {**config.get('run', {}), 'kind': kind}}
     (run / 'config.toml').write_text(toml.dumps(config))
     registry.save(run / 'keypoint_registry.toml')
     prov = {**provenance(), **(extra or {})}
@@ -180,7 +214,7 @@ def full_training_state(ck: dict) -> bool:
 
 def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                     name: str = 'last', write: bool = True,
-                    registry: Registry | None = None) -> Path | None:
+                    registry: Registry | None = None, kind: str = 'pose') -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
     `model_state` is the raw training weight (resume); `model_state_eval` is the averaged weight
@@ -194,7 +228,13 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     (`muon_schedulefree = false`), in which case `model_state_eval` would be half-averaged;
     `has_averaged_iterate` reports whether both halves carry an `x`. The eval/train toggle is
     UNCONDITIONAL -- every rank pays it -- for the same bit-exactness reason.
+
+    `kind` records WHAT these weights are. It is written explicitly rather than left implicit
+    because `_load_packaged_pose` DEFAULTED to `'pose'` for a missing key: before this parameter,
+    a scorer checkpoint would have loaded as a pose checkpoint without raising, and the two share
+    every encoder/decoder tensor name. Defaulting to `'pose'` keeps every existing file's meaning.
     """
+    assert kind in KINDS, f'kind must be one of {KINDS}, got {kind!r}'
     state = None
     if write:
         ckpt_dir = run / 'checkpoints'
@@ -212,7 +252,7 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
         return None
     path = ckpt_dir / f'checkpoint_{name}.pth'
     tmp = path.with_suffix('.tmp')
-    torch.save({'iteration': iteration, 'model_state': state,
+    torch.save({'kind': kind, 'iteration': iteration, 'model_state': state,
                 'model_state_eval': eval_state,
                 'optimizer_state': optimizer.state_dict(),
                 'config': config,
@@ -228,7 +268,7 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
     if not isinstance(ckpt, dict):
         raise ValueError(f'{path}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
     if ckpt.get('kind', 'pose') != 'pose':
-        raise ValueError(f'{path}: expected a pose checkpoint, got kind={ckpt.get("kind")!r}')
+        _require_ckpt_kind(ckpt, 'pose', path)
     registry_doc = ckpt.get('keypoint_registry')
     if not isinstance(registry_doc, dict):
         raise ValueError(f'{path}: pose checkpoint has no embedded keypoint_registry; '
@@ -272,9 +312,32 @@ def peek_registry(run: Path) -> Registry:
     return Registry.load(run / 'keypoint_registry.toml')
 
 
+def run_kind(config: dict) -> str:
+    """The `[run] kind` a run folder's config carries. An absent key means `'pose'`: every run
+    folder written before this key existed is a pose run, and the detector family has its own
+    writer, so nothing shipped changes meaning.
+    """
+    return config.get('run', {}).get('kind', 'pose')
+
+
+def require_kind(config: dict, want: str, where) -> None:
+    """Refuse a run folder of the wrong family, BY NAME.
+
+    The families share almost every tensor name -- a scorer IS a pose encoder plus heads -- so
+    loading one as another produces a model rather than an exception. This is the same failure
+    mode `gridresid_offset` is named for, so it is refused rather than warned about.
+    """
+    got = run_kind(config)
+    if got != want:
+        raise ValueError(
+            f'{where}: this is a {got!r} run folder, not a {want!r} one. The two families share '
+            'their encoder and decoder tensor names, so loading one as the other would build a '
+            f'model with the wrong weights instead of raising. Point at a {want!r} run.')
+
+
 def load_run(run: Path, checkpoint: str | None = None, device='cpu',
              model_overrides: dict | None = None):
-    """(model, config, registry, checkpoint_path) from a run folder or pose checkpoint."""
+    """(model, config, registry, checkpoint_path) from a pose run folder or pose checkpoint."""
     run = Path(run)
     if run.is_file():
         if checkpoint is not None:
@@ -283,6 +346,7 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
         return _load_packaged_pose(run, device=device, model_overrides=model_overrides)
     with open(run / 'config.toml', 'rb') as f:
         config = tomllib.load(f)
+    require_kind(config, 'pose', run)
     check_image_size(config)
     if model_overrides:
         config['model'] = {**config.get('model', {}), **model_overrides}
@@ -371,3 +435,60 @@ def _report(what, missing, unexpected, dropped):
         print(f'{what}: {len(unexpected)} checkpoint key(s) UNUSED: {head(unexpected)}')
     if not (dropped or missing or unexpected):
         print(f'{what}: exact match, nothing fresh and nothing discarded')
+
+
+def load_scorer_run(run: Path, checkpoint: str | None = None, device='cpu'):
+    """(model, config, registry, checkpoint_path) from a scorer run folder.
+
+    The scorer has NO packaged-checkpoint form: a scorer is always a run folder, because the
+    `kind` guard needs somewhere to live and because a scorer is never a deployment artefact --
+    it is a QC tool that always ships with its registry.
+
+    Resume vs warm start: a checkpoint carrying a full training state is RESUMED by the caller
+    (`train_scorer.py`), and a pose checkpoint is a WARM START. Both are readable from here; what
+    is refused is a run folder of the wrong family, or a checkpoint whose recorded `kind` is not
+    the one the caller asked for.
+
+    The `build_scorer` import is local to keep the package import graph flat: `scorer.model`
+    imports from `..model`, and a module-level import here would make `checkpoints` a dependency
+    of nothing in particular while still working.
+    """
+    from .scorer.model import build_scorer
+
+    run = Path(run)
+    with open(run / 'config.toml', 'rb') as f:
+        config = tomllib.load(f)
+    require_kind(config, 'scorer', run)
+    check_image_size(config)
+    registry = Registry.load(run / 'keypoint_registry.toml')
+    path = resolve_checkpoint(run / 'checkpoints', checkpoint)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    _require_ckpt_kind(ckpt, 'scorer', path)
+    scorer_cfg = dict(config.get('scorer', {}))
+    scorer_cfg.pop('corruption', None)
+    model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
+                         registry.n_keypoints, **{k: v for k, v in scorer_cfg.items()
+                                                  if k in ('pool_num_heads', 'score_hidden',
+                                                           'use_precision')})
+    state = ckpt.get('model_state_eval') or ckpt['model_state']
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    _report('load_scorer_run', missing, unexpected, [])
+    prov = run / 'provenance.toml'
+    if prov.exists():
+        with open(prov, 'rb') as f:
+            p = tomllib.load(f)
+        print(f'run provenance: {p.get("commit", "?")[:12]}'
+              f'{" +DIRTY" if p.get("dirty") else ""}')
+    return model.to(device).eval(), config, registry, path
+
+
+def _require_ckpt_kind(ckpt: dict, want: str, where) -> None:
+    """A checkpoint's recorded kind. `_load_packaged_pose` reads `ckpt.get('kind', 'pose')`, which
+    is why a scorer checkpoint written before this key existed would load as a pose one -- the
+    default is a compatibility promise about OLD files, not a licence to write new ones without it.
+    """
+    got = ckpt.get('kind', 'pose')
+    if got != want:
+        raise ValueError(
+            f'{where}: this is a {got!r} checkpoint, not a {want!r} one. They share almost every '
+            'tensor name, so loading one as the other builds a model rather than raising.')

@@ -20,7 +20,6 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -30,7 +29,7 @@ from posetail.posetail.cube import is_point_visible, project_points_torch
 
 from tailcyclenet.checkpoints import _SCORER_CONFIG, load_config
 from tailcyclenet.dataset import PoseDataset
-from tailcyclenet.scorer.dataset import ScorerDataset, scorer_collate
+from tailcyclenet.scorer.dataset import ScorerDataset
 from tailcyclenet.scorer.train import corruption_config, loader_config
 
 

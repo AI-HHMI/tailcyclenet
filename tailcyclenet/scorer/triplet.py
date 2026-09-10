@@ -276,6 +276,11 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
     all three members); for 2D it is `transfer_points_2d`, because there the coordinates ARE the
     crop's pixels.
 
+    A keypoint with NO observed frame is DROPPED before anything is drawn (section 3.9). It has by
+    construction no slot any corruption could move, so leaving it in would train the scorer on a
+    point whose only content is the missing token AND make the sparse "did the corruption move an
+    observed slot" check unsatisfiable for it. Fewer than 2 survivors rejects the whole window.
+
     The crop for every member comes from the CLEAN, PRE-DROP track, fixed BEFORE any corruption is
     drawn. This one is a real leak if violated: a crop that followed each candidate's own
     coordinates would give the bad sample different pixels from the good one, and the pair would
@@ -305,10 +310,6 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
 
     counts = observed_frame_counts(coords, sel.frames)
 
-    # Section 3.9: a keypoint with NO observed frame is DROPPED here, before anything is drawn.
-    # It has by construction no slot any corruption could move, so leaving it in would (a) train
-    # the scorer on a point whose only content is the missing token, and (b) make the sparse
-    # "did the corruption move an observed slot" check unsatisfiable for it.
     alive = counts[0] > 0
     if int(alive.sum()) < 2:
         return None

@@ -43,6 +43,8 @@ def overfit_root(tmp_path_factory):
     root = tmp_path_factory.mktemp('overfit')
     C._session_3d(root / 'mouselike' / 'train' / 'sess_c')
     C._session_3d_multi(root / 'mouselike' / 'train' / 'sess_m', T=4)
+    C._session_2d(root / 'ratlike' / 'train' / 'sess_a')
+    C._session_2d(root / 'ratlike' / 'train' / 'sess_b')
     return root
 
 
@@ -57,21 +59,24 @@ def _windows(loader, n):
     return out
 
 
-def _overfit(root, iterations=120, n_windows=2, lr=1e-3, seed=0):
+def _overfit(root, iterations=120, n_windows=2, lr=1e-3, seed=0, session='mouselike'):
     """Train on a handful of frozen windows and report the final triplet accuracy.
 
     The windows are collected ONCE and reused, so this measures whether the objective is learnable
-    rather than whether the loader keeps producing consistent samples.
+    rather than whether the loader keeps producing consistent samples. `session` selects the
+    dimensionality: `mouselike` is 3D multiview, `ratlike` is 2D single-view, and the 2D arm is
+    what exercises the transform composition rather than a different objective.
 
     Inputs: root -- the dataset root; iterations -- optimisation steps; n_windows -- how many
-            distinct windows to memorise; lr -- AdamW learning rate; seed -- torch seed.
+            distinct windows to memorise; lr -- AdamW learning rate; seed -- torch seed;
+            session -- which dataset root to overfit.
     Outputs: (final `triplet_acc`, the loss history's last `score_gap`).
     Side effects: builds a model and Dataset, decodes video.
     """
     from tailcyclenet.scorer.model import build_scorer
 
     torch.manual_seed(seed)
-    ds = ScorerDataset(PoseDataset(root / 'mouselike', 'train', CFG, train=True), CORRUPTION)
+    ds = ScorerDataset(PoseDataset(root / session, 'train', CFG, train=True), CORRUPTION)
     loader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=scorer_collate,
                         num_workers=0)
     windows = _windows(loader, n_windows)
@@ -106,17 +111,20 @@ def _overfit(root, iterations=120, n_windows=2, lr=1e-3, seed=0):
     return acc, gap
 
 
-def test_the_scorer_overfits_a_handful_of_windows(overfit_root):
+@pytest.mark.parametrize('session,mode', [('mouselike', '3d'), ('ratlike', '2d')])
+def test_the_scorer_overfits_a_handful_of_windows(overfit_root, session, mode):
     """A tiny model must drive `triplet_acc` to 1.0 on a couple of windows.
 
-    This is the phase-3 exit gate. 120 AdamW steps at lr 1e-3 on two frozen windows is far more
-    capacity than the task needs; failing to reach 1.0 means the path is broken, not under-trained.
+    This is the phase-3 (3D) and phase-4 (2D) exit gate. 120 AdamW steps at lr 1e-3 on two frozen
+    windows is far more capacity than the task needs; failing to reach 1.0 means the path is
+    broken, not under-trained. The 2D arm is not a different objective -- it is the same one over
+    `transfer_points_2d`, the anchor's coordinate carry, which is the part with no 3D analogue.
     """
-    acc, gap = _overfit(overfit_root)
+    acc, gap = _overfit(overfit_root, session=session, n_windows=2)
     assert acc == pytest.approx(1.0), (
-        f'the scorer did not overfit: triplet_acc={acc:.3f}, score_gap={gap:.4g}. '
-        'A perfect score on two windows is the floor, so this is a broken path rather than an '
-        'under-trained model.')
+        f'{mode}: the scorer did not overfit {session}: triplet_acc={acc:.3f}, '
+        f'score_gap={gap:.4g}. A perfect score on two windows is the floor, so this is a broken '
+        'path rather than an under-trained model.')
 
 
 def test_the_overfit_curves_are_reproducible(overfit_root):

@@ -285,8 +285,18 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
     if coords.shape[0] != 1:
         raise ValueError('the scorer builds one window per triplet (batch_size 1)')
 
-    K = coords.shape[2]
     counts = observed_frame_counts(coords, sel.frames)
+
+    # Section 3.9: a keypoint with NO observed frame is DROPPED here, before anything is drawn.
+    # It has by construction no slot any corruption could move, so leaving it in would (a) train
+    # the scorer on a point whose only content is the missing token, and (b) make the sparse
+    # "did the corruption move an observed slot" check unsatisfiable for it.
+    alive = counts[0] > 0
+    if int(alive.sum()) < 2:
+        return None
+    coords = coords[:, :, alive]
+    counts = counts[:, alive]
+    K = coords.shape[2]
 
     cube_scale_b = None
     if mode == '3d':
@@ -295,18 +305,15 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
 
     dense = dense_3d if mode == '3d' else dense_2d
     sparse = sparse_3d if mode == '3d' else sparse_2d
-    shift_dense, fired_dense = _draw_shift(dense, coords)
-    shift_sparse, fired_sparse = _draw_shift(sparse, coords)
     is_dense = (counts >= int(cfg.get('min_valid_frames', 1)))[0]
+    shift_dense, fired_dense = _draw_shift(dense, coords)
+    shift_sparse, fired_sparse = _draw_sparse_moved(sparse, coords, is_dense)
     pick = is_dense.view(1, 1, K, 1)
     pick_type = is_dense.view(1, K, 1)
     shift = torch.where(pick, shift_dense, shift_sparse)
     fired = torch.where(pick_type, fired_dense, fired_sparse)
     if mode == '3d':
         shift = shift * cube_scale_b[:, None, None, None]
-
-    if not bool(is_dense.all()):
-        _ensure_sparse_corruption_moved(shift, coords, is_dense)
 
     drop_mask = _compute_drop_mask(coords, cfg, counts)
     good = apply_drop_mask(coords, drop_mask)
@@ -333,7 +340,7 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
         'good': (gv, good[:, :, keep], view_a.cgroup),
         'bad': (gv, bad[:, :, keep], view_a.cgroup),
         'anchor': (av, anchor[:, :, keep], view_b.cgroup),
-        'kpt_ids': dataset._kpt_ids[sel.sess.path][keep][None],
+        'kpt_ids': dataset._kpt_ids[sel.sess.path][alive][keep][None],
         'anchor_label': anchor_label,
         'mode': mode,
         'reuse_scene_for_anchor': False,
@@ -359,28 +366,50 @@ def _draw_shift(corruptor, coords):
             fired.reshape(b, k, len(GENERATORS)))
 
 
-def _ensure_sparse_corruption_moved(shift, coords, is_dense, draws=8):
-    """A sparse keypoint's corruption must actually move an OBSERVED slot.
+SPARSE_DRAW_RETRIES = 16
 
-    `gradual_drift` ramps from zero and `sinusoid` crosses it, so at a sparse window's single
-    observed frame either can contribute nothing. A corruption that changes no coordinate would
-    train the scorer to call a corrupt sample clean -- worse than not training that window at
-    all -- so `SPARSE_TYPES` is restricted to the two types that cannot do that, and this check is
-    the backstop that says so out loud.
+
+def _sparse_stuck(shift, coords, is_dense):
+    """[b,k] bool: a SPARSE keypoint whose drawn corruption moves no observed slot.
+
+    `const_offset` moves every frame once it fires, and `frame_noise` moves a contiguous window --
+    which need not cover the ONE frame a sparse keypoint is observed in. A sparse keypoint whose
+    `const_offset` did not fire and whose `frame_noise` window missed is corrupted by nothing, and
+    training on it would teach the scorer that a corrupt sample is clean.
 
     Inputs: shift -- [b,t,k,R] the drawn (unit-space) shift; coords -- [b,t,k,R];
-            is_dense -- [b,k] bool; draws -- how many extra draws to try before giving up.
-    Outputs: None; raises when a sparse keypoint still has no realised displacement.
-    Side effects: none (reads `shift` and `coords`).
+            is_dense -- [b,k] bool.
+    Outputs: [b,k] bool.
+    Side effects: none.
     """
     valid = torch.isfinite(coords).all(-1)
     moved = (shift.abs().sum(-1).masked_fill(~valid, 0.0) > 0).any(dim=1)
-    stuck = (~is_dense) & (~moved)
-    if bool(stuck.any()):
-        raise ValueError(
-            f'{int(stuck.sum())} sparse keypoint(s) drew a corruption that moves NO observed '
-            'slot. The sparse menu is restricted to types that cannot cancel, so this means the '
-            'draw or the observed-frame count is wrong -- refusing rather than training on it.')
+    return (~is_dense) & (~moved)
+
+
+def _draw_sparse_moved(sparse_corruptor, coords, is_dense):
+    """Draw the sparse corruption, RESAMPLING until every sparse keypoint is actually moved.
+
+    Section 3.8b invariant 1: the sampled corruption must change an observed slot, so a draw that
+    misses one is redrawn rather than accepted. The whole draw is redrawn rather than patched,
+    because patching would bias the mix toward the type used to patch it.
+
+    Inputs: sparse_corruptor -- the reduced-menu `PointCorruptor`; coords -- [b,t,k,R];
+            is_dense -- [b,k] bool.
+    Outputs: (shift [b,t,k,R], fired [b,k,n_types]).
+    Side effects: draws from the ambient torch RNG.
+    """
+    shift, fired = _draw_shift(sparse_corruptor, coords)
+    for _ in range(SPARSE_DRAW_RETRIES):
+        stuck = _sparse_stuck(shift, coords, is_dense)
+        if not bool(stuck.any()):
+            return shift, fired
+        shift, fired = _draw_shift(sparse_corruptor, coords)
+    stuck = _sparse_stuck(shift, coords, is_dense)
+    raise ValueError(
+        f'{int(stuck.sum())} sparse keypoint(s) still moved no observed slot after '
+        f'{SPARSE_DRAW_RETRIES} redraws of a menu restricted to types that cannot cancel. That '
+        'is not a sampling accident, so the observed-frame count or the magnitudes are wrong.')
 
 
 def triplet_collate(batch):

@@ -1,0 +1,12 @@
+# The scorer's per-root overlay: it sets WHERE the data and the warm start are and nothing else,
+# so the two roots differ in exactly those two facts and a comparison between them is a comparison
+# of roots rather than of recipes.
+
+[run]
+kind = "scorer"
+
+[data]
+path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/calms21"
+
+[training]
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/tailcyclenet/runs/boxwidenf12distractor-20260820_1840/calms21-box-wide-unfreeze-nframes12-distractor-a010-k007"

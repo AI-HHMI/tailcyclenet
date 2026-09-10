@@ -1169,7 +1169,7 @@ class PoseDataset(Dataset):
                          attempt_swap_animal=attempt_swap_animal, neighbour_row=neighbour_row,
                          inflate=inflate)
 
-    def _realise(self, sel, rng) -> View | None:
+    def _realise(self, sel, rng, world_gauge=True) -> View | None:
         """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
 
         Consumes the rotation draw (one per camera), the crop jitter, the grayscale coin and the
@@ -1188,6 +1188,17 @@ class PoseDataset(Dataset):
 
         Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
         fewer bytes to collate/queue/pin; the model divides on device).
+
+        `world_gauge` gates the 3D WORLD-GAUGE rotation (the `_rotate_camera_group_with_neighbours`
+        calls), NOT the per-camera image-plane rotation, and defaults True -- the pose path
+        unchanged. A scorer sets it False because the gauge rotation moves `coords` as well as the
+        cameras, so two independent realisations would put the good/bad track and the anchor's
+        track in DIFFERENT world gauges, and one coord tensor could then not serve all three
+        members.
+
+        Inputs: sel -- a `Selection`; rng -- this view's own stream; world_gauge -- see above.
+        Outputs: the `View`, or None when the crop fails or a frame will not decode.
+        Side effects: decodes video frames through the reader cache and draws from `rng`.
         """
         group, lab = sel.group, sel.lab
         frames = sel.frames
@@ -1257,7 +1268,7 @@ class PoseDataset(Dataset):
             if attempt_swap_animal:
                 others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],
                                              dtype=torch.float32)
-            if self.train:
+            if self.train and world_gauge:
                 cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
             cp3 = None if crop_pts is None else [
@@ -1271,7 +1282,7 @@ class PoseDataset(Dataset):
             resized = [_resize_camera(c, self.cfg.image_size) for c in cgroup]
             cgroup = [c for c, _ in resized]
             scales = [s for _, s in resized]
-            if self.train:
+            if self.train and world_gauge:
                 cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
             if others_raw is not None:

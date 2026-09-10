@@ -299,3 +299,55 @@ def test_the_triplet_scores_end_to_end(roots):
     assert torch.isfinite(total), 'the triplet loss is non-finite'
     assert any(p.grad is not None and p.grad.abs().sum() > 0
                for p in model.score_head.parameters())
+
+
+# -- corruption tagging (Gate B needs a per-type breakdown) -----------------------------------
+
+def test_tagged_draw_matches_the_library_corruptor_exactly():
+    """`tagged_draw` must draw the SAME shift as the library's `PointCorruptor`.
+
+    The tags decide what the per-type `triplet_acc` means, so if this draw diverged from the one
+    the model is trained on, the breakdown would describe a different corruption than the model
+    saw. Same seed, same tensors -- not a statistical match.
+    """
+    from posetail.datasets.scorer_corruption import PointCorruptor, GENERATORS
+
+    from tailcyclenet.scorer.triplet import tagged_draw
+
+    probs = {n: 0.5 for n in GENERATORS}
+    mags = {n: 10.0 for n in GENERATORS}
+    P, T, D = 7, 4, 3
+
+    torch.manual_seed(1234)
+    want = PointCorruptor(probs, mags)(P, T, D, torch.device('cpu'))
+    torch.manual_seed(1234)
+    got, fired = tagged_draw(PointCorruptor(probs, mags), P, T, D, torch.device('cpu'))
+
+    assert torch.equal(got, want), (got - want).abs().max()
+    assert fired.shape == (P, len(GENERATORS))
+    assert bool(fired.any()), 'no type was tagged -- the breakdown would be empty'
+
+
+def test_tagged_draw_tags_every_point_with_at_least_one_type():
+    """Every point is corrupted, so every point must carry at least one tag."""
+    from posetail.datasets.scorer_corruption import PointCorruptor, GENERATORS
+
+    from tailcyclenet.scorer.triplet import tagged_draw
+
+    probs = {n: 0.0 for n in GENERATORS}
+    probs['const_offset'] = 0.01                 # almost never fires on its own
+    torch.manual_seed(7)
+    _shift, fired = tagged_draw(PointCorruptor(probs, {n: 5.0 for n in GENERATORS}),
+                                6, 3, 2, torch.device('cpu'))
+    assert bool(fired.any(dim=1).all()), 'a point was left with no corruption tag'
+
+
+def test_the_triplet_carries_per_type_tags_for_the_surviving_points(roots):
+    """`make_triplet` must return tags aligned with the keypoints it kept."""
+    from posetail.datasets.scorer_corruption import GENERATORS
+
+    _ds, trip = _one(roots, 'mouselike', False, 0)
+    assert trip is not None
+    K = trip['good'][1].shape[2]
+    assert trip['fired'].shape == (1, K, len(GENERATORS))
+    assert bool(trip['fired'].any()), 'no corruption was tagged on a real triplet'

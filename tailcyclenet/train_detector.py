@@ -180,7 +180,7 @@ def _record_run(run: Path, config: dict) -> None:
         (run / 'provenance.toml').write_text(toml.dumps(prov))
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Train the box predictor; exit via SystemExit on bad config.
 
     Inputs: argv (via argparse): --config, --out, --iters, --device.
@@ -208,7 +208,7 @@ def main():
       weights, and selects on `val` where there is one (`train` otherwise);
       the loader does NOT trust `detector_last.pth`.
     """
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(prog='tailcyclenet train-detector', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', type=Path, default=None,
                     help='defaults to the packaged configs/detector.toml (the shipped recipe, '
@@ -222,7 +222,7 @@ def main():
                          '~/.cache/tailcyclenet/weights, auto-fetched from Megvii\'s tagged '
                          '0.1.1rc0 GitHub release if not already cached there. Pass this to use a '
                          'pre-staged directory instead (e.g. on a host with no internet access).')
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     config = load_detector_config(args.config or _DETECTOR_CONFIG, out=args.out,
                                   iters=args.iters, device=args.device)

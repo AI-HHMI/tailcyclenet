@@ -337,7 +337,7 @@ def launch(args):
     return fabric
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Finetune a posetail tracker into a pose estimator.
 
     Side effects: trains; writes checkpoints + log.jsonl under the run folder; launches Fabric
@@ -368,7 +368,7 @@ def main():
       `grad_norm` is the clipped AdamW half only; `saved_mpjpe` is the metric of
       `checkpoint_best.pth` on disk.
     """
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(prog='tailcyclenet train', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--config', type=Path, default=None,
                     help='defaults to the packaged configs/base.toml (the shipped recipe, '
@@ -400,7 +400,7 @@ def main():
                          '(memory, throughput) whose weights are worthless and whose files are '
                          '~5.6 GB each -- checkpoint_freq alone cannot express this, because the '
                          'last iteration always writes.')
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     fabric = launch(args)
     world, is0 = fabric.world_size, fabric.is_global_zero
 

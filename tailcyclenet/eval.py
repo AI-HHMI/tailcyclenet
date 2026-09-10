@@ -290,7 +290,7 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
                         min_kpts_frac=min_kpts_frac, cost=match_cost, last=last)
 
 
-def main():
+def main(argv: list[str] | None = None):
     """Score a prediction file; exit via SystemExit on bad config.
 
     Inputs: argv (via argparse): predictions, --data, --split, --pck,
@@ -322,7 +322,7 @@ def main():
       label path. The FP split is paired as well: a paired `fp_rate` alone cannot say which
       term an arm moved.
     """
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(prog='tailcyclenet eval', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('predictions', type=Path)
     ap.add_argument('--data', required=True, type=Path)
@@ -369,7 +369,7 @@ def main():
                          'from a perfectly-tracked pair depending only on row storage order, and '
                          'idsw has no other documented noise floor; MOTA has had one (+-0.023) '
                          'since CLAUDE.md eval rule 8. 32 is the plan\'s own suggested N.')
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     preds, meta = load_predictions(args.predictions)
     labels = label_lookup(args.data, args.split)

@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     any input-specific group because the range serves both input paths -- it is a window-loop
     lever, not an input-format one.
     """
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(prog='tailcyclenet infer', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path,
                     help='pose run folder or a self-contained pose checkpoint .pth')

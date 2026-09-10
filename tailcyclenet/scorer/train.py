@@ -293,6 +293,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     step = 0
     t0 = time.time()
     window: dict[str, list] = {}
+    best_acc = float('-inf')
+    best_iter = -1
     while step < n_iter:
         for trip in train_loader:
             if step >= n_iter:
@@ -321,8 +323,16 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 val_loss_fn.reset_history()
                 if hasattr(optimizer, 'train'):
                     optimizer.train()
+                acc = values.get('val/triplet_acc')
+                if acc is not None and acc > best_acc:
+                    best_acc, best_iter = float(acc), iteration
+                    save_checkpoint(out, iteration, model, optimizer, config,
+                                    name='best', registry=registry, kind='scorer')
                 print(f'[{iteration}] ' + '  '.join(
                     f'{k}={v:.4g}' for k, v in values.items() if k.startswith('val/')))
+                if acc is not None:
+                    print(f'[{iteration}] best val/triplet_acc {best_acc:.4f} at iteration '
+                          f'{best_iter}')
 
             if wb is not None:
                 log(wb, values, iteration)
@@ -340,6 +350,9 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             step += 1
     if wb is not None:
         wb.finish()
+    if best_iter >= 0:
+        print(f'best: val/triplet_acc {best_acc:.4f} at iteration {best_iter} '
+              f'(checkpoints/checkpoint_best.pth)')
     print(f'done: {n_iter} iterations into {out}')
 
 

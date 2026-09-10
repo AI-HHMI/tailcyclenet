@@ -37,6 +37,15 @@ class ScorerDataset(torch.utils.data.Dataset):
         self.cfg = dict(corruption_cfg)
         self.corruptors = build_corruptors_for(self.cfg)
 
+    def mix(self):
+        """Requested-versus-natural (source, mode) share, from the base loader.
+
+        Inputs: none.
+        Outputs: the base `PoseDataset.mix()` result, or None when no mixing lever is configured.
+        Side effects: none.
+        """
+        return self.base.mix()
+
     def __len__(self):
         """Inputs: none. Outputs: the number of base windows. Side effects: none."""
         return len(self.base)

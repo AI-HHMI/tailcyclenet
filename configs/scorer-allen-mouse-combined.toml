@@ -1,0 +1,16 @@
+# The scorer's per-root overlay: it sets WHERE the data and the warm start are and nothing else,
+# so the roots differ in exactly those two facts and a comparison between them is a comparison of
+# roots rather than of recipes. allen-mouse-combined is the phase-3.5 mechanism root: it holds
+# 76 annotated sessions plus 1 tracked one, so it is the only one of the three where annot_frac
+# and the sparse corruption menu are not structurally inert. It has NO test/ split, so every
+# number off it is a val/seen-animal number.
+
+[run]
+kind = "scorer"
+
+[data]
+path = "/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/allen-mouse-combined"
+annot_frac = 0.5
+
+[training]
+checkpoint_path = "/groups/karashchuk/home/karashchukl/results/tailcyclenet/runs/boxwidenf12distractor-20260820_1840/allen-mouse-combined-box-wide-unfreeze-nframes12-distractor-a010-k007"

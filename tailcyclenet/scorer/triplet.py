@@ -200,7 +200,9 @@ def view_affine_2d(view):
     Side effects: none.
     """
     assert len(view.cgroup) == 1, 'a 2D view is single-camera'
-    scale = float(view.scale[0])
+    scale = torch.as_tensor(view.scale[0], dtype=torch.float64)
+    if scale.ndim == 0:
+        scale = scale.repeat(2)
     box = view.boxes[0]
     x1, y1 = float(box[0]), float(box[1])
 
@@ -217,7 +219,7 @@ def view_affine_2d(view):
     T[1, 2] = -y1
     H = T @ H
     S = torch.eye(3, dtype=torch.float64)
-    S[0, 0] = S[1, 1] = scale
+    S[0, 0], S[1, 1] = scale[0], scale[1]
     return S @ H
 
 
@@ -362,6 +364,7 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
         'kpt_ids': dataset._kpt_ids[sel.sess.path][alive][keep][None],
         'anchor_label': anchor_label,
         'mode': mode,
+        'source': sel.sess.label_source,
         'reuse_scene_for_anchor': False,
         'occlusion': None,
         'counts': counts[:, keep],

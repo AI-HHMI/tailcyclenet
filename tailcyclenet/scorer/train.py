@@ -189,7 +189,7 @@ def evaluate(model, loader, loss_fn, device, max_batches: int) -> dict:
 
 
 def run(config_path, data_path, out: Path, checkpoint: str | None, device,
-        max_iterations: int | None, no_wandb: bool) -> None:
+        max_iterations: int | None, no_wandb: bool, fresh: bool = False) -> None:
     """Train one scorer run.
 
     The per-step training metrics are averaged over the last `print_freq` steps before printing,
@@ -201,7 +201,12 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             root (overrides `[data].path`); out -- the run folder; checkpoint -- a pose run folder
             or checkpoint to warm-start from, or a scorer run folder's checkpoint to RESUME from;
             device -- torch device; max_iterations -- override `[training].n_iterations`;
-            no_wandb -- skip wandb.
+            no_wandb -- skip wandb; fresh -- ignore this run folder's own checkpoint and start
+            from the warm start, which is what `--fresh` is for.
+    `[training].n_iterations` (and `--iterations`) is a TOTAL, not an increment: resuming a
+    60000-iteration run whose checkpoint sits at 40000 runs 20000 more and stops at 60000. Without
+    that, a re-submitted job would silently train past its own budget.
+
     Outputs: none.
     Side effects: writes the run folder, checkpoints and wandb logs.
     """
@@ -213,10 +218,17 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    ckpt_path = checkpoint or train_cfg.get('checkpoint_path') or None
+    resumed = out / 'checkpoints' / 'checkpoint_last.pth'
+    if resumed.exists() and not fresh:
+        ckpt_path = str(resumed)
+        registry_ref = out
+        print(f'resuming this run folder: {resumed}')
+    else:
+        ckpt_path = checkpoint or train_cfg.get('checkpoint_path') or None
+        registry_ref = None
     base_reg = None
-    if ckpt_path:
-        ref = Path(ckpt_path)
+    ref = Path(ckpt_path) if ckpt_path else registry_ref
+    if ref is not None:
         ref = ref.parent.parent if ref.is_file() else ref
         if (ref / 'keypoint_registry.toml').exists():
             base_reg = Registry.load(ref / 'keypoint_registry.toml')
@@ -266,13 +278,14 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     wb = None if no_wandb else init_wandb(config, out)
     train_loader, val_loader = _loaders(train_ds, val_ds, config, seed)
 
-    n_iter = int(max_iterations or train_cfg.get('n_iterations', 10000))
+    n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
     val_freq = int(train_cfg.get('val_freq', 200))
     val_batches = int(train_cfg.get('val_batches', 20))
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
     print_freq = int(train_cfg.get('print_freq', 20))
     max_norm = float(train_cfg.get('max_grad_norm', 10.0))
     start_iter = int(resume_state.get('iteration', 0)) if resume_state else 0
+    n_iter = max(0, n_target - start_iter)
 
     model.train()
     if hasattr(optimizer, 'train'):
@@ -347,7 +360,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--iterations', type=int, default=None)
     parser.add_argument('--no-wandb', action='store_true')
+    parser.add_argument('--fresh', action='store_true',
+                        help="start from iteration 0 even if this run folder holds a "
+                             "checkpoint_last")
     args = parser.parse_args(argv)
     run(args.config, args.data, Path(args.out), args.checkpoint, args.device,
-        args.iterations, args.no_wandb)
+        args.iterations, args.no_wandb, args.fresh)
     return 0

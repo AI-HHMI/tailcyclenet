@@ -165,10 +165,14 @@ def test_the_crop_does_not_depend_on_the_corruption(roots):
     sel_a = ds._select(0, rng_a, shape)
     standalone = ds._realise(sel_a, rng_a, world_gauge=False)
 
+    torch.manual_seed(0)
     rng_b = np.random.default_rng(0)
     sel_b = ds._select(0, rng_b, shape)
     trip = make_triplet(ds, sel_b, rng_b, CORRUPTION, build_corruptors_for(CORRUPTION))
-    assert standalone is not None and trip is not None
+    assert standalone is not None, 'the standalone realisation failed'
+    assert trip is not None, ('the triplet did not build for this seed. The corruption draws come '
+                              'from the ambient torch RNG, so this test seeds it -- a build '
+                              'failure here means the visibility filter rejected every keypoint')
 
     assert len(standalone.cgroup) == len(trip['good'][2])
     for a, b in zip(standalone.cgroup, trip['good'][2]):
@@ -227,10 +231,24 @@ def test_a_sparse_keypoint_gets_only_the_types_that_can_move_it():
     assert set(s2.names) == {'const_offset', 'frame_noise'}
 
 
-def test_a_sparse_menu_with_no_enabled_type_is_refused():
-    """A sparse window that cannot be corrupted must be a loud failure, not silent no-training."""
-    cfg = dict(CORRUPTION, const_offset_prob=0.0, frame_noise_prob=0.0)
-    with pytest.raises(AssertionError, match='sparse'):
+def test_the_sparse_menu_forces_const_offset():
+    """`const_offset` must be FORCED for a sparse keypoint, not gated at its configured value.
+
+    Section 3.8b's own wording is that `const_offset` "always qualifies". Gating it at 0.5 leaves a
+    sparse keypoint observed in only the last few frames of a window uncorrupted most of the time,
+    because `frame_noise` moves a contiguous window that need not reach them -- measured at ~83% of
+    draws on 3dpop. A window trained on an uncorrupted "bad" sample teaches the scorer that a
+    corrupt track is clean, which is worse than not training that window at all.
+    """
+    cfg = dict(CORRUPTION, const_offset_prob=0.01, frame_noise_prob=0.0)
+    _d3, _d2, s3, _s2 = build_corruptors_for(cfg)
+    assert s3.probs['const_offset'] == 1.0, 'const_offset is not forced for sparse keypoints'
+
+
+def test_a_sparse_menu_with_a_zero_forced_magnitude_is_refused():
+    """Forcing a zero-magnitude type would corrupt nothing, so it must fail loudly."""
+    cfg = dict(CORRUPTION, mag_3d={k: 0.0 for k in CORRUPTION['mag_3d']})
+    with pytest.raises(ValueError, match='const_offset'):
         build_corruptors_for(cfg)
 
 
@@ -255,25 +273,61 @@ def test_sparse_windows_still_build_and_still_carry_signal(roots):
         assert float(delta.max()) > 0, 'a sparse window drew a corruption that moved nothing'
 
 
-def test_an_uncorruptible_sparse_draw_is_refused_not_trained_on():
-    """Invariant 1 of section 3.8b, tested directly.
+def test_sparse_stuck_detects_a_corruption_that_moves_no_observed_slot():
+    """The detector behind section 3.8b's invariant 1, tested directly.
 
-    `_ensure_sparse_corruption_moved` must raise when a sparse keypoint's shift moves no observed
-    slot -- a corruption that changes nothing would teach the scorer to call a corrupt sample
-    clean.
+    A shift that moves only slots the keypoint was never observed at is a corruption in name only.
     """
-    from tailcyclenet.scorer.triplet import _ensure_sparse_corruption_moved
+    from tailcyclenet.scorer.triplet import _sparse_stuck
 
     coords = torch.zeros(1, 4, 2, 3)
     coords[0, 0, 1] = float('nan')
     is_dense = torch.tensor([[True, False]])
     shift = torch.zeros(1, 4, 2, 3)
     shift[0, 3, 0] = 5.0                     # moves only the DENSE point (keypoint 0)
-    with pytest.raises(ValueError, match='moves NO observed slot'):
-        _ensure_sparse_corruption_moved(shift, coords, is_dense)
+    stuck = _sparse_stuck(shift, coords, is_dense)
+    assert bool(stuck[0, 1]), 'a sparse keypoint moved nowhere was not flagged'
+    assert not bool(stuck[0, 0]), 'the dense keypoint was flagged'
 
-    shift[0, 1, 1] = 5.0                     # now it moves the SPARSE point at an observed frame
-    _ensure_sparse_corruption_moved(shift, coords, is_dense)
+    shift[0, 1, 1] = 5.0                     # now it moves the sparse point at an observed frame
+    assert not bool(_sparse_stuck(shift, coords, is_dense).any())
+
+
+def test_the_forced_sparse_menu_moves_every_sparse_keypoint(roots):
+    """With `const_offset` forced, NO sparse keypoint is ever left uncorrupted.
+
+    This is the regression guard for the bug that stopped the first 3dpop probe: a sparse keypoint
+    observed in only the window's last few frames was missed by `frame_noise`'s window on ~83% of
+    draws, and `const_offset` gated at 0.5 left it stuck. A forced `const_offset` moves every frame,
+    so `_draw_sparse_moved` cannot fail.
+    """
+    from tailcyclenet.scorer.triplet import _draw_sparse_moved, _sparse_stuck
+
+    ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
+    _d3, _d2, sparse_3d, _s2 = build_corruptors_for(CORRUPTION)
+    checked = 0
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        sel = ds._select(0, rng, ds._shape(np.random.default_rng(1)))
+        if sel is None:
+            continue
+        view = ds._realise(sel, rng, world_gauge=False)
+        if view is None:
+            continue
+        coords = view.coords[None]
+        counts = observed_frame_counts(coords, sel.frames)
+        alive = counts[0] > 0
+        if int(alive.sum()) < 2:
+            continue
+        c = coords[:, :, alive]
+        is_dense = (counts[:, alive] >= 6)[0]
+        if bool(is_dense.all()):
+            is_dense = torch.zeros_like(is_dense)      # force the sparse path for the test
+        shift, _fired = _draw_sparse_moved(sparse_3d, c, is_dense)
+        assert not bool(_sparse_stuck(shift, c, is_dense).any()), \
+            f'seed {seed}: a sparse keypoint was left uncorrupted'
+        checked += 1
+    assert checked > 0, 'no window exercised the sparse path'
 
 
 # -- the triplet feeds the model -------------------------------------------------------------

@@ -35,7 +35,8 @@ TRIPLET_KEYS = ('good', 'bad', 'anchor')
 # The corruption types that can move a SINGLE observed slot, which is all a sparse window can be
 # trained on. `gradual_drift` and `sinusoid` ramp from or through zero, so at one observed frame
 # they may corrupt nothing at all -- and a corruption that changes nothing would teach the scorer
-# to call a corrupt sample clean, which is worse than excluding the window.
+# to call a corrupt sample clean, which is worse than excluding the window. `const_offset` is
+# FORCED for sparse keypoints (see `build_corruptors_for`); `frame_noise` rides alongside it.
 SPARSE_TYPES = ('const_offset', 'frame_noise')
 
 
@@ -84,20 +85,37 @@ def tagged_draw(corruptor, P, T, D, device):
 def build_corruptors_for(cfg):
     """(dense, sparse) `PointCorruptor` pairs for 3D and 2D.
 
-    The dense pair is the reference's full menu. The sparse pair keeps only `SPARSE_TYPES`, and
-    is what a keypoint with too few distinct observed frames is corrupted with.
+    The dense pair is the reference's full menu -- all four types, each gated at its configured
+    probability. The sparse pair is what a keypoint with too few distinct observed frames gets, and
+    it FORCES `const_offset` (probability 1.0) rather than gating it at the configured value.
+
+    Forcing it is section 3.8b's own wording -- "`const_offset` always qualifies" for a sparse
+    keypoint -- and it is the difference between a sparse window that trains and one that does not.
+    `frame_noise` moves a CONTIGUOUS window, and a sparse keypoint observed in only the last few
+    frames of a window is missed by that window often; measured on 3dpop, a sparse keypoint was
+    left uncorrupted by ~83% of draws with `const_offset` merely gated at 0.5. `const_offset` adds
+    one offset to EVERY frame, so forcing it makes a sparse keypoint's corruption deterministic.
 
     Inputs: cfg -- the `[scorer.corruption]` block.
     Outputs: (dense_3d, dense_2d, sparse_3d, sparse_2d).
-    Side effects: none.
+    Side effects: none, or raises AssertionError when the forced magnitude is zero.
     """
     dense_3d, dense_2d = build_corruptors(cfg)
-    probs = {n: (cfg.get(f'{n}_prob', 0.0) if n in SPARSE_TYPES else 0.0) for n in GENERATORS}
-    assert any(v > 0 for v in probs.values()), (
-        f'none of the sparse corruption types {SPARSE_TYPES} is enabled; a sparse window could '
-        'then not be corrupted at all. Enable one of them, or exclude sparse windows entirely.')
-    sparse_3d = PointCorruptor(probs, dict(cfg.get('mag_3d', {})))
-    sparse_2d = PointCorruptor(probs, dict(cfg.get('mag_2d', {})))
+    probs = {n: 0.0 for n in GENERATORS}
+    probs['const_offset'] = 1.0
+    for n in SPARSE_TYPES:
+        if n != 'const_offset':
+            probs[n] = cfg.get(f'{n}_prob', 0.0)
+    mag_3d = dict(cfg.get('mag_3d', {}))
+    mag_2d = dict(cfg.get('mag_2d', {}))
+    if not (mag_3d.get('const_offset', 0.0) > 0 and mag_2d.get('const_offset', 0.0) > 0):
+        raise ValueError(
+            'the sparse corruption menu forces const_offset, so its magnitude must be nonzero in '
+            f'BOTH mag_3d ({mag_3d.get("const_offset")}) and mag_2d '
+            f'({mag_2d.get("const_offset")}); otherwise a sparse keypoint is corrupted by nothing '
+            'and the window would train the scorer to call a corrupt sample clean.')
+    sparse_3d = PointCorruptor(probs, mag_3d)
+    sparse_2d = PointCorruptor(probs, mag_2d)
     return dense_3d, dense_2d, sparse_3d, sparse_2d
 
 

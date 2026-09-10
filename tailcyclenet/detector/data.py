@@ -387,7 +387,9 @@ class BoxDataset(Dataset):
             for gid, group in sess.groups.items():
                 lab = sess.labels(gid)
                 vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
-                if vis is None:
+                if vis is None or vis.shape[0] == 0:
+                    # Converted sessions may legitimately contain an empty group/animal axis;
+                    # there is no labelled detector frame to index in that group.
                     continue
                 v = vis.reshape(vis.shape[0], vis.shape[1], -1)
                 frames = np.flatnonzero((v != UNLABELED).any((0, 2)))

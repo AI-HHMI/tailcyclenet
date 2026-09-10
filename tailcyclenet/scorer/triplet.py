@@ -39,6 +39,48 @@ TRIPLET_KEYS = ('good', 'bad', 'anchor')
 SPARSE_TYPES = ('const_offset', 'frame_noise')
 
 
+def tagged_draw(corruptor, P, T, D, device):
+    """A `PointCorruptor` draw that ALSO reports which types fired for each point.
+
+    Gate B needs `triplet_acc` broken out per corruption type: an aggregate that hides
+    "sinusoid 0.99 / const_offset 0.51" is not a measurement, and a type at chance means that
+    corruption is invisible and its magnitude is wrong. The library's `PointCorruptor.__call__`
+    returns only the summed shift, so this reproduces its algorithm exactly and adds tags.
+
+    Kept in step with the library by `tests/test_scorer_triplet.py`, which asserts this and
+    `PointCorruptor` produce the SAME tensor from the same RNG state -- without that, the tags
+    would describe a different draw from the one the model was trained on.
+
+    Inputs: corruptor -- a `PointCorruptor`; P, T, D -- points, frames, coordinate dim;
+            device -- where to build the draw.
+    Outputs: (shift [P,T,D] in unit magnitude space, fired [P, len(GENERATORS)] bool).
+    Side effects: draws from the ambient torch RNG.
+    """
+    names = corruptor.names
+    slot = {n: i for i, n in enumerate(GENERATORS)}
+    fired = torch.zeros(P, len(GENERATORS), dtype=torch.bool, device=device)
+    contributions = {}
+    applied = torch.zeros(P, dtype=torch.bool, device=device)
+    total = torch.zeros(P, T, D, device=device)
+    for name in names:
+        shift = GENERATORS[name](P, T, D, device, corruptor.mags[name])
+        contributions[name] = shift
+        mask = torch.rand(P, device=device) < corruptor.probs[name]
+        total = total + shift * mask[:, None, None].float()
+        applied = applied | mask
+        fired[:, slot[name]] |= mask
+
+    need = ~applied
+    if need.any():
+        pick = torch.randint(0, len(names), (P,), device=device)
+        for ci, name in enumerate(names):
+            m = need & (pick == ci)
+            if m.any():
+                total = total + contributions[name] * m[:, None, None].float()
+                fired[:, slot[name]] |= m
+    return total, fired
+
+
 def build_corruptors_for(cfg):
     """(dense, sparse) `PointCorruptor` pairs for 3D and 2D.
 
@@ -253,11 +295,13 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
 
     dense = dense_3d if mode == '3d' else dense_2d
     sparse = sparse_3d if mode == '3d' else sparse_2d
-    shift_dense = _draw_shift(dense, coords)
-    shift_sparse = _draw_shift(sparse, coords)
+    shift_dense, fired_dense = _draw_shift(dense, coords)
+    shift_sparse, fired_sparse = _draw_shift(sparse, coords)
     is_dense = (counts >= int(cfg.get('min_valid_frames', 1)))[0]
     pick = is_dense.view(1, 1, K, 1)
+    pick_type = is_dense.view(1, K, 1)
     shift = torch.where(pick, shift_dense, shift_sparse)
+    fired = torch.where(pick_type, fired_dense, fired_sparse)
     if mode == '3d':
         shift = shift * cube_scale_b[:, None, None, None]
 
@@ -295,6 +339,7 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
         'reuse_scene_for_anchor': False,
         'occlusion': None,
         'counts': counts[:, keep],
+        'fired': fired[:, keep, :],
         'n_dense': int(is_dense[keep].sum()),
         'n_sparse': int((~is_dense[keep]).sum()),
     }
@@ -304,12 +349,14 @@ def _draw_shift(corruptor, coords):
     """One corruption draw for every (batch, keypoint) point, in UNIT magnitude space.
 
     Inputs: corruptor -- a `PointCorruptor`; coords -- [b,t,k,R].
-    Outputs: [b,t,k,R] shift; 3D shifts are still in cube-scale units (the caller scales them).
+    Outputs: ([b,t,k,R] shift, [b,k,n_types] fired); 3D shifts are in cube-scale units (the
+        caller scales them).
     Side effects: draws from the ambient torch RNG.
     """
     b, t, k, dim = coords.shape
-    shifts = corruptor(b * k, t, dim, coords.device)
-    return shifts.reshape(b, k, t, dim).permute(0, 2, 1, 3)
+    shifts, fired = tagged_draw(corruptor, b * k, t, dim, coords.device)
+    return (shifts.reshape(b, k, t, dim).permute(0, 2, 1, 3),
+            fired.reshape(b, k, len(GENERATORS)))
 
 
 def _ensure_sparse_corruption_moved(shift, coords, is_dense, draws=8):

@@ -117,6 +117,21 @@ val_freq = 200
 val_batches = 20
 print_freq = 20
 
+[training.optimizer]
+optimizer = "muon"
+learning_rate = 1e-4
+kpt_lr = 5e-4
+encoder_lr_scale = 0.1
+weight_decay = 0.002
+warmup_steps = 500
+beta1 = 0.9
+beta2 = 0.95
+muon_schedulefree = true
+muon_lr_scale = 1.0
+muon_momentum = 0.95
+muon_warmup_steps = 500
+muon_adjust_lr_fn = "match_rms_adamw"
+
 [model]
 query = "prior"
 query_encoder = "wide"

@@ -51,12 +51,29 @@ def _frame_to_window(starts, n_frames, T):
     return assign
 
 
-def _per_window_error(pred_sess, ref_sess, group_id, animal_idx, starts, T, keypoint):
+def _animal_index(lab, animal_id):
+    """Position of an animal ID within a group's `animal_ids`, or None if absent.
+
+    The QC table carries the animal's ID string, not its position: the id is stable across the
+    prediction and the reference, and a position would silently mean different animals if either
+    session listed them in another order.
+
+    Inputs: lab -- a `Labels`; animal_id -- the id as it appears in the QC table.
+    Outputs: the index into `lab.animal_ids`, or None.
+    Side effects: none.
+    """
+    ids = [str(a) for a in lab.animal_ids]
+    want = str(animal_id)
+    return ids.index(want) if want in ids else None
+
+
+def _per_window_error(pred_sess, ref_sess, group_id, animal_id, starts, T, keypoint):
     """Mean disagreement for one (group, animal, keypoint) over each window's assigned frames.
 
     Inputs: pred_sess / ref_sess -- loaded Sessions of the same underlying clip; group_id -- which
-            group; animal_idx -- which animal; starts -- that animal's window starts; T -- window
-            length; keypoint -- the keypoint NAME, resolved per session.
+            group; animal_id -- the animal's ID, as the QC table reports it; starts -- that
+            animal's window starts; T -- window length; keypoint -- the keypoint NAME, resolved
+            separately in each session because their name orders need not agree.
     Outputs: {start: mean distance} for windows with at least one frame observed in both.
     Side effects: reads parquet tables.
     """
@@ -64,13 +81,16 @@ def _per_window_error(pred_sess, ref_sess, group_id, animal_idx, starts, T, keyp
     rlab = ref_sess.groups[group_id].labels()
     if plab.points3d is None or rlab.points3d is None:
         return {}
-    if animal_idx >= plab.n_animals or animal_idx >= rlab.n_animals:
+    pa = _animal_index(plab, animal_id)
+    ra = _animal_index(rlab, animal_id)
+    if pa is None or ra is None:
+        return {}
+    pnames, rnames = [str(n) for n in pred_sess.names], [str(n) for n in ref_sess.names]
+    if keypoint not in pnames or keypoint not in rnames:
         return {}
     n_frames = pred_sess.groups[group_id].n_frames
-    pk = plab.animal_ids and list(pred_sess.names).index(keypoint)
-    rk = list(ref_sess.names).index(keypoint)
-    p = plab.points3d[animal_idx, :, pk, :]
-    r = rlab.points3d[animal_idx, :, rk, :]
+    p = plab.points3d[pa, :, pnames.index(keypoint), :]
+    r = rlab.points3d[ra, :, rnames.index(keypoint), :]
     n = min(p.shape[0], r.shape[0], n_frames)
     d = np.linalg.norm(p[:n] - r[:n], axis=-1)
     assign = _frame_to_window(starts, n, T)
@@ -117,12 +137,12 @@ def main(argv=None) -> int:
             continue
         starts = sorted(sub['start'].unique())
         for kpt, ksub in sub.groupby('keypoint'):
-            errs = _per_window_error(pred_sess, ref_sess, group, int(animal), starts, T, kpt)
+            errs = _per_window_error(pred_sess, ref_sess, group, animal, starts, T, kpt)
             for r in ksub.itertuples():
                 e = errs.get(int(r.start))
                 if e is None:
                     continue
-                rows.append({'session': session, 'group': group, 'animal': int(animal),
+                rows.append({'session': session, 'group': group, 'animal': str(animal),
                              'start': int(r.start), 'keypoint': kpt, 'score': float(r.score),
                              'error': e})
 

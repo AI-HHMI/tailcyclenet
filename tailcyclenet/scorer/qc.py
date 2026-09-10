@@ -77,6 +77,29 @@ def _windows(dataset):
             yield dataset.index[i].session, item
 
 
+def _to_device(views, coords, cgroup, kpt_ids, device):
+    """Batch, and move to the model's device, everything one window's forward needs.
+
+    A window arrives on CPU from the loader; the model may be on a GPU. Every tensor the forward
+    touches has to travel -- the views, the coordinates, the camera dict AND the keypoint ids --
+    because `conv3d` raises on a CPU input under a CUDA weight, and the camera tensors feed the
+    decoder's geometry.
+
+    Inputs: views -- a list of per-camera frame tensors; coords -- [T,K,R]; cgroup -- the camera
+            dict; kpt_ids -- [K] int64; device -- the target device.
+    Outputs: the same four, with views and coords batched to one window and everything moved.
+        `kpt_ids` keeps its [K] shape -- the caller batches it.
+    Side effects: none.
+    """
+    dev = torch.device(device)
+    views = [v[None].to(dev, non_blocking=True) for v in views]
+    coords = coords[None].to(dev, non_blocking=True)
+    kpt_ids = kpt_ids.to(dev)
+    cgroup = [{k: (v.to(dev) if torch.is_tensor(v) else v) for k, v in cam.items()}
+              for cam in cgroup]
+    return views, coords, cgroup, kpt_ids
+
+
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
@@ -99,8 +122,8 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             break
         views, coords, _vis, _frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
             item[:13]
-        views = [v[None] for v in views]
-        coords = coords[None]
+        views, coords, cgroup, kpt_ids = _to_device(
+            views, coords, cgroup, kpt_ids, device)
         with torch.no_grad():
             scores, precision = model(views, coords, cgroup, kpt_ids[None])
         scores = scores[0].cpu().numpy()

@@ -24,7 +24,6 @@ import torch
 from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
 from posetail.posetail.cube import (get_camera_scale, is_point_visible, project_points_torch)
 
-from tailcyclenet import box_prompt as bpmod
 from tailcyclenet import crop as cropmod
 from tailcyclenet.dataset import (_apply_affine, _crop_inflate, _mask_outside, _resize_camera,
                                  _rotate_2d, _rotate_camera_group_with_neighbours, _vis2d_target,

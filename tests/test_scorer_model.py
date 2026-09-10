@@ -10,7 +10,6 @@ a loss curve:
   * a moving rig must be REFUSED, because `_scene_scalars` and the ray construction treat the rig
     as static and would silently mis-project.
 """
-import tempfile
 from pathlib import Path
 
 import pytest

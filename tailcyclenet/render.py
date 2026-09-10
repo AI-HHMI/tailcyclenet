@@ -61,8 +61,9 @@ def draw_instance(img, p2d, colour, skel_ix, tid, radius=3, lw=1, font=0.5, mark
 def project(session, pred, cam, gid=None, frames=None):
     """(S,T,K,3) world points -> (S,T,K,2) pixels in camera `cam`'s stored image.
 
-    aniposelib owns the projection; `offset` is subtracted because `matrix` is in SENSOR
-    coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
+    Zero-skew static cameras use aniposelib's established projection. Static cameras with
+    nonzero skew use posetail's full-matrix projection; `offset` is subtracted because `matrix`
+    is in SENSOR coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
     `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
     `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
     pixels already -- the same call `infer._fill_box_agreement` makes, for the same reason. The
@@ -82,6 +83,17 @@ def project(session, pred, cam, gid=None, frames=None):
             xy = [project_points_torch([cams[cam]], p[s])[0].cpu().numpy() for s in range(S)]
         return np.stack(xy).astype(np.float32)
     obj = session.rig.by_name(name)
+    # aniposelib's static Camera.project() ignores intrinsic skew.  Keep its
+    # established path for ordinary zero-skew calibrations, but use the same
+    # full-matrix posetail projection as inference for skewed cameras.
+    skew = float(obj.matrix[0, 1].detach().cpu())
+    if skew != 0.0:
+        from posetail.posetail.cube import project_points_torch
+
+        with torch.no_grad():
+            p = torch.as_tensor(np.asarray(pred), dtype=torch.float64)
+            xy = project_points_torch([session.rig.posetail()[cam]], p)[0]
+        return xy.detach().cpu().numpy().astype(np.float32)
     with torch.no_grad():
         p = torch.as_tensor(np.asarray(pred).reshape(-1, 3),
                             dtype=obj.matrix.dtype, device=obj.matrix.device)

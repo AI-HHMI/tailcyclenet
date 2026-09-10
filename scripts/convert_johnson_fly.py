@@ -287,7 +287,7 @@ def build_pinhole_rig(src: Path, data: dict, session: str, cameras: list[str],
 
 
 def _triangulate_skew_aware(rig: fmt.Rig, p2d: np.ndarray) -> np.ndarray:
-    """Triangulate normalized pixels with full-K undistortion and posetail's DLT."""
+    """Triangulate zero-distortion pixels with full-K normalization and posetail's DLT."""
     import torch
     from posetail.posetail.cube import triangulate_simple_batch
 
@@ -296,6 +296,9 @@ def _triangulate_skew_aware(rig: fmt.Rig, p2d: np.ndarray) -> np.ndarray:
     valid = np.isfinite(p2d).all(axis=-1)
     extrinsics = []
     for ci, cam in enumerate(rig.cameras):
+        distortion = cam.dist.detach().cpu().numpy() if torch.is_tensor(cam.dist) else cam.dist
+        if np.any(np.asarray(distortion, dtype=np.float64) != 0.0):
+            raise ValueError(f'{cam.get_name()}: skew-aware DLT requires zero distortion')
         K = cam.matrix.detach().cpu().numpy().astype(np.float64)
         ext = cam.get_extrinsics_mat().detach().cpu().numpy().astype(np.float64)
         extrinsics.append(ext)

@@ -122,6 +122,30 @@ def test_a_3d_prediction_renders_with_no_data(infer_cli, render_cli, monkeypatch
     assert any(f.std() > 0 for f in frames), 'a blank render would pass the frame-count check too'
 
 
+def test_static_skew_projection_uses_full_intrinsics(tmp_path):
+    """Static 3D rendering must not route a nonzero-skew camera through aniposelib's projection."""
+    from aniposelib.cameras import Camera, CameraGroup
+    from tailcyclenet import format as fmt
+    from tailcyclenet.render import project
+
+    K = np.array([[800.0, 40.0, 320.0], [0.0, 780.0, 240.0], [0.0, 0.0, 1.0]])
+    cam = Camera(matrix=K, dist=np.zeros(5), rvec=np.zeros(3),
+                 tvec=np.array([0.0, 0.0, 50.0]), name='skew')
+    cam.set_size((640, 480))
+    rig = fmt.Rig(CameraGroup([cam]), offset={'skew': (7.0, -4.0)},
+                  moving={'skew': False}, calibrated={'skew': True})
+    sess = fmt.Session(path=tmp_path / 's', mode='3d', units='mm', label_source='tracked',
+                       names=['a', 'b'], rig=rig, groups={'g': fmt.Group('g', 1)})
+    world = np.array([[[[1.0, 2.0, 10.0], [-2.0, 1.0, 20.0]]]], dtype=np.float64)
+    got = project(sess, world, 0)
+
+    camera_xyz = world + np.array([0.0, 0.0, 50.0])
+    homogeneous = camera_xyz @ K.T
+    expected = homogeneous[..., :2] / homogeneous[..., 2, None]
+    expected -= np.array([7.0, -4.0])
+    np.testing.assert_allclose(got, expected, rtol=0.0, atol=2e-4)
+
+
 # 3. byte identity: a directory session and a --videos session reading the SAME file
 
 

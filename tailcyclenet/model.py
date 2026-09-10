@@ -42,20 +42,8 @@ def scene_center(camera_group):
     for cam in camera_group:
         px = (cam['size'].to(torch.float64) / 2.0).reshape(1, 2)
         off = cam['offset']
-        offsets = off if off.ndim == 2 else off[None]
-        if float(cam['mat'][0, 1]) != 0.0 and torch.count_nonzero(cam['dist']) == 0:
-            # posetail's generic undistort_points path currently extracts only fx/fy/cx/cy.
-            # Fly50 has zero distortion but genuine skew, so normalize those rays with full K.
-            K = cam['mat'].to(torch.float64)
-            K_inv = torch.linalg.inv(K)
-            und = []
-            for o in offsets:
-                sensor = px + o.to(torch.float64)
-                homogeneous = torch.cat([sensor, sensor.new_ones((1, 1))], dim=1)
-                ray = homogeneous @ K_inv.t()
-                und.append(ray[:, :2] / ray[:, 2, None])
-        else:
-            und = [undistort_points(dict(cam, offset=o), px) for o in offsets]
+        und = [undistort_points(dict(cam, offset=o), px)
+               for o in (off if off.ndim == 2 else off[None])]
         ext = cam['ext'] if cam['ext'].ndim == 3 else cam['ext'][None]
         centre = cam['center'] if cam['center'].ndim == 2 else cam['center'][None]
         for t in range(max(ext.shape[0], len(und))):

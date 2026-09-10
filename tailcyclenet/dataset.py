@@ -22,7 +22,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from posetail.datasets.posetail_dataset import custom_collate, rotate_camera_image_plane_3d
+from posetail.datasets.posetail_dataset import (
+    custom_collate, rotate_camera_image_plane_3d as _posetail_rotate_camera_image_plane_3d,
+)
+from .geometry import _has_skew
 from posetail.posetail.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
@@ -210,6 +213,41 @@ def prior_out_of_bounds(p, mode, cgroup):
         v = is_point_visible(c, p, margin=2)
         seen.append(v.any(0) if v.ndim > 1 else v)
     return torch.stack(seen).sum(0) < 2
+
+
+def _needs_full_image_rotation(cam):
+    """Whether an image-plane rotation cannot commute with this camera model."""
+    K2 = cam['mat'][:2, :2]
+    unequal_focal = not torch.isclose(K2[0, 0], K2[1, 1], rtol=1e-6, atol=1e-6)
+    nonzero_distortion = bool(torch.count_nonzero(cam['dist']))
+    return _has_skew(cam) or unequal_focal or nonzero_distortion
+
+
+def rotate_camera_image_plane_3d(cam, angle_deg):
+    """Rotate a 3D image and keep a full intrinsic matrix projection-consistent.
+
+    posetail's helper implements the equivalent camera update by rolling the camera frame. That
+    relies on the image transform commuting with the intrinsic/distortion model, which is only
+    safe for the narrow isotropic, zero-distortion case. For skew, unequal focal lengths, or
+    nonzero distortion, leave extrinsics fixed and left-multiply the complete homogeneous `K` by
+    the image affine, transforming offsets by its linear part. The projected 3D points then follow
+    exactly the same affine as the warped image.
+    """
+    cam_rot, rotation = _posetail_rotate_camera_image_plane_3d(cam, angle_deg)
+    if not _needs_full_image_rotation(cam):
+        return cam_rot, rotation
+
+    M, _ = rotation
+    H = torch.eye(3, dtype=cam['mat'].dtype, device=cam['mat'].device)
+    H[:2] = torch.as_tensor(M, dtype=H.dtype, device=H.device)
+    cam_rot['mat'] = H @ cam['mat']
+    cam_rot['ext'] = cam['ext']
+    cam_rot['ext_inv'] = cam['ext_inv']
+    cam_rot['center'] = cam['center']
+    linear = H[:2, :2]
+    offset = cam['offset']
+    cam_rot['offset'] = torch.matmul(offset, linear.t())
+    return cam_rot, rotation
 
 
 def _rotate_camera_group_with_neighbours(cgroup, coords, others):
@@ -1469,17 +1507,22 @@ def _mask_outside(coords, size):
 
 
 def _resize_camera(cam, target_res):
-    """Scale a camera so its long side is `target_res`. Returns (cam, scale).
+    """Scale a camera so its long side is `target_res`. Returns (cam, (sx, sy)).
 
-    A zero side is the WHOLE frame to cv2.warpAffine (a 0 in `dsize` means "use source size"),
-    silently returning the full frame while the camera dict claims a sliver -- hence the clamp
-    to 1.
+    The output dimensions are integer pixels, so the affine actually applied by OpenCV has
+    independently rounded x/y scales. Return those exact scales and apply them to the complete
+    intrinsic matrix and offset; using the pre-rounding scalar leaves projections a fraction of a
+    pixel away from the warped image on nonsquare crops.
     """
     cam = dict(cam)
     size = cam['size']
-    scale = float(target_res) / float(max(size))
-    cam['size'] = torch.round(size * scale).to(torch.int32).clamp_min(1)
-    cam['mat'] = cam['mat'] * scale
+    nominal = float(target_res) / float(max(size))
+    new_size = torch.round(size * nominal).to(torch.int32).clamp_min(1)
+    scale = new_size.to(dtype=cam['mat'].dtype) / size.to(dtype=cam['mat'].dtype)
+    cam['size'] = new_size
+    cam['mat'] = cam['mat'].clone()
+    cam['mat'][0] *= scale[0]
+    cam['mat'][1] *= scale[1]
     cam['mat'][2, 2] = 1
     cam['offset'] = cam['offset'] * scale
     return cam, scale

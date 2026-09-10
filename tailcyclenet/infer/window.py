@@ -187,7 +187,7 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
                 continue
             corners = cropmod.box_corners(db)
             origin = torch.as_tensor(boxes[i][:2], dtype=torch.float32)
-            cf = (corners - origin) * float(scales[i])
+            cf = (corners - origin) * torch.as_tensor(scales[i], dtype=corners.dtype)
             size = cgroup[i]['size']
             for t in range(T):
                 bx = cropmod.crop_box_for_points(cf[t], size,
@@ -200,7 +200,7 @@ def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, 
               else cropmod.box_corners(torch.as_tensor(boxes_stc[a][frames][:, use[0]],
                                                        dtype=torch.float32)))
     origin = torch.as_tensor(boxes[0][:2], dtype=torch.float32)
-    cf = (source - origin) * float(scales[0])
+    cf = (source - origin) * torch.as_tensor(scales[0], dtype=source.dtype)
     size = cgroup[0]['size']
     T = cf.shape[0]
     out = torch.full((T, 1, 4), float('nan'), dtype=torch.float32)
@@ -774,7 +774,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         p = out['coords_pred'][0].detach().cpu().numpy()
         q = None
         if mode == '2d':
-            p = p / scales[0] + np.asarray(boxes[0][:2], np.float32)
+            p = p / np.asarray(scales[0], dtype=np.float32) + np.asarray(
+                boxes[0][:2], np.float32)
             q = p
         elif cfg.carry_source == 'pred':
             q = p
@@ -784,7 +785,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         if '2d_pred' in out:
             p2 = out['2d_pred'][:, 0].detach().cpu().numpy().copy()
             for i in range(len(use)):
-                p2[i] = p2[i] / scales[i] + np.asarray(boxes[i][:2], np.float32)
+                p2[i] = p2[i] / np.asarray(scales[i], dtype=np.float32) + np.asarray(
+                    boxes[i][:2], np.float32)
             if out.get('vis_pred_2d') is not None:
                 v2 = out['vis_pred_2d'][:, 0].detach().cpu().numpy()
         return p, q, out, p2, v2

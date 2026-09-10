@@ -438,10 +438,16 @@ def _reanchor_ce_target(out, src):
     return out
 
 
-def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
+def build_model(model_cfg: dict, n_keypoints: int, cls=PoseTrackerEncoder, **extra) -> PoseTrackerEncoder:
     """`[model]` splatted into the constructor, with this repo's two keys pulled out first. Two
     library options are checked here because both are wrong in a way that produces numbers
     instead of exceptions.
+
+    `cls` selects the class to construct and `**extra` is forwarded to it verbatim; both exist
+    for one caller (`scorer.build_scorer`, which wants a `PoseScorer` and its head kwargs). The
+    defaults reproduce the historical behaviour exactly, so every refusal below is shared rather
+    than copied -- a second copy of these checks is how two builders come to disagree
+    about what a config means.
 
     The two query terms are derived from `query` -- see PoseTrackerEncoder.__init__.
     gridresid_offset has NO DEFAULT, DELIBERATELY: the two values are different architectures
@@ -502,6 +508,6 @@ def build_model(model_cfg: dict, n_keypoints: int) -> PoseTrackerEncoder:
         'use_volume_embedding is not supported: the encoder builds no volume term, so the value '
         'would be silently ignored. Set use_volume_embedding = false or drop the key.')
 
-    return PoseTrackerEncoder(n_keypoints=n_keypoints, query=query, query_encoder=enc,
-                              gridresid_offset=offset, query_terms=query_terms,
-                              box_prompt=box_prompt, **cfg)
+    return cls(n_keypoints=n_keypoints, query=query, query_encoder=enc,
+               gridresid_offset=offset, query_terms=query_terms,
+               box_prompt=box_prompt, **cfg, **extra)

@@ -23,8 +23,10 @@ def main(argv=None):
     parser.add_argument('--out', required=True, help='where the QC artefacts go')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--top', type=int, default=10)
+    parser.add_argument('--limit', type=int, default=None)
     args = parser.parse_args(argv)
-    table, _registry, _config = score_root(Path(args.run), args.data, args.split, args.device)
+    table, _registry, _config = score_root(Path(args.run), args.data, args.split,
+                                          args.device, args.limit)
     report = rank(table, args.top)
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report)

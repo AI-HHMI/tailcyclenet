@@ -192,6 +192,11 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         max_iterations: int | None, no_wandb: bool) -> None:
     """Train one scorer run.
 
+    The per-step training metrics are averaged over the last `print_freq` steps before printing,
+    because ONE step is one window: with K keypoints that is K triplets (7 on calms21), so a
+    single step's `triplet_acc` is quantised in units of 1/K and swings over the full range while
+    the model learns. The val pass is the number to read; this is the trace.
+
     Inputs: config_path -- a config layering over `configs/scorer.toml`; data_path -- the dataset
             root (overrides `[data].path`); out -- the run folder; checkpoint -- a pose run folder
             or checkpoint to warm-start from, or a scorer run folder's checkpoint to RESUME from;
@@ -274,6 +279,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         optimizer.train()
     step = 0
     t0 = time.time()
+    window: dict[str, list] = {}
     while step < n_iter:
         for trip in train_loader:
             if step >= n_iter:
@@ -288,8 +294,13 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
             iteration = start_iter + step
-            values = {k: v for k, v in loss_fn.collapse_history(prefix='train/').items()}
+            hist = loss_fn.collapse_history(prefix='')
             loss_fn.reset_history()
+            for k, v in hist.items():
+                window.setdefault(k, []).append(v)
+            values = {f'train/{k}': float(np.mean(vs)) for k, vs in window.items()}
+            if step % print_freq == 0:
+                window.clear()
 
             if val_loader is not None and step % val_freq == 0:
                 values.update(evaluate(model, val_loader, val_loss_fn, device, val_batches))
@@ -304,7 +315,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 log(wb, values, iteration)
             if step % print_freq == 0:
                 el = time.time() - t0
-                print(f'[{iteration}] loss={values.get("train/scorer_loss", float("nan")):.4g} '
+                print(f'[{iteration}] last {print_freq} steps: '
+                      f'loss={values.get("train/scorer_loss", float("nan")):.4g} '
                       f'acc={values.get("train/triplet_acc", float("nan")):.3f} '
                       f'gap={values.get("train/score_gap", float("nan")):.4g} '
                       f'({el:.0f}s)')

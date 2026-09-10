@@ -77,11 +77,12 @@ def _windows(dataset):
             yield dataset.index[i].session, item
 
 
-def score_root(run: Path, data: str, split: str, device='cpu') -> tuple:
+def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
-            device -- where to run the model.
+            device -- where to run the model; limit -- stop after this many windows (a long clip
+            is thousands of them, and a first look must not need the whole split).
     Outputs: (DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
@@ -93,7 +94,9 @@ def score_root(run: Path, data: str, split: str, device='cpu') -> tuple:
 
     rows = []
     model.eval()
-    for sess, item in _windows(ds):
+    for n_seen, (sess, item) in enumerate(_windows(ds)):
+        if limit is not None and n_seen >= limit:
+            break
         views, coords, _vis, _frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
             item[:13]
         views = [v[None] for v in views]

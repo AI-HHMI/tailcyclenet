@@ -1364,8 +1364,8 @@ def test_session_writer_preserves_model_2d_confidence_separately(scene, tmp_path
     K = sess.n_keypoints
     C = len(sess.rig)
     pred2d = np.zeros((1, 2, C, K, 2), np.float32)
-    visibility_logit = np.full((1, 2, C, K), 2.0, np.float32)
-    model_logit = np.full((1, 2, C, K), -2.0, np.float32)
+    visibility_logit = (np.arange(2 * C * K, dtype=np.float32).reshape(1, 2, C, K) / 10) - 1
+    model_logit = (np.arange(2 * C * K, dtype=np.float32).reshape(1, 2, C, K) / 7) - 2
     blk = {
         'animal_ids': np.array(['a00'], object),
         'pred': np.zeros((1, 2, K, 2), np.float32),
@@ -1386,10 +1386,32 @@ def test_session_writer_preserves_model_2d_confidence_separately(scene, tmp_path
 
     table = pq.read_table(out / 'keypoints.pq')
     assert {'score', 'score_logit', 'confidence_2d', 'confidence_2d_logit'} <= set(table.column_names)
-    assert np.allclose(table['score'].to_numpy(), 1 / (1 + np.exp(-2)))
-    assert np.allclose(table['score_logit'].to_numpy(), 2.0)
-    assert np.allclose(table['confidence_2d'].to_numpy(), 1 / (1 + np.exp(2)))
-    assert np.allclose(table['confidence_2d_logit'].to_numpy(), -2.0)
+    score_logit = table['score_logit'].to_numpy()
+    confidence_logit = table['confidence_2d_logit'].to_numpy()
+    assert np.allclose(table['score'].to_numpy(), 1 / (1 + np.exp(-score_logit)))
+    assert np.allclose(table['confidence_2d'].to_numpy(),
+                       1 / (1 + np.exp(-confidence_logit)))
+    assert not np.allclose(score_logit, confidence_logit)
+
+    no_model = dict(blk)
+    no_model.pop('model_conf2d')
+    out_no_model = tmp_path / 'pred-no-model-confidence'
+    writer = SessionWriter(out_no_model, sess, registry, {}, [gid])
+    writer.write_block(gid, no_model, 0, 0)
+    writer.close()
+    missing = pq.read_table(out_no_model / 'keypoints.pq')
+    assert np.isnan(missing['confidence_2d'].to_numpy()).all()
+    assert np.isnan(missing['confidence_2d_logit'].to_numpy()).all()
+
+
+def test_merge_blocks_stitches_model_2d_confidence():
+    from tailcyclenet.infer.window import merge_blocks
+
+    first = {'model_conf2d': np.array([[[[0.1]]]], np.float32)}
+    second = {'model_conf2d': np.array([[[[0.9]]]], np.float32)}
+    merged = merge_blocks([first, second])
+    np.testing.assert_array_equal(merged['model_conf2d'],
+                                  np.array([[[[0.1]], [[0.9]]]], np.float32))
 
 
 def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp_path):

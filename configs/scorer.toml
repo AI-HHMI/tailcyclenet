@@ -41,6 +41,12 @@
 # otherwise pass a finiteness floor. It selects the corruption MENU rather than whether a window
 # trains: below it a window still trains, on the reduced sparse menu of section 3.8b.
 
+# `n_iterations` is 60000. This objective sits at its tie state (loss pinned at
+# `margin*p + -log(p)*w`, p = w/margin = 0.6) for thousands of iterations before the ranking
+# signal takes over: the two qdmouse runs that reached val 0.87/0.92 left it at iteration 4720
+# and 5220, and their checkpoint_best landed at 9400 and 8200, so 10000 truncated them. Escape
+# iteration varies by root.
+
 [run]
 kind = "scorer"
 
@@ -109,7 +115,7 @@ sinusoid = 10.0
 [training]
 # A POSE run folder or checkpoint: a warm start, not a resume. Required.
 checkpoint_path = ""
-n_iterations = 10000
+n_iterations = 60000
 seed = 23
 max_grad_norm = 10.0
 checkpoint_freq = 1000

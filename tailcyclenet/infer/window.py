@@ -326,7 +326,7 @@ def _plan_windows(session_id, gid, cam_sizes, n_frames, overlap, T_total, frame_
 
 
 # Frame/window-indexed columns stitched by `merge_blocks`; anything else is a per-group constant.
-_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'box_agree', 'det_box', 'det_score')
+_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score')
 _WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
 
 
@@ -781,7 +781,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             q = p
         elif out.get('3d_pred_triangulate') is not None:
             q = out['3d_pred_triangulate'][0].detach().cpu().numpy()
-        p2 = v2 = None
+        p2 = v2 = c2 = None
         if '2d_pred' in out:
             p2 = out['2d_pred'][:, 0].detach().cpu().numpy().copy()
             for i in range(len(use)):
@@ -789,7 +789,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     boxes[i][:2], np.float32)
             if out.get('vis_pred_2d') is not None:
                 v2 = out['vis_pred_2d'][:, 0].detach().cpu().numpy()
-        return p, q, out, p2, v2
+            if out.get('conf_pred_2d') is not None:
+                c2 = out['conf_pred_2d'][:, 0].detach().cpu().numpy()
+        return p, q, out, p2, v2, c2
 
     def _process_window(wi, frames, window_cams, plans, crops):
         """Forward and write every column for one window, given already-decoded `crops`.
@@ -867,7 +869,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             got = forward(frames, plan, crops, wi)
             if got is None:
                 continue
-            p, q, out, p2, v2 = got
+            p, q, out, p2, v2, c2 = got
             outcome[a, wi - w0] = OUTCOMES.index('ok')
             _fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
             if p2 is not None:
@@ -875,6 +877,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     pred2d[a, frames - f0, ci] = p2[i]
                     if v2 is not None:
                         conf2d[a, frames - f0, ci] = v2[i]
+                    if c2 is not None:
+                        model_conf2d[a, frames - f0, ci] = c2[i]
             vlogit = None
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
@@ -895,6 +899,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         pred2d[a, frames[drop] - f0, ci] = np.nan
                         if v2 is not None:
                             conf2d[a, frames[drop] - f0, ci] = np.nan
+                        if c2 is not None:
+                            model_conf2d[a, frames[drop] - f0, ci] = np.nan
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
                 _capture_overlap_agreement(stats, a, frames, f0, pred, p)
             pred[a, frames - f0] = p
@@ -947,6 +953,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             conf = np.full((S, n_blk, K), np.nan, np.float32)
             pred2d = np.full((S, n_blk, len(session.rig), K, 2), np.nan, np.float32)
             conf2d = np.full((S, n_blk, len(session.rig), K), np.nan, np.float32)
+            model_conf2d = np.full((S, n_blk, len(session.rig), K), np.nan, np.float32)
             box_agree = np.full((S, n_blk, len(session.rig)), np.nan, np.float32)
             outcome = np.full((S, n_win), OUTCOMES.index('no box'), np.int8)
             crop = np.full((S, n_win, len(session.rig), 4), np.nan, np.float32)
@@ -985,6 +992,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 _census_block_boundary(stats, f_read, f_own)
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
                    'pred2d': pred2d[:, :keep], 'conf2d': conf2d[:, :keep],
+                   'model_conf2d': model_conf2d[:, :keep],
                    'box_agree': box_agree[:, :keep],
                    'det_box': det_box[:, :keep], 'det_score': det_score[:, :keep],
                    'animal_ids': np.asarray(animal_ids, object),

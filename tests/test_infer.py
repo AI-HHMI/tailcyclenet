@@ -1353,6 +1353,45 @@ def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
                                       np.nan_to_num(out['pred'], nan=-9e9))
 
 
+def test_session_writer_preserves_model_2d_confidence_separately(scene, tmp_path):
+    """Model 2D confidence must survive beside, not overwrite, visibility confidence."""
+    import pyarrow.parquet as pq
+
+    _, sess, registry, _ = scene
+    from tailcyclenet.infer.predictions import SessionWriter
+
+    gid = next(iter(sess.groups))
+    K = sess.n_keypoints
+    C = len(sess.rig)
+    pred2d = np.zeros((1, 2, C, K, 2), np.float32)
+    visibility_logit = np.full((1, 2, C, K), 2.0, np.float32)
+    model_logit = np.full((1, 2, C, K), -2.0, np.float32)
+    blk = {
+        'animal_ids': np.array(['a00'], object),
+        'pred': np.zeros((1, 2, K, 2), np.float32),
+        'conf': np.zeros((1, 2, K), np.float32),
+        'pred2d': pred2d,
+        'conf2d': visibility_logit,
+        'model_conf2d': model_logit,
+        'box_agree': np.full((1, 2, C), np.nan, np.float32),
+        'outcome': np.zeros((1, 1), np.int8),
+        'crop': np.zeros((1, 1, C, 4), np.float32),
+        'outcome_names': ['ok'],
+        'window_start': np.array([0], np.int32),
+    }
+    out = tmp_path / 'pred'
+    writer = SessionWriter(out, sess, registry, {}, [gid])
+    writer.write_block(gid, blk, 0, 0)
+    writer.close()
+
+    table = pq.read_table(out / 'keypoints.pq')
+    assert {'score', 'score_logit', 'confidence_2d', 'confidence_2d_logit'} <= set(table.column_names)
+    assert np.allclose(table['score'].to_numpy(), 1 / (1 + np.exp(-2)))
+    assert np.allclose(table['score_logit'].to_numpy(), 2.0)
+    assert np.allclose(table['confidence_2d'].to_numpy(), 1 / (1 + np.exp(2)))
+    assert np.allclose(table['confidence_2d_logit'].to_numpy(), -2.0)
+
+
 def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp_path):
     """The pose run, its checkpoint FILE and the detector, all resolvable later.
 

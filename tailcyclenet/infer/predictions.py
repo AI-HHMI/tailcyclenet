@@ -10,7 +10,9 @@ There are no pixels and no `groups/` -- the directory is not self-contained, and
 are is recorded in `[provenance]`, which `scripts/render.py` reads (an npz carries no provenance
 to find its pixels with). Three columns are additive spec additions: `score` and `box_agree` on
 `instances.pq`, and `score_logit` beside `score` on the keypoint tables -- the latter because
-`sigmoid` rounds to exactly 1.0 in float32 at the logit medians this repo measures.
+`sigmoid` rounds to exactly 1.0 in float32 at the logit medians this repo measures. Prediction
+keypoint rows also carry `confidence_2d`/`confidence_2d_logit`, explicitly preserving the model's
+2D confidence head separately from the legacy visibility score.
 """
 from __future__ import annotations
 
@@ -145,6 +147,7 @@ class SessionWriter:
                     'score_logit': conf.ravel()[keep].astype(np.float32)})
 
         p2, c2 = np.asarray(blk['pred2d']), np.asarray(blk['conf2d'])
+        mc2 = np.asarray(blk.get('model_conf2d', np.full_like(c2, np.nan)))
         C = p2.shape[2]
         a2, t2, c2i, k2 = (x.ravel() for x in np.meshgrid(
             np.arange(S), np.arange(T), np.arange(C), np.arange(K), indexing='ij'))
@@ -161,7 +164,9 @@ class SessionWriter:
                 'x': p2[..., 0].ravel()[keep2].astype(np.float32),
                 'y': p2[..., 1].ravel()[keep2].astype(np.float32),
                 'score': _sigmoid(c2.ravel()[keep2]).astype(np.float32),
-                'score_logit': c2.ravel()[keep2].astype(np.float32)})
+                'score_logit': c2.ravel()[keep2].astype(np.float32),
+                'confidence_2d': _sigmoid(mc2.ravel()[keep2]).astype(np.float32),
+                'confidence_2d_logit': mc2.ravel()[keep2].astype(np.float32)})
 
         ba = np.asarray(blk['box_agree'])
         det = blk.get('det_box')

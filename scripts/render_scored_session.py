@@ -85,6 +85,13 @@ def load_scores(path: Path, session: str, group: str, animal: str) -> dict:
     }
 
 
+# The colour scale: RED at the low end, GREEN at the high end, fixed so two clips are comparable.
+SCORE_RANGE = (-0.5, 0.5)
+BAD = (0, 0, 255)
+GOOD = (0, 255, 0)
+UNSCORED = (128, 128, 128)
+
+
 def frame_to_window(starts: np.ndarray, n_frames: int, t: int) -> int | None:
     """The window a frame belongs to: the LAST one containing it, or None outside the scored set.
 
@@ -105,13 +112,16 @@ def frame_to_window(starts: np.ndarray, n_frames: int, t: int) -> int | None:
 
 
 def _colour(score: float, lo: float, hi: float):
-    """BGR for one score on a viridis ramp, normalised over [lo, hi]."""
-    import cv2
+    """BGR for one score: RED at `lo`, GREEN at `hi`, linear between, CLAMPED outside.
 
+    BGR (cv2's order), so `BAD` is (0, 0, 255) = red and `GOOD` is (0, 255, 0) = green.
+    The scale is FIXED by default (`SCORE_RANGE`) rather than normalised per clip: scores are
+    relative, so a per-clip ramp would repaint the same track differently in a different clip and
+    two renders could not be compared. A score past either end is clamped to that end and reads as
+    "at least this bad/good", which is what the legend states.
+    """
     frac = 0.0 if hi <= lo else float(np.clip((score - lo) / (hi - lo), 0.0, 1.0))
-    val = np.uint8(round(frac * 255))
-    return tuple(int(c) for c in cv2.applyColorMap(np.array([[val]], np.uint8),
-                                                   cv2.COLORMAP_VIRIDIS)[0, 0])
+    return tuple(int(round(a + (b - a) * frac)) for a, b in zip(BAD, GOOD))
 
 
 def draw_scored(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
@@ -148,7 +158,7 @@ def draw_scored(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[st
         if vis is not None and vis[k] == fmt.UNLABELED:
             continue
         score = scores.get((start, names[k])) if start is not None else None
-        colour = _colour(score, lo, hi) if score is not None else (128, 128, 128)
+        colour = _colour(score, lo, hi) if score is not None else UNSCORED
         centre = (int(pts[k][0]), int(pts[k][1]))
         r = 5 * s if score is not None else 3 * s
         cv2.circle(im, centre, r, colour, -1)
@@ -201,8 +211,9 @@ def main() -> int:
                                                                'scorer run in provenance.toml')
     ap.add_argument('--width', type=int, default=960)
     ap.add_argument('--stride', type=int, default=1, help='write every Nth frame')
-    ap.add_argument('--score-range', default='', help='lo,hi for the colour map; default the '
-                                                      'rendered range')
+    ap.add_argument('--score-range', default='',
+                    help=f'lo,hi for the colour map; default {SCORE_RANGE[0]},{SCORE_RANGE[1]} '
+                         '(red at lo, green at hi, clamped outside)')
     args = ap.parse_args()
 
     n_frames = window_length(args.scores, args.n_frames)
@@ -216,10 +227,13 @@ def main() -> int:
     if not vals:
         raise SystemExit(f'no scored windows start in [{args.start}, {args.end}); the scored '
                          f'windows are {starts.min()}..{starts.max()}')
-    lo, hi = (float(np.min(vals)), float(np.max(vals)))
+    lo, hi = SCORE_RANGE
     if args.score_range:
         lo, hi = (float(x) for x in args.score_range.split(','))
-    print(f'{len(vals)} keypoint scores over {len(starts)} windows, colour range {lo:.4f}..{hi:.4f}')
+    inside = sum(lo <= v <= hi for v in vals)
+    print(f'{len(vals)} keypoint scores over {len(starts)} windows; this span runs '
+          f'{np.min(vals):.4f}..{np.max(vals):.4f}, of which {inside} of {len(vals)} fall inside '
+          f'the colour range {lo:g}..{hi:g} (red..green; the rest clamp to the end)')
 
     cameras = ([c.strip() for c in args.cameras.split(',')] if args.cameras
                else list(session.cam_names))

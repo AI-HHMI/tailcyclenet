@@ -79,6 +79,21 @@ def test_has_visibility_assessment(tiny_root, tracked_no_assessment_root):
     assert tracked_assessed.has_visibility_assessment is True
 
 
+def test_preload_caches_visibility_before_dropping_tables(tiny_root, tracked_no_assessment_root):
+    """Preloading must not make the first selection reread parquet visibility tables."""
+    cases = [
+        (tiny_root / 'ratlike' / 'train' / 'sess_a', True),
+        (tiny_root / 'mouselike' / 'train' / 'sess_c', True),
+        (tracked_no_assessment_root / 'train' / 's', False),
+    ]
+    for path, expected in cases:
+        sess = fmt.Session.load(path)
+        sess.preload()
+        assert '_tables' not in sess.__dict__
+        assert sess.has_visibility_assessment is expected
+        assert '_tables' not in sess.__dict__
+
+
 def test_moving_camera(tiny_root):
     """extrinsics.pq gives (C,T,4,4); static cameras in the same session broadcast to constant."""
     sess = fmt.Session.load(tiny_root / 'mouselike' / 'train' / 'sess_moving')

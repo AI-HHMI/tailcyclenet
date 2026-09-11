@@ -630,6 +630,10 @@ class Session:
         """
         for gid in self.groups:
             self.labels(gid)
+        # `has_visibility_assessment` is read by every sampled window.  Cache it while the
+        # parquet tables are still resident so dropping `_tables` below cannot make the first
+        # selection reread all five files.
+        self.has_visibility_assessment
         self.__dict__.pop('_tables', None)
 
     def cgroup(self, gid: str, frames=None) -> list[dict]:

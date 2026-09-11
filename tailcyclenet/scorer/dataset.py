@@ -79,15 +79,22 @@ class ScorerDataset(torch.utils.data.Dataset):
         Side effects: decodes video frames; draws from the item, ambient torch and imgaug RNGs.
         """
         base_idx = idx[1] if isinstance(idx, tuple) else idx
-        for _ in range(GETITEM_MAX_RETRIES):
-            rng, shape_rng, _frozen = self._streams(base_idx)
+        for attempt in range(GETITEM_MAX_RETRIES):
+            rng, shape_rng, frozen = self._streams(base_idx)
             shape = self.base._shape(shape_rng)
             sel = self.base._select(base_idx, rng, shape)
             if sel is not None:
                 trip = make_triplet(self.base, sel, rng, self.cfg, self.corruptors)
                 if trip is not None:
                     return trip
-            base_idx = int(np.random.default_rng().integers(len(self.base)))
+            # The replacement index must be as reproducible as the item it replaces. `_streams`
+            # keys val/test on `(seed, idx)` precisely so a metric is comparable across
+            # checkpoints; drawing the retry index from an unseeded RNG breaks that, because the
+            # window that actually gets scored would then depend on how many earlier windows
+            # failed to build. Train keeps its entropy seed -- there the point is decorrelation.
+            pick = (np.random.default_rng((self.base.seed, 0xC0FFEE, base_idx, attempt))
+                    if frozen else np.random.default_rng())
+            base_idx = int(pick.integers(len(self.base)))
         return None
 
 

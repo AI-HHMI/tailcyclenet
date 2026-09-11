@@ -109,7 +109,12 @@ def build_datasets(config: dict, registry_base: Registry | None):
         (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())
     if not has_val:
         return train_ds, None, registry
-    val_base = PoseDataset(data_cfg['path'], 'val', lc, registry=registry)
+    # Val is a FIXED camera count, exactly as in the pose trainer (`train.py`'s `val_lc`).
+    # `cams_to_sample` is the TRAIN draw; `val_cams_to_sample` is dead unless it replaces it
+    # here, and without this every val window draws its own count from the train range, so the
+    # held-out number averages windows of different difficulty.
+    val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
+    val_base = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry)
     return train_ds, ScorerDataset(val_base, corr), registry
 
 
@@ -172,31 +177,46 @@ def _per_type_accuracy(scores: torch.Tensor, fired: torch.Tensor) -> dict:
     return out
 
 
-def evaluate(model, loader, loss_fn, device, max_batches: int) -> dict:
+def evaluate(model, loader, loss_fn, device, max_batches: int,
+             optimizer=None) -> dict:
     """The held-out synthetic pass: loss history plus per-type triplet accuracy.
+
+    Scored on the AVERAGED iterate (`optimizer.eval()`), which is the regime every consumer of a
+    checkpoint gets: `load_scorer_run` loads `model_state_eval`, so a val number taken on the raw
+    training iterate would select `checkpoint_best` on numbers nothing downstream reproduces.
+    `train.py`'s pose eval does the same; the `finally` restores BOTH the optimizer and the model,
+    so an exception mid-val cannot leave the run training in eval mode.
 
     Inputs: model -- the scorer; loader -- the val loader; loss_fn -- a `TripletScorerLoss`
             (its history is collapsed and reset by the caller); device -- where to run;
-            max_batches -- how many triplets to score.
+            max_batches -- how many triplets to score; optimizer -- the run's optimizer, whose
+            averaged iterate to score on (None scores the current weights).
     Outputs: {'val/<metric>': float} including the per-type accuracies.
-    Side effects: switches the model to eval and back to train.
+    Side effects: switches the model and the optimizer to eval and back to train.
     """
     model.eval()
+    averaged = optimizer is not None and hasattr(optimizer, 'eval')
     per_type: dict[str, list] = {}
     seen = 0
-    with torch.no_grad():
-        for trip in loader:
-            if trip is None:
-                continue
-            trip = triplet_to_device(trip, device)
-            scores, precision, labels = model.score_triplet(trip)
-            loss_fn(scores, precision, labels)
-            for k, v in _per_type_accuracy(scores, trip['fired'][0]).items():
-                per_type.setdefault(k, []).append(v)
-            seen += 1
-            if seen >= max_batches:
-                break
-    model.train()
+    try:
+        if averaged:
+            optimizer.eval()
+        with torch.no_grad():
+            for trip in loader:
+                if trip is None:
+                    continue
+                trip = triplet_to_device(trip, device)
+                scores, precision, labels = model.score_triplet(trip)
+                loss_fn(scores, precision, labels)
+                for k, v in _per_type_accuracy(scores, trip['fired'][0]).items():
+                    per_type.setdefault(k, []).append(v)
+                seen += 1
+                if seen >= max_batches:
+                    break
+    finally:
+        if averaged:
+            optimizer.train()
+        model.train()
     out = {k: float(np.mean(v)) for k, v in per_type.items()}
     out['val/n_scored'] = float(seen)
     return out
@@ -264,7 +284,13 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             resume_state = loaded
             print(f'resume: {ckpt_file} at iteration {loaded.get("iteration", "?")}')
         else:
-            fresh = warm_start(model, ckpt_file, base_names=tuple(registry.names))
+            # `base_names` is the registry the CHECKPOINT's identity table belongs to -- the
+            # SOURCE run's -- not this run's grown registry. `warm_start`'s length check is what
+            # keeps a row on its own keypoint, so passing the grown registry (n != n0) refuses the
+            # copy and reinitialises EVERY row, including the source rows that should have been
+            # preserved. Same call as `train.py`'s warm start.
+            fresh = warm_start(model, ckpt_file,
+                               base_names=tuple(base_reg.names) if base_reg else None)
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',
                                            'precision_head'))}
@@ -336,7 +362,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
 
             if val_loader is not None and step % val_freq == 0:
                 started = time.time()
-                values.update(evaluate(model, val_loader, val_loss_fn, device, val_batches))
+                values.update(evaluate(model, val_loader, val_loss_fn, device, val_batches,
+                                        optimizer))
                 evalled[0] += time.time() - started
                 values.update(val_loss_fn.collapse_history(prefix='val/'))
                 val_loss_fn.reset_history()

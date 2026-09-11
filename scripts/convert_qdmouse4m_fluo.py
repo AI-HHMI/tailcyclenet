@@ -63,10 +63,35 @@ def split_cameras(calibration: Path) -> tuple[fmt.Rig, list[str], dict[str, str]
     return rig, rig.names, mapping
 
 
+def camera_index_map(src_names: list[str], dst_names: list[str],
+                     suffix: str = "_fluo") -> list[int]:
+    """For each destination camera, the source camera whose labels it carries.
+
+    The expanded rig INTERLEAVES ``<view>`` and ``<view>_fluo``, so expanding an array as
+    ``concatenate([a, a], axis=camera)`` -- a block copy -- would hand destination camera ``j``
+    the labels of source camera ``j``, a different physical view.  Every destination camera is
+    a channel of exactly one source camera; this is the map that says which, and it is derived
+    from NAMES so it stays correct whatever order ``split_cameras`` grows.
+    """
+    out = []
+    for name in dst_names:
+        base = name[: -len(suffix)] if name.endswith(suffix) else name
+        if base not in src_names:
+            raise RuntimeError(f"destination camera {name!r} has no source camera {base!r}")
+        out.append(src_names.index(base))
+    return out
+
+
 def convert_session(source: Path, output: Path) -> dict[str, str]:
     """Convert one session through ``Session.load``/``write_session`` APIs."""
     old = fmt.Session.load(source)
     rig, _, mapping = split_cameras(source / "calibration.toml")
+    take = camera_index_map(old.cam_names, rig.names)
+
+    def pick(arr, axis: int):
+        """Map one source label array onto the expanded camera axis by NAME."""
+        return None if arr is None else np.take(np.asarray(arr), take, axis=axis)
+
     groups = {
         gid: fmt.Group(group_id=g.group_id, n_frames=g.n_frames, fps=g.fps,
                        source_video=g.source_video, source_frame_start=g.source_frame_start,
@@ -83,19 +108,25 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
         # than asserting fluorescence visibility observations.
         regions = None
         if lab.regions is not None:
-            first = np.asarray(lab.regions, dtype=np.float64)
-            second = first.copy()
-            second[:, 1] += len(mapping)
-            regions = np.concatenate([first, second], axis=0)
+            base = np.asarray(lab.regions, dtype=np.float64)
+            rows = []
+            for j, src in enumerate(take):
+                sel = base[:, 1] == src
+                if not sel.any():
+                    continue
+                block = base[sel].copy()
+                block[:, 1] = j
+                rows.append(block)
+            regions = np.concatenate(rows, axis=0) if rows else np.zeros((0, 6))
         labels[gid] = fmt.Labels(
             animal_ids=list(lab.animal_ids),
             points3d=lab.points3d,
             vis3d=lab.vis3d,
-            points2d=np.concatenate([lab.points2d, lab.points2d], axis=3),
-            vis2d=np.concatenate([lab.vis2d, lab.vis2d], axis=3),
-            boxes=None if lab.boxes is None else np.concatenate([lab.boxes, lab.boxes], axis=2),
-            instance=None if lab.instance is None else np.concatenate([lab.instance, lab.instance], axis=2),
-            ext=None if lab.ext is None else np.concatenate([lab.ext, lab.ext], axis=0),
+            points2d=pick(lab.points2d, 3),
+            vis2d=pick(lab.vis2d, 3),
+            boxes=pick(lab.boxes, 2),
+            instance=pick(lab.instance, 2),
+            ext=pick(lab.ext, 0),
             regions=regions,
         )
     provenance = dict(old.provenance)
@@ -103,6 +134,8 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
         "source": "qdmouse4m-fluo (separate reference/fluorescence cameras)",
         "camera_modalities": {"reference": list(mapping), "fluorescence": list(mapping.values())},
         "fluorescence_calibration": "copied associated reference camera geometry; no independent source calibration",
+        "camera_label_source": {"dst": list(rig.names),
+                               "src_index": take},
     })
     fmt.write_session(
         output, mode=old.mode, units=old.units, label_source=old.label_source,

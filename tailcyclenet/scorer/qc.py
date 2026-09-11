@@ -60,22 +60,32 @@ def _check_names(registry, target_registry, data) -> None:
             'scorer for this root. Refusing rather than scoring them with a meaningless row.')
 
 
-def _windows(dataset):
-    """Enumerate the dataset's fixed windows as `(session, item)`, skipping build failures.
+def _span_indices(dataset, spans: dict) -> list[int]:
+    """The `dataset.index` positions whose window STARTS inside a requested span.
 
-    The SESSION comes back with the item because the keypoint AXIS belongs to it: `coords` and
-    `kpt_ids` are both laid out in the session's own `names` order, which may reorder or subset the
-    dataset's. Labelling a score with the dataset's name order would mislabel every reordered
-    session -- and `Registry.ids_for` exists precisely because that ordering differs per session.
+    Filtering the INDEX, not each decoded item, is the whole point of `spans`: it exists so a
+    targeted look at a clip's bad stretch is affordable, and decoding a window only to discover it
+    is out of range spends exactly the cost the flag avoids (a long tracked group is thousands of
+    windows, and a root is many groups).
 
-    Inputs: dataset -- a `PoseDataset` built with `train=False`.
-    Outputs: an iterator of `(session, item)`.
-    Side effects: decodes video frames.
+    Inputs: dataset -- a `PoseDataset` built with `train=False`; spans -- `{(session, group,
+            animal): (lo, hi)}`, the keys spelled as the loader's own `row` carries them.
+    Outputs: the kept index positions, in index order.
+    Side effects: none -- no window is realised, so no frame is decoded.
     """
-    for i in range(len(dataset)):
-        item = dataset[i]
-        if item is not None:
-            yield dataset.index[i].session, item
+    out = []
+    animal_ids: dict[tuple[str, str], list[str]] = {}
+    for i, item in enumerate(dataset.index):
+        key = (item.session.session_id, item.gid)
+        if key not in animal_ids:
+            animal_ids[key] = [str(a) for a in item.session.labels(item.gid).animal_ids]
+        ids = animal_ids[key]
+        if item.animal >= len(ids):
+            continue
+        rng = spans.get((key[0], key[1], ids[item.animal]))
+        if rng is not None and rng[0] <= int(item.start) <= rng[1]:
+            out.append(i)
+    return out
 
 
 def _to_device(views, coords, cgroup, kpt_ids, device):
@@ -125,19 +135,34 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
         lc = replace(lc, val_stride=int(val_stride))
     ds = PoseDataset(data, split, lc, registry_base=registry, train=False)
     _check_names(registry, ds.registry, data)
-    print(f'scoring {len(ds)} windows from {data}/{split} with {ckpt.name}')
+
+    where = list(range(len(ds)))
+    if spans is not None:
+        where = _span_indices(ds, spans)
+        print(f'{len(where)} of {len(ds)} windows start inside the requested spans')
+        if not where:
+            raise SystemExit(
+                'no window starts inside the given spans, so there is nothing to score: check '
+                'the session/group/animal keys, and that span_start is a WINDOW start (a multiple '
+                'of the run n_frames, plus --window-offset)')
+    print(f'scoring up to {len(where)} windows from {data}/{split} with {ckpt.name}')
 
     rows = []
     model.eval()
-    for n_seen, (sess, item) in enumerate(_windows(ds)):
+    n_seen = 0
+    for i in where:
         if limit is not None and n_seen >= limit:
             break
+        item = ds[i]
+        if item is None:
+            continue
+        n_seen += 1
+        # The SESSION comes from the INDEX entry, not the dataset: `coords` and `kpt_ids` are
+        # laid out in the session's own `names` order, which may reorder or subset the dataset's,
+        # so labelling a score with the dataset's name order would mislabel a reordered session.
+        sess = ds.index[i].session
         views, coords, _vis, _frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
             item[:13]
-        if spans is not None:
-            rng = spans.get((row['session'], row['group'], str(row['animal'])))
-            if rng is None or not (rng[0] <= int(row['start']) <= rng[1]):
-                continue
         views, coords, cgroup, kpt_ids = _to_device(
             views, coords, cgroup, kpt_ids, device)
         with torch.no_grad():

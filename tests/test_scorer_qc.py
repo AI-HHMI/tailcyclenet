@@ -9,9 +9,11 @@ The shapes matter as much as the device. `views` and `coords` gain a batch axis 
 while `kpt_ids` does not -- batching the ids early made them `[1, 1, K]` and tripped `score`'s own
 `(B, K)` assertion. Both halves are asserted here, on CPU, so no GPU is needed to hold the line.
 """
+from types import SimpleNamespace
+
 import torch
 
-from tailcyclenet.scorer.qc import _to_device
+from tailcyclenet.scorer.qc import _span_indices, _to_device
 
 
 def _window():
@@ -55,3 +57,45 @@ def test_the_move_is_real_and_not_a_noop_that_happens_to_type_check():
     views, coords, _cgroup, _kpt_ids = _to_device(*_window(), 'meta')
     assert views[0].device.type == 'meta'
     assert coords.device.type == 'meta'
+
+
+def _fake_dataset(starts, animals=('det00',), session='sess', gid='g'):
+    """An index-only stand-in: `_span_indices` must never realise a window."""
+    def labels(_gid):
+        return SimpleNamespace(animal_ids=list(animals))
+
+    sess = SimpleNamespace(session_id=session, labels=labels)
+    index = []
+    for a in range(len(animals)):
+        for st in starts:
+            index.append(SimpleNamespace(session=sess, gid=gid, animal=a, start=st))
+    return SimpleNamespace(index=index)
+
+
+def test_spans_select_by_window_start_not_by_decoded_item():
+    """A span picks the windows that START inside it, and only those.
+
+    The filter runs on `dataset.index`, so a 1000-frame span of a 122k-frame clip costs ~84
+    windows to score instead of the ~10k the whole group would. Scoring the item first and
+    dropping it after would spend exactly the cost `--spans-csv` exists to avoid.
+    """
+    ds = _fake_dataset([0, 12, 24, 36, 48])
+    kept = _span_indices(ds, {('sess', 'g', 'det00'): (12, 36)})
+    assert [ds.index[i].start for i in kept] == [12, 24, 36]
+
+
+def test_spans_key_is_the_loader_row_key_and_a_miss_is_empty():
+    """The key is `(session_id, group, animal_id)` -- what the loader's `row` carries. A key that
+    names a different session, group or animal matches nothing rather than selecting by accident.
+    """
+    ds = _fake_dataset([0, 12])
+    assert _span_indices(ds, {('other', 'g', 'det00'): (0, 100)}) == []
+    assert _span_indices(ds, {('sess', 'other', 'det00'): (0, 100)}) == []
+    assert _span_indices(ds, {('sess', 'g', 'det01'): (0, 100)}) == []
+
+
+def test_every_animal_of_a_group_is_matched_by_its_own_key():
+    """A multi-animal group has one index entry per animal; the span names one of them."""
+    ds = _fake_dataset([0, 12], animals=('det00', 'det01'))
+    kept = _span_indices(ds, {('sess', 'g', 'det01'): (0, 100)})
+    assert [ds.index[i].animal for i in kept] == [1, 1]

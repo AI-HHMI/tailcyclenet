@@ -158,6 +158,27 @@ def test_registry_is_append_only(dataset_2d, dataset_3d, tmp_path):
     assert grown.names[:first.n_keypoints] == first.names
 
 
+def test_a_base_that_grew_past_one_dataset_keeps_its_own_dataset(dataset_2d, dataset_3d):
+    """A registry may only have ONE dataset when it is first written, and grow later.
+
+    That is the shape every allen scorer is in: the pose checkpoint contributed
+    `allen-mouse-combined` and the scorer run added `allen-mouse-combined-tracked`, both recorded
+    with the BARE keypoint names because neither build had more than one dataset. The next build
+    taking that registry as its base therefore has `prefix = True`, so a target root the base
+    already names came back under `allen-mouse-combined-tracked-nose` -- 47 NEW identities -- and
+    `build` then raised `keypoint ids changed against the base registry`. The scorer QC path
+    (`score_session.py`) could not score the very root the scorer was trained on.
+    """
+    base = fmt.Registry.build([dataset_2d])
+    grown = fmt.Registry.build([dataset_3d], base=base)
+    assert len(grown.datasets) == 2, 'the fixture must reproduce a base with two datasets'
+
+    again = fmt.Registry.build([dataset_3d], base=grown)      # raised before the fix
+    assert again.names == grown.names
+    np.testing.assert_array_equal(again.ids_for_dataset('mouselike'),
+                                  grown.ids_for_dataset('mouselike'))
+
+
 def _rewrite_names(path, names):
     """Restate a session's keypoint axis. Legal: the parquet tables are keyed by NAME."""
     import tomllib

@@ -1074,6 +1074,21 @@ class Registry:
                 f'subset, but not invent one. Retrain, or fix the session\'s `names`.')
         return ids[[ix[n] for n in names]]
 
+    @staticmethod
+    def _base_spelling(base: 'Registry | None', ds: 'Dataset') -> str | None:
+        """How `base` spells this dataset's keypoints: 'prefixed', 'unprefixed', or None.
+
+        Inputs: base -- the registry being appended to, or None; ds -- the dataset to look up.
+        Outputs: the spelling the base recorded, or None when the base does not name the dataset.
+        Side effects: none.
+        """
+        recorded = dict(base.datasets).get(ds.name) if base is not None else None
+        if not recorded:
+            return None
+        if all(base.names[i].startswith(f'{ds.name}-') for i in recorded):
+            return 'prefixed'
+        return 'unprefixed'
+
     @classmethod
     def build(cls, datasets: list[Dataset], base: 'Registry | None' = None) -> 'Registry':
         """Build a registry covering `datasets`, appending to `base` when given.
@@ -1088,9 +1103,17 @@ class Registry:
         index = {n: i for i, n in enumerate(names)}
         out = dict(base.datasets) if base else {}
         for ds in datasets:
+            # A dataset the base ALREADY names keeps the spelling it was recorded under. Identity
+            # is the name the base used, and the spelling is fixed when a dataset is FIRST added:
+            # a base that has since grown past one dataset would otherwise re-prefix a dataset it
+            # already carries, turning every one of its keypoints into a duplicate identity and
+            # then tripping the append-only check below. That is a scorer whose base holds two
+            # datasets refusing to score its own training root.
+            spelling = cls._base_spelling(base, ds)
+            ds_prefix = prefix if spelling is None else spelling == 'prefixed'
             ids = []
             for local in ds.names:
-                full = f'{ds.name}-{local}' if prefix else local
+                full = f'{ds.name}-{local}' if ds_prefix else local
                 if full not in index:
                     index[full] = len(names)
                     names.append(full)

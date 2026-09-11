@@ -230,9 +230,14 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
                 if seen >= max_batches:
                     break
     finally:
-        if averaged:
-            optimizer.train()
-        model.train()
+        # Nested: if the optimizer's own restore raises, the MODEL must still go back to train
+        # mode. A run left in eval mode trains nothing and looks exactly like a run that is
+        # learning nothing.
+        try:
+            if averaged:
+                optimizer.train()
+        finally:
+            model.train()
     out = {k: float(np.mean(v)) for k, v in per_type.items()}
     out['val/n_scored'] = float(seen)
     return out

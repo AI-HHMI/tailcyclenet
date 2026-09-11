@@ -434,3 +434,21 @@ def test_val_retries_never_use_an_entropy_seeded_rng(scorer_root, monkeypatch):
     assert any(s is None for s in seeds), (
         'train must keep drawing its retry index from an entropy seed, or workers replay each '
         'other')
+
+
+def test_a_failing_optimizer_restore_still_puts_the_model_back_in_train_mode(monkeypatch):
+    """The cleanup is nested: the model's restore must not depend on the optimizer's succeeding."""
+    from tailcyclenet.scorer import train as st
+
+    class _RudeOptimizer(_FakeOptimizer):
+        def train(self):
+            self.calls.append('train')
+            raise RuntimeError('the optimizer failed to restore')
+
+    monkeypatch.setattr(st, 'triplet_to_device', lambda trip, device: trip)
+    monkeypatch.setattr(st, '_per_type_accuracy', lambda scores, fired: {'acc': 0.0})
+    model, opt = _FakeModel(), _RudeOptimizer()
+    with pytest.raises(RuntimeError, match='failed to restore'):
+        st.evaluate(model, _fake_loader(), lambda *a: None, 'cpu', 1, opt)
+    assert opt.calls == ['eval', 'train']
+    assert model.mode == 'train', 'the model must be restored even when the optimizer is not'

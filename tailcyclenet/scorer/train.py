@@ -29,7 +29,7 @@ from ..checkpoints import (_SCORER_CONFIG, full_training_state, load_config, sav
                            save_run_meta, warm_start)
 from ..dataset import LoaderConfig, PoseDataset
 from ..format import Registry
-from ..train import build_optimizer, init_wandb, log
+from ..train import _gpu_peak_gb, build_optimizer, init_wandb, log
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer
 from .triplet import seed_worker
@@ -110,6 +110,19 @@ def build_datasets(config: dict, registry_base: Registry | None):
         return train_ds, None, registry
     val_base = PoseDataset(data_cfg['path'], 'val', lc, registry=registry)
     return train_ds, ScorerDataset(val_base, corr), registry
+
+
+def timed(loader, wait: list[float]):
+    """Yield loader items while accumulating time blocked in ``next()``."""
+    iterator = iter(loader)
+    while True:
+        started = time.time()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        wait[0] += time.time() - started
+        yield item
 
 
 def _loaders(train_ds, val_ds, config: dict, seed: int):
@@ -291,22 +304,25 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     if hasattr(optimizer, 'train'):
         optimizer.train()
     step = 0
+    skipped = 0
     t0 = time.time()
+    waited, evalled, ckpted = [0.0], [0.0], [0.0]
     window: dict[str, list] = {}
     best_acc = float('-inf')
     best_iter = -1
     while step < n_iter:
-        for trip in train_loader:
+        for trip in timed(train_loader, waited):
             if step >= n_iter:
                 break
             if trip is None:
+                skipped += 1
                 continue
             trip = triplet_to_device(trip, device)
             optimizer.zero_grad(set_to_none=True)
             scores, precision, labels = model.score_triplet(trip)
             total = loss_fn(scores, precision, labels)
             total.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             optimizer.step()
             iteration = start_iter + step
             hist = loss_fn.collapse_history(prefix='')
@@ -318,7 +334,9 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 window.clear()
 
             if val_loader is not None and step % val_freq == 0:
+                started = time.time()
                 values.update(evaluate(model, val_loader, val_loss_fn, device, val_batches))
+                evalled[0] += time.time() - started
                 values.update(val_loss_fn.collapse_history(prefix='val/'))
                 val_loss_fn.reset_history()
                 if hasattr(optimizer, 'train'):
@@ -326,27 +344,51 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 acc = values.get('val/triplet_acc')
                 if acc is not None and acc > best_acc:
                     best_acc, best_iter = float(acc), iteration
+                    started = time.time()
                     save_checkpoint(out, iteration, model, optimizer, config,
                                     name='best', registry=registry, kind='scorer')
+                    ckpted[0] += time.time() - started
                 print(f'[{iteration}] ' + '  '.join(
                     f'{k}={v:.4g}' for k, v in values.items() if k.startswith('val/')))
                 if acc is not None:
                     print(f'[{iteration}] best val/triplet_acc {best_acc:.4f} at iteration '
                           f'{best_iter}')
 
-            if wb is not None:
-                log(wb, values, iteration)
             if step % print_freq == 0:
-                el = time.time() - t0
+                wall = time.time() - t0
+                elapsed = max(wall - evalled[0] - ckpted[0], 1e-9)
+                report_steps = max(1, min(print_freq, step + 1))
+                dt = elapsed / report_steps
+                wait_frac = waited[0] / elapsed
+                eval_frac = evalled[0] / wall if wall > 0 else 0.0
+                values.update({
+                    'train/iteration': iteration,
+                    'train/grad_norm': float(grad_norm),
+                    'train/gpu_peak_gb': _gpu_peak_gb(device, reset=True),
+                    'train/sec_per_it': dt,
+                    'train/loader_wait_frac': wait_frac,
+                    'train/eval_frac': eval_frac,
+                    'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
+                    'train/skipped_frac': skipped / max(step + skipped, 1),
+                    'train/world_size': 1,
+                })
                 print(f'[{iteration}] last {print_freq} steps: '
                       f'loss={values.get("train/scorer_loss", float("nan")):.4g} '
                       f'acc={values.get("train/triplet_acc", float("nan")):.3f} '
                       f'gap={values.get("train/score_gap", float("nan")):.4g} '
-                      f'({el:.0f}s)')
+                      f'({dt:.2f}s/it wait {wait_frac:.0%} eval {eval_frac:.0%})')
+                if wb is not None:
+                    log(wb, values, iteration)
+                t0 = time.time()
+                waited[0] = evalled[0] = ckpted[0] = 0.0
+            elif wb is not None:
+                log(wb, values, iteration)
 
             if step % ckpt_freq == 0 or step + 1 == n_iter:
+                started = time.time()
                 save_checkpoint(out, iteration, model, optimizer, config, registry=registry,
                                 kind='scorer')
+                ckpted[0] += time.time() - started
             step += 1
     if wb is not None:
         wb.finish()

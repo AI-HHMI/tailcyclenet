@@ -28,7 +28,7 @@ def test_old_recipe_has_the_observed_interior_collapse_minimum():
     assert float(loss.detach()) < float(at_high.detach())
 
 
-def test_shipped_recipe_pushes_precision_up_at_equal_scores():
+def test_experimental_higher_precision_weight_pushes_precision_up():
     """With lambda above the margin, the collapsed point is not an interior minimum."""
     at_collapsed, _ = _equal_score_loss(0.30, 0.60)
     at_high, _ = _equal_score_loss(0.30, 0.99)
@@ -46,9 +46,9 @@ def test_shipped_recipe_is_the_unchanged_control():
     """The shipped recipe stays at the historical value until an arm MEASURES a replacement.
 
     `precision_reg_weight = 0.30` removes the interior `p = lambda/margin` minimum, but the
-    measured consequence on 154271160 was precision saturating at ~0.9 with `score_gap` still
-    ~0.0025 -- the ranking failure is NOT the precision attractor, so shipping 0.30 as a default
-    would be an unmeasured recipe change. It stays an explicit overlay.
+    the early 154271160 trace reached precision ~0.9 while `score_gap` was still ~0.0025. That
+    arm was also later found to use misaligned videos, so it cannot establish ranking recovery.
+    The shipped default stays unchanged; 0.30 remains an explicit overlay.
     """
     import tomllib
 

@@ -29,6 +29,7 @@ from ..checkpoints import (_SCORER_CONFIG, full_training_state, load_config, sav
                            save_run_meta, warm_start)
 from ..dataset import LoaderConfig, PoseDataset
 from ..format import Registry
+from ..memory import peak_gb as _cpu_peak_gb
 from ..train import _gpu_peak_gb, build_optimizer, init_wandb, log
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer
@@ -365,6 +366,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                     'train/iteration': iteration,
                     'train/grad_norm': float(grad_norm),
                     'train/gpu_peak_gb': _gpu_peak_gb(device, reset=True),
+                    'train/cpu_peak_gb': _cpu_peak_gb(),
                     'train/sec_per_it': dt,
                     'train/loader_wait_frac': wait_frac,
                     'train/eval_frac': eval_frac,

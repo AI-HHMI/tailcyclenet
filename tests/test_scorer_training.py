@@ -16,6 +16,8 @@ Each of these was a silent wrong number rather than a crash:
 import sys
 from pathlib import Path
 
+import numpy as np
+
 import pytest
 import torch
 
@@ -209,13 +211,226 @@ def test_grown_registry_is_refused_and_the_source_registry_copies(tmp_path):
     assert 'query_encoder.kpt_embed.weight' not in fresh
 
 
-def test_the_scorer_warm_start_passes_the_checkpoints_own_registry():
-    """The scorer's warm-start call must name the checkpoint's registry.
+def test_warm_start_names_returns_the_source_registry_not_the_grown_one():
+    """The choice the scorer's warm-start call makes, and the consequence of getting it wrong.
 
-    Pins the call site: `base_reg` is the registry read from the SOURCE run folder, and it is what
-    `warm_start` must be given. A regression here reinitialises every source row silently.
+    `warm_start` copies the identity table row-for-row only when the name list it is given has
+    the table's length, so the grown registry (source + appended) refuses the copy and
+    reinitialises EVERY row. The test drives the real helper and the real `warm_start`; it does
+    not read the call site's source text.
     """
-    src = (REPO / 'tailcyclenet' / 'scorer' / 'train.py').read_text()
-    assert 'base_names=tuple(registry.names)' not in src, \
-        'the grown registry must not be passed as the identity table base'
-    assert 'base_names=tuple(base_reg.names) if base_reg else None' in src
+    from tailcyclenet.format import Registry
+    from tailcyclenet.scorer.train import warm_start_names
+
+    source = Registry(names=('a', 'b', 'c'), datasets=(('src', (0, 1, 2)),))
+    grown = Registry(names=('a', 'b', 'c', 'd', 'e'),
+                     datasets=(('src', (0, 1, 2)), ('tgt', (3, 4))))
+    assert warm_start_names(source) == ('a', 'b', 'c')
+    assert warm_start_names(None) is None, 'no source registry means no copy is attempted'
+
+    model = _KptModel(3)
+    ckpt = Path(__file__).parent / '_wkpt_tmp.pth'
+    try:
+        torch.save({'model_state': {'query_encoder.kpt_embed.weight':
+                                    model.query_encoder.kpt_embed.weight.detach().clone()}}, ckpt)
+        wide = _KptModel(5)
+        before = wide.query_encoder.kpt_embed.weight.detach().clone()
+        ck.warm_start(wide, ckpt, verbose=False, base_names=warm_start_names(grown))
+        assert torch.equal(wide.query_encoder.kpt_embed.weight.detach(), before), \
+            'the grown registry must leave the table alone (it is longer than the table)'
+        ck.warm_start(wide, ckpt, verbose=False, base_names=warm_start_names(source))
+        assert torch.equal(wide.query_encoder.kpt_embed.weight.detach()[:3],
+                           model.query_encoder.kpt_embed.weight.detach()), \
+            'the source registry must copy its rows'
+    finally:
+        ckpt.unlink(missing_ok=True)
+
+
+class _Routed(torch.nn.Module):
+    """The two shapes the routing rule distinguishes: an identity table and a 2D matrix."""
+
+    def __init__(self, n: int = 5, d: int = 4):
+        super().__init__()
+        self.query_encoder = torch.nn.Module()
+        self.query_encoder.kpt_embed = torch.nn.Embedding(n, d)
+        self.score_head = torch.nn.Linear(d, 1)
+        self.scene_encoder = torch.nn.Module()          # a Muon-routable 2D matrix, so the
+        self.scene_encoder.kv_proj = torch.nn.Linear(d, d)   # muon half is never empty
+
+
+def _route_of(opt, param):
+    """(<half>, group index, lr) for one parameter, or None.
+
+    The Muon recipe returns a `DualOptimizer` (a Muon half and an AdamW-SF half); the
+    schedule-free recipe returns the bare `AdamWScheduleFree`. Both are inspected here rather
+    than assumed, because the question is which group actually holds the parameter.
+    """
+    subs = [(name, sub) for name, sub in (('muon', getattr(opt, 'opt_muon', None)),
+                                          ('adamw', getattr(opt, 'opt_adam', None)))
+            if sub is not None] or [('single', opt)]
+    for which, sub in subs:
+        for gi, group in enumerate(sub.param_groups):
+            if any(p is param for p in group['params']):
+                return which, gi, float(group['lr'])
+    return None
+
+
+@pytest.mark.parametrize('kind', ['muon', 'schedulefree'])
+def test_widening_the_identity_table_does_not_move_it_between_optimizer_groups(kind):
+    """A successful widening removes `kpt_embed.weight` from `fresh`; the routing must not care.
+
+    It does not: the table is an `nn.Embedding`, so Muon excludes it however `fresh` is spelled,
+    and the schedule-free path pins it by NAME (`query_encoder.kpt_`). A change here would
+    silently retune the identity table the moment the warm start starts working.
+    """
+    from tailcyclenet.train import build_optimizer
+
+    cfg = {'optimizer': kind, 'learning_rate': 1e-4, 'kpt_lr': 5e-4, 'encoder_lr_scale': 0.1,
+           'weight_decay': 0.002, 'warmup_steps': 0, 'muon_schedulefree': True,
+           'muon_momentum': 0.95, 'muon_warmup_steps': 0, 'muon_adjust_lr_fn': 'match_rms_adamw'}
+    name = 'query_encoder.kpt_embed.weight'
+    routes = []
+    for fresh in ({name}, set()):
+        model = _Routed()
+        opt = build_optimizer(model, fresh, cfg)
+        routes.append(_route_of(opt, model.query_encoder.kpt_embed.weight))
+    assert routes[0] == routes[1], f'the table moved between groups: {routes}'
+    assert routes[0] is not None, 'the identity table must be in an optimizer group'
+    if kind == 'muon':
+        assert routes[0][0] == 'adamw', (
+            'each row of the identity table is a keypoint; Muon orthogonalises matrices and must '
+            'not touch it')
+    else:
+        assert routes[0][2] == pytest.approx(5e-4), (
+            'the schedule-free path pins the table to kpt_lr by NAME (query_encoder.kpt_)')
+
+
+# -- the averaged iterate is what val MEASURES, numerically -----------------------------------
+
+class _TinyScorer(torch.nn.Module):
+    """A model whose triplet scores are a function of ONE parameter, so the raw iterate and the
+    schedule-free average are directly comparable."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.zeros(1))
+        self.head = torch.nn.Linear(1, 3)
+
+    def score_triplet(self, trip):
+        s = self.w.reshape(1)
+        scores = torch.cat([s + 1.0, s - 1.0, s * 0.0]).reshape(1, 3)
+        return scores, torch.ones_like(scores), torch.ones_like(scores)
+
+
+_SF_CFG = {'optimizer': 'schedulefree', 'learning_rate': 1e-2, 'kpt_lr': 1e-2,
+           'encoder_lr_scale': 1.0, 'weight_decay': 0.0, 'warmup_steps': 0,
+           'beta1': 0.9, 'beta2': 0.95}
+
+
+def _in_train_mode(opt) -> bool:
+    """AdamWScheduleFree records the mode per param group; every group must be back in train."""
+    return all(g['train_mode'] for g in opt.param_groups)
+
+
+def test_validation_measures_the_averaged_iterate_and_it_round_trips(tmp_path, monkeypatch):
+    """The number `checkpoint_best` is chosen on must be the one a consumer can reproduce.
+
+    Raw and averaged weights are made to disagree on purpose; the test then checks that
+    `evaluate(..., optimizer)` measures the averaged prediction, that `save_checkpoint` +
+    `model_state_eval` reproduces exactly that prediction, and that both normal completion and a
+    raised error leave the model and the optimizer in TRAIN mode.
+    """
+    from tailcyclenet.scorer import train as st
+    from tailcyclenet.train import build_optimizer
+
+    monkeypatch.setattr(st, 'triplet_to_device', lambda trip, device: trip)
+    monkeypatch.setattr(st, '_per_type_accuracy', lambda scores, fired: {'acc': 0.0})
+    seen: dict = {}
+
+    def loss_fn(scores, *rest):
+        seen['scores'] = scores.detach().clone()
+
+    model = _TinyScorer()
+    opt = build_optimizer(model, set(), _SF_CFG)
+    opt.train()                                         # a fresh AdamWScheduleFree is in EVAL mode
+    for _ in range(5):                                  # the average must LAG the iterate
+        opt.zero_grad()
+        ((model.w - 3.0) ** 2).sum().backward()
+        opt.step()
+    assert _in_train_mode(opt)
+
+    st.evaluate(model, _fake_loader(), loss_fn, 'cpu', 1)
+    raw = seen['scores']
+    st.evaluate(model, _fake_loader(), loss_fn, 'cpu', 1, opt)
+    averaged = seen['scores']
+    assert not torch.allclose(raw, averaged), 'the averaged iterate must be a different model'
+    assert _in_train_mode(opt), 'val must leave the optimizer in train mode'
+    assert model.training, 'val must leave the model in train mode'
+
+    run = tmp_path / 'run'
+    ck.save_checkpoint(run, 5, model, opt, {'seed': 0}, name='last', kind='scorer')
+    saved = torch.load(run / 'checkpoints' / 'checkpoint_last.pth', map_location='cpu',
+                       weights_only=False)
+    assert not torch.allclose(saved['model_state']['w'], saved['model_state_eval']['w']), \
+        'the checkpoint must carry both iterates'
+    reloaded = _TinyScorer()
+    reloaded.load_state_dict(saved['model_state_eval'])
+    st.evaluate(reloaded, _fake_loader(), loss_fn, 'cpu', 1)
+    assert torch.allclose(seen['scores'], averaged, atol=1e-6), \
+        'model_state_eval must reproduce the val measurement'
+    assert reloaded.training
+
+    def boom(*_a):
+        raise RuntimeError('mid-val failure')
+
+    with pytest.raises(RuntimeError, match='mid-val failure'):
+        st.evaluate(model, _fake_loader(), boom, 'cpu', 1, opt)
+    assert _in_train_mode(opt), 'a raised val must still restore the optimizer'
+    assert model.training, 'a raised val must still restore the model'
+
+
+def test_val_retries_never_use_an_entropy_seeded_rng(scorer_root, monkeypatch):
+    """Directly: on val every RNG is seeded; on train the retry keeps its entropy seed.
+
+    The earlier assertion compares two chains, which would pass for ANY deterministic rule. This
+    one records the seeds `np.random.default_rng` was actually called with while a val retry ran,
+    and requires all of them to be seeded -- the property the fix restores.
+    """
+    from tailcyclenet.scorer.dataset import ScorerDataset
+
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                       crop_jitter=0.0)
+    corr = {'const_offset_prob': 1.0, 'frame_noise_prob': 0.0, 'gradual_drift_prob': 0.0,
+            'sinusoid_prob': 0.0, 'point_drop_prob': 0.0, 'min_valid_frames': 2,
+            'mag_3d': {'const_offset': 15.0}, 'mag_2d': {'const_offset': 10.0}}
+    seeds: list = []
+    real = np.random.default_rng
+
+    def spy(seed=None):
+        seeds.append(seed)
+        return real(seed)
+
+    monkeypatch.setattr(np.random, 'default_rng', spy)
+
+    def build(split: str):
+        base = PoseDataset(scorer_root, split, cfg, train=(split == 'train'))
+        original = base._select
+
+        def select(idx, rng, shape=None):
+            return None if idx == 0 else original(idx, rng, shape)
+
+        monkeypatch.setattr(base, '_select', select)
+        return ScorerDataset(base, corr)
+
+    val = build('val')
+    seeds.clear()
+    assert val[0] is not None
+    assert seeds, 'the val build must have drawn at least one RNG'
+    assert all(s is not None for s in seeds), f'val used an entropy-seeded RNG: {seeds}'
+
+    train = build('train')
+    seeds.clear()
+    assert train[0] is not None
+    assert any(s is None for s in seeds), (
+        'train must keep drawing its retry index from an entropy seed, or workers replay each '
+        'other')

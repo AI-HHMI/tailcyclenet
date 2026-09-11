@@ -38,6 +38,22 @@ from .triplet import seed_worker
 SCORER_HEAD_KEYS = ('pool_num_heads', 'score_hidden', 'use_precision')
 
 
+def warm_start_names(base_reg) -> tuple[str, ...] | None:
+    """The registry `warm_start` must be given: the SOURCE run's, never this run's grown one.
+
+    `warm_start` copies a checkpoint's identity table row-for-row only when the name list it is
+    handed has exactly the table's length; that check is what keeps a row on its own keypoint. The
+    grown registry (source names plus this dataset's appended ones) is longer than the table, so
+    passing it refuses the copy and reinitialises EVERY row -- including the source rows that
+    should have been preserved. Same call as the pose trainer's.
+
+    Inputs: base_reg -- the registry read from the source run folder, or None when it has none.
+    Outputs: its names, or None (then no copy is attempted, which is the correct refusal).
+    Side effects: none.
+    """
+    return tuple(base_reg.names) if base_reg is not None else None
+
+
 def loader_config(data_cfg: dict, model_cfg: dict) -> LoaderConfig:
     """`[data]` -> a `LoaderConfig`, refusing unknown keys and forcing the model's box setting.
 
@@ -289,8 +305,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             # keeps a row on its own keypoint, so passing the grown registry (n != n0) refuses the
             # copy and reinitialises EVERY row, including the source rows that should have been
             # preserved. Same call as `train.py`'s warm start.
-            fresh = warm_start(model, ckpt_file,
-                               base_names=tuple(base_reg.names) if base_reg else None)
+            fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',
                                            'precision_head'))}

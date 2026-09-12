@@ -456,7 +456,7 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
     if missing := required - set(manifest.columns):
         raise RuntimeError(f'{manifest_path}: missing columns {sorted(missing)}')
 
-    drops: list[tuple[str, fmt.Session, str, fmt.Labels]] = []
+    drops: list[tuple[str, fmt.Session, str]] = []
     before_rows: dict[tuple[str, str, str], int] = {}
     for split in fmt.SPLITS:
         for session in ds.sessions.get(split, []):
@@ -476,18 +476,26 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
                             if n:
                                 raise RuntimeError(
                                     f'{session.path}/{gid}: empty labels but {n} {stem} rows')
-                    drops.append((split, session, gid, labels))
+                    drops.append((split, session, gid))
 
-    by_split = dict(pd.Series([x[0] for x in drops]).value_counts()) if drops else {}
-    if by_split != {'train': 37}:
-        raise RuntimeError(f'unexpected unlabeled groups by split: {by_split}, expected train=37')
-    drop_keys = {(split, session.session_id, gid) for split, session, gid, _ in drops}
+    drop_keys = {(split, session.session_id, gid) for split, session, gid in drops}
     manifest_keys = set(zip(manifest.split, manifest.session, manifest.child_group))
     if not drop_keys <= manifest_keys:
         raise RuntimeError('unlabeled groups are missing from cleaning_manifest.tsv')
+    for split, session, gid in drops:
+        mask = ((manifest.split == split) & (manifest.session == session.session_id) &
+                (manifest.child_group == gid))
+        if int(mask.sum()) != 1:
+            raise RuntimeError(f'{split}/{session.session_id}/{gid}: manifest row count != 1')
+        if split != 'train' and manifest.loc[mask, 'reason'].iloc[0] != 'dropped_no_labels':
+            raise RuntimeError(f'{split}/{session.session_id}/{gid}: unexpected non-train drop')
 
-    for split, session, gid, _ in drops:
-        remaining_groups = {k: v for k, v in session.groups.items() if k != gid}
+    by_session: dict[Path, list[str]] = {}
+    for _, session, gid in drops:
+        by_session.setdefault(session.path, []).append(gid)
+    for session_path, gids in by_session.items():
+        session = next(s for s in ds.all_sessions() if s.path == session_path)
+        remaining_groups = {k: v for k, v in session.groups.items() if k not in gids}
         if not remaining_groups:
             raise RuntimeError(f'{session.path}: pruning would leave no groups')
         labels = {k: session.labels(k) for k in remaining_groups}
@@ -502,59 +510,73 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
         reloaded = fmt.Session.load(session.path)
         if reloaded.has_visibility_assessment != visibility_before:
             raise RuntimeError(f'{session.path}: visibility assessment changed while pruning')
-        group_dir = session.path / 'groups' / gid
         groups_root = (session.path / 'groups').resolve()
-        if group_dir.exists() or group_dir.is_symlink():
-            if group_dir.parent.resolve() != groups_root:
-                raise RuntimeError(f'refusing unsafe group path: {group_dir}')
-            if group_dir.is_symlink():
-                group_dir.unlink()
-            else:
-                shutil.rmtree(group_dir)
+        for gid in gids:
+            group_dir = session.path / 'groups' / gid
+            if group_dir.exists() or group_dir.is_symlink():
+                if group_dir.parent.resolve() != groups_root:
+                    raise RuntimeError(f'refusing unsafe group path: {group_dir}')
+                if group_dir.is_symlink():
+                    group_dir.unlink()
+                else:
+                    shutil.rmtree(group_dir)
 
-    for split, session, gid, _ in drops:
+    for split, session, gid in drops:
         mask = ((manifest.split == split) & (manifest.session == session.session_id) &
                 (manifest.child_group == gid))
-        if int(mask.sum()) != 1:
-            raise RuntimeError(f'{split}/{session.session_id}/{gid}: manifest row count != 1')
         manifest.loc[mask, 'reason'] = 'dropped_no_labels'
         manifest.loc[mask, 'dropped_frames'] = manifest.loc[mask, 'child_n_frames']
     manifest.to_csv(manifest_path, sep='\t', index=False)
 
+    after_ds = fmt.load_dataset(root)
     after_rows: dict[tuple[str, str, str], int] = {}
+    phantom = []
     for split in fmt.SPLITS:
-        for session in fmt.load_dataset(root).sessions.get(split, []):
+        for session in after_ds.sessions.get(split, []):
+            for gid in session.groups:
+                if not (session.path / 'groups' / gid).exists():
+                    phantom.append(f'{split}/{session.session_id}/{gid}')
             for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
                 table_path = session.path / f'{stem}.pq'
                 if table_path.exists():
                     after_rows[(split, session.session_id, stem)] = pq.read_metadata(
                         table_path).num_rows
+    if phantom:
+        raise RuntimeError(f'groups.pq has missing pixel directories: {phantom[:5]}')
     if before_rows != after_rows:
         raise RuntimeError(f'label table row counts changed: before={before_rows}, after={after_rows}')
+    kept_manifest = manifest[manifest.reason != 'dropped_no_labels']
+    if len(kept_manifest) != sum(len(s.groups) for s in after_ds.all_sessions()):
+        raise RuntimeError('manifest kept-group count differs from groups.pq')
 
+    all_dropped = manifest[manifest.reason == 'dropped_no_labels']
     summary_path = root / 'cleaning_summary.json'
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     summary.update({
-        'children': int(sum(len(s.groups) for s in ds.all_sessions()) - len(drops)),
-        'dropped_no_labels': len(drops),
-        'dropped_frames': int(sum(int(x[1].groups[x[2]].n_frames) for x in drops)),
-        'dropped_no_labels_by_split': {k: int(v) for k, v in by_split.items()},
+        'children': int(sum(len(s.groups) for s in after_ds.all_sessions())),
+        'dropped_no_labels': int(len(all_dropped)),
+        'dropped_frames': int(all_dropped.child_n_frames.sum()),
+        'dropped_no_labels_by_split': {
+            k: int(v) for k, v in all_dropped.groupby('split').size().items()},
     })
     summary_path.write_text(json.dumps(summary, indent=2) + '\n')
 
     provenance_path = root / 'provenance.toml'
     provenance = toml.load(provenance_path) if provenance_path.exists() else {}
     repo = Path(__file__).resolve().parent.parent
+    provenance['prune_runs'] = int(provenance.get('prune_runs', 0)) + 1
     provenance['prune'] = {
         'predicate': 'loader target visibility has no cell != UNLABELED',
-        'dropped_no_labels': len(drops),
-        'dropped_frames': int(sum(int(x[1].groups[x[2]].n_frames) for x in drops)),
+        'dropped_this_run': len(drops),
+        'dropped_total': len(all_dropped),
+        'dropped_frames_total': int(all_dropped.child_n_frames.sum()),
         'code_commit': subprocess_run(['git', 'rev-parse', 'HEAD'], cwd=repo),
         'code_dirty': bool(subprocess_run(['git', 'status', '--short'], cwd=repo)),
         'created_utc': datetime.now(timezone.utc).isoformat(),
     }
     provenance_path.write_text(toml.dumps(provenance))
-    return {'dropped_no_labels': len(drops), 'dropped_frames': summary['dropped_frames']}
+    return {'dropped_this_run': len(drops), 'dropped_total': len(all_dropped),
+            'dropped_frames_total': int(all_dropped.child_n_frames.sum())}
 
 
 def subprocess_run(args: list[str], cwd: Path) -> str:

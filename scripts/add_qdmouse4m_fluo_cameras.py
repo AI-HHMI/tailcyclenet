@@ -139,7 +139,9 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
                             abs(float(parent.fps) - float(child.fps)) > 1e-6):
                         raise RuntimeError(f'{clean.path}/{row.child_group}: child span or fps '
                                            f'disagrees with fluo parent {row.parent_group}')
-                rows_by_child = rows.set_index('child_group', verify_integrity=True)
+                rows_by_child = rows.set_index('child_group')
+                if not rows_by_child.index.is_unique:
+                    raise RuntimeError(f'{clean.path}: manifest has duplicate child groups')
                 take = camera_index_map(clean.cam_names, fluo.cam_names)
                 out_session = stage / split / session_id
                 out_session.mkdir(parents=True, exist_ok=True)

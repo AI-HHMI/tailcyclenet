@@ -1048,6 +1048,23 @@ class PoseDataset(Dataset):
             idx = int(rng.integers(len(self.index)))
         raise RuntimeError(f'{self.split}: 8 consecutive items failed to build')
 
+    def get_once(self, idx):
+        """Build exactly the indexed item once, without the ordinary retry replacement.
+
+        This is for deterministic QC/evaluation callers that must not silently substitute a
+        different window when decoding or realisation fails. Training and the normal Dataset
+        protocol continue to use :meth:`__getitem__`, including its retry behavior.
+
+        Inputs: idx -- an integer index into ``self.index``.
+        Outputs: the indexed item, or ``None`` when that item cannot be built.
+        Side effects: decodes and realises one item, just like the first ``__getitem__`` attempt.
+        """
+        if isinstance(idx, tuple):
+            raise TypeError('get_once expects an integer index, not an ordinal/index tuple')
+        idx = int(idx)
+        rng = np.random.default_rng(None if self.train else (self.seed, idx))
+        return self._item(idx, rng, self._shape(rng))
+
     def _shape(self, rng) -> dict:
         """The cost-determining draws, made from a stream every rank shares. See `__getitem__`.
 

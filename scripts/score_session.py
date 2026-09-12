@@ -41,12 +41,13 @@ def main(argv=None):
             for r in _csv.DictReader(f):
                 lo = int(r['span_start'])
                 spans[(r['session'], r['group'], str(r['animal']))] = (lo, lo + int(r['span_len']))
+    coverage = []
     table, _registry, _config = score_root(Path(args.run), args.data, args.split,
                                           args.device, args.limit,
-                                          args.window_offset, args.val_stride, spans)
+                                          args.window_offset, args.val_stride, spans, coverage)
     report = rank(table, args.top)
     print(report)
-    write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report)
+    write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage)
     return 0
 
 

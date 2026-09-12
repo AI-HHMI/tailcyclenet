@@ -9,10 +9,13 @@ The shapes matter as much as the device. `views` and `coords` gain a batch axis 
 while `kpt_ids` does not -- batching the ids early made them `[1, 1, K]` and tripped `score`'s own
 `(B, K)` assertion. Both halves are asserted here, on CPU, so no GPU is needed to hold the line.
 """
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
+import tailcyclenet.scorer.qc as qc
+from tailcyclenet.dataset import PoseDataset
 from tailcyclenet.scorer.qc import _span_indices, _to_device
 
 
@@ -99,3 +102,58 @@ def test_every_animal_of_a_group_is_matched_by_its_own_key():
     ds = _fake_dataset([0, 12], animals=('det00', 'det01'))
     kept = _span_indices(ds, {('sess', 'g', 'det01'): (0, 100)})
     assert [ds.index[i].animal for i in kept] == [1, 1]
+
+
+def test_get_once_does_not_retry_a_failed_index():
+    """QC's single-attempt accessor cannot silently draw a replacement index."""
+    ds = PoseDataset.__new__(PoseDataset)
+    ds.train = False
+    ds.seed = 23
+    calls = []
+    ds._shape = lambda rng: {'n_cams': 1, 'single_view_draw': 0.0}
+    ds._item = lambda idx, rng, shape: calls.append(idx) or None
+
+    assert ds.get_once(7) is None
+    assert calls == [7]
+
+
+def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
+    """A failed requested window is coverage, never a random group's score."""
+    sess = SimpleNamespace(session_id='sess', names=['k'])
+    sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
+
+    class FakeDataset:
+        registry = SimpleNamespace(names=['k'])
+        seed = 23
+        train = False
+        index = [SimpleNamespace(session=sess, gid='target', animal=0, start=0)]
+
+        def __init__(self, *_args, **_kwargs):
+            self.calls = []
+
+        def __len__(self):
+            return len(self.index)
+
+        def get_once(self, idx):
+            self.calls.append(idx)
+            return None
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    ckpt = SimpleNamespace(name='checkpoint_last.pth')
+    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    monkeypatch.setattr(qc, 'load_scorer_run',
+                        lambda *_args, **_kwargs: (FakeModel(), {},
+                                                    SimpleNamespace(names=['k']), ckpt))
+    coverage = []
+    table, _registry, _config = qc.score_root(
+        Path('run'), 'data', 'test', spans={('sess', 'target', 'a0'): (0, 100)},
+        coverage=coverage)
+
+    assert table.empty
+    assert coverage == [{'index': 0, 'session': 'sess', 'group': 'target', 'animal': 'a0',
+                         'start': 0, 'status': 'unscorable',
+                         'reason': 'item_build_failed'}]

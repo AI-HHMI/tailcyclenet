@@ -113,7 +113,7 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
 
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
                window_offset: int | None = None, val_stride: int | None = None,
-               spans: dict | None = None) -> tuple:
+               spans: dict | None = None, coverage: list[dict] | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
@@ -123,7 +123,8 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             track under a framing other than the one that produced it; val_stride -- window
             spacing, defaulting to the run's `n_frames` (non-overlapping); spans -- restrict
             scoring to windows starting inside a frame range, as {(session, group, animal):
-            (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable.
+            (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable;
+            coverage -- optional list populated with one record per requested window.
     Outputs: (DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
@@ -153,9 +154,35 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     for i in where:
         if limit is not None and n_seen >= limit:
             break
-        item = ds[i]
+        requested = ds.index[i]
+        expected_session = requested.session.session_id
+        expected_group = requested.gid
+        expected_animal = str(requested.session.labels(requested.gid).animal_ids[requested.animal])
+        expected_start = int(requested.start)
+        item = ds.get_once(i)
         if item is None:
+            if coverage is not None:
+                coverage.append({'index': int(i), 'session': expected_session,
+                                 'group': expected_group, 'animal': expected_animal,
+                                 'start': expected_start, 'status': 'unscorable',
+                                 'reason': 'item_build_failed'})
             continue
+        row_identity = (str(item[5]['session']), str(item[5]['group']),
+                        str(item[5]['animal']), int(item[5]['start']))
+        expected_identity = (str(expected_session), str(expected_group), expected_animal,
+                             expected_start)
+        if row_identity != expected_identity:
+            if coverage is not None:
+                coverage.append({'index': int(i), 'session': expected_session,
+                                 'group': expected_group, 'animal': expected_animal,
+                                 'start': expected_start, 'status': 'identity_mismatch',
+                                 'reason': f'returned {row_identity}'})
+            raise RuntimeError(f'QC index {i} returned {row_identity}, expected '
+                               f'{expected_identity}; refusing cross-group scoring')
+        if coverage is not None:
+            coverage.append({'index': int(i), 'session': expected_session,
+                             'group': expected_group, 'animal': expected_animal,
+                             'start': expected_start, 'status': 'scored', 'reason': ''})
         n_seen += 1
         # The SESSION comes from the INDEX entry, not the dataset: `coords` and `kpt_ids` are
         # laid out in the session's own `names` order, which may reorder or subset the dataset's,
@@ -221,13 +248,14 @@ def rank(table: pd.DataFrame, top: int = 10) -> str:
 
 
 def write_outputs(out: Path, table: pd.DataFrame, run: Path, data: str, split: str,
-                  report: str) -> None:
+                  report: str, coverage: list[dict] | None = None) -> None:
     """Write `scores.pq`, `report.txt` and `provenance.toml` under `out`.
 
     Inputs: out -- the output directory; table -- the score DataFrame; run -- the scorer run;
             data -- the scored root; split -- the split scored; report -- the ranking text.
     Outputs: none.
-    Side effects: creates `out` and writes three files. The scored root is not touched.
+    Side effects: creates `out` and writes three files plus `coverage.csv` when coverage is
+        supplied. The scored root is not touched.
     """
     import toml
 
@@ -238,4 +266,7 @@ def write_outputs(out: Path, table: pd.DataFrame, run: Path, data: str, split: s
         **provenance(), 'scorer_run': str(run), 'source_root': str(data), 'split': split,
         'n_rows': int(len(table)),
     }))
+    if coverage is not None:
+        pd.DataFrame(coverage, columns=['index', 'session', 'group', 'animal', 'start',
+                                        'status', 'reason']).to_csv(out / 'coverage.csv', index=False)
     print(f'wrote {out}/scores.pq, {out}/report.txt, {out}/provenance.toml')

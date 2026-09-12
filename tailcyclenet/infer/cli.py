@@ -62,8 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help='RAW FOOTAGE INSTEAD OF A SESSION DIRECTORY: files and/or directories '
                           '(a directory expands to its .mp4/.avi children, sorted, NOT '
                           'recursively). THE SESSION IS BUILT IN MEMORY -- nothing is staged, and '
-                          'nothing is written but --out. Needs --calibration, and --cam-regex '
-                          'unless the calibration names exactly one camera. NO LABELS, therefore '
+                          'nothing is written but --out. A single-camera 2D run may omit '
+                          '--calibration and uses a nominal cam0; 3D needs --calibration and '
+                          '--cam-regex unless the calibration names exactly one camera. NO LABELS, '
+                          'therefore '
                           'NO SCORING: scripts/eval.py has nothing to compare a video-sourced '
                           'prediction against, and a number needs annotations, i.e. a converter. '
                           'It also makes --max-animals and a box source (--detector/--boxes) '
@@ -97,10 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
                          'i.e. one raw recording per invocation (`Cam2005325.mp4` under '
                          "'Cam[0-9]+' leaves ''). INERT otherwise. Some empty and some not is a "
                          'genuine ambiguity and is refused. Default: the session id.')
-    ap.add_argument('--units', default='mm',
-                    help='with --videos: the 3D units. A DECLARATION about the calibration, not a '
-                         'measurement, and it CANNOT BE CHECKED here -- a calibration in metres '
-                         'declared as mm produces a prediction 1000x off with no symptom, because '
+    ap.add_argument('--units', default=None,
+                    help='with --videos: the units declaration. Defaults to px for a derived 2D '
+                         'single-camera session; a 3D run MUST state --units explicitly because '
+                         'calibration.toml has no units field and the declaration cannot be checked '
+                         'against it. A calibration in metres declared as mm produces a prediction '
+                         '1000x off with no symptom, because '
                          "nothing downstream knows the animal's size.")
     ap.add_argument('--fps', type=float, default=None,
                     help="with --videos: override the container's own fps. Reaches groups.pq "
@@ -395,10 +399,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if bool(args.data) == bool(args.videos):
         ap.error('exactly one of --data (a session directory in docs/annotation_format.md) or '
-                 '--videos (raw footage plus --calibration) is required.')
-    if args.videos and not args.calibration:
-        ap.error('--videos needs --calibration: an aniposelib-layout calibration.toml. There is '
-                 'no geometry in a filename.')
+                 '--videos (raw footage) is required.')
     if args.calibration and not args.videos:
         ap.error('--calibration only means anything with --videos; a session directory carries '
                  'its own calibration.toml.')

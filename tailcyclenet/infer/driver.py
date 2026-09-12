@@ -419,8 +419,18 @@ def run_dataset(args):
         reg = peek_registry(args.run)
         vplan = adopt.plan(args.videos, args.calibration, args.cam_regex,
                           session_id=args.session_id, group_id=args.group_id)
+        if args.units is None:
+            if vplan.mode == '3d':
+                raise SystemExit('--units is required for a 3D --videos run: calibration.toml '
+                                 'has no units field, so state the calibration units explicitly.')
+            units = 'px'
+        else:
+            units = args.units
+        if getattr(vplan, 'mode', None) == '3d' and units == 'px':
+            raise SystemExit('--units px is inconsistent with a 3D --videos run: pixel units '
+                             'describe 2D image coordinates, not calibrated world coordinates.')
         ds_name = adopt.dataset_name(reg, args.dataset_name)
-        sess = adopt.build(vplan, names=reg.local_names(ds_name), units=args.units,
+        sess = adopt.build(vplan, names=reg.local_names(ds_name), units=units,
                            fps=args.fps, assoc_res_max_px=assoc_res_max_px,
                            trim=args.trim_to_shortest)
         src_prov = adopt.provenance_of(vplan)

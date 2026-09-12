@@ -78,6 +78,24 @@ def test_one_camera_needs_no_regex(tmp_path, monkeypatch):
     assert all(list(v) == ['cam0'] for v in p.videos.values())
 
 
+def test_uncalibrated_single_camera_uses_nominal_camera_from_video_size(tmp_path):
+    """A 2D raw recording has enough information for a nominal cam0; its geometry is built from
+    the decoder's own (width, height), not an invented calibration matrix."""
+    wh = (80, 48)
+    video = _write_video(tmp_path / 'rec' / 'take.mp4', 0, 4, wh)
+    p = adopt.plan([video], None, None)
+    sess = adopt.build(p, names=KPTS_3D, units='px', verbose=False)
+    assert sess.mode == '2d' and sess.units == 'px'
+    assert sess.cam_names == ['cam0']
+    assert sess.rig.size('cam0') == wh
+    assert sess.rig.offset['cam0'] == (0.0, 0.0)
+    assert sess.rig.moving['cam0'] is False
+    assert sess.rig.calibrated['cam0'] is False
+    np.testing.assert_allclose(
+        sess.rig.by_name('cam0').get_camera_matrix().detach().cpu().numpy(),
+        fmt.nominal_camera('cam0', wh).get_camera_matrix().detach().cpu().numpy())
+
+
 def test_multiple_groups_in_one_session_is_free(tmp_path, monkeypatch):
     """One invocation shares one calibration, mode and keypoint axis; twelve trials is one session."""
     _no_probe(monkeypatch)

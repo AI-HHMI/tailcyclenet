@@ -26,6 +26,7 @@ def test_inference_speed_options_default_to_measured_path():
 
     parser = build_parser()
     assert parser.get_default('precision') == 'bf16'
+    assert parser.get_default('units') is None, 'units are resolved only after deriving video mode'
     assert parser.get_default('camera_batch') is True
     options = {option for action in parser._actions for option in action.option_strings}
     assert '--camera-batch' in options and '--no-camera-batch' in options
@@ -1992,7 +1993,7 @@ def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch,
     np.savez(tmp_path / 'boxes.npz', **{'rec/t': pts})
 
     common = ['--run', str(run), '--boxes', str(tmp_path / 'boxes.npz'), '--anchor', 'none',
-              '--device', 'cpu', '--overlap', '2', '--dataset-name', 'ds']
+              '--device', 'cpu', '--overlap', '2', '--dataset-name', 'ds', '--units', 'mm']
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--data', str(sdir),
                                       '--out', str(tmp_path / 'a')] + common)
     cli.main()
@@ -2015,6 +2016,70 @@ def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch,
 
     a, b = rows('a'), rows('b')
     assert a and a == b, '--videos must be an input path, not a second pipeline'
+
+
+def test_2d_videos_without_calibration_defaults_to_px_and_nominal_cam(cli, monkeypatch, tmp_path):
+    """The raw single-view path derives mode from one video, defaults units to pixels, and
+    records the converter-compatible nominal cam0 using the video's dimensions."""
+    import tomllib
+
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.format import Registry, Session
+
+    wh, T = (80, 48), 8
+    video = cf._write_video(tmp_path / 'rec' / 'take.mp4', 0, T, wh)
+    names = cf.KPTS_3D
+    registry = Registry(names=tuple(names), datasets=(('ds', tuple(range(len(names)))),))
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    points = np.zeros((1, T, len(names), 2), np.float32)
+    points[..., 0] = wh[0] / 2
+    points[..., 1] = wh[1] / 2
+    np.savez(tmp_path / 'boxes.npz', **{'rec/take': points})
+
+    out = tmp_path / 'pred'
+    monkeypatch.setattr(sys, 'argv', [
+        'infer.py', '--run', str(run), '--videos', str(video), '--boxes', str(tmp_path / 'boxes.npz'),
+        '--anchor', 'none', '--device', 'cpu', '--overlap', '2', '--dataset-name', 'ds',
+        '--out', str(out)])
+    cli.main()
+
+    got = Session.load(out)
+    assert got.mode == '2d' and got.units == 'px'
+    assert got.cam_names == ['cam0'] and got.rig.size('cam0') == wh
+    from tailcyclenet import adopt
+    back = adopt.session_from_prediction(out)
+    assert back.cam_names == ['cam0'] and back.rig.size('cam0') == wh
+    with open(out / 'session.toml', 'rb') as f:
+        cfg = tomllib.load(f)
+    assert cfg['units'] == 'px'
+
+
+@pytest.mark.parametrize('units', [None, 'px'])
+def test_3d_videos_without_valid_units_refuses_before_checkpoint_load(cli, monkeypatch, tmp_path,
+                                                                     units):
+    """A multiview calibration determines 3D mode, but cannot determine units: the operator
+    must declare them explicitly rather than inheriting a misleading default."""
+    import conftest as cf
+
+    rig, vids, _ = _videos_fixture(tmp_path)
+    run, registry = _videos_run(tmp_path, cf.KPTS_3D)
+    argv = [
+        'infer.py', '--run', str(run), '--videos', str(tmp_path / 'rec'),
+        '--calibration', str(tmp_path / 'calib.toml'), '--cam-regex', 'cam([0-9]+)_',
+        '--group-id', 't', '--session-id', 'rec', '--boxes', str(tmp_path / 'missing.npz'),
+        '--anchor', 'none', '--device', 'cpu', '--out', str(tmp_path / 'pred')]
+    if units is not None:
+        argv += ['--units', units]
+    monkeypatch.setattr(sys, 'argv', argv)
+    with pytest.raises(SystemExit, match='--units'):
+        cli.main()
+    assert not (tmp_path / 'pred').exists(), 'the refusal must precede output/checkpoint work'
 
 
 def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
@@ -2076,17 +2141,18 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
 @pytest.mark.parametrize('argv,expect', [
     ([], 'exactly one of --data'),
     (['--data', '/tmp/x', '--videos', '/tmp/y.mp4'], 'not allowed with'),
-    (['--videos', '/tmp/y.mp4'], 'needs --calibration'),
+    (['--videos', '/tmp/y.mp4'], 'needs a box source'),
     (['--data', '/tmp/x', '--calibration', '/tmp/c.toml'], 'only means anything with --videos'),
 ])
 def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, capsys, argv, expect):
     """argparse's own mutual-exclusion message names one flag; "exactly one of" names both, which
-    is what a user who supplied neither needs to read. `ap.error` exits 2 and writes to stderr, so
-    the message is read there rather than off the exception."""
+    is what a user who supplied neither needs to read. Parser errors write to stderr, while a
+    raw-footage refusal is raised by the input-path checks, so inspect whichever carries it."""
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', '/tmp/r', '--out', '/tmp/o'] + argv)
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc:
         cli.main()
-    err = capsys.readouterr().err
+    captured = capsys.readouterr().err
+    err = captured or str(exc.value)
     assert expect in err, f'wanted {expect!r}, got: {err}'
 
 

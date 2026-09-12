@@ -40,7 +40,7 @@ def probe_workers(n_videos: int, budget=None) -> int:
 
 @dataclass(frozen=True)
 class VideoPlan:
-    """Everything derivable from the FILENAMES plus the calibration. No pixels were opened."""
+    """Everything derivable from the FILENAMES plus optional calibration. No pixels were opened."""
     session_id: str
     # '3d' | '2d'
     mode: str
@@ -151,7 +151,8 @@ def _common_parent(files: list[Path]) -> Path:
 
 def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None) -> VideoPlan:
     """PURE GIVEN THE FILESYSTEM'S NAMES. Refusals 1-6. Opens no video, decodes nothing, loads
-    no checkpoint. `calibration` is an aniposelib-layout toml -- what `format.load_calibration`
+    no checkpoint. `calibration`, when supplied, is an aniposelib-layout toml -- what
+    `format.load_calibration`
     reads and what anipose itself writes.
 
     A camera block with no `size` is patched here (Refusal 14, and the one place this path may
@@ -174,35 +175,49 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
         _die('--videos matched no file. Pass video files, or a directory holding them '
              f'(expanded non-recursively over {fmt.VIDEO_EXTS}).')
 
-    cal = Path(calibration).resolve()
-    if not cal.exists():
-        _die(f'--calibration {cal}: no such file.')
-    with open(cal, 'rb') as f:
-        doc = tomllib.load(f)
-    need_size = []
-    for k, block in doc.items():
-        if k == 'metadata' or not isinstance(block, dict):
-            continue
-        if 'size' not in block:
-            need_size.append(str(block.get('name', k)))
-            block['size'] = [0, 0]
-    rig = fmt.rig_from_doc(doc, str(cal))
+    # A calibration is required for a real multiview rig, but a raw single-camera recording is
+    # already enough to establish the 2D geometry.  Start with a harmless placeholder; `build`
+    # replaces it with `nominal_camera('cam0', decoded_size)` after probing, so its focal length
+    # and principal point are those of the actual pixels rather than invented constants.
+    if calibration is None:
+        from aniposelib.cameras import CameraGroup
 
-    moving = [n for n in rig.names if rig.moving[n]]
-    if moving:
-        _die(f'{cal}: cameras {moving} declare moving = true, and --videos cannot supply '
-             'per-frame extrinsics -- there is no extrinsics.pq and no filename that could carry '
-             'one. Convert the recording to a session directory if the rig really moves.')
+        cal = None
+        rig = fmt.Rig(cgroup=CameraGroup([fmt.nominal_camera('cam0', (1, 1))]),
+                      offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
+                      calibrated={'cam0': False})
+        need_size = ['cam0']
+    else:
+        cal = Path(calibration).resolve()
+        if not cal.exists():
+            _die(f'--calibration {cal}: no such file.')
+        with open(cal, 'rb') as f:
+            doc = tomllib.load(f)
+        need_size = []
+        for k, block in doc.items():
+            if k == 'metadata' or not isinstance(block, dict):
+                continue
+            if 'size' not in block:
+                need_size.append(str(block.get('name', k)))
+                block['size'] = [0, 0]
+        rig = fmt.rig_from_doc(doc, str(cal))
+
+        moving = [n for n in rig.names if rig.moving[n]]
+        if moving:
+            _die(f'{cal}: cameras {moving} declare moving = true, and --videos cannot supply '
+                 'per-frame extrinsics -- there is no extrinsics.pq and no filename that could carry '
+                 'one. Convert the recording to a session directory if the rig really moves.')
+
+        mode = '3d' if len(rig) > 1 else '2d'
+        if mode == '3d':
+            bad = [n for n in rig.names if not rig.calibrated[n]]
+            if bad:
+                _die(f'{cal}: {len(rig)} cameras means 3D, but {bad} carry no matrix/rotation/'
+                     'translation, so load_calibration invented a nominal camera for each. A '
+                     'triangulation against an invented camera is silently wrong. Calibrate them, or '
+                     'run one camera at a time.')
 
     mode = '3d' if len(rig) > 1 else '2d'
-    if mode == '3d':
-        bad = [n for n in rig.names if not rig.calibrated[n]]
-        if bad:
-            _die(f'{cal}: {len(rig)} cameras means 3D, but {bad} carry no matrix/rotation/'
-                 'translation, so load_calibration invented a nominal camera for each. A '
-                 'triangulation against an invented camera is silently wrong. Calibrate them, or '
-                 'run one camera at a time.')
-
     if cam_regex is None and len(rig) != 1:
         _die(f'--cam-regex is required: the calibration names {len(rig)} cameras '
              f'({rig.names[:4]}...) and nothing else says which video is which. It is anipose\'s '
@@ -212,7 +227,13 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
     parsed: list[tuple[Path, str, str]] = []
     for f in files:
         cam, gid = parse_name(f.stem, cam_regex)
-        if cam_regex is None:
+        if calibration is None:
+            # There is no camera-name mapping to read from a calibration.  All *matched* footage
+            # belongs to the one nominal camera; a supplied regex may still be useful for its group
+            # id, while a regex that matches nothing still gets the normal refusal below.
+            if cam_regex is None or cam:
+                cam = 'cam0'
+        elif cam_regex is None:
             cam = rig.names[0]
         parsed.append((f, cam, gid))
 
@@ -383,14 +404,33 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
             if verbose:
                 print(f'  {gid}/{cam}: {n} frames, {wh[0]}x{wh[1]}, {f:g} fps', flush=True)
 
-    for name in plan.need_size:
-        wh = next((v[1] for (g, c), v in got.items() if c == name), None)
-        if wh is None:
-            continue
-        plan.rig.by_name(name).set_size(wh)
-        if verbose:
-            print(f'--calibration: camera {name!r} carried no `size`; filled from its own first '
-                  f'frame as {wh[0]}x{wh[1]}.')
+    if plan.calibration is None:
+        # No calibration means exactly one nominal 2D camera.  Rebuild it after probing: merely
+        # calling set_size on the (1, 1) placeholder leaves its focal length at 1 instead of the
+        # converter/session convention in `format.nominal_camera`.
+        sizes = {v[1] for v in got.values()}
+        if len(sizes) > 1:
+            _die(f'--videos without --calibration: the single nominal camera has videos with '
+                 f'different sizes {sorted(sizes)}. A camera cannot change sensor resolution '
+                 'within one run; provide matching videos or a calibration for a reduced run.')
+        if sizes:
+            wh = next(iter(sizes))
+            cam = fmt.nominal_camera('cam0', wh)
+            # VideoPlan is frozen (the filename plan is immutable), but its CameraGroup is the
+            # intentionally mutable runtime object; replace the placeholder camera in place.
+            plan.rig.cgroup.cameras[0] = cam
+            if verbose:
+                print(f'--videos: no --calibration; using nominal camera \'cam0\' at '
+                      f'{wh[0]}x{wh[1]} (offset [0, 0], moving false).')
+    else:
+        for name in plan.need_size:
+            wh = next((v[1] for (g, c), v in got.items() if c == name), None)
+            if wh is None:
+                continue
+            plan.rig.by_name(name).set_size(wh)
+            if verbose:
+                print(f'--calibration: camera {name!r} carried no `size`; filled from its own first '
+                      f'frame as {wh[0]}x{wh[1]}.')
 
     for (gid, cam), (n, wh, f) in sorted(got.items()):
         want = plan.rig.size(cam)
@@ -454,7 +494,9 @@ def provenance_of(plan: VideoPlan) -> dict:
     return {
         'source': 'tailcyclenet infer --videos',
         'source_session': '',
-        'source_calibration': str(plan.calibration),
+        # Empty is the explicit record for a nominal single-camera run; `None` would be a
+        # misleading filesystem path and would make reconstruction try to open it.
+        'source_calibration': '' if plan.calibration is None else str(plan.calibration),
         'source_cam_regex': str(plan.cam_regex or ''),
         'source_group_id': str(plan.group_id),
         'source_videos': [str(p) for p in plan.files],
@@ -478,7 +520,8 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
             f'{pred_dir}: [provenance] has no `source_videos`, so this prediction was not made '
             'from a --videos run and there is nothing to reconstruct.')
 
-    p = plan(files, prov['source_calibration'], prov.get('source_cam_regex') or None,
+    p = plan(files, prov.get('source_calibration') or None,
+             prov.get('source_cam_regex') or None,
              session_id=prov.get('source_session_id') or None,
              group_id=prov.get('source_group_id') or None)
 
@@ -490,11 +533,20 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
             f'{pred_dir}: the videos named in [provenance] now derive groups '
             f'{sorted(p.videos)}, but this prediction was written over {sorted(want_groups)}. A '
             'video was renamed, moved or added since the run.')
-    want_cams = fmt.load_calibration(pred_dir / 'calibration.toml').names
+    prediction_rig = fmt.load_calibration(pred_dir / 'calibration.toml')
+    want_cams = prediction_rig.names
     if list(p.rig.names) != list(want_cams):
         raise fmt.FormatError(
             f'{pred_dir}: the calibration named in [provenance] now has cameras {p.rig.names}, '
             f'but this prediction was written over {want_cams}.')
+    if p.calibration is None:
+        # There is no source calibration to reload.  The prediction's own calibration is the
+        # nominal camera built from the source pixels during the original probe.  VideoPlan is
+        # frozen, so replace its placeholder camera in the mutable CameraGroup.
+        p.rig.cgroup.cameras[0] = prediction_rig.cameras[0]
+        p.rig.offset.update(prediction_rig.offset)
+        p.rig.moving.update(prediction_rig.moving)
+        p.rig.calibrated.update(prediction_rig.calibrated)
 
     names = list(cfg['names'])
     K, C = len(names), len(p.rig)

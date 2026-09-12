@@ -104,7 +104,9 @@ def _session_2d(path, T=4, S=2, label_source='annotated'):
     lab.points2d[0, 0, 1, 0] = np.nan
     lab.vis2d[1, 2, 3, 0] = fmt.UNLABELED
     lab.points2d[1, 2, 3, 0] = np.nan
-    # a01 is labeled, a02 is a present-but-unannotated ignore region on frame 1
+    # a01 is labeled, a02 is a present-but-unannotated ignore region on frame 1. a01 deliberately
+    # has NO stored box anywhere: that is what `test_box_source_falls_back_per_view` pins for the
+    # pose loader, whose per-camera keypoint fallback is unchanged.
     lab.instance = np.full((S, T, 1), fmt.INST_NONE, np.int8)
     lab.boxes = np.full((S, T, 1, 4), np.nan, np.float32)
     lab.instance[:, :, 0] = fmt.INST_LABELED

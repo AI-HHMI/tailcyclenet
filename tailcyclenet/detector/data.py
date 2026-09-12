@@ -400,6 +400,15 @@ class BoxDataset(Dataset):
                     for ci in range(len(sess.rig)):
                         origins = ([None] if self.tile_wh is None
                                    else self._tile_origins(sess, gid, int(f), ci, rng))
+                        if not self._has_target(sess, gid, int(f), ci, lab):
+                            # A frame that yields no usable target is not a training item. Its
+                            # `vis` rows exist (a `missing` judgement carries no coordinates, and
+                            # an `instances.pq` row need not be `labeled` or need not have a box),
+                            # but no GT box would come out of it -- so the item would be EVERY
+                            # anchor as background, teaching "nothing here" about a frame the
+                            # annotator merely did not place points in. Such frames are skipped
+                            # rather than trained as pure negatives.
+                            continue
                         for o in origins:
                             self.index.append((sess, gid, int(f), ci))
                             self.origins.append(o)
@@ -411,6 +420,32 @@ class BoxDataset(Dataset):
     def __len__(self):
         """Number of indexed items (one camera view of one frame each)."""
         return len(self.index)
+
+    def _has_target(self, sess, gid, f, ci, lab):
+        """Whether this (frame, view) yields at least one usable GT box under `box_source`.
+
+        Mirrors `boxes_for`'s own source selection, so the index cannot include an item the loss
+        has nothing to supervise:
+
+        * `box_source='instances'` with an `instances.pq` present: at least one finite stored box.
+          The table is the only box source here, so an animal it does not describe gets no target
+          and a frame with no stored box at all is not a training item.
+        * otherwise (`box_source='keypoints'`, or no `instances.pq` to read): at least one animal
+          with a finite point in this view, because `crop_box_for_points` returns None on all-NaN
+          and that is the only way it returns None.
+
+        A keypoint that is merely `missing` is not a point: it has no coordinates, so it cannot
+        anchor a box.
+        """
+        if self.box_source == 'instances' and lab.boxes is not None and lab.instance is not None:
+            # The table is the box source, so eligibility IS "does it hold a box here". Not
+            # `labeled`-only: a `present` box is a real stored extent, and the detector has always
+            # regressed it (the fixture in `tests/conftest.py` pins that). No keypoint fallback.
+            if not bool(np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1).any()):
+                return False
+            return True
+        p2d = self._points_2d(sess, gid, f, ci)
+        return bool(torch.isfinite(p2d).all(-1).any())
 
     def default_train_weights(self, annot_frac=None):
         """THE default train sampling weight. Always an array, never None.
@@ -705,7 +740,14 @@ class BoxDataset(Dataset):
         animal here". An `instances.pq` stored box is an ALREADY-PADDED extent that re-enters the
         rule at pad 0, warped as FOUR corners (a two-corner warp under rotation/flip crops the
         animal the box exists to enclose), per animal rather than per session because rat-city's
-        tracker loses animals and its keypoints are then the only source left.
+        tracker loses animals.
+
+        WHEN `instances.pq` IS THE BOX SOURCE IT IS THE ONLY ONE: an animal the table does not
+        describe at this (frame, view) gets NO box, not a keypoint-derived one. Falling back would
+        invent a target where the table deliberately records none, and on schulze-6fish it put the
+        unlabelled-but-present fish of a partial anchor back into training as background. A frame
+        with no stored box at all therefore yields no finite box, which is what `_has_target`
+        drops at index time.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -742,14 +784,22 @@ class BoxDataset(Dataset):
 
         boxes = []
         for s in range(p2d.shape[0]):
-            src, pad = p2d[s], 20
             if self.box_source == 'instances' and lab.boxes is not None:
+                # `instances.pq` exists and is the box source, so it is the ONLY box source: an
+                # animal it does not describe here gets NO target rather than a keypoint-derived
+                # one. The fallback would silently invent a target for an animal the table has
+                # nothing to say about, which is exactly the polarity `instances.pq` exists to
+                # express (absent row = no determination, not "assume the keypoint extent").
                 b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
-                if torch.isfinite(b).all():
-                    x0, y0, x1, y1 = b
-                    src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
-                                       torch.stack([x1, y1]), torch.stack([x0, y1])])
-                    pad = 0
+                if not torch.isfinite(b).all():
+                    boxes.append(torch.full((4,), float('nan')))
+                    continue
+                x0, y0, x1, y1 = b
+                src = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
+                                   torch.stack([x1, y1]), torch.stack([x0, y1])])
+                pad = 0
+            else:
+                src, pad = p2d[s], 20
             if warp is not None:
                 src = _apply_affine(src, (warp, None))
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))

@@ -94,6 +94,10 @@ torchaudio = { version = "*", index = "https://download.pytorch.org/whl/cu128" }
 # the hub checkout, so it has to be present before `torch.hub.load('facebookresearch/dinov3', ...)`
 # can even build the module tree.
 termcolor = "*"
+# Read ONLY by scripts/convert_schulze.py, to locate temporal discontinuities in a source recording
+# from its per-frame model positions (the package ships no timestamps). A conversion-time script
+# dependency, not a library one, so it stays out of [project] dependencies.
+h5py = "*"
 
 [tool.pixi.feature.dev.dependencies]
 python-build = "*"

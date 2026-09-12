@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Convert a Johnson Lab Fly50 JARVIS release to tailcycle-dataset format.
 
-Fly50_V7 uses telecentric/orthographic 3x4 projection matrices.  This converter
+Fly50 releases use telecentric/orthographic 3x4 projection matrices.  This converter
 uses the closed-form telecentric-to-telephoto-pinhole construction documented in
 ``posetail-preprocessing/preprocess.md`` and preserves the JARVIS train/val
 frameset membership.  The source's projectionMatrix already contains the
@@ -391,6 +391,10 @@ def convert(src: Path, out: Path, max_gap: int, reject_px: float,
             only: list[str] | None, max_groups: int | None, dry_run: bool) -> None:
     """Convert all Fly50 train/val sessions."""
     by_split = {split: read_split(src, split) for split in SPLITS}
+    release_name = src.name
+    release_json = src / 'release.json'
+    if release_json.exists():
+        release_name = json.loads(release_json.read_text()).get('name', release_name)
     # Parse every calibration before creating any destination files.  This makes
     # malformed integer/decimal/scientific YAML payloads fail preflight rather
     # than leaving a half-written root.
@@ -480,7 +484,7 @@ def convert(src: Path, out: Path, max_gap: int, reject_px: float,
                 skeleton=skeleton, flip_pairs=flip_pairs,
                 assoc_res_max_px=30.0,
                 provenance={
-                    'source': f'Fly50_V7/{split}/{session}',
+                    'source': f'{release_name}/{split}/{session}',
                     'annotator': '', 'annotator_tool': 'FlyPose JARVIS release',
                     'points3d_source': 'telecentric DLT-derived pinhole triangulation; '
                                        'not native 3D',

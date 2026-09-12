@@ -126,8 +126,20 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
             for session_id, clean in clean_sessions.items():
                 fluo = fluo_sessions[session_id]
                 assert_calibration_matches(clean, fluo)
-                if set(clean.groups) - set(fluo.groups):
-                    raise RuntimeError(f'{clean.path}: source fluo groups are incomplete')
+                rows = kept[(kept.split == split) & (kept.session == session_id)]
+                if set(rows.child_group) != set(clean.groups):
+                    raise RuntimeError(f'{clean.path}: manifest children != groups.pq')
+                missing = set(rows.parent_group.astype(str)) - set(fluo.groups)
+                if missing:
+                    raise RuntimeError(f'{clean.path}: fluo root lacks parent groups {sorted(missing)}')
+                for row in rows.itertuples(index=False):
+                    parent = fluo.groups[str(row.parent_group)]
+                    child = clean.groups[row.child_group]
+                    if (int(row.child_local_end) > parent.n_frames or
+                            abs(float(parent.fps) - float(child.fps)) > 1e-6):
+                        raise RuntimeError(f'{clean.path}/{row.child_group}: child span or fps '
+                                           f'disagrees with fluo parent {row.parent_group}')
+                rows_by_child = rows.set_index('child_group', verify_integrity=True)
                 take = camera_index_map(clean.cam_names, fluo.cam_names)
                 out_session = stage / split / session_id
                 out_session.mkdir(parents=True, exist_ok=True)
@@ -155,11 +167,9 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
                 if reloaded.has_visibility_assessment != visibility_before:
                     raise RuntimeError(f'{clean.path}: visibility assessment changed')
                 for gid, group in clean.groups.items():
-                    row = kept[(kept.split == split) & (kept.session == session_id) &
-                               (kept.child_group == gid)]
-                    if len(row) != 1:
+                    if gid not in rows_by_child.index:
                         raise RuntimeError(f'{split}/{session_id}/{gid}: manifest row missing')
-                    row = row.iloc[0]
+                    row = rows_by_child.loc[gid]
                     child_dir = out_session / 'groups' / gid
                     child_dir.mkdir(parents=True, exist_ok=True)
                     for camera in clean.cam_names:

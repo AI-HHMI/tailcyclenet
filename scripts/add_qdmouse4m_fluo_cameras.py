@@ -70,10 +70,16 @@ def map_labels(labels: fmt.Labels, take: list[int]) -> fmt.Labels:
 
 def assert_calibration_matches(clean: fmt.Session, fluo: fmt.Session) -> None:
     """Ensure each reference camera retained its original calibration by name."""
-    refs = [name for name in fluo.cam_names if not name.endswith('_fluo')]
-    if refs != clean.cam_names:
-        raise RuntimeError(f'{clean.path}: reference camera order changed: {refs} vs '
-                           f'{clean.cam_names}')
+    expected = [name for camera in clean.cam_names for name in (camera, f'{camera}_fluo')]
+    if fluo.cam_names != expected:
+        raise RuntimeError(f'{clean.path}: fluo camera order changed: {fluo.cam_names} vs {expected}')
+
+    def arr(value):
+        """Convert an aniposelib parameter to a numeric array."""
+        if hasattr(value, 'detach'):
+            value = value.detach().cpu()
+        return np.asarray(value, dtype=np.float64)
+
     for name in clean.cam_names:
         if clean.rig.size(name) != fluo.rig.size(name):
             raise RuntimeError(f'{clean.path}: camera size changed for {name}')
@@ -81,13 +87,14 @@ def assert_calibration_matches(clean: fmt.Session, fluo: fmt.Session) -> None:
             raise RuntimeError(f'{clean.path}: camera offset changed for {name}')
         if clean.rig.moving[name] != fluo.rig.moving[name]:
             raise RuntimeError(f'{clean.path}: moving flag changed for {name}')
-        a = clean.rig.posetail()[clean.cam_names.index(name)]
-        b = fluo.rig.posetail()[fluo.cam_names.index(name)]
-        if a.keys() != b.keys() or any(not np.allclose(
-                np.asarray(a[k].detach().cpu() if hasattr(a[k], 'detach') else a[k]),
-                np.asarray(b[k].detach().cpu() if hasattr(b[k], 'detach') else b[k]),
-                equal_nan=True) for k in a):
-            raise RuntimeError(f'{clean.path}: calibration changed for {name}')
+        if clean.rig.calibrated[name] != fluo.rig.calibrated[name]:
+            raise RuntimeError(f'{clean.path}: calibrated flag changed for {name}')
+        clean_camera = clean.rig.by_name(name)
+        fluo_camera = fluo.rig.by_name(name)
+        for getter in ('get_camera_matrix', 'get_distortions', 'get_rotation', 'get_translation'):
+            if not np.allclose(arr(getattr(clean_camera, getter)()),
+                               arr(getattr(fluo_camera, getter)()), atol=1e-6):
+                raise RuntimeError(f'{clean.path}: {getter} differs for {name}')
 
 
 

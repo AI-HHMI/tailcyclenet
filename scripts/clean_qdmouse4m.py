@@ -1,0 +1,469 @@
+#!/usr/bin/env python
+"""Clean the processed QDMouse4M dataset using scorer quality and pose jumps.
+
+The cleaner keeps the source sessions and camera calibration, removes low-quality label rows
+(as no-label/UNLABELED cells), and splits a parent group at coherent 3D body-centroid jumps. Child
+pixel clips are cut from the processed group-local videos, never from raw full-session videos.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import av
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tailcyclenet import format as fmt
+
+SOURCE = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/qdmouse4m')
+SCORES = Path('/groups/karashchuk/home/karashchukl/projects/tailcycle/tailcyclenet/'
+              'scratch/qdmouse-full-score-25399/merged/scores.pq')
+OUTPUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/'
+              'tailcycle-datasets/qdmouse4m-cleaned')
+JUMP_THRESHOLD_MM = 8.0
+SCORE_THRESHOLD = 0.1
+SCORE_WINDOW = 12
+CHECKPOINT_ITERATION = 25399
+CHECKPOINT_SHA256 = 'f263fb124a258a6e7dfbe6971be1cb6ebc0ef6177a33ba03e797fbba7f21c411'
+
+
+def sha256(path: Path) -> str:
+    """Return a file's SHA256 digest."""
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for block in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def source_rate(stream) -> float:
+    """Return a video stream's exact average rate as a float."""
+    rate = stream.average_rate or stream.base_rate
+    if rate is None:
+        raise RuntimeError(f'video has no frame rate: {stream}')
+    return float(rate)
+
+
+def jump_cuts(labels: fmt.Labels, names: list[str], threshold_mm: float) -> list[int]:
+    """Return local target-frame indices where a non-tail 3D centroid jumps.
+
+    A returned index ``t`` denotes the transition ``t-1 -> t``. Splitting at ``t`` therefore
+    keeps every source frame while ensuring that transition is a child boundary. A transition is
+    considered only when both centroids have finite, positioned points.
+    """
+    if labels.points3d is None or labels.vis3d is None:
+        return []
+    non_tail = [i for i, name in enumerate(names) if not name.startswith('tail_')]
+    if not non_tail:
+        return []
+    xyz = np.asarray(labels.points3d)
+    positioned = np.isin(labels.vis3d, fmt.POSITIONED)
+    cuts: set[int] = set()
+    for animal in range(xyz.shape[0]):
+        centroids = np.full((xyz.shape[1], 3), np.nan, dtype=np.float64)
+        for frame in range(xyz.shape[1]):
+            valid = positioned[animal, frame, non_tail]
+            values = xyz[animal, frame, non_tail][valid]
+            if len(values):
+                finite = np.isfinite(values).all(axis=1)
+                if finite.any():
+                    centroids[frame] = values[finite].mean(axis=0)
+        displacement = np.linalg.norm(np.diff(centroids, axis=0), axis=1)
+        cuts.update((np.flatnonzero(np.isfinite(displacement) &
+                                    (displacement > threshold_mm)) + 1).tolist())
+    return sorted(cuts)
+
+
+def segments(n_frames: int, cuts: list[int]) -> list[tuple[int, int]]:
+    """Convert target transition indices into half-open child frame intervals."""
+    valid = sorted({int(c) for c in cuts if 0 < int(c) < n_frames})
+    bounds = [0, *valid, n_frames]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def score_masks(scores: pd.DataFrame, session: str, group: str, names: list[str],
+                animals: list[str], n_frames: int, *, threshold: float = SCORE_THRESHOLD,
+                window_frames: int = SCORE_WINDOW) -> dict[str, np.ndarray]:
+    """Build per-animal ``(frame,keypoint)`` low-score masks using any covering window.
+
+    Missing score rows do not mark a point low. This means an entirely unscored frame remains as
+    it was; the caller records the score source and policy in the dataset provenance.
+    """
+    cols = ['session', 'group', 'animal', 'start', 'keypoint']
+    subset = scores[(scores.session == session) & (scores.group == group)]
+    if subset.empty:
+        return {}
+    if subset[cols].duplicated().any():
+        raise RuntimeError(f'duplicate scorer rows for {session}/{group}')
+    kpt_index = {name: i for i, name in enumerate(names)}
+    unknown = sorted(set(subset.keypoint) - set(kpt_index))
+    if unknown:
+        raise RuntimeError(f'{session}/{group}: scores contain unknown keypoints {unknown}')
+    out: dict[str, np.ndarray] = {}
+    for animal, adf in subset.groupby('animal', sort=False):
+        by_start: dict[int, np.ndarray] = {}
+        for start, sdf in adf.groupby('start', sort=True):
+            values = np.full(len(names), np.nan, dtype=np.float64)
+            for row in sdf.itertuples(index=False):
+                values[kpt_index[row.keypoint]] = float(row.score)
+            by_start[int(start)] = values
+        low = np.zeros((n_frames, len(names)), dtype=bool)
+        starts = sorted(by_start)
+        for frame in range(n_frames):
+            covering = [s for s in starts if s <= frame < s + window_frames]
+            for start in covering:
+                values = by_start[start]
+                low[frame] |= np.isfinite(values) & (values < threshold)
+        out[str(animal)] = low
+    missing_animals = sorted(set(animals) - set(out))
+    if missing_animals:
+        raise RuntimeError(f'{session}/{group}: scores missing animals {missing_animals}')
+    return out
+
+
+def clean_labels(labels: fmt.Labels, names: list[str], masks: dict[str, np.ndarray]) -> fmt.Labels:
+    """Copy labels and turn low-score cells into no-label cells with null coordinates."""
+    out = fmt.Labels(
+        animal_ids=list(labels.animal_ids),
+        points3d=None if labels.points3d is None else np.array(labels.points3d, copy=True),
+        vis3d=None if labels.vis3d is None else np.array(labels.vis3d, copy=True),
+        points2d=None if labels.points2d is None else np.array(labels.points2d, copy=True),
+        vis2d=None if labels.vis2d is None else np.array(labels.vis2d, copy=True),
+        boxes=None if labels.boxes is None else np.array(labels.boxes, copy=True),
+        instance=None if labels.instance is None else np.array(labels.instance, copy=True),
+        ext=None if labels.ext is None else np.array(labels.ext, copy=True),
+        regions=None if labels.regions is None else np.array(labels.regions, copy=True),
+    )
+    for ai, animal in enumerate(out.animal_ids):
+        low = masks.get(animal)
+        if low is None:
+            continue
+        if out.vis3d is not None:
+            out.vis3d[ai] = np.where(low, fmt.UNLABELED, out.vis3d[ai])
+            out.points3d[ai] = np.where(low[..., None], np.nan, out.points3d[ai])
+        if out.vis2d is not None:
+            out.vis2d[ai] = np.where(low[..., None], fmt.UNLABELED, out.vis2d[ai])
+            out.points2d[ai] = np.where(low[..., None, None], np.nan, out.points2d[ai])
+    return out
+
+
+def slice_labels(labels: fmt.Labels, start: int, end: int) -> fmt.Labels:
+    """Return a copied label slice with local frame coordinates and regions adjusted."""
+    regions = None
+    if labels.regions is not None:
+        regions = np.array(labels.regions, copy=True)
+        keep = (regions[:, 0] >= start) & (regions[:, 0] < end)
+        regions = regions[keep]
+        regions[:, 0] -= start
+    return fmt.Labels(
+        animal_ids=list(labels.animal_ids),
+        points3d=None if labels.points3d is None else labels.points3d[:, start:end].copy(),
+        vis3d=None if labels.vis3d is None else labels.vis3d[:, start:end].copy(),
+        points2d=None if labels.points2d is None else labels.points2d[:, start:end].copy(),
+        vis2d=None if labels.vis2d is None else labels.vis2d[:, start:end].copy(),
+        boxes=None if labels.boxes is None else labels.boxes[:, start:end].copy(),
+        instance=None if labels.instance is None else labels.instance[:, start:end].copy(),
+        ext=None if labels.ext is None else labels.ext[:, start:end].copy(),
+        regions=regions,
+    )
+
+
+def unlabeled_counts(before: fmt.Labels, after: fmt.Labels) -> tuple[int, int]:
+    """Count 3D and 2D cells changed from a determination to no-label."""
+    n3 = 0
+    n2 = 0
+    if before.vis3d is not None:
+        n3 = int(((before.vis3d != fmt.UNLABELED) & (after.vis3d == fmt.UNLABELED)).sum())
+    if before.vis2d is not None:
+        n2 = int(((before.vis2d != fmt.UNLABELED) & (after.vis2d == fmt.UNLABELED)).sum())
+    return n3, n2
+
+
+def cut_clip(source: Path, target: Path, start: int, end: int, expected_fps: float) -> None:
+    """Decode a group-local source interval and encode it as a lossless H.264 MP4."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f'.{target.name}.{os.getpid()}.tmp')
+    tmp.unlink(missing_ok=True)
+    try:
+        with av.open(str(source), mode='r') as inp:
+            stream = next((s for s in inp.streams if s.type == 'video'), None)
+            if stream is None:
+                raise RuntimeError(f'no video stream: {source}')
+            rate = source_rate(stream)
+            if abs(rate - expected_fps) > 1e-4:
+                raise RuntimeError(f'fps mismatch {source}: source={rate}, group={expected_fps}')
+            wanted = list(range(start, end))
+            if not wanted:
+                raise RuntimeError(f'empty clip requested: {target}')
+            time_base = stream.time_base
+            if time_base is None:
+                raise RuntimeError(f'video has no time base: {source}')
+            seek_ts = int(wanted[0] / rate / float(time_base))
+            inp.seek(max(0, seek_ts), stream=stream, any_frame=False, backward=True)
+            selected: dict[int, av.VideoFrame] = {}
+            for frame in inp.decode(stream):
+                if frame.pts is None:
+                    raise RuntimeError(f'missing PTS while decoding {source}')
+                index = int(round(float(frame.pts * time_base * rate)))
+                if index in wanted:
+                    selected[index] = frame
+                    if len(selected) == len(wanted):
+                        break
+                if index > wanted[-1]:
+                    break
+            if len(selected) != len(wanted):
+                missing = [i for i in wanted if i not in selected]
+                raise RuntimeError(f'{source}: missing source frames {missing[:5]}')
+            with av.open(str(tmp), mode='w', format='mp4') as out:
+                enc = out.add_stream('libx264', rate=stream.average_rate or stream.base_rate)
+                enc.width, enc.height = stream.width, stream.height
+                enc.pix_fmt = stream.pix_fmt or 'yuv420p'
+                enc.options = {'crf': '0', 'preset': 'ultrafast'}
+                from fractions import Fraction
+                enc_tb = Fraction(1, 1) / (stream.average_rate or stream.base_rate)
+                for j, index in enumerate(wanted):
+                    frame = selected[index]
+                    frame.pts = j
+                    frame.time_base = enc_tb
+                    for packet in enc.encode(frame):
+                        out.mux(packet)
+                for packet in enc.encode():
+                    out.mux(packet)
+        os.replace(tmp, target)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _cut_worker(task: tuple[str, str, int, int, float]) -> str:
+    """Pool worker for one camera/child clip."""
+    source, target, start, end, fps = task
+    cut_clip(Path(source), Path(target), start, end, fps)
+    return target
+
+
+def link_group_pixels(src_group: fmt.Group, dst_dir: Path, cameras: list[str]) -> None:
+    """Link an unsplit child to the absolute processed group-local source clips."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for camera in cameras:
+        kind, source = src_group.pixels(camera)
+        if kind != 'video':
+            raise RuntimeError(f'expected video source for {src_group.group_id}/{camera}, got {kind}')
+        fmt.link(dst_dir / source.name, source.resolve())
+
+
+def write_root_provenance(root: Path, source: Path, scores: Path, *, jump_threshold: float,
+                          score_threshold: float, score_window: int, code_commit: str,
+                          code_dirty: bool) -> None:
+    """Write the root-level provenance record for the cleaning operation."""
+    import toml
+    doc = {
+        'kind': 'qdmouse4m-cleaned',
+        'source_root': str(source),
+        'score_table': str(scores),
+        'score_table_sha256': sha256(scores),
+        'scorer_checkpoint_iteration': CHECKPOINT_ITERATION,
+        'scorer_checkpoint_sha256': CHECKPOINT_SHA256,
+        'jump_metric': 'non-tail 3D body-centroid displacement per frame',
+        'jump_threshold_mm_per_frame': float(jump_threshold),
+        'score_threshold': float(score_threshold),
+        'score_mapping': 'any covering window',
+        'score_window_frames': int(score_window),
+        'short_segments': 'kept',
+        'code_commit': code_commit,
+        'code_dirty': bool(code_dirty),
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+    }
+    (root / 'provenance.toml').write_text(toml.dumps(doc))
+
+
+def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: float,
+          score_threshold: float, score_window: int, workers: int, overwrite: bool,
+          write_videos: bool = True) -> dict[str, int]:
+    """Build the cleaned dataset atomically in a sibling staging directory."""
+    if output.exists() and not overwrite:
+        raise RuntimeError(f'{output} exists; pass --overwrite to replace it')
+    source_ds = fmt.load_dataset(source)
+    scores = pq.read_table(scores_path).to_pandas()
+    required = {'session', 'group', 'animal', 'start', 'keypoint', 'score'}
+    missing = required - set(scores.columns)
+    if missing:
+        raise RuntimeError(f'{scores_path}: missing score columns {sorted(missing)}')
+    if not np.isfinite(scores.score).all():
+        raise RuntimeError(f'{scores_path}: non-finite scores')
+    if scores[['session', 'group', 'animal', 'start', 'keypoint']].duplicated().any():
+        raise RuntimeError(f'{scores_path}: duplicate score keys')
+    stage = output.with_name(f'.{output.name}.tmp-{os.getpid()}')
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    manifest: list[dict[str, object]] = []
+    tasks: list[tuple[str, str, int, int, float]] = []
+    counts = {'sessions': 0, 'groups': 0, 'children': 0, 'split_parents': 0,
+              'jump_transitions': 0, 'symlinks': 0, 'cut_clips': 0,
+              'unlabeled_3d': 0, 'unlabeled_2d': 0}
+    try:
+        for split in fmt.SPLITS:
+            for src_session in source_ds.sessions.get(split, []):
+                out_session = stage / split / src_session.session_id
+                out_session.mkdir(parents=True, exist_ok=True)
+                counts['sessions'] += 1
+                session_labels: dict[str, fmt.Labels] = {}
+                out_groups: dict[str, fmt.Group] = {}
+                child_pixels: list[tuple[str, fmt.Group, int, int, bool]] = []
+                visibility_before = src_session.has_visibility_assessment
+                for parent_id, src_group in src_session.groups.items():
+                    original = src_session.labels(parent_id)
+                    masks = score_masks(scores, src_session.session_id, parent_id,
+                                        src_session.names, original.animal_ids, src_group.n_frames,
+                                        threshold=score_threshold, window_frames=score_window)
+                    cleaned = clean_labels(original, src_session.names, masks)
+                    cuts = jump_cuts(original, src_session.names, jump_threshold)
+                    counts['jump_transitions'] += len(cuts)
+                    spans = segments(src_group.n_frames, cuts)
+                    if len(spans) > 1:
+                        counts['split_parents'] += 1
+                    for child_no, (start, end) in enumerate(spans):
+                        child_id = parent_id if len(spans) == 1 else f'{parent_id}_s{child_no}'
+                        child = slice_labels(cleaned, start, end)
+                        before_child = slice_labels(original, start, end)
+                        n3, n2 = unlabeled_counts(before_child, child)
+                        counts['unlabeled_3d'] += n3
+                        counts['unlabeled_2d'] += n2
+                        raw_start = src_group.source_frame_start + start * src_group.source_frame_step
+                        raw_end = src_group.source_frame_start + (end - 1) * src_group.source_frame_step
+                        note = src_group.notes
+                        suffix = f'; parent_group={parent_id}; cleaned_score_lt={score_threshold:g}'
+                        if len(spans) > 1:
+                            note += f'; split_at_centroid_gt={jump_threshold:g}mm'
+                        out_groups[child_id] = fmt.Group(
+                            group_id=child_id, n_frames=end - start, fps=src_group.fps,
+                            source_video=src_group.source_video,
+                            source_frame_start=raw_start,
+                            source_frame_step=src_group.source_frame_step,
+                            notes=(note + suffix).strip('; '),
+                        )
+                        session_labels[child_id] = child
+                        child_pixels.append((child_id, src_group, start, end, len(spans) == 1))
+                        manifest.append({
+                            'split': split, 'session': src_session.session_id,
+                            'parent_group': parent_id, 'child_group': child_id,
+                            'parent_n_frames': src_group.n_frames,
+                            'child_local_start': start, 'child_local_end': end,
+                            'child_n_frames': end - start,
+                            'source_frame_start': raw_start, 'source_frame_end': raw_end,
+                            'jump_cuts_in_parent': ','.join(map(str, cuts)),
+                            'reason': 'unsplit' if len(spans) == 1 else 'jump_split',
+                            'n_unlabeled_3d': n3, 'n_unlabeled_2d': n2,
+                            'dropped_frames': 0,
+                        })
+                if visibility_before != src_session.has_visibility_assessment:
+                    raise RuntimeError(f'{src_session.path}: visibility assessment changed in source')
+                prov = dict(src_session.provenance)
+                prov.update({'source': str(src_session.path), 'cleaning': 'qdmouse4m-cleaned',
+                             'cleaning_score_threshold': float(score_threshold),
+                             'cleaning_jump_threshold_mm_per_frame': float(jump_threshold),
+                             'cleaning_score_mapping': 'any covering window'})
+                fmt.write_session(
+                    out_session, mode=src_session.mode, units=src_session.units,
+                    label_source=src_session.label_source, names=src_session.names, rig=src_session.rig,
+                    groups=out_groups, labels=session_labels, skeleton=src_session.skeleton,
+                    flip_pairs=src_session.flip_pairs, provenance=prov,
+                    assoc_res_max_px=src_session.assoc_res_max_px,
+                )
+                for child_id, src_group, start, end, unsplit in child_pixels:
+                    dst_dir = out_session / 'groups' / child_id
+                    if unsplit:
+                        link_group_pixels(src_group, dst_dir, src_session.cam_names)
+                        counts['symlinks'] += len(src_session.cam_names)
+                    else:
+                        dst_dir.mkdir(parents=True, exist_ok=True)
+                        for camera in src_session.cam_names:
+                            kind, src_video = src_group.pixels(camera)
+                            if kind != 'video':
+                                raise RuntimeError(f'expected video source for {src_group.group_id}/{camera}')
+                            target = dst_dir / f'{camera}.mp4'
+                            tasks.append((str(src_video.resolve()), str(target), start, end,
+                                          float(src_group.fps)))
+                counts['groups'] += len(out_groups)
+                counts['children'] += len(out_groups)
+        if write_videos and tasks:
+            from multiprocessing import get_context
+            with get_context('spawn').Pool(processes=max(1, workers)) as pool:
+                for _ in pool.imap_unordered(_cut_worker, tasks):
+                    counts['cut_clips'] += 1
+        elif not write_videos and tasks:
+            counts['cut_clips'] = 0
+        code = subprocess_run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parent.parent)
+        dirty = bool(subprocess_run(['git', 'status', '--short'], cwd=Path(__file__).resolve().parent.parent).strip())
+        write_root_provenance(stage, source, scores_path, jump_threshold=jump_threshold,
+                              score_threshold=score_threshold, score_window=score_window,
+                              code_commit=code, code_dirty=dirty)
+        pd.DataFrame(manifest).to_csv(stage / 'cleaning_manifest.tsv', sep='\t', index=False)
+        (stage / 'cleaning_summary.json').write_text(json.dumps(counts, indent=2) + '\n')
+        if output.exists():
+            if not overwrite:
+                raise RuntimeError(f'{output} appeared during build')
+            shutil.rmtree(output)
+        stage.rename(output)
+        return counts
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def subprocess_run(args: list[str], cwd: Path) -> str:
+    """Run a small provenance command and return stripped stdout."""
+    import subprocess
+    result = subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def validate(root: Path, check_images: bool = False) -> None:
+    """Validate a generated root and raise with the first violations."""
+    ds = fmt.load_dataset(root)
+    errors = fmt.validate_dataset(ds, check_images=check_images)
+    if errors:
+        raise RuntimeError('validation failed:\n' + '\n'.join(errors[:50]))
+    print(f'validated {len(ds.all_sessions())} sessions', flush=True)
+
+
+def main() -> None:
+    """Build or validate the cleaned dataset."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--source', type=Path, default=SOURCE)
+    parser.add_argument('--scores', type=Path, default=SCORES)
+    parser.add_argument('--output', type=Path, default=OUTPUT)
+    parser.add_argument('--jump-threshold-mm', type=float, default=JUMP_THRESHOLD_MM)
+    parser.add_argument('--score-threshold', type=float, default=SCORE_THRESHOLD)
+    parser.add_argument('--score-window', type=int, default=SCORE_WINDOW)
+    parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--no-videos', action='store_true')
+    parser.add_argument('--validate', action='store_true')
+    parser.add_argument('--validate-images', action='store_true')
+    args = parser.parse_args()
+    if args.score_window < 1 or args.jump_threshold_mm <= 0:
+        raise SystemExit('thresholds must be positive')
+    if args.validate and not args.output.exists():
+        raise SystemExit(f'missing output: {args.output}')
+    if not args.validate:
+        print(build(args.source, args.scores, args.output,
+                    jump_threshold=args.jump_threshold_mm, score_threshold=args.score_threshold,
+                    score_window=args.score_window, workers=args.workers,
+                    overwrite=args.overwrite, write_videos=not args.no_videos), flush=True)
+    if args.validate or not args.no_videos:
+        validate(args.output, check_images=args.validate_images)
+
+
+if __name__ == '__main__':
+    main()

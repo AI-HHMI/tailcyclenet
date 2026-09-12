@@ -130,6 +130,12 @@ def score_masks(scores: pd.DataFrame, session: str, group: str, names: list[str]
     return out
 
 
+def has_labels(labels: fmt.Labels) -> bool:
+    """Whether the loader's target visibility array contains any labelled cell."""
+    vis = labels.vis3d if labels.vis3d is not None else labels.vis2d
+    return vis is not None and bool(np.any(vis != fmt.UNLABELED))
+
+
 def clean_labels(labels: fmt.Labels, names: list[str], masks: dict[str, np.ndarray]) -> fmt.Labels:
     """Copy labels and turn low-score cells into no-label cells with null coordinates."""
     out = fmt.Labels(
@@ -308,9 +314,9 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
     stage.mkdir(parents=True)
     manifest: list[dict[str, object]] = []
     tasks: list[tuple[str, str, int, int, float]] = []
-    counts = {'sessions': 0, 'groups': 0, 'children': 0, 'split_parents': 0,
-              'jump_transitions': 0, 'symlinks': 0, 'cut_clips': 0,
-              'unlabeled_3d': 0, 'unlabeled_2d': 0}
+    counts = {'sessions': 0, 'groups': 0, 'children': 0, 'dropped_no_labels': 0,
+              'dropped_frames': 0, 'split_parents': 0, 'jump_transitions': 0,
+              'symlinks': 0, 'cut_clips': 0, 'unlabeled_3d': 0, 'unlabeled_2d': 0}
     try:
         for split in fmt.SPLITS:
             for src_session in source_ds.sessions.get(split, []):
@@ -345,6 +351,22 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
                         suffix = f'; parent_group={parent_id}; cleaned_score_lt={score_threshold:g}'
                         if len(spans) > 1:
                             note += f'; split_at_centroid_gt={jump_threshold:g}mm'
+                        reason = 'unsplit' if len(spans) == 1 else 'jump_split'
+                        if not has_labels(child):
+                            counts['dropped_no_labels'] += 1
+                            counts['dropped_frames'] += end - start
+                            manifest.append({
+                                'split': split, 'session': src_session.session_id,
+                                'parent_group': parent_id, 'child_group': child_id,
+                                'parent_n_frames': src_group.n_frames,
+                                'child_local_start': start, 'child_local_end': end,
+                                'child_n_frames': end - start,
+                                'source_frame_start': raw_start, 'source_frame_end': raw_end,
+                                'jump_cuts_in_parent': ','.join(map(str, cuts)),
+                                'reason': 'dropped_no_labels', 'n_unlabeled_3d': n3,
+                                'n_unlabeled_2d': n2, 'dropped_frames': end - start,
+                            })
+                            continue
                         out_groups[child_id] = fmt.Group(
                             group_id=child_id, n_frames=end - start, fps=src_group.fps,
                             source_video=src_group.source_video,
@@ -362,8 +384,7 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
                             'child_n_frames': end - start,
                             'source_frame_start': raw_start, 'source_frame_end': raw_end,
                             'jump_cuts_in_parent': ','.join(map(str, cuts)),
-                            'reason': 'unsplit' if len(spans) == 1 else 'jump_split',
-                            'n_unlabeled_3d': n3, 'n_unlabeled_2d': n2,
+                            'reason': reason, 'n_unlabeled_3d': n3, 'n_unlabeled_2d': n2,
                             'dropped_frames': 0,
                         })
                 if visibility_before != src_session.has_visibility_assessment:
@@ -421,6 +442,121 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
         raise
 
 
+def prune_unlabeled(root: Path) -> dict[str, int]:
+    """Remove existing child groups whose loader target has no labelled cells."""
+    import toml
+
+    root = Path(root).resolve()
+    ds = fmt.load_dataset(root)
+    manifest_path = root / 'cleaning_manifest.tsv'
+    if not manifest_path.exists():
+        raise RuntimeError(f'{root}: missing cleaning_manifest.tsv')
+    manifest = pd.read_csv(manifest_path, sep='\t')
+    required = {'split', 'session', 'child_group', 'child_n_frames', 'reason', 'dropped_frames'}
+    if missing := required - set(manifest.columns):
+        raise RuntimeError(f'{manifest_path}: missing columns {sorted(missing)}')
+
+    drops: list[tuple[str, fmt.Session, str, fmt.Labels]] = []
+    before_rows: dict[tuple[str, str, str], int] = {}
+    for split in fmt.SPLITS:
+        for session in ds.sessions.get(split, []):
+            for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
+                table_path = session.path / f'{stem}.pq'
+                if table_path.exists():
+                    before_rows[(split, session.session_id, stem)] = pq.read_metadata(
+                        table_path).num_rows
+            for gid in session.groups:
+                labels = session.labels(gid)
+                if not has_labels(labels):
+                    for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
+                        table_path = session.path / f'{stem}.pq'
+                        if table_path.exists():
+                            group_ids = pq.read_table(table_path, columns=['group_id'])
+                            n = group_ids.column('group_id').to_pylist().count(gid)
+                            if n:
+                                raise RuntimeError(
+                                    f'{session.path}/{gid}: empty labels but {n} {stem} rows')
+                    drops.append((split, session, gid, labels))
+
+    by_split = dict(pd.Series([x[0] for x in drops]).value_counts()) if drops else {}
+    if by_split != {'train': 37}:
+        raise RuntimeError(f'unexpected unlabeled groups by split: {by_split}, expected train=37')
+    drop_keys = {(split, session.session_id, gid) for split, session, gid, _ in drops}
+    manifest_keys = set(zip(manifest.split, manifest.session, manifest.child_group))
+    if not drop_keys <= manifest_keys:
+        raise RuntimeError('unlabeled groups are missing from cleaning_manifest.tsv')
+
+    for split, session, gid, _ in drops:
+        remaining_groups = {k: v for k, v in session.groups.items() if k != gid}
+        if not remaining_groups:
+            raise RuntimeError(f'{session.path}: pruning would leave no groups')
+        labels = {k: session.labels(k) for k in remaining_groups}
+        visibility_before = session.has_visibility_assessment
+        fmt.write_session(
+            session.path, mode=session.mode, units=session.units,
+            label_source=session.label_source, names=session.names, rig=session.rig,
+            groups=remaining_groups, labels=labels, skeleton=session.skeleton,
+            flip_pairs=session.flip_pairs, provenance=session.provenance,
+            assoc_res_max_px=session.assoc_res_max_px,
+        )
+        reloaded = fmt.Session.load(session.path)
+        if reloaded.has_visibility_assessment != visibility_before:
+            raise RuntimeError(f'{session.path}: visibility assessment changed while pruning')
+        group_dir = session.path / 'groups' / gid
+        groups_root = (session.path / 'groups').resolve()
+        if group_dir.exists() or group_dir.is_symlink():
+            if group_dir.parent.resolve() != groups_root:
+                raise RuntimeError(f'refusing unsafe group path: {group_dir}')
+            if group_dir.is_symlink():
+                group_dir.unlink()
+            else:
+                shutil.rmtree(group_dir)
+
+    for split, session, gid, _ in drops:
+        mask = ((manifest.split == split) & (manifest.session == session.session_id) &
+                (manifest.child_group == gid))
+        if int(mask.sum()) != 1:
+            raise RuntimeError(f'{split}/{session.session_id}/{gid}: manifest row count != 1')
+        manifest.loc[mask, 'reason'] = 'dropped_no_labels'
+        manifest.loc[mask, 'dropped_frames'] = manifest.loc[mask, 'child_n_frames']
+    manifest.to_csv(manifest_path, sep='\t', index=False)
+
+    after_rows: dict[tuple[str, str, str], int] = {}
+    for split in fmt.SPLITS:
+        for session in fmt.load_dataset(root).sessions.get(split, []):
+            for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
+                table_path = session.path / f'{stem}.pq'
+                if table_path.exists():
+                    after_rows[(split, session.session_id, stem)] = pq.read_metadata(
+                        table_path).num_rows
+    if before_rows != after_rows:
+        raise RuntimeError(f'label table row counts changed: before={before_rows}, after={after_rows}')
+
+    summary_path = root / 'cleaning_summary.json'
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    summary.update({
+        'children': int(sum(len(s.groups) for s in ds.all_sessions()) - len(drops)),
+        'dropped_no_labels': len(drops),
+        'dropped_frames': int(sum(int(x[1].groups[x[2]].n_frames) for x in drops)),
+        'dropped_no_labels_by_split': {k: int(v) for k, v in by_split.items()},
+    })
+    summary_path.write_text(json.dumps(summary, indent=2) + '\n')
+
+    provenance_path = root / 'provenance.toml'
+    provenance = toml.load(provenance_path) if provenance_path.exists() else {}
+    repo = Path(__file__).resolve().parent.parent
+    provenance['prune'] = {
+        'predicate': 'loader target visibility has no cell != UNLABELED',
+        'dropped_no_labels': len(drops),
+        'dropped_frames': int(sum(int(x[1].groups[x[2]].n_frames) for x in drops)),
+        'code_commit': subprocess_run(['git', 'rev-parse', 'HEAD'], cwd=repo),
+        'code_dirty': bool(subprocess_run(['git', 'status', '--short'], cwd=repo)),
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+    }
+    provenance_path.write_text(toml.dumps(provenance))
+    return {'dropped_no_labels': len(drops), 'dropped_frames': summary['dropped_frames']}
+
+
 def subprocess_run(args: list[str], cwd: Path) -> str:
     """Run a small provenance command and return stripped stdout."""
     import subprocess
@@ -440,6 +576,7 @@ def validate(root: Path, check_images: bool = False) -> None:
 def main() -> None:
     """Build or validate the cleaned dataset."""
     parser = argparse.ArgumentParser()
+    parser.add_argument('--prune-unlabeled', type=Path, metavar='ROOT')
     parser.add_argument('--source', type=Path, default=SOURCE)
     parser.add_argument('--scores', type=Path, default=SCORES)
     parser.add_argument('--output', type=Path, default=OUTPUT)
@@ -452,6 +589,11 @@ def main() -> None:
     parser.add_argument('--validate', action='store_true')
     parser.add_argument('--validate-images', action='store_true')
     args = parser.parse_args()
+    if args.prune_unlabeled is not None:
+        if args.validate or args.overwrite or args.no_videos or args.validate_images:
+            raise SystemExit('--prune-unlabeled cannot be combined with build/validate flags')
+        print(prune_unlabeled(args.prune_unlabeled), flush=True)
+        return
     if args.score_window < 1 or args.jump_threshold_mm <= 0:
         raise SystemExit('thresholds must be positive')
     if args.validate and not args.output.exists():

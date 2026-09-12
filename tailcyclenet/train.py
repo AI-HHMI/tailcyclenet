@@ -184,6 +184,51 @@ def _tune_smoothness(loss_fn, T, stride=1):
         sl.weight = sl._configured_weight / float(stride) ** sl.order
 
 
+_SMOOTHNESS_KEYS = ('smoothness_3d_loss', 'smoothness_2d_loss')
+
+
+def _clear_loss_history(loss_fn):
+    """Clear recorded loss samples in place, preserving ``defaultdict`` lazy keys."""
+    for samples in loss_fn.loss_history.values():
+        samples.clear()
+
+
+def _drain_smoothness(loss_fn):
+    """Drain one batch's smoothness samples as ``name -> (finite sum, finite count)``.
+
+    The training loop calls this after every batch.  It can therefore discard a skipped batch
+    before adding anything to the print interval, while the in-place clear prevents history growth
+    without replacing ``TotalLoss.loss_history`` with a plain dict.
+    """
+    stats = {}
+    for name in _SMOOTHNESS_KEYS:
+        samples = loss_fn.loss_history.get(name, ())
+        finite = [float(value) for value in samples if np.isfinite(value)]
+        if finite:
+            stats[name] = (float(np.sum(finite)), len(finite))
+    _clear_loss_history(loss_fn)
+    return stats
+
+
+def _smoothness_log_values(stats, fabric=None):
+    """Reduce finite sums/counts and return interval means for the W&B payload.
+
+    Every rank calls this at the print boundary, including ranks with no valid samples.  A metric
+    is omitted only when its global finite count is zero; genuine zero-valued terms are retained.
+    """
+    values = {}
+    for name in _SMOOTHNESS_KEYS:
+        total, count = stats.get(name, (0.0, 0))
+        if fabric is not None and fabric.world_size > 1:
+            reduced = fabric.all_reduce(
+                torch.tensor([total, float(count)], dtype=torch.float64, device=fabric.device),
+                reduce_op='sum')
+            total, count = float(reduced[0]), int(round(float(reduced[1])))
+        if count:
+            values[f'train/{name}'] = total / count
+    return values
+
+
 def run_batch(model, loss_fn, batch, device, raw=None):
     """One forward + loss; a non-finite sub-loss returns NaN, never raises.
 
@@ -659,6 +704,7 @@ def main(argv: list[str] | None = None):
     opt.train()
     step = dist_utils.ceil_div(start_it, world)
     it, skipped, t0, running, clipped = step * world, 0, time.time(), [], []
+    smoothness_running = {name: [0.0, 0] for name in _SMOOTHNESS_KEYS}
     best_mpjpe, best_iter, saved_mpjpe = float('inf'), start_it, float('inf')
     if start_it and log_path.exists():
         prev = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
@@ -700,6 +746,7 @@ def main(argv: list[str] | None = None):
                     record({'iter': it, 'ddp_rewrapped': True})
             loss, _ = run_batch(model, loss_fn, batch, device, raw=raw)
             if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(loss))):
+                _drain_smoothness(loss_fn)  # skipped batches do not enter the interval metrics
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
@@ -712,6 +759,7 @@ def main(argv: list[str] | None = None):
             mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())
             if not dist_utils.all_ranks_finite(
                     fabric, bool(torch.isfinite(gn) and torch.isfinite(mgn))):
+                _drain_smoothness(loss_fn)  # discard the batch after a failed backward/clip
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
@@ -719,6 +767,9 @@ def main(argv: list[str] | None = None):
                 continue
             opt.step()
             running.append(dist_utils.all_ranks_mean(fabric, float(loss.detach())))
+            for name, (total, count) in _drain_smoothness(loss_fn).items():
+                smoothness_running[name][0] += total
+                smoothness_running[name][1] += count
             clipped.append(float(max_grad is not None and float(gn) > max_grad))
             step += 1
             it = step * world
@@ -735,6 +786,7 @@ def main(argv: list[str] | None = None):
                              f'peak {peak_gb:5.1f}G  skipped {skipped * world}  '
                              f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                              f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
+                smoothness = _smoothness_log_values(smoothness_running, fabric)
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
                          'train/grad_norm_muon': float(mgn),
                          'train/iteration': it,
@@ -745,7 +797,8 @@ def main(argv: list[str] | None = None):
                          'train/eval_frac': eval_frac,
                          'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
                          'train/skipped_frac': skipped / max(step, 1),
-                         'train/world_size': world}, it)
+                         'train/world_size': world, **smoothness}, it)
+                smoothness_running = {name: [0.0, 0] for name in _SMOOTHNESS_KEYS}
                 running, t0 = [], time.time()
                 waited[0] = evalled[0] = ckpted[0] = 0.0
 

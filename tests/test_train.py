@@ -126,6 +126,134 @@ def test_stride_is_divided_out_of_the_smoothness_weight():
     assert loss_fn.smoothness_loss_3d.weight == 0.5
 
 
+def test_smoothness_metrics_reach_wandb_and_preserve_zero_values():
+    """Finite smoothness components reach W&B; NaN samples are omitted but zero is real data."""
+    from collections import defaultdict
+
+    tr = _train_module()
+
+    class FakeWandb:
+        def __init__(self):
+            self.calls = []
+
+        def log(self, values, step):
+            self.calls.append((values, step))
+
+    class LossHistory:
+        def __init__(self):
+            self.loss_history = defaultdict(list, {
+                'smoothness_3d_loss': [1.0, 3.0, float('nan'), float('inf')],
+                'smoothness_2d_loss': [0.0, float('nan')],
+            })
+
+    history = LossHistory()
+    values = tr._drain_smoothness(history)
+    wb = FakeWandb()
+    tr.log(wb, {'train/loss': 2.0, **tr._smoothness_log_values(values)}, step=20)
+
+    assert values == {
+        'smoothness_3d_loss': (4.0, 2),
+        'smoothness_2d_loss': (0.0, 1),
+    }
+    assert history.loss_history == {
+        'smoothness_3d_loss': [], 'smoothness_2d_loss': [],
+    }
+    assert wb.calls == [({'train/loss': 2.0,
+                          'train/smoothness_3d_loss': 2.0,
+                          'train/smoothness_2d_loss': 0.0}, 20)]
+
+
+def test_smoothness_log_reduces_finite_sum_and_count_on_every_rank():
+    """The W&B value is count-weighted and rank 0 may have no local samples."""
+    tr = _train_module()
+
+    class FakeFabric:
+        world_size = 2
+        device = 'cpu'
+
+        def __init__(self):
+            self.calls = 0
+
+        def all_reduce(self, tensor, reduce_op):
+            assert reduce_op == 'sum'
+            result = ((10.0, 4.0), (6.0, 2.0))[self.calls]
+            self.calls += 1
+            return torch.tensor(result, dtype=tensor.dtype)
+
+    fabric = FakeFabric()
+    values = tr._smoothness_log_values({
+        'smoothness_3d_loss': (0.0, 0),
+        'smoothness_2d_loss': (0.0, 0),
+    }, fabric)
+
+    assert values == {
+        'train/smoothness_3d_loss': 2.5,
+        'train/smoothness_2d_loss': 3.0,
+    }
+    assert fabric.calls == 2, 'all ranks must participate even with empty local histories'
+    assert tr._smoothness_log_values({
+        'smoothness_3d_loss': (0.0, 0),
+        'smoothness_2d_loss': (0.0, 0),
+    }) == {}
+
+
+def test_smoothness_drain_discards_skips_and_keeps_intervals_separate():
+    """A skipped batch is drained without entering the next accepted interval."""
+    from collections import defaultdict
+
+    tr = _train_module()
+
+    class LossHistory:
+        def __init__(self, values):
+            self.loss_history = defaultdict(list, values)
+
+    running = {name: [0.0, 0] for name in tr._SMOOTHNESS_KEYS}
+    skipped = tr._drain_smoothness(LossHistory({
+        'smoothness_3d_loss': [100.0], 'smoothness_2d_loss': [200.0],
+    }))
+    assert skipped == {
+        'smoothness_3d_loss': (100.0, 1), 'smoothness_2d_loss': (200.0, 1),
+    }
+    assert running == {name: [0.0, 0] for name in tr._SMOOTHNESS_KEYS}
+
+    accepted = tr._drain_smoothness(LossHistory({
+        'smoothness_3d_loss': [2.0], 'smoothness_2d_loss': [0.0],
+    }))
+    for name, (total, count) in accepted.items():
+        running[name][0] += total
+        running[name][1] += count
+    assert tr._smoothness_log_values(running) == {
+        'train/smoothness_3d_loss': 2.0,
+        'train/smoothness_2d_loss': 0.0,
+    }
+
+    next_interval = tr._drain_smoothness(LossHistory({
+        'smoothness_3d_loss': [4.0], 'smoothness_2d_loss': [float('nan')],
+    }))
+    assert tr._smoothness_log_values(next_interval) == {
+        'train/smoothness_3d_loss': 4.0,
+    }
+
+
+def test_smoothness_drain_preserves_lazily_added_loss_keys():
+    """Clearing samples in place must not break PoseLoss's later defaultdict appends."""
+    from collections import defaultdict
+
+    tr = _train_module()
+
+    class LossHistory:
+        def __init__(self):
+            self.loss_history = defaultdict(list, {'smoothness_3d_loss': [1.0]})
+
+    history = LossHistory()
+    mapping_id = id(history.loss_history)
+    tr._drain_smoothness(history)
+    history.loss_history['vis_loss_2d'].append(3.0)
+
+    assert id(history.loss_history) == mapping_id
+    assert history.loss_history['vis_loss_2d'] == [3.0]
+
+
 def test_run_batch_routes_2d_visibility_on_its_own_wire():
     """`batch.vis_2d` means a DIFFERENT thing depending on mode: in 3D it is posetail's own
     per-camera term (`vis_true_cams`, both-or-neither with `vis_true`); in 2D it must reach

@@ -21,11 +21,13 @@ into contiguous runs first (`detect_runs`), each run's anchors are packed indepe
 shorter than `WINDOW` yields a proportionally shorter group rather than a window that reaches
 across the boundary. `lili_6fish_260831` documents no dropouts and is unaffected.
 
-No `regions.pq` is written, and no `instances.pq`. Absence of `regions.pq` is the format's claim
-of exhaustive labelling; that is the wanted reading here, with the six-fish partial anchors named
-explicitly in provenance (`partial_frame_note`) rather than papered over. `instances.pq` PRESENT
-rows are impossible to author honestly: the source discarded its machine predictions and carries
-no coordinates for an unlabelled fish.
+No `regions.pq` is written. `instances.pq` carries derived boxes only on complete labelled
+anchors; partial six-fish anchors have no instance rows, so they are excluded from detector
+training while their keypoints remain available to pose training. Absence of `regions.pq` is the
+format's claim of exhaustive labelling; that is the wanted reading here, with the six-fish partial
+anchors documented in provenance. Instance boxes use the configured keypoint extent padding
+(default 2 px, the published value; `--box-pad 20` reproduces the pose crop rule's own pad),
+and are not claimed to be source-authored boxes.
 
 The source README says occluded landmarks are placed rather than visibility-labeled. Finite points
 therefore use ``projected`` (position, no visibility claim); explicit rows with no coordinates and
@@ -364,7 +366,7 @@ def infer_identity_map(anchors: list[int], rows_by_frame: dict[int, list[dict]],
 def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names: list[str],
                  expected: int, start: int, width: int, height: int, group_id: str,
                  identity_map: dict[tuple[int, int], str] | None = None,
-                 n_frames: int = WINDOW) -> tuple[fmt.Labels, int]:
+                 n_frames: int = WINDOW, box_pad: int = 2) -> tuple[fmt.Labels, int]:
     """Build one group's labels over `n_frames` stored frames, at its anchors only.
 
     `regions.pq` is deliberately NOT emitted. Its absence is the format's claim of exhaustive
@@ -383,8 +385,9 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
       rule when the stored box is all-NaN, so a partial anchor keeps every one of its keypoints
       and is cropped exactly as it was before `instances.pq` existed.
 
-    Boxes are the crop rule's own PADDED extent (pad 20), stored so that reading them back with
-    pad 0 reproduces the identical box -- the convention `scripts/convert_apt_lbl.py` uses. They
+    Boxes are the crop rule's own PADDED extent (the configured `box_pad`, 2 by default), stored
+    so that reading them back with pad 0 reproduces the identical box -- the convention
+    `scripts/convert_apt_lbl.py` uses. They
     are DERIVED from the labelled keypoints, not an independent human box, which spec S9 permits
     (a box need not match any particular crop rule) and which is the only honest option here: the
     source DISCARDED its predictions (`EXPORT_REPORT.txt`) and ships no coordinates for an
@@ -445,7 +448,7 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
         for a in range(S):
             pts = by_animal.get(a)
             box = (None if not pts else
-                   crop_box_for_points(torch.as_tensor(pts, dtype=torch.float32), size_wh, 64, 20))
+                   crop_box_for_points(torch.as_tensor(pts, dtype=torch.float32), size_wh, 64, box_pad))
             if box is None:
                 continue
             instance[a, local, 0] = fmt.INST_LABELED
@@ -557,7 +560,8 @@ def link_group_frames(session: Path, gid: str, start: int, n_frames: int, cache:
         destination.symlink_to(Path(os.path.relpath(source, local_dir)))
 
 
-def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool) -> None:
+def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
+                box_pad: int = 2) -> None:
     """Convert one source package into one staged tailcycle dataset root."""
     if out.exists():
         if clean and not resume:
@@ -621,7 +625,8 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool) -> N
                                  if cfg['n_animals'] > 1 else (None, []))
         identity_records.extend(records)
         lab, n_complete = build_labels(anchors, rows_by_frame, names, cfg['n_animals'],
-                                       start, width, height, gid, identity_map, length)
+                                       start, width, height, gid, identity_map, length,
+                                       box_pad=box_pad)
         groups[gid] = fmt.Group(
             gid, length, fps=cfg['fps'], source_video=str(video), source_frame_start=start,
             source_frame_step=1,
@@ -679,12 +684,13 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool) -> N
                               if cfg['n_animals'] > 1 else 'one fish; identity association is not applicable'),
             'regions_note': ('no regions.pq is written; per spec S9b its absence asserts exhaustive '
                              'labelling everywhere'),
-            'instances_note': ('instances.pq carries the crop rule\'s own padded extent as a '
-                               '`labeled` row, written ONLY on anchors where every expected '
-                               'animal is present and labelled. Partial anchors have NO row, which '
-                               'drops them from detector training while pose falls back per '
-                               'camera to the keypoint crop rule and keeps every keypoint. '
-                               'Boxes are DERIVED from the labelled keypoints, not annotated.'),
+            'instances_note': (f'instances.pq carries the crop rule\'s own padded extent '
+                               f'(pad={box_pad} px, min_crop_dim=64) as a `labeled` row, '
+                               'written ONLY on anchors where every expected animal is present '
+                               'and labelled. Partial anchors have NO row, which drops them from '
+                               'detector training while pose falls back per camera to the keypoint '
+                               'crop rule and keeps every keypoint. Boxes are DERIVED from the '
+                               'labelled keypoints, not annotated.'),
             'split_note': 'source supplied no train/val/test split; all labeled frames are under train',
             'timing_note': ('1-fish stored frames are NOT temporally contiguous; each window is confined '
                             'to one contiguous run so no window shows the fish teleporting across a '
@@ -722,11 +728,17 @@ def main() -> None:
     parser.add_argument('--clean', action='store_true')
     parser.add_argument('--resume', action='store_true',
                         help='reuse valid cache PNGs and safely rebuild the session')
+    parser.add_argument('--box-pad', type=int, default=2,
+                        help='keypoint-extent padding in pixels for derived instances boxes '
+                             '(published Schulze roots carry pad 2 as of 2026-09-12; 20 is the '
+                             'pose crop rule\'s own pad (tailcyclenet/crop.py))')
     args = parser.parse_args()
+    if args.box_pad < 0:
+        parser.error('--box-pad must be non-negative')
     for source_name in args.only or sorted(DATASETS):
         cfg = DATASETS[source_name]
         convert_one(args.src / source_name, args.out_parent / cfg['out_name'], cfg,
-                    args.clean, args.resume)
+                    args.clean, args.resume, box_pad=args.box_pad)
 
 
 if __name__ == '__main__':

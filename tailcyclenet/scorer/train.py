@@ -110,6 +110,9 @@ def build_datasets(config: dict, registry_base: Registry | None):
     Inputs: config -- the merged run config; registry_base -- a registry to append to, or None.
     Outputs: (train_dataset, val_dataset_or_None, registry).
     Side effects: reads the dataset root; prints the window counts and the source mix.
+
+    Validation samples use `val_cams_to_sample`, a fixed camera count, rather than the training
+    camera-count draw, so held-out windows have comparable difficulty.
     """
     data_cfg = config['data']
     lc = loader_config(data_cfg, config['model'])
@@ -125,10 +128,6 @@ def build_datasets(config: dict, registry_base: Registry | None):
         (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())
     if not has_val:
         return train_ds, None, registry
-    # Val is a FIXED camera count, exactly as in the pose trainer (`train.py`'s `val_lc`).
-    # `cams_to_sample` is the TRAIN draw; `val_cams_to_sample` is dead unless it replaces it
-    # here, and without this every val window draws its own count from the train range, so the
-    # held-out number averages windows of different difficulty.
     val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
     val_base = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry)
     return train_ds, ScorerDataset(val_base, corr), registry
@@ -208,7 +207,8 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
             max_batches -- how many triplets to score; optimizer -- the run's optimizer, whose
             averaged iterate to score on (None scores the current weights).
     Outputs: {'val/<metric>': float} including the per-type accuracies.
-    Side effects: switches the model and the optimizer to eval and back to train.
+    Side effects: switches the model and the optimizer to eval and back to train. The nested
+        restore ensures the model returns to train mode even if restoring the optimizer raises.
     """
     model.eval()
     averaged = optimizer is not None and hasattr(optimizer, 'eval')
@@ -230,9 +230,6 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
                 if seen >= max_batches:
                     break
     finally:
-        # Nested: if the optimizer's own restore raises, the MODEL must still go back to train
-        # mode. A run left in eval mode trains nothing and looks exactly like a run that is
-        # learning nothing.
         try:
             if averaged:
                 optimizer.train()
@@ -258,6 +255,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             device -- torch device; max_iterations -- override `[training].n_iterations`;
             no_wandb -- skip wandb; fresh -- ignore this run folder's own checkpoint and start
             from the warm start, which is what `--fresh` is for.
+    A warm start receives the source run's registry names, not this run's grown registry, so its
+    identity rows remain keyed to the same keypoints.
     `[training].n_iterations` (and `--iterations`) is a TOTAL, not an increment: resuming a
     60000-iteration run whose checkpoint sits at 40000 runs 20000 more and stops at 60000. Without
     that, a re-submitted job would silently train past its own budget.
@@ -305,11 +304,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             resume_state = loaded
             print(f'resume: {ckpt_file} at iteration {loaded.get("iteration", "?")}')
         else:
-            # `base_names` is the registry the CHECKPOINT's identity table belongs to -- the
-            # SOURCE run's -- not this run's grown registry. `warm_start`'s length check is what
-            # keeps a row on its own keypoint, so passing the grown registry (n != n0) refuses the
-            # copy and reinitialises EVERY row, including the source rows that should have been
-            # preserved. Same call as `train.py`'s warm start.
             fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',

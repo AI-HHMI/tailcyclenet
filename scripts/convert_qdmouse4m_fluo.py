@@ -83,7 +83,12 @@ def camera_index_map(src_names: list[str], dst_names: list[str],
 
 
 def convert_session(source: Path, output: Path) -> dict[str, str]:
-    """Convert one session through ``Session.load``/``write_session`` APIs."""
+    """Convert one session through ``Session.load``/``write_session`` APIs.
+
+    The source per-camera projections are duplicated onto the expanded camera
+    axis with their ``PROJECTED`` status unchanged. Region camera indices are
+    remapped by source camera name, matching the label arrays.
+    """
     old = fmt.Session.load(source)
     rig, _, mapping = split_cameras(source / "calibration.toml")
     take = camera_index_map(old.cam_names, rig.names)
@@ -103,9 +108,6 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
         lab = old.labels(gid)
         if lab.points2d is None or lab.vis2d is None:
             raise RuntimeError(f"{source}/{gid}: expected source per-camera 2D labels")
-        # Existing rows are PROJECTED projections of the 3D layer.  Duplicating
-        # them for the channel-separated stream preserves that status rather
-        # than asserting fluorescence visibility observations.
         regions = None
         if lab.regions is not None:
             base = np.asarray(lab.regions, dtype=np.float64)
@@ -157,15 +159,17 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
 
 
 def convert(*, source=SOURCE, output=OUTPUT, overwrite=False, validate=False) -> None:
-    """Convert all train/val/test sessions without touching ``source``."""
+    """Convert all train/val/test sessions without touching ``source``.
+
+    Existing manifests are copied alongside the derived root; the selection
+    manifest's output pointer is updated while its label policy is unchanged.
+    """
     source, output = Path(source), Path(output)
     if output.exists():
         if not overwrite:
             raise SystemExit(f"{output} exists; use --overwrite to replace it")
         shutil.rmtree(output)
     output.mkdir(parents=True)
-    # Keep converter manifests alongside the derived root, updating only the
-    # manifest's output pointer; label policy is unchanged.
     for stem in ("selection.json", "label_policy.json"):
         src_manifest = source / stem
         if src_manifest.exists():
@@ -192,6 +196,12 @@ def convert(*, source=SOURCE, output=OUTPUT, overwrite=False, validate=False) ->
 
 
 def main() -> None:
+    """Parse command-line options and convert the requested dataset root.
+
+    Inputs: command-line source/output paths and conversion flags.
+    Outputs: none; writes the converted dataset or raises on failure.
+    Side effects: creates or replaces the output directory and its contents.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=SOURCE)
     parser.add_argument("--output", type=Path, default=OUTPUT)

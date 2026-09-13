@@ -68,7 +68,8 @@ def project(session, pred, cam, gid=None, frames=None):
     `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
     pixels already -- the same call `infer._fill_box_agreement` makes, for the same reason. The
     projection is PER ANIMAL: `project_points_torch` aligns the (T,4,4) extrinsic against axis
-    -3, so flattening (S,T) would project animal i through frame i's pose.
+    -3, so flattening (S,T) would project animal i through frame i's pose. Static cameras
+    retain aniposelib's projection at zero skew; skewed cameras use the full-matrix path.
     """
     import torch
 
@@ -83,9 +84,6 @@ def project(session, pred, cam, gid=None, frames=None):
             xy = [project_points_torch([cams[cam]], p[s])[0].cpu().numpy() for s in range(S)]
         return np.stack(xy).astype(np.float32)
     obj = session.rig.by_name(name)
-    # aniposelib's static Camera.project() ignores intrinsic skew.  Keep its
-    # established path for ordinary zero-skew calibrations, but use the same
-    # full-matrix posetail projection as inference for skewed cameras.
     skew = float(obj.matrix[0, 1].detach().cpu())
     if skew != 0.0:
         from posetail.posetail.cube import project_points_torch

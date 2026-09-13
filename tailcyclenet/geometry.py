@@ -74,7 +74,13 @@ def undistort_points(cam, points):
 
 
 def projection_sensitivity(cam, points):
-    """Jacobian of full-K Brown pinhole projection, preserving zero-skew compatibility."""
+    """Jacobian of full-K Brown pinhole projection, preserving zero-skew compatibility.
+
+    Inputs: cam -- camera dictionary; points -- world points.
+    Outputs: the projection Jacobian for each point.
+    Side effects: delegates zero-skew cameras to posetail's original implementation. The
+    normalized-coordinate mask indexes input columns (x and y), not output rows.
+    """
     if not _has_skew(cam):
         return cube._tailcyclenet_scalar_projection_sensitivity(cam, points)
     if cam.get('type', 'pinhole') != 'pinhole':
@@ -105,7 +111,6 @@ def projection_sensitivity(cam, points):
         torch.stack([y * drdx + dtydx, radial + y * drdy + dtydy], dim=-1),
     ], dim=1)
     inside = (q_raw.abs() < 3.0).to(J_dist.dtype)
-    # `inside` indexes the normalized-coordinate input columns (x and y), not output rows.
     J_dist = J_dist * inside[:, None, :]
     J_q = torch.zeros((len(p), 2, 3), dtype=torch.float64, device=p.device)
     J_q[:, 0, 0] = 1 / Z

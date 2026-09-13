@@ -746,7 +746,7 @@ def main(argv: list[str] | None = None):
                     record({'iter': it, 'ddp_rewrapped': True})
             loss, _ = run_batch(model, loss_fn, batch, device, raw=raw)
             if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(loss))):
-                _drain_smoothness(loss_fn)  # skipped batches do not enter the interval metrics
+                _drain_smoothness(loss_fn)
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
@@ -759,7 +759,7 @@ def main(argv: list[str] | None = None):
             mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())
             if not dist_utils.all_ranks_finite(
                     fabric, bool(torch.isfinite(gn) and torch.isfinite(mgn))):
-                _drain_smoothness(loss_fn)  # discard the batch after a failed backward/clip
+                _drain_smoothness(loss_fn)
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1

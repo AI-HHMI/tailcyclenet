@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import shutil
 import sys
@@ -188,7 +187,11 @@ def orient_direction(A: np.ndarray, X: np.ndarray) -> np.ndarray:
 
 def build_pinhole_rig(src: Path, data: dict, session: str, cameras: list[str],
                       sizes: dict[str, tuple[int, int]], support: np.ndarray) -> fmt.Rig:
-    """Build the reference telephoto-pinhole approximation for one session."""
+    """Build a telephoto-pinhole approximation, retaining the full camera skew.
+
+    The production projection path differs from aniposelib's ``Camera.project()``:
+    it retains ``K[0, 1]``.
+    """
     from aniposelib.cameras import CameraGroup
     import cv2
 
@@ -264,8 +267,6 @@ def build_pinhole_rig(src: Path, data: dict, session: str, cameras: list[str],
         moving={camera: False for camera in cameras},
         calibrated={camera: True for camera in cameras},
     )
-    # This is the actual production projection path, unlike aniposelib's
-    # Camera.project(), which drops K[0,1].  It retains the full skew.
     import torch
     from posetail.posetail.cube import project_points_torch
     projected = project_points_torch(rig.posetail(), torch.as_tensor(support, dtype=torch.float64))
@@ -354,7 +355,11 @@ def triangulate_robust(rig: fmt.Rig, p2d: np.ndarray, reject_px: float,
 
 def build_labels(data: dict, run: list[int], views: dict[int, dict[str, int]], rig: fmt.Rig,
                  names: list[str], reject_px: float) -> tuple[fmt.Labels, int]:
-    """Build 2D, boxes, instances and derived 3D for one group."""
+    """Build 2D, boxes, instances, and derived 3D for one group.
+
+    Rejection applies only to the derived 3D fit; source 2D placements remain
+    intact in ``keypoints.pq`` and ``instances.pq``.
+    """
     K, C, T = len(names), len(rig), len(run)
     labels = fmt.empty_labels(1, T, K, C, mode3d=True, animal_ids=['a00'])
     labels.boxes = np.full((1, T, C, 4), np.nan, np.float32)
@@ -379,8 +384,6 @@ def build_labels(data: dict, run: list[int], views: dict[int, dict[str, int]], r
     good = np.isfinite(p3d).all(axis=-1)
     labels.vis3d[0][good] = fmt.VISIBLE
     labels.points3d[0][good] = p3d[good].astype(np.float32)
-    # Rejection is only for the derived 3D fit.  The source 2D placements are
-    # human annotations and must remain intact in keypoints.pq/instances.pq.
     return labels, int(rejected.sum())
 
 
@@ -389,15 +392,16 @@ def build_labels(data: dict, run: list[int], views: dict[int, dict[str, int]], r
 
 def convert(src: Path, out: Path, max_gap: int, reject_px: float,
             only: list[str] | None, max_groups: int | None, dry_run: bool) -> None:
-    """Convert all Fly50 train/val sessions."""
+    """Convert all Fly50 train/val sessions after calibration preflight.
+
+    Every calibration is parsed before destination files are created so malformed
+    projection payloads fail without leaving a partially written output root.
+    """
     by_split = {split: read_split(src, split) for split in SPLITS}
     release_name = src.name
     release_json = src / 'release.json'
     if release_json.exists():
         release_name = json.loads(release_json.read_text()).get('name', release_name)
-    # Parse every calibration before creating any destination files.  This makes
-    # malformed integer/decimal/scientific YAML payloads fail preflight rather
-    # than leaving a half-written root.
     calibration_paths = set()
     for data in by_split.values():
         for session, cameras in data['calibrations'].items():
@@ -495,6 +499,7 @@ def convert(src: Path, out: Path, max_gap: int, reject_px: float,
 
 
 def main() -> None:
+    """Parse CLI arguments, convert the release, and validate the output."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--src', type=Path, default=SRC)
     ap.add_argument('--out', type=Path, default=OUT)

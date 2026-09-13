@@ -77,6 +77,10 @@ class ScorerDataset(torch.utils.data.Dataset):
                 the base loader consumes and this passes through untouched).
         Outputs: a triplet dict, or None when every retry failed.
         Side effects: decodes video frames; draws from the item, ambient torch and imgaug RNGs.
+
+        Replacement indices use the same deterministic `(seed, idx)` stream as validation items,
+        so a failed build cannot make the scored window depend on earlier failures. Training keeps
+        entropy-seeded replacement for worker decorrelation.
         """
         base_idx = idx[1] if isinstance(idx, tuple) else idx
         for attempt in range(GETITEM_MAX_RETRIES):
@@ -87,11 +91,6 @@ class ScorerDataset(torch.utils.data.Dataset):
                 trip = make_triplet(self.base, sel, rng, self.cfg, self.corruptors)
                 if trip is not None:
                     return trip
-            # The replacement index must be as reproducible as the item it replaces. `_streams`
-            # keys val/test on `(seed, idx)` precisely so a metric is comparable across
-            # checkpoints; drawing the retry index from an unseeded RNG breaks that, because the
-            # window that actually gets scored would then depend on how many earlier windows
-            # failed to build. Train keeps its entropy seed -- there the point is decorrelation.
             pick = (np.random.default_rng((self.base.seed, 0xC0FFEE, base_idx, attempt))
                     if frozen else np.random.default_rng())
             base_idx = int(pick.integers(len(self.base)))

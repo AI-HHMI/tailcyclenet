@@ -346,7 +346,8 @@ class BoxDataset(Dataset):
         Outputs:
             Builds `self.index`, `self.origins` (tile origin or None -- parallel to `index`,
             not a fifth tuple element), and `self.chunk` (one (group, camera) file's worth of
-            positions -- the locality block `ChunkShuffle` needs).
+            positions -- the locality block `ChunkShuffle` needs). Frames with visibility rows
+            but no usable box are omitted rather than trained as pure background examples.
         Side effects:
             None.
         """
@@ -388,8 +389,6 @@ class BoxDataset(Dataset):
                 lab = sess.labels(gid)
                 vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
                 if vis is None or vis.shape[0] == 0:
-                    # Converted sessions may legitimately contain an empty group/animal axis;
-                    # there is no labelled detector frame to index in that group.
                     continue
                 v = vis.reshape(vis.shape[0], vis.shape[1], -1)
                 frames = np.flatnonzero((v != UNLABELED).any((0, 2)))
@@ -401,13 +400,6 @@ class BoxDataset(Dataset):
                         origins = ([None] if self.tile_wh is None
                                    else self._tile_origins(sess, gid, int(f), ci, rng))
                         if not self._has_target(sess, gid, int(f), ci, lab):
-                            # A frame that yields no usable target is not a training item. Its
-                            # `vis` rows exist (a `missing` judgement carries no coordinates, and
-                            # an `instances.pq` row need not be `labeled` or need not have a box),
-                            # but no GT box would come out of it -- so the item would be EVERY
-                            # anchor as background, teaching "nothing here" about a frame the
-                            # annotator merely did not place points in. Such frames are skipped
-                            # rather than trained as pure negatives.
                             continue
                         for o in origins:
                             self.index.append((sess, gid, int(f), ci))
@@ -438,9 +430,6 @@ class BoxDataset(Dataset):
         anchor a box.
         """
         if self.box_source == 'instances' and lab.boxes is not None and lab.instance is not None:
-            # The table is the box source, so eligibility IS "does it hold a box here". Not
-            # `labeled`-only: a `present` box is a real stored extent, and the detector has always
-            # regressed it (the fixture in `tests/conftest.py` pins that). No keypoint fallback.
             if not bool(np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1).any()):
                 return False
             return True
@@ -714,40 +703,24 @@ class BoxDataset(Dataset):
         return ig, boxes
 
     def boxes_for(self, i, warp=None, with_keypoints=False):
-        """The letterboxed target boxes for item `i`, without decoding its image.
+        """Return letterboxed target boxes without decoding the image.
 
-        `with_keypoints=True` also returns the KEYPOINT target, (S,K,3) of (x, y, vis), in the
-        same letterboxed pixels -- free, because the keypoints are the input `crop_box_for_points`
-        is already called on, so there is no second data path to disagree about the transform.
+        With `with_keypoints=True`, also return `(S,K,3)` `(x, y, vis)` targets in the same
+        pixels. The `vis` channel is the format status, not coordinate finiteness; it is NaN when
+        the session made no assessment.
 
-        The `vis` channel is the format's `status`, NOT coordinate-finiteness: supervising
-        `isfinite(x, y)` teaches "was this annotated", which on a root that writes every point
-        VISIBLE is an all-true target. `vis` is NaN where the session made no assessment, so the
-        score loss is withheld there rather than asserting "not visible".
+        The method is separate from `__getitem__` so assignment diagnostics can inspect targets
+        without decoding pixels. `warp` is a source-pixel 2x3 augmentation: points move through it
+        and boxes are re-derived by `crop_box_for_points`, rather than scaled.
 
-        Split out of `__getitem__` so the assignment diagnostic can read what the loss is actually
-        assigned over without paying for the pixels.
+        Points are frame-indexed (axis -3 is the animal), including moving-camera extrinsics.
+        Points outside the frame or tile are dropped. An `instances.pq` box is an already-padded
+        extent, re-entered with pad 0 and warped through all four corners.
 
-        `warp` is an augmentation's 2x3 in SOURCE pixels. The geometry moves through it and the
-        box is then RE-DERIVED by the crop rule, never scaled: the 20 px pad would scale with the
-        image but the `min_crop_dim` floor would not, so a floored box scaled by 0.8 is a box the
-        rule can never emit.
-
-        `pts` is frame-indexed (axis -3 is the ANIMAL, so a moving camera's (T,4,4) extrinsic
-        projects animal `i` through frame `i`'s pose). A point outside the TILE is dropped exactly
-        like an out-of-frame point, in SOURCE pixels and AFTER the warp (`__getitem__` composes
-        `tile @ warp @ decode`); drop them all and `crop_box_for_points` returns None, i.e. "no
-        animal here". An `instances.pq` stored box is an ALREADY-PADDED extent that re-enters the
-        rule at pad 0, warped as FOUR corners (a two-corner warp under rotation/flip crops the
-        animal the box exists to enclose), per animal rather than per session because rat-city's
-        tracker loses animals.
-
-        WHEN `instances.pq` IS THE BOX SOURCE IT IS THE ONLY ONE: an animal the table does not
-        describe at this (frame, view) gets NO box, not a keypoint-derived one. Falling back would
-        invent a target where the table deliberately records none, and on schulze-6fish it put the
-        unlabelled-but-present fish of a partial anchor back into training as background. A frame
-        with no stored box at all therefore yields no finite box, which is what `_has_target`
-        drops at index time.
+        When `instances.pq` is the box source, it is the only source: an animal absent from the
+        table gets no target, and a frame with no stored boxes yields no finite boxes. This avoids
+        inventing targets for partial annotations; those keypoints remain available to pose
+        training, but detector training must not treat unlabelled animals as background.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -785,11 +758,6 @@ class BoxDataset(Dataset):
         boxes = []
         for s in range(p2d.shape[0]):
             if self.box_source == 'instances' and lab.boxes is not None:
-                # `instances.pq` exists and is the box source, so it is the ONLY box source: an
-                # animal it does not describe here gets NO target rather than a keypoint-derived
-                # one. The fallback would silently invent a target for an animal the table has
-                # nothing to say about, which is exactly the polarity `instances.pq` exists to
-                # express (absent row = no determination, not "assume the keypoint extent").
                 b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
                 if not torch.isfinite(b).all():
                     boxes.append(torch.full((4,), float('nan')))

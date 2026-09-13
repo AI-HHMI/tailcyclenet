@@ -169,16 +169,16 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
     about DISAGREEMENT, not emptiness: all empty is one group (a raw rig dump); some empty and
     some not is a genuine ambiguity (Refusals 3 and 4 cover a duplicate (group, camera) pair
     and a group missing a calibrated camera's video).
+
+    Without calibration, all matched footage belongs to one nominal camera, while a supplied
+    regex may still provide group ids. The nominal camera starts as a placeholder and is rebuilt
+    from the probed image size in `build`.
     """
     files = _expand(videos)
     if not files:
         _die('--videos matched no file. Pass video files, or a directory holding them '
              f'(expanded non-recursively over {fmt.VIDEO_EXTS}).')
 
-    # A calibration is required for a real multiview rig, but a raw single-camera recording is
-    # already enough to establish the 2D geometry.  Start with a harmless placeholder; `build`
-    # replaces it with `nominal_camera('cam0', decoded_size)` after probing, so its focal length
-    # and principal point are those of the actual pixels rather than invented constants.
     if calibration is None:
         from aniposelib.cameras import CameraGroup
 
@@ -228,9 +228,6 @@ def plan(videos, calibration, cam_regex=None, *, session_id=None, group_id=None)
     for f in files:
         cam, gid = parse_name(f.stem, cam_regex)
         if calibration is None:
-            # There is no camera-name mapping to read from a calibration.  All *matched* footage
-            # belongs to the one nominal camera; a supplied regex may still be useful for its group
-            # id, while a regex that matches nothing still gets the normal refusal below.
             if cam_regex is None or cam:
                 cam = 'cam0'
         elif cam_regex is None:
@@ -388,7 +385,9 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
     string per group; left empty for multi-camera rather than picking arbitrarily. `path` is a
     LABEL, not a location -- the common parent is what makes `session_id` right and error
     strings name something a human recognises. The probe is where the memory goes, so the
-    process is trimmed and peak-checked afterwards.
+    process is trimmed and peak-checked afterwards. Without calibration, the placeholder
+    camera is replaced after probing so its focal length and principal point match the pixels.
+    The frozen filename plan's mutable camera group is updated in place.
     """
     jobs = [(gid, cam, p) for gid, cams in plan.videos.items() for cam, p in cams.items()]
     got: dict[tuple[str, str], tuple] = {}
@@ -405,9 +404,6 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
                 print(f'  {gid}/{cam}: {n} frames, {wh[0]}x{wh[1]}, {f:g} fps', flush=True)
 
     if plan.calibration is None:
-        # No calibration means exactly one nominal 2D camera.  Rebuild it after probing: merely
-        # calling set_size on the (1, 1) placeholder leaves its focal length at 1 instead of the
-        # converter/session convention in `format.nominal_camera`.
         sizes = {v[1] for v in got.values()}
         if len(sizes) > 1:
             _die(f'--videos without --calibration: the single nominal camera has videos with '
@@ -416,8 +412,6 @@ def build(plan: VideoPlan, *, names, units='mm', fps=None, assoc_res_max_px=30.0
         if sizes:
             wh = next(iter(sizes))
             cam = fmt.nominal_camera('cam0', wh)
-            # VideoPlan is frozen (the filename plan is immutable), but its CameraGroup is the
-            # intentionally mutable runtime object; replace the placeholder camera in place.
             plan.rig.cgroup.cameras[0] = cam
             if verbose:
                 print(f'--videos: no --calibration; using nominal camera \'cam0\' at '
@@ -489,13 +483,12 @@ def provenance_of(plan: VideoPlan) -> dict:
     camera) key would collide). `source_session` is deliberately empty: there is no directory,
     and a stale-looking path reads as a root. `source_group_id` is load-bearing exactly where
     the regex leaves every remainder empty -- without it the reconstruction cannot name the
-    group.
+    group. For nominal single-camera runs, `source_calibration` is the empty string rather than
+    `None`, avoiding a misleading path that reconstruction would try to open.
     """
     return {
         'source': 'tailcyclenet infer --videos',
         'source_session': '',
-        # Empty is the explicit record for a nominal single-camera run; `None` would be a
-        # misleading filesystem path and would make reconstruction try to open it.
         'source_calibration': '' if plan.calibration is None else str(plan.calibration),
         'source_cam_regex': str(plan.cam_regex or ''),
         'source_group_id': str(plan.group_id),
@@ -508,7 +501,9 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
 
     `names`, `mode`, `units` and `n_frames` come from the PREDICTION, so no video is probed. The
     reconstruction CHECKS ITSELF against the prediction's own `groups.pq` and `calibration.toml`
-    -- a mismatch means a video was renamed, moved or added since the run.
+    -- a mismatch means a video was renamed, moved or added since the run. For a nominal
+    single-camera run, the prediction's calibrated camera replaces the plan placeholder because
+    there is no source calibration to reload.
     """
     pred_dir = Path(pred_dir)
     with open(pred_dir / 'session.toml', 'rb') as f:
@@ -540,9 +535,6 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
             f'{pred_dir}: the calibration named in [provenance] now has cameras {p.rig.names}, '
             f'but this prediction was written over {want_cams}.')
     if p.calibration is None:
-        # There is no source calibration to reload.  The prediction's own calibration is the
-        # nominal camera built from the source pixels during the original probe.  VideoPlan is
-        # frozen, so replace its placeholder camera in the mutable CameraGroup.
         p.rig.cgroup.cameras[0] = prediction_rig.cameras[0]
         p.rig.offset.update(prediction_rig.offset)
         p.rig.moving.update(prediction_rig.moving)

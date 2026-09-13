@@ -125,6 +125,8 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             scoring to windows starting inside a frame range, as {(session, group, animal):
             (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable;
             coverage -- optional list populated with one record per requested window.
+    The session for each row comes from the index entry: coordinates and keypoint ids retain the
+    session's own name order, which may reorder or subset the dataset registry.
     Outputs: (DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
@@ -184,9 +186,6 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                              'group': expected_group, 'animal': expected_animal,
                              'start': expected_start, 'status': 'scored', 'reason': ''})
         n_seen += 1
-        # The SESSION comes from the INDEX entry, not the dataset: `coords` and `kpt_ids` are
-        # laid out in the session's own `names` order, which may reorder or subset the dataset's,
-        # so labelling a score with the dataset's name order would mislabel a reordered session.
         sess = ds.index[i].session
         views, coords, _vis, _frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
             item[:13]

@@ -1,41 +1,16 @@
 #!/usr/bin/env python
-"""Convert the Schulze SLEAP human-label exports to tailcycle 2D datasets.
+"""Convert Schulze SLEAP human-label exports to tailcycle 2D datasets.
 
-The source package contains human labels in ``ground_truth_points.csv`` and a matching
-``ground_truth_user_only.slp``. The CSV is the documented plain-text export and this repository's
-pixi environment intentionally does not depend on SLEAP. ``MACHINE_ANNOTATED_*`` artifacts are
-never read.
+Labels come from ``ground_truth_points.csv``; SLEAP and machine-annotated artifacts are not read.
+Each group contains consecutive stored-video frames around nearby anchors, with labels only at
+those anchors. Groups never cross discontinuities detected from the source predictions, and short
+runs produce proportionally shorter groups. Groups share a resumable lossless PNG cache through
+relative symlinks.
 
-Each output group is a window of consecutive stored-video frames. A group is centered on one or
-more nearby labeled source frames; sorted anchors whose span from the first anchor is less than
-30 frames are combined. A combined group's labels appear at their local source-frame positions,
-while all context frames remain unassessed. Overlapping windows share one dataset-local lossless
-PNG cache through relative symlinks. The cache is resumable: existing PNG dimensions are checked
-and valid files are reused.
-
-**A window never crosses a temporal discontinuity.** ``lili_1fish_260831`` is not temporally
-contiguous -- the camera wrote 2,400 of 6,228 acquired frames -- and a window straddling one of
-those boundaries shows the model a fish that jumps 100-305 px between consecutive frames at
-240 Hz, against a median frame-to-frame motion of 0.6 px. Each recording is therefore segmented
-into contiguous runs first (`detect_runs`), each run's anchors are packed independently, and a run
-shorter than `WINDOW` yields a proportionally shorter group rather than a window that reaches
-across the boundary. `lili_6fish_260831` documents no dropouts and is unaffected.
-
-No `regions.pq` is written. `instances.pq` carries derived boxes only on complete labelled
-anchors; partial six-fish anchors have no instance rows, so they are excluded from detector
-training while their keypoints remain available to pose training. Absence of `regions.pq` is the
-format's claim of exhaustive labelling; that is the wanted reading here, with the six-fish partial
-anchors documented in provenance. Instance boxes use the configured keypoint extent padding
-(default 2 px, the published value; `--box-pad 20` reproduces the pose crop rule's own pad),
-and are not claimed to be source-authored boxes.
-
-The source README says occluded landmarks are placed rather than visibility-labeled. Finite points
-therefore use ``projected`` (position, no visibility claim); explicit rows with no coordinates and
-``visible=0`` use ``missing``. The six-fish package has no identity ground truth, so its IDs are
-inferred per group -- a one-to-one match over that group's own anchors only, span <= 31 frames --
-and are group-qualified (``g006934_006947_animal00``). The same label in two groups is two
-different fish; no cross-group trajectory is claimed. Source ``instance_idx`` and the per-row match
-diagnostics are retained in ``identity_map.pq``.
+No ``regions.pq`` is written. Complete anchors receive derived ``instances.pq`` boxes, while
+partial six-fish anchors retain keypoints but no instance row. Finite placed occlusions are
+``projected``; explicit coordinate-free rows are ``missing``. Six-fish identities are inferred
+only within each group and recorded with match diagnostics in ``identity_map.pq``.
 """
 from __future__ import annotations
 
@@ -298,9 +273,13 @@ def infer_identity_map(anchors: list[int], rows_by_frame: dict[int, list[dict]],
     reading: two labelled fish among six cannot say which four the others are.
 
     `match_distance_px` and `competitor_margin_px` are recorded per row so a consumer can
-    quarantine ambiguous anchors rather than trusting every inferred label equally.
+    quarantine ambiguous anchors rather than trusting every inferred label equally. The first
+    anchor establishes deterministic position-ordered slots; unavailable prior positions are
+    excluded from Hungarian matches, and unclaimed instances receive new slots rather than being
+    dropped.
     """
     def centres(frame: int) -> dict[int, np.ndarray]:
+        """Return mean finite coordinates grouped by source instance for one frame."""
         by_instance: dict[int, list[tuple[float, float]]] = defaultdict(list)
         for row in rows_by_frame.get(frame, []):
             if row['x'] is not None:
@@ -317,8 +296,6 @@ def infer_identity_map(anchors: list[int], rows_by_frame: dict[int, list[dict]],
         if not instances:
             continue
         if not slots:
-            # First labelled anchor of this group: order the row slots by position, which is
-            # arbitrary but deterministic and lets the *rest* of the group stay consistent.
             ordered = sorted(instances, key=lambda i: tuple(current[i]))
             slots = [f'{group_id}_animal{i:02d}' for i in range(len(ordered))]
             if len(slots) > expected:
@@ -330,9 +307,6 @@ def infer_identity_map(anchors: list[int], rows_by_frame: dict[int, list[dict]],
                                   for s in track_ids])
             inst_pos = np.stack([current[i] for i in instances])
             cost = np.linalg.norm(track_pos[:, None] - inst_pos[None, :], axis=2)
-            # A slot with no position yet (the group's first anchor was partial) cannot be
-            # matched; `linear_sum_assignment` cannot take NaN, so those rows are parked far away
-            # and then discarded below.
             blocked = ~np.isfinite(cost)
             cost = np.where(blocked, 1e12, cost)
             rr, cc = linear_sum_assignment(cost)
@@ -348,8 +322,6 @@ def infer_identity_map(anchors: list[int], rows_by_frame: dict[int, list[dict]],
             for instance in instances:
                 if instance in claimed:
                     continue
-                # An instance no slot claimed (more animals present than the group has slots):
-                # give it a new slot rather than dropping a real animal.
                 slot = f'{group_id}_animal{len(slots):02d}'
                 slots.append(slot)
                 assignments.append((instance, slot, None, None))
@@ -400,12 +372,9 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
     else:
         if identity_map is None:
             raise RuntimeError('six-fish labels require a per-group identity map')
-        # Slots already carry this group's own name (`g..._animalNN`), so the assigned slot IS the
-        # group-qualified label. Sort on the slot index, not on the string.
         animal_ids = sorted({identity_map[(frame, int(row['instance']))]
                              for frame in anchors for row in rows_by_frame[frame]},
                             key=lambda slot: int(slot.rsplit('animal', 1)[1]))
-    # The one-fish ID is fixed; six-fish IDs are group-local by construction.
     if expected == 1 and all_instances != [0]:
         raise RuntimeError(f'one-fish source has unexpected instance ids {all_instances}')
     ai = {aid: i for i, aid in enumerate(animal_ids)}
@@ -436,8 +405,6 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
                 status[a, local, k, 0] = fmt.PROJECTED
                 points[a, local, k, 0] = (row['x'], row['y'])
         if not full_frame:
-            # A partial anchor gets NO instances row, so the detector skips the frame entirely
-            # while pose keeps its keypoints (see this function's docstring).
             continue
         by_animal: dict[int, list[tuple[float, float]]] = defaultdict(list)
         for row in rows_by_frame[frame]:
@@ -562,7 +529,12 @@ def link_group_frames(session: Path, gid: str, start: int, n_frames: int, cache:
 
 def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
                 box_pad: int = 2) -> None:
-    """Convert one source package into one staged tailcycle dataset root."""
+    """Convert one source package into one staged tailcycle dataset root.
+
+    Anchors are packed independently inside contiguous runs; one-frame runs are recorded as
+    excluded because the upstream loader cannot train on a one-frame window. Rebuilds quarantine
+    stale group directories outside the dataset rather than deleting their withdrawn pixels.
+    """
     if out.exists():
         if clean and not resume:
             shutil.rmtree(out)
@@ -587,12 +559,12 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
     runs = detect_runs(src, n_video, label_extent_px(rows_by_frame))
 
     def run_of(frame: int) -> tuple[int, int]:
+        """Return the contiguous run containing a labelled source frame."""
         for run in runs:
             if run[0] <= frame <= run[1]:
                 return run
         raise RuntimeError(f'{frame}: no run contains this labelled frame')
 
-    # Each run's anchors are packed independently, so no group can span a discontinuity.
     windows: list[tuple[list[int], tuple[int, int], int, int]] = []
     dropped: list[int] = []
     for run in runs:
@@ -600,7 +572,6 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
         if not in_run:
             continue
         if run[1] - run[0] + 1 < 2:
-            # A one-frame run cannot hold a window at all (T=1 is unusable upstream).
             dropped.extend(in_run)
             continue
         for cluster in anchor_groups(in_run):
@@ -620,7 +591,6 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
         gid = f'g{anchors[0]:06d}_{anchors[-1]:06d}'
         if gid in groups:
             raise RuntimeError(f'duplicate generated group id {gid!r}')
-        # Identity is inferred PER GROUP, over that group's own anchors only (span <= WINDOW).
         identity_map, records = (infer_identity_map(anchors, rows_by_frame, gid, cfg['n_animals'])
                                  if cfg['n_animals'] > 1 else (None, []))
         identity_records.extend(records)
@@ -639,12 +609,6 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
         link_group_frames(session, gid, start, length, cache)
 
     rig = make_rig(width, height)
-    # A rebuild can WITHDRAW groups (a window start moves, a run boundary splits a cluster, an
-    # anchor is dropped). `link_group_frames` only ever creates, so any group directory this run
-    # did not write is a leftover from an earlier one -- it would sit in the published dataset as a
-    # group no table declares, carrying pixels, loadable by anything that walks `groups/`.
-    # Quarantined outside the dataset root rather than deleted: those frames are the only record of
-    # work deliberately withdrawn, and an over-eager prune would destroy the evidence.
     session.mkdir(parents=True, exist_ok=True)
     stale = sorted(d.name for d in (session / 'groups').iterdir()
                    if d.is_dir() and d.name not in groups)
@@ -704,8 +668,6 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
         import pyarrow.parquet as pq
         pq.write_table(pa.Table.from_pylist(identity_records), out / 'identity_map.pq')
     if dropped:
-        # The anchors this conversion deliberately did NOT train on, and why. An audit manifest
-        # rather than a log line: otherwise the only record of a withdrawn label is a printout.
         import pyarrow as pa
         import pyarrow.parquet as pq
         pq.write_table(pa.Table.from_pylist([
@@ -720,6 +682,7 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
 
 
 def main() -> None:
+    """Parse conversion options and convert each selected source dataset."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--src', type=Path, default=SRC_ROOT)
     parser.add_argument('--out-parent', type=Path,

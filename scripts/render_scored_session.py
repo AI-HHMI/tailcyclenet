@@ -98,12 +98,11 @@ def frame_to_window(starts: np.ndarray, n_frames: int, t: int) -> int | None:
     Inputs: starts -- the scored window starts, ascending; n_frames -- the window length;
             t -- a frame index.
     Outputs: the chosen window start, or None when no scored window covers `t`.
+    A frame before the first window must return None rather than indexing the final window.
     Side effects: none.
     """
     pos = int(np.searchsorted(starts, t, side='right'))
     if pos == 0:
-        # `pos - 1` would be -1 and pick the LAST window, so a frame before the first scored
-        # window would be coloured by a window from the end of the clip.
         return None
     start = int(starts[pos - 1])
     if t >= start + n_frames:
@@ -193,7 +192,10 @@ def window_stats(scores: dict, precisions: dict, lo: float, hi: float) -> dict:
 
 
 def main() -> int:
-    """Render the span for every requested camera and print each path."""
+    """Render the span for every requested camera and print each path.
+
+    Decoding uses bounded blocks so native-resolution frames are not held for the full span.
+    """
     import cv2
 
     ap = argparse.ArgumentParser(description=__doc__,
@@ -245,7 +247,6 @@ def main() -> int:
         ci = session.cam_names.index(cam)
         path = args.out / f'{session.session_id}_{args.group}_{cam}_{args.start}_{args.end}.mp4'
         writer = None
-        # Decode in bounded blocks: the span at native resolution is several GB if held at once.
         for lo_i in range(0, len(frames), 200):
             block = frames[lo_i:lo_i + 200]
             for t, im in zip(block, read_frames(group, cam, block)):

@@ -626,13 +626,12 @@ class Session:
         """Scatter every group now and drop the parquet tables.
 
         Call in the PARENT process before forking dataloader workers: the dense arrays are then
-        shared copy-on-write instead of each worker scattering its own copy.
+        shared copy-on-write instead of each worker scattering its own copy. Visibility assessment
+        is cached while parquet tables are resident, before those tables are dropped, so sampled
+        windows do not trigger a reread.
         """
         for gid in self.groups:
             self.labels(gid)
-        # `has_visibility_assessment` is read by every sampled window.  Cache it while the
-        # parquet tables are still resident so dropping `_tables` below cannot make the first
-        # selection reread all five files.
         self.has_visibility_assessment
         self.__dict__.pop('_tables', None)
 
@@ -1097,18 +1096,16 @@ class Registry:
                 base -- an existing registry whose ids must be preserved.
         Outputs: a Registry whose ids are append-only against `base`.
         Side effects: raises FormatError if an existing id would move.
+
+        A dataset already named by `base` keeps the spelling recorded when it was first added.
+        This remains true even after `base` grows, preventing duplicate identities and preserving
+        append-only ids.
         """
         prefix = len(datasets) > 1 or (base is not None and len(base.datasets) > 1)
         names = list(base.names) if base else []
         index = {n: i for i, n in enumerate(names)}
         out = dict(base.datasets) if base else {}
         for ds in datasets:
-            # A dataset the base ALREADY names keeps the spelling it was recorded under. Identity
-            # is the name the base used, and the spelling is fixed when a dataset is FIRST added:
-            # a base that has since grown past one dataset would otherwise re-prefix a dataset it
-            # already carries, turning every one of its keypoints into a duplicate identity and
-            # then tripping the append-only check below. That is a scorer whose base holds two
-            # datasets refusing to score its own training root.
             spelling = cls._base_spelling(base, ds)
             ds_prefix = prefix if spelling is None else spelling == 'prefixed'
             ids = []

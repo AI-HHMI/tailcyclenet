@@ -269,7 +269,9 @@ def link_group_pixels(src_group: fmt.Group, dst_dir: Path, cameras: list[str]) -
 
 def write_root_provenance(root: Path, source: Path, scores: Path, *, jump_threshold: float,
                           score_threshold: float, score_window: int, code_commit: str,
-                          code_dirty: bool) -> None:
+                          code_dirty: bool, checkpoint_iteration: int,
+                          checkpoint_sha256: str, scorer_code_commit: str | None,
+                          scorer_code_dirty: bool | None) -> None:
     """Write the root-level provenance record for the cleaning operation."""
     import toml
     doc = {
@@ -277,8 +279,8 @@ def write_root_provenance(root: Path, source: Path, scores: Path, *, jump_thresh
         'source_root': str(source),
         'score_table': str(scores),
         'score_table_sha256': sha256(scores),
-        'scorer_checkpoint_iteration': CHECKPOINT_ITERATION,
-        'scorer_checkpoint_sha256': CHECKPOINT_SHA256,
+        'scorer_checkpoint_iteration': checkpoint_iteration,
+        'scorer_checkpoint_sha256': checkpoint_sha256,
         'jump_metric': 'non-tail 3D body-centroid displacement per frame',
         'jump_threshold_mm_per_frame': float(jump_threshold),
         'score_threshold': float(score_threshold),
@@ -289,17 +291,28 @@ def write_root_provenance(root: Path, source: Path, scores: Path, *, jump_thresh
         'code_dirty': bool(code_dirty),
         'created_utc': datetime.now(timezone.utc).isoformat(),
     }
+    if scorer_code_commit is not None:
+        doc['scorer_code_commit'] = scorer_code_commit
+    if scorer_code_dirty is not None:
+        doc['scorer_code_dirty'] = scorer_code_dirty
     (root / 'provenance.toml').write_text(toml.dumps(doc))
 
 
 def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: float,
           score_threshold: float, score_window: int, workers: int, overwrite: bool,
-          write_videos: bool = True) -> dict[str, int]:
+          checkpoint_iteration: int, checkpoint_sha256: str,
+          scores_sha256: str | None, scorer_code_commit: str | None,
+          scorer_code_dirty: bool | None, write_videos: bool = True) -> dict[str, int]:
     """Build the cleaned dataset atomically in a sibling staging directory."""
     if output.exists() and not overwrite:
         raise RuntimeError(f'{output} exists; pass --overwrite to replace it')
     source_ds = fmt.load_dataset(source)
     scores = pq.read_table(scores_path).to_pandas()
+    if scores_sha256 is not None:
+        actual_scores_sha256 = sha256(scores_path)
+        if actual_scores_sha256 != scores_sha256:
+            raise RuntimeError(
+                f'{scores_path}: SHA256 {actual_scores_sha256} != expected {scores_sha256}')
     required = {'session', 'group', 'animal', 'start', 'keypoint', 'score'}
     missing = required - set(scores.columns)
     if missing:
@@ -426,9 +439,15 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
             counts['cut_clips'] = 0
         code = subprocess_run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parent.parent)
         dirty = bool(subprocess_run(['git', 'status', '--short'], cwd=Path(__file__).resolve().parent.parent).strip())
-        write_root_provenance(stage, source, scores_path, jump_threshold=jump_threshold,
-                              score_threshold=score_threshold, score_window=score_window,
-                              code_commit=code, code_dirty=dirty)
+        write_root_provenance(
+            stage, source, scores_path, jump_threshold=jump_threshold,
+            score_threshold=score_threshold, score_window=score_window,
+            code_commit=code, code_dirty=dirty,
+            checkpoint_iteration=checkpoint_iteration,
+            checkpoint_sha256=checkpoint_sha256,
+            scorer_code_commit=scorer_code_commit,
+            scorer_code_dirty=scorer_code_dirty,
+        )
         pd.DataFrame(manifest).to_csv(stage / 'cleaning_manifest.tsv', sep='\t', index=False)
         (stage / 'cleaning_summary.json').write_text(json.dumps(counts, indent=2) + '\n')
         if output.exists():
@@ -605,6 +624,11 @@ def main() -> None:
     parser.add_argument('--jump-threshold-mm', type=float, default=JUMP_THRESHOLD_MM)
     parser.add_argument('--score-threshold', type=float, default=SCORE_THRESHOLD)
     parser.add_argument('--score-window', type=int, default=SCORE_WINDOW)
+    parser.add_argument('--scores-sha256')
+    parser.add_argument('--checkpoint-iteration', type=int, default=CHECKPOINT_ITERATION)
+    parser.add_argument('--checkpoint-sha256', default=CHECKPOINT_SHA256)
+    parser.add_argument('--scorer-code-commit')
+    parser.add_argument('--scorer-code-dirty', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--no-videos', action='store_true')
@@ -624,7 +648,13 @@ def main() -> None:
         print(build(args.source, args.scores, args.output,
                     jump_threshold=args.jump_threshold_mm, score_threshold=args.score_threshold,
                     score_window=args.score_window, workers=args.workers,
-                    overwrite=args.overwrite, write_videos=not args.no_videos), flush=True)
+                    overwrite=args.overwrite,
+                    checkpoint_iteration=args.checkpoint_iteration,
+                    checkpoint_sha256=args.checkpoint_sha256,
+                    scores_sha256=args.scores_sha256,
+                    scorer_code_commit=args.scorer_code_commit,
+                    scorer_code_dirty=args.scorer_code_dirty,
+                    write_videos=not args.no_videos), flush=True)
     if args.validate or not args.no_videos:
         validate(args.output, check_images=args.validate_images)
 

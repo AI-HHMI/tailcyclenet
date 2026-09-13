@@ -153,7 +153,7 @@ def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
         Path('run'), 'data', 'test', spans={('sess', 'target', 'a0'): (0, 100)},
         coverage=coverage)
 
-    assert table.empty
+    assert table.is_empty()
     assert coverage == [{'index': 0, 'session': 'sess', 'group': 'target', 'animal': 'a0',
                          'start': 0, 'status': 'unscorable',
                          'reason': 'item_build_failed'}]

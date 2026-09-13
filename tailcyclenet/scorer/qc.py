@@ -12,14 +12,19 @@ spec is the human's and is untouched. Everything this writes goes to `--out`.
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-import pandas as pd
-import torch
 from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import polars as pl
+import torch
 
 from ..checkpoints import load_scorer_run, provenance
-from ..dataset import LoaderConfig, PoseDataset
+# Importing dataset eagerly pulls posetail's legacy training dataset. Keep QC's
+# table-only import free of pandas; scoring imports the loader only when it actually runs.
+PoseDataset = None
+if TYPE_CHECKING:
+    from ..dataset import LoaderConfig
 
 
 def _loader_config(config: dict) -> LoaderConfig:
@@ -29,6 +34,8 @@ def _loader_config(config: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming unknown keys.
     """
+    from ..dataset import LoaderConfig
+
     data_cfg = dict(config.get('data', {}))
     known = set(LoaderConfig.__dataclass_fields__) | {'path', 'num_workers'}
     unknown = set(data_cfg) - known
@@ -127,7 +134,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             coverage -- optional list populated with one record per requested window.
     The session for each row comes from the index entry: coordinates and keypoint ids retain the
     session's own name order, which may reorder or subset the dataset registry.
-    Outputs: (DataFrame of per-keypoint scores, the scorer's registry, the run's config).
+    Outputs: (Polars DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
     model, config, registry, ckpt = load_scorer_run(Path(run), device=device)
@@ -136,7 +143,10 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
         lc = replace(lc, val_offset=int(window_offset))
     if val_stride is not None:
         lc = replace(lc, val_stride=int(val_stride))
-    ds = PoseDataset(data, split, lc, registry_base=registry, train=False)
+    dataset_cls = PoseDataset
+    if dataset_cls is None:
+        from ..dataset import PoseDataset as dataset_cls
+    ds = dataset_cls(data, split, lc, registry_base=registry, train=False)
     _check_names(registry, ds.registry, data)
 
     where = list(range(len(ds)))
@@ -205,48 +215,91 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                 'score': float(scores[ki]), 'precision': float(precision[ki]),
                 'n_observed_frames': int(observed[ki]), 'n_cams': len(cgroup),
             })
-    return pd.DataFrame(rows), registry, config
+    return pl.DataFrame(rows), registry, config
 
 
-def rank(table: pd.DataFrame, top: int = 10) -> str:
+def _non_missing(table: pl.DataFrame, name: str) -> pl.Expr:
+    """Match the table backend's default missing-value policy for a grouping/aggregate column."""
+    expr = pl.col(name).is_not_null()
+    if table.schema[name] in (pl.Float32, pl.Float64):
+        expr = expr & pl.col(name).is_not_nan()
+    return expr
+
+
+def _aggregate_input(table: pl.DataFrame) -> pl.DataFrame:
+    """Make IEEE NaNs participate in Polars aggregates like nulls do."""
+    columns = []
+    for name in ("score", "n_observed_frames"):
+        if name in table.columns and table.schema[name] in (pl.Float32, pl.Float64):
+            columns.append(pl.col(name).fill_nan(None))
+    return table.with_columns(columns) if columns else table
+
+
+def _as_report_float(value) -> float:
+    """Render null aggregate values with the historical ``nan`` spelling."""
+    return float("nan") if value is None else float(value)
+
+
+def rank(table: pl.DataFrame, top: int = 10) -> str:
     """The worst-first report: worst windows, then worst (group, keypoint) pairs.
 
     Scores are relative, so the report gives RANKS and counts and never a threshold -- a reader
     acting on a cut-off would be inventing one.
 
-    Inputs: table -- `score_root`'s DataFrame; top -- how many rows to show per section.
+    Inputs: table -- ``score_root``'s Polars DataFrame; top -- how many rows to show per section.
     Outputs: the report as a string.
-    Side effects: none.
+    Side effects: none. Missing grouping keys are excluded like pandas `groupby(dropna=True)`,
+    and NaN scores are normalized to null before Polars aggregation.
     """
-    if table.empty:
+    if table.is_empty():
         return 'no windows were scored'
-    lines = [f'scored {len(table)} (window, keypoint) rows over '
-             f'{table.group.nunique()} group(s)',
+
+    group_keys = ['dataset', 'session', 'group', 'animal']
+    keypoint_keys = ['dataset', 'session', 'group', 'keypoint']
+    aggregate = _aggregate_input(table)
+    group_input = aggregate.filter(pl.all_horizontal([_non_missing(aggregate, k)
+                                                       for k in group_keys]))
+    kpt_input = aggregate.filter(pl.all_horizontal([_non_missing(aggregate, k)
+                                                     for k in keypoint_keys]))
+    per_group = (group_input.group_by(group_keys, maintain_order=True)
+                 .agg(pl.col('score').min().alias('worst'),
+                      pl.col('score').median().alias('median'),
+                      pl.len().alias('n'))
+                 .sort(['worst', *group_keys], nulls_last=True, maintain_order=True))
+    per_kpt = (kpt_input.group_by(keypoint_keys, maintain_order=True)
+               .agg(pl.col('score').median().alias('median'),
+                    pl.len().alias('n'),
+                    pl.col('n_observed_frames').median().alias('obs'))
+               .sort(['median', *keypoint_keys], nulls_last=True, maintain_order=True))
+
+    n_groups = table.filter(_non_missing(table, 'group')).get_column('group').n_unique()
+    lines = [f'scored {table.height} (window, keypoint) rows over '
+             f'{n_groups} group(s)',
              '',
              'per-group minimum keypoint score (worst first):']
-    per_group = (table.groupby(['dataset', 'session', 'group', 'animal'])
-                 .agg(worst=('score', 'min'), median=('score', 'median'), n=('score', 'size'))
-                 .reset_index().sort_values('worst'))
-    for _, r in per_group.head(top).iterrows():
-        lines.append(f'  {r["worst"]:>9.4f}  {r["dataset"]}/{r["session"]}/{r["group"]}'
-                     f'/animal{r["animal"]}  (median {r["median"]:.4f}, {int(r["n"])} points)')
+    for row in per_group.head(top).iter_rows(named=True):
+        worst = _as_report_float(row['worst'])
+        median = _as_report_float(row['median'])
+        lines.append(f'  {worst:>9.4f}  {row["dataset"]}/{row["session"]}/{row["group"]}'
+                     f'/animal{row["animal"]}  (median {median:.4f}, {int(row["n"])} points)')
 
     lines += ['', 'worst (group, keypoint) pairs by median score:']
-    per_kpt = (table.groupby(['dataset', 'session', 'group', 'keypoint'])
-               .agg(median=('score', 'median'), n=('score', 'size'),
-                    obs=('n_observed_frames', 'median'))
-               .reset_index().sort_values('median'))
-    for _, r in per_kpt.head(top).iterrows():
-        lines.append(f'  {r["median"]:>9.4f}  {r["dataset"]}/{r["session"]}/{r["group"]}'
-                     f'/{r["keypoint"]}  (n {int(r["n"])}, obs {r["obs"]:.0f})')
+    for row in per_kpt.head(top).iter_rows(named=True):
+        median = _as_report_float(row['median'])
+        obs = _as_report_float(row['obs'])
+        lines.append(f'  {median:>9.4f}  {row["dataset"]}/{row["session"]}/{row["group"]}'
+                     f'/{row["keypoint"]}  (n {int(row["n"])}, obs {obs:.0f})')
 
-    weak = per_kpt['median'] < per_kpt['median'].median()
-    lines += ['', f'{int(weak.sum())} of {len(per_kpt)} (group, keypoint) pairs fall below this '
-                  'root\'s own median. That is a RANK, not a threshold.']
+    root_median = per_kpt.get_column('median').median()
+    weak = 0 if root_median is None else sum(
+        value is not None and value < root_median
+        for value in per_kpt.get_column('median').to_list())
+    lines += ['', f'{weak} of {per_kpt.height} (group, keypoint) pairs fall below this '
+              'root\'s own median. That is a RANK, not a threshold.']
     return '\n'.join(lines)
 
 
-def write_outputs(out: Path, table: pd.DataFrame, run: Path, data: str, split: str,
+def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: str,
                   report: str, coverage: list[dict] | None = None) -> None:
     """Write `scores.pq`, `report.txt` and `provenance.toml` under `out`.
 
@@ -254,18 +307,19 @@ def write_outputs(out: Path, table: pd.DataFrame, run: Path, data: str, split: s
             data -- the scored root; split -- the split scored; report -- the ranking text.
     Outputs: none.
     Side effects: creates `out` and writes three files plus `coverage.csv` when coverage is
-        supplied. The scored root is not touched.
+        supplied. The scored root is not touched. The Parquet output keeps the historical Snappy
+        compression while intentionally omitting pandas index metadata.
     """
     import toml
 
     out.mkdir(parents=True, exist_ok=True)
-    table.to_parquet(out / 'scores.pq', index=False)
+    table.write_parquet(out / 'scores.pq', compression='snappy')
     (out / 'report.txt').write_text(report + '\n')
     (out / 'provenance.toml').write_text(toml.dumps({
         **provenance(), 'scorer_run': str(run), 'source_root': str(data), 'split': split,
         'n_rows': int(len(table)),
     }))
     if coverage is not None:
-        pd.DataFrame(coverage, columns=['index', 'session', 'group', 'animal', 'start',
-                                        'status', 'reason']).to_csv(out / 'coverage.csv', index=False)
+        coverage_columns = ['index', 'session', 'group', 'animal', 'start', 'status', 'reason']
+        pl.DataFrame(coverage, schema=coverage_columns).write_csv(out / 'coverage.csv')
     print(f'wrote {out}/scores.pq, {out}/report.txt, {out}/provenance.toml')

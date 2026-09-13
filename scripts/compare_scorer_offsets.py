@@ -21,7 +21,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import stats
 
 
@@ -35,6 +35,19 @@ def _coincidence(offset, T, pred_stride):
     """
     hits = sum(1 for k in range(24) if (offset + k * T) % pred_stride == 0)
     return hits == 24, hits / 24.0
+
+
+def _non_missing(table, column):
+    """Expression excluding null and float NaN group keys."""
+    expr = pl.col(column).is_not_null()
+    if table.schema[column].is_float():
+        expr = expr & ~pl.col(column).is_nan()
+    return expr
+
+
+def _float_array(series):
+    """Convert a numeric Polars series for SciPy, retaining nulls as NaN."""
+    return np.asarray(series.to_numpy(), dtype=np.float64)
 
 
 def main(argv=None) -> int:
@@ -57,7 +70,7 @@ def main(argv=None) -> int:
     for d in sorted(root.glob('off*')):
         f = d / 'error_correlation_rows.pq'
         if f.exists():
-            arms[int(d.name[3:])] = pd.read_parquet(f)
+            arms[int(d.name[3:])] = pl.read_parquet(f)
     if not arms:
         print(f'no off<N>/error_correlation_rows.pq under {root}')
         return 1
@@ -66,9 +79,20 @@ def main(argv=None) -> int:
           f'{"kpts neg":>9}  {"same-lattice?":>14}')
     rows = []
     for off, df in sorted(arms.items()):
-        overall = stats.spearmanr(df['score'], df['error'])[0]
-        per = [stats.spearmanr(s['score'], s['error'])[0]
-               for _k, s in df.groupby('keypoint') if len(s) >= 30]
+        overall = stats.spearmanr(
+            _float_array(df.get_column('score')), _float_array(df.get_column('error'))
+        )[0]
+        per = [
+            stats.spearmanr(
+                _float_array(s.get_column('score')), _float_array(s.get_column('error'))
+            )[0]
+            for s in (
+                df.filter(_non_missing(df, 'keypoint'))
+                .sort('keypoint', nulls_last=True, maintain_order=True)
+                .partition_by('keypoint', maintain_order=True)
+            )
+            if s.height >= 30
+        ]
         med = float(np.median(per)) if per else float('nan')
         neg = sum(1 for r in per if r < 0)
         _, frac = _coincidence(off, args.T, args.pred_stride)

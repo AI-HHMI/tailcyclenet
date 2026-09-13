@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy import stats
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -101,6 +101,19 @@ def _per_window_error(pred_sess, ref_sess, group_id, animal_id, starts, T, keypo
     return {s: float(np.mean(v)) for s, v in buckets.items() if v}
 
 
+def _non_missing(table, column):
+    """Expression excluding null and float NaN group keys."""
+    expr = pl.col(column).is_not_null()
+    if table.schema[column].is_float():
+        expr = expr & ~pl.col(column).is_nan()
+    return expr
+
+
+def _float_array(series):
+    """Convert a numeric Polars series for SciPy, retaining nulls as NaN."""
+    return np.asarray(series.to_numpy(), dtype=np.float64)
+
+
 def main(argv=None) -> int:
     """Entry point for the Gate D correlation report.
 
@@ -121,11 +134,18 @@ def main(argv=None) -> int:
 
     config = load_config(args.config, base=_SCORER_CONFIG)
     T = int(config['data']['n_frames'])
-    table = pd.read_parquet(args.scores)
-    print(f'{len(table)} scored rows over {table["session"].nunique()} session(s), T={T}')
+    table = pl.read_parquet(args.scores)
+    n_sessions = table.filter(_non_missing(table, 'session')).get_column('session').n_unique()
+    print(f'{len(table)} scored rows over {n_sessions} session(s), T={T}')
 
     rows = []
-    for (session, group, animal), sub in table.groupby(['session', 'group', 'animal']):
+    group_cols = ['session', 'group', 'animal']
+    grouped = (
+        table.filter(pl.all_horizontal(_non_missing(table, c) for c in group_cols))
+        .sort(group_cols, nulls_last=True, maintain_order=True)
+        .group_by(group_cols, maintain_order=True)
+    )
+    for (session, group, animal), sub in grouped:
         pred_dir = Path(args.pred_root) / args.split / session
         ref_dir = Path(args.ref_root) / args.split / session
         if not pred_dir.exists() or not ref_dir.exists():
@@ -135,26 +155,36 @@ def main(argv=None) -> int:
         pred_sess, ref_sess = fmt.Session.load(pred_dir), fmt.Session.load(ref_dir)
         if group not in pred_sess.groups or group not in ref_sess.groups:
             continue
-        starts = sorted(sub['start'].unique())
-        for kpt, ksub in sub.groupby('keypoint'):
+        starts = sorted(sub.get_column('start').unique().to_list())
+        kpt_groups = (
+            sub.filter(_non_missing(sub, 'keypoint'))
+            .sort('keypoint', nulls_last=True, maintain_order=True)
+            .group_by('keypoint', maintain_order=True)
+        )
+        for (kpt,), ksub in kpt_groups:
             errs = _per_window_error(pred_sess, ref_sess, group, animal, starts, T, kpt)
-            for r in ksub.itertuples():
-                e = errs.get(int(r.start))
+            for r in ksub.iter_rows(named=True):
+                e = errs.get(int(r['start']))
                 if e is None:
                     continue
                 rows.append({'session': session, 'group': group, 'animal': str(animal),
-                             'start': int(r.start), 'keypoint': kpt, 'score': float(r.score),
-                             'error': e})
+                             'start': int(r['start']), 'keypoint': kpt,
+                             'score': float(r['score']), 'error': e})
 
     if not rows:
         print('no (window, keypoint) row had both a score and a reference disagreement')
         return 1
-    df = pd.DataFrame(rows)
+    schema = {
+        'session': pl.String, 'group': pl.String, 'animal': pl.String,
+        'start': pl.Int64, 'keypoint': pl.String, 'score': pl.Float64, 'error': pl.Float64,
+    }
+    df = pl.DataFrame(rows, schema=schema)
     print(f'\n{len(df)} (window, keypoint) rows carry both a score and a disagreement')
-    print(f'disagreement: median {df["error"].median():.3f} mm, '
-          f'p90 {df["error"].quantile(0.9):.3f} mm, max {df["error"].max():.3f} mm')
+    errors = _float_array(df.get_column('error'))
+    print(f'disagreement: median {np.median(errors):.3f} mm, '
+          f'p90 {np.quantile(errors, 0.9):.3f} mm, max {np.max(errors):.3f} mm')
 
-    rho, p = stats.spearmanr(df['score'], df['error'])
+    rho, p = stats.spearmanr(_float_array(df.get_column('score')), errors)
     print(f'\nOVERALL Spearman(score, disagreement) = {rho:+.4f}  (p={p:.3g}, n={len(df)})')
     print('  score is a QUALITY score, so a working scorer gives a NEGATIVE rho here:')
     print('  higher score <-> smaller disagreement.')
@@ -162,11 +192,18 @@ def main(argv=None) -> int:
     print(f'\nWITHIN KEYPOINT (>= {args.min_windows} scored windows):')
     print(f'  {"keypoint":>16}  {"rho":>8}  {"n":>6}')
     per = []
-    for kpt, sub in df.groupby('keypoint'):
-        if len(sub) < args.min_windows:
+    per_groups = (
+        df.filter(pl.col('keypoint').is_not_null())
+        .sort('keypoint', nulls_last=True, maintain_order=True)
+        .group_by('keypoint', maintain_order=True)
+    )
+    for (kpt,), sub in per_groups:
+        if sub.height < args.min_windows:
             continue
-        r, _pv = stats.spearmanr(sub['score'], sub['error'])
-        per.append((kpt, r, len(sub)))
+        r, _pv = stats.spearmanr(
+            _float_array(sub.get_column('score')), _float_array(sub.get_column('error'))
+        )
+        per.append((kpt, r, sub.height))
     for kpt, r, n in sorted(per, key=lambda x: x[1]):
         print(f'  {kpt:>16}  {r:>+8.4f}  {n:>6}')
     if per:
@@ -175,7 +212,7 @@ def main(argv=None) -> int:
               f'(negative); median rho {np.median(rhos):+.4f}')
 
     out = Path(args.scores).parent
-    df.to_parquet(out / 'error_correlation_rows.pq')
+    df.write_parquet(out / 'error_correlation_rows.pq', compression='snappy')
     print(f'\nwrote {out / "error_correlation_rows.pq"}')
     return 0
 

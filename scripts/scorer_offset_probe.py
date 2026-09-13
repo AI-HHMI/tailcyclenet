@@ -32,6 +32,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 import torch
 from scipy import stats
 
@@ -39,7 +40,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
 from tailcyclenet.checkpoints import load_config, load_scorer_run, _SCORER_CONFIG  # noqa: E402
-from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.qc import _loader_config, _to_device  # noqa: E402
 
 
@@ -118,6 +118,8 @@ def main(argv=None) -> int:
                          'bootstrapped over tracks')
     args = ap.parse_args(argv)
 
+    from tailcyclenet.dataset import PoseDataset
+
     spans = _load_spans(args.spans_csv)
     print(f'{len(spans)} span(s) requested')
 
@@ -177,8 +179,14 @@ def main(argv=None) -> int:
         print(f'{off:>7}  {len(d):>6}  {rho:>+12.4f}  '
               f'{np.mean([r["error"] for r in d]):>9.2f}')
     if args.save_rows:
-        import pandas as pd
-        pd.DataFrame([r for rows in arms.values() for r in rows]).to_parquet(args.save_rows)
+        row_schema = {
+            'offset': pl.Int64, 'session': pl.String, 'animal': pl.String,
+            'start': pl.Int64, 'keypoint': pl.String, 'score': pl.Float64,
+            'error': pl.Float64,
+        }
+        pl.DataFrame([r for rows in arms.values() for r in rows], schema=row_schema).write_parquet(
+            args.save_rows, compression='snappy'
+        )
         print(f'wrote {args.save_rows}')
 
     if len(per) > 1:

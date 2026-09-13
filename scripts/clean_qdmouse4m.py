@@ -8,6 +8,7 @@ pixel clips are cut from the processed group-local videos, never from raw full-s
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ from pathlib import Path
 
 import av
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -34,6 +35,68 @@ SCORE_THRESHOLD = 0.1
 SCORE_WINDOW = 12
 CHECKPOINT_ITERATION = 25399
 CHECKPOINT_SHA256 = 'f263fb124a258a6e7dfbe6971be1cb6ebc0ef6177a33ba03e797fbba7f21c411'
+
+MANIFEST_COLUMNS = [
+    'split', 'session', 'parent_group', 'child_group', 'parent_n_frames',
+    'child_local_start', 'child_local_end', 'child_n_frames', 'source_frame_start',
+    'source_frame_end', 'jump_cuts_in_parent', 'reason', 'n_unlabeled_3d',
+    'n_unlabeled_2d', 'dropped_frames',
+]
+MANIFEST_NULL_VALUES = ['', '#N/A', '#N/A N/A', '#NA', '-1.#IND', '-1.#QNAN', '-NaN',
+                       '-nan', '1.#IND', '1.#QNAN', '<NA>', 'N/A', 'NA', 'NULL', 'NaN',
+                       'None', 'n/a', 'nan', 'null']
+MANIFEST_SCHEMA = {
+    'split': pl.String, 'session': pl.String, 'parent_group': pl.String,
+    'child_group': pl.String, 'parent_n_frames': pl.Int64,
+    'child_local_start': pl.Int64, 'child_local_end': pl.Int64, 'child_n_frames': pl.Int64,
+    'source_frame_start': pl.Int64, 'source_frame_end': pl.Int64,
+    'jump_cuts_in_parent': pl.String, 'reason': pl.String,
+    'n_unlabeled_3d': pl.Int64, 'n_unlabeled_2d': pl.Int64, 'dropped_frames': pl.Int64,
+}
+
+
+def write_manifest(manifest: list[dict[str, object]] | pl.DataFrame, path: Path) -> None:
+    """Write the stable 15-column cleaning manifest as a minimally quoted TSV.
+
+    Python csv minimal quoting keeps empty jump-cut fields blank rather than quoting them;
+    None renders as an empty field.
+    """
+    if isinstance(manifest, pl.DataFrame):
+        frame = manifest
+    elif manifest:
+        frame = pl.DataFrame(manifest)
+    else:
+        frame = pl.DataFrame([], schema=MANIFEST_SCHEMA)
+    if set(frame.columns) != set(MANIFEST_COLUMNS):
+        raise RuntimeError(f'cleaning manifest columns differ: {frame.columns}')
+    integer_columns = [name for name, dtype in MANIFEST_SCHEMA.items() if dtype == pl.Int64]
+    for name in integer_columns:
+        values = frame[name].to_list()
+        invalid = [value for value in values
+                   if isinstance(value, (float, np.floating)) and
+                   (not np.isnan(value) and
+                    (not np.isfinite(value) or float(value) != int(value)))]
+        if invalid:
+            raise RuntimeError(f'cleaning manifest {name} contains non-integer values')
+    float_columns = [name for name, dtype in frame.schema.items()
+                     if dtype in (pl.Float32, pl.Float64)]
+    if float_columns:
+        frame = frame.with_columns(*(pl.col(name).fill_nan(None) for name in float_columns))
+    frame = frame.select(MANIFEST_COLUMNS).cast(MANIFEST_SCHEMA, strict=True)
+    with Path(path).open('w', newline='') as stream:
+        writer = csv.writer(stream, delimiter='\t', lineterminator='\n')
+        writer.writerow(MANIFEST_COLUMNS)
+        writer.writerows(frame.iter_rows())
+
+
+def read_manifest(path: Path) -> pl.DataFrame:
+    """Read and validate a cleaning manifest without changing its column contract."""
+    frame = pl.read_csv(path, separator='\t', null_values=MANIFEST_NULL_VALUES,
+                        schema_overrides=MANIFEST_SCHEMA)
+    if frame.columns != MANIFEST_COLUMNS:
+        raise RuntimeError(f'{path}: expected cleaning manifest columns {MANIFEST_COLUMNS}, '
+                           f'got {frame.columns}')
+    return frame
 
 
 def sha256(path: Path) -> str:
@@ -90,7 +153,7 @@ def segments(n_frames: int, cuts: list[int]) -> list[tuple[int, int]]:
     return list(zip(bounds[:-1], bounds[1:]))
 
 
-def score_masks(scores: pd.DataFrame, session: str, group: str, names: list[str],
+def score_masks(scores: pl.DataFrame, session: str, group: str, names: list[str],
                 animals: list[str], n_frames: int, *, threshold: float = SCORE_THRESHOLD,
                 window_frames: int = SCORE_WINDOW) -> dict[str, np.ndarray]:
     """Build per-animal ``(frame,keypoint)`` low-score masks using any covering window.
@@ -99,22 +162,24 @@ def score_masks(scores: pd.DataFrame, session: str, group: str, names: list[str]
     it was; the caller records the score source and policy in the dataset provenance.
     """
     cols = ['session', 'group', 'animal', 'start', 'keypoint']
-    subset = scores[(scores.session == session) & (scores.group == group)]
-    if subset.empty:
+    subset = scores.filter((pl.col('session') == session) & (pl.col('group') == group))
+    if subset.is_empty():
         return {}
-    if subset[cols].duplicated().any():
+    if subset.select(pl.struct(cols).is_duplicated().any()).item():
         raise RuntimeError(f'duplicate scorer rows for {session}/{group}')
     kpt_index = {name: i for i, name in enumerate(names)}
-    unknown = sorted(set(subset.keypoint) - set(kpt_index))
+    unknown = sorted(set(subset.get_column('keypoint').to_list()) - set(kpt_index))
     if unknown:
         raise RuntimeError(f'{session}/{group}: scores contain unknown keypoints {unknown}')
     out: dict[str, np.ndarray] = {}
-    for animal, adf in subset.groupby('animal', sort=False):
+    for animal_group in subset.group_by('animal', maintain_order=True):
+        (animal,), adf = animal_group
         by_start: dict[int, np.ndarray] = {}
-        for start, sdf in adf.groupby('start', sort=True):
+        for start_group in adf.sort('start').group_by('start', maintain_order=True):
+            (start,), sdf = start_group
             values = np.full(len(names), np.nan, dtype=np.float64)
-            for row in sdf.itertuples(index=False):
-                values[kpt_index[row.keypoint]] = float(row.score)
+            for row in sdf.iter_rows(named=True):
+                values[kpt_index[row['keypoint']]] = float(row['score'])
             by_start[int(start)] = values
         low = np.zeros((n_frames, len(names)), dtype=bool)
         starts = sorted(by_start)
@@ -307,7 +372,7 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
     if output.exists() and not overwrite:
         raise RuntimeError(f'{output} exists; pass --overwrite to replace it')
     source_ds = fmt.load_dataset(source)
-    scores = pq.read_table(scores_path).to_pandas()
+    scores = pl.read_parquet(scores_path)
     if scores_sha256 is not None:
         actual_scores_sha256 = sha256(scores_path)
         if actual_scores_sha256 != scores_sha256:
@@ -317,9 +382,11 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
     missing = required - set(scores.columns)
     if missing:
         raise RuntimeError(f'{scores_path}: missing score columns {sorted(missing)}')
-    if not np.isfinite(scores.score).all():
+    finite = scores.select(pl.col('score').is_finite().fill_null(False).all()).item()
+    if not finite:
         raise RuntimeError(f'{scores_path}: non-finite scores')
-    if scores[['session', 'group', 'animal', 'start', 'keypoint']].duplicated().any():
+    score_keys = ['session', 'group', 'animal', 'start', 'keypoint']
+    if scores.select(pl.struct(score_keys).is_duplicated().any()).item():
         raise RuntimeError(f'{scores_path}: duplicate score keys')
     stage = output.with_name(f'.{output.name}.tmp-{os.getpid()}')
     if stage.exists():
@@ -448,7 +515,7 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
             scorer_code_commit=scorer_code_commit,
             scorer_code_dirty=scorer_code_dirty,
         )
-        pd.DataFrame(manifest).to_csv(stage / 'cleaning_manifest.tsv', sep='\t', index=False)
+        write_manifest(manifest, stage / 'cleaning_manifest.tsv')
         (stage / 'cleaning_summary.json').write_text(json.dumps(counts, indent=2) + '\n')
         if output.exists():
             if not overwrite:
@@ -470,10 +537,7 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
     manifest_path = root / 'cleaning_manifest.tsv'
     if not manifest_path.exists():
         raise RuntimeError(f'{root}: missing cleaning_manifest.tsv')
-    manifest = pd.read_csv(manifest_path, sep='\t')
-    required = {'split', 'session', 'child_group', 'child_n_frames', 'reason', 'dropped_frames'}
-    if missing := required - set(manifest.columns):
-        raise RuntimeError(f'{manifest_path}: missing columns {sorted(missing)}')
+    manifest = read_manifest(manifest_path)
 
     drops: list[tuple[str, fmt.Session, str]] = []
     before_rows: dict[tuple[str, str, str], int] = {}
@@ -498,15 +562,17 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
                     drops.append((split, session, gid))
 
     drop_keys = {(split, session.session_id, gid) for split, session, gid in drops}
-    manifest_keys = set(zip(manifest.split, manifest.session, manifest.child_group))
+    manifest_keys = set(zip(manifest['split'].to_list(), manifest['session'].to_list(),
+                            manifest['child_group'].to_list()))
     if not drop_keys <= manifest_keys:
         raise RuntimeError('unlabeled groups are missing from cleaning_manifest.tsv')
     for split, session, gid in drops:
-        mask = ((manifest.split == split) & (manifest.session == session.session_id) &
-                (manifest.child_group == gid))
-        if int(mask.sum()) != 1:
+        mask = ((pl.col('split') == split) & (pl.col('session') == session.session_id) &
+                (pl.col('child_group') == gid))
+        matching = manifest.filter(mask)
+        if len(matching) != 1:
             raise RuntimeError(f'{split}/{session.session_id}/{gid}: manifest row count != 1')
-        if split != 'train' and manifest.loc[mask, 'reason'].iloc[0] != 'dropped_no_labels':
+        if split != 'train' and matching['reason'][0] != 'dropped_no_labels':
             raise RuntimeError(f'{split}/{session.session_id}/{gid}: unexpected non-train drop')
 
     by_session: dict[Path, list[str]] = {}
@@ -541,11 +607,15 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
                     shutil.rmtree(group_dir)
 
     for split, session, gid in drops:
-        mask = ((manifest.split == split) & (manifest.session == session.session_id) &
-                (manifest.child_group == gid))
-        manifest.loc[mask, 'reason'] = 'dropped_no_labels'
-        manifest.loc[mask, 'dropped_frames'] = manifest.loc[mask, 'child_n_frames']
-    manifest.to_csv(manifest_path, sep='\t', index=False)
+        mask = ((pl.col('split') == split) & (pl.col('session') == session.session_id) &
+                (pl.col('child_group') == gid))
+        manifest = manifest.with_columns(
+            pl.when(mask).then(pl.lit('dropped_no_labels')).otherwise(pl.col('reason'))
+              .alias('reason'),
+            pl.when(mask).then(pl.col('child_n_frames')).otherwise(pl.col('dropped_frames'))
+              .alias('dropped_frames'),
+        )
+    write_manifest(manifest, manifest_path)
 
     after_ds = fmt.load_dataset(root)
     after_rows: dict[tuple[str, str, str], int] = {}
@@ -564,19 +634,21 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
         raise RuntimeError(f'groups.pq has missing pixel directories: {phantom[:5]}')
     if before_rows != after_rows:
         raise RuntimeError(f'label table row counts changed: before={before_rows}, after={after_rows}')
-    kept_manifest = manifest[manifest.reason != 'dropped_no_labels']
+    kept_manifest = manifest.filter(pl.col('reason').is_null() |
+                                    (pl.col('reason') != 'dropped_no_labels'))
     if len(kept_manifest) != sum(len(s.groups) for s in after_ds.all_sessions()):
         raise RuntimeError('manifest kept-group count differs from groups.pq')
 
-    all_dropped = manifest[manifest.reason == 'dropped_no_labels']
+    all_dropped = manifest.filter(pl.col('reason') == 'dropped_no_labels')
     summary_path = root / 'cleaning_summary.json'
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     summary.update({
         'children': int(sum(len(s.groups) for s in after_ds.all_sessions())),
         'dropped_no_labels': int(len(all_dropped)),
-        'dropped_frames': int(all_dropped.child_n_frames.sum()),
+        'dropped_frames': int(all_dropped['child_n_frames'].sum()),
         'dropped_no_labels_by_split': {
-            k: int(v) for k, v in all_dropped.groupby('split').size().items()},
+            row['split']: int(row['len'])
+            for row in all_dropped.group_by('split').len().sort('split').iter_rows(named=True)},
     })
     summary_path.write_text(json.dumps(summary, indent=2) + '\n')
 
@@ -588,7 +660,7 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
         'predicate': 'loader target visibility has no cell != UNLABELED',
         'dropped_this_run': len(drops),
         'dropped_total': len(all_dropped),
-        'dropped_frames_total': int(all_dropped.child_n_frames.sum()),
+        'dropped_frames_total': int(all_dropped['child_n_frames'].sum()),
         'code_commit': subprocess_run(['git', 'rev-parse', 'HEAD'], cwd=repo),
         'code_dirty': bool(subprocess_run(['git', 'status', '--short'], cwd=repo)),
         'created_utc': datetime.now(timezone.utc).isoformat(),

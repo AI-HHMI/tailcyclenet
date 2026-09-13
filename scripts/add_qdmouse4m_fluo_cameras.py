@@ -10,11 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt
-from scripts.clean_qdmouse4m import _cut_worker
+from scripts.clean_qdmouse4m import MANIFEST_COLUMNS, _cut_worker, read_manifest
 from scripts.convert_qdmouse4m_fluo import camera_index_map
 
 CLEAN = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/'
@@ -111,8 +111,11 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
     manifest_path = clean_root / 'cleaning_manifest.tsv'
-    manifest = pd.read_csv(manifest_path, sep='\t')
-    kept = manifest[manifest.reason != 'dropped_no_labels']
+    manifest = read_manifest(manifest_path)
+    if manifest.columns != MANIFEST_COLUMNS:
+        raise RuntimeError(f'{manifest_path}: unexpected cleaning manifest columns')
+    kept = manifest.filter(pl.col('reason').is_null() |
+                           (pl.col('reason') != 'dropped_no_labels'))
     if len(kept) != sum(len(s.groups) for s in clean_ds.all_sessions()):
         raise RuntimeError('cleaning manifest does not match cleaned groups')
     tasks = []
@@ -126,22 +129,23 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
             for session_id, clean in clean_sessions.items():
                 fluo = fluo_sessions[session_id]
                 assert_calibration_matches(clean, fluo)
-                rows = kept[(kept.split == split) & (kept.session == session_id)]
-                if set(rows.child_group) != set(clean.groups):
+                rows = kept.filter((pl.col('split') == split) &
+                                   (pl.col('session') == session_id))
+                if set(rows['child_group'].to_list()) != set(clean.groups):
                     raise RuntimeError(f'{clean.path}: manifest children != groups.pq')
-                missing = set(rows.parent_group.astype(str)) - set(fluo.groups)
+                missing = set(rows['parent_group'].cast(pl.String).to_list()) - set(fluo.groups)
                 if missing:
                     raise RuntimeError(f'{clean.path}: fluo root lacks parent groups {sorted(missing)}')
-                for row in rows.itertuples(index=False):
-                    parent = fluo.groups[str(row.parent_group)]
-                    child = clean.groups[row.child_group]
-                    if (int(row.child_local_end) > parent.n_frames or
+                for row in rows.iter_rows(named=True):
+                    parent = fluo.groups[str(row['parent_group'])]
+                    child = clean.groups[row['child_group']]
+                    if (int(row['child_local_end']) > parent.n_frames or
                             abs(float(parent.fps) - float(child.fps)) > 1e-6):
-                        raise RuntimeError(f'{clean.path}/{row.child_group}: child span or fps '
-                                           f'disagrees with fluo parent {row.parent_group}')
-                rows_by_child = rows.set_index('child_group')
-                if not rows_by_child.index.is_unique:
+                        raise RuntimeError(f"{clean.path}/{row['child_group']}: child span or fps "
+                                           f"disagrees with fluo parent {row['parent_group']}")
+                if rows['child_group'].is_duplicated().any():
                     raise RuntimeError(f'{clean.path}: manifest has duplicate child groups')
+                rows_by_child = {row['child_group']: row for row in rows.iter_rows(named=True)}
                 take = camera_index_map(clean.cam_names, fluo.cam_names)
                 out_session = stage / split / session_id
                 out_session.mkdir(parents=True, exist_ok=True)
@@ -169,9 +173,9 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
                 if reloaded.has_visibility_assessment != visibility_before:
                     raise RuntimeError(f'{clean.path}: visibility assessment changed')
                 for gid, group in clean.groups.items():
-                    if gid not in rows_by_child.index:
+                    if gid not in rows_by_child:
                         raise RuntimeError(f'{split}/{session_id}/{gid}: manifest row missing')
-                    row = rows_by_child.loc[gid]
+                    row = rows_by_child[gid]
                     child_dir = out_session / 'groups' / gid
                     child_dir.mkdir(parents=True, exist_ok=True)
                     for camera in clean.cam_names:
@@ -180,17 +184,17 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
                         counts['symlinks'] += 1
                     for camera in clean.cam_names:
                         fluo_name = f'{camera}_fluo'
-                        src_group = fluo.groups[str(row.parent_group)]
+                        src_group = fluo.groups[str(row['parent_group'])]
                         src = src_group.dir / f'{fluo_name}.mp4'
-                        if row.reason == 'unsplit':
+                        if row['reason'] == 'unsplit':
                             fmt.link(child_dir / f'{fluo_name}.mp4', src.resolve())
                             counts['symlinks'] += 1
                         else:
                             if not src.exists():
-                                raise RuntimeError(f'{fluo.path}/{row.parent_group}: missing {src}')
+                                raise RuntimeError(f"{fluo.path}/{row['parent_group']}: missing {src}")
                             target = child_dir / f'{fluo_name}.mp4'
                             tasks.append((str(src.resolve()), str(target),
-                                          int(row.child_local_start), int(row.child_local_end),
+                                          int(row['child_local_start']), int(row['child_local_end']),
                                           float(group.fps)))
                 counts['groups'] += len(groups)
                 counts['sessions'] += 1

@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
+import polars as pl
 
 from tailcyclenet import format as fmt
 
@@ -65,13 +66,14 @@ def _holes(table, key_cols: list[str]) -> int:
     """Rows with NO entry inside a (key_cols) group that has >= 1 entry, per bodypart.
 
     `key_cols` is `(group_id, frame, animal_id[, camera])`; the missing axis is `bodypart`.
+    Null bodyparts are excluded from the distinct-keypoint count, and null grouping keys are
+    excluded explicitly to match the previous pandas behavior.
     """
-    import pandas as pd  # noqa: F401 -- pulled in by pyarrow's to_pandas()
-
-    df = table.select([*key_cols, 'bodypart']).to_pandas()
-    n_kpts = df['bodypart'].nunique()
-    live_keys = df.groupby(key_cols, observed=True).ngroups
-    return int(live_keys * n_kpts - len(df))
+    df = pl.from_arrow(table.select([*key_cols, 'bodypart']))
+    n_kpts = df.get_column('bodypart').drop_nulls().n_unique()
+    complete_keys = df.drop_nulls(subset=key_cols)
+    live_keys = complete_keys.group_by(key_cols).len().height
+    return int(live_keys * n_kpts - df.height)
 
 
 def _is_symlink_farm(root_dir: Path) -> bool:

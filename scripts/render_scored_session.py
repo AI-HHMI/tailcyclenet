@@ -66,22 +66,33 @@ def load_scores(path: Path, session: str, group: str, animal: str) -> dict:
     Outputs: `{'score': dict, 'precision': dict, 'starts': sorted array, 'starts_seen': set}`.
     Side effects: reads one parquet file.
     """
-    import pandas as pd
+    import polars as pl
 
     pq = path if path.is_file() else path / 'scores.pq'
     if not pq.exists():
         raise SystemExit(f'{pq}: not found')
-    df = pd.read_parquet(pq)
-    want = ((df.session == session) & (df.group == group) & (df.animal.astype(str) == animal))
-    df = df[want]
-    if df.empty:
-        have = df.session.unique() if len(df) else []
+    df = pl.read_parquet(pq)
+    want = (
+        (pl.col('session') == session)
+        & (pl.col('group') == group)
+        & (pl.col('animal').cast(pl.String) == animal)
+    )
+    df = df.filter(want)
+    if df.is_empty():
+        have = df.get_column('session').unique().to_list() if df.height else []
         raise SystemExit(f'{pq}: no rows for {session}/{group}/{animal}. '
                          f'Sessions present: {list(have)[:3]}')
+    rows = df.iter_rows(named=True)
+    score = {}
+    precision = {}
+    for row in rows:
+        key = (int(row['start']), str(row['keypoint']))
+        score[key] = float(row['score'])
+        precision[key] = float(row['precision'])
     return {
-        'score': {(int(r.start), str(r.keypoint)): float(r.score) for r in df.itertuples()},
-        'precision': {(int(r.start), str(r.keypoint)): float(r.precision) for r in df.itertuples()},
-        'starts': np.unique(df.start.to_numpy()),
+        'score': score,
+        'precision': precision,
+        'starts': np.unique(df.get_column('start').to_numpy()),
     }
 
 

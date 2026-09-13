@@ -230,9 +230,8 @@ def test_csv_round_trip_has_no_index_and_parquet_schema_metadata_is_observable(t
     assert _records(polars.read_parquet(pandas_parquet), pandas=False) == rows
 
 
-@pytest.mark.xfail(strict=False, reason="Phase 0 contract: production modules still import pandas")
 def test_target_modules_do_not_load_pandas_in_a_fresh_subprocess():
-    """This turns green after the bridge and QC migration without breaking the current suite."""
+    """Table-only modules must not import pandas in a fresh interpreter."""
     for module in ("tailcyclenet.infer.bridge", "tailcyclenet.scorer.qc"):
         code = f"import sys; import {module}; print('pandas' in sys.modules)"
         result = subprocess.run([sys.executable, "-c", code],

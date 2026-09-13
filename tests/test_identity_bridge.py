@@ -5,7 +5,7 @@ are the ones that bound the damage: it must be a no-op when there is nothing to 
 only ever permute rows inside a declared component, and it must refuse rather than guess.
 """
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 from tailcyclenet.infer import bridge
@@ -13,13 +13,13 @@ from tailcyclenet.infer import bridge
 
 def _windows(n_windows, stride, gid='g'):
     """One window table: window `i` starts at `i * stride`."""
-    return pd.DataFrame({'group_id': [gid] * n_windows,
+    return pl.DataFrame({'group_id': [gid] * n_windows,
                          'window': list(range(n_windows)),
                          'frame': [i * stride for i in range(n_windows)]})
 
 
 def _events(rows, gid='g'):
-    return pd.DataFrame({'group_id': [gid] * len(rows),
+    return pl.DataFrame({'group_id': [gid] * len(rows),
                          'frame': [r[0] for r in rows],
                          'slot': [r[1] for r in rows],
                          'event': [r[2] for r in rows],
@@ -308,11 +308,11 @@ def test_rewrite_tables_deletes_quarantine_and_relabels_the_release(tmp_path):
     plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
             'refused': False}
     bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], segments, [plan], n_frames=30)
-    out = pd.read_parquet(tmp_path / 'points3d.pq')
+    out = pl.read_parquet(tmp_path / 'points3d.pq')
     # window 0 (frames 0..9) is quarantined, so its rows are gone entirely
-    assert set(out.frame.tolist()) == {20}
+    assert set(out['frame'].to_list()) == {20}
     # window 1 onward is released under [1, 0], so the two ids are exchanged
-    got = dict(zip(out.animal_id.astype(str), out.x))
+    got = dict(zip(out['animal_id'].cast(pl.String).to_list(), out['x'].to_list()))
     assert got['a0'] == pytest.approx(5.0) and got['a1'] == pytest.approx(4.0)
 
 
@@ -329,9 +329,9 @@ def test_rewrite_tables_leaves_other_groups_byte_exact(tmp_path):
     plan = {'component': [0, 1], 'windows': [0], 'release': None, 'mapping': None,
             'refused': True}
     bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10)}, [plan], 10)
-    out = pd.read_parquet(tmp_path / 'points3d.pq')
-    assert out.group_id.astype(str).tolist() == ['other', 'other']
-    assert out.x.tolist() == [2.0, 3.0]
+    out = pl.read_parquet(tmp_path / 'points3d.pq')
+    assert out['group_id'].cast(pl.String).to_list() == ['other', 'other']
+    assert out['x'].to_list() == [2.0, 3.0]
 
 
 def test_provenance_lists_every_lever_unconditionally():
@@ -418,7 +418,7 @@ def test_fill_keeps_a_quarantined_row_with_the_fill_pass_measurements(tmp_path):
         'status': np.array(['visible'] * 6, dtype=object),
         'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
         'z': np.zeros(6, np.float32)}, dict_cols=DICT_COLS)
-    fill_table = pd.DataFrame({
+    fill_table = pl.DataFrame({
         'group_id': np.array(['g'] * 4, dtype=object),
         'frame': np.array([0, 0, 5, 20], np.int32),
         'animal_id': np.array(['f0', 'f1', 'f0', 'f0'], dtype=object),
@@ -431,9 +431,9 @@ def test_fill_keeps_a_quarantined_row_with_the_fill_pass_measurements(tmp_path):
             'refused': False, 'fill_map': {0: 0, 1: 1}}
     fill = {'tables': {'points3d': fill_table}, 'animal_ids': ['f0', 'f1']}
     bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], segments, [plan], n_frames=30, fill=fill)
-    out = pd.read_parquet(tmp_path / 'points3d.pq')
-    got = {(str(r.animal_id), int(r.frame)): (float(r.x), str(r.status))
-           for r in out.itertuples()}
+    out = pl.read_parquet(tmp_path / 'points3d.pq')
+    got = {(str(r['animal_id']), int(r['frame'])): (float(r['x']), str(r['status']))
+           for r in out.iter_rows(named=True)}
     # both quarantined a0 rows observed by fill slot f0: kept with the fill's measurements
     assert got[('a0', 0)][0] == pytest.approx(90.0)
     assert got[('a0', 5)][0] == pytest.approx(92.0)
@@ -461,5 +461,5 @@ def test_fill_defaults_off_and_is_byte_identical_to_before(tmp_path):
             'refused': False}
     bridge.rewrite_tables(tmp_path, 'g', ['a0', 'a1'], {0: np.arange(0, 10), 1: np.arange(10, 30)},
                           [plan], n_frames=30)
-    out = pd.read_parquet(tmp_path / 'points3d.pq')
-    assert set(out.frame.tolist()) == {20}
+    out = pl.read_parquet(tmp_path / 'points3d.pq')
+    assert set(out['frame'].to_list()) == {20}

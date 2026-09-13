@@ -36,7 +36,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import toml
 
 from .predictions import load_predictions
@@ -96,7 +96,7 @@ class BridgeConfig:
             raise ValueError('missing_cost must be > 0')
 
 
-def owned_segments(windows: pd.DataFrame, gid: str, n_frames: int,
+def owned_segments(windows: pl.DataFrame, gid: str, n_frames: int,
                    window_length: int) -> dict[int, np.ndarray]:
     """Frames each window OWNS after the seam rule, which is last-write-wins.
 
@@ -108,40 +108,40 @@ def owned_segments(windows: pd.DataFrame, gid: str, n_frames: int,
     missing = [c for c in cols if c not in windows.columns]
     if missing:
         raise ValueError(f'windows.pq lacks columns {missing}')
-    mine = windows[windows.group_id.astype(str) == str(gid)][cols].drop_duplicates()
-    mine = mine.sort_values('window')
-    if mine.empty:
+    mine = (windows.filter(pl.col('group_id').cast(pl.String) == str(gid))
+            .select(cols).unique(maintain_order=True).sort('window', maintain_order=True))
+    if mine.is_empty():
         raise ValueError(f'windows.pq has no rows for group {gid!r}')
-    if mine['window'].duplicated().any():
+    if mine['window'].is_duplicated().any():
         raise ValueError('one window id has more than one start frame')
     owner = np.full(int(n_frames), -1, np.int32)
-    for row in mine.itertuples(index=False):
-        start = int(row.frame)
-        owner[start:min(start + int(window_length), int(n_frames))] = int(row.window)
-    out = {int(w): np.flatnonzero(owner == w) for w in mine['window']}
+    for row in mine.iter_rows(named=True):
+        start = int(row['frame'])
+        owner[start:min(start + int(window_length), int(n_frames))] = int(row['window'])
+    out = {int(w): np.flatnonzero(owner == w) for w in mine['window'].to_list()}
     return {w: f for w, f in out.items() if len(f)}
 
 
-def episodes(events: pd.DataFrame, gid: str, max_gap: int) -> list[dict]:
+def episodes(events: pl.DataFrame, gid: str, max_gap: int) -> list[dict]:
     """Gap-join this group's duplicate events into episodes, each with its own component.
 
     An episode is the unit a single permutation repair applies to. Two events closer than
     `max_gap` frames are one interaction; further apart they are two, and get separate repairs.
     """
-    if events is None or events.empty:
+    if events is None or events.is_empty():
         return []
-    keep = events[(events.group_id.astype(str) == str(gid))
-                  & events.event.isin(EPISODE_EVENTS)]
-    if keep.empty:
+    keep = events.filter((pl.col('group_id').cast(pl.String) == str(gid))
+                         & pl.col('event').is_in(EPISODE_EVENTS))
+    if keep.is_empty():
         return []
-    keep = keep.sort_values('frame')
+    keep = keep.sort('frame', maintain_order=True)
     out, current, last = [], [], None
-    for row in keep.itertuples(index=False):
-        frame = int(row.frame)
+    for row in keep.iter_rows(named=True):
+        frame = int(row['frame'])
         if last is not None and frame - last > int(max_gap):
             out.append(current)
             current = []
-        current.append((frame, int(row.slot)))
+        current.append((frame, int(row['slot'])))
         last = frame
     out.append(current)
     made = []
@@ -379,7 +379,7 @@ def apply_plan(rows: dict, segments: dict[int, np.ndarray], plan: dict,
     return out
 
 
-def bridge_group(rows: dict, windows: pd.DataFrame, events: pd.DataFrame, gid: str,
+def bridge_group(rows: dict, windows: pl.DataFrame, events: pl.DataFrame, gid: str,
                  n_frames: int, window_length: int, cfg: BridgeConfig) -> tuple[dict, list[dict]]:
     """Bridge every episode in one group, latest first. Returns the rows and the decisions.
 
@@ -455,33 +455,49 @@ _FILL_MEAS_COLS = frozenset({'status', 'x', 'y', 'z', 'score', 'score_logit',
                              'box_agree', 'x0', 'y0', 'x1', 'y1'})
 
 
-def _fill_slice(ftable: pd.DataFrame, fill_name: str, table: pd.DataFrame, sel: np.ndarray,
-                match_cols: list[str], replace_cols: list[str]) -> tuple[np.ndarray, dict]:
-    """Fill values for the selected standard rows from the fill session's rows for `fill_name`.
+def _key_value(value):
+    """Make scalar parquet values safe and null-aware as Python dict keys."""
+    if value is None:
+        return ("__null__",)
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return ("__nan__",)
+    if isinstance(value, np.generic):
+        value = value.item()
+    return value
 
-    Matches on `match_cols` (frame plus the structural bodypart/camera), returns (got, vals):
-    `got` is a bool array aligned to `sel`, True where the fill session has a row for the mapped
-    fill animal at the same frame and bodypart/camera; `vals` maps each measurement column to an
-    array aligned to the WHOLE table (undefined where not filled), so the caller assigns
-    wholesale. A frame the fill pass did not observe stays for the quarantine to drop.
+
+def _fill_slice(ftable: pl.DataFrame, fill_name: str, table: pl.DataFrame, sel: np.ndarray,
+                match_cols: list[str], replace_cols: list[str]) -> tuple[np.ndarray, dict]:
+    """Left-join selected rows to one fill animal, preserving left row order.
+
+    The fill side must be unique on ``match_cols``.  A duplicate would make a pandas-style
+    left join multiply rows and silently misalign the update, so reject it explicitly instead.
     """
-    n = int(sel.sum())
-    got = np.zeros(n, bool)
-    if n == 0:
+    selected = np.flatnonzero(sel)
+    got = np.zeros(len(selected), bool)
+    if not len(selected):
         return got, {}
-    sub = ftable[ftable['animal_id'].astype(str) == str(fill_name)]
-    if sub.empty:
+    sub = ftable.filter(pl.col('animal_id').cast(pl.String) == str(fill_name))
+    if sub.is_empty():
         return got, {}
-    keys = pd.DataFrame({'_row': np.flatnonzero(sel),
-                         'frame': table['frame'].astype(np.int64).to_numpy()[sel]})
-    for c in match_cols:
-        if c != 'frame':
-            keys[c] = table[c].to_numpy()[sel]
-    merged = keys.merge(sub[match_cols + replace_cols], on=match_cols, how='left',
-                        indicator=True).sort_values('_row')
-    hit = (merged['_merge'] == 'both').to_numpy()
-    got = hit
-    vals = {c: merged[c].to_numpy()[hit] for c in replace_cols}
+    missing = [c for c in [*match_cols, *replace_cols] if c not in sub.columns]
+    if missing:
+        raise ValueError(f'fill table lacks columns {missing}')
+    lookup = {}
+    for row in sub.select([*match_cols, *replace_cols]).iter_rows(named=True):
+        key = tuple(_key_value(row[c]) for c in match_cols)
+        if key in lookup:
+            raise ValueError(f'fill table has duplicate key {key!r}')
+        lookup[key] = row
+    vals = {c: [] for c in replace_cols}
+    selected_rows = table.select([*match_cols]).gather(selected.tolist()).iter_rows(named=True)
+    for i, row in zip(range(len(selected)), selected_rows):
+        match = lookup.get(tuple(_key_value(row[c]) for c in match_cols))
+        if match is None:
+            continue
+        got[i] = True
+        for c in replace_cols:
+            vals[c].append(match[c])
     return got, vals
 
 
@@ -501,9 +517,9 @@ def _fill_session(fill_dir: Path, fill_preds: dict) -> dict:
             f = fill_dir / f'{stem}.pq'
             if not f.exists():
                 continue
-            t = pd.read_parquet(f)
-            t = t[t['group_id'].astype(str) == key]
-            if not t.empty:
+            t = pl.read_parquet(f)
+            t = t.filter(pl.col('group_id').cast(pl.String) == key)
+            if not t.is_empty():
                 tables[stem] = t
         out[key] = {'pred': rows['pred'], 'animal_ids': rows['animal_ids'], 'tables': tables}
     return out
@@ -511,26 +527,11 @@ def _fill_session(fill_dir: Path, fill_preds: dict) -> dict:
 
 def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndarray],
                    plans: list[dict], n_frames: int, fill: dict | None = None) -> dict[str, int]:
-    """Apply plans to the stored parquet tables as row deletions and `animal_id` relabels.
+    """Apply bridge plans while retaining all columns and the stored row order.
 
-    A permutation IS a relabel and a quarantine IS a deletion, so the tables are edited at row
-    level rather than rebuilt from arrays. That matters: `write_block` needs `conf2d`, which does
-    not survive a `load_predictions` round trip, so rebuilding would silently drop the per-camera
-    scores. Editing rows preserves every column this module does not explicitly touch.
-
-    Only rows of THIS group are considered, so a multi-group session keeps the others byte-exact.
-    Plans are applied latest-first for the same reason `bridge_group` does: each release persists
-    to the end of the clip.
-
-    `fill` (plan section 6.4, default None): this group's slice of the fill pass's session --
-    {'pred': array, 'animal_ids': array, 'tables': {stem: DataFrame}} -- with each real plan
-    carrying a 'fill_map' ({standard slot: fill slot}) computed at the quarantine boundary. When
-    set, a quarantined row with a fill observation is KEPT and its measurement columns are
-    replaced by the mapped fill row's values wholesale (the fill pass's own observation of the
-    mapped animal); a row with no fill observation stays dropped, exactly as the quarantine would
-    leave it. (animal_id, frame, group_id) and the structural bodypart/camera are never replaced
-    -- the row keeps the standard session's identity and only borrows the fill pass's
-    measurements.
+    Tables are read as Polars, but updates use Python lists and NumPy masks.  This deliberately
+    avoids reconstructing a prediction table from model arrays: uninterpreted columns such as
+    ``conf2d``, dictionary values, and nullable coordinates must survive the rewrite.
     """
     from ..format import DICT_COLS, write_table
     counts = {}
@@ -540,19 +541,30 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
         f = path / f'{stem}.pq'
         if not f.exists():
             continue
-        table = pd.read_parquet(f)
-        if not {'animal_id', 'frame', 'group_id'}.issubset(table.columns):
+        table = pl.read_parquet(f)
+        required = {'animal_id', 'frame', 'group_id'}
+        if not required.issubset(table.columns):
             continue
-        gcol = table['group_id'].astype(str).to_numpy()
-        frame = table['frame'].astype(np.int64).to_numpy()
-        animal = table['animal_id'].astype(str).to_numpy().astype(object)
+        columns = table.columns
+        values = {}
+        for c in columns:
+            series = table[c]
+            if series.dtype in (pl.Float32, pl.Float64) or (
+                    series.dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                                     pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+                                     pl.Boolean) and series.null_count() == 0):
+                values[c] = series.to_numpy().copy()
+            else:
+                values[c] = series.to_list()
+        gcol = np.asarray([str(v) for v in values['group_id']], dtype=object)
+        frame = np.asarray(values['frame'], dtype=np.int64)
+        animal = np.asarray([str(v) for v in values['animal_id']], dtype=object)
         mine = gcol == str(gid)
         drop = np.zeros(len(frame), bool)
         new_animal = animal.copy()
-        cols_np = {c: np.array(table[c].to_numpy()) for c in table.columns}
-        match_cols = [c for c in table.columns
+        match_cols = [c for c in columns
                       if c not in _FILL_MEAS_COLS and c not in ('group_id', 'animal_id')]
-        replace_cols = [c for c in table.columns if c in _FILL_MEAS_COLS]
+        replace_cols = [c for c in columns if c in _FILL_MEAS_COLS]
         for plan in sorted(plans, key=lambda p: (p['windows'] or [0])[0], reverse=True):
             if plan.get('skipped') or plan.get('identity'):
                 continue
@@ -574,8 +586,9 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
                                                 match_cols, replace_cols)
                         hit = np.flatnonzero(sel)[got]
                         here[hit] = False
-                        for c, v in vals.items():
-                            cols_np[c][hit] = v
+                        for c, replacement in vals.items():
+                            for row_idx, value in zip(hit, replacement):
+                                values[c][int(row_idx)] = (np.nan if value is None else value)
                 drop |= here
             if len(released) and plan['mapping'] is not None:
                 inr = np.isin(frame, released) & mine
@@ -584,7 +597,19 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
                     sel = inr & (source == str(animal_ids[local]))
                     new_animal[sel] = str(animal_ids[logical])
         keep = ~drop
-        out = {c: cols_np[c][keep] for c in table.columns}
+        empty_dtypes = {pl.Int8: np.int8, pl.Int16: np.int16, pl.Int32: np.int32,
+                        pl.Int64: np.int64, pl.UInt8: np.uint8, pl.UInt16: np.uint16,
+                        pl.UInt32: np.uint32, pl.UInt64: np.uint64, pl.Boolean: np.bool_,
+                        pl.Float32: np.float32, pl.Float64: np.float64}
+        out = {}
+        for c in columns:
+            if isinstance(values[c], np.ndarray):
+                out[c] = values[c][keep]
+            elif not keep.any():
+                dtype = empty_dtypes.get(table[c].dtype, object)
+                out[c] = np.empty(0, dtype=dtype)
+            else:
+                out[c] = [value for value, keep_row in zip(values[c], keep) if keep_row]
         out['animal_id'] = new_animal[keep]
         write_table(f, out, dict_cols=DICT_COLS)
         counts[stem] = int(drop.sum())
@@ -622,12 +647,12 @@ def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
                 'segment, and without the window table it cannot be bridged first.')
         bridge_session(fill_dir, cfg, window_length)
     predictions, _ = load_predictions(path)
-    windows = pd.read_parquet(path / 'windows.pq')
+    windows = pl.read_parquet(path / 'windows.pq')
     epath = path / 'identity_events.pq'
     if not epath.exists():
         return {}
-    events = pd.read_parquet(epath)
-    if events.empty:
+    events = pl.read_parquet(epath)
+    if events.is_empty():
         return {}
     fill = None
     if fill_dir is not None:

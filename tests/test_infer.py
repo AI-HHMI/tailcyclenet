@@ -738,6 +738,26 @@ def test_carried_prior_is_bounds_masked_and_dated():
                         cgroup) == (None, None)
 
 
+def test_per_keypoint_seed_schedule_uses_individual_query_times():
+    """A seeded oracle can inject each keypoint at its own source frame in one window."""
+    from tailcyclenet.infer import _build_prior
+
+    K, size = 3, torch.tensor([100, 100], dtype=torch.int32)
+    cgroup = [{'size': size}]
+    cfg = InferConfig(anchor='labels')
+    frames = np.arange(0, 10)
+    boxes = [(0, 0, 100, 100)]
+    src = np.zeros((1, 10, K, 2), dtype=np.float32)
+    src[0, 0] = [[1, 1], [2, 2], [3, 3]]
+    seeds = torch.tensor([[11, 11], [22, 22], [33, 33]])
+    prior, qt = _build_prior(cfg, None, src, 0, 1, frames, boxes, [1.0], '2d', K, 2,
+                             cgroup, seeds, np.array([2, 7, 30]))
+    assert torch.equal(qt, torch.tensor([[2, 7, 0]], dtype=torch.int32))
+    assert torch.equal(prior[0, 0], seeds[0])
+    assert torch.equal(prior[0, 1], seeds[1])
+    assert torch.equal(prior[0, 2], torch.tensor([3., 3.]))
+
+
 def test_oracle_corrupt_near_picks_nearest_eligible_row():
     """`near` must pick the ELIGIBLE row closest to the target in the MODEL's own frame -- not
     the fixed `a + 1` row `other` uses -- and must be a NO-OP when nothing qualifies.

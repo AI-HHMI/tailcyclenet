@@ -64,11 +64,9 @@ def _paths_and_labels(path: Path):
         if xy.shape != (len(node_names), 2) or not np.isfinite(xy).all():
             raise RuntimeError(f'{path}: non-finite or wrong-shaped points at frame {int(frame["frame_id"])}')
         if not vis.any():
-            reason = ('all 8 points visible=false; empty-maze placeholder'
-                      if source_frame == 0 else
-                      'all 8 points visible=false; exact coordinate copy of frame 0')
             excluded.append({'source_video': source, 'source_frame': source_frame,
-                             'reason': reason})
+                             'reason': 'all 8 points visible=false; SLEAP placeholder instance, '
+                                      'not a label'})
             continue
         labels[source].append({'source_frame': source_frame, 'xy': xy, 'visible': vis})
     if len(excluded) != 4:

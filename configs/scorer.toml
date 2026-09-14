@@ -31,8 +31,9 @@
 # it for a box.
 #
 # The reference's corruption magnitudes are a STARTING POINT, not a default: they were tuned for
-# its 128 generic points on a different data distribution. Phase 5 measures the realised
-# displacement and the out-of-view fraction per type before any long run.
+# its 128 generic points on a different data distribution. These defaults scale the reference
+# values by approximately 3/5 in 3D and 2/3 in 2D, rounded to whole units. Phase 5 measures
+# the realised displacement and the out-of-view fraction per type before any long run.
 #
 # `annot_frac` is inert on a 100%-tracked root (3dpop and calms21 have an EMPTY annotated cell
 # before any filtering reaches it); allen-mouse-combined is where it is exercised, with 76
@@ -100,17 +101,17 @@ point_drop_bernoulli_rate = 0.2
 
 [scorer.corruption.mag_3d]
 # cube-scale units (~pixel-equivalent: world shift = mag * cube_scale)
-const_offset = 15.0
-frame_noise = 10.0
-gradual_drift = 24.0
-sinusoid = 16.0
+const_offset = 9.0
+frame_noise = 6.0
+gradual_drift = 14.0
+sinusoid = 10.0
 
 [scorer.corruption.mag_2d]
 # pixels at image_size 256
-const_offset = 10.0
-frame_noise = 8.0
-gradual_drift = 12.0
-sinusoid = 10.0
+const_offset = 7.0
+frame_noise = 5.0
+gradual_drift = 8.0
+sinusoid = 7.0
 
 [training]
 # A POSE run folder or checkpoint: a warm start, not a resume. Required.

@@ -465,19 +465,15 @@ def merge_blocks(blocks):
 
 @torch.no_grad()
 def run_group(model, session: Session, gid: str, registry, dataset_name: str,
-              cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None,
-              query_seed_coords=None, query_seed_frames=None) -> dict:
+              cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None) -> dict:
     """`run_blocks` for a whole group, merged. See both for what a block is."""
     return merge_blocks(run_blocks(model, session, gid, registry, dataset_name, cfg,
-                                   box_points=box_points, boxes_for=boxes_for, n_rows=n_rows,
-                                   query_seed_coords=query_seed_coords,
-                                   query_seed_frames=query_seed_frames))
+                                   box_points=box_points, boxes_for=boxes_for, n_rows=n_rows))
 
 
 @torch.no_grad()
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
-               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None,
-               query_seed_coords=None, query_seed_frames=None):
+               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None):
     """Predict every animal in one group, a block of windows at a time. Yields one dict per block.
 
     Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, not
@@ -508,8 +504,6 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     not the stop index, and `refine` is the resolved value.
     """
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
-    if (query_seed_coords is None) != (query_seed_frames is None):
-        raise ValueError('query_seed_coords and query_seed_frames must be supplied together')
     assert cfg.carry_source in CARRY_SOURCES, \
         f'carry_source must be one of {CARRY_SOURCES}, got {cfg.carry_source!r}'
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
@@ -544,12 +538,6 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     S = n_src if cfg.max_animals == 0 else min(n_src, cfg.max_animals)
     cam_ix = [0] if mode == '2d' else list(range(len(session.rig)))
     n_lab = 0 if src is None else len(src)
-    if query_seed_coords is not None:
-        query_seed_coords = np.asarray(query_seed_coords, dtype=np.float32)
-        query_seed_frames = np.asarray(query_seed_frames, dtype=np.int64)
-        if query_seed_coords.shape != (S, K, R) or query_seed_frames.shape != (S, K):
-            raise ValueError(f'query seed shapes must be {(S, K, R)} and {(S, K)}, got '
-                             f'{query_seed_coords.shape} and {query_seed_frames.shape}')
     animal_ids = ([f'det{a:02d}' for a in range(S)] if boxes_for is not None else
                   [lab.animal_ids[a] if a < len(lab.animal_ids) else f'det{a:02d}'
                    for a in range(S)])
@@ -747,10 +735,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         views = [crops[a, ci] for ci in use]
         if any(v is None for v in views):
             return None
-        prior, prompt_t = _build_prior(
-            cfg, carried[a], src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup,
-            None if query_seed_coords is None else query_seed_coords[a],
-            None if query_seed_frames is None else query_seed_frames[a])
+        prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
+                                       scales, mode, K, R, cgroup)
         if stats is not None and stats.get('capture_overlap_agreement') and prior is not None:
             _count_prior_oob(stats, a, int(frames[0]), prior)
         dev = cfg.device
@@ -1174,8 +1160,7 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales=None)
     return p + torch.as_tensor(float(amt) * width * v, dtype=p.dtype), 0
 
 
-def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup,
-                 seed_coords=None, seed_frames=None):
+def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup):
     """The per-keypoint prior for this window, in the model's coordinate frame.
 
     The prompt frame is not always 0: `carried[1]` holds the frame the carried pose describes,
@@ -1190,47 +1175,23 @@ def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R,
     """
     if cfg.anchor in ('none', 'self'):
         return None, None
-    seeded = seed_coords is not None or seed_frames is not None
-    if seeded and (seed_coords is None or seed_frames is None):
-        raise ValueError('seed_coords and seed_frames must be supplied together')
-    if seeded:
-        seed_coords = torch.as_tensor(seed_coords, dtype=torch.float32)
-        seed_frames = np.asarray(seed_frames, dtype=np.int64)
-        if seed_coords.shape != (K, R) or seed_frames.shape != (K,):
-            raise ValueError(f'seed shapes must be {(K, R)} and {(K,)}, got '
-                             f'{tuple(seed_coords.shape)} and {seed_frames.shape}')
-
     if cfg.anchor == 'labels':
         if src is None or a >= n_lab:
             return None, None
-        # With a per-keypoint schedule, the first pass uses source labels and subsequent
-        # windows carry the model output. A keypoint is reseeded exactly in the window that
-        # contains its own last-good frame.
-        if seeded and carried is not None:
-            p = carried[0].clone().float()
-            qt = torch.as_tensor(carried[1] - int(frames[0]), dtype=torch.int64).repeat(K)
-        else:
-            p, label_qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales)
-            if p is None:
-                return None, None
-            qt = torch.full((K,), int(label_qt), dtype=torch.int64)
-        if seeded:
-            p = p.clone()
-            for k, sf in enumerate(seed_frames):
-                if int(frames[0]) <= int(sf) < int(frames[-1]) + 1:
-                    p[k] = seed_coords[k]
-                    qt[k] = int(sf) - int(frames[0])
+        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales)
+        if p is None:
+            return None, None
     else:
         if carried is None:
             return None, None
         p = carried[0].clone().float()
-        qt = torch.as_tensor(carried[1] - int(frames[0]), dtype=torch.int64).repeat(K)
-        if int(qt.min()) < 0:
+        qt = int(carried[1]) - int(frames[0])
+        if qt < 0:
             return None, None
     if p.shape != (K, R):
         return None, None
     p = _prior_to_model_frame(p, mode, boxes, scales)
     p = p.clone()
     p[prior_out_of_bounds(p, mode, cgroup)] = float('nan')
-    qt = qt.clamp(0, len(frames) - 1)
-    return p[None], qt[None].to(torch.int32)
+    qt = min(max(qt, 0), len(frames) - 1)
+    return p[None], torch.full((1, K), qt, dtype=torch.int32)

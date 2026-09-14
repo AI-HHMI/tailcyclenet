@@ -32,6 +32,9 @@ MISSING_OK = {
     'allen-mouse-annotated': ('keypoints', 'points3d'),
     # APT's Inf sentinel (fully occluded) stays `missing`; its NaN skip stays absent.
     'rat-city-annotated': ('keypoints',),
+    # SLEAP's per-point `visible=False` is an annotator occlusion judgement; the position it
+    # keeps is stale, so the row is `missing` rather than `projected`.
+    'comrie-minimaze': ('keypoints',),
 }
 
 # root -> {table: exact hole count}, summed over every session in the root, checked only for

@@ -163,6 +163,68 @@ def test_smoothness_metrics_reach_wandb_and_preserve_zero_values():
                           'train/smoothness_2d_loss': 0.0}, 20)]
 
 
+def test_train_metrics_match_validation_metric_names_and_drop_nonfinite(monkeypatch):
+    """A training forward exposes the scalar validation metrics, including Jaccard thresholds."""
+    tr = _train_module()
+    batch = _batch()
+    out = {
+        'coords_pred': torch.zeros_like(batch.coords),
+        'vis_pred': torch.zeros(*batch.coords.shape[:-1], 1),
+    }
+    values = tr.train_metrics(out, batch)
+    assert set(values) == set(tr._TRAIN_METRIC_KEYS)
+    assert all(isinstance(value, float) and value == value for value in values.values())
+    assert tr.train_metrics({'coords_pred': out['coords_pred']}, batch) == {}
+
+    from posetail.posetail import eval_metrics
+    monkeypatch.setattr(eval_metrics, 'get_eval_metrics',
+                        lambda **kwargs: {'mpjpe': 0.0, 'mte': float('nan'),
+                                          'jaccard_1': float('inf')})
+    assert tr.train_metrics(out, batch) == {'mpjpe': 0.0}
+
+
+def test_metric_log_values_keep_zero_and_separate_modes():
+    tr = _train_module()
+    stats = {mode: {key: [0.0, 0] for key in tr._TRAIN_METRIC_KEYS}
+             for mode in tr._TRAIN_METRIC_MODES}
+    stats['3d']['mpjpe'] = [0.0, 2]
+    stats['2d']['mpjpe'] = [6.0, 2]
+    values = tr._metric_log_values(stats)
+    assert values['train/3d/mpjpe'] == 0.0
+    assert values['train/2d/mpjpe'] == 3.0
+    assert 'train/3d/mte' not in values
+
+
+def test_metric_log_reduces_fixed_shape_even_when_a_rank_has_no_metrics():
+    """Rank-local NaNs must not change the collective shape or deadlock DDP."""
+    tr = _train_module()
+
+    class FakeFabric:
+        world_size = 2
+        device = 'cpu'
+
+        def __init__(self):
+            self.calls = 0
+            self.numel = None
+
+        def all_reduce(self, tensor, reduce_op):
+            assert reduce_op == 'sum'
+            self.calls += 1
+            self.numel = tensor.numel()
+            return tensor
+
+    full = {mode: {key: [0.0, 0] for key in tr._TRAIN_METRIC_KEYS}
+            for mode in tr._TRAIN_METRIC_MODES}
+    full['3d']['mpjpe'] = [1.0, 1]
+    empty = {mode: {} for mode in tr._TRAIN_METRIC_MODES}
+    fabric_full, fabric_empty = FakeFabric(), FakeFabric()
+    tr._metric_log_values(full, fabric_full)
+    tr._metric_log_values(empty, fabric_empty)
+    expected = 2 * len(tr._TRAIN_METRIC_KEYS) * len(tr._TRAIN_METRIC_MODES)
+    assert fabric_full.calls == fabric_empty.calls == 1
+    assert fabric_full.numel == fabric_empty.numel == expected
+
+
 def test_smoothness_log_reduces_finite_sum_and_count_on_every_rank():
     """The W&B value is count-weighted and rank 0 may have no local samples."""
     tr = _train_module()
@@ -176,9 +238,10 @@ def test_smoothness_log_reduces_finite_sum_and_count_on_every_rank():
 
         def all_reduce(self, tensor, reduce_op):
             assert reduce_op == 'sum'
-            result = ((10.0, 4.0), (6.0, 2.0))[self.calls]
+            result = torch.zeros_like(tensor)
+            result[:4] = torch.tensor((10.0, 4.0, 6.0, 2.0), dtype=tensor.dtype)
             self.calls += 1
-            return torch.tensor(result, dtype=tensor.dtype)
+            return result
 
     fabric = FakeFabric()
     values = tr._smoothness_log_values({
@@ -190,7 +253,7 @@ def test_smoothness_log_reduces_finite_sum_and_count_on_every_rank():
         'train/smoothness_3d_loss': 2.5,
         'train/smoothness_2d_loss': 3.0,
     }
-    assert fabric.calls == 2, 'all ranks must participate even with empty local histories'
+    assert fabric.calls == 1, 'all ranks must participate even with empty local histories'
     assert tr._smoothness_log_values({
         'smoothness_3d_loss': (0.0, 0),
         'smoothness_2d_loss': (0.0, 0),
@@ -338,8 +401,8 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
 # -- config guards -----------------------------------------------------------------------------
 
 KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision', 'max_grad_norm',
-                  'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq', 'out', 'optimizer',
-                  'losses'}
+                  'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq', 'train_metric_freq',
+                  'out', 'optimizer', 'losses'}
 
 
 def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overwrite_it():

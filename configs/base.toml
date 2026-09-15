@@ -95,6 +95,8 @@ checkpoint_freq = 1000
 val_freq = 200
 val_batches = 20
 print_freq = 20
+# Evaluate accepted forwards (total frequency across ranks; 0 disables); train/2d/* are pixels, train/3d/* world units; local B=1,T=12,K=47 pass ~2.9 ms.
+train_metric_freq = 1
 # `freeze_encoder` was REMOVED -- [model].video_encoder_requires_grad is the only statement of the encoder's gradient state; naming the old key is refused.
 
 [training.optimizer]

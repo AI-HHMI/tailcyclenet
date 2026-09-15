@@ -185,6 +185,35 @@ def _tune_smoothness(loss_fn, T, stride=1):
 
 
 _SMOOTHNESS_KEYS = ('smoothness_3d_loss', 'smoothness_2d_loss')
+# Scalar outputs shared with validation; delta_x_1..16 are per-batch arrays and are omitted by
+# the same scalar filter. The visibility-based 2D values are diagnostic only: that head has no
+# gradient when vis_loss_2d_weight is 0 (the shipped default).
+_TRAIN_METRIC_KEYS = (
+    'mte', 'delta_x_avg', 'occlusion_acc', 'avg_jaccard', 'survival_rate', 'mpjpe',
+    'jaccard_1', 'jaccard_2', 'jaccard_4', 'jaccard_8', 'jaccard_16',
+)
+_TRAIN_METRIC_MODES = ('2d', '3d')
+
+
+@torch.no_grad()
+def train_metrics(out, batch):
+    """Return finite pose metrics for one accepted training forward.
+
+    These are the same metrics as validation, but the training forward uses the batch's
+    ground-truth prompt.  They are therefore an easier, prompt-conditioned diagnostic and
+    must not be compared directly with ``val/`` or ``val_self/``.  Metrics are kept separate
+    by mode because 2D values are pixels while 3D values are world units.
+    """
+    if 'vis_pred' not in out or 'coords_pred' not in out:
+        return {}
+    from posetail.posetail.eval_metrics import get_eval_metrics, get_vis_true
+
+    coords = batch.coords
+    vis_true = batch.vis if batch.vis is not None else get_vis_true(coords)
+    metrics = get_eval_metrics(vis_pred=out['vis_pred'], vis_true=vis_true,
+                               coords_pred=out['coords_pred'], coords_true=coords, prefix='')
+    return {k: float(v) for k, v in metrics.items()
+            if k in _TRAIN_METRIC_KEYS and np.ndim(v) == 0 and np.isfinite(v)}
 
 
 def _clear_loss_history(loss_fn):
@@ -210,23 +239,44 @@ def _drain_smoothness(loss_fn):
     return stats
 
 
-def _smoothness_log_values(stats, fabric=None):
-    """Reduce finite sums/counts and return interval means for the W&B payload.
+def _interval_means(stats, keys, prefix, fabric=None):
+    """Reduce finite sum/count pairs and return count-weighted interval means.
 
-    Every rank calls this at the print boundary, including ranks with no valid samples.  A metric
-    is omitted only when its global finite count is zero; genuine zero-valued terms are retained.
+    The reduction is one fixed-size collective so every rank participates even when its local
+    interval has no samples.  A metric is omitted only when its global count is zero; genuine
+    zero-valued terms are retained.
     """
+    keys = tuple(keys)
+    if fabric is not None and fabric.world_size > 1:
+        local = []
+        for key in keys:
+            total, count = stats.get(key, (0.0, 0))
+            local.extend((total, float(count)))
+        reduced = fabric.all_reduce(
+            torch.tensor(local, dtype=torch.float64, device=fabric.device), reduce_op='sum')
+        stats = {key: (float(reduced[2 * i]), int(round(float(reduced[2 * i + 1]))))
+                 for i, key in enumerate(keys)}
     values = {}
-    for name in _SMOOTHNESS_KEYS:
-        total, count = stats.get(name, (0.0, 0))
-        if fabric is not None and fabric.world_size > 1:
-            reduced = fabric.all_reduce(
-                torch.tensor([total, float(count)], dtype=torch.float64, device=fabric.device),
-                reduce_op='sum')
-            total, count = float(reduced[0]), int(round(float(reduced[1])))
+    for key in keys:
+        total, count = stats.get(key, (0.0, 0))
         if count:
-            values[f'train/{name}'] = total / count
+            values[f'{prefix}{key}'] = total / count
     return values
+
+
+def _smoothness_log_values(stats, fabric=None):
+    """Reduce smoothness samples and return interval means for the W&B payload."""
+    return _interval_means(stats, _SMOOTHNESS_KEYS, 'train/', fabric)
+
+
+def _metric_log_values(stats, fabric=None):
+    """Return mode-separated training metric interval means for W&B."""
+    flat = {f'{mode}/{key}': pair for mode in _TRAIN_METRIC_MODES
+            for key, pair in stats.get(mode, {}).items()}
+    return _interval_means(flat,
+                           tuple(f'{mode}/{key}' for mode in _TRAIN_METRIC_MODES
+                                 for key in _TRAIN_METRIC_KEYS),
+                           'train/', fabric)
 
 
 def run_batch(model, loss_fn, batch, device, raw=None):
@@ -408,6 +458,7 @@ def main(argv: list[str] | None = None):
       the resume replay and after an unfreeze.
     - The resolved `box_source`, optimizer kind and world size are recorded in
       `provenance.toml`; metrics always go to log.jsonl.
+    - `train/{2d,3d}/*` uses the batch's GT prompt (`kpt_prior`/`prompt_t`); `val/*` is prompt-free, so do not plot them on one axis.
     - Every frequency is a total across ranks; `step` is this rank's local count,
       `it = step * world` global; a skipped step is a collective decision.
       `grad_norm` is the clipped AdamW half only; `saved_mpjpe` is the metric of
@@ -461,7 +512,7 @@ def main(argv: list[str] | None = None):
     device = fabric.device
     known_training = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision',
                       'max_grad_norm', 'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq',
-                      'out', 'optimizer', 'losses'}
+                      'train_metric_freq', 'out', 'optimizer', 'losses'}
     unknown_training = set(train_cfg) - known_training - {'freeze_encoder'}
     if unknown_training:
         raise SystemExit(
@@ -705,6 +756,11 @@ def main(argv: list[str] | None = None):
     step = dist_utils.ceil_div(start_it, world)
     it, skipped, t0, running, clipped = step * world, 0, time.time(), [], []
     smoothness_running = {name: [0.0, 0] for name in _SMOOTHNESS_KEYS}
+    metrics_running = {
+        mode: {name: [0.0, 0] for name in _TRAIN_METRIC_KEYS}
+        for mode in _TRAIN_METRIC_MODES}
+    metric_freq = int(train_cfg.get('train_metric_freq', 1))
+    local_metric_freq = dist_utils.per_rank(metric_freq, world) if metric_freq else 0
     best_mpjpe, best_iter, saved_mpjpe = float('inf'), start_it, float('inf')
     if start_it and log_path.exists():
         prev = [json.loads(ln) for ln in log_path.read_text().splitlines() if ln.strip()]
@@ -744,7 +800,7 @@ def main(argv: list[str] | None = None):
                                  f'tensor(s) -- the encoder is in the reducer from here',
                                  flush=True)
                     record({'iter': it, 'ddp_rewrapped': True})
-            loss, _ = run_batch(model, loss_fn, batch, device, raw=raw)
+            loss, out = run_batch(model, loss_fn, batch, device, raw=raw)
             if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(loss))):
                 _drain_smoothness(loss_fn)
                 skipped += 1
@@ -767,6 +823,12 @@ def main(argv: list[str] | None = None):
                 continue
             opt.step()
             running.append(dist_utils.all_ranks_mean(fabric, float(loss.detach())))
+            if local_metric_freq and step % local_metric_freq == 0:
+                bucket = metrics_running.get(batch.sample_info['mode'])
+                if bucket is not None:
+                    for name, value in train_metrics(out, batch).items():
+                        bucket[name][0] += value
+                        bucket[name][1] += 1
             for name, (total, count) in _drain_smoothness(loss_fn).items():
                 smoothness_running[name][0] += total
                 smoothness_running[name][1] += count
@@ -787,6 +849,7 @@ def main(argv: list[str] | None = None):
                              f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                              f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
                 smoothness = _smoothness_log_values(smoothness_running, fabric)
+                train_metric_values = _metric_log_values(metrics_running, fabric)
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
                          'train/grad_norm_muon': float(mgn),
                          'train/iteration': it,
@@ -797,8 +860,12 @@ def main(argv: list[str] | None = None):
                          'train/eval_frac': eval_frac,
                          'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
                          'train/skipped_frac': skipped / max(step, 1),
-                         'train/world_size': world, **smoothness}, it)
+                         'train/world_size': world, **smoothness, **train_metric_values}, it)
+                record({'iter': it, 'train': train_metric_values})
                 smoothness_running = {name: [0.0, 0] for name in _SMOOTHNESS_KEYS}
+                metrics_running = {
+                    mode: {name: [0.0, 0] for name in _TRAIN_METRIC_KEYS}
+                    for mode in _TRAIN_METRIC_MODES}
                 running, t0 = [], time.time()
                 waited[0] = evalled[0] = ckpted[0] = 0.0
 

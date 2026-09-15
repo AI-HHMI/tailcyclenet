@@ -12,6 +12,8 @@ while `kpt_ids` does not -- batching the ids early made them `[1, 1, K]` and tri
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+import polars as pl
 import torch
 
 import tailcyclenet.scorer.qc as qc
@@ -119,6 +121,7 @@ def test_get_once_does_not_retry_a_failed_index():
 
 def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
     """A failed requested window is coverage, never a random group's score."""
+
     sess = SimpleNamespace(session_id='sess', names=['k'])
     sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
 
@@ -157,3 +160,108 @@ def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
     assert coverage == [{'index': 0, 'session': 'sess', 'group': 'target', 'animal': 'a0',
                          'start': 0, 'status': 'unscorable',
                          'reason': 'item_build_failed'}]
+
+
+def test_score_root_forwards_explicit_checkpoint_and_records_iteration(monkeypatch, tmp_path):
+    """An explicitly selected checkpoint reaches the loader and output metadata sink."""
+    checkpoint = tmp_path / 'checkpoint_best.pth'
+    torch.save({'iteration': 37}, checkpoint)
+    calls = {}
+
+    class FakeDataset:
+        registry = SimpleNamespace(names=['k'])
+        index = []
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 0
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    def fake_load(*args, **kwargs):
+        calls.update(kwargs)
+        return FakeModel(), {}, SimpleNamespace(names=['k']), checkpoint
+
+    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    monkeypatch.setattr(qc, 'load_scorer_run', fake_load)
+    info = {}
+    table, _registry, _config = qc.score_root(
+        Path('run'), 'data', 'test', checkpoint='checkpoint_best.pth', checkpoint_info=info)
+
+    assert table.is_empty()
+    assert calls == {'checkpoint': 'checkpoint_best.pth', 'device': 'cpu'}
+    assert info == {'checkpoint_file': str(checkpoint), 'checkpoint_iteration': 37}
+
+
+def test_score_root_omits_checkpoint_selection_by_default(monkeypatch):
+    """No selection remains the loader's existing latest/last behavior, not implicit best."""
+    calls = {}
+
+    class FakeDataset:
+        registry = SimpleNamespace(names=['k'])
+        index = []
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 0
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    def fake_load(*args, **kwargs):
+        calls.update(kwargs)
+        return FakeModel(), {}, SimpleNamespace(names=['k']), SimpleNamespace(name='checkpoint_last.pth')
+
+    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    monkeypatch.setattr(qc, 'load_scorer_run', fake_load)
+    qc.score_root(Path('run'), 'data', 'test')
+
+    assert calls == {'checkpoint': None, 'device': 'cpu'}
+
+
+def test_score_root_explicit_missing_checkpoint_raises(monkeypatch):
+    """The loader's explicit-file refusal is not swallowed by QC."""
+    def fake_load(*_args, **kwargs):
+        raise FileNotFoundError(kwargs['checkpoint'])
+
+    monkeypatch.setattr(qc, 'load_scorer_run', fake_load)
+    with pytest.raises(FileNotFoundError, match='missing.pth'):
+        qc.score_root(Path('run'), 'data', 'test', checkpoint='missing.pth')
+
+
+def test_write_outputs_records_checkpoint_provenance(monkeypatch, tmp_path):
+    """The output records the resolved file and the checkpoint's training iteration."""
+    import toml
+
+    monkeypatch.setattr(qc, 'provenance', lambda: {})
+    qc.write_outputs(tmp_path, pl.DataFrame({'score': [1.0]}), Path('run'), 'data', 'test',
+                     'report', checkpoint_file=Path('/runs/checkpoint_best.pth'),
+                     checkpoint_iteration=37)
+    result = toml.load(tmp_path / 'provenance.toml')
+    assert result['checkpoint_file'] == '/runs/checkpoint_best.pth'
+    assert result['checkpoint_iteration'] == 37
+
+
+def test_score_session_help_requires_explicit_best_checkpoint(capsys):
+    """The CLI documents that validation-selected best is never implicit."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location('score_session_cli', 'scripts/score_session.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pytest.raises(SystemExit):
+        module.main(['--help'])
+    help_text = capsys.readouterr().out
+    assert '--checkpoint' in help_text
+    assert 'checkpoint_best.pth' in help_text
+    assert 'validation-selected' in help_text
+    assert 'explicitly named' in help_text

@@ -120,7 +120,8 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
 
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
                window_offset: int | None = None, val_stride: int | None = None,
-               spans: dict | None = None, coverage: list[dict] | None = None) -> tuple:
+               spans: dict | None = None, coverage: list[dict] | None = None, *,
+               checkpoint_info: dict | None = None, checkpoint: str | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
@@ -131,13 +132,21 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             spacing, defaulting to the run's `n_frames` (non-overlapping); spans -- restrict
             scoring to windows starting inside a frame range, as {(session, group, animal):
             (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable;
-            coverage -- optional list populated with one record per requested window.
+            coverage -- optional list populated with one record per requested window; checkpoint --
+            an explicit checkpoint filename passed to the scorer loader (for example
+            ``checkpoint_best.pth``); checkpoint_info -- optional mutable mapping populated with
+            the resolved checkpoint file and training iteration for output provenance.
     The session for each row comes from the index entry: coordinates and keypoint ids retain the
     session's own name order, which may reorder or subset the dataset registry.
     Outputs: (Polars DataFrame of per-keypoint scores, the scorer's registry, the run's config).
     Side effects: decodes video frames; puts the model in eval mode.
     """
-    model, config, registry, ckpt = load_scorer_run(Path(run), device=device)
+    model, config, registry, ckpt = load_scorer_run(
+        Path(run), checkpoint=checkpoint, device=device)
+    if checkpoint_info is not None:
+        checkpoint_info['checkpoint_file'] = str(ckpt)
+        checkpoint_data = torch.load(ckpt, map_location='cpu', weights_only=False)
+        checkpoint_info['checkpoint_iteration'] = checkpoint_data.get('iteration')
     lc = _loader_config(config)
     if window_offset is not None:
         lc = replace(lc, val_offset=int(window_offset))
@@ -300,11 +309,15 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
 
 
 def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: str,
-                  report: str, coverage: list[dict] | None = None) -> None:
+                  report: str, coverage: list[dict] | None = None, *,
+                  checkpoint_file: str | Path | None = None,
+                  checkpoint_iteration: int | None = None) -> None:
     """Write `scores.pq`, `report.txt` and `provenance.toml` under `out`.
 
     Inputs: out -- the output directory; table -- the score DataFrame; run -- the scorer run;
-            data -- the scored root; split -- the split scored; report -- the ranking text.
+            data -- the scored root; split -- the split scored; report -- the ranking text;
+            checkpoint_file -- resolved scorer checkpoint path; checkpoint_iteration -- its
+            recorded training iteration.
     Outputs: none.
     Side effects: creates `out` and writes three files plus `coverage.csv` when coverage is
         supplied. The scored root is not touched. The Parquet output keeps the historical Snappy
@@ -315,10 +328,15 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
     out.mkdir(parents=True, exist_ok=True)
     table.write_parquet(out / 'scores.pq', compression='snappy')
     (out / 'report.txt').write_text(report + '\n')
-    (out / 'provenance.toml').write_text(toml.dumps({
+    output_provenance = {
         **provenance(), 'scorer_run': str(run), 'source_root': str(data), 'split': split,
         'n_rows': int(len(table)),
-    }))
+    }
+    if checkpoint_file is not None:
+        output_provenance['checkpoint_file'] = str(checkpoint_file)
+    if checkpoint_iteration is not None:
+        output_provenance['checkpoint_iteration'] = int(checkpoint_iteration)
+    (out / 'provenance.toml').write_text(toml.dumps(output_provenance))
     if coverage is not None:
         coverage_columns = ['index', 'session', 'group', 'animal', 'start', 'status', 'reason']
         pl.DataFrame(coverage, schema=coverage_columns).write_csv(out / 'coverage.csv')

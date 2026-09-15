@@ -18,6 +18,9 @@ def main(argv=None):
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', required=True, help='a scorer run folder')
+    parser.add_argument('--checkpoint', default=None,
+                        help='checkpoint filename; checkpoint_best.pth is validation-selected and '
+                             'must be explicitly named')
     parser.add_argument('--data', required=True, help='the tracked root to score')
     parser.add_argument('--split', default='test', help='which split of --data to score')
     parser.add_argument('--out', required=True, help='where the QC artefacts go')
@@ -42,12 +45,16 @@ def main(argv=None):
                 lo = int(r['span_start'])
                 spans[(r['session'], r['group'], str(r['animal']))] = (lo, lo + int(r['span_len']))
     coverage = []
-    table, _registry, _config = score_root(Path(args.run), args.data, args.split,
-                                          args.device, args.limit,
-                                          args.window_offset, args.val_stride, spans, coverage)
+    checkpoint_info = {}
+    table, _registry, _config = score_root(
+        Path(args.run), args.data, args.split, args.device, args.limit,
+        args.window_offset, args.val_stride, spans, coverage,
+        checkpoint=args.checkpoint, checkpoint_info=checkpoint_info)
     report = rank(table, args.top)
     print(report)
-    write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage)
+    write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage,
+                  checkpoint_file=checkpoint_info.get('checkpoint_file'),
+                  checkpoint_iteration=checkpoint_info.get('checkpoint_iteration'))
     return 0
 
 

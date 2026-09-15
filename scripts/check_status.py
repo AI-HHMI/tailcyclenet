@@ -43,6 +43,8 @@ HOLE_EXEMPTIONS = {
     # APT's `NaN` (annotator skip) stays absent -- `missing` would claim an assessment nobody
     # made; the `Inf` sentinel is already counted in MISSING_OK.
     'rat-city-annotated': {'keypoints': 220},
+    # APTv2 COCO v==0 is a zero triplet that asserts nothing was assessed; it becomes no row.
+    'apt-v2': {'keypoints': 387928},
     # 1-view and over-gate triangulations are left as no row; the 0-view-all-assessed case is the
     # 178 `missing` rows counted in MISSING_OK, not a hole.
     'allen-mouse-annotated': {'points3d': 211},

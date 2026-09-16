@@ -517,15 +517,26 @@ class PoseScorer(PoseTrackerEncoder):
             self.query_encoder._query_ok = None
             self.query_encoder._box_prompt = None
 
-    def forward(self, views, coords, camera_group, kpt_ids, kpt_chunk=None, occlusion=None):
-        """Single-sample inference path.
+    def forward(self, views, coords=None, camera_group=None, kpt_ids=None, kpt_chunk=None,
+                occlusion=None):
+        """Single-sample inference or DDP-visible triplet path.
 
-        Inputs: views -- list of [b,t,h,w,c] uint8 or float; coords -- [b,t,k,R]; camera_group --
-                posetail cameras; kpt_ids -- [b,k] global registry ids (see `score`).
-        Outputs: (scores [b,k], precision [b,k]) in sequence mode, or
-            (scores [b,t,k], precision [b,t,k]) in frame mode.
-        Side effects: none beyond `score`'s temporary stashes.
+        Passing a triplet dictionary dispatches to ``score_triplet`` through ``forward`` so a
+        DistributedDataParallel wrapper sees the complete graph and synchronizes its gradients.
+        The ordinary inference signature remains unchanged.
         """
+        if isinstance(views, dict) and coords is None:
+            result = self.score_triplet(views)
+            # Frame loss owns a learnable calibration scalar but is called outside this module's
+            # forward.  Keep it in the forward graph (with zero value) so DDP does not classify it
+            # as unused and then reject its real gradient in the external loss call.
+            frame_loss = getattr(self, 'frame_loss', None)
+            scale = getattr(frame_loss, 'pointwise_log_scale', None)
+            if scale is not None:
+                scores, precision, labels = result
+                scores = scores + scale.to(dtype=scores.dtype, device=scores.device) * 0.0
+                result = scores, precision, labels
+            return result
         views_norm = self._normalize_views(views)
         scene_features = self.encode_scene(views_norm)
         return self.score(views_norm, scene_features, coords, camera_group, kpt_ids,

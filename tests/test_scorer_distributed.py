@@ -24,6 +24,33 @@ def test_scorer_rank_sampler_is_replacement_and_rank_seeded():
     assert list(a.sampler) != list(b.sampler)
 
 
+def test_scorer_loader_uses_separate_train_and_validation_workers():
+    class D(torch.utils.data.Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, index): return index
+
+    cfg = {'data': {'num_workers': 2, 'val_num_workers': 1, 'prefetch_factor': 1,
+                    'worker_cv_threads': 2}}
+    train, val = scorer_train._loaders(D(), D(), cfg, 23, world=4, rank=0, num_samples=5)
+    assert train.num_workers == 2
+    assert val.num_workers == 1
+    assert train.prefetch_factor == val.prefetch_factor == 1
+    assert not train.pin_memory and not val.pin_memory
+    assert train.persistent_workers and val.persistent_workers
+
+
+def test_scorer_loader_allows_open_cv_default_without_workers():
+    class D(torch.utils.data.Dataset):
+        def __len__(self): return 1
+        def __getitem__(self, index): return index
+
+    train, val = scorer_train._loaders(
+        D(), D(), {'data': {'num_workers': 0, 'val_num_workers': 0,
+                             'worker_cv_threads': 0}}, 23, world=1, num_samples=1)
+    assert train.num_workers == val.num_workers == 0
+    assert train.prefetch_factor is None and val.prefetch_factor is None
+
+
 def test_scorer_absolute_rates_scale_only_with_world():
     cfg = {'learning_rate': 1e-4, 'kpt_lr': 5e-4, 'encoder_lr_scale': .1}
     got = dist_utils.scale_optimizer_cfg(cfg, 4)

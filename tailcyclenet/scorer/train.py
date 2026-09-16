@@ -19,6 +19,7 @@ import sys
 import time
 import tomllib
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -277,7 +278,8 @@ def loader_config(data_cfg: dict, model_cfg: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming the unknown keys.
     """
-    known = set(LoaderConfig.__dataclass_fields__) | {'path', 'num_workers'}
+    known = set(LoaderConfig.__dataclass_fields__) | {
+        'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
     unknown = set(data_cfg) - known
     if unknown:
         raise SystemExit(
@@ -364,22 +366,52 @@ def timed(loader, wait: list[float]):
         yield item
 
 
+def scorer_worker_init(worker_id: int, *, cv_threads: int = 2):
+    """Initialise a scorer worker without disabling useful OpenCV parallelism.
+
+    NumPy's scorer RNG retains the existing worker-specific seed.  Torch's intra-op pool is
+    limited to one thread because each worker already has its own decode/transform work.  OpenCV
+    remains parallel at two threads by default (rather than being forced to one); callers can set
+    ``worker_cv_threads=0`` to leave OpenCV's own default untouched or choose another small value.
+    """
+    seed_worker(worker_id)
+    torch.set_num_threads(1)
+    cv_threads = int(cv_threads)
+    if cv_threads < 0:
+        raise ValueError(f'worker_cv_threads must be >= 0, got {cv_threads}')
+    if cv_threads:
+        import cv2
+        cv2.setNumThreads(cv_threads)
+
+
 def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
              rank: int = 0, num_samples: int | None = None,
              val_indices: list[int] | None = None):
     """Build rank-local loaders; one triplet (batch=1) is the per-rank batch.
 
     Distributed training uses independent rank-seeded replacement streams, giving the world-size
-    batch without replaying a shuffle permutation.  Validation receives a deterministic strided
-    shard; callers gather its sufficient metrics before selecting a checkpoint.
+    batch without replaying a shuffle permutation. Validation receives a deterministic strided
+    shard; callers gather its sufficient metrics before selecting a checkpoint. Train and
+    validation worker counts are separate because validation is small but should remain asynchronous.
     """
-    nw = int(config['data'].get('num_workers', 8))
+    data_cfg = config['data']
+    nw = int(data_cfg.get('num_workers', 2))
+    val_nw = int(data_cfg.get('val_num_workers', 1))
+    prefetch = int(data_cfg.get('prefetch_factor', 1))
+    cv_threads = int(data_cfg.get('worker_cv_threads', 2))
+    if nw < 0 or val_nw < 0:
+        raise ValueError(f'worker counts must be >= 0, got train={nw}, val={val_nw}')
+    if prefetch < 1:
+        raise ValueError(f'prefetch_factor must be >= 1, got {prefetch}')
+    if cv_threads < 0:
+        raise ValueError(f'worker_cv_threads must be >= 0, got {cv_threads}')
+    worker_init = partial(scorer_worker_init, cv_threads=cv_threads)
     # Distributed scorer samples can contain clamp-pad views with overlapping strides; PyTorch's
-    # pin-memory walker refuses those views.  DDP already transfers one triplet per rank directly,
+    # pin-memory walker refuses those views. DDP already transfers one triplet per rank directly,
     # so disable pinning only for the sharded path and preserve the one-GPU loader unchanged.
     kwargs = dict(batch_size=1, collate_fn=scorer_collate, num_workers=nw,
-                  prefetch_factor=2 if nw else None, persistent_workers=bool(nw),
-                  pin_memory=(world == 1), worker_init_fn=seed_worker)
+                  prefetch_factor=prefetch if nw else None, persistent_workers=bool(nw),
+                  pin_memory=(world == 1), worker_init_fn=worker_init)
     if world > 1:
         gen = torch.Generator().manual_seed(int(seed) + int(rank))
         kwargs['sampler'] = StepSampler(len(train_ds), int(num_samples), generator=gen)
@@ -391,9 +423,9 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
     if val_indices is not None:
         val_ds = torch.utils.data.Subset(val_ds, val_indices)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=scorer_collate,
-                            num_workers=nw, prefetch_factor=2 if nw else None,
-                            persistent_workers=bool(nw), pin_memory=(world == 1),
-                            worker_init_fn=seed_worker)
+                            num_workers=val_nw, prefetch_factor=prefetch if val_nw else None,
+                            persistent_workers=bool(val_nw), pin_memory=(world == 1),
+                            worker_init_fn=worker_init)
     return train_loader, val_loader
 
 
@@ -895,6 +927,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                         'output_granularity': output_granularity}
     if data_path:
         config['data'] = {**config['data'], 'path': data_path}
+    if num_workers is not None:
+        config['data'] = {**config['data'], 'num_workers': int(num_workers)}
     train_cfg = config['training']
     seed = int(train_cfg.get('seed', 23))
     torch.manual_seed(seed)
@@ -950,6 +984,32 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         world_size=world)
     if fabric is not None:
         dist_utils.check_registry(fabric, registry.names)
+
+    # Build and start DataLoader workers before allocating the model on CUDA.  The dense label
+    # arrays are intentionally parent-built so fork workers can share them copy-on-write; starting
+    # them after CUDA setup risks private native/CUDA heaps in each worker.  The iterator is retained
+    # by DataLoader when persistent_workers=True and is reused by the training loop below.
+    val_batches = int(train_cfg.get('val_batches', 20))
+    n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
+    val_indices = None
+    if val_ds is not None:
+        n_val = min(dist_utils.per_rank(val_batches, world), len(val_ds))
+        val_indices = ([int(i) for i in np.unique(
+            np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
+                       if n_val else [])
+    train_loader, val_loader = _loaders(
+        train_ds, val_ds, config, seed, world=world, rank=(fabric.global_rank if fabric else 0),
+        num_samples=dist_utils.ceil_div(n_target, world), val_indices=val_indices)
+    if train_loader.num_workers or (val_loader is not None and val_loader.num_workers):
+        iter(train_loader)
+        if val_loader is not None and val_loader.num_workers:
+            iter(val_loader)
+        if is0:
+            print(f'loader workers: train={train_loader.num_workers} '
+                  f'val={val_loader.num_workers if val_loader is not None else 0} '
+                  f'prefetch={config["data"].get("prefetch_factor", 1)} '
+                  '(started before model CUDA allocation)')
+
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
                          registry.n_keypoints, **scorer_kwargs(config)).to(device)
     loss_fn = build_scorer_loss(config, output_granularity)
@@ -1015,9 +1075,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     if output_granularity == 'frame':
         val_loss_fn.pointwise_log_scale = model.frame_loss.pointwise_log_scale
 
-    n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
-    if num_workers is not None:
-        config['data'] = {**config['data'], 'num_workers': int(num_workers)}
     prior_world = prior_provenance(out).get('world_size')
     if prior_world and int(prior_world) != world and fabric is not None:
         fabric.print(f'WARNING: run folder was written by {prior_world} rank(s), this run has '
@@ -1031,25 +1088,13 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         fabric.barrier()
     wb = None if no_wandb or not is0 else init_wandb(config, out)
     val_freq = int(train_cfg.get('val_freq', 200))
-    val_batches = int(train_cfg.get('val_batches', 20))
     ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
     print_freq = int(train_cfg.get('print_freq', 20))
     max_norm = float(train_cfg.get('max_grad_norm', 10.0))
     start_iter = int(resume_state.get('iteration', 0)) if resume_state else 0
     n_iter = max(0, n_target - start_iter)
-    local_iters = dist_utils.ceil_div(n_target, world)
-    # Validation is a fixed deterministic set, sharded across ranks.  A frame metric is gathered
+    # Validation is a fixed deterministic set, sharded across ranks. A frame metric is gathered
     # below before selection, so each rank sees exactly the same checkpoint decision.
-    val_indices = None
-    if val_ds is not None:
-        n_val = min(dist_utils.per_rank(val_batches, world), len(val_ds))
-        val_indices = ([int(i) for i in np.unique(
-            np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
-                       if n_val else [])
-    train_loader, val_loader = _loaders(
-        train_ds, val_ds, config, seed, world=world, rank=(fabric.global_rank if fabric else 0),
-        num_samples=local_iters, val_indices=val_indices)
-
     raw_model = model
     wrap = fabric is not None and world > 1
     model = fabric.setup_module(raw_model) if wrap else raw_model

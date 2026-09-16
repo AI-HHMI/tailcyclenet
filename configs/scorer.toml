@@ -64,7 +64,14 @@ aug_prob = 0.25
 per_image_aug_prob = 0.25
 grayscale_prob = 0.2
 crop_inflate = [0.9, 1.5]
-num_workers = 8
+# Two train workers per rank keep the GPU fed without the old 8-worker RAM multiplier.
+num_workers = 2
+# Validation is small but remains asynchronous; this is independent of train workers.
+val_num_workers = 1
+# One queued triplet per worker is enough and bounds host-side prefetched crops.
+prefetch_factor = 1
+# Keep useful OpenCV parallelism while avoiding an unbounded native thread pool per worker.
+worker_cv_threads = 2
 box_prompt = "none"
 frame_strides = [1]
 balance_datasets = true

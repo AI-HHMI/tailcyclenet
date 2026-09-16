@@ -374,9 +374,12 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
     shard; callers gather its sufficient metrics before selecting a checkpoint.
     """
     nw = int(config['data'].get('num_workers', 8))
+    # Distributed scorer samples can contain clamp-pad views with overlapping strides; PyTorch's
+    # pin-memory walker refuses those views.  DDP already transfers one triplet per rank directly,
+    # so disable pinning only for the sharded path and preserve the one-GPU loader unchanged.
     kwargs = dict(batch_size=1, collate_fn=scorer_collate, num_workers=nw,
                   prefetch_factor=2 if nw else None, persistent_workers=bool(nw),
-                  pin_memory=True, worker_init_fn=seed_worker)
+                  pin_memory=(world == 1), worker_init_fn=seed_worker)
     if world > 1:
         gen = torch.Generator().manual_seed(int(seed) + int(rank))
         kwargs['sampler'] = StepSampler(len(train_ds), int(num_samples), generator=gen)
@@ -389,7 +392,7 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
         val_ds = torch.utils.data.Subset(val_ds, val_indices)
     val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=scorer_collate,
                             num_workers=nw, prefetch_factor=2 if nw else None,
-                            persistent_workers=bool(nw), pin_memory=True,
+                            persistent_workers=bool(nw), pin_memory=(world == 1),
                             worker_init_fn=seed_worker)
     return train_loader, val_loader
 

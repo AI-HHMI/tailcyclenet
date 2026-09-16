@@ -16,6 +16,9 @@ def test_scorer_rank_sampler_is_replacement_and_rank_seeded():
     a, _ = scorer_train._loaders(D(), None, cfg, 23, world=2, rank=0, num_samples=5)
     b, _ = scorer_train._loaders(D(), None, cfg, 23, world=2, rank=1, num_samples=5)
     assert isinstance(a.sampler, StepSampler)
+    assert not a.pin_memory
+    one, _ = scorer_train._loaders(D(), None, cfg, 23, world=1, num_samples=5)
+    assert one.pin_memory
     # Both streams have a fixed local length and distinct rank-seeded draws.
     assert len(a) == len(b) == 5
     assert list(a.sampler) != list(b.sampler)

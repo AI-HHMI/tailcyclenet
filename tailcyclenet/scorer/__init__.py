@@ -10,6 +10,7 @@ generators (`PointCorruptor` / `GENERATORS` / `apply_drop_mask`) and `AttentionP
 imported verbatim from the installed `posetail`. The triplet ASSEMBLY is ours, because the
 reference builds it against a loader whose contract this repo's loader does not share.
 """
+from .losses import FrameTripletScorerLoss
 from .model import PoseScorer, build_scorer
 
-__all__ = ['PoseScorer', 'build_scorer']
+__all__ = ['PoseScorer', 'build_scorer', 'FrameTripletScorerLoss']

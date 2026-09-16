@@ -155,6 +155,51 @@ def test_evaluate_scores_the_averaged_iterate_and_restores_train_mode(monkeypatc
     assert out['val/n_scored'] == 1.0
 
 
+def test_evaluate_frame_metrics_use_active_rows_and_pointwise_labels(monkeypatch):
+    from tailcyclenet.scorer import train as st
+    from tailcyclenet.scorer.losses import FrameTripletScorerLoss
+
+    class FrameModel:
+        def __init__(self):
+            self.mode = 'train'
+
+        def eval(self):
+            self.mode = 'eval'
+
+        def train(self):
+            self.mode = 'train'
+
+        def score_triplet(self, _trip):
+            # Far frame: bad is low; near frame: bad stays clean. Anchor is clean.
+            scores = torch.tensor([[[[1.0, -1.0, 1.0]], [[1.0, 0.5, 1.0]]]])
+            labels = torch.tensor([[[[1.0, -1.0, 1.0]], [[1.0, -1.0, 1.0]]]])
+            return scores, torch.ones_like(scores), labels
+
+    trip = {
+        'active_mask': torch.tensor([[[True], [False]]]),
+        'observed_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'in_view_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'anchor_observed_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'far_mask': torch.tensor([[[True], [False]]]),
+        'near_mask': torch.tensor([[[False], [True]]]),
+        'ambiguous_mask': torch.zeros((1, 2, 1), dtype=torch.bool),
+        'corruption_type_mask': torch.zeros((1, 2, 1, 4), dtype=torch.bool),
+        'source_frame_weight': torch.ones((1, 2, 1)),
+        'anchor_label': 1.0,
+    }
+    trip['corruption_type_mask'][0, 0, 0, 0] = True
+    monkeypatch.setattr(st, 'triplet_to_device', lambda value, device: value)
+    model = FrameModel()
+    loss = FrameTripletScorerLoss(score_reg_weight=0.0)
+    out = st.evaluate(model, [trip], loss, 'cpu', 1, output_granularity='frame')
+    assert out['val/active_triplet_acc'] == 1.0
+    assert out['val/active_fraction'] == 0.5
+    assert out['val/pointwise_auroc'] == 1.0
+    assert out['val/localization'] == 1.0
+    assert out['val/acc_const_offset'] == 1.0
+    assert model.mode == 'train'
+
+
 def test_evaluate_restores_train_mode_when_the_pass_raises(monkeypatch):
     """An exception mid-val must not leave the run training an eval-mode model."""
     from tailcyclenet.scorer import train as st

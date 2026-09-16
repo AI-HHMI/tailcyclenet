@@ -19,9 +19,9 @@ import pytest
 import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
-from tailcyclenet.scorer.triplet import (build_corruptors_for, make_triplet,
+from tailcyclenet.scorer.triplet import (build_corruptors_for, displacement_masks, make_triplet,
                                          observed_frame_counts, transfer_points_2d,
-                                         view_affine_2d)
+                                         view_affine_2d, _draw_shift)
 
 CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0)
 
@@ -341,13 +341,17 @@ def test_the_triplet_scores_end_to_end(roots):
     K = trip['kpt_ids'].shape[1]
     model = _scorer(max(int(trip['kpt_ids'].max()) + 1, 4), stride_length=4)
     scores, precision, labels = model.score_triplet(trip)
-    assert scores.shape == (K, 3) and precision.shape == (K, 3) and labels.shape == (K, 3)
+    assert scores.shape == (1, K, 3) and precision.shape == (1, K, 3)
+    assert labels.shape == (1, K, 3)
     assert torch.isfinite(scores).all(), 'a non-finite score reached the loss'
-    assert torch.equal(labels[:, 0], torch.ones(K)) and torch.equal(labels[:, 1], -torch.ones(K))
+    assert torch.equal(labels[0, :, 0], torch.ones(K))
+    assert torch.equal(labels[0, :, 1], -torch.ones(K))
 
     from posetail.posetail.losses_scorer import TripletScorerLoss
+    from tailcyclenet.scorer.model import flatten_sequence_triplet
 
     loss = TripletScorerLoss()
+    scores, precision, labels = flatten_sequence_triplet(scores, precision, labels)
     total = loss(scores, precision, labels)
     total.backward()
     assert torch.isfinite(total), 'the triplet loss is non-finite'
@@ -405,3 +409,85 @@ def test_the_triplet_carries_per_type_tags_for_the_surviving_points(roots):
     K = trip['good'][1].shape[2]
     assert trip['fired'].shape == (1, K, len(GENERATORS))
     assert bool(trip['fired'].any()), 'no corruption was tagged on a real triplet'
+
+
+def test_frame_triplet_masks_are_post_gate_and_source_weighted(roots):
+    """Frame mode exposes far/near masks, partial segments, and duplicate-safe weights."""
+    cfg = dict(CORRUPTION, output_granularity='frame', min_valid_frames=0,
+               const_offset_prob=1.0, frame_noise_prob=0.0,
+               gradual_drift_prob=0.0, sinusoid_prob=0.0,
+               min_corrupt_px=1.0, max_clean_px=0.1, segment_prob=1.0,
+               segment_count=1, segment_len_frames=[2, 2], full_window_share=0.0,
+               reference_gate='source_far')
+    for root_name, mode in (('mouselike', '3d'), ('ratlike', '2d')):
+        ds = PoseDataset(roots / root_name, 'train', CFG, train=True)
+        rng = np.random.default_rng(0)
+        sel = ds._select(0, rng, ds._shape(np.random.default_rng(1)))
+        trip = make_triplet(ds, sel, rng, cfg, build_corruptors_for(cfg))
+        assert trip is not None and trip['mode'] == mode
+        shape = (1, trip['good'][1].shape[1], trip['good'][1].shape[2])
+        for key in ('observed_mask', 'anchor_observed_mask', 'in_view_mask', 'moved_mask',
+                    'far_mask', 'near_mask', 'ambiguous_mask', 'active_mask',
+                    'source_frame_weight'):
+            assert trip[key].shape == shape, key
+        assert torch.equal(
+            trip['active_mask'],
+            trip['far_mask'] & trip['observed_mask'] & trip['in_view_mask']
+            & trip['anchor_observed_mask'])
+        assert torch.equal(
+            trip['corruption_type_mask'],
+            trip['fired_frame'] & trip['far_mask'][..., None])
+        # The forced segment is shorter than T, so at least one valid keypoint has a clean run.
+        assert bool((~trip['far_mask'] & trip['observed_mask']).any())
+        frames = trip['frames'].cpu().tolist()
+        for ki in range(shape[2]):
+            for frame in set(frames):
+                slots = [i for i, value in enumerate(frames) if value == frame]
+                eligible = trip['observed_mask'][0, slots, ki]
+                if bool(eligible.any()):
+                    assert torch.isclose(trip['source_frame_weight'][0, slots, ki][eligible].sum(),
+                                         torch.tensor(1.0))
+
+
+def test_frame_corruption_gathers_one_shift_for_duplicate_source_frames():
+    _dense_3d, dense_2d, _sparse_3d, _sparse_2d = build_corruptors_for(CORRUPTION)
+    coords = torch.zeros((1, 4, 1, 2))
+    frames = np.array([0, 1, 1, 2], dtype=np.int64)
+    torch.manual_seed(5)
+    shift, _fired = _draw_shift(
+        dense_2d, coords, frames=frames,
+        cfg={'output_granularity': 'frame', 'segment_prob': 0.0})
+    assert torch.equal(shift[:, 1], shift[:, 2])
+    assert shift.shape == coords.shape
+
+
+def test_distance_states_exclude_near_and_ambiguous_rows():
+    camera = [{'size': (100, 100)}]
+    good = torch.tensor([[[[50.0, 50.0], [30.0, 30.0]]]])
+    anchor = good.clone()
+    # K0 is near (0.2 px), K1 is ambiguous (0.75 px), and the final K0 row is far.
+    bad = torch.tensor([[[[50.2, 50.0], [30.75, 30.0]]]])
+    out = displacement_masks(good, bad, anchor, camera, '2d',
+                             {'min_corrupt_px': 1.0, 'max_clean_px': 0.5})
+    assert bool(out['near_mask'][0, 0, 0])
+    assert bool(out['ambiguous_mask'][0, 0, 1])
+    assert not bool(out['active_mask'].any())
+    bad[0, 0, 0] = torch.tensor([52.0, 50.0])
+    out = displacement_masks(good, bad, anchor, camera, '2d',
+                             {'min_corrupt_px': 1.0, 'max_clean_px': 0.5})
+    assert bool(out['far_mask'][0, 0, 0]) and bool(out['active_mask'][0, 0, 0])
+
+
+def test_independent_reference_gate_rejects_an_improved_bad_point():
+    camera = [{'size': (100, 100)}]
+    good = torch.tensor([[[[10.0, 10.0]]]])
+    bad = torch.tensor([[[[11.0, 10.0]]]])
+    anchor = good.clone()
+    reference = torch.tensor([[[[11.0, 10.0]]]])
+    out = displacement_masks(
+        good, bad, anchor, camera, '2d',
+        {'min_corrupt_px': 0.5, 'max_clean_px': 0.1, 'reference_gate': 'independent_far',
+         'reference_margin_px': 0.0}, reference=reference)
+    assert bool(out['base_far_mask'].all())
+    assert not bool(out['far_mask'].any())
+    assert bool(out['reference_rejected_mask'].all())

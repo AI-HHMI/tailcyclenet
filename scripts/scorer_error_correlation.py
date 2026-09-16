@@ -101,6 +101,25 @@ def _per_window_error(pred_sess, ref_sess, group_id, animal_id, starts, T, keypo
     return {s: float(np.mean(v)) for s, v in buckets.items() if v}
 
 
+def _per_frame_error(pred_sess, ref_sess, group_id, animal_id, keypoint):
+    """Per-source-frame disagreement for one (group, animal, keypoint)."""
+    plab = pred_sess.groups[group_id].labels()
+    rlab = ref_sess.groups[group_id].labels()
+    if plab.points3d is None or rlab.points3d is None:
+        return {}
+    pa = _animal_index(plab, animal_id)
+    ra = _animal_index(rlab, animal_id)
+    pnames, rnames = [str(n) for n in pred_sess.names], [str(n) for n in ref_sess.names]
+    if pa is None or ra is None or keypoint not in pnames or keypoint not in rnames:
+        return {}
+    n = min(plab.points3d.shape[1], rlab.points3d.shape[1],
+            pred_sess.groups[group_id].n_frames)
+    p = plab.points3d[pa, :n, pnames.index(keypoint), :]
+    r = rlab.points3d[ra, :n, rnames.index(keypoint), :]
+    d = np.linalg.norm(p - r, axis=-1)
+    return {f: float(value) for f, value in enumerate(d) if np.isfinite(value)}
+
+
 def _non_missing(table, column):
     """Expression excluding null and float NaN group keys."""
     expr = pl.col(column).is_not_null()
@@ -135,6 +154,7 @@ def main(argv=None) -> int:
     config = load_config(args.config, base=_SCORER_CONFIG)
     T = int(config['data']['n_frames'])
     table = pl.read_parquet(args.scores)
+    frame_mode = {'frame', 'local_t'}.issubset(table.columns)
     n_sessions = table.filter(_non_missing(table, 'session')).get_column('session').n_unique()
     print(f'{len(table)} scored rows over {n_sessions} session(s), T={T}')
 
@@ -155,21 +175,40 @@ def main(argv=None) -> int:
         pred_sess, ref_sess = fmt.Session.load(pred_dir), fmt.Session.load(ref_dir)
         if group not in pred_sess.groups or group not in ref_sess.groups:
             continue
-        starts = sorted(sub.get_column('start').unique().to_list())
-        kpt_groups = (
-            sub.filter(_non_missing(sub, 'keypoint'))
-            .sort('keypoint', nulls_last=True, maintain_order=True)
-            .group_by('keypoint', maintain_order=True)
-        )
-        for (kpt,), ksub in kpt_groups:
-            errs = _per_window_error(pred_sess, ref_sess, group, animal, starts, T, kpt)
-            for r in ksub.iter_rows(named=True):
-                e = errs.get(int(r['start']))
-                if e is None:
-                    continue
-                rows.append({'session': session, 'group': group, 'animal': str(animal),
-                             'start': int(r['start']), 'keypoint': kpt,
-                             'score': float(r['score']), 'error': e})
+        if frame_mode:
+            valid = (_non_missing(sub, 'keypoint') & _non_missing(sub, 'frame')
+                     & _non_missing(sub, 'score'))
+            if 'observed' in sub.columns:
+                valid = valid & pl.col('observed').fill_null(False)
+            kpt_groups = (sub.filter(valid)
+                          .sort('keypoint', nulls_last=True, maintain_order=True)
+                          .group_by('keypoint', maintain_order=True))
+            for (kpt,), ksub in kpt_groups:
+                errs = _per_frame_error(pred_sess, ref_sess, group, animal, kpt)
+                for r in ksub.iter_rows(named=True):
+                    frame = int(r['frame'])
+                    error = errs.get(frame)
+                    if error is None:
+                        continue
+                    rows.append({'session': session, 'group': group, 'animal': str(animal),
+                                 'start': int(r['start']), 'frame': frame, 'keypoint': kpt,
+                                 'score': float(r['score']), 'error': error})
+        else:
+            starts = sorted(sub.get_column('start').unique().to_list())
+            kpt_groups = (
+                sub.filter(_non_missing(sub, 'keypoint'))
+                .sort('keypoint', nulls_last=True, maintain_order=True)
+                .group_by('keypoint', maintain_order=True)
+            )
+            for (kpt,), ksub in kpt_groups:
+                errs = _per_window_error(pred_sess, ref_sess, group, animal, starts, T, kpt)
+                for r in ksub.iter_rows(named=True):
+                    e = errs.get(int(r['start']))
+                    if e is None or not np.isfinite(r['score']):
+                        continue
+                    rows.append({'session': session, 'group': group, 'animal': str(animal),
+                                 'start': int(r['start']), 'keypoint': kpt,
+                                 'score': float(r['score']), 'error': e})
 
     if not rows:
         print('no (window, keypoint) row had both a score and a reference disagreement')
@@ -178,6 +217,8 @@ def main(argv=None) -> int:
         'session': pl.String, 'group': pl.String, 'animal': pl.String,
         'start': pl.Int64, 'keypoint': pl.String, 'score': pl.Float64, 'error': pl.Float64,
     }
+    if frame_mode:
+        schema['frame'] = pl.Int64
     df = pl.DataFrame(rows, schema=schema)
     print(f'\n{len(df)} (window, keypoint) rows carry both a score and a disagreement')
     errors = _float_array(df.get_column('error'))

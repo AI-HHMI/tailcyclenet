@@ -18,6 +18,7 @@ import torch
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
 from tailcyclenet.query_encoder import _tile_to_query_axis
 from tailcyclenet.scorer import build_scorer
+from tailcyclenet.scorer.model import FrameCameraPooling, flatten_sequence_triplet
 
 from .test_model import SMALL
 
@@ -321,6 +322,130 @@ def test_a_2d_window_scores_single_camera(tmp_path_factory):
         scores, precision = model(views, coords, cgroup, item[10][None])
     assert scores.shape == (1, ds.registry.n_keypoints)
     assert torch.isfinite(scores).all()
+
+
+
+# -- explicit framewise output ---------------------------------------------------------------
+
+def test_explicit_frame_mode_keeps_time_and_only_pools_cameras(scorer_batch):
+    """Frame mode has one readout per source/local frame and no temporal pool embedding."""
+    _sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
+    model = _scorer(K, stride_length=4, output_granularity='frame').eval()
+
+    captured = {}
+    h = model.attn_pool.pool.register_forward_pre_hook(
+        lambda mod, args, kwargs: captured.update({'x': args[0], 'mask': kwargs.get('key_padding_mask')}),
+        with_kwargs=True)
+    try:
+        with torch.no_grad():
+            scores, precision = model(views, coords, cgroup, kpt_ids)
+    finally:
+        h.remove()
+
+    B, T, _K, _R = coords.shape
+    assert model.output_granularity == 'frame'
+    assert scores.shape == (B, T, K)
+    assert precision.shape == (B, T, K)
+    assert torch.isfinite(scores).all() and torch.isfinite(precision).all()
+    assert not model.attn_pool.use_time_embedding
+    # The wrapped primitive sees one singleton time axis for each original frame,
+    # and all cameras remain in that axis rather than being folded into time.
+    assert captured['x'].shape[:4] == (B * T, 1, K, len(cgroup))
+    assert captured['mask'].shape == (B * T, K, 1, len(cgroup))
+    assert not hasattr(model.attn_pool.pool, 'time_embed')
+
+
+def test_frame_mode_missing_mask_is_per_frame_keypoint(scorer_batch):
+    """A missing frame/keypoint is not allowed to unmask other frames of that keypoint."""
+    _sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
+    model = _scorer(K, stride_length=4, output_granularity='frame').eval()
+    c = _fully_observed(coords)
+    c[:, 1, 2] = float('nan')
+
+    captured = {}
+    h = model.attn_pool.register_forward_pre_hook(
+        lambda mod, args, kwargs: captured.update(kwargs), with_kwargs=True)
+    try:
+        with torch.no_grad():
+            scores, precision = model(views, c, cgroup, kpt_ids)
+    finally:
+        h.remove()
+
+    mask = captured['key_padding_mask']
+    assert mask.shape == (1, coords.shape[1], K, len(cgroup))
+    # The all-missing (t=1,k=2) camera set is force-unmasked for finite attention;
+    # no other (t,k) row is changed because every other slot is observed.
+    assert not bool(mask[0, 1, 2].any())
+    assert not bool(mask.sum())
+    assert torch.isfinite(scores).all() and torch.isfinite(precision).all()
+
+
+def test_frame_mode_kpt_chunk_is_exact(scorer_batch):
+    """Framewise keypoint chunks preserve frame and keypoint axes exactly."""
+    _sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
+    model = _scorer(K, stride_length=4, output_granularity='frame').eval()
+    with torch.no_grad():
+        whole_s, whole_p = model(views, coords, cgroup, kpt_ids)
+        chunk_s, chunk_p = model(views, coords, cgroup, kpt_ids, kpt_chunk=1)
+    assert whole_s.shape == chunk_s.shape == (1, coords.shape[1], K)
+    assert whole_p.shape == chunk_p.shape == (1, coords.shape[1], K)
+    assert torch.allclose(whole_s, chunk_s, atol=1e-5), (whole_s - chunk_s).abs().max()
+    assert torch.allclose(whole_p, chunk_p, atol=1e-5)
+
+
+def test_frame_mode_triplet_keeps_structured_axes(scorer_batch):
+    """Only frame mode exposes [B,T,K,member], unlike the legacy flattened sequence API."""
+    sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
+    trip = {
+        'good': (views, coords, cgroup),
+        'bad': (views, coords + 0.25, cgroup),
+        'anchor': (views, coords, cgroup),
+        'kpt_ids': kpt_ids,
+        'anchor_label': 1.0,
+        'occlusion': None,
+        'reuse_scene_for_anchor': False,
+    }
+    frame = _scorer(K, stride_length=4, output_granularity='frame').eval()
+    with torch.no_grad():
+        fs, fp, fl = frame.score_triplet(trip)
+        ss, sp, sl = sequence.score_triplet(trip)
+    assert fs.shape == fp.shape == fl.shape == (1, coords.shape[1], K, 3)
+    assert ss.shape == sp.shape == sl.shape == (1, K, 3)
+    assert torch.equal(fl[..., 0], torch.ones_like(fl[..., 0]))
+    assert torch.equal(fl[..., 1], -torch.ones_like(fl[..., 1]))
+
+
+def test_flatten_sequence_triplet_is_explicit_legacy_loss_boundary():
+    scores = torch.arange(2 * 3 * 3, dtype=torch.float32).reshape(2, 3, 3)
+    precision = scores + 100
+    labels = scores + 200
+    flat = flatten_sequence_triplet(scores, precision, labels)
+    assert all(x.shape == (6, 3) for x in flat)
+    assert torch.equal(flat[0], scores.reshape(6, 3))
+    assert torch.equal(flat[1], precision.reshape(6, 3))
+    assert torch.equal(flat[2], labels.reshape(6, 3))
+
+
+def test_frame_camera_pooling_forces_only_all_missing_rows_finite():
+    """The local camera pool's mask conversion keeps valid rows and repairs all-missing rows."""
+    x = torch.randn(2, 3, 4, 2, 8)
+    mask = torch.zeros(2, 3, 4, 2, dtype=torch.bool)
+    mask[0, 1, 2] = True
+    pool = FrameCameraPooling(8, num_heads=2).eval()
+    captured = {}
+    h = pool.pool.register_forward_pre_hook(
+        lambda mod, args, kwargs: captured.update(kwargs), with_kwargs=True)
+    try:
+        with torch.no_grad():
+            out = pool(x, mask)
+    finally:
+        h.remove()
+    assert out.shape == (2, 3, 4, 8) and torch.isfinite(out).all()
+    got = captured['key_padding_mask']
+    assert got.shape == (2 * 3, 4, 1, 2)
+    # [batch=0, frame=1, keypoint=2] is the sole repaired row.
+    assert not bool(got[1, 2].any())
+    assert not bool(got[[i for i in range(6) if i != 1]].any())
 
 
 def test_an_absent_gridresid_offset_is_still_a_refusal_not_a_default():

@@ -27,6 +27,84 @@ from posetail.posetail.encoder_decoder import AttentionPooling
 from ..model import PoseTrackerEncoder, build_model
 
 
+SCORER_OUTPUT_GRANULARITIES = ('sequence', 'frame')
+
+
+def flatten_sequence_triplet(scores, precision, labels):
+    """Flatten a structured sequence triplet at the legacy-loss boundary.
+
+    ``PoseScorer.score_triplet`` always returns its explicit structured contract, including in
+    legacy sequence mode: ``[B, K, 3]``.  The installed ``TripletScorerLoss`` predates the batch
+    axis and consumes ``[B*K, 3]``; callers using that loss should invoke this helper immediately
+    before the loss rather than making the model's public output shape mode-dependent.
+
+    Inputs: ``scores``, ``precision`` and ``labels`` with matching ``[B,K,3]`` shapes.
+    Outputs: three matching ``[B*K,3]`` tensors, preserving the row order.
+    Side effects: none.
+    """
+    if scores.ndim != 3 or scores.shape[-1] != 3:
+        raise ValueError(f'sequence triplet scores must be [B,K,3], got {tuple(scores.shape)}')
+    if precision.shape != scores.shape or labels.shape != scores.shape:
+        raise ValueError(
+            'sequence triplet scores, precision and labels must have matching [B,K,3] shapes; '
+            f'got {tuple(scores.shape)}, {tuple(precision.shape)}, {tuple(labels.shape)}')
+    return (scores.reshape(-1, 3), precision.reshape(-1, 3), labels.reshape(-1, 3))
+
+
+class FrameCameraPooling(nn.Module):
+    """Pool only the camera axis of per-frame scorer latents.
+
+    ``AttentionPooling`` is written for the legacy sequence readout: it consumes
+    ``[B, T, K, C, D]`` and pools the combined ``(T, C)`` set, with a learned time
+    embedding.  A framewise score must not use that pool with ``T=1`` because the
+    time embedding would still be a learned readout term.  Instead this wrapper
+    applies an otherwise identical pooling primitive independently to each
+    ``(frame, keypoint)`` pair.  The primitive therefore sees one time slot and
+    cameras only, with ``use_time_embedding=False``.
+
+    The wrapper owns the layout conversion at the boundary: callers pass a mask in
+    ``[B, T, K, C]`` layout, while the upstream primitive expects
+    ``[B, K, T, C]``.  An all-masked camera set is force-unmasked per frame/keypoint
+    so missing coordinates still produce finite token/readout values.
+    """
+
+    def __init__(self, dim, num_heads=8):
+        """Build camera-only attention pooling with time embeddings disabled."""
+        super().__init__()
+        self.pool = AttentionPooling(dim, num_heads=num_heads, n_frames=1,
+                                     use_time_embedding=False)
+
+    @property
+    def use_time_embedding(self):
+        """Whether the underlying primitive adds a frame/time embedding (always false)."""
+        return self.pool.use_time_embedding
+
+    def forward(self, x, key_padding_mask=None):
+        """Return camera-pooled features with shape ``[B, T, K, D]``.
+
+        Inputs: ``x`` is ``[B, T, K, C, D]``; ``key_padding_mask`` is optional
+        ``[B, T, K, C]`` with ``True`` meaning drop.
+        """
+        if x.ndim != 5:
+            raise ValueError(f'frame camera pooling expects [B,T,K,C,D], got {tuple(x.shape)}')
+        b, t, k, cams, _ = x.shape
+        mask = None
+        if key_padding_mask is not None:
+            expected = (b, t, k, cams)
+            if tuple(key_padding_mask.shape) != expected:
+                raise ValueError(
+                    'frame camera pooling expects key_padding_mask [B,T,K,C] = '
+                    f'{expected}, got {tuple(key_padding_mask.shape)}')
+            mask = rearrange(key_padding_mask, 'b t k cams -> (b t) k 1 cams').contiguous()
+            all_masked = mask.all(dim=-1).squeeze(-1)
+            if bool(all_masked.any()):
+                mask[all_masked] = False
+
+        tokens = rearrange(x, 'b t k cams d -> (b t) 1 k cams d')
+        pooled = self.pool(tokens, key_padding_mask=mask)
+        return rearrange(pooled, '(b t) k d -> b t k d', b=b, t=t)
+
+
 def _refuse_moving_rig(camera_group):
     """The scorer is static-camera only, refused BY NAME where the cameras are in hand.
 
@@ -52,13 +130,25 @@ def _refuse_moving_rig(camera_group):
 class PoseScorer(PoseTrackerEncoder):
     """The pose encoder plus an attention-pooling head and a score/precision readout.
 
+    ``output_granularity`` is an explicit architecture switch:
+
+      * ``"sequence"`` (the default) keeps the historical temporal+camera
+        ``AttentionPooling`` and returns one score per ``(batch, keypoint)``;
+      * ``"frame"`` uses :class:`FrameCameraPooling`, which pools cameras
+        independently for every frame and returns one score per ``(batch, frame,
+        keypoint)``.  The decoder remains sequence-contextual in this mode.
+
+    The sequence default is intentional: a scorer API call, and a legacy run folder whose config
+    predates this key, must instantiate the old head and load its checkpoint exactly. New scorer
+    family configs pass ``output_granularity="frame"`` explicitly.
+
     Adds, on top of `PoseTrackerEncoder`:
-      * `attn_pool` -- pools the per-(time, camera) decoder latents of each point into one latent
-        (permutation-invariant over cameras, time-embedded).
+      * `attn_pool` -- the mode-specific pooling head, retaining this attribute
+        name so fresh-parameter routing and checkpoint reports remain explicit;
       * `missing_point` -- a learned token substituted for slots whose track coordinate is NaN, so
-        a missing point never reaches the decoder as a NaN or as a fabricated position.
+        a missing point never reaches the decoder as a NaN or as a fabricated position;
       * `score_feature`/`score_head` -- the scalar quality readout, its head built with NO bias
-        (mirroring the reference's miss-alignment lineage).
+        (mirroring the reference's miss-alignment lineage);
       * `precision_head` -- a per-point confidence in (0,1) used to weight the triplet loss.
 
     The inherited pose heads (the 3D grid head, the 2D head bank, confidence/visibility) are NOT
@@ -68,7 +158,8 @@ class PoseScorer(PoseTrackerEncoder):
     `requires_grad=False` parameters in every branch, so freezing them is safe once measured.
     """
 
-    def __init__(self, *args, pool_num_heads=8, score_hidden=64, use_precision=True, **kwargs):
+    def __init__(self, *args, output_granularity='sequence', pool_num_heads=8,
+                 score_hidden=64, use_precision=True, **kwargs):
         """`*args`/`**kwargs` go to `PoseTrackerEncoder` unchanged -- every encoder/decoder shape
         comes from there, so a warm start stays an exact load. The keyword arguments here are the
         scorer's own heads and are FRESH at warm start.
@@ -87,10 +178,18 @@ class PoseScorer(PoseTrackerEncoder):
         Outputs: none.
         Side effects: builds parameters and prints the query-encoder summary via the parent.
         """
+        if output_granularity not in SCORER_OUTPUT_GRANULARITIES:
+            raise ValueError(
+                'output_granularity must be one of '
+                f'{SCORER_OUTPUT_GRANULARITIES}, got {output_granularity!r}')
         super().__init__(*args, **kwargs)
         d = self.decoder.embed_dim
+        self.output_granularity = output_granularity
 
-        self.attn_pool = AttentionPooling(d, num_heads=pool_num_heads, n_frames=self.S)
+        if output_granularity == 'sequence':
+            self.attn_pool = AttentionPooling(d, num_heads=pool_num_heads, n_frames=self.S)
+        else:
+            self.attn_pool = FrameCameraPooling(d, num_heads=pool_num_heads)
 
         self.missing_point = nn.Parameter(torch.zeros(self.query_encoder.decoder_dim))
         nn.init.normal_(self.missing_point, std=0.02)
@@ -249,14 +348,16 @@ class PoseScorer(PoseTrackerEncoder):
         QUERY == TARGET: each `(t, k)` token lives at its own frame and is evaluated at that frame,
         which is the whole structural difference from the tracker. Missing slots are replaced by
         the learned `missing_point` token, and the pooling mask drops only OBSERVED `(t, camera)`
-        slots -- missingness is orthogonal to track quality, so it must not shift the score. The
-        mask is force-cleared for a fully missing point, because a softmax over all `-inf` is NaN
-        and `min_valid_frames` is a training-side guarantee this function should not assume.
+        slots -- missingness is orthogonal to track quality, so it must not shift the score. In
+        sequence mode the historical guard force-clears a fully missing keypoint; in frame mode it
+        force-clears only a fully missing `(t, k)` camera set. Both avoid a softmax over all `-inf`
+        while leaving every other missing slot masked.
 
         Inputs: cf -- [B,T,Kc,R] coords for this slice; valid_s -- [B,T,Kc] bool;
                 occ_s -- [B,Kc,n_cams] occlusion state or None; k0 -- the slice's offset into K;
                 ctx -- the shared scene scalars, times, RoPE positions and slice-invariant sizes.
-        Outputs: (scores [B,Kc], precision [B,Kc]).
+        Outputs: (scores [B,Kc], precision [B,Kc]) in sequence mode, or
+                  (scores [B,T,Kc], precision [B,T,Kc]) in frame mode.
         Side effects: sets `query_encoder._kpt_ids` / `_query_ok` for the duration of the call.
         """
         device = cf.device
@@ -316,10 +417,18 @@ class PoseScorer(PoseTrackerEncoder):
         latents = self.decoder(scene_features, query_embeds, query_rays, mode_idx,
                                scene_frame_pos=scene_frame_pos)['latent']
 
-        pool_mask = repeat(~valid_s, 'b t k -> b k t cams', cams=latents.shape[3]).contiguous()
-        all_masked = pool_mask.flatten(2).all(dim=-1)
-        if all_masked.any():
-            pool_mask[all_masked] = False
+        if self.output_granularity == 'frame':
+            pool_mask = repeat(~valid_s, 'b t k -> b t k cams',
+                               cams=latents.shape[3]).contiguous()
+            all_masked = pool_mask.all(dim=-1)
+            if bool(all_masked.any()):
+                pool_mask[all_masked] = False
+        else:
+            pool_mask = repeat(~valid_s, 'b t k -> b k t cams',
+                               cams=latents.shape[3]).contiguous()
+            all_masked = pool_mask.flatten(2).all(dim=-1)
+            if bool(all_masked.any()):
+                pool_mask[all_masked] = False
 
         pooled = self.attn_pool(latents, key_padding_mask=pool_mask)
         feats = self.score_feature(pooled)
@@ -332,7 +441,11 @@ class PoseScorer(PoseTrackerEncoder):
 
     def score(self, views_norm, scene_features, coords_full, camera_group, kpt_ids,
               kpt_chunk=None, occlusion=None):
-        """Score one window's track. `coords_full`: [B, T, K, R] -> (scores, precision) [B, K].
+        """Score one window's track.
+
+        ``coords_full`` is ``[B,T,K,R]``.  Sequence mode returns ``[B,K]`` scores
+        and precision; frame mode returns ``[B,T,K]`` for both.  ``kpt_chunk``
+        changes only peak memory and preserves the corresponding output exactly.
 
         `kpt_ids`: [B, K] LONG -- the GLOBAL REGISTRY ids of the keypoints in `coords_full`'s own
         axis order, exactly as the loader hands them to the pose model. NOT `arange(K)`, and the
@@ -354,7 +467,8 @@ class PoseScorer(PoseTrackerEncoder):
         Inputs: views_norm -- normalised views; scene_features -- their encode; coords_full --
                 [B,T,K,R]; camera_group -- posetail cameras; kpt_ids -- [B,K] global registry ids;
                 kpt_chunk -- score K in slices of this size, or None; occlusion -- [B,K,n_cams].
-        Outputs: (scores [B,K], precision [B,K]).
+        Outputs: (scores [B,K], precision [B,K]) in sequence mode, or
+            (scores [B,T,K], precision [B,T,K]) in frame mode.
         Side effects: temporarily stashes `_kpt_ids`/`_query_ok`/`_box_prompt` on the query
             encoder, always clearing them; raises ValueError on a moving rig or a bad keypoint id.
         """
@@ -395,7 +509,8 @@ class PoseScorer(PoseTrackerEncoder):
                                              k0, ctx)
                     s_parts.append(s)
                     p_parts.append(p)
-                return torch.cat(s_parts, dim=1), torch.cat(p_parts, dim=1)
+                axis = 2 if self.output_granularity == 'frame' else 1
+                return torch.cat(s_parts, dim=axis), torch.cat(p_parts, dim=axis)
             return self._score_slice(coords_full, valid, occlusion, 0, ctx)
         finally:
             self.query_encoder._kpt_ids = None
@@ -407,7 +522,8 @@ class PoseScorer(PoseTrackerEncoder):
 
         Inputs: views -- list of [b,t,h,w,c] uint8 or float; coords -- [b,t,k,R]; camera_group --
                 posetail cameras; kpt_ids -- [b,k] global registry ids (see `score`).
-        Outputs: (scores [b,k], precision [b,k]).
+        Outputs: (scores [b,k], precision [b,k]) in sequence mode, or
+            (scores [b,t,k], precision [b,t,k]) in frame mode.
         Side effects: none beyond `score`'s temporary stashes.
         """
         views_norm = self._normalize_views(views)
@@ -428,8 +544,10 @@ class PoseScorer(PoseTrackerEncoder):
         Inputs: trip -- the dict from `tailcyclenet.scorer.triplet.make_triplet`, carrying
                 `good`/`bad`/`anchor` as `(views, coords, cgroup)`, `kpt_ids`, `anchor_label`,
                 optional `occlusion`, and `reuse_scene_for_anchor`.
-        Outputs: (scores [N,3], precision [N,3], labels [N,3]) with N = b*k and columns
-            (good, bad, anchor).
+        Outputs: sequence mode returns structured tensors with shape ``[B,K,3]``;
+            frame mode returns structured tensors with shape ``[B,T,K,3]``.  The
+            final axis is always ``(good, bad, anchor)``.  Use
+            :func:`flatten_sequence_triplet` only at a legacy loss boundary.
         Side effects: none beyond `score`'s temporary stashes.
         """
         gv, gc, gcg = trip['good']
@@ -449,8 +567,8 @@ class PoseScorer(PoseTrackerEncoder):
             asf = self.encode_scene(avn)
         anc_s, anc_p = self.score(avn, asf, ac, acg, kpt_ids, occlusion=occ)
 
-        scores = torch.stack([good_s, bad_s, anc_s], dim=-1).reshape(-1, 3)
-        precision = torch.stack([good_p, bad_p, anc_p], dim=-1).reshape(-1, 3)
+        scores = torch.stack([good_s, bad_s, anc_s], dim=-1)
+        precision = torch.stack([good_p, bad_p, anc_p], dim=-1)
         labels = torch.tensor([1.0, -1.0, float(trip['anchor_label'])],
                               device=scores.device).expand_as(scores)
         return scores, precision, labels

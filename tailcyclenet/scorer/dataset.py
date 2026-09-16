@@ -83,14 +83,25 @@ class ScorerDataset(torch.utils.data.Dataset):
         entropy-seeded replacement for worker decorrelation.
         """
         base_idx = idx[1] if isinstance(idx, tuple) else idx
+        rejected_draws = 0
+        last_reason = 'no_selection'
         for attempt in range(GETITEM_MAX_RETRIES):
             rng, shape_rng, frozen = self._streams(base_idx)
             shape = self.base._shape(shape_rng)
             sel = self.base._select(base_idx, rng, shape)
             if sel is not None:
-                trip = make_triplet(self.base, sel, rng, self.cfg, self.corruptors)
+                try:
+                    trip = make_triplet(self.base, sel, rng, self.cfg, self.corruptors)
+                except (AssertionError, IndexError, KeyError, RuntimeError, ValueError):
+                    trip = None
+                    last_reason = 'build_failed'
                 if trip is not None:
+                    trip['retry_count'] = int(attempt)
+                    trip['rejected_draws'] = int(rejected_draws)
+                    trip['rejection_reason'] = last_reason if rejected_draws else ''
                     return trip
+                last_reason = 'no_active_or_unscorable'
+            rejected_draws += 1
             pick = (np.random.default_rng((self.base.seed, 0xC0FFEE, base_idx, attempt))
                     if frozen else np.random.default_rng())
             base_idx = int(pick.integers(len(self.base)))
@@ -124,7 +135,7 @@ def triplet_to_device(trip, device):
         trip[key] = ([v.to(device) for v in views], coords.to(device),
                      [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cam.items()}
                       for cam in cgroup])
-    for key in ('kpt_ids', 'counts', 'occlusion'):
-        if trip.get(key) is not None:
-            trip[key] = trip[key].to(device)
+    for key, value in list(trip.items()):
+        if torch.is_tensor(value):
+            trip[key] = value.to(device)
     return trip

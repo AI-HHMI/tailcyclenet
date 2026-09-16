@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tailcyclenet.checkpoints import scorer_output_granularity
 from tailcyclenet.scorer.qc import rank, score_root, write_outputs
 
 
@@ -14,7 +15,8 @@ def main(argv=None):
 
     Inputs: argv -- argument list, or None for `sys.argv`.
     Outputs: a process exit code.
-    Side effects: writes `scores.pq`, `report.txt` and `provenance.toml` under `--out`.
+    Side effects: writes `scores.pq`, `report.txt` and `provenance.toml` under `--out`; framewise
+        runs also write raw `window_scores.pq` and canonicalize rows by source-frame ownership.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run', required=True, help='a scorer run folder')
@@ -23,7 +25,8 @@ def main(argv=None):
                              'must be explicitly named')
     parser.add_argument('--data', required=True, help='the tracked root to score')
     parser.add_argument('--split', default='test', help='which split of --data to score')
-    parser.add_argument('--out', required=True, help='where the QC artefacts go')
+    parser.add_argument('--out', required=True,
+                        help='where QC artefacts go (frame mode also writes window_scores.pq)')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--top', type=int, default=10)
     parser.add_argument('--limit', type=int, default=None)
@@ -54,7 +57,8 @@ def main(argv=None):
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage,
                   checkpoint_file=checkpoint_info.get('checkpoint_file'),
-                  checkpoint_iteration=checkpoint_info.get('checkpoint_iteration'))
+                  checkpoint_iteration=checkpoint_info.get('checkpoint_iteration'),
+                  output_granularity=scorer_output_granularity(_config))
     return 0
 
 

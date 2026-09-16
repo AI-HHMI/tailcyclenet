@@ -16,10 +16,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import polars as pl
 import torch
 
-from ..checkpoints import load_scorer_run, provenance
+from ..checkpoints import load_scorer_run, provenance, scorer_contract, scorer_output_granularity
 # Importing dataset eagerly pulls posetail's legacy training dataset. Keep QC's
 # table-only import free of pandas; scoring imports the loader only when it actually runs.
 PoseDataset = None
@@ -169,6 +170,7 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                 'of the run n_frames, plus --window-offset)')
     print(f'scoring up to {len(where)} windows from {data}/{split} with {ckpt.name}')
 
+    output_granularity = scorer_output_granularity(config)
     rows = []
     model.eval()
     n_seen = 0
@@ -206,25 +208,74 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
                              'start': expected_start, 'status': 'scored', 'reason': ''})
         n_seen += 1
         sess = ds.index[i].session
-        views, coords, _vis, _frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
+        views, coords, _vis, frames, cgroup, row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
             item[:13]
         views, coords, cgroup, kpt_ids = _to_device(
             views, coords, cgroup, kpt_ids, device)
         with torch.no_grad():
             scores, precision = model(views, coords, cgroup, kpt_ids[None])
-        scores = scores[0].cpu().numpy()
-        precision = precision[0].cpu().numpy()
-        observed = torch.isfinite(coords[0]).all(-1).sum(0).cpu().numpy()
+        scores = scores[0].detach().cpu().numpy()
+        precision = precision[0].detach().cpu().numpy()
+        observed_slots = torch.isfinite(coords[0]).all(-1).cpu().numpy()
         names = list(sess.names)
-        for ki in range(scores.shape[0]):
-            rows.append({
-                'dataset': row['dataset'], 'session': row['session'], 'group': row['group'],
-                'animal': row['animal'], 'mode': row['mode'], 'start': int(row['start']),
-                'keypoint': names[ki] if ki < len(names) else str(ki),
-                'score': float(scores[ki]), 'precision': float(precision[ki]),
-                'n_observed_frames': int(observed[ki]), 'n_cams': len(cgroup),
-            })
-    return pl.DataFrame(rows), registry, config
+        if output_granularity == 'frame':
+            if scores.ndim != 2:
+                raise RuntimeError(
+                    f'framewise scorer returned {scores.shape!r} after batch removal; expected '
+                    '[T,K]. Check the run output_granularity and checkpoint contract.')
+            source_frames = (frames.detach().cpu().numpy() if torch.is_tensor(frames)
+                             else np.asarray(frames))
+            source_frames = np.asarray(source_frames).reshape(-1)
+            if len(source_frames) != scores.shape[0]:
+                raise RuntimeError(
+                    f'framewise scorer returned T={scores.shape[0]} but loader supplied '
+                    f'{len(source_frames)} source frames; refusing ambiguous QC ownership')
+            for local_t in range(scores.shape[0]):
+                source_frame = int(source_frames[local_t])
+                for ki in range(scores.shape[1]):
+                    is_observed = bool(observed_slots[local_t, ki])
+                    rows.append({
+                        'dataset': row['dataset'], 'session': row['session'],
+                        'group': row['group'], 'animal': row['animal'], 'mode': row['mode'],
+                        'window_start': int(row['start']), 'start': int(row['start']),
+                        'local_t': int(local_t), 'frame': source_frame,
+                        'keypoint': names[ki] if ki < len(names) else str(ki),
+                        'score': float(scores[local_t, ki]) if is_observed else float('nan'),
+                        'precision': float(precision[local_t, ki]) if is_observed else float('nan'),
+                        'observed': is_observed, 'n_cams': len(cgroup),
+                    })
+        else:
+            if scores.ndim != 1:
+                raise RuntimeError(
+                    f'sequence scorer returned {scores.shape!r} after batch removal; expected [K]')
+            observed = observed_slots.sum(0)
+            for ki in range(scores.shape[0]):
+                rows.append({
+                    'dataset': row['dataset'], 'session': row['session'], 'group': row['group'],
+                    'animal': row['animal'], 'mode': row['mode'], 'start': int(row['start']),
+                    'keypoint': names[ki] if ki < len(names) else str(ki),
+                    'score': float(scores[ki]), 'precision': float(precision[ki]),
+                    'n_observed_frames': int(observed[ki]), 'n_cams': len(cgroup),
+                })
+
+    if rows:
+        table = pl.DataFrame(rows)
+    elif output_granularity == 'frame':
+        table = pl.DataFrame(schema={
+            'dataset': pl.String, 'session': pl.String, 'group': pl.String,
+            'animal': pl.String, 'mode': pl.String, 'window_start': pl.Int64,
+            'start': pl.Int64, 'local_t': pl.Int64, 'frame': pl.Int64,
+            'keypoint': pl.String, 'score': pl.Float64, 'precision': pl.Float64,
+            'observed': pl.Boolean, 'n_cams': pl.Int64,
+        })
+    else:
+        table = pl.DataFrame(schema={
+            'dataset': pl.String, 'session': pl.String, 'group': pl.String,
+            'animal': pl.String, 'mode': pl.String, 'start': pl.Int64,
+            'keypoint': pl.String, 'score': pl.Float64, 'precision': pl.Float64,
+            'n_observed_frames': pl.Int64, 'n_cams': pl.Int64,
+        })
+    return table, registry, config
 
 
 def _non_missing(table: pl.DataFrame, name: str) -> pl.Expr:
@@ -249,6 +300,74 @@ def _as_report_float(value) -> float:
     return float("nan") if value is None else float(value)
 
 
+
+def _canonical_frame_table(table: pl.DataFrame) -> pl.DataFrame:
+    """Apply the declared last-window/last-occurrence ownership rule to frame rows.
+
+    ``score_root`` returns the raw contextual window table so overlapping windows remain auditable.
+    The user-facing table has one observed/missing row per source frame/keypoint.  Sorting by
+    ``window_start`` then ``local_t`` makes the reducer deterministic and agrees with the inference
+    ownership convention; duplicate clamp copies therefore cannot multiply a QC aggregate.
+    """
+    required = {'frame', 'keypoint', 'local_t'}
+    if table.is_empty() or not required.issubset(table.columns):
+        return table
+    order = [c for c in ('dataset', 'session', 'group', 'animal', 'frame', 'keypoint',
+                         'window_start', 'start', 'local_t') if c in table.columns]
+    table = table.sort(order, nulls_last=True, maintain_order=True)
+    keys = [c for c in ('dataset', 'session', 'group', 'animal', 'frame', 'keypoint')
+            if c in table.columns]
+    return table.group_by(keys, maintain_order=True).last()
+
+
+def _frame_mode(table: pl.DataFrame) -> bool:
+    """Return whether a QC table carries framewise ownership columns."""
+    return {'frame', 'local_t'}.issubset(table.columns)
+
+
+
+def _rank_frame(table: pl.DataFrame, top: int = 10) -> str:
+    """Worst-first report for source-frame/keypoint rows."""
+    aggregate = _aggregate_input(table)
+    if 'observed' in aggregate.columns:
+        valid = pl.col('observed').fill_null(False)
+    else:
+        valid = pl.lit(True)
+    valid = valid & _non_missing(aggregate, 'score')
+    usable = aggregate.filter(valid)
+    if usable.is_empty():
+        return 'no observed frame/keypoint rows were scored'
+    group_keys = ['dataset', 'session', 'group', 'animal']
+    kpt_keys = ['dataset', 'session', 'group', 'keypoint']
+    per_group = (usable.group_by(group_keys, maintain_order=True)
+                 .agg(pl.col('score').min().alias('worst'),
+                      pl.col('score').median().alias('median'), pl.len().alias('n'))
+                 .sort(['worst', *group_keys], nulls_last=True, maintain_order=True))
+    per_kpt = (usable.group_by(kpt_keys, maintain_order=True)
+               .agg(pl.col('score').median().alias('median'), pl.len().alias('n'))
+               .sort(['median', *kpt_keys], nulls_last=True, maintain_order=True))
+    n_groups = usable.get_column('group').n_unique()
+    lines = [f'scored {usable.height} observed (window, frame, keypoint) rows over '
+             f'{n_groups} group(s)', '',
+             'per-group minimum frame/keypoint score (worst first):']
+    for row in per_group.head(top).iter_rows(named=True):
+        lines.append(f'  {float(row["worst"]):>9.4f}  '
+                     f'{row["dataset"]}/{row["session"]}/{row["group"]}/animal{row["animal"]}'
+                     f'  (median {float(row["median"]):.4f}, {int(row["n"])} points)')
+    lines += ['', 'worst (group, keypoint) frame pairs by median score:']
+    for row in per_kpt.head(top).iter_rows(named=True):
+        lines.append(f'  {float(row["median"]):>9.4f}  '
+                     f'{row["dataset"]}/{row["session"]}/{row["group"]}/{row["keypoint"]}'
+                     f'  (n {int(row["n"])})')
+    root_median = per_kpt.get_column('median').median()
+    weak = 0 if root_median is None else sum(
+        value is not None and value < root_median
+        for value in per_kpt.get_column('median').to_list())
+    lines += ['', f'{weak} of {per_kpt.height} (group, keypoint) pairs fall below this '
+              "root's own median. That is a RANK, not a threshold."]
+    return '\n'.join(lines)
+
+
 def rank(table: pl.DataFrame, top: int = 10) -> str:
     """The worst-first report: worst windows, then worst (group, keypoint) pairs.
 
@@ -262,6 +381,8 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
     """
     if table.is_empty():
         return 'no windows were scored'
+    if _frame_mode(table):
+        return _rank_frame(_canonical_frame_table(table), top)
 
     group_keys = ['dataset', 'session', 'group', 'animal']
     keypoint_keys = ['dataset', 'session', 'group', 'keypoint']
@@ -311,27 +432,55 @@ def rank(table: pl.DataFrame, top: int = 10) -> str:
 def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: str,
                   report: str, coverage: list[dict] | None = None, *,
                   checkpoint_file: str | Path | None = None,
-                  checkpoint_iteration: int | None = None) -> None:
-    """Write `scores.pq`, `report.txt` and `provenance.toml` under `out`.
+                  checkpoint_iteration: int | None = None,
+                  output_granularity: str | None = None) -> None:
+    """Write mode-aware QC tables, report, provenance, and optional coverage.
 
-    Inputs: out -- the output directory; table -- the score DataFrame; run -- the scorer run;
-            data -- the scored root; split -- the split scored; report -- the ranking text;
-            checkpoint_file -- resolved scorer checkpoint path; checkpoint_iteration -- its
-            recorded training iteration.
-    Outputs: none.
-    Side effects: creates `out` and writes three files plus `coverage.csv` when coverage is
-        supplied. The scored root is not touched. The Parquet output keeps the historical Snappy
-        compression while intentionally omitting pandas index metadata.
+    Framewise ``table`` is the raw contextual window table returned by :func:`score_root`.  It is
+    retained as ``window_scores.pq`` and reduced to one source-frame/keypoint row in
+    ``scores.pq`` using the deterministic last-window/last-occurrence rule.  Sequence tables keep
+    the historical single-file schema.
     """
     import toml
 
     out.mkdir(parents=True, exist_ok=True)
-    table.write_parquet(out / 'scores.pq', compression='snappy')
+    frame_mode = _frame_mode(table) if output_granularity is None else output_granularity == 'frame'
+    canonical = _canonical_frame_table(table) if frame_mode else table
+    if frame_mode:
+        table.write_parquet(out / 'window_scores.pq', compression='snappy')
+    canonical.write_parquet(out / 'scores.pq', compression='snappy')
     (out / 'report.txt').write_text(report + '\n')
     output_provenance = {
         **provenance(), 'scorer_run': str(run), 'source_root': str(data), 'split': split,
-        'n_rows': int(len(table)),
+        'n_rows': int(len(canonical)), 'output_granularity': 'frame' if frame_mode else 'sequence',
     }
+    config_path = Path(run) / 'config.toml'
+    if config_path.exists():
+        import tomllib
+        with config_path.open('rb') as handle:
+            run_config = tomllib.load(handle)
+        scorer_cfg = run_config.get('scorer', {})
+        corr_cfg = scorer_cfg.get('corruption', {})
+        for key, value in scorer_contract(run_config).items():
+            if value is not None:
+                output_provenance[f'scorer_{key}'] = value
+        for key in ('loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy'):
+            if key in scorer_cfg:
+                output_provenance[key] = scorer_cfg[key]
+        for key in ('segment_prob', 'segment_count', 'n_segments', 'segment_len_frames',
+                    'full_window_share', 'segment_types', 'min_corrupt_px', 'max_clean_px',
+                    'reference_gate', 'out_of_view_policy'):
+            if key in corr_cfg:
+                output_provenance[f'corruption_{key}'] = corr_cfg[key]
+        if 'val_stride' in run_config.get('data', {}):
+            output_provenance['val_stride'] = run_config['data']['val_stride']
+    if frame_mode:
+        output_provenance.update({
+            'n_raw_rows': int(len(table)),
+            'frame_reducer': 'last_window_last_occurrence',
+            'score_table': 'scores.pq',
+            'raw_score_table': 'window_scores.pq',
+        })
     if checkpoint_file is not None:
         output_provenance['checkpoint_file'] = str(checkpoint_file)
     if checkpoint_iteration is not None:

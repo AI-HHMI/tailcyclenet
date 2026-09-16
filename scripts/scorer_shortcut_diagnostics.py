@@ -27,6 +27,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -36,7 +37,10 @@ from tailcyclenet.checkpoints import load_config, load_scorer_run, _SCORER_CONFI
 from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.dataset import scorer_collate  # noqa: E402
-from tailcyclenet.scorer.train import _per_type_accuracy, corruption_config, loader_config  # noqa: E402
+from tailcyclenet.scorer.model import flatten_sequence_triplet  # noqa: E402
+from tailcyclenet.scorer.train import (corruption_config, loader_config,  # noqa: E402
+                                       _frame_pointwise_arrays, _weighted_binary_metrics,
+                                       scorer_output_granularity)
 from tailcyclenet.scorer.triplet import GENERATORS, seed_worker  # noqa: E402
 
 
@@ -72,7 +76,7 @@ def _swap_views(trip, other_views):
     return swapped
 
 
-def _arms(model, loader, device, max_batches):
+def _arms(model, loader, device, max_batches, output_granularity='sequence'):
     """Real, coordinate-only and mismatched-video `triplet_acc`, overall and per type.
 
     Inputs: model -- a trained scorer in eval mode; loader -- the val loader; device -- where to
@@ -81,7 +85,8 @@ def _arms(model, loader, device, max_batches):
         mismatched draws that had to be skipped for shape reasons under the key 'skipped'.
     Side effects: decodes video frames through the loader.
     """
-    arms = {a: {'acc': [], 'per_type': {}}
+    arms = {a: {'hits': 0.0, 'weight': 0.0, 'n': 0, 'per_type': {},
+                'pointwise': [], 'pointwise_types': {}}
             for a in ('real', 'coordinate_only', 'mismatched')}
     skipped = 0
     reservoir: list = []
@@ -91,7 +96,9 @@ def _arms(model, loader, device, max_batches):
             if trip is None:
                 continue
             trip = triplet_to_device(trip, device)
-            fired = trip['fired'][0]
+            fired = (trip.get('corruption_type_mask') if output_granularity == 'frame'
+                     else trip['fired'][0])
+            active = trip.get('active_mask') if output_granularity == 'frame' else None
             donor = next((r for r in reservoir if _shapes_match(r, trip['good'][0])), None)
             variants = {'real': trip,
                         'coordinate_only': _swap_views(
@@ -103,13 +110,49 @@ def _arms(model, loader, device, max_batches):
                 if t is None:
                     continue
                 scores, _precision, labels = model.score_triplet(t)
-                correct = (scores[:, 0] > scores[:, 1]).float()
-                arms[arm]['acc'].append(float(correct.mean()))
-                for key, v in _per_type_accuracy(scores, fired).items():
-                    name = key.removeprefix('val/acc_')
-                    slot = arms[arm]['per_type'].setdefault(name, [0, 0])
-                    slot[0] += 1
-                    slot[1] += float(v)
+                if output_granularity == 'sequence':
+                    scores, _precision, labels = flatten_sequence_triplet(
+                        scores, _precision, labels)
+                    correct_for_type = scores[:, 0] > scores[:, 1]
+                    metric_mask = torch.ones_like(correct_for_type, dtype=torch.bool)
+                    weights_for_type = torch.ones_like(correct_for_type, dtype=scores.dtype)
+                else:
+                    correct_for_type = scores[..., 0] > scores[..., 1]
+                    metric_mask = (active.to(correct_for_type.device).bool()
+                                   if active is not None
+                                   else torch.ones_like(correct_for_type, dtype=torch.bool))
+                    weights_for_type = trip.get('source_frame_weight')
+                    if weights_for_type is None:
+                        weights_for_type = torch.ones_like(correct_for_type, dtype=scores.dtype)
+                    else:
+                        weights_for_type = weights_for_type.to(
+                            device=correct_for_type.device, dtype=scores.dtype)
+                if not bool(metric_mask.any()):
+                    continue
+                metric_weight = weights_for_type[metric_mask]
+                arms[arm]['hits'] += float(
+                    (metric_weight * correct_for_type[metric_mask].to(metric_weight.dtype)).sum())
+                arms[arm]['weight'] += float(metric_weight.sum())
+                arms[arm]['n'] += 1
+                type_mask = fired.to(correct_for_type.device).bool()
+                if output_granularity == 'frame':
+                    arms[arm]['pointwise'].append(
+                        _frame_pointwise_arrays(scores, labels, t))
+                    for gi, name in enumerate(GENERATORS):
+                        arms[arm]['pointwise_types'].setdefault(name, []).append(
+                            _frame_pointwise_arrays(scores, labels, t, gi))
+                if scores.ndim == 2 and type_mask.ndim == 3:
+                    type_mask = type_mask[0]
+                if output_granularity == 'frame' and active is not None:
+                    type_mask = type_mask & active[..., None].to(type_mask.device).bool()
+                for i, name in enumerate(GENERATORS):
+                    mask = type_mask[..., i]
+                    if not bool(mask.any()):
+                        continue
+                    slot = arms[arm]['per_type'].setdefault(name, [0.0, 0.0])
+                    slot[0] += float(weights_for_type[mask].sum())
+                    slot[1] += float((weights_for_type[mask]
+                                      * correct_for_type[mask].to(weights_for_type.dtype)).sum())
             reservoir.append([v.detach() for v in trip['good'][0]])
             if len(reservoir) > 64:
                 reservoir.pop(0)
@@ -118,11 +161,32 @@ def _arms(model, loader, device, max_batches):
                 break
     out = {}
     for arm, d in arms.items():
-        n = len(d['acc'])
+        pointwise = [chunk for chunk in d['pointwise'] if len(chunk[0])]
+        if pointwise:
+            point_scores = np.concatenate([chunk[0] for chunk in pointwise])
+            point_targets = np.concatenate([chunk[1] for chunk in pointwise])
+            point_weights = np.concatenate([chunk[2] for chunk in pointwise])
+            point_auc, point_ap = _weighted_binary_metrics(
+                point_scores, point_targets, point_weights)
+        else:
+            point_auc = point_ap = float('nan')
+        type_pointwise = {}
+        for name, chunks in d['pointwise_types'].items():
+            typed = [chunk for chunk in chunks if len(chunk[0])]
+            if not typed:
+                continue
+            typed_scores = np.concatenate([chunk[0] for chunk in typed])
+            typed_targets = np.concatenate([chunk[1] for chunk in typed])
+            typed_weights = np.concatenate([chunk[2] for chunk in typed])
+            type_pointwise[name] = _weighted_binary_metrics(
+                typed_scores, typed_targets, typed_weights)
         out[arm] = {
-            'n': n,
-            'acc': sum(d['acc']) / max(n, 1),
+            'n': d['n'],
+            'acc': d['hits'] / d['weight'] if d['weight'] else float('nan'),
             'per_type': {k: v[1] / max(v[0], 1) for k, v in d['per_type'].items()},
+            'pointwise_auroc': point_auc,
+            'pointwise_ap': point_ap,
+            'pointwise_per_type': type_pointwise,
         }
     out['skipped'] = skipped
     return out
@@ -145,7 +209,14 @@ def main(argv=None) -> int:
 
     model, _rcfg, registry, ckpt = load_scorer_run(Path(args.run), device=args.device)
     model.eval()
+    output_granularity = scorer_output_granularity(_rcfg)
     config = load_config(args.config, base=_SCORER_CONFIG)
+    config['scorer'] = {**config.get('scorer', {}),
+                        'output_granularity': output_granularity}
+    config['scorer']['corruption'] = {
+        **config['scorer'].get('corruption', {}),
+        'output_granularity': output_granularity,
+    }
     ds = ScorerDataset(
         PoseDataset(config['data']['path'], args.split,
                     loader_config(config['data'], config['model']), registry=registry),
@@ -157,7 +228,7 @@ def main(argv=None) -> int:
 
     print(f'run {args.run}  checkpoint {ckpt.name}  split {args.split}  '
           f'val windows {len(ds)}  K={registry.n_keypoints}')
-    res = _arms(model, val_loader, args.device, args.batches)
+    res = _arms(model, val_loader, args.device, args.batches, output_granularity)
     real = res['real']['acc']
     print(f'\n{"arm":>17}  {"triplet_acc":>11}  {"n":>4}   gap vs real')
     for arm in ('real', 'coordinate_only', 'mismatched'):
@@ -165,6 +236,13 @@ def main(argv=None) -> int:
         gap = '' if arm == 'real' else f'{a["acc"] - real:+.3f}'
         print(f'{arm:>17}  {a["acc"]:>11.4f}  {a["n"]:>4}   {gap}')
     print(f'\nmismatched draws skipped for shape mismatch: {res["skipped"]}')
+    if output_granularity == 'frame':
+        print('\npointwise signed metrics (real / coordinate-only / mismatched):')
+        for metric in ('pointwise_auroc', 'pointwise_ap'):
+            values = [res[arm][metric] for arm in ('real', 'coordinate_only', 'mismatched')]
+            cells = '  '.join('   n/a  ' if not np.isfinite(v) else f'{v:7.4f}'
+                              for v in values)
+            print(f'  {metric:>20}  {cells}')
     print('\nper corruption type (real / coordinate-only / mismatched):')
     for name in GENERATORS:
         row = [res[a]['per_type'].get(name) for a in

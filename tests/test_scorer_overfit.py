@@ -100,6 +100,8 @@ def _overfit(root, iterations=120, n_windows=2, lr=1e-3, seed=0, session='mousel
             trip = triplet_to_device(trip, torch.device('cpu'))
             opt.zero_grad(set_to_none=True)
             scores, precision, labels = model.score_triplet(trip)
+            from tailcyclenet.scorer.model import flatten_sequence_triplet
+            scores, precision, labels = flatten_sequence_triplet(scores, precision, labels)
             total = loss_fn(scores, precision, labels)
             total.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 10.0)
@@ -161,6 +163,7 @@ def test_an_untrained_scorer_is_near_chance(overfit_root):
     with torch.no_grad():
         for trip in windows:
             scores, _p, _l = model.score_triplet(triplet_to_device(trip, torch.device('cpu')))
+            scores = scores.reshape(-1, 3)
             hits += int((scores[:, 0] > scores[:, 1]).sum())
             total += scores.shape[0]
     acc = hits / max(total, 1)

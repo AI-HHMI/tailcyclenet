@@ -162,6 +162,38 @@ def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
                          'reason': 'item_build_failed'}]
 
 
+def test_empty_frame_qc_keeps_frame_schema_and_raw_output(monkeypatch, tmp_path):
+    import toml
+
+    class FakeDataset:
+        registry = SimpleNamespace(names=['k'])
+        index = []
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 0
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    monkeypatch.setattr(qc, 'load_scorer_run',
+                        lambda *_args, **_kwargs: (FakeModel(),
+                                                    {'scorer': {'output_granularity': 'frame'}},
+                                                    SimpleNamespace(names=['k']),
+                                                    SimpleNamespace(name='checkpoint_last.pth')))
+    table, _registry, config = qc.score_root(Path('run'), 'data', 'test')
+    assert {'frame', 'local_t', 'window_start'}.issubset(table.columns)
+    qc.write_outputs(tmp_path, table, Path('run'), 'data', 'test', 'report',
+                     output_granularity=qc.scorer_output_granularity(config))
+    assert (tmp_path / 'window_scores.pq').exists()
+    assert toml.load(tmp_path / 'provenance.toml')['output_granularity'] == 'frame'
+
+
 def test_score_root_forwards_explicit_checkpoint_and_records_iteration(monkeypatch, tmp_path):
     """An explicitly selected checkpoint reaches the loader and output metadata sink."""
     checkpoint = tmp_path / 'checkpoint_best.pth'

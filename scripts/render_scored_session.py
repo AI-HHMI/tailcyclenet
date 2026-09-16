@@ -82,17 +82,25 @@ def load_scores(path: Path, session: str, group: str, animal: str) -> dict:
         have = df.get_column('session').unique().to_list() if df.height else []
         raise SystemExit(f'{pq}: no rows for {session}/{group}/{animal}. '
                          f'Sessions present: {list(have)[:3]}')
+    framewise = {'frame', 'local_t'}.issubset(df.columns)
     rows = df.iter_rows(named=True)
     score = {}
     precision = {}
     for row in rows:
-        key = (int(row['start']), str(row['keypoint']))
+        if framewise:
+            if not row.get('observed', True) or not np.isfinite(row['score']):
+                continue
+            key = (int(row['frame']), str(row['keypoint']))
+        else:
+            key = (int(row['start']), str(row['keypoint']))
         score[key] = float(row['score'])
         precision[key] = float(row['precision'])
+    start_column = 'window_start' if 'window_start' in df.columns else 'start'
     return {
         'score': score,
         'precision': precision,
-        'starts': np.unique(df.get_column('start').to_numpy()),
+        'starts': np.unique(df.get_column(start_column).drop_nulls().to_numpy()),
+        'framewise': framewise,
     }
 
 
@@ -236,7 +244,8 @@ def main() -> int:
     starts = table['starts']
     scores = table['score']
 
-    vals = [v for (st, _k), v in scores.items() if args.start <= st < args.end]
+    vals = [v for (st, _k), v in scores.items()
+            if args.start <= st < args.end and np.isfinite(v)]
     if not vals:
         raise SystemExit(f'no scored windows start in [{args.start}, {args.end}); the scored '
                          f'windows are {starts.min()}..{starts.max()}')
@@ -263,10 +272,15 @@ def main() -> int:
             for t, im in zip(block, read_frames(group, cam, block)):
                 if im is None:
                     continue
-                win = frame_to_window(starts, n_frames, t)
-                note = f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  window {win}'
+                if table['framewise']:
+                    score_key = t if any(frame == t for frame, _ in scores) else None
+                    note = (f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  '
+                            f'framewise score {"available" if score_key is not None else "missing"}')
+                else:
+                    score_key = frame_to_window(starts, n_frames, t)
+                    note = f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  window {score_key}'
                 out_im = draw_scored(im, labels, t, ci, session.names, session.skeleton,
-                                     scores, win, lo, hi, note, stats)
+                                     scores, score_key, lo, hi, note, stats)
                 h = int(round(out_im.shape[0] * args.width / out_im.shape[1]))
                 out_im = cv2.resize(out_im, (args.width, h), interpolation=cv2.INTER_AREA)
                 if writer is None:

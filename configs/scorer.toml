@@ -82,12 +82,24 @@ box_prompt_scale_jitter = 0.0
 box_source = "keypoints"
 
 [scorer]
+# New scorer runs are framewise; old folders without this key resolve to sequence on load.
+output_granularity = "frame"
 pool_num_heads = 8
 score_hidden = 64
 use_precision = true
 triplet_margin = 0.25
 precision_reg_weight = 0.15
 score_reg_weight = 0.001
+# Framewise loss arms; nonzero pointwise/consistency terms are refused in sequence mode.
+pointwise_weight = 0.0
+pointwise_balance = true
+pointwise_label_smoothing = 0.05
+inactive_consistency_weight = 0.0
+anchor_consistency_weight = 0.0
+selection_metric = "active_triplet_acc"
+loss_schema = "framewise-v1"
+corruption_mask_semantics = "far-observed-in-view-anchor-observed"
+source_frame_duplicate_policy = "inverse_multiplicity"
 min_valid_frames = 6       # DISTINCT OBSERVED frames per keypoint; selects the corruption menu
 
 [scorer.corruption]
@@ -98,6 +110,19 @@ sinusoid_prob = 0.5
 point_drop_prob = 0.3
 point_drop_max_frac = 0.4
 point_drop_bernoulli_rate = 0.2
+# Framewise corruption draws use partial segments; absent sequence mode stays legacy.
+min_corrupt_px = 1.0
+max_clean_px = 0.5
+reference_gate = "source_far"
+reference_margin_px = 0.0
+sequence_far_gate = false
+segment_prob = 0.8
+segment_count = 1
+segment_len_frames = [2, 6]
+full_window_share = 0.1
+segment_types = ["const_offset", "gradual_drift", "sinusoid"]
+no_active_slot_policy = "retry"
+out_of_view_policy = "exclude"
 
 [scorer.corruption.mag_3d]
 # cube-scale units (~pixel-equivalent: world shift = mag * cube_scale)

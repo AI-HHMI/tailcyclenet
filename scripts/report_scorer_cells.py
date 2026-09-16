@@ -30,8 +30,8 @@ from tailcyclenet.checkpoints import load_config, _SCORER_CONFIG  # noqa: E402
 from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.model import build_scorer  # noqa: E402
-from tailcyclenet.scorer.train import (corruption_config, loader_config,  # noqa: E402
-                                       scorer_kwargs)
+from tailcyclenet.scorer.train import (build_scorer_loss, corruption_config, loader_config,  # noqa: E402
+                                       resolve_output_granularity, scorer_kwargs, scorer_loss)
 from tailcyclenet.scorer.triplet import GENERATORS, make_triplet  # noqa: E402
 
 
@@ -84,7 +84,16 @@ def _walk(config, split, n_windows):
         accepted[cell] += 1
         density[cell]['dense'] += trip['n_dense']
         density[cell]['sparse'] += trip['n_sparse']
-        names = trip['fired'].sum((0, 1)).tolist()
+        active = trip.get('active_mask')
+        type_mask = trip.get('corruption_type_mask')
+        if type_mask is None:
+            type_mask = trip['fired'][:, None].expand(-1, trip['good'][1].shape[1], -1, -1)
+        if active is not None:
+            type_mask = type_mask & active[..., None]
+            is_dense = trip['counts'] >= int(cfg.get('min_valid_frames', 1))
+            density[cell]['active_dense'] += int((active & is_dense[:, None, :]).sum())
+            density[cell]['active_sparse'] += int((active & ~is_dense[:, None, :]).sum())
+        names = type_mask.sum((0, 1, 2)).tolist()
         for j, name in enumerate(GENERATORS):
             if names[j] > 0:
                 fired[cell][name] += names[j]
@@ -101,7 +110,8 @@ def _grad_check(config, device):
     ds = _open(config, 'train')
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
                          ds.base.registry.n_keypoints, **scorer_kwargs(config)).to(device)
-    loss_fn = _loss(config)
+    loss_fn = build_scorer_loss(config, resolve_output_granularity(config)).to(device)
+    output_granularity = resolve_output_granularity(config)
     out = {}
     wanted = {}
     for i in range(len(ds)):
@@ -123,27 +133,13 @@ def _grad_check(config, device):
         trip = triplet_to_device(trip, device)
         model.zero_grad(set_to_none=True)
         scores, precision, labels = model.score_triplet(trip)
-        loss = loss_fn(scores, precision, labels)
+        loss = scorer_loss(loss_fn, scores, precision, labels, trip, output_granularity)
         loss.backward()
         n_bad = sum(int((~torch.isfinite(p.grad).all()).sum()) for p in model.parameters()
                     if p.grad is not None)
         n_t = sum(1 for p in model.parameters() if p.grad is not None)
         out[cell] = (float(loss.detach()), bool(torch.isfinite(loss)), n_t, n_bad)
     return out
-
-
-def _loss(config):
-    """A `TripletScorerLoss` built from the config's [scorer] block.
-
-    Inputs: config -- a loaded scorer config.
-    Outputs: the loss module.
-    Side effects: none.
-    """
-    from posetail.posetail.losses_scorer import TripletScorerLoss
-    s = config['scorer']
-    return TripletScorerLoss(margin=float(s.get('triplet_margin', 0.25)),
-                             precision_reg_weight=float(s.get('precision_reg_weight', 0.01)),
-                             score_reg_weight=float(s.get('score_reg_weight', 0.0)))
 
 
 def main(argv=None) -> int:
@@ -174,7 +170,8 @@ def main(argv=None) -> int:
     for cell, n in accepted.most_common():
         d = density[cell]
         print(f'  {cell[0]:>9}/{cell[1]}  {n:5d} triplets  '
-              f'({100.0 * n / max(total, 1):5.1f}%)  dense kpts {d["dense"]}, sparse {d["sparse"]}')
+              f'({100.0 * n / max(total, 1):5.1f}%)  dense kpts {d["dense"]}, sparse {d["sparse"]}  '
+              f'active slots dense {d["active_dense"]}, sparse {d["active_sparse"]}')
     if reasons:
         print('\nrejections, by cell and stage:')
         for (src, mode, why), n in reasons.most_common():

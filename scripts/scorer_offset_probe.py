@@ -39,7 +39,8 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
-from tailcyclenet.checkpoints import load_config, load_scorer_run, _SCORER_CONFIG  # noqa: E402
+from tailcyclenet.checkpoints import (load_config, load_scorer_run, scorer_output_granularity,
+                                      _SCORER_CONFIG)  # noqa: E402
 from tailcyclenet.scorer.qc import _loader_config, _to_device  # noqa: E402
 
 
@@ -78,7 +79,7 @@ def _targets(ds, spans):
 
 
 def _disagreement(pred_root, ref_root, split, session, group, animal_id, T):
-    """[n_frames] distance from the prediction to the reference for one track.
+    """[n_frames, K] distance from the prediction to the reference for one track.
 
     Inputs: pred_root / ref_root -- roots holding <split>/<session>; session -- the session name;
             group -- the group id; animal_id -- the animal's ID string; T -- unused, kept for
@@ -93,8 +94,27 @@ def _disagreement(pred_root, ref_root, split, session, group, animal_id, T):
     pa = [str(x) for x in pl.animal_ids].index(str(animal_id))
     ra = [str(x) for x in rl.animal_ids].index(str(animal_id))
     n = min(pl.points3d.shape[1], rl.points3d.shape[1], p.groups[group].n_frames)
-    d = np.linalg.norm(pl.points3d[pa, :n] - rl.points3d[ra, :n], axis=-1)
-    return np.nanmean(np.where(np.isfinite(d), d, np.nan), axis=1), n
+    pnames = [str(name) for name in p.names]
+    rnames = [str(name) for name in r.names]
+    d = np.full((n, len(pnames)), np.nan, dtype=np.float64)
+    for ki, name in enumerate(pnames):
+        if name not in rnames:
+            continue
+        ri = rnames.index(name)
+        d[:, ki] = np.linalg.norm(
+            pl.points3d[pa, :n, ki] - rl.points3d[ra, :n, ri], axis=-1)
+    return d, n
+
+
+def _dedupe_frame_rows(rows):
+    """Keep the last contextual window for each source-frame/keypoint row."""
+    latest = {}
+    for row in rows:
+        key = (row['session'], row['animal'], row['frame'], row['keypoint'])
+        old = latest.get(key)
+        if old is None or row['start'] >= old['start']:
+            latest[key] = row
+    return list(latest.values())
 
 
 def main(argv=None) -> int:
@@ -127,6 +147,7 @@ def main(argv=None) -> int:
     T = int(config['data']['n_frames'])
     model, rcfg, registry, ckpt = load_scorer_run(Path(args.run), device=args.device)
     model.eval()
+    output_granularity = scorer_output_granularity(rcfg)
     lc = _loader_config(rcfg)
     print(f'checkpoint {ckpt.name}, T={T}, K={registry.n_keypoints}')
 
@@ -146,7 +167,7 @@ def main(argv=None) -> int:
                 item = ds[i]
                 if item is None:
                     continue
-                views, coords, _v, _fr, cgroup, _row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
+                views, coords, _v, frames, cgroup, _row, _qt, _v2, _p2d, _occ, kpt_ids, _pr, _pt = \
                     item[:13]
                 views, coords, cgroup, kpt_ids = _to_device(
                     views, coords, cgroup, kpt_ids, args.device)
@@ -154,15 +175,42 @@ def main(argv=None) -> int:
                 scores = scores[0].cpu().numpy()
                 dist, nf = dists[(session, group, animal)]
                 names = list(ds.index[i].session.names)
-                for ki in range(scores.shape[0]):
+                if output_granularity == 'frame':
+                    source_frames = (frames.detach().cpu().numpy()
+                                     if torch.is_tensor(frames) else np.asarray(frames))
+                    source_frames = np.asarray(source_frames).reshape(-1)
+                    if scores.ndim != 2 or len(source_frames) != scores.shape[0]:
+                        raise RuntimeError(
+                            f'framewise scorer returned {scores.shape!r} for '
+                            f'{len(source_frames)} source frames')
+                    for local_t, source_frame in enumerate(source_frames):
+                        source_frame = int(source_frame)
+                        if not (0 <= source_frame < nf):
+                            continue
+                        for ki in range(scores.shape[1]):
+                            if (ki >= dist.shape[1] or not np.isfinite(scores[local_t, ki])
+                                    or not np.isfinite(dist[source_frame, ki])):
+                                continue
+                            rows.append({'offset': off, 'session': session, 'animal': animal,
+                                         'start': start, 'frame': source_frame,
+                                         'keypoint': names[ki],
+                                         'score': float(scores[local_t, ki]),
+                                         'error': float(dist[source_frame, ki])})
+                else:
+                    if scores.ndim != 1:
+                        raise RuntimeError(
+                            f'sequence scorer returned {scores.shape!r}; expected [K]')
                     lo, hi = start, min(start + T, nf)
                     seg = dist[lo:hi]
                     if not np.isfinite(seg).any():
                         continue
-                    rows.append({'offset': off, 'session': session, 'animal': animal,
-                                 'start': start, 'keypoint': names[ki],
-                                 'score': float(scores[ki]),
-                                 'error': float(np.nanmean(seg))})
+                    for ki in range(scores.shape[0]):
+                        rows.append({'offset': off, 'session': session, 'animal': animal,
+                                     'start': start, 'keypoint': names[ki],
+                                     'score': float(scores[ki]),
+                                     'error': float(np.nanmean(seg))})
+        if output_granularity == 'frame':
+            rows = _dedupe_frame_rows(rows)
         arms[off] = rows
         print(f'  offset {off}: scored {len(tgt)} windows -> {len(rows)} rows '
               f'in {time.time() - t0:.1f}s')
@@ -184,6 +232,8 @@ def main(argv=None) -> int:
             'start': pl.Int64, 'keypoint': pl.String, 'score': pl.Float64,
             'error': pl.Float64,
         }
+        if output_granularity == 'frame':
+            row_schema['frame'] = pl.Int64
         pl.DataFrame([r for rows in arms.values() for r in rows], schema=row_schema).write_parquet(
             args.save_rows, compression='snappy'
         )

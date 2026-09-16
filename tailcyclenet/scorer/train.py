@@ -319,7 +319,8 @@ def corruption_config(config: dict) -> dict:
     return cfg
 
 
-def build_datasets(config: dict, registry_base: Registry | None):
+def build_datasets(config: dict, registry_base: Registry | None, *, rank: int = 0,
+                   world_size: int = 1):
     """(train, val) `ScorerDataset`s, with val None when the root has no val split.
 
     Inputs: config -- the merged run config; registry_base -- a registry to append to, or None.
@@ -332,7 +333,8 @@ def build_datasets(config: dict, registry_base: Registry | None):
     data_cfg = config['data']
     lc = loader_config(data_cfg, config['model'])
     corr = corruption_config(config)
-    train_base = PoseDataset(data_cfg['path'], 'train', lc, registry_base=registry_base)
+    train_base = PoseDataset(data_cfg['path'], 'train', lc, registry_base=registry_base,
+                             rank=rank, world_size=world_size)
     registry = train_base.registry
     train_ds = ScorerDataset(train_base, corr)
     print(f'train: {len(train_ds)} windows, {registry.n_keypoints} keypoints')
@@ -344,7 +346,8 @@ def build_datasets(config: dict, registry_base: Registry | None):
     if not has_val:
         return train_ds, None, registry
     val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
-    val_base = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry)
+    val_base = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry,
+                           rank=rank, world_size=world_size)
     return train_ds, ScorerDataset(val_base, corr), registry
 
 
@@ -939,7 +942,9 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                         checkpoint_contract_mismatch = True
                         print(f'{probe}: {e}; using warm-start weights')
 
-    train_ds, val_ds, registry = build_datasets(config, base_reg)
+    train_ds, val_ds, registry = build_datasets(
+        config, base_reg, rank=(fabric.global_rank if fabric is not None else 0),
+        world_size=world)
     if fabric is not None:
         dist_utils.check_registry(fabric, registry.names)
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
@@ -1034,12 +1039,13 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     # below before selection, so each rank sees exactly the same checkpoint decision.
     val_indices = None
     if val_ds is not None:
-        n_val = min(val_batches, len(val_ds))
-        val_indices = [int(i) for i in np.unique(np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
+        n_val = min(dist_utils.per_rank(val_batches, world), len(val_ds))
+        val_indices = ([int(i) for i in np.unique(
+            np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
+                       if n_val else [])
     train_loader, val_loader = _loaders(
         train_ds, val_ds, config, seed, world=world, rank=(fabric.global_rank if fabric else 0),
-        num_samples=local_iters, val_indices=(val_indices[fabric.global_rank::world]
-                                              if val_indices is not None and fabric is not None else val_indices))
+        num_samples=local_iters, val_indices=val_indices)
 
     raw_model = model
     wrap = fabric is not None and world > 1

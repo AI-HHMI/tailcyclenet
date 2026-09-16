@@ -1,9 +1,11 @@
 """Focused contracts for the scorer's distributed launch helpers."""
 import torch
+from pathlib import Path
+import sys
 
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet.scorer import train as scorer_train
-from tailcyclenet.dataset import StepSampler
+from tailcyclenet.dataset import LoaderConfig, PoseDataset, StepSampler, shard_sessions
 
 
 def test_scorer_rank_sampler_is_replacement_and_rank_seeded():
@@ -63,3 +65,25 @@ def test_launch_requests_ddp_for_multiple_cpu_devices(monkeypatch):
     assert seen['accelerator'] == 'cpu'
     assert seen['devices'] == 4
     assert seen['strategy'] == 'ddp_find_unused_parameters_true'
+
+
+def test_session_sharding_is_disjoint_and_one_gpu_is_unchanged():
+    sessions = list(range(11))
+    shards = [shard_sessions(sessions, rank, 4) for rank in range(4)]
+    assert sorted(x for shard in shards for x in shard) == sessions
+    assert len(set().union(*map(set, shards))) == len(sessions)
+    assert shard_sessions(sessions) == sessions
+
+
+def test_empty_validation_session_shard_is_allowed(tmp_path):
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as C
+
+    root = tmp_path / 'ds'
+    for i in range(3):
+        C._session_3d(root / 'val' / f'session_{i}')
+    cfg = LoaderConfig(n_frames=4, image_size=64, val_cams_to_sample=2,
+                       prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0)
+    empty = PoseDataset(root, 'val', cfg, rank=3, world_size=4)
+    assert len(empty) == 0
+    assert empty.registry.n_keypoints > 0

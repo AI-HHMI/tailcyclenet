@@ -812,10 +812,23 @@ class View:
     scale: list
 
 
+def shard_sessions(sessions, rank: int = 0, world_size: int = 1):
+    """Return a deterministic disjoint session shard, preserving source order.
+
+    ``world_size=1`` is exactly the historical list.  Session metadata remains visible to
+    registry construction; only the returned sessions are preloaded by ``PoseDataset``.
+    """
+    world_size, rank = int(world_size), int(rank)
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError(f'invalid session shard rank={rank}, world_size={world_size}')
+    return list(sessions)[rank::world_size]
+
+
 class PoseDataset(Dataset):
     def __init__(self, path, split: str, cfg: LoaderConfig, registry: Registry | None = None,
                  train: bool | None = None, seed: int = 23,
-                 registry_base: Registry | None = None):
+                 registry_base: Registry | None = None, rank: int = 0,
+                 world_size: int = 1):
         """Build the window index for one split of a dataset (or folder of datasets).
 
         Scatters every session's parquet into dense arrays in the parent process so forked
@@ -829,6 +842,9 @@ class PoseDataset(Dataset):
                 train -- override the train/val flag (defaults to split == 'train').
                 seed -- the RNG seed for reproducible val/test sampling.
                 registry_base -- a base registry whose ids must be preserved (warm start).
+                rank/world_size -- optional disjoint session shard; metadata for the registry is
+                                   still read from every session, while only this rank's sessions
+                                   are preloaded. Empty validation shards are allowed.
         Side effects: reads every label table; prints the box_source coverage per dataset.
 
         `n_frames` must be >= 2 (T = 1 gives posetail `gT = 0` and a zero-length
@@ -855,6 +871,11 @@ class PoseDataset(Dataset):
         self.split = split
         self.train = (split == 'train') if train is None else train
         self.datasets = load_datasets(path)
+        self.rank, self.world_size = int(rank), int(world_size)
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size:
+            raise ValueError(f'invalid dataset shard rank={self.rank}, world_size={self.world_size}')
+        # Registry.build reads only Dataset metadata/names.  Build it BEFORE selecting the shard,
+        # so every rank has the same append-only embedding axis without preloading other sessions.
         self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
         self._aug = _build_augmenters(cfg) if self.train and cfg.aug_prob > 0 else None
@@ -865,7 +886,7 @@ class PoseDataset(Dataset):
         boxed: list[tuple[str, int, int]] = []
         for di, ds in enumerate(self.datasets):
             mine, n_box, n_sess = [], 0, 0
-            for sess in ds.sessions.get(split, []):
+            for sess in shard_sessions(ds.sessions.get(split, []), self.rank, self.world_size):
                 sess.preload()
                 n_sess += 1
                 self._kpt_ids[sess.path] = torch.as_tensor(
@@ -890,8 +911,9 @@ class PoseDataset(Dataset):
                 n_box += (sess.path / 'instances.pq').exists()
             boxed.append((ds.name, n_box, n_sess))
             self.by_dataset.append(mine)
-        if not self.index:
-            raise ValueError(f'{path}: split {split!r} yielded no usable windows')
+        if not self.index and self.train:
+            raise ValueError(f'{path}: split {split!r} yielded no usable windows on rank '
+                             f'{self.rank}/{self.world_size}')
         if cfg.box_source == 'instances':
             print(f'{split}: box_source=instances  ' + '  '.join(
                 f'{n}/{t} {name}' + ('' if n == t else ' (keypoint fallback)')

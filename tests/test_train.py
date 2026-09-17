@@ -455,6 +455,8 @@ def test_load_config_layers_over_the_repo_base_by_default(tmp_path):
     assert cfg['training']['n_iterations'] == 60000
     assert cfg['training']['optimizer']['optimizer'] == 'muon'
     assert cfg['training']['losses']['delta'] == 6
+    assert cfg['data']['grayscale_prob'] == 0.2
+    assert cfg['data']['invert_prob'] == 0.0
 
 
 def test_load_config_extends_is_deleted_and_raises(tmp_path):

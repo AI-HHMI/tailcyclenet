@@ -67,6 +67,7 @@ flip_2d_prob = 0.0
 flip_2d_modes = ["horizontal"]
 per_image_aug_prob = 0.25
 grayscale_prob = 0.2
+invert_prob = 0.0
 crop_inflate = [0.9, 1.5]
 # Two train workers per rank keep the GPU fed without the old 8-worker RAM multiplier.
 num_workers = 2

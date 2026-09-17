@@ -494,6 +494,28 @@ def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
     assert any(not np.array_equal(varied[0], v) for v in varied[1:])
 
 
+def test_invert_augmentation_complements_pixels(tiny_root):
+    """Color inversion maps every uint8 channel to its black/white complement."""
+    class _Identity:
+        def to_deterministic(self):
+            return self
+
+        def __call__(self, *, image):
+            return image
+
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                       per_image_aug_prob=0.0, grayscale_prob=0.0, invert_prob=1.0,
+                       crop_jitter=0.0)
+    ds = PoseDataset(tiny_root / 'ratlike', 'train', cfg)
+    # Keep this unit test focused on inversion rather than imgaug's independent appearance draws.
+    ds._aug = (_Identity(), _Identity())
+    imgs = [np.array([[[0, 1, 127], [128, 254, 255]]], dtype=np.uint8)]
+    got = ds._augment([imgs[0].copy()], 0, torch.tensor([2, 1]), None, None, False,
+                      np.random.default_rng(0), invert=True)
+    np.testing.assert_array_equal(got[0], 255 - imgs[0])
+    assert got[0].dtype == np.uint8
+
+
 def test_cutout_marks_covered_keypoints_not_visible():
     """A keypoint under a cutout rect must be labelled not-visible, including where it was NaN."""
     from tailcyclenet.dataset import _cutout_rects

@@ -8,6 +8,10 @@ n_frames = 12               # a CEILING: a train window is sized to the labelled
 image_size = 256
 balance_datasets = true
 aug_prob = 0.25
+# Train-only grayscale conversion; zero disables it.
+grayscale_prob = 0.2
+# Train-only black <-> white color inversion; zero disables it.
+invert_prob = 0.0
 # Train-only source-canvas flips; zero disables them, and active 2D sessions must declare `flip_pairs`.
 flip_2d_prob = 0.0
 flip_2d_modes = ["horizontal"]

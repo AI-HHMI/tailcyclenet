@@ -69,6 +69,8 @@ class LoaderConfig:
     per_image_aug_prob: float = 0.25
     # rate at which a train item drops colour entirely
     grayscale_prob: float = 0.2
+    # rate at which a train item inverts colour (black <-> white)
+    invert_prob: float = 0.0
     # box centre jitter, fraction of box size
     crop_jitter: float = 0.3
     # box scale jitter
@@ -1434,8 +1436,9 @@ class PoseDataset(Dataset):
         """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
 
         Consumes the rotation draw (one per camera), the optional per-view 2D flip draw, the crop
-        jitter, the grayscale coin and the appearance augmenters -- everything whose value is a
-        property of HOW the window is shown. The flip coin is drawn only after the complete 2D
+        jitter, the grayscale/inversion coins and the appearance augmenters -- everything whose
+        value is a property of HOW the window is shown. The flip coin is drawn only after the
+        complete 2D
         rotation block and only when its configured probability is positive.
         Returns the `View`, or None when the crop or the decode fails.
         `sel` is NOT mutated: `vis_2d` is cloned on entry and no library helper in this path
@@ -1568,6 +1571,8 @@ class PoseDataset(Dataset):
             p2d = p2d_all if single_view else None
 
         gray = self._aug is not None and rng.random() < self.cfg.grayscale_prob
+        invert = (self._aug is not None and self.cfg.invert_prob > 0
+                  and rng.random() < self.cfg.invert_prob)
         use_pool = group.source(cam_names[0])[0] != 'video'
         with (ThreadPoolExecutor(max_workers=16) if use_pool else nullcontext()) as pool:
             views = []
@@ -1579,7 +1584,7 @@ class PoseDataset(Dataset):
                     return None
                 if self._aug is not None:
                     imgs = self._augment(imgs, cnum, cgroup[cnum]['size'], p2d_all, vis_2d,
-                                         gray, rng)
+                                         gray, rng, invert=invert)
                 views.append(torch.from_numpy(np.asarray(imgs)))
 
         if vis is not None and vis_2d is not None:
@@ -1709,11 +1714,12 @@ class PoseDataset(Dataset):
             out.append(box)
         return tuple(out)
 
-    def _augment(self, imgs, cnum, size, p2d, vis_2d, gray, rng):
+    def _augment(self, imgs, cnum, size, p2d, vis_2d, gray, rng, invert=False):
         """Appearance augmentation for one camera's T crops. `vis_2d` is mutated by cutout.
 
         `to_deterministic()` freezes this camera's sampled parameters so every frame gets the
-        SAME gamma/hue; only the apply is per-frame.
+        SAME gamma/hue; only the apply is per-frame. `invert` is one item-level color-inversion
+        decision, shared by every frame and camera in the item.
         """
         import cv2
 
@@ -1726,6 +1732,8 @@ class PoseDataset(Dataset):
                     im[y1:y2, x1:x2] = fill
         if gray:
             imgs = [np.stack([cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)] * 3, -1) for im in imgs]
+        if invert:
+            imgs = [255 - im for im in imgs]
         return imgs
 
     def _jitter(self, rng):

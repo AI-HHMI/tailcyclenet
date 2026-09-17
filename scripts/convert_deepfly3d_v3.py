@@ -581,12 +581,20 @@ def skeleton_for(result: NativeResult) -> tuple[list[list[str]], list[list[str]]
 
 
 def _source_files_for(result: NativeResult, images: Path) -> list[list[Path]]:
-    """Resolve all seven source image sequences and verify dimensions against native metadata."""
+    """Resolve source sequences and verify representative dimensions against native metadata.
+
+    The extraction/worker checks already establish the complete contiguous 900-frame layout.
+    Opening and decoding all 1.24 million JPEGs again on the shared filesystem made inventory
+    needlessly take hours, so inspect the first and last frame of each camera here; the generic
+    session validator repeats the first-frame calibration-size check after writing.
+    """
     from PIL import Image
     out = []
     for c in range(N_CAMERAS):
         files = camera_files(images, c, result.n_frames)
-        for frame, path in enumerate(files):
+        check_frames = sorted({0, len(files) - 1})
+        for frame in check_frames:
+            path = files[frame]
             try:
                 with Image.open(path) as im:
                     got = tuple(int(v) for v in im.size)

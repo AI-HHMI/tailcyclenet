@@ -236,9 +236,12 @@ def require_scorer_contract(config: dict, ckpt: dict, *, where='checkpoint') -> 
         if isinstance(metadata_contract, dict):
             missing = required - set(metadata_contract)
             if missing:
-                raise ValueError(
-                    f'{where}: incomplete frame scorer contract metadata; missing '
-                    f'{sorted(missing)}')
+                embedded_contract = scorer_contract(embedded) if isinstance(embedded, dict) else {}
+                unresolved = missing - set(embedded_contract)
+                if unresolved:
+                    raise ValueError(
+                        f'{where}: incomplete frame scorer contract metadata; missing '
+                        f'{sorted(unresolved)}')
         elif not isinstance(embedded, dict):
             raise ValueError(f'{where}: frame scorer checkpoint has no complete semantic contract')
     mismatches = scorer_contract_mismatches(config, ckpt)

@@ -334,7 +334,9 @@ def build_datasets(config: dict, registry_base: Registry | None, *, rank: int = 
     camera-count draw, so held-out windows have comparable difficulty.
     """
     data_cfg = config['data']
-    lc = loader_config(data_cfg, config['model'])
+    loader_data = {**data_cfg, 'two_d_sampling': config['scorer'].get(
+        'two_d_sampling', 'true-2d-hybrid-v1')}
+    lc = loader_config(loader_data, config['model'])
     corr = corruption_config(config)
     train_base = PoseDataset(data_cfg['path'], 'train', lc, registry_base=registry_base,
                              rank=rank, world_size=world_size)

@@ -73,6 +73,22 @@ def test_true_2d_sampling_semantics_are_part_of_scorer_contract():
     assert 'config.two_d_sampling' in mismatches
 
 
+def test_legacy_frame_checkpoint_uses_embedded_config_for_new_contract_fields():
+    config = {'scorer': {'output_granularity': 'frame',
+                         'two_d_sampling': 'legacy-3d-single-view'},
+              'data': {'prob_2d_only': 0.2}}
+    embedded = {'scorer': {'output_granularity': 'frame'},
+                'data': {'prob_2d_only': 0.2}}
+    metadata_contract = scorer_contract(embedded)
+    metadata_contract.pop('two_d_sampling')
+    metadata_contract.pop('prob_2d_only')
+    from tailcyclenet.checkpoints import require_scorer_contract
+    require_scorer_contract(
+        config,
+        {'config': embedded, 'scorer_metadata': {'contract': metadata_contract}},
+    )
+
+
 def test_scorer_window_length_must_match_model_stride():
     config = {'scorer': {}, 'data': {'n_frames': 12}, 'model': {'stride_length': 24}}
     with pytest.raises(SystemExit, match='n_frames.*stride_length'):

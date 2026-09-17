@@ -49,6 +49,8 @@ class LoaderConfig:
     val_cams_to_sample: int | list = 5
     # rate at which a training item uses the single-camera image-plane 2D path
     prob_2d_only: float = 0.25
+    # semantic switch for 3D single-view sampling; legacy keeps 3D targets in one camera
+    two_d_sampling: str = 'true-2d-hybrid-v1'
     # sample datasets uniformly, not proportionally
     balance_datasets: bool = True
     # in-plane rotation, per-camera appearance, cutout
@@ -1243,11 +1245,19 @@ class PoseDataset(Dataset):
         inflate = _crop_inflate(self.cfg, rng, self.train)
 
         session_2d = sess.mode == '2d'
-        force_2d = (not session_2d and self.train
-                    and self.cfg.prob_2d_only > 0
-                    and shape['single_view_draw'] < self.cfg.prob_2d_only)
-        true_2d = session_2d or force_2d
-        single_view = False
+        if self.cfg.two_d_sampling == 'true-2d-hybrid-v1':
+            force_2d = (not session_2d and self.train
+                        and self.cfg.prob_2d_only > 0
+                        and shape['single_view_draw'] < self.cfg.prob_2d_only)
+            true_2d = session_2d or force_2d
+            single_view = False
+        elif self.cfg.two_d_sampling == 'legacy-3d-single-view':
+            true_2d = session_2d
+            single_view = (not true_2d and self.train
+                           and self.cfg.prob_2d_only > 0
+                           and shape['single_view_draw'] < self.cfg.prob_2d_only)
+        else:
+            raise ValueError(f'unknown two_d_sampling={self.cfg.two_d_sampling!r}')
 
         if true_2d:
             cam_ix = ([0] if session_2d else

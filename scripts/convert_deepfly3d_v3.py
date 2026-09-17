@@ -609,15 +609,24 @@ def _source_files_for(result: NativeResult, images: Path) -> list[list[Path]]:
 
 
 def link_pixels(view_dir: Path, source_files: list[Path]) -> None:
-    """Create a deterministic numbered symlink farm without copying image bytes."""
+    """Create a deterministic numbered symlink farm without copying image bytes.
+
+    New farms are empty by construction, so avoid an existence/stat/resolve round trip for every
+    frame on the shared filesystem.  The slower collision-checking path remains for idempotent
+    reruns or manually resumed sessions.
+    """
+    fresh = not view_dir.exists()
     view_dir.mkdir(parents=True, exist_ok=True)
     for i, source in enumerate(source_files):
         dst = view_dir / f'{i:06d}{source.suffix.lower()}'
+        if fresh:
+            os.symlink(os.fspath(source), os.fspath(dst))
+            continue
         if dst.exists() or dst.is_symlink():
             if not dst.is_symlink() or dst.resolve() != source.resolve():
                 raise RuntimeError(f'pixel link collision: {dst}')
             continue
-        dst.symlink_to(source.resolve())
+        dst.symlink_to(source)
 
 
 def _append_scores(path: Path, scores: np.ndarray) -> None:

@@ -35,6 +35,9 @@ MISSING_OK = {
     # SLEAP's per-point `visible=False` is an annotator occlusion judgement; the position it
     # keeps is stale, so the row is `missing` rather than `projected`.
     'comrie-minimaze': ('keypoints',),
+    # Native deeperfly's pathway plan explicitly assesses which fly38 points each view can
+    # predict: finite 2D output is visible and NaN/unassigned output is missing.
+    'deepfly3d-v3': ('keypoints',),
 }
 
 # root -> {table: exact hole count}, summed over every session in the root, checked only for

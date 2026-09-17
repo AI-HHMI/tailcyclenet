@@ -1,0 +1,549 @@
+# deeperfly run configuration -- a single self-contained file.
+#
+# Bundles everything one run needs: the shared inputs ([[sources]] footage, the
+# camera rig, the skeleton) and the pipeline -- a linear sequence of stages, each
+# a top-level table. The 2D detector and its detection plan live under [pose2d]
+# (preprocessors -> models -> pathways, with [pose2d.output_points] saying how
+# each pathway's output channels are packaged into the per-view 2D keypoints).
+# Run with:
+#
+#     deeperfly run recording/ -c config.toml -o outputs/
+#     # -c defaults to this packaged config; -o defaults to <recording>/deeperfly_outputs/
+#
+# Every section is also usable on its own: CameraGroup.from_config reads only
+# [cameras.*], Skeleton.from_config only [skeleton] -- foreign sections are ignored.
+
+
+# ===========================================================================
+# Sources: named footage globs, each decoded once. A shared input -- a
+# [[pose2d.pathways]] entry runs a detector on a source, and visualization draws
+# a view's frames from it. Decoupled from the cameras and pathways that reference
+# it by name, so one source can feed several pathways.
+# ===========================================================================
+# `filename` is a footage glob (a file, prefix, or wildcard), or a list of
+# alternates tried in order -- the first that resolves footage wins. It is matched
+# case-insensitively, so `camera_RH.mp4` finds a `CAMERA_rh.MP4`. Each source below
+# names its self-describing anatomical file (RH = right hind, F = front, ...) and
+# falls back to the DeepFly3D positional index (`camera_0` .. `camera_6`).
+[[sources]]
+name = "vid_rh"
+filename = "camera_0"
+[[sources]]
+name = "vid_rm"
+filename = "camera_1"
+[[sources]]
+name = "vid_rf"
+filename = "camera_2"
+[[sources]]
+name = "vid_f"
+filename = "camera_3"
+[[sources]]
+name = "vid_lf"
+filename = "camera_4"
+[[sources]]
+name = "vid_lm"
+filename = "camera_5"
+[[sources]]
+name = "vid_lh"
+filename = "camera_6"
+
+[io.image]
+workers = 0   # decode threads (0 = auto, one per CPU)
+
+
+# ===========================================================================
+# Skeleton: the tracked points and their structure (DeepFly3D 7-camera rig). 38
+# points = 19 per side (L = 0..18, R = 19..37): three 5-point legs, one antenna
+# and three abdominal markers per side. `limb_points` groups the points into 10
+# named limbs, each a kinematic chain; `limb_palette` gives each limb its
+# plotting color. Edit to track a different animal.
+# ===========================================================================
+[skeleton]
+name = "fly38"
+
+point_names = [
+    "lf_thorax_coxa", "lf_coxa_trochanter", "lf_femur_tibia", "lf_tibia_tarsus", "lf_claw",
+    "lm_thorax_coxa", "lm_coxa_trochanter", "lm_femur_tibia", "lm_tibia_tarsus", "lm_claw",
+    "lh_thorax_coxa", "lh_coxa_trochanter", "lh_femur_tibia", "lh_tibia_tarsus", "lh_claw",
+    "l_antenna", "l_abdomen0", "l_abdomen1", "l_abdomen2",
+    "rf_thorax_coxa", "rf_coxa_trochanter", "rf_femur_tibia", "rf_tibia_tarsus", "rf_claw",
+    "rm_thorax_coxa", "rm_coxa_trochanter", "rm_femur_tibia", "rm_tibia_tarsus", "rm_claw",
+    "rh_thorax_coxa", "rh_coxa_trochanter", "rh_femur_tibia", "rh_tibia_tarsus", "rh_claw",
+    "r_antenna", "r_abdomen0", "r_abdomen1", "r_abdomen2",
+]
+
+# Limbs: each entry lists a limb's tracked points (by name) in kinematic-chain order.
+[skeleton.limb_points]
+lf_leg = ["lf_thorax_coxa", "lf_coxa_trochanter", "lf_femur_tibia", "lf_tibia_tarsus", "lf_claw"]
+lm_leg = ["lm_thorax_coxa", "lm_coxa_trochanter", "lm_femur_tibia", "lm_tibia_tarsus", "lm_claw"]
+lh_leg = ["lh_thorax_coxa", "lh_coxa_trochanter", "lh_femur_tibia", "lh_tibia_tarsus", "lh_claw"]
+l_antenna = ["l_antenna"]
+l_abdomen = ["l_abdomen0", "l_abdomen1", "l_abdomen2"]
+rf_leg = ["rf_thorax_coxa", "rf_coxa_trochanter", "rf_femur_tibia", "rf_tibia_tarsus", "rf_claw"]
+rm_leg = ["rm_thorax_coxa", "rm_coxa_trochanter", "rm_femur_tibia", "rm_tibia_tarsus", "rm_claw"]
+rh_leg = ["rh_thorax_coxa", "rh_coxa_trochanter", "rh_femur_tibia", "rh_tibia_tarsus", "rh_claw"]
+r_antenna = ["r_antenna"]
+r_abdomen = ["r_abdomen0", "r_abdomen1", "r_abdomen2"]
+
+# Per-limb plotting color (hex). Legs read left = blue / right = red, lightening
+# front -> hind. Limbs without an entry fall back to a default colormap.
+[skeleton.limb_palette]
+lf_leg = "#0f7399"
+lm_leg = "#1a8daf"
+lh_leg = "#75becb"
+l_antenna = "#0a4f6b"
+l_abdomen = "#a9dbe4"
+rf_leg = "#ba1e31"
+rm_leg = "#c9564f"
+rh_leg = "#d58579"
+r_antenna = "#8c1525"
+r_abdomen = "#e6b3a8"
+
+
+# ===========================================================================
+# Views: the geometric cameras a pathway maps its points back into -- an array
+# of views orbiting an object near the world origin. Each `[cameras.<name>]` holds
+# only geometry (intrinsics + the orbit extrinsics); its footage comes from the
+# pathway's source, and its intrinsics describe that source's raw frame.
+# `[cameras.defaults]` is merged into every view; per-view keys override it.
+# ===========================================================================
+[cameras.defaults]
+focal_length_px = [22388.125, 22388.125]    # scalar also allowed when fx == fy
+
+# optional; omit to use each view's image center ((w-1)/2, (h-1)/2). Set it only
+# when the principal point is not at the image center.
+# principal_point_px = [479.5, 239.5]
+
+distortion_coefficients = []  # empty means no distortion
+look_at = [0.0, 0.0, 0.0]
+distance = 107.463
+elevation_deg = 0.0
+roll_deg = 0.0
+
+[cameras.rh]
+azimuth_deg = -120
+[cameras.rm]
+azimuth_deg = -90
+[cameras.rf]
+azimuth_deg = -45
+[cameras.f]
+azimuth_deg = 0
+[cameras.lf]
+azimuth_deg = 45
+[cameras.lm]
+azimuth_deg = 90
+[cameras.lh]
+azimuth_deg = 120
+
+
+# ===========================================================================
+# Pipeline: a linear sequence of stages, each an on/off switch in [pipeline]
+# (do_<stage>) with its own parameter table:
+#
+#   do_pose2d               -> [pose2d]               detect 2D per view
+#   do_bundle_adjustment    -> [bundle_adjustment]    refine the cameras
+#   do_pictorial_structures -> [pictorial_structures] peak recovery
+#   do_triangulation        -> [triangulation]        2D -> 3D
+#   do_visualization        -> [visualization]        render the videos
+#
+# An enabled stage reuses its cached result from the output dir while its
+# parameters here are unchanged; *editing this file recomputes exactly the
+# affected stages* (and the ones after them) on the next run -- tweak the
+# triangulation or the videos and re-run; the slow 2D detection is reused.
+# --overwrite forces a recompute even when nothing changed (bare --overwrite
+# redoes everything; `--overwrite pose2d visualization` redoes just those, plus
+# the stages after them). The cached 2D pose always feeds the stages downstream
+# -- so `do_pose2d = false` reconstructs 3D from a cached 2D pose without
+# re-detecting -- while a *derived* stage's cached output is used only while
+# that stage is on. An enabled stage whose input is unavailable is skipped,
+# with the reason logged.
+# ===========================================================================
+[pipeline]
+do_pose2d               = true   # detect 2D pose in every camera view
+do_bundle_adjustment    = true   # refine the cameras with bundle adjustment
+do_pictorial_structures = false  # DeepFly3D-style pictorial-structures recovery
+do_triangulation        = true   # triangulate 2D -> 3D
+do_visualization        = false  # LSF production: retain H5, skip visualization videos
+
+
+# ===========================================================================
+# 2D detection (the pose2d stage). [pose2d] holds the detector's performance
+# knobs; its detection plan -- what to detect and how -- follows as sub-tables
+# whose counts may all differ:
+#   [[pose2d.preprocessors]]      -- named, reusable frame-op pipelines (mirror/crop/resize)
+#   [[pose2d.models]]             -- detector models (class + weights + input contract)
+#   [[pose2d.pathways]]           -- a named source -> preprocessor -> model inference run
+#   [pose2d.output_points.<view>] -- how each pathway's output channels are packaged
+#                                    into the per-view 2D keypoints
+# Video frames are decoded with PyAV (on the CPU).
+# ===========================================================================
+[pose2d]
+# Forward precision. "float32" is the reference; "float16" runs under CUDA autocast
+# -- ~1.5-2x faster on the GPU with negligible keypoint drift. "bfloat16" (default)
+# is about as fast with a wider range (no overflow) at slightly lower precision.
+# Ignored on CPU/MPS, which stay float32.
+precision = "bfloat16"
+# GPU forward batch: images pushed through the detector at once. The 8-stack
+# network is compute-bound, so throughput plateaus by ~16 on a fast GPU -- 16
+# saturates speed while keeping forward VRAM low (~0.8 GB). Raise it only if a
+# benchmark shows a gain on your hardware. Ignored on CPU (one pass-group at a time).
+batch_size = 8
+# Video decode buffer, in multiples of batch_size. Each camera is decoded in one
+# continuous pass into a queue, one batch_size-frame block at a time; the reader
+# runs ahead and pauses once this many blocks are queued, so it never outruns the
+# GPU or grows memory without bound (peak ~(decode_buffer + 2) * batch_size frames
+# per camera). Raise it to keep the GPU fed when decode is jittery (slow seeks,
+# network/remote storage); lower it to shave memory.
+decode_buffer = 1
+
+# Named preprocessors: an ordered op list applied to a pathway's frames before
+# the model. The detector's points are mapped back into the view frame by
+# inverting these ops, so a mirror here never moves the reconstructed skeleton.
+# A pathway may omit `preprocessor` entirely -- that means no ops (identity),
+# the same as referencing a preprocessor whose `ops = []`.
+# Ops: { op = "fliplr" } / { op = "flipud" } / { op = "rot90", k = 1 } /
+#      { op = "crop", x=, y=, width=, height= } / { op = "resize", scale= }.
+[[pose2d.preprocessors]]
+name = "flip"
+ops = [{ op = "fliplr" }]
+
+# Models: `class` selects the network ("hourglass" = DeepFly2D); `weights` is a
+# checkpoint path ("" / omitted uses the auto-provisioned cache); `input_size`
+# (height, width) is the frame size the network was trained on -- every frame is
+# resized to it before inference and the output peaks are scaled back out of it,
+# so it cannot be inferred; `mean` is subtracted after /255; `n_out_channels` is
+# the output heatmap count (validated against the weights).
+[[pose2d.models]]
+name = "deepfly2d"
+class = "hourglass"
+weights = "/groups/karashchuk/karashchuklab/animal-datasets/ramdya-fly/deepfly3d_weights/sh8_front_j8.tar"
+input_size = [256, 512]
+mean = 0.22
+n_out_channels = 19
+
+# Pathways: each a named source -> preprocessor -> model run. A pathway just says
+# what to detect on; where its output channels land is in [pose2d.output_points]
+# below. The front source feeds two pathways (one mirrored). Each pathway needs a
+# unique `name` so [pose2d.output_points] can reference it.
+[[pose2d.pathways]]
+name = "rh"
+source = "vid_rh"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "rm"
+source = "vid_rm"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "rf"
+source = "vid_rf"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "f"
+source = "vid_f"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "f_flip"
+source = "vid_f"
+preprocessor = "flip"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "lf_flip"
+source = "vid_lf"
+preprocessor = "flip"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "lm_flip"
+source = "vid_lm"
+preprocessor = "flip"
+model = "deepfly2d"
+
+[[pose2d.pathways]]
+name = "lh_flip"
+source = "vid_lh"
+preprocessor = "flip"
+model = "deepfly2d"
+
+# output_points: how the stage packages its result. For each view, where every
+# tracked point's data comes from: `point = { pathway, out_channel }` fills that
+# point of the view from output channel `out_channel` of the named pathway. Keying
+# by (view, point) means each point has exactly one source (a repeat is an error);
+# a (view, point) left out stays unobserved (NaN) -- that union is the visibility
+# mask. The front view is filled by two pathways: the un-flipped pass supplies the
+# right distal joints, the mirrored pass the left.
+[pose2d.output_points.rh]
+rf_thorax_coxa     = { pathway = "rh", out_channel = 0  }
+rf_coxa_trochanter = { pathway = "rh", out_channel = 1  }
+rf_femur_tibia     = { pathway = "rh", out_channel = 2  }
+rf_tibia_tarsus    = { pathway = "rh", out_channel = 3  }
+rf_claw            = { pathway = "rh", out_channel = 4  }
+rm_thorax_coxa     = { pathway = "rh", out_channel = 5  }
+rm_coxa_trochanter = { pathway = "rh", out_channel = 6  }
+rm_femur_tibia     = { pathway = "rh", out_channel = 7  }
+rm_tibia_tarsus    = { pathway = "rh", out_channel = 8  }
+rm_claw            = { pathway = "rh", out_channel = 9  }
+rh_thorax_coxa     = { pathway = "rh", out_channel = 10 }
+rh_coxa_trochanter = { pathway = "rh", out_channel = 11 }
+rh_femur_tibia     = { pathway = "rh", out_channel = 12 }
+rh_tibia_tarsus    = { pathway = "rh", out_channel = 13 }
+rh_claw            = { pathway = "rh", out_channel = 14 }
+r_antenna          = { pathway = "rh", out_channel = 15 }
+r_abdomen0         = { pathway = "rh", out_channel = 16 }
+r_abdomen1         = { pathway = "rh", out_channel = 17 }
+r_abdomen2         = { pathway = "rh", out_channel = 18 }
+
+[pose2d.output_points.rm]
+rf_thorax_coxa     = { pathway = "rm", out_channel = 0  }
+rf_coxa_trochanter = { pathway = "rm", out_channel = 1  }
+rf_femur_tibia     = { pathway = "rm", out_channel = 2  }
+rf_tibia_tarsus    = { pathway = "rm", out_channel = 3  }
+rf_claw            = { pathway = "rm", out_channel = 4  }
+rm_thorax_coxa     = { pathway = "rm", out_channel = 5  }
+rm_coxa_trochanter = { pathway = "rm", out_channel = 6  }
+rm_femur_tibia     = { pathway = "rm", out_channel = 7  }
+rm_tibia_tarsus    = { pathway = "rm", out_channel = 8  }
+rm_claw            = { pathway = "rm", out_channel = 9  }
+rh_thorax_coxa     = { pathway = "rm", out_channel = 10 }
+rh_coxa_trochanter = { pathway = "rm", out_channel = 11 }
+rh_femur_tibia     = { pathway = "rm", out_channel = 12 }
+rh_tibia_tarsus    = { pathway = "rm", out_channel = 13 }
+rh_claw            = { pathway = "rm", out_channel = 14 }
+r_antenna          = { pathway = "rm", out_channel = 15 }
+r_abdomen0         = { pathway = "rm", out_channel = 16 }
+r_abdomen1         = { pathway = "rm", out_channel = 17 }
+r_abdomen2         = { pathway = "rm", out_channel = 18 }
+
+[pose2d.output_points.rf]
+rf_thorax_coxa     = { pathway = "rf", out_channel = 0  }
+rf_coxa_trochanter = { pathway = "rf", out_channel = 1  }
+rf_femur_tibia     = { pathway = "rf", out_channel = 2  }
+rf_tibia_tarsus    = { pathway = "rf", out_channel = 3  }
+rf_claw            = { pathway = "rf", out_channel = 4  }
+rm_thorax_coxa     = { pathway = "rf", out_channel = 5  }
+rm_coxa_trochanter = { pathway = "rf", out_channel = 6  }
+rm_femur_tibia     = { pathway = "rf", out_channel = 7  }
+rm_tibia_tarsus    = { pathway = "rf", out_channel = 8  }
+rm_claw            = { pathway = "rf", out_channel = 9  }
+rh_thorax_coxa     = { pathway = "rf", out_channel = 10 }
+rh_coxa_trochanter = { pathway = "rf", out_channel = 11 }
+rh_femur_tibia     = { pathway = "rf", out_channel = 12 }
+rh_tibia_tarsus    = { pathway = "rf", out_channel = 13 }
+rh_claw            = { pathway = "rf", out_channel = 14 }
+r_antenna          = { pathway = "rf", out_channel = 15 }
+
+[pose2d.output_points.f]
+rf_femur_tibia     = { pathway = "f", out_channel = 2  }
+rf_tibia_tarsus    = { pathway = "f", out_channel = 3  }
+rf_claw            = { pathway = "f", out_channel = 4  }
+rm_femur_tibia     = { pathway = "f", out_channel = 7  }
+rm_tibia_tarsus    = { pathway = "f", out_channel = 8  }
+rm_claw            = { pathway = "f", out_channel = 9  }
+r_antenna          = { pathway = "f", out_channel = 15 }
+lf_femur_tibia     = { pathway = "f_flip", out_channel = 2  }
+lf_tibia_tarsus    = { pathway = "f_flip", out_channel = 3  }
+lf_claw            = { pathway = "f_flip", out_channel = 4  }
+lm_femur_tibia     = { pathway = "f_flip", out_channel = 7  }
+lm_tibia_tarsus    = { pathway = "f_flip", out_channel = 8  }
+lm_claw            = { pathway = "f_flip", out_channel = 9  }
+l_antenna          = { pathway = "f_flip", out_channel = 15 }
+
+[pose2d.output_points.lf]
+lf_thorax_coxa     = { pathway = "lf_flip", out_channel = 0  }
+lf_coxa_trochanter = { pathway = "lf_flip", out_channel = 1  }
+lf_femur_tibia     = { pathway = "lf_flip", out_channel = 2  }
+lf_tibia_tarsus    = { pathway = "lf_flip", out_channel = 3  }
+lf_claw            = { pathway = "lf_flip", out_channel = 4  }
+lm_thorax_coxa     = { pathway = "lf_flip", out_channel = 5  }
+lm_coxa_trochanter = { pathway = "lf_flip", out_channel = 6  }
+lm_femur_tibia     = { pathway = "lf_flip", out_channel = 7  }
+lm_tibia_tarsus    = { pathway = "lf_flip", out_channel = 8  }
+lm_claw            = { pathway = "lf_flip", out_channel = 9  }
+lh_thorax_coxa     = { pathway = "lf_flip", out_channel = 10 }
+lh_coxa_trochanter = { pathway = "lf_flip", out_channel = 11 }
+lh_femur_tibia     = { pathway = "lf_flip", out_channel = 12 }
+lh_tibia_tarsus    = { pathway = "lf_flip", out_channel = 13 }
+lh_claw            = { pathway = "lf_flip", out_channel = 14 }
+l_antenna          = { pathway = "lf_flip", out_channel = 15 }
+
+[pose2d.output_points.lm]
+lf_thorax_coxa     = { pathway = "lm_flip", out_channel = 0  }
+lf_coxa_trochanter = { pathway = "lm_flip", out_channel = 1  }
+lf_femur_tibia     = { pathway = "lm_flip", out_channel = 2  }
+lf_tibia_tarsus    = { pathway = "lm_flip", out_channel = 3  }
+lf_claw            = { pathway = "lm_flip", out_channel = 4  }
+lm_thorax_coxa     = { pathway = "lm_flip", out_channel = 5  }
+lm_coxa_trochanter = { pathway = "lm_flip", out_channel = 6  }
+lm_femur_tibia     = { pathway = "lm_flip", out_channel = 7  }
+lm_tibia_tarsus    = { pathway = "lm_flip", out_channel = 8  }
+lm_claw            = { pathway = "lm_flip", out_channel = 9  }
+lh_thorax_coxa     = { pathway = "lm_flip", out_channel = 10 }
+lh_coxa_trochanter = { pathway = "lm_flip", out_channel = 11 }
+lh_femur_tibia     = { pathway = "lm_flip", out_channel = 12 }
+lh_tibia_tarsus    = { pathway = "lm_flip", out_channel = 13 }
+lh_claw            = { pathway = "lm_flip", out_channel = 14 }
+l_antenna          = { pathway = "lm_flip", out_channel = 15 }
+l_abdomen0         = { pathway = "lm_flip", out_channel = 16 }
+l_abdomen1         = { pathway = "lm_flip", out_channel = 17 }
+l_abdomen2         = { pathway = "lm_flip", out_channel = 18 }
+
+[pose2d.output_points.lh]
+lf_thorax_coxa     = { pathway = "lh_flip", out_channel = 0  }
+lf_coxa_trochanter = { pathway = "lh_flip", out_channel = 1  }
+lf_femur_tibia     = { pathway = "lh_flip", out_channel = 2  }
+lf_tibia_tarsus    = { pathway = "lh_flip", out_channel = 3  }
+lf_claw            = { pathway = "lh_flip", out_channel = 4  }
+lm_thorax_coxa     = { pathway = "lh_flip", out_channel = 5  }
+lm_coxa_trochanter = { pathway = "lh_flip", out_channel = 6  }
+lm_femur_tibia     = { pathway = "lh_flip", out_channel = 7  }
+lm_tibia_tarsus    = { pathway = "lh_flip", out_channel = 8  }
+lm_claw            = { pathway = "lh_flip", out_channel = 9  }
+lh_thorax_coxa     = { pathway = "lh_flip", out_channel = 10 }
+lh_coxa_trochanter = { pathway = "lh_flip", out_channel = 11 }
+lh_femur_tibia     = { pathway = "lh_flip", out_channel = 12 }
+lh_tibia_tarsus    = { pathway = "lh_flip", out_channel = 13 }
+lh_claw            = { pathway = "lh_flip", out_channel = 14 }
+l_antenna          = { pathway = "lh_flip", out_channel = 15 }
+l_abdomen0         = { pathway = "lh_flip", out_channel = 16 }
+l_abdomen1         = { pathway = "lh_flip", out_channel = 17 }
+l_abdomen2         = { pathway = "lh_flip", out_channel = 18 }
+
+
+# Bundle adjustment: the fly itself is the target. Solved with
+# scipy.optimize.least_squares; its kwargs (max_nfev, loss, f_scale, ...) sit
+# directly in this table.
+[bundle_adjustment]
+# Skeleton point names (from [skeleton].point_names) that drive bundle adjustment.
+# The leg joints sit at sharp limb corners and detect most reliably, so the
+# default uses the 30 leg points only. Omit this key to bundle-adjust on all keypoints.
+points_to_use = [
+    "lf_thorax_coxa", "lf_coxa_trochanter", "lf_femur_tibia", "lf_tibia_tarsus", "lf_claw",
+    "lm_thorax_coxa", "lm_coxa_trochanter", "lm_femur_tibia", "lm_tibia_tarsus", "lm_claw",
+    "lh_thorax_coxa", "lh_coxa_trochanter", "lh_femur_tibia", "lh_tibia_tarsus", "lh_claw",
+    "rf_thorax_coxa", "rf_coxa_trochanter", "rf_femur_tibia", "rf_tibia_tarsus", "rf_claw",
+    "rm_thorax_coxa", "rm_coxa_trochanter", "rm_femur_tibia", "rm_tibia_tarsus", "rm_claw",
+    "rh_thorax_coxa", "rh_coxa_trochanter", "rh_femur_tibia", "rh_tibia_tarsus", "rh_claw",
+]
+fixed = [
+    "*.intr",       # keep all intrinsics fixed
+    # "f.rvec",     # anchor the front camera's orientation ...
+    # "f.tvec",     # ... and position (fixes the world gauge)
+    # "rm.tvec[2]",
+]
+shared = [] # e.g., [["lf.tvec[2]", "rf.tvec[2]"]] to tie the cameras' z distances together
+weigh_by_confidence = false # whether keypoints with higher detector confidence get more weight
+max_frames = 100            # bundle-adjust on at most this many frames (subsampled from the recording)
+frame_sampling = "even"     # which frames to keep when subsampling:
+                            #   even       - evenly spaced over the recording (default; temporal spread)
+                            #   confidence - the highest-confidence frame in each time bin
+                            #                (uses detector confidence; independent of weigh_by_confidence)
+                            #   coverage   - the frame in each time bin with the most
+                            #                keypoints seen by >= 2 cameras (best-conditioned)
+                            #   diversity  - frames whose postures are most spread apart, so the
+                            #                target is seen in many distinct configurations
+max_nfev = 2000             # forwarded to scipy.optimize.least_squares
+loss = "linear"
+
+
+# Pictorial structures: DeepFly3D-style peak recovery over the detector's top-K
+# candidates before triangulation. The candidates are extracted during detection
+# and cached when this stage is on -- enabling it on an existing output dir
+# re-runs pose2d once; afterwards, tweaking temporal/lam reuses the cached
+# candidates without re-detecting.
+[pictorial_structures]
+k = 5                    # candidate peaks per joint
+temporal = false         # add a temporal-consistency term
+lam = 1.0                # bone-length prior weight
+
+
+# Triangulation: how the per-view 2D points become one 3D point.
+[triangulation]
+weigh_by_confidence = false # whether keypoints with higher detector confidence get more weight
+method = "dlt"              # ransac - largest multi-view consensus (default, robust)
+                            # greedy - drop the worst-reprojecting view
+                            # dlt    - plain least-squares, no outlier handling
+ransac_threshold = 15.0     # inlier reprojection cutoff (px) for method = ransac
+min_inliers = 2             # min agreeing views to accept a point (ransac)
+# reproj_threshold = 40.0   # method = greedy: per-view reprojection cutoff (px)
+# max_drops = 5             # method = greedy: max views dropped per offending point
+
+
+# ---------------------------------------------------------------------------
+# Visualization: each [[visualization.videos]] is one output MP4
+# (`<video_name>.mp4`), composited from an ordered list of `panels`. A panel draws
+# one `plot` op for one `view` (camera) with its top-left at pixel (`x0`, `y0`):
+#   imshow      - that view's video frame
+#   skeleton_2d - that view's 2D detections
+#   skeleton_3d - the 3D skeleton reprojected into that view (OpenCV, depth-sorted)
+# Panels draw in order, so a skeleton panel after an `imshow` at the same offset
+# overlays it. The canvas auto-sizes to fit all panels unless you set
+# `width`/`height` on the video.
+#
+# `background` is the canvas fill (default black): set it under `[visualization]`
+# for every video, or per panel to repaint just its tile.
+#
+# Output frame rate: set `output_fps` (explicit fps) or `speed` (output fps = input
+# fps * speed; 0.5 = slow motion) -- globally or per video, the per-video value
+# winning. With neither, a video plays at the recording's own detected rate.
+#
+# Draw-op kwargs (point_radius, line_thickness, scale, palette, ...) merge across
+# three levels, each keyed by the `plot` op name, most specific winning:
+# `[visualization.kwargs]` (every video), a `kwargs` table on a video entry (that
+# video), and extra keys on a single panel.
+#
+# Instead of `scale`, give a target `width` and/or `height` in pixels (settable at
+# any level, priority over `scale`): both -> that exact box, one -> the other
+# follows to keep aspect.
+# ---------------------------------------------------------------------------
+[visualization]
+background = "black"
+# Output MP4s are encoded with PyAV (H.264 / libx264, on the CPU).
+# output_fps = 30        # explicit output fps for every video (per-video override below)
+# speed      = 1.0       # or scale the input video fps instead (0.5 = slow motion)
+
+[visualization.kwargs]
+imshow      = { width = 480, height = 240 }
+skeleton_2d = { line_thickness = 2, width = 480, height = 240 }
+skeleton_3d = { line_thickness = 2, width = 480, height = 240 }
+
+[[visualization.videos]]
+video_name = "pose2d"   # camera frames with the raw 2D detections drawn on top
+panels = [
+    { plot = "imshow",      view = "f",  x0 = 240, y0 = 0   },
+    { plot = "skeleton_2d", view = "f",  x0 = 240, y0 = 0   },
+    { plot = "imshow",      view = "rf", x0 = 0,   y0 = 240 },
+    { plot = "skeleton_2d", view = "rf", x0 = 0,   y0 = 240 },
+    { plot = "imshow",      view = "lf", x0 = 480, y0 = 240 },
+    { plot = "skeleton_2d", view = "lf", x0 = 480, y0 = 240 },
+    { plot = "imshow",      view = "rm", x0 = 0,   y0 = 480 },
+    { plot = "skeleton_2d", view = "rm", x0 = 0,   y0 = 480 },
+    { plot = "imshow",      view = "lm", x0 = 480, y0 = 480 },
+    { plot = "skeleton_2d", view = "lm", x0 = 480, y0 = 480 },
+    { plot = "imshow",      view = "rh", x0 = 0,   y0 = 720 },
+    { plot = "skeleton_2d", view = "rh", x0 = 0,   y0 = 720 },
+    { plot = "imshow",      view = "lh", x0 = 480, y0 = 720 },
+    { plot = "skeleton_2d", view = "lh", x0 = 480, y0 = 720 },
+]
+
+[[visualization.videos]]
+video_name = "pose3d"   # same montage with the triangulated 3D skeleton reprojected back
+panels = [
+    { plot = "imshow",      view = "f",  x0 = 240, y0 = 0   },
+    { plot = "skeleton_3d", view = "f",  x0 = 240, y0 = 0   },
+    { plot = "imshow",      view = "rf", x0 = 0,   y0 = 240 },
+    { plot = "skeleton_3d", view = "rf", x0 = 0,   y0 = 240 },
+    { plot = "imshow",      view = "lf", x0 = 480, y0 = 240 },
+    { plot = "skeleton_3d", view = "lf", x0 = 480, y0 = 240 },
+    { plot = "imshow",      view = "rm", x0 = 0,   y0 = 480 },
+    { plot = "skeleton_3d", view = "rm", x0 = 0,   y0 = 480 },
+    { plot = "imshow",      view = "lm", x0 = 480, y0 = 480 },
+    { plot = "skeleton_3d", view = "lm", x0 = 480, y0 = 480 },
+    { plot = "imshow",      view = "rh", x0 = 0,   y0 = 720 },
+    { plot = "skeleton_3d", view = "rh", x0 = 0,   y0 = 720 },
+    { plot = "imshow",      view = "lh", x0 = 480, y0 = 720 },
+    { plot = "skeleton_3d", view = "lh", x0 = 480, y0 = 720 },
+]

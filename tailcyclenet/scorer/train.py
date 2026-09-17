@@ -1170,6 +1170,9 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 step += 1
                 continue
             optimizer.step()
+            # `step` counts completed local (per-rank) optimizer steps.  Match pose training:
+            # one synchronized DDP step advances the headline iteration by `world`.
+            step += 1
             iteration = step * world
             hist = loss_fn.collapse_history(prefix='')
             loss_fn.reset_history()
@@ -1214,7 +1217,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             if step % local_print_freq == 0:
                 wall = time.time() - t0
                 elapsed = max(wall - evalled[0] - ckpted[0], 1e-9)
-                report_steps = max(1, min(local_print_freq, step + 1))
+                report_steps = max(1, min(local_print_freq, step))
                 dt = elapsed / report_steps
                 wait_frac = waited[0] / elapsed
                 eval_frac = evalled[0] / wall if wall > 0 else 0.0
@@ -1227,7 +1230,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                     'train/loader_wait_frac': wait_frac,
                     'train/eval_frac': eval_frac,
                     'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
-                    'train/skipped_frac': skipped / max(step + skipped, 1),
+                    'train/skipped_frac': skipped / max(step, 1),
                     'train/world_size': world,
                 })
                 train_acc = values.get('train/active_triplet_acc',
@@ -1246,7 +1249,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             elif wb is not None and is0:
                 log(wb, values, iteration)
 
-            if step % local_ckpt_freq == 0 or step + 1 == local_target:
+            if step % local_ckpt_freq == 0 or step == local_target:
                 started = time.time()
                 if fabric is not None:
                     dist_utils.check_ranks_agree(fabric, raw_model)
@@ -1255,7 +1258,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 if fabric is not None:
                     fabric.barrier()
                 ckpted[0] += time.time() - started
-            step += 1
         if step == epoch_start:
             raise RuntimeError(
                 'scorer DataLoader produced no successful triplets in an epoch; all samples were '

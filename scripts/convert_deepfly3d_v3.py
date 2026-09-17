@@ -191,10 +191,18 @@ def _result_matches(result: Path, record: Record) -> bool:
 
 
 def _find_result(outputs: Path, record: Record, paths: list[Path]) -> tuple[Path | None, str | None]:
-    """Resolve exactly one native result for a trial."""
-    matched = [p for p in paths if _result_matches(p, record)]
+    """Resolve exactly one native result for a trial without quadratic HDF5 metadata reads."""
     if outputs.is_file() and len(paths) == 1:
-        matched = paths
+        return paths[0], None
+    names = {record.archive, record.archive.removesuffix('_behData_images'),
+             record.archive.removesuffix('_images')}
+    # Production workers preserve the source session as the results directory name.  Resolve
+    # that cheap path key first; the old metadata fallback is only needed for renamed outputs.
+    matched = [p for p in paths if p.parent.name in names and record.condition in p.parts]
+    if not matched:
+        matched = [p for p in paths if p.parent.name in names]
+    if not matched:
+        matched = [p for p in paths if _result_matches(p, record)]
     if not matched:
         return None, 'missing_result'
     if len(matched) != 1:

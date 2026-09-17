@@ -38,7 +38,8 @@ def _loader_config(config: dict) -> LoaderConfig:
     from ..dataset import LoaderConfig
 
     data_cfg = dict(config.get('data', {}))
-    known = set(LoaderConfig.__dataclass_fields__) | {'path', 'num_workers'}
+    known = set(LoaderConfig.__dataclass_fields__) | {
+        'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
     unknown = set(data_cfg) - known
     if unknown:
         raise SystemExit(f'[data]: unknown key(s) {sorted(unknown)}')

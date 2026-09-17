@@ -65,6 +65,14 @@ def _both(roots, seed=0, **over):
             _one(roots, 'ratlike', True, seed, **over))
 
 
+def test_prob_2d_only_builds_a_2d_scorer_triplet(roots):
+    _ds, trip = _one(roots, 'mouselike', False, seed=0, prob_2d_only=1.0)
+    assert trip is not None
+    assert trip['mode'] == '2d'
+    assert trip['good'][1].shape[-1] == 2
+    assert len(trip['good'][0]) == 1
+
+
 # -- A.3: good and bad share pixels exactly -------------------------------------------------
 
 @pytest.mark.parametrize('seed', [0, 1, 7])

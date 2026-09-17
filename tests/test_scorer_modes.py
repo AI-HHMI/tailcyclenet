@@ -63,6 +63,16 @@ def test_sequence_contract_normalizes_inherited_frame_defaults_and_ranges():
     assert not scorer_contract_mismatches(config, {'scorer_metadata': {'contract': contract}})
 
 
+def test_true_2d_sampling_semantics_are_part_of_scorer_contract():
+    config = {'scorer': {'output_granularity': 'frame',
+                         'two_d_sampling': 'true-2d-hybrid-v1'},
+              'data': {'prob_2d_only': 0.2}}
+    old = {'config': {'scorer': {'output_granularity': 'frame'},
+                      'data': {'prob_2d_only': 0.2}}}
+    mismatches = scorer_contract_mismatches(config, old)
+    assert 'config.two_d_sampling' in mismatches
+
+
 def test_scorer_window_length_must_match_model_stride():
     config = {'scorer': {}, 'data': {'n_frames': 12}, 'model': {'stride_length': 24}}
     with pytest.raises(SystemExit, match='n_frames.*stride_length'):

@@ -260,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
                     help='3D only. 2 builds every instance from a camera PAIR (single-view animals '
                          'dropped); 1 also emits leftover boxes as single-view instances. Whether '
-                         'the pose model can use one is [data].prob_2d_only.')
+                         'the pose model can use one is [data].cams_to_sample.')
     ap.add_argument('--max-age', type=int, default=8,
                     help='frames without evidence before a lost identity is retired: '
                          '`CrossViewTracker` (3D, `--track`) and `link_rows` (2D, `--link-boxes`) '

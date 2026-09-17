@@ -204,8 +204,8 @@ _CASES = {
                              box_prompt_dropout=0.0, box_prompt_frames='first'),
     # The RANGED crop-inflate draw (a per-item uniform draw, not a scalar).
     'ranged-inflate': _L(prob_2d_only=0.0, aug_prob=0.5, crop_inflate=[0.9, 1.5]),
-    # 3D single-view via `prob_2d_only`, and a ranged camera count.
-    'single-view': _L(prob_2d_only=1.0, aug_prob=1.0, crop_jitter=0.2, cams_to_sample=[2, 3]),
+    # The true-2D `prob_2d_only` path is tested separately because its target semantics differ
+    # intentionally from the frozen pre-change oracle.
     # Val geometry: jitter and crop-inflate draws OFF, a fixed window.
     'val-geometry': _L(prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0, crop_inflate=[0.9, 1.5]),
 }
@@ -215,12 +215,23 @@ def _cases_for(name):
     """Which (root, split) pairs a case is meaningful on, and whether that split is train."""
     if name in ('box-prompt', 'box-prompt-dropped'):
         return [('ratlike', 'train', True), ('mouselike', 'train', True)]   # 2D and 3D boxes
-    if name in ('ranged-inflate', 'single-view', 'prompt-noise', 'prompt-swaps'):
+    if name in ('ranged-inflate', 'prompt-noise', 'prompt-swaps'):
         return [('mouselike', 'train', True)]
     if name == 'val-geometry':
         return [('ratlike', 'val', False), ('mouselike', 'val', False)]
     return [('ratlike', 'train', True), ('ratlike', 'val', False),
             ('mouselike', 'train', True), ('mouselike', 'val', False)]
+
+
+def test_prob_2d_only_projects_a_3d_session(seam_root):
+    cfg = _L(prob_2d_only=1.0, aug_prob=0.0, crop_jitter=0.0, cams_to_sample=[2, 3])
+    ds = PoseDataset(seam_root / 'mouselike', 'train', cfg)
+    item = ds[0]
+    assert item is not None
+    assert item[1].shape[-1] == 2
+    assert len(item[0]) == 1
+    assert item[5]['mode'] == '2d'
+    assert item[8] is not None
 
 
 @pytest.mark.parametrize('case', sorted(_CASES))

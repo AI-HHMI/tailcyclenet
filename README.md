@@ -101,8 +101,8 @@ One estimator trains across every dataset root under `[data].path`; a keypoint e
 what lets roots with different keypoint sets share a model.
 
 ```bash
-# 3D (multiview / single-view) or 2D (single-view) -- the camera-count keys in base.toml are
-# harmless on a one-camera root, so one config serves both
+# 3D (multiview / single-view) or 2D (single-view); prob_2d_only adds a train-time true-2D
+# image-plane path on 3D sessions, so one config serves both
 pixi run python scripts/train.py --config configs/base.toml --data <root>
 
 # one node, N gpus: one item per rank, gradients averaged by DDP
@@ -114,9 +114,9 @@ tailcyclenet train --data <root> [--devices 4]
 
 Facts that are easy to get wrong:
 
-- The two configs differ in exactly three keys — `cams_to_sample`, `val_cams_to_sample`,
-  `prob_2d_only` — all camera-count questions a one-camera root cannot ask. `n_keypoints` is
-  **derived from the data, never configured**.
+- `cams_to_sample` and `val_cams_to_sample` control camera count; `prob_2d_only` is a train-only
+  true-2D image-plane draw on 3D sessions, with stored 2D labels preferred and 3D projection as
+  fallback. `n_keypoints` is **derived from the data, never configured**.
 - The per-rank batch is structurally **1**; `--devices N` is the only batch dimension this repo has.
   Every iteration count in a config is a **total across ranks** (60,000 is 60,000 samples on any
   gpu count) and the learning rate is scaled by `sqrt(N)`, so a multi-gpu run is two levers off a

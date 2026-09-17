@@ -13,7 +13,7 @@ import torch
 
 from tailcyclenet import crop as cropmod
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
-from tailcyclenet.format import Registry, load_dataset
+from tailcyclenet.format import MISSING, UNLABELED, VISIBLE, Registry, load_dataset
 
 from .conftest import KPTS_2D
 
@@ -367,15 +367,49 @@ def test_window_is_at_least_two_frames(tiny_root):
     assert b2.views[0].shape[1] == 4
 
 
-def test_single_view_keeps_3d_targets(tiny_root):
+def test_prob_2d_only_uses_true_2d_targets_on_3d_session(tiny_root):
     cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=1.0, aug_prob=0.0,
                        crop_jitter=0.0, prompt_dropout=0.0)
     ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
     b = _batch(ds)
-    assert b.coords.shape[-1] == 3          # targets stay world-metric
+    assert b.coords.shape[-1] == 2          # projected image-plane targets
     assert len(b.views) == 1                # exactly one camera
     assert b.p2d is not None
-    assert b.sample_info['single_view'] is True
+    assert b.sample_info['mode'] == '2d'
+    assert b.sample_info['single_view'] is False
+
+
+def test_hybrid_2d_targets_respect_visibility_status(tiny_root):
+    from types import SimpleNamespace
+    from posetail.posetail.cube import project_points_torch
+
+    ds = PoseDataset(tiny_root / 'mouselike', 'train',
+                     LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0,
+                                  aug_prob=0.0, crop_jitter=0.0))
+    sess = ds.datasets[0].sessions['train'][0]
+    lab = sess.labels(next(iter(sess.groups)))
+    frames = np.array([0])
+    cgroup = sess.cgroup(next(iter(sess.groups)), frames)
+    xyz = torch.as_tensor(lab.points3d[0, 0])
+    projected = project_points_torch([cgroup[2]], xyz)[0]
+    finite = torch.isfinite(projected).all(-1).nonzero(as_tuple=True)[0]
+    assert len(finite) >= 1
+    xyz = xyz[int(finite[0])].numpy()
+    points3d = np.broadcast_to(xyz, (1, 1, 4, 3)).copy()
+    points2d = np.full((1, 1, 4, 3, 2), np.nan, np.float32)
+    vis2d = np.full((1, 1, 4, 3), UNLABELED, np.int8)
+    vis2d[0, 0, 0, 2] = MISSING
+    vis2d[0, 0, 1, 2] = UNLABELED
+    vis2d[0, 0, 2, 2] = VISIBLE
+    vis2d[0, 0, 3, 2] = VISIBLE
+    points2d[0, 0, 3, 2] = [123.0, 124.0]
+    hybrid = ds._hybrid_2d_coords(
+        SimpleNamespace(points3d=points3d, points2d=points2d, vis2d=vis2d),
+        0, frames, cgroup[2], 2)
+    assert torch.isnan(hybrid[0, 0]).all()
+    assert torch.isfinite(hybrid[0, 1]).all()
+    assert torch.isfinite(hybrid[0, 2]).all()
+    assert hybrid[0, 3].tolist() == [123.0, 124.0]
 
 
 def test_cams_to_sample_takes_a_range(tiny_root):

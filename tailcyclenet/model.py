@@ -244,8 +244,8 @@ class PoseTrackerEncoder(TrackerEncoder):
 
         The kpt-cursor assertion runs after the call, not in the `finally`; the stash is
         always cleared (a leak would apply one item's ids to the next forward). In 2D the
-        grid head decodes ABSOLUTE pixel bins (`coords_pred` in PIXELS); 3D single-view
-        keeps the query-anchored residual (the `prob_2d_only` path).
+        grid head decodes ABSOLUTE pixel bins (`coords_pred` in PIXELS); a one-camera 3D
+        sample keeps the query-anchored residual.
         """
         assert mode in ('2d', '3d'), mode
         B, K = kpt_ids.shape

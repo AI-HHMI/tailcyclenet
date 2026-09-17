@@ -184,9 +184,9 @@ CGROUP = 4          # `_item`'s field order: views, coords, vis, frames, cgroup,
 
 
 def _ds(root, **over):
-    """`prob_2d_only = 0` unless a test says otherwise: it defaults to 0.25, which collapses a 3D
-    item to ONE camera and would otherwise supply the variation these tests are attributing to
-    `cams_to_sample`."""
+    """`prob_2d_only = 0` unless a test says otherwise: it defaults to 0.25, which switches a 3D
+    item to the one-camera 2D path and would otherwise supply the variation these tests are
+    attributing to `cams_to_sample`."""
     from tailcyclenet.dataset import LoaderConfig, PoseDataset
     return PoseDataset(root, 'train', LoaderConfig(**{'prob_2d_only': 0.0, **over}))
 
@@ -245,8 +245,8 @@ def test_camera_count_distribution_is_unchanged(tiny_root):
 
 
 def test_the_single_view_coin_is_also_synchronised(tiny_root):
-    """`prob_2d_only` collapses a 3D item to ONE camera, so it is a cost draw too -- a rank that
-    took the single-view branch while its peers encoded 8 cameras is the same straggler in
+    """`prob_2d_only` switches a 3D item to ONE camera and the 2D path, so it is a cost draw too --
+    a rank that took that branch while its peers encoded 8 cameras is the same straggler in
     reverse. Its default is 0.25, so this fires on a quarter of steps in any 3D recipe that leaves
     it alone."""
     r0 = _ds(tiny_root / 'mouselike', cams_to_sample=3, prob_2d_only=0.5)

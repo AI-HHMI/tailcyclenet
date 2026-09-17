@@ -527,9 +527,6 @@ class PoseScorer(PoseTrackerEncoder):
         """
         if isinstance(views, dict) and coords is None:
             result = self.score_triplet(views)
-            # Frame loss owns a learnable calibration scalar but is called outside this module's
-            # forward.  Keep it in the forward graph (with zero value) so DDP does not classify it
-            # as unused and then reject its real gradient in the external loss call.
             frame_loss = getattr(self, 'frame_loss', None)
             scale = getattr(frame_loss, 'pointwise_log_scale', None)
             if scale is not None:

@@ -1,8 +1,9 @@
 """The training loader: tailcycle-dataset on disk -> the batch posetail's model consumes.
 
 Three sampling modes, decided per item: 3D multiview (`cams_to_sample` cameras, world-mm targets),
-3D single-view (one camera, targets still world mm, fired at `prob_2d_only`), and 2D single-view
-(crop-pixel targets). Mode is a property of the sampled SESSION, so one `train/` may hold both
+3D single-view (one camera, world-mm targets, possible when `cams_to_sample` draws one), and 2D
+single-view (crop-pixel targets, including the training-only `prob_2d_only` coin). Mode is a
+property of the sampled SESSION except for that explicit 2D coin, so one `train/` may hold both
 and both head-bank slots get gradient. Two non-negotiable rules: keypoints are never filtered
 (the library's `filter_keypoints` shrinks N so array position stops equalling identity), and
 T >= 2 always (a T=1 window gives posetail a zero-length pos_embed).
@@ -31,7 +32,7 @@ from posetail.posetail.cube import get_camera_scale, is_point_visible, project_p
 from . import crop as cropmod
 from . import memory as _memory
 from .crop import BOX_SOURCES
-from .format import PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
+from .format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
 
 
 @dataclass
@@ -46,7 +47,7 @@ class LoaderConfig:
     cams_to_sample: int | list = 0
     # the reference's [dataset.val] value
     val_cams_to_sample: int | list = 5
-    # rate at which a 3D session is shown a single camera
+    # rate at which a training item uses the single-camera image-plane 2D path
     prob_2d_only: float = 0.25
     # sample datasets uniformly, not proportionally
     balance_datasets: bool = True
@@ -857,9 +858,8 @@ class PoseDataset(Dataset):
         unmappable root fails at construction rather than mid-epoch; a mode/table mismatch
         is refused here too (`_item` picks its target off `sess.mode` alone, and a 3d
         session carrying only keypoints.pq would crash mid-epoch). With
-        `box_source = 'instances'` the roots the switch actually reached are printed (a
-        root with no `instances.pq` silently falls back to keypoints). Balancing across
-        datasets is train-only, so a window's identity stays tied to its index.
+        `box_source = 'instances'` prints roots reached by the switch. Balancing across datasets
+        is train-only, so a window's identity stays tied to its index.
         """
         assert cfg.n_frames >= 2, (
             f'n_frames = {cfg.n_frames} is not usable: posetail computes gT = T // tubelet_size '
@@ -874,8 +874,6 @@ class PoseDataset(Dataset):
         self.rank, self.world_size = int(rank), int(world_size)
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError(f'invalid dataset shard rank={self.rank}, world_size={self.world_size}')
-        # Registry.build reads only Dataset metadata/names.  Build it BEFORE selecting the shard,
-        # so every rank has the same append-only embedding axis without preloading other sessions.
         self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
         self._aug = _build_augmenters(cfg) if self.train and cfg.aug_prob > 0 else None
@@ -1014,8 +1012,10 @@ class PoseDataset(Dataset):
         return np.cumsum(w / w.sum())
 
     def mix(self):
-        """Realised share of train steps per (label_source, mode) cell. Reporting only: printed
-        at startup because the mix is invisible in the loss curve.
+        """Source-session share per (label_source, mode) cell before the 2-D path coin.
+
+        Reporting only: printed at startup because the source mix is invisible in the loss curve;
+        3-D sessions contribute `prob_2d_only` of their train draws to the runtime 2-D path.
         """
         out: dict[str, float] = {}
         for p, cum in self._pools:
@@ -1091,8 +1091,8 @@ class PoseDataset(Dataset):
         """The cost-determining draws, made from a stream every rank shares. See `__getitem__`.
 
         Exactly the two draws that change how much WORK an item is and nothing else: the camera
-        count and the single-view coin. The cell, session, start, T and every augmentation stay
-        on the item's own stream.
+        count and the 2-D path coin. The cell, session, start, T and every augmentation stay on
+        the item's own stream.
         """
         return {'n_cams': _n_cams(self.cfg.cams_to_sample, rng),
                 'single_view_draw': float(rng.random())}
@@ -1157,6 +1157,33 @@ class PoseDataset(Dataset):
         b = lab.boxes[a][frames][:, cam_ix]
         return torch.as_tensor(cropmod.box_corners(b), dtype=torch.float32)
 
+    def _hybrid_2d_coords(self, lab, a, frames, camera, camera_index):
+        """Return stored 2-D labels with projected 3-D labels filling missing slots.
+
+        Inputs: lab -- the session labels; a -- animal index; frames -- source frame ids;
+        camera -- one pre-transform camera dictionary; camera_index -- its session camera axis.
+        Outputs: `[T,K,2]` source-image pixels. Side effects: none.
+        """
+        projected = None
+        if lab.points3d is not None:
+            xyz = torch.as_tensor(lab.points3d[a][frames], dtype=torch.float32)
+            projected = project_points_torch([camera], xyz)[0]
+            visible = is_point_visible(camera, xyz)
+            projected = projected.masked_fill(~visible.unsqueeze(-1), float('nan'))
+        if lab.points2d is None:
+            return projected
+        stored = torch.as_tensor(lab.points2d[a][frames, :, camera_index, :], dtype=torch.float32)
+        if projected is None:
+            return stored
+        finite = torch.isfinite(stored).all(-1, keepdim=True)
+        if lab.vis2d is None:
+            return torch.where(finite, stored, projected)
+        status = torch.as_tensor(lab.vis2d[a][frames, :, camera_index], dtype=torch.int8)
+        missing = status.eq(MISSING).unsqueeze(-1)
+        fallback = projected.masked_fill(missing, float('nan'))
+        coords = torch.where(finite, stored, fallback)
+        return coords.masked_fill(missing, float('nan'))
+
     def _item(self, idx, rng, shape=None):
         """One window, built as `_select` -> `_realise` -> `_targets`.
 
@@ -1215,15 +1242,16 @@ class PoseDataset(Dataset):
         cgroup = sess.cgroup(item.gid, frames)
         inflate = _crop_inflate(self.cfg, rng, self.train)
 
-        true_2d = sess.mode == '2d'
-        single_view = (not true_2d and self.train
-                       and self.cfg.prob_2d_only > 0
-                       and shape['single_view_draw'] < self.cfg.prob_2d_only)
+        session_2d = sess.mode == '2d'
+        force_2d = (not session_2d and self.train
+                    and self.cfg.prob_2d_only > 0
+                    and shape['single_view_draw'] < self.cfg.prob_2d_only)
+        true_2d = session_2d or force_2d
+        single_view = False
 
         if true_2d:
-            cam_ix = [0]
-        elif single_view:
-            cam_ix = [int(rng.integers(len(cgroup)))]
+            cam_ix = ([0] if session_2d else
+                      [int(rng.integers(len(cgroup)))])
         else:
             n = shape['n_cams']
             cam_ix = (sorted(rng.choice(len(cgroup), n, replace=False)) if 0 < n < len(cgroup)
@@ -1233,7 +1261,9 @@ class PoseDataset(Dataset):
         crop_pts = self._crop_pts(lab, a, frames, cam_ix)
 
         if true_2d:
-            coords = torch.as_tensor(lab.points2d[a][frames][:, :, 0], dtype=torch.float32)
+            coords = self._hybrid_2d_coords(lab, a, frames, cgroup[0], cam_ix[0])
+            if coords is None:
+                return None
             vis = vis_2d = None
             if lab.vis2d is not None and sess.has_visibility_assessment:
                 v2 = lab.vis2d[a][frames][:, :, cam_ix]
@@ -1331,8 +1361,8 @@ class PoseDataset(Dataset):
             if vis_2d is not None:
                 vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
             if attempt_swap_animal:
-                raw = torch.as_tensor(lab.points2d[neighbour_row][frames][..., 0, :],
-                                      dtype=torch.float32)
+                raw = self._hybrid_2d_coords(
+                    lab, neighbour_row, frames, sel.cgroup[0], sel.cam_ix[0])
                 raw = _apply_affine(raw, rotation_info[0])
                 neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
             cgroup, boxes = [cam], [box]

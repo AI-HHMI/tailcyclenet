@@ -53,6 +53,7 @@ SCORER_CONFIG_KEYS = {
     'pointwise_weight', 'pointwise_balance', 'pointwise_label_smoothing',
     'inactive_consistency_weight', 'anchor_consistency_weight', 'selection_metric',
     'loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy',
+    'two_d_sampling',
 }
 FRAME_SELECTION_METRICS = {
     'triplet_acc', 'active_triplet_acc', 'score_gap', 'active_score_gap',
@@ -406,9 +407,6 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
     if cv_threads < 0:
         raise ValueError(f'worker_cv_threads must be >= 0, got {cv_threads}')
     worker_init = partial(scorer_worker_init, cv_threads=cv_threads)
-    # Distributed scorer samples can contain clamp-pad views with overlapping strides; PyTorch's
-    # pin-memory walker refuses those views. DDP already transfers one triplet per rank directly,
-    # so disable pinning only for the sharded path and preserve the one-GPU loader unchanged.
     kwargs = dict(batch_size=1, collate_fn=scorer_collate, num_workers=nw,
                   prefetch_factor=prefetch if nw else None, persistent_workers=bool(nw),
                   pin_memory=(world == 1), worker_init_fn=worker_init)
@@ -873,7 +871,6 @@ def _gather_eval(fabric, metrics: dict) -> dict:
                         float(m[key]) for m in gathered if m.get(key, 0.0))
             out[key] = active / valid if valid else float('nan')
             continue
-        # Sequence values are per-window means; frame active values carry n_active_rows.
         weights = [float(m.get('val/n_active_rows', m.get('val/n_scored', 0.0)))
                    for m in gathered if key in m and np.isfinite(m[key])]
         den = sum(weights)
@@ -985,10 +982,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     if fabric is not None:
         dist_utils.check_registry(fabric, registry.names)
 
-    # Build and start DataLoader workers before allocating the model on CUDA.  The dense label
-    # arrays are intentionally parent-built so fork workers can share them copy-on-write; starting
-    # them after CUDA setup risks private native/CUDA heaps in each worker.  The iterator is retained
-    # by DataLoader when persistent_workers=True and is reused by the training loop below.
     val_batches = int(train_cfg.get('val_batches', 20))
     n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
     val_indices = None
@@ -1040,8 +1033,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 require_scorer_granularity(output_granularity,
                                            scorer_checkpoint_granularity(loaded),
                                            where=str(ckpt_file))
-            # A cross-mode scorer is intentionally weights-only: warm_start names every dropped
-            # and fresh tensor, while full-state resume remains refused above.
             fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',
@@ -1093,8 +1084,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     max_norm = float(train_cfg.get('max_grad_norm', 10.0))
     start_iter = int(resume_state.get('iteration', 0)) if resume_state else 0
     n_iter = max(0, n_target - start_iter)
-    # Validation is a fixed deterministic set, sharded across ranks. A frame metric is gathered
-    # below before selection, so each rank sees exactly the same checkpoint decision.
     raw_model = model
     wrap = fabric is not None and world > 1
     model = fabric.setup_module(raw_model) if wrap else raw_model
@@ -1151,7 +1140,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         for trip in timed(train_loader, waited):
             if step >= local_target:
                 break
-            # Every rank must make the same decision before any rank enters DDP forward/backward.
             accepted = dist_utils.all_ranks_finite(fabric, trip is not None)
             if not accepted:
                 skipped += 1

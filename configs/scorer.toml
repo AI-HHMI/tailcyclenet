@@ -56,6 +56,7 @@ n_frames = 12
 image_size = 256
 cams_to_sample = [1, 8]
 val_cams_to_sample = 5
+# train-only true-2D image-plane fraction on 3D sessions; stored labels preferred, 3D projected fallback
 prob_2d_only = 0.2
 crop_jitter = 0.3
 crop_jitter_scale = 0.3
@@ -107,6 +108,8 @@ selection_metric = "active_triplet_acc"
 loss_schema = "framewise-v1"
 corruption_mask_semantics = "far-observed-in-view-anchor-observed"
 source_frame_duplicate_policy = "inverse_multiplicity"
+# Semantic version for the loader's prob_2d_only path; changes force a weights-only warm start.
+two_d_sampling = "true-2d-hybrid-v1"
 min_valid_frames = 6       # DISTINCT OBSERVED frames per keypoint; selects the corruption menu
 
 [scorer.corruption]

@@ -173,6 +173,8 @@ def scorer_contract(config: dict | None) -> dict:
         'loss_schema': loss_schema,
         'corruption_mask_semantics': mask_semantics,
         'source_frame_duplicate_policy': duplicate_policy,
+        'two_d_sampling': scorer.get('two_d_sampling', 'legacy-3d-single-view'),
+        'prob_2d_only': float(data.get('prob_2d_only', 0.25)),
         'n_frames': int(data['n_frames']) if 'n_frames' in data else None,
         'stride_length': int(model['stride_length']) if 'stride_length' in model else None,
         'frame_strides': list(data['frame_strides']) if 'frame_strides' in data else None,

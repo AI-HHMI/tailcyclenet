@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 from tailcyclenet import distributed as dist_utils
+from tailcyclenet.scorer import dataset as scorer_dataset
 from tailcyclenet.scorer import train as scorer_train
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, StepSampler, shard_sessions
 
@@ -22,6 +23,17 @@ def test_scorer_rank_sampler_is_replacement_and_rank_seeded():
     # Both streams have a fixed local length and distinct rank-seeded draws.
     assert len(a) == len(b) == 5
     assert list(a.sampler) != list(b.sampler)
+
+
+def test_scorer_shape_draws_are_shared_by_ddp_ordinal():
+    from types import SimpleNamespace
+
+    wrapped = object.__new__(scorer_dataset.ScorerDataset)
+    wrapped.base = SimpleNamespace(seed=23, train=True,
+                                  cfg=LoaderConfig(cams_to_sample=[1, 8]))
+    _, shape0, _ = wrapped._streams(17, ordinal=41)
+    _, shape1, _ = wrapped._streams(93, ordinal=41)
+    assert PoseDataset._shape(wrapped.base, shape0) == PoseDataset._shape(wrapped.base, shape1)
 
 
 def test_scorer_loader_uses_separate_train_and_validation_workers():

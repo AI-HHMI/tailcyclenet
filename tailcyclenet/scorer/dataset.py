@@ -50,26 +50,30 @@ class ScorerDataset(torch.utils.data.Dataset):
         """Inputs: none. Outputs: the number of base windows. Side effects: none."""
         return len(self.base)
 
-    def _streams(self, idx):
-        """The item's rng, its shape stream, and whether to freeze the corruption RNG.
+    def _streams(self, idx, ordinal=None):
+        """The item's rng, its cost-shape stream, and whether to freeze corruption RNG.
 
         Train entropy-seeds the item stream so workers do not replay one another's augmentation;
-        val/test key it on `(seed, idx)` so a metric is reproducible. The CORRUPTION draws come
-        from the ambient torch RNG (the library's `PointCorruptor` has no generator argument), so
-        on val/test torch is seeded per item as well -- otherwise the same window would be
-        corrupted differently at every checkpoint and `triplet_acc` would compare nothing.
+        val/test key it on `(seed, idx)` so a metric is reproducible. During distributed training,
+        ``ordinal`` is the global step from :class:`StepSampler`: cost-determining draws use a
+        separate ordinal-keyed stream so every rank samples the same camera count and single-view
+        coin even though their window indices differ. The CORRUPTION draws come from the ambient
+        torch RNG (the library's `PointCorruptor` has no generator argument), so on val/test torch
+        is seeded per item as well -- otherwise the same window would be corrupted differently at
+        every checkpoint and `triplet_acc` would compare nothing.
 
-        Inputs: idx -- the window index.
+        Inputs: idx -- the window index; ordinal -- the shared DDP step, or None for ordinary access.
         Outputs: (item_rng, shape_rng, frozen).
         Side effects: seeds the ambient torch RNG when `frozen` is True.
         """
         frozen = not self.base.train
         rng = np.random.default_rng(None if not frozen else (self.base.seed, idx))
-        shape_rng = np.random.default_rng((self.base.seed, 0x5AFE, idx)) if frozen else rng
+        shape_rng = (np.random.default_rng((self.base.seed, 0x5AFE, int(ordinal)))
+                     if ordinal is not None else
+                     (np.random.default_rng((self.base.seed, 0x5AFE, idx)) if frozen else rng))
         if frozen:
             torch.manual_seed((int(self.base.seed) * 1000003 + int(idx)) % (2 ** 31))
         return rng, shape_rng, frozen
-
     def __getitem__(self, idx):
         """Build one triplet, retrying other windows on a failed build.
 
@@ -82,11 +86,11 @@ class ScorerDataset(torch.utils.data.Dataset):
         so a failed build cannot make the scored window depend on earlier failures. Training keeps
         entropy-seeded replacement for worker decorrelation.
         """
-        base_idx = idx[1] if isinstance(idx, tuple) else idx
+        ordinal, base_idx = (idx if isinstance(idx, tuple) else (None, idx))
         rejected_draws = 0
         last_reason = 'no_selection'
         for attempt in range(GETITEM_MAX_RETRIES):
-            rng, shape_rng, frozen = self._streams(base_idx)
+            rng, shape_rng, frozen = self._streams(base_idx, ordinal=ordinal)
             shape = self.base._shape(shape_rng)
             sel = self.base._select(base_idx, rng, shape)
             if sel is not None:

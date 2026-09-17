@@ -166,7 +166,8 @@ def add_cameras(clean_root: Path, fluo_root: Path, output: Path, workers: int,
                     out_session, mode=clean.mode, units=clean.units,
                     label_source=clean.label_source, names=clean.names, rig=fluo.rig,
                     groups=groups, labels=labels, skeleton=clean.skeleton,
-                    flip_pairs=clean.flip_pairs, provenance=provenance,
+                    flip_pairs=(clean.flip_pairs if clean.flip_pairs_declared else None),
+                    provenance=provenance,
                     assoc_res_max_px=clean.assoc_res_max_px,
                 )
                 reloaded = fmt.Session.load(out_session)

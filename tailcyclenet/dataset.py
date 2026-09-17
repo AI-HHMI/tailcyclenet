@@ -62,6 +62,9 @@ class LoaderConfig:
     aug_rotation_deg: float = 45.0
     # None means "follow aug_prob"; set it to dial rotation without moving appearance jitter.
     aug_rotation_prob: float | None = None
+    # train-only source-canvas reflection for native/forced 2D items; zero is byte/RNG-identical.
+    flip_2d_prob: float = 0.0
+    flip_2d_modes: list = field(default_factory=lambda: ['horizontal'])
     # per-FRAME appearance: motion blur, sensor noise
     per_image_aug_prob: float = 0.25
     # rate at which a train item drops colour entirely
@@ -137,6 +140,35 @@ class LoaderConfig:
     # exposure bias: the deployed box is a DETECTOR box
     box_prompt_jitter: float = 0.0
     box_prompt_scale_jitter: float = 0.0
+
+    def __post_init__(self):
+        """Validate the opt-in 2D reflection configuration at construction time."""
+        try:
+            probability = float(self.flip_2d_prob)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f'flip_2d_prob must be a number in [0, 1], got {self.flip_2d_prob!r}') from exc
+        if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError(f'flip_2d_prob must be in [0, 1], got {self.flip_2d_prob!r}')
+        if not isinstance(self.flip_2d_modes, (list, tuple)):
+            raise ValueError(
+                f'flip_2d_modes must be a list of "horizontal"/"vertical" values, '
+                f'got {self.flip_2d_modes!r}')
+        modes = list(self.flip_2d_modes)
+        allowed = ('horizontal', 'vertical')
+        unknown = [mode for mode in modes if not isinstance(mode, str) or mode not in allowed]
+        if unknown:
+            raise ValueError(
+                f'flip_2d_modes must contain only {allowed}, got {unknown[0]!r}')
+        if len(set(modes)) != len(modes):
+            raise ValueError(f'flip_2d_modes must contain no duplicate entries, got {modes!r}')
+        if probability > 0 and not modes:
+            raise AssertionError(
+                'flip_2d_modes must be non-empty when flip_2d_prob > 0; '
+                'a positive probability has no legal mode to draw')
+        self.flip_2d_prob = probability
+        self.flip_2d_modes = modes
+
     # WIDE-CROP TRAINING: widen the crop-rule box about its centre by this factor BEFORE the
     # coords are shifted into it, so the animal sits off-centre in a wider crop and the box
     # (computed post-hoc from the returned coords) is the only non-centred cue for which animal.
@@ -189,8 +221,53 @@ def _rotate_2d(cam, coords, angle_deg):
     return out, coords @ Mt[:, :2].T + Mt[:, 2], (M, (cw, ch))
 
 
+def _flip_2d(cam, coords, mode, prior_rotation=None, perm=None):
+    """Reflect one 2D camera on its current source canvas and permute semantic keypoints.
+
+    The reflection is composed into the source-to-canvas affine so image pixels, crop geometry,
+    camera metadata and labels stay in one coordinate frame. ``W - 1 - x`` and ``H - 1 - y`` are
+    pixel-center conventions, matching ``cv2.flip``. The intrinsic matrix is left-multiplied by
+    the reflection, so 3D projection remains consistent as well; because the reflection acts after
+    distortion, the distortion coefficients remain unchanged. ``perm`` is a session-axis
+    involution; when omitted, the helper only performs the geometric transform for callers testing
+    the affine.
+    """
+    if mode not in ('horizontal', 'vertical'):
+        raise ValueError(f'2D flip mode must be "horizontal" or "vertical", got {mode!r}')
+    W, H = (int(v) for v in cam['size'][:2])
+    if mode == 'horizontal':
+        F = np.array([[-1.0, 0.0, W - 1.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    else:
+        F = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, H - 1.0]], dtype=np.float64)
+
+    if prior_rotation is None:
+        M_prior = np.eye(3, dtype=np.float64)
+    else:
+        M_prior_2x3 = np.asarray(prior_rotation[0], dtype=np.float64)
+        if M_prior_2x3.shape != (2, 3):
+            raise ValueError(f'2D rotation must be a 2x3 affine, got {M_prior_2x3.shape}')
+        M_prior = np.vstack([M_prior_2x3, [0.0, 0.0, 1.0]])
+    F_h = np.vstack([F, [0.0, 0.0, 1.0]])
+    composed = (F_h @ M_prior)[:2]
+
+    out = dict(cam)
+    out['mat'] = cam['mat'].clone()
+    out['offset'] = cam['offset'].clone()
+    F_t = torch.as_tensor(F, dtype=cam['mat'].dtype, device=cam['mat'].device)
+    out['mat'][:2, :2] = F_t[:, :2] @ cam['mat'][:2, :2]
+    pp = cam['mat'][:2, 2] - cam['offset']
+    pp_flip = F_t @ torch.cat([pp, torch.ones(1, dtype=pp.dtype, device=pp.device)])
+    out['mat'][:2, 2] = pp_flip + cam['offset']
+    Ft = torch.as_tensor(F, dtype=coords.dtype, device=coords.device)
+    transformed = coords @ Ft[:, :2].T + Ft[:, 2]
+    if perm is not None:
+        perm = torch.as_tensor(perm, dtype=torch.long, device=coords.device)
+        transformed = transformed[:, perm]
+    return out, transformed, (composed, (W, H))
+
+
 def _apply_affine(pts, rotation):
-    """Move (...,2) pixel points through a rotation's own 2x3, or pass through untouched.
+    """Move (...,2) pixel points through a rotation/reflection's own 2x3, or pass through untouched.
 
     Shared so a stored box and the labels can never end up in different frames; a list is a
     per-frame rotation over `pts`' leading (time) axis.
@@ -799,6 +876,8 @@ class View:
     consumer has to move coordinates BETWEEN two realisations of the same selection and the
     composed matrix is the only correct way to do it (re-deriving it from the camera dicts is how
     the two frames come to disagree). `rotation` and `scale` are per camera; 2D has one entry.
+    `kpt_perm` maps each view slot to its source/session slot when a semantic flip permutation was
+    applied; it is needed by scorer transfer because an affine cannot encode a keypoint-axis map.
     """
     views: list
     coords: torch.Tensor
@@ -813,6 +892,38 @@ class View:
     neighbour_full: object
     rotation: list
     scale: list
+    kpt_perm: torch.Tensor | None = None
+
+
+def _session_flip_permutation(sess):
+    """Return the session-axis permutation implied by its declared ``flip_pairs``."""
+    if not all(isinstance(name, str) for name in sess.names):
+        raise ValueError(f'{sess.path}: session names must all be strings for flip_pairs remapping')
+    if len(set(sess.names)) != len(sess.names):
+        raise ValueError(f'{sess.path}: session names must be unique for flip_pairs remapping')
+    slots = {name: i for i, name in enumerate(sess.names)}
+    perm = np.arange(len(sess.names), dtype=np.int64)
+    paired: set[str] = set()
+    for pair in sess.flip_pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(
+                f'{sess.path}: flip_pairs entries must be [left, right] name pairs, got {pair!r}')
+        left, right = pair
+        if not isinstance(left, str) or not isinstance(right, str):
+            raise ValueError(
+                f'{sess.path}: flip_pairs names must be strings, got {pair!r}')
+        if left not in slots or right not in slots:
+            raise ValueError(
+                f'{sess.path}: flip_pairs names must be in session names, got {pair!r}')
+        if left == right:
+            raise ValueError(f'{sess.path}: flip_pairs cannot self-pair {left!r}')
+        if left in paired or right in paired:
+            raise ValueError(
+                f'{sess.path}: flip_pairs must be an involution with each keypoint in one pair, '
+                f'got {pair!r}')
+        paired.update((left, right))
+        perm[slots[left]], perm[slots[right]] = slots[right], slots[left]
+    return torch.as_tensor(perm, dtype=torch.long), [n for n in sess.names if n not in paired]
 
 
 def shard_sessions(sessions, rank: int = 0, world_size: int = 1):
@@ -883,6 +994,24 @@ class PoseDataset(Dataset):
         self.index: list[_Item] = []
         self.by_dataset: list[list[int]] = []
         self._kpt_ids: dict[Path, torch.Tensor] = {}
+        self._flip_perm: dict[Path, torch.Tensor] = {}
+        if self.train and cfg.flip_2d_prob > 0:
+            for ds in self.datasets:
+                for sess in ds.sessions.get(split, []):
+                    eligible = sess.mode == '2d' or (
+                        sess.mode == '3d' and cfg.prob_2d_only > 0)
+                    if not eligible:
+                        continue
+                    if not getattr(sess, 'flip_pairs_declared', False):
+                        raise ValueError(
+                            f'{sess.path}: flip_2d_prob > 0 requires a declared flip_pairs key. '
+                            'Add flip_pairs (possibly []), set flip_2d_prob = 0, or for a 3D '
+                            'session set prob_2d_only = 0.')
+                    perm, unpaired = _session_flip_permutation(sess)
+                    self._flip_perm[sess.path] = perm
+                    if unpaired and self.rank == 0:
+                        print(f'{sess.path}: flip_pairs leaves unpaired keypoints: '
+                              + ', '.join(unpaired))
         boxed: list[tuple[str, int, int]] = []
         for di, ds in enumerate(self.datasets):
             mine, n_box, n_sess = [], 0, 0
@@ -1304,10 +1433,11 @@ class PoseDataset(Dataset):
     def _realise(self, sel, rng, world_gauge=True) -> View | None:
         """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
 
-        Consumes the rotation draw (one per camera), the crop jitter, the grayscale coin and the
-        appearance augmenters -- everything whose value is a property of HOW the window is shown.
+        Consumes the rotation draw (one per camera), the optional per-view 2D flip draw, the crop
+        jitter, the grayscale coin and the appearance augmenters -- everything whose value is a
+        property of HOW the window is shown. The flip coin is drawn only after the complete 2D
+        rotation block and only when its configured probability is positive.
         Returns the `View`, or None when the crop or the decode fails.
-
         `sel` is NOT mutated: `vis_2d` is cloned on entry and no library helper in this path
         writes through a camera dict or through `coords`, so the same selection may be realised
         repeatedly (the scorer's independently-viewed anchor) without the first view
@@ -1329,8 +1459,8 @@ class PoseDataset(Dataset):
         members.
 
         Inputs: sel -- a `Selection`; rng -- this view's own stream; world_gauge -- see above.
-        Outputs: the `View`, or None when the crop fails or a frame will not decode.
-        Side effects: decodes video frames through the reader cache and draws from `rng`.
+        Outputs: the `View`, or None when the crop fails or a frame will not decode; side effects:
+        decodes video frames through the reader cache and draws from `rng`.
         """
         group, lab = sel.group, sel.lab
         frames = sel.frames
@@ -1347,8 +1477,11 @@ class PoseDataset(Dataset):
         rot_deg = self.cfg.aug_rotation_deg
         rotation_info = [None] * len(cgroup)
         neighbour_full = None
+        flipped = False
+        kpt_perm = None
         if true_2d:
             cam = cgroup[0]
+            kpt_perm = torch.arange(sel.n_keypoints, dtype=torch.long)
             coords = _mask_outside(coords, cam['size'])
             if vis_2d is not None:
                 vis_2d[:, :, 0][~torch.isfinite(coords).all(-1) & (vis_2d[:, :, 0] == 1)] = 0
@@ -1357,7 +1490,16 @@ class PoseDataset(Dataset):
                 cam, coords, rot = _rotate_2d(cam, coords,
                                               float(rng.uniform(-rot_deg, rot_deg)))
                 rotation_info = [rot]
-                cp = _apply_affine(cp, rot)
+            if (self.train and self.cfg.flip_2d_prob > 0
+                    and rng.random() < self.cfg.flip_2d_prob):
+                mode = self.cfg.flip_2d_modes[int(rng.integers(len(self.cfg.flip_2d_modes)))]
+                kpt_perm = self._flip_perm[sel.sess.path]
+                cam, coords, flip = _flip_2d(cam, coords, mode, rotation_info[0], kpt_perm)
+                rotation_info = [flip]
+                flipped = True
+                if vis_2d is not None:
+                    vis_2d = vis_2d[:, kpt_perm]
+            cp = _apply_affine(cp, rotation_info[0])
             jit = self._jitter(rng)
             cam, box, coords = cropmod.crop_to_points_2d(cam, coords, self.cfg.min_crop_dim,
                                                          jit, crop_pts=cp,
@@ -1374,6 +1516,8 @@ class PoseDataset(Dataset):
                 raw = self._hybrid_2d_coords(
                     lab, neighbour_row, frames, sel.cgroup[0], sel.cam_ix[0])
                 raw = _apply_affine(raw, rotation_info[0])
+                if flipped:
+                    raw = raw[:, self._flip_perm[sel.sess.path]]
                 neighbour_full = (raw - box[:2].to(raw.dtype)) * scale
             cgroup, boxes = [cam], [box]
             p2d = p2d_all = coords[None]
@@ -1444,7 +1588,8 @@ class PoseDataset(Dataset):
         return View(views=views, coords=coords, vis=vis, vis_2d=vis_2d, cgroup=cgroup,
                     boxes=boxes, cam_names=cam_names, r=2 if true_2d else 3,
                     single_view=single_view, p2d=p2d,
-                    neighbour_full=neighbour_full, rotation=rotation_info, scale=scales)
+                    neighbour_full=neighbour_full, rotation=rotation_info, scale=scales,
+                    kpt_perm=kpt_perm)
 
     def _targets(self, sel, view, rng):
         """Turn a realised `View` into the pose training targets and the item tuple.

@@ -37,7 +37,8 @@ def _session_with_a_region(path):
     lab.boxes[0, :, 0] = [8.0, 6.0, 34.0, 28.0]
     fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
                       names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},
-                      flip_pairs=sess.flip_pairs, provenance=sess.provenance)
+                      flip_pairs=(sess.flip_pairs if sess.flip_pairs_declared else None),
+                      provenance=sess.provenance)
     return fmt.Session.load(path)
 
 

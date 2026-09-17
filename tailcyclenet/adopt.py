@@ -553,6 +553,8 @@ def session_from_prediction(pred_dir) -> fmt.VideoSession:
         path=_common_parent([Path(f) for f in files]) / p.session_id,
         mode=cfg['mode'], units=cfg['units'], label_source='tracked', names=names,
         rig=p.rig, groups=groups,
+        flip_pairs=[list(pair) for pair in cfg.get('flip_pairs', [])],
+        flip_pairs_declared='flip_pairs' in cfg,
         assoc_res_max_px=float(cfg.get('assoc_res_max_px', 30.0)),
         provenance=dict(prov), empty=empty)
     for g in groups.values():
@@ -569,6 +571,7 @@ def dump(sess: fmt.VideoSession, out: Path) -> None:
     fmt.write_session(out, mode=sess.mode, units=sess.units, label_source=sess.label_source,
                       names=sess.names, rig=sess.rig, groups=sess.groups,
                       labels={g: sess.labels(g) for g in sess.groups},
+                      flip_pairs=sess.flip_pairs if sess.flip_pairs_declared else None,
                       provenance=dict(sess.provenance),
                       assoc_res_max_px=sess.assoc_res_max_px)
     for gid, g in sess.groups.items():

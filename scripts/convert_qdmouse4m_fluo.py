@@ -142,7 +142,8 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
     fmt.write_session(
         output, mode=old.mode, units=old.units, label_source=old.label_source,
         names=old.names, rig=rig, groups=groups, labels=labels,
-        skeleton=old.skeleton, flip_pairs=old.flip_pairs, provenance=provenance,
+        skeleton=old.skeleton,
+        flip_pairs=(old.flip_pairs if old.flip_pairs_declared else None), provenance=provenance,
         assoc_res_max_px=old.assoc_res_max_px,
     )
     for gid, g in old.groups.items():

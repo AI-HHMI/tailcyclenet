@@ -147,11 +147,13 @@ def tracked_no_assessment_root(tmp_path_factory):
     return root / 'catlike'
 
 
-def _session_3d(path, T=4, moving=False, label_source='tracked'):
+def _session_3d(path, T=4, moving=False, label_source='tracked', names=None,
+                flip_pairs=None):
     """allen-mouse's shape: native 3D plus coordinate-free per-camera visibility rows."""
     W, H = 64, 48
+    names = KPTS_3D if names is None else list(names)
     rig = _rig([(f'cam{i}', W, H, True, moving and i == 0, i + 1) for i in range(3)])
-    K = len(KPTS_3D)
+    K = len(names)
     lab = fmt.empty_labels(1, T, K, 3, mode3d=True, animal_ids=['m1'])
     rng = np.random.default_rng(1)
     lab.vis3d[:] = fmt.VISIBLE
@@ -171,9 +173,10 @@ def _session_3d(path, T=4, moving=False, label_source='tracked'):
                 lab.ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
     groups = {'g000': fmt.Group('g000', T, fps=200.0)}
-    fmt.write_session(path, mode='3d', units='mm', label_source=label_source, names=KPTS_3D,
-                      rig=rig, groups=groups,
-                      labels={'g000': lab}, provenance={'source': 'synthetic'})
+    write_args = {} if flip_pairs is None else {'flip_pairs': flip_pairs}
+    fmt.write_session(path, mode='3d', units='mm', label_source=label_source, names=names,
+                      rig=rig, groups=groups, labels={'g000': lab},
+                      provenance={'source': 'synthetic'}, **write_args)
     for name in rig.names:
         _write_frames(path / 'groups' / 'g000', name, T, (W, H))
     return lab

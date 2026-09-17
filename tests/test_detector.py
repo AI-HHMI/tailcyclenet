@@ -2245,7 +2245,8 @@ def _root_with_regions(tmp_path, rect=(4.0, 4.0, 44.0, 34.0)):
     lab.regions = np.array([[1.0, 0.0, *rect]])
     fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
                       names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},
-                      flip_pairs=sess.flip_pairs, provenance=sess.provenance)
+                      flip_pairs=(sess.flip_pairs if sess.flip_pairs_declared else None),
+                      provenance=sess.provenance)
     return tmp_path / 'ds'
 
 

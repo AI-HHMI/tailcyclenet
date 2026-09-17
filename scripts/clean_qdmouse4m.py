@@ -478,7 +478,8 @@ def build(source: Path, scores_path: Path, output: Path, *, jump_threshold: floa
                     out_session, mode=src_session.mode, units=src_session.units,
                     label_source=src_session.label_source, names=src_session.names, rig=src_session.rig,
                     groups=out_groups, labels=session_labels, skeleton=src_session.skeleton,
-                    flip_pairs=src_session.flip_pairs, provenance=prov,
+                    flip_pairs=(src_session.flip_pairs if src_session.flip_pairs_declared else None),
+                    provenance=prov,
                     assoc_res_max_px=src_session.assoc_res_max_px,
                 )
                 for child_id, src_group, start, end, unsplit in child_pixels:
@@ -589,7 +590,8 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
             session.path, mode=session.mode, units=session.units,
             label_source=session.label_source, names=session.names, rig=session.rig,
             groups=remaining_groups, labels=labels, skeleton=session.skeleton,
-            flip_pairs=session.flip_pairs, provenance=session.provenance,
+            flip_pairs=(session.flip_pairs if session.flip_pairs_declared else None),
+            provenance=session.provenance,
             assoc_res_max_px=session.assoc_res_max_px,
         )
         reloaded = fmt.Session.load(session.path)

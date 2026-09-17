@@ -38,6 +38,11 @@ class FormatError(Exception):
     """A dataset on disk does not satisfy docs/annotation_format.md."""
 
 
+# ``None`` means an explicitly requested omission for round-trip callers, while this sentinel
+# keeps an omitted argument distinct from an explicitly empty declaration.
+_FLIP_PAIRS_UNSET = object()
+
+
 # cameras
 
 def nominal_camera(name: str, size, dist=None):
@@ -495,6 +500,8 @@ class Session:
     groups: dict[str, Group]
     skeleton: list[list[str]] = field(default_factory=list)
     flip_pairs: list[list[str]] = field(default_factory=list)
+    # Whether session.toml explicitly declared ``flip_pairs`` (including an empty list).
+    flip_pairs_declared: bool = False
     provenance: dict = field(default_factory=dict)
     assoc_res_max_px: float = 30.0
     _label_cache: dict = field(default_factory=dict, repr=False, compare=False)
@@ -615,6 +622,7 @@ class Session:
             groups=groups,
             skeleton=[list(p) for p in cfg.get('skeleton', [])],
             flip_pairs=[list(p) for p in cfg.get('flip_pairs', [])],
+            flip_pairs_declared='flip_pairs' in cfg,
             provenance=dict(cfg.get('provenance', {})),
             assoc_res_max_px=float(cfg.get('assoc_res_max_px', 30.0)),
         )
@@ -760,7 +768,7 @@ class Session:
 
 def write_session(path: Path, *, mode: str, units: str, label_source: str, names: list[str],
                   rig: Rig, groups: dict[str, Group], labels: dict[str, Labels],
-                  skeleton=(), flip_pairs=(), provenance=None,
+                  skeleton=(), flip_pairs=_FLIP_PAIRS_UNSET, provenance=None,
                   assoc_res_max_px: float | None = None) -> None:
     """Write session.toml, calibration.toml and the label tables. Pixels are the caller's job.
 
@@ -783,7 +791,7 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
     cfg = {'mode': mode, 'units': units, 'labels': label_source, 'names': list(names)}
     if skeleton:
         cfg['skeleton'] = [list(p) for p in skeleton]
-    if flip_pairs:
+    if flip_pairs is not _FLIP_PAIRS_UNSET and flip_pairs is not None:
         cfg['flip_pairs'] = [list(p) for p in flip_pairs]
     if assoc_res_max_px is not None:
         cfg['assoc_res_max_px'] = float(assoc_res_max_px)
@@ -1170,21 +1178,42 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         """Record one rule violation against this session."""
         errs.append(f'{here}: [rule {rule}] {msg}')
 
-    if len(set(sess.names)) != len(sess.names):
+    if not all(isinstance(name, str) for name in sess.names):
+        bad(2, 'names must contain only strings')
+    if len({name for name in sess.names if isinstance(name, str)}) != sum(
+            isinstance(name, str) for name in sess.names):
         bad(2, 'names has duplicates')
-    known = set(sess.names)
-    for pair in sess.skeleton + sess.flip_pairs:
-        for n in pair:
-            if n not in known:
-                bad(2, f'skeleton/flip_pairs names unknown keypoint {n!r}')
+    known = {name for name in sess.names if isinstance(name, str)}
+    valid_flip_pairs = []
+    for kind, pairs in (('skeleton', sess.skeleton), ('flip_pairs', sess.flip_pairs)):
+        for i, pair in enumerate(pairs):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                bad(2, f'{kind}[{i}] must be a [name, name] pair')
+                continue
+            if not all(isinstance(n, str) for n in pair):
+                bad(2, f'{kind}[{i}] names must be strings')
+                continue
+            for n in pair:
+                if n not in known:
+                    bad(2, f'{kind} names unknown keypoint {n!r}')
+            if kind == 'flip_pairs':
+                valid_flip_pairs.append((pair[0], pair[1], i))
     flip: dict[str, str] = {}
-    for a, b in sess.flip_pairs:
+    seen_pairs: set[frozenset[str]] = set()
+    for a, b, i in valid_flip_pairs:
+        if a == b:
+            bad(2, f'flip_pairs has a self-pair at {a!r}')
+            continue
+        if a not in known or b not in known:
+            continue
+        pair_key = frozenset((a, b))
+        if pair_key in seen_pairs:
+            bad(2, f'flip_pairs lists the pair {a!r}, {b!r} more than once')
+        seen_pairs.add(pair_key)
         for x, y in ((a, b), (b, a)):
             if flip.setdefault(x, y) != y:
                 bad(2, f'flip_pairs is not an involution: {x!r} maps to both '
                        f'{flip[x]!r} and {y!r}')
-        if a == b:
-            bad(2, f'flip_pairs has a self-pair at {a!r}')
 
     for name in sess.cam_names:
         if not name:

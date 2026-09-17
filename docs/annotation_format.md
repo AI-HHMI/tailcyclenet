@@ -125,7 +125,10 @@ fps is declared per group (§6).
 - `skeleton` and `flip_pairs` are optional and expected to be empty for most data — they are
   needed only for bone-length diagnostics and bilateral flip augmentation. When present, every
   name must be in `names`, and `flip_pairs` lists each pair **once** (the involution is its
-  symmetric closure).
+  symmetric closure). A training consumer that enables bilateral reflection requires the key to
+  be declared in every eligible session, even when the intentional value is `[]`; a partial map
+  is legal and leaves unpaired names identity-mapped. Consumers must not infer missing pairs from
+  keypoint spelling.
 - **`labels` says who produced the labels, not how many there are.** It is the one thing a
   consumer cannot recover reliably from the tables: a training sampler weights hand-annotated
   stills against machine-tracked clips, and a root that mixes them gives no other honest signal.

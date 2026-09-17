@@ -8,6 +8,9 @@ n_frames = 12               # a CEILING: a train window is sized to the labelled
 image_size = 256
 balance_datasets = true
 aug_prob = 0.25
+# Train-only source-canvas flips; zero disables them, and active 2D sessions must declare `flip_pairs`.
+flip_2d_prob = 0.0
+flip_2d_modes = ["horizontal"]
 crop_jitter = 0.3           # measured: tight crops cut the detector-crop penalty and improve base accuracy, because a tight box teaches the model the animal always fills the frame, which no detector delivers
 crop_jitter_scale = 0.3
 min_crop_dim = 64

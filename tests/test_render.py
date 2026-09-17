@@ -395,3 +395,50 @@ def test_load_predictions_groups_filter_matches_the_unfiltered_read(tmp_path):
     filtered, _ = load_predictions(tmp_path / 'sess', groups=['g000'])
     assert list(filtered) == ['sess/g000']
     np.testing.assert_array_equal(filtered['sess/g000']['pred'], full['sess/g000']['pred'])
+
+
+def test_skeleton_override_validates_pairs_and_keypoint_names(tmp_path):
+    from tailcyclenet.render import load_skeleton_override
+
+    good = tmp_path / 'skeleton.toml'
+    good.write_text('skeleton = [["a", "b"], ["b", "c"]]\n')
+    assert load_skeleton_override(good, ['a', 'b', 'c']) == [['a', 'b'], ['b', 'c']]
+
+    missing = tmp_path / 'missing.toml'
+    missing.write_text('names = ["a", "b"]\n')
+    with pytest.raises(SystemExit, match='top-level `skeleton`'):
+        load_skeleton_override(missing, ['a', 'b'])
+
+    malformed = tmp_path / 'malformed.toml'
+    malformed.write_text('skeleton = [["a"], ["a", 3]]\n')
+    with pytest.raises(SystemExit, match=r'skeleton\[0\]'):
+        load_skeleton_override(malformed, ['a', 'b'])
+
+    unknown = tmp_path / 'unknown.toml'
+    unknown.write_text('skeleton = [["a", "missing"]]\n')
+    with pytest.raises(SystemExit, match='not in the prediction keypoint axis'):
+        load_skeleton_override(unknown, ['a', 'b'])
+
+
+def test_render_skeleton_override_replaces_resolved_session(monkeypatch, tmp_path):
+    import types
+    import tailcyclenet.render as render
+    import tailcyclenet.infer.predictions as predictions
+
+    pred = tmp_path / 'pred'
+    pred.mkdir()
+    (pred / 'session.toml').write_text('names = ["a", "b"]\n[provenance]\n')
+    skeleton = tmp_path / 'skeleton.toml'
+    skeleton.write_text('skeleton = [["a", "b"]]\n')
+    sess = types.SimpleNamespace(
+        names=['a', 'b'], skeleton=[], session_id='s', cam_names=['cam0'],
+        groups={'g': types.SimpleNamespace(n_frames=1)})
+    monkeypatch.setattr(render, 'session_for_prediction', lambda *args, **kwargs: sess)
+    monkeypatch.setattr(predictions, 'load_predictions',
+                        lambda *args, **kwargs: ({'s/g': {'pred': np.zeros((1, 1, 2, 2), np.float32)}}, {}))
+    seen = {}
+    monkeypatch.setattr(render, 'render_group',
+                        lambda session, *args, **kwargs: seen.setdefault('skeleton', session.skeleton))
+
+    render.main(['--pred', str(pred), '--out', str(tmp_path / 'out'), '--skeleton', str(skeleton)])
+    assert seen['skeleton'] == [['a', 'b']]

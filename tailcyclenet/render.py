@@ -210,6 +210,44 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     return out_path
 
 
+def load_skeleton_override(path, names):
+    """Load and validate a render-only skeleton override from a TOML file."""
+    import tomllib
+
+    path = Path(path)
+    try:
+        with open(path, 'rb') as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError as e:
+        raise SystemExit(f'--skeleton {path}: file not found') from e
+    except OSError as e:
+        raise SystemExit(f'--skeleton {path}: cannot read TOML: {e}') from e
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f'--skeleton {path}: invalid TOML: {e}') from e
+
+    if 'skeleton' not in cfg:
+        raise SystemExit(f'--skeleton {path}: TOML must contain a top-level `skeleton` field')
+    raw = cfg['skeleton']
+    if not isinstance(raw, list):
+        raise SystemExit(f'--skeleton {path}: `skeleton` must be an array of [name, name] pairs')
+
+    known = set(names)
+    out = []
+    for i, pair in enumerate(raw):
+        if not isinstance(pair, list) or len(pair) != 2 or not all(
+                isinstance(name, str) and name for name in pair):
+            raise SystemExit(
+                f'--skeleton {path}: skeleton[{i}] must be exactly [non-empty string, '
+                'non-empty string]')
+        unknown = [name for name in pair if name not in known]
+        if unknown:
+            raise SystemExit(
+                f'--skeleton {path}: skeleton[{i}] names {unknown!r} are not in the '
+                f"prediction keypoint axis {list(names)!r}")
+        out.append(list(pair))
+    return out
+
+
 def resolve_camera(session, token: str) -> int:
     """A `--cams` token -> a camera INDEX. NAME first, then index: a token that IS a camera name
     must never be silently re-read as a position.
@@ -334,6 +372,9 @@ def build_parser() -> argparse.ArgumentParser:
                          'only place their disagreement is legible.')
     ap.add_argument('--boxes', action='store_true',
                     help="draw instances.pq boxes in each animal's own colour")
+    ap.add_argument('--skeleton', type=Path, default=None,
+                     help='TOML file containing a top-level skeleton = [[name, name], ...] '
+                     'override')
     ap.add_argument('--fps', type=float, default=15)
     ap.add_argument('--max-side', type=int, default=1600)
     return ap
@@ -390,6 +431,9 @@ def main(argv=None):
     prov = cfg.get('provenance', {})
 
     sess = session_for_prediction(args.pred, data=args.data, split=args.split)
+
+    if args.skeleton is not None:
+        sess.skeleton = load_skeleton_override(args.skeleton, sess.names)
 
     want_groups = [g.strip() for g in args.groups.split(',') if g.strip()] if args.groups else None
     preds, meta = load_predictions(args.pred, groups=want_groups)

@@ -25,6 +25,12 @@ def main(argv=None):
                              'must be explicitly named')
     parser.add_argument('--data', required=True, help='the tracked root to score')
     parser.add_argument('--split', default='test', help='which split of --data to score')
+    parser.add_argument('--session', default=None,
+                        help='score one exact session id instead of the whole split')
+    parser.add_argument('--start', type=int, default=None,
+                        help='zero-based inclusive window-index start')
+    parser.add_argument('--stop', type=int, default=None,
+                        help='zero-based exclusive window-index stop')
     parser.add_argument('--out', required=True,
                         help='where QC artefacts go (frame mode also writes window_scores.pq)')
     parser.add_argument('--device', default='cpu')
@@ -52,13 +58,16 @@ def main(argv=None):
     table, _registry, _config = score_root(
         Path(args.run), args.data, args.split, args.device, args.limit,
         args.window_offset, args.val_stride, spans, coverage,
-        checkpoint=args.checkpoint, checkpoint_info=checkpoint_info)
+        checkpoint=args.checkpoint, checkpoint_info=checkpoint_info,
+        session=args.session, start=args.start, stop=args.stop)
     report = rank(table, args.top)
     print(report)
     write_outputs(Path(args.out), table, Path(args.run), args.data, args.split, report, coverage,
                   checkpoint_file=checkpoint_info.get('checkpoint_file'),
                   checkpoint_iteration=checkpoint_info.get('checkpoint_iteration'),
-                  output_granularity=scorer_output_granularity(_config))
+                  output_granularity=scorer_output_granularity(_config), session=args.session,
+                  start=args.start, stop=args.stop, window_offset=args.window_offset,
+                  val_stride=args.val_stride)
     return 0
 
 

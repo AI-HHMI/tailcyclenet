@@ -123,7 +123,9 @@ def _to_device(views, coords, cgroup, kpt_ids, device):
 def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None = None,
                window_offset: int | None = None, val_stride: int | None = None,
                spans: dict | None = None, coverage: list[dict] | None = None, *,
-               checkpoint_info: dict | None = None, checkpoint: str | None = None) -> tuple:
+               checkpoint_info: dict | None = None, checkpoint: str | None = None,
+               session: str | None = None, start: int | None = None,
+               stop: int | None = None) -> tuple:
     """Score every window of `data`'s `split` with the scorer in `run`.
 
     Inputs: run -- a scorer run folder; data -- a dataset root; split -- which split to score;
@@ -131,7 +133,9 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             is thousands of them, and a first look must not need the whole split);
             window_offset -- shift the window lattice by this many frames, so the scorer judges a
             track under a framing other than the one that produced it; val_stride -- window
-            spacing, defaulting to the run's `n_frames` (non-overlapping); spans -- restrict
+            spacing, defaulting to the run's `n_frames` (non-overlapping); session -- score only
+            the exact session id; start/stop -- zero-based half-open positions in the resulting
+            window index (after session and span filtering); spans -- restrict
             scoring to windows starting inside a frame range, as {(session, group, animal):
             (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable;
             coverage -- optional list populated with one record per requested window; checkpoint --
@@ -161,14 +165,30 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
     _check_names(registry, ds.registry, data)
 
     where = list(range(len(ds)))
+    if session is not None:
+        session_where = [i for i in where
+                         if str(ds.index[i].session.session_id) == str(session)]
+        if not session_where:
+            raise SystemExit(f'no session {session!r} found in {data}/{split}')
+        where = session_where
+        print(f'{len(where)} windows belong to session {session!r}')
     if spans is not None:
-        where = _span_indices(ds, spans)
-        print(f'{len(where)} of {len(ds)} windows start inside the requested spans')
-        if not where:
+        span_where = set(_span_indices(ds, spans))
+        if not span_where:
             raise SystemExit(
                 'no window starts inside the given spans, so there is nothing to score: check '
                 'the session/group/animal keys, and that span_start is a WINDOW start (a multiple '
                 'of the run n_frames, plus --window-offset)')
+        where = [i for i in where if i in span_where]
+        print(f'{len(where)} windows remain inside the requested spans')
+    if start is not None or stop is not None:
+        lo = 0 if start is None else int(start)
+        hi = len(where) if stop is None else int(stop)
+        total = len(where)
+        if lo < 0 or hi < lo or hi > total:
+            raise ValueError(f'invalid window range [{lo}, {hi}) for {total} windows')
+        where = where[lo:hi]
+        print(f'window range [{lo}, {hi}) of {total}: {len(where)} windows')
     print(f'scoring up to {len(where)} windows from {data}/{split} with {ckpt.name}')
 
     output_granularity = scorer_output_granularity(config)
@@ -434,7 +454,10 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
                   report: str, coverage: list[dict] | None = None, *,
                   checkpoint_file: str | Path | None = None,
                   checkpoint_iteration: int | None = None,
-                  output_granularity: str | None = None) -> None:
+                  output_granularity: str | None = None,
+                  session: str | None = None, start: int | None = None,
+                  stop: int | None = None, window_offset: int | None = None,
+                  val_stride: int | None = None) -> None:
     """Write mode-aware QC tables, report, provenance, and optional coverage.
 
     Framewise ``table`` is the raw contextual window table returned by :func:`score_root`.  It is
@@ -486,8 +509,21 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         output_provenance['checkpoint_file'] = str(checkpoint_file)
     if checkpoint_iteration is not None:
         output_provenance['checkpoint_iteration'] = int(checkpoint_iteration)
+    if session is not None:
+        output_provenance['session'] = str(session)
+    if start is not None:
+        output_provenance['window_start_index'] = int(start)
+    if stop is not None:
+        output_provenance['window_stop_index'] = int(stop)
+    if window_offset is not None:
+        output_provenance['window_offset'] = int(window_offset)
+    if val_stride is not None:
+        output_provenance['val_stride'] = int(val_stride)
     (out / 'provenance.toml').write_text(toml.dumps(output_provenance))
     if coverage is not None:
-        coverage_columns = ['index', 'session', 'group', 'animal', 'start', 'status', 'reason']
-        pl.DataFrame(coverage, schema=coverage_columns).write_csv(out / 'coverage.csv')
+        coverage_schema = {
+            'index': pl.Int64, 'session': pl.String, 'group': pl.String,
+            'animal': pl.String, 'start': pl.Int64, 'status': pl.String, 'reason': pl.String,
+        }
+        pl.DataFrame(coverage, schema=coverage_schema).write_csv(out / 'coverage.csv')
     print(f'wrote {out}/scores.pq, {out}/report.txt, {out}/provenance.toml')

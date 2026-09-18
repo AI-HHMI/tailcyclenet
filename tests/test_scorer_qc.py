@@ -119,6 +119,81 @@ def test_get_once_does_not_retry_a_failed_index():
     assert calls == [7]
 
 
+def test_score_root_applies_session_and_half_open_window_range(monkeypatch):
+    """Session filtering happens before the zero-based half-open window slice."""
+    sessions = []
+    for name in ('sess-a', 'sess-b'):
+        sess = SimpleNamespace(session_id=name, names=['k'])
+        sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
+        sessions.append(sess)
+
+    class FakeDataset:
+        registry = SimpleNamespace(names=['k'])
+        seed = 23
+        train = False
+        index = [SimpleNamespace(session=sessions[0], gid='g', animal=0, start=i)
+                 for i in range(4)] + [
+                     SimpleNamespace(session=sessions[1], gid='g', animal=0, start=i)
+                     for i in range(2)]
+
+        def __init__(self, *_args, **_kwargs):
+            self.calls = []
+
+        def __len__(self):
+            return len(self.index)
+
+        def get_once(self, idx):
+            self.calls.append(idx)
+            return None
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    monkeypatch.setattr(qc, 'load_scorer_run',
+                        lambda *_args, **_kwargs: (FakeModel(), {},
+                                                    SimpleNamespace(names=['k']),
+                                                    SimpleNamespace(name='checkpoint_last.pth')))
+    coverage = []
+    table, _registry, _config = qc.score_root(
+        Path('run'), 'data', 'test', session='sess-a', start=1, stop=3,
+        coverage=coverage)
+
+    assert table.is_empty()
+    assert [row['index'] for row in coverage] == [1, 2]
+
+
+def test_score_root_rejects_window_range_outside_filtered_index(monkeypatch):
+    """A coordinator typo must fail instead of silently scoring a smaller shard."""
+    sess = SimpleNamespace(session_id='sess', names=['k'])
+    sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
+
+    class FakeDataset:
+        registry = SimpleNamespace(names=['k'])
+        index = [SimpleNamespace(session=sess, gid='g', animal=0, start=0)]
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
+    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
+    monkeypatch.setattr(qc, 'load_scorer_run',
+                        lambda *_args, **_kwargs: (FakeModel(), {},
+                                                    SimpleNamespace(names=['k']),
+                                                    SimpleNamespace(name='checkpoint_last.pth')))
+    with pytest.raises(ValueError, match='invalid window range'):
+        qc.score_root(Path('run'), 'data', 'test', start=0, stop=2)
+
+
 def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
     """A failed requested window is coverage, never a random group's score."""
 
@@ -297,3 +372,6 @@ def test_score_session_help_requires_explicit_best_checkpoint(capsys):
     assert 'checkpoint_best.pth' in help_text
     assert 'validation-selected' in help_text
     assert 'explicitly named' in help_text
+    assert '--session' in help_text
+    assert '--start' in help_text
+    assert '--stop' in help_text

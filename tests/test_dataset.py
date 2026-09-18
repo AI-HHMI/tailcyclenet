@@ -249,6 +249,29 @@ def test_one_frame_under_many_crops_decodes_once(dataset_3d, monkeypatch):
 # the loader
 # ----------------------------------------------------------------------------------------------
 
+def test_pose_dataset_does_not_discover_other_splits(tmp_path):
+    """Train/val construction must not parse a malformed test session."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as C
+
+    root = tmp_path / 'ds'
+    C._session_2d(root / 'train' / 'train_session')
+    C._session_2d(root / 'val' / 'val_session')
+    test_session = root / 'test' / 'test_session'
+    C._session_2d(test_session)
+    (test_session / 'calibration.toml').unlink()
+
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                       crop_jitter=0.0, prompt_dropout=0.0)
+    train = PoseDataset(root, 'train', cfg)
+    val = PoseDataset(root, 'val', cfg, registry=train.registry, train=False)
+
+    assert {s.split for ds in train.datasets for s in ds.sessions['train']} == {'train'}
+    assert {s.split for ds in val.datasets for s in ds.sessions['val']} == {'val'}
+    assert len(train) > 0 and len(val) > 0
+
+
 CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                    crop_jitter=0.0, prompt_dropout=0.0)
 

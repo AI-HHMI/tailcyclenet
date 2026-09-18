@@ -947,9 +947,9 @@ class PoseDataset(Dataset):
                  world_size: int = 1):
         """Build the window index for one split of a dataset (or folder of datasets).
 
-        Scatters every session's parquet into dense arrays in the parent process so forked
-        workers share them copy-on-write, resolves each session's keypoint axis against the
-        registry, and refuses sessions whose label tables cannot supervise the requested mode.
+        Scatters every requested split session's parquet into dense arrays in the parent process
+        so forked workers share them copy-on-write, resolves each session's keypoint axis against
+        the registry, and refuses sessions whose label tables cannot supervise the requested mode.
 
         Inputs: path -- a dataset root or a folder of dataset roots.
                 split -- 'train', 'val' or 'test'.
@@ -958,16 +958,17 @@ class PoseDataset(Dataset):
                 train -- override the train/val flag (defaults to split == 'train').
                 seed -- the RNG seed for reproducible val/test sampling.
                 registry_base -- a base registry whose ids must be preserved (warm start).
-                rank/world_size -- optional disjoint session shard; metadata for the registry is
-                                   still read from every session, while only this rank's sessions
+                rank/world_size -- optional disjoint session shard; only this rank's sessions
                                    are preloaded. Empty validation shards are allowed.
-        Side effects: reads every label table; prints the box_source coverage per dataset.
+        Side effects: reads every requested split label table; prints the box_source coverage per
+        dataset.
 
         `n_frames` must be >= 2 (T = 1 gives posetail `gT = 0` and a zero-length
         pos_embed, which the clamp-pad does NOT cover); `box_source` is asserted against
         `BOX_SOURCES` (a typo would silently mean `keypoints`). `registry_base` makes the
         ids APPEND-ONLY so embedding rows survive warm start; `Registry.build` raises if
-        an old id would move. The parquet is scattered HERE, in the parent process, so
+        an old id would move. Only the requested split is discovered, and its parquet is
+        scattered HERE, in the parent process, so
         forked workers share the dense arrays copy-on-write. Keypoint ids are per SESSION,
         not per dataset (a session may reorder or subset the root's names), so an
         unmappable root fails at construction rather than mid-epoch; a mode/table mismatch
@@ -985,7 +986,7 @@ class PoseDataset(Dataset):
         self.cfg = cfg
         self.split = split
         self.train = (split == 'train') if train is None else train
-        self.datasets = load_datasets(path)
+        self.datasets = load_datasets(path, split=split)
         self.rank, self.world_size = int(rank), int(world_size)
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError(f'invalid dataset shard rank={self.rank}, world_size={self.world_size}')

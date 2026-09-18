@@ -38,10 +38,29 @@ def scorer_root(tmp_path_factory):
     for i in range(3):
         C._session_3d(root / 'train' / f'sess_train_{i}')
         C._session_3d(root / 'val' / f'sess_val_{i}')
+    test_session = root / 'test' / 'must_not_be_loaded'
+    C._session_3d(test_session)
+    (test_session / 'calibration.toml').unlink()
     return root
 
 
 # -- val is scored at a FIXED camera count ---------------------------------------------------
+
+def test_scorer_build_datasets_excludes_test_split(scorer_root):
+    """The scorer must not parse test metadata while building train and val datasets."""
+    from tailcyclenet.scorer.train import build_datasets
+
+    cfg = ck.load_config(str(REPO / 'configs/scorer.toml'), base=ck._SCORER_CONFIG)
+    cfg['data'] = {**cfg['data'], 'path': str(scorer_root), 'num_workers': 0,
+                   'val_num_workers': 0, 'n_frames': 4, 'image_size': 64,
+                   'prob_2d_only': 0.0, 'aug_prob': 0.0, 'per_image_aug_prob': 0.0,
+                   'grayscale_prob': 0.0, 'crop_jitter': 0.0}
+    train_ds, val_ds, _ = build_datasets(cfg, None)
+
+    assert {s.split for ds in train_ds.base.datasets for s in ds.sessions['train']} == {'train'}
+    assert val_ds is not None
+    assert {s.split for ds in val_ds.base.datasets for s in ds.sessions['val']} == {'val'}
+
 
 def test_val_uses_the_fixed_val_camera_count_not_the_train_range(scorer_root):
     """`val_cams_to_sample` must reach the val Dataset.

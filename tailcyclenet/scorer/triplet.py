@@ -997,7 +997,9 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
         'segment_mask': seg_local,
         'segments': [[metadata_flat[i] for i in range(K) if bool(keep[i])]],
         'corruption_type_mask': type_mask,
-        'fired_frame': fired_keep[:, None, :, :].expand(-1, coords.shape[1], -1, -1),
+        # Pinning a broadcast view fails with overlapping memory; workers hand this to the
+        # single-GPU DataLoader's pin-memory thread, so materialise the frame axis here.
+        'fired_frame': fired_keep[:, None, :, :].expand(-1, coords.shape[1], -1, -1).contiguous(),
         'source_frame_weight': weights,
         'max_clean_px': float(cfg.get('max_clean_px', 0.0)),
         'n_dense': int(is_dense[keep].sum()),

@@ -160,7 +160,15 @@ def rig_from_doc(doc: dict, where: str) -> Rig:
         if 'size' not in block:
             raise FormatError(f'{path}: camera {name!r} has no size')
         if 'matrix' in block:
-            cams.append(CameraGroup.from_dicts([block]).cameras[0])
+            # aniposelib accepts short distortion vectors, but posetail's projection helper
+            # consumes the standard five OpenCV coefficients unconditionally.  Missing trailing
+            # coefficients mean zero, so pad at the load boundary rather than mutating every
+            # on-disk calibration.toml.
+            camera_doc = dict(block)
+            distortions = list(camera_doc.get('distortions') or [])
+            if len(distortions) < 5:
+                camera_doc['distortions'] = distortions + [0.0] * (5 - len(distortions))
+            cams.append(CameraGroup.from_dicts([camera_doc]).cameras[0])
         else:
             cams.append(nominal_camera(name, block['size'], block.get('distortions')))
         offset[name] = tuple(float(v) for v in block.get('offset', (0.0, 0.0)))

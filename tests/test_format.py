@@ -37,6 +37,29 @@ def test_roundtrip_2d(tiny_root):
     np.testing.assert_allclose(lab.boxes[1, 1, 0], [10, 10, 30, 30])
 
 
+@pytest.mark.parametrize(
+    ('distortions', 'expected'),
+    [([], np.zeros(5)), ([0.1, -0.2], [0.1, -0.2, 0.0, 0.0, 0.0])],
+)
+def test_short_distortions_load_padded(distortions, expected):
+    """Short calibration vectors are zero-padded for projection consumers."""
+    doc = {
+        'cam0': {
+            'name': 'cam0',
+            'size': [640, 480],
+            'matrix': [[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]],
+            'distortions': distortions,
+            'rotation': [0.0, 0.0, 0.0],
+            'translation': [0.0, 0.0, 1.0],
+        },
+    }
+    rig = fmt.rig_from_doc(doc, '<memory>')
+    np.testing.assert_array_equal(
+        rig.cgroup.cameras[0].get_distortions().detach().cpu().numpy(), expected,
+    )
+    assert doc['cam0']['distortions'] == distortions
+
+
 def test_roundtrip_3d(tiny_root):
     """The 3D layer is first-class, and per-camera visibility needs no 2D position."""
     sess = fmt.Session.load(tiny_root / 'mouselike' / 'train' / 'sess_c')

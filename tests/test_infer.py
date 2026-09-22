@@ -1179,6 +1179,41 @@ def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeyp
         cli.main()
 
 
+def test_session_writer_finalizes_incomplete_output_when_preload_fails(cli, monkeypatch, tmp_path):
+    import tomllib
+
+    import conftest as cf
+    import pyarrow.parquet as pq
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.format import Session
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    registry = Registry.build([load_dataset(root)])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    out = tmp_path / 'partial-prediction'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                      '--device', 'cpu', '--out', str(out)])
+
+    def fail_preload(_self):
+        raise RuntimeError('injected preload failure')
+
+    monkeypatch.setattr(Session, 'preload', fail_preload)
+    with pytest.raises(RuntimeError, match='injected preload failure'):
+        cli.main()
+
+    with (out / 'session.toml').open('rb') as f:
+        assert tomllib.load(f)['complete'] is False
+    # A finalized empty Parquet footer is readable, so resources were closed despite the error.
+    assert pq.read_table(out / 'points2d.pq').num_rows == 0
+
+
 def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
     """A minimal but genuinely loadable detector checkpoint -- `load_detector` needs real
     tensors and every key it reads, not a stub."""

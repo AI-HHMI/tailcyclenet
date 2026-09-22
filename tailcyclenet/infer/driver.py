@@ -697,15 +697,15 @@ def run_dataset(args):
                             *_box_provenance(args, det_tile, det_red, det_boxsrc).items(),
                             *_identity_provenance(args).items()],
                            gids)
-    sess.preload()
-    _total_frames = sum(max(0, min(sess.groups[g].n_frames,
-                                  cfg.frame_stop or cfg.max_frames or sess.groups[g].n_frames)
-                            - cfg.frame_start) for g in gids)
-    progress = _Progress(_total_frames)
     det_trace_groups = {}
     overlap_rows = {}
     _completed = False
     try:
+        sess.preload()
+        _total_frames = sum(max(0, min(sess.groups[g].n_frames,
+                                      cfg.frame_stop or cfg.max_frames or sess.groups[g].n_frames)
+                                - cfg.frame_start) for g in gids)
+        progress = _Progress(_total_frames)
         for gid in gids:
             key = f'{sess.session_id}/{gid}'
             boxes_for, det_stats, n_want = None, {}, 0

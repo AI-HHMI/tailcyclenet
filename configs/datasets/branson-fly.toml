@@ -17,6 +17,16 @@ names = [
 ]
 
 skeleton = []
-flip_pairs = []
+flip_pairs = [
+  ["kp16", "kp11"],
+  ["kp02", "kp01"],
+  ["kp03", "kp04"],
+  ["kp09", "kp07"],
+  ["kp10", "kp08"],
+  ["kp15", "kp12"],
+  ["kp14", "kp13"],
+  ["kp20", "kp18"],
+  ["kp19", "kp17"],
+]
 
 # Measured from the best checkpoint of this dataset's longest run. See DatasetSpec.

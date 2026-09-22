@@ -451,7 +451,9 @@ def test_frame_triplet_masks_are_post_gate_and_source_weighted(roots):
         for ki in range(shape[2]):
             for frame in set(frames):
                 slots = [i for i, value in enumerate(frames) if value == frame]
-                eligible = trip['observed_mask'][0, slots, ki]
+                eligible = (trip['observed_mask'][0, slots, ki]
+                            & trip['in_view_mask'][0, slots, ki]
+                            & trip['anchor_observed_mask'][0, slots, ki])
                 if bool(eligible.any()):
                     assert torch.isclose(trip['source_frame_weight'][0, slots, ki][eligible].sum(),
                                          torch.tensor(1.0))

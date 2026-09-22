@@ -54,7 +54,7 @@ the distinction from row counts in every consumer is guesswork the producer can 
 11. **No `annotator` column.** Multiple annotators = separate dataset roots, the annotator named
     in `session.toml` `[provenance]`. Two annotators on one point would collide with the row key.
 12. **All camera geometry lives in `calibration.toml`**, including the crop. `session.toml` is
-    keypoint identity, label source and provenance only.
+    keypoint identity, label source, optional prediction-session marker, and provenance.
 13. **Tables are Parquet.** `.pq`, tidy long form, one row per assessed thing.
 
 ## 3. Directory layout
@@ -66,8 +66,9 @@ the distinction from row counts in every consumer is guesswork the producer can 
       session.toml                    # keypoint identity + label source + provenance
       calibration.toml                # ALL camera geometry incl. crop; always present
       groups.pq                       # one row per group
-      keypoints.pq                    # per-camera 2D + per-camera visibility   (optional)
+      keypoints.pq                    # per-camera 2D observations + visibility (optional)
       points3d.pq                     # 3D                                      (optional)
+      points2d.pq                     # inference predictions only              (optional extension)
       instances.pq                    # boxes / present / absent                (optional)
       regions.pq                      # areas certified completely labelled     (optional)
       extrinsics.pq                   # per-frame extrinsics, moving cameras    (optional)
@@ -77,7 +78,10 @@ the distinction from row counts in every consumer is guesswork the producer can 
           <cam>.mp4                          # video, one per camera
 ```
 
-At least one of `keypoints.pq` / `points3d.pq` must exist and be non-empty.
+An annotation session must have at least one non-empty `keypoints.pq` or `points3d.pq`. An
+inference prediction session is marked by the top-level `prediction_session = true` key and may
+carry `points2d.pq`; see §8b. That prediction-only table is not an annotation-label substitute and
+does not make the session a training-data session.
 
 Either the image directory or the video may be a **symlink**, and a converter is encouraged to
 symlink whole directories rather than copy or link individual frames. A dense dataset then costs
@@ -94,6 +98,7 @@ table set.
 mode   = "3d"       # "3d" -> >= 2 cameras + full calibration; "2d" -> exactly 1 camera
 units  = "mm"       # units of 3D. Pixel labels are ALWAYS pixels, in every mode.
 labels = "annotated"   # "annotated" (a human placed these) | "tracked" (a machine produced them)
+# prediction_session = true  # top-level marker, present only in inference prediction sessions
 
 names      = [ ... ]   # ordered keypoint names -- THE authority for the keypoint axis
 skeleton   = []        # OPTIONAL, usually empty: [["a","b"], ...] name pairs
@@ -255,6 +260,68 @@ A session may carry `points3d.pq` alone, `keypoints.pq` alone, or both (a calibr
 session with real 2D labels *and* a triangulated 3D solution). The consumer derives what it
 needs: 2D from 3D by projection, 3D from 2D by triangulation. Neither derivation is stored.
 
+### 8b. `points2d.pq` — inference-only 2D predictions
+
+This is a prediction-output extension, **not** the annotation/input table. `keypoints.pq` remains
+the source for assessed 2D labels, visibility states, training targets, and the annotation
+validation rules above. Inference writes per-camera 2D model estimates to `points2d.pq` so they are
+not represented as assessed observations and are not implicitly required to reproject from or
+triangulate to `points3d.pq`. The model's 2D and 3D heads may produce different estimates.
+
+A session containing this table must set the top-level `prediction_session = true` key in
+`session.toml`. Its rows are sparse: a row exists for each finite model prediction. There is no
+annotation `status` column.
+
+| column | type | req | meaning |
+|---|---|---|---|
+| `group_id`, `animal_id`, `camera`, `bodypart` | dictionary\<int32,str\> | ✓ | prediction key |
+| `frame` | int32 | ✓ | source frame index within the group |
+| `x`, `y` | float32 | ✓ | predicted stored-image px |
+| `visibility_logit` | float32 | | per-camera visibility-head logit |
+| `visibility_probability` | float32 | | sigmoid of `visibility_logit` |
+| `confidence_logit` | float32 | | separate per-camera confidence-head logit |
+| `confidence_probability` | float32 | | sigmoid of `confidence_logit` |
+| `slot` | int32 | | source row/slot for downstream identity work |
+| `window` | int32 | | window ordinal whose estimate is stored |
+| `window_start`, `window_stop` | int32 | | that window's half-open source-frame interval |
+
+The visibility head and confidence head are separate quantities; neither is annotation `status`.
+A `points2d.pq` row may disagree with the 3D estimate in the same prediction session without
+violating the annotation 2D/3D triangulation rule. Annotation/training readers ignore this
+prediction-only table; inference prediction readers load it explicitly. Older prediction sessions
+may have 2D predictions in `keypoints.pq`; a compatibility reader may handle those as a legacy
+prediction layout only when inference provenance identifies the session (currently `run` and
+`checkpoint`). Do not infer prediction semantics from `labels = "tracked"` or `keypoints.pq` alone;
+ambiguous marker-free sessions must not be reinterpreted as predictions.
+
+In independent-window inference, `animal_id` is unique to `(group, window, slot)`; it is shared
+across cameras within a window but deliberately does not link identities across windows. `slot`
+retains the row number for downstream association. `window` and its half-open source-frame interval
+make the prediction's model context explicit.
+
+Prediction sessions write `score = sigmoid(vis_pred)` into the existing `points3d.pq` `score`
+column and add `score_logit = vis_pred` (the logit is preserved because float32 sigmoid may
+saturate). They set `status = visible` iff `score > 0.5` (equivalently `score_logit > 0`),
+otherwise `status = missing`. Unlike an annotation `missing` row, a prediction row with
+`status = missing` retains its best-guess `x,y,z`; those
+coordinates may be less reliable, but remain useful estimates. This is an explicit exception for
+`prediction_session = true`, not a change to annotation rows.
+
+Prediction-specific `points3d.pq` columns:
+
+| column | type | meaning |
+|---|---|---|
+| `score` | float32 | sigmoid of the 3D visibility-head logit, `vis_pred` |
+| `score_logit` | float32 | 3D visibility-head logit, `vis_pred` |
+| `triangulated_x`, `triangulated_y`, `triangulated_z` | float32 | anchor-free triangulation estimate in session units, when available |
+| `slot` | int32 | inference row/slot |
+| `window` | int32 | source inference window ordinal |
+| `window_start`, `window_stop` | int32 | half-open source-frame interval for that estimate |
+
+An independent-window prediction session gives the same `(group, window, slot)`-scoped
+`animal_id` to its `points3d.pq`, `points2d.pq`, and `instances.pq` rows. It uses a new ID in the
+next window; do not interpret these IDs as persistent animal identities.
+
 ## 9. `instances.pq` — boxes and the ignore region (optional)
 
 One row per animal per view per frame **where a determination was made**.
@@ -352,7 +419,9 @@ is outside this format as written.
 Checkable rules, so a validator can be written without re-deriving them.
 
 1. Every session has `session.toml` with `mode`, `units`, `labels` and non-empty `names`. `mode` is
-   `"2d"` or `"3d"`; `labels` is `"annotated"` or `"tracked"`. The session id is the folder name;
+   `"2d"` or `"3d"`; `labels` is `"annotated"` or `"tracked"`. The optional top-level
+   `prediction_session` key is boolean and, when true, routes the session to prediction-output
+   validation/reading rather than annotation/training semantics. The session id is the folder name;
    the split is its parent folder name.
 2. `names` has no duplicates; every `skeleton` / `flip_pairs` name is in `names`; no keypoint
    appears in two flip pairs with different partners, and no pair maps a name to itself.
@@ -365,7 +434,9 @@ Checkable rules, so a validator can be written without re-deriving them.
 5. `mode = "3d"` ⇒ ≥ 2 cameras, each with `matrix`, `rotation`, `translation`.
    `mode = "2d"` ⇒ exactly 1 camera.
 6. Every `bodypart` ∈ `names`; every `camera` ∈ `calibration.toml`; every `group_id` ∈
-   `groups.pq`; every `frame` ∈ `[0, n_frames)`.
+   `groups.pq`; every `frame` ∈ `[0, n_frames)`. Annotation sessions need non-empty
+   `keypoints.pq` or `points3d.pq`; `prediction_session = true` may instead use `points2d.pq` and
+   is not eligible as training annotation input.
 7. Each group folder has exactly one `<cam>/` dir **or** one `<cam>.mp4` per declared camera —
    not both. An image dir holds exactly `n_frames` files named `%06d.png` or `%06d.jpg`,
    contiguous from `000000`, **one extension per directory**. (Positional and contiguous because
@@ -373,18 +444,22 @@ Checkable rules, so a validator can be written without re-deriving them.
    files claiming the same index.)
 8. Every image's dimensions equal that camera's `size`. Video frame size likewise.
 9. No duplicate key in any table: `(group_id, frame, animal_id, camera, bodypart)` for
-   `keypoints.pq`, `(group_id, frame, animal_id, bodypart)` for `points3d.pq`,
+   `keypoints.pq` and `points2d.pq`, `(group_id, frame, animal_id, bodypart)` for `points3d.pq`,
    `(group_id, frame, animal_id, camera)` for `instances.pq`, `(group_id, frame, camera)` for
    `extrinsics.pq`.
-10. A positioned row — `visible` or `projected` — has its coordinates: `points3d.pq` requires
-    `x,y,z`; `keypoints.pq` requires `x,y` **unless** a `points3d` row exists for the same key.
-    `missing` and `unlabeled` rows have null coordinates in both tables.
+10. A positioned annotation row — `visible` or `projected` — has its coordinates: `points3d.pq`
+    requires `x,y,z`; `keypoints.pq` requires `x,y` **unless** a `points3d` row exists for the
+    same key. Prediction-only `points2d.pq` has no status semantics; its finite-coordinate rule is
+    in §8b. In annotation sessions, `missing` and `unlabeled` rows have null coordinates. In
+    prediction sessions only, `points3d.pq` may retain best-guess `x,y,z` on `status = missing`
+    rows as specified in §8b.
 11. If `instances.pq` exists, every positioned or `missing` keypoint row has a matching instance
     row with `status = labeled`, and a `labeled` instance has at least one such row.
     `unlabeled` rows are exempt — they are progress markers. Fewer than `K` assessed rows is
     legal.
-12. `mode = "3d"` with per-camera 2D: every `animal_id` with ≥ 2 `labeled` views triangulates
-    with median reprojection residual below `assoc_res_max_px`. Catches cross-view id mismatches.
+12. `mode = "3d"` with per-camera annotation 2D: every `animal_id` with ≥ 2 `labeled` views
+    triangulates with median reprojection residual below `assoc_res_max_px`. Catches cross-view id
+    mismatches. This rule does not compare prediction-only `points2d.pq` against `points3d.pq`.
 13. Every camera in `extrinsics.pq` has `moving = true`, and covers every frame of every group in
     which it appears.
 14. **Consumer-side leak rule:** a session must not be used both for training and for held-out

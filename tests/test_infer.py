@@ -239,7 +239,7 @@ def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, 
         raw_boxes = raw[0]
         n = raw_boxes.shape[1]
         boxes = np.zeros((n_want, n, C, 4), np.float32)
-        x0 = 8.0 + raw_boxes[0, :, 0, 0]
+        x0 = np.full(n, 8.0 + kw['frame_base'], np.float32)
         boxes[0, :, :, 0] = x0[:, None]
         boxes[0, :, :, 1] = 6.0
         boxes[0, :, :, 2] = np.minimum(x0 + 32.0, 63.0)[:, None]
@@ -280,6 +280,25 @@ def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, 
             b['frame'], b['camera'], b['bodypart'], b['window_start'], b['window_stop'])
         for field in ('x', 'y', 'visibility_logit', 'confidence_logit'):
             np.testing.assert_array_equal(a[field], b[field], err_msg=field)
+
+    # The primary block keeps the same seam owner for prediction, detector box, and identity.
+    for frame, owner in enumerate(full['owner_window']):
+        np.testing.assert_array_equal(full['det_box'][0, frame, 0, 0],
+                                      8 + full['window_start'][owner])
+    from tailcyclenet.infer.predictions import SessionWriter
+    out = tmp_path / 'owned-primary'
+    writer = SessionWriter(out, sess, registry, {
+        'n_frames': 4, 'independent_windows': True, 'source_session_id': sess.session_id,
+    }, [gid])
+    writer.write_block(gid, full, 0, 0)
+    writer.close(complete=True)
+    import pyarrow.parquet as pq
+    instance_rows = pq.read_table(out / 'instances.pq').to_pylist()
+    assert len(instance_rows) == sess.groups[gid].n_frames
+    for row in instance_rows:
+        owner = int(full['owner_window'][row['frame']])
+        assert row['animal_id'] == f'w{owner:06d}_s{row["slot"]:02d}'
+        assert row['x0'] == float(8 + full['window_start'][owner])
 
 
 def test_more_detector_rows_than_label_rows(scene):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Draw a prediction over the pixels it was made from. Offline, and model-free.
+"""Draw a prediction over its source pixels; model 2D overlays come from points2d.pq.
 
     pixi run python scripts/render.py --pred pred/ --out clips/
 

@@ -452,7 +452,10 @@ def boundary_fill_map(pred: np.ndarray, fill_pred: np.ndarray, frame: int,
 # Columns a fill row BORROWS wholesale; everything else ((group_id, frame, animal_id) plus the
 # structural bodypart/camera) stays the standard session's own.
 _FILL_MEAS_COLS = frozenset({'status', 'x', 'y', 'z', 'score', 'score_logit',
-                             'box_agree', 'x0', 'y0', 'x1', 'y1'})
+                             'box_agree', 'x0', 'y0', 'x1', 'y1',
+                             'visibility_logit', 'visibility_probability',
+                             'confidence_logit', 'confidence_probability',
+                             'confidence_2d', 'confidence_2d_logit'})
 
 
 def _key_value(value):
@@ -501,6 +504,41 @@ def _fill_slice(ftable: pl.DataFrame, fill_name: str, table: pl.DataFrame, sel: 
     return got, vals
 
 
+def _prediction_2d_stem(path: Path) -> str | None:
+    """Prediction 2D table, allowing only provenance-identified legacy output."""
+    import tomllib
+
+    path = Path(path)
+    try:
+        with open(path / 'session.toml', 'rb') as f:
+            session = tomllib.load(f)
+    except (OSError, ValueError):
+        session = {}
+    provenance = session.get('provenance', {})
+    if session.get('independent_windows', provenance.get('independent_windows', False)):
+        raise ValueError(f'{path}: identity bridge/fill refuses independent-window IDs')
+    if (path / 'points2d.pq').exists():
+        return 'points2d'
+    legacy = path / 'keypoints.pq'
+    if not legacy.exists():
+        return None
+    try:
+        with open(path / 'session.toml', 'rb') as f:
+            prov = tomllib.load(f).get('provenance', {})
+    except (OSError, ValueError):
+        prov = {}
+    if prov.get('run') and prov.get('checkpoint'):
+        return 'keypoints'
+    raise ValueError(f'{path}: keypoints.pq without run+checkpoint provenance is ambiguous; '
+                     'refusing to treat annotation observations as predictions')
+
+
+def _prediction_tables(path: Path):
+    """Table stems to mutate/read as prediction output, never source annotations."""
+    stem = _prediction_2d_stem(path)
+    return ('points3d', *((stem,) if stem else ()), 'instances')
+
+
 def _fill_session(fill_dir: Path, fill_preds: dict) -> dict:
     """Per-group slice of the fill pass's session: its pred array, animal ids, and tables.
 
@@ -513,7 +551,7 @@ def _fill_session(fill_dir: Path, fill_preds: dict) -> dict:
     for gid, rows in fill_preds.items():
         key = str(rows.get('group_id', gid))
         tables = {}
-        for stem in ('points3d', 'keypoints', 'instances'):
+        for stem in _prediction_tables(fill_dir):
             f = fill_dir / f'{stem}.pq'
             if not f.exists():
                 continue
@@ -537,7 +575,7 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
     counts = {}
     ftables = (fill or {}).get('tables', {})
     fill_ids = (fill or {}).get('animal_ids')
-    for stem in ('points3d', 'keypoints', 'instances'):
+    for stem in _prediction_tables(path):
         f = path / f'{stem}.pq'
         if not f.exists():
             continue

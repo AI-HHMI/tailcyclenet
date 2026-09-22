@@ -366,7 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "prediction's own recorded --end-frame.")
     ap.add_argument('--draw', default='pred', choices=('pred', 'keypoints', 'both'),
                     help="'pred' (default): the prediction itself -- a 3D reprojection or the 2D "
-                         "pose. 'keypoints': camera cam's OWN 2D head output (keypoints.pq), no "
+                         "pose. 'keypoints': camera cam's OWN 2D head output (points2d.pq), no "
                          "projection. 'both': the reprojection with the per-camera head overlaid "
                          'as thin crosses -- the two are different quantities and this is the '
                          'only place their disagreement is legible.')
@@ -391,6 +391,50 @@ def _frame_range(prov, n_total, args):
     f0 = max(0, pred_start, req_start)
     f1 = min(n_total, pred_stop, req_stop)
     return f0, f1
+
+
+def _read_prediction_2d(pred_path, preds, sess):
+    """Load model 2D rows, with a provenance-checked legacy keypoints branch."""
+    import tomllib
+    import polars as pl
+
+    pred_path = Path(pred_path)
+    table_path = pred_path / 'points2d.pq'
+    if not table_path.exists():
+        if not (pred_path / 'keypoints.pq').exists():
+            return
+        try:
+            with open(pred_path / 'session.toml', 'rb') as f:
+                prov = tomllib.load(f).get('provenance', {})
+        except (OSError, ValueError):
+            prov = {}
+        if not (prov.get('run') and prov.get('checkpoint')):
+            raise SystemExit(f'{pred_path}: keypoints.pq without run+checkpoint provenance is '
+                             'ambiguous; refusing to render annotations as predictions')
+        table_path = pred_path / 'keypoints.pq'
+    tab = pl.read_parquet(table_path)
+    for key, out in preds.items():
+        gid = key.split('/', 1)[-1]
+        ids = [str(v) for v in out.get('animal_ids', [])]
+        S = len(ids)
+        T, C, K = sess.groups[gid].n_frames, len(sess.cam_names), len(sess.names)
+        ai = {v: i for i, v in enumerate(ids)}
+        ci, ki = {v: i for i, v in enumerate(sess.cam_names)}, {v: i for i, v in enumerate(sess.names)}
+        p2 = np.full((S, T, C, K, 2), np.nan, np.float32)
+        q = tab.filter(pl.col('group_id').cast(pl.String) == gid)
+        independent = bool(out.get('independent_windows', False))
+        for r in q.iter_rows(named=True):
+            a = (int(r.get('slot', -1)) if independent
+                 else ai.get(str(r.get('animal_id')), -1))
+            c = ci.get(str(r.get('camera')), -1)
+            k = ki.get(str(r.get('bodypart')), -1)
+            t = int(r['frame'])
+            if 0 <= a < S and 0 <= c < C and 0 <= k < K and 0 <= t < T:
+                if r.get('x') is not None and r.get('y') is not None:
+                    p2[a, t, c, k] = (r['x'], r['y'])
+        out['pred2d'] = p2
+        if str(out.get('mode')) == '2d':
+            out['pred'] = p2[:, :, 0]
 
 
 def main(argv=None):
@@ -437,6 +481,9 @@ def main(argv=None):
 
     want_groups = [g.strip() for g in args.groups.split(',') if g.strip()] if args.groups else None
     preds, meta = load_predictions(args.pred, groups=want_groups)
+    if cfg.get('independent_windows', prov.get('independent_windows', False)):
+        print('WARNING: independent-window animal IDs are window-local, not continuous tracks.')
+    _read_prediction_2d(args.pred, preds, sess)
     if not preds:
         raise SystemExit(f'--groups {args.groups!r}: none of the requested groups is in '
                          f'{args.pred}.')
@@ -472,8 +519,12 @@ def main(argv=None):
             draw_arr, overlay = pred_arr, None
             if args.draw in ('keypoints', 'both'):
                 if p2 is None:
-                    print(f'{key}/{cam_name}: --draw {args.draw} needs keypoints.pq, which this '
-                         'prediction does not carry; falling back to --draw pred.')
+                    message = (f'{key}/{cam_name}: --draw {args.draw} needs points2d.pq '
+                               '(or a provenance-identified legacy prediction); no model 2D '
+                               'estimate is available.')
+                    if args.draw == 'keypoints':
+                        raise SystemExit(message)
+                    print(message + ' Rendering the 3D prediction only, without a 2D overlay.')
                 elif args.draw == 'keypoints':
                     draw_arr = p2[:, :, ci]
                 else:

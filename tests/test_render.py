@@ -379,7 +379,9 @@ def _two_group_session(path):
         labs[gid] = lab
     groups = {gid: fmt.Group(gid, T, fps=20.0) for gid in labs}
     fmt.write_session(path, mode='2d', units='px', label_source='tracked', names=names,
-                      rig=rig, groups=groups, labels=labs, provenance={'source': 'synthetic'})
+                      rig=rig, groups=groups, labels=labs,
+                      provenance={'source': 'synthetic', 'run': 'legacy-run',
+                                  'checkpoint': 'legacy-checkpoint.pth'})
     for gid in labs:
         cf._write_frames(path / 'groups' / gid, 'cam0', T, (W, H))
 
@@ -395,6 +397,47 @@ def test_load_predictions_groups_filter_matches_the_unfiltered_read(tmp_path):
     filtered, _ = load_predictions(tmp_path / 'sess', groups=['g000'])
     assert list(filtered) == ['sess/g000']
     np.testing.assert_array_equal(filtered['sess/g000']['pred'], full['sess/g000']['pred'])
+
+
+def test_independent_window_render_scatter_uses_slots_not_window_ids(tmp_path):
+    import conftest as cf
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tailcyclenet.format import load_dataset
+    from tailcyclenet.render import _read_prediction_2d
+
+    root = tmp_path / 'data'
+    cf._session_2d(root / 'test' / 's', T=4)
+    sess = load_dataset(root).sessions['test'][0]
+    pred_path = tmp_path / 'pred'
+    pred_path.mkdir()
+    pq.write_table(pa.table({
+        'group_id': ['g000'], 'frame': [0], 'animal_id': ['w000001_s01'],
+        'camera': ['cam0'], 'bodypart': ['nose'], 'x': [12.5], 'y': [23.5], 'slot': [1],
+    }), pred_path / 'points2d.pq')
+    preds = {'s/g000': {'mode': '2d', 'animal_ids': np.array(['slot_00', 'slot_01'], object),
+                        'independent_windows': True,
+                        'pred': np.full((2, 4, len(sess.names), 2), np.nan, np.float32)}}
+
+    _read_prediction_2d(pred_path, preds, sess)
+
+    np.testing.assert_array_equal(preds['s/g000']['pred2d'][1, 0, 0, 0], [12.5, 23.5])
+
+
+def test_load_predictions_refuses_ambiguous_marker_free_session(tmp_path):
+    import toml
+    from tailcyclenet.infer.predictions import load_predictions
+
+    path = tmp_path / 'sess'
+    _two_group_session(path)
+    cfg = toml.loads((path / 'session.toml').read_text())
+    cfg['provenance'].pop('run')
+    cfg['provenance'].pop('checkpoint')
+    (path / 'session.toml').write_text(toml.dumps(cfg))
+
+    with pytest.raises(ValueError, match='refusing ambiguous annotation data'):
+        load_predictions(path)
 
 
 def test_skeleton_override_validates_pairs_and_keypoint_names(tmp_path):

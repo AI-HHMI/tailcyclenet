@@ -987,6 +987,11 @@ class PoseDataset(Dataset):
         self.split = split
         self.train = (split == 'train') if train is None else train
         self.datasets = load_datasets(path, split=split)
+        prediction_sessions = [s.path for ds in self.datasets for s in ds.all_sessions()
+                              if s.prediction_session]
+        if prediction_sessions:
+            raise ValueError('prediction sessions are not annotation inputs: '
+                             + ', '.join(map(str, prediction_sessions[:5])))
         self.rank, self.world_size = int(rank), int(world_size)
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError(f'invalid dataset shard rank={self.rank}, world_size={self.world_size}')

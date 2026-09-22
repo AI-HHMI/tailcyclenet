@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Score a prediction file against the labels. Offline and model-free.
+"""Score prediction sessions or legacy archives; independent-window sessions are scored by slot without identity metrics.
 
     pixi run python scripts/eval.py pred.npz --data <dataset> --split test
 

@@ -376,6 +376,10 @@ class BoxDataset(Dataset):
                 f'{path}: the detector is trained per dataset (input size and box statistics are '
                 f'dataset-specific); found {len(self.datasets)} dataset roots')
         self.ds = self.datasets[0]
+        prediction_sessions = [s.path for s in self.ds.all_sessions() if s.prediction_session]
+        if prediction_sessions:
+            raise ValueError('prediction sessions are not detector-training annotations: '
+                             + ', '.join(map(str, prediction_sessions[:5])))
         self.input_wh = tuple(input_wh) if self.tile_wh is None else self.tile_wh
         self.min_crop_dim = min_crop_dim
         self.train = split == 'train'

@@ -280,6 +280,87 @@ def test_rule_3_cross_session_names_must_agree(tmp_path):
     assert _rule(errs, 3)
 
 
+def _mark_prediction(path, complete=None):
+    cfg = path / 'session.toml'
+    text = cfg.read_text()
+    fields = 'prediction_session = true\n'
+    if complete is not None:
+        fields += f'complete = {str(complete).lower()}\n'
+    cfg.write_text(text.replace('[provenance]', fields + '\n[provenance]'))
+
+
+def _prediction_points2d(path, rows=1):
+    """Write a minimal prediction-only point table for format-layer tests."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    data = {
+        'group_id': ['g000'] * rows, 'frame': [0] * rows,
+        'animal_id': [f'pred{i}' for i in range(rows)], 'camera': ['cam0'] * rows,
+        'bodypart': ['tail_base'] * rows, 'x': [1.0] * rows, 'y': [2.0] * rows,
+        'visibility_logit': [0.0] * rows, 'visibility_probability': [0.5] * rows,
+        'confidence_logit': [0.0] * rows, 'confidence_probability': [0.5] * rows,
+        'slot': list(range(rows)), 'window': [0] * rows, 'window_start': [0] * rows,
+        'window_stop': [2] * rows,
+    }
+    pq.write_table(pa.table(data), path / 'points2d.pq')
+
+
+def test_prediction_points2d_validates_but_is_not_training_labels(tmp_path):
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    (path / 'keypoints.pq').unlink()
+    _mark_prediction(path, complete=False)
+    _prediction_points2d(path)
+
+    sess = fmt.Session.load(path)
+    assert sess.prediction_session is True and sess.complete is False
+    assert sess._tables['points2d'] is not None
+    assert not fmt.validate_session(sess, check_images=False)
+    # Prediction rows cannot add IDs or annotations to the dense training-label view.
+    lab = sess.labels('g000')
+    assert 'pred0' not in lab.animal_ids and lab.points2d is None
+
+
+def test_points2d_requires_marker_and_unique_prediction_keys(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    _prediction_points2d(path)
+    assert any('prediction-only' in e for e in fmt.validate_session(
+        fmt.Session.load(path), check_images=False))
+
+    _mark_prediction(path)
+    t = pq.read_table(path / 'points2d.pq')
+    row = t.slice(0, 1)
+    pq.write_table(pa.concat_tables([row, row]), path / 'points2d.pq')
+    errs = fmt.validate_session(fmt.Session.load(path), check_images=False)
+    assert any('points2d.pq has duplicate keys' in e for e in errs)
+
+
+def test_prediction_points3d_missing_status_may_keep_coordinates(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_3d(path)
+    table_path = path / 'points3d.pq'
+    t = pq.read_table(table_path)
+    status_i = t.column_names.index('status')
+    t = t.set_column(status_i, 'status', pa.array(['missing'] * len(t)).dictionary_encode())
+    pq.write_table(t, table_path, compression='zstd')
+
+    # This remains invalid annotation data; the explicit marker enables the prediction exception.
+    sess = fmt.Session.load(path)
+    assert any('missing/unlabeled row carrying coordinates' in e for e in
+               fmt.validate_session(sess, check_images=False))
+    _mark_prediction(path)
+    assert not any('missing/unlabeled row carrying coordinates' in e for e in
+                   fmt.validate_session(fmt.Session.load(path), check_images=False))
+
+
 def test_rule_5_3d_needs_two_calibrated_cameras(tmp_path):
     _session_3d(tmp_path / 'ds' / 'train' / 'a')
     calib = tmp_path / 'ds' / 'train' / 'a' / 'calibration.toml'

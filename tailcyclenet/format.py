@@ -512,6 +512,10 @@ class Session:
     flip_pairs_declared: bool = False
     provenance: dict = field(default_factory=dict)
     assoc_res_max_px: float = 30.0
+    # Prediction outputs have narrowly different coordinate/status semantics. Missing on legacy
+    # annotation sessions means False; complete is optional for pre-marker sessions.
+    prediction_session: bool = False
+    complete: bool | None = None
     _label_cache: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
@@ -574,9 +578,10 @@ class Session:
 
     @cached_property
     def _tables(self) -> dict[str, pa.Table | None]:
-        """The five label tables keyed by stem; missing files are None."""
+        """Label and prediction tables keyed by stem; missing files are None."""
         return {s: self._table(s)
-                for s in ('keypoints', 'points3d', 'instances', 'regions', 'extrinsics')}
+                for s in ('keypoints', 'points2d', 'points3d', 'instances', 'regions',
+                          'extrinsics')}
 
     @classmethod
     def load(cls, path: Path) -> 'Session':
@@ -633,6 +638,8 @@ class Session:
             flip_pairs_declared='flip_pairs' in cfg,
             provenance=dict(cfg.get('provenance', {})),
             assoc_res_max_px=float(cfg.get('assoc_res_max_px', 30.0)),
+            prediction_session=bool(cfg.get('prediction_session', False)),
+            complete=cfg.get('complete'),
         )
         for g in groups.values():
             g.session = sess
@@ -1252,8 +1259,12 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     elif len(sess.rig) != 1:
         bad(5, f'mode=2d with {len(sess.rig)} cameras')
 
-    if not (sess.path / 'keypoints.pq').exists() and not (sess.path / 'points3d.pq').exists():
-        bad(6, 'neither keypoints.pq nor points3d.pq exists')
+    has_annotation_table = ((sess.path / 'keypoints.pq').exists()
+                            or (sess.path / 'points3d.pq').exists())
+    has_prediction_2d = (sess.prediction_session and (sess.path / 'points2d.pq').exists())
+    if not has_annotation_table and not has_prediction_2d:
+        bad(6, 'neither keypoints.pq nor points3d.pq exists'
+            + (' (prediction sessions may use points2d.pq)' if sess.prediction_session else ''))
 
     keys = {'keypoints': ('group_id', 'frame', 'animal_id', 'camera', 'bodypart'),
             'points3d': ('group_id', 'frame', 'animal_id', 'bodypart'),
@@ -1271,6 +1282,54 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if n and len(table.select(cols).group_by(list(cols)).aggregate([])) != n:
             bad(9, f'{stem}.pq has duplicate keys')
 
+    # Model-produced 2D points are not assessed annotation rows. They are recognized only in an
+    # explicitly marked prediction session and are never scattered into Labels below.
+    t2p = sess._tables['points2d']
+    if t2p is not None:
+        if not sess.prediction_session:
+            bad(9, 'points2d.pq is prediction-only; set prediction_session = true')
+        else:
+            required = ('group_id', 'frame', 'animal_id', 'camera', 'bodypart', 'x', 'y',
+                        'visibility_logit', 'visibility_probability', 'confidence_logit',
+                        'confidence_probability', 'slot', 'window', 'window_start',
+                        'window_stop')
+            missing = [c for c in required if c not in t2p.column_names]
+            if missing:
+                bad(9, f'points2d.pq missing columns {missing}')
+            else:
+                point_keys = ('group_id', 'frame', 'animal_id', 'camera', 'bodypart')
+                n = len(t2p)
+                for key in point_keys:
+                    if t2p.column(key).null_count:
+                        bad(9, f'points2d.pq has null {key} values')
+                if n and len(t2p.select(point_keys).group_by(list(point_keys)).aggregate([])) != n:
+                    bad(9, 'points2d.pq has duplicate keys')
+                # Validate references and frame bounds without invoking annotation scatter/status
+                # rules (prediction tables intentionally have no status column).
+                groups = set(sess.groups)
+                gvals = t2p.column('group_id').to_pylist()
+                frames = t2p.column('frame').to_pylist()
+                cameras = t2p.column('camera').to_pylist()
+                bodyparts = t2p.column('bodypart').to_pylist()
+                animals = t2p.column('animal_id').to_pylist()
+                unknown_group = next((g for g in gvals if g not in groups), None)
+                if unknown_group is not None:
+                    bad(9, f'points2d.pq has unknown group_id {unknown_group!r}')
+                unknown_camera = next((c for c in cameras if c not in sess._cam_vocab), None)
+                if unknown_camera is not None:
+                    bad(9, f'points2d.pq has unknown camera {unknown_camera!r}')
+                unknown_bodypart = next((k for k in bodyparts if k not in sess._kpt_vocab), None)
+                if unknown_bodypart is not None:
+                    bad(9, f'points2d.pq has unknown bodypart {unknown_bodypart!r}')
+                bad_frame = next(((g, f) for g, f in zip(gvals, frames)
+                                  if g in groups and (f is None or f < 0 or
+                                                      f >= sess.groups[g].n_frames)), None)
+                if bad_frame is not None:
+                    bad(9, f'points2d.pq has frame {bad_frame[1]!r} outside group '
+                        f'{bad_frame[0]!r}')
+                if any(a is None for a in animals):
+                    bad(9, 'points2d.pq has a null animal_id')
+
     positioned = ('visible', 'projected')
     t3 = sess._tables['points3d']
     if t3 is not None and len(t3):
@@ -1279,8 +1338,14 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         xyz = np.stack([_floats(t3, c, len(t3)) for c in 'xyz'], -1)
         if vis.any() and not np.isfinite(xyz[vis]).all():
             bad(10, 'points3d.pq has a visible row without x,y,z')
-        if (~vis).any() and np.isfinite(xyz[~vis]).any():
-            bad(10, 'points3d.pq has a missing/unlabeled row carrying coordinates')
+        if (~vis).any():
+            positioned_status = np.isin(st, [i for i, v in enumerate(vals) if v in positioned])
+            prediction_missing = (sess.prediction_session
+                                  & np.isin(st, [i for i, v in enumerate(vals)
+                                                 if v == 'missing']))
+            forbidden = ~positioned_status & ~prediction_missing
+            if np.any(forbidden & np.isfinite(xyz).any(-1)):
+                bad(10, 'points3d.pq has a missing/unlabeled row carrying coordinates')
 
     tk = sess._tables['keypoints']
     if tk is not None and len(tk):

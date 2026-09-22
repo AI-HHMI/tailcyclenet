@@ -209,16 +209,19 @@ def test_independent_detector_batches_raw_globally_but_associates_each_window_fr
                                 2, 1, independent=True)
     first = boxes_for.for_window(store, 4, 8, 6, ordinal=0)
     second = boxes_for.for_window(store, 6, 10, 8, ordinal=1)
+    third = boxes_for.for_window(store, 10, 14, 12, ordinal=2)
 
     assert len(default_detection_batches) == len(detect_calls) == 1
     np.testing.assert_array_equal(default_detection_batches[0], detect_calls[0])
     assert detect_calls[0].tolist() == list(range(_DET_BATCH))
     np.testing.assert_array_equal(associate_calls[0][0], [4, 5, 6, 7])
     np.testing.assert_array_equal(associate_calls[1][0], [6, 7, 8, 9])
-    assert [c[1] for c in associate_calls] == [4, 6]
-    assert associate_calls[0][2] is not associate_calls[1][2]
+    np.testing.assert_array_equal(associate_calls[2][0], [10, 11, 12, 13])
+    assert [c[1] for c in associate_calls] == [4, 6, 10]
+    assert len({id(c[2]) for c in associate_calls}) == 3
     np.testing.assert_array_equal(first[0][0, :, 0, 0], np.full(4, 4, np.float32))
     np.testing.assert_array_equal(second[0][0, :, 0, 0], np.full(4, 6, np.float32))
+    np.testing.assert_array_equal(third[0][0, :, 0, 0], np.full(4, 10, np.float32))
 
 
 def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, monkeypatch):

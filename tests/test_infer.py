@@ -111,6 +111,116 @@ def test_every_anchor_runs(scene, anchor):
     assert len(out['animal_ids']) == out['pred'].shape[0]
 
 
+
+def test_independent_windows_propagate_exact_owner_and_window_descriptors(multiwindow_scene):
+    model, sess, registry, name = multiwindow_scene
+    gid = 'g000'
+    C = len(sess.rig)
+    S = 1
+    calls = []
+
+    def boxes_for(store, lo, hi):
+        raise AssertionError('independent mode must request per-window associations')
+
+    def for_window(store, lo, hi, keep_from=None, ordinal=None):
+        calls.append((ordinal, lo, hi, keep_from))
+        b = np.zeros((S, hi - lo, C, 4), np.float32)
+        x = 8 + int(ordinal)
+        b[..., 0], b[..., 1], b[..., 2], b[..., 3] = x, 8, x + 24, 32
+        return b, np.ones((S, hi - lo, C), np.float32), None
+
+    boxes_for.for_window = for_window
+    cfg = _cfg(anchor='none', independent_windows=True, refine=False,
+               capture_window_predictions=True, vis_thresh=1e9)
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+    out = merge_blocks(run_blocks(model, sess, gid, registry, name, cfg,
+                                  boxes_for=boxes_for, n_rows=S))
+    assert [c[0] for c in calls] == list(range(len(calls)))
+    assert np.all(out['owner_window'] >= 0)
+    np.testing.assert_array_equal(out['window_ordinal'], np.arange(len(calls)))
+    np.testing.assert_array_equal(out['window_start'], [c[1] for c in calls])
+    np.testing.assert_array_equal(out['window_stop'], [c[2] for c in calls])
+    assert out['slot'].tolist() == [0]
+    assert out['det_box'].shape[:2] == (S, sess.groups[gid].n_frames)
+    assert out['triangulated'].shape == (S, sess.groups[gid].n_frames,
+                                         sess.n_keypoints, 3)
+    records = out['window_records']
+    assert sum(r['record_type'] == 'window' for r in records) == len(calls) * S * C
+    assert all({'group_id', 'frame', 'window', 'window_start', 'window_stop', 'slot',
+                'animal_id', 'camera', 'bodypart', 'record_type'} <= r.keys()
+               for r in records)
+    assert any(r['record_type'] == 'point2d' for r in records)
+    if sess.mode == '3d':
+        assert any(r['record_type'] == 'point3d' for r in records)
+    if sess.mode == '2d':
+        assert all(r['gated'] for r in records if r['record_type'] == 'point2d')
+    else:
+        assert not any(r['gated'] for r in records if r['record_type'] == 'point2d')
+    assert not np.isfinite(out['pred']).any(), 'primary values should be vis-threshold gated'
+    for frame, owner in enumerate(out['owner_window']):
+        assert int(owner) == max(i for i, (_, start, stop, _) in enumerate(calls)
+                                 if start <= frame < stop)
+
+
+def test_independent_detector_batches_raw_globally_but_associates_each_window_fresh(
+        multiwindow_scene, monkeypatch):
+    from types import SimpleNamespace
+
+    import tailcyclenet.detector as detector
+    from tailcyclenet.infer.driver import _DET_BATCH, _detector_boxes
+
+    _, sess, _, _ = multiwindow_scene
+    gid = 'g000'
+    C = len(sess.rig)
+    detect_calls, associate_calls = [], []
+
+    def detect_raw(_det, _wh, _sess, _gid, _top_k, **kw):
+        frames = np.asarray(kw['frames'], np.int32)
+        detect_calls.append(frames.copy())
+        boxes = np.zeros((1, len(frames), C, 4), np.float32)
+        boxes[0, :, :, 0] = frames[:, None]
+        scores = np.ones((1, len(frames), C), np.float32)
+        return boxes, scores, None
+
+    def associate_group(raw, _sess, _gid, n_want, **kw):
+        raw_frames = raw[0][0, :, 0, 0].copy()
+        associate_calls.append((raw_frames, kw['frame_base'], kw['state']))
+        n = len(raw_frames)
+        boxes = np.zeros((n_want, n, C, 4), np.float32)
+        boxes[..., 0] = kw['frame_base']
+        return boxes, np.ones((n_want, n, C), np.float32), None
+
+    monkeypatch.setattr(detector, 'detect_raw', detect_raw)
+    monkeypatch.setattr(detector, 'associate_group', associate_group)
+    args = SimpleNamespace(
+        frame_start=3, frame_stop=0, det_score=0.01, det_nms_iou=0.5,
+        det_nms_center_dist=0.3, det_trace=None, link_boxes=True, min_views=2,
+        track=True, max_move=1.0, max_age=8, pose_nms=None,
+        duplicate_radius=0.75, duplicate_persist=5)
+    store = object()
+    default_boxes = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False, None,
+                                    2, 1, independent=False)
+    default_boxes(store, 4, 8)
+    default_detection_batches = [call.copy() for call in detect_calls]
+    detect_calls.clear()
+    associate_calls.clear()
+
+    boxes_for = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False, None,
+                                2, 1, independent=True)
+    first = boxes_for.for_window(store, 4, 8, 6, ordinal=0)
+    second = boxes_for.for_window(store, 6, 10, 8, ordinal=1)
+
+    assert len(default_detection_batches) == len(detect_calls) == 1
+    np.testing.assert_array_equal(default_detection_batches[0], detect_calls[0])
+    assert detect_calls[0].tolist() == list(range(_DET_BATCH))
+    np.testing.assert_array_equal(associate_calls[0][0], [4, 5, 6, 7])
+    np.testing.assert_array_equal(associate_calls[1][0], [6, 7, 8, 9])
+    assert [c[1] for c in associate_calls] == [4, 6]
+    assert associate_calls[0][2] is not associate_calls[1][2]
+    np.testing.assert_array_equal(first[0][0, :, 0, 0], np.full(4, 4, np.float32))
+    np.testing.assert_array_equal(second[0][0, :, 0, 0], np.full(4, 6, np.float32))
+
+
 def test_more_detector_rows_than_label_rows(scene):
     """A DETECTOR ROW IS NOT A LABEL ROW.
 
@@ -967,8 +1077,10 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     from tailcyclenet.format import Session, validate_session
     from tailcyclenet.infer.predictions import load_predictions
 
-    for f in ('session.toml', 'calibration.toml', 'groups.pq', 'keypoints.pq', 'windows.pq'):
+    for f in ('session.toml', 'calibration.toml', 'groups.pq', 'points2d.pq', 'windows.pq'):
         assert (out / f).exists(), f'{f} missing; wrote {sorted(p.name for p in out.iterdir())}'
+    assert not (out / 'keypoints.pq').exists(), 'model estimates are not annotation observations'
+    assert not (out / 'window_predictions.pq').exists(), 'sidecar export is opt-in'
     got = Session.load(out)
     assert got.label_source == 'tracked'
     # Only rule 7 may fail: a prediction carries NO PIXELS by design, and `[provenance]
@@ -1099,6 +1211,18 @@ def test_cli_allow_detector_transfer_bypasses_the_family_refusal(cli, monkeypatc
     (['--oracle-corrupt', 'off'], 'needs an amount'),
     (['--oracle-corrupt', 'swap'], 'needs an amount'),
     (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
+    (['--independent-windows'], 'requires --detector'),
+    (['--independent-windows', '--detector', 'missing-detector'], '--anchor none'),
+    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
+      '--boxes', 'boxes.npz'], 'refuses --boxes'),
+    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
+      '--identity-bridge'], 'refuses --identity-bridge'),
+    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
+      '--fill-from', 'prior'], 'refuses --identity-bridge'),
+    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
+      '--overlap-trace', 'trace.npz'], 'refuses --overlap-trace'),
+    (['--independent-windows', '--detector', 'missing-detector', '--anchor', 'none',
+      '--box-prompt', 'labels'], 'refuses --box-prompt labels'),
 ])
 def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
                                                                         argv, expect):
@@ -1354,8 +1478,8 @@ def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
                                       np.nan_to_num(out['pred'], nan=-9e9))
 
 
-def test_session_writer_preserves_model_2d_confidence_separately(scene, tmp_path):
-    """Model 2D confidence must survive beside, not overwrite, visibility confidence."""
+def test_session_writer_preserves_named_2d_signals_and_window_metadata(scene, tmp_path):
+    """The new prediction table keeps visibility and model confidence as separate signals."""
     import pyarrow.parquet as pq
 
     _, sess, registry, _ = scene
@@ -1379,30 +1503,35 @@ def test_session_writer_preserves_model_2d_confidence_separately(scene, tmp_path
         'crop': np.zeros((1, 1, C, 4), np.float32),
         'outcome_names': ['ok'],
         'window_start': np.array([0], np.int32),
+        'window_stop': np.array([2], np.int32),
+        'owner_window': np.array([0, 0], np.int32),
     }
     out = tmp_path / 'pred'
-    writer = SessionWriter(out, sess, registry, {}, [gid])
+    writer = SessionWriter(out, sess, registry, {'n_frames': 2}, [gid])
     writer.write_block(gid, blk, 0, 0)
-    writer.close()
+    writer.close(complete=True)
 
-    table = pq.read_table(out / 'keypoints.pq')
-    assert {'score', 'score_logit', 'confidence_2d', 'confidence_2d_logit'} <= set(table.column_names)
-    score_logit = table['score_logit'].to_numpy()
-    confidence_logit = table['confidence_2d_logit'].to_numpy()
-    assert np.allclose(table['score'].to_numpy(), 1 / (1 + np.exp(-score_logit)))
-    assert np.allclose(table['confidence_2d'].to_numpy(),
-                       1 / (1 + np.exp(-confidence_logit)))
-    assert not np.allclose(score_logit, confidence_logit)
+    table = pq.read_table(out / 'points2d.pq')
+    assert {'visibility_logit', 'visibility_probability', 'confidence_logit',
+            'confidence_probability', 'slot', 'window', 'window_start', 'window_stop'} <= set(
+                table.column_names)
+    visibility = table['visibility_logit'].to_numpy()
+    confidence = table['confidence_logit'].to_numpy()
+    assert np.allclose(table['visibility_probability'].to_numpy(),
+                       1 / (1 + np.exp(-visibility)))
+    assert np.allclose(table['confidence_probability'].to_numpy(),
+                       1 / (1 + np.exp(-confidence)))
+    assert not np.allclose(visibility, confidence)
 
     no_model = dict(blk)
     no_model.pop('model_conf2d')
     out_no_model = tmp_path / 'pred-no-model-confidence'
-    writer = SessionWriter(out_no_model, sess, registry, {}, [gid])
+    writer = SessionWriter(out_no_model, sess, registry, {'n_frames': 2}, [gid])
     writer.write_block(gid, no_model, 0, 0)
-    writer.close()
-    missing = pq.read_table(out_no_model / 'keypoints.pq')
-    assert np.isnan(missing['confidence_2d'].to_numpy()).all()
-    assert np.isnan(missing['confidence_2d_logit'].to_numpy()).all()
+    writer.close(complete=True)
+    missing = pq.read_table(out_no_model / 'points2d.pq')
+    assert np.isnan(missing['confidence_probability'].to_numpy()).all()
+    assert np.isnan(missing['confidence_logit'].to_numpy()).all()
 
 
 def test_merge_blocks_stitches_model_2d_confidence():
@@ -1413,6 +1542,130 @@ def test_merge_blocks_stitches_model_2d_confidence():
     merged = merge_blocks([first, second])
     np.testing.assert_array_equal(merged['model_conf2d'],
                                   np.array([[[[0.1]], [[0.9]]]], np.float32))
+
+
+def test_prediction_3d_missing_status_retains_best_guess_coordinates(scene, tmp_path):
+    import pyarrow.parquet as pq
+
+    _, sess, registry, _ = scene
+    if sess.mode != '3d':
+        pytest.skip('3D-only prediction status contract')
+    from tailcyclenet.infer.predictions import SessionWriter, load_predictions
+
+    gid = next(iter(sess.groups))
+    K, C, T = sess.n_keypoints, len(sess.rig), 2
+    pattern = np.resize(np.array([-1.0, 0.0, 1.0], np.float32), K)
+    logits = np.tile(pattern[None, None], (1, T, 1))
+    pred = np.arange(T * K * 3, dtype=np.float32).reshape(1, T, K, 3) + 1
+    blk = {
+        'animal_ids': np.array(['a00'], object), 'pred': pred, 'conf': logits,
+        'pred2d': np.full((1, T, C, K, 2), np.nan, np.float32),
+        'conf2d': np.full((1, T, C, K), np.nan, np.float32),
+        'box_agree': np.full((1, T, C), np.nan, np.float32),
+        'outcome': np.zeros((1, 1), np.int8), 'crop': np.zeros((1, 1, C, 4), np.float32),
+        'outcome_names': ['ok'], 'window_start': np.array([0], np.int32),
+        'window_stop': np.array([T], np.int32), 'owner_window': np.zeros(T, np.int32),
+    }
+    out = tmp_path / 'pred3d'
+    writer = SessionWriter(out, sess, registry,
+                           {'n_frames': T, 'source_session_id': sess.session_id}, [gid])
+    writer.write_block(gid, blk, 0, 0)
+    writer.close(complete=True)
+
+    table = pq.read_table(out / 'points3d.pq')
+    rows = table.to_pylist()
+    assert len(rows) == T * K
+    for row in rows:
+        assert row['status'] == ('visible' if row['score'] > 0.5 else 'missing')
+        assert np.isfinite([row['x'], row['y'], row['z']]).all()
+    zero_logit = next(row for row in rows if row['score_logit'] == 0.0)
+    assert zero_logit['status'] == 'missing' and zero_logit['x'] is not None
+    preds, _ = load_predictions(out)
+    assert np.isfinite(preds[f'{sess.session_id}/{gid}']['pred'][:, :T]).all()
+    from tailcyclenet.format import Session, validate_session
+    errs = [e for e in validate_session(Session.load(out)) if '[rule 7]' not in e]
+    assert not errs, f'prediction-only 3D rows should validate apart from missing pixels: {errs}'
+
+
+def test_independent_primary_rows_keep_owner_window_identity(scene, tmp_path):
+    import pyarrow.parquet as pq
+
+    _, sess, registry, _ = scene
+    if sess.mode != '2d':
+        pytest.skip('the box/point rows in this contract test use one 2D camera')
+    from tailcyclenet.infer.predictions import SessionWriter
+
+    gid = next(iter(sess.groups))
+    S, T, C, K = 1, 4, len(sess.rig), sess.n_keypoints
+    pred = np.arange(S * T * K * 2, dtype=np.float32).reshape(S, T, K, 2) + 1
+    pred2d = pred[:, :, None]
+    det_box = np.zeros((S, T, C, 4), np.float32)
+    det_box[0, :, 0, 0] = [10, 10, 20, 20]
+    det_box[..., 2:] = 30
+    blk = {
+        'animal_ids': np.array(['det0'], object), 'pred': pred,
+        'conf': np.ones((S, T, K), np.float32), 'pred2d': pred2d,
+        'conf2d': np.ones((S, T, C, K), np.float32),
+        'model_conf2d': np.ones((S, T, C, K), np.float32),
+        'box_agree': np.zeros((S, T, C), np.float32), 'det_box': det_box,
+        'det_score': np.ones((S, T, C), np.float32),
+        'outcome': np.zeros((S, 2), np.int8),
+        'crop': np.zeros((S, 2, C, 4), np.float32), 'outcome_names': ['ok'],
+        'window_start': np.array([0, 2], np.int32),
+        'window_stop': np.array([4, 4], np.int32),
+        'owner_window': np.array([0, 0, 1, 1], np.int32),
+    }
+    out = tmp_path / 'independent-primary'
+    writer = SessionWriter(out, sess, registry, {
+        'n_frames': 4, 'independent_windows': True,
+        'source_session_id': sess.session_id,
+    }, [gid])
+    writer.write_block(gid, blk, 0, 0)
+    writer.close(complete=True)
+
+    points = pq.read_table(out / 'points2d.pq').to_pylist()
+    boxes = pq.read_table(out / 'instances.pq').to_pylist()
+    windows = pq.read_table(out / 'windows.pq').to_pylist()
+    assert {r['frame']: r['animal_id'] for r in points if r['bodypart'] == sess.names[0]} == {
+        0: 'w000000_s00', 1: 'w000000_s00', 2: 'w000001_s00', 3: 'w000001_s00'}
+    assert {r['frame']: r['animal_id'] for r in boxes} == {
+        0: 'w000000_s00', 1: 'w000000_s00', 2: 'w000001_s00', 3: 'w000001_s00'}
+    assert {(r['window'], r['animal_id']) for r in windows} == {
+        (0, 'w000000_s00'), (1, 'w000001_s00')}
+
+
+def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_path):
+    import pyarrow.parquet as pq
+
+    _, sess, registry, _ = scene
+    from tailcyclenet.infer.predictions import SessionWriter
+
+    gid = next(iter(sess.groups))
+    out = tmp_path / 'pred-with-sidecar'
+    writer = SessionWriter(out, sess, registry,
+                           {'n_frames': 4, 'window_predictions': True}, [gid])
+    writer.write_window_records([
+        {'record_type': 'window', 'group_id': gid, 'frame': None, 'window': 1,
+         'window_start': 2, 'window_stop': 4, 'slot': 0, 'animal_id': 'a00',
+         'camera': sess.cam_names[0], 'bodypart': None, 'outcome': 'ok',
+         'crop_x0': 1.0, 'crop_y0': 2.0, 'crop_x1': 3.0, 'crop_y1': 4.0,
+         'crop_refined_x0': 5.0},
+        {'record_type': 'point3d', 'group_id': gid, 'frame': 2, 'window': 1,
+         'window_start': 2, 'window_stop': 4, 'slot': 0, 'animal_id': 'a00',
+         'camera': None, 'bodypart': sess.names[0], 'x': 1.5, 'y': 2.5, 'z': 3.5,
+         'status': 'missing', 'score': 0.4, 'score_logit': -0.4, 'gated': True},
+    ])
+    writer.close(complete=True)
+
+    table = pq.read_table(out / 'window_predictions.pq')
+    rows = table.to_pylist()
+    assert len(rows) == 2
+    assert rows[0]['frame'] is None and rows[0]['bodypart'] is None
+    assert rows[0]['refined_x0'] == 5.0
+    assert rows[1]['status'] == 'missing' and rows[1]['gated'] is True
+    assert (rows[1]['x'], rows[1]['y'], rows[1]['z']) == (1.5, 2.5, 3.5)
+    assert table.schema.field('frame').nullable
+    assert table.schema.field('bodypart').nullable
 
 
 def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp_path):
@@ -1637,15 +1890,18 @@ def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
                                       '--data', str(root / 'test' / 's'), '--anchor', 'none',
                                       '--device', 'cpu', '--overlap', '2',
                                       '--start-frame', '6', '--end-frame', '14',
-                                      '--out', str(out)])
+                                      '--window-predictions', '--out', str(out)])
     cli.main()
 
     import pyarrow.parquet as pq
     gt = pq.read_table(out / 'groups.pq').to_pydict()
     assert int(gt['n_frames'][0]) == 16, 'groups.pq must keep the FULL group length'
-    kp = pq.read_table(out / 'keypoints.pq')
+    kp = pq.read_table(out / 'points2d.pq')
     fr = np.asarray(kp.column('frame').to_pylist())
     assert fr.min() >= 6 and fr.max() < 14, f'frames outside the range: {fr.min()}..{fr.max()}'
+    sidecar = pq.read_table(out / 'window_predictions.pq')
+    assert {'point2d', 'window'} <= set(sidecar['record_type'].to_pylist())
+    assert all(r is None or 6 <= r < 14 for r in sidecar['frame'].to_pylist())
 
     preds, _ = load_predictions(out)
     p = preds['s/g000']['pred']
@@ -1932,7 +2188,7 @@ def test_identity_events_are_absent_not_fatal_on_a_2d_run(cli, monkeypatch, tmp_
         '--anchor', 'none'])
     cli.main()               # must not raise
 
-    assert (out / 'keypoints.pq').exists(), 'the 2D run itself must still produce a prediction'
+    assert (out / 'points2d.pq').exists(), 'the 2D run itself must still produce a prediction'
     assert not (out / 'identity_events.pq').exists(), \
         'a run with no tracker has no identity events; an empty table would imply it had some'
 
@@ -2170,7 +2426,7 @@ def test_cross_view_defaults_select_the_measured_configuration():
 def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
     """A2 (dev/plans/multianimal_system_improvements.md): the 2D vis-thresh gate masked p/conf/
     box_agree but the writer saved pred2d/conf2d before it -- and `load_predictions` reads the
-    saved keypoints.pq back as the primary prediction, so a declined row resurrected in the
+    saved points2d.pq back as the primary prediction, so a declined row resurrected in the
     saved session. The fix masks pred2d/conf2d too; 3D keeps its per-camera rows as diagnostics.
     """
     import conftest as cf

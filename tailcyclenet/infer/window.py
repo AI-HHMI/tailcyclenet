@@ -113,6 +113,10 @@ class InferConfig:
     # `_build_plans`/`decode_crops` never read `carried`, which is touched only in window order
     # on the main thread. 0 is the exact old serial path.
     prefetch_windows: int = 1
+    # Reset detector association at each pose window; requires per-window detections.
+    independent_windows: bool = False
+    # Retain block-local long-form pre-gate records for the optional window sidecar.
+    capture_window_predictions: bool = False
 
 
 def _window_starts(n_frames: int, T: int, overlap: int, start: int = 0):
@@ -326,8 +330,8 @@ def _plan_windows(session_id, gid, cam_sizes, n_frames, overlap, T_total, frame_
 
 
 # Frame/window-indexed columns stitched by `merge_blocks`; anything else is a per-group constant.
-_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score')
-_WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start')
+_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score', 'owner_window', 'triangulated')
+_WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start', 'window_stop', 'window_ordinal')
 
 
 def _capture_overlap_agreement(stats, a, frames, f0, pred, p):
@@ -460,6 +464,8 @@ def merge_blocks(blocks):
             continue
         axis = 0 if np.asarray(out[k]).ndim == 1 else 1
         out[k] = np.concatenate([b[k] for b in blocks], axis=axis)
+    if 'window_records' in out:
+        out['window_records'] = [r for block in blocks for r in block.get('window_records', [])]
     return out
 
 
@@ -506,6 +512,10 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
     assert cfg.anchor in ANCHORS, f'anchor must be one of {ANCHORS}'
     assert cfg.carry_source in CARRY_SOURCES, \
         f'carry_source must be one of {CARRY_SOURCES}, got {cfg.carry_source!r}'
+    if cfg.independent_windows and cfg.anchor != 'none':
+        raise ValueError('independent_windows requires anchor=none')
+    if cfg.independent_windows and (boxes_for is None or not hasattr(boxes_for, 'for_window')):
+        raise ValueError('independent_windows requires a per-window detector callback')
     if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
         raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
                          'overlap >= 1; got 0')
@@ -543,6 +553,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    for a in range(S)])
 
     carried = [None] * S
+    window_records = []
     cam_sizes = [session.rig.size(session.cam_names[ci]) for ci in cam_ix]
     starts, blocks, cam_decode, _pipeline_det = _plan_windows(
         session.session_id, gid, cam_sizes, cfg.n_frames, cfg.overlap, T_total, frame_start)
@@ -556,7 +567,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    ('given points' if box_points is not None else
                     ('instances.pq' if inst_boxes is not None else 'labels')))
 
-    def _build_plans(wi, start):
+    def _build_plans(wi, start, window_det=None):
         """Everything the loop does before any pixel touches: pure geometry.
 
         Returns (frames, window_cams, plans). Writes into `outcome`/`crop` pre-allocated and
@@ -590,13 +601,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         if len(frames) < 2:
             frames = np.clip(np.arange(start, start + 2), frame_start, T_total - 1)
         fl = frames - f0
+        dl = np.arange(len(frames)) if window_det is not None else fl
+        _boxes_stc, _det_kpts_stc = ((window_det[0], window_det[2]) if window_det is not None
+                                     else (boxes_stc, det_kpts_stc))
         wl = wi - w0
         window_cams = session.cgroup(gid, frames)
         plans = []
         for a in range(S):
             bb = None
-            if boxes_stc is not None:
-                bb = boxes_stc[a][fl]
+            if _boxes_stc is not None:
+                bb = _boxes_stc[a][dl]
                 if int(np.isfinite(bb).all(-1).sum()) < cfg.min_box_frames:
                     continue
             elif inst_boxes is not None and a < len(inst_boxes):
@@ -623,8 +637,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         x1 = int(np.clip(np.ceil(v[:, 2].max()), x0 + 1, w))
                         y1 = int(np.clip(np.ceil(v[:, 3].max()), y0 + 1, h))
                         box = torch.tensor([x0, y0, x1, y1], dtype=torch.int32)
-                    if cfg.crop_source == 'keypoints' and det_kpts_stc is not None:
-                        kk = det_kpts_stc[a, fl, ci][..., :2].reshape(-1, 2)
+                    if cfg.crop_source == 'keypoints' and _det_kpts_stc is not None:
+                        kk = _det_kpts_stc[a, dl, ci][..., :2].reshape(-1, 2)
                         kk = kk[np.isfinite(kk).all(-1)]
                         if len(kk):
                             kb = cropmod.crop_box_for_points(
@@ -704,7 +718,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
-    def forward(frames, plan, crops, wi):
+    def forward(frames, plan, crops, wi, window_det=None):
         """One animal, one window -> its prediction in the SOURCE frame, or None.
 
         `frames` is a parameter for the same reason as `decode_crops`. `carried` is read here on
@@ -753,11 +767,13 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     box_t = _deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
                                               cgroup, dev)
             elif cfg.box_prompt == 'detector':
-                if boxes_stc is None:
+                _prompt_boxes = window_det[0] if window_det is not None else boxes_stc
+                if _prompt_boxes is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
-                box_t = _deploy_box_prompt(mode, None, boxes_stc, frames - f0, a, use, boxes,
-                                          scales, cgroup, dev)
+                box_t = _deploy_box_prompt(mode, None, _prompt_boxes,
+                                          np.arange(len(frames)) if window_det is not None else frames - f0,
+                                          a, use, boxes, scales, cgroup, dev)
             if box_t is not None:
                 mkw['box_prompt'] = box_t
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
@@ -793,7 +809,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 c2 = out['conf_pred_2d'][:, 0].detach().cpu().numpy()
         return p, q, out, p2, v2, c2
 
-    def _process_window(wi, frames, window_cams, plans, crops):
+    def _process_window(wi, frames, window_cams, plans, crops, window_det=None):
         """Forward and write every column for one window, given already-decoded `crops`.
 
         `crops` is a parameter -- `_prepare` computes it on a background thread, and this must
@@ -821,7 +837,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         gated frame must be left out of the mean, not blanked once and averaged back in); `q` is
         untouched, so the carried prompt is unaffected, and `conf`/`box_agree` follow the same
         rule as `p`. In 2D `p` IS the per-camera pose, so `pred2d`/`conf2d` are masked the same
-        way or `keypoints.pq` would disagree with what `pred` reports; 3D leaves its per-camera
+        way or `points2d.pq` would disagree with what `pred` reports; 3D leaves its per-camera
         overlay untouched, a diagnostic rather than the primary output.
         """
         if cfg.refine:
@@ -841,7 +857,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             refined = []
             for plan in plans:
                 a, use, boxes, cgroup, scales, *_ = plan
-                got = forward(frames, plan, crops, wi)
+                got = forward(frames, plan, crops, wi, window_det)
                 if got is None:
                     refined.append(_at_image_size(plan))
                     continue
@@ -866,7 +882,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
         for plan in plans:
             a, use, boxes, cgroup, scales, *_ = plan
-            got = forward(frames, plan, crops, wi)
+            got = forward(frames, plan, crops, wi, window_det)
             if got is None:
                 continue
             p, q, out, p2, v2, c2 = got
@@ -880,16 +896,87 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     if c2 is not None:
                         model_conf2d[a, frames - f0, ci] = c2[i]
             vlogit = None
+            tri = out.get('3d_pred_triangulate')
+            if tri is not None:
+                triangulated[a, frames - f0] = tri[0].detach().cpu().numpy()
             if 'vis_pred' in out:
                 v = out['vis_pred'][0].detach().cpu().numpy().reshape(len(frames), K)
                 conf[a, frames - f0] = v
                 vlogit = v
-            j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
+            drop = np.zeros(len(frames), dtype=bool)
             if cfg.vis_thresh is not None and vlogit is not None:
                 with warnings.catch_warnings(), np.errstate(all='ignore'):
                     warnings.simplefilter('ignore', RuntimeWarning)
                     med = np.nanmedian(vlogit, axis=-1)
                 drop = ~(med >= cfg.vis_thresh)
+            if cfg.capture_window_predictions:
+                start_w = int(frames[0])
+                stop_w = min(start_w + cfg.n_frames, T_total)
+                animal_id = (f'w{wi:06d}_s{a:02d}' if cfg.independent_windows
+                             else str(animal_ids[a]))
+                tri_np = (None if tri is None else tri[0].detach().cpu().numpy())
+                for ti, frame in enumerate(frames):
+                    gated = bool(drop[ti])
+                    if mode == '3d':
+                        for k in range(K):
+                            if not np.isfinite(p[ti, k]).all():
+                                continue
+                            rec_k = _window_record_base(gid, wi, start_w, stop_w, a, animal_id,
+                                                        int(frame), str(session.names[k]), 'point3d')
+                            logit = float(vlogit[ti, k]) if vlogit is not None else None
+                            rec_k.update({'x': float(p[ti, k, 0]),
+                                          'y': float(p[ti, k, 1]),
+                                          'z': float(p[ti, k, 2]),
+                                          'score_logit': logit,
+                                          'score': (_logit_probability(logit)
+                                                    if logit is not None else None),
+                                          'status': ('visible' if logit is not None and
+                                                     logit > 0 else 'missing'),
+                                          'gated': gated})
+                            if tri_np is not None and np.isfinite(tri_np[ti, k]).all():
+                                rec_k.update({'triangulated_x': float(tri_np[ti, k, 0]),
+                                              'triangulated_y': float(tri_np[ti, k, 1]),
+                                              'triangulated_z': float(tri_np[ti, k, 2])})
+                            window_records.append(rec_k)
+                    if p2 is not None:
+                        for i, ci in enumerate(use):
+                            for k in range(K):
+                                if not np.isfinite(p2[i, ti, k]).all():
+                                    continue
+                                vis_logit = (float(v2[i, ti, k]) if v2 is not None else None)
+                                conf_logit = (float(c2[i, ti, k]) if c2 is not None else None)
+                                rec2 = _window_record_base(
+                                    gid, wi, start_w, stop_w, a, animal_id, int(frame),
+                                    str(session.names[k]), 'point2d')
+                                rec2.update({'camera': str(session.cam_names[ci]),
+                                             'x': float(p2[i, ti, k, 0]),
+                                             'y': float(p2[i, ti, k, 1]),
+                                             'visibility_logit': vis_logit,
+                                             'visibility_probability': (_logit_probability(vis_logit)
+                                                                        if vis_logit is not None else None),
+                                             'confidence_logit': conf_logit,
+                                             'confidence_probability': (_logit_probability(conf_logit)
+                                                                        if conf_logit is not None else None),
+                                             'gated': gated if mode == '2d' else False})
+                                window_records.append(rec2)
+                    for ci, cam in enumerate(session.cam_names):
+                        box = det_box[a, int(frame) - f0, ci]
+                        agree = box_agree[a, int(frame) - f0, ci]
+                        if np.isfinite(box).all() or np.isfinite(agree):
+                            reci = _window_record_base(
+                                gid, wi, start_w, stop_w, a, animal_id, int(frame), None,
+                                'instance', str(cam))
+                            reci.update({'x0': float(box[0]) if np.isfinite(box[0]) else None,
+                                         'y0': float(box[1]) if np.isfinite(box[1]) else None,
+                                         'x1': float(box[2]) if np.isfinite(box[2]) else None,
+                                         'y1': float(box[3]) if np.isfinite(box[3]) else None,
+                                         'score': (float(det_score[a, int(frame) - f0, ci])
+                                                   if np.isfinite(det_score[a, int(frame) - f0, ci])
+                                                   else None),
+                                         'box_agree': float(agree) if np.isfinite(agree) else None})
+                            window_records.append(reci)
+            j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
+            if cfg.vis_thresh is not None and vlogit is not None:
                 p = p.copy()
                 p[drop] = np.nan
                 conf[a, frames[drop] - f0] = np.nan
@@ -908,17 +995,40 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
                               None if vlogit is None else torch.as_tensor(vlogit[j]))
 
+        if cfg.capture_window_predictions:
+            start_w = int(frames[0])
+            stop_w = min(start_w + cfg.n_frames, T_total)
+            for animal in range(S):
+                animal_id = (f'w{wi:06d}_s{animal:02d}' if cfg.independent_windows
+                             else str(animal_ids[animal]))
+                outcome_name = OUTCOMES[int(outcome[animal, wi - w0])]
+                for ci, cam in enumerate(session.cam_names):
+                    recw = _window_record_base(gid, wi, start_w, stop_w, animal,
+                                               animal_id, None, None, 'window', str(cam))
+                    recw['outcome'] = outcome_name
+                    crop_box = crop[animal, wi - w0, ci]
+                    refined_box = (None if crop_refined is None else
+                                   crop_refined[animal, wi - w0, ci])
+                    for prefix, values in (('crop_', crop_box), ('crop_refined_', refined_box)):
+                        for axis, value in zip(('x0', 'y0', 'x1', 'y1'),
+                                               (values if values is not None else
+                                                [np.nan] * 4)):
+                            recw[prefix + axis] = float(value) if np.isfinite(value) else None
+                    recw['box_prompt_cams'] = (None if box_cams is None else
+                                               int(box_cams[animal, wi - w0]))
+                    window_records.append(recw)
+
     n_ahead = max(0, int(cfg.prefetch_windows))
     _prefetch_pool = ThreadPoolExecutor(max_workers=1) if n_ahead else None
 
-    def _prepare(wi, start):
+    def _prepare(wi, start, window_det=None):
         """Build the plans and decode the pixels for window `wi` at source frame `start`."""
-        frames, window_cams, plans = _build_plans(wi, start)
+        frames, window_cams, plans = _build_plans(wi, start, window_det)
         crops = decode_crops(frames, plans)
         return frames, window_cams, plans, crops
 
     _det_pool = (ThreadPoolExecutor(max_workers=1)
-                 if (boxes_for is not None and _pipeline_det) else None)
+                 if (boxes_for is not None and _pipeline_det and not cfg.independent_windows) else None)
 
     def _detect(bi):
         """Boxes for block `bi`, or None past the end. Runs on `_det_pool`, in block order."""
@@ -937,7 +1047,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             n_blk, n_win = f_read - f0, w1 - w0
 
             boxes_stc = det_kpts_stc = None
-            if _det_pool is not None:
+            if cfg.independent_windows:
+                boxes_stc = det_kpts_stc = _scores = None
+            elif _det_pool is not None:
                 boxes_stc, _scores, det_kpts_stc = _pending_det.result()
                 _pending_det = _det_pool.submit(_detect, bi + 1)
             elif boxes_for is not None:
@@ -949,6 +1061,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 det_box[...] = boxes_stc
                 det_score[...] = _scores
 
+            owner_window = np.full(n_blk, -1, np.int32)
+            triangulated = np.full((S, n_blk, K, 3), np.nan, np.float32)
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
             conf = np.full((S, n_blk, K), np.nan, np.float32)
             pred2d = np.full((S, n_blk, len(session.rig), K, 2), np.nan, np.float32)
@@ -960,20 +1074,31 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             crop_refined = (np.full_like(crop, np.nan) if cfg.refine else None)
             box_cams = (np.full((S, n_win), -1, np.int8) if cfg.box_prompt != 'none' else None)
 
+            window_records = []
             pending = {}
-            if _prefetch_pool is not None:
+            if _prefetch_pool is not None and not cfg.independent_windows:
                 for j in range(min(n_ahead, n_win - 1)):
                     pending[w0 + j + 1] = _prefetch_pool.submit(
                         _prepare, w0 + j + 1, starts[w0 + j + 1])
             for wi in range(w0, w1):
+                window_det = None
+                if cfg.independent_windows:
+                    window_det = boxes_for.for_window(
+                        store, int(starts[wi]), int(min(starts[wi] + cfg.n_frames, T_total)),
+                        int(starts[wi + 1]) if wi + 1 < len(starts) else T_total, wi)
                 if wi in pending:
                     frames, window_cams, plans, crops = pending.pop(wi).result()
                 else:
-                    frames, window_cams, plans, crops = _prepare(wi, starts[wi])
+                    frames, window_cams, plans, crops = _prepare(wi, starts[wi], window_det)
                 nxt = wi + n_ahead
-                if _prefetch_pool is not None and nxt < w1 and nxt not in pending:
+                if _prefetch_pool is not None and not cfg.independent_windows and nxt < w1 and nxt not in pending:
                     pending[nxt] = _prefetch_pool.submit(_prepare, nxt, starts[nxt])
-                _process_window(wi, frames, window_cams, plans, crops)
+                if cfg.independent_windows:
+                    db, ds, _dk = window_det
+                    det_box[:, frames - f0] = db
+                    det_score[:, frames - f0] = ds
+                _process_window(wi, frames, window_cams, plans, crops, window_det)
+                owner_window[frames - f0] = wi
                 if wi + 1 < w1:
                     store.evict_below(int(starts[max(w0, wi - n_ahead + 1)]))
                 memory.trim()
@@ -995,9 +1120,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                    'model_conf2d': model_conf2d[:, :keep],
                    'box_agree': box_agree[:, :keep],
                    'det_box': det_box[:, :keep], 'det_score': det_score[:, :keep],
+                   'owner_window': owner_window[:keep],
+                   'triangulated': triangulated[:, :keep],
+                   'slot': np.arange(S, dtype=np.int32),
                    'animal_ids': np.asarray(animal_ids, object),
                    'outcome': outcome, 'crop': crop,
                    'window_start': np.asarray(starts[w0:w1]),
+                   'window_stop': np.asarray([min(int(starts[j]) + cfg.n_frames, T_total)
+                                              for j in range(w0, w1)], dtype=np.int32),
+                   'window_ordinal': np.arange(w0, w1, dtype=np.int32),
+                   'window_records': window_records,
                    'outcome_names': np.asarray(OUTCOMES, object),
                    'mode': mode, 'group_id': gid, 'session': session.session_id,
                    'dataset': dataset_name, 'anchor': cfg.anchor,
@@ -1013,6 +1145,20 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         if _prefetch_pool is not None:
             _prefetch_pool.shutdown(wait=True)
         store.clear()
+
+
+def _logit_probability(value):
+    """Stable scalar logit-to-probability conversion for optional window records."""
+    return float(1.0 / (1.0 + np.exp(-np.clip(float(value), -80.0, 80.0))))
+
+
+def _window_record_base(gid, window, start, stop, slot, animal_id, frame, bodypart,
+                        record_type, camera=None):
+    """Common long-form sidecar keys; absent dimensions are explicit nulls."""
+    return {'record_type': record_type, 'group_id': str(gid), 'frame': frame,
+            'window': int(window), 'window_start': int(start), 'window_stop': int(stop),
+            'slot': int(slot), 'animal_id': str(animal_id), 'camera': camera,
+            'bodypart': bodypart}
 
 
 def _overlaps(a, b):

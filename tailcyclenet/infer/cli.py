@@ -131,11 +131,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--split', default=None,
                     help='default: test. Inert with --videos, and refused rather than ignored.')
     ap.add_argument('--out', required=True, type=Path,
-                    help='the prediction SESSION directory to write: session.toml, '
-                         'calibration.toml, groups.pq and the label tables, in '
-                         'docs/annotation_format.md. No pixels -- [provenance] '
-                         'source_session says where they are.')
+                    help='the prediction SESSION directory: session.toml, calibration.toml, '
+                         'groups.pq, points3d.pq and prediction-only points2d.pq. No pixels; '
+                         '[provenance] source_session says where they are.')
     ap.add_argument('--checkpoint', default=None)
+    ap.add_argument('--independent-windows', action='store_true',
+                    help='reset detector association in every pose window. Requires --detector '
+                         'and --anchor none; no query prior reaches the model, and window-local '
+                         'IDs are not continuous tracks. Unmeasured, opt-in.')
+    ap.add_argument('--window-predictions', action='store_true',
+                    help='write pre-gate predictions from every processed window to '
+                         '<out>/window_predictions.pq (default: off)')
     ap.add_argument('--anchor', default='carry', choices=ANCHORS,
                     help="'labels' is an ORACLE, not a deployment number")
     ap.add_argument('--overlap', type=int, default=4,

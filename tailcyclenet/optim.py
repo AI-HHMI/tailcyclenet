@@ -25,6 +25,10 @@ KNOWN_OPTIMIZER_KEYS = frozenset({
 # order `load_state_dict` matches them by -- so a resumed run must reconstruct it exactly.
 ROUTES = ('muon_dec', 'muon_fresh', 'muon_enc', 'adamw_base', 'adamw_enc')
 
+# Checkpoint metadata is deliberately versioned: optimizer state matches groups by position,
+# so a name-level layout is needed before state loading can be trusted.
+OPTIMIZER_LAYOUT_SCHEMA = 'tailcyclenet.optimizer-layout.v1'
+
 _DEC_SUBSTR = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
                'decoder.temporal_attns')
 
@@ -109,17 +113,39 @@ class PoseDualOptimizer(DualOptimizer):
         """
         return all(hasattr(o, 'eval') and hasattr(o, 'train') for o in self._opts)
 
-    def load_state_dict(self, sd):
-        """Delegate, then force `ScheduleFreeWrapper.train_mode = True`.
+    def state_dict(self):
+        """Persist Muon's scheduler state, which the upstream DualOptimizer omits."""
+        state = super().state_dict()
+        state['_tailcyclenet'] = {
+            'schema': 'tailcyclenet.pose-dual.v1',
+            'muon_warmup_steps': int(self.muon_warmup_steps),
+            'gstep': int(self._gstep),
+            'muon_base_lrs': [float(lr) for lr in self._muon_base_lrs],
+        }
+        return state
 
-        The wrapper keeps `train_mode` as an attribute that does NOT round-trip, so after load
-        the params sit at the averaged x while the loop calls `opt.train()` -- lerping y toward z
-        a second time.
-        """
+    def load_state_dict(self, sd):
+        """Restore upstream state plus this repo's Muon warmup without mutating ``sd``."""
         from schedulefree import ScheduleFreeWrapper
         _refuse_state_shape(self, sd)
         refuse_group_count_mismatch(self, sd)
-        super().load_state_dict(sd)
+        extra = sd.get('_tailcyclenet') if isinstance(sd, dict) else None
+        if isinstance(extra, dict) and extra.get('schema') == 'tailcyclenet.pose-dual.v1':
+            if int(extra.get('muon_warmup_steps', self.muon_warmup_steps)) != self.muon_warmup_steps:
+                raise SystemExit('optimizer state has a different muon_warmup_steps; start a warm start')
+            saved_base = [float(x) for x in extra.get('muon_base_lrs', [])]
+            if saved_base and saved_base != [float(x) for x in self._muon_base_lrs]:
+                raise SystemExit('optimizer state has a different Muon base learning-rate layout; '
+                                  'start a warm start')
+        # The upstream loader only consumes the two optimizer halves; copying keeps the source
+        # checkpoint (and its metadata) unchanged.
+        super().load_state_dict({k: v for k, v in sd.items() if k != '_tailcyclenet'})
+        if isinstance(extra, dict) and extra.get('schema') == 'tailcyclenet.pose-dual.v1':
+            self._gstep = int(extra.get('gstep', 0))
+        elif self.muon_warmup_steps:
+            # Old schedule-free Muon states carry the global step as each group's ``k``.
+            self._gstep = max((int(g.get('k', 0)) for g in
+                               sd.get('muon', {}).get('param_groups', [])), default=0)
         for o in self._opts:
             if isinstance(o, ScheduleFreeWrapper):
                 o.train_mode = True
@@ -196,6 +222,68 @@ def group_lr(route: str, cfg: dict) -> float:
     if route == 'muon_dec':
         return lr * float(cfg.get('muon_lr_scale', 1.0))
     return lr
+
+
+def optimizer_metadata(model, optimizer, fresh_names: set[str] | None = None) -> dict:
+    """Return stable, name-based optimizer layout metadata for a pose checkpoint."""
+    names = {id(p): name for name, p in model.named_parameters()}
+
+    def groups_doc(groups, lrs=None):
+        return [{'lr': float(group['lr'] if lrs is None else lrs[i]),
+                 'names': [names[id(p)] for p in group['params']]}
+                for i, group in enumerate(groups)]
+
+    if isinstance(optimizer, PoseDualOptimizer):
+        groups = {'muon': groups_doc(optimizer.opt_muon.param_groups, optimizer._muon_base_lrs),
+                  'adamw': groups_doc(optimizer.opt_adam.param_groups)}
+        kind = 'muon'
+    else:
+        groups = {'muon': [], 'adamw': groups_doc(optimizer.param_groups)}
+        kind = 'schedulefree'
+    return {'schema': OPTIMIZER_LAYOUT_SCHEMA, 'optimizer': kind,
+            'fresh_names': sorted(str(n) for n in (fresh_names or set())),
+            'groups': groups}
+
+
+def optimizer_metadata_from_checkpoint(checkpoint: dict) -> tuple[set[str], dict | None]:
+    """Read optimizer metadata without modifying ``checkpoint``.
+
+    Old checkpoints intentionally fall back to the pre-metadata behavior.
+    """
+    metadata = checkpoint.get('optimizer_metadata') if isinstance(checkpoint, dict) else None
+    if not isinstance(metadata, dict) or metadata.get('schema') != OPTIMIZER_LAYOUT_SCHEMA:
+        return set(), None
+    fresh = metadata.get('fresh_names', [])
+    groups = metadata.get('groups')
+    if not isinstance(fresh, list) or not all(isinstance(n, str) for n in fresh):
+        return set(), None
+    if not isinstance(groups, dict):
+        return set(), None
+    if not all(isinstance(groups.get(key), list) for key in ('muon', 'adamw')):
+        return set(), None
+    return set(fresh), metadata
+
+
+def optimizer_layout_matches_metadata(opt, model, metadata: dict | None) -> bool:
+    """Check current named groups and rates against saved layout metadata."""
+    if not isinstance(metadata, dict) or metadata.get('schema') != OPTIMIZER_LAYOUT_SCHEMA:
+        return True
+    names = {id(p): name for name, p in model.named_parameters()}
+
+    def current(groups):
+        return [{'lr': float(g['lr']),
+                 'names': [names.get(id(p)) for p in g['params']]} for g in groups]
+
+    if isinstance(opt, PoseDualOptimizer):
+        actual = {'muon': current(opt.opt_muon.param_groups)}
+        for i, lr in enumerate(opt._muon_base_lrs):
+            actual['muon'][i]['lr'] = float(lr)
+        actual['adamw'] = current(opt.opt_adam.param_groups)
+        kind = 'muon'
+    else:
+        actual = {'muon': [], 'adamw': current(opt.param_groups)}
+        kind = 'schedulefree'
+    return kind == metadata.get('optimizer') and actual == metadata.get('groups')
 
 
 def _is_dual_state(state) -> bool:
@@ -279,20 +367,34 @@ def state_matches_optimizer_kind(state, kind: str) -> bool:
 
 
 def optimizer_layout_matches(opt, state) -> bool:
-    """Whether `state`'s param-group layout equals what `opt` currently holds: the same number
-    of groups and the same lr per group, on both halves. `load_state_dict` matches groups BY
-    POSITION, so counts alone cannot tell a kpt group from an encoder group -- the per-group lr
-    sequence can. A checkpoint whose layout differs cannot be resumed (its state would land on
-    the wrong groups), so it is a warm start instead.
-    """
+    """Whether saved and current optimizer groups have the same stable layout and rates."""
     def lrs(groups):
-        """The per-group lr sequence of a param_groups list."""
         return [float(g['lr']) for g in groups]
 
     if _is_dual_state(state):
         if not isinstance(opt, PoseDualOptimizer):
             return False
-        return (lrs(opt.opt_muon.param_groups) == lrs(state['muon']['param_groups'])
+        extra = state.get('_tailcyclenet')
+        if not isinstance(extra, dict) or extra.get('schema') != 'tailcyclenet.pose-dual.v1':
+            # Recover the old schedule-free global step from each group's persisted ``k`` and
+            # undo the transient warmup factor before comparing base rates.
+            groups = state['muon']['param_groups']
+            gstep = max((int(g.get('k', 0)) for g in groups), default=0)
+            if opt.muon_warmup_steps and not any('k' in g for g in groups):
+                return False
+            factor = (min(1.0, gstep / opt.muon_warmup_steps)
+                      if opt.muon_warmup_steps else 1.0)
+            if factor == 0.0:
+                return (not gstep and
+                        lrs(groups) == [float(x) for x in opt._muon_base_lrs] and
+                        lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
+            saved_base = [float(g['lr']) / factor for g in groups]
+            return (saved_base == [float(x) for x in opt._muon_base_lrs]
+                    and lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
+        if int(extra.get('muon_warmup_steps', -1)) != int(opt.muon_warmup_steps):
+            return False
+        saved_base = [float(x) for x in extra.get('muon_base_lrs', [])]
+        return (saved_base == [float(x) for x in opt._muon_base_lrs]
                 and lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
     if isinstance(opt, PoseDualOptimizer):
         return False

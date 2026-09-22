@@ -434,7 +434,8 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                     name: str = 'last', write: bool = True,
                     registry: Registry | None = None, kind: str = 'pose',
                     scorer_selection_metric: str | None = None,
-                    scorer_selection_value: float | None = None) -> Path | None:
+                    scorer_selection_value: float | None = None,
+                    fresh_names: set[str] | None = None) -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
     `model_state` is the raw training weight (resume); `model_state_eval` is the averaged weight
@@ -478,6 +479,10 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                'config': config,
                'model_config': config.get('model'),
                'keypoint_registry': None if registry is None else registry.to_dict()}
+    if kind == 'pose':
+        # Name membership is required because torch loads optimizer state by group position.
+        from .optim import optimizer_metadata
+        payload['optimizer_metadata'] = optimizer_metadata(model, optimizer, fresh_names)
     if kind == 'scorer':
         mode = scorer_output_granularity(config)
         if scorer_selection_metric is not None:

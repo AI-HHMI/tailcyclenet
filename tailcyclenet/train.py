@@ -37,12 +37,15 @@ from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
-def build_optimizer(model, fresh: set[str], cfg: dict):
+def build_optimizer(model, fresh: set[str], cfg: dict, layout: dict | None = None):
     """The run's optimizer, selected by `[training.optimizer].optimizer`; an absent key is "muon".
 
     `"schedulefree"` is the AdamW-SF recipe a resume needs. Fresh params (identity table,
     no-query tokens, fusion gate) get `kpt_lr`; a trainable encoder gets a lower one.
     """
+    # Metadata is authoritative for the historical fresh set; old checkpoints pass no layout.
+    if isinstance(layout, dict) and isinstance(layout.get('fresh_names'), list):
+        fresh = set(layout['fresh_names'])
     kind = str(cfg.get('optimizer', 'muon'))
     if kind == 'muon':
         from tailcyclenet.optim import build_muon
@@ -587,7 +590,9 @@ def main(argv: list[str] | None = None):
 
     resumed = run / 'checkpoints' / 'checkpoint_last.pth'
     opt_kind = str(config['training']['optimizer'].get('optimizer', 'muon'))
-    from tailcyclenet.optim import (optimizer_layout_matches, state_matches_optimizer_kind)
+    from tailcyclenet.optim import (optimizer_layout_matches, optimizer_layout_matches_metadata,
+                                    optimizer_metadata_from_checkpoint,
+                                    state_matches_optimizer_kind)
     checkpoint = None
     if not args.no_warm_start and train_cfg.get('checkpoint_path'):
         checkpoint_ref = train_cfg['checkpoint_path']
@@ -603,6 +608,7 @@ def main(argv: list[str] | None = None):
                 else config['model'])
     model = build_model(model_cfg, n_keypoints=registry.n_keypoints)
     fresh: set[str] = set()
+    resume_layout: dict | None = None
     start_it, ck, resume_from = 0, None, None
     if resumed.exists() and not args.no_resume:
         resume_from = resumed
@@ -614,6 +620,12 @@ def main(argv: list[str] | None = None):
                                                                     opt_kind):
             resume_from = checkpoint
             start_it = int(ck['iteration'])
+    if ck is not None and resume_from is not None:
+        fresh, resume_layout = optimizer_metadata_from_checkpoint(ck)
+        if resume_layout is None:
+            # Backward-compatible fallback: historical checkpoints had no named layout.
+            fresh = set()
+
     if ck is not None and resume_from != resumed:
         try:
             model.load_state_dict(ck['model_state'])
@@ -621,7 +633,7 @@ def main(argv: list[str] | None = None):
             print(f'checkpoint_path: {resume_from} does not resume -- weights do not load '
                   f'into this model ({type(e).__name__}: {str(e).splitlines()[0]}); '
                   'continuing as a warm start')
-            ck, start_it, resume_from = None, 0, None
+            ck, start_it, resume_from, resume_layout = None, 0, None, None
     if checkpoint is not None and (ck is None or resume_from == resumed):
         fresh = warm_start(model, checkpoint, base_names=base_reg.names if base_reg else None)
     if 'freeze_encoder' in train_cfg:
@@ -665,7 +677,7 @@ def main(argv: list[str] | None = None):
                      + (f', kpt_lr {opt_cfg_scaled["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg_scaled
                         else '')
                      + ' (the multipliers -- encoder_lr_scale, muon_lr_scale -- are unchanged)')
-    opt = build_optimizer(model, fresh, opt_cfg_scaled)
+    opt = build_optimizer(model, fresh, opt_cfg_scaled, layout=resume_layout)
     losses = dict(config['training']['losses'])
     losses.setdefault('per_camera_cube_scale',
                       bool(config['model'].get('per_camera_cube_scale', False)))
@@ -674,24 +686,36 @@ def main(argv: list[str] | None = None):
     if ck is not None:
         if resume_from == resumed:
             model.load_state_dict(ck['model_state'])
-        info = replay_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh)
+        info = replay_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh,
+                                      layout=resume_layout)
         if info:
             print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
                   f'norms {info["norms"]}, {info["n_params"]:,} params)')
-        from tailcyclenet.optim import refuse_mismatched_optimizer_state
-        refuse_mismatched_optimizer_state(
-            opt, ck['optimizer_state'], resume_from,
-            resolved=opt_kind,
-            explicit='optimizer' in config['training']['optimizer'])
-        if resume_from != resumed and not optimizer_layout_matches(opt, ck['optimizer_state']):
-            print(f'checkpoint_path: {resume_from} was trained with a different optimizer '
-                  'param-group layout than this config builds (group count or per-group lr); '
+        metadata_ok = (resume_layout is None or
+                       optimizer_layout_matches_metadata(opt, model, resume_layout))
+        if not metadata_ok:
+            if resume_from == resumed:
+                raise SystemExit(
+                    f'{resume_from} has a different named optimizer layout than this run builds; '
+                    'start a warm start or restore the matching configuration')
+            print(f'checkpoint_path: {resume_from} has a different named optimizer layout; '
                   'the weights stand, the optimizer starts fresh at iteration 0')
             ck, start_it = None, 0
         else:
-            opt.load_state_dict(ck['optimizer_state'])
-            print(f'resuming {resume_from} at iteration {start_it} of {n_iter} '
-                  '(--no-resume to start over, which OVERWRITES both checkpoints)')
+            from tailcyclenet.optim import refuse_mismatched_optimizer_state
+            refuse_mismatched_optimizer_state(
+                opt, ck['optimizer_state'], resume_from,
+                resolved=opt_kind,
+                explicit='optimizer' in config['training']['optimizer'])
+            if resume_from != resumed and not optimizer_layout_matches(opt, ck['optimizer_state']):
+                print(f'checkpoint_path: {resume_from} was trained with a different optimizer '
+                      'param-group layout than this config builds (group count or per-group lr); '
+                      'the weights stand, the optimizer starts fresh at iteration 0')
+                ck, start_it = None, 0
+            else:
+                opt.load_state_dict(ck['optimizer_state'])
+                print(f'resuming {resume_from} at iteration {start_it} of {n_iter} '
+                      '(--no-resume to start over, which OVERWRITES both checkpoints)')
     elif resumed.exists():
         print(f'--no-resume: {resumed} and any checkpoint_best.pth beside it WILL be overwritten')
 
@@ -892,10 +916,12 @@ def main(argv: list[str] | None = None):
                 t_ck = time.time()
                 drift, p = dist_utils.check_ranks_agree(fabric, raw), None
                 if not args.no_checkpoints:
-                    p = save_checkpoint(run, it, raw, opt, config, write=is0, registry=registry)
+                    p = save_checkpoint(run, it, raw, opt, config, write=is0, registry=registry,
+                                     fresh_names=fresh)
                     if latest[1] == it and latest[0] < saved_mpjpe:
                         saved_mpjpe = latest[0]
-                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0, registry=registry)
+                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0, registry=registry,
+                                         fresh_names=fresh)
                         fabric.print(f'  new best: mpjpe {saved_mpjpe:.4g} -> '
                                      f'checkpoint_best.pth')
                         record({'iter': it, 'saved_mpjpe': saved_mpjpe})

@@ -221,6 +221,65 @@ def test_independent_detector_batches_raw_globally_but_associates_each_window_fr
     np.testing.assert_array_equal(second[0][0, :, 0, 0], np.full(4, 6, np.float32))
 
 
+def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, monkeypatch):
+    import tailcyclenet.detector as detector
+    from tailcyclenet.infer.driver import _detector_boxes
+
+    model, sess, registry, name = _range_scene(tmp_path)
+    gid = 'g000'
+    C = len(sess.rig)
+
+    def detect_raw(_det, _wh, _sess, _gid, _top_k, **kw):
+        frames = np.asarray(kw['frames'], np.int32)
+        boxes = np.zeros((1, len(frames), C, 4), np.float32)
+        boxes[0, :, :, 0] = frames[:, None]
+        return boxes, np.ones((1, len(frames), C), np.float32), None
+
+    def associate_group(raw, _sess, _gid, n_want, **kw):
+        raw_boxes = raw[0]
+        n = raw_boxes.shape[1]
+        boxes = np.zeros((n_want, n, C, 4), np.float32)
+        x0 = 8.0 + raw_boxes[0, :, 0, 0]
+        boxes[0, :, :, 0] = x0[:, None]
+        boxes[0, :, :, 1] = 6.0
+        boxes[0, :, :, 2] = np.minimum(x0 + 32.0, 63.0)[:, None]
+        boxes[0, :, :, 3] = 42.0
+        return boxes, np.ones((n_want, n, C), np.float32), None
+
+    monkeypatch.setattr(detector, 'detect_raw', detect_raw)
+    monkeypatch.setattr(detector, 'associate_group', associate_group)
+
+    def run(start):
+        args = type('Args', (), {
+            'frame_start': start, 'frame_stop': 16, 'det_score': 0.01,
+            'det_nms_iou': 0.5, 'det_nms_center_dist': 0.3, 'det_trace': None,
+            'link_boxes': True, 'min_views': 2, 'track': True, 'max_move': 1.0,
+            'max_age': 8, 'pose_nms': None, 'duplicate_radius': 0.75,
+            'duplicate_persist': 5,
+        })()
+        boxes_for = _detector_boxes(object(), (64, 64), sess, gid, args, 'cpu', False,
+                                    None, 1, 1, independent=True)
+        cfg = _cfg(anchor='none', independent_windows=True, capture_window_predictions=True,
+                   refine=False, frame_start=start, frame_stop=16)
+        return run_group(model, sess, gid, registry, name, cfg, boxes_for=boxes_for, n_rows=1)
+
+    full = run(0)
+    start = int(full['window_start'][2])
+    ranged = run(start)
+    full_rows = [r for r in full['window_records']
+                 if r['record_type'] == 'point2d' and r['window'] == 2]
+    range_rows = [r for r in ranged['window_records']
+                  if r['record_type'] == 'point2d' and r['window'] == 0]
+    key = lambda r: (r['frame'], r['camera'], r['bodypart'])
+    full_rows, range_rows = sorted(full_rows, key=key), sorted(range_rows, key=key)
+    assert len(full_rows) == len(range_rows) > 0
+    for a, b in zip(full_rows, range_rows):
+        assert (a['frame'], a['camera'], a['bodypart'], a['window_start'], a['window_stop']) == (
+            b['frame'], b['camera'], b['bodypart'], b['window_start'], b['window_stop'])
+        for field in ('x', 'y', 'visibility_logit', 'confidence_logit'):
+            np.testing.assert_array_equal(a[field], b[field], err_msg=field)
+
+
 def test_more_detector_rows_than_label_rows(scene):
     """A DETECTOR ROW IS NOT A LABEL ROW.
 

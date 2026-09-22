@@ -360,6 +360,13 @@ def _independent_slots(path, preds, labels):
         if chosen is None:
             raise SystemExit(f'{path}: independent prediction has no points2d.pq')
         table, stem = pl.read_parquet(path / f'{chosen}.pq'), '2d'
+    slot_tables = [table]
+    seen_paths = {path / f'{stem}.pq'}
+    for extra in ('instances', 'windows'):
+        candidate_path = path / f'{extra}.pq'
+        if candidate_path.exists() and candidate_path not in seen_paths:
+            slot_tables.append(pl.read_parquet(candidate_path))
+            seen_paths.add(candidate_path)
     for key, out in preds.items():
         if key not in labels:
             continue
@@ -369,11 +376,8 @@ def _independent_slots(path, preds, labels):
         slot_values = set()
         # Include point, instance, and window tables: a slot that failed every point prediction
         # still belongs in the output axis, including when it is the highest-numbered slot.
-        for candidate_path in (path / f'{stem}.pq', path / 'instances.pq', path / 'windows.pq'):
-            if not candidate_path.exists():
-                continue
-            candidate = pl.read_parquet(candidate_path).filter(
-                pl.col('group_id').cast(pl.String) == gid)
+        for candidate_table in slot_tables:
+            candidate = candidate_table.filter(pl.col('group_id').cast(pl.String) == gid)
             if 'slot' in candidate.columns:
                 slot_values.update(int(x) for x in candidate['slot'].drop_nulls().unique().to_list())
         if not slot_values:

@@ -270,7 +270,9 @@ def test_independent_window_matches_detector_batch_aligned_ranged_run(tmp_path, 
                  if r['record_type'] == 'point2d' and r['window'] == 2]
     range_rows = [r for r in ranged['window_records']
                   if r['record_type'] == 'point2d' and r['window'] == 0]
-    key = lambda r: (r['frame'], r['camera'], r['bodypart'])
+    def key(record):
+        return record['frame'], record['camera'], record['bodypart']
+
     full_rows, range_rows = sorted(full_rows, key=key), sorted(range_rows, key=key)
     assert len(full_rows) == len(range_rows) > 0
     for a, b in zip(full_rows, range_rows):

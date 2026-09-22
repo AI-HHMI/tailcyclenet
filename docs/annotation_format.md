@@ -69,6 +69,7 @@ the distinction from row counts in every consumer is guesswork the producer can 
       keypoints.pq                    # per-camera 2D observations + visibility (optional)
       points3d.pq                     # 3D                                      (optional)
       points2d.pq                     # inference predictions only              (optional extension)
+      window_predictions.pq           # optional, non-spec per-window sidecar
       instances.pq                    # boxes / present / absent                (optional)
       regions.pq                      # areas certified completely labelled     (optional)
       extrinsics.pq                   # per-frame extrinsics, moving cameras    (optional)
@@ -80,8 +81,10 @@ the distinction from row counts in every consumer is guesswork the producer can 
 
 An annotation session must have at least one non-empty `keypoints.pq` or `points3d.pq`. An
 inference prediction session is marked by the top-level `prediction_session = true` key and may
-carry `points2d.pq`; see §8b. That prediction-only table is not an annotation-label substitute and
-does not make the session a training-data session.
+carry `points2d.pq`; see §8b. Its top-level `complete` marker is false while output is being
+written and becomes true only after all tables finalize; prediction readers refuse `complete = false`.
+This prediction-only table is not an annotation-label substitute and does not make the session a
+training-data session. `window_predictions.pq`, when requested, is a non-spec inference sidecar.
 
 Either the image directory or the video may be a **symlink**, and a converter is encouraged to
 symlink whole directories rather than copy or link individual frames. A dense dataset then costs
@@ -99,6 +102,7 @@ mode   = "3d"       # "3d" -> >= 2 cameras + full calibration; "2d" -> exactly 1
 units  = "mm"       # units of 3D. Pixel labels are ALWAYS pixels, in every mode.
 labels = "annotated"   # "annotated" (a human placed these) | "tracked" (a machine produced them)
 # prediction_session = true  # top-level marker, present only in inference prediction sessions
+# complete = false           # prediction writer finalization marker; true only on success
 
 names      = [ ... ]   # ordered keypoint names -- THE authority for the keypoint axis
 skeleton   = []        # OPTIONAL, usually empty: [["a","b"], ...] name pairs
@@ -321,6 +325,16 @@ Prediction-specific `points3d.pq` columns:
 An independent-window prediction session gives the same `(group, window, slot)`-scoped
 `animal_id` to its `points3d.pq`, `points2d.pq`, and `instances.pq` rows. It uses a new ID in the
 next window; do not interpret these IDs as persistent animal identities.
+
+The optional `window_predictions.pq` sidecar is a typed, nullable union table for the full
+per-window overlap, captured before the visibility gate. Its `record_type` is `window`, `instance`,
+`point3d`, or `point2d`; window rows carry crop/outcome metadata, instance rows boxes/scores,
+`point3d` rows fused xyz and optional triangulated xyz, and `point2d` rows per-camera xy plus
+separate visibility/confidence signals. Point rows carry `gated`, the decision made by
+`--vis-thresh`; for 3D overlays this is false because that gate applies to the 3D pose. Window rows
+have null `frame`/`bodypart`; unavailable values remain null. The Parquet schema carries a
+`tailcyclenet.schema_version` metadata value. This sidecar is diagnostic output, not annotation
+input, and does not change `load_predictions` or evaluation behavior.
 
 ## 9. `instances.pq` — boxes and the ignore region (optional)
 

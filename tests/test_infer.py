@@ -1221,7 +1221,7 @@ def test_session_writer_finalizes_incomplete_output_when_preload_fails(cli, monk
     out = tmp_path / 'partial-prediction'
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
                                       '--data', str(root / 'test' / 's'), '--anchor', 'none',
-                                      '--device', 'cpu', '--out', str(out)])
+                                      '--device', 'cpu', '--window-predictions', '--out', str(out)])
 
     def fail_preload(_self):
         raise RuntimeError('injected preload failure')
@@ -1232,8 +1232,9 @@ def test_session_writer_finalizes_incomplete_output_when_preload_fails(cli, monk
 
     with (out / 'session.toml').open('rb') as f:
         assert tomllib.load(f)['complete'] is False
-    # A finalized empty Parquet footer is readable, so resources were closed despite the error.
+    # Finalized empty Parquet footers are readable, including the optional sidecar writer.
     assert pq.read_table(out / 'points2d.pq').num_rows == 0
+    assert pq.read_table(out / 'window_predictions.pq').num_rows == 0
 
 
 def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):

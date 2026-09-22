@@ -38,6 +38,8 @@ MISSING_OK = {
     # Native deeperfly's pathway plan explicitly assesses which fly38 points each view can
     # predict: finite 2D output is visible and NaN/unassigned output is missing.
     'deepfly3d-v3': ('keypoints',),
+    # v4 preserves native deeperfly's assessed missing views and adds scorer-masked unlabeled rows.
+    'deepfly3d-v4': ('keypoints',),
 }
 
 # root -> {table: exact hole count}, summed over every session in the root, checked only for

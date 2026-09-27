@@ -579,6 +579,7 @@ def test_appearance_augmentation_is_train_only(tiny_root):
     assert not torch.equal(plain.views[0], pose_collate([train_ds[0]]).views[0])
 
 
+@pytest.mark.timeout(60)
 def test_workers_do_not_share_a_random_stream(tiny_root):
     """Two workers must not produce identically-augmented items: torch reseeds per worker, but
     imgaug's own global RNG is fork-copied and needs `worker_init`.

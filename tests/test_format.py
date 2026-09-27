@@ -12,6 +12,18 @@ from tailcyclenet import format as fmt
 from .conftest import KPTS_2D, KPTS_3D, _session_2d, _session_3d
 
 
+def _project_3d_labels(sess, lab):
+    """Populate per-camera positions from the known 3D fixture."""
+    S, T, K = lab.vis3d.shape
+    C = len(sess.rig)
+    lab.points2d = np.full((S, T, K, C, 2), np.nan, np.float32)
+    for c, cam in enumerate(sess.rig.cameras):
+        xy = cam.project(lab.points3d.reshape(-1, 3)).detach().cpu().numpy()
+        xy = xy.reshape(S, T, K, 2)
+        positioned = np.isin(lab.vis2d[..., c], fmt.POSITIONED)
+        lab.points2d[..., c, :] = np.where(positioned[..., None], xy, np.nan)
+
+
 def test_roundtrip_2d(tiny_root):
     """Every dense array comes back byte-identical, including the three status codes."""
     sess = fmt.Session.load(tiny_root / 'ratlike' / 'train' / 'sess_a')
@@ -35,6 +47,45 @@ def test_roundtrip_2d(tiny_root):
     assert lab.instance[1, 1, 0] == fmt.INST_PRESENT
     assert lab.instance[0, 1, 0] == fmt.INST_LABELED
     np.testing.assert_allclose(lab.boxes[1, 1, 0], [10, 10, 30, 30])
+
+
+def test_triangulate_group_applies_residual_gate(tmp_path):
+    path = tmp_path / 's'
+    _session_3d(path)
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    _project_3d_labels(sess, lab)
+    # Perturb one camera so the least-squares triangulation has nonzero reprojection residual.
+    lab.points2d[0, 0, 0, 0, 0] += 20
+    visible, gated, _missing = fmt.triangulate_group(sess.rig, lab, gate=0.01)
+    assert gated >= 1
+    assert lab.vis3d[0, 0, 0] == fmt.UNLABELED
+
+
+def test_triangulate_group_single_view_is_not_a_3d_label(tmp_path):
+    path = tmp_path / 's'
+    _session_3d(path)
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    _project_3d_labels(sess, lab)
+    lab.points2d[0, 0, 0, 1:] = np.nan
+    lab.vis2d[0, 0, 0, 1:] = fmt.MISSING
+    fmt.triangulate_group(sess.rig, lab, gate=30)
+    assert lab.vis3d[0, 0, 0] == fmt.UNLABELED
+    assert np.isnan(lab.points3d[0, 0, 0]).all()
+
+
+def test_triangulate_group_all_assessed_missing_stays_missing(tmp_path):
+    path = tmp_path / 's'
+    _session_3d(path)
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    _project_3d_labels(sess, lab)
+    lab.points2d[0, 0, 0] = np.nan
+    lab.vis2d[0, 0, 0] = fmt.MISSING
+    fmt.triangulate_group(sess.rig, lab, gate=30)
+    assert lab.vis3d[0, 0, 0] == fmt.MISSING
+    assert np.isnan(lab.points3d[0, 0, 0]).all()
 
 
 @pytest.mark.parametrize(

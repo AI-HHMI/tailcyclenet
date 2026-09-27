@@ -1317,26 +1317,41 @@ def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
     assert cv2.warpAffine(src, aff, (256, 1)).shape == (1, 256, 3)
 
 
-def test_a_3d_session_with_no_points3d_is_refused_by_name(tmp_path):
-    """The format allows it; training on it does not. It used to CRASH mid-epoch instead, with
-    nothing in the message naming the session.
-    """
+def test_a_3d_session_without_points3d_is_triangulated_at_load(tmp_path):
+    """Stored 2D positions recover the 3D window targets when points3d.pq is absent."""
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent))
     import conftest as cf
+    from tailcyclenet import format as fmt
 
     root = tmp_path / 'ds'
-    cf._session_3d(root / 'train' / 's_3d')
-    (root / 'train' / 's_3d' / 'points3d.pq').unlink()
+    original = cf._session_3d(root / 'train' / 's_3d')
+    known = original.points3d.copy()
+    path = root / 'train' / 's_3d'
+    rig = fmt.load_calibration(path / 'calibration.toml')
+    original.points2d = np.full((1, 4, len(cf.KPTS_3D), 3, 2), np.nan, np.float32)
+    for c, cam in enumerate(rig.cameras):
+        projected = cam.project(original.points3d[0].reshape(-1, 3)).detach().cpu().numpy()
+        projected = projected.reshape(4, -1, 2)
+        positioned = np.isin(original.vis2d[0, :, :, c], (fmt.VISIBLE, fmt.PROJECTED))
+        original.points2d[0, :, :, c] = np.where(
+            positioned[..., None], projected, np.nan)
+    original.points3d = original.vis3d = None
+    fmt.write_session(path, mode='3d', units='mm', label_source='tracked',
+                      names=cf.KPTS_3D, rig=rig,
+                      groups={'g000': fmt.Group('g000', 4)}, labels={'g000': original})
+    # Re-write emits keypoints.pq only; explicitly pin the input's missing 3D table.
+    (path / 'points3d.pq').unlink(missing_ok=True)
 
-    with pytest.raises(ValueError, match='points3d'):
-        PoseDataset(root, 'train', CFG, train=False)
-    # ...and the message names the session, which is the whole point of moving the check here.
-    try:
-        PoseDataset(root, 'train', CFG, train=False)
-    except ValueError as e:
-        assert 's_3d' in str(e)
+    ds = PoseDataset(root, 'train', LoaderConfig(n_frames=2, image_size=32, aug_prob=0.0,
+                                                 crop_jitter=0.0), train=False)
+    lab = ds.index[0].session.labels('g000')
+    assert lab.points3d is not None and np.isfinite(lab.points3d).any()
+    valid = np.isfinite(known).all(-1) & (lab.vis3d == fmt.VISIBLE)
+    assert np.allclose(lab.points3d[valid], known[valid], atol=1e-2)
+    batch = pose_collate([ds[0]])
+    assert torch.isfinite(batch.coords).any(), 'triangulated 3D targets must reach windows'
 
 
 def test_a_session_with_no_pose_table_is_skipped_not_refused(tmp_path):

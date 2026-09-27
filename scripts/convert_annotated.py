@@ -117,46 +117,7 @@ def read_session(sdir: Path, names: list[str]) -> tuple:
 
 # the 3D layer
 
-def triangulate_group(rig: fmt.Rig, lab: fmt.Labels, gate: float) -> tuple[int, int, int]:
-    """Fill `lab.points3d` / `lab.vis3d` from the per-camera 2D. Returns (visible, gated, missing).
 
-    `offset` goes back on before triangulating (2D is stored-image px, calibration is sensor px).
-    >= 2 views within the residual gate -> visible; over the gate or 1 view -> no row (a
-    triangulation failure, not an occlusion); 0 views with every camera assessed -> `missing`.
-
-    aniposelib is on the pytorch branch, so its intrinsics are nn.Parameters and its outputs
-    carry requires_grad.
-    """
-    import torch
-
-    S, T, K, C, _ = lab.points2d.shape
-    off = np.array([rig.offset[n] for n in rig.names], np.float64)
-    p2 = lab.points2d.astype(np.float64) + off
-    lab.points3d = np.full((S, T, K, 3), np.nan, np.float32)
-    lab.vis3d = np.full((S, T, K), fmt.UNLABELED, np.int8)
-
-    nvis = np.isfinite(p2).all(-1).sum(-1)
-    idx = np.flatnonzero(nvis.reshape(-1) >= 2)
-    flat_vis, flat_p3 = lab.vis3d.reshape(-1), lab.points3d.reshape(-1, 3)
-
-    n_vis = n_gated = 0
-    if idx.size:
-        X = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))
-        with torch.no_grad():
-            p3 = np.asarray(rig.cgroup.triangulate(X, progress=False))
-            rep = np.asarray(rig.cgroup.reprojection_error(p3, X, mean=False))
-        err = np.linalg.norm(rep, axis=-1)
-        seen = np.isfinite(X).all(-1)
-        res = np.nanmedian(np.where(seen, err, np.nan), axis=0)
-        good = np.isfinite(p3).all(-1) & (res <= gate)
-        flat_vis[idx[good]] = fmt.VISIBLE
-        flat_p3[idx[good]] = p3[good].astype(np.float32)
-        n_vis, n_gated = int(good.sum()), int((~good).sum())
-
-    assessed_all = (lab.vis2d != fmt.UNLABELED).all(-1)
-    miss = ((nvis == 0) & assessed_all).reshape(-1)
-    flat_vis[miss] = fmt.MISSING
-    return n_vis, n_gated, int(miss.sum())
 
 
 # writing
@@ -200,7 +161,7 @@ def write_3d(dst: Path, cfg: dict, rig, groups, labels, names, root, sid, gate) 
     """
     stats = {'visible': 0, 'gated': 0, 'missing': 0}
     for gid, lab in labels.items():
-        v, g, m = triangulate_group(rig, lab, gate)
+        v, g, m = fmt.triangulate_group(rig, lab, gate)
         stats['visible'] += v
         stats['gated'] += g
         stats['missing'] += m

@@ -432,6 +432,54 @@ def _animal_vocab(tables: list[pa.Table | None], gid: str) -> list[str]:
     return sorted(found)
 
 
+def triangulate_group(rig: Rig, lab: Labels, gate: float) -> tuple[int, int, int]:
+    """Derive 3D labels from per-camera positions; return (visible, gated, missing).
+
+    Stored 2D coordinates are in image pixels, so camera offsets are restored before
+    triangulation. `visible` and `projected` both carry positions; `missing` does not.
+    A point with at least two views is accepted when its median reprojection residual is
+    within `gate`; failures and single-view points remain unlabelled. Zero-view points are
+    missing only when every camera was assessed.
+
+    Moving-camera rigs are refused: callers must provide frame-specific camera geometry rather
+    than silently triangulating against the static calibration.
+    """
+    if lab.points2d is None or lab.vis2d is None:
+        raise ValueError('triangulation requires per-camera 2D labels and visibility')
+    if any(rig.moving.values()):
+        raise FormatError('cannot triangulate keypoints-only 3D session with moving cameras; '
+                          'frame-specific extrinsics are required')
+    import torch
+
+    S, T, K, C, _ = lab.points2d.shape
+    off = np.asarray([rig.offset[n] for n in rig.names], dtype=np.float64)
+    p2 = lab.points2d.astype(np.float64) + off.reshape(1, 1, 1, C, 2)
+    lab.points3d = np.full((S, T, K, 3), np.nan, np.float32)
+    lab.vis3d = np.full((S, T, K), UNLABELED, np.int8)
+
+    nviews = np.isfinite(p2).all(-1).sum(-1)
+    idx = np.flatnonzero(nviews.reshape(-1) >= 2)
+    flat_vis, flat_p3 = lab.vis3d.reshape(-1), lab.points3d.reshape(-1, 3)
+    n_visible = n_gated = 0
+    if idx.size:
+        xy = np.ascontiguousarray(p2.reshape(-1, C, 2)[idx].transpose(1, 0, 2))
+        with torch.no_grad():
+            xyz = np.asarray(rig.cgroup.triangulate(xy, progress=False))
+            reproj = np.asarray(rig.cgroup.reprojection_error(xyz, xy, mean=False))
+        residual = np.linalg.norm(reproj, axis=-1)
+        seen = np.isfinite(xy).all(-1)
+        median = np.nanmedian(np.where(seen, residual, np.nan), axis=0)
+        good = np.isfinite(xyz).all(-1) & (median <= gate)
+        flat_vis[idx[good]] = VISIBLE
+        flat_p3[idx[good]] = xyz[good].astype(np.float32)
+        n_visible, n_gated = int(good.sum()), int((~good).sum())
+
+    assessed_all = (lab.vis2d != UNLABELED).all(-1)
+    missing = ((nviews == 0) & assessed_all).reshape(-1)
+    flat_vis[missing] = MISSING
+    return n_visible, n_gated, int(missing.sum())
+
+
 # groups and sessions
 
 @dataclass
@@ -775,6 +823,8 @@ class Session:
 
         out = Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
                      vis2d=vis2d, boxes=boxes, instance=instance, ext=ext, regions=regions)
+        if self.mode == '3d' and out.points3d is None and out.points2d is not None:
+            triangulate_group(self.rig, out, self.assoc_res_max_px)
         self._label_cache[gid] = out
         return out
 

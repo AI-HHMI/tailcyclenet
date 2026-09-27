@@ -49,6 +49,15 @@ def test_roundtrip_2d(tiny_root):
     np.testing.assert_allclose(lab.boxes[1, 1, 0], [10, 10, 30, 30])
 
 
+def test_prediction_session_is_not_triangulated_as_annotation(tmp_path):
+    path = tmp_path / 's'
+    _session_3d(path)
+    (path / 'points3d.pq').unlink()
+    sess = fmt.Session.load(path)
+    sess.prediction_session = True
+    assert sess.labels('g000').points3d is None
+
+
 def test_keypoints_only_moving_rig_refuses_static_triangulation(tmp_path):
     path = tmp_path / 's'
     _session_3d(path, moving=True)

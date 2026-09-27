@@ -823,7 +823,8 @@ class Session:
 
         out = Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
                      vis2d=vis2d, boxes=boxes, instance=instance, ext=ext, regions=regions)
-        if self.mode == '3d' and out.points3d is None and out.points2d is not None:
+        if (self.mode == '3d' and not self.prediction_session and out.points3d is None
+                and out.points2d is not None):
             triangulate_group(self.rig, out, self.assoc_res_max_px)
         self._label_cache[gid] = out
         return out

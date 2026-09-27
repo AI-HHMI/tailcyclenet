@@ -1338,6 +1338,28 @@ def test_a_3d_session_with_no_points3d_is_refused_by_name(tmp_path):
     except ValueError as e:
         assert 's_3d' in str(e)
 
+
+def test_a_session_with_no_pose_table_is_skipped_not_refused(tmp_path):
+    """No label table is required (format §3): a boxes-only or unlabelled session in the split
+    contributes no windows, and the labelled sessions beside it still train.
+    """
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    root = tmp_path / 'ds'
+    cf._session_2d(root / 'train' / 's_lab')
+    cf._session_2d(root / 'train' / 's_box')
+    (root / 'train' / 's_box' / 'keypoints.pq').unlink()
+    cf._session_2d(root / 'train' / 's_none')
+    for f in ('keypoints.pq', 'instances.pq'):
+        (root / 'train' / 's_none' / f).unlink()
+
+    ds = PoseDataset(root, 'train', CFG, train=False)
+    assert ds.index
+    assert {it.session.path.name for it in ds.index} == {'s_lab'}
+
+
 def test_a_3d_rotation_that_loses_the_animal_is_reverted():
     """The library's rotation crops to the border-free inscribed rectangle, which can throw the
     animal out of the frame; `_item`'s guard must revert such a rotation, not keep it silently.

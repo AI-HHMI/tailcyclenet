@@ -79,8 +79,11 @@ the distinction from row counts in every consumer is guesswork the producer can 
           <cam>.mp4                          # video, one per camera
 ```
 
-An annotation session must have at least one non-empty `keypoints.pq` or `points3d.pq`. An
-inference prediction session is marked by the top-level `prediction_session = true` key and may
+Every label table is optional. A session may carry any combination of `keypoints.pq`,
+`points3d.pq` and `instances.pq`, including none of them: boxes alone are a detection dataset,
+and a session with no label table at all is an unlabelled clip — context, pretraining media, or
+footage waiting to be annotated. A consumer that needs a particular layer skips sessions that do
+not have it. An inference prediction session is marked by the top-level `prediction_session = true` key and may
 carry `points2d.pq`; see §8b. Its top-level `complete` marker is false while output is being
 written and becomes true only after all tables finalize; prediction readers refuse `complete = false`.
 This prediction-only table is not an annotation-label substitute and does not make the session a
@@ -260,8 +263,8 @@ Same enum, same semantics as §7. `missing` here means "this point exists on thi
 frame and is not observable" — the honest 3D counterpart of an occlusion, distinct from a row
 that was never written.
 
-A session may carry `points3d.pq` alone, `keypoints.pq` alone, or both (a calibrated multi-view
-session with real 2D labels *and* a triangulated 3D solution). The consumer derives what it
+A session may carry `points3d.pq` alone, `keypoints.pq` alone, both (a calibrated multi-view
+session with real 2D labels *and* a triangulated 3D solution), or neither (§3). The consumer derives what it
 needs: 2D from 3D by projection, 3D from 2D by triangulation. Neither derivation is stored.
 
 ### 8b. `points2d.pq` — inference-only 2D predictions
@@ -348,7 +351,9 @@ One row per animal per view per frame **where a determination was made**.
 | `status` | dictionary\<int8,str\> | ✓ | `labeled` \| `present` \| `absent` |
 | `notes` | str | | |
 
-- `labeled` — keypoint or 3D rows exist for this instance (partially or fully).
+- `labeled` — the instance was annotated: keypoint or 3D rows exist for it (partially or fully),
+  or it carries a box and no keypoints at all. A box-only `labeled` row is a detection label — a
+  detector trains on it — which is the opposite of `present`.
 - `present` — the animal is in this view but was not annotated. **An ignore region**: a
   prediction landing here is neither a true nor a false positive. This exists because it is
   measurable: on a multi-animal rodent recording, **73% of a tracker's false positives were real
@@ -448,9 +453,9 @@ Checkable rules, so a validator can be written without re-deriving them.
 5. `mode = "3d"` ⇒ ≥ 2 cameras, each with `matrix`, `rotation`, `translation`.
    `mode = "2d"` ⇒ exactly 1 camera.
 6. Every `bodypart` ∈ `names`; every `camera` ∈ `calibration.toml`; every `group_id` ∈
-   `groups.pq`; every `frame` ∈ `[0, n_frames)`. Annotation sessions need non-empty
-   `keypoints.pq` or `points3d.pq`; `prediction_session = true` may instead use `points2d.pq` and
-   is not eligible as training annotation input.
+   `groups.pq`; every `frame` ∈ `[0, n_frames)`. No label table is required (§3).
+   `prediction_session = true` may carry `points2d.pq` and is not eligible as training annotation
+   input.
 7. Each group folder has exactly one `<cam>/` dir **or** one `<cam>.mp4` per declared camera —
    not both. An image dir holds exactly `n_frames` files named `%06d.png` or `%06d.jpg`,
    contiguous from `000000`, **one extension per directory**. (Positional and contiguous because
@@ -468,7 +473,9 @@ Checkable rules, so a validator can be written without re-deriving them.
     prediction sessions only, `points3d.pq` may retain best-guess `x,y,z` on `status = missing`
     rows as specified in §8b.
 11. If `instances.pq` exists, every positioned or `missing` keypoint row has a matching instance
-    row with `status = labeled`, and a `labeled` instance has at least one such row.
+    row with `status = labeled`, and a `labeled` instance has at least one such row, a
+    `points3d.pq` row for the same `(group_id, frame, animal_id)`, or a box. A `labeled` row with
+    none of the three asserts an annotation that is not there.
     `unlabeled` rows are exempt — they are progress markers. Fewer than `K` assessed rows is
     legal.
 12. `mode = "3d"` with per-camera annotation 2D: every `animal_id` with ≥ 2 `labeled` views
@@ -552,8 +559,9 @@ The mechanical parts are easy; these are the parts that bite.
 - **Symlink the pixels.** One link per camera per group; do not copy, and do not link per frame.
 - **Check the frame counts.** Array length and image count disagreeing by one is common; truncate
   to the pixels and report it per group rather than padding silently.
-- **A fully-unlabelled clip should be dropped, loudly.** It will otherwise be a group every
-  consumer rejects, for reasons no one can see from the files.
+- **Decide whether a fully-unlabelled clip belongs.** A session with no label table is legal and
+  useful as context or pretraining media, but a supervised consumer skips it. If it is there by
+  accident, drop it loudly rather than ship a session nobody can learn from.
 - **Calibration that differs between clips means they are different sessions.** Calibration is a
   session property in this format; clips that disagree about it cannot share a session.
 - **Decide whether the source labels every animal, and say so.** Omitting `regions.pq` asserts

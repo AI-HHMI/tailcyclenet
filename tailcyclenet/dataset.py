@@ -1030,12 +1030,16 @@ class PoseDataset(Dataset):
                     self.registry.ids_for(ds.name, sess.names), dtype=torch.long)
                 for gid, group in sess.groups.items():
                     lab = sess.labels(gid)
+                    if lab.points2d is None and lab.points3d is None:
+                        # No pose layer at all (boxes-only or unlabelled, both legal, §3):
+                        # nothing to index, so skip rather than refuse.
+                        continue
                     need = 'points3d' if sess.mode == '3d' else 'points2d'
                     if getattr(lab, need) is None:
                         raise ValueError(
                             f'{sess.path}: mode is {sess.mode!r} so every window needs '
                             f'{need}, and this session carries none. The format allows it '
-                            '(one label table is enough) but training on it does not: there is '
+                            '(no label table is required) but training on it does not: there is '
                             'nothing to supervise the targets with.')
                     vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
                     if vis is None:

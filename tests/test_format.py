@@ -361,6 +361,24 @@ def test_prediction_points3d_missing_status_may_keep_coordinates(tmp_path):
                    fmt.validate_session(fmt.Session.load(path), check_images=False))
 
 
+def test_rule_6_no_label_table_is_required(tmp_path):
+    """Boxes alone are a detection session; no label table at all is an unlabelled clip."""
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    (path / 'keypoints.pq').unlink()
+    assert (path / 'instances.pq').exists()
+    sess = fmt.Session.load(path)
+    assert not fmt.validate_session(sess, check_images=False)
+    lab = sess.labels('g000')
+    assert lab.points2d is None or not np.isfinite(lab.points2d).any()
+    assert (lab.instance == fmt.INST_LABELED).any()
+
+    (path / 'instances.pq').unlink()
+    sess = fmt.Session.load(path)
+    assert not fmt.validate_session(sess, check_images=False)
+    sess.labels('g000')
+
+
 def test_rule_5_3d_needs_two_calibrated_cameras(tmp_path):
     _session_3d(tmp_path / 'ds' / 'train' / 'a')
     calib = tmp_path / 'ds' / 'train' / 'a' / 'calibration.toml'

@@ -1192,7 +1192,7 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     rule 2 (names unique; skeleton/flip_pairs reference known names; flip is an involution --
     each pair is listed once, and the involution is the symmetric closure, so the only way to
     break it is to name a keypoint in two pairs with different partners); rules 4/5 (cameras
-    and calibration); rule 6 (a label table exists); rule 9 (no duplicate keys); rule 10 (a
+    and calibration); rule 9 (no duplicate keys); rule 10 (a
     positioned row -- visible or projected -- carries its coordinates); rule 15 (regions:
     known status, non-empty rectangles; camera and frame are checked by `labels()`); rule 13
     (extrinsics only for cameras declared moving, and EVERY frame of every moving camera -- a
@@ -1259,12 +1259,8 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     elif len(sess.rig) != 1:
         bad(5, f'mode=2d with {len(sess.rig)} cameras')
 
-    has_annotation_table = ((sess.path / 'keypoints.pq').exists()
-                            or (sess.path / 'points3d.pq').exists())
-    has_prediction_2d = (sess.prediction_session and (sess.path / 'points2d.pq').exists())
-    if not has_annotation_table and not has_prediction_2d:
-        bad(6, 'neither keypoints.pq nor points3d.pq exists'
-            + (' (prediction sessions may use points2d.pq)' if sess.prediction_session else ''))
+    # No label table is required (§3): boxes alone are a detection session, and a session with
+    # no label table at all is an unlabelled clip. Consumers skip what they cannot use.
 
     keys = {'keypoints': ('group_id', 'frame', 'animal_id', 'camera', 'bodypart'),
             'points3d': ('group_id', 'frame', 'animal_id', 'bodypart'),

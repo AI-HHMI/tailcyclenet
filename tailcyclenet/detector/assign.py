@@ -151,32 +151,6 @@ def assign(anchors, gt_boxes, max_pos_per_gt=None):
     return out
 
 
-def certified_anchors(anchors, regions, gt_boxes):
-    """(A,) bool: which anchors sit in area an annotator certified as completely labelled.
-
-    An anchor is certified when its centre is inside any `regions.pq` rectangle OR inside any
-    finite GT box -- the union is APT's own rule, and without it an animal's own anchors would be
-    unsupervised wherever the annotator drew no Label Box, which is most frames. Non-finite rows
-    in either input are dropped, so `box_collate`'s NaN padding certifies nothing rather than
-    certifying the origin.
-
-    OUTSIDE this set the objectness target is UNKNOWN, not negative: on a labelled root a frame
-    names a median of 2 rats where the tracker finds 11, so training the other ~9 as background
-    is a false negative per rat per frame.
-    """
-    cx, cy = anchors[:, 0], anchors[:, 1]
-    ok = torch.zeros(cx.shape, dtype=torch.bool, device=anchors.device)
-    for r in (regions, gt_boxes):
-        if r is None or r.numel() == 0:
-            continue
-        r = r[torch.isfinite(r).all(-1)]
-        if r.numel() == 0:
-            continue
-        ok |= ((cx[:, None] > r[None, :, 0]) & (cx[:, None] < r[None, :, 2]) &
-               (cy[:, None] > r[None, :, 1]) & (cy[:, None] < r[None, :, 3])).any(1)
-    return ok
-
-
 def keypoint_loss(pred, target, gt_boxes):
     """L1 over box sides + BCE on the score channel, both masked by the LABEL, not by K.
 
@@ -258,7 +232,7 @@ def ciou_loss(pred, target, eps=1e-7):
 
 def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                   kpts=None, gt_kpts=None, kpt_weight=1.0, kpt_score_weight=1.0,
-                  regions=None, negative_supervision=None, iou_aware=False, iou_aware_warmup=2000, it=None,
+                  negative_supervision=None, iou_aware=False, iou_aware_warmup=2000, it=None,
                   max_pos_per_gt=None, assignment='center', box_loss_fn='giou',
                   tal_topk=13, tal_alpha=1.0, tal_beta=6.0):
     """BCE(objectness) over every anchor + GIoU over the positives.
@@ -273,7 +247,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         iou_aware_warmup / it -- the IoU target stays at hard 1.0 while `it < warmup`
             (chicken-and-egg: with the head's rare-positive bias, predicted IoU starts near 0);
             `it=None` behaves as "past warmup".
-        regions (B,M,4) -- restrict the objectness BCE to CERTIFIED area.
         negative_supervision (B,) bool -- whether each image's non-positive anchors are known
             background. False keeps only positive objectness terms; it is reported as
             `parts['negative_frames']`.
@@ -282,14 +255,13 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
             selection.
     Outputs:
         (total, parts): total = obj + box_weight*box (+ keypoint terms); parts carries obj,
-        box, n_pos and any optional diagnostics (certified, negative_frames, iou_target, kpt,
-        kpt_score).
+        box, n_pos and any optional diagnostics (negative_frames, iou_target, kpt, kpt_score).
     Side effects:
         None.
     Notes:
         The normaliser is deliberately `/ max(n_pos, B)`: masking shrinks the objectness SUM
         without shrinking its divisor, silently reweighting `obj` against `box_weight`, and
-        `parts['certified']` reports the shift. The certified/negative weight-forcing keys on
+        `parts['negative_frames']` reports the shift. The negative weight-forcing keys on
         WHETHER an anchor is positive (`pos_mask`, binary), never on its target VALUE -- under
         `iou_aware` those come apart.
     """
@@ -304,9 +276,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
         if negative_supervision.numel() != B:
             raise ValueError(f'negative_supervision has {negative_supervision.numel()} values '
                              f'for batch size {B}')
-    weight = (None if regions is None and negative_supervision is None
-              else torch.ones_like(obj_logits))
-    n_cert = 0.0
+    weight = None if negative_supervision is None else torch.ones_like(obj_logits)
     losses_box, n_pos = [], 0
     kpt_reg, kpt_sc, n_kpt, n_vis = [], [], 0, 0
     for b in range(B):
@@ -316,10 +286,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
                                   beta=tal_beta)
         else:
             pos, gix = assign(anchors, gt_boxes[b], max_pos_per_gt=max_pos_per_gt)
-        if regions is not None:
-            cert = certified_anchors(anchors, regions[b], gt_boxes[b])
-            weight[b] *= cert.to(weight.dtype)
-            n_cert += float(cert.float().mean())
         if negative_supervision is not None and not bool(negative_supervision[b]):
             weight[b].zero_()
         if pos.numel():
@@ -349,8 +315,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
            else torch.zeros((), device=device))
     total = obj + box_weight * box
     parts = {'obj': float(obj.detach()), 'box': float(box.detach()), 'n_pos': n_pos}
-    if regions is not None:
-        parts['certified'] = n_cert / max(B, 1)
     if negative_supervision is not None:
         parts['negative_frames'] = float(negative_supervision.float().mean())
     if iou_aware:

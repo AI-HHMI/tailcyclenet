@@ -195,7 +195,7 @@ def _make_labels(group_anchors: list[dict], start: int, names: list[str]) -> fmt
         status[0, local, visible, 0] = fmt.VISIBLE
         status[0, local, ~visible, 0] = fmt.MISSING
     return fmt.Labels(animal_ids=['animal0'], points3d=None, vis3d=None,
-                      points2d=points, vis2d=status, boxes=None, instance=None, regions=None)
+                      points2d=points, vis2d=status, boxes=None, instance=None)
 
 
 def convert(src: Path, out: Path, clean: bool = False) -> None:

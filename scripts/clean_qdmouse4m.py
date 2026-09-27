@@ -212,7 +212,6 @@ def clean_labels(labels: fmt.Labels, names: list[str], masks: dict[str, np.ndarr
         boxes=None if labels.boxes is None else np.array(labels.boxes, copy=True),
         instance=None if labels.instance is None else np.array(labels.instance, copy=True),
         ext=None if labels.ext is None else np.array(labels.ext, copy=True),
-        regions=None if labels.regions is None else np.array(labels.regions, copy=True),
     )
     for ai, animal in enumerate(out.animal_ids):
         low = masks.get(animal)
@@ -228,13 +227,7 @@ def clean_labels(labels: fmt.Labels, names: list[str], masks: dict[str, np.ndarr
 
 
 def slice_labels(labels: fmt.Labels, start: int, end: int) -> fmt.Labels:
-    """Return a copied label slice with local frame coordinates and regions adjusted."""
-    regions = None
-    if labels.regions is not None:
-        regions = np.array(labels.regions, copy=True)
-        keep = (regions[:, 0] >= start) & (regions[:, 0] < end)
-        regions = regions[keep]
-        regions[:, 0] -= start
+    """Return a copied label slice with local frame coordinates."""
     return fmt.Labels(
         animal_ids=list(labels.animal_ids),
         points3d=None if labels.points3d is None else labels.points3d[:, start:end].copy(),
@@ -244,7 +237,6 @@ def slice_labels(labels: fmt.Labels, start: int, end: int) -> fmt.Labels:
         boxes=None if labels.boxes is None else labels.boxes[:, start:end].copy(),
         instance=None if labels.instance is None else labels.instance[:, start:end].copy(),
         ext=None if labels.ext is None else labels.ext[:, start:end].copy(),
-        regions=regions,
     )
 
 
@@ -544,7 +536,7 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
     before_rows: dict[tuple[str, str, str], int] = {}
     for split in fmt.SPLITS:
         for session in ds.sessions.get(split, []):
-            for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
+            for stem in ('points3d', 'keypoints', 'instances', 'extrinsics'):
                 table_path = session.path / f'{stem}.pq'
                 if table_path.exists():
                     before_rows[(split, session.session_id, stem)] = pq.read_metadata(
@@ -552,7 +544,7 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
             for gid in session.groups:
                 labels = session.labels(gid)
                 if not has_labels(labels):
-                    for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
+                    for stem in ('points3d', 'keypoints', 'instances', 'extrinsics'):
                         table_path = session.path / f'{stem}.pq'
                         if table_path.exists():
                             group_ids = pq.read_table(table_path, columns=['group_id'])
@@ -627,7 +619,7 @@ def prune_unlabeled(root: Path) -> dict[str, int]:
             for gid in session.groups:
                 if not (session.path / 'groups' / gid).exists():
                     phantom.append(f'{split}/{session.session_id}/{gid}')
-            for stem in ('points3d', 'keypoints', 'instances', 'regions', 'extrinsics'):
+            for stem in ('points3d', 'keypoints', 'instances', 'extrinsics'):
                 table_path = session.path / f'{stem}.pq'
                 if table_path.exists():
                     after_rows[(split, session.session_id, stem)] = pq.read_metadata(

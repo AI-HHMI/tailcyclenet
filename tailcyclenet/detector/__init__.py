@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from .assign import (assign, assign_tal, box_iou, certified_anchors, ciou_loss, decode,
+from .assign import (assign, assign_tal, box_iou, ciou_loss, decode,
                      detector_loss, giou_loss, paired_iou)
 from .associate import associate
 from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
@@ -68,7 +68,7 @@ __all__ = ['YOLOXNano', 'YOLOX_TIERS', 'BoxDataset', 'ChunkShuffle', 'CohortSamp
            'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'unletterbox_keypoints', 'assign', 'assign_tal', 'box_iou',
-           'certified_anchors', 'ciou_loss', 'decode', 'detector_loss', 'giou_loss',
+           'ciou_loss', 'decode', 'detector_loss', 'giou_loss',
            'associate',
            'detect_raw', 'associate_group', 'link_rows', 'load_coco_backbone',
            'paired_iou', 'resolve_detector_checkpoint']

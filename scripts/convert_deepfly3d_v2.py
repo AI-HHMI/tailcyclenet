@@ -195,7 +195,6 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool) -> di
     labels = fmt.Labels(
         animal_ids=['fly0'], points3d=dense_xyz, vis3d=dense_vis3d,
         points2d=dense_xy, vis2d=dense_vis2d, boxes=None, instance=None,
-        regions=np.zeros((0, 6), np.float64),
     )
     provenance = {
         'source': 'DeepFly3D v1 Ramdya Dataverse v2 tracked output',

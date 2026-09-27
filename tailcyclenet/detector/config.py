@@ -26,6 +26,10 @@ keys: `det_scale`, `scale_jitter`, `aug_switch_off_iter`, `ignore_present`, `neg
 `augment_copypaste`/`copypaste_max`, `neg_loss_weight`, `temporal_input`, `p2_bottomup`,
 `tal_soft_prior`, `no_decay_norm_bias`, `freeze_backbone`, `head_depthwise`, the ViT backbones
 and CSPNeXt. See that plan for the evidence behind each.
+
+`use_regions` is DELETED with `regions.pq` itself: the format no longer has certified areas. A
+camera-frame's negatives are governed by its `instances.pq` statuses (`BoxDataset
+.negative_supervision_for`), which needs no key.
 """
 from __future__ import annotations
 
@@ -41,7 +45,7 @@ DATA_KEYS = frozenset({
     'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
     'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
-    'use_regions', 'alpha',
+    'alpha',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -176,7 +180,6 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['reduce'] = bool(data.get('reduce', False))
     data['keypoints'] = bool(data.get('keypoints', False))
     data['hflip'] = bool(data.get('hflip', True))
-    data['use_regions'] = bool(data.get('use_regions', False))
     af = data.get('annot_frac', None)
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:

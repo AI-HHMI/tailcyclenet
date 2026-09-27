@@ -7,7 +7,7 @@ those anchors. Groups never cross discontinuities detected from the source predi
 runs produce proportionally shorter groups. Groups share a resumable lossless PNG cache through
 relative symlinks.
 
-No ``regions.pq`` is written. Complete anchors receive derived ``instances.pq`` boxes, while
+Complete anchors receive derived ``instances.pq`` boxes, while
 partial six-fish anchors retain keypoints but no instance row. Finite placed occlusions are
 ``projected``; explicit coordinate-free rows are ``missing``. Six-fish identities are inferred
 only within each group and recorded with match diagnostics in ``identity_map.pq``.
@@ -341,9 +341,8 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
                  n_frames: int = WINDOW, box_pad: int = 2) -> tuple[fmt.Labels, int]:
     """Build one group's labels over `n_frames` stored frames, at its anchors only.
 
-    `regions.pq` is deliberately NOT emitted. Its absence is the format's claim of exhaustive
-    labelling (spec S9b), and `instances.pq` now carries the machinery that makes that claim
-    safe: a `labeled` row is written ONLY for an anchor frame where every expected animal is
+    A session without an incompleteness marker claims exhaustive labelling (spec S9), and
+    `instances.pq` carries the machinery that makes that claim safe: a `labeled` row is written ONLY for an anchor frame where every expected animal is
     present and labelled. An anchor that labelled 1/2/4 of 6 fish gets NO rows at all.
 
     That one omission does two things, and it is why the fix is an omitted row rather than
@@ -421,8 +420,7 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
             instance[a, local, 0] = fmt.INST_LABELED
             boxes[a, local, 0] = box.numpy()
     return fmt.Labels(animal_ids=animal_ids, points3d=None, vis3d=None,
-                      points2d=points, vis2d=status, boxes=boxes, instance=instance,
-                      regions=None), complete
+                      points2d=points, vis2d=status, boxes=boxes, instance=instance), complete
 
 
 def _valid_png(path: Path, width: int, height: int) -> bool:
@@ -646,8 +644,6 @@ def convert_one(src: Path, out: Path, cfg: dict, clean: bool, resume: bool,
                               'identity_map.pq carries the per-row match distance and '
                               'competitor margin.'
                               if cfg['n_animals'] > 1 else 'one fish; identity association is not applicable'),
-            'regions_note': ('no regions.pq is written; per spec S9b its absence asserts exhaustive '
-                             'labelling everywhere'),
             'instances_note': (f'instances.pq carries the crop rule\'s own padded extent '
                                f'(pad={box_pad} px, min_crop_dim=64) as a `labeled` row, '
                                'written ONLY on anchors where every expected animal is present '

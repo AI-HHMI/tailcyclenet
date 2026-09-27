@@ -48,9 +48,9 @@ the distinction from row counts in every consumer is guesswork the producer can 
    missing row means "no determination". A dense session simply has a row everywhere.
 9. **Partial assessment is legal.** Completeness is a read-time policy; the format never
    enforces it.
-10. **A box per animal per view, always optional** — for `labeled`, `present` and `absent` alike.
-    When given it is a human judgment enclosing the animal; it is *not* required to match the
-    keypoint extent or any particular crop rule.
+10. **A box per animal per view: required on `labeled`, optional on `present` and `absent`.**
+    It is a judgment enclosing the animal; it is *not* required to match the keypoint extent or
+    any particular crop rule.
 11. **No `annotator` column.** Multiple annotators = separate dataset roots, the annotator named
     in `session.toml` `[provenance]`. Two annotators on one point would collide with the row key.
 12. **All camera geometry lives in `calibration.toml`**, including the crop. `session.toml` is
@@ -71,7 +71,6 @@ the distinction from row counts in every consumer is guesswork the producer can 
       points2d.pq                     # inference predictions only              (optional extension)
       window_predictions.pq           # optional, non-spec per-window sidecar
       instances.pq                    # boxes / present / absent                (optional)
-      regions.pq                      # areas certified completely labelled     (optional)
       extrinsics.pq                   # per-frame extrinsics, moving cameras    (optional)
       groups/
         <group_id>/
@@ -347,17 +346,21 @@ One row per animal per view per frame **where a determination was made**.
 |---|---|---|---|
 | `group_id`, `animal_id`, `camera` | dictionary\<int32,str\> | ✓ | the key |
 | `frame` | int32 | ✓ | |
-| `x0,y0,x1,y1` | float32 | | box in stored-image px; always optional |
+| `x0,y0,x1,y1` | float32 | | box in stored-image px; **required** on `labeled`, optional otherwise |
 | `status` | dictionary\<int8,str\> | ✓ | `labeled` \| `present` \| `absent` |
 | `notes` | str | | |
 
-- `labeled` — the instance was annotated: keypoint or 3D rows exist for it (partially or fully),
-  or it carries a box and no keypoints at all. A box-only `labeled` row is a detection label.
-  **`labeled` asserts the view is completely labelled**: every animal in it has a row, so the
-  background of that camera-frame is a genuine negative.
+- `labeled` — the instance was annotated, **and it carries a box** (rule 11). Keypoint or 3D rows
+  may exist for it (partially or fully), or the box may be the whole annotation — a box-only
+  `labeled` row is a detection label. **`labeled` asserts the view is completely labelled**:
+  every animal in it has a row, so the background of that camera-frame is a genuine negative. An
+  animal that was looked at but has no box (every point occluded, say) is `present`, not
+  `labeled`.
 - `present` — the animal is in this view but was not (fully) annotated. **It marks the whole
   camera-frame as incompletely labelled**, whether or not the row carries a box: other animals
-  may be there without a row, so the background is not a reliable negative. A prediction landing
+  may be there without a row, so the background is not a reliable negative. The `animal_id` need
+  not be a real animal: a converter may mark a frame incomplete with a reserved id, and a boxed
+  area the annotator singled out (APT's Label Box, say) is written this way. A prediction landing
   on a `present` animal is neither a true nor a false positive when scoring. This exists because
   it is measurable: on a multi-animal rodent recording, **73% of a tracker's false positives were
   real animals the annotator had skipped**, and excluding them moved MOTA from 0.692 to 0.709.
@@ -369,13 +372,13 @@ One row per animal per view per frame **where a determination was made**.
 | rows in this camera-frame | positive boxes | background negatives |
 |---|---|---|
 | any `present` row (boxed or not) | every finite `labeled` / `present` box | **none** |
-| `labeled` and/or `absent`, no `present` | every finite `labeled` box | yes |
+| `labeled` and/or `absent`, no `present` | every `labeled` box | yes |
 | no row at all | none | none — no determination was made |
 
 Only the background is withheld on a `present` frame; its boxed animals are still positives. A
-`labeled` row with no box, where the consumer takes its targets from the boxes, is an animal with
-no target, so the consumer must not train that frame's background as negative either. A session
-with no `instances.pq` keeps the §9b rule: exhaustive everywhere, or only inside `regions.pq`.
+session with no `instances.pq` makes no incompleteness claim: it is exhaustively labelled
+everywhere, and a converter whose source labels only some animals must write `present` rows to
+say so.
 
 **Box encoding.** `[x0, x1) × [y0, y1)`, top-left inclusive, bottom-right exclusive, so width is
 `x1 - x0`. This matches the usual array-slicing convention, so an integer box can be used as a
@@ -387,54 +390,6 @@ warn.
 animal. That is what makes triangulation possible without a separate association step, and it is
 checkable — a validator reprojects a triangulated instance and flags ids whose median residual
 exceeds `assoc_res_max_px` (rule 12).
-
-## 9b. `regions.pq` — areas certified completely labelled (optional)
-
-One row per rectangle an annotator has certified as **exhaustively labelled**: inside it, every
-animal that is there carries a row, so an area with no label is a genuine negative.
-
-| column | type | req | meaning |
-|---|---|---|---|
-| `group_id`, `camera` | dictionary\<int32,str\> | ✓ | the key, with `frame` |
-| `frame` | int32 | ✓ | 0-based index into the group |
-| `x0,y0,x1,y1` | float32 | ✓ | stored-image px, `[x0,x1) × [y0,y1)` as in §9 |
-| `status` | dictionary\<int8,str\> | ✓ | `labelled_complete` |
-
-**The file's absence is a claim, not a gap.** No `regions.pq` means the session is exhaustively
-labelled everywhere — the reading every dataset in this format already assumed, so nothing changes
-for a session that does not carry one. When the file *is* present the claim inverts: only the
-listed rectangles, together with that frame's own `instances.pq` boxes, are certified, and
-everything outside them is unknown. A consumer training a detector must then supervise only the
-certified area, or it teaches the unlabelled animals elsewhere in the frame to be background.
-
-**This cannot ride in `instances.pq`, and the reason is polarity.** That table is keyed by
-`animal_id`, and a `present` row withdraws the negative claim for its whole camera-frame (§9).
-A region is the opposite: a statement about pixels, with no animal attached, asserting that absence
-of a label here *is* evidence of absence. There is no `animal_id` to give it, and the two would be
-read with opposite signs by the same consumer. Where both apply, the `present` rule wins: a
-camera-frame with a `present` row trains no background negatives, certified or not.
-
-Rows may overlap, and a frame may carry any number of them (including none). There is no unique
-key, so rule 9 does not apply. A rectangle with `x1 <= x0` or `y1 <= y0` is an error (rule 15),
-not an empty region — a certificate covering nothing is always a bug in the converter.
-
-**Membership is by CENTROID, not by overlap, and this is not a detail.** An animal is inside a
-region iff the mean of its keypoints is; one straddling the boundary with its centre outside is
-*not* required to be labelled. A consumer that instead tests pixel overlap will read that animal
-as an uncertified miss inside a certified area and conclude the certificate is unreliable. This
-was hit on the first render of `rat-city-annotated`: a Label Box that looked like it held an
-unlabelled rat, whose centre is in fact just outside the edge. It is also the source's own rule —
-APT tests `mask[round(nanmean(keypoints))]` (`APT_interface.py`, `labels_within_mask`).
-
-The source is APT's `labelsRoi` ("Label Box"), whose own help text describes it as marking
-"regions that are completely labeled… teaching the classifier what a negative label is". A frame
-with a Label Box but no rectangle covering the rest of the frame is asserting exactly that: the
-box is trustworthy and the rest of the frame is not. APT joins these to the per-target loss masks
-around each labelled animal (`rois = concatenate([rois, erois])`) and then samples its *negative*
-patches from inside the union, which is the polarity stated above, measured rather than inferred
-from the name. Note that its per-target mask is the keypoint extent padded by 1.5× with a 32 px
-floor, which is larger than the box `instances.pq` carries here — so reading the certified area as
-"regions ∪ instance boxes" understates it slightly, in the safe direction.
 
 ## 10. `extrinsics.pq` — moving cameras (optional)
 
@@ -490,12 +445,13 @@ Checkable rules, so a validator can be written without re-deriving them.
     in §8b. In annotation sessions, `missing` and `unlabeled` rows have null coordinates. In
     prediction sessions only, `points3d.pq` may retain best-guess `x,y,z` on `status = missing`
     rows as specified in §8b.
-11. If `instances.pq` exists, every positioned or `missing` keypoint row has a matching instance
-    row with `status = labeled`, and a `labeled` instance has at least one such row, a
-    `points3d.pq` row for the same `(group_id, frame, animal_id)`, or a box. A `labeled` row with
-    none of the three asserts an annotation that is not there.
+11. **Every `labeled` instance row carries a finite, non-empty box** (`x1 > x0`, `y1 > y0`). A
+    `labeled` row without one asserts a detection label that is not there; write `present` for an
+    animal whose box was not annotated. If `instances.pq` exists, every positioned or `missing`
+    keypoint row has a matching instance row with `status = labeled` or `present`.
     `unlabeled` rows are exempt — they are progress markers. Fewer than `K` assessed rows is
-    legal.
+    legal. Prediction sessions (§8b) are exempt: their `instances.pq` may carry a `labeled` row
+    with a null box where no detector box was available.
 12. `mode = "3d"` with per-camera annotation 2D: every `animal_id` with ≥ 2 `labeled` views
     triangulates with median reprojection residual below `assoc_res_max_px`. Catches cross-view id
     mismatches. This rule does not compare prediction-only `points2d.pq` against `points3d.pq`.
@@ -506,12 +462,6 @@ Checkable rules, so a validator can be written without re-deriving them.
     only in `[provenance] annotator` are the carve-out — they share sessions by design. A dataset
     whose splits are frame ranges of one recording violates the spirit of this by construction; a
     validator should **warn rather than fail**, because the alternative is discarding the dataset.
-15. If `regions.pq` exists, every row has `status = labelled_complete`, a `camera` in
-    `calibration.toml`, a `frame` in `[0, n_frames)`, and a non-empty rectangle (`x1 > x0` and
-    `y1 > y0`). An empty rectangle is an error, not a no-op. A group with no rows is legal and
-    means nothing in that group is certified — which is why an **empty** `regions.pq` differs from
-    an **absent** one, and a converter that has no regions for a session must decide which it
-    means rather than defaulting.
 
 ## 12. What a consumer reads
 
@@ -527,15 +477,7 @@ vis2d       (S, T, K, C)    int8       same codes, plus 2 projected (position, n
 boxes       (S, T, C, 4)    float32    NaN where no box
 instance    (S, T, C)       int8       -1 none, 0 absent, 1 present(incomplete), 2 labeled
 ext         (C, T, 4, 4)    float64    only when a camera is moving
-regions     (M, 6)          float64    [frame, camera, x0, y0, x1, y1]; None iff no regions.pq
 ```
-
-`regions` has no animal axis, so it is a flat list rather than a dense array — the rows of one
-group's `regions.pq`, in file order. **`None` and an empty `(0,6)` are different answers** and a
-consumer must not conflate them: `None` means the file is absent and the session claims to be
-exhaustively labelled, while `(0,6)` means the file exists and certifies nothing in this group.
-Collapsing them to "no regions" reads a group with zero certified area as fully labelled, which is
-the exact inversion the table exists to prevent.
 
 `K` is the length of `names`; `C` the number of cameras; `S` the number of distinct `animal_id`s
 in the group; `T` the group's `n_frames`.
@@ -582,13 +524,13 @@ The mechanical parts are easy; these are the parts that bite.
   accident, drop it loudly rather than ship a session nobody can learn from.
 - **Calibration that differs between clips means they are different sessions.** Calibration is a
   session property in this format; clips that disagree about it cannot share a session.
-- **Decide whether the source labels every animal, and say so.** Omitting `regions.pq` asserts
-  that it does. Many hand-annotation projects label a few animals per frame in a crowded scene and
-  record the completely-labelled area separately (APT's `labelsRoi`); converting the keypoints and
-  dropping that area teaches every unlabelled animal to a detector as background. Measured on one
-  such project: a labelled frame names a median of **2** rats where a tracker finds a median of
-  **11**. If the source records completeness, convert it; if it records nothing, and you know the
-  labelling is partial, write an **empty** `regions.pq` rather than none.
+- **Decide whether the source labels every animal, and say so.** A camera-frame with no `present`
+  row asserts that it does. Many hand-annotation projects label a few animals per frame in a
+  crowded scene; converting only the keypoints teaches every unlabelled animal to a detector as
+  background. Measured on one such project: a labelled frame names a median of **2** rats where a
+  tracker finds a median of **11**. If you know the labelling of a frame is partial, write a
+  `present` row on it (boxed if you have a box, under a reserved `animal_id` if you have no
+  animal).
 
 ### From isolated labelled frames
 

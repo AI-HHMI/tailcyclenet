@@ -56,17 +56,14 @@ keypoints = false
 # the horizontal flip in the augmentation; exists for the box-only control arm (`keypoints = true` disables it implicitly).
 hflip = true
 
-# train on TILES of this size in INPUT pixels (SOURCE extent = tile_wh / tile_scale); empty = whole frames, byte-identical; its ONE justification is use_regions.
+# train on TILES of this size in INPUT pixels (SOURCE extent = tile_wh / tile_scale); empty = whole frames, byte-identical.
 tile_wh = []
 
 # source -> input scale for tile_wh (1.0 = native). DO NOT ALSO RESIZE THE TILE: the invariant is the animal's size in INPUT pixels.
 tile_scale = 1.0
 
-# background tiles per frame, centres inside the certified area
+# background tiles per frame; drawn only on camera-frames whose background is a known negative (no `present` instance row)
 tile_bg_per_frame = 1
-
-# mask the objectness loss to the area regions.pq certifies as completely labelled; measured DEAD on whole frames -- use it WITH tiles; UNDEFINED under augment_strong.
-use_regions = false
 
 [model]
 # the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, byte-identical to every recorded detector). DEFAULTS TO `hybrid` (CNN backbone + a from-scratch ViT stage + Simple Feature Pyramid) -- confirmed the detector-architecture-sweep winner (report 47): large wins on rat-city-combined and allen-mouse-combined, ties elsewhere, no significant loss on any of the 6 training roots. `tiny` (COCO-pretrained) is the prior default, still available by name.

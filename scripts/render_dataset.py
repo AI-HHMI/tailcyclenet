@@ -5,8 +5,7 @@
 
 Three views per sampled group: the sheet (labelled frame, all overlays), per-animal crops at
 NATIVE resolution (the only view a keypoint's position is checkable in), and optionally a
-video of the whole group with the frame index burned in. `regions.pq` is drawn in CYAN: it marks
-the area the annotator certified as completely labelled, not an animal.
+video of the whole group with the frame index burned in.
 """
 from __future__ import annotations
 
@@ -21,8 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt
 from tailcyclenet.dataset import read_frames
 
-# BGR (cv2's order). Cyan for regions, instance-status colours, fixed per-keypoint palette.
-REGION = (255, 255, 0)
+# BGR (cv2's order). Instance-status colours, fixed per-keypoint palette.
 INST_COLOR = {fmt.INST_LABELED: (80, 220, 80), fmt.INST_PRESENT: (60, 200, 255),
               fmt.INST_ABSENT: (150, 150, 150)}
 PALETTE = [(60, 60, 255), (60, 200, 255), (60, 255, 60), (255, 200, 60), (255, 60, 200),
@@ -46,13 +44,6 @@ def draw(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
     im = np.ascontiguousarray(im[:, :, ::-1]).copy()
     s = _scale((im.shape[1], im.shape[0]))
     ix = {n: i for i, n in enumerate(names)}
-
-    if lab.regions is not None and len(lab.regions):
-        for r in lab.regions[(lab.regions[:, 0] == t) & (lab.regions[:, 1] == ci)]:
-            p0, p1 = (int(r[2]), int(r[3])), (int(r[4]), int(r[5]))
-            cv2.rectangle(im, p0, p1, REGION, 3 * s)
-            cv2.putText(im, 'labelled_complete', (p0[0] + 4 * s, p0[1] + 14 * s),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, REGION, s)
 
     for a in range(lab.vis2d.shape[0] if lab.vis2d is not None else 0):
         if lab.instance is not None and lab.instance[a, t, ci] != fmt.INST_NONE:

@@ -274,47 +274,6 @@ def _drop_outside(x, bounds):
     return torch.where(out[..., None], torch.nan, x)
 
 
-def _warp_region(rects, M):
-    """(M,4) certified rects through an in-plane similarity, ROUNDING DOWN. Returns (M,4).
-
-    A certified region is a CLAIM -- "everything in here is labelled" -- and a claim must shrink
-    under a transform that makes it approximate, never grow: the axis-aligned hull of a rotated
-    rectangle claims area the annotator never marked, re-admitting the unlabelled animals
-    `regions.pq` exists to exclude. This inscribes instead, the same
-    `_rotated_rect_max_inscribed` computation the rotated image canvas uses. Under every warp that
-    existed before rotation the inscribed and circumscribed rects coincide, so this is a no-op
-    against the old code.
-
-    The rotation angle is read reflection-safe from the 2x2 block, so a scale or a flip cannot
-    be read as an angle; the inscribed-rectangle computation runs on tensors so a whole (M,4)
-    passes through at once, taking the exactly-45-degree branch where the normal one is singular.
-    """
-    A = np.asarray(M)[:, :2]
-    ang = float(np.arctan2(A[1, 0], A[0, 0]))
-    sin_a, cos_a = abs(np.sin(ang)), abs(np.cos(ang))
-    x0, y0, x1, y1 = rects.unbind(-1)
-    c = torch.stack([(x0 + x1) / 2, (y0 + y1) / 2], -1)
-    c = _apply_affine(c, (M, None))
-    s = float(np.sqrt(abs(np.linalg.det(A))))
-    w, h = (x1 - x0) * s, (y1 - y0) * s
-    if sin_a > 1e-9:
-        long_, short = torch.maximum(w, h), torch.minimum(w, h)
-        degen = short <= 2 * sin_a * cos_a * long_
-        if abs(sin_a - cos_a) < 1e-10:
-            degen = torch.ones_like(degen)
-        x, wide = 0.5 * short, w >= h
-        cw_d = torch.where(wide, x / max(sin_a, 1e-12), x / max(cos_a, 1e-12))
-        ch_d = torch.where(wide, x / max(cos_a, 1e-12), x / max(sin_a, 1e-12))
-        denom = cos_a * cos_a - sin_a * sin_a
-        denom = denom if abs(denom) > 1e-12 else 1e-12
-        cw_n = (w * cos_a - h * sin_a) / denom
-        ch_n = (h * cos_a - w * sin_a) / denom
-        w = torch.clamp(torch.where(degen, cw_d, cw_n), min=0.0)
-        h = torch.clamp(torch.where(degen, ch_d, ch_n), min=0.0)
-    half = torch.stack([w, h], -1) / 2
-    return torch.cat([c - half, c + half], -1)
-
-
 class BoxDataset(Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
@@ -325,8 +284,7 @@ class BoxDataset(Dataset):
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
-                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, use_regions=False,
-                 strong=False):
+                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False):
         """Build the per-view/per-frame index of labelled items for one dataset root.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time.
@@ -336,8 +294,6 @@ class BoxDataset(Dataset):
             input_wh -- model input size; replaced by the tile size under tiling.
             tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
                 size; `tile_scale` is the source -> input scale and the only scale there is.
-            use_regions -- mask objectness supervision to `regions.pq` CERTIFIED area; the
-                opt-in (M,4) named-dict slot `box_collate` reads by key (never by rank).
             keypoints -- also emit per-keypoint targets and kill the horizontal flip (hflip=None
                 decides from `keypoints`).
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
@@ -361,14 +317,11 @@ class BoxDataset(Dataset):
         self.tile_bg_per_frame = int(tile_bg_per_frame)
         if self.tile_wh is not None and self.tile_scale <= 0:
             raise ValueError(f'tile_scale must be > 0, got {tile_scale}')
-        self.use_regions = bool(use_regions)
         self.keypoints = bool(keypoints)
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
         self.rotate_deg = float(rotate_deg)
         self.augment = augment
         self.strong = bool(strong)
-        if self.strong and self.use_regions:
-            raise ValueError('--augment-strong (mosaic-lite) is undefined under --use-regions')
         self.reduce = reduce
         self.seed = seed
         self.datasets = load_datasets(path)
@@ -443,7 +396,7 @@ class BoxDataset(Dataset):
     def negative_supervision_for(self, sess, gid, f, ci, lab=None):
         """Whether background anchors are known negatives for this camera-frame.
 
-        Without `instances.pq`, retain the format's existing exhaustive/regions policy. With an
+        Without `instances.pq`, the session is exhaustively labelled (spec §9). With an
         instance table, a `present` row (even with no box) marks the frame incomplete and disables
         all background negatives. Otherwise at least one explicit `labeled` or `absent` row is
         required; an unrecorded frame makes no negative claim. When instance boxes are the target
@@ -476,7 +429,7 @@ class BoxDataset(Dataset):
                 return True
         # With no positive box, only an explicitly absent-only view is an all-background item. A
         # labeled animal that yields no box here (all keypoints missing, say) stays omitted, as
-        # before: its view was assessed for pose, not certified empty.
+        # before: its view was assessed for pose, not declared empty.
         if lab.instance is None or (lab.instance[:, f, ci] == INST_LABELED).any():
             return False
         return self.negative_supervision_for(sess, gid, f, ci, lab)
@@ -605,41 +558,23 @@ class BoxDataset(Dataset):
         tw, th = self._tile_extent()
         return (ox + tw / 2, oy + th / 2)
 
-    def _region_rects(self, sess, gid, f, ci):
-        """(M,4) certified rects in SOURCE px for one (frame, camera), or None if no regions.pq.
-
-        `None` and an empty `(0,4)` are DIFFERENT ANSWERS and both are returned faithfully: None is
-        "the session carries no regions.pq, so it claims exhaustive labelling and every pixel is
-        certified", `(0,4)` is "the file exists and certifies nothing here".
-        """
-        r = sess.labels(gid).regions
-        if r is None:
-            return None
-        if not len(r):
-            return np.zeros((0, 4), np.float64)
-        sel = (r[:, 0].astype(int) == f) & (r[:, 1].astype(int) == ci)
-        return np.asarray(r[sel][:, 2:], np.float64)
-
     def _tile_origins(self, sess, gid, f, ci, rng):
         """Source-pixel tile origins for one (frame, camera).
 
-        One tile per certified region, one per animal, plus `tile_bg_per_frame` background tiles.
-        Origins are JITTERED by up to a quarter of the tile: a detector trained only on animals at
-        dead centre has never seen one near a border, and `assign`'s centre prior would then be
-        learned as a centre-of-image prior.
+        One tile per animal, plus `tile_bg_per_frame` background tiles. Origins are JITTERED by up
+        to a quarter of the tile: a detector trained only on animals at dead centre has never seen
+        one near a border, and `assign`'s centre prior would then be learned as a centre-of-image
+        prior.
 
-        Where background tiles may be drawn from is exactly the None/empty distinction: `regions
-        is None` (exhaustively labelled) allows anywhere in the frame; non-empty restricts to
-        inside a certified rect (elsewhere is UNKNOWN, not background); empty `(0,4)` means no
-        certified background exists and none is drawn.
+        Background tiles are drawn only where the camera-frame's background is a known negative
+        (`negative_supervision_for`); on an incompletely labelled frame a background tile would
+        carry no loss at all.
 
-        A frame with no animal, no region and no certified background still yields ONE tile:
-        objectness has to learn "nothing here", and dropping the frame would train a detector
-        that has never seen an empty image.
+        A frame with no animal and no background tile still yields ONE tile: dropping the frame
+        would train a detector that has never seen an empty image.
         """
         W, H = (float(v) for v in sess.rig.size(sess.cam_names[ci]))
         tw, th = self._tile_extent()
-        regions = self._region_rects(sess, gid, f, ci)
         out = []
 
         def push(cx, cy):
@@ -653,18 +588,11 @@ class BoxDataset(Dataset):
             out.append((float(np.clip(cx - tw / 2 + jx, -tw / 4, max(0.0, W - 3 * tw / 4))),
                         float(np.clip(cy - th / 2 + jy, -th / 4, max(0.0, H - 3 * th / 4)))))
 
-        if regions is not None:
-            for r in regions.reshape(-1, 4):
-                push((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)
         for c in self._animal_centres(sess, gid, f, ci):
             push(c[0], c[1])
         if self.negative_supervision_for(sess, gid, f, ci):
             for _ in range(self.tile_bg_per_frame):
-                if regions is None:
-                    push(rng.uniform(0, W), rng.uniform(0, H))
-                elif len(regions):
-                    r = regions[rng.integers(len(regions))]
-                    push(rng.uniform(r[0], r[2]), rng.uniform(r[1], r[3]))
+                push(rng.uniform(0, W), rng.uniform(0, H))
         return out or [(max(0.0, (W - tw) / 2), max(0.0, (H - th) / 2))]
 
     def _animal_centres(self, sess, gid, f, ci):
@@ -710,31 +638,12 @@ class BoxDataset(Dataset):
     def _transform(self, i, size):
         """The `(scale, (padx, pady))` for item `i`: its tile's, or the whole-frame letterbox.
 
-        THE one place that choice is made; `boxes_for` and `regions_for` both come here, because a
-        region transformed by a different rule than its own boxes is invisible in a loss curve.
+        THE one place that choice is made; `boxes_for` and `ignore_for` both come here, because a
+        rectangle transformed by a different rule than its own boxes is invisible in a loss curve.
         """
         if self.origins[i] is None:
             return letterbox_transform(size, self.input_wh)
         return tile_transform(self.origins[i], self.tile_scale)
-
-    def regions_for(self, i, warp=None):
-        """Certified rectangles for item `i` in INPUT pixels, `(M,4)`, or None.
-
-        None means the session carries no `regions.pq` and therefore claims to be exhaustively
-        labelled -- every anchor is supervised. An empty `(0,4)` means the file exists and this
-        view certifies nothing. See `_region_rects`.
-        """
-        sess, gid, f, ci = self.index[i]
-        rects = self._region_rects(sess, gid, f, ci)
-        if rects is None:
-            return None
-        out = torch.as_tensor(rects, dtype=torch.float32).reshape(-1, 4)
-        if warp is not None and out.numel():
-            out = _warp_region(out, warp)
-        scale, pad = self._transform(i, sess.rig.size(sess.cam_names[ci]))
-        out[:, 0::2] = out[:, 0::2] * scale + pad[0]
-        out[:, 1::2] = out[:, 1::2] * scale + pad[1]
-        return out
 
     def ignore_for(self, i):
         """`(ig (S,) bool, ig_boxes (S,4))` for evaluation, in INPUT pixels.
@@ -888,9 +797,6 @@ class BoxDataset(Dataset):
         A keypoint of the source instance that falls outside the pasted box is dropped, the same
         rule a point warped off-frame follows.
         """
-        if self.use_regions:
-            raise RuntimeError('mosaic-lite is undefined under --use-regions: a composite frame '
-                               'has no expressible certified-area mask')
         if len(self) < 2:
             return boxes, kpts, img
         for _ in range(4):
@@ -926,12 +832,13 @@ class BoxDataset(Dataset):
         return boxes, kpts, img
 
     def __getitem__(self, i):
-        """Decode item `i`: letterboxed/tiled pixels, boxes, and optional kpts/regions.
+        """Decode item `i`: letterboxed/tiled pixels, boxes, optional kpts, and whether the
+        view's background negatives are supervised.
 
         Fresh entropy is drawn per train visit; evaluation is deterministic. Under tiling the
         input is the frame at `tile_scale`, not the tile size. One warpAffine composes decode
         scale, augmentation and letterbox-or-tile geometry. The strong suite is appearance-only
-        except cutout, which withholds targets it covers; mosaic-lite is incompatible with regions.
+        except cutout, which withholds targets it covers.
         """
         import cv2
 
@@ -942,7 +849,6 @@ class BoxDataset(Dataset):
                               centre=self._warp_centre(i)) if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
-        regions = self.regions_for(i, warp) if self.use_regions else None
         negative_supervision = self.negative_supervision_for(sess, gid, f, ci)
 
         out_wh = (self.input_wh if self.tile_wh is None
@@ -991,10 +897,6 @@ class BoxDataset(Dataset):
         item = {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
         if kpts is not None:
             item['kpts'] = kpts
-        if self.use_regions:
-            item['regions'] = (regions if regions is not None else
-                               torch.tensor([[0.0, 0.0, float(self.input_wh[0]),
-                                              float(self.input_wh[1])]]))
         return item
 
 
@@ -1084,13 +986,9 @@ def box_collate(batch):
     a real animal with no finite point in this view sends. Keypoints pad the same way, so a
     padded (S,K,3) slice is non-finite in every channel and every mask drops it.
 
-    Items are explicit named dicts (`x`, `boxes`, optional `kpts`/`regions`) -- dispatched BY
-    NAME, not by rank or tuple length. The old rank-based dispatch was what let the docstring's
-    own "ambiguous at three elements" failure silently feed regions to the keypoint loss; a
-    named contract cannot.
-
-    Regions NaN-pad the same way, and for the same reason: `certified_anchors` drops a
-    non-finite rect, so a padded row certifies nothing rather than certifying the origin.
+    Items are explicit named dicts (`x`, `boxes`, optional `kpts`, `negative_supervision`) --
+    dispatched BY NAME, not by rank or tuple length. The old rank-based dispatch once fed
+    rectangles to the keypoint loss; a named contract cannot.
     """
     xs = torch.stack([b['x'] for b in batch])
     n = max(b['boxes'].shape[0] for b in batch)
@@ -1107,15 +1005,6 @@ def box_collate(batch):
             kpts[i, :k.shape[0]] = k
         out['kpts'] = kpts
 
-    if any('regions' in b for b in batch):
-        rs = [b['regions'] for b in batch if 'regions' in b]
-        m = max(1, max(r.shape[0] for r in rs))
-        regions = torch.full((len(batch), m, 4), float('nan'))
-        for i, b in enumerate(batch):
-            r = b['regions']
-            regions[i, :r.shape[0]] = r
-        out['regions'] = regions
-
     if any('negative_supervision' in b for b in batch):
         out['negative_supervision'] = torch.tensor(
             [bool(b.get('negative_supervision', True)) for b in batch], dtype=torch.bool)
@@ -1123,10 +1012,8 @@ def box_collate(batch):
 
 
 def split_batch(batch):
-    """A collated batch dict -> `(x, boxes, kpts, regions, negative_supervision)`.
+    """A collated batch dict -> `(x, boxes, kpts_or_None, negative_supervision_or_None)`.
 
-    Keys, not ranks: the old rank-based version could not tell keypoints (B,S,K,3) from rectangles
-    (B,M,4) without a shape gamble that fed boxes to the keypoint loss.
+    Keys, not ranks: an old rank-based version fed rectangles to the keypoint loss.
     """
-    return (batch['x'], batch['boxes'], batch.get('kpts'), batch.get('regions'),
-            batch.get('negative_supervision'))
+    return batch['x'], batch['boxes'], batch.get('kpts'), batch.get('negative_supervision')

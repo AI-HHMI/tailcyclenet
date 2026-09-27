@@ -203,7 +203,6 @@ def convert_session(dst: Path, split: str, difficulty: str, species: str,
                                animal_ids=aids)
         lab.boxes = np.full((len(aids), T, 1, 4), np.nan, np.float32)
         lab.instance = np.full((len(aids), T, 1), fmt.INST_NONE, np.int8)
-        lab.regions = np.zeros((0, 6), np.float64)
         for a in anns:
             track = int(a['track_id'])
             frame = int(Path(images[int(a['image_id'])]['file_name']).stem)
@@ -241,7 +240,6 @@ def convert_session(dst: Path, split: str, difficulty: str, species: str,
             'visibility_source': 'COCO keypoint visibility: v=2 -> visible; v=0 -> no row; '
                                  'APTv2 has no v=1 occluded-with-position state',
             'box_source': 'COCO bbox [x,y,w,h], converted to [x0,y0,x1,y1]',
-            'regions_note': 'empty regions.pq: APTv2 does not certify exhaustive labelling',
         })
     return len(groups), sum(g.n_frames for g in groups.values()), sum(len(x) for x in groups_data.values())
 

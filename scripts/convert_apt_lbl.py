@@ -6,8 +6,8 @@
 The `.lbl` is a POSIX tar holding a MATLAB-v5 `label_file.lbl`; `labels{i}.p` is x-block-then-
 y-block; NaN = unlabeled, Inf = fully occluded. Four conversion decisions are recorded in
 `[provenance]`: occ==1 points are written `visible` WITH coordinates (label density over an
-honest visibility channel); `tail` -> `tail_base`; `labelsRoi` -> `regions.pq`, written even when
-empty (absence would claim exhaustive labelling); one group per labelled frame, label centered.
+honest visibility channel); `tail` -> `tail_base`; `labelsRoi` (Label Box) -> a boxed `present`
+instances.pq row per box; one group per labelled frame, label centered.
 Pixels are COPIED from the MJPEG AVI (`ffmpeg -c:v copy -bsf:v mjpeg2jpeg`), verified frame-exact.
 """
 from __future__ import annotations
@@ -97,12 +97,12 @@ def movie_labels(entry) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return frm, tgt, np.transpose(xy, (2, 1, 0))
 
 
-def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
+def movie_label_boxes(entry) -> tuple[np.ndarray, np.ndarray]:
     """One `labelsRoi{i}` cell -> (frames, (n,4) [x0,y0,x1,y1]), both 0-based.
 
-    APT's "Label Box" certifies an area as COMPLETELY LABELLED (not an animal box -- it has no
-    target index). Axis-alignment is asserted: a rotated ROI would silently become its bounding
-    box and certify area the annotator did not. Vertices are 1-based, like `p` and `frm`.
+    APT's "Label Box" marks an area the annotator labelled completely (not an animal box -- it
+    has no target index). Axis-alignment is asserted: a rotated ROI would silently become its
+    bounding box, an area the annotator did not mark. Vertices are 1-based, like `p` and `frm`.
     """
     v = getattr(entry, 'verts', None)
     if v is None or np.size(v) == 0:
@@ -116,7 +116,7 @@ def movie_regions(entry) -> tuple[np.ndarray, np.ndarray]:
     corner_on_edge = (np.isclose(v, lo[None]) | np.isclose(v, hi[None])).all()
     if not corner_on_edge:
         raise SystemExit('labelsRoi holds a rotated rectangle; the format stores axis-aligned '
-                         'regions and squaring it would certify area nobody marked')
+                         'boxes and squaring it would mark area nobody marked')
     return f, np.stack([lo[0], lo[1], hi[0], hi[1]], -1)
 
 
@@ -184,7 +184,7 @@ def build_jobs(d: dict) -> list[Job]:
             if frm.size == 0:
                 continue
             nfo = info[i].info
-            roi_f, roi_rect = movie_regions(rois[i]) if i < rois.size else \
+            roi_f, roi_rect = movie_label_boxes(rois[i]) if i < rois.size else \
                 (np.zeros(0, int), np.zeros((0, 4)))
             jobs.append(Job(
                 split=split_of(movie, is_gt), session=session_id(movie), movie=movie,
@@ -373,25 +373,52 @@ def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels
         lab.vis2d[a, lf, positioned, 0] = fmt.VISIBLE
         lab.points2d[a, lf, positioned, 0] = pts[positioned].astype(np.float32)
         if (occluded | positioned).any():
-            lab.instance[a, lf, 0] = fmt.INST_LABELED
-            lab.boxes[a, lf, 0] = padded_extent(pts, job.wh)
+            # Rule 11: `labeled` requires a box. An animal with only occluded points has no
+            # extent, so it is `present` -- in view, not fully annotated.
+            box = padded_extent(pts, job.wh)
+            lab.boxes[a, lf, 0] = box
+            lab.instance[a, lf, 0] = (fmt.INST_LABELED if np.isfinite(box).all()
+                                      else fmt.INST_PRESENT)
     return lab
 
 
-def group_regions(job: Job, frame: int, start: int, wh) -> tuple[np.ndarray, int]:
-    """Region rows for one group: the ROIs on ITS OWN labelled frame, and no others.
+def group_label_boxes(job: Job, frame: int, wh) -> tuple[np.ndarray, int]:
+    """(M,4) Label Boxes on ONE group's own labelled frame, clipped to the image.
 
-    A Label Box certifies one source frame; the claim is only sound in the group carrying that
-    frame's labels. Column 0 is the group-local frame index and column 1 the single camera.
-    Returns ((M,6) in `Labels.regions` layout, n_clipped_away).
+    A Label Box describes one source frame, so it is only kept in the group carrying that frame's
+    labels. Returns (rects, n_clipped_away).
     """
     r = job.roi_rect[np.flatnonzero(job.roi_f == frame)]
-    out = np.zeros((len(r), 6))
-    out[:, 0] = frame - start
-    out[:, 1] = 0
-    out[:, 2:] = np.clip(r, 0.0, np.tile(np.asarray(wh, float), 2))
-    keep = (out[:, 4] > out[:, 2]) & (out[:, 5] > out[:, 3])
-    return out[keep], int((~keep).sum())
+    r = np.clip(r, 0.0, np.tile(np.asarray(wh, float), 2)).reshape(-1, 4)
+    keep = (r[:, 2] > r[:, 0]) & (r[:, 3] > r[:, 1])
+    return r[keep], int((~keep).sum())
+
+
+def add_label_boxes(lab: fmt.Labels, rects: np.ndarray, lf: int) -> fmt.Labels:
+    """Append each Label Box as a boxed `present` instance row on group-local frame `lf`.
+
+    Owner decision (2026-09-27): with `regions.pq` removed from the format, APT's Label Boxes are
+    kept as `present` rows under reserved animal ids `labelbox_NN`. A `present` row marks the
+    camera-frame incompletely labelled (no background negatives), and its box is trained as a
+    positive -- which is knowingly wrong for an area, but was the chosen trade.
+    """
+    m = len(rects)
+    if not m:
+        return lab
+    S, T = lab.instance.shape[:2]
+
+    def grow(a, fill):
+        """Append `m` rows filled with `fill` along the animal axis."""
+        return np.concatenate([a, np.full((m,) + a.shape[1:], fill, a.dtype)], 0)
+
+    lab.animal_ids = list(lab.animal_ids) + [f'labelbox_{i:02d}' for i in range(m)]
+    lab.points2d = grow(lab.points2d, np.nan)
+    lab.vis2d = grow(lab.vis2d, fmt.UNLABELED)
+    lab.boxes = grow(lab.boxes, np.nan)
+    lab.instance = grow(lab.instance, fmt.INST_NONE)
+    lab.instance[S:, lf, 0] = fmt.INST_PRESENT
+    lab.boxes[S:, lf, 0] = rects.astype(np.float32)
+    return lab
 
 
 # one movie -> one session
@@ -412,16 +439,15 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     `--labels-only` never re-runs ffmpeg -- the extracted frames are already correct, and the
     groups on disk stay the authority for `n_frames`/`source_frame_start`. The project file's
     `nframes` is a claim about the container: groups are truncated to what came out and dropped
-    if the labelled frame is past the end or fewer than two frames. Every group gets a `regions`
-    array, empty or not: absence is the format's claim of exhaustive labelling, and a
-    label-sparse root is the opposite (the GT sessions carry no ROIs).
+    if the labelled frame is past the end or fewer than two frames. Label Boxes become boxed
+    `present` rows on their own group's labelled frame (the GT sessions carry none).
     """
     names = [RENAME.get(nm, nm) for nm in APT_NAMES]
     dst = out / job.split / job.session
     if dst.exists() and args.clean:
         shutil.rmtree(dst)
     stat = {'session': job.session, 'split': job.split, 'groups': 0, 'frames': 0,
-            'decode_fallback': 0, 'decode_movie': False, 'skipped': 0, 'regions': 0,
+            'decode_fallback': 0, 'decode_movie': False, 'skipped': 0, 'label_boxes': 0,
             'roi_off_label': int((~np.isin(job.roi_f, job.frames)).sum()), 'warnings': []}
 
     starts = {f: window_start(f, job.n_source, context) for f in job.frames}
@@ -480,8 +506,9 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
 
     clipped = 0
     for gid, g in groups.items():
-        labels[gid].regions, n = group_regions(job, int(gid[1:]), g.source_frame_start, job.wh)
-        stat['regions'] += len(labels[gid].regions)
+        rects, n = group_label_boxes(job, int(gid[1:]), job.wh)
+        add_label_boxes(labels[gid], rects, int(gid[1:]) - g.source_frame_start)
+        stat['label_boxes'] += len(rects)
         clipped += n
     if clipped:
         stat['warnings'].append(f'{clipped} Label Box(es) clipped away as empty')
@@ -517,10 +544,10 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
             'context_frames': context,
             'extract': extract or ('ffmpeg -c:v copy -bsf:v mjpeg2jpeg (lossless)'
                                    if mode == 'copy' else 'PyAV decode + JPEG q95'),
-            'regions_source': "APT labelsRoi (Label Box), axis-aligned, kept only on each group's "
-                              'own labelled frame -- a certificate is sound only where that '
-                              "frame's labels live. An empty regions.pq means nothing in the "
-                              'session is certified, which is NOT the same as no file at all.',
+            'label_box_source': "APT labelsRoi (Label Box), axis-aligned, kept only on each "
+                                "group's own labelled frame, written as a boxed `present` "
+                                'instances.pq row under animal_id labelbox_NN. It marks that '
+                                'frame incompletely labelled; its box is trained as a positive.',
         })
     return stat
 
@@ -598,14 +625,14 @@ def main() -> int:
                 print(f'  [warn] {stat["session"]}: {w}')
             print(f'  {stat["split"]:5s} {stat["session"]:42s} '
                   f'{stat["groups"]:4d} groups {stat["frames"]:6d} frames'
-                  + (f' {stat["regions"]:3d} regions' if stat['regions'] else '')
+                  + (f' {stat["label_boxes"]:3d} label boxes' if stat['label_boxes'] else '')
                   + (' RE-ENCODED' if stat['decode_movie'] else '')
                   + (f' {stat["decode_fallback"]} fallback' if stat['decode_fallback'] else '')
                   + (f' {stat["skipped"]} skipped' if stat['skipped'] else ''))
 
     reenc = [s for s in stats if s['decode_movie']]
     off = sum(s['roi_off_label'] for s in stats)
-    print(f'\nregions: {sum(s["regions"] for s in stats)} written, '
+    print(f'\nlabel boxes: {sum(s["label_boxes"] for s in stats)} written as present rows, '
           f'{off} label boxes dropped (on a frame no group is centered on)')
     print(f'total: {sum(s["groups"] for s in stats)} groups, '
           f'{sum(s["frames"] for s in stats)} frames, '

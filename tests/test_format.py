@@ -43,10 +43,10 @@ def test_roundtrip_2d(tiny_root):
     assert np.isnan(lab.points2d[0, 0, 1, 0]).all()
     assert np.isfinite(lab.points2d[lab.vis2d == fmt.VISIBLE]).all()
 
-    # the ignore region survives
-    assert lab.instance[1, 1, 0] == fmt.INST_PRESENT
-    assert lab.instance[0, 1, 0] == fmt.INST_LABELED
+    # the instance statuses and the one stored box survive
+    assert (lab.instance[:, :, 0] == fmt.INST_PRESENT).all()
     np.testing.assert_allclose(lab.boxes[1, 1, 0], [10, 10, 30, 30])
+    assert np.isnan(lab.boxes[0]).all()
 
 
 def test_prediction_session_is_not_triangulated_as_annotation(tmp_path):
@@ -440,7 +440,7 @@ def test_rule_6_no_label_table_is_required(tmp_path):
     assert not fmt.validate_session(sess, check_images=False)
     lab = sess.labels('g000')
     assert lab.points2d is None or not np.isfinite(lab.points2d).any()
-    assert (lab.instance == fmt.INST_LABELED).any()
+    assert (lab.instance == fmt.INST_PRESENT).any()
 
     (path / 'instances.pq').unlink()
     sess = fmt.Session.load(path)
@@ -564,14 +564,14 @@ def test_label_source_does_not_shadow_the_labels_method(tiny_root):
 
 
 # ----------------------------------------------------------------------------------------------
-# regions.pq -- §9b. The file's ABSENCE is a claim, so None and empty are different answers.
+# rule 11: a `labeled` instance row carries a box. `regions.pq` is no longer part of the format.
 # ----------------------------------------------------------------------------------------------
 
-def _rewrite_with_regions(path, regions):
-    """Re-emit a session written by `_session_2d`, this time carrying `regions`."""
+def _rewrite(path, edit):
+    """Re-emit a session written by `_session_2d` after `edit(lab)` mutates its labels."""
     sess = fmt.Session.load(path)
     lab = sess.labels('g000')
-    lab.regions = regions
+    edit(lab)
     fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
                       names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},
                       flip_pairs=(sess.flip_pairs if sess.flip_pairs_declared else None),
@@ -579,57 +579,58 @@ def _rewrite_with_regions(path, regions):
     return fmt.Session.load(path)
 
 
-def test_regions_absent_means_exhaustively_labelled(tmp_path):
-    """Every session written before regions.pq existed keeps reading as fully labelled."""
-    _session_2d(tmp_path / 'ds' / 'train' / 'a')
-    sess = fmt.Session.load(tmp_path / 'ds' / 'train' / 'a')
-    assert not (sess.path / 'regions.pq').exists()
-    assert sess.labels('g000').regions is None
-
-
-def test_regions_roundtrip(tmp_path):
+def test_write_session_refuses_a_labeled_row_without_a_box(tmp_path):
     path = tmp_path / 'ds' / 'train' / 'a'
     _session_2d(path)
-    want = np.array([[0, 0, 1.0, 2.0, 30.0, 20.0],
-                     [0, 0, 5.0, 5.0, 15.0, 15.0],      # two rects on one frame, overlapping
-                     [2, 0, 8.0, 9.0, 40.0, 30.0]])
-    got = _rewrite_with_regions(path, want).labels('g000').regions
-    np.testing.assert_allclose(got, want)
-    assert not fmt.validate_session(fmt.Session.load(path), check_images=False)
+
+    def boxless(lab):
+        lab.instance[0, 0, 0] = fmt.INST_LABELED        # the fixture stores no box for a01
+
+    with pytest.raises(fmt.FormatError, match='rule 11'):
+        _rewrite(path, boxless)
+
+    def empty_box(lab):
+        lab.instance[0, 0, 0] = fmt.INST_LABELED
+        lab.boxes[0, 0, 0] = [10.0, 10.0, 10.0, 20.0]  # x1 == x0: empty, equivalent to no box
+
+    with pytest.raises(fmt.FormatError, match='rule 11'):
+        _rewrite(path, empty_box)
+
+    def boxed(lab):
+        lab.instance[0, 0, 0] = fmt.INST_LABELED
+        lab.boxes[0, 0, 0] = [10.0, 10.0, 20.0, 20.0]
+
+    sess = _rewrite(path, boxed)
+    assert sess.labels('g000').instance[0, 0, 0] == fmt.INST_LABELED
+    assert not _rule(fmt.validate_session(sess, check_images=False), 11)
 
 
-def test_regions_empty_is_not_the_same_as_absent(tmp_path):
-    """The whole semantic: a certified-nothing group must not read as fully labelled. This is the
-    rat-city-annotated `test/` split, where APT's GT mode records no ROIs at all.
-    """
-    path = tmp_path / 'ds' / 'train' / 'a'
-    _session_2d(path)
-    sess = _rewrite_with_regions(path, np.zeros((0, 6)))
-    assert (path / 'regions.pq').exists()
-    regions = sess.labels('g000').regions
-    assert regions is not None and regions.shape == (0, 6)
-
-
-def test_rule_15_rejects_an_empty_rectangle(tmp_path):
-    path = tmp_path / 'ds' / 'train' / 'a'
-    _session_2d(path)
-    sess = _rewrite_with_regions(path, np.array([[0, 0, 30.0, 20.0, 30.0, 25.0]]))   # x1 == x0
-    assert _rule(fmt.validate_session(sess, check_images=False), 15)
-
-
-def test_rule_15_rejects_an_unknown_status(tmp_path):
+def test_rule_11_flags_a_labeled_row_without_a_box_on_disk(tmp_path):
+    """A table written by some other tool is caught by validation, not only by the writer."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     path = tmp_path / 'ds' / 'train' / 'a'
     _session_2d(path)
-    _rewrite_with_regions(path, np.array([[0, 0, 1.0, 2.0, 30.0, 20.0]]))
-    t = pq.read_table(path / 'regions.pq')
+    t = pq.read_table(path / 'instances.pq')
     i = t.column_names.index('status')
-    pq.write_table(t.set_column(i, 'status', pa.array(['present']).dictionary_encode()),
-                   path / 'regions.pq')
+    status = pa.array(['labeled'] * len(t)).dictionary_encode()
+    pq.write_table(t.set_column(i, 'status', status), path / 'instances.pq')
     errs = fmt.validate_session(fmt.Session.load(path), check_images=False)
-    assert _rule(errs, 15) and 'present' in _rule(errs, 15)[0]
+    assert _rule(errs, 11) and 'box' in _rule(errs, 11)[0]
+
+
+def test_a_stale_regions_file_is_a_validation_error(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / 'ds' / 'train' / 'a'
+    _session_2d(path)
+    pq.write_table(pa.table({'group_id': ['g000']}), path / 'regions.pq')
+    errs = fmt.validate_session(fmt.Session.load(path), check_images=False)
+    assert any('regions.pq is no longer part of the format' in e for e in errs)
+
+
 def test_table_writer_chunks_match_one_shot(tmp_path):
     """A table written in chunks must read back exactly as one written at once.
 

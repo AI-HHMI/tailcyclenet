@@ -644,7 +644,7 @@ def _append_scores(path: Path, scores: np.ndarray) -> None:
 def _fsync_tree(path: Path) -> None:
     """Best-effort fsync for a completed session directory before its rename."""
     for name in ('session.toml', 'calibration.toml', 'groups.pq', 'keypoints.pq',
-                 'points3d.pq', 'regions.pq'):
+                 'points3d.pq'):
         p = path / name
         if p.exists():
             with p.open('rb') as f:
@@ -731,7 +731,6 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool = Fals
         labels = fmt.Labels(
             animal_ids=['fly0'], points3d=points3d, vis3d=vis3d,
             points2d=points2d, vis2d=vis2d, boxes=None, instance=None,
-            regions=np.zeros((0, 6), np.float64),
         )
         provenance = {
             'source': 'native deeperfly results.h5',

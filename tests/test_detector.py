@@ -8,7 +8,7 @@ import pytest
 import torch
 from pathlib import Path
 
-from tailcyclenet.crop import box_corners, crop_box_for_points
+from tailcyclenet.crop import crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler, YOLOXNano, assign,
                                    assign_tal, box_collate, box_iou, ciou_loss, decode,
                                    detector_loss, giou_loss, letterbox, paired_iou, split_batch,
@@ -966,37 +966,6 @@ def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
     np.testing.assert_allclose(M @ c, c[:2], atol=1e-3)
 
 
-def test_a_rotated_region_certifies_less_not_more(tiny_root):
-    """A certified area is a CLAIM, and under a rotation a claim must round DOWN: the hull of a
-    rotated rect claims area the annotator never marked, re-admitting the unlabelled animals
-    `regions.pq` exists to exclude.
-    """
-    from tailcyclenet.detector.data import _warp_region
-
-    r = torch.tensor([[100.0, 200.0, 500.0, 900.0], [0.0, 0.0, 64.0, 64.0]])
-
-    # Every warp that existed before rotation keeps a rect axis-aligned, so inscribed and
-    # circumscribed coincide and this is a no-op against the old four-corner code.
-    for M in (np.array([[1.0, 0.0, 37.0], [0.0, 1.0, -12.0]], np.float32),
-              np.array([[0.83, 0.0, 5.0], [0.0, 0.83, 9.0]], np.float32),
-              np.array([[-1.1, 0.0, 900.0], [0.0, 1.1, 3.0]], np.float32)):
-        c = box_corners(r) @ torch.as_tensor(M[:, :2]).T + torch.as_tensor(M[:, 2])
-        want = torch.cat([c.amin(-2), c.amax(-2)], -1)
-        torch.testing.assert_close(_warp_region(r, M), want, atol=1e-3, rtol=0)
-
-    sq = torch.tensor([[0.0, 0.0, 400.0, 400.0]])
-    for deg in (15.0, 45.0, 137.0):
-        a = np.radians(deg)
-        M = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0]], np.float32)
-        hull = box_corners(sq) @ torch.as_tensor(M[:, :2]).T
-        out = _warp_region(sq, M)
-        assert float(out[0, 2] - out[0, 0]) < 400.0 < float((hull.amax(-2) - hull.amin(-2))[0, 0])
-    # 90 degrees maps a square onto itself exactly -- no shrink is owed and none is taken.
-    M90 = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0]], np.float32)
-    torch.testing.assert_close(_warp_region(sq, M90)[0, 2] - _warp_region(sq, M90)[0, 0],
-                               torch.tensor(400.0), atol=1e-3, rtol=0)
-
-
 def test_chunk_is_one_containers_worth_of_index(tiny_root):
     """`ChunkShuffle`'s block must be one video, or the locality it exists for is not there: a
     hardcoded 512 spanned 13 calms21 videos per block and ran the reader cache at a 16% hit rate.
@@ -1723,7 +1692,7 @@ def test_box_only_sessions_fall_back_to_labeled_instance_boxes(tmp_path):
 
     batch = box_collate([ds[0], ds[1]])
     assert batch['negative_supervision'].tolist() == [False, False]
-    assert split_batch(batch)[4] is batch['negative_supervision']
+    assert split_batch(batch)[3] is batch['negative_supervision']
 
 
 def test_mixed_pose_and_box_only_sessions_both_index(tmp_path):
@@ -2339,24 +2308,8 @@ def test_train_detector_help_renders():
 
 
 # ----------------------------------------------------------------------------------------------
-# tiling and the regions.pq certified mask
+# tiling
 # ----------------------------------------------------------------------------------------------
-
-def _root_with_regions(tmp_path, rect=(4.0, 4.0, 44.0, 34.0)):
-    """A copy of the 2D fixture carrying one certified region on frame 1, camera 0."""
-    from tailcyclenet import format as fmt
-    from .conftest import _session_2d
-    path = tmp_path / 'ds' / 'train' / 'a'
-    _session_2d(path)
-    sess = fmt.Session.load(path)
-    lab = sess.labels('g000')
-    lab.regions = np.array([[1.0, 0.0, *rect]])
-    fmt.write_session(path, mode=sess.mode, units=sess.units, label_source=sess.label_source,
-                      names=sess.names, rig=sess.rig, groups=sess.groups, labels={'g000': lab},
-                      flip_pairs=(sess.flip_pairs if sess.flip_pairs_declared else None),
-                      provenance=sess.provenance)
-    return tmp_path / 'ds'
-
 
 def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
     """`tile_scale` without `tile_wh` must not reach `detect_group`, or it derives the input size.
@@ -2431,62 +2384,15 @@ def test_an_off_frame_tile_is_grey_not_wrapped(tiny_root):
     torch.testing.assert_close(x, torch.full_like(x, 114 / 255.0))
 
 
-def test_regions_none_and_empty_are_different_in_the_loader(tmp_path, tiny_root):
-    """`None` claims exhaustive labelling; `(0,4)` certifies nothing. Both reach the loader."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1)
-    assert ds.regions_for(0) is None                     # the fixture has no regions.pq
-
-    root = _root_with_regions(tmp_path)
-    d2 = BoxDataset(root, 'train', input_wh=(64, 48), max_frames_per_group=4)
-    got = {int(d2.index[i][2]): d2.regions_for(i) for i in range(len(d2))}
-    assert got[1] is not None and got[1].shape == (1, 4)  # frame 1 carries the region
-    assert got[0] is not None and got[0].shape == (0, 4)  # frame 0 certifies nothing
-
-
-def test_regions_ride_the_same_transform_as_the_boxes(tmp_path):
-    """A region letterboxed by a different rule than its own boxes is invisible in the loss."""
-    root = _root_with_regions(tmp_path, rect=(4.0, 4.0, 44.0, 34.0))
-    ds = BoxDataset(root, 'train', input_wh=(128, 96), max_frames_per_group=4)
-    i = next(i for i in range(len(ds)) if int(ds.index[i][2]) == 1)
-    scale, pad = ds._transform(i, (64, 48))
-    r = ds.regions_for(i)[0]
-    torch.testing.assert_close(r, torch.tensor([4.0 * scale + pad[0], 4.0 * scale + pad[1],
-                                                44.0 * scale + pad[0], 34.0 * scale + pad[1]]))
-
-
-def test_use_regions_emits_a_full_frame_rect_when_the_session_has_none(tiny_root):
-    """No regions.pq = exhaustively labelled = every anchor supervised, encoded as one big rect."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
-                    use_regions=True)
-    item = ds[0]
-    assert set(item) == {'x', 'boxes', 'regions', 'negative_supervision'}
-    torch.testing.assert_close(item['regions'], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
-
-
-def test_certified_anchors_unions_the_boxes_in():
-    from tailcyclenet.detector import certified_anchors
-    anchors = torch.tensor([[5.0, 5.0, 8.0], [50.0, 50.0, 8.0], [95.0, 95.0, 8.0]])
-    regions = torch.tensor([[0.0, 0.0, 10.0, 10.0]])
-    boxes = torch.tensor([[40.0, 40.0, 60.0, 60.0], [float('nan')] * 4])
-    got = certified_anchors(anchors, regions, boxes)
-    assert got.tolist() == [True, True, False]           # region, GT box, neither
-    # a NaN-padded rect certifies nothing rather than certifying the origin
-    assert not certified_anchors(anchors, torch.full((1, 4), float('nan')),
-                                 torch.full((1, 4), float('nan'))).any()
-
-
 def test_split_batch_reads_explicit_keys_not_ranks():
     from tailcyclenet.detector import split_batch
     x, b = torch.zeros(2, 3, 8, 8), torch.zeros(2, 1, 4)
-    k, r, ig = torch.zeros(2, 1, 5, 3), torch.zeros(2, 3, 4), torch.tensor([True, False])
-    assert split_batch({'x': x, 'boxes': b}) == (x, b, None, None, None)
+    k, neg = torch.zeros(2, 1, 5, 3), torch.tensor([True, False])
+    assert split_batch({'x': x, 'boxes': b}) == (x, b, None, None)
     assert split_batch({'x': x, 'boxes': b, 'kpts': k})[2] is k \
         and split_batch({'x': x, 'boxes': b, 'kpts': k})[3] is None
-    assert split_batch({'x': x, 'boxes': b, 'regions': r})[2] is None \
-        and split_batch({'x': x, 'boxes': b, 'regions': r})[3] is r
-    got = split_batch({'x': x, 'boxes': b, 'kpts': k, 'regions': r,
-                       'negative_supervision': ig})
-    assert got[2] is k and got[3] is r and got[4] is ig
+    got = split_batch({'x': x, 'boxes': b, 'kpts': k, 'negative_supervision': neg})
+    assert got[2] is k and got[3] is neg
 
 
 def test_detector_loss_drops_negatives_on_incomplete_frames_but_keeps_positives():
@@ -2507,7 +2413,7 @@ def test_detector_loss_drops_negatives_on_incomplete_frames_but_keeps_positives(
     assert float(same) == float(base)
 
 
-def test_detector_loss_without_regions_is_unchanged():
+def test_detector_loss_without_a_negative_mask_is_unchanged():
     """THE BACKWARD-COMPATIBILITY PROOF. Reports 10-15's numbers depend on this equality."""
     torch.manual_seed(0)
     anchors = YOLOXNano().anchor_points(64, 64, 'cpu')
@@ -2515,19 +2421,18 @@ def test_detector_loss_without_regions_is_unchanged():
     boxes = torch.rand(2, anchors.shape[0], 4) * 64
     gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
     base, bp = detector_loss(obj, boxes, anchors, gt)
-    same, sp = detector_loss(obj, boxes, anchors, gt, regions=None)
-    assert float(base) == float(same) and 'certified' not in bp and 'certified' not in sp
+    same, sp = detector_loss(obj, boxes, anchors, gt, negative_supervision=None)
+    assert float(base) == float(same) and 'negative_frames' not in bp
 
-    # a mask that certifies everything is the same loss; one that certifies nothing keeps only
-    # the positives, which are forced in because an unsupervised positive is an animal trained
-    # as nothing.
-    everything = torch.tensor([[[0.0, 0.0, 64.0, 64.0]]] * 2)
-    allm, ap = detector_loss(obj, boxes, anchors, gt, regions=everything)
+    # every frame complete is the same loss; no frame complete keeps only the positives, which
+    # are forced in because an unsupervised positive is an animal trained as nothing.
+    allm, ap = detector_loss(obj, boxes, anchors, gt,
+                             negative_supervision=torch.tensor([True, True]))
     torch.testing.assert_close(allm, base)
-    assert ap['certified'] == 1.0
-    nothing = torch.full((2, 1, 4), float('nan'))
-    _, np_ = detector_loss(obj, boxes, anchors, gt, regions=nothing)
-    assert 0.0 < np_['certified'] < 1.0
+    assert ap['negative_frames'] == 1.0
+    none, np_ = detector_loss(obj, boxes, anchors, gt,
+                              negative_supervision=torch.tensor([False, False]))
+    assert np_['negative_frames'] == 0.0 and np_['obj'] < bp['obj']
 
 
 def test_paired_iou_matches_box_iou_diagonal():
@@ -2618,14 +2523,14 @@ def test_detector_loss_iou_aware_it_none_means_past_warmup():
 
 
 def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
-    """THE SUBTLE CORRECTNESS CASE this key introduces: `--use-regions`/`ignore` mask the
+    """THE SUBTLE CORRECTNESS CASE this key introduces: `negative_supervision` masks the
     objectness weight, and a pre-existing guard (`weight = maximum(weight, ...)`) forces a TRUE
     POSITIVE's weight back to 1 so masking can never silently drop a real animal from the
     objectness term. That guard must key on WHETHER an anchor is positive (`pos_mask`), not on the
     VALUE its target holds -- under `iou_aware` with bad boxes the target there can be near 0, and
     forcing off THAT would only guarantee a near-0 weight, defeating the guard's whole purpose.
 
-    Constructed so a `regions` mask certifies NOTHING (weight starts at 0 everywhere) and the
+    Constructed so the frame supervises NO negatives (weight starts at 0 everywhere) and the
     predicted boxes are deliberately bad (low true IoU): if the guard were wrongly keyed on
     `target`, the positive anchor's contribution to `obj` would be scaled by ~its IoU instead of
     1, and this loss would NOT match the identical computation with `iou_aware=False` (which is
@@ -2636,9 +2541,9 @@ def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
     obj = torch.randn(1, anchors.shape[0])
     boxes = torch.rand(1, anchors.shape[0], 4) * 5              # bad boxes -> low true IoU
     gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]]])
-    nothing_certified = torch.full((1, 1, 4), float('nan'))     # certifies NOTHING
+    no_negatives = torch.tensor([False])                   # supervises NO negatives
 
-    _, sp = detector_loss(obj, boxes, anchors, gt, regions=nothing_certified,
+    _, sp = detector_loss(obj, boxes, anchors, gt, negative_supervision=no_negatives,
                           iou_aware=True, iou_aware_warmup=0, it=1)
     assert sp['iou_target'] < 0.5, 'the test needs a genuinely low IoU to be a real check'
     # The OBJ term (not the box term, which iou_aware never touches) must be identical: the
@@ -2659,7 +2564,7 @@ def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
     # Re-derived directly rather than relying on `hard`/`soft` above (which also include
     # box_weight * box, identical in both arms and therefore not informative here) -- read `obj`
     # off `parts` instead.
-    _, hp = detector_loss(obj, boxes, anchors, gt, regions=nothing_certified, iou_aware=False)
+    _, hp = detector_loss(obj, boxes, anchors, gt, negative_supervision=no_negatives, iou_aware=False)
     assert hp['obj'] == pytest.approx(float(expected_hard_obj), rel=1e-4)
     assert sp['obj'] == pytest.approx(float(expected_soft_obj), rel=1e-4)
 
@@ -3055,7 +2960,7 @@ def test_box_mota_a_missed_animal_is_a_miss_not_an_fp():
 
 
 def test_score_dataset_scores_unaugmented_and_restores_the_flag():
-    """`ignore_for` takes no `warp`, unlike `boxes_for` and `regions_for` beside it.
+    """`ignore_for` takes no `warp`, unlike `boxes_for` beside it.
 
     So under `--augment` the predictions and the GT were warped while the `instances.pq` PRESENT
     boxes were not, and the ignore mask excused the wrong pixels. rat-city ships 26,021 of those
@@ -3069,7 +2974,6 @@ def test_score_dataset_scores_unaugmented_and_restores_the_flag():
 
     # The asymmetry that caused it, pinned so a future `warp` on `ignore_for` is noticed.
     assert 'warp' in inspect.signature(ddata.BoxDataset.boxes_for).parameters
-    assert 'warp' in inspect.signature(ddata.BoxDataset.regions_for).parameters
     assert 'warp' not in inspect.signature(ddata.BoxDataset.ignore_for).parameters, \
         'ignore_for now takes a warp -- score_dataset can stop disabling augmentation'
 
@@ -3248,24 +3152,6 @@ def test_mosaic_paste_is_fully_interior_and_reencodes_the_crop_rule(tiny_root):
     pytest.skip('no fixture item produced a finite mosaic source box in the tries allotted')
 
 
-def test_mosaic_rejected_when_use_regions(tiny_root):
-    """Fails at CONSTRUCTION, not on the ~20%% of items that happen to draw mosaic-lite -- a
-    training job should not discover this combination is undefined hours into a run.
-    """
-    with pytest.raises(ValueError):
-        BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
-                  max_frames_per_group=2, augment=True, strong=True, use_regions=True, seed=0)
-
-    # And `_mosaic_paste` itself still refuses to run, for a caller that reaches it some other way.
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
-                    max_frames_per_group=2, augment=True, use_regions=True, seed=0)
-    ds.strong = True     # bypass the constructor guard to exercise the method's own guard
-    boxes = ds.boxes_for(0)
-    img, _, _ = ds._load_letterbox(0)
-    with pytest.raises(RuntimeError):
-        ds._mosaic_paste(0, boxes, None, img, np.random.default_rng(0))
-
-
 def test_infer_help_renders():
     """`--help` must actually print: argparse expands every `help=` string as `help % params`, so a
     bare `%` kills it with a format TypeError and hides every option the script has.
@@ -3347,7 +3233,7 @@ out = "/tmp/run-det"
     assert d['augment'] is True and d['augment_strong'] is True
     assert d['rotate_deg'] == 45.0
     assert d['reduce'] is False and d['keypoints'] is False and d['hflip'] is True
-    assert d['use_regions'] is False
+    assert 'use_regions' not in d          # DELETED with regions.pq
     assert d['input_wh'] is None and d['tile_wh'] is None       # absent pair -> None
     assert d['tile_scale'] == 1.0 and d['tile_bg_per_frame'] == 1
     assert m['yolox'] == 'hybrid'
@@ -3497,7 +3383,6 @@ hflip = true
 tile_wh = []
 tile_scale = 1.0
 tile_bg_per_frame = 1
-use_regions = false
 [model]
 yolox = "tiny"
 [training]
@@ -3698,7 +3583,6 @@ hflip = true
 tile_wh = []
 tile_scale = 1.0
 tile_bg_per_frame = 1
-use_regions = false
 [model]
 yolox = "trimmed"
 [training]

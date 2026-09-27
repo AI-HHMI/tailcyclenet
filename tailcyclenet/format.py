@@ -18,14 +18,9 @@ POSITIONED = (VISIBLE, PROJECTED)
 # Instance codes. -1 doubles as "no row" == no determination.
 INST_NONE, INST_ABSENT, INST_PRESENT, INST_LABELED = -1, 0, 1, 2
 
-# Region codes, for `regions.pq`. A region certifies a pixel area as fully labelled, so
-# absence of a label inside it IS evidence of absence -- opposite polarity to `instances.pq`.
-REGION_COMPLETE = 0
-
 KPT_STATUS = {'unlabeled': UNLABELED, 'missing': MISSING, 'visible': VISIBLE,
               'projected': PROJECTED}
 INST_STATUS = {'absent': INST_ABSENT, 'present': INST_PRESENT, 'labeled': INST_LABELED}
-REGION_STATUS = {'labelled_complete': REGION_COMPLETE}
 IMAGE_EXTS = ('.png', '.jpg')
 VIDEO_EXTS = ('.mp4', '.avi')
 SPLITS = ('train', 'val', 'test')
@@ -235,8 +230,8 @@ def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
 def _arrow(rows: dict[str, np.ndarray], dict_cols: tuple[str, ...]) -> pa.Table:
     """One chunk of tidy-long rows as an arrow table. Non-finite floats become NULL, which is
     what "empty" means in parquet for a `missing` row's x,y. An empty object array would
-    otherwise infer pyarrow's `null` type; only a zero-row table gets here (an empty
-    regions.pq, which is meaningful).
+    otherwise infer pyarrow's `null` type; only a zero-row table gets here (an empty mode
+    table, which rule 6 requires to exist).
     """
     arrays, names = [], []
     for name, values in rows.items():
@@ -340,9 +335,6 @@ class Labels:
     instance: np.ndarray | None
     # (C,T,4,4) float64, only when a camera is moving
     ext: np.ndarray | None = None
-    # (M,6) float64 [frame, camera, x0, y0, x1, y1]. None IFF the session has no regions.pq
-    # (its absence claims exhaustive labelling); an empty (0,6) says the file certifies nothing.
-    regions: np.ndarray | None = None
 
     @property
     def n_animals(self) -> int:
@@ -389,32 +381,20 @@ def _scatter(table, gid, T, kpt_vocab, cam_vocab, animals, where, per_camera, n_
     return sel, a, frame, k, c, status
 
 
-def _regions(table: pa.Table, gid: str, T: int, cam_vocab: dict[str, int],
-             where: str) -> np.ndarray:
-    """One group's `regions.pq` rows as (M,6) [frame, camera, x0, y0, x1, y1].
+def _nonempty_box(box: np.ndarray) -> np.ndarray:
+    """(...,4) xyxy -> (...) bool: finite and `x1 > x0`, `y1 > y0` (spec §9 box encoding)."""
+    box = np.asarray(box, np.float64)
+    with np.errstate(invalid='ignore'):
+        return (np.isfinite(box).all(-1) & (box[..., 2] > box[..., 0])
+                & (box[..., 3] > box[..., 1]))
 
-    Not `_scatter`: a region has no `animal_id` and no dense shape to scatter into -- it is a
-    list of rectangles, and the number of them per frame is unbounded.
-    """
-    empty = np.zeros((0, 6), np.float64)
-    gcodes, gvals = _codes(table, 'group_id')
-    if gid not in gvals:
-        return empty
-    sel = np.flatnonzero(gcodes == gvals.index(gid))
-    if sel.size == 0:
-        return empty
 
-    frame = table.column('frame').combine_chunks().to_numpy(
-        zero_copy_only=False)[sel].astype(np.int64)
-    if frame.min() < 0 or frame.max() >= T:
-        raise FormatError(f'{where}: group {gid!r} has a frame outside [0, {T})')
-    c = _remap(*_codes(table, 'camera'), cam_vocab, 'camera', where, sel)
-    _remap(*_codes(table, 'status'), REGION_STATUS, 'status', where, sel)
-
-    n = len(table)
-    box = np.stack([_floats(table, q, n)[sel] for q in ('x0', 'y0', 'x1', 'y1')], -1)
-    return np.concatenate([frame[:, None].astype(np.float64),
-                           c[:, None].astype(np.float64), box], axis=1)
+def _boxless_labeled(instance: np.ndarray, boxes: np.ndarray | None) -> int:
+    """Count `labeled` cells of a dense `(S,T,C)` instance array with no usable box (rule 11)."""
+    labeled = np.asarray(instance) == INST_LABELED
+    if boxes is None:
+        return int(labeled.sum())
+    return int((labeled & ~_nonempty_box(boxes)).sum())
 
 
 def _animal_vocab(tables: list[pa.Table | None], gid: str) -> list[str]:
@@ -628,8 +608,7 @@ class Session:
     def _tables(self) -> dict[str, pa.Table | None]:
         """Label and prediction tables keyed by stem; missing files are None."""
         return {s: self._table(s)
-                for s in ('keypoints', 'points2d', 'points3d', 'instances', 'regions',
-                          'extrinsics')}
+                for s in ('keypoints', 'points2d', 'points3d', 'instances', 'extrinsics')}
 
     @classmethod
     def load(cls, path: Path) -> 'Session':
@@ -784,10 +763,6 @@ class Session:
                                 for q in ('x0', 'y0', 'x1', 'y1')], -1)
                 boxes[a, f, c] = box
 
-        regions = None
-        if t['regions'] is not None:
-            regions = _regions(t['regions'], gid, T, self._cam_vocab, f'{where}/regions')
-
         ext = None
         moving = [n for n in self.rig.names if self.rig.moving[n]]
         if moving:
@@ -822,7 +797,7 @@ class Session:
                     ext[i] = cam.get_extrinsics_mat().detach().cpu().numpy()
 
         out = Labels(animal_ids=animals, points3d=points3d, vis3d=vis3d, points2d=points2d,
-                     vis2d=vis2d, boxes=boxes, instance=instance, ext=ext, regions=regions)
+                     vis2d=vis2d, boxes=boxes, instance=instance, ext=ext)
         if (self.mode == '3d' and not self.prediction_session and out.points3d is None
                 and out.points2d is not None):
             triangulate_group(self.rig, out, self.assoc_res_max_px)
@@ -842,17 +817,25 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
     annotation and dense tracking are the same code path. `label_source` becomes the `labels`
     key of session.toml and is required, not defaulted.
 
-    A session that certifies nothing anywhere still writes an EMPTY regions.pq if any group
-    said `regions is not None` -- absence of the file is the claim of exhaustive labelling.
-    The same empty-file-is-a-claim rule applies to the mode's own tables: rule 6 requires
-    them to EXIST, so `points3d.pq`/`keypoints.pq` are emitted when the corresponding array is
-    present, not when any row is labelled.
+    Rule 6 requires the mode's own tables to EXIST, so `points3d.pq`/`keypoints.pq` are emitted
+    when the corresponding array is present, not when any row is labelled.
+
+    Rule 11 is refused here rather than written and caught later: a `labeled` instance row must
+    carry a finite, non-empty box.
     """
     import toml
 
     if label_source not in LABEL_SOURCES:
         raise FormatError(f'{path}: label_source must be one of {LABEL_SOURCES}, '
                           f'got {label_source!r}')
+    for gid, lab in labels.items():
+        if lab is None or lab.instance is None:
+            continue
+        n = _boxless_labeled(lab.instance, lab.boxes)
+        if n:
+            raise FormatError(f'{path}: group {gid!r} has {n} labeled instance row(s) without a '
+                              f'finite, non-empty box (rule 11); write `present` for an animal '
+                              f'whose box was not annotated')
     path.mkdir(parents=True, exist_ok=True)
     cfg = {'mode': mode, 'units': units, 'labels': label_source, 'names': list(names)}
     if skeleton:
@@ -887,11 +870,8 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
         'instances': {c: [] for c in
                       ('group_id', 'frame', 'animal_id', 'camera', 'x0', 'y0', 'x1', 'y1',
                        'status')},
-        'regions': {c: [] for c in
-                    ('group_id', 'frame', 'camera', 'x0', 'y0', 'x1', 'y1', 'status')},
         'extrinsics': {c: [] for c in ('group_id', 'frame', 'camera', 'ext')},
     }
-    emit_regions = any(lab is not None and lab.regions is not None for lab in labels.values())
     emit_points3d = any(lab is not None and lab.vis3d is not None for lab in labels.values())
     emit_keypoints = any(lab is not None and lab.vis2d is not None for lab in labels.values())
 
@@ -930,13 +910,6 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
                  x0=box[:, 0], y0=box[:, 1], x1=box[:, 2], y1=box[:, 3],
                  status=[inst[v] for v in lab.instance[s, t, c]])
 
-        if lab.regions is not None and len(lab.regions):
-            r = np.asarray(lab.regions, np.float64).reshape(-1, 6)
-            push('regions', group_id=[gid] * len(r), frame=r[:, 0].astype(np.int32),
-                 camera=np.asarray(cam_names, dtype=object)[r[:, 1].astype(np.int64)],
-                 x0=r[:, 2], y0=r[:, 3], x1=r[:, 4], y1=r[:, 5],
-                 status=['labelled_complete'] * len(r))
-
         if lab.ext is not None:
             for ci, name in enumerate(cam_names):
                 if not rig.moving[name]:
@@ -946,8 +919,7 @@ def write_session(path: Path, *, mode: str, units: str, label_source: str, names
                      camera=[name] * T, ext=[e.ravel().tolist() for e in lab.ext[ci]])
 
     for stem, cols in tables.items():
-        if not cols['group_id'] and not (stem == 'regions' and emit_regions) \
-                and not (stem == 'points3d' and emit_points3d) \
+        if not cols['group_id'] and not (stem == 'points3d' and emit_points3d) \
                 and not (stem == 'keypoints' and emit_keypoints):
             continue
         write_table(path / f'{stem}.pq',
@@ -1244,8 +1216,9 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     each pair is listed once, and the involution is the symmetric closure, so the only way to
     break it is to name a keypoint in two pairs with different partners); rules 4/5 (cameras
     and calibration); rule 9 (no duplicate keys); rule 10 (a
-    positioned row -- visible or projected -- carries its coordinates); rule 15 (regions:
-    known status, non-empty rectangles; camera and frame are checked by `labels()`); rule 13
+    positioned row -- visible or projected -- carries its coordinates); rule 11 (a `labeled`
+    instance row carries a finite, non-empty box; prediction sessions are exempt); rule 6 (no
+    stale `regions.pq`); rule 13
     (extrinsics only for cameras declared moving, and EVERY frame of every moving camera -- a
     missing frame reads as a real pose at the world origin (eye(4) pre-fill); reported here as
     well as raised in `labels()` so a bulk validate lists every bad session); and rules 6/7/8
@@ -1404,18 +1377,19 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if (~vis).any() and np.isfinite(xy[~vis]).any():
             bad(10, 'keypoints.pq has a missing/unlabeled row carrying coordinates')
 
-    tr = sess._tables['regions']
-    if tr is not None and len(tr):
-        _, vals = _codes(tr, 'status')
-        unknown = sorted(set(vals) - set(REGION_STATUS))
-        if unknown:
-            bad(15, f'regions.pq has unknown status {unknown[0]!r}')
-        n = len(tr)
-        x0, y0, x1, y1 = (_floats(tr, q, n) for q in ('x0', 'y0', 'x1', 'y1'))
-        empty = ~((x1 > x0) & (y1 > y0))
-        if empty.any():
-            bad(15, f'regions.pq has {int(empty.sum())} empty rectangle(s) (x1<=x0 or y1<=y0); a '
-                    f'certificate covering nothing is a converter bug, not a no-op')
+    if (sess.path / 'regions.pq').exists():
+        bad(6, 'regions.pq is no longer part of the format; mark an incompletely labelled '
+               'camera-frame with a `present` instances.pq row instead')
+
+    ti = sess._tables['instances']
+    if ti is not None and len(ti) and not sess.prediction_session:
+        st, vals = _codes(ti, 'status')
+        n = len(ti)
+        labeled = np.isin(st, [i for i, v in enumerate(vals) if v == 'labeled'])
+        box = np.stack([_floats(ti, q, n) for q in ('x0', 'y0', 'x1', 'y1')], -1)
+        m = int((labeled & ~_nonempty_box(box)).sum())
+        if m:
+            bad(11, f'instances.pq has {m} labeled row(s) without a finite, non-empty box')
 
     te = sess._tables['extrinsics']
     moving = {n for n in sess.cam_names if sess.rig.moving[n]}

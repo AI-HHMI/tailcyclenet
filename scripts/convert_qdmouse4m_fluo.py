@@ -108,18 +108,6 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
         lab = old.labels(gid)
         if lab.points2d is None or lab.vis2d is None:
             raise RuntimeError(f"{source}/{gid}: expected source per-camera 2D labels")
-        regions = None
-        if lab.regions is not None:
-            base = np.asarray(lab.regions, dtype=np.float64)
-            rows = []
-            for j, src in enumerate(take):
-                sel = base[:, 1] == src
-                if not sel.any():
-                    continue
-                block = base[sel].copy()
-                block[:, 1] = j
-                rows.append(block)
-            regions = np.concatenate(rows, axis=0) if rows else np.zeros((0, 6))
         labels[gid] = fmt.Labels(
             animal_ids=list(lab.animal_ids),
             points3d=lab.points3d,
@@ -129,7 +117,6 @@ def convert_session(source: Path, output: Path) -> dict[str, str]:
             boxes=pick(lab.boxes, 2),
             instance=pick(lab.instance, 2),
             ext=pick(lab.ext, 0),
-            regions=regions,
         )
     provenance = dict(old.provenance)
     provenance.update({

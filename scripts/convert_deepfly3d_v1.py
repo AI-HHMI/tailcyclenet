@@ -241,7 +241,7 @@ def convert_camera(record: Record, camera: int, split: str, root: Path, *, force
     )
     labels = fmt.Labels(
         animal_ids=['fly0'], points3d=None, vis3d=None, points2d=dense_xy,
-        vis2d=dense_vis, boxes=None, instance=None, regions=np.zeros((0, 6), np.float64),
+        vis2d=dense_vis, boxes=None, instance=None,
     )
     provenance = {
         'source': 'DeepFly3D v1 Ramdya Dataverse v2 tracked output',

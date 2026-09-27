@@ -80,12 +80,9 @@ def chunk_frames(preds, labels, n):
                 sub[k] = a[:, t0:t1] if (a.ndim >= 2 and a.shape[1] == T) else v
             fields = {f.name: getattr(lab, f.name) for f in dataclasses.fields(lab)}
             for k, v in fields.items():
-                if isinstance(v, np.ndarray) and v.ndim >= 2 and k != 'regions':
+                if isinstance(v, np.ndarray) and v.ndim >= 2:
                     if v.shape[1] == lab_T:
                         fields[k] = v[:, t0:t1]
-            if isinstance(fields.get('regions'), np.ndarray) and fields['regions'].size:
-                r = fields['regions']
-                fields['regions'] = r[(r[:, 0] >= t0) & (r[:, 0] < t1)]
             sub['__extent__'] = np.float64(extent)
             sub['__chunk_of__'] = key
             sub['__t0__'] = t0

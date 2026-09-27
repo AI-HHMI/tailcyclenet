@@ -36,22 +36,6 @@ def copy_group(group: fmt.Group) -> fmt.Group:
 
 
 
-def map_regions(regions, take: list[int]) -> np.ndarray | None:
-    """Duplicate region rows onto the destination camera axis by source camera index."""
-    if regions is None:
-        return None
-    base = np.asarray(regions, dtype=np.float64)
-    rows = []
-    for dst, src in enumerate(take):
-        selected = base[:, 1] == src
-        if selected.any():
-            block = base[selected].copy()
-            block[:, 1] = dst
-            rows.append(block)
-    return np.concatenate(rows, axis=0) if rows else np.zeros((0, 6), dtype=np.float64)
-
-
-
 def map_labels(labels: fmt.Labels, take: list[int]) -> fmt.Labels:
     """Widen per-camera arrays; 3D arrays and camera-independent fields are unchanged."""
     return fmt.Labels(
@@ -63,7 +47,6 @@ def map_labels(labels: fmt.Labels, take: list[int]) -> fmt.Labels:
         boxes=None if labels.boxes is None else np.take(labels.boxes, take, axis=2),
         instance=None if labels.instance is None else np.take(labels.instance, take, axis=2),
         ext=None if labels.ext is None else np.take(labels.ext, take, axis=0),
-        regions=map_regions(labels.regions, take),
     )
 
 

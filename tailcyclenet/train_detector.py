@@ -245,8 +245,7 @@ def main(argv: list[str] | None = None):
     print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
-                  tile_bg_per_frame=data_cfg['tile_bg_per_frame'],
-                  use_regions=data_cfg['use_regions'])
+                  tile_bg_per_frame=data_cfg['tile_bg_per_frame'])
     train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
                        box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
                        augment=data_cfg['augment'], reduce=data_cfg['reduce'],
@@ -350,21 +349,19 @@ def main(argv: list[str] | None = None):
         for batch in loader:
             if it >= train_cfg['iters']:
                 break
-            x, gt, gt_kpts, gt_tail, gt_negative = split_batch(batch)
+            x, gt, gt_kpts, gt_negative = split_batch(batch)
             x, gt = x.to(device), gt.to(device)
             gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
-            gt_tail = None if gt_tail is None else gt_tail.to(device)
             gt_negative = None if gt_negative is None else gt_negative.to(device)
             if gt_negative is not None and bool(gt_negative.all()):
                 gt_negative = None
-            gt_regions = gt_tail if data_cfg['use_regions'] else None
             out = model(x)
             obj, boxes, kpt = out[0], out[1], out[2]
             anchors = model.anchor_points(x.shape[-2], x.shape[-1], device)
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=train_cfg['kpt_weight'],
                                         kpt_score_weight=train_cfg['kpt_score_weight'],
-                                        regions=gt_regions, negative_supervision=gt_negative,
+                                        negative_supervision=gt_negative,
                                         iou_aware=train_cfg['iou_aware_obj'],
                                         iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it,
                                         max_pos_per_gt=train_cfg['max_pos_per_gt'] or None,
@@ -393,8 +390,8 @@ def main(argv: list[str] | None = None):
             if it % 50 == 0:
                 kp = (f'  kpt {parts["kpt"]:6.3f}  kscore {parts["kpt_score"]:5.3f}'
                       if 'kpt' in parts else '')
-                kp += f'  cert {parts["certified"]:5.3f}' if 'certified' in parts else ''
-                kp += f'  ign {parts["ignored"]:5.3f}' if 'ignored' in parts else ''
+                kp += (f'  negf {parts["negative_frames"]:5.3f}'
+                       if 'negative_frames' in parts else '')
                 kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
                 kp += f'  iouT {parts["iou_target"]:5.3f}' if 'iou_target' in parts else ''
                 print(f'{it:7d}/{train_cfg["iters"]}  loss {np.mean(running):7.4f}  '
@@ -440,7 +437,6 @@ def main(argv: list[str] | None = None):
                         'p2': model_cfg['p2'],
                         'seed': train_cfg['seed'],
                         'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
-                        'use_regions': data_cfg['use_regions'],
                         'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
                         'annot_frac': data_cfg['annot_frac'],
                         'weight_decay': train_cfg['weight_decay'],

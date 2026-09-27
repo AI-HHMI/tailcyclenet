@@ -352,13 +352,30 @@ One row per animal per view per frame **where a determination was made**.
 | `notes` | str | | |
 
 - `labeled` — the instance was annotated: keypoint or 3D rows exist for it (partially or fully),
-  or it carries a box and no keypoints at all. A box-only `labeled` row is a detection label — a
-  detector trains on it — which is the opposite of `present`.
-- `present` — the animal is in this view but was not annotated. **An ignore region**: a
-  prediction landing here is neither a true nor a false positive. This exists because it is
-  measurable: on a multi-animal rodent recording, **73% of a tracker's false positives were real
-  animals the annotator had skipped**, and excluding them moved MOTA from 0.692 to 0.709.
-- `absent` — explicitly asserted not visible in this view. A genuine negative.
+  or it carries a box and no keypoints at all. A box-only `labeled` row is a detection label.
+  **`labeled` asserts the view is completely labelled**: every animal in it has a row, so the
+  background of that camera-frame is a genuine negative.
+- `present` — the animal is in this view but was not (fully) annotated. **It marks the whole
+  camera-frame as incompletely labelled**, whether or not the row carries a box: other animals
+  may be there without a row, so the background is not a reliable negative. A prediction landing
+  on a `present` animal is neither a true nor a false positive when scoring. This exists because
+  it is measurable: on a multi-animal rodent recording, **73% of a tracker's false positives were
+  real animals the annotator had skipped**, and excluding them moved MOTA from 0.692 to 0.709.
+- `absent` — explicitly asserted not visible in this view. A genuine negative; a camera-frame
+  whose only rows are `absent` is an all-background example.
+
+**What a detector trains on.** Per camera-frame, when the session has `instances.pq`:
+
+| rows in this camera-frame | positive boxes | background negatives |
+|---|---|---|
+| any `present` row (boxed or not) | every finite `labeled` / `present` box | **none** |
+| `labeled` and/or `absent`, no `present` | every finite `labeled` box | yes |
+| no row at all | none | none — no determination was made |
+
+Only the background is withheld on a `present` frame; its boxed animals are still positives. A
+`labeled` row with no box, where the consumer takes its targets from the boxes, is an animal with
+no target, so the consumer must not train that frame's background as negative either. A session
+with no `instances.pq` keeps the §9b rule: exhaustive everywhere, or only inside `regions.pq`.
 
 **Box encoding.** `[x0, x1) × [y0, y1)`, top-left inclusive, bottom-right exclusive, so width is
 `x1 - x0`. This matches the usual array-slicing convention, so an integer box can be used as a
@@ -391,10 +408,11 @@ everything outside them is unknown. A consumer training a detector must then sup
 certified area, or it teaches the unlabelled animals elsewhere in the frame to be background.
 
 **This cannot ride in `instances.pq`, and the reason is polarity.** That table is keyed by
-`animal_id` and its `present` status is an *ignore* region — "an animal is here, do not score it".
+`animal_id`, and a `present` row withdraws the negative claim for its whole camera-frame (§9).
 A region is the opposite: a statement about pixels, with no animal attached, asserting that absence
 of a label here *is* evidence of absence. There is no `animal_id` to give it, and the two would be
-read with opposite signs by the same consumer.
+read with opposite signs by the same consumer. Where both apply, the `present` rule wins: a
+camera-frame with a `present` row trains no background negatives, certified or not.
 
 Rows may overlap, and a frame may carry any number of them (including none). There is no unique
 key, so rule 9 does not apply. A rectangle with `x1 <= x0` or `y1 <= y0` is an error (rule 15),
@@ -507,7 +525,7 @@ vis3d       (S, T, K)       int8       -1 unlabeled/absent, 0 missing, 1 visible
 points2d    (S, T, K, C, 2) float32    NaN where not positioned or not observed
 vis2d       (S, T, K, C)    int8       same codes, plus 2 projected (position, no claim)
 boxes       (S, T, C, 4)    float32    NaN where no box
-instance    (S, T, C)       int8       -1 none, 0 absent, 1 present(ignore), 2 labeled
+instance    (S, T, C)       int8       -1 none, 0 absent, 1 present(incomplete), 2 labeled
 ext         (C, T, 4, 4)    float64    only when a camera is moving
 regions     (M, 6)          float64    [frame, camera, x0, y0, x1, y1]; None iff no regions.pq
 ```

@@ -16,7 +16,8 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
-from ..format import INST_LABELED, INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
+from ..format import (INST_ABSENT, INST_LABELED, INST_NONE, INST_PRESENT, PROJECTED, UNLABELED,
+                      VISIBLE, load_datasets)
 
 
 def reduce_factor(size, out_wh):
@@ -346,8 +347,8 @@ class BoxDataset(Dataset):
         Outputs:
             Builds `self.index`, `self.origins` (tile origin or None -- parallel to `index`,
             not a fifth tuple element), and `self.chunk` (one (group, camera) file's worth of
-            positions -- the locality block `ChunkShuffle` needs). Frames with visibility rows
-            but no usable box are omitted rather than trained as pure background examples.
+            positions -- the locality block `ChunkShuffle` needs). Views with neither a positive
+            box nor supervised background negatives are omitted.
         Side effects:
             None.
         """
@@ -395,16 +396,17 @@ class BoxDataset(Dataset):
                 vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
                 box_only = lab.points2d is None and lab.points3d is None
                 if self.box_source == 'keypoints' and box_only and self._uses_instance_boxes(sess, lab):
-                    if ((lab.instance == INST_LABELED) & np.isfinite(lab.boxes).all(-1)).any():
+                    positive = (lab.instance == INST_LABELED) | (lab.instance == INST_PRESENT)
+                    if (positive & np.isfinite(lab.boxes).all(-1)).any():
                         self.box_only_fallback_sessions.add(sess.path)
                 frames = np.zeros(group.n_frames, dtype=bool)
                 if vis is not None and vis.shape[0]:
                     v = vis.reshape(vis.shape[0], vis.shape[1], -1)
                     frames |= (v != UNLABELED).any((0, 2))
-                if self._uses_instance_boxes(sess, lab):
-                    has_labeled_box = ((lab.instance == INST_LABELED)
-                                       & np.isfinite(lab.boxes).all(-1))
-                    frames |= has_labeled_box.any((0, 2))
+                if lab.instance is not None:
+                    # An explicit absent-only frame is a useful all-negative detector example;
+                    # present-only frames are retained only when they have a positive target.
+                    frames |= (lab.instance != INST_NONE).any((0, 2))
                 frames = np.flatnonzero(frames)
                 if max_frames_per_group and frames.size > max_frames_per_group:
                     keep = rng.choice(frames, max_frames_per_group, replace=False)
@@ -438,14 +440,46 @@ class BoxDataset(Dataset):
         box_only = lab.points2d is None and lab.points3d is None
         return has_instances and (self.box_source == 'instances' or box_only)
 
-    def _has_target(self, sess, gid, f, ci, lab):
-        """Whether this (frame, view) yields at least one usable GT box."""
+    def negative_supervision_for(self, sess, gid, f, ci, lab=None):
+        """Whether background anchors are known negatives for this camera-frame.
+
+        Without `instances.pq`, retain the format's existing exhaustive/regions policy. With an
+        instance table, a `present` row (even with no box) marks the frame incomplete and disables
+        all background negatives. Otherwise at least one explicit `labeled` or `absent` row is
+        required; an unrecorded frame makes no negative claim. When instance boxes are the target
+        source, a `labeled` row without a finite box is an animal with no target, so it disables
+        negatives too rather than teaching its pixels to be background.
+        """
+        lab = sess.labels(gid) if lab is None else lab
+        if lab.instance is None:
+            return True
+        status = lab.instance[:, f, ci]
+        if (status == INST_PRESENT).any():
+            return False
         if self._uses_instance_boxes(sess, lab):
-            labeled = lab.instance[:, f, ci] == INST_LABELED
+            boxed = np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1)
+            if ((status == INST_LABELED) & ~boxed).any():
+                return False
+        return bool(((status == INST_LABELED) | (status == INST_ABSENT)).any())
+
+    def _has_target(self, sess, gid, f, ci, lab):
+        """Whether this (frame, view) yields a positive target or supervised negatives."""
+        if self._uses_instance_boxes(sess, lab):
+            positive = ((lab.instance[:, f, ci] == INST_LABELED) |
+                        (lab.instance[:, f, ci] == INST_PRESENT))
             finite = np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1)
-            return bool((labeled & finite).any())
-        p2d = self._points_2d(sess, gid, f, ci)
-        return bool(torch.isfinite(p2d).all(-1).any())
+            if (positive & finite).any():
+                return True
+        else:
+            p2d = self._points_2d(sess, gid, f, ci)
+            if torch.isfinite(p2d).all(-1).any():
+                return True
+        # With no positive box, only an explicitly absent-only view is an all-background item. A
+        # labeled animal that yields no box here (all keypoints missing, say) stays omitted, as
+        # before: its view was assessed for pose, not certified empty.
+        if lab.instance is None or (lab.instance[:, f, ci] == INST_LABELED).any():
+            return False
+        return self.negative_supervision_for(sess, gid, f, ci, lab)
 
     def default_train_weights(self, annot_frac=None):
         """THE default train sampling weight. Always an array, never None.
@@ -624,12 +658,13 @@ class BoxDataset(Dataset):
                 push((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)
         for c in self._animal_centres(sess, gid, f, ci):
             push(c[0], c[1])
-        for _ in range(self.tile_bg_per_frame):
-            if regions is None:
-                push(rng.uniform(0, W), rng.uniform(0, H))
-            elif len(regions):
-                r = regions[rng.integers(len(regions))]
-                push(rng.uniform(r[0], r[2]), rng.uniform(r[1], r[3]))
+        if self.negative_supervision_for(sess, gid, f, ci):
+            for _ in range(self.tile_bg_per_frame):
+                if regions is None:
+                    push(rng.uniform(0, W), rng.uniform(0, H))
+                elif len(regions):
+                    r = regions[rng.integers(len(regions))]
+                    push(rng.uniform(r[0], r[2]), rng.uniform(r[1], r[3]))
         return out or [(max(0.0, (W - tw) / 2), max(0.0, (H - th) / 2))]
 
     def _animal_centres(self, sess, gid, f, ci):
@@ -643,8 +678,9 @@ class BoxDataset(Dataset):
         if (lab.points2d is None and lab.points3d is None
                 and lab.instance is not None and lab.boxes is not None):
             boxes = np.asarray(lab.boxes[:, f, ci])
-            labeled = lab.instance[:, f, ci] == INST_LABELED
-            finite = np.isfinite(boxes).all(-1) & labeled
+            positive = ((lab.instance[:, f, ci] == INST_LABELED) |
+                        (lab.instance[:, f, ci] == INST_PRESENT))
+            finite = np.isfinite(boxes).all(-1) & positive
             return [((b[:2] + b[2:]) / 2).tolist() for b in boxes[finite]]
         p2d = self._points_2d(sess, gid, f, ci).numpy()
         out = []
@@ -701,10 +737,10 @@ class BoxDataset(Dataset):
         return out
 
     def ignore_for(self, i):
-        """`(ig (S,) bool, ig_boxes (S,4))` for item `i`, in INPUT pixels. Or `(None, None)`.
+        """`(ig (S,) bool, ig_boxes (S,4))` for evaluation, in INPUT pixels.
 
-        The `instances.pq` PRESENT rows -- an animal in this view that was not annotated, so a
-        prediction on it is neither a true nor a false positive; scoring them as false positives
+        The `instances.pq` PRESENT rows are animals in this view that were not annotated, so a
+        prediction on them is neither a true nor a false positive; scoring them as false positives
         would measure the annotator. HERE rather than in `evaluate.py` because it needs item `i`'s
         own transform, which under tiling is the tile's and not the frame letterbox.
         """
@@ -737,11 +773,10 @@ class BoxDataset(Dataset):
         Points outside the frame or tile are dropped. An `instances.pq` box is an already-padded
         extent, re-entered with pad 0 and warped through all four corners.
 
-        When `instances.pq` is the box source, only finite `labeled` rows are positives; `present`
-        rows are excluded (they remain available through `ignore_for` for evaluation), and `absent`
-        rows have no target. Box-only sessions automatically use their instance boxes even when
-        the configured source is `keypoints`. The detector training loss currently does not mask
-        `present` regions, so anchors there remain background negatives; they are never positives.
+        When `instances.pq` is the box source, finite `labeled` and `present` rows are positives;
+        `absent` rows have no positive box. A `present` row also disables background-negative
+        supervision for the entire view/frame, even when its box is null. Box-only sessions
+        automatically use their instance boxes even when the configured source is `keypoints`.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -781,7 +816,8 @@ class BoxDataset(Dataset):
         for s in range(p2d.shape[0]):
             if use_instances:
                 b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
-                if lab.instance[s, f, ci] != INST_LABELED or not torch.isfinite(b).all():
+                if (lab.instance[s, f, ci] not in (INST_LABELED, INST_PRESENT)
+                        or not torch.isfinite(b).all()):
                     boxes.append(torch.full((4,), float('nan')))
                     continue
                 x0, y0, x1, y1 = b
@@ -907,6 +943,7 @@ class BoxDataset(Dataset):
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
         regions = self.regions_for(i, warp) if self.use_regions else None
+        negative_supervision = self.negative_supervision_for(sess, gid, f, ci)
 
         out_wh = (self.input_wh if self.tile_wh is None
                   else (size[0] * self.tile_scale, size[1] * self.tile_scale))
@@ -951,7 +988,7 @@ class BoxDataset(Dataset):
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
-        item = {'x': x, 'boxes': boxes}
+        item = {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
         if kpts is not None:
             item['kpts'] = kpts
         if self.use_regions:
@@ -1078,14 +1115,18 @@ def box_collate(batch):
             r = b['regions']
             regions[i, :r.shape[0]] = r
         out['regions'] = regions
+
+    if any('negative_supervision' in b for b in batch):
+        out['negative_supervision'] = torch.tensor(
+            [bool(b.get('negative_supervision', True)) for b in batch], dtype=torch.bool)
     return out
 
 
 def split_batch(batch):
-    """A collated batch dict -> `(x, boxes, kpts_or_None, regions_or_None)`.
+    """A collated batch dict -> `(x, boxes, kpts, regions, negative_supervision)`.
 
-    Keys, not ranks: the old rank-based version could not tell keypoints (B,S,K,3) from regions
-    (B,M,4) without the shape gamble that fed rectangles to the keypoint loss when the optional
-    tails were built from a three-element tuple.
+    Keys, not ranks: the old rank-based version could not tell keypoints (B,S,K,3) from rectangles
+    (B,M,4) without a shape gamble that fed boxes to the keypoint loss.
     """
-    return batch['x'], batch['boxes'], batch.get('kpts'), batch.get('regions')
+    return (batch['x'], batch['boxes'], batch.get('kpts'), batch.get('regions'),
+            batch.get('negative_supervision'))

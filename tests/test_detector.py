@@ -11,7 +11,7 @@ from pathlib import Path
 from tailcyclenet.crop import box_corners, crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler, YOLOXNano, assign,
                                    assign_tal, box_collate, box_iou, ciou_loss, decode,
-                                   detector_loss, giou_loss, letterbox, paired_iou,
+                                   detector_loss, giou_loss, letterbox, paired_iou, split_batch,
                                    unletterbox_boxes)
 from tailcyclenet.detector.config import (MODEL_KEYS, TRAINING_KEYS,
                                            load_detector_config)
@@ -1658,11 +1658,52 @@ def test_box_source_instances_uses_only_labeled_stored_boxes(tmp_path):
     assert torch.isfinite(plain[0]).all(), 'the keypoint source would produce a crop box'
 
 
-def test_box_source_instances_excludes_present_only_labels(tiny_root):
-    """A session with only present instance boxes has no positive detector targets."""
-    with pytest.raises(ValueError, match='no labelled frames'):
-        BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
-                   max_frames_per_group=4, box_source='instances')
+def test_box_source_instances_trains_present_boxes_without_negatives(tiny_root):
+    """A present box is a positive, and it makes the frame's background unreliable."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=0, box_source='instances')
+    # every other frame has only labeled rows without stored boxes: no target, no negatives
+    assert [f for _, _, f, _ in ds.index] == [1]
+    item = ds[0]
+    assert not torch.isfinite(item['boxes'][0]).any()
+    assert torch.isfinite(item['boxes'][1]).all(), 'present boxes are positive targets'
+    assert item['negative_supervision'] is False
+
+
+def test_negative_supervision_follows_instance_statuses(tmp_path):
+    """Negatives need labeled/absent evidence and no present row, with or without a box."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+    from tailcyclenet import format as fmt
+
+    T = 5
+    path = tmp_path / 'ds' / 'train' / 'boxes'
+    rig = cf._rig([('cam0', 64, 48, False, False, 0)])
+    lab = fmt.empty_labels(2, T, len(cf.KPTS_2D), 1, mode3d=False, animal_ids=['a', 'b'])
+    lab.points2d = lab.vis2d = None
+    lab.instance = np.full((2, T, 1), fmt.INST_NONE, np.int8)
+    lab.boxes = np.full((2, T, 1, 4), np.nan, np.float32)
+    lab.instance[0, 0, 0] = fmt.INST_LABELED           # labeled box: positives + negatives
+    lab.boxes[0, 0, 0] = [8, 7, 28, 29]
+    lab.instance[0, 1, 0] = fmt.INST_ABSENT            # absent-only: all-background example
+    lab.instance[0, 2, 0] = fmt.INST_LABELED           # labeled box beside a boxless present
+    lab.boxes[0, 2, 0] = [8, 7, 28, 29]
+    lab.instance[1, 2, 0] = fmt.INST_PRESENT
+    lab.instance[0, 3, 0] = fmt.INST_PRESENT           # boxless present only: nothing to train
+    # frame 4 has no instance row at all: no claim, not a negative
+    fmt.write_session(path, mode='2d', units='px', label_source='annotated',
+                      names=cf.KPTS_2D, rig=rig, groups={'g': fmt.Group('g', T)},
+                      labels={'g': lab})
+    cf._write_frames(path / 'groups' / 'g', 'cam0', T, (64, 48))
+
+    ds = BoxDataset(path.parent.parent, 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=0)
+    got = {f: ds[i]['negative_supervision'] for i, (_, _, f, _) in enumerate(ds.index)}
+    assert got == {0: True, 1: True, 2: False}
+    assert not torch.isfinite(ds[1]['boxes']).any(), 'absent rows are not positives'
+    batch = box_collate([ds[0], ds[1], ds[2]])
+    assert batch['negative_supervision'].tolist() == [True, True, False]
 
 
 def test_box_only_sessions_fall_back_to_labeled_instance_boxes(tmp_path):
@@ -1677,8 +1718,12 @@ def test_box_only_sessions_fall_back_to_labeled_instance_boxes(tmp_path):
     for i in range(len(ds)):
         boxes, kpts = ds.boxes_for(i, with_keypoints=True)
         assert torch.isfinite(boxes[0]).all()
-        assert not torch.isfinite(boxes[1]).any(), 'present boxes cannot be positive targets'
+        assert torch.isfinite(boxes[1]).all(), 'present boxes are positive targets'
         assert not torch.isfinite(kpts[..., :2]).any(), 'box-only rows must not invent keypoints'
+
+    batch = box_collate([ds[0], ds[1]])
+    assert batch['negative_supervision'].tolist() == [False, False]
+    assert split_batch(batch)[4] is batch['negative_supervision']
 
 
 def test_mixed_pose_and_box_only_sessions_both_index(tmp_path):
@@ -2414,7 +2459,7 @@ def test_use_regions_emits_a_full_frame_rect_when_the_session_has_none(tiny_root
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
                     use_regions=True)
     item = ds[0]
-    assert set(item) == {'x', 'boxes', 'regions'}
+    assert set(item) == {'x', 'boxes', 'regions', 'negative_supervision'}
     torch.testing.assert_close(item['regions'], torch.tensor([[0.0, 0.0, 64.0, 48.0]]))
 
 
@@ -2433,14 +2478,33 @@ def test_certified_anchors_unions_the_boxes_in():
 def test_split_batch_reads_explicit_keys_not_ranks():
     from tailcyclenet.detector import split_batch
     x, b = torch.zeros(2, 3, 8, 8), torch.zeros(2, 1, 4)
-    k, r = torch.zeros(2, 1, 5, 3), torch.zeros(2, 3, 4)
-    assert split_batch({'x': x, 'boxes': b}) == (x, b, None, None)
+    k, r, ig = torch.zeros(2, 1, 5, 3), torch.zeros(2, 3, 4), torch.tensor([True, False])
+    assert split_batch({'x': x, 'boxes': b}) == (x, b, None, None, None)
     assert split_batch({'x': x, 'boxes': b, 'kpts': k})[2] is k \
         and split_batch({'x': x, 'boxes': b, 'kpts': k})[3] is None
     assert split_batch({'x': x, 'boxes': b, 'regions': r})[2] is None \
         and split_batch({'x': x, 'boxes': b, 'regions': r})[3] is r
-    got = split_batch({'x': x, 'boxes': b, 'kpts': k, 'regions': r})
-    assert got[2] is k and got[3] is r
+    got = split_batch({'x': x, 'boxes': b, 'kpts': k, 'regions': r,
+                       'negative_supervision': ig})
+    assert got[2] is k and got[3] is r and got[4] is ig
+
+
+def test_detector_loss_drops_negatives_on_incomplete_frames_but_keeps_positives():
+    anchors = torch.tensor([[5.0, 5.0, 8.0], [40.0, 40.0, 8.0]])
+    obj = torch.zeros(2, 2, requires_grad=True)
+    pred_boxes = torch.tensor([[[0.0, 0.0, 16.0, 16.0], [35.0, 35.0, 45.0, 45.0]]] * 2)
+    gt = torch.tensor([[[0.0, 0.0, 16.0, 16.0]]] * 2)
+    neg = torch.tensor([True, False])
+    loss, parts = detector_loss(obj, pred_boxes, anchors, gt, negative_supervision=neg)
+    loss.backward()
+    assert parts['negative_frames'] == 0.5
+    assert obj.grad[0, 1] != 0, 'a complete frame trains its background negative'
+    assert obj.grad[1, 0] != 0, 'an incomplete frame still trains its positive'
+    assert obj.grad[1, 1] == 0, 'an incomplete frame trains no background negative'
+    same, _ = detector_loss(obj.detach(), pred_boxes, anchors, gt,
+                            negative_supervision=torch.tensor([True, True]))
+    base, _ = detector_loss(obj.detach(), pred_boxes, anchors, gt)
+    assert float(same) == float(base)
 
 
 def test_detector_loss_without_regions_is_unchanged():

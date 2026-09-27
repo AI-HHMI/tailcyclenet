@@ -350,10 +350,13 @@ def main(argv: list[str] | None = None):
         for batch in loader:
             if it >= train_cfg['iters']:
                 break
-            x, gt, gt_kpts, gt_tail = split_batch(batch)
+            x, gt, gt_kpts, gt_tail, gt_negative = split_batch(batch)
             x, gt = x.to(device), gt.to(device)
             gt_kpts = None if gt_kpts is None else gt_kpts.to(device)
             gt_tail = None if gt_tail is None else gt_tail.to(device)
+            gt_negative = None if gt_negative is None else gt_negative.to(device)
+            if gt_negative is not None and bool(gt_negative.all()):
+                gt_negative = None
             gt_regions = gt_tail if data_cfg['use_regions'] else None
             out = model(x)
             obj, boxes, kpt = out[0], out[1], out[2]
@@ -361,7 +364,7 @@ def main(argv: list[str] | None = None):
             loss, parts = detector_loss(obj, boxes, anchors, gt, kpts=kpt, gt_kpts=gt_kpts,
                                         kpt_weight=train_cfg['kpt_weight'],
                                         kpt_score_weight=train_cfg['kpt_score_weight'],
-                                        regions=gt_regions,
+                                        regions=gt_regions, negative_supervision=gt_negative,
                                         iou_aware=train_cfg['iou_aware_obj'],
                                         iou_aware_warmup=train_cfg['iou_aware_warmup'], it=it,
                                         max_pos_per_gt=train_cfg['max_pos_per_gt'] or None,

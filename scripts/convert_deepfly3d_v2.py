@@ -24,7 +24,7 @@ from tailcyclenet import format as fmt
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from convert_deepfly3d_v1 import (
     CAMERA_ORDER, IMAGE_SIZE, N_CAMERAS, N_FRAMES, NAMES, SKELETON, FLIP_PAIRS,
-    SOURCE_CONDITIONS, Record, camera_files, discover, sha256, split_map,
+    SOURCE_CONDITIONS, Record, discover, sha256, split_map,
 )
 
 UNITS = 'deepfly3d_calibrated'

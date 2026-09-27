@@ -264,6 +264,8 @@ def main(argv: list[str] | None = None):
         print(f'  DEPLOYMENT INPUT is the whole frame at this scale, NOT the tile size: '
               f'{tiled_input_wh(probe_sess.rig.size(probe_sess.cam_names[0]), data_cfg["tile_scale"])}')
     print(f'train: {len(train)} views')
+    print(f'box_source={data_cfg["boxes"]}; box-only instance fallback: '
+          f'{len(train.box_only_fallback_sessions)} session(s)')
     n_kpts = len(roots[0].names) if data_cfg['keypoints'] else 0
     if data_cfg['keypoints']:
         print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')

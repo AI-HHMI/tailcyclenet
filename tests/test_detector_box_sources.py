@@ -105,16 +105,10 @@ def test_an_animal_the_table_omits_gets_no_box(tmp_path):
     assert not torch.isfinite(got[1]).any(), 'the omitted animal must have no target'
 
 
-def test_boxes_with_no_keypoints_are_unreachable_by_the_index(tmp_path):
-    """KNOWN GAP, pinned so it cannot be mistaken for intended behaviour.
-
-    `instances.pq` holds real extents for animals whose keypoints the source removed -- 7,891 such
-    frames exist in `3dpop`. `_has_target` would accept one, because it reads the selected source,
-    but the candidate frames still come from keypoint visibility alone, so the item is never
-    offered. Deriving eligibility from the selected source is what closes this; it is deliberately
-    NOT done here because it changes the training set behind every existing 3dpop detector number.
-    """
+def test_instance_box_without_keypoints_is_indexed(tmp_path):
+    """A labeled instance box is an eligible frame even when no keypoints were recorded."""
     vis, points, inst, boxes = _tables(1, kp_frames=(), box_frames=(0,))
     root = _root(tmp_path, vis=vis, points=points, instance=inst, boxes=boxes)
-    with np.testing.assert_raises(ValueError):
-        BoxDataset(root, 'train', input_wh=(64, 64), min_crop_dim=8, box_source='instances')
+    ds, idx = _index(root, box_source='instances')
+    assert idx == {('g000', 0)}
+    assert torch.isfinite(ds.boxes_for(0)[0]).all()

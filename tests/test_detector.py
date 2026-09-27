@@ -20,6 +20,34 @@ from tailcyclenet.detector.data import (_cutout_rects, _keypoints_in_rects, _pho
 
 
 
+def _box_only_session(path, group_ids=('video_ix0', 'video_ix10')):
+    """Write multiple clips with labeled and present boxes but no keypoint/3D tables."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+    from tailcyclenet import format as fmt
+
+    T = 2
+    rig = cf._rig([('cam0', 64, 48, False, False, 0)])
+    groups = {gid: fmt.Group(gid, T) for gid in group_ids}
+    labels = {}
+    for gid in group_ids:
+        lab = fmt.empty_labels(2, T, len(cf.KPTS_2D), 1, mode3d=False,
+                               animal_ids=['labeled', 'present'])
+        lab.points2d = lab.vis2d = None
+        lab.instance = np.full((2, T, 1), fmt.INST_NONE, np.int8)
+        lab.boxes = np.full((2, T, 1, 4), np.nan, np.float32)
+        lab.instance[0, :, 0] = fmt.INST_LABELED
+        lab.boxes[0, :, 0] = [8, 7, 28, 29]
+        lab.instance[1, :, 0] = fmt.INST_PRESENT
+        lab.boxes[1, :, 0] = [35, 8, 55, 30]
+        labels[gid] = lab
+    fmt.write_session(path, mode='2d', units='px', label_source='annotated',
+                      names=cf.KPTS_2D, rig=rig, groups=groups, labels=labels)
+    for gid in group_ids:
+        cf._write_frames(path / 'groups' / gid, 'cam0', T, (64, 48))
+
+
 def _infer_program_source():
     """The inference PROGRAM as one string: `tailcyclenet/infer/{cli,driver}.py`.
 
@@ -1592,44 +1620,79 @@ def test_link_rows_survives_a_dropped_frame():
     assert linked[1, 3, 0][0] == 110
 
 
-def test_box_source_instances_uses_only_stored_boxes(tiny_root):
-    """`--boxes instances` regresses the stored extent, and does NOT fall back to keypoints.
+def test_box_source_instances_uses_only_labeled_stored_boxes(tmp_path):
+    """Stored labeled corners are targets, not the crop rule over keypoints."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+    from tailcyclenet import format as fmt
 
-    When the table is the box source it is the ONLY box source. An animal it does not describe at
-    this (frame, view) has no target at all -- not a keypoint-derived one -- which is the rule that
-    keeps a partially-labelled anchor out of detector training instead of teaching the animals it
-    left unlabelled as background. The keypoint source is built alongside to show the fallback it
-    would otherwise have taken.
-    """
-    # min_crop_dim 8, not the default 64: the fixture frame is 64x48, so a 64 px floor forces
-    # every crop to the whole image and the two sources would agree for the wrong reason.
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+    root = tmp_path / 'ds'
+    path = root / 'train' / 's'
+    cf._session_2d(path)
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    lab.instance[1, 1, 0] = fmt.INST_LABELED  # one stored positive alongside keypoints-only a01
+    fmt.write_session(path, mode='2d', units='px', label_source='annotated', names=sess.names,
+                      rig=sess.rig, groups=sess.groups, labels={'g000': lab},
+                      flip_pairs=sess.flip_pairs)
+
+    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8,
                     max_frames_per_group=4, box_source='instances')
-    base = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+    base = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8,
                       max_frames_per_group=4)
-    # The fixture's only stored box is a02 on frame 1, so frame 1 is the ONLY item the table can
-    # train on: a frame with no stored box at all is not an item. The keypoint source, which does
-    # not read the table, still indexes every frame.
-    assert len(ds) == 1, 'a frame with no stored box must not become a training item'
-    sess, gid, f, ci = ds.index[0]
-    assert f == 1
+    assert len(ds) == 1
+    sess, gid, frame, cam_ix = ds.index[0]
     boxes = ds[0]['boxes']
-    j = next(i for i, (_, _, ff, _) in enumerate(base.index) if ff == 1)
-    plain = base[j]['boxes']
+    plain_index = next(i for i, (_, _, ff, _) in enumerate(base.index) if ff == frame)
+    plain = base[plain_index]['boxes']
     lab = sess.labels(gid)
-    cam = sess.rig.posetail()[ci]
+    cam = sess.rig.posetail()[cam_ix]
     img = np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8)
     _, scale, pad = letterbox(img, ds.input_wh)
-
-    # a02 (row 1) carries the box: the target is the STORED corners at pad=0, not the keypoints
-    want = crop_box_for_points(torch.as_tensor(lab.boxes[1, f, ci]).view(2, 2),
+    want = crop_box_for_points(torch.as_tensor(lab.boxes[1, frame, cam_ix]).view(2, 2),
                                cam['size'], ds.min_crop_dim, pad=0)
     back = unletterbox_boxes(boxes[1][None], scale, pad)[0]
     torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
-    assert not torch.allclose(boxes[1], plain[1], atol=0.51)
-    # a01 (row 0) has KEYPOINTS here but no stored box: it gets NO target, not a keypoint box
-    assert not torch.isfinite(boxes[0]).any(), 'instances mode must not fall back to keypoints'
-    assert torch.isfinite(plain[0]).all(), 'the keypoint source would have produced a box here'
+    assert not torch.isfinite(boxes[0]).any(), 'no stored box means no target, despite keypoints'
+    assert torch.isfinite(plain[0]).all(), 'the keypoint source would produce a crop box'
+
+
+def test_box_source_instances_excludes_present_only_labels(tiny_root):
+    """A session with only present instance boxes has no positive detector targets."""
+    with pytest.raises(ValueError, match='no labelled frames'):
+        BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                   max_frames_per_group=4, box_source='instances')
+
+
+def test_box_only_sessions_fall_back_to_labeled_instance_boxes(tmp_path):
+    root = tmp_path / 'ds'
+    path = root / 'train' / 'boxes_only'
+    _box_only_session(path)
+    assert not (path / 'keypoints.pq').exists()
+    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8)
+    assert len(ds) == 4
+    assert {item[1] for item in ds.index} == {'video_ix0', 'video_ix10'}
+    assert len(ds.box_only_fallback_sessions) == 1
+    for i in range(len(ds)):
+        boxes, kpts = ds.boxes_for(i, with_keypoints=True)
+        assert torch.isfinite(boxes[0]).all()
+        assert not torch.isfinite(boxes[1]).any(), 'present boxes cannot be positive targets'
+        assert not torch.isfinite(kpts[..., :2]).any(), 'box-only rows must not invent keypoints'
+
+
+def test_mixed_pose_and_box_only_sessions_both_index(tmp_path):
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    import conftest as cf
+
+    root = tmp_path / 'ds'
+    _box_only_session(root / 'train' / 'boxes_only')
+    cf._session_2d(root / 'train' / 'pose')
+    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8)
+    indexed = {sess.session_id for sess, _, _, _ in ds.index}
+    assert indexed == {'boxes_only', 'pose'}
+    assert ds.box_only_fallback_sessions == {root / 'train' / 'boxes_only'}
 
 
 def test_box_source_rejects_a_typo(tiny_root):

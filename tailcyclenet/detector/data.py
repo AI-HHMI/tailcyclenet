@@ -16,7 +16,7 @@ from posetail.posetail.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
-from ..format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
+from ..format import INST_LABELED, INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, load_datasets
 
 
 def reduce_factor(size, out_wh):
@@ -387,15 +387,25 @@ class BoxDataset(Dataset):
 
         self.origins: list = []
         self.index = []
+        self.box_only_fallback_sessions = set()
         for sess in self.ds.sessions.get(split, []):
             sess.preload()
             for gid, group in sess.groups.items():
                 lab = sess.labels(gid)
                 vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
-                if vis is None or vis.shape[0] == 0:
-                    continue
-                v = vis.reshape(vis.shape[0], vis.shape[1], -1)
-                frames = np.flatnonzero((v != UNLABELED).any((0, 2)))
+                box_only = lab.points2d is None and lab.points3d is None
+                if self.box_source == 'keypoints' and box_only and self._uses_instance_boxes(sess, lab):
+                    if ((lab.instance == INST_LABELED) & np.isfinite(lab.boxes).all(-1)).any():
+                        self.box_only_fallback_sessions.add(sess.path)
+                frames = np.zeros(group.n_frames, dtype=bool)
+                if vis is not None and vis.shape[0]:
+                    v = vis.reshape(vis.shape[0], vis.shape[1], -1)
+                    frames |= (v != UNLABELED).any((0, 2))
+                if self._uses_instance_boxes(sess, lab):
+                    has_labeled_box = ((lab.instance == INST_LABELED)
+                                       & np.isfinite(lab.boxes).all(-1))
+                    frames |= has_labeled_box.any((0, 2))
+                frames = np.flatnonzero(frames)
                 if max_frames_per_group and frames.size > max_frames_per_group:
                     keep = rng.choice(frames, max_frames_per_group, replace=False)
                     frames = np.asarray(sorted(keep.tolist()), dtype=np.int64)
@@ -417,26 +427,23 @@ class BoxDataset(Dataset):
         """Number of indexed items (one camera view of one frame each)."""
         return len(self.index)
 
-    def _has_target(self, sess, gid, f, ci, lab):
-        """Whether this (frame, view) yields at least one usable GT box under `box_source`.
+    def _uses_instance_boxes(self, sess, lab):
+        """Resolve the box source per session, including box-only fallback.
 
-        Mirrors `boxes_for`'s own source selection, so the index cannot include an item the loss
-        has nothing to supervise:
-
-        * `box_source='instances'` with an `instances.pq` present: at least one finite stored box.
-          The table is the only box source here, so an animal it does not describe gets no target
-          and a frame with no stored box at all is not a training item.
-        * otherwise (`box_source='keypoints'`, or no `instances.pq` to read): at least one animal
-          with a finite point in this view, because `crop_box_for_points` returns None on all-NaN
-          and that is the only way it returns None.
-
-        A keypoint that is merely `missing` is not a point: it has no coordinates, so it cannot
-        anchor a box.
+        The configured source remains authoritative where pose labels exist. A session with no
+        2D or 3D pose layer cannot produce keypoint boxes, so its `instances.pq` boxes are used
+        even when the split-wide setting says `keypoints`.
         """
-        if self.box_source == 'instances' and lab.boxes is not None and lab.instance is not None:
-            if not bool(np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1).any()):
-                return False
-            return True
+        has_instances = lab.boxes is not None and lab.instance is not None
+        box_only = lab.points2d is None and lab.points3d is None
+        return has_instances and (self.box_source == 'instances' or box_only)
+
+    def _has_target(self, sess, gid, f, ci, lab):
+        """Whether this (frame, view) yields at least one usable GT box."""
+        if self._uses_instance_boxes(sess, lab):
+            labeled = lab.instance[:, f, ci] == INST_LABELED
+            finite = np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1)
+            return bool((labeled & finite).any())
         p2d = self._points_2d(sess, gid, f, ci)
         return bool(torch.isfinite(p2d).all(-1).any())
 
@@ -632,6 +639,13 @@ class BoxDataset(Dataset):
         running the crop rule for every animal of every frame at index-build time would pay for
         precision nothing here uses.
         """
+        lab = sess.labels(gid)
+        if (lab.points2d is None and lab.points3d is None
+                and lab.instance is not None and lab.boxes is not None):
+            boxes = np.asarray(lab.boxes[:, f, ci])
+            labeled = lab.instance[:, f, ci] == INST_LABELED
+            finite = np.isfinite(boxes).all(-1) & labeled
+            return [((b[:2] + b[2:]) / 2).tolist() for b in boxes[finite]]
         p2d = self._points_2d(sess, gid, f, ci).numpy()
         out = []
         for s in range(p2d.shape[0]):
@@ -649,11 +663,13 @@ class BoxDataset(Dataset):
         through frame `i`'s pose.
         """
         lab = sess.labels(gid)
-        if sess.mode == '3d':
+        if sess.mode == '3d' and lab.points3d is not None:
             cam = sess.cgroup(gid, f)[ci]
             pts = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)
             return project_points_torch([cam], pts)[0]
-        return torch.as_tensor(lab.points2d[:, f, :, ci], dtype=torch.float32)
+        if lab.points2d is not None:
+            return torch.as_tensor(lab.points2d[:, f, :, ci], dtype=torch.float32)
+        return torch.full((len(lab.animal_ids), sess.n_keypoints, 2), float('nan'))
 
     def _transform(self, i, size):
         """The `(scale, (padx, pady))` for item `i`: its tile's, or the whole-frame letterbox.
@@ -721,10 +737,11 @@ class BoxDataset(Dataset):
         Points outside the frame or tile are dropped. An `instances.pq` box is an already-padded
         extent, re-entered with pad 0 and warped through all four corners.
 
-        When `instances.pq` is the box source, it is the only source: an animal absent from the
-        table gets no target, and a frame with no stored boxes yields no finite boxes. This avoids
-        inventing targets for partial annotations; those keypoints remain available to pose
-        training, but detector training must not treat unlabelled animals as background.
+        When `instances.pq` is the box source, only finite `labeled` rows are positives; `present`
+        rows are excluded (they remain available through `ignore_for` for evaluation), and `absent`
+        rows have no target. Box-only sessions automatically use their instance boxes even when
+        the configured source is `keypoints`. The detector training loss currently does not mask
+        `present` regions, so anchors there remain background negatives; they are never positives.
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
@@ -760,10 +777,11 @@ class BoxDataset(Dataset):
             kpts = torch.cat([k, v[..., None].to(k.dtype)], -1)
 
         boxes = []
+        use_instances = self._uses_instance_boxes(sess, lab)
         for s in range(p2d.shape[0]):
-            if self.box_source == 'instances' and lab.boxes is not None:
+            if use_instances:
                 b = torch.as_tensor(lab.boxes[s, f, ci], dtype=torch.float32)
-                if not torch.isfinite(b).all():
+                if lab.instance[s, f, ci] != INST_LABELED or not torch.isfinite(b).all():
                     boxes.append(torch.full((4,), float('nan')))
                     continue
                 x0, y0, x1, y1 = b

@@ -49,6 +49,15 @@ def test_roundtrip_2d(tiny_root):
     np.testing.assert_allclose(lab.boxes[1, 1, 0], [10, 10, 30, 30])
 
 
+def test_keypoints_only_moving_rig_refuses_static_triangulation(tmp_path):
+    path = tmp_path / 's'
+    _session_3d(path, moving=True)
+    (path / 'points3d.pq').unlink()
+    sess = fmt.Session.load(path)
+    with pytest.raises(fmt.FormatError, match='moving cameras'):
+        sess.labels('g000')
+
+
 def test_triangulate_group_applies_residual_gate(tmp_path):
     path = tmp_path / 's'
     _session_3d(path)

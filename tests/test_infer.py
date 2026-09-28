@@ -1907,6 +1907,26 @@ def test_assoc_res_max_px_overrides_a_data_session_but_defaults_to_its_own(cli, 
         'given explicitly, it must override'
 
 
+def test_uncalibrated_singleview_prediction_session_uses_normalized_units(tmp_path):
+    """The finite single-view fallback must not inherit a 2D source's pixel units."""
+    import tomllib
+    import conftest as cf
+    from tailcyclenet.format import Session
+    from tailcyclenet.infer.predictions import SessionWriter
+
+    source_path = tmp_path / 'r' / 'train' / 's'
+    cf._session_2d(source_path, T=4)
+    source = Session.load(source_path)
+    source.mode = '3d'
+    registry = Registry.build([load_dataset(source_path.parent.parent)])
+    out = tmp_path / 'prediction'
+    writer = SessionWriter(out, source, registry, {}, list(source.groups))
+    writer.close(complete=True)
+    cfg = tomllib.loads((out / 'session.toml').read_text())
+    assert cfg['mode'] == '3d'
+    assert cfg['units'] == 'normalized'
+
+
 def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path):
     """Two facts under one name lost one of them, and nothing said so.
 

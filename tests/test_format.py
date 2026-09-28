@@ -31,6 +31,7 @@ def test_roundtrip_2d(tiny_root):
     assert sess.names == KPTS_2D
     assert sess.cam_names == ['cam0']
     assert not sess.rig.calibrated['cam0']     # a 2D camera may omit its intrinsics
+    assert sess.cgroup('g000')[0]['calibrated'] is False
 
     lab = sess.labels('g000')
     assert lab.animal_ids == ['a01', 'a02']

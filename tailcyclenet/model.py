@@ -8,6 +8,7 @@ dedicated fusion term. (2) What the 3D residual is an offset FROM is a switch
 `"triangulated"` re-adds the residual to each frame's own triangulation.
 """
 from contextlib import contextmanager
+import warnings
 
 import torch
 from einops import einsum, repeat
@@ -60,6 +61,27 @@ def scene_center(camera_group):
     b = torch.einsum('cij,cj->i', P, origins)
     A = A + eye * (1e-6 * torch.diagonal(A).abs().sum().clamp_min(1.0))
     return torch.linalg.solve(A, b).to(torch.float32)
+
+
+def _uncalibrated_singleview_anchor(cam):
+    """Put a query-free nominal camera anchor one arbitrary unit along its crop-centre ray.
+
+    A single camera's minimum-norm scene centre is its optical-ray point nearest the origin. For
+    an uncalibrated identity camera that is the camera centre itself, where projection sensitivity
+    is undefined and posetail's ``cube_scale`` becomes NaN. The one-unit offset supplies a finite
+    gauge for inference only; it cannot recover metric depth or world scale.
+    """
+    size = cam['size'].to(torch.float64)
+    px = (size / 2.0).reshape(1, 2)
+    offset = cam['offset']
+    offsets = offset if offset.ndim == 2 else offset[None]
+    und = [undistort_points(dict(cam, offset=o), px)[0] for o in offsets]
+    ext = cam['ext'] if cam['ext'].ndim == 3 else cam['ext'][None]
+    center = cam['center'] if cam['center'].ndim == 2 else cam['center'][None]
+    ray_cam = torch.cat([und[0], und[0].new_ones(1)])
+    direction = ext[0, :3, :3].to(torch.float64).t() @ ray_cam
+    direction = direction / direction.norm().clamp_min(1e-12)
+    return center[0].to(torch.float64) + direction
 
 
 # the model
@@ -260,8 +282,18 @@ class PoseTrackerEncoder(TrackerEncoder):
             coords_q = (size * 0.5).view(1, 1, 2).expand(B, K, 2).contiguous()
         else:
             assert n_cams >= 1, 'need at least one camera'
-            coords_q = scene_center(camera_group).to(device).view(1, 1, 3).expand(
-                B, K, 3).contiguous()
+            center = scene_center(camera_group).to(device)
+            cam = camera_group[0]
+            if (n_cams == 1 and not self.training
+                    and cam.get('calibrated', True) is False and cam['ext'].ndim == 2):
+                center = _uncalibrated_singleview_anchor(cam).to(device=device, dtype=torch.float32)
+                if not getattr(self, '_warned_singleview_scale_fallback', False):
+                    warnings.warn(
+                        'uncalibrated single-view 3D inference: using a one-unit camera-ray '
+                        'anchor to keep cube_scale finite; resulting XYZ is normalized and NOT '
+                        'metric', RuntimeWarning, stacklevel=2)
+                    self._warned_singleview_scale_fallback = True
+            coords_q = center.view(1, 1, 3).expand(B, K, 3).contiguous()
 
         if prior is not None:
             assert prior.shape == (B, K, coords_q.shape[-1]), \

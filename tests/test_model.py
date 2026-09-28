@@ -760,6 +760,39 @@ def test_single_view_predicts_from_rays_instead_of_dropping_the_step(moving_batc
     assert 'grid' in out, 'the depth CE (weight 1.5) must survive the single-view path'
 
 
+def test_uncalibrated_singleview_uses_finite_unit_anchor(moving_batch):
+    """A nominal one-camera inference has no metric scale, but must not emit NaN XYZ."""
+    from tailcyclenet.model import scene_center
+
+    b = moving_batch
+    cam = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in
+           b.cgroup[SEEING_CAM].items()}
+    device = b.views[SEEING_CAM].device
+    w, h = map(int, cam['size'].tolist())
+    f = float(max(w, h))
+    cam['mat'] = torch.tensor([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]],
+                              dtype=torch.float32, device=device)
+    cam['dist'] = torch.zeros_like(cam['dist'])
+    cam['offset'] = torch.zeros_like(cam['offset'])
+    cam['ext'] = torch.eye(4, dtype=torch.float32, device=device)
+    cam['center'] = torch.zeros(3, dtype=torch.float32, device=device)
+    cam['calibrated'] = False
+    assert torch.linalg.norm(scene_center([cam])) < 1e-6
+
+    model = build_model(small('wide', query='none', metric_ray_translation=True),
+                        n_keypoints=int(b.kpt_ids.max()) + 1).eval()
+    with pytest.warns(RuntimeWarning, match='NOT metric'):
+        with torch.no_grad():
+            out = model([b.views[SEEING_CAM]], b.kpt_ids, [cam], mode='3d',
+                        kpt_prior=None, prompt_time=None)
+
+    scale = out['grid']['cube_scale']
+    assert torch.isfinite(scale).all() and (scale > 0).all()
+    assert torch.isfinite(out['depth_pred']).all()
+    assert torch.isfinite(out['3d_pred_cams_rays']).all()
+    assert torch.isfinite(out['coords_pred']).all()
+
+
 def test_rays_fallback_is_a_mean_not_the_library_weighted_sum(moving_batch):
     """At one camera the prediction must BE that camera's ray point: `3d_pred_rays` is a weighted
     SUM with no division, so at one camera it lands about halfway from the world origin to the

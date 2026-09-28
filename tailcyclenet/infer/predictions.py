@@ -191,7 +191,14 @@ class SessionWriter:
                          if self.window_predictions else None)
 
         import toml
-        cfg = {'mode': source.mode, 'units': source.units, 'labels': 'tracked',
+        units = source.units
+        if (source.mode == '3d' and len(source.cam_names) == 1
+                and not source.rig.calibrated[source.cam_names[0]]
+                and not source.rig.moving[source.cam_names[0]]):
+            # The model's uncalibrated single-view fallback uses a one-unit ray anchor. Do not
+            # label those camera-relative coordinates with the source session's 2D pixel units.
+            units = 'normalized'
+        cfg = {'mode': source.mode, 'units': units, 'labels': 'tracked',
                'names': list(source.names), 'prediction_session': True, 'complete': False,
                'assoc_res_max_px': float(source.assoc_res_max_px),
                'provenance': dict(provenance)}

@@ -125,7 +125,9 @@ class Rig:
                 n = cam.get_name()
                 d = format_camera(cam, {n: self.offset[n]}, self.cam_type(n), device,
                                   ext_override=None if moving_ext is None else moving_ext.get(n))
-                out.append({k: (v.detach() if torch.is_tensor(v) else v) for k, v in d.items()})
+                camera = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in d.items()}
+                camera['calibrated'] = bool(self.calibrated[n])
+                out.append(camera)
         return out
 
 

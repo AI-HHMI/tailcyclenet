@@ -128,3 +128,155 @@ def test_read_frames_uses_the_pyav_backend(tmp_path):
     out = np.asarray(ds.read_frames(g, 'cam0', want))
     ds._readers = None
     assert out.shape == (len(want), H, W, 3)
+
+
+
+# ---------------------------------------------------------------------------------------------
+# the frame table: index k = the k-th pts in display order
+
+
+def _ffmpeg(*args):
+    import subprocess
+
+    rc = subprocess.run(['ffmpeg', '-nostdin', '-loglevel', 'error', '-y', *args]).returncode
+    if rc != 0:
+        pytest.skip('ffmpeg could not produce the fixture')
+
+
+def _assert_colours(got, idx, cam, scale=1):
+    for pos, i in enumerate(idx):
+        mean = got[pos].reshape(-1, 3).mean(0)
+        want = np.asarray(_video_colour(cam, scale * i), float)
+        assert np.abs(mean - want).max() < 12, f'position {pos} should be frame {i}; got {mean}'
+
+
+@pytest.fixture
+def fresh_tables(tmp_path, monkeypatch):
+    """An empty in-process table cache and a private on-disk one."""
+    monkeypatch.setenv('TAILCYCLENET_FRAME_TABLE_CACHE', str(tmp_path / 'tables'))
+    video._TABLES.clear()
+    yield tmp_path / 'tables'
+    video._TABLES.clear()
+
+
+def test_a_20fps_camera_on_a_1_30_grid_decodes_every_index(tmp_path, fresh_tables):
+    """THE OUTDOOR-PORTABLE CAMERAS: 20 fps written onto a 1/30 time base, pts 0,2,3,5,6,...
+    `pts x guessed_rate(30)` skipped every third index ("frames [1, 4, 7, ...] did not decode");
+    a rank in the pts table cannot."""
+    import av
+
+    src = _write_video(tmp_path / 'src.mp4', 1, 60, (64, 48))
+    dst = tmp_path / 'grid.mp4'
+    _ffmpeg('-i', str(src), '-vf', 'settb=1/30,setpts=ceil(N*1.5)', '-fps_mode', 'passthrough',
+            '-video_track_timescale', '30', '-c:v', 'libx264', '-bf', '0', '-g', '10',
+            '-crf', '10', '-pix_fmt', 'yuv420p', str(dst))
+    with av.open(str(dst)) as c:
+        pts = [p.pts for p in c.demux(c.streams.video[0]) if p.pts is not None]
+    if sorted(pts)[:4] != [0, 2, 3, 5]:
+        pytest.skip(f'this ffmpeg did not write the 1/30 grid (pts {sorted(pts)[:4]})')
+
+    r = video.PyAVReader(str(dst))
+    try:
+        assert r.table_source == 'index'      # read off the MP4 header, no scan
+        assert len(r) == 60
+        assert r.fps == pytest.approx(20.0, rel=0.01)
+        assert r.frame_times()[:4] == pytest.approx([0, 2 / 30, 3 / 30, 5 / 30])
+        idx = list(range(60))
+        _assert_colours(r.get_batch(idx), idx, 1)
+        idx = [59, 1, 1, 31, 4, 0]            # seeks, repeats, out of order
+        _assert_colours(r.get_batch(idx), idx, 1)
+    finally:
+        r.close()
+
+
+def test_b_frames_are_indexed_in_display_order(tmp_path, fresh_tables):
+    """The MP4 sample index holds DECODE timestamps; with B-frames the header route must shift
+    them onto presentation time (validated against the head and tail packets) or fall back."""
+    src = _write_video(tmp_path / 'src.mp4', 2, 90, (64, 48))
+    dst = tmp_path / 'bf.mp4'
+    _ffmpeg('-i', str(src), '-c:v', 'libx264', '-bf', '3', '-g', '12', '-crf', '10',
+            '-pix_fmt', 'yuv420p', str(dst))
+    r = video.PyAVReader(str(dst))
+    try:
+        assert r.table_source in ('index', 'scan')
+        assert len(r) == 90
+        idx = [0, 1, 2, 3, 50, 49, 89, 88, 13, 13, 70]
+        _assert_colours(r.get_batch(idx), idx, 2)
+    finally:
+        r.close()
+
+
+def test_mkv_falls_back_to_a_packet_scan_that_is_cached_on_disk(tmp_path, fresh_tables):
+    """Matroska cues index only keyframes, so the header route refuses and the file is demuxed
+    once -- then the NEXT process (here: a cleared in-process cache) reads the stored table."""
+    src = _write_video(tmp_path / 'src.mp4', 0, 40, (64, 48))
+    dst = tmp_path / 'clip.mkv'
+    _ffmpeg('-i', str(src), '-c:v', 'libx264', '-bf', '2', '-g', '8', '-crf', '10',
+            '-pix_fmt', 'yuv420p', str(dst))
+    r = video.PyAVReader(str(dst))
+    assert r.table_source == 'scan'
+    idx = [39, 0, 20, 21, 21]
+    _assert_colours(r.get_batch(idx), idx, 0)
+    r.close()
+    assert len(list(fresh_tables.glob('*.npy'))) == 1
+
+    video._TABLES.clear()
+    r = video.PyAVReader(str(dst))
+    try:
+        assert r.table_source == 'cache'
+        assert len(r) == 40
+        _assert_colours(r.get_batch(idx), idx, 0)
+    finally:
+        r.close()
+
+
+def test_a_wrong_header_table_is_replaced_by_a_scan(tmp_path, fresh_tables, monkeypatch):
+    """Every decoded pts must be a MEMBER of the table, so a header table that is wrong past the
+    probed ends is caught at the first frame it would mislabel, and rebuilt -- never trusted."""
+    src = _write_video(tmp_path / 'src.mp4', 1, 60, (64, 48))
+    dst = tmp_path / 'clip.mp4'
+    _ffmpeg('-i', str(src), '-c:v', 'libx264', '-bf', '0', '-g', '10', '-crf', '10',
+            '-pix_fmt', 'yuv420p', str(dst))
+    real = video._index_table
+
+    def corrupt(container, stream):
+        pts = real(container, stream)
+        pts = pts.copy()
+        pts[30:] += 1                           # a table off by one tick from frame 30 on
+        return pts
+
+    monkeypatch.setattr(video, '_index_table', corrupt)
+    r = video.PyAVReader(str(dst))
+    try:
+        assert r.table_source == 'index'
+        idx = [0, 1, 45, 46]
+        _assert_colours(r.get_batch(idx), idx, 1)
+        assert r.table_source == 'scan'
+    finally:
+        r.close()
+
+
+def test_scattered_indices_in_one_call_are_fetched_by_separate_seeks(tmp_path, fresh_tables,
+                                                                    monkeypatch):
+    """A batch spanning a long file must not decode everything between its ends: indices more
+    than `_FORWARD_LIMIT` apart are separate runs, each seeking on its own."""
+    src = _write_video(tmp_path / 'src.mp4', 1, 400, (64, 48))
+    monkeypatch.setattr(video, '_FORWARD_LIMIT', 20)
+    r = video.PyAVReader(str(src))
+    decoded = []
+    real = r._decode_until
+
+    def counting(target, got, last):
+        before = r._pos
+        out = real(target, got, last)
+        decoded.append((before, r._pos))
+        return out
+
+    r._decode_until = counting
+    try:
+        idx = [390, 5, 200, 201, 5]
+        _assert_colours(r.get_batch(idx), idx, 1)
+        assert len(decoded) == 3                 # three runs: [5], [200, 201], [390]
+        assert r._pos <= 391
+    finally:
+        r.close()

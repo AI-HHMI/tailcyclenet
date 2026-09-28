@@ -120,9 +120,7 @@ def _dense_arrays(session_dir: Path, group_id: str, names: list[str],
         pose[key[0], key[1], key[2]] = xyz
         n_positioned += 1
 
-    # NaN represents no visibility assessment in the archive. The Posetail loader changes
-    # NaNs to visible when constructing its legacy boolean mask; the quality-masked NaNs in
-    # pose above still prevent these unassessed points from becoming 3D pose targets.
+
     vis = np.full((len(animal_ids), n_frames, len(names), len(cameras)),
                   np.nan, dtype=np.float32)
     seen_vis: set[tuple[int, int, int, int]] = set()
@@ -147,7 +145,7 @@ def _dense_arrays(session_dir: Path, group_id: str, names: list[str],
             vis[key] = 1.0
         elif status == 'missing':
             vis[key] = 0.0
-        # 'projected', 'unlabeled', and other non-assertive states stay NaN.
+
 
     return pose, vis, animal_ids, n_positioned
 
@@ -187,7 +185,7 @@ def _posetail_metadata(calibration: dict[str, Any], camera_blocks: list[dict[str
         world_to_camera[:3, 3] = translation
         metadata['intrinsic_matrices'][name] = matrix.tolist()
         metadata['extrinsic_matrices'][name] = world_to_camera.tolist()
-        # The target reader passes each value to aniposelib as a distortion array.
+
         metadata['distortion_matrices'][name] = [distortions.tolist()]
         metadata['camera_widths'][name] = int(size[0])
         metadata['camera_heights'][name] = int(size[1])

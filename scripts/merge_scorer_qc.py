@@ -14,6 +14,7 @@ from tailcyclenet.scorer.qc import _canonical_frame_table, rank
 
 
 def _load_provenance(part: Path) -> dict:
+    """Load a part's provenance metadata, failing if it is absent."""
     path = part / 'provenance.toml'
     if not path.exists():
         raise SystemExit(f'{part}: missing provenance.toml')
@@ -21,6 +22,7 @@ def _load_provenance(part: Path) -> dict:
 
 
 def _check_common(provenance: list[dict]) -> None:
+    """Require all parts to share run, source, split, and scoring settings."""
     keys = ('scorer_run', 'source_root', 'split', 'session', 'checkpoint_file',
             'checkpoint_iteration', 'output_granularity', 'val_stride', 'window_offset')
     first = provenance[0]
@@ -33,6 +35,7 @@ def _check_common(provenance: list[dict]) -> None:
 
 
 def _part_range(part: Path) -> tuple[int, int]:
+    """Parse a part directory named ``part-START-STOP`` as a half-open range."""
     match = re.fullmatch(r'part-(\d+)-(\d+)', part.name)
     if match is None:
         raise SystemExit(f'{part}: expected directory name part-START-STOP')
@@ -43,6 +46,7 @@ def _part_range(part: Path) -> tuple[int, int]:
 
 
 def _check_ranges(parts: list[Path], expected_total: int) -> list[tuple[int, int]]:
+    """Validate that part ranges exactly partition [0, expected_total)."""
     ranges = [_part_range(part) for part in parts]
     if len(set(ranges)) != len(ranges):
         raise SystemExit('duplicate train part ranges')
@@ -59,6 +63,7 @@ def _check_ranges(parts: list[Path], expected_total: int) -> list[tuple[int, int
 
 def _merge_coverage(parts: list[Path], out: Path, expected_total: int,
                     expected_index_start: int) -> None:
+    """Merge optional coverage tables and verify their global index partition."""
     paths = [part / 'coverage.csv' for part in parts]
     present = [path.exists() for path in paths]
     if any(present) and not all(present):
@@ -84,6 +89,7 @@ def _merge_coverage(parts: list[Path], out: Path, expected_total: int,
 
 
 def main(argv=None) -> int:
+    """Merge scorer-QC parts after checking ranges, provenance, and table schemas."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--part', required=True, nargs='+', type=Path,
                         help='part output directories to merge')

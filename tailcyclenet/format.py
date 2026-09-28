@@ -141,8 +141,9 @@ def load_calibration(path: Path) -> Rig:
 def rig_from_doc(doc: dict, where: str) -> Rig:
     """`load_calibration`'s body, over an already-parsed document.
 
-    Split out for one caller: `adopt.plan` patches a camera block that carries no `size` before
-    the Rig is built, and a temporary file is a worse fact than a function.
+    Split out for `adopt.plan`, which patches missing camera sizes before building the Rig.
+    Distortion vectors are padded to five OpenCV coefficients at this load boundary because
+    posetail's projection helper consumes all five; the on-disk calibration is left unchanged.
     """
     from aniposelib.cameras import CameraGroup
 
@@ -157,10 +158,6 @@ def rig_from_doc(doc: dict, where: str) -> Rig:
         if 'size' not in block:
             raise FormatError(f'{path}: camera {name!r} has no size')
         if 'matrix' in block:
-            # aniposelib accepts short distortion vectors, but posetail's projection helper
-            # consumes the standard five OpenCV coefficients unconditionally.  Missing trailing
-            # coefficients mean zero, so pad at the load boundary rather than mutating every
-            # on-disk calibration.toml.
             camera_doc = dict(block)
             distortions = list(camera_doc.get('distortions') or [])
             if len(distortions) < 5:
@@ -1225,7 +1222,9 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     missing frame reads as a real pose at the world origin (eye(4) pre-fill); reported here as
     well as raised in `labels()` so a bulk validate lists every bad session); and rules 6/7/8
     (per group: frames in range, pixels present and the right shape). `sess.labels(gid)` is
-    also run per group and raises on unknown bodypart/camera/animal or bad frame.
+    also run per group and raises on unknown bodypart/camera/animal or bad frame. Label tables
+    are optional; `points2d.pq` is accepted only for marked prediction sessions and is checked
+    independently of annotation status/scatter rules.
     """
     errs: list[str] = []
     here = str(sess.path)
@@ -1285,9 +1284,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
     elif len(sess.rig) != 1:
         bad(5, f'mode=2d with {len(sess.rig)} cameras')
 
-    # No label table is required (§3): boxes alone are a detection session, and a session with
-    # no label table at all is an unlabelled clip. Consumers skip what they cannot use.
-
     keys = {'keypoints': ('group_id', 'frame', 'animal_id', 'camera', 'bodypart'),
             'points3d': ('group_id', 'frame', 'animal_id', 'bodypart'),
             'instances': ('group_id', 'frame', 'animal_id', 'camera'),
@@ -1304,8 +1300,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
         if n and len(table.select(cols).group_by(list(cols)).aggregate([])) != n:
             bad(9, f'{stem}.pq has duplicate keys')
 
-    # Model-produced 2D points are not assessed annotation rows. They are recognized only in an
-    # explicitly marked prediction session and are never scattered into Labels below.
     t2p = sess._tables['points2d']
     if t2p is not None:
         if not sess.prediction_session:
@@ -1326,8 +1320,6 @@ def validate_session(sess: Session, check_images: bool = True) -> list[str]:
                         bad(9, f'points2d.pq has null {key} values')
                 if n and len(t2p.select(point_keys).group_by(list(point_keys)).aggregate([])) != n:
                     bad(9, 'points2d.pq has duplicate keys')
-                # Validate references and frame bounds without invoking annotation scatter/status
-                # rules (prediction tables intentionally have no status column).
                 groups = set(sess.groups)
                 gvals = t2p.column('group_id').to_pylist()
                 frames = t2p.column('frame').to_pylist()

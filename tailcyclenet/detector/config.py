@@ -1,12 +1,10 @@
 """Detector training config: load, validate, apply CLI overrides.
 
 The detector is trained from a TOML config, the same way the pose side is (`scripts/train.py` +
-`checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml` and EVERY
-detector config layers over it automatically: this module passes it as `load_config`'s `base`
-(the pose side defaults to `configs/base.toml` the same way), so an absent key inherits the
-shipped recipe's value, and the `extends` key is deleted -- it RAISES by name. Every key is
-validated against an explicit allowed set -- an unknown key is a typo, not a comment, and must
-not silently train at defaults.
+`checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml`; EVERY detector
+config layers over it automatically via `load_config`'s `base` argument.
+Absent keys inherit the shipped recipe; `extends` is deleted and raises by name. Keys are
+validated against an explicit allowed set so typos cannot silently train at defaults.
 
 Blocks:
     [data]      the loader and what the regression target bounds

@@ -66,7 +66,12 @@ def _skeleton_edges(mat) -> list[tuple[str, str]]:
 
 
 def convert(src: Path, out: Path, clean: bool = False) -> None:
-    """Write the LEAP crops and labels as one annotated tailcycle train session."""
+    """Write the LEAP crops and labels as one annotated tailcycle train session.
+
+    MATLAB ``positions`` are stored as (row, column), or (y, x), and are reversed to tailcycle
+    pixel order (x, y). The source has no visibility labels, so finite placements are marked
+    visible; all independent sampled crops are assigned to the train split.
+    """
     h5_path, mat_path = src / H5_NAME, src / MAT_NAME
     if not h5_path.is_file() or not mat_path.is_file():
         raise FileNotFoundError(f'expected {h5_path} and {mat_path}')
@@ -93,9 +98,7 @@ def convert(src: Path, out: Path, clean: bool = False) -> None:
         raise ValueError('HDF5 and MATLAB label counts disagree')
     if boxes.dtype != np.uint8:
         raise ValueError(f'box dtype is {boxes.dtype}, expected uint8')
-    # LEAP's MATLAB positions are stored as (row, column), i.e. (y, x), despite
-    # the generic name `positions`. Tailcycle stores pixel coordinates as (x, y).
-    xy = np.transpose(positions, (2, 0, 1))[:, :, ::-1]  # (N, K, (y,x)) -> (N,K,(x,y))
+    xy = np.transpose(positions, (2, 0, 1))[:, :, ::-1]
     if not np.isfinite(xy).all() or (xy < 0).any() or (xy[..., 0] >= 192).any() \
             or (xy[..., 1] >= 192).any():
         raise ValueError('labels contain non-finite or out-of-crop coordinates')

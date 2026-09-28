@@ -33,6 +33,7 @@ V1_ROOT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/'
 
 
 def load_prediction(record: Record) -> dict:
+    """Load a record and validate its 2D and 3D prediction arrays."""
     if record.result is None or record.reason:
         raise ValueError(f'{record.condition}/{record.archive}: no usable result')
     with record.result.open('rb') as f:
@@ -81,6 +82,7 @@ def calibration_rig(pred: dict, where: str) -> fmt.Rig:
 
 
 def calibration_fingerprint(pred: dict) -> str:
+    """Hash the source camera calibration dictionaries deterministically."""
     payload = []
     for c in range(N_CAMERAS):
         payload.append({k: np.asarray(pred[c][k]).tolist() for k in ('R', 'tvec', 'intr', 'distort')})
@@ -136,6 +138,7 @@ def audit_prediction(pred: dict) -> dict:
 
 
 def pose_correction_file(record: Record) -> Path | None:
+    """Find the optional pose-correction file, rejecting ambiguous matches."""
     files = sorted(record.result_dir.glob('pose_corr_*.pkl'))
     if len(files) > 1:
         raise ValueError(f'{record.result_dir}: multiple pose correction files')
@@ -152,6 +155,7 @@ def v1_pixel_dir(record: Record, split: str, camera: int) -> Path:
 
 
 def convert_record(record: Record, split: str, root: Path, *, force: bool) -> dict:
+    """Convert one source record into a provisional calibrated 3D session."""
     if record.reason:
         return {'condition': record.condition, 'archive': record.archive, 'split': split,
                 'status': 'quarantined', 'reason': record.reason}
@@ -252,6 +256,7 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool) -> di
 
 
 def worker(payload) -> list[dict]:
+    """Convert a worker payload of records and return per-record results."""
     records, splits, root, force = payload
     out = []
     for record in records:
@@ -261,6 +266,7 @@ def worker(payload) -> list[dict]:
 
 
 def main() -> int:
+    """Parse options, convert records, and write the dataset manifests."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--source', required=True, type=Path)
     ap.add_argument('--outputs', required=True, type=Path)

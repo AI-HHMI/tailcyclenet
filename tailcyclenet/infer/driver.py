@@ -278,6 +278,9 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
         Detection advances a group-wide cursor in `_DET_BATCH` runs and overshoots `hi`; the
         results are buffered by source frame and sliced to the requested range on return.
 
+        Every frame is consumed by this window; later windows may need only the suffix beginning
+        at their start, so buffered raw detections before that next start are discarded.
+
         `max_frames=T` passes the resolved STOP index -- not `args.max_frames` (0 whenever the
         range came in as --start-frame/--end-frame): it tells `detect_raw` where the clip ends,
         and its alignment assert accepts a short final slice only at that end. The aligned lead-in
@@ -367,8 +370,6 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                     stats.setdefault('identity_events', []).extend(events)
                 stats['filled'] = stats.get('filled', 0) + int(np.isfinite(b).all(-1).sum())
                 stats['slots'] = stats.get('slots', 0) + int(np.isfinite(b).all(-1).size)
-            # Every frame is consumed by this window; subsequent windows may still need only
-            # the suffix beginning at their start. Keep raw detections from that next start.
             next_start = T if keep_from is None else int(keep_from)
             for t in [t for t in raw_buf if t < next_start]:
                 del raw_buf[t]

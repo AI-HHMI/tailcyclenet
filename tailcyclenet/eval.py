@@ -338,7 +338,11 @@ def _scatter_prediction_2d(path, preds, labels):
 
 
 def _independent_slots(path, preds, labels):
-    """Replace expanded window IDs by S seam-owned slot rows for pose scoring."""
+    """Replace expanded window IDs by S seam-owned slot rows for pose scoring.
+
+    The output axis includes slots found in point, instance, and window tables, even when a slot
+    failed every point prediction or is the highest-numbered slot.
+    """
     import tomllib
     import polars as pl
 
@@ -371,8 +375,6 @@ def _independent_slots(path, preds, labels):
         gid = key.rsplit('/', 1)[-1]
         q = table.filter(pl.col('group_id').cast(pl.String) == gid)
         slot_values = set()
-        # Include point, instance, and window tables: a slot that failed every point prediction
-        # still belongs in the output axis, including when it is the highest-numbered slot.
         for candidate_table in slot_tables:
             candidate = candidate_table.filter(pl.col('group_id').cast(pl.String) == gid)
             if 'slot' in candidate.columns:

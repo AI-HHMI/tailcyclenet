@@ -125,7 +125,12 @@ class PoseDualOptimizer(DualOptimizer):
         return state
 
     def load_state_dict(self, sd):
-        """Restore upstream state plus this repo's Muon warmup without mutating ``sd``."""
+        """Restore upstream state and Muon warmup without mutating ``sd``.
+
+        The upstream loader consumes only the two optimizer halves; copying the filtered state
+        preserves the caller's checkpoint metadata. Older states recover the global step from
+        the Muon groups' persisted ``k`` values.
+        """
         from schedulefree import ScheduleFreeWrapper
         _refuse_state_shape(self, sd)
         refuse_group_count_mismatch(self, sd)
@@ -137,13 +142,10 @@ class PoseDualOptimizer(DualOptimizer):
             if saved_base and saved_base != [float(x) for x in self._muon_base_lrs]:
                 raise SystemExit('optimizer state has a different Muon base learning-rate layout; '
                                   'start a warm start')
-        # The upstream loader only consumes the two optimizer halves; copying keeps the source
-        # checkpoint (and its metadata) unchanged.
         super().load_state_dict({k: v for k, v in sd.items() if k != '_tailcyclenet'})
         if isinstance(extra, dict) and extra.get('schema') == 'tailcyclenet.pose-dual.v1':
             self._gstep = int(extra.get('gstep', 0))
         elif self.muon_warmup_steps:
-            # Old schedule-free Muon states carry the global step as each group's ``k``.
             self._gstep = max((int(g.get('k', 0)) for g in
                                sd.get('muon', {}).get('param_groups', [])), default=0)
         for o in self._opts:
@@ -229,6 +231,7 @@ def optimizer_metadata(model, optimizer, fresh_names: set[str] | None = None) ->
     names = {id(p): name for name, p in model.named_parameters()}
 
     def groups_doc(groups, lrs=None):
+        """Describe parameter groups by stable names and effective rates."""
         return [{'lr': float(group['lr'] if lrs is None else lrs[i]),
                  'names': [names[id(p)] for p in group['params']]}
                 for i, group in enumerate(groups)]
@@ -271,6 +274,7 @@ def optimizer_layout_matches_metadata(opt, model, metadata: dict | None) -> bool
     names = {id(p): name for name, p in model.named_parameters()}
 
     def current(groups):
+        """Describe the current groups with their parameter names and rates."""
         return [{'lr': float(g['lr']),
                  'names': [names.get(id(p)) for p in g['params']]} for g in groups]
 
@@ -367,8 +371,13 @@ def state_matches_optimizer_kind(state, kind: str) -> bool:
 
 
 def optimizer_layout_matches(opt, state) -> bool:
-    """Whether saved and current optimizer groups have the same stable layout and rates."""
+    """Whether saved and current optimizer groups have the same stable layout and rates.
+
+    Legacy dual-optimizer state stores the global step in each Muon group's ``k`` value;
+    transient warmup is removed before comparing saved and configured base rates.
+    """
     def lrs(groups):
+        """Return group learning rates in their stored order."""
         return [float(g['lr']) for g in groups]
 
     if _is_dual_state(state):
@@ -376,8 +385,6 @@ def optimizer_layout_matches(opt, state) -> bool:
             return False
         extra = state.get('_tailcyclenet')
         if not isinstance(extra, dict) or extra.get('schema') != 'tailcyclenet.pose-dual.v1':
-            # Recover the old schedule-free global step from each group's persisted ``k`` and
-            # undo the transient warmup factor before comparing base rates.
             groups = state['muon']['param_groups']
             gstep = max((int(g.get('k', 0)) for g in groups), default=0)
             if opt.muon_warmup_steps and not any('k' in g for g in groups):

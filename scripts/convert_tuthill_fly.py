@@ -92,7 +92,11 @@ def image_for(folder: Path, name: str) -> Path:
 
 
 def config_name(prefix: str) -> str:
-    """Map a source recording prefix to the archived calibration/config filename."""
+    """Map a source recording prefix to its archived calibration/config filename.
+
+    Offball exports reference a missing workstation calibration; use the matching pre-Sarah
+    8.13.19 rig rather than 7.24.20, whose residuals are about 50 pixels.
+    """
     if prefix.startswith('2019-09-04'):
         return '5.22.19'
     if prefix.startswith('evyn6_2020-04-15'):
@@ -100,8 +104,6 @@ def config_name(prefix: str) -> str:
     if prefix.startswith('evyn6_2020-05-07'):
         return '8.13.19'
     if prefix.startswith('offball_flies_'):
-        # These metadata paths point at a missing workstation calibration; the archived
-        # 8.13.19 rig is the matching pre-Sarah rig (7.24.20 gives ~50 px residuals).
         return '8.13.19'
     if prefix.startswith('sarah6_2020-07-29'):
         return '7.24.20'
@@ -116,8 +118,9 @@ def calibrated_rig(src: Path, prefix: str, sizes: dict[str, tuple[int, int]],
     """Load an exact Sarah date calibration and attach its crop offsets/sizes.
 
     Sarah sessions are eligible for 3D only when the rclone-populated cache contains both
-    ``<date>/metadata/config.toml`` and ``<date>/calibration.toml``.  No archived fallback is
-    allowed for Sarah: a missing external pair is handled by the caller as 2D.
+    ``<date>/metadata/config.toml`` and ``<date>/calibration.toml``. No archived fallback is
+    allowed; a missing pair is handled by the caller as 2D. Some older Anipose ROI exports use
+    inclusive width/height endpoints, so decoded image dimensions are authoritative.
     """
     stem = config_name(prefix)
     if prefix.startswith('sarah6_'):
@@ -142,8 +145,6 @@ def calibrated_rig(src: Path, prefix: str, sizes: dict[str, tuple[int, int]],
             raise RuntimeError(f'{stem}: missing four-value crop offset for camera {cam}')
         off = tuple(float(v) for v in values[:2])
         cfg_size = tuple(int(v) for v in values[2:])
-        # Older Anipose ROI exports use inclusive width/height endpoints, so a stored
-        # crop can differ from the config by one pixel.  The decoded image is authoritative.
         rig.offset[cam] = off
         rig.by_name(cam).set_size(sizes.get(cam, cfg_size))
         rig.moving[cam] = False
@@ -163,7 +164,12 @@ def reprojection(rig: fmt.Rig, p2_sensor: np.ndarray) -> tuple[np.ndarray, np.nd
 
 
 def refine_rig(rig: fmt.Rig, p2_sensor: np.ndarray, reject_px: float) -> tuple[fmt.Rig, np.ndarray, np.ndarray, dict]:
-    """Reject gross observations, bundle-adjust extrinsics, and apply the final gate."""
+    """Reject gross observations, bundle-adjust extrinsics, and apply the final gate.
+
+    Keep the adjustment only when its median residual is not plainly worse than the archived
+    calibration. The camera group is mutated by bundle adjustment, so callers must reload it if
+    that guard rejects the result.
+    """
     work = p2_sensor.copy()
     initial_p3, initial_err = reprojection(rig, work)
     for _ in range(2):
@@ -180,13 +186,11 @@ def refine_rig(rig: fmt.Rig, p2_sensor: np.ndarray, reject_px: float) -> tuple[f
         except (RuntimeError, ValueError, np.linalg.LinAlgError) as e:
             ba_message = f'{type(e).__name__}: {e}'
     final_p3, final_err = reprojection(ba_rig, work)
-    # Do not retain an adjustment that is plainly worse than the archived calibration.
     finite_initial = initial_err[np.isfinite(initial_err)]
     finite_final = final_err[np.isfinite(final_err)]
     if (not len(finite_final) or (len(finite_initial) and
                                   np.nanmedian(finite_final) > max(1.0, 2 * np.nanmedian(finite_initial)))):
         ba_rig = rig
-        # The rig was already mutated; reload is done by caller when this guard is needed.
         ba_message = 'rejected: bundle adjustment worsened residuals'
     bad = np.isfinite(final_err) & (final_err > reject_px)
     work[bad] = np.nan
@@ -201,7 +205,13 @@ def refine_rig(rig: fmt.Rig, p2_sensor: np.ndarray, reject_px: float) -> tuple[f
 
 def make_multiview(src: Path, out: Path, prefix: str, folders: list[Path], reject_px: float,
                    clean: bool, sarah_cal_root: Path | None = None) -> dict:
-    """Convert one synchronized six-camera prefix into one 3D session."""
+    """Convert one synchronized six-camera prefix into one 3D session.
+
+    Metadata can include unlabeled images; retain only images present in every camera's DLC CSV.
+    Preserve source DLC coordinates as 2D labels: sensor-offset coordinates are used only for
+    triangulation and gating, and filtered observations are omitted rather than replaced by
+    reprojections.
+    """
     folders = sorted(folders, key=lambda p: p.name[-1])
     if tuple(p.name[-1] for p in folders) != CAMERAS:
         raise RuntimeError(f'{prefix}: expected cameras A-F, got {[p.name for p in folders]}')
@@ -209,8 +219,6 @@ def make_multiview(src: Path, out: Path, prefix: str, folders: list[Path], rejec
     csv_maps = [{r['image']: r for r in rows} for rows in csv_rows]
     with (folders[0] / 'anipose_metadata.csv').open(newline='') as f:
         metadata_all = list(csv.DictReader(f))
-    # Some exports retain metadata for unlabeled images.  Keep the synchronized intersection
-    # that is actually present in every camera's DLC CSV.
     common_images = set.intersection(*(set(m) for m in csv_maps))
     metadata = [r for r in metadata_all if Path(r['img'].replace('\\', '/')).name in common_images]
     if not metadata:
@@ -245,8 +253,6 @@ def make_multiview(src: Path, out: Path, prefix: str, folders: list[Path], rejec
     for i, meta in enumerate(metadata):
         gid = f'{i:06d}'
         lab = fmt.empty_labels(1, 1, K, len(CAMERAS), mode3d=True, animal_ids=['a00'])
-        # Keep the source DLC coordinates verbatim.  ``work`` is only the sensor-coordinate
-        # copy used for triangulation/gating; never write its reprojections back as 2D labels.
         raw_points = raw[:, i * K:(i + 1) * K]
         source_missing = ~np.isfinite(raw_points).all(-1)
         removed = np.isfinite(raw_points).all(-1) & ~np.isfinite(work[:, i * K:(i + 1) * K]).all(-1)

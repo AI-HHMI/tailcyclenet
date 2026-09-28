@@ -892,7 +892,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     The per-step training metrics are averaged over the last `print_freq` steps before printing,
     because ONE step is one window: with K keypoints that is K triplets (7 on calms21), so a
     single step's `triplet_acc` is quantised in units of 1/K and swings over the full range while
-    the model learns. The val pass is the number to read; this is the trace.
+    the model learns. The val pass is the number to read; this is the trace. A synchronized DDP
+    step advances the headline iteration by `world`; `step` counts completed local optimizer steps.
 
     Inputs: config_path -- a config layering over `configs/scorer.toml`; data_path -- the dataset
             root (overrides `[data].path`); out -- the run folder; checkpoint -- a pose run folder
@@ -1172,8 +1173,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 step += 1
                 continue
             optimizer.step()
-            # `step` counts completed local (per-rank) optimizer steps.  Match pose training:
-            # one synchronized DDP step advances the headline iteration by `world`.
             step += 1
             iteration = step * world
             hist = loss_fn.collapse_history(prefix='')

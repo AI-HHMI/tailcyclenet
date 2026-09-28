@@ -95,14 +95,14 @@ class Record:
 class NativeResult:
     """Materialized arrays and calibration from one native HDF5 result."""
 
-    points2d: np.ndarray  # (C,T,K,2), stored-image x,y pixels
-    confidence: np.ndarray  # (C,T,K)
-    points3d: np.ndarray  # (T,K,3), native units
+    points2d: np.ndarray
+    confidence: np.ndarray
+    points3d: np.ndarray
     camera_names: list[str]
-    intrinsics: np.ndarray  # (C,4), fx,fy,cx,cy (or supplied 3x3 converted)
+    intrinsics: np.ndarray
     distortions: list[np.ndarray]
-    rvecs: np.ndarray  # (C,3), world -> camera Rodrigues
-    tvecs: np.ndarray  # (C,3), world -> camera native units
+    rvecs: np.ndarray
+    tvecs: np.ndarray
     names: list[str]
     bones: list[tuple[int, int]]
     image_sizes: list[tuple[int, int]]
@@ -152,8 +152,8 @@ def _read(f: h5py.File, name: str, *, required: bool = True):
 
 def _archive_for(record: Record) -> Path | None:
     """Find the source ZIP alongside an extracted trial, if one exists."""
-    # Extraction uses the ZIP stem as the directory name.  Do not require it: a user may
-    # intentionally retain only extracted images.
+
+
     root = record.images.parent.parent
     candidates = [root / f'{record.archive}.zip', root.parent / f'{record.archive}.zip']
     return next((p for p in candidates if p.is_file()), None)
@@ -177,8 +177,8 @@ def _result_matches(result: Path, record: Record) -> bool:
         return True
     if result.parent.name in names:
         return True
-    # Native deeperfly stores the absolute image paths as pose2d/footage metadata.  Reading one
-    # small attribute is safer than guessing when output names were changed by a batch runner.
+
+
     try:
         with h5py.File(result, 'r') as f:
             raw = f.get('pose2d')
@@ -196,8 +196,8 @@ def _find_result(outputs: Path, record: Record, paths: list[Path]) -> tuple[Path
         return paths[0], None
     names = {record.archive, record.archive.removesuffix('_behData_images'),
              record.archive.removesuffix('_images')}
-    # Production workers preserve the source session as the results directory name.  Resolve
-    # that cheap path key first; the old metadata fallback is only needed for renamed outputs.
+
+
     matched = [p for p in paths if p.parent.name in names and record.condition in p.parts]
     if not matched:
         matched = [p for p in paths if p.parent.name in names]
@@ -222,9 +222,8 @@ def camera_files(images: Path, camera: int, n_frames: int | None = None) -> list
                          f'needs at least {n_frames}')
     expected = [images / f'camera_{camera}_img_{i:06d}{files[0].suffix}'
                 for i in range(n_frames)] if files else []
-    # Native H5 pilots may contain a prefix of a longer extracted trial.  The result frame
-    # count defines the converted interval; require that prefix to be contiguous and return
-    # only it.  Full production results still exercise the exact 000000..000899 path.
+
+
     if files[:n_frames] != expected:
         raise ValueError(f'{images}: camera {camera} is not contiguous 000000..{n_frames - 1:06d}')
     return files[:n_frames]
@@ -235,7 +234,7 @@ def discover(source: Path, outputs: Path) -> list[Record]:
     source, outputs = Path(source), Path(outputs)
     if not source.is_dir():
         raise SystemExit(f'missing source directory: {source}')
-    # Keep v1's four-condition order where present, while allowing a fixture with only a subset.
+
     known_conditions = [c for c in SOURCE_CONDITIONS if (source / c / 'extracted').is_dir()]
     extra_conditions = sorted(p.name for p in source.iterdir()
                               if p.is_dir() and (p / 'extracted').is_dir()
@@ -252,15 +251,15 @@ def discover(source: Path, outputs: Path) -> list[Record]:
                     fam = family_id(condition, d.name)
                     reason = None
                 except ValueError as exc:
-                    # Keep malformed archives visible in inventory and assign a deterministic
-                    # quarantine-only family so split_map can still build a complete manifest.
+
+
                     fam = f'{condition}__invalid__{d.name}'
                     reason = 'invalid_family_id:' + str(exc)
                 candidates.append((condition, d.name, d / 'images', fam, reason))
     paths = _candidate_result_paths(outputs)
     records: list[Record] = []
-    # A direct HDF5 is unambiguous only for a one-trial source.  Assigning it to every
-    # extracted trial would silently duplicate one experiment (and was an easy CLI footgun).
+
+
     direct = outputs.is_file()
     for condition, archive, images, fam, reason in candidates:
         if reason is None and not images.is_dir():
@@ -332,9 +331,8 @@ def load_result(path: Path, *, source_images: Path | None = None) -> NativeResul
     path = Path(path)
     try:
         with h5py.File(path, 'r') as f:
-            # Native PoseResult chooses the most-derived per-view coordinates.  The
-            # triangulation stage may have filtered a detector outlier, while confidence
-            # remains the pose2d detector's raw peak for that point.
+
+
             p2_name = next((name for name in ('triangulation/points',
                                                'pictorial_structures/points',
                                                'pose2d/points') if name in f), None)
@@ -360,9 +358,8 @@ def load_result(path: Path, *, source_images: Path | None = None) -> NativeResul
 
             ba = 'bundle_adjustment/cameras'
             cams = _camera_names(f, ba)
-            # Pose arrays are view-leading too.  If the native file carries the pose camera
-            # table, require its order to agree with BA rather than silently pairing points
-            # from one view with calibration from another.
+
+
             if 'pose2d/cameras' in f and _camera_names(f, 'pose2d/cameras') != cams:
                 raise ValueError('pose2d/cameras order differs from bundle_adjustment/cameras')
             intr = _intrinsics(_read(f, f'{ba}/intrs'), N_CAMERAS, ba)
@@ -396,8 +393,8 @@ def load_result(path: Path, *, source_images: Path | None = None) -> NativeResul
                         raise ValueError(f'skeleton/bones contains index {(a,b)} outside fly38')
                     bones.append((a, b))
             if not bones:
-                # The native fly38 skeleton has these chains; do not silently produce a
-                # misleading empty skeleton when a minimal result omits the optional group.
+
+
                 bones = [(i, i + 1) for start in (0, 5, 10, 19, 24, 29)
                           for i in range(start, start + 4)] + [(16, 17), (17, 18), (35, 36), (36, 37)]
             if (15, 34) not in bones and (34, 15) not in bones:
@@ -411,7 +408,7 @@ def load_result(path: Path, *, source_images: Path | None = None) -> NativeResul
             if raw_sizes:
                 try:
                     doc = json.loads(raw_sizes)
-                    # Native metadata is {view: [height,width]}.
+
                     sizes = [(int(doc[name][1]), int(doc[name][0])) for name in cams]
                 except (KeyError, TypeError, ValueError, IndexError, json.JSONDecodeError) as exc:
                     raise ValueError('pose2d image_sizes metadata is malformed') from exc
@@ -424,8 +421,8 @@ def load_result(path: Path, *, source_images: Path | None = None) -> NativeResul
                     with Image.open(files[0]) as im:
                         sizes.append(tuple(int(v) for v in im.size))
             if not sizes:
-                # Native deeperfly's extracted Ramdya images are 960x480.  This fallback is
-                # used only for small HDF5 fixtures and is visible in provenance.
+
+
                 sizes = [(960, 480)] * N_CAMERAS
             if len(sizes) != N_CAMERAS:
                 raise ValueError('could not determine seven image sizes')
@@ -709,18 +706,17 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool = Fals
     try:
         names = result.names
         skeleton, flip_pairs = skeleton_for(result)
-        # Native arrays are C,T,K; tailcycle dense arrays are S,T,K,C.
+
         points2d = np.transpose(result.points2d, (1, 2, 0, 3))[None].astype(np.float32)
-        # The native pathway plan is the only per-view visibility information: an output
-        # coordinate means the point was predicted in that view; NaN means the pathway did
-        # not predict that anatomical point.  Preserve both outcomes as explicit statuses.
+
+
         vis2d = np.full((1, result.n_frames, N_KEYPOINTS, N_CAMERAS), fmt.MISSING, np.int8)
         vis2d[0][np.transpose(observed, (1, 2, 0))] = fmt.VISIBLE
         points3d = (result.points3d * scale)[None].astype(np.float32)
         vis3d = np.full((1, result.n_frames, N_KEYPOINTS), fmt.UNLABELED, np.int8)
         valid3 = np.isfinite(result.points3d).all(axis=-1) & (support >= 2)
         vis3d[0][valid3] = fmt.PROJECTED
-        # The arrays for failed 3D points stay NaN; write_session emits no row for them.
+
         points3d[0][~np.isfinite(result.points3d).all(axis=-1)] = np.nan
     
         group = fmt.Group(
@@ -772,7 +768,7 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool = Fals
         fmt.write_session(temp, mode='3d', units='mm', label_source='tracked', names=names,
                           rig=rig, groups={'g000': group}, labels={'g000': labels},
                           skeleton=skeleton, flip_pairs=flip_pairs, provenance=provenance)
-        # Score ordering is exactly the dense status order: frame, bodypart, camera.
+
         _append_scores(temp / 'keypoints.pq', result.confidence.transpose(1, 2, 0).reshape(-1))
     
         for c, cname in enumerate(result.camera_names):
@@ -791,7 +787,7 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool = Fals
     except Exception:
         shutil.rmtree(temp, ignore_errors=True)
         for farm in farms:
-            # A failed validation must not leave a misleading successful pixel farm behind.
+
             shutil.rmtree(farm, ignore_errors=True)
         raise
     return {
@@ -917,8 +913,8 @@ def _same_policy(root: Path, policy: dict) -> bool:
                 return False
         return True
     except Exception:
-        # A damaged prior session is not an idempotent success; the caller will refuse it
-        # unless --force explicitly quarantines the root.
+
+
         return False
 
 
@@ -985,8 +981,8 @@ def convert_command(args) -> int:
                                                  max_reprojection_px=args.max_reprojection_px))
             except (AssertionError, OSError, ValueError, RuntimeError, KeyError, TypeError,
                     EOFError, OverflowError) as exc:
-                # A malformed trial is quarantined; a session that was partially written is
-                # removed by convert_record before raising.  Other trials remain convertible.
+
+
                 inventory.append({'condition': record.condition, 'archive': record.archive,
                                   'split': split, 'status': 'quarantined',
                                   'reason': 'conversion_failed:' + str(exc),

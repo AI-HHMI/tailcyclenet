@@ -856,7 +856,8 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
 
     The function returns ``None`` for ordinary view/keypoint failures, or for a distance-gated draw
     with no evaluable active row.  Sparse keypoints redraw their corruption up to the existing
-    retry cap when the distance gate leaves them with no active far slot.
+    retry cap when the distance gate leaves them with no active far slot. Pin-memory workers
+    require the returned `fired_frame` frame axis to be materialized, not an expanded view.
     """
     dense_3d, dense_2d, sparse_3d, sparse_2d = corruptors
     view_a = dataset._realise(sel, rng, world_gauge=False)
@@ -997,8 +998,6 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
         'segment_mask': seg_local,
         'segments': [[metadata_flat[i] for i in range(K) if bool(keep[i])]],
         'corruption_type_mask': type_mask,
-        # Pinning a broadcast view fails with overlapping memory; workers hand this to the
-        # single-GPU DataLoader's pin-memory thread, so materialise the frame axis here.
         'fired_frame': fired_keep[:, None, :, :].expand(-1, coords.shape[1], -1, -1).contiguous(),
         'source_frame_weight': weights,
         'max_clean_px': float(cfg.get('max_clean_px', 0.0)),

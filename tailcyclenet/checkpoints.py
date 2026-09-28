@@ -442,6 +442,9 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     (evaluate), captured by toggling the optimizer into eval mode and back. Only `last` and
     `best` are ever written; the write renames a sibling temp file into place.
 
+    Pose checkpoints also store optimizer metadata keyed by parameter name because state loading
+    matches optimizer groups by position.
+
     `write = False` runs the eval/train toggle but skips the clone and disk write -- correctness,
     not an optimisation: the float32 toggle round trip is not bit-exact, so every rank must pay
     it (only rank 0 writes) or rank 0's weights drift, which `check_ranks_agree` exists to catch.
@@ -480,7 +483,6 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                'model_config': config.get('model'),
                'keypoint_registry': None if registry is None else registry.to_dict()}
     if kind == 'pose':
-        # Name membership is required because torch loads optimizer state by group position.
         from .optim import optimizer_metadata
         payload['optimizer_metadata'] = optimizer_metadata(model, optimizer, fresh_names)
     if kind == 'scorer':

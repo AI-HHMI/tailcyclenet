@@ -84,6 +84,7 @@ class _WindowPredictionWriter:
         'refined_x1', 'refined_y1')
 
     def __init__(self, path: Path):
+        """Open a typed Parquet writer; status fields use a stable dictionary type."""
         import pyarrow as pa
         import pyarrow.parquet as pq
 
@@ -91,7 +92,6 @@ class _WindowPredictionWriter:
         fields.extend(pa.field(name, pa.int32()) for name in self.INT_FIELDS)
         fields.extend(pa.field(name, pa.float32()) for name in self.FLOAT_FIELDS)
         fields.extend(pa.field(name, pa.bool_()) for name in self.BOOL_FIELDS)
-        # status uses a stable dictionary field even though it is null on most record types.
         fields = [pa.field(f.name, pa.dictionary(pa.int32(), pa.string())
                            if f.name in self.DICT_FIELDS else f.type) for f in fields]
         self.schema = pa.schema(fields, metadata={b'tailcyclenet.schema_version': b'1'})
@@ -99,6 +99,7 @@ class _WindowPredictionWriter:
         self._closed = False
 
     def write(self, records) -> None:
+        """Normalize and append prediction records; empty batches are ignored."""
         import pyarrow as pa
 
         records = list(records)
@@ -137,6 +138,7 @@ class _WindowPredictionWriter:
         self._writer.write_table(pa.table(columns, schema=self.schema))
 
     def close(self) -> None:
+        """Close the underlying Parquet writer once."""
         if not self._closed:
             self._writer.close()
             self._closed = True
@@ -195,8 +197,6 @@ class SessionWriter:
         if (source.mode == '3d' and len(source.cam_names) == 1
                 and not source.rig.calibrated[source.cam_names[0]]
                 and not source.rig.moving[source.cam_names[0]]):
-            # The model's uncalibrated single-view fallback uses a one-unit ray anchor. Do not
-            # label those camera-relative coordinates with the source session's 2D pixel units.
             units = 'normalized'
         cfg = {'mode': source.mode, 'units': units, 'labels': 'tracked',
                'names': list(source.names), 'prediction_session': True, 'complete': False,
@@ -412,14 +412,12 @@ class SessionWriter:
         tmp.replace(path)
 
     def close(self, complete: bool = False):
-        """Close writers and mark the session complete only after successful finalization."""
+        """Close writers and mark completion; create an empty typed points2d table if needed."""
         for w in self._w.values():
             w.close()
         if self._sidecar is not None:
             self._sidecar.close()
         if not (self.out / 'points2d.pq').exists():
-            # A prediction session remains structurally valid when no finite 2D point was
-            # produced; preserve the prediction-table schema in an empty Parquet file.
             write_table(self.out / 'points2d.pq', {
                 'group_id': np.array([], object), 'frame': np.array([], np.int32),
                 'animal_id': np.array([], object), 'camera': np.array([], object),
@@ -511,8 +509,6 @@ def _load_prediction_session(path, sess, cfg, groups=None):
             S = max(slot_values, default=-1) + 1
             animal_ids = [f'slot_{i:02d}' for i in range(S)]
         else:
-            # Annotation labels are never populated from points2d; IDs are taken directly from
-            # prediction tables if this 2D-only prediction has no 3D/instance rows.
             lab = sess.labels(gid)
             animal_ids = list(lab.animal_ids)
             if not animal_ids:
@@ -566,12 +562,14 @@ def _load_prediction_session(path, sess, cfg, groups=None):
 
 
 def _filter_group(table, gid, pc):
+    """Select rows belonging to one group, preserving absent or empty tables."""
     if table is None or not len(table):
         return table
     return table.filter(pc.equal(table.column('group_id'), gid))
 
 
 def _nullable_ints(table, col):
+    """Read an integer column, replacing null entries with -1."""
     return np.asarray([-1 if v is None else int(v) for v in table.column(col).to_pylist()],
                       dtype=np.int64)
 
@@ -625,6 +623,7 @@ def _scatter_prediction(table, out, sess, gid, id_index, independent, fields,
 
 
 def _nullable_floats(table, col):
+    """Read a float column as float32, using NaN for null or absent values."""
     if col not in table.column_names:
         return np.full(len(table), np.nan, np.float32)
     return np.asarray([np.nan if v is None else float(v)

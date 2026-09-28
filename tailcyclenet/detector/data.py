@@ -287,7 +287,9 @@ class BoxDataset(Dataset):
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False):
         """Build the per-view/per-frame index of labelled items for one dataset root.
 
-        Every opt-in lever defaults to OFF, so an arm moves one key at a time.
+        Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
+        absent-only frames can supply all-negative examples; present-only frames require a
+        positive target, while pose-assessed frames with no box are omitted.
 
         Inputs:
             path, split -- dataset root and split directory.
@@ -357,8 +359,6 @@ class BoxDataset(Dataset):
                     v = vis.reshape(vis.shape[0], vis.shape[1], -1)
                     frames |= (v != UNLABELED).any((0, 2))
                 if lab.instance is not None:
-                    # An explicit absent-only frame is a useful all-negative detector example;
-                    # present-only frames are retained only when they have a positive target.
                     frames |= (lab.instance != INST_NONE).any((0, 2))
                 frames = np.flatnonzero(frames)
                 if max_frames_per_group and frames.size > max_frames_per_group:
@@ -427,9 +427,6 @@ class BoxDataset(Dataset):
             p2d = self._points_2d(sess, gid, f, ci)
             if torch.isfinite(p2d).all(-1).any():
                 return True
-        # With no positive box, only an explicitly absent-only view is an all-background item. A
-        # labeled animal that yields no box here (all keypoints missing, say) stays omitted, as
-        # before: its view was assessed for pose, not declared empty.
         if lab.instance is None or (lab.instance[:, f, ci] == INST_LABELED).any():
             return False
         return self.negative_supervision_for(sess, gid, f, ci, lab)

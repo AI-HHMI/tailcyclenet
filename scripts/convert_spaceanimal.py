@@ -45,9 +45,11 @@ def _natural_key(path: Path) -> tuple[int, str]:
 
 
 def _skeleton(category: dict, names: list[str]) -> list[tuple[str, str]]:
-    """Build a connected, anatomical skeleton for each SpaceAnimal keypoint axis."""
-    # The fly export's COCO graph omits the attachments of all six legs and attaches the eyes
-    # to ``mouth``.  Use the body ``back``/thorax point as the common limb anchor instead.
+    """Build a connected, anatomical skeleton for each SpaceAnimal keypoint axis.
+
+    The fly export omits all six leg attachments and connects the eyes to ``mouth``. Anchor
+    its limbs at ``back`` instead; other species use the graph declared in their COCO category.
+    """
     if 'leftleg1_1' in names:
         edges = [('mouth', 'head'), ('head', 'back'), ('back', 'tail'),
                  ('head', 'lefteye'), ('head', 'righteye'),
@@ -128,6 +130,7 @@ def _frame_files(data_dir: Path) -> list[Path]:
 
 
 def _image_size(path: Path) -> tuple[int, int]:
+    """Read an image's pixel width and height."""
     from PIL import Image
 
     with Image.open(path) as image:
@@ -138,7 +141,13 @@ def _write_clip(out: Path, source_root: Path, split: str, group_name: str,
                 images: dict[int, dict], annotations: list[dict], names: list[str],
                 skeleton: list[tuple[str, str]], flip_pairs: list[tuple[str, str]],
                 animal_key: str, ann_path: Path) -> None:
-    """Write one source clip as one tailcycle session."""
+    """Write one source clip as one tailcycle session.
+
+    COCO visibility 1 is a positioned but not-visible assessment and maps to ``missing``;
+    visibility 2 retains its coordinates as ``visible``. Source clips have fixed resolution, so
+    only one JPEG is inspected while every annotated frame's JSON dimensions are checked.
+    Pixels are linked by absolute path to preserve JPEG bytes without per-frame realpath lookups.
+    """
     data_dir = source_root / 'data' / group_name
     files = _frame_files(data_dir)
     frame_index = {p.name: i for i, p in enumerate(files)}
@@ -179,14 +188,10 @@ def _write_clip(out: Path, source_root: Path, split: str, group_name: str,
                     labels.points2d[a, frame, k, 0] = (float(x), float(y))
                     labels.vis2d[a, frame, k, 0] = fmt.VISIBLE
                 elif int(visibility) == 1:
-                    # COCO v=1 means labelled but not visible: this is a genuine assessment.
                     labels.vis2d[a, frame, k, 0] = fmt.MISSING
                 elif int(visibility) != 0:
                     raise RuntimeError(f'{ann_path}: unsupported COCO visibility {visibility!r}')
 
-    # The source is a fixed-resolution clip.  Inspecting every JPEG here is needlessly expensive;
-    # the JSON metadata records the dimensions for every annotated frame and validation can do a
-    # full image check later when requested.
     size = _image_size(files[0])
     metadata_sizes = {(int(row['width']), int(row['height'])) for row in images.values()
                       if Path(row['file_name']).parent.name == group_name}
@@ -199,8 +204,6 @@ def _write_clip(out: Path, source_root: Path, split: str, group_name: str,
     pixel_dir = dst / 'groups' / 'clip' / 'cam0'
     pixel_dir.mkdir(parents=True, exist_ok=True)
     for i, source in enumerate(files):
-        # Absolute symlinks keep the processed tree movable only as a whole, but avoid a costly
-        # realpath lookup for every frame and preserve the original JPEG bytes exactly.
         fmt.link(pixel_dir / f'{i:06d}.jpg', source)
 
     group = fmt.Group('clip', T, fps=float('nan'), source_video=str(data_dir),
@@ -221,7 +224,11 @@ def _write_clip(out: Path, source_root: Path, split: str, group_name: str,
 
 
 def convert(name: str, clean: bool = False, workers: int = 32) -> None:
-    """Convert one named SpaceAnimal dataset, including train and val, in parallel."""
+    """Convert one named SpaceAnimal dataset, including train and val, in parallel.
+
+    Clips are independent and the hot path is filesystem metadata and symlink creation, so
+    threads overlap I/O without copying large image arrays into worker processes.
+    """
     cfg = DATASETS[name]
     source_root = SRC / cfg['source']
     out = OUT / name
@@ -236,8 +243,6 @@ def convert(name: str, clean: bool = False, workers: int = 32) -> None:
             jobs.append((split, group_name, images, by_group[group_name], names, skeleton,
                          flip_pairs, ann_path))
 
-    # Clips are independent and the hot path is filesystem metadata/symlink creation, so threads
-    # overlap the I/O without copying the large image arrays into worker processes.
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
         futures = [pool.submit(_write_clip, out, source_root, split, group_name, images, anns,
                                names, skeleton, flip_pairs, cfg['animal_key'], ann_path)
@@ -247,6 +252,7 @@ def convert(name: str, clean: bool = False, workers: int = 32) -> None:
 
 
 def main() -> None:
+    """Parse CLI options and convert selected SpaceAnimal datasets."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dataset', choices=sorted(DATASETS), action='append',
                         help='dataset to convert; repeatable (default: all)')

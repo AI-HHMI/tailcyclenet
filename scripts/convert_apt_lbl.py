@@ -355,9 +355,11 @@ def window_start(frame: int, n_source: int, context: int) -> tuple[int, int]:
 
 
 def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels:
-    """The dense arrays for one group: one labelled frame at `frame - start`, the rest unlabeled.
+    """Build one group's dense labels, centered on its single labeled source frame.
 
-    NaN -> no row (an unlabeled skip, not an assessment); Inf -> `missing` with null coordinates.
+    NaN means no row (not an assessment); Inf means ``missing`` with null coordinates. Rule 11
+    requires a box for ``labeled`` instances, so animals with only occluded points and no extent
+    are represented as ``present`` instead.
     """
     rows = np.flatnonzero(job.frm == frame)
     slots = job.tgt[rows]
@@ -373,8 +375,6 @@ def group_labels(job: Job, frame: int, start: int, n: int, K: int) -> fmt.Labels
         lab.vis2d[a, lf, positioned, 0] = fmt.VISIBLE
         lab.points2d[a, lf, positioned, 0] = pts[positioned].astype(np.float32)
         if (occluded | positioned).any():
-            # Rule 11: `labeled` requires a box. An animal with only occluded points has no
-            # extent, so it is `present` -- in view, not fully annotated.
             box = padded_extent(pts, job.wh)
             lab.boxes[a, lf, 0] = box
             lab.instance[a, lf, 0] = (fmt.INST_LABELED if np.isfinite(box).all()

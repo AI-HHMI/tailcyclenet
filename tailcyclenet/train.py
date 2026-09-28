@@ -41,9 +41,9 @@ def build_optimizer(model, fresh: set[str], cfg: dict, layout: dict | None = Non
     """The run's optimizer, selected by `[training.optimizer].optimizer`; an absent key is "muon".
 
     `"schedulefree"` is the AdamW-SF recipe a resume needs. Fresh params (identity table,
-    no-query tokens, fusion gate) get `kpt_lr`; a trainable encoder gets a lower one.
+    no-query tokens, fusion gate) get `kpt_lr`; a trainable encoder gets a lower one. Checkpoint
+    metadata is authoritative for historical fresh parameters; older checkpoints have no layout.
     """
-    # Metadata is authoritative for the historical fresh set; old checkpoints pass no layout.
     if isinstance(layout, dict) and isinstance(layout.get('fresh_names'), list):
         fresh = set(layout['fresh_names'])
     kind = str(cfg.get('optimizer', 'muon'))
@@ -623,7 +623,6 @@ def main(argv: list[str] | None = None):
     if ck is not None and resume_from is not None:
         fresh, resume_layout = optimizer_metadata_from_checkpoint(ck)
         if resume_layout is None:
-            # Backward-compatible fallback: historical checkpoints had no named layout.
             fresh = set()
 
     if ck is not None and resume_from != resumed:

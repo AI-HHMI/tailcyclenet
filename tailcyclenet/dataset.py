@@ -947,9 +947,8 @@ class PoseDataset(Dataset):
                  world_size: int = 1):
         """Build the window index for one split of a dataset (or folder of datasets).
 
-        Scatters every requested split session's parquet into dense arrays in the parent process
-        so forked workers share them copy-on-write, resolves each session's keypoint axis against
-        the registry, and refuses sessions whose label tables cannot supervise the requested mode.
+        Scatters requested split tables in the parent process for copy-on-write workers, resolves
+        each session's keypoint axis, and refuses tables that cannot supervise the requested mode.
 
         Inputs: path -- a dataset root or a folder of dataset roots.
                 split -- 'train', 'val' or 'test'.
@@ -974,8 +973,8 @@ class PoseDataset(Dataset):
         unmappable root fails at construction rather than mid-epoch; a mode/table mismatch
         is refused here too (`_item` picks its target off `sess.mode` alone, and a 3d
         session carrying only keypoints.pq would crash mid-epoch). With
-        `box_source = 'instances'` prints roots reached by the switch. Balancing across datasets
-        is train-only, so a window's identity stays tied to its index.
+        `box_source = 'instances'` prints roots reached by the switch. Dataset balancing is
+        train-only, so a window's identity stays tied to its index.
         """
         assert cfg.n_frames >= 2, (
             f'n_frames = {cfg.n_frames} is not usable: posetail computes gT = T // tubelet_size '
@@ -1031,8 +1030,6 @@ class PoseDataset(Dataset):
                 for gid, group in sess.groups.items():
                     lab = sess.labels(gid)
                     if lab.points2d is None and lab.points3d is None:
-                        # No pose layer at all (boxes-only or unlabelled, both legal, §3):
-                        # nothing to index, so skip rather than refuse.
                         continue
                     need = 'points3d' if sess.mode == '3d' else 'points2d'
                     if getattr(lab, need) is None:
@@ -1445,11 +1442,9 @@ class PoseDataset(Dataset):
     def _realise(self, sel, rng, world_gauge=True) -> View | None:
         """Realise ONE view of a `Selection`: rotation, crop, resize, decode, appearance aug.
 
-        Consumes the rotation draw (one per camera), the optional per-view 2D flip draw, the crop
-        jitter, the grayscale/inversion coins and the appearance augmenters -- everything whose
-        value is a property of HOW the window is shown. The flip coin is drawn only after the
-        complete 2D
-        rotation block and only when its configured probability is positive.
+        Applies per-camera rotation, optional 2D flip, crop jitter and appearance augmentation.
+        The flip draw follows the complete 2D rotation block and is made only for positive
+        configured probability.
         Returns the `View`, or None when the crop or the decode fails.
         `sel` is NOT mutated: `vis_2d` is cloned on entry and no library helper in this path
         writes through a camera dict or through `coords`, so the same selection may be realised

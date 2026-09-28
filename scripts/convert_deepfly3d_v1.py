@@ -31,7 +31,7 @@ SOURCE_CONDITIONS = (
 )
 N_CAMERAS = 7
 N_FRAMES = 900
-IMAGE_SIZE = (960, 480)  # width, height
+IMAGE_SIZE = (960, 480)
 CAMERA_ORDER = (6, 5, 4, 3, 2, 1, 0)
 
 # DeepFly3D's fixed 38-joint axis.  The source skeleton_fly.py is the authority for these
@@ -78,6 +78,7 @@ class Record:
 
 
 def sha256(path: Path, chunk: int = 1 << 20) -> str:
+    """Return the SHA-256 digest of a file, reading it in bounded chunks."""
     h = hashlib.sha256()
     with path.open('rb') as f:
         while data := f.read(chunk):
@@ -86,6 +87,7 @@ def sha256(path: Path, chunk: int = 1 << 20) -> str:
 
 
 def family_id(condition: str, archive: str) -> str:
+    """Derive the stable split-group identifier from a recording archive name."""
     m = re.match(r'^(\d+)_.*?_Fly(\d+)_', archive)
     if not m:
         raise ValueError(f'cannot derive fly family from {archive!r}')
@@ -93,6 +95,7 @@ def family_id(condition: str, archive: str) -> str:
 
 
 def discover(source: Path, outputs: Path) -> list[Record]:
+    """Inventory source clips and match each with its extracted images and result."""
     records: list[Record] = []
     for condition in SOURCE_CONDITIONS:
         extracted = source / condition / 'extracted'
@@ -120,6 +123,7 @@ def discover(source: Path, outputs: Path) -> list[Record]:
 
 
 def camera_files(images: Path, camera: int) -> list[Path]:
+    """Return the camera image sequence after enforcing the expected frame range."""
     files = sorted(images.glob(f'camera_{camera}_img_*.jpg'))
     expected = [images / f'camera_{camera}_img_{i:06d}.jpg' for i in range(N_FRAMES)]
     if files != expected:
@@ -128,6 +132,7 @@ def camera_files(images: Path, camera: int) -> list[Path]:
 
 
 def inspect_record(record: Record) -> dict:
+    """Validate one inventory record and collect its source metadata."""
     out = {
         'condition': record.condition,
         'archive': record.archive,
@@ -164,6 +169,7 @@ def inspect_record(record: Record) -> dict:
 
 
 def split_map(records: list[Record]) -> dict[str, str]:
+    """Assign each recording family deterministically to train, val, or test."""
     families = sorted({r.family for r in records})
     result = {}
     for i, family in enumerate(families):
@@ -172,6 +178,7 @@ def split_map(records: list[Record]) -> dict[str, str]:
 
 
 def nominal_rig():
+    """Build the explicitly uncalibrated one-camera rig required by 2D sessions."""
     from aniposelib.cameras import CameraGroup
     cam = fmt.nominal_camera('cam0', IMAGE_SIZE)
     return fmt.Rig(cgroup=CameraGroup([cam]), offset={'cam0': (0.0, 0.0)},
@@ -179,6 +186,7 @@ def nominal_rig():
 
 
 def load_points(result: Path) -> np.ndarray:
+    """Load and validate the fixed-frame DeepFly3D 2D prediction array."""
     with result.open('rb') as f:
         prediction = pickle.load(f)
     points = np.asarray(prediction['points2d'], dtype=np.float32)
@@ -193,6 +201,7 @@ def load_points(result: Path) -> np.ndarray:
 
 
 def link_pixels(view_dir: Path, source_files: list[Path]) -> None:
+    """Create numbered symlinks to source frames in a shared pixel directory."""
     view_dir.mkdir(parents=True, exist_ok=True)
     for i, source in enumerate(source_files):
         dst = view_dir / f'{i:06d}.jpg'
@@ -204,15 +213,17 @@ def link_pixels(view_dir: Path, source_files: list[Path]) -> None:
 
 
 def convert_record(record: Record, split: str, root: Path, *, force: bool) -> dict:
+    """Reject record-level conversion; this dataset requires one session per camera."""
     if record.reason:
         return {'condition': record.condition, 'archive': record.archive, 'split': split,
                 'status': 'quarantined', 'reason': record.reason}
-    # This function is called once for each physical camera so that mode=2d has exactly one
-    # declared camera. The caller appends the camera number to the session id.
+
+
     raise AssertionError('convert_record requires a camera; call convert_camera')
 
 
 def convert_camera(record: Record, camera: int, split: str, root: Path, *, force: bool) -> dict:
+    """Write and validate one single-camera 2D session from a source clip."""
     points = load_points(record.result)
     session_id = f'{record.condition}__{record.archive}__cam{camera}'
     session_dir = root / split / session_id
@@ -225,7 +236,7 @@ def convert_camera(record: Record, camera: int, split: str, root: Path, *, force
         shutil.rmtree(temp)
     temp.mkdir(parents=True)
 
-    # DeepFly3D stores normalized (row, column), while tailcycle stores image (x, y) pixels.
+
     raw = points[camera]
     valid = np.isfinite(raw).all(axis=-1) & ~((raw == 0).all(axis=-1))
     xy = np.stack((raw[..., 1] * IMAGE_SIZE[0], raw[..., 0] * IMAGE_SIZE[1]), axis=-1)
@@ -261,8 +272,8 @@ def convert_camera(record: Record, camera: int, split: str, root: Path, *, force
                       skeleton=SKELETON, flip_pairs=FLIP_PAIRS, provenance=provenance)
 
     source_files = camera_files(record.images, camera)
-    # Keep the image bytes in the source archive. The session contains one camera directory link;
-    # the shared target-side view directory contains only numbered symlinks.
+
+
     view_dir = root / '.pixel_views' / f'{record.condition}__{record.archive}__cam{camera}'
     link_pixels(view_dir, source_files)
     pixel_link = temp / 'groups' / 'g000' / 'cam0'
@@ -285,6 +296,7 @@ def convert_camera(record: Record, camera: int, split: str, root: Path, *, force
 
 
 def inventory_command(args) -> int:
+    """Write the source inventory report and optionally fail on invalid records."""
     records = discover(Path(args.source), Path(args.outputs))
     report = [inspect_record(r) for r in records]
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
@@ -312,6 +324,7 @@ def convert_condition(payload) -> list[dict]:
 
 
 def convert_command(args) -> int:
+    """Convert source clips into split dataset sessions and manifests."""
     if args.mode != '2d-fallback':
         raise SystemExit('3-D conversion is refused: calibration and units are not rig-validated; '
                          'use --mode 2d-fallback')

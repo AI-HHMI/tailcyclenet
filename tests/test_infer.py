@@ -102,6 +102,27 @@ def _cfg(**kw):
     return InferConfig(n_frames=4, image_size=64, min_crop_dim=16, device='cpu', **kw)
 
 
+def test_detector_inference_without_keypoint_table(tmp_path):
+    """A deployment detector can drive pose inference without 2D pose labels."""
+    import conftest as cf
+
+    session_path = tmp_path / 'portable' / 'train' / 'session'
+    cf._session_2d(session_path, T=4, S=2)
+    (session_path / 'keypoints.pq').unlink()
+    ds = load_dataset(session_path.parent.parent)
+    sess = ds.sessions['train'][0]
+    registry = Registry.build([ds])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
+    boxes = np.zeros((1, 4, 1, 4), np.float32)
+    boxes[..., 2:] = 32
+
+    out = run_group(model, sess, 'g000', registry, ds.name,
+                    _cfg(anchor='none', refine=False), boxes_for=_boxes_for(boxes), n_rows=1)
+
+    assert out['pred'].shape == (1, 4, sess.n_keypoints, 2)
+    assert out['animal_ids'] == ['det00']
+
+
 @pytest.mark.parametrize('anchor', ['none', 'carry', 'self', 'labels'])
 def test_every_anchor_runs(scene, anchor):
     model, sess, registry, name = scene

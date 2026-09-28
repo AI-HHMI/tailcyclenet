@@ -539,8 +539,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                               dtype=torch.long)[None]
     assert kpt_ids.shape[1] == K
 
-    src = box_points if box_points is not None else (
-        lab.points3d if mode == '3d' else lab.points2d[..., 0, :])
+    src = (box_points if box_points is not None else
+           None if boxes_for is not None else
+           (lab.points3d if mode == '3d' else lab.points2d[..., 0, :]))
     inst_boxes = (lab.boxes if (boxes_for is None and box_points is None
                                 and cfg.box_source == 'instances' and lab.boxes is not None
                                 and bool(np.isfinite(lab.boxes).any())) else None)

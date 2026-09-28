@@ -43,7 +43,7 @@ DATA_KEYS = frozenset({
     'path', 'boxes', 'min_crop_dim', 'input_wh', 'min_box_px', 'max_input_px',
     'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
-    'alpha',
+    'alpha', 'balance_datasets', 'boxes_by_dataset',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -134,8 +134,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         train['device'] = str(device)
 
     if not data.get('path'):
-        raise SystemExit('[data].path is required: ONE dataset root (has train/, optionally '
-                         'val/ and test/). The detector is trained per dataset.')
+        raise SystemExit('[data].path is required: a dataset root (has train/, optionally '
+                         'val/ and test/) or a folder whose children are dataset roots.')
     if not train.get('out'):
         raise SystemExit('[training].out is required: the run folder for checkpoints, '
                          'metrics.json and the recorded config, and neither the config nor '
@@ -185,6 +185,21 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     al = data.get('alpha', None)
     data['alpha'] = None if al in (None, '', []) else float(al)
     data['boxes'] = str(data.get('boxes', 'instances'))
+    bal = data.get('balance_datasets', True)
+    if not isinstance(bal, bool):
+        raise SystemExit(f'[data].balance_datasets must be true or false, got {bal!r}.')
+    data['balance_datasets'] = bal
+    by = data.get('boxes_by_dataset', {})
+    if by is None:
+        by = {}
+    if not isinstance(by, dict):
+        raise SystemExit('[data].boxes_by_dataset must be a table of dataset-root name -> box '
+                         f'source, got {by!r}.')
+    bad = {k: v for k, v in by.items() if v not in BOX_SOURCES}
+    if bad:
+        raise SystemExit(f'[data].boxes_by_dataset: values must be one of {BOX_SOURCES}, got '
+                         f'{bad}.')
+    data['boxes_by_dataset'] = {str(k): str(v) for k, v in by.items()}
     model['yolox'] = str(model.get('yolox', 'tiny'))
 
     model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))

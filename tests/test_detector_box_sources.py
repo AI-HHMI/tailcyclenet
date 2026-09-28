@@ -105,6 +105,22 @@ def test_an_animal_the_table_omits_gets_no_box(tmp_path):
     assert not torch.isfinite(got[1]).any(), 'the omitted animal must have no target'
 
 
+def test_multi_root_box_source_override_is_resolved_per_session(tmp_path):
+    vis, points, inst, boxes = _tables(1, kp_frames=(0,), box_frames=(0,))
+    root_dir = tmp_path / 'multi'
+    _root(root_dir, vis=vis, points=points, instance=inst, boxes=boxes, name='alpha')
+    _root(root_dir, vis=vis, points=points, instance=inst, boxes=boxes, name='zeta')
+    ds = BoxDataset(root_dir, 'train', input_wh=(64, 64), min_crop_dim=8,
+                    box_source='keypoints', boxes_by_dataset={'zeta': 'instances'},
+                    max_frames_per_group=0)
+    by_root = {}
+    for i, (sess, _, _, _) in enumerate(ds.index):
+        by_root[ds.session_dataset[sess.path]] = ds.boxes_for(i)[0]
+    assert set(by_root) == {'alpha', 'zeta'}
+    torch.testing.assert_close(by_root['zeta'], torch.tensor([10.0, 18.0, 30.0, 38.0]))
+    assert not torch.allclose(by_root['alpha'], by_root['zeta'])
+
+
 def test_instance_box_without_keypoints_is_indexed(tmp_path):
     """A labeled instance box is an eligible frame even when no keypoints were recorded."""
     vis, points, inst, boxes = _tables(1, kp_frames=(), box_frames=(0,))

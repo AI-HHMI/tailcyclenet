@@ -123,6 +123,11 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
                       shared_head=bool(ckpt.get('shared_head', True)),
                       fpn_upsample=str(ckpt.get('fpn_upsample', 'nearest') or 'nearest'))
     model.load_state_dict(ckpt['model_state'])
+    trained_datasets = ckpt.get('datasets')
+    if not trained_datasets:
+        trained_datasets = [ckpt.get('dataset', '')] if ckpt.get('dataset') else []
+    model.trained_datasets = [str(name) for name in trained_datasets]
+    model.box_sources = {str(k): str(v) for k, v in (ckpt.get('box_sources') or {}).items()}
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:
         raise ValueError(

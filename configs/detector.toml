@@ -12,11 +12,17 @@
 # value, byte-identical), but THIS FILE's own shipped value is 0.01 -- see the key's own comment.
 
 [data]
-# ONE dataset root (train/, optionally val/ and test/); a folder whose children are roots is refused.
+# A dataset root (train/, optionally val/ and test/) OR a folder whose children are dataset roots (one box-only detector across all of them; `keypoints = true` is refused there).
 path = ""
+
+# Multi-root only: true draws each root with equal probability (the existing view/cohort/alpha weighting applies WITHIN each root); false pools every root into one big dataset. Inert on a single root.
+balance_datasets = true
 
 # Regression target: `instances` (instances.pq extent, matching LoaderConfig.box_source) or `keypoints` where the shipped boxes disagree with the crop rule (calms21, johnson-mouse).
 boxes = "instances"
+
+# Per-root overrides of `boxes`, keyed by EXACT dataset-root folder name, e.g. { johnson-mouse-combined-aug = "keypoints" }; an unknown root name raises. Roots not named use `boxes`.
+boxes_by_dataset = {}
 
 # Must equal the pose run's [data].min_crop_dim -- same crop rule; infer.py refuses a mismatch.
 min_crop_dim = 64

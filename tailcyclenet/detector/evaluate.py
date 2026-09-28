@@ -130,7 +130,7 @@ def _summarise(s):
 @torch.no_grad()
 def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_thresh=0.05,
                   num_workers=4, max_animals=None, out_scores=None, iou_thresh=0.5,
-                  center_dist_thresh=0.5):
+                  center_dist_thresh=0.5, subset_indices=None, root_qualified_keys=False):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
     Inputs:
@@ -159,7 +159,12 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     """
     was_training = model.training
     model.eval()
-    order = list(iter(ChunkShuffle(len(ds), chunk=ds.chunk, seed=seed)))[:batches * batch_size]
+    order = list(iter(ChunkShuffle(len(ds), chunk=ds.chunk, seed=seed)))
+    if subset_indices is not None:
+        allowed = set(int(i) for i in subset_indices)
+        order = [i for i in order if i in allowed][:batches * batch_size]
+    else:
+        order = order[:batches * batch_size]
 
     aug_was = ds.augment
     ds.augment = False
@@ -178,6 +183,9 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
             item = order[bi * batch_size + j]
             sess, gid, f, ci = ds.index[item]
             key = f'{sess.session_id}/{gid}'
+            if root_qualified_keys:
+                root_id = ds.root_ids[item]
+                key = f'{ds.root_names[root_id]}/{key}'
             if key not in n_want:
                 sessions[key] = sess
                 n_want[key] = max_animals or max(1, len(sess.labels(gid).animal_ids))

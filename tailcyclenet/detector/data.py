@@ -284,8 +284,9 @@ class BoxDataset(Dataset):
     def __init__(self, path, split: str, input_wh=(416, 416), min_crop_dim=64,
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
-                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False):
-        """Build the per-view/per-frame index of labelled items for one dataset root.
+                 tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
+                 boxes_by_dataset=None, include_roots=None):
+        """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
         absent-only frames can supply all-negative examples; present-only frames require a
@@ -314,6 +315,12 @@ class BoxDataset(Dataset):
         assert box_source in BOX_SOURCES, \
             f'box_source must be one of {BOX_SOURCES}, got {box_source!r}'
         self.box_source = box_source
+        self.box_sources = dict(boxes_by_dataset or {})
+        bad_sources = {name: value for name, value in self.box_sources.items()
+                       if value not in BOX_SOURCES}
+        if bad_sources:
+            raise ValueError(f'boxes_by_dataset values must be one of {BOX_SOURCES}, '
+                             f'got {bad_sources}.')
         self.tile_wh = None if tile_wh is None else tuple(int(v) for v in tile_wh)
         self.tile_scale = float(tile_scale)
         self.tile_bg_per_frame = int(tile_bg_per_frame)
@@ -326,13 +333,34 @@ class BoxDataset(Dataset):
         self.strong = bool(strong)
         self.reduce = reduce
         self.seed = seed
-        self.datasets = load_datasets(path)
-        if len(self.datasets) != 1:
-            raise ValueError(
-                f'{path}: the detector is trained per dataset (input size and box statistics are '
-                f'dataset-specific); found {len(self.datasets)} dataset roots')
-        self.ds = self.datasets[0]
-        prediction_sessions = [s.path for s in self.ds.all_sessions() if s.prediction_session]
+        all_datasets = load_datasets(path)
+        split_datasets = load_datasets(path, split=split)
+        if include_roots is None:
+            self.datasets = split_datasets
+        else:
+            include_roots = set(include_roots)
+            all_root_names = {ds.name for ds in all_datasets}
+            unknown_roots = include_roots - all_root_names
+            if unknown_roots:
+                raise ValueError(f'include_roots names unknown dataset roots '
+                                 f'{sorted(unknown_roots)}.')
+            self.datasets = [ds for ds in split_datasets if ds.name in include_roots]
+            if not self.datasets:
+                raise ValueError(f'{path}: split {split!r} has no included roots with data')
+        if len(self.datasets) > 1 and self.keypoints:
+            raise ValueError('multi-root detector training is box-only: [data].keypoints = true '
+                             'is explicitly unsupported when more than one dataset root is given.')
+        self.ds = self.datasets[0] if len(self.datasets) == 1 else None
+        self.root_names = [ds.name for ds in self.datasets]
+        all_root_names = {ds.name for ds in all_datasets}
+        unknown = set(self.box_sources) - all_root_names
+        if unknown:
+            raise ValueError(f'boxes_by_dataset names unknown dataset roots {sorted(unknown)}; '
+                             f'available roots are {sorted(all_root_names)}.')
+        self.session_dataset = {sess.path: ds.name for ds in self.datasets
+                                for sess in ds.all_sessions()}
+        prediction_sessions = [s.path for ds in all_datasets for s in ds.all_sessions()
+                               if s.prediction_session]
         if prediction_sessions:
             raise ValueError('prediction sessions are not detector-training annotations: '
                              + ', '.join(map(str, prediction_sessions[:5])))
@@ -343,44 +371,57 @@ class BoxDataset(Dataset):
 
         self.origins: list = []
         self.index = []
+        self.root_ids: list[int] = []
         self.box_only_fallback_sessions = set()
-        for sess in self.ds.sessions.get(split, []):
-            sess.preload()
-            for gid, group in sess.groups.items():
-                lab = sess.labels(gid)
-                vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
-                box_only = lab.points2d is None and lab.points3d is None
-                if self.box_source == 'keypoints' and box_only and self._uses_instance_boxes(sess, lab):
-                    positive = (lab.instance == INST_LABELED) | (lab.instance == INST_PRESENT)
-                    if (positive & np.isfinite(lab.boxes).all(-1)).any():
-                        self.box_only_fallback_sessions.add(sess.path)
-                frames = np.zeros(group.n_frames, dtype=bool)
-                if vis is not None and vis.shape[0]:
-                    v = vis.reshape(vis.shape[0], vis.shape[1], -1)
-                    frames |= (v != UNLABELED).any((0, 2))
-                if lab.instance is not None:
-                    frames |= (lab.instance != INST_NONE).any((0, 2))
-                frames = np.flatnonzero(frames)
-                if max_frames_per_group and frames.size > max_frames_per_group:
-                    keep = rng.choice(frames, max_frames_per_group, replace=False)
-                    frames = np.asarray(sorted(keep.tolist()), dtype=np.int64)
-                for f in sorted(frames):
-                    for ci in range(len(sess.rig)):
-                        origins = ([None] if self.tile_wh is None
-                                   else self._tile_origins(sess, gid, int(f), ci, rng))
-                        if not self._has_target(sess, gid, int(f), ci, lab):
-                            continue
-                        for o in origins:
-                            self.index.append((sess, gid, int(f), ci))
-                            self.origins.append(o)
+        for root_id, ds in enumerate(self.datasets):
+            before = len(self.index)
+            for sess in ds.sessions.get(split, []):
+                sess.preload()
+                for gid, group in sess.groups.items():
+                    lab = sess.labels(gid)
+                    vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
+                    box_only = lab.points2d is None and lab.points3d is None
+                    if (self._box_source_for(sess) == 'keypoints' and box_only
+                            and self._uses_instance_boxes(sess, lab)):
+                        positive = (lab.instance == INST_LABELED) | (lab.instance == INST_PRESENT)
+                        if (positive & np.isfinite(lab.boxes).all(-1)).any():
+                            self.box_only_fallback_sessions.add(sess.path)
+                    frames = np.zeros(group.n_frames, dtype=bool)
+                    if vis is not None and vis.shape[0]:
+                        v = vis.reshape(vis.shape[0], vis.shape[1], -1)
+                        frames |= (v != UNLABELED).any((0, 2))
+                    if lab.instance is not None:
+                        frames |= (lab.instance != INST_NONE).any((0, 2))
+                    frames = np.flatnonzero(frames)
+                    if max_frames_per_group and frames.size > max_frames_per_group:
+                        keep = rng.choice(frames, max_frames_per_group, replace=False)
+                        frames = np.asarray(sorted(keep.tolist()), dtype=np.int64)
+                    for f in sorted(frames):
+                        for ci in range(len(sess.rig)):
+                            origins = ([None] if self.tile_wh is None
+                                       else self._tile_origins(sess, gid, int(f), ci, rng))
+                            if not self._has_target(sess, gid, int(f), ci, lab):
+                                continue
+                            for o in origins:
+                                self.index.append((sess, gid, int(f), ci))
+                                self.origins.append(o)
+                                self.root_ids.append(root_id)
+            count = len(self.index) - before
+            if count == 0:
+                raise ValueError(f'{ds.root}: split {split!r} has no usable supervised views')
         if not self.index:
             raise ValueError(f'{path}: split {split!r} has no labelled frames')
-        n_src = len({(s.session_id, g, c) for s, g, _, c in self.index})
+        n_src = len({(str(s.path), g, c) for s, g, _, c in self.index})
         self.chunk = max(1, len(self.index) // n_src)
 
     def __len__(self):
         """Number of indexed items (one camera view of one frame each)."""
         return len(self.index)
+
+    def _box_source_for(self, sess):
+        """Effective box source for a session's owning dataset root."""
+        name = self.session_dataset.get(sess.path)
+        return self.box_sources.get(name, self.box_source)
 
     def _uses_instance_boxes(self, sess, lab):
         """Resolve the box source per session, including box-only fallback.
@@ -391,7 +432,7 @@ class BoxDataset(Dataset):
         """
         has_instances = lab.boxes is not None and lab.instance is not None
         box_only = lab.points2d is None and lab.points3d is None
-        return has_instances and (self.box_source == 'instances' or box_only)
+        return has_instances and (self._box_source_for(sess) == 'instances' or box_only)
 
     def negative_supervision_for(self, sess, gid, f, ci, lab=None):
         """Whether background anchors are known negatives for this camera-frame.
@@ -431,42 +472,18 @@ class BoxDataset(Dataset):
             return False
         return self.negative_supervision_for(sess, gid, f, ci, lab)
 
-    def default_train_weights(self, annot_frac=None):
-        """THE default train sampling weight. Always an array, never None.
-
-        `frames_per_group` is gone (`dev/plans/detector_iteration_budget.md` SS3.1b): the train
-        index now holds EVERY labelled (frame, camera), so a frame-uniform draw is no longer a
-        neutral default -- it is SS3.1b trap 1's failure mode. On rat-city-combined it would hand
-        98.5% of draws to the ONE tracked session (57,594 frames) and drown 37 annotated sessions
-        that used to hold 95.7%. So the draw is weighted here instead of being capped there:
-
-        - **View-uniform within a cohort.** A "view" is one (session, group, camera); every view in
-          a cohort carries the same TOTAL probability whatever its frame count, and a view's frames
-          split it equally. This is what the cap was approximating -- badly, and by discarding.
-        - **Cohort share.** `annot_frac` sets P(a draw comes from an `annotated` session) exactly.
-          Absent (the default), each cohort keeps its NATURAL share of index entries, i.e. its
-          labelled-frame share -- no cross-cohort correction unless the user asks for one. Only
-          the WITHIN-cohort uniformity is always on.
-          Inert on a single-cohort split (3dpop, calms21, branson-fly): the cohort factor is 1 and
-          this reduces to plain view-uniform.
-
-        Composes multiplicatively with `alpha_weights` -- see `train_detector.py`. NOTE that
-        `alpha_weights`' exponent is now measured against a view-uniform base rather than a
-        frame-uniform one, so its `alpha = 0` / `alpha = 1` landmarks shift by one; it is opt-in and
-        no shipped recipe sets it.
-
-        Inputs: annot_frac -- explicit annotated-cohort draw share, or None for the natural share.
-        Outputs: float64 weights, one per index entry, summing to 1.
-        """
-        n = len(self.index)
-        src = np.array([s.label_source for s, _, _, _ in self.index])
-        keys = np.array([f'{s.session_id}/{g}/{c}' for s, g, _, c in self.index])
+    def _base_weights(self, indices, annot_frac=None):
+        """Existing view/cohort rule applied to the selected index positions."""
+        indices = np.asarray(indices, dtype=np.int64)
+        n = len(indices)
+        src = np.array([self.index[int(i)][0].label_source for i in indices])
+        keys = np.array([f'{self.index[int(i)][0].path}/{self.index[int(i)][1]}/'
+                         f'{self.index[int(i)][3]}' for i in indices])
         _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
         per_entry = 1.0 / counts[inv].astype(np.float64)
         present = [c for c in sorted(set(src.tolist()))]
-        if annot_frac is not None:
-            if not 0.0 <= float(annot_frac) <= 1.0:
-                raise ValueError(f'annot_frac must be in [0, 1], got {annot_frac}')
+        if annot_frac is not None and not 0.0 <= float(annot_frac) <= 1.0:
+            raise ValueError(f'annot_frac must be in [0, 1], got {annot_frac}')
         w = np.zeros(n, dtype=np.float64)
         for cohort in present:
             m = src == cohort
@@ -481,6 +498,22 @@ class BoxDataset(Dataset):
             raise ValueError('default_train_weights: weights are all zero or non-finite')
         return w / w.sum()
 
+    def default_train_weights(self, annot_frac=None, balance_datasets=True):
+        """View-uniform sampling weights, optionally balanced to equal root shares.
+
+        One-root output is exactly the historical rule. With multiple roots, `annot_frac` applies
+        within each root if balanced, and globally if roots are pooled.
+        """
+        all_indices = np.arange(len(self.index), dtype=np.int64)
+        if not balance_datasets or len(self.datasets) == 1:
+            return self._base_weights(all_indices, annot_frac)
+        w = np.zeros(len(self.index), dtype=np.float64)
+        for root_id in range(len(self.datasets)):
+            ix = np.flatnonzero(np.asarray(self.root_ids) == root_id)
+            if ix.size:
+                w[ix] = self._base_weights(ix, annot_frac) / len(self.datasets)
+        return w
+
     def cohort_mix(self, weights=None):
         """Realised share of train draws per cohort. Reporting only -- the mix is invisible in
         the loss curve, so `train_detector.py` prints it, exactly as `PoseDataset.mix` is.
@@ -489,6 +522,48 @@ class BoxDataset(Dataset):
         w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
              else np.asarray(weights, dtype=np.float64) / np.sum(weights))
         return {c: float(w[src == c].sum()) for c in sorted(set(src.tolist()))}
+
+    def root_mix(self, weights=None):
+        """Realised draw probability for each dataset root."""
+        ids = np.asarray(self.root_ids, dtype=np.int64)
+        w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
+             else np.asarray(weights, dtype=np.float64) / np.sum(weights))
+        return {name: float(w[ids == i].sum()) for i, name in enumerate(self.root_names)}
+
+    def root_cohort_mix(self, weights=None):
+        """Realised label-source shares within each dataset root."""
+        ids = np.asarray(self.root_ids, dtype=np.int64)
+        w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
+             else np.asarray(weights, dtype=np.float64) / np.sum(weights))
+        out = {}
+        for i, name in enumerate(self.root_names):
+            m = ids == i
+            total = w[m].sum()
+            src = np.array([s.label_source for s, _, _, _ in self.index])
+            out[name] = {cohort: float(w[m & (src == cohort)].sum() / total)
+                         for cohort in sorted(set(src[m].tolist()))}
+        return out
+
+    def train_weights(self, annot_frac=None, alpha=None, balance_datasets=True):
+        """Compose cohort/view and alpha weighting, then enforce root balance if requested."""
+        if not balance_datasets or len(self.datasets) == 1:
+            base = self.default_train_weights(annot_frac, balance_datasets=False)
+            alpha_w = self.alpha_weights(alpha)
+            return base if alpha_w is None else base * alpha_w
+        weights = np.zeros(len(self.index), dtype=np.float64)
+        ids = np.asarray(self.root_ids, dtype=np.int64)
+        alpha_w = self.alpha_weights(alpha)
+        for root_id in range(len(self.datasets)):
+            ix = np.flatnonzero(ids == root_id)
+            local = self._base_weights(ix, annot_frac)
+            if alpha_w is not None:
+                local *= alpha_w[ix]
+            total = local.sum()
+            if not np.isfinite(total) or total <= 0:
+                raise ValueError(f'train_weights: root {self.root_names[root_id]!r} has no '
+                                 'positive finite sampling weight')
+            weights[ix] = local / total / len(self.datasets)
+        return weights
 
     def alpha_weights(self, alpha):
         """B1b (detector_v2 plan SS2.7): per-entry weights giving each GROUP (session, gid) total
@@ -521,7 +596,7 @@ class BoxDataset(Dataset):
         if alpha is None:
             return None
         alpha = float(alpha)
-        keys = np.array([f'{s.session_id}/{g}' for s, g, _, _ in self.index])
+        keys = np.array([f'{s.path}/{g}' for s, g, _, _ in self.index])
         _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
         n_views = counts[inv].astype(np.float64)
         w = n_views ** (alpha - 1.0)

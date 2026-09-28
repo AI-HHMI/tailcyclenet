@@ -35,6 +35,25 @@ def _dataset_family(name: str) -> str:
     return str(name).split('-', 1)[0].strip().lower()
 
 
+def _detector_matches_source(trained_datasets, trained_on, ds_name):
+    """Multi-root checkpoints require exact membership; legacy/single-root keeps family matching."""
+    if len(trained_datasets) > 1:
+        return ds_name in trained_datasets
+    return bool(trained_on and ds_name
+                and _dataset_family(trained_on) == _dataset_family(ds_name))
+
+
+def _detector_box_source(det, ds_name, default):
+    """Effective detector target for this source root, with a unique-family fallback."""
+    by_root = getattr(det, 'box_sources', {}) or {}
+    if ds_name in by_root:
+        return by_root[ds_name]
+    family = _dataset_family(ds_name) if ds_name else ''
+    matches = [value for name, value in by_root.items()
+               if family and _dataset_family(name) == family]
+    return matches[0] if len(matches) == 1 else default
+
+
 def _box_provenance(args, det_tile, det_red, det_boxsrc):
     """Every input the detections depend on, recorded beside the numbers they produced.
 
@@ -621,12 +640,21 @@ def run_dataset(args):
                   f'q10 {det_objq.get("q10", float("nan")):.4f} '
                   f'q90 {det_objq.get("q90", float("nan")):.4f}. This detector is NOT saturated; '
                   'sweep the threshold -- 0.97 maximises identity, 0.5 coverage.', flush=True)
+        trained_datasets = list(getattr(det, 'trained_datasets', []) or ([det_ds] if det_ds else []))
+        det_boxsrc = _detector_box_source(det, ds_name, det_boxsrc)
+        trained_label = (trained_datasets[0] if len(trained_datasets) == 1 else
+                         (', '.join(trained_datasets) if trained_datasets else det_ds))
         print(f'detector: {det_path} ({det_wh[0]}x{det_wh[1]}'
               + (f' TILE at scale {det_tile:g}, whole-frame input derived per camera'
                  if det_tile else '')
-              + f', trained on {det_ds!r}, boxes={det_boxsrc or "keypoints"})')
-        if det_ds and ds_name and (_dataset_family(det_ds) != _dataset_family(ds_name)) \
-                and not args.allow_detector_transfer:
+              + f', trained on {trained_label!r}, boxes={det_boxsrc or "keypoints"})')
+        if ds_name and trained_datasets and not _detector_matches_source(
+                trained_datasets, det_ds, ds_name) and not args.allow_detector_transfer:
+            if len(trained_datasets) > 1:
+                raise SystemExit(
+                    f'{args.detector}: multi-root detector was trained on {trained_datasets}, '
+                    f'but this session is {ds_name!r}, which is not a member root. Pass '
+                    '--allow-detector-transfer for an explicit, labelled transfer-evaluation run.')
             raise SystemExit(
                 f'{args.detector}: trained on dataset {det_ds!r}, but this session is '
                 f'{ds_name!r} -- different dataset families. Detectors are trained one per '

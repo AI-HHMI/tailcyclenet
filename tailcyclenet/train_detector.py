@@ -1,4 +1,4 @@
-"""Train the box predictor, one detector per dataset.
+"""Train one box predictor on one dataset root or a folder of roots.
 
 Body of `tailcyclenet train-detector` (`tailcyclenet/__main__.py`) and of
 `scripts/train_detector.py` (`pixi run python scripts/train_detector.py --config
@@ -70,6 +70,52 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416)
     oh = max(64, int(round(base[1] * s / 32) * 32))
     print(f' -> {ow}x{oh}')
     return ow, oh
+
+
+def input_wh_for_roots(roots, box_source, boxes_by_dataset=None, min_box_px=32,
+                       max_px=4 * 416 * 416):
+    """One deterministic aspect/scale compromise for multiple detector roots."""
+    ratios = []
+    for ds in roots:
+        values = [w / h for sess in ds.sessions.get('train', []) for cam in sess.cam_names
+                  for w, h in [sess.rig.size(cam)]]
+        if values:
+            ratios.append(float(np.median(values)))
+    if not ratios:
+        raise ValueError('multi-root input sizing found no training cameras')
+    ar = float(np.median(ratios))
+    base = (max(64, int(round((416 * 416 * ar) ** 0.5 / 32) * 32)),
+            max(64, int(round((416 * 416 / ar) ** 0.5 / 32) * 32)))
+    if min_box_px <= 0:
+        return base
+
+    by = boxes_by_dataset or {}
+    stats = {}
+    for ds in roots:
+        root_boxes = {ds.name: by[ds.name]} if ds.name in by else {}
+        sampled = BoxDataset(ds.root, 'train', input_wh=base, box_source=box_source,
+                             boxes_by_dataset=root_boxes, max_frames_per_group=4)
+        ix = np.random.default_rng(0).choice(len(sampled), min(300, len(sampled)), replace=False)
+        sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
+                           for b in (sampled.boxes_for(int(i)) for i in ix)])
+        sides = sides[torch.isfinite(sides)]
+        if sides.numel():
+            stats[ds.name] = (float(sides.median()), float(sides.quantile(0.1)))
+    if not stats:
+        return base
+    required = max([1.0, *(min_box_px / med for med, _ in stats.values() if med > 0)])
+    cap = (max_px / (base[0] * base[1])) ** 0.5
+    scale = min(required, cap)
+    capped = required > cap
+    for name, (med, p10) in stats.items():
+        print(f'{name}: median box {med:.1f}px (p10 {p10:.1f}) at {base[0]}x{base[1]}; '
+              f'common x{scale:.2f} -> median {med * scale:.1f}px'
+              + (' (cap below min_box_px)' if capped and med * scale < min_box_px else ''))
+    if required > 1:
+        print(f'multi-root input sizing: common aspect {ar:.3f}, scale x{scale:.2f}'
+              + (f' capped by max_input_px={max_px}' if capped else ''))
+    return (max(64, int(round(base[0] * scale / 32) * 32)),
+            max(64, int(round(base[1] * scale / 32) * 32)))
 
 
 # Any pretrained backbone gets this x lr; see main()'s own docstring note.
@@ -234,22 +280,35 @@ def main(argv: list[str] | None = None):
     run = Path(train_cfg['out'])
     _record_run(run, config)
 
-    roots = load_datasets(data_cfg['path'])
-    if len(roots) != 1:
-        raise SystemExit(f'{data_cfg["path"]}: the detector is trained per dataset; '
-                         f'found {len(roots)}')
+    all_roots = load_datasets(data_cfg['path'])
+    roots = load_datasets(data_cfg['path'], split='train')
+    multi = len(roots) > 1
+    if multi and data_cfg['keypoints']:
+        raise SystemExit(f'{data_cfg["path"]}: multi-root detector training is box-only; '
+                         '[data].keypoints = true is explicitly refused when more than one '
+                         'training root is given.')
+    root_names = [ds.name for ds in roots]
+    unknown_box_roots = set(data_cfg['boxes_by_dataset']) - {ds.name for ds in all_roots}
+    if unknown_box_roots:
+        raise SystemExit(f'[data].boxes_by_dataset names unknown dataset roots '
+                         f'{sorted(unknown_box_roots)}.')
     probe_sess = roots[0].all_sessions()[0]
-    wh = (tuple(data_cfg['input_wh']) if data_cfg['input_wh']
-          else input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
-                            data_cfg['min_box_px'], data_cfg['max_input_px']))
-    print(f'input {wh[0]}x{wh[1]}  (frame {probe_sess.rig.size(probe_sess.cam_names[0])})')
+    if data_cfg['input_wh']:
+        wh = tuple(data_cfg['input_wh'])
+    elif multi:
+        wh = input_wh_for_roots(roots, data_cfg['boxes'], data_cfg['boxes_by_dataset'],
+                                data_cfg['min_box_px'], data_cfg['max_input_px'])
+    else:
+        wh = input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
+                          data_cfg['min_box_px'], data_cfg['max_input_px'])
+    print(f'input {wh[0]}x{wh[1]}  training roots={root_names}')
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
                   tile_bg_per_frame=data_cfg['tile_bg_per_frame'])
     train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
-                       box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
-                       augment=data_cfg['augment'], reduce=data_cfg['reduce'],
-                       max_frames_per_group=0,
+                       box_source=data_cfg['boxes'], boxes_by_dataset=data_cfg['boxes_by_dataset'],
+                       min_crop_dim=data_cfg['min_crop_dim'], augment=data_cfg['augment'],
+                       reduce=data_cfg['reduce'], max_frames_per_group=0,
                        keypoints=data_cfg['keypoints'],
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
@@ -262,10 +321,12 @@ def main(argv: list[str] | None = None):
               f'{data_cfg["tile_bg_per_frame"]} background tile(s)/frame')
         print(f'  DEPLOYMENT INPUT is the whole frame at this scale, NOT the tile size: '
               f'{tiled_input_wh(probe_sess.rig.size(probe_sess.cam_names[0]), data_cfg["tile_scale"])}')
-    print(f'train: {len(train)} views')
-    print(f'box_source={data_cfg["boxes"]}; box-only instance fallback: '
+    print(f'train: {len(train)} views across {len(train.root_names)} root(s)')
+    effective_sources = {name: data_cfg['boxes_by_dataset'].get(name, data_cfg['boxes'])
+                         for name in train.root_names}
+    print(f'box sources={effective_sources}; box-only instance fallback: '
           f'{len(train.box_only_fallback_sessions)} session(s)')
-    n_kpts = len(roots[0].names) if data_cfg['keypoints'] else 0
+    n_kpts = len(all_roots[0].names) if data_cfg['keypoints'] else 0
     if data_cfg['keypoints']:
         print(f'keypoint branch: {n_kpts} keypoints, hflip disabled')
         cen = np.zeros(n_kpts)
@@ -276,49 +337,55 @@ def main(argv: list[str] | None = None):
             cen += np.isfinite(k[..., :2].numpy()).all(-1).sum(0)
             seen += k.shape[0]
         frac = cen / max(seen, 1)
-        names = roots[0].names
+        names = all_roots[0].names
         thin = [f'{names[i]} {frac[i]:.2f}' for i in np.argsort(frac)[:5]]
         print(f'  labelled fraction per keypoint over {seen} sampled instances: '
               f'min {frac.min():.3f}  median {np.median(frac):.3f}  max {frac.max():.3f}')
         print(f'  thinnest: {", ".join(thin)}', flush=True)
-    base_w = train.default_train_weights(data_cfg['annot_frac'])
-    alpha_w = train.alpha_weights(data_cfg['alpha'])
-    weights = [w for w in (base_w, alpha_w) if w is not None]
-    combined_w = None
-    for w in weights:
-        combined_w = w if combined_w is None else combined_w * w
+    combined_w = train.train_weights(data_cfg['annot_frac'], data_cfg['alpha'],
+                                     data_cfg['balance_datasets'])
     sampler = CohortSampler(combined_w, seed=train_cfg['seed'])
     was = train.cohort_mix()
     now = train.cohort_mix(combined_w)
+    root_mix = train.root_mix(combined_w)
     af = ('natural' if data_cfg['annot_frac'] is None
           else f'annot_frac={data_cfg["annot_frac"]:g}')
-    print(f'sampling: view-uniform within cohort, cohort share {af}; mix (frame-uniform -> '
-          f'realised) ' + '  '.join(f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
+    print(f'sampling: balance_datasets={data_cfg["balance_datasets"]}; view-uniform within '
+          f'cohort, cohort share {af}; roots ' + '  '.join(
+              f'{k} {v:.3f}' for k, v in root_mix.items()))
+    if multi:
+        print('  cohort mix by root: ' + '  '.join(
+            f'{name} ' + ', '.join(f'{cohort}={share:.3f}' for cohort, share in cohorts.items())
+            for name, cohorts in train.root_cohort_mix(combined_w).items()))
+    print('  cohort mix (frame-uniform -> realised) ' + '  '.join(
+        f'{k} {was[k]:.3f}->{now[k]:.3f}' for k in sorted(now)))
     if data_cfg['annot_frac'] is not None and len(now) < 2:
-        print(f'  annot_frac is INERT here: {train.ds.name} train holds one cohort')
+        held = ', '.join(train.root_names)
+        print(f'  annot_frac is INERT here: {held} train holds one cohort')
     if data_cfg['alpha'] is not None:
         print(f'alpha={data_cfg["alpha"]:g}: group-size draw exponent applied on top of the '
-              'view-uniform base (its 0/1 landmarks shift by one -- see alpha_weights)')
+              'view/cohort base (its 0/1 landmarks shift by one -- see alpha_weights)')
     loader = torch.utils.data.DataLoader(
-        train, batch_size=train_cfg['batch_size'],
-        sampler=sampler,
-        num_workers=train_cfg['num_workers'],
-        collate_fn=box_collate, drop_last=True,
-        persistent_workers=train_cfg['num_workers'] > 0,
-        worker_init_fn=worker_init)
+        train, batch_size=train_cfg['batch_size'], sampler=sampler,
+        num_workers=train_cfg['num_workers'], collate_fn=box_collate, drop_last=True,
+        persistent_workers=train_cfg['num_workers'] > 0, worker_init_fn=worker_init)
+    val_roots = [ds for ds in all_roots if ds.name in root_names and (ds.root / 'val').is_dir()]
     val = None
-    root = Path(data_cfg['path'])
-    if not ((root / 'val').is_dir() or any(
-            (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())):
-        print(f'val:   none (no val/ split under {root})')
+    if not val_roots:
+        print(f'val:   none (no val/ split under {data_cfg["path"]}); selection falls back to train')
     else:
         val = BoxDataset(data_cfg['path'], 'val', input_wh=wh,
-                         box_source=data_cfg['boxes'], min_crop_dim=data_cfg['min_crop_dim'],
-                         reduce=data_cfg['reduce'],
+                         box_source=data_cfg['boxes'], boxes_by_dataset=data_cfg['boxes_by_dataset'],
+                         min_crop_dim=data_cfg['min_crop_dim'], reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
-                         **tiling)
-        print(f'val:   {len(val)} views')
+                         include_roots=root_names, **tiling)
+        missing_val = sorted(set(root_names) - set(val.root_names))
+        print(f'val:   {len(val)} views across {val.root_names}; '
+              f'no val split: {missing_val or "none"}')
+    eval_roots = len(train.root_names) + (0 if val is None else len(val.root_names))
+    print(f'eval work/pass: up to {train_cfg["eval_batches"]} batches x {eval_roots} '
+          f'root/split evaluations')
 
     model = YOLOXNano(n_keypoints=n_kpts,
                       version=model_cfg['yolox'],
@@ -402,15 +469,41 @@ def main(argv: list[str] | None = None):
                 if hasattr(opt, 'eval'):
                     opt.eval()
                 scores, obj_scores = {}, []
-                for name, ds in (('train', train), ('val', val)):
+                selection_kind = ('macro' if data_cfg['balance_datasets'] else 'pooled')
+                for split_name, ds in (('train', train), ('val', val)):
                     if ds is None:
                         continue
-                    obj_scores.clear()
-                    scores[name] = overall(score_dataset(
-                        model, ds, device, batch_size=train_cfg['batch_size'],
-                        batches=train_cfg['eval_batches'], num_workers=2,
-                        out_scores=obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
-                        center_dist_thresh=train_cfg['nms_center_dist_thresh']))
+                    split_obj_scores, root_rows, root_scores = [], {}, {}
+                    for root_id, root_name in enumerate(ds.root_names):
+                        subset = (np.flatnonzero(np.asarray(ds.root_ids) == root_id)
+                                  if multi else None)
+                        root_obj_scores = []
+                        rows = score_dataset(
+                            model, ds, device, batch_size=train_cfg['batch_size'],
+                            batches=train_cfg['eval_batches'], num_workers=2,
+                            out_scores=root_obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
+                            center_dist_thresh=train_cfg['nms_center_dist_thresh'],
+                            subset_indices=subset, root_qualified_keys=multi)
+                        root_rows[root_name] = rows
+                        root_scores[root_name] = overall(rows)
+                        split_obj_scores.extend(root_obj_scores)
+                    obj_scores = split_obj_scores
+                    if not multi:
+                        scores[split_name] = root_scores[ds.root_names[0]]
+                        continue
+                    pooled_rows = {key: row for rows in root_rows.values()
+                                   for key, row in rows.items()}
+                    pooled = overall(pooled_rows)
+                    macro = {'n_gt': sum(v['n_gt'] for v in root_scores.values()),
+                             'fp_ignored': sum(v['fp_ignored'] for v in root_scores.values())}
+                    for metric in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
+                        vals = [v[metric] for v in root_scores.values()]
+                        macro[metric] = float(np.mean(vals)) if vals else float('nan')
+                    scores[f'{split_name}_macro'] = macro
+                    scores[f'{split_name}_pooled'] = pooled
+                    for root_name, value in root_scores.items():
+                        scores[f'{split_name}_root_{root_name}'] = value
+                    scores[split_name] = macro if selection_kind == 'macro' else pooled
                 if hasattr(opt, 'train'):
                     opt.train()
                 obj_q = {}
@@ -420,6 +513,10 @@ def main(argv: list[str] | None = None):
                              for q in (0.01, 0.10, 0.50, 0.90)}
                     print(f'   objectness q01 {obj_q["q01"]:.4f}  q10 {obj_q["q10"]:.4f}  '
                           f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}', flush=True)
+                select_split = 'val' if val is not None else 'train'
+                selection_metric = (f'{select_split}_{selection_kind}_r50' if multi
+                                    else f'{select_split}_r50')
+                selected_score = scores[select_split]['r50']
                 ckpt = {'iteration': it, 'model_state': model.state_dict(), 'config': config,
                         'input_wh': wh, 'n_keypoints': n_kpts,
                         'norm': 'gn',
@@ -437,7 +534,12 @@ def main(argv: list[str] | None = None):
                         'p2': model_cfg['p2'],
                         'seed': train_cfg['seed'],
                         'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
-                        'dataset': train.ds.name, 'box_source': data_cfg['boxes'],
+                        'dataset': train.root_names[0] if len(train.root_names) == 1 else '',
+                        'datasets': list(train.root_names), 'box_source': data_cfg['boxes'],
+                        'box_sources': effective_sources,
+                        'balance_datasets': data_cfg['balance_datasets'],
+                        'root_mix': root_mix, 'selection_metric': selection_metric,
+                        'selection_score': selected_score,
                         'annot_frac': data_cfg['annot_frac'],
                         'weight_decay': train_cfg['weight_decay'],
                         'min_crop_dim': data_cfg['min_crop_dim'],
@@ -448,11 +550,12 @@ def main(argv: list[str] | None = None):
                         'eval': scores}
                 torch.save(ckpt, run / f'detector_it{it:06d}.pth')
                 torch.save(ckpt, run / 'detector_last.pth')
-                sel = scores.get('val', scores.get('train', {})).get('r50', -float('inf'))
+                sel = selected_score
                 if sel >= best_score:
                     best_score = sel
                     torch.save(ckpt, run / 'detector.pth')
-                history.append({'iteration': it,
+                history.append({'iteration': it, 'selection_metric': selection_metric,
+                                'selection_score': selected_score,
                                 **{f'{k}_{m}': v[m] for k, v in scores.items()
                                    for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
                 (run / 'metrics.json').write_text(json.dumps(history, indent=1))
@@ -465,7 +568,9 @@ def main(argv: list[str] | None = None):
     print(f'done: {it} iterations -> {run}')
     if best:
         print(f'best: it {best["iteration"]} (this is what detector.pth holds)  ' +
-              '  '.join(f'{k} {v:.4f}' for k, v in best.items() if k != 'iteration'))
+              '  '.join(f'{k} {v:.4f}' for k, v in best.items()
+                        if k not in ('iteration', 'selection_metric')
+                        and isinstance(v, (int, float))))
 
 
 if __name__ == '__main__':

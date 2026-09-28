@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train the box predictor, one detector per dataset.
+"""Train one box predictor on one dataset root or a folder of roots.
 
     pixi run python scripts/train_detector.py --config configs/detector.toml
 

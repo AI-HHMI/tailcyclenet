@@ -121,6 +121,65 @@ def _two_cohort_root(tmp_path, n_annot_frames=2, n_tracked_frames=30):
     return root
 
 
+def _multi_detector_roots(tmp_path):
+    """Two colliding roots; the larger one has four tracked sessions instead of one."""
+    import shutil
+
+    root_dir = tmp_path / 'roots'
+    root_dir.mkdir()
+    small = _two_cohort_root(tmp_path / 'small_src', n_annot_frames=2, n_tracked_frames=4)
+    large = _two_cohort_root(tmp_path / 'large_src', n_annot_frames=2, n_tracked_frames=20)
+    shutil.copytree(small, root_dir / 'alpha')
+    shutil.copytree(large, root_dir / 'zeta')
+    for i in range(3):
+        shutil.copytree(root_dir / 'zeta' / 'train' / 't',
+                        root_dir / 'zeta' / 'train' / f't_extra_{i}')
+    return root_dir
+
+
+def test_multi_root_weights_balance_roots_and_preserve_within_root_cohorts(tmp_path):
+    ds = BoxDataset(_multi_detector_roots(tmp_path), 'train', input_wh=(64, 64),
+                    max_frames_per_group=0)
+    weights = ds.train_weights(annot_frac=0.25, balance_datasets=True)
+    assert ds.root_names == ['alpha', 'zeta']
+    assert ds.root_mix(weights) == pytest.approx({'alpha': 0.5, 'zeta': 0.5})
+    for cohorts in ds.root_cohort_mix(weights).values():
+        assert cohorts == pytest.approx({'annotated': 0.25, 'tracked': 0.75})
+
+
+def test_multi_root_pooling_follows_combined_cohort_population(tmp_path):
+    ds = BoxDataset(_multi_detector_roots(tmp_path), 'train', input_wh=(64, 64),
+                    max_frames_per_group=0)
+    weights = ds.train_weights(annot_frac=0.25, balance_datasets=False)
+    assert weights == pytest.approx(ds.default_train_weights(0.25, balance_datasets=False))
+    assert ds.root_mix(weights)['zeta'] > 0.65
+    assert ds.cohort_mix(weights) == pytest.approx({'annotated': 0.25, 'tracked': 0.75})
+
+
+def test_multi_root_alpha_keeps_equal_root_shares_and_single_root_weights_unchanged(tmp_path):
+    root = _multi_detector_roots(tmp_path)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=0)
+    weights = ds.train_weights(annot_frac=None, alpha=0.5, balance_datasets=True)
+    assert ds.root_mix(weights) == pytest.approx({'alpha': 0.5, 'zeta': 0.5})
+
+    single = BoxDataset(root / 'alpha', 'train', input_wh=(64, 64), max_frames_per_group=0)
+    base = single.default_train_weights(0.5)
+    alpha = single.alpha_weights(0.5)
+    np.testing.assert_array_equal(single.train_weights(0.5, 0.5, True), base * alpha)
+
+
+def test_multi_root_keypoint_branch_is_explicitly_refused(tmp_path):
+    root = _multi_detector_roots(tmp_path)
+    with pytest.raises(ValueError, match='multi-root.*box-only.*keypoints = true'):
+        BoxDataset(root, 'train', keypoints=True)
+
+
+def test_multi_root_box_source_overrides_validate_names(tmp_path):
+    root = _multi_detector_roots(tmp_path)
+    with pytest.raises(ValueError, match='unknown dataset roots'):
+        BoxDataset(root, 'train', boxes_by_dataset={'typo': 'instances'})
+
+
 def test_annot_frac_absent_means_no_weighting(tmp_path):
     """Absent must stay byte-identical: None weights => the caller keeps `ChunkShuffle`."""
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
@@ -266,6 +325,44 @@ def test_alpha_is_a_free_noop_on_uniform_group_sizes(tmp_path):
 
 
 
+
+
+def test_detector_config_multi_root_defaults_and_types(tmp_path):
+    p = _write_config(tmp_path, """
+[data]
+path = "/tmp/roots"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    cfg = load_detector_config(p)
+    assert cfg['data']['balance_datasets'] is True
+    assert cfg['data']['boxes_by_dataset'] == {}
+
+    bad = _write_config(tmp_path, """
+[data]
+path = "/tmp/roots"
+balance_datasets = "false"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""", name='bad-balance.toml')
+    with pytest.raises(SystemExit, match='balance_datasets'):
+        load_detector_config(bad)
+
+    bad_map = _write_config(tmp_path, """
+[data]
+path = "/tmp/roots"
+boxes_by_dataset = []
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""", name='bad-box-map.toml')
+    with pytest.raises(SystemExit, match='boxes_by_dataset must be a table'):
+        load_detector_config(bad_map)
 
 
 def test_detector_config_weight_decay_inherits_the_shipped_0_01(tmp_path):

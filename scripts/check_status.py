@@ -54,10 +54,18 @@ HOLE_EXEMPTIONS = {
     # 178 `missing` rows counted in MISSING_OK, not a hole.
     'allen-mouse-annotated': {'points3d': 211},
     # Outlier 2D is dropped as no row -- a rejected measurement, not an occlusion.
-    'johnson-mouse-annotated': {'keypoints': 19},
-    # The aug root re-runs the same gate over its own variant set, independently -- 18 vs 19 is
-    # not a discrepancy.
+    'johnson-mouse-annotated': {'keypoints': 18},
+    # The aug root re-runs the same gate over its own variant set, independently; its count can
+    # differ from the standard root.
     'johnson-mouse-annotated-aug': {'keypoints': 18},
+    # The v2 Tailcycle export preserves the same 18 rejected 2D outliers as no-row holes.
+    'johnson-mouse-annotated-aug-v2': {'keypoints': 18},
+    # Facemap's blank DLC x,y cells are unassessed and intentionally omitted.
+    'facemap': {'keypoints': 2196},
+    # RP-5.7K has one partial LabelMe pose with two absent point shapes.
+    'rat-rp-5.7k': {'keypoints': 2},
+    # UDARP's two out-of-bounds tail_root coordinates are omitted and noted per frame.
+    'rat-udarp-9.4k': {'keypoints': 2},
 }
 
 

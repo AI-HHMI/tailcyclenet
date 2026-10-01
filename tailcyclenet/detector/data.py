@@ -464,10 +464,8 @@ class BoxDataset(Dataset):
             finite = np.isfinite(np.asarray(lab.boxes[:, f, ci])).all(-1)
             if (positive & finite).any():
                 return True
-        else:
-            p2d = self._points_2d(sess, gid, f, ci)
-            if torch.isfinite(p2d).all(-1).any():
-                return True
+        elif self._positioned_views(sess, gid, lab)[f, ci]:
+            return True
         if lab.instance is None or (lab.instance[:, f, ci] == INST_LABELED).any():
             return False
         return self.negative_supervision_for(sess, gid, f, ci, lab)
@@ -689,6 +687,33 @@ class BoxDataset(Dataset):
             if ok.any():
                 out.append(p2d[s][ok].mean(0))
         return out
+
+    def _positioned_views(self, sess, gid, lab):
+        """(T, C) bool: whether `_points_2d(sess, gid, f, ci)` has any finite point, for a group.
+
+        The whole-group form of the per-view check `_has_target` makes while indexing: ONE
+        projection per camera per group instead of one rig build + projection per (frame,
+        camera), which was the entire cost of a multi-root index build (~600k views). Same
+        projection function, so finiteness is identical. Cached per (session, group). Shapes:
+        points3d (S, T, K, 3) projects to (C, S, T, K, 2); points2d is (S, T, K, C, 2).
+        """
+        cache = self.__dict__.setdefault('_positioned_cache', {})
+        key = (str(sess.path), gid)
+        if key in cache:
+            return cache[key]
+        n_frames, n_cams = sess.groups[gid].n_frames, len(sess.rig)
+        if sess.mode == '3d' and lab.points3d is not None:
+            cams = (sess.cgroup(gid) if any(sess.rig.moving.values())
+                    else [self._camera(sess, gid, 0, ci) for ci in range(n_cams)])
+            pts = torch.as_tensor(lab.points3d, dtype=torch.float32)
+            proj = project_points_torch(cams, pts)
+            mask = torch.isfinite(proj).all(-1).any(-1).any(1).T.numpy()
+        elif lab.points2d is not None:
+            mask = np.isfinite(np.asarray(lab.points2d)).all(-1).any((0, 2))
+        else:
+            mask = np.zeros((n_frames, n_cams), dtype=bool)
+        cache[key] = mask
+        return mask
 
     def _camera(self, sess, gid, f, ci):
         """One posetail camera dict for `(frame, camera)`, read-only.

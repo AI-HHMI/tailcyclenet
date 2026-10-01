@@ -1773,3 +1773,39 @@ def test_whole_item_dropout_survives_the_neighbour_swap_2d(tiny_root):
     item = pose_collate([_train_item(ds)])
     assert int(torch.isfinite(item.kpt_prior).sum()) == 0, \
         'dropout=1.0 must stay query-free in 2D too'
+
+
+
+class _Squares(torch.utils.data.Dataset):
+    """A module-level (so spawn-picklable) dataset carrying a big array, for `SpawnHandoff`."""
+
+    def __init__(self):
+        self.big = np.arange(300_000, dtype=np.float64)
+
+    def __len__(self):
+        return 6
+
+    def __getitem__(self, i):
+        return torch.tensor(self.big[i] ** 2)
+
+
+def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
+    """`SpawnHandoff` pickles to a small payload (shared bytes travel as a handle) and a spawn
+    worker sees exactly the wrapped dataset; the in-process path forwards untouched."""
+    import pickle
+    from multiprocessing.reduction import ForkingPickler
+
+    import torch.multiprocessing  # noqa: F401  (registers torch's shared-memory reducers)
+
+    from tailcyclenet.dataset import SpawnHandoff
+
+    ds = _Squares()
+    wrapped = SpawnHandoff(ds)
+    assert len(wrapped) == 6 and wrapped[3] == ds[3]
+    payload = bytes(ForkingPickler.dumps(wrapped))
+    assert len(payload) < 64 * 1024 < len(pickle.dumps(ds))
+    back = pickle.loads(payload)
+    assert type(back) is _Squares and np.array_equal(back.big, ds.big)
+    loader = torch.utils.data.DataLoader(wrapped, batch_size=None, num_workers=2,
+                                         multiprocessing_context='spawn')
+    assert [float(x) for x in loader] == [float(ds[i]) for i in range(6)]

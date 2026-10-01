@@ -11,6 +11,7 @@ T >= 2 always (a T=1 window gives posetail a zero-length pos_embed).
 from __future__ import annotations
 
 import os
+import pickle
 import random
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -1809,6 +1810,46 @@ class StepSampler(torch.utils.data.Sampler):
         idx = torch.randint(0, self.n, (self.num_samples,), generator=self.generator)
         for k, i in enumerate(idx.tolist()):
             yield (self.start + k, i)
+
+
+def _from_shared_pickle(buf: torch.Tensor):
+    """Unpickle the object `SpawnHandoff` wrote into a shared-memory byte tensor."""
+    return pickle.loads(memoryview(buf.numpy()))
+
+
+class SpawnHandoff(Dataset):
+    """Hand a big dataset to `spawn` loader workers through shared memory.
+
+    Starting a `spawn` worker writes the pickled dataset into a pipe. The child reads that pipe only
+    after it has imported torch/posetail (~4 s), and a pipe holds 64 KB. So for a 361 MB
+    PoseDataset each `Process.start()` blocks for that worker's import plus unpickle (~5 s), and
+    the workers start ONE AT A TIME: 8 workers took ~40 s, on every rank. Here the dataset is
+    pickled once into a shared-memory tensor, and torch's own reducer sends only a handle down
+    the pipe. Every start then returns at once, the imports run in parallel, and each worker
+    unpickles the same bytes it would have read from the pipe. A worker receives the wrapped
+    dataset itself, not this wrapper.
+    """
+
+    def __init__(self, dataset):
+        """Wrap `dataset`; nothing is pickled until the first worker starts."""
+        self.dataset = dataset
+        self._buf = None
+
+    def __len__(self):
+        """Length of the wrapped dataset."""
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        """Item `i` of the wrapped dataset (the in-process / `num_workers=0` path)."""
+        return self.dataset[i]
+
+    def __reduce__(self):
+        """Pickle as (unpickle, shared bytes); the bytes are written once for all workers."""
+        if self._buf is None:
+            data = pickle.dumps(self.dataset, protocol=pickle.HIGHEST_PROTOCOL)
+            self._buf = torch.empty(len(data), dtype=torch.uint8).share_memory_()
+            self._buf.numpy()[:] = np.frombuffer(data, dtype=np.uint8)
+        return _from_shared_pickle, (self._buf,)
 
 
 def worker_init(worker_id):

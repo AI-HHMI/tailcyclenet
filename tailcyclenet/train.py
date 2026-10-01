@@ -25,8 +25,8 @@ from tailcyclenet.checkpoints import (_BASE_CONFIG, check_image_size, full_train
                                       is_hf_repo_id, load_config, prior_provenance,
                                       resolve_checkpoint, resolve_hf_checkpoint, save_checkpoint,
                                       save_run_meta, warm_start)
-from tailcyclenet.dataset import (LoaderConfig, PoseDataset, StepSampler, pose_collate,
-                                  worker_init)
+from tailcyclenet.dataset import (LoaderConfig, PoseDataset, SpawnHandoff, StepSampler,
+                                  pose_collate, worker_init)
 from tailcyclenet.format import Registry
 from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
@@ -565,7 +565,7 @@ def main(argv: list[str] | None = None):
         gen = torch.Generator().manual_seed(int(train_cfg.get('seed', 23)) + fabric.global_rank)
     local_iters = dist_utils.per_rank(n_iter, world)
     loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=1, num_workers=nw, collate_fn=pose_collate,
+        SpawnHandoff(train_ds), batch_size=1, num_workers=nw, collate_fn=pose_collate,
         sampler=StepSampler(len(train_ds), num_samples=local_iters, generator=gen),
         generator=gen,
         persistent_workers=nw > 0, pin_memory=True, drop_last=True,

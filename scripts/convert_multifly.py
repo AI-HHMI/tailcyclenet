@@ -52,10 +52,11 @@ SPLITS = {'train': 'train_annotations.json', 'test': 'test_annotations.json'}
 CAM = 'cam0'
 HALF = 16
 STAGE = '.staging'
+RENAME = {'right_mid_fitib': 'right_mid_fetib'}
 CROP = 192
 CTR = (CROP - 1) / 2
 FLIP = [('right_eye', 'left_eye'), ('right_thorax', 'left_thorax'),
-        ('right_mid_fe', 'left_mid_fe'), ('right_mid_fitib', 'left_mid_fetib'),
+        ('right_mid_fe', 'left_mid_fe'), ('right_mid_fetib', 'left_mid_fetib'),
         ('right_front_tar', 'left_front_tar'), ('right_mid_tar', 'left_mid_tar'),
         ('right_back_tar', 'left_back_tar'), ('right_mid_wing', 'left_mid_wing'),
         ('right_outer_wing', 'left_outer_wing')]
@@ -96,8 +97,8 @@ def load_jobs(src: Path) -> tuple[list[dict], list[str], list]:
         d = json.loads((data / fname).read_text())
         cat = d['categories'][0]
         if names is None:
-            names, skeleton = list(cat['keypoints']), cat['skeleton']
-        elif list(cat['keypoints']) != names:
+            names, skeleton = [RENAME.get(n, n) for n in cat['keypoints']], cat['skeleton']
+        elif [RENAME.get(n, n) for n in cat['keypoints']] != names:
             raise SystemExit(f'{fname}: keypoint list differs from train')
         imgs = {im['id']: im for im in d['images']}
         beh, cond = d['info'].get('behaviors', {}), d['info'].get('conditions', {})
@@ -260,6 +261,7 @@ def convert(job: dict, out: Path, names: list[str], skeleton: list, dry_run: boo
                              f'(~2.3% source-wide). Do not judge a vis head on this root.',
             'instances': 'every labelled fly is `present` (not all flies in a frame are labelled), '
                          'boxed by the axis-aligned 192x192 crop window centred on the crop centre',
+            'keypoint_renames': ', '.join(f'{k} -> {v}' for k, v in RENAME.items()),
             'animal_id_source': 'registered_trx target index (tgt), fly##',
             'context': f'each labelled frame centred in [f-{HALF}, f+{HALF}]; overlapping or '
                        f'touching windows merged',
@@ -310,7 +312,7 @@ def main() -> int:
         print(f'{sp:5s} {len(mine):3d} sessions {sum(len(j["plan"]) for j in mine):5d} groups '
               f'{sum(len(j["anns"]) for j in mine):5d} labelled fly-frames')
     if not args.dry_run:
-        for j in {(j['source_split'], j['session']) for j in jobs}:
+        for j in {(sp, j['session']) for j in jobs for sp in (j['split'], j['source_split'])}:
             src, dst = args.out / j[0] / j[1], args.out / STAGE / j[0] / j[1]
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)

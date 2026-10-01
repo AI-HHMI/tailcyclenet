@@ -690,6 +690,21 @@ class BoxDataset(Dataset):
                 out.append(p2d[s][ok].mean(0))
         return out
 
+    def _camera(self, sess, gid, f, ci):
+        """One posetail camera dict for `(frame, camera)`, read-only.
+
+        A static rig's cameras are frame-invariant, so they are built once per session: rebuilding
+        the whole rig per call was 81% of index-construction time on a 3D multi-root detector.
+        A moving rig still goes through `Session.cgroup(gid, f)` for its per-frame extrinsics.
+        """
+        if any(sess.rig.moving.values()):
+            return sess.cgroup(gid, f)[ci]
+        cache = self.__dict__.setdefault('_static_cameras', {})
+        key = str(sess.path)
+        if key not in cache:
+            cache[key] = sess.rig.posetail()
+        return cache[key][ci]
+
     def _points_2d(self, sess, gid, f, ci):
         """(S,K,2) source-pixel points for one (frame, camera). 3D sessions project.
 
@@ -700,7 +715,7 @@ class BoxDataset(Dataset):
         """
         lab = sess.labels(gid)
         if sess.mode == '3d' and lab.points3d is not None:
-            cam = sess.cgroup(gid, f)[ci]
+            cam = self._camera(sess, gid, f, ci)
             pts = torch.as_tensor(lab.points3d[:, f], dtype=torch.float32)
             return project_points_torch([cam], pts)[0]
         if lab.points2d is not None:
@@ -761,7 +776,7 @@ class BoxDataset(Dataset):
         """
         sess, gid, f, ci = self.index[i]
         lab = sess.labels(gid)
-        cam = sess.cgroup(gid, f)[ci]
+        cam = self._camera(sess, gid, f, ci)
         p2d = self._points_2d(sess, gid, f, ci)
         if sess.mode == '3d':
             vis = None if lab.vis3d is None else lab.vis3d[:, f]

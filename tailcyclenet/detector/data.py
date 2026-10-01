@@ -8,6 +8,8 @@ for a dataset whose stored keypoints are too sparse to bound the animal.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -285,7 +287,7 @@ class BoxDataset(Dataset):
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
-                 boxes_by_dataset=None, include_roots=None):
+                 boxes_by_dataset=None, include_roots=None, datasets=None):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
@@ -294,6 +296,10 @@ class BoxDataset(Dataset):
 
         Inputs:
             path, split -- dataset root and split directory.
+            datasets -- optional pre-loaded all-splits Dataset list (as `load_datasets(path)`),
+                so several BoxDatasets share one set of Sessions and their label caches. It
+                is narrowed to `split` (same Session objects), so the pickle a loader worker
+                receives carries no other split.
             input_wh -- model input size; replaced by the tile size under tiling.
             tile_wh / tile_scale / tile_bg_per_frame -- tiling: the tile is the model's INPUT
                 size; `tile_scale` is the source -> input scale and the only scale there is.
@@ -333,8 +339,10 @@ class BoxDataset(Dataset):
         self.strong = bool(strong)
         self.reduce = reduce
         self.seed = seed
-        all_datasets = load_datasets(path)
-        split_datasets = load_datasets(path, split=split)
+        all_datasets = load_datasets(path) if datasets is None else datasets
+        split_datasets = (load_datasets(path, split=split) if datasets is None else
+                          [replace(ds, sessions={split: ds.sessions[split]})
+                           for ds in all_datasets if split in ds.sessions])
         if include_roots is None:
             self.datasets = split_datasets
         else:
@@ -694,13 +702,16 @@ class BoxDataset(Dataset):
         The whole-group form of the per-view check `_has_target` makes while indexing: ONE
         projection per camera per group instead of one rig build + projection per (frame,
         camera), which was the entire cost of a multi-root index build (~600k views). Same
-        projection function, so finiteness is identical. Cached per (session, group). Shapes:
-        points3d (S, T, K, 3) projects to (C, S, T, K, 2); points2d is (S, T, K, C, 2).
+        projection function, so finiteness is identical. Shapes: points3d (S, T, K, 3) projects
+        to (C, S, T, K, 2); points2d is (S, T, K, C, 2).
+
+        Cached per group ON THE SESSION, not on this dataset: the mask is pure label geometry,
+        and `train_detector` hands one set of preloaded Sessions to the input-size probe, the
+        train index and val, so the probe's projections are the train index's.
         """
-        cache = self.__dict__.setdefault('_positioned_cache', {})
-        key = (str(sess.path), gid)
-        if key in cache:
-            return cache[key]
+        cache = sess.__dict__.setdefault('_detector_positioned_cache', {})
+        if gid in cache:
+            return cache[gid]
         n_frames, n_cams = sess.groups[gid].n_frames, len(sess.rig)
         if sess.mode == '3d' and lab.points3d is not None:
             cams = (sess.cgroup(gid) if any(sess.rig.moving.values())
@@ -712,7 +723,7 @@ class BoxDataset(Dataset):
             mask = np.isfinite(np.asarray(lab.points2d)).all(-1).any((0, 2))
         else:
             mask = np.zeros((n_frames, n_cams), dtype=bool)
-        cache[key] = mask
+        cache[gid] = mask
         return mask
 
     def _camera(self, sess, gid, f, ci):

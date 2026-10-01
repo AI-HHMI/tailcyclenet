@@ -39,7 +39,8 @@ def default_input_wh(dataset, target_px=416 * 416):
     return max(ow, 64), max(oh, 64)
 
 
-def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416):
+def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416,
+                 datasets=None):
     """Aspect-matched, then raised until the median animal is `min_box_px` across.
 
     At stride 32 (the coarsest FPN level) an animal smaller than 32 px exists at only the
@@ -49,7 +50,8 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416)
     base = default_input_wh(dataset)
     if min_box_px <= 0:
         return base
-    ds = BoxDataset(path, 'train', input_wh=base, box_source=box_source, max_frames_per_group=4)
+    ds = BoxDataset(path, 'train', input_wh=base, box_source=box_source,
+                    max_frames_per_group=4, datasets=datasets)
     ix = np.random.default_rng(0).choice(len(ds), min(300, len(ds)), replace=False)
     sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
                        for b in (ds.boxes_for(int(i)) for i in ix)])
@@ -94,7 +96,8 @@ def input_wh_for_roots(roots, box_source, boxes_by_dataset=None, min_box_px=32,
     for ds in roots:
         root_boxes = {ds.name: by[ds.name]} if ds.name in by else {}
         sampled = BoxDataset(ds.root, 'train', input_wh=base, box_source=box_source,
-                             boxes_by_dataset=root_boxes, max_frames_per_group=4)
+                             boxes_by_dataset=root_boxes, max_frames_per_group=4,
+                             datasets=[ds])
         ix = np.random.default_rng(0).choice(len(sampled), min(300, len(sampled)), replace=False)
         sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
                            for b in (sampled.boxes_for(int(i)) for i in ix)])
@@ -317,7 +320,7 @@ def main(argv: list[str] | None = None):
     wb = _init_detector_wandb(config, run)
 
     all_roots = load_datasets(data_cfg['path'])
-    roots = load_datasets(data_cfg['path'], split='train')
+    roots = [ds for ds in all_roots if 'train' in ds.sessions]
     multi = len(roots) > 1
     if multi and data_cfg['keypoints']:
         raise SystemExit(f'{data_cfg["path"]}: multi-root detector training is box-only; '
@@ -336,7 +339,7 @@ def main(argv: list[str] | None = None):
                                 data_cfg['min_box_px'], data_cfg['max_input_px'])
     else:
         wh = input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
-                          data_cfg['min_box_px'], data_cfg['max_input_px'])
+                          data_cfg['min_box_px'], data_cfg['max_input_px'], datasets=all_roots)
     print(f'input {wh[0]}x{wh[1]}  training roots={root_names}')
 
     tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
@@ -348,7 +351,7 @@ def main(argv: list[str] | None = None):
                        keypoints=data_cfg['keypoints'],
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
-                       seed=train_cfg['seed'], **tiling)
+                       seed=train_cfg['seed'], datasets=all_roots, **tiling)
     wh = train.input_wh
     if data_cfg['tile_wh']:
         ext = train._tile_extent()
@@ -415,7 +418,7 @@ def main(argv: list[str] | None = None):
                          min_crop_dim=data_cfg['min_crop_dim'], reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
-                         include_roots=root_names, **tiling)
+                         include_roots=root_names, datasets=all_roots, **tiling)
         missing_val = sorted(set(root_names) - set(val.root_names))
         print(f'val:   {len(val)} views across {val.root_names}; '
               f'no val split: {missing_val or "none"}')

@@ -64,8 +64,9 @@ HOLE_EXEMPTIONS = {
     'facemap': {'keypoints': 2196},
     # RP-5.7K has one partial LabelMe pose with two absent point shapes.
     'rat-rp-5.7k': {'keypoints': 2},
-    # UDARP's two out-of-bounds tail_root coordinates are omitted and noted per frame.
-    'rat-udarp-9.4k': {'keypoints': 2},
+    # UDARP's two out-of-bounds tail_root coordinates and 350 `0_0` unlabelled-point sentinels
+    # are omitted and noted per frame.
+    'rat-udarp-9.4k': {'keypoints': 352},
 }
 
 

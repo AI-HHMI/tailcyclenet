@@ -70,6 +70,7 @@ def read_records(src: Path) -> list[dict]:
                     width, height = im.size
                 points = {}
                 invalid_points = []
+                zero_points = []
                 for name in spec['names']:
                     value = (row.get(name) or '').strip()
                     parts = value.split('_')
@@ -83,10 +84,18 @@ def read_records(src: Path) -> list[dict]:
                     if not np.isfinite([x, y]).all():
                         raise SystemExit(f'{csv_path}:{row_number}: non-finite coordinates '
                                          f'{name}={value!r}')
+                    if x == 0 and y == 0:
+                        # The source's unlabelled-point sentinel; it lies outside the BBox.
+                        zero_points.append(name)
+                        continue
                     if not (0 <= x < width and 0 <= y < height):
                         invalid_points.append((name, value))
                         continue
                     points[name] = (x, y)
+                if not points:
+                    raise SystemExit(f'{csv_path}:{row_number}: no positioned keypoints')
+                box, box_note = instance_box(row['BBox'], points, width, height,
+                                             f'{csv_path}:{row_number}')
                 records.append({
                     'collection': collection,
                     'relative_image': rel,
@@ -96,12 +105,43 @@ def read_records(src: Path) -> list[dict]:
                     'animal_id': f"rat{row['Rat_num']}",
                     'points': points,
                     'invalid_points': invalid_points,
+                    'zero_points': zero_points,
+                    'box': box,
+                    'box_note': box_note,
                 })
     records.sort(key=lambda r: r['relative_image'])
     paths = [r['relative_image'] for r in records]
     if len(paths) != len(set(paths)):
         raise SystemExit('annotation CSVs contain duplicate source images')
     return records
+
+
+def instance_box(value: str, points: dict, width: int, height: int,
+                 where: str) -> tuple[tuple[float, float, float, float], str]:
+    """Return the image-clipped union of the source BBox and positioned keypoints.
+
+    Source corners are not consistently ordered, so they are sorted per axis. A degenerate or
+    too-small source box is expanded by the keypoint extent; the note records any such expansion.
+    """
+    parts = value.strip().split('_')
+    if len(parts) != 4:
+        raise SystemExit(f'{where}: malformed BBox={value!r}')
+    try:
+        a, b, c, d = map(float, parts)
+    except ValueError as exc:
+        raise SystemExit(f'{where}: bad BBox={value!r}') from exc
+    source = (min(a, c), min(b, d), max(a, c), max(b, d))
+    pts = np.asarray(list(points.values()), np.float64)
+    box = (min(source[0], pts[:, 0].min()), min(source[1], pts[:, 1].min()),
+           max(source[2], pts[:, 0].max()), max(source[3], pts[:, 1].max()))
+    box = (max(0.0, box[0]), max(0.0, box[1]), min(float(width), box[2]),
+           min(float(height), box[3]))
+    if not (box[2] > box[0] and box[3] > box[1]):
+        raise SystemExit(f'{where}: empty instance box from BBox={value!r}')
+    note = ''
+    if any(abs(x - y) > 3.0 for x, y in zip(box, source)):
+        note = f'bbox_expanded_to_keypoints=source:{value}'
+    return tuple(float(v) for v in box), note
 
 
 def write_pixels(session_dir: Path, group_id: str, source: Path) -> None:
@@ -123,8 +163,8 @@ def write_pixels(session_dir: Path, group_id: str, source: Path) -> None:
 def labels_for(record: dict, names: list[str]) -> fmt.Labels:
     """Build one rat, one still, one camera worth of positioned 2D labels.
 
-    Provided points are visible per owner instruction. The source box is omitted because its
-    ordering is inconsistent; a boxless `present` instance avoids false background negatives.
+    Provided points are visible per owner instruction. Each still has one annotated rat, so its
+    corner-sorted, keypoint-covering source box is a `labeled` instance.
     """
     lab = fmt.empty_labels(1, 1, len(names), 1, mode3d=False,
                            animal_ids=[record['animal_id']])
@@ -133,8 +173,8 @@ def labels_for(record: dict, names: list[str]) -> fmt.Labels:
             continue
         lab.points2d[0, 0, index, 0] = record['points'][name]
         lab.vis2d[0, 0, index, 0] = fmt.VISIBLE
-    lab.boxes = np.full((1, 1, 1, 4), np.nan, np.float32)
-    lab.instance = np.full((1, 1, 1), fmt.INST_PRESENT, np.int8)
+    lab.boxes = np.asarray(record['box'], np.float32).reshape(1, 1, 1, 4)
+    lab.instance = np.full((1, 1, 1), fmt.INST_LABELED, np.int8)
     return lab
 
 
@@ -172,6 +212,10 @@ def convert(src: Path, out: Path, *, val_frames: int = VAL_FRAMES,
             if record['invalid_points']:
                 invalid = ','.join(f'{name}={value}' for name, value in record['invalid_points'])
                 note += f'; excluded_out_of_bounds={invalid}'
+            if record['zero_points']:
+                note += '; excluded_zero_sentinel=' + ','.join(record['zero_points'])
+            if record['box_note']:
+                note += f"; {record['box_note']}"
             groups[group_id] = fmt.Group(
                 group_id, 1, source_frame_start=0, source_frame_step=1, notes=note)
             labels[group_id] = labels_for(record, names)
@@ -190,9 +234,11 @@ def convert(src: Path, out: Path, *, val_frames: int = VAL_FRAMES,
                 'source_image_count_total': int(len(records)),
                 'keypoint_status_note': 'all source keypoint coordinates are stored as visible per dataset '
                                         'owner instruction; source cells use x_y_0; out-of-bounds '
-                                        'coordinates are omitted and named in their group notes',
-                'instance_note': 'boxless present rows; source BBox ordering is inconsistent and '
-                                 'boxes are omitted to avoid false background negatives',
+                                        'coordinates and 0_0 sentinels are omitted and named in '
+                                        'their group notes',
+                'instance_note': 'one labeled rat per still; source BBox corners are sorted per '
+                                 'axis, unioned with positioned keypoints, and clipped to the '
+                                 'image; expansions are named in group notes',
             })
         print(f'{split}/{session_id}: {len(groups)} image group(s), '
               f'{sum(len(r[1]["points"]) for r in members)} positioned keypoints')
@@ -202,9 +248,11 @@ def convert(src: Path, out: Path, *, val_frames: int = VAL_FRAMES,
     if (train_count, val_count) != (len(records) - val_frames, val_frames):
         raise RuntimeError(f'split count mismatch: train={train_count}, val={val_count}')
     invalid_count = sum(len(r['invalid_points']) for r in records)
+    zero_count = sum(len(r['zero_points']) for r in records)
+    expanded = sum(bool(r['box_note']) for r in records)
     print(f'converted {len(records)} images: {train_count} train, {val_count} val '
-          f'(seed={seed}); excluded {invalid_count} out-of-bounds keypoint(s), recorded in '
-          f'groups.pq notes; output {out}')
+          f'(seed={seed}); excluded {invalid_count} out-of-bounds and {zero_count} 0_0 '
+          f'keypoint(s); expanded {expanded} source box(es); notes in groups.pq; output {out}')
 
     if validate:
         print('\n-- validation')

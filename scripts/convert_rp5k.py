@@ -130,8 +130,8 @@ def collect_records(source: Path) -> list[dict]:
 def main() -> None:
     """Convert the source dataset and validate the generated root.
 
-    The stable input order and seed define the frame-level split. The only boxless source still
-    has a partial pose, so it is emitted as `present` to avoid a false detector-negative claim.
+    The stable input order and seed define the frame-level split. Each still has one annotated
+    rat; the only boxless source still uses its positioned-keypoint extent as a `labeled` box.
     """
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -186,6 +186,15 @@ def main() -> None:
                 note = f"source_image={subset}/{record['source_name']}"
                 if record['missing_points']:
                     note += "; point_shape_absent_unassessed=" + ','.join(record['missing_points'])
+                box = record['box']
+                if box is None:
+                    pts = np.asarray(list(record['points'].values()), np.float64)
+                    w, h = part[0]['size']
+                    box = (max(0.0, pts[:, 0].min()), max(0.0, pts[:, 1].min()),
+                           min(float(w), pts[:, 0].max()), min(float(h), pts[:, 1].max()))
+                    if not (box[2] > box[0] and box[3] > box[1]):
+                        raise SystemExit(f'{gid}: boxless still has an empty keypoint extent')
+                    note += '; box_from_keypoint_extent'
                 groups[gid] = fmt.Group(group_id=gid, n_frames=1, notes=note)
                 lab = fmt.empty_labels(1, 1, len(NAMES), 1, mode3d=False,
                                        animal_ids=['rat_0'])
@@ -195,12 +204,8 @@ def main() -> None:
                     lab.points2d[0, 0, k, 0] = record['points'][name]
                     lab.vis2d[0, 0, k, 0] = fmt.VISIBLE
                 lab.boxes = np.full((1, 1, 1, 4), np.nan, np.float32)
-                lab.instance = np.full((1, 1, 1), fmt.INST_NONE, np.int8)
-                if record['box'] is not None:
-                    lab.boxes[0, 0, 0] = record['box']
-                    lab.instance[0, 0, 0] = fmt.INST_LABELED
-                else:
-                    lab.instance[0, 0, 0] = fmt.INST_PRESENT
+                lab.boxes[0, 0, 0] = box
+                lab.instance = np.full((1, 1, 1), fmt.INST_LABELED, np.int8)
                 labels[gid] = lab
 
                 pixel_dir = session_path / 'groups' / gid / CAMERA
@@ -220,8 +225,8 @@ def main() -> None:
                                     f'validation_frames={args.val_frames}',
                     'visibility_note': 'keypoints encoded as visible per dataset owner direction; '
                                        'absent point shapes are unassessed and remain no-row holes',
-                    'instance_note': 'the one boxless partial pose is marked present so it does not '
-                                     'claim exhaustive detector background',
+                    'instance_note': 'one labeled rat per still; the one boxless partial pose uses '
+                                     'its positioned-keypoint extent',
                 })
             total[split] += len(part)
             print(f'{split}/{session_id}: {len(part)} still groups')

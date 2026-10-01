@@ -8,7 +8,8 @@ session per (split, trial). `cv2.FileStorage` misparses the newer bare-integer y
 `parse_calib` is a regex reader. There is no 3D in the source, so it is triangulated from the
 16-view 2D with outlier rejection (plain least squares has no breakdown point). Everything is
 driven from the JSON `images` list -- a filesystem walk would enrol the unreferenced ghost jpgs.
-Groups are runs cut where the source frame gap exceeds `--max-gap`.
+Groups are runs cut where the source frame gap exceeds `--max-gap`. Incomplete framesets are dropped
+loudly because the output format requires every calibrated camera for each frame.
 """
 from __future__ import annotations
 
@@ -245,10 +246,24 @@ def convert(src: Path, out: Path, max_gap: int, only: list[str] | None, max_grou
             frames = sorted(fsets)
 
             cams = sorted(d['calibrations'][trial])
+            incomplete = []
             for f in frames:
-                if sorted(fsets[f]) != cams:
-                    raise RuntimeError(f'{split}/{trial}/{f}: cameras {sorted(fsets[f])} '
-                                       f'disagree with calibration {cams}')
+                present = sorted(fsets[f])
+                unknown = sorted(set(present) - set(cams))
+                if unknown:
+                    raise RuntimeError(f'{split}/{trial}/{f}: unknown camera(s) {unknown}; '
+                                       f'calibration has {cams}')
+                if present != cams:
+                    missing = sorted(set(cams) - set(present))
+                    print(f'   ! {split}/{trial}/{f}: missing {missing} -- frameset DROPPED '
+                          f'(rule 7 needs every camera)')
+                    incomplete.append(f)
+            for f in incomplete:
+                del fsets[f]
+            frames = sorted(fsets)
+            if not frames:
+                raise RuntimeError(f'{split}/{trial}: no complete framesets remain after '
+                                   'dropping incomplete camera views')
             sizes = {c: (d['_imgs'][fsets[frames[0]][c]]['width'],
                          d['_imgs'][fsets[frames[0]][c]]['height']) for c in cams}
             rig = build_rig(src, d['calibrations'][trial], sizes)

@@ -32,6 +32,7 @@ MISSING_OK = {
     'allen-mouse-annotated': ('keypoints', 'points3d'),
     # APT's Inf sentinel (fully occluded) stays `missing`; its NaN skip stays absent.
     'rat-city-annotated': ('keypoints',),
+    'rat-city-annotated-present': ('keypoints',),
     # SLEAP's per-point `visible=False` is an annotator occlusion judgement; the position it
     # keeps is stale, so the row is `missing` rather than `projected`.
     'comrie-minimaze': ('keypoints',),
@@ -48,6 +49,7 @@ HOLE_EXEMPTIONS = {
     # APT's `NaN` (annotator skip) stays absent -- `missing` would claim an assessment nobody
     # made; the `Inf` sentinel is already counted in MISSING_OK.
     'rat-city-annotated': {'keypoints': 220},
+    'rat-city-annotated-present': {'keypoints': 220},
     # APTv2 COCO v==0 is a zero triplet that asserts nothing was assessed; it becomes no row.
     'apt-v2': {'keypoints': 387928},
     # 1-view and over-gate triangulations are left as no row; the 0-view-all-assessed case is the

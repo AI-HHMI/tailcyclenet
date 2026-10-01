@@ -195,8 +195,65 @@ def dump_calibration(path: Path, rig: Rig) -> None:
 
 # parquet helpers
 
+class _Columns:
+    """A parquet table whose decoded columns are memoised.
+
+    `Session.labels` scatters one group at a time, and every group used to re-decode every
+    column of the WHOLE session table -- O(groups x rows), ~30 s on a 350-group session. This
+    decodes each column once and indexes rows by group once. Callers must not mutate what the
+    helpers return (all of them slice with `[sel]`, which copies).
+    """
+
+    def __init__(self, table: pa.Table):
+        """Wrap `table`; nothing is decoded until asked for."""
+        self.table = table
+        self.column_names = table.column_names
+        self._memo: dict = {}
+
+    def __len__(self) -> int:
+        """Row count of the wrapped table."""
+        return len(self.table)
+
+    def column(self, col: str):
+        """The wrapped table's raw column."""
+        return self.table.column(col)
+
+    def memo(self, key, fn):
+        """`fn()` the first time `key` is asked for, the stored value after."""
+        if key not in self._memo:
+            self._memo[key] = fn()
+        return self._memo[key]
+
+
+def _group_rows(table, gid: str) -> np.ndarray | None:
+    """Ascending row indices of group `gid`, or None when the table has no such group."""
+    if isinstance(table, _Columns):
+        def build():
+            """group id -> its ascending row indices, from one stable argsort of the codes."""
+            codes, values = _codes(table, 'group_id')
+            order = np.argsort(codes, kind='stable')
+            bounds = np.searchsorted(codes[order], np.arange(len(values) + 1))
+            return {v: order[bounds[i]:bounds[i + 1]] for i, v in enumerate(values)}
+        rows = table.memo(('rows',), build).get(gid)
+        return rows if rows is not None and rows.size else None
+    gcodes, gvals = _codes(table, 'group_id')
+    if gid not in gvals:
+        return None
+    sel = np.flatnonzero(gcodes == gvals.index(gid))
+    return sel if sel.size else None
+
+
+def _ints(table, col: str) -> np.ndarray:
+    """An integer column as int64 numpy."""
+    if isinstance(table, _Columns):
+        return table.memo(('ints', col), lambda: _ints(table.table, col))
+    return table.column(col).combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64)
+
+
 def _codes(table: pa.Table, col: str) -> tuple[np.ndarray, list[str]]:
     """(int32 codes, distinct values) for a string column. Dictionary-encodes if it is not."""
+    if isinstance(table, _Columns):
+        return table.memo(('codes', col), lambda: _codes(table.table, col))
     arr = table.column(col).combine_chunks()
     if not pa.types.is_dictionary(arr.type):
         arr = arr.dictionary_encode()
@@ -223,6 +280,8 @@ def _floats(table: pa.Table, col: str, n: int) -> np.ndarray:
     """A float64 column as numpy, nulls as NaN. Missing column -> all NaN."""
     if col not in table.column_names:
         return np.full(n, np.nan)
+    if isinstance(table, _Columns):
+        return table.memo(('floats', col), lambda: _floats(table.table, col, n))
     return table.column(col).combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64)
 
 
@@ -347,16 +406,11 @@ def _scatter(table, gid, T, kpt_vocab, cam_vocab, animals, where, per_camera, n_
     Returns (rows_index, a, f, k, c, status) with `a` already remapped to 0..S-1 and `c` None
     when the table has no camera column.
     """
-    gcodes, gvals = _codes(table, 'group_id')
-    try:
-        want = gvals.index(gid)
-    except ValueError:
-        return None
-    sel = np.flatnonzero(gcodes == want)
-    if sel.size == 0:
+    sel = _group_rows(table, gid)
+    if sel is None:
         return None
 
-    frame = table.column('frame').combine_chunks().to_numpy(zero_copy_only=False)[sel].astype(np.int64)
+    frame = _ints(table, 'frame')[sel]
     if frame.min() < 0 or frame.max() >= T:
         raise FormatError(f'{where}: group {gid!r} has a frame outside [0, {T})')
 
@@ -402,10 +456,9 @@ def _animal_vocab(tables: list[pa.Table | None], gid: str) -> list[str]:
     for table in tables:
         if table is None:
             continue
-        gcodes, gvals = _codes(table, 'group_id')
-        if gid not in gvals:
+        sel = _group_rows(table, gid)
+        if sel is None:
             continue
-        sel = gcodes == gvals.index(gid)
         acodes, avals = _codes(table, 'animal_id')
         found.update(np.asarray(avals, dtype=object)[np.unique(acodes[sel])].tolist())
     return sorted(found)
@@ -671,6 +724,11 @@ class Session:
             g.session = sess
         return sess
 
+    @cached_property
+    def _columns(self) -> dict[str, _Columns | None]:
+        """`_tables` with memoised column decodes, for `labels()`. Dropped with `_tables`."""
+        return {s: None if t is None else _Columns(t) for s, t in self._tables.items()}
+
     def preload(self) -> None:
         """Scatter every group now and drop the parquet tables.
 
@@ -683,6 +741,7 @@ class Session:
             self.labels(gid)
         self.has_visibility_assessment
         self.__dict__.pop('_tables', None)
+        self.__dict__.pop('_columns', None)
 
     def cgroup(self, gid: str, frames=None) -> list[dict]:
         """posetail cameras for a group, carrying per-frame extrinsics where a camera moves.
@@ -715,7 +774,7 @@ class Session:
             return self._label_cache[gid]
         group = self.groups[gid]
         T, K, C = group.n_frames, len(self.names), len(self.rig)
-        t = self._tables
+        t = self._columns
         animals = _animal_vocab([t['keypoints'], t['points3d'], t['instances']], gid)
         avocab = {a: i for i, a in enumerate(animals)}
         S = len(animals)

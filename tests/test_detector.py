@@ -365,6 +365,80 @@ out = "/tmp/run"
         load_detector_config(bad_map)
 
 
+def test_detector_config_optional_wandb_block(tmp_path):
+    default = _write_config(tmp_path, """
+[data]
+path = "/tmp/roots"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+""")
+    assert 'wandb' not in load_detector_config(default)
+
+    configured = _write_config(tmp_path, """
+[data]
+path = "/tmp/roots"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+[wandb]
+project_name = "tailcycle-detector"
+path = "/tmp/wandb"
+mode = "online"
+""", name='wandb.toml')
+    cfg = load_detector_config(configured)
+    assert cfg['wandb'] == {'project_name': 'tailcycle-detector',
+                            'path': '/tmp/wandb', 'mode': 'online'}
+
+    bad = _write_config(tmp_path, """
+[data]
+path = "/tmp/roots"
+[model]
+yolox = "tiny"
+[training]
+out = "/tmp/run"
+[wandb]
+mode = "invalid"
+""", name='bad-wandb.toml')
+    with pytest.raises(SystemExit, match=r"\[wandb\]\.mode"):
+        load_detector_config(bad)
+
+
+def test_detector_wandb_metrics_flatten_scalars():
+    from tailcyclenet.train_detector import _wandb_eval_metrics
+
+    scores = {'val_macro': {'r50': 0.75, 'n_gt': 12, 'nan': float('nan')},
+              'val_root_facemap': {'r50': 0.5, 'label': 'ignored'}}
+    got = _wandb_eval_metrics(scores, {'q50': 0.87})
+    assert got == {'eval/val_macro/r50': 0.75, 'eval/val_macro/n_gt': 12.0,
+                   'eval/val_root_facemap/r50': 0.5, 'train/objectness_q50': 0.87}
+
+
+def test_detector_wandb_initialization_and_logging(tmp_path, monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    from tailcyclenet.train_detector import _init_detector_wandb, _log_detector_wandb
+
+    calls = {}
+    fake = ModuleType('wandb')
+    fake.run = SimpleNamespace(name='test-run')
+    fake.init = lambda **kwargs: calls.update(init=kwargs)
+    fake.log = lambda values, step: calls.update(log=(values, step))
+    monkeypatch.setitem(sys.modules, 'wandb', fake)
+
+    config = {'wandb': {'project_name': 'tailcycle-detector', 'path': str(tmp_path),
+                        'mode': 'online'}}
+    wb = _init_detector_wandb(config, tmp_path / 'run')
+    _log_detector_wandb(wb, {'train/loss': 1.25}, 50)
+    assert calls['init']['project'] == 'tailcycle-detector'
+    assert calls['init']['mode'] == 'online'
+    assert calls['init']['config'] is config
+    assert calls['log'] == ({'train/loss': 1.25}, 50)
+
+
 def test_detector_config_weight_decay_inherits_the_shipped_0_01(tmp_path):
     """The implicit base is `configs/detector.toml`, so an absent key inherits its shipped
     value (0.01) rather than the old AdamW hardcoded 5e-4 -- a bare config now runs the

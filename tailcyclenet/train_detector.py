@@ -207,6 +207,41 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     return opt, None
 
 
+def _init_detector_wandb(config, run: Path):
+    """Initialize optional detector W&B logging from the `[wandb]` config block."""
+    cfg = config.get('wandb')
+    if not cfg:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print('wandb: not installed, skipping')
+        return None
+    Path(cfg['path']).mkdir(parents=True, exist_ok=True)
+    name = f'{time.strftime("%Y%m%d_%H%M%S")}-{run.name}'
+    wandb.init(project=cfg['project_name'], dir=cfg['path'], mode=cfg['mode'], name=name,
+               config=config)
+    print(f'wandb: {cfg["mode"]} | {wandb.run.name}', flush=True)
+    return wandb
+
+
+def _log_detector_wandb(wb, values, step):
+    """Log a non-empty scalar batch to W&B when configured."""
+    if wb is not None and values:
+        wb.log(values, step=step)
+
+
+def _wandb_eval_metrics(scores, obj_q):
+    """Flatten scalar detector evaluation metrics into stable W&B keys."""
+    metrics = {}
+    for split, values in scores.items():
+        for key, value in values.items():
+            if isinstance(value, (int, float, np.number)) and np.isfinite(value):
+                metrics[f'eval/{split}/{key}'] = float(value)
+    metrics.update({f'train/objectness_{key}': float(value) for key, value in obj_q.items()})
+    return metrics
+
+
 def _record_run(run: Path, config: dict) -> None:
     """Write the run folder's reproducibility record: the effective config + provenance.
 
@@ -279,6 +314,7 @@ def main(argv: list[str] | None = None):
     device = train_cfg['device'] if torch.cuda.is_available() else 'cpu'
     run = Path(train_cfg['out'])
     _record_run(run, config)
+    wb = _init_detector_wandb(config, run)
 
     all_roots = load_datasets(data_cfg['path'])
     roots = load_datasets(data_cfg['path'], split='train')
@@ -461,9 +497,19 @@ def main(argv: list[str] | None = None):
                        if 'negative_frames' in parts else '')
                 kp += f'  id {parts["ident"]:6.3f}' if 'ident' in parts else ''
                 kp += f'  iouT {parts["iou_target"]:5.3f}' if 'iou_target' in parts else ''
+                seconds_per_it = (time.time() - t0) / 50
                 print(f'{it:7d}/{train_cfg["iters"]}  loss {np.mean(running):7.4f}  '
                       f'obj {parts["obj"]:6.3f}  box {parts["box"]:6.3f}{kp}  '
-                      f'pos {parts["n_pos"]:4d}  {(time.time() - t0) / 50:5.3f}s/it', flush=True)
+                      f'pos {parts["n_pos"]:4d}  {seconds_per_it:5.3f}s/it', flush=True)
+                train_metrics = {'train/loss': float(np.mean(running)),
+                                 'train/obj': float(parts['obj']),
+                                 'train/box': float(parts['box']),
+                                 'train/positive_anchors': float(parts['n_pos']),
+                                 'train/seconds_per_iteration': float(seconds_per_it)}
+                for key in ('kpt', 'kpt_score', 'negative_frames', 'ident', 'iou_target'):
+                    if key in parts:
+                        train_metrics[f'train/{key}'] = float(parts[key])
+                _log_detector_wandb(wb, train_metrics, it)
                 running, t0 = [], time.time()
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
                 if hasattr(opt, 'eval'):
@@ -559,6 +605,7 @@ def main(argv: list[str] | None = None):
                                 **{f'{k}_{m}': v[m] for k, v in scores.items()
                                    for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
                 (run / 'metrics.json').write_text(json.dumps(history, indent=1))
+                _log_detector_wandb(wb, _wandb_eval_metrics(scores, obj_q), it)
                 for name, s in scores.items():
                     print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
                           f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
@@ -571,6 +618,8 @@ def main(argv: list[str] | None = None):
               '  '.join(f'{k} {v:.4f}' for k, v in best.items()
                         if k not in ('iteration', 'selection_metric')
                         and isinstance(v, (int, float))))
+    if wb is not None:
+        wb.finish()
 
 
 if __name__ == '__main__':

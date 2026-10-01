@@ -126,3 +126,5 @@ fpn_upsample = "bilinear"
 tal_topk = 20
 
 optimizer = "muon"
+
+# Optional `[wandb]` block accepts `project_name`, `path`, and `mode` to log detector metrics.

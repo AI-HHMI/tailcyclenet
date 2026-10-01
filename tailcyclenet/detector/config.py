@@ -9,7 +9,7 @@ validated against an explicit allowed set so typos cannot silently train at defa
 Blocks:
     [data]      the loader and what the regression target bounds
     [model]     the architecture: `yolox` (capacity tier), plus `pretrained` (COCO transfer)
-    [training]  schedule, run folder, device
+    [training]  schedule, run folder, device; optional `[wandb]` config enables tracking
 
 `frames_per_group` is DELETED and now RAISES as an unknown key. The train loader indexes every
 labelled frame and weights the draw view-uniformly within a cohort (`BoxDataset
@@ -132,6 +132,21 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         train['iters'] = int(iters)
     if device is not None:
         train['device'] = str(device)
+
+    wandb_cfg = cfg.get('wandb')
+    if wandb_cfg is not None:
+        if not isinstance(wandb_cfg, dict):
+            raise SystemExit('[wandb] must be a table.')
+        _raise_unknown('wandb', wandb_cfg, frozenset({'project_name', 'path', 'mode'}))
+        wandb_cfg.setdefault('project_name', 'tailcyclenet')
+        wandb_cfg.setdefault('path', '.')
+        wandb_cfg.setdefault('mode', 'offline')
+        if not isinstance(wandb_cfg['project_name'], str) or not wandb_cfg['project_name']:
+            raise SystemExit('[wandb].project_name must be a non-empty string.')
+        if not isinstance(wandb_cfg['path'], str) or not wandb_cfg['path']:
+            raise SystemExit('[wandb].path must be a non-empty string.')
+        if wandb_cfg['mode'] not in ('online', 'offline'):
+            raise SystemExit("[wandb].mode must be 'online' or 'offline'.")
 
     if not data.get('path'):
         raise SystemExit('[data].path is required: a dataset root (has train/, optionally '

@@ -278,7 +278,7 @@ def _keypoints_in_rects(kpts_xy, rects):
 
 
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
-                  rotate_deg=0.0, centre=None, vflip=0.0, rot90=0.0):
+                  rotate_deg=0.0, centre=None, vflip=0.0):
     """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
 
     Deliberately a similarity and not YOLOX's shear-and-perspective: the target is
@@ -286,9 +286,10 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     whose extent is no longer the crop rule's box for anything.
 
     `rotate_deg` REPLACES THE FLIP and is strictly easier: a rotation moves every keypoint through
-    the same affine and permutes nothing, where a mirror needs a `flip_pairs` map. Default-off on
-    evidence (its 180-degree setting is refuted on two roots), kept because a full circle costs no
-    more retained area than a quarter one.
+    the same affine and permutes nothing, where a mirror needs a `flip_pairs` map. Off by default
+    here; the shipped detector config sets 180 (full circle) for cross-rig generalization, by owner
+    decision 2026-10-02, although 180 was refuted IN-DOMAIN on two roots (report 17). A full circle
+    costs no more retained area than a quarter one.
 
     `centre` IS WHY TILING AND ROTATION COMPOSE: the tile is cut AFTER this warp, so about the
     frame centre a scale of 0.8 moves an animal 2,000 px out by 400 -- more than a 640 px tile --
@@ -301,12 +302,9 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     keypoints are not a target, which is why `BoxDataset` passes `hflip=0` (and `vflip=0`)
     whenever it emits them.
 
-    `vflip` (probability of a vertical mirror) and `rot90` (probability of an extra exact
-    90/180/270-degree turn, uniform over the three, about the same centre) are box-only-safe for
-    the same reason; a 90-degree turn permutes no keypoint either. Both draw from `rng` ONLY when
-    nonzero, so at 0 the draw sequence -- and every augmentation stream on record -- is unchanged.
-    The turn stays in the frame's own canvas, exactly as `rotate_deg` does: a wide frame loses
-    its sides rather than the animal shrinking by the aspect ratio.
+    `vflip` (probability of a vertical mirror) is box-only-safe for the same reason. It draws
+    from `rng` ONLY when nonzero, so at 0 the draw sequence -- and every augmentation stream on
+    record -- is unchanged.
     """
     w, h = float(size[0]), float(size[1])
     s = rng.uniform(*scale)
@@ -317,9 +315,6 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
     if rotate_deg:
         a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
         A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
-    if rot90 and rng.random() < rot90:
-        k = int(rng.integers(1, 4))
-        A = np.linalg.matrix_power(np.array([[0.0, -1.0], [1.0, 0.0]]), k) @ A
     t = (np.array([cx, cy]) - A @ np.array([cx, cy])
          + np.array([rng.uniform(-translate, translate) * w,
                      rng.uniform(-translate, translate) * h]))
@@ -375,7 +370,7 @@ class BoxDataset(Dataset):
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
                  boxes_by_dataset=None, include_roots=None, datasets=None,
-                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, rot90=0.0):
+                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
@@ -396,7 +391,7 @@ class BoxDataset(Dataset):
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
             box_target -- 'crop' (legacy): `crop_box_for_points` itself. 'extent': the tight
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
-            antialias / grayscale_prob / vflip / rot90 -- area-filtered shrinking and the
+            antialias / grayscale_prob / vflip -- area-filtered shrinking and the
                 train-augmentation probabilities; `vflip` is 0 under `keypoints`.
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
@@ -430,7 +425,6 @@ class BoxDataset(Dataset):
         self.antialias = bool(antialias)
         self.grayscale_prob = float(grayscale_prob)
         self.vflip = 0.0 if self.keypoints else float(vflip)
-        self.rot90 = float(rot90)
         self.rotate_deg = float(rotate_deg)
         self.augment = augment
         self.strong = bool(strong)
@@ -1074,7 +1068,7 @@ class BoxDataset(Dataset):
         size = tuple(sess.rig.size(sess.cam_names[ci]))
         rng = np.random.default_rng(None) if self.augment and self.train else None
         warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
-                              centre=self._warp_centre(i), vflip=self.vflip, rot90=self.rot90)
+                              centre=self._warp_centre(i), vflip=self.vflip)
                 if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)

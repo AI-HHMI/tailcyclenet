@@ -44,7 +44,7 @@ DATA_KEYS = frozenset({
     'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'alpha', 'balance_datasets', 'boxes_by_dataset',
-    'box_target', 'antialias', 'grayscale_prob', 'vflip', 'rot90_prob',
+    'box_target', 'antialias', 'grayscale_prob', 'vflip',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -187,7 +187,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
     ncd = train.get('nms_center_dist_thresh', 0.5)
     train['nms_center_dist_thresh'] = None if ncd in (None, '', []) else float(ncd)
-    for k, default in (('rotate_deg', 45.0), ('tile_scale', 1.0)):
+    for k, default in (('rotate_deg', 180.0), ('tile_scale', 1.0)):
         data[k] = float(data.get(k, default))
     data['augment'] = bool(data.get('augment', True))
     data['augment_strong'] = bool(data.get('augment_strong', True))
@@ -200,10 +200,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     if data['box_target'] not in ('crop', 'extent'):
         raise SystemExit(f"[data].box_target must be 'crop' or 'extent', got "
                          f"{data['box_target']!r}.")
-    for k, default in (('grayscale_prob', 0.2), ('rot90_prob', 0.5)):
-        data[k] = float(data.get(k, default))
-        if not 0.0 <= data[k] <= 1.0:
-            raise SystemExit(f'[data].{k} must be in [0, 1], got {data[k]}.')
+    data['grayscale_prob'] = float(data.get('grayscale_prob', 0.2))
+    if not 0.0 <= data['grayscale_prob'] <= 1.0:
+        raise SystemExit(f"[data].grayscale_prob must be in [0, 1], got {data['grayscale_prob']}.")
     af = data.get('annot_frac', None)
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:

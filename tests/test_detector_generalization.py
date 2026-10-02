@@ -6,7 +6,7 @@ Each test pins one claim the change rests on:
 - the crop rule is a function of the extent alone, so regressing the tight extent and applying
   `crop_boxes_from_extents` after detection gives the crop `crop_box_for_points` would;
 - `antialias` changes the filter, never the geometry;
-- `vflip` / `rot90` / `grayscale_prob` draw nothing at 0, and do what they say at 1.
+- `vflip` / `grayscale_prob` draw nothing at 0, and do what they say at 1.
 """
 from __future__ import annotations
 
@@ -87,33 +87,39 @@ def test_extent_target_is_tight_and_gives_back_the_crop_rule(tiny_root):
 
 
 def test_random_affine_new_levers_draw_nothing_when_off():
-    """At vflip=0, rot90=0 the draw sequence is the legacy one, so every augmentation stream on
-    record is reproduced; at 1 they are an exact mirror and an exact quarter-turn."""
+    """At vflip=0 the draw sequence is the legacy one, so every augmentation stream on record is
+    reproduced; at 1 it is an exact mirror."""
     for seed in range(20):
         a = random_affine((640, 480), np.random.default_rng(seed), rotate_deg=30.0)
-        b = random_affine((640, 480), np.random.default_rng(seed), rotate_deg=30.0,
-                          vflip=0.0, rot90=0.0)
+        b = random_affine((640, 480), np.random.default_rng(seed), rotate_deg=30.0, vflip=0.0)
         assert np.array_equal(a, b)
     neutral = dict(scale=(1.0, 1.0), translate=0.0, hflip=0.0)
     M = random_affine((100, 100), np.random.default_rng(0), vflip=1.0, **neutral)
     np.testing.assert_allclose(M[:, :2], [[1, 0], [0, -1]])
     np.testing.assert_allclose(M @ [50, 50, 1], [50, 50], atol=1e-5)
-    seen = set()
-    for seed in range(40):
-        M = random_affine((100, 60), np.random.default_rng(seed), rot90=1.0, **neutral)
-        A = M[:, :2]
-        assert np.array_equal(A, np.round(A)) and round(np.linalg.det(A)) == 1
-        assert not np.array_equal(A, np.eye(2)), 'rot90=1 must always turn'
-        np.testing.assert_allclose(M @ [50, 30, 1], [50, 30], atol=1e-5)
-        seen.add(tuple(A.ravel().astype(int)))
-    assert len(seen) == 3, f'expected all three quarter-turns, saw {seen}'
+
+
+def test_shipped_detector_rotation_is_the_full_circle(tmp_path):
+    """The shipped recipe rotates uniformly over +-180 degrees (owner decision 2026-10-02), and
+    `random_affine` at 180 reaches both ends of the circle about the frame centre."""
+    from tailcyclenet.detector.config import load_detector_config
+
+    cfg = tmp_path / 'c.toml'
+    cfg.write_text(f'[data]\npath = "{tmp_path}"\n[model]\n[training]\nout = "{tmp_path}"\n')
+    assert load_detector_config(cfg)['data']['rotate_deg'] == 180.0
+    neutral = dict(scale=(1.0, 1.0), translate=0.0, hflip=0.0)
+    angles = []
+    for seed in range(400):
+        M = random_affine((100, 60), np.random.default_rng(seed), rotate_deg=180.0, **neutral)
+        np.testing.assert_allclose(M @ [50, 30, 1], [50, 30], atol=1e-4)
+        angles.append(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
+    assert min(angles) < -170 and max(angles) > 170
 
 
 def test_vflip_is_off_under_keypoints(tiny_root):
     """A vertical mirror swaps left/right keypoints exactly as a horizontal one does."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 64), keypoints=True,
-                    vflip=0.5, rot90=0.5)
-    assert ds.vflip == 0.0 and ds.hflip == 0.0 and ds.rot90 == 0.5
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 64), keypoints=True, vflip=0.5)
+    assert ds.vflip == 0.0 and ds.hflip == 0.0
 
 
 def _checker(n=256):

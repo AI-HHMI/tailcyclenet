@@ -56,8 +56,8 @@ augment = true
 # Strong appearance/erasure/mosaic-lite suite on top of augment (color jitter, noise, blur, cutout, mosaic-lite).
 augment_strong = true
 
-# random in-plane rotation (+-DEG per visit); 0 is off, byte-identical.
-rotate_deg = 45.0
+# random in-plane rotation (+-DEG per visit, uniform); 180 = the full circle, shipped 2026-10-02 by owner decision for cross-rig generalization (180 was refuted IN-DOMAIN, report 17); 0 is off, byte-identical.
+rotate_deg = 180.0
 
 # decode JPEGs at 1/N via libjpeg where the frame is far above the letterbox target; stored in the checkpoint; no effect on a video root.
 reduce = false
@@ -70,9 +70,6 @@ hflip = true
 
 # the vertical flip (p 0.5), box-only like hflip (`keypoints = true` disables it). Shipped 2026-10-02 for cross-rig generalization, not measured.
 vflip = true
-
-# probability of an extra exact 90/180/270-degree turn (uniform over the three) on top of rotate_deg; 0 is off, byte-identical. NOTE: rotate_deg 180 was refuted IN-DOMAIN (report 17); shipped 2026-10-02 for cross-rig generalization, not measured.
-rot90_prob = 0.5
 
 # probability a train view is converted to grayscale (IR / monochrome rigs); 0 is off, byte-identical. Matches the pose loader's grayscale_prob. Not measured.
 grayscale_prob = 0.2

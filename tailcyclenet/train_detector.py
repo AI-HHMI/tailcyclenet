@@ -358,7 +358,7 @@ def main(argv: list[str] | None = None):
                        seed=train_cfg['seed'], datasets=all_roots,
                        box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
                        grayscale_prob=data_cfg['grayscale_prob'],
-                       vflip=0.5 if data_cfg['vflip'] else 0.0, rot90=data_cfg['rot90_prob'],
+                       vflip=0.5 if data_cfg['vflip'] else 0.0,
                        **tiling)
     wh = train.input_wh
     if data_cfg['tile_wh']:
@@ -583,7 +583,6 @@ def main(argv: list[str] | None = None):
                         **({'model_state_train': train_state} if train_state is not None else {}),
                         'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
                         'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
-                        'rot90_prob': data_cfg['rot90_prob'],
                         'input_wh': wh, 'n_keypoints': n_kpts,
                         'norm': 'gn',
                         'yolox_version': model_cfg['yolox'],

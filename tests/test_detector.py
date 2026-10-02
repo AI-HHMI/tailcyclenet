@@ -3403,7 +3403,7 @@ out = "/tmp/run-det"
     assert 'frames_per_group' not in d      # DELETED: the train draw is weighted, not capped
     assert d['val_frames_per_group'] == 8
     assert d['augment'] is True and d['augment_strong'] is True
-    assert d['rotate_deg'] == 45.0
+    assert d['rotate_deg'] == 180.0
     assert d['reduce'] is False and d['keypoints'] is False and d['hflip'] is True
     assert 'use_regions' not in d          # DELETED with regions.pq
     assert d['input_wh'] is None and d['tile_wh'] is None       # absent pair -> None

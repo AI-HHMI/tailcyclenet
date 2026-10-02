@@ -1,6 +1,6 @@
 # tailcyclenet
 
-Finetune a [posetail](https://pypi.org/project/posetail/) point tracker into an animal pose
+Finetune a [tracktail](https://pypi.org/project/tracktail/) point tracker into an animal pose
 estimator. Three settings, one model: **3D multiview**, **3D single-view**, **2D single-view**.
 
 The pipeline detects animals, crops them, and decodes per-keypoint poses through a single window

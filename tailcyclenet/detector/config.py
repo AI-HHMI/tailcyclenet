@@ -54,7 +54,7 @@ TRAINING_KEYS = frozenset({
     'nms_center_dist_thresh', 'assignment', 'box_loss',
     'tal_topk', 'tal_alpha', 'tal_beta',
     'optimizer', 'muon_momentum', 'muon_lr_scale', 'warmup_steps', 'beta1', 'beta2',
-    'shared_head', 'fpn_upsample',
+    'shared_head', 'fpn_upsample', 'save_every',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid')
@@ -172,6 +172,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         train[k] = int(train.get(k, {'iters': 20000, 'batch_size': 16, 'num_workers': 8,
                                      'seed': 0, 'eval_every': 2000, 'eval_batches': 25,
                                      'iou_aware_warmup': 2000, 'max_pos_per_gt': 0}[k]))
+    train['save_every'] = int(train.get('save_every', train['eval_every']))
+    if train['save_every'] < 1:
+        raise SystemExit('[training].save_every must be >= 1.')
     train['iou_aware_obj'] = bool(train.get('iou_aware_obj', False))
     for k in ('min_crop_dim', 'min_box_px', 'max_input_px',
               'val_frames_per_group', 'tile_bg_per_frame'):

@@ -11,6 +11,7 @@ what the arm was trained on; score 3dpop on `test` (its val is one session).
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -21,9 +22,72 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import BOX_SOURCES
 from tailcyclenet.detector import BoxDataset, load_detector
-from tailcyclenet.detector.evaluate import deployment_score, score_dataset
+from tailcyclenet.detector.evaluate import deployment_score, score_dataset, score_fixed_views
 from tailcyclenet.format import load_datasets
 from tailcyclenet.metrics import paired_bootstrap
+
+
+class FixedSplitDataset:
+    """Index a set of BoxDatasets as one deterministic evaluation dataset."""
+
+    def __init__(self, datasets):
+        """Combine split-specific datasets while preserving their item order."""
+        self.parts = datasets
+        self.offsets = np.cumsum([0] + [len(ds) for ds in datasets]).tolist()
+        self.index = [item for ds in datasets for item in ds.index]
+        self.root_ids = [root_id for ds in datasets for root_id in ds.root_ids]
+        self.root_names = list(dict.fromkeys(name for ds in datasets for name in ds.root_names))
+        self.datasets = list(dict((id(root), root) for ds in datasets for root in ds.datasets).values())
+        self.chunk = 1
+        self.min_crop_dim = datasets[0].min_crop_dim
+        self._augment = False
+
+    @property
+    def augment(self):
+        """Return the shared augmentation setting."""
+        return self._augment
+
+    @augment.setter
+    def augment(self, value):
+        """Set augmentation on every split dataset."""
+        self._augment = value
+        for ds in self.parts:
+            ds.augment = value
+
+    @property
+    def tt_transform(self):
+        """Return the shared test-time image transform."""
+        return self.parts[0].tt_transform
+
+    @tt_transform.setter
+    def tt_transform(self, value):
+        """Set the test-time transform on every split dataset."""
+        for ds in self.parts:
+            ds.tt_transform = value
+
+    def _locate(self, index):
+        """Map a combined item index to its child dataset and local index."""
+        part = max(i for i, start in enumerate(self.offsets[:-1]) if start <= index)
+        return self.parts[part], index - self.offsets[part]
+
+    def __len__(self):
+        """Return the total number of views."""
+        return len(self.index)
+
+    def __getitem__(self, index):
+        """Load one view from the matching split dataset."""
+        ds, local = self._locate(index)
+        return ds[local]
+
+    def ignore_for(self, index):
+        """Return transformed ignore annotations for one combined item."""
+        ds, local = self._locate(index)
+        return ds.ignore_for(local)
+
+    def boxes_for(self, index):
+        """Return target boxes for one combined item."""
+        ds, local = self._locate(index)
+        return ds.boxes_for(local)
 
 
 def _tiled(run, tile_scale):
@@ -63,6 +127,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path, help='detector run folder or .pth')
+    ap.add_argument('--checkpoint', default='latest', help='checkpoint file within run folder')
+    ap.add_argument('--evalset', type=Path)
+    ap.add_argument('--out', type=Path)
+    ap.add_argument('--tt-gain', type=float, nargs='+', default=[1.0])
+    ap.add_argument('--tt-gamma', type=float, nargs='+', default=[1.0])
+    ap.add_argument('--det-input-wh', type=int, nargs=2)
     ap.add_argument('--compare', type=Path, default=None,
                     help='a second run, scored on the SAME groups, reported as `--run` minus this '
                          'one under a PAIRED bootstrap.')
@@ -78,7 +148,7 @@ def main():
     ap.add_argument('--max-animals', type=int, default=None,
                     help='top_k for decode; default is the session\'s own animal count, which is '
                          'what scripts/infer.py supplies')
-    ap.add_argument('--score-thresh', type=float, default=0.05,
+    ap.add_argument('--score-thresh', type=float, nargs='+', default=[0.05],
                     help='0.05: score_dataset\'s own long-standing "as-trained" convention '
                          '(unrelated to deployment tuning -- this is what the model candidate-'
                          'decoded, not what a deployment run would keep). ALSO used as --det-score '
@@ -123,20 +193,93 @@ def main():
     device = args.device if torch.cuda.is_available() else 'cpu'
     if args.deploy:
         return main_deploy(args, device)
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
+    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
+    if args.det_input_wh:
+        wh = tuple(args.det_input_wh)
+    score_thresh = args.score_thresh[0]
     _tiled(args.run, tile_scale)
     if trained_on != args.boxes:
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy.')
-    ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
-                    min_crop_dim=args.min_crop_dim or mcd, reduce=red,
-                    max_frames_per_group=args.frames_per_group,
-                    box_target=getattr(model, 'box_target', 'crop'),
-                    antialias=getattr(model, 'antialias', False))
+    from tailcyclenet.detector.data import tt_photometric_transform
+    eval_spec = json.loads(args.evalset.read_text()) if args.evalset else None
+    split_names = sorted({item.get('split', args.split) for item in eval_spec['frames']}) if eval_spec else args.split.split(',')
+    parts = [BoxDataset(args.data, split, input_wh=wh, box_source=args.boxes,
+                        min_crop_dim=args.min_crop_dim or mcd, reduce=red,
+                        max_frames_per_group=args.frames_per_group,
+                        box_target=getattr(model, 'box_target', 'crop'),
+                        antialias=getattr(model, 'antialias', False)) for split in split_names]
+    if eval_spec:
+        for split in split_names:
+            part = parts[split_names.index(split)]
+            present = {(sess.session_id, gid, frame, ci) for sess, gid, frame, ci in part.index}
+            for entry in eval_spec['frames']:
+                if entry.get('split', args.split) != split:
+                    continue
+                sess = next((sess for root in part.datasets for sess in root.all_sessions()
+                             if sess.session_id == entry['session']), None)
+                if sess is None:
+                    raise SystemExit(f"{entry['session']}: session not found in split {split}")
+                for ci in range(len(sess.cam_names)):
+                    key = (sess.session_id, entry['group'], int(entry['frame']), ci)
+                    if key not in present:
+                        part.index.append((sess, entry['group'], int(entry['frame']), ci))
+                        part.origins.append(None)
+                        part.root_ids.append(0)
+                        present.add(key)
+    ds = parts[0] if len(parts) == 1 else FixedSplitDataset(parts)
+    index_splits = [split for split, part in zip(split_names, parts) for _ in part.index]
+    fixed = None
+    if args.evalset:
+        spec = eval_spec
+        fixed = set()
+        for item in spec['frames']:
+            for i, (sess, gid, frame, ci) in enumerate(ds.index):
+                if (sess.session_id == item['session'] and gid == item['group']
+                        and frame == int(item['frame'])
+                        and index_splits[i] == item.get('split', split_names[0])):
+                    fixed.add(i)
+        if not fixed:
+            raise SystemExit(f'{args.evalset}: no matching views in {args.data}/{args.split}')
+    result_blocks = []
+    for gain in args.tt_gain:
+        for gamma in args.tt_gamma:
+            ds.tt_transform = lambda img, g=gain, ga=gamma: tt_photometric_transform(img, g, ga)
+            blocks = []
+            for threshold in args.score_thresh:
+                scores_for_threshold = []
+                rows = score_dataset(model, ds, device, batch_size=args.batch_size,
+                                     batches=max(args.batches, (len(fixed) + args.batch_size - 1)//args.batch_size) if fixed else args.batches,
+                                     seed=args.seed, score_thresh=threshold,
+                                     num_workers=args.num_workers, max_animals=args.max_animals,
+                                     iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
+                                     subset_indices=fixed, out_scores=scores_for_threshold)
+                from tailcyclenet.detector.evaluate import overall
+                summary = overall(rows)
+                values = np.concatenate(scores_for_threshold) if scores_for_threshold else np.zeros(0)
+                summary['objectness_quantiles'] = ({f'q{int(q * 100):02d}': float(np.quantile(values, q))
+                                                    for q in (0.01, 0.1, 0.5, 0.9)}
+                                                   if values.size else {})
+                view_rows = (score_fixed_views(model, ds, fixed, device, score_thresh=threshold,
+                                               batch_size=args.batch_size, max_animals=args.max_animals,
+                                               iou_thresh=args.nms_iou,
+                                               center_dist_thresh=args.nms_center_dist)
+                             if fixed is not None else [])
+                blocks.append({'score_thresh': threshold, 'aggregate': summary,
+                               'per_view': view_rows})
+            result_blocks.append({'tt_gain': gain, 'tt_gamma': gamma,
+                                  'input_wh': list(wh), 'thresholds': blocks})
+    ds.tt_transform = None
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
-                         seed=args.seed, score_thresh=args.score_thresh,
+                         seed=args.seed, score_thresh=score_thresh,
                          num_workers=args.num_workers, max_animals=args.max_animals,
-                         iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
+                         iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
+                         subset_indices=fixed)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        payload = {'evalset': str(args.evalset) if args.evalset else None,
+                   'blocks': result_blocks}
+        args.out.write_text(json.dumps(payload, indent=2, default=float) + '\n')
 
     print(f'{args.run}  {args.data.name}/{args.split}  {wh[0]}x{wh[1]}  boxes={args.boxes}  '
           f'min_crop_dim={ds.min_crop_dim}  max_animals={args.max_animals or "(GT count)"}\n')
@@ -179,7 +322,7 @@ def main():
                          box_target=getattr(m2, 'box_target', 'crop'),
                          antialias=getattr(m2, 'antialias', False))
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
-                              seed=args.seed, score_thresh=args.score_thresh,
+                              seed=args.seed, score_thresh=args.score_thresh[0],
                               num_workers=args.num_workers, max_animals=args.max_animals,
                               iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
         keys = sorted(set(rows) & set(other))
@@ -212,7 +355,10 @@ def main_deploy(args, device):
     per group (each group is already a quantile of many windows/points), so a mean-of-medians is
     reported rather than bootstrapped a second time.
     """
-    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device)
+    model, wh, _, mcd, red, trained_on, tile_scale, _objq = load_detector(args.run, device=device, checkpoint=args.checkpoint, input_wh=args.det_input_wh)
+    if args.det_input_wh:
+        wh = tuple(args.det_input_wh)
+    score_thresh = args.score_thresh[0]
     ds = load_datasets(args.data)[0]
     sessions = ds.sessions.get(args.split, [])
     if not sessions:
@@ -227,7 +373,7 @@ def main_deploy(args, device):
         for gid, group in sess.groups.items():
             r = deployment_score(model, sess, gid, input_wh=wh, device=device,
                                  top_k=args.top_k, max_animals=args.max_animals,
-                                 det_score=args.score_thresh, track=args.deploy_track,
+                                 det_score=score_thresh, track=args.deploy_track,
                                  link=args.link_boxes, min_crop_dim=args.min_crop_dim or mcd,
                                  reduce=red, tile_scale=tile_scale,
                                  max_frames=args.det_max_frames, n_frames=args.n_frames,

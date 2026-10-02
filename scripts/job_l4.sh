@@ -20,8 +20,9 @@ case "$KIND" in
     infer)             SCRIPT=scripts/infer.py ;;
     train)             SCRIPT=scripts/train.py ;;
     train_detector)    SCRIPT=scripts/train_detector.py ;;
+    train_detector_eval) SCRIPT='' ;;
     eval)              SCRIPT=scripts/eval.py ;;
-    *) echo "FATAL: expected infer|train|train_detector|eval, got $KIND" >&2
+    *) echo "FATAL: expected infer|train|train_detector|train_detector_eval|eval, got $KIND" >&2
        exit 2 ;;
 esac
 
@@ -36,4 +37,28 @@ export PATH="/groups/karashchuk/home/karashchukl/bin:/home/karashchukl@hhmi.org/
 export PYTHONUNBUFFERED=1
 
 nvidia-smi
-exec pixi run python "$SCRIPT" "$@"
+if [[ "$KIND" == train_detector_eval ]]; then
+    CONFIG=$1; OUT=$2; EVALSPEC=$3
+    shift 3
+    pixi run python scripts/train_detector.py --config "$CONFIG" --out "$OUT" "$@"
+    pixi run python - "$OUT" "$EVALSPEC" <<'PY'
+import sys, tomllib
+from pathlib import Path
+out, spec = Path(sys.argv[1]), tomllib.loads(Path(sys.argv[2]).read_text())
+for entry in spec.get('eval', []):
+    name, data, split, evalset = (entry[k] for k in ('name', 'data', 'split', 'evalset'))
+    extra = entry.get('extra', [])
+    for ckpt in (f"detector_it{int(tomllib.loads((out / 'config.toml').read_text())['training']['iters']):06d}.pth", 'detector_it004000.pth'):
+        path = out / ckpt
+        if not path.exists():
+            continue
+        dest = out / 'eval' / f'{name}__{path.stem}.json'
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        import subprocess
+        cmd = ['pixi', 'run', 'python', 'scripts/eval_detector.py', '--run', str(out), '--checkpoint', ckpt, '--data', data, '--split', split, '--evalset', evalset, '--out', str(dest), '--boxes', 'keypoints', *extra]
+        with dest.with_suffix('.log').open('w') as log:
+            subprocess.run(cmd, check=True, stdout=log, stderr=subprocess.STDOUT)
+PY
+else
+    exec pixi run python "$SCRIPT" "$@"
+fi

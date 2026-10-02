@@ -216,6 +216,44 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
     return {g: _summarise(s) for g, s in per_group.items()}
 
 
+
+@torch.no_grad()
+def score_fixed_views(model, ds, indices, device, score_thresh=0.05, batch_size=16,
+                      max_animals=None, iou_thresh=0.5, center_dist_thresh=0.5):
+    """Return detailed decoded metrics for selected dataset item indices."""
+    was_training = model.training
+    model.eval()
+    ds.augment = False
+    indices = sorted(int(i) for i in indices)
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, sampler=indices,
+                                         num_workers=0, collate_fn=box_collate)
+    rows = []
+    offset = 0
+    for batch in loader:
+        out = model(batch['x'].to(device))
+        for j in range(batch['x'].shape[0]):
+            i = indices[offset]
+            offset += 1
+            sess, gid, frame, ci = ds.index[i]
+            gt_all = batch['boxes'][j]
+            gt = gt_all[torch.isfinite(gt_all).all(-1)]
+            k = max_animals or max(1, len(sess.labels(gid).animal_ids))
+            pred, scores = decode(out[0][j], out[1][j], top_k=k,
+                                  score_thresh=score_thresh, iou_thresh=iou_thresh,
+                                  center_dist_thresh=center_dist_thresh)
+            ious, fp = greedy_match(gt, pred.cpu())
+            mota_row = box_mota({0: (pred.cpu().numpy(), gt_all.numpy(),
+                                     *ds.ignore_for(i))})
+            rows.append({'session': sess.session_id, 'group': gid, 'frame': frame,
+                         'camera': sess.cam_names[ci], 'n_gt': int(gt.shape[0]),
+                         'matched': int((ious >= 0.5).sum()),
+                         'miss': int(mota_row['misses']), 'fp': int(fp),
+                         'fp_dup': int(mota_row['fp_dup']), 'fp_none': int(mota_row['fp_none']),
+                         'scores': scores.detach().cpu().tolist()})
+    if was_training:
+        model.train()
+    return rows
+
 def overall(rows):
     """Weight groups by their labelled-box count. The per-group table is the unweighted view.
 

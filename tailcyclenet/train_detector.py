@@ -524,6 +524,27 @@ def main(argv: list[str] | None = None):
                         train_metrics[f'train/{key}'] = float(parts[key])
                 _log_detector_wandb(wb, train_metrics, it)
                 running, t0 = [], time.time()
+            if (it % train_cfg['save_every'] == 0 and it % train_cfg['eval_every'] != 0
+                    and it != train_cfg['iters']):
+                if hasattr(opt, 'eval'):
+                    opt.eval()
+                eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                if hasattr(opt, 'train'):
+                    opt.train()
+                save_ckpt = {
+                    'iteration': it, 'model_state': eval_state, 'config': config,
+                    'model_state_is': 'eval', 'input_wh': wh, 'n_keypoints': n_kpts,
+                    'norm': 'gn', 'yolox_version': model_cfg['yolox'],
+                    'bottleneck_expansion': model_cfg['bottleneck_expansion'],
+                    'pretrained': model_cfg['pretrained'], 'shared_head': train_cfg['shared_head'],
+                    'fpn_upsample': train_cfg['fpn_upsample'], 'p2': model_cfg['p2'],
+                    'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
+                    'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
+                    'min_crop_dim': data_cfg['min_crop_dim'], 'reduce': data_cfg['reduce'],
+                    'box_source': data_cfg['boxes'], 'dataset': train.root_names[0],
+                    'datasets': list(train.root_names), 'seed': train_cfg['seed'],
+                }
+                torch.save(save_ckpt, run / f'detector_it{it:06d}.pth')
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
                 if hasattr(opt, 'eval'):
                     opt.eval()

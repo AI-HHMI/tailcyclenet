@@ -13,7 +13,7 @@ from tailcyclenet.dataset import read_frames
 from tailcyclenet.format import INST_LABELED, INST_PRESENT, Session, load_datasets
 
 SAMPLES = 64
-MAX_SIDE = 1024
+MAX_SIDE = 512
 MIN_VALID = 8
 
 
@@ -99,21 +99,27 @@ def _robust_background(frames, label_masks):
         for start in range(0, h * w, 32768):
             end = min(start + 32768, h * w)
             blocked = fgflat[:, start:end]
-            values = flat[:, start:end].astype(np.float32)
-            values[blocked] = np.nan
-            median = np.nanmedian(values, axis=0)
-            background[start:end] = np.nan_to_num(median, nan=0).clip(0, 255).astype(np.uint8)
+            counts = (~blocked).sum(0)
+            values = flat[:, start:end, :].astype(np.int16)
+            values[blocked] = 256
+            ordered = np.sort(values, axis=0)
+            middle = (counts // 2)[None, :, None]
+            median = np.take_along_axis(ordered, np.broadcast_to(middle, (1, end - start, 3)), axis=0)[0]
+            background[start:end] = np.minimum(median, 255).astype(np.uint8)
             if iteration < 3:
-                deviation = np.abs(values - median[None])
-                mad = np.nanmedian(deviation, axis=0).mean(-1)
-                threshold[start:end] = np.maximum(12.0, 4.0 * np.nan_to_num(mad, nan=0.0))
+                deviation = np.abs(values - median[None]).astype(np.int16)
+                deviation[blocked] = 32767
+                mad_ordered = np.sort(deviation, axis=0)
+                mad = np.take_along_axis(
+                    mad_ordered, np.broadcast_to(middle, (1, end - start, 3)), axis=0)[0]
+                threshold[start:end] = np.maximum(12.0, 4.0 * mad.mean(-1))
         if iteration == 3:
             break
         bg = background.reshape(h, w, 3)
         limits = threshold.reshape(h, w)
         kernel = np.ones((5, 5), dtype=np.uint8)
         for i in range(n):
-            delta = np.abs(frames[i].astype(np.float32) - bg).mean(-1)
+            delta = np.abs(frames[i].astype(np.int16) - bg.astype(np.int16)).mean(-1)
             detected = delta > limits
             closed = cv2.morphologyEx(detected.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
             foreground[i] |= cv2.dilate(closed, np.ones((3, 3), np.uint8)) > 0

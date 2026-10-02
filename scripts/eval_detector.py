@@ -241,6 +241,11 @@ def main():
                     fixed.add(i)
         if not fixed:
             raise SystemExit(f'{args.evalset}: no matching views in {args.data}/{args.split}')
+    # A fixed eval set is scored in the PARENT by `score_fixed_views` (num_workers=0); a later
+    # forked loader worker then inherits a decoder mid-state and deadlocks on video roots
+    # (CLAUDE.md gotcha 10 -- qdmouse's mp4 guard hung for hours at 0% CPU). The set is at most a
+    # few hundred views, so load it in-process throughout.
+    workers = 0 if fixed is not None else args.num_workers
     result_blocks = []
     for gain in args.tt_gain:
         for gamma in args.tt_gamma:
@@ -251,7 +256,7 @@ def main():
                 rows = score_dataset(model, ds, device, batch_size=args.batch_size,
                                      batches=max(args.batches, (len(fixed) + args.batch_size - 1)//args.batch_size) if fixed else args.batches,
                                      seed=args.seed, score_thresh=threshold,
-                                     num_workers=args.num_workers, max_animals=args.max_animals,
+                                     num_workers=workers, max_animals=args.max_animals,
                                      iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
                                      subset_indices=fixed, out_scores=scores_for_threshold)
                 from tailcyclenet.detector.evaluate import overall
@@ -272,7 +277,7 @@ def main():
     ds.tt_transform = None
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=score_thresh,
-                         num_workers=args.num_workers, max_animals=args.max_animals,
+                         num_workers=workers, max_animals=args.max_animals,
                          iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
                          subset_indices=fixed)
     if args.out:

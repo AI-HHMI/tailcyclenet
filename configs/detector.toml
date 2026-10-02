@@ -27,6 +27,12 @@ boxes_by_dataset = {}
 # Must equal the pose run's [data].min_crop_dim -- same crop rule; infer.py refuses a mismatch.
 min_crop_dim = 64
 
+# "extent" (shipped 2026-10-02, unmeasured): regress the TIGHT extent and apply the crop rule (source-px pad/square/floor, invisible after a letterbox) after detection -- same crop; "crop" = the legacy target.
+box_target = "extent"
+
+# INTER_AREA shrinking in the letterbox/warp, train AND deployment (recorded in the checkpoint); false = bilinear, which aliases at a 4K rig's 4-6x downscale.
+antialias = true
+
 # Explicit input size, overriding min_box_px entirely; omit (or []) to use min_box_px.
 input_wh = []
 
@@ -61,6 +67,15 @@ keypoints = false
 
 # the horizontal flip in the augmentation; exists for the box-only control arm (`keypoints = true` disables it implicitly).
 hflip = true
+
+# the vertical flip (p 0.5), box-only like hflip (`keypoints = true` disables it). Shipped 2026-10-02 for cross-rig generalization, not measured.
+vflip = true
+
+# probability of an extra exact 90/180/270-degree turn (uniform over the three) on top of rotate_deg; 0 is off, byte-identical. NOTE: rotate_deg 180 was refuted IN-DOMAIN (report 17); shipped 2026-10-02 for cross-rig generalization, not measured.
+rot90_prob = 0.5
+
+# probability a train view is converted to grayscale (IR / monochrome rigs); 0 is off, byte-identical. Matches the pose loader's grayscale_prob. Not measured.
+grayscale_prob = 0.2
 
 # train on TILES of this size in INPUT pixels (SOURCE extent = tile_wh / tile_scale); empty = whole frames, byte-identical.
 tile_wh = []

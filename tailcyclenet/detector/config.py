@@ -44,6 +44,7 @@ DATA_KEYS = frozenset({
     'val_frames_per_group', 'annot_frac', 'augment', 'augment_strong', 'rotate_deg',
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'alpha', 'balance_datasets', 'boxes_by_dataset',
+    'box_target', 'antialias', 'grayscale_prob', 'vflip', 'rot90_prob',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -193,6 +194,16 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['reduce'] = bool(data.get('reduce', False))
     data['keypoints'] = bool(data.get('keypoints', False))
     data['hflip'] = bool(data.get('hflip', True))
+    data['vflip'] = bool(data.get('vflip', True))
+    data['antialias'] = bool(data.get('antialias', True))
+    data['box_target'] = str(data.get('box_target', 'extent'))
+    if data['box_target'] not in ('crop', 'extent'):
+        raise SystemExit(f"[data].box_target must be 'crop' or 'extent', got "
+                         f"{data['box_target']!r}.")
+    for k, default in (('grayscale_prob', 0.2), ('rot90_prob', 0.5)):
+        data[k] = float(data.get(k, default))
+        if not 0.0 <= data[k] <= 1.0:
+            raise SystemExit(f'[data].{k} must be in [0, 1], got {data[k]}.')
     af = data.get('annot_frac', None)
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:

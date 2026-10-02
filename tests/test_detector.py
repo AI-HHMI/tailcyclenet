@@ -2973,7 +2973,8 @@ def test_provenance_records_every_box_affecting_option():
     params = set(inspect.signature(detect_raw).parameters) - plumbing
     # How each is spelled in the record, where the CLI name differs from the parameter name.
     alias = {'score_thresh': 'det_score', 'input_wh': 'det_input_wh', 'top_k': 'det_top_k',
-             'iou_thresh': 'det_nms_iou', 'center_dist_thresh': 'det_nms_center_dist'}
+             'iou_thresh': 'det_nms_iou', 'center_dist_thresh': 'det_nms_center_dist',
+             'box_source': 'det_box_source'}
     missing = [p for p in sorted(params) if alias.get(p, p) not in prov]
     assert not missing, (
         f'these change the detections and are not recorded in the prediction: {missing}. Two runs '

@@ -54,6 +54,43 @@ def crop_box_for_points(p2d, size, min_crop_dim=64, pad=20):
     return torch.cat([low, high])
 
 
+def crop_boxes_from_extents(boxes, size, min_crop_dim=64, pad=20):
+    """(N,4) xyxy EXTENTS -> (N,4) crop-rule boxes, `crop_box_for_points` row by row, vectorised.
+
+    The crop rule only reads the min/max of its points, so an extent's two corners give exactly
+    the box its points would. That is what lets the detector regress the TIGHT extent and have
+    the crop rule (pad, square, floor -- all in SOURCE pixels, which a letterboxed network cannot
+    see) applied afterwards, here. int32-exact against `crop_box_for_points` (a test asserts it);
+    a row with any non-finite value comes back NaN, as "no box here" does everywhere else.
+    Returns float32 torch.
+    """
+    b = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+    out = torch.full_like(b, float('nan'))
+    ok = torch.isfinite(b).all(-1)
+    if not ok.any():
+        return out
+    W, H = (float(v) for v in size)
+    Wi, Hi = int(W), int(H)
+    e = b[ok]
+    lo = torch.minimum(e[:, :2], e[:, 2:]) - pad
+    hi = torch.maximum(e[:, :2], e[:, 2:]) + pad
+    lim = torch.tensor([W, H])
+    low = torch.minimum(torch.clamp(lo, min=0.0), lim).to(torch.int32)
+    high = torch.minimum(torch.clamp(hi, min=0.0), lim).to(torch.int32)
+    wh = high - low
+    base = torch.clamp(wh.max(-1).values, min=int(min_crop_dim))
+    for ax, lim_i in ((0, Wi), (1, Hi)):
+        md = torch.clamp(base, max=lim_i)
+        short = wh[:, ax] < md
+        c = torch.div(low[:, ax] + high[:, ax], 2, rounding_mode='floor')
+        start = torch.minimum(torch.clamp(c - torch.div(md, 2, rounding_mode='floor'), min=0),
+                              lim_i - md)
+        low[:, ax] = torch.where(short, start, low[:, ax])
+        high[:, ax] = torch.where(short, start + md, high[:, ax])
+    out[ok] = torch.cat([low, high], -1).to(torch.float32)
+    return out
+
+
 def box_corners(boxes):
     """(..., 4) xyxy -> (..., 4, 2), ALL FOUR corners. numpy in, numpy out; torch in, torch out.
 

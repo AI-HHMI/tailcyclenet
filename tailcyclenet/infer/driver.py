@@ -264,7 +264,7 @@ def check_frame_range(args) -> None:
 
 
 def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
-                    stats=None, independent=False):
+                    stats=None, independent=False, box_source=None):
     """-> `boxes_for(store, lo, hi)`, detecting and associating on demand for one group.
 
     The detection cursor is not the block cursor: blocks are sized by free memory, and a
@@ -314,7 +314,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                              score_thresh=args.det_score, reduce=det_red,
                              iou_thresh=getattr(args, 'det_nms_iou', 0.5),
                              center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
-                             max_frames=T, tile_scale=det_tile,
+                             max_frames=T, tile_scale=det_tile, box_source=box_source,
                              frames=np.arange(cursor, end),
                              trace=(stats.setdefault('decode_trace', [])
                                     if getattr(args, 'det_trace', None) else None),
@@ -355,7 +355,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                                  score_thresh=args.det_score, reduce=det_red,
                                  iou_thresh=getattr(args, 'det_nms_iou', 0.5),
                                  center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
-                                 max_frames=T, tile_scale=det_tile,
+                                 max_frames=T, tile_scale=det_tile, box_source=box_source,
                                  frames=np.arange(window_cursor, end),
                                  trace=(stats.setdefault('decode_trace', [])
                                         if getattr(args, 'det_trace', None) else None),
@@ -746,7 +746,7 @@ def run_dataset(args):
                       flush=True)
                 boxes_for = _detector_boxes(
                     det, det_wh, sess, gid, args, device, det_red, det_tile, n_det, n_want,
-                    stats=det_stats, independent=independent)
+                    stats=det_stats, independent=independent, box_source=det_boxsrc)
             if args.boxes and key not in boxes:
                 raise SystemExit(
                     f'{args.boxes}: no entry for {key!r}. Falling back to the labels here would '

@@ -51,7 +51,7 @@ def input_wh_for(path, dataset, box_source, min_box_px=32, max_px=4 * 416 * 416,
     if min_box_px <= 0:
         return base
     ds = BoxDataset(path, 'train', input_wh=base, box_source=box_source,
-                    max_frames_per_group=4, datasets=datasets)
+                    max_frames_per_group=4, datasets=datasets, box_target='crop')
     ix = np.random.default_rng(0).choice(len(ds), min(300, len(ds)), replace=False)
     sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
                        for b in (ds.boxes_for(int(i)) for i in ix)])
@@ -97,7 +97,7 @@ def input_wh_for_roots(roots, box_source, boxes_by_dataset=None, min_box_px=32,
         root_boxes = {ds.name: by[ds.name]} if ds.name in by else {}
         sampled = BoxDataset(ds.root, 'train', input_wh=base, box_source=box_source,
                              boxes_by_dataset=root_boxes, max_frames_per_group=4,
-                             datasets=[ds])
+                             datasets=[ds], box_target='crop')
         ix = np.random.default_rng(0).choice(len(sampled), min(300, len(sampled)), replace=False)
         sides = torch.cat([(b[:, 2:] - b[:, :2]).flatten()
                            for b in (sampled.boxes_for(int(i)) for i in ix)])
@@ -291,6 +291,10 @@ def main(argv: list[str] | None = None):
       written. Evaluation scores both splits, stores the score beside the
       weights, and selects on `val` where there is one (`train` otherwise);
       the loader does NOT trust `detector_last.pth`.
+    - `model_state` IS THE SCORED WEIGHT. Under schedule-free, `opt.eval()` swaps in the
+      averaged `x` for scoring and `opt.train()` swaps the SAME tensors back to the gradient point
+      `y` in place, so `x` is cloned before the swap; saving after it deployed weights nobody had
+      scored. `model_state_train` keeps `y`; a plain-AdamW run has one state and writes one.
     """
     ap = argparse.ArgumentParser(prog='tailcyclenet train-detector', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -351,7 +355,11 @@ def main(argv: list[str] | None = None):
                        keypoints=data_cfg['keypoints'],
                        hflip=0.0 if not data_cfg['hflip'] else None,
                        rotate_deg=data_cfg['rotate_deg'], strong=data_cfg['augment_strong'],
-                       seed=train_cfg['seed'], datasets=all_roots, **tiling)
+                       seed=train_cfg['seed'], datasets=all_roots,
+                       box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
+                       grayscale_prob=data_cfg['grayscale_prob'],
+                       vflip=0.5 if data_cfg['vflip'] else 0.0, rot90=data_cfg['rot90_prob'],
+                       **tiling)
     wh = train.input_wh
     if data_cfg['tile_wh']:
         ext = train._tile_extent()
@@ -418,7 +426,9 @@ def main(argv: list[str] | None = None):
                          min_crop_dim=data_cfg['min_crop_dim'], reduce=data_cfg['reduce'],
                          max_frames_per_group=data_cfg['val_frames_per_group'],
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
-                         include_roots=root_names, datasets=all_roots, **tiling)
+                         include_roots=root_names, datasets=all_roots,
+                         box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
+                         **tiling)
         missing_val = sorted(set(root_names) - set(val.root_names))
         print(f'val:   {len(val)} views across {val.root_names}; '
               f'no val split: {missing_val or "none"}')
@@ -553,8 +563,10 @@ def main(argv: list[str] | None = None):
                     for root_name, value in root_scores.items():
                         scores[f'{split_name}_root_{root_name}'] = value
                     scores[split_name] = macro if selection_kind == 'macro' else pooled
+                eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 if hasattr(opt, 'train'):
                     opt.train()
+                train_state = model.state_dict() if hasattr(opt, 'eval') else None
                 obj_q = {}
                 if obj_scores:
                     a = np.concatenate(obj_scores)
@@ -566,7 +578,12 @@ def main(argv: list[str] | None = None):
                 selection_metric = (f'{select_split}_{selection_kind}_r50' if multi
                                     else f'{select_split}_r50')
                 selected_score = scores[select_split]['r50']
-                ckpt = {'iteration': it, 'model_state': model.state_dict(), 'config': config,
+                ckpt = {'iteration': it, 'model_state': eval_state, 'config': config,
+                        'model_state_is': 'eval',
+                        **({'model_state_train': train_state} if train_state is not None else {}),
+                        'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
+                        'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
+                        'rot90_prob': data_cfg['rot90_prob'],
                         'input_wh': wh, 'n_keypoints': n_kpts,
                         'norm': 'gn',
                         'yolox_version': model_cfg['yolox'],

@@ -98,7 +98,8 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     GroupNorm model. `tile_scale` is meaningless without `tile_wh`, so it is dropped (untiled runs
     record 1.0). The trailing objectness quantiles describe the distribution this checkpoint
     produces; `--det-score` is not portable across detector generations, so callers warn rather
-    than guess a threshold.
+    than guess a threshold. `box_target`/`antialias` (what the head regresses, how its input was
+    resampled) ride on the model for `detect_raw`; absent = crop-rule boxes, bilinear shrinking.
     """
     import torch
     p = resolve_detector_checkpoint(path, checkpoint=checkpoint)
@@ -128,6 +129,10 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
         trained_datasets = [ckpt.get('dataset', '')] if ckpt.get('dataset') else []
     model.trained_datasets = [str(name) for name in trained_datasets]
     model.box_sources = {str(k): str(v) for k, v in (ckpt.get('box_sources') or {}).items()}
+    model.box_target = str(ckpt.get('box_target', 'crop'))
+    model.antialias = bool(ckpt.get('antialias', False))
+    model.min_crop_dim = int(ckpt.get('min_crop_dim', 64))
+    model.box_source = str(ckpt.get('box_source', 'keypoints'))
     ts = ckpt.get('tile_scale')
     if ckpt.get('tile_wh') is not None and ts is None:
         raise ValueError(
@@ -154,7 +159,8 @@ def tiled_input_wh(src_wh, tile_scale):
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
-               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False):
+               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False,
+               box_source=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 
     Inputs:
@@ -170,6 +176,9 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             GLOBAL `batch` BOUNDARY (aligned slices are byte-identical to one whole-clip pass).
         read -- replaces the decode with `(ci, cam_name, frames, pool) -> imgs`.
         trace / trace_detail -- optional decode-stage diagnostics; output unchanged.
+        box_source -- this session's box source (pad 20 for 'keypoints', 0 for 'instances');
+            None = the checkpoint's. An `extent` head's boxes get the crop rule HERE, in source
+            px (`crop_boxes_from_extents`), so callers still receive crop-rule boxes.
     Outputs:
         (boxes (D,T,C,4), scores (D,T,C), kpts (D,T,C,K,3) or None): `d` is the d-th
         highest-scoring detection in that camera at that frame; rows become an animal axis in
@@ -197,6 +206,18 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
             "path yet (see YOLOXNano's docstring, `NOT YET WIRED`). Retrain with the default "
             "[data].temporal_input='none', or wire a real deployment reader before using this "
             'checkpoint.')
+
+    from ..crop import crop_boxes_from_extents
+
+    extent = getattr(det, 'box_target', 'crop') == 'extent'
+    antialias = bool(getattr(det, 'antialias', False))
+    crop_pad = 0 if (box_source or getattr(det, 'box_source', 'keypoints')) == 'instances' else 20
+    crop_mcd = int(getattr(det, 'min_crop_dim', 64))
+
+    def _to_crop(bx, src):
+        """Unletterboxed (N,4) boxes -> what callers consume: crop-rule boxes for an `extent`
+        checkpoint, unchanged for a `crop` one (re-applying the rule would pad twice)."""
+        return crop_boxes_from_extents(bx, src, crop_mcd, crop_pad) if extent else bx
 
     group = session.groups[gid]
     T_clip = min(group.n_frames, max_frames or group.n_frames)
@@ -237,7 +258,7 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         n = len(imgs)
         metas, arr = [], None
         for i in range(n):
-            lb, scale, pad = letterbox(imgs[i], wh, src_wh=src)
+            lb, scale, pad = letterbox(imgs[i], wh, src_wh=src, antialias=antialias)
             if arr is None:
                 arr = np.empty((n, 3, lb.shape[0], lb.shape[1]), np.uint8)
             arr[i] = lb.transpose(2, 0, 1)
@@ -305,18 +326,20 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
                         if trace_detail:
                             for stage, key in (('all', 'all'), ('score', 'score'),
                                                ('nms', 'nms')):
-                                bx = unletterbox_boxes(dt[f'{key}_boxes'].cpu(), *metas[j],
-                                                       src_wh=src)
+                                bx = _to_crop(unletterbox_boxes(dt[f'{key}_boxes'].cpu(),
+                                                                *metas[j], src_wh=src), src)
                                 record[f'{stage}_boxes'] = bx.numpy().tolist()
                                 record[f'{stage}_scores'] = dt[f'{key}_scores'].cpu().numpy().tolist()
-                            final_b = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)
+                            final_b = _to_crop(unletterbox_boxes(b.cpu(), *metas[j], src_wh=src),
+                                               src)
                             record['final_boxes'] = final_b.numpy().tolist()
                             record['final_scores'] = s.cpu().numpy().tolist()
                         trace.append(record)
                     if not b.numel():
                         continue
                     n = min(D, b.shape[0])
-                    out[:n, t, ci] = unletterbox_boxes(b.cpu(), *metas[j], src_wh=src)[:n].numpy()
+                    out[:n, t, ci] = _to_crop(unletterbox_boxes(b.cpu(), *metas[j], src_wh=src),
+                                              src)[:n].numpy()
                     sc[:n, t, ci] = s.cpu().numpy()[:n]
                     if kp is not None and kpts is not None:
                         k = unletterbox_keypoints(kpts[j, ix].cpu(), *metas[j], src_wh=src)

@@ -19,10 +19,11 @@ depthwise)` -- see `YOLOX_TIERS`. It exists to test whether the detector is CAPA
 throughout, not BatchNorm -- see `conv_norm_act`; (2) the neck unifies all three pyramid levels to
 ONE output width rather than Megvii's per-level neck width with three separate head stems.
 
-The regression target is the SAME crop box the pose pipeline uses
-(`tailcyclenet.crop.crop_box_for_points`), so the detector reproduces the crop the pose model
-was trained on rather than some other box, at every version. `tests/test_dataset.py` keeps that
-true.
+The detector reproduces the SAME crop box the pose pipeline uses
+(`tailcyclenet.crop.crop_box_for_points`): either by regressing it directly (`box_target =
+'crop'`, legacy) or by regressing the tight extent the rule is a function of and applying the rule
+after detection (`'extent'`, shipped -- see `detector/data.py`). `tests/test_dataset.py` keeps
+the rule exact.
 """
 import torch
 import torch.nn as nn

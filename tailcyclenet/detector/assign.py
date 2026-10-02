@@ -5,8 +5,9 @@ its cell centre falls inside that box AND within a fixed radius of the box centr
 With one class and a handful of instances per frame, SimOTA's dynamic-k machinery buys nothing
 and adds a second thing that can be wrong.
 
-The regression target is the crop rule's box, so what the detector learns is "reproduce the crop
-the pose model was trained on" -- not "find an animal". Those are different objectives and only
+The regression target is the crop rule's box (or, under `box_target = 'extent'`, the tight
+extent the rule is applied to after detection), so what the detector learns is "reproduce the
+crop the pose model was trained on" -- not "find an animal". Those are different objectives and only
 the first one keeps the downstream accuracy.
 """
 import torch

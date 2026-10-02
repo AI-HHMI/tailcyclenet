@@ -131,7 +131,8 @@ def main():
     ds = BoxDataset(args.data, args.split, input_wh=wh, box_source=args.boxes,
                     min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                     max_frames_per_group=args.frames_per_group,
-)
+                    box_target=getattr(model, 'box_target', 'crop'),
+                    antialias=getattr(model, 'antialias', False))
     rows = score_dataset(model, ds, device, batch_size=args.batch_size, batches=args.batches,
                          seed=args.seed, score_thresh=args.score_thresh,
                          num_workers=args.num_workers, max_animals=args.max_animals,
@@ -167,10 +168,16 @@ def main():
             print(f'note: {args.compare} runs at {wh2[0]}x{wh2[1]} and --run at {wh[0]}x{wh[1]}. '
                   'Each is scored in its own letterbox; IoU is scale-invariant, so the columns '
                   'below are comparable.')
+        if getattr(m2, 'box_target', 'crop') != getattr(model, 'box_target', 'crop'):
+            print(f'note: {args.run} regresses {getattr(model, "box_target", "crop")!r} boxes and '
+                  f'{args.compare} {getattr(m2, "box_target", "crop")!r} ones; each is scored '
+                  'against its own target, so IoU/r@.75 compare different boxes. Use --deploy '
+                  '(crop-rule boxes for both) for a like-for-like comparison.')
         ds2 = BoxDataset(args.data, args.split, input_wh=wh2, box_source=args.boxes,
                          min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
                          max_frames_per_group=args.frames_per_group,
-)
+                         box_target=getattr(m2, 'box_target', 'crop'),
+                         antialias=getattr(m2, 'antialias', False))
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
                               seed=args.seed, score_thresh=args.score_thresh,
                               num_workers=args.num_workers, max_animals=args.max_animals,

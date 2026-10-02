@@ -1,7 +1,10 @@
-"""Box training data: labels -> the crop rule's box, letterboxed into the detector's input.
+"""Box training data: labels -> a box target, letterboxed into the detector's input.
 
-The target is `tailcyclenet.crop.crop_box_for_points` applied to the same points the pose loader
-crops on, so the detector reproduces the crop the pose model was trained on. An animal with no
+The target is derived from the same points the pose loader crops on, so the detector reproduces
+the crop the pose model was trained on. Under `box_target='crop'` (legacy) it IS
+`tailcyclenet.crop.crop_box_for_points`; under `'extent'` (shipped) it is the tight extent and
+the crop rule -- whose pad and floor are SOURCE pixels, invisible after a letterbox -- is applied
+after detection (`detect_raw`), which yields the identical crop. An animal with no
 finite point in a view gets a NaN box, not a dropped frame -- objectness still has to learn "no
 animal here". `box_source='instances'` takes the extent from `instances.pq` instead, opt-in,
 for a dataset whose stored keypoints are too sparse to bound the animal.
@@ -36,12 +39,26 @@ def reduce_factor(size, out_wh):
     return n
 
 
-def letterbox(img, out_wh, src_wh=None):
+# The smallest TIGHT-extent side (INPUT pixels) a `box_target = 'extent'` target is floored at,
+# symmetrically about its centre. A one- or two-point extent is degenerate (zero area), and TAL
+# only takes anchors strictly inside a box; 8 px holds 2x2 stride-4 anchors. Resolution-free by
+# construction -- unlike `min_crop_dim`, which is SOURCE pixels and is applied after detection.
+MIN_EXTENT_PX = 8.0
+
+BOX_TARGETS = ('crop', 'extent')
+
+
+def letterbox(img, out_wh, src_wh=None, antialias=False):
     """Resize preserving aspect ratio, pad with grey. Returns (img, scale, (padx, pady)).
 
     `src_wh` is the size of the image BEFORE any decode-time reduction. The returned `scale` is
     then dst<-source rather than dst<-decoded, which is what keeps `unletterbox_boxes` and the box
     target correct without either of them knowing a reduction happened.
+
+    `antialias=True` shrinks with `INTER_AREA` (a box filter) instead of `cv2.resize`'s default
+    INTER_LINEAR, which at the 3-6x downscales of a 4K rig samples a 2x2 neighbourhood and aliases
+    -- a per-rig texture signature a detector can learn. Upscaling stays linear. A checkpoint
+    records which one it was trained under (`antialias`, absent = False) and deploys the same.
     """
     import cv2
     H, W = img.shape[:2]
@@ -49,7 +66,10 @@ def letterbox(img, out_wh, src_wh=None):
     sw, sh = (W, H) if src_wh is None else (float(src_wh[0]), float(src_wh[1]))
     s = min(ow / sw, oh / sh)
     nw, nh = int(round(sw * s)), int(round(sh * s))
-    resized = cv2.resize(img, (nw, nh))
+    if antialias and (nw < W or nh < H):
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    else:
+        resized = cv2.resize(img, (nw, nh))
     canvas = np.full((oh, ow, 3), 114, np.uint8)
     px, py = (ow - nw) // 2, (oh - nh) // 2
     canvas[py:py + nh, px:px + nw] = resized
@@ -66,6 +86,30 @@ def letterbox_transform(size, out_wh):
     s = min(out_wh[0] / w, out_wh[1] / h)
     nw, nh = int(round(w * s)), int(round(h * s))
     return s, ((out_wh[0] - nw) // 2, (out_wh[1] - nh) // 2)
+
+
+def warp_image(img, M, out_wh, antialias=False):
+    """`cv2.warpAffine(img, M, out_wh)` on the grey border, optionally anti-aliased.
+
+    warpAffine has no area filter: it samples bilinearly however far it shrinks. With `antialias`
+    the shrinking part of `M` (its smaller column norm, a similarity's scale) is done first by an
+    INTER_AREA resize, and `M` is re-composed with the exact pixel-centre map of that resize, so
+    the geometry is unchanged and only the filter differs. A non-shrinking `M` is untouched.
+    """
+    import cv2
+    M = np.asarray(M, np.float64)
+    if antialias:
+        s = min(np.hypot(M[0, 0], M[1, 0]), np.hypot(M[0, 1], M[1, 1]))
+        h, w = img.shape[:2]
+        nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
+        if s < 1.0 and (nw < w or nh < h):
+            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+            fx, fy = w / nw, h / nh
+            M = np.vstack([M, [0.0, 0.0, 1.0]]) @ np.array(
+                [[fx, 0.0, 0.5 * fx - 0.5], [0.0, fy, 0.5 * fy - 0.5], [0.0, 0.0, 1.0]])
+            M = M[:2]
+    return cv2.warpAffine(img, M.astype(np.float32), (int(out_wh[0]), int(out_wh[1])),
+                          borderValue=(114, 114, 114))
 
 
 def tile_transform(origin, scale):
@@ -187,6 +231,13 @@ def _motion_blur(img, rng, k=(3, 5)):
     return cv2.filter2D(img, -1, kernel)
 
 
+def _grayscale(img):
+    """RGB -> luminance replicated to 3 channels: an IR / monochrome rig, which no hue or
+    saturation shift reaches. The pose loader draws the same thing (`grayscale_prob`)."""
+    import cv2
+    return np.repeat(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)[..., None], 3, -1)
+
+
 def _cutout_rects(wh, rng, n=(1, 3), frac=0.15):
     """1-3 rects of `frac` x `frac` of `wh` (INPUT pixels), random RGB fill.
 
@@ -227,7 +278,7 @@ def _keypoints_in_rects(kpts_xy, rects):
 
 
 def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
-                  rotate_deg=0.0, centre=None):
+                  rotate_deg=0.0, centre=None, vflip=0.0, rot90=0.0):
     """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
 
     Deliberately a similarity and not YOLOX's shear-and-perspective: the target is
@@ -247,16 +298,28 @@ def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
 
     No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
     relabelling left to right permutes the set and the extent is unchanged -- but only while
-    keypoints are not a target, which is why `BoxDataset` passes `hflip=0` whenever it emits them.
+    keypoints are not a target, which is why `BoxDataset` passes `hflip=0` (and `vflip=0`)
+    whenever it emits them.
+
+    `vflip` (probability of a vertical mirror) and `rot90` (probability of an extra exact
+    90/180/270-degree turn, uniform over the three, about the same centre) are box-only-safe for
+    the same reason; a 90-degree turn permutes no keypoint either. Both draw from `rng` ONLY when
+    nonzero, so at 0 the draw sequence -- and every augmentation stream on record -- is unchanged.
+    The turn stays in the frame's own canvas, exactly as `rotate_deg` does: a wide frame loses
+    its sides rather than the animal shrinking by the aspect ratio.
     """
     w, h = float(size[0]), float(size[1])
     s = rng.uniform(*scale)
     sx = -s if rng.random() < hflip else s
+    sy = (-s if rng.random() < vflip else s) if vflip else s
     cx, cy = (w / 2, h / 2) if centre is None else (float(centre[0]), float(centre[1]))
-    A = np.array([[sx, 0.0], [0.0, s]], np.float64)
+    A = np.array([[sx, 0.0], [0.0, sy]], np.float64)
     if rotate_deg:
         a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
         A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
+    if rot90 and rng.random() < rot90:
+        k = int(rng.integers(1, 4))
+        A = np.linalg.matrix_power(np.array([[0.0, -1.0], [1.0, 0.0]]), k) @ A
     t = (np.array([cx, cy]) - A @ np.array([cx, cy])
          + np.array([rng.uniform(-translate, translate) * w,
                      rng.uniform(-translate, translate) * h]))
@@ -276,6 +339,30 @@ def _drop_outside(x, bounds):
     return torch.where(out[..., None], torch.nan, x)
 
 
+def _extent(points, size):
+    """(...,2) points -> float (4,) tight xyxy extent of the finite ones, clamped into the frame,
+    or None when none is finite. The crop rule's own min/max/clamp with no pad, square or floor.
+    """
+    pts = points.reshape(-1, 2)
+    pts = pts[torch.isfinite(pts).all(-1)]
+    if not pts.shape[0]:
+        return None
+    lim = torch.as_tensor(size, dtype=torch.float32).reshape(2)
+    lo = torch.minimum(torch.clamp(pts.min(0).values, min=0.0), lim)
+    hi = torch.minimum(torch.clamp(pts.max(0).values, min=0.0), lim)
+    return torch.cat([lo, hi])
+
+
+def _floor_extent(boxes, min_side):
+    """Grow each (N,4) box symmetrically to at least `min_side` per axis; NaN rows stay NaN."""
+    out = boxes.clone()
+    for a in (0, 1):
+        grow = torch.clamp(min_side - (out[:, a + 2] - out[:, a]), min=0.0) / 2
+        out[:, a] = out[:, a] - grow
+        out[:, a + 2] = out[:, a + 2] + grow
+    return out
+
+
 class BoxDataset(Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
@@ -287,7 +374,8 @@ class BoxDataset(Dataset):
                  max_frames_per_group: int = 40, seed: int = 23, box_source='keypoints',
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
-                 boxes_by_dataset=None, include_roots=None, datasets=None):
+                 boxes_by_dataset=None, include_roots=None, datasets=None,
+                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, rot90=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
@@ -306,6 +394,10 @@ class BoxDataset(Dataset):
             keypoints -- also emit per-keypoint targets and kill the horizontal flip (hflip=None
                 decides from `keypoints`).
             reduce -- a KEY, not a loader detail: changes which source pixels reach the model.
+            box_target -- 'crop' (legacy): `crop_box_for_points` itself. 'extent': the tight
+                extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
+            antialias / grayscale_prob / vflip / rot90 -- area-filtered shrinking and the
+                train-augmentation probabilities; `vflip` is 0 under `keypoints`.
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
                 draw instead; the parameter survives to carry `val_frames_per_group`.
@@ -313,9 +405,7 @@ class BoxDataset(Dataset):
             Builds `self.index`, `self.origins` (tile origin or None -- parallel to `index`,
             not a fifth tuple element), and `self.chunk` (one (group, camera) file's worth of
             positions -- the locality block `ChunkShuffle` needs). Views with neither a positive
-            box nor supervised background negatives are omitted.
-        Side effects:
-            None.
+            box nor supervised background negatives are omitted. No side effects.
         """
 
         assert box_source in BOX_SOURCES, \
@@ -334,6 +424,13 @@ class BoxDataset(Dataset):
             raise ValueError(f'tile_scale must be > 0, got {tile_scale}')
         self.keypoints = bool(keypoints)
         self.hflip = (0.0 if self.keypoints else 0.5) if hflip is None else float(hflip)
+        if box_target not in BOX_TARGETS:
+            raise ValueError(f'box_target must be one of {BOX_TARGETS}, got {box_target!r}')
+        self.box_target = box_target
+        self.antialias = bool(antialias)
+        self.grayscale_prob = float(grayscale_prob)
+        self.vflip = 0.0 if self.keypoints else float(vflip)
+        self.rot90 = float(rot90)
         self.rotate_deg = float(rotate_deg)
         self.augment = augment
         self.strong = bool(strong)
@@ -863,12 +960,17 @@ class BoxDataset(Dataset):
                 src = drop_outside(src, (0.0, 0.0, float(cam['size'][0]), float(cam['size'][1])))
             if tile_box is not None:
                 src = drop_outside(src, tile_box)
-            box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
+            if self.box_target == 'extent':
+                box = _extent(src, cam['size'])
+            else:
+                box = crop_box_for_points(src, cam['size'], self.min_crop_dim, pad)
             boxes.append(torch.full((4,), float('nan')) if box is None else box.float())
         boxes = torch.stack(boxes)
         scale, pad = self._transform(i, cam['size'])
         boxes[:, 0::2] = boxes[:, 0::2] * scale + pad[0]
         boxes[:, 1::2] = boxes[:, 1::2] * scale + pad[1]
+        if self.box_target == 'extent':
+            boxes = _floor_extent(boxes, MIN_EXTENT_PX)
         if kpts is None:
             return boxes
         kpts[..., 0] = kpts[..., 0] * scale + pad[0]
@@ -882,8 +984,6 @@ class BoxDataset(Dataset):
         source of another frame's pixels and its own crop-rule box -- it must not recurse into
         `__getitem__`'s augmentation path, or a mosaic source could itself be mosaicked.
         """
-        import cv2
-
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
         out_wh = (self.input_wh if self.tile_wh is None
@@ -895,13 +995,13 @@ class BoxDataset(Dataset):
         dec = (img.shape[1], img.shape[0])
         d = size[0] / dec[0]
         if self.origins[i] is None:
-            img, _, _ = letterbox(img, self.input_wh, src_wh=size)
+            img, _, _ = letterbox(img, self.input_wh, src_wh=size, antialias=self.antialias)
         else:
             scale, pad = self._transform(i, size)
             L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
             D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
             M = (L @ D)[:2]
-            img = cv2.warpAffine(img, M, self.input_wh, borderValue=(114, 114, 114))
+            img = warp_image(img, M, self.input_wh, self.antialias)
         got = self.boxes_for(i, None, with_keypoints=with_keypoints)
         boxes, kpts = got if with_keypoints else (got, None)
         return img, boxes, kpts
@@ -918,7 +1018,8 @@ class BoxDataset(Dataset):
         unchanged if none fits.
 
         A keypoint of the source instance that falls outside the pasted box is dropped, the same
-        rule a point warped off-frame follows.
+        rule a point warped off-frame follows. An `extent` target stops at the outermost POINT,
+        not the animal's edge, so its paste carries a quarter-side margin of context.
         """
         if len(self) < 2:
             return boxes, kpts, img
@@ -933,7 +1034,13 @@ class BoxDataset(Dataset):
             cand = torch.nonzero(finite).flatten().tolist()
             s = int(rng.choice(cand))
             b = src_boxes[s]
-            x0, y0, x1, y1 = (int(v) for v in b.round().tolist())
+            region = b
+            if self.box_target == 'extent':
+                m = 0.25 * float(0.5 * ((b[2] - b[0]) + (b[3] - b[1])))
+                region = torch.stack([(b[0] - m).clamp(min=0), (b[1] - m).clamp(min=0),
+                                      (b[2] + m).clamp(max=self.input_wh[0]),
+                                      (b[3] + m).clamp(max=self.input_wh[1])])
+            x0, y0, x1, y1 = (int(v) for v in region.round().tolist())
             bw, bh = x1 - x0, y1 - y0
             if bw <= 0 or bh <= 0 or bw > self.input_wh[0] or bh > self.input_wh[1]:
                 continue
@@ -963,13 +1070,12 @@ class BoxDataset(Dataset):
         scale, augmentation and letterbox-or-tile geometry. The strong suite is appearance-only
         except cutout, which withholds targets it covers.
         """
-        import cv2
-
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
         rng = np.random.default_rng(None) if self.augment and self.train else None
         warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
-                              centre=self._warp_centre(i)) if rng is not None else None)
+                              centre=self._warp_centre(i), vflip=self.vflip, rot90=self.rot90)
+                if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
         negative_supervision = self.negative_supervision_for(sess, gid, f, ci)
@@ -986,14 +1092,14 @@ class BoxDataset(Dataset):
             f'{gid}/{sess.cam_names[ci]} frame {f}: decoded {dec}, expected {want} at reduce={r} '\
             f'or {size} unreduced'
         if warp is None and self.origins[i] is None:
-            img, _, _ = letterbox(img, self.input_wh, src_wh=size)
+            img, _, _ = letterbox(img, self.input_wh, src_wh=size, antialias=self.antialias)
         else:
             scale, pad = self._transform(i, size)
             d = size[0] / dec[0]
             L = np.array([[scale, 0.0, pad[0]], [0.0, scale, pad[1]], [0.0, 0.0, 1.0]], np.float32)
             D = np.array([[d, 0.0, 0.0], [0.0, d, 0.0], [0.0, 0.0, 1.0]], np.float32)
             W = np.vstack([warp, [0, 0, 1]]) if warp is not None else np.eye(3, dtype=np.float32)
-            img = cv2.warpAffine(img, (L @ W @ D)[:2], self.input_wh, borderValue=(114, 114, 114))
+            img = warp_image(img, (L @ W @ D)[:2], self.input_wh, self.antialias)
             if warp is not None:
                 img = _photometric(img, rng)
                 if self.strong:
@@ -1016,6 +1122,8 @@ class BoxDataset(Dataset):
                     kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
+        if rng is not None and self.grayscale_prob and rng.random() < self.grayscale_prob:
+            img = _grayscale(img)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         item = {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
         if kpts is not None:

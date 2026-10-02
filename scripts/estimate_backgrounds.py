@@ -36,6 +36,57 @@ def _sample_frames(sess, count):
     return selected
 
 
+def _labelled_frames(lab):
+    """Frames of one group carrying any keypoint or instance-box label."""
+    marks = np.zeros(0, dtype=bool)
+    if lab.points2d is not None:
+        marks = np.isfinite(lab.points2d).all(-1).any(axis=(0, 2, 3))
+    if lab.points3d is not None:
+        hit = np.isfinite(lab.points3d).all(-1).any(axis=(0, 2))
+        marks = hit if marks.size == 0 else marks | hit
+    if lab.boxes is not None:
+        hit = np.isfinite(lab.boxes).all(-1).any(axis=(0, 2))
+        marks = hit if marks.size == 0 else marks | hit
+    return np.flatnonzero(marks).tolist()
+
+
+def _source_video(sess):
+    """The one readable source video a single-camera session was cut from, else None."""
+    if len(sess.cam_names) != 1:
+        return None
+    sources = {getattr(g, 'source_video', None) for g in sess.groups.values()}
+    if len(sources) != 1:
+        return None
+    source = sources.pop()
+    return source if source and Path(source).is_file() else None
+
+
+def _resize(raw):
+    """Downscale a frame to MAX_SIDE; returns the frame and its scale."""
+    h0, w0 = raw.shape[:2]
+    scale = min(1.0, MAX_SIDE / max(h0, w0))
+    if scale < 1.0:
+        import cv2
+
+        w, h = max(1, round(w0 * scale)), max(1, round(h0 * scale))
+        raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_AREA)
+    return raw, scale
+
+
+def _video_samples(path, count):
+    """Evenly spaced frames over a whole source video, with no label masks."""
+    from tailcyclenet.video import open_reader
+
+    reader = open_reader(path)
+    try:
+        n = len(reader)
+        frames = [_resize(reader.get_batch([int(i)])[0])[0]
+                  for i in np.linspace(0, n - 1, count).round().astype(int)]
+    finally:
+        reader.close()
+    return frames, n
+
+
 def _project(sess, lab, gid, frame, ci):
     """Return one animal-axis array of 2D points in camera pixels."""
     if sess.mode == '3d' and lab.points3d is not None:
@@ -134,8 +185,22 @@ def _session_job(task):
     sess = Session.load(Path(session_path))
     if any(sess.rig.moving.values()):
         return {'session': sess.session_id, 'skipped': 'moving rig', 'views': {}}
-    selected = _sample_frames(sess, SAMPLES)
+    # A session cut as short clips from one long recording (rat-city-annotated: every clip can
+    # fall in the first 30 s of a 30 min video) would give a median of near-identical frames, so
+    # an animal that sits still for the span survives. Sample the whole recording instead and
+    # keep the session's labelled frames for the ghost check only.
+    source = _source_video(sess)
     by_camera = {cam: [] for cam in sess.cam_names}
+    checks = {cam: [] for cam in sess.cam_names}
+    if source is not None:
+        frames, n_source = _video_samples(source, SAMPLES)
+        cam = sess.cam_names[0]
+        by_camera[cam] = [(f, np.zeros(f.shape[:2], dtype=bool), []) for f in frames]
+        selected = [(gid, frame) for gid in sess.groups
+                    for frame in _labelled_frames(sess.labels(gid))]
+    else:
+        n_source = None
+        selected = _sample_frames(sess, SAMPLES)
     for gid, frame in selected:
         group = sess.groups[gid]
         lab = sess.labels(gid)
@@ -143,16 +208,10 @@ def _session_job(task):
             raw = read_frames(group, cam, [frame])[0]
             if raw is None:
                 continue
-            h0, w0 = raw.shape[:2]
-            scale = min(1.0, MAX_SIDE / max(h0, w0))
-            if scale < 1.0:
-                import cv2
-
-                w, h = max(1, round(w0 * scale)), max(1, round(h0 * scale))
-                raw = cv2.resize(raw, (w, h), interpolation=cv2.INTER_AREA)
+            raw, scale = _resize(raw)
             h, w = raw.shape[:2]
             mask, boxes = _mask_for(sess, lab, gid, frame, ci, scale, h, w)
-            by_camera[cam].append((raw, mask, boxes))
+            (checks if source is not None else by_camera)[cam].append((raw, mask, boxes))
     result = {}
     session_out = Path(out_root) / sess.session_id
     session_out.mkdir(parents=True, exist_ok=True)
@@ -162,6 +221,10 @@ def _session_job(task):
         frames = np.stack([x for x, _, _ in samples])
         masks = np.stack([m for _, m, _ in samples])
         background, valid = _robust_background(frames, masks)
+        if source is not None:
+            samples = checks[cam] or samples
+            frames = np.stack([x for x, _, _ in samples])
+            masks = np.stack([m for _, m, _ in samples])
         comparisons = np.abs(frames.astype(np.float32) - background[None]).mean(-1)
         ghost_boxes = 0
         for i, (_, _, boxes) in enumerate(samples):
@@ -188,7 +251,9 @@ def _session_job(task):
         background[~valid] = 0
         Image.fromarray(background).save(session_out / f'{cam}.png')
         Image.fromarray((valid * 255).astype(np.uint8)).save(session_out / f'{cam}_valid.png')
-        result[cam] = {'n_samples': len(samples), 'unknown_frac': unknown_fraction,
+        result[cam] = {'n_samples': len(by_camera[cam]),
+                       'frame_source': 'source_video' if source is not None else 'groups',
+                       'source_frames': n_source, 'n_ghost_checks': len(samples), 'unknown_frac': unknown_fraction,
                        'ghost_score': ghost_score, 'ghost_boxes': ghost_boxes,
                        'inside_delta': inside_delta, 'outside_delta': outside_delta,
                        'usable': bool(usable), 'scale': min(1.0, MAX_SIDE / max(background.shape[:2])),

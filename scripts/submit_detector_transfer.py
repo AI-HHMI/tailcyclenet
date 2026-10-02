@@ -45,7 +45,7 @@ def main():
         if args.dry_run:
             continue
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        jobid = result.stdout.strip().split('<')[-1].split('>')[0]
+        jobid = result.stdout.split('<', 1)[1].split('>', 1)[0]
         print(f'  -> job {jobid}')
         with manifest.open('a') as stream:
             stream.write(f'{name}\t{arm["config"]}\t{out}\t{arm["evalspec"]}\t{jobid}\t{time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')

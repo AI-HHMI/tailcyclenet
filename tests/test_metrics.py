@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
-from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, idsw_stability_band,
+from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, idf1, idsw_stability_band,
                                   match_instances, matched_error, mota, motion_ratio)
 
 REPO = Path(__file__).resolve().parent.parent
@@ -668,3 +668,68 @@ def test_paired_bootstrap_is_unchanged_without_weights():
     flat = paired_bootstrap(a, seed=5)
     ones = paired_bootstrap(a, seed=5, weights=np.ones(a.size))
     assert np.isclose(flat['mean'], ones['mean']) and np.isclose(flat['lo'], ones['lo'])
+
+
+def test_idf1_sees_a_parked_swap_that_idsw_counts_once():
+    """Two animals, prediction rows swapped for the second half of the clip: ONE correspondence
+    change per animal (`idsw = 2`), but each row is on the wrong animal for half the clip, so
+    IDF1 under one global mapping is 0.5. A relabel that undoes the swap is charged nothing by
+    IDF1 and reads 1.0 -- the lever MOTA's idsw cannot score (scratch/object-tracking-v2 E1).
+    """
+    T = 10
+    true = np.zeros((2, T, 1, 2))
+    true[1, :, 0] = [100.0, 100.0]
+    swapped = true.copy()
+    swapped[:, T // 2:] = true[::-1, T // 2:]
+    assert mota(swapped, true, 1.0)['idsw'] == 2
+    r = idf1(swapped, true, 1.0)
+    assert r['idf1'] == pytest.approx(0.5) and r['idtp'] == T and r['n_pred'] == r['n_true'] == 2 * T
+    assert idf1(true, true, 1.0)['idf1'] == 1.0
+    assert idf1(true[::-1], true, 1.0)['idf1'] == 1.0, 'row order is not identity: one global map'
+
+
+def test_idf1_counts_fp_and_misses_and_honours_the_ignore_region():
+    """A spare row on nothing is IDFP; an unlabelled animal's row inside its PRESENT box is
+    excused exactly as `mota` excuses it (`fp_ignored`); a missed animal is IDFN."""
+    true = np.full((2, 4, 1, 2), np.nan)
+    true[0, :, 0] = [0.0, 0.0]
+    pred = np.full((2, 4, 1, 2), np.nan)
+    pred[0] = true[0]
+    pred[1, :, 0] = [50.0, 50.0]
+    r = idf1(pred, true, 1.0)
+    assert (r['idtp'], r['idfp'], r['idfn']) == (4, 4, 0)
+    ignore = np.zeros((2, 4), bool)
+    ignore[1] = True
+    boxes = np.full((2, 4, 4), np.nan)
+    boxes[1] = [40.0, 40.0, 60.0, 60.0]
+    assert idf1(pred, true, 1.0, ignore=ignore, ignore_boxes=boxes)['idfp'] == 0
+    boxes[1] = [0.0, 0.0, 1.0, 1.0]
+    assert idf1(pred, true, 1.0, ignore=ignore, ignore_boxes=boxes)['idfp'] == 4
+    half = pred[:1].copy()
+    half[:, 2:] = np.nan
+    assert idf1(half, true, 1.0)['idfn'] == 2
+
+
+def test_idf1_group_mapping_spans_chunks():
+    """`score()` gives each `--chunk` unit its own IDF1 (one map per unit, optimistic) AND a
+    per-GROUP IDF1 with ONE map across every chunk -- which must equal the unchunked number."""
+    from tailcyclenet import format as fmt
+
+    ev = _eval_module()
+    S, T = 2, 8
+    lab = fmt.empty_labels(S, T, 1, 1, mode3d=False)
+    lab.vis2d[:] = fmt.VISIBLE
+    lab.points2d[0, :, 0, 0, :] = [0.0, 0.0]
+    lab.points2d[1, :, 0, 0, :] = [100.0, 100.0]
+    true = lab.points2d[..., 0, :].copy()
+    pred = true.copy()
+    pred[:, 4:] = true[::-1, 4:]
+    preds = {'s/g0': {'pred': pred, 'mode': np.array('2d')}}
+    labels = {'s/g0': (lab, None)}
+    whole = ev.score(preds, labels, mota_dist=1.0, quiet=True)[0]
+    assert whole['idf1']['idf1'] == pytest.approx(0.5)
+    cp, cl = ev.chunk_frames(preds, labels, 4)
+    chunked = ev.score(cp, cl, mota_dist=1.0, quiet=True)
+    assert [r['idf1']['idf1'] for r in chunked] == [1.0, 1.0], 'each unit maps on its own'
+    assert all(r['idf1_group']['idf1'] == pytest.approx(0.5) for r in chunked)
+    assert chunked[0]['idf1_group'] == whole['idf1_group']

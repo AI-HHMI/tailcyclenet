@@ -16,9 +16,10 @@ import numpy as np
 
 from tailcyclenet.format import INST_PRESENT, PROJECTED, UNLABELED, VISIBLE, sessions_for
 from tailcyclenet.infer.predictions import load_predictions
-from tailcyclenet.metrics import (ERR_PCTS, _per_frame_means, error_and_coverage,
-                                  idsw_stability_band, match_instances, matched_error, mota,
-                                  motion_ratio, paired_bootstrap, pck)
+from tailcyclenet.metrics import (ERR_PCTS, _per_frame_means, error_and_coverage, idf1,
+                                  idf1_from_state, idf1_merge, idsw_stability_band,
+                                  match_instances, matched_error, mota, motion_ratio,
+                                  paired_bootstrap, pck)
 
 _PCT_KEYS = tuple(f'p{p}' for p in ERR_PCTS)
 
@@ -126,6 +127,7 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
     """
     rows = []
     mota_state = {}
+    idf1_state = {}
     order = sorted(preds.items(),
                    key=lambda kv: (kv[1].get('__chunk_of__', kv[0]), kv[1].get('__t0__', 0),
                                     kv[0]))
@@ -194,7 +196,17 @@ def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_c
             m['mota_r'], m['mota'] = _mota_for(m, lab, mota_dist, min_kpts_frac,
                                                extent_override=out.get('__extent__'),
                                                match_cost=match_cost, last=state)
+            unit = {}
+            m['idf1'] = idf1(pred, true, m['mota_r'], ignore=m['_mota_ignore'],
+                             ignore_boxes=m['_mota_ignore_boxes'], min_kpts_frac=min_kpts_frac,
+                             cost=match_cost, acc=unit)
+            group = out.get('__chunk_of__', key)
+            idf1_merge(idf1_state.setdefault(group, {}), unit)
+            m['idf1_of'] = group
         rows.append(m)
+    for m in rows:
+        if 'idf1_of' in m:
+            m['idf1_group'] = idf1_from_state(idf1_state[m['idf1_of']])
     return rows
 
 
@@ -598,7 +610,7 @@ def main(argv: list[str] | None = None):
             print(f'{m["group"][:40]:40s} MOTA {r["mota"]:.3f}  miss {r["miss_rate"]:.3f}  '
                   f'fp {r["fp_rate"]:.3f} (dup {r["fp_dup_rate"]:.3f} none '
                   f'{r["fp_none_rate"]:.3f})  idsw {r["idsw_rate"]:.4f}  '
-                  f'fp_ignored {r["fp_ignored"]:d}  '
+                  f'fp_ignored {r["fp_ignored"]:d}  IDF1 {m["idf1"]["idf1"]:.3f}  '
                   f'(mota r={m["mota_r"]:.1f}, mpjpe r={m["mpjpe_r"]:.1f} {unit})')
             if args.idsw_band:
                 band = idsw_stability_band(
@@ -608,6 +620,19 @@ def main(argv: list[str] | None = None):
                 print(f'{"":40s} idsw band (n={band["n"]}): median {band["median"]:.1f}  '
                       f'[{band["min"]:.0f}, {band["max"]:.0f}]  p5-p95 '
                       f'[{band["p5"]:.1f}, {band["p95"]:.1f}]  raw idsw={r["idsw"]:d}')
+        groups = {}
+        for m in multi:
+            groups.setdefault(m['idf1_of'], m['idf1_group'])
+        tp = sum(g['idtp'] for g in groups.values())
+        npred = sum(g['n_pred'] for g in groups.values())
+        ntrue = sum(g['n_true'] for g in groups.values())
+        if npred + ntrue:
+            print(f'\nIDF1 {2 * tp / (npred + ntrue):.3f}  IDP {tp / npred if npred else float("nan"):.3f}'
+                  f'  IDR {tp / ntrue if ntrue else float("nan"):.3f}  (pooled over {len(groups)} '
+                  'group(s), ONE row mapping per WHOLE group'
+                  + (', across its --chunk units' if args.chunk else '') + '; the per-row IDF1 '
+                  'above maps each scoring unit on its own). idsw counts correspondence CHANGES '
+                  'and is blind to a row parked on the wrong animal -- read the two together.')
 
     if args.vs:
         other, ometa = load_predictions(args.vs)
@@ -689,6 +714,7 @@ def main(argv: list[str] | None = None):
             for name in ('mota', 'miss_rate', 'fp_rate', 'fp_dup_rate', 'fp_none_rate',
                          'idsw_rate'):
                 paired(name, lambda m, k=name: m['mota'][k] if 'mota' in m else None)
+            paired('idf1', lambda m: m['idf1']['idf1'] if 'idf1' in m else None)
 
 
 def _shared_error(a, b):

@@ -329,6 +329,114 @@ def mota(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0
     return out
 
 
+def _pair_costs(p, q, max_dist, need, penalise):
+    """One frame's (Sp,St) instance costs, exactly as `match_instances` builds them."""
+    d = np.linalg.norm(p[:, None] - q[None, :], axis=-1)
+    ok = np.isfinite(p).all(-1)[:, None] & np.isfinite(q).all(-1)[None, :]
+    n_ok = ok.sum(-1)
+    if penalise:
+        n_lab = np.broadcast_to(np.isfinite(q).all(-1).sum(-1)[None, :], n_ok.shape)
+        num = np.where(ok, d, 0.0).sum(-1) + max_dist * (n_lab - n_ok)
+        return np.where(n_ok >= need, num / np.maximum(n_lab, 1), np.nan)
+    return np.where(n_ok >= need, np.where(ok, d, 0.0).sum(-1) / np.maximum(n_ok, 1), np.nan)
+
+
+def idf1(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0, cost='mean',
+         acc=None) -> dict:
+    """IDF1 (Ristani et al. 2016): identity measured under ONE clip-global row mapping.
+
+    `idsw` counts CHANGES of correspondence, so it cannot see a row that sits on the wrong animal
+    for a long stretch, and a lever that corrects such a stretch is charged a switch for the
+    correction. IDF1 asks the other question: fix one one-to-one mapping pred row -> label row
+    for the whole sequence (the one maximising agreement), then count instance-frames where the
+    row is within `max_dist` of its mapped label (IDTP). On calms21 mouse085 the shipped 2D rows
+    read ~0.49 IDF1 at 272 idsw -- each row spends about half the clip on each mouse -- which the
+    MOTA block alone does not show (scratch/object-tracking-v2/e1_appearance_memory).
+
+    The pair test is `match_instances`' own per-pair cost (`cost`, `min_kpts_frac`, `max_dist`),
+    so IDF1 and MOTA use one notion of "this row is on that animal". An unmatched-in-every-way
+    prediction landing in the `ignore` region is excused from IDFP exactly as `mota` excuses it
+    from FP (`fp_ignored`), using any-admissible-pair as the per-frame "matched" test.
+
+    `acc` threads a running state across calls over the continuation of one sequence (the
+    `--chunk` units of one group): pass the same dict each time and the returned numbers are
+    for the WHOLE sequence so far, under one mapping. `None` scores this call alone.
+
+    Returns {idf1, idp, idr, idtp, idfp, idfn, n_pred, n_true, mapping}; `mapping` is a list
+    of (pred_row, true_row) pairs.
+    """
+    if cost not in ('mean', 'penalised'):
+        raise ValueError(f"idf1: cost must be 'mean' or 'penalised', got {cost!r}")
+    pred, true = np.asarray(pred, float), np.asarray(true, float)
+    Sp, St, T, K = pred.shape[0], true.shape[0], true.shape[1], true.shape[2]
+    penalise = cost == 'penalised' and np.isfinite(max_dist)
+    need = max(1, int(np.ceil(min_kpts_frac * K)))
+    state = {} if acc is None else acc
+    agree = state.get('agree')
+    if agree is None or agree.shape != (Sp, St):
+        if agree is not None:
+            grown = np.zeros((max(Sp, agree.shape[0]), max(St, agree.shape[1])), np.int64)
+            grown[:agree.shape[0], :agree.shape[1]] = agree
+            agree = grown
+        else:
+            agree = np.zeros((Sp, St), np.int64)
+    n_pred, n_true = int(state.get('n_pred', 0)), int(state.get('n_true', 0))
+    pred_present = np.isfinite(pred).all(-1).any(-1)
+    true_present = np.isfinite(true).all(-1).any(-1)
+    if ignore is not None:
+        ignore = np.asarray(ignore, bool)
+    if ignore_boxes is not None:
+        ignore_boxes = np.asarray(ignore_boxes, float)
+    with np.errstate(invalid='ignore'), warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        centroid = np.nanmean(pred, axis=2)
+        for t in range(T):
+            c = _pair_costs(pred[:, t], true[:, t], max_dist, need, penalise)
+            admissible = np.isfinite(c) & (c <= max_dist)
+            agree[:Sp, :St] += admissible
+            n_true += int(true_present[:, t].sum())
+            rows = np.flatnonzero(ignore[:, t]) if ignore is not None else np.empty(0, int)
+            for i in np.flatnonzero(pred_present[:, t]):
+                if (not admissible[i].any() and len(rows)
+                        and _in_ignore(centroid[i, t], rows, t, ignore_boxes)):
+                    continue
+                n_pred += 1
+    state.update(agree=agree, n_pred=n_pred, n_true=n_true)
+    return idf1_from_state(state)
+
+
+def idf1_merge(into, other) -> dict:
+    """Add one `idf1(acc=...)` state into another (rows may differ in count). Returns `into`."""
+    a, b = into.get('agree'), other['agree']
+    if a is None:
+        a = np.zeros_like(b)
+    out = np.zeros((max(a.shape[0], b.shape[0]), max(a.shape[1], b.shape[1])), np.int64)
+    out[:a.shape[0], :a.shape[1]] += a
+    out[:b.shape[0], :b.shape[1]] += b
+    into.update(agree=out, n_pred=int(into.get('n_pred', 0)) + int(other['n_pred']),
+                n_true=int(into.get('n_true', 0)) + int(other['n_true']))
+    return into
+
+
+def idf1_from_state(state) -> dict:
+    """IDF1 and its counts from an accumulated `idf1` state: one global Hungarian mapping."""
+    agree = state['agree']
+    n_pred, n_true = int(state['n_pred']), int(state['n_true'])
+    if agree.size:
+        ri, ci = linear_sum_assignment(-agree)
+        mapping = [(int(i), int(j)) for i, j in zip(ri, ci) if agree[i, j] > 0]
+        idtp = int(sum(agree[i, j] for i, j in mapping))
+    else:
+        mapping, idtp = [], 0
+    idfp, idfn = n_pred - idtp, n_true - idtp
+    denom = 2 * idtp + idfp + idfn
+    return {'idf1': 2 * idtp / denom if denom else float('nan'),
+            'idp': idtp / n_pred if n_pred else float('nan'),
+            'idr': idtp / n_true if n_true else float('nan'),
+            'idtp': idtp, 'idfp': idfp, 'idfn': idfn, 'n_pred': n_pred, 'n_true': n_true,
+            'mapping': mapping}
+
+
 def idsw_stability_band(pred, true, max_dist, ignore=None, ignore_boxes=None, min_kpts_frac=0.0,
                         cost='mean', n=32, seed=0) -> dict:
     """`idsw` under N deterministic row-order permutations of `pred`/`true`, reporting a band

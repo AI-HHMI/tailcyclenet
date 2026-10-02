@@ -131,6 +131,7 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     model.box_sources = {str(k): str(v) for k, v in (ckpt.get('box_sources') or {}).items()}
     model.box_target = str(ckpt.get('box_target', 'crop'))
     model.antialias = bool(ckpt.get('antialias', False))
+    model.input_norm = str(ckpt.get('input_norm', 'none'))
     model.min_crop_dim = int(ckpt.get('min_crop_dim', 64))
     model.box_source = str(ckpt.get('box_source', 'keypoints'))
     ts = ckpt.get('tile_scale')
@@ -211,6 +212,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
 
     extent = getattr(det, 'box_target', 'crop') == 'extent'
     antialias = bool(getattr(det, 'antialias', False))
+    input_norm = str(getattr(det, 'input_norm', 'none'))
+    from .transfer_aug import normalize_input
     crop_pad = 0 if (box_source or getattr(det, 'box_source', 'keypoints')) == 'instances' else 20
     crop_mcd = int(getattr(det, 'min_crop_dim', 64))
 
@@ -259,6 +262,8 @@ def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score
         metas, arr = [], None
         for i in range(n):
             lb, scale, pad = letterbox(imgs[i], wh, src_wh=src, antialias=antialias)
+            if input_norm != 'none':
+                lb = normalize_input(lb, input_norm)
             if arr is None:
                 arr = np.empty((n, 3, lb.shape[0], lb.shape[1]), np.uint8)
             arr[i] = lb.transpose(2, 0, 1)

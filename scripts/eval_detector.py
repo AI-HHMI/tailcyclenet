@@ -208,7 +208,8 @@ def main():
                         min_crop_dim=args.min_crop_dim or mcd, reduce=red,
                         max_frames_per_group=args.frames_per_group,
                         box_target=getattr(model, 'box_target', 'crop'),
-                        antialias=getattr(model, 'antialias', False)) for split in split_names]
+                        antialias=getattr(model, 'antialias', False),
+                        input_norm=getattr(model, 'input_norm', 'none')) for split in split_names]
     if eval_spec:
         for split in split_names:
             part = parts[split_names.index(split)]
@@ -325,7 +326,8 @@ def main():
                          min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
                          max_frames_per_group=args.frames_per_group,
                          box_target=getattr(m2, 'box_target', 'crop'),
-                         antialias=getattr(m2, 'antialias', False))
+                         antialias=getattr(m2, 'antialias', False),
+                         input_norm=getattr(m2, 'input_norm', 'none'))
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
                               seed=args.seed, score_thresh=args.score_thresh[0],
                               num_workers=args.num_workers, max_animals=args.max_animals,

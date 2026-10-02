@@ -377,7 +377,9 @@ class BoxDataset(Dataset):
                  augment=False, reduce=False, keypoints=False, hflip=None, rotate_deg=0.0,
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
                  boxes_by_dataset=None, include_roots=None, datasets=None,
-                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, tt_transform=None):
+                 box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, tt_transform=None,
+                 input_norm='none', exposure_prob=0.0, scale_range=(0.8, 1.25),
+                 background_bank=None, background_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
@@ -400,6 +402,12 @@ class BoxDataset(Dataset):
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
             antialias / grayscale_prob / vflip -- area-filtered shrinking and the
                 train-augmentation probabilities; `vflip` is 0 under `keypoints`.
+            input_norm -- deterministic per-image normalisation of the model input
+                (`transfer_aug.normalize_input`), applied on every split AND at deployment.
+            exposure_prob / scale_range / background_bank, background_prob -- train-only
+                cross-rig augmentation (`transfer_aug`): wide gain+gamma, the similarity's
+                scale range, and compositing the view's animals onto a bank canvas. Off = no
+                draw at all. Compositing is box-only (refused with `keypoints`).
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
                 draw instead; the parameter survives to carry `val_frames_per_group`.
@@ -431,6 +439,16 @@ class BoxDataset(Dataset):
         self.box_target = box_target
         self.antialias = bool(antialias)
         self.tt_transform = tt_transform
+        from .transfer_aug import INPUT_NORMS
+        if input_norm not in INPUT_NORMS:
+            raise ValueError(f'input_norm must be one of {INPUT_NORMS}, got {input_norm!r}')
+        self.input_norm = input_norm
+        self.exposure_prob = float(exposure_prob)
+        self.scale_range = tuple(float(v) for v in scale_range)
+        self.background_bank = background_bank
+        self.background_prob = float(background_prob) if background_bank is not None else 0.0
+        if self.background_prob and keypoints:
+            raise ValueError('background compositing is box-only; it drops keypoint targets')
         self.grayscale_prob = float(grayscale_prob)
         self.vflip = 0.0 if self.keypoints else float(vflip)
         self.rotate_deg = float(rotate_deg)
@@ -1075,8 +1093,9 @@ class BoxDataset(Dataset):
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
         rng = np.random.default_rng(None) if self.augment and self.train else None
-        warp = (random_affine(size, rng, hflip=self.hflip, rotate_deg=self.rotate_deg,
-                              centre=self._warp_centre(i), vflip=self.vflip)
+        warp = (random_affine(size, rng, scale=self.scale_range, hflip=self.hflip,
+                              rotate_deg=self.rotate_deg, centre=self._warp_centre(i),
+                              vflip=self.vflip)
                 if rng is not None else None)
         got = self.boxes_for(i, warp, with_keypoints=self.keypoints)
         boxes, kpts = got if self.keypoints else (got, None)
@@ -1126,8 +1145,20 @@ class BoxDataset(Dataset):
                     kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
+        if rng is not None and self.exposure_prob and rng.random() < self.exposure_prob:
+            from .transfer_aug import exposure
+            img = exposure(img, rng)
+        if rng is not None and self.background_prob and rng.random() < self.background_prob:
+            from .transfer_aug import composite
+            img, boxes = composite(img, boxes, self.background_bank, rng, self.input_wh,
+                                   avoid=(sess.session_id, sess.cam_names[ci]),
+                                   decoys_ok=bool(negative_supervision))
+            negative_supervision = True
         if rng is not None and self.grayscale_prob and rng.random() < self.grayscale_prob:
             img = _grayscale(img)
+        if self.input_norm != 'none':
+            from .transfer_aug import normalize_input
+            img = normalize_input(img, self.input_norm)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         item = {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
         if kpts is not None:

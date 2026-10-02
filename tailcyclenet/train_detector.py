@@ -245,6 +245,25 @@ def _wandb_eval_metrics(scores, obj_q):
     return metrics
 
 
+def _background_bank(data_cfg, all_roots, root_names):
+    """The compositing canvas bank for `[data].background_prob`, or None when it is off.
+
+    Only the TRAINING roots' own estimated backgrounds are read (`background_own/<root>/`); a
+    transfer arm never sees another root's pixels. `background_own` / `background_generic` may be
+    empty, in which case that source's weight is dropped and the rest renormalised.
+    """
+    if not data_cfg['background_prob']:
+        return None
+    from .detector.transfer_aug import BackgroundBank
+    bank = BackgroundBank(root_names, own_dir=data_cfg['background_own'] or None,
+                          generic_dir=data_cfg['background_generic'] or None,
+                          weights=data_cfg['background_weights'])
+    print(f"backgrounds: p={data_cfg['background_prob']:g}  own {len(bank.own)} views  "
+          f"generic {len(bank.generic)} images  weights own/generic/synthetic "
+          + '/'.join(f'{w:.2f}' for w in bank.weights))
+    return bank
+
+
 def _record_run(run: Path, config: dict) -> None:
     """Write the run folder's reproducibility record: the effective config + provenance.
 
@@ -359,6 +378,11 @@ def main(argv: list[str] | None = None):
                        box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
                        grayscale_prob=data_cfg['grayscale_prob'],
                        vflip=0.5 if data_cfg['vflip'] else 0.0,
+                       input_norm=data_cfg['input_norm'],
+                       exposure_prob=data_cfg['exposure_prob'],
+                       scale_range=tuple(data_cfg['scale_range']),
+                       background_bank=_background_bank(data_cfg, all_roots, root_names),
+                       background_prob=data_cfg['background_prob'],
                        **tiling)
     wh = train.input_wh
     if data_cfg['tile_wh']:
@@ -428,6 +452,7 @@ def main(argv: list[str] | None = None):
                          keypoints=data_cfg['keypoints'], seed=train_cfg['seed'],
                          include_roots=root_names, datasets=all_roots,
                          box_target=data_cfg['box_target'], antialias=data_cfg['antialias'],
+                         input_norm=data_cfg['input_norm'],
                          **tiling)
         missing_val = sorted(set(root_names) - set(val.root_names))
         print(f'val:   {len(val)} views across {val.root_names}; '
@@ -539,6 +564,7 @@ def main(argv: list[str] | None = None):
                     'pretrained': model_cfg['pretrained'], 'shared_head': train_cfg['shared_head'],
                     'fpn_upsample': train_cfg['fpn_upsample'], 'p2': model_cfg['p2'],
                     'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
+                    'input_norm': data_cfg['input_norm'],
                     'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
                     'min_crop_dim': data_cfg['min_crop_dim'], 'reduce': data_cfg['reduce'],
                     'box_source': data_cfg['boxes'], 'dataset': train.root_names[0],
@@ -603,6 +629,7 @@ def main(argv: list[str] | None = None):
                         'model_state_is': 'eval',
                         **({'model_state_train': train_state} if train_state is not None else {}),
                         'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
+                        'input_norm': data_cfg['input_norm'],
                         'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
                         'input_wh': wh, 'n_keypoints': n_kpts,
                         'norm': 'gn',

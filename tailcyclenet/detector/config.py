@@ -45,6 +45,8 @@ DATA_KEYS = frozenset({
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'alpha', 'balance_datasets', 'boxes_by_dataset',
     'box_target', 'antialias', 'grayscale_prob', 'vflip',
+    'input_norm', 'exposure_prob', 'scale_range', 'background_prob', 'background_own',
+    'background_generic', 'background_weights',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -206,6 +208,29 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     data['grayscale_prob'] = float(data.get('grayscale_prob', 0.2))
     if not 0.0 <= data['grayscale_prob'] <= 1.0:
         raise SystemExit(f"[data].grayscale_prob must be in [0, 1], got {data['grayscale_prob']}.")
+    data['input_norm'] = str(data.get('input_norm', 'none'))
+    if data['input_norm'] not in ('none', 'equalize', 'percentile'):
+        raise SystemExit(f"[data].input_norm must be 'none', 'equalize' or 'percentile', got "
+                         f"{data['input_norm']!r}.")
+    data['exposure_prob'] = float(data.get('exposure_prob', 0.0))
+    data['background_prob'] = float(data.get('background_prob', 0.0))
+    for k in ('exposure_prob', 'background_prob'):
+        if not 0.0 <= data[k] <= 1.0:
+            raise SystemExit(f'[data].{k} must be in [0, 1], got {data[k]}.')
+    sr = data.get('scale_range', [0.8, 1.25])
+    if (not isinstance(sr, (list, tuple)) or len(sr) != 2
+            or not 0 < float(sr[0]) <= float(sr[1])):
+        raise SystemExit(f'[data].scale_range must be [lo, hi] with 0 < lo <= hi, got {sr!r}.')
+    data['scale_range'] = [float(sr[0]), float(sr[1])]
+    data['background_own'] = str(data.get('background_own', ''))
+    data['background_generic'] = str(data.get('background_generic', ''))
+    bw = data.get('background_weights', [0.4, 0.3, 0.3])
+    if not isinstance(bw, (list, tuple)) or len(bw) != 3 or min(float(v) for v in bw) < 0:
+        raise SystemExit(f'[data].background_weights must be [own, generic, synthetic] >= 0, '
+                         f'got {bw!r}.')
+    data['background_weights'] = [float(v) for v in bw]
+    if data['background_prob'] and data['keypoints']:
+        raise SystemExit('[data].background_prob is box-only; it cannot combine with keypoints.')
     af = data.get('annot_frac', None)
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:

@@ -57,7 +57,8 @@ for entry in spec.get('eval', []):
         import subprocess
         cmd = ['pixi', 'run', 'python', 'scripts/eval_detector.py', '--run', str(out), '--checkpoint', ckpt, '--data', data, '--split', split, '--evalset', evalset, '--out', str(dest), '--boxes', 'keypoints', *extra]
         with dest.with_suffix('.log').open('w') as log:
-            subprocess.run(cmd, check=True, stdout=log, stderr=subprocess.STDOUT)
+            rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
+        print(f'eval {name} {ckpt}: exit {rc} -> {dest}', flush=True)
 PY
 else
     exec pixi run python "$SCRIPT" "$@"

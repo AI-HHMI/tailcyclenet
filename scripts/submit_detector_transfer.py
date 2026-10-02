@@ -9,10 +9,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = Path('/groups/karashchuk/home/karashchukl/results/tailcyclenet/detectors/transfer')
+LOGS = '/groups/karashchuk/home/karashchukl/logs/tailcyclenet'
 
 
 def main():
-    """Validate capacity, submit the requested arms, and append each job to the manifest."""
+    """Validate capacity, submit the requested arms, and append each job to the manifest.
+
+    `ssh` joins its arguments with spaces and the remote shell re-splits them, so the whole
+    remote command is ONE pre-quoted string, run from the repo (job_l4.sh is a relative path).
+    The run folder is named by the arm alone (arm names already carry their seed). A dry run
+    prints and writes nothing.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument('arms', type=Path, help='JSON list of {arm, config, evalspec, seed}')
     ap.add_argument('--dry-run', action='store_true')
@@ -27,16 +34,19 @@ def main():
     manifest.parent.mkdir(parents=True, exist_ok=True)
     for arm in arms:
         name = arm['arm']
-        out = str(RESULTS / f'{name}-s{arm["seed"]}')
-        cmd = ['ssh', 'login2', 'bsub', '-q', 'gpu_l4', '-gpu', 'num=1', '-n', '8', '-R',
-               'span[hosts=1] rusage[mem=122880]', '-W', '3:00', '-J', f'tcn-dtx-{name}',
-               '-o', f'~/logs/tailcyclenet/dtx-{name}.out', 'bash', 'scripts/job_l4.sh',
-               'train_detector_eval', arm['config'], out, arm['evalspec']]
+        out = str(RESULTS / name)
+        bsub = ['bsub', '-q', 'gpu_l4', '-gpu', 'num=1', '-n', '8', '-R',
+                'span[hosts=1] rusage[mem=122880]', '-W', '3:00', '-J', f'tcn-dtx-{name}',
+                '-o', f'{LOGS}/dtx-{name}.out', 'bash', 'scripts/job_l4.sh',
+                'train_detector_eval', arm['config'], out, arm['evalspec']]
+        remote = f'mkdir -p {LOGS} && cd {shlex.quote(str(ROOT))} && {shlex.join(bsub)}'
+        cmd = ['ssh', 'login2', remote]
         print(shlex.join(cmd))
-        jobid = 'DRY-RUN'
-        if not args.dry_run:
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            jobid = result.stdout.strip().split('<')[-1].split('>')[0]
+        if args.dry_run:
+            continue
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        jobid = result.stdout.strip().split('<')[-1].split('>')[0]
+        print(f'  -> job {jobid}')
         with manifest.open('a') as stream:
             stream.write(f'{name}\t{arm["config"]}\t{out}\t{arm["evalspec"]}\t{jobid}\t{time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
 

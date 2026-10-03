@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet.dataset import read_frames
 from tailcyclenet.detector import BoxDataset, letterbox
 from tailcyclenet.detector.config import load_detector_config
-from tailcyclenet.detector.transfer_aug import PAD, composite, normalize_input
+from tailcyclenet.detector.transfer_aug import PAD, composite, invert, normalize_input
 
 
 def _scene(seed=0):
@@ -103,6 +103,7 @@ def test_transfer_keys_default_off(tmp_path):
     d = load_detector_config(_cfg(tmp_path))['data']
     assert d['input_norm'] == 'none' and d['exposure_prob'] == 0.0
     assert d['background_prob'] == 0.0 and d['scale_range'] == [0.8, 1.25]
+    assert d['invert_prob'] == 0.0
 
 
 @pytest.mark.parametrize('extra, match', [
@@ -115,3 +116,11 @@ def test_transfer_keys_default_off(tmp_path):
 def test_transfer_keys_refuse_nonsense(tmp_path, extra, match):
     with pytest.raises(SystemExit, match=match):
         load_detector_config(_cfg(tmp_path, extra))
+
+
+def test_invert_flips_content_and_keeps_padding():
+    img = _scene()
+    out = invert(img)
+    content = ~(img == PAD).all(-1)
+    assert (out[~content] == PAD).all()
+    assert np.array_equal(out[content], 255 - img[content])

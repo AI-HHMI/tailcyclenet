@@ -73,6 +73,19 @@ def exposure(img, rng, gain=(0.1, 4.0), gamma=(0.4, 2.5)):
     return out
 
 
+def invert(img):
+    """Photometric negative of the content, letterbox grey kept at 114.
+
+    Coat colour and lighting flip contrast polarity across rigs (qdmouse: dark mouse, bright
+    rim-lit tail, dark floor; allen: black mouse, dark tail, bright floor), so a detector that
+    keys on the sign of an edge cannot transfer. A random negative makes the sign uninformative.
+    """
+    keep = _content_mask(img)
+    out = 255 - img
+    out[~keep] = PAD
+    return out
+
+
 def _fit(img, wh, rng, crop=True):
     """Resize a canvas source to `wh`: random aspect-matched crop (generic) or letterbox (own)."""
     import cv2

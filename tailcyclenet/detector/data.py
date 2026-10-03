@@ -379,7 +379,7 @@ class BoxDataset(Dataset):
                  boxes_by_dataset=None, include_roots=None, datasets=None,
                  box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, tt_transform=None,
                  input_norm='none', exposure_prob=0.0, scale_range=(0.8, 1.25),
-                 background_bank=None, background_prob=0.0):
+                 background_bank=None, background_prob=0.0, invert_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
@@ -404,7 +404,7 @@ class BoxDataset(Dataset):
                 train-augmentation probabilities; `vflip` is 0 under `keypoints`.
             input_norm -- deterministic per-image normalisation of the model input
                 (`transfer_aug.normalize_input`), applied on every split AND at deployment.
-            exposure_prob / scale_range / background_bank, background_prob -- train-only
+            exposure_prob / invert_prob / scale_range / background_bank, background_prob -- train-only
                 cross-rig augmentation (`transfer_aug`): wide gain+gamma, the similarity's
                 scale range, and compositing the view's animals onto a bank canvas. Off = no
                 draw at all. Compositing is box-only (refused with `keypoints`).
@@ -444,6 +444,7 @@ class BoxDataset(Dataset):
             raise ValueError(f'input_norm must be one of {INPUT_NORMS}, got {input_norm!r}')
         self.input_norm = input_norm
         self.exposure_prob = float(exposure_prob)
+        self.invert_prob = float(invert_prob)
         self.scale_range = tuple(float(v) for v in scale_range)
         self.background_bank = background_bank
         self.background_prob = float(background_prob) if background_bank is not None else 0.0
@@ -1148,6 +1149,9 @@ class BoxDataset(Dataset):
         if rng is not None and self.exposure_prob and rng.random() < self.exposure_prob:
             from .transfer_aug import exposure
             img = exposure(img, rng)
+        if rng is not None and self.invert_prob and rng.random() < self.invert_prob:
+            from .transfer_aug import invert
+            img = invert(img)
         if rng is not None and self.background_prob and rng.random() < self.background_prob:
             from .transfer_aug import composite
             img, boxes = composite(img, boxes, self.background_bank, rng, self.input_wh,

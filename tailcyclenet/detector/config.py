@@ -46,7 +46,7 @@ DATA_KEYS = frozenset({
     'alpha', 'balance_datasets', 'boxes_by_dataset',
     'box_target', 'antialias', 'grayscale_prob', 'vflip',
     'input_norm', 'exposure_prob', 'scale_range', 'background_prob', 'background_own',
-    'background_generic', 'background_weights',
+    'background_generic', 'background_weights', 'invert_prob',
 })
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
@@ -214,7 +214,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                          f"{data['input_norm']!r}.")
     data['exposure_prob'] = float(data.get('exposure_prob', 0.0))
     data['background_prob'] = float(data.get('background_prob', 0.0))
-    for k in ('exposure_prob', 'background_prob'):
+    data['invert_prob'] = float(data.get('invert_prob', 0.0))
+    for k in ('exposure_prob', 'background_prob', 'invert_prob'):
         if not 0.0 <= data[k] <= 1.0:
             raise SystemExit(f'[data].{k} must be in [0, 1], got {data[k]}.')
     sr = data.get('scale_range', [0.8, 1.25])

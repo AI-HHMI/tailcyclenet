@@ -380,6 +380,7 @@ def main(argv: list[str] | None = None):
                        vflip=0.5 if data_cfg['vflip'] else 0.0,
                        input_norm=data_cfg['input_norm'],
                        exposure_prob=data_cfg['exposure_prob'],
+                       invert_prob=data_cfg['invert_prob'],
                        scale_range=tuple(data_cfg['scale_range']),
                        background_bank=_background_bank(data_cfg, all_roots, root_names),
                        background_prob=data_cfg['background_prob'],

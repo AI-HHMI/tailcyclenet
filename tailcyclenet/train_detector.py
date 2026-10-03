@@ -125,6 +125,13 @@ def input_wh_for_roots(roots, box_source, boxes_by_dataset=None, min_box_px=32,
 BACKBONE_LR_SCALE = 0.1
 
 
+def _pretrained_params(model):
+    """The COCO-initialised parameters: the whole backbone, or only a `hybrid-<tier>`'s CNN half
+    (its transformer stages are fresh and train at the full LR)."""
+    pick = getattr(model.backbone, 'pretrained_parameters', None)
+    return pick() if pick is not None else list(model.backbone.parameters())
+
+
 def build_detector_optimizer(model, train_cfg, model_cfg):
     """Build the detector's optimizer + optional LR scheduler.
 
@@ -150,7 +157,7 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
         groups = []
         trainable = [p for p in model.parameters() if p.requires_grad]
         if model_cfg['pretrained']:
-            backbone_ids = {id(p) for p in model.backbone.parameters()}
+            backbone_ids = {id(p) for p in _pretrained_params(model)}
             backbone_params = [p for p in trainable if id(p) in backbone_ids]
             other_params = [p for p in trainable if id(p) not in backbone_ids]
             groups.append({'params': backbone_params, 'lr': lr * BACKBONE_LR_SCALE,
@@ -165,7 +172,7 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
     from torch.optim import Muon as TorchMuon
     from schedulefree import AdamWScheduleFree, ScheduleFreeWrapper
 
-    backbone_ids = ({id(p) for p in model.backbone.parameters()}
+    backbone_ids = ({id(p) for p in _pretrained_params(model)}
                     if model_cfg['pretrained'] else set())
     muon_groups, adamw_groups = [], []
 
@@ -473,7 +480,8 @@ def main(argv: list[str] | None = None):
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
     if model_cfg['pretrained'] == 'coco':
-        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'], weights_dir=args.weights_dir)
+        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'].removeprefix('hybrid-'),
+                                               weights_dir=args.weights_dir)
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors', flush=True)
 
     opt, sched = build_detector_optimizer(model, train_cfg, model_cfg)

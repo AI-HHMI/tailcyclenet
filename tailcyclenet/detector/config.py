@@ -59,7 +59,8 @@ TRAINING_KEYS = frozenset({
     'shared_head', 'fpn_upsample', 'save_every',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
-YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid')
+YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid',
+                 *(f'hybrid-{t}' for t in sorted(YOLOX_TIERS)))
 
 
 def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:

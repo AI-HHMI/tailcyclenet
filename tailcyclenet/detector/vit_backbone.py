@@ -93,3 +93,46 @@ class HybridBackbone(nn.Module):
         s4 = self.stage4_blocks(self.stage4_down(s3))
         s5 = self.stage5_blocks(self.stage5_down(s4))
         return (s2, s3, s4, s5) if self.p2 else (s3, s4, s5)
+
+
+class HybridCSPBackbone(HybridBackbone):
+    """The hybrid with its CNN half swapped for a canonical YOLOX tier's stem/dark2/dark3.
+
+    Strides 2/4/8 are the tier's own `Focus` + CSP stages (module names `stem`/`dark2`/`dark3`,
+    exactly `CSPDarknet`'s, so `load_coco_backbone` maps Megvii's COCO weights onto them); the
+    stride-16/32 transformer stages are the hybrid's, from scratch. `pretrained_parameters()`
+    names the COCO-initialised half so only it gets the backbone LR scale.
+    """
+
+    def __init__(self, tier='tiny', n_transformer_blocks=(4, 2), n_heads=8, mlp_ratio=4.0,
+                 p2=True, in_channels=3, bottleneck_expansion=1.0, token_dims=(512, 1024)):
+        """Build the tier's CNN stages, then the hybrid's two transformer stages."""
+        nn.Module.__init__(self)
+        from .yolox import YOLOX_TIERS, CSPDarknet
+        depth_mul, width_mul, depthwise = YOLOX_TIERS[tier]
+        cnn = CSPDarknet(width_mul, depth_mul, depthwise=depthwise,
+                         bottleneck_expansion=bottleneck_expansion, p2=True,
+                         in_channels=in_channels)
+        self.p2 = bool(p2)
+        self.stem, self.dark2, self.dark3 = cnn.stem, cnn.dark2, cnn.dark3
+        c2, c3 = cnn.out_channels[0], cnn.out_channels[1]
+        d4, d5 = token_dims
+        self.stage4_down = conv_norm_act(c3, d4, 3, 2)
+        self.stage4_blocks = nn.Sequential(
+            *[TransformerBlock(d4, n_heads, mlp_ratio) for _ in range(n_transformer_blocks[0])])
+        self.stage5_down = conv_norm_act(d4, d5, 3, 2)
+        self.stage5_blocks = nn.Sequential(
+            *[TransformerBlock(d5, n_heads, mlp_ratio) for _ in range(n_transformer_blocks[1])])
+        self.out_channels = (c2, c3, d4, d5) if self.p2 else (c3, d4, d5)
+
+    def pretrained_parameters(self):
+        """The COCO-loadable CNN half's parameters."""
+        return [p for m in (self.stem, self.dark2, self.dark3) for p in m.parameters()]
+
+    def forward(self, x):
+        """CSP stages at strides 2/4/8, transformer stages at 16/32."""
+        s2 = self.dark2(self.stem(x))
+        s3 = self.dark3(s2)
+        s4 = self.stage4_blocks(self.stage4_down(s3))
+        s5 = self.stage5_blocks(self.stage5_down(s4))
+        return (s2, s3, s4, s5) if self.p2 else (s3, s4, s5)

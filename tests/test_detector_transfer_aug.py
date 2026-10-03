@@ -124,3 +124,30 @@ def test_invert_flips_content_and_keeps_padding():
     content = ~(img == PAD).all(-1)
     assert (out[~content] == PAD).all()
     assert np.array_equal(out[content], 255 - img[content])
+
+
+def test_hybrid_tiny_cnn_half_is_coco_shaped_and_only_it_is_pretrained():
+    """`hybrid-tiny`'s stride-2/4/8 stages are yolox-tiny's own (same names and shapes, so the
+    COCO remap lands), and only they get the pretrained-backbone LR scale."""
+    from tailcyclenet.detector.yolox import YOLOXNano
+    from tailcyclenet.train_detector import _pretrained_params
+    hyb = YOLOXNano(version='hybrid-tiny', bottleneck_expansion=1.0, p2=True)
+    tiny = YOLOXNano(version='tiny', bottleneck_expansion=1.0, p2=True)
+    want = {k: v.shape for k, v in tiny.backbone.state_dict().items()
+            if k.split('.')[0] in ('stem', 'dark2', 'dark3')}
+    got = {k: v.shape for k, v in hyb.backbone.state_dict().items()
+           if k.split('.')[0] in ('stem', 'dark2', 'dark3')}
+    assert want == got and want
+    pre = {id(p) for p in _pretrained_params(hyb)}
+    names = [n for n, p in hyb.backbone.named_parameters() if id(p) in pre]
+    assert names and all(n.split('.')[0] in ('stem', 'dark2', 'dark3') for n in names)
+    assert len(_pretrained_params(tiny)) == len(list(tiny.backbone.parameters()))
+    obj, boxes, _ = hyb(torch.rand(1, 3, 64, 96))
+    assert obj.shape[1] == boxes.shape[1]
+
+
+def test_hybrid_tiny_accepts_coco_in_config(tmp_path):
+    p = tmp_path / 'c.toml'
+    p.write_text('[data]\npath = "/tmp/ds"\n[model]\nyolox = "hybrid-tiny"\npretrained = "coco"\n'
+                 'bottleneck_expansion = 1.0\n[training]\nout = "/tmp/run"\n')
+    assert load_detector_config(p)['model']['yolox'] == 'hybrid-tiny'

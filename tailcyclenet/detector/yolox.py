@@ -438,7 +438,8 @@ class YOLOXNano(nn.Module):
 
         `pretrained` selects which hub checkpoint loads: '' (default) trains from scratch; 'coco'
         loads Megvii's COCO backbone (canonical tiers only). `hybrid` builds a CNN stem
-        (strides 2/4/8) + transformer blocks (strides 16/32) from scratch at neck width 256.
+        (strides 2/4/8) + transformer blocks (strides 16/32) from scratch at neck width 256;
+        `hybrid-<tier>` (e.g. `hybrid-tiny`) takes that tier's COCO-loadable CSP stages instead.
         """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
@@ -456,6 +457,13 @@ class YOLOXNano(nn.Module):
                     "to fix). Use a canonical tier for a COCO-compatible backbone.")
             self.backbone = CSPDarknetNano(p2=self.p2, in_channels=self.in_channels)
             neck_out, depthwise = width, True
+        elif self.version.startswith('hybrid-'):
+            from .vit_backbone import HybridCSPBackbone
+            self.backbone = HybridCSPBackbone(tier=self.version.split('-', 1)[1], p2=self.p2,
+                                              in_channels=self.in_channels,
+                                              bottleneck_expansion=self.bottleneck_expansion)
+            neck_out = round8(256)
+            depthwise = False
         elif self.version == 'hybrid':
             from .vit_backbone import HybridBackbone
             self.backbone = HybridBackbone(p2=self.p2, in_channels=self.in_channels)

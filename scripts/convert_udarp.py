@@ -49,7 +49,11 @@ FLIP_PAIRS = [['rRP', 'lRP'], ['rFP', 'lFP']]
 
 
 def read_records(src: Path) -> list[dict]:
-    """Read all annotation CSV rows, validate their stills, and return a sorted image pool."""
+    """Read all annotation CSV rows, validate their stills, and return a sorted image pool.
+
+    A keypoint at exactly (0, 0) is the source's unlabelled-point sentinel (it lies outside the
+    BBox): it is excluded from the positioned points and named in the record's note.
+    """
     records = []
     for collection, spec in COLLECTIONS.items():
         csv_path = src / spec['directory'] / spec['csv']
@@ -85,7 +89,6 @@ def read_records(src: Path) -> list[dict]:
                         raise SystemExit(f'{csv_path}:{row_number}: non-finite coordinates '
                                          f'{name}={value!r}')
                     if x == 0 and y == 0:
-                        # The source's unlabelled-point sentinel; it lies outside the BBox.
                         zero_points.append(name)
                         continue
                     if not (0 <= x < width and 0 <= y < height):

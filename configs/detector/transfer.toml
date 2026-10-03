@@ -24,7 +24,7 @@ scale_range = [0.55, 1.4]
 # paste the view's animals onto own empty-arena estimates / generic pack / procedural canvases (0.4/0.3/0.3)
 background_prob = 0.25
 background_own = "~/.cache/tailcyclenet/backgrounds"
-background_generic = "~/.cache/tailcyclenet/generic_backgrounds_v1"
+background_generic = "~/.cache/tailcyclenet/generic_backgrounds_coco_v1"
 
 [model]
 # ImageNet ConvNeXt-T beat COCO tiny/m, DINOv2-S/B, hybrid-tiny and cspvit-m on both pairs.

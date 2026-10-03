@@ -1,7 +1,7 @@
-"""Build `generic_backgrounds_v1`: a small pack of animal-free images for detector background aug.
+"""Build `generic_backgrounds_coco_v1`: animal-free COCO images for detector background aug.
 
-One-shot. Reads full COCO val2017 + DTD downloads (`--src`) and writes a curated pack (`--out`,
-default $TAILCYCLENET_CACHE_DIR/generic_backgrounds_v1): `images/*.jpg` (max side 512, JPEG q85),
+One-shot. Reads the COCO val2017 download (`--src`) and writes a curated pack (`--out`, default
+$TAILCYCLENET_CACHE_DIR/generic_backgrounds_coco_v1): `images/*.jpg` (max side 512, JPEG q85),
 `manifest.json` (source, id, licence, attribution URL per image) and one `.tar` archive.
 
 Selection, deterministic:
@@ -9,8 +9,8 @@ Selection, deterministic:
   `teddy bear`, and only under licences that allow redistributing a resized copy: CC BY 2.0,
   CC BY-SA 2.0, "No known copyright restrictions" and US Government Work. NC and ND licences are
   dropped. Each kept image keeps its Flickr URL for attribution; BY-SA images stay BY-SA.
-- DTD r1.0.1: `--dtd-per-class` images from each texture class except `freckled` (faces) (DTD is research-use;
-  the manifest records it).
+No DTD (owner, 2026-10-03): its images are research-use only and cannot ship. Report 73's runs
+used the earlier `generic_backgrounds_v1` (this COCO set + 184 DTD textures).
 COCO annotations are incomplete, so an unannotated person or animal can still appear; the pack is
 for background/negative augmentation where a rare miss costs little.
 """
@@ -26,16 +26,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-VERSION = 'generic_backgrounds_v1'
+VERSION = 'generic_backgrounds_coco_v1'
 MAX_SIDE = 512
 QUALITY = 85
 # COCO licence ids (instances_val2017.json `licenses`): 4 BY, 5 BY-SA, 7 no known copyright, 8 US Gov.
 COCO_KEEP_LICENSES = {4, 5, 7, 8}
 COCO_DROP_SUPERCATEGORIES = {'animal', 'person'}
 COCO_DROP_NAMES = {'teddy bear'}
-# `freckled` is mostly close-up human faces.
-DTD_DROP_CLASSES = {'freckled'}
-DTD_LICENSE = 'DTD r1.0.1: research purposes only (https://www.robots.ox.ac.uk/~vgg/data/dtd/)'
 
 
 def _save(src: Path, dst: Path) -> tuple[int, int]:
@@ -67,18 +64,6 @@ def _coco(src: Path, n: int, rng: np.random.Generator):
                 'attribution_url': im.get('flickr_url') or im.get('coco_url')})
 
 
-def _dtd(src: Path, per_class: int, rng: np.random.Generator):
-    """`per_class` images from each DTD texture class."""
-    root = src / 'dtd' / 'images'
-    for cls in sorted(p.name for p in root.iterdir()
-                      if p.is_dir() and p.name not in DTD_DROP_CLASSES):
-        files = sorted((root / cls).glob('*.jpg'))
-        for i in sorted(rng.choice(len(files), min(per_class, len(files)), replace=False)):
-            yield (files[i], {'source': 'dtd', 'source_id': f'{cls}/{files[i].name}',
-                              'license': DTD_LICENSE, 'license_url': None,
-                              'attribution_url': None})
-
-
 def main():
     """Build the pack, its manifest and its archive."""
     cache = Path(os.environ.get('TAILCYCLENET_CACHE_DIR', Path.home() / '.cache' / 'tailcyclenet'))
@@ -86,14 +71,13 @@ def main():
     ap.add_argument('--src', type=Path, default=cache / 'images')
     ap.add_argument('--out', type=Path, default=cache / VERSION)
     ap.add_argument('--coco', type=int, default=0, help='COCO images to keep; 0 = every eligible')
-    ap.add_argument('--dtd-per-class', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
     img_dir = args.out / 'images'
     img_dir.mkdir(parents=True, exist_ok=True)
     rows = []
-    for path, meta in [*_coco(args.src, args.coco, rng), *_dtd(args.src, args.dtd_per_class, rng)]:
+    for path, meta in _coco(args.src, args.coco, rng):
         name = f'{len(rows):04d}_{meta["source"]}.jpg'
         w, h = _save(path, img_dir / name)
         meta.update(file=f'images/{name}', width=w, height=h,
@@ -101,7 +85,7 @@ def main():
         rows.append(meta)
     manifest = {'version': VERSION, 'max_side': MAX_SIDE, 'jpeg_quality': QUALITY,
                 'seed': args.seed, 'n_images': len(rows),
-                'counts': {s: sum(r['source'] == s for r in rows) for s in ('coco_val2017', 'dtd')},
+                'counts': {'coco_val2017': len(rows)},
                 'note': 'Training-only background/negative images. COCO filtered on its own '
                         '(incomplete) annotations: no animal, person or teddy bear; redistributable '
                         'licences only. Per-image licence and attribution below.',

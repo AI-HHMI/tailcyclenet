@@ -147,9 +147,13 @@ class BackgroundBank:
         each TRAINING root (never another). Unknown pixels are inpainted -- they are where the
         estimate could not be trusted, so they are not used as known background as-is.
     generic: a `generic_backgrounds_v1` folder (`manifest.json` + images/).
+    Both paths take `~` and `$VARS` (a config is shared between hosts whose `~` differ).
     """
 
     def __init__(self, roots, own_dir=None, generic_dir=None, weights=(0.4, 0.3, 0.3)):
+        import os
+        own_dir = os.path.expandvars(os.path.expanduser(own_dir)) if own_dir else None
+        generic_dir = os.path.expandvars(os.path.expanduser(generic_dir)) if generic_dir else None
         self.own = []
         if own_dir:
             for root in roots:

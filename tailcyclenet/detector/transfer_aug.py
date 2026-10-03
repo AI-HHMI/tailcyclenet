@@ -1,26 +1,22 @@
-"""Cross-rig detector levers: input normalisation, wide exposure, background compositing.
+"""Cross-rig detector levers (report 73): input normalisation, photometric negative, compositing.
 
-Every lever here is OFF unless its `[data]` key says otherwise, and off draws nothing, so an arm
-moves one key at a time (plan: `dev/plans/detector_transfer.md`, Wave 2).
+Each lever is a `[data]` key; at its off value it draws nothing.
 
 - `normalize_input` -- a DETERMINISTIC per-image map applied to the model INPUT (after the
   letterbox/warp) at training AND deployment (`detect_raw`), recorded in the checkpoint like
   `antialias`. `equalize` = histogram equalisation of luma; `percentile` = a 0.5/99.5 stretch.
   The grey letterbox/warp border (exactly 114,114,114) is excluded from the statistics and kept
   at 114, so padding means the same thing on every rig.
-- `exposure` -- a wide log-uniform gain and gamma, the augmentation control for normalisation.
-- `BackgroundBank` + `composite` -- copy-paste the item's own (already warped) animals onto a
-  canvas that is NOT their own frame: the SOURCE root's estimated empty-arena backgrounds
-  (`scripts/estimate_backgrounds.py`), a generic animal-free image pack
-  (`scripts/build_generic_backgrounds.py`), or a procedural canvas with animal-sized dark
-  distractors. Decoy patches cut from the same frame's animal-free area are pasted too, so a
-  pasted rectangle is not itself the cue. The bank only ever reads backgrounds of the roots the
-  detector trains on (transfer arms are source-only by owner rule).
+- `invert` -- a photometric negative (`invert_prob`).
+- `composite` -- copy-paste the item's own (already warped) animals onto a procedural
+  `synthetic_canvas` with animal-sized dark distractors (`background_prob`). Decoy patches cut
+  from the same frame's animal-free area are pasted too, so a pasted rectangle is not itself the
+  cue. Synthetic canvases only: report 73 §9 measured the root's own estimated empty-arena
+  backgrounds and a generic COCO image pack and neither beat synthetic, so both were deleted
+  (with `scripts/estimate_backgrounds.py` / `build_generic_backgrounds.py`). `exposure` (a wide
+  gain/gamma augmentation) was deleted too -- null on both transfer pairs (report 73 §5).
 """
 from __future__ import annotations
-
-import json
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -62,17 +58,6 @@ def normalize_input(img, mode):
     return out
 
 
-def exposure(img, rng, gain=(0.1, 4.0), gamma=(0.4, 2.5)):
-    """Log-uniform gain and gamma -- spans the ~10x mean-intensity gap between rigs."""
-    g = float(np.exp(rng.uniform(np.log(gain[0]), np.log(gain[1]))))
-    ga = float(np.exp(rng.uniform(np.log(gamma[0]), np.log(gamma[1]))))
-    lut = np.clip(255.0 * (np.arange(256) / 255.0) ** ga * g, 0, 255).astype(np.uint8)
-    keep = _content_mask(img)
-    out = lut[img]
-    out[~keep] = PAD
-    return out
-
-
 def invert(img):
     """Photometric negative of the content, letterbox grey kept at 114.
 
@@ -84,25 +69,6 @@ def invert(img):
     out = 255 - img
     out[~keep] = PAD
     return out
-
-
-def _fit(img, wh, rng, crop=True):
-    """Resize a canvas source to `wh`: random aspect-matched crop (generic) or letterbox (own)."""
-    import cv2
-    W, H = int(wh[0]), int(wh[1])
-    h, w = img.shape[:2]
-    if crop:
-        s = rng.uniform(0.5, 1.0)
-        a = W / H
-        cw = min(w, int(round(np.sqrt(s * w * h * a))))
-        ch = min(h, max(1, int(round(cw / a))))
-        cw = min(w, max(1, int(round(ch * a))))
-        x0 = int(rng.integers(0, w - cw + 1))
-        y0 = int(rng.integers(0, h - ch + 1))
-        img = img[y0:y0 + ch, x0:x0 + cw]
-        return cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA if cw > W else cv2.INTER_LINEAR)
-    from .data import letterbox
-    return letterbox(img, (W, H), antialias=True)[0]
 
 
 def synthetic_canvas(wh, rng, blob_side=40.0):
@@ -140,81 +106,6 @@ def synthetic_canvas(wh, rng, blob_side=40.0):
     return img
 
 
-class BackgroundBank:
-    """Canvases for `composite`, loaded lazily in each loader worker (paths pickle, pixels don't).
-
-    own: `{dir}/{root}/index.json` from `scripts/estimate_backgrounds.py`, usable views only, for
-        each TRAINING root (never another). Unknown pixels are inpainted -- they are where the
-        estimate could not be trusted, so they are not used as known background as-is.
-    generic: a `generic_backgrounds_v1` folder (`manifest.json` + images/).
-    Both paths take `~` and `$VARS` (a config is shared between hosts whose `~` differ).
-    """
-
-    def __init__(self, roots, own_dir=None, generic_dir=None, weights=(0.4, 0.3, 0.3)):
-        """Index the usable own-background views and generic images; renormalise `weights`."""
-        import os
-        own_dir = os.path.expandvars(os.path.expanduser(own_dir)) if own_dir else None
-        generic_dir = os.path.expandvars(os.path.expanduser(generic_dir)) if generic_dir else None
-        self.own = []
-        if own_dir:
-            for root in roots:
-                index = Path(own_dir) / root / 'index.json'
-                if not index.exists():
-                    raise FileNotFoundError(f'{index}: no estimated backgrounds for training '
-                                            f'root {root!r} (scripts/estimate_backgrounds.py)')
-                views = json.loads(index.read_text())['views']
-                for key, info in sorted(views.items()):
-                    if info.get('usable'):
-                        sess, cam = key.rsplit('/', 1)
-                        self.own.append((str(index.parent / sess / f'{cam}.png'),
-                                         str(index.parent / sess / f'{cam}_valid.png'), sess, cam))
-        self.generic = []
-        if generic_dir:
-            m = json.loads((Path(generic_dir) / 'manifest.json').read_text())
-            self.generic = [str(Path(generic_dir) / r['file']) for r in m['images']]
-        w = np.asarray(weights, np.float64) * np.array([bool(self.own), bool(self.generic), 1.0])
-        if w.sum() <= 0:
-            raise ValueError('background bank has no source with nonzero weight')
-        self.weights = w / w.sum()
-        self._cache = {}
-
-    def __len__(self):
-        """Number of real-image canvases (own + generic)."""
-        return len(self.own) + len(self.generic)
-
-    def _own(self, j):
-        """Own background `j` with its unknown pixels inpainted, cached per worker."""
-        if j not in self._cache:
-            import cv2
-            png, valid, _, _ = self.own[j]
-            img = cv2.cvtColor(cv2.imread(png, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-            ok = cv2.imread(valid, cv2.IMREAD_GRAYSCALE)
-            ok = cv2.resize(ok, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
-            if (ok == 0).any():
-                img = cv2.inpaint(img, (ok == 0).astype(np.uint8), 5, cv2.INPAINT_TELEA)
-            self._cache[j] = img
-        return self._cache[j]
-
-    def _generic(self, j):
-        """Generic image `j`, RGB."""
-        import cv2
-        return cv2.cvtColor(cv2.imread(self.generic[j], cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
-
-    def canvas(self, wh, rng, avoid=None, blob_side=40.0):
-        """One canvas at `wh`, plus the source it came from ('own'|'generic'|'synthetic')."""
-        kind = ('own', 'generic', 'synthetic')[int(rng.choice(3, p=self.weights))]
-        if kind == 'own':
-            pool = [j for j, (_, _, s, c) in enumerate(self.own) if (s, c) != avoid] or \
-                list(range(len(self.own)))
-            img = _fit(self._own(int(rng.choice(pool))), wh, rng, crop=False)
-            if rng.random() < 0.5:
-                img = img[:, ::-1].copy()
-            return img, kind
-        if kind == 'generic':
-            return _fit(self._generic(int(rng.integers(len(self.generic)))), wh, rng), kind
-        return synthetic_canvas(wh, rng, blob_side), kind
-
-
 def _feather(h, w, frac=0.15):
     """(h, w, 1) alpha: 1 inside, a smooth ramp over `frac` of each side at the border."""
     ry = np.minimum(np.arange(h), np.arange(h)[::-1]) / max(1.0, frac * h)
@@ -250,9 +141,8 @@ def _place(canvas, patch, alpha, rng, taken, match_prob=0.7):
     return None
 
 
-def composite(img, boxes, bank, rng, wh, avoid=None, empty_prob=0.25, decoys=(0, 2),
-              decoys_ok=True):
-    """Paste `img`'s animals (and decoy patches) onto a bank canvas. Returns (img, boxes).
+def composite(img, boxes, rng, wh, empty_prob=0.25, decoys=(0, 2), decoys_ok=True):
+    """Paste `img`'s animals (and decoy patches) onto a synthetic canvas. Returns (img, boxes).
 
     `boxes` (N,4) in input px, NaN rows = no box. Each animal is cut with a quarter-side margin
     and feathered; its box is translated with it. With `empty_prob` no animal is pasted (a pure
@@ -262,8 +152,7 @@ def composite(img, boxes, bank, rng, wh, avoid=None, empty_prob=0.25, decoys=(0,
     """
     fin = torch.isfinite(boxes).all(-1)
     sides = (boxes[fin, 2:] - boxes[fin, :2]).max(-1).values if fin.any() else torch.tensor([40.])
-    canvas, _ = bank.canvas(wh, rng, avoid=avoid, blob_side=float(sides.median()))
-    canvas = canvas.copy()
+    canvas = synthetic_canvas(wh, rng, blob_side=float(sides.median()))
     H, W = canvas.shape[:2]
     taken, out = [], []
     if fin.any() and rng.random() >= empty_prob:

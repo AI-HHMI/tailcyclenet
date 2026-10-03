@@ -40,6 +40,7 @@ val_frames_per_group = 4
 augment = false
 augment_strong = false
 keypoints = {str(keypoints).lower()}
+background_prob = 0.0
 [model]
 yolox = "trimmed"
 pretrained = ""

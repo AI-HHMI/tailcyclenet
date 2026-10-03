@@ -1,5 +1,5 @@
 # The detector training config (`scripts/train_detector.py --config configs/detector.toml`).
-# One shipped recommended recipe. Per-root differences are key overrides in YOUR config, not a
+# One shipped recommended recipe (since 2026-10-03 the cross-rig recipe of dev/reports/73_detector_transfer.md). Per-root differences are key overrides in YOUR config, not a
 # second shipped file -- every config layers over this file automatically (`extends` is deleted).
 # The recall-v2 assignment/loss defaults
 # below are the selected rat-city training recommendation; set assignment="center" and
@@ -74,6 +74,18 @@ vflip = true
 # probability a train view is converted to grayscale (IR / monochrome rigs); 0 is off, byte-identical. Matches the pose loader's grayscale_prob. Not measured.
 grayscale_prob = 0.2
 
+# per-image luma histogram equalisation of the model input, train AND deployment (stored in the checkpoint); "none" | "equalize" | "percentile". OWNER DEFAULT 2026-10-03 (report 73): the qdmouse->allen transfer lever; measured in-domain on allen only.
+input_norm = "equalize"
+
+# probability of a photometric negative on a train view (coat/lighting contrast polarity flips across rigs); 0 is off. OWNER DEFAULT 2026-10-03 (report 73), measured on two transfer pairs + allen.
+invert_prob = 0.15
+
+# [lo, hi] zoom range of the train similarity (animal size differs ~2x across rigs); the pre-report-73 range was [0.8, 1.25]. OWNER DEFAULT 2026-10-03.
+scale_range = [0.55, 1.4]
+
+# probability a train view's animals (+ decoy patches) are pasted onto a procedural synthetic canvas; 0 is off. Synthetic-only by measurement (report 73 §9: own estimated / generic COCO backgrounds never beat it).
+background_prob = 0.25
+
 # train on TILES of this size in INPUT pixels (SOURCE extent = tile_wh / tile_scale); empty = whole frames, byte-identical.
 tile_wh = []
 
@@ -84,8 +96,8 @@ tile_scale = 1.0
 tile_bg_per_frame = 1
 
 [model]
-# the ARCHITECTURE, recorded in the checkpoint (absent means `trimmed`, byte-identical to every recorded detector). DEFAULTS TO `hybrid` (CNN backbone + a from-scratch ViT stage + Simple Feature Pyramid) -- confirmed the detector-architecture-sweep winner (report 47): large wins on rat-city-combined and allen-mouse-combined, ties elsewhere, no significant loss on any of the 6 training roots. `tiny` (COCO-pretrained) is the prior default, still available by name.
-yolox = "hybrid"
+# the ARCHITECTURE, recorded in the checkpoint (absent = `trimmed`). OWNER DEFAULT 2026-10-03: `convnext-t`, ImageNet ConvNeXt-T (report 73 §8: best on both transfer pairs, no in-domain cost on allen; NOT measured in-domain on the other roots, where `hybrid` won report 47 -- still available by name, and every pre-2026-10-03 checkpoint is one). `[model].pretrained` absent = the architecture's own source (imagenet here; '' = scratch).
+yolox = "convnext-t"
 
 # stride-4 (P2) FPN level on top of either tier; DEFAULTS TO true (confirmed on 3dpop at both seeds); false restores the 3-level FPN, byte-identical to every checkpoint on record.
 p2 = true
@@ -94,8 +106,8 @@ p2 = true
 # run folder: checkpoints, metrics.json, effective config.toml + provenance.toml; overridden by `--out` on the command line.
 out = ""
 
-# total iterations; prefer the FINAL checkpoint for arm-vs-arm (best-on-val iteration varies widely across identical recipes).
-iters = 20000
+# total iterations; prefer the FINAL checkpoint for arm-vs-arm. OWNER DEFAULT 2026-10-03: 8000 (was 20000) -- longer training made cross-rig transfer WORSE (report 73 §6); not an in-domain schedule study.
+iters = 8000
 
 # DEFAULTS TO 8 PER USER INSTRUCTION, NOT A MEASURED VALUE -- lower memory headroom for smaller GPUs (16 GB class): the hybrid recipe's worst-case root (3dpop, the largest resolved input of the six at 736x448) measured ~21.1 GB at batch_size=16 on an L4's 23 GB, an ESTIMATE (not measured) that batch_size=8 would land around 10-12 GB. Was 16.
 batch_size = 8

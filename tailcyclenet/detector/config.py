@@ -45,9 +45,28 @@ DATA_KEYS = frozenset({
     'reduce', 'keypoints', 'hflip', 'tile_wh', 'tile_scale', 'tile_bg_per_frame',
     'alpha', 'balance_datasets', 'boxes_by_dataset',
     'box_target', 'antialias', 'grayscale_prob', 'vflip',
-    'input_norm', 'exposure_prob', 'scale_range', 'background_prob', 'background_own',
-    'background_generic', 'background_weights', 'invert_prob',
+    'input_norm', 'scale_range', 'background_prob', 'invert_prob',
 })
+# Measured and deleted (report 73). Named here so an old config fails with the reason, not as a
+# generic unknown key -- and never trains silently without the lever it asked for.
+DELETED_DATA_KEYS = {
+    'exposure_prob': 'null on both transfer pairs (report 73 §5)',
+    'background_own': "the root's own estimated backgrounds never beat synthetic canvases "
+                      '(report 73 §9); compositing is synthetic-only, `background_prob` alone',
+    'background_generic': 'the generic COCO image pack never beat synthetic canvases (report 73 '
+                          '§9); compositing is synthetic-only, `background_prob` alone',
+    'background_weights': 'compositing is synthetic-only (report 73 §9); `background_prob` alone',
+}
+DELETED_YOLOX = {
+    'dinov2-': 'worse than convnext-t on both transfer pairs and in-domain (report 73 §8)',
+    'hybrid-': 'worse than convnext-t on both transfer pairs (report 73 §8)',
+    'cspvit-': 'worse than convnext-t on both transfer pairs (report 73 §8)',
+}
+
+
+def deleted_yolox_reason(version: str):
+    """Why a deleted `[model].yolox` value was removed, or None for a live one."""
+    return next((why for pre, why in DELETED_YOLOX.items() if str(version).startswith(pre)), None)
 MODEL_KEYS = frozenset({'yolox', 'bottleneck_expansion', 'pretrained', 'p2'})
 TRAINING_KEYS = frozenset({
     'out', 'iters', 'batch_size', 'lr', 'num_workers', 'seed', 'device', 'eval_every',
@@ -59,9 +78,7 @@ TRAINING_KEYS = frozenset({
     'shared_head', 'fpn_upsample', 'save_every',
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
-YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid',
-                 *(f'hybrid-{t}' for t in sorted(YOLOX_TIERS)),
-                 *(f'cspvit-{t}' for t in sorted(YOLOX_TIERS)), *PRETRAINED_TRUNKS)
+YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid', *PRETRAINED_TRUNKS)
 
 
 def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
@@ -112,7 +129,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         moves one key at a time; the code-level fallbacks only apply to keys the shipped file
         does not state. Shorthand references `dev/plans/detector_v2.md`.
         `nms_center_dist_thresh` defaults ON (A5, '' restores the old off); `pretrained`
-        accepts 'coco' (required to exist NOW); the recommended shipped recipe is TAL + CIoU.
+        accepts 'coco' (required to exist NOW) or 'imagenet' (convnext-t); ABSENT means the
+        architecture's own source (convnext-t -> 'imagenet', every other -> scratch), so an
+        overlay that changes `yolox` never inherits a source that cannot load into it, and an
+        explicit '' trains from scratch. Deleted keys / `yolox` values (report 73) raise with
+        their reason. The recommended shipped recipe is TAL + CIoU.
         The remaining keys (iou_aware_obj, box_weight, weight_decay, annot_frac, alpha,
         bottleneck_expansion, p2, optimizer, shared_head, fpn_upsample) each only matter
         once a config states something else. The implicit base is `checkpoints._DETECTOR_CONFIG`
@@ -127,6 +148,14 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     if missing:
         raise SystemExit(f'{path}: missing block(s) {missing}. A detector config needs '
                          f'[data], [model] and [training].')
+    gone = sorted(set(cfg['data']) & set(DELETED_DATA_KEYS))
+    if gone:
+        raise SystemExit('[data]: deleted key(s) ' + '; '.join(
+            f'{k!r}: {DELETED_DATA_KEYS[k]}' for k in gone) + '. Remove them.')
+    why = deleted_yolox_reason(cfg['model'].get('yolox', ''))
+    if why:
+        raise SystemExit(f"[model].yolox={cfg['model']['yolox']!r} is deleted: {why}. "
+                         "Use 'convnext-t' (the default) or 'hybrid'.")
     for block, known in BLOCKS:
         _raise_unknown(block, cfg[block], known)
     data, model, train = cfg['data'], cfg['model'], cfg['training']
@@ -214,10 +243,9 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     if data['input_norm'] not in ('none', 'equalize', 'percentile'):
         raise SystemExit(f"[data].input_norm must be 'none', 'equalize' or 'percentile', got "
                          f"{data['input_norm']!r}.")
-    data['exposure_prob'] = float(data.get('exposure_prob', 0.0))
     data['background_prob'] = float(data.get('background_prob', 0.0))
     data['invert_prob'] = float(data.get('invert_prob', 0.0))
-    for k in ('exposure_prob', 'background_prob', 'invert_prob'):
+    for k in ('background_prob', 'invert_prob'):
         if not 0.0 <= data[k] <= 1.0:
             raise SystemExit(f'[data].{k} must be in [0, 1], got {data[k]}.')
     sr = data.get('scale_range', [0.8, 1.25])
@@ -225,15 +253,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
             or not 0 < float(sr[0]) <= float(sr[1])):
         raise SystemExit(f'[data].scale_range must be [lo, hi] with 0 < lo <= hi, got {sr!r}.')
     data['scale_range'] = [float(sr[0]), float(sr[1])]
-    data['background_own'] = str(data.get('background_own', ''))
-    data['background_generic'] = str(data.get('background_generic', ''))
-    bw = data.get('background_weights', [0.4, 0.3, 0.3])
-    if not isinstance(bw, (list, tuple)) or len(bw) != 3 or min(float(v) for v in bw) < 0:
-        raise SystemExit(f'[data].background_weights must be [own, generic, synthetic] >= 0, '
-                         f'got {bw!r}.')
-    data['background_weights'] = [float(v) for v in bw]
     if data['background_prob'] and data['keypoints']:
-        raise SystemExit('[data].background_prob is box-only; it cannot combine with keypoints.')
+        raise SystemExit(f"[data].background_prob={data['background_prob']:g} (the shipped default "
+                         'is 0.25) is box-only -- compositing drops keypoint targets. Set '
+                         '[data].background_prob = 0 alongside keypoints = true.')
     af = data.get('annot_frac', None)
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:
@@ -259,7 +282,12 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     model['yolox'] = str(model.get('yolox', 'tiny'))
 
     model['bottleneck_expansion'] = float(model.get('bottleneck_expansion', 0.5))
-    model['pretrained'] = str(model.get('pretrained', ''))
+    pre = model.get('pretrained')
+    model['pretrained'] = PRETRAINED_TRUNKS.get(model['yolox'], '') if pre is None else str(pre)
+    if model['pretrained'] not in ('', 'coco', 'imagenet'):
+        raise SystemExit(
+            f"[model].pretrained={model['pretrained']!r}: expected '' (from scratch), 'coco' (a "
+            "canonical yolox tier) or 'imagenet' (convnext-t).")
     if model['yolox'] == 'trimmed' and model['bottleneck_expansion'] != 0.5:
         raise SystemExit(
             f"[model].bottleneck_expansion={model['bottleneck_expansion']} was set alongside "
@@ -278,14 +306,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                 "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
                 "every bottleneck conv is half Megvii's width and the load would silently take "
                 "only 19 of 35 backbone tensors.")
-    elif model['yolox'] in PRETRAINED_TRUNKS or model['pretrained'] in ('imagenet', 'dinov2'):
+    elif model['yolox'] in PRETRAINED_TRUNKS or model['pretrained'] == 'imagenet':
         want = PRETRAINED_TRUNKS.get(model['yolox'])
         if model['pretrained'] not in ('', want):
             raise SystemExit(f"[model].yolox={model['yolox']!r} loads {want!r} weights; "
                              f"pretrained={model['pretrained']!r} does not match it.")
-    elif model['pretrained'] != '':
-        raise SystemExit(
-            f"[model].pretrained={model['pretrained']!r}: expected '' (from scratch) or 'coco'.")
 
     model['p2'] = bool(model.get('p2', False))
 

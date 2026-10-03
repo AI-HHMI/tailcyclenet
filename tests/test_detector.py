@@ -3408,7 +3408,7 @@ out = "/tmp/run-det"
     assert 'use_regions' not in d          # DELETED with regions.pq
     assert d['input_wh'] is None and d['tile_wh'] is None       # absent pair -> None
     assert d['tile_scale'] == 1.0 and d['tile_bg_per_frame'] == 1
-    assert m['yolox'] == 'hybrid'
+    assert m['yolox'] == 'convnext-t' and m['pretrained'] == 'imagenet'
     assert t['out'] == '/tmp/run-det'
     assert t['iters'] == 7
     assert t['batch_size'] == 8 and t['lr'] == 1e-3

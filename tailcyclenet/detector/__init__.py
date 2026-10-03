@@ -109,6 +109,11 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
                          'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
                          'branson-fly 416 416).')
+    from .config import deleted_yolox_reason
+    why = deleted_yolox_reason(ckpt.get('yolox_version', ''))
+    if why:
+        raise ValueError(f"{p}: yolox={ckpt.get('yolox_version')!r} is a deleted architecture "
+                         f'({why}); retrain this detector on the default (convnext-t).')
     norm = str(ckpt.get('norm', 'bn'))
     if norm != 'gn':
         raise ValueError(

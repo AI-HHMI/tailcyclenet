@@ -3,8 +3,9 @@
 Each test pins one claim:
 - `normalize_input` is deterministic, keeps the letterbox grey, and removes a global gain;
 - the training item and the deployment input see the SAME normalisation (train == deploy);
-- `composite` moves a box with its animal's pixels;
-- the new config keys default off and refuse nonsense.
+- `composite` (synthetic canvases only) moves a box with its animal's pixels;
+- the shipped defaults are the report-73 recipe, nonsense values and DELETED keys / `yolox` values
+  raise by name, and an absent `pretrained` follows the architecture.
 """
 from __future__ import annotations
 
@@ -65,18 +66,20 @@ def test_dataset_item_matches_deployment_normalisation(tiny_root):
     torch.testing.assert_close(got, want, atol=1e-3, rtol=0)
 
 
-class _FlatBank:
-    """A bank returning a flat grey canvas."""
-    def canvas(self, wh, rng, avoid=None, blob_side=40.0):
-        return np.full((wh[1], wh[0], 3), 90, np.uint8), 'synthetic'
+@pytest.fixture
+def flat_canvas(monkeypatch):
+    """Make `composite`'s synthetic canvas a flat grey, so pasted pixels are checkable."""
+    from tailcyclenet.detector import transfer_aug
+    monkeypatch.setattr(transfer_aug, 'synthetic_canvas',
+                        lambda wh, rng, blob_side=40.0: np.full((wh[1], wh[0], 3), 90, np.uint8))
 
 
-def test_composite_moves_the_box_with_the_animal():
+def test_composite_moves_the_box_with_the_animal(flat_canvas):
     img = np.zeros((96, 128, 3), np.uint8)
     img[40:56, 60:84] = 255                              # the 'animal'
     boxes = torch.tensor([[60.0, 40.0, 84.0, 56.0], [float('nan')] * 4])
     for seed in range(10):
-        out, new = composite(img, boxes, _FlatBank(), np.random.default_rng(seed), (128, 96),
+        out, new = composite(img, boxes, np.random.default_rng(seed), (128, 96),
                              empty_prob=0.0, decoys_ok=False)
         assert new.shape == (1, 4)
         x0, y0, x1, y1 = new[0].round().int().tolist()
@@ -84,34 +87,66 @@ def test_composite_moves_the_box_with_the_animal():
         assert (x1 - x0, y1 - y0) == (24, 16)
 
 
-def test_composite_empty_canvas_has_no_boxes():
+def test_composite_empty_canvas_has_no_boxes(flat_canvas):
     img = np.zeros((96, 128, 3), np.uint8)
     boxes = torch.tensor([[60.0, 40.0, 84.0, 56.0]])
-    out, new = composite(img, boxes, _FlatBank(), np.random.default_rng(0), (128, 96),
+    out, new = composite(img, boxes, np.random.default_rng(0), (128, 96),
                          empty_prob=1.0, decoys_ok=False)
     assert new.shape == (0, 4) and (out == 90).all()
 
 
-def _cfg(tmp_path, extra=''):
+def _cfg(tmp_path, extra='', model='yolox = "tiny"'):
     p = tmp_path / 'c.toml'
-    p.write_text(f'[data]\npath = "/tmp/ds"\n{extra}\n[model]\nyolox = "tiny"\n'
+    p.write_text(f'[data]\npath = "/tmp/ds"\n{extra}\n[model]\n{model}\n'
                  '[training]\nout = "/tmp/run"\n')
     return p
 
 
-def test_transfer_keys_default_off(tmp_path):
-    d = load_detector_config(_cfg(tmp_path))['data']
-    assert d['input_norm'] == 'none' and d['exposure_prob'] == 0.0
-    assert d['background_prob'] == 0.0 and d['scale_range'] == [0.8, 1.25]
-    assert d['invert_prob'] == 0.0
+def test_shipped_defaults_are_the_report_73_recipe(tmp_path):
+    cfg = load_detector_config(_cfg(tmp_path, '', model=''))
+    d, m = cfg['data'], cfg['model']
+    assert (m['yolox'], m['pretrained']) == ('convnext-t', 'imagenet')
+    assert d['input_norm'] == 'equalize' and d['invert_prob'] == 0.15
+    assert d['scale_range'] == [0.55, 1.4] and d['background_prob'] == 0.25
+    assert cfg['training']['iters'] == 8000 and d['boxes'] == 'instances'
+
+
+@pytest.mark.parametrize('model, want', [
+    ('yolox = "convnext-t"', 'imagenet'), ('yolox = "convnext-t"\npretrained = ""', ''),
+    ('yolox = "tiny"', ''), ('yolox = "hybrid"', ''),
+    ('yolox = "tiny"\npretrained = "coco"\nbottleneck_expansion = 1.0', 'coco')])
+def test_absent_pretrained_follows_the_architecture(tmp_path, model, want):
+    """An overlay that changes `yolox` never inherits a source that cannot load into it."""
+    assert load_detector_config(_cfg(tmp_path, '', model=model))['model']['pretrained'] == want
+
+
+@pytest.mark.parametrize('extra, model, match', [
+    ('exposure_prob = 0.5', '', 'exposure_prob'),
+    ('background_own = "x"', '', 'background_own'),
+    ('background_generic = "x"', '', 'background_generic'),
+    ('background_weights = [0, 0, 1]', '', 'background_weights'),
+    ('', 'yolox = "dinov2-s"', 'deleted'), ('', 'yolox = "hybrid-tiny"', 'deleted'),
+    ('', 'yolox = "cspvit-m"', 'deleted'), ('', 'yolox = "tiny"\npretrained = "imagenet"', 'imagenet')])
+def test_deleted_and_mismatched_keys_raise_by_name(tmp_path, extra, model, match):
+    with pytest.raises(SystemExit, match=match):
+        load_detector_config(_cfg(tmp_path, extra, model=model))
+
+
+def test_load_detector_refuses_a_deleted_architecture(tmp_path):
+    from tailcyclenet.detector import load_detector
+    p = tmp_path / 'detector_it000010.pth'
+    torch.save({'yolox_version': 'hybrid-tiny', 'input_wh': [64, 64], 'norm': 'gn',
+                'model_state': {}}, p)
+    with pytest.raises(ValueError, match='deleted architecture'):
+        load_detector(p)
 
 
 @pytest.mark.parametrize('extra, match', [
     ('input_norm = "clahe"', 'input_norm'),
-    ('exposure_prob = 1.5', 'exposure_prob'),
+    ('invert_prob = 1.5', 'invert_prob'),
     ('scale_range = [1.2, 0.5]', 'scale_range'),
-    ('background_weights = [1, 1]', 'background_weights'),
     ('background_prob = 0.5\nkeypoints = true', 'box-only'),
+    ('keypoints = true', 'background_prob = 0 alongside keypoints'),
 ])
 def test_transfer_keys_refuse_nonsense(tmp_path, extra, match):
     with pytest.raises(SystemExit, match=match):
@@ -126,80 +161,21 @@ def test_invert_flips_content_and_keeps_padding():
     assert np.array_equal(out[content], 255 - img[content])
 
 
-def test_hybrid_tiny_cnn_half_is_coco_shaped_and_only_it_is_pretrained():
-    """`hybrid-tiny`'s stride-2/4/8 stages are yolox-tiny's own (same names and shapes, so the
-    COCO remap lands), and only they get the pretrained-backbone LR scale."""
+def test_convnext_meets_the_backbone_contract():
+    """Strides 4/8/16/32 at exactly H//s x W//s; the ImageNet trunk is what gets the backbone LR
+    scale. Architecture only -- no weight download in CI."""
     from tailcyclenet.detector.yolox import YOLOXNano
     from tailcyclenet.train_detector import _pretrained_params
-    hyb = YOLOXNano(version='hybrid-tiny', bottleneck_expansion=1.0, p2=True)
-    tiny = YOLOXNano(version='tiny', bottleneck_expansion=1.0, p2=True)
-    want = {k: v.shape for k, v in tiny.backbone.state_dict().items()
-            if k.split('.')[0] in ('stem', 'dark2', 'dark3')}
-    got = {k: v.shape for k, v in hyb.backbone.state_dict().items()
-           if k.split('.')[0] in ('stem', 'dark2', 'dark3')}
-    assert want == got and want
-    pre = {id(p) for p in _pretrained_params(hyb)}
-    names = [n for n, p in hyb.backbone.named_parameters() if id(p) in pre]
-    assert names and all(n.split('.')[0] in ('stem', 'dark2', 'dark3') for n in names)
-    assert len(_pretrained_params(tiny)) == len(list(tiny.backbone.parameters()))
-    obj, boxes, _ = hyb(torch.rand(1, 3, 64, 96))
-    assert obj.shape[1] == boxes.shape[1]
-
-
-def test_hybrid_tiny_accepts_coco_in_config(tmp_path):
-    p = tmp_path / 'c.toml'
-    p.write_text('[data]\npath = "/tmp/ds"\n[model]\nyolox = "hybrid-tiny"\npretrained = "coco"\n'
-                 'bottleneck_expansion = 1.0\n[training]\nout = "/tmp/run"\n')
-    assert load_detector_config(p)['model']['yolox'] == 'hybrid-tiny'
-
-
-@pytest.mark.parametrize('version', ['convnext-t', 'dinov2-s'])
-def test_pretrained_trunks_meet_the_backbone_contract(version):
-    """Strides 4/8/16/32 at exactly H//s x W//s (dinov2 pads to a multiple of 14 inside), and
-    only the pretrained trunk gets the backbone LR scale."""
-    from tailcyclenet.detector.pretrained_backbones import hub_dir
-    from tailcyclenet.detector.yolox import YOLOXNano
-    from tailcyclenet.train_detector import _pretrained_params
-    if version.startswith('dinov2') and not (hub_dir() / 'facebookresearch_dinov2_main').exists():
-        pytest.skip('DINOv2 hub repo not cached')
-    m = YOLOXNano(version=version, p2=True)
+    m = YOLOXNano(version='convnext-t', p2=True)
     feats = m.backbone(torch.rand(1, 3, 96, 160))
     assert [tuple(f.shape[2:]) for f in feats] == [(96 // s, 160 // s) for s in (4, 8, 16, 32)]
     assert [f.shape[1] for f in feats] == list(m.backbone.out_channels)
     trunk = {id(p) for p in _pretrained_params(m)}
-    assert trunk and trunk <= {id(p) for p in m.backbone.parameters()}
+    assert trunk == {id(p) for p in m.backbone.features.parameters()}
 
 
-@pytest.mark.parametrize('version, pretrained, ok', [
-    ('convnext-t', 'imagenet', True), ('dinov2-s', 'dinov2', True), ('dinov2-b', '', True),
-    ('convnext-t', 'dinov2', False), ('tiny', 'imagenet', False)])
-def test_pretrained_trunk_config_pairs(tmp_path, version, pretrained, ok):
-    p = tmp_path / 'c.toml'
-    p.write_text(f'[data]\npath = "/tmp/ds"\n[model]\nyolox = "{version}"\n'
-                 f'pretrained = "{pretrained}"\n[training]\nout = "/tmp/run"\n')
-    if ok:
-        assert load_detector_config(p)['model']['yolox'] == version
-    else:
-        with pytest.raises(SystemExit):
-            load_detector_config(p)
-
-
-def test_cspvit_starts_as_its_cnn_and_only_the_cnn_is_pretrained():
-    """`cspvit-<tier>`'s transformer blocks are zero-initialised residuals: at step 0 the backbone
-    is exactly its CSPDarknet, so a COCO load starts from the COCO network unchanged."""
-    from tailcyclenet.detector.yolox import YOLOXNano
-    from tailcyclenet.train_detector import _pretrained_params
-    m = YOLOXNano(version='cspvit-s', bottleneck_expansion=1.0, p2=True)
-    b = m.backbone
-    x = torch.rand(1, 3, 96, 160)
-    with torch.no_grad():
-        s2 = b.dark2(b.stem(x))
-        s3 = b.dark3(s2)
-        s4 = b.dark4(s3)
-        want = (s2, s3, s4, b.dark5(s4))
-        got = b(x)
-    assert all(torch.equal(u, v) for u, v in zip(got, want))
-    pre = {id(p) for p in _pretrained_params(m)}
-    assert not pre & {id(p) for p in b.blocks4.parameters()}
-    assert pre == {id(p) for k in ('stem', 'dark2', 'dark3', 'dark4', 'dark5')
-                   for p in getattr(b, k).parameters()}
+def test_synthetic_canvas_is_deterministic_given_the_rng():
+    from tailcyclenet.detector.transfer_aug import synthetic_canvas
+    a = synthetic_canvas((96, 64), np.random.default_rng(3))
+    b = synthetic_canvas((96, 64), np.random.default_rng(3))
+    assert a.shape == (64, 96, 3) and a.dtype == np.uint8 and np.array_equal(a, b)

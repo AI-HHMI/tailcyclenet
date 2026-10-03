@@ -126,8 +126,8 @@ BACKBONE_LR_SCALE = 0.1
 
 
 def _pretrained_params(model):
-    """The COCO-initialised parameters: the whole backbone, or only a `hybrid-<tier>`'s CNN half
-    (its transformer stages are fresh and train at the full LR)."""
+    """The pretrained parameters that get BACKBONE_LR_SCALE: a backbone's own
+    `pretrained_parameters()` (ConvNeXt-T: its ImageNet trunk), else the whole backbone (COCO)."""
     pick = getattr(model.backbone, 'pretrained_parameters', None)
     return pick() if pick is not None else list(model.backbone.parameters())
 
@@ -252,25 +252,6 @@ def _wandb_eval_metrics(scores, obj_q):
     return metrics
 
 
-def _background_bank(data_cfg, all_roots, root_names):
-    """The compositing canvas bank for `[data].background_prob`, or None when it is off.
-
-    Only the TRAINING roots' own estimated backgrounds are read (`background_own/<root>/`); a
-    transfer arm never sees another root's pixels. `background_own` / `background_generic` may be
-    empty, in which case that source's weight is dropped and the rest renormalised.
-    """
-    if not data_cfg['background_prob']:
-        return None
-    from .detector.transfer_aug import BackgroundBank
-    bank = BackgroundBank(root_names, own_dir=data_cfg['background_own'] or None,
-                          generic_dir=data_cfg['background_generic'] or None,
-                          weights=data_cfg['background_weights'])
-    print(f"backgrounds: p={data_cfg['background_prob']:g}  own {len(bank.own)} views  "
-          f"generic {len(bank.generic)} images  weights own/generic/synthetic "
-          + '/'.join(f'{w:.2f}' for w in bank.weights))
-    return bank
-
-
 def _record_run(run: Path, config: dict) -> None:
     """Write the run folder's reproducibility record: the effective config + provenance.
 
@@ -386,10 +367,8 @@ def main(argv: list[str] | None = None):
                        grayscale_prob=data_cfg['grayscale_prob'],
                        vflip=0.5 if data_cfg['vflip'] else 0.0,
                        input_norm=data_cfg['input_norm'],
-                       exposure_prob=data_cfg['exposure_prob'],
                        invert_prob=data_cfg['invert_prob'],
                        scale_range=tuple(data_cfg['scale_range']),
-                       background_bank=_background_bank(data_cfg, all_roots, root_names),
                        background_prob=data_cfg['background_prob'],
                        **tiling)
     wh = train.input_wh
@@ -479,12 +458,11 @@ def main(argv: list[str] | None = None):
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
-    if model_cfg['pretrained'] in ('imagenet', 'dinov2'):
+    if model_cfg['pretrained'] == 'imagenet':
         n_loaded, n_total = model.backbone.load_weights()
         print(f'  loaded {model_cfg["pretrained"]} trunk: {n_loaded}/{n_total} tensors', flush=True)
     if model_cfg['pretrained'] == 'coco':
-        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'].split('-')[-1],
-                                               weights_dir=args.weights_dir)
+        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'], weights_dir=args.weights_dir)
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors', flush=True)
 
     opt, sched = build_detector_optimizer(model, train_cfg, model_cfg)

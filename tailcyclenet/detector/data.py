@@ -378,8 +378,8 @@ class BoxDataset(Dataset):
                  tile_wh=None, tile_scale=1.0, tile_bg_per_frame=1, strong=False,
                  boxes_by_dataset=None, include_roots=None, datasets=None,
                  box_target='crop', antialias=False, grayscale_prob=0.0, vflip=0.0, tt_transform=None,
-                 input_norm='none', exposure_prob=0.0, scale_range=(0.8, 1.25),
-                 background_bank=None, background_prob=0.0, invert_prob=0.0):
+                 input_norm='none', scale_range=(0.8, 1.25), background_prob=0.0,
+                 invert_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
         Every opt-in lever defaults to OFF, so an arm moves one key at a time. Absent-only frames
@@ -401,7 +401,7 @@ class BoxDataset(Dataset):
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
             antialias / grayscale_prob / vflip -- area-filtered shrinking and the
                 train-augmentation probabilities; `vflip` is 0 under `keypoints`.
-            input_norm / exposure_prob / invert_prob / scale_range / background_* -- `transfer_aug`.
+            input_norm / invert_prob / scale_range / background_prob -- `transfer_aug` (report 73).
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
                 draw instead; the parameter survives to carry `val_frames_per_group`.
@@ -437,11 +437,9 @@ class BoxDataset(Dataset):
         if input_norm not in INPUT_NORMS:
             raise ValueError(f'input_norm must be one of {INPUT_NORMS}, got {input_norm!r}')
         self.input_norm = input_norm
-        self.exposure_prob = float(exposure_prob)
         self.invert_prob = float(invert_prob)
         self.scale_range = tuple(float(v) for v in scale_range)
-        self.background_bank = background_bank
-        self.background_prob = float(background_prob) if background_bank is not None else 0.0
+        self.background_prob = float(background_prob)
         if self.background_prob and keypoints:
             raise ValueError('background compositing is box-only; it drops keypoint targets')
         self.grayscale_prob = float(grayscale_prob)
@@ -1140,16 +1138,12 @@ class BoxDataset(Dataset):
                     kpts[..., 2] = torch.where(mask, torch.zeros_like(kpts[..., 2]), kpts[..., 2])
             if rng.random() < 0.2:
                 boxes, kpts, img = self._mosaic_paste(i, boxes, kpts, img, rng)
-        if rng is not None and self.exposure_prob and rng.random() < self.exposure_prob:
-            from .transfer_aug import exposure
-            img = exposure(img, rng)
         if rng is not None and self.invert_prob and rng.random() < self.invert_prob:
             from .transfer_aug import invert
             img = invert(img)
         if rng is not None and self.background_prob and rng.random() < self.background_prob:
             from .transfer_aug import composite
-            img, boxes = composite(img, boxes, self.background_bank, rng, self.input_wh,
-                                   avoid=(sess.session_id, sess.cam_names[ci]),
+            img, boxes = composite(img, boxes, rng, self.input_wh,
                                    decoys_ok=bool(negative_supervision))
             negative_supervision = True
         if rng is not None and self.grayscale_prob and rng.random() < self.grayscale_prob:

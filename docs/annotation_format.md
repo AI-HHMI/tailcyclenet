@@ -198,13 +198,42 @@ lets the same session also be read as 3D single-view.
 | `n_frames` | int32 ≥ 1 | ✓ | images (or video frames) per camera |
 | `fps` | float32 | | fps of the source recording — **the only place fps is declared** |
 | `source_video` | str | | provenance: which recording this came from |
-| `source_frame_start` | int32 | | absolute source index of group frame `0` |
-| `source_frame_step` | int32 | | default `1` |
+| `source_frame_start` | int32 | | provenance only: original source index of group frame `0`; default `0` |
+| `source_frame_step` | int32 | | provenance only: source sampling step; default `1` |
 | `notes` | str | | free text |
 
 No `split` (§2.1), no `include` (delete or rename the group folder, or filter consumer-side on
 `group_id` / `notes`), and **no `label_frames`** — which frames carry labels is a fact about the
 label tables, and a consumer must scan them to build a validity mask anyway.
+
+### Group-local indexing and source provenance
+
+**Every parquet `frame` is a zero-based index into the group's stored pixels**, in
+`[0, n_frames)`. This applies to `keypoints.pq`, `points3d.pq`, `points2d.pq`,
+`instances.pq`, and `extrinsics.pq`. At group frame `i`, a reader uses image
+`groups/<group_id>/<cam>/<i:06d>.jpg` (or `.png`), or the **i-th decoded frame** of
+`groups/<group_id>/<cam>.mp4`. The same rule holds for symlinked pixels.
+
+**`source_video`, `source_frame_start`, and `source_frame_step` describe provenance, not
+pixel addressing.** Readers must not add the start, multiply by the step, or seek into an
+original recording using these fields. They do not define a virtual slice of a longer video.
+For regularly sampled source frames, `source_frame_start + i * source_frame_step` describes
+where group frame `i` originated; it is not the index to decode from the group's container.
+There is no `source_frame_end` field. For regular sampling the last original source index is
+`source_frame_start + (n_frames - 1) * source_frame_step`. These two fields cannot encode an
+irregular source-frame sequence; they must not be used to reconstruct one.
+
+For example, a group extracted from original frames `100, 102, 104` has `n_frames = 3`,
+`source_frame_start = 100`, and `source_frame_step = 2`. Its images are named
+`000000.jpg`, `000001.jpg`, `000002.jpg` (or its video contains those three frames in that
+order). A label for original frame `102` must have parquet `frame = 1`, **not `102`**.
+
+Converters must reindex labels and prepare the corresponding group-local pixels together.
+Subtracting a source offset from labels while linking an untrimmed recording does not work:
+the reader would decode the wrong images. Alternatively, make the full recording the group,
+set `n_frames` to its frame count, and keep labels indexed directly into that recording
+(with start `0` and step `1` when no source trimming or subsampling occurred). A sparse
+label table does not shorten the group: `n_frames` describes pixels, not the labelled span.
 
 ## 7. `keypoints.pq` — per-camera 2D and per-camera visibility
 
@@ -253,7 +282,7 @@ a per-camera observation.
 | column | type | req | meaning |
 |---|---|---|---|
 | `group_id`, `animal_id`, `bodypart` | dictionary\<int32,str\> | ✓ | the key |
-| `frame` | int32 | ✓ | |
+| `frame` | int32 | ✓ | 0-based index into the group's stored pixels (§6) |
 | `status` | dictionary\<int8,str\> | ✓ | `visible` \| `missing` \| `unlabeled` |
 | `x`, `y`, `z` | float32 | ✓ iff `visible` | in `session.toml` `units` |
 | `score` | float32 | | |
@@ -281,7 +310,7 @@ annotation `status` column.
 | column | type | req | meaning |
 |---|---|---|---|
 | `group_id`, `animal_id`, `camera`, `bodypart` | dictionary\<int32,str\> | ✓ | prediction key |
-| `frame` | int32 | ✓ | source frame index within the group |
+| `frame` | int32 | ✓ | 0-based index into the input group's stored pixels (§6); not an original-recording index from provenance |
 | `x`, `y` | float32 | ✓ | predicted stored-image px |
 | `visibility_logit` | float32 | | per-camera visibility-head logit |
 | `visibility_probability` | float32 | | sigmoid of `visibility_logit` |
@@ -426,7 +455,8 @@ Checkable rules, so a validator can be written without re-deriving them.
 5. `mode = "3d"` ⇒ ≥ 2 cameras, each with `matrix`, `rotation`, `translation`.
    `mode = "2d"` ⇒ exactly 1 camera.
 6. Every `bodypart` ∈ `names`; every `camera` ∈ `calibration.toml`; every `group_id` ∈
-   `groups.pq`; every `frame` ∈ `[0, n_frames)`. No label table is required (§3).
+   `groups.pq`; every `frame` ∈ `[0, n_frames)` indexes the group's stored images/video directly
+   (§6), without applying `source_frame_start` or `source_frame_step`. No label table is required (§3).
    `prediction_session = true` may carry `points2d.pq` and is not eligible as training annotation
    input.
 7. Each group folder has exactly one `<cam>/` dir **or** one `<cam>.mp4` per declared camera —

@@ -33,7 +33,8 @@ QUALITY = 85
 COCO_KEEP_LICENSES = {4, 5, 7, 8}
 COCO_DROP_SUPERCATEGORIES = {'animal', 'person'}
 COCO_DROP_NAMES = {'teddy bear'}
-DTD_DROP_CLASSES = {'freckled'}  # mostly close-up human faces
+# `freckled` is mostly close-up human faces.
+DTD_DROP_CLASSES = {'freckled'}
 DTD_LICENSE = 'DTD r1.0.1: research purposes only (https://www.robots.ox.ac.uk/~vgg/data/dtd/)'
 
 

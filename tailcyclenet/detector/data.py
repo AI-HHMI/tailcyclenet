@@ -382,9 +382,8 @@ class BoxDataset(Dataset):
                  background_bank=None, background_prob=0.0, invert_prob=0.0):
         """Build the per-view/per-frame index of labelled items for one or more dataset roots.
 
-        Every opt-in lever defaults to OFF, so an arm moves one key at a time. Explicit
-        absent-only frames can supply all-negative examples; present-only frames require a
-        positive target, while pose-assessed frames with no box are omitted.
+        Every opt-in lever defaults to OFF, so an arm moves one key at a time. Absent-only frames
+        give all-negative examples; present-only frames need a positive; no-box frames are omitted.
 
         Inputs:
             path, split -- dataset root and split directory.
@@ -402,12 +401,7 @@ class BoxDataset(Dataset):
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
             antialias / grayscale_prob / vflip -- area-filtered shrinking and the
                 train-augmentation probabilities; `vflip` is 0 under `keypoints`.
-            input_norm -- deterministic per-image normalisation of the model input
-                (`transfer_aug.normalize_input`), applied on every split AND at deployment.
-            exposure_prob / invert_prob / scale_range / background_bank, background_prob -- train-only
-                cross-rig augmentation (`transfer_aug`): wide gain+gamma, the similarity's
-                scale range, and compositing the view's animals onto a bank canvas. Off = no
-                draw at all. Compositing is box-only (refused with `keypoints`).
+            input_norm / exposure_prob / invert_prob / scale_range / background_* -- `transfer_aug`.
             max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
                 `[data].frames_per_group` is deleted and `default_train_weights` weights the
                 draw instead; the parameter survives to carry `val_frames_per_group`.

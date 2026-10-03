@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import time
 from pathlib import Path
 
@@ -180,15 +181,17 @@ def _robust_background(frames, label_masks):
 
 
 def _session_job(task):
-    """Estimate all camera backgrounds for one static training session."""
+    """Estimate all camera backgrounds for one static training session.
+
+    A session cut as short clips from one long recording (rat-city-annotated: every clip can fall
+    in the first 30 s of a 30 min video) would give a median of near-identical frames, so an
+    animal that sits still for the span survives. Such a session samples its whole source
+    recording instead and keeps its labelled frames for the ghost check only.
+    """
     session_path, out_root = task
     sess = Session.load(Path(session_path))
     if any(sess.rig.moving.values()):
         return {'session': sess.session_id, 'skipped': 'moving rig', 'views': {}}
-    # A session cut as short clips from one long recording (rat-city-annotated: every clip can
-    # fall in the first 30 s of a 30 min video) would give a median of near-identical frames, so
-    # an animal that sits still for the span survives. Sample the whole recording instead and
-    # keep the session's labelled frames for the ghost check only.
     source = _source_video(sess)
     by_camera = {cam: [] for cam in sess.cam_names}
     checks = {cam: [] for cam in sess.cam_names}
@@ -293,7 +296,8 @@ def main():
     """Run background estimation for each supplied dataset root."""
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', nargs='+', required=True)
-    parser.add_argument('--out', default='scratch/detector_transfer/backgrounds')
+    parser.add_argument('--out', default=str(Path(os.environ.get(
+        'TAILCYCLENET_CACHE_DIR', Path.home() / '.cache' / 'tailcyclenet')) / 'backgrounds'))
     parser.add_argument('--workers', type=int, default=16)
     args = parser.parse_args()
     started = time.monotonic()

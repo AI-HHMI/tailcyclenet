@@ -117,7 +117,10 @@ def main():
 
     A temporal-input checkpoint's BoxDataset must supply the same stacked-frame shape it was
     trained on; `model.in_channels` (part of the weights) is the source of truth, not a CLI
-    flag. `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED,
+    flag. A fixed `--evalset` is scored IN-PROCESS throughout (`num_workers` forced to 0):
+    `score_fixed_views` decodes in the parent, and a later forked loader worker would inherit a
+    decoder mid-state and deadlock on a video root (gotcha 10; qdmouse hung for hours at 0% CPU).
+    `fp` is `greedy_match`'s count at `top_k = max_animals or GT count` -- BUDGET-CAPPED,
     and on a single-view root it is close to `1 - r@.5` restated, not an independent quantity;
     `fp_dup`/`fp_none` come from `box_mota`'s own uncapped pass. Two runs at different
     `input_wh` are pairable: a letterbox is a uniform scale plus a translation applied to the
@@ -242,10 +245,6 @@ def main():
                     fixed.add(i)
         if not fixed:
             raise SystemExit(f'{args.evalset}: no matching views in {args.data}/{args.split}')
-    # A fixed eval set is scored in the PARENT by `score_fixed_views` (num_workers=0); a later
-    # forked loader worker then inherits a decoder mid-state and deadlocks on video roots
-    # (CLAUDE.md gotcha 10 -- qdmouse's mp4 guard hung for hours at 0% CPU). The set is at most a
-    # few hundred views, so load it in-process throughout.
     workers = 0 if fixed is not None else args.num_workers
     result_blocks = []
     for gain in args.tt_gain:

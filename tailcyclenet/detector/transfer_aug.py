@@ -151,6 +151,7 @@ class BackgroundBank:
     """
 
     def __init__(self, roots, own_dir=None, generic_dir=None, weights=(0.4, 0.3, 0.3)):
+        """Index the usable own-background views and generic images; renormalise `weights`."""
         import os
         own_dir = os.path.expandvars(os.path.expanduser(own_dir)) if own_dir else None
         generic_dir = os.path.expandvars(os.path.expanduser(generic_dir)) if generic_dir else None
@@ -178,9 +179,11 @@ class BackgroundBank:
         self._cache = {}
 
     def __len__(self):
+        """Number of real-image canvases (own + generic)."""
         return len(self.own) + len(self.generic)
 
     def _own(self, j):
+        """Own background `j` with its unknown pixels inpainted, cached per worker."""
         if j not in self._cache:
             import cv2
             png, valid, _, _ = self.own[j]
@@ -193,6 +196,7 @@ class BackgroundBank:
         return self._cache[j]
 
     def _generic(self, j):
+        """Generic image `j`, RGB."""
         import cv2
         return cv2.cvtColor(cv2.imread(self.generic[j], cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 

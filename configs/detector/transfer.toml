@@ -1,11 +1,11 @@
 # Cross-rig detector recipe: a detector meant to find the animal on a rig it was never trained on.
 # Measured in dev/reports/73_detector_transfer_wave1.md (plan dev/plans/detector_transfer.md) on two
 # source-only transfer pairs, each at two seeds, 8k iterations: qdmouse -> allen cost (miss +
-# fp/view) 1.81/1.50 -> 0.96/0.85, allen -> johnson 1.84/1.89 -> 0.91/1.14. The price is in-domain:
-# allen's own val miss 0.012/0.036 -> 0.071/0.071 (6 of 84 views); qdmouse's own val stays 0.
+# fp/view) 1.81/1.50 -> 0.44/0.42, allen -> johnson 1.84/1.89 -> 0.87/0.80, with NO in-domain cost
+# (allen's own val miss 0.012/0.024 vs 0.012/0.036; qdmouse's own val 0).
 #
-# Not the shipped default (configs/detector.toml): that would move every detector from the hybrid
-# (report 47's in-domain winner) to COCO yolox-m on the evidence of three mouse roots.
+# Not the shipped default (configs/detector.toml): the hybrid is report 47's in-domain winner on six
+# roots, and this trunk is measured on three mouse roots only.
 #
 # Use: copy this file, set [data].path. The training roots need estimated backgrounds first
 # (`scripts/estimate_backgrounds.py --data <root>`, writes ~/.cache/tailcyclenet/backgrounds/<root>/;
@@ -27,10 +27,9 @@ background_own = "~/.cache/tailcyclenet/backgrounds"
 background_generic = "~/.cache/tailcyclenet/generic_backgrounds_v1"
 
 [model]
-# COCO pretraining alone moved qdmouse->allen; m beat tiny and s under the same augmentation.
-yolox = "m"
-pretrained = "coco"
-bottleneck_expansion = 1.0
+# ImageNet ConvNeXt-T beat COCO tiny/m, DINOv2-S/B, hybrid-tiny and cspvit-m on both pairs.
+yolox = "convnext-t"
+pretrained = "imagenet"
 
 [training]
 # LONGER IS WORSE FOR TRANSFER: the tiny compound at 16k lost 0.17 on both pairs vs 8k.

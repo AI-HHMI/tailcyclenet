@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt
 from tailcyclenet.dataset import read_frames
+from tailcyclenet.video import H264Writer
 
 # BGR (cv2's order). Instance-status colours, fixed per-keypoint palette.
 INST_COLOR = {fmt.INST_LABELED: (80, 220, 80), fmt.INST_PRESENT: (60, 200, 255),
@@ -143,8 +144,7 @@ def render_group(sess: fmt.Session, gid: str, out: Path, stem: str, args) -> dic
                 print(f'  [warn] {stem}/{cam}: unreadable frames, no video')
                 continue
             first = fit(draw(ims[0], lab, 0, ci, sess.names, sess.skeleton), args.width)
-            vw = cv2.VideoWriter(str(out / f'{tag}.mp4'), cv2.VideoWriter_fourcc(*'mp4v'),
-                                 args.fps, (first.shape[1], first.shape[0]))
+            vw = H264Writer(out / f'{tag}.mp4', args.fps, (first.shape[1], first.shape[0]))
             for i, raw in enumerate(ims):
                 fr = fit(draw(raw, lab, i, ci, sess.names, sess.skeleton), args.width)
                 mark = '  <-- LABELLED' if i in frames else ''

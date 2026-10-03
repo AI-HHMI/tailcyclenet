@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from .dataset import read_frames
+from .video import H264Writer
 
 # BGR. Twelve, which is exactly rat-city's rat count -- no two animals share a colour there.
 PALETTE = [(60, 60, 255), (60, 220, 60), (255, 140, 40), (40, 220, 220), (230, 80, 230),
@@ -121,7 +122,7 @@ def follow(pred, zoom, W, H, smooth=15):
 
 def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoom=0,
                  boxes=None, frames=None, overlay=None):
-    """Predicted tracks over one group's frames -> an mp4 at `out_path`.
+    """Predicted tracks over one group's frames -> an H.264/yuv420p mp4 at `out_path`.
 
     `pred` is `run_group`'s own output (or a prediction session's `pred`/`pred2d`): `(S,T,K,2)`
     in SOURCE pixels for a 2D session, or `(S,T,K,3)` world points for a 3D one, projected into
@@ -164,9 +165,7 @@ def render_group(session, gid, pred, out_path, cam=0, max_side=1600, fps=15, zoo
     skel_ix = [(ix[a], ix[b]) for a, b in session.skeleton if a in ix and b in ix]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
-    if not writer.isOpened():
-        raise RuntimeError(f'cv2 could not open {out_path} for writing')
+    writer = H264Writer(out_path, fps, size)
     try:
         for lo in range(0, T, CHUNK):
             cols = np.arange(lo, min(lo + CHUNK, T))

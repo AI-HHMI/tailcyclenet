@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 import cv2
@@ -485,3 +486,23 @@ def test_render_skeleton_override_replaces_resolved_session(monkeypatch, tmp_pat
 
     render.main(['--pred', str(pred), '--out', str(tmp_path / 'out'), '--skeleton', str(skeleton)])
     assert seen['skeleton'] == [['a', 'b']]
+
+
+def test_render_writes_h264_yuv420p(tmp_path):
+    """Rendered clips are H.264/yuv420p (web-playable), and an odd size is padded, not refused."""
+    import av
+
+    from tailcyclenet.video import H264Writer
+
+    path = tmp_path / 'clip.mp4'
+    rng = np.random.default_rng(0)
+    with H264Writer(path, 12.5, (33, 21)) as w:
+        for _ in range(5):
+            w.write(rng.integers(0, 255, (21, 33, 3), dtype=np.uint8))
+    with av.open(str(path)) as c:
+        st = c.streams.video[0]
+        assert st.codec_context.name == 'h264'
+        assert st.codec_context.pix_fmt == 'yuv420p'
+        assert (st.codec_context.width, st.codec_context.height) == (34, 22)
+        assert st.average_rate == Fraction(25, 2)
+        assert sum(1 for _ in c.decode(st)) == 5

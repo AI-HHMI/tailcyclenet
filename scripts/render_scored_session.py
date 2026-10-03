@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt
 from tailcyclenet.dataset import read_frames
+from tailcyclenet.video import H264Writer
 
 
 def window_length(scores: Path, override: int | None) -> int:
@@ -284,11 +285,8 @@ def main() -> int:
                 h = int(round(out_im.shape[0] * args.width / out_im.shape[1]))
                 out_im = cv2.resize(out_im, (args.width, h), interpolation=cv2.INTER_AREA)
                 if writer is None:
-                    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'),
-                                             float(group.fps) / args.stride,
-                                             (out_im.shape[1], out_im.shape[0]))
-                    if not writer.isOpened():
-                        raise SystemExit(f'could not open {path}')
+                    writer = H264Writer(path, float(group.fps) / args.stride,
+                                        (out_im.shape[1], out_im.shape[0]))
                 writer.write(out_im)
         if writer is not None:
             writer.release()

@@ -34,7 +34,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..crop import BOX_SOURCES
-from .yolox import YOLOX_TIERS
+from .yolox import PRETRAINED_TRUNKS, YOLOX_TIERS
 
 # THE ALLOWED KEYS, PER BLOCK. Anything else raises -- see module docstring. These are the
 # one-to-one names of the argparse flags `scripts/train_detector.py` used to take (minus
@@ -60,7 +60,8 @@ TRAINING_KEYS = frozenset({
 })
 BLOCKS = (('data', DATA_KEYS), ('model', MODEL_KEYS), ('training', TRAINING_KEYS))
 YOLOX_CHOICES = ('trimmed', *sorted(YOLOX_TIERS), 'hybrid',
-                 *(f'hybrid-{t}' for t in sorted(YOLOX_TIERS)))
+                 *(f'hybrid-{t}' for t in sorted(YOLOX_TIERS)),
+                 *(f'cspvit-{t}' for t in sorted(YOLOX_TIERS)), *PRETRAINED_TRUNKS)
 
 
 def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
@@ -277,6 +278,11 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                 "[model].pretrained='coco' requires [model].bottleneck_expansion=1.0 -- at 0.5 "
                 "every bottleneck conv is half Megvii's width and the load would silently take "
                 "only 19 of 35 backbone tensors.")
+    elif model['yolox'] in PRETRAINED_TRUNKS or model['pretrained'] in ('imagenet', 'dinov2'):
+        want = PRETRAINED_TRUNKS.get(model['yolox'])
+        if model['pretrained'] not in ('', want):
+            raise SystemExit(f"[model].yolox={model['yolox']!r} loads {want!r} weights; "
+                             f"pretrained={model['pretrained']!r} does not match it.")
     elif model['pretrained'] != '':
         raise SystemExit(
             f"[model].pretrained={model['pretrained']!r}: expected '' (from scratch) or 'coco'.")

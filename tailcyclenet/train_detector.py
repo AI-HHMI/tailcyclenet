@@ -479,8 +479,11 @@ def main(argv: list[str] | None = None):
     n = sum(p.numel() for p in model.parameters())
     print(f'YOLOX [{model_cfg["yolox"]}]: {n / 1e6:.2f}M params'
           f'  (bottleneck_expansion={model_cfg["bottleneck_expansion"]:g})')
+    if model_cfg['pretrained'] in ('imagenet', 'dinov2'):
+        n_loaded, n_total = model.backbone.load_weights()
+        print(f'  loaded {model_cfg["pretrained"]} trunk: {n_loaded}/{n_total} tensors', flush=True)
     if model_cfg['pretrained'] == 'coco':
-        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'].removeprefix('hybrid-'),
+        n_loaded, n_total = load_coco_backbone(model, model_cfg['yolox'].split('-')[-1],
                                                weights_dir=args.weights_dir)
         print(f'  loaded COCO backbone: {n_loaded}/{n_total} conv tensors', flush=True)
 

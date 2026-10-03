@@ -16,8 +16,9 @@ class TransformerBlock(nn.Module):
     `nn.MultiheadAttention` (batch_first=True) -- trained from scratch, no pretrained weights.
     """
 
-    def __init__(self, dim, n_heads, mlp_ratio=4.0):
-        """Build the pre-norm block: layernorm, attention, MLP."""
+    def __init__(self, dim, n_heads, mlp_ratio=4.0, zero_init=False):
+        """Build the pre-norm block: layernorm, attention, MLP. `zero_init` zeroes both residual
+        branches' output projections, so the block starts as the identity."""
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, n_heads, batch_first=True)
@@ -25,6 +26,10 @@ class TransformerBlock(nn.Module):
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden), nn.SiLU(inplace=True), nn.Linear(hidden, dim))
+        if zero_init:
+            for lin in (self.attn.out_proj, self.mlp[2]):
+                nn.init.zeros_(lin.weight)
+                nn.init.zeros_(lin.bias)
 
     def forward(self, x):
         """Tokenised attention path with residual connections."""
@@ -135,4 +140,46 @@ class HybridCSPBackbone(HybridBackbone):
         s3 = self.dark3(s2)
         s4 = self.stage4_blocks(self.stage4_down(s3))
         s5 = self.stage5_blocks(self.stage5_down(s4))
+        return (s2, s3, s4, s5) if self.p2 else (s3, s4, s5)
+
+
+class CSPTransformerBackbone(nn.Module):
+    """A canonical YOLOX tier's WHOLE CSPDarknet (COCO-loadable, stem..dark5 incl. SPP) with the
+    hybrid's transformer blocks inserted after dark4 (stride 16) and dark5 (stride 32).
+
+    The blocks are ZERO-INITIALISED residuals, so at step 0 the backbone computes exactly the
+    COCO network; attention is learned as a correction on top. Module names `stem`/`dark2..5` are
+    `CSPDarknet`'s, so `load_coco_backbone` loads every conv (the blocks have no 4-D tensors).
+    """
+
+    def __init__(self, tier='m', n_transformer_blocks=(4, 2), n_heads=8, mlp_ratio=4.0,
+                 p2=True, in_channels=3, bottleneck_expansion=1.0):
+        """Build the tier's CSPDarknet and the two identity-initialised transformer stacks."""
+        super().__init__()
+        from .yolox import YOLOX_TIERS, CSPDarknet
+        depth_mul, width_mul, depthwise = YOLOX_TIERS[tier]
+        cnn = CSPDarknet(width_mul, depth_mul, depthwise=depthwise,
+                         bottleneck_expansion=bottleneck_expansion, p2=True,
+                         in_channels=in_channels)
+        self.stem, self.dark2, self.dark3 = cnn.stem, cnn.dark2, cnn.dark3
+        self.dark4, self.dark5 = cnn.dark4, cnn.dark5
+        c2, c3, c4, c5 = cnn.out_channels
+        self.blocks4 = nn.Sequential(*[TransformerBlock(c4, n_heads, mlp_ratio, zero_init=True)
+                                       for _ in range(n_transformer_blocks[0])])
+        self.blocks5 = nn.Sequential(*[TransformerBlock(c5, n_heads, mlp_ratio, zero_init=True)
+                                       for _ in range(n_transformer_blocks[1])])
+        self.p2 = bool(p2)
+        self.out_channels = (c2, c3, c4, c5) if self.p2 else (c3, c4, c5)
+
+    def pretrained_parameters(self):
+        """The COCO CSPDarknet's parameters (not the transformer blocks)."""
+        return [p for m in (self.stem, self.dark2, self.dark3, self.dark4, self.dark5)
+                for p in m.parameters()]
+
+    def forward(self, x):
+        """CSPDarknet with attention after dark4 and dark5."""
+        s2 = self.dark2(self.stem(x))
+        s3 = self.dark3(s2)
+        s4 = self.blocks4(self.dark4(s3))
+        s5 = self.blocks5(self.dark5(s4))
         return (s2, s3, s4, s5) if self.p2 else (s3, s4, s5)

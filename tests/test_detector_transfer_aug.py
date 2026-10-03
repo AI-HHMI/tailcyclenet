@@ -151,3 +151,55 @@ def test_hybrid_tiny_accepts_coco_in_config(tmp_path):
     p.write_text('[data]\npath = "/tmp/ds"\n[model]\nyolox = "hybrid-tiny"\npretrained = "coco"\n'
                  'bottleneck_expansion = 1.0\n[training]\nout = "/tmp/run"\n')
     assert load_detector_config(p)['model']['yolox'] == 'hybrid-tiny'
+
+
+@pytest.mark.parametrize('version', ['convnext-t', 'dinov2-s'])
+def test_pretrained_trunks_meet_the_backbone_contract(version):
+    """Strides 4/8/16/32 at exactly H//s x W//s (dinov2 pads to a multiple of 14 inside), and
+    only the pretrained trunk gets the backbone LR scale."""
+    from tailcyclenet.detector.pretrained_backbones import hub_dir
+    from tailcyclenet.detector.yolox import YOLOXNano
+    from tailcyclenet.train_detector import _pretrained_params
+    if version.startswith('dinov2') and not (hub_dir() / 'facebookresearch_dinov2_main').exists():
+        pytest.skip('DINOv2 hub repo not cached')
+    m = YOLOXNano(version=version, p2=True)
+    feats = m.backbone(torch.rand(1, 3, 96, 160))
+    assert [tuple(f.shape[2:]) for f in feats] == [(96 // s, 160 // s) for s in (4, 8, 16, 32)]
+    assert [f.shape[1] for f in feats] == list(m.backbone.out_channels)
+    trunk = {id(p) for p in _pretrained_params(m)}
+    assert trunk and trunk <= {id(p) for p in m.backbone.parameters()}
+
+
+@pytest.mark.parametrize('version, pretrained, ok', [
+    ('convnext-t', 'imagenet', True), ('dinov2-s', 'dinov2', True), ('dinov2-b', '', True),
+    ('convnext-t', 'dinov2', False), ('tiny', 'imagenet', False)])
+def test_pretrained_trunk_config_pairs(tmp_path, version, pretrained, ok):
+    p = tmp_path / 'c.toml'
+    p.write_text(f'[data]\npath = "/tmp/ds"\n[model]\nyolox = "{version}"\n'
+                 f'pretrained = "{pretrained}"\n[training]\nout = "/tmp/run"\n')
+    if ok:
+        assert load_detector_config(p)['model']['yolox'] == version
+    else:
+        with pytest.raises(SystemExit):
+            load_detector_config(p)
+
+
+def test_cspvit_starts_as_its_cnn_and_only_the_cnn_is_pretrained():
+    """`cspvit-<tier>`'s transformer blocks are zero-initialised residuals: at step 0 the backbone
+    is exactly its CSPDarknet, so a COCO load starts from the COCO network unchanged."""
+    from tailcyclenet.detector.yolox import YOLOXNano
+    from tailcyclenet.train_detector import _pretrained_params
+    m = YOLOXNano(version='cspvit-s', bottleneck_expansion=1.0, p2=True)
+    b = m.backbone
+    x = torch.rand(1, 3, 96, 160)
+    with torch.no_grad():
+        s2 = b.dark2(b.stem(x))
+        s3 = b.dark3(s2)
+        s4 = b.dark4(s3)
+        want = (s2, s3, s4, b.dark5(s4))
+        got = b(x)
+    assert all(torch.equal(u, v) for u, v in zip(got, want))
+    pre = {id(p) for p in _pretrained_params(m)}
+    assert not pre & {id(p) for p in b.blocks4.parameters()}
+    assert pre == {id(p) for k in ('stem', 'dark2', 'dark3', 'dark4', 'dark5')
+                   for p in getattr(b, k).parameters()}

@@ -35,6 +35,9 @@ CH_PER_GROUP = 8
 # (depth_mul, width_mul, depthwise), Megvii's own values. Only `nano` is depthwise-separable --
 # tiny/s/m/l/x are full-convolution. `base_channels = round8(64 * width_mul)` and
 # `base_depth = max(1, round(3 * depth_mul))` are applied in `CSPDarknet` below.
+# version -> the pretrained source its trunk loads (`pretrained_backbones.py`).
+PRETRAINED_TRUNKS = {'convnext-t': 'imagenet', 'dinov2-s': 'dinov2', 'dinov2-b': 'dinov2'}
+
 YOLOX_TIERS = {
     'nano': (0.33, 0.25, True),
     'tiny': (0.33, 0.375, False),
@@ -440,6 +443,9 @@ class YOLOXNano(nn.Module):
         loads Megvii's COCO backbone (canonical tiers only). `hybrid` builds a CNN stem
         (strides 2/4/8) + transformer blocks (strides 16/32) from scratch at neck width 256;
         `hybrid-<tier>` (e.g. `hybrid-tiny`) takes that tier's COCO-loadable CSP stages instead.
+        `cspvit-<tier>` is the whole COCO CSPDarknet + identity-initialised transformer blocks.
+        `convnext-t` / `dinov2-s` / `dinov2-b` are ImageNet / DINOv2 trunks
+        (`pretrained_backbones.py`); weights load in training, not here.
         """
         super().__init__()
         self.n_keypoints = int(n_keypoints)
@@ -457,6 +463,22 @@ class YOLOXNano(nn.Module):
                     "to fix). Use a canonical tier for a COCO-compatible backbone.")
             self.backbone = CSPDarknetNano(p2=self.p2, in_channels=self.in_channels)
             neck_out, depthwise = width, True
+        elif self.version in PRETRAINED_TRUNKS:
+            from .pretrained_backbones import ConvNeXtBackbone, DinoV2Backbone
+            if self.version == 'convnext-t':
+                self.backbone = ConvNeXtBackbone(p2=self.p2, in_channels=self.in_channels)
+            else:
+                self.backbone = DinoV2Backbone(size=self.version[-1], p2=self.p2,
+                                               in_channels=self.in_channels)
+            neck_out = round8(256)
+            depthwise = False
+        elif self.version.startswith('cspvit-'):
+            from .vit_backbone import CSPTransformerBackbone
+            depth_mul, width_mul, depthwise = YOLOX_TIERS[self.version.split('-', 1)[1]]
+            self.backbone = CSPTransformerBackbone(tier=self.version.split('-', 1)[1], p2=self.p2,
+                                                   in_channels=self.in_channels,
+                                                   bottleneck_expansion=self.bottleneck_expansion)
+            neck_out = round8(256 * width_mul)
         elif self.version.startswith('hybrid-'):
             from .vit_backbone import HybridCSPBackbone
             self.backbone = HybridCSPBackbone(tier=self.version.split('-', 1)[1], p2=self.p2,

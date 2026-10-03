@@ -23,12 +23,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('arms', type=Path, help='JSON list of {arm, config, evalspec, seed}')
     ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--cap', type=int, default=32, help='project L4 job cap (owner: 32 from 2026-10-03)')
     args = ap.parse_args()
     arms = json.loads(args.arms.read_text())
     listing = subprocess.run(['ssh', 'login2', 'bjobs', '-w'], check=True,
                              capture_output=True, text=True).stdout
     active = sum('gpu_l4' in line for line in listing.splitlines()[1:])
-    if active + len(arms) > 8:
+    if active + len(arms) > args.cap:
         raise SystemExit(f'refusing {len(arms)} jobs: {active} project L4 jobs already active')
     manifest = ROOT / 'scratch/detector_transfer/manifest.tsv'
     manifest.parent.mkdir(parents=True, exist_ok=True)

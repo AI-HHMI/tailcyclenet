@@ -166,13 +166,13 @@ def test_share_scene_matches_encoding_every_time(moving_batch):
     b = moving_batch
     model = build_model(SMALL, n_keypoints=int(b.kpt_ids.max()) + 1).eval()
     n_enc = [0]
-    real = model.scene_encoder.forward
+    real = model.encode_scene
 
     def counted(*a, **k):
         n_enc[0] += 1
         return real(*a, **k)
 
-    model.scene_encoder.forward = counted
+    model.encode_scene = counted
     kw = dict(mode='3d', prompt_time=b.prompt_t)
     with torch.no_grad():
         free = model(b.views, b.kpt_ids, b.cgroup, kpt_prior=None, **kw)['coords_pred']
@@ -210,6 +210,25 @@ def test_camera_batch_scene_encode_is_bit_identical(pos_mode):
         batched = model.encode_scene(views)
 
     torch.testing.assert_close(batched, loop, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('camera_batch', [False, True])
+@pytest.mark.parametrize('precision', ['fp32', 'bf16'])
+def test_split_scene_encoding_matches_posetail(camera_batch, precision):
+    """The local backbone/tail split must preserve posetail's complete scene output."""
+    torch.manual_seed(0)
+    model = build_model(small(scene_pos_embed_mode='ropepos'), n_keypoints=5).eval()
+    views = [torch.randn(1, 4, 3, 64, 64) for _ in range(3)]
+    model.set_scene_speed(precision=precision, camera_batch=camera_batch)
+    with torch.no_grad():
+        encoding = model.encode_scene_backbone(views)
+        with model._scene_autocast(encoding.views):
+            expected = model.scene_encoder(encoding.views)
+        if encoding.camera_batched:
+            expected = expected[0].reshape(encoding.n_cams, encoding.batch_size,
+                                           *expected.shape[2:])
+        actual = model.project_scene(encoding)
+    torch.testing.assert_close(actual, expected.float(), rtol=0, atol=0)
 
 
 def test_camera_batch_single_camera_is_an_exact_noop():

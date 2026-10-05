@@ -316,6 +316,8 @@ annotation `status` column.
 | `visibility_probability` | float32 | | sigmoid of `visibility_logit` |
 | `confidence_logit` | float32 | | separate per-camera confidence-head logit |
 | `confidence_probability` | float32 | | sigmoid of `confidence_logit` |
+| `quality_score` | float32 | | optional framewise scorer output for this pose; nullable |
+| `quality_precision` | float32 | | optional scorer precision output for this pose; nullable |
 | `slot` | int32 | | source row/slot for downstream identity work |
 | `window` | int32 | | window ordinal whose estimate is stored |
 | `window_start`, `window_stop` | int32 | | that window's half-open source-frame interval |
@@ -340,7 +342,10 @@ saturate). They set `status = visible` iff `score > 0.5` (equivalently `score_lo
 otherwise `status = missing`. Unlike an annotation `missing` row, a prediction row with
 `status = missing` retains its best-guess `x,y,z`; those
 coordinates may be less reliable, but remain useful estimates. This is an explicit exception for
-`prediction_session = true`, not a change to annotation rows.
+`prediction_session = true`, not a change to annotation rows. Integrated inference may optionally
+add `quality_score` and `quality_precision` from a framewise scorer. These are nullable, separate
+from pose confidence/visibility, and are written only when `--scorer` is supplied; they do not
+filter or alter pose predictions. They are model outputs, not calibrated probabilities.
 
 Prediction-specific `points3d.pq` columns:
 
@@ -348,6 +353,8 @@ Prediction-specific `points3d.pq` columns:
 |---|---|---|
 | `score` | float32 | sigmoid of the 3D visibility-head logit, `vis_pred` |
 | `score_logit` | float32 | 3D visibility-head logit, `vis_pred` |
+| `quality_score` | float32 | optional framewise scorer output for this 3D pose; nullable |
+| `quality_precision` | float32 | optional scorer precision output for this 3D pose; nullable |
 | `triangulated_x`, `triangulated_y`, `triangulated_z` | float32 | anchor-free triangulation estimate in session units, when available |
 | `slot` | int32 | inference row/slot |
 | `window` | int32 | source inference window ordinal |
@@ -361,7 +368,8 @@ The optional `window_predictions.pq` sidecar is a typed, nullable union table fo
 per-window overlap, captured before the visibility gate. Its `record_type` is `window`, `instance`,
 `point3d`, or `point2d`; window rows carry crop/outcome metadata, instance rows boxes/scores,
 `point3d` rows fused xyz and optional triangulated xyz, and `point2d` rows per-camera xy plus
-separate visibility/confidence signals. Point rows carry `gated`, the decision made by
+separate visibility/confidence signals. When integrated scoring is enabled, point rows also carry
+nullable `quality_score` and `quality_precision`. Point rows carry `gated`, the decision made by
 `--vis-thresh`; for 3D overlays this is false because that gate applies to the 3D pose. Window rows
 have null `frame`/`bodypart`; unavailable values remain null. The Parquet schema carries a
 `tailcyclenet.schema_version` metadata value. This sidecar is diagnostic output, not annotation

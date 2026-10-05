@@ -82,15 +82,18 @@ class _WindowPredictionWriter:
         'confidence_probability', 'det_score', 'box_agree', 'x0', 'y0', 'x1', 'y1',
         'crop_x0', 'crop_y0', 'crop_x1', 'crop_y1', 'refined_x0', 'refined_y0',
         'refined_x1', 'refined_y1')
+    QUALITY_FIELDS = ('quality_score', 'quality_precision')
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, quality_enabled=False):
         """Open a typed Parquet writer; status fields use a stable dictionary type."""
         import pyarrow as pa
         import pyarrow.parquet as pq
 
         fields = [pa.field(name, pa.string()) for name in self.STRING_FIELDS]
         fields.extend(pa.field(name, pa.int32()) for name in self.INT_FIELDS)
-        fields.extend(pa.field(name, pa.float32()) for name in self.FLOAT_FIELDS)
+        self.float_fields = (self.FLOAT_FIELDS + self.QUALITY_FIELDS
+                             if quality_enabled else self.FLOAT_FIELDS)
+        fields.extend(pa.field(name, pa.float32()) for name in self.float_fields)
         fields.extend(pa.field(name, pa.bool_()) for name in self.BOOL_FIELDS)
         fields = [pa.field(f.name, pa.dictionary(pa.int32(), pa.string())
                            if f.name in self.DICT_FIELDS else f.type) for f in fields]
@@ -131,7 +134,7 @@ class _WindowPredictionWriter:
             columns[name] = pa.array([row.get(name) for row in normalized], type=pa.int32())
         for name in self.BOOL_FIELDS:
             columns[name] = pa.array([row.get(name) for row in normalized], type=pa.bool_())
-        for name in self.FLOAT_FIELDS:
+        for name in self.float_fields:
             values = [row.get(name) for row in normalized]
             values = [None if v is None or not np.isfinite(v) else float(v) for v in values]
             columns[name] = pa.array(values, type=pa.float32())
@@ -152,7 +155,8 @@ class SessionWriter:
     directory that says what it was.
     """
 
-    def __init__(self, out: Path, source: Session, registry, provenance: dict, groups):
+    def __init__(self, out: Path, source: Session, registry, provenance: dict, groups, *,
+                 quality_enabled=False):
         """Open a prediction session for writing: header first, parquet writers for every table.
 
         Inputs: out -- output session directory (created here).
@@ -187,10 +191,12 @@ class SessionWriter:
         self.provenance = dict(provenance)
         self.independent_windows = bool(self.provenance.get('independent_windows', False))
         self.window_predictions = bool(self.provenance.get('window_predictions', False))
+        self.quality_enabled = bool(quality_enabled)
         self.window_length = int(self.provenance.get('n_frames', 0) or 0)
         self.frame_stop = int(self.provenance.get('frame_stop', 0) or 0)
-        self._sidecar = (_WindowPredictionWriter(self.out / 'window_predictions.pq')
-                         if self.window_predictions else None)
+        self._sidecar = (_WindowPredictionWriter(
+            self.out / 'window_predictions.pq', quality_enabled=self.quality_enabled)
+            if self.window_predictions else None)
 
         import toml
         units = source.units
@@ -283,7 +289,11 @@ class SessionWriter:
                                        np.asarray(blk['triangulated'])[..., 1].ravel()[keep].astype(np.float32)),
                     'triangulated_z': (np.full(int(keep.sum()), np.nan, np.float32)
                                        if blk.get('triangulated') is None else
-                                       np.asarray(blk['triangulated'])[..., 2].ravel()[keep].astype(np.float32))})
+                                       np.asarray(blk['triangulated'])[..., 2].ravel()[keep].astype(np.float32)),
+                    **({} if blk.get('quality') is None else {
+                        'quality_score': np.asarray(blk['quality']).ravel()[keep].astype(np.float32),
+                        'quality_precision': np.asarray(blk['quality_precision'])
+                        .ravel()[keep].astype(np.float32)})})
 
         p2, c2 = np.asarray(blk['pred2d']), np.asarray(blk['conf2d'])
         mc2 = np.asarray(blk.get('model_conf2d', np.full_like(c2, np.nan)))
@@ -309,7 +319,14 @@ class SessionWriter:
                 'slot': a2[keep2].astype(np.int32),
                 'window': owner[t2[keep2]].astype(np.int32),
                 'window_start': owner_start[t2[keep2]].astype(np.int32),
-                'window_stop': owner_stop[t2[keep2]].astype(np.int32)})
+                'window_stop': owner_stop[t2[keep2]].astype(np.int32),
+                **({} if pred.shape[-1] != 2 or blk.get('quality') is None else {
+                    'quality_score': np.broadcast_to(
+                        np.asarray(blk['quality'])[:, :, None, :], p2.shape[:-1])
+                    .ravel()[keep2].astype(np.float32),
+                    'quality_precision': np.broadcast_to(
+                        np.asarray(blk['quality_precision'])[:, :, None, :], p2.shape[:-1])
+                    .ravel()[keep2].astype(np.float32)})})
 
         ba = np.asarray(blk['box_agree'])
         det = blk.get('det_box')

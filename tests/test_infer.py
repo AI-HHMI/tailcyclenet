@@ -28,8 +28,10 @@ def test_inference_speed_options_default_to_measured_path():
     assert parser.get_default('precision') == 'bf16'
     assert parser.get_default('units') is None, 'units are resolved only after deriving video mode'
     assert parser.get_default('camera_batch') is True
+    assert parser.get_default('allow_pose_scorer_mismatch') is False
     options = {option for action in parser._actions for option in action.option_strings}
     assert '--camera-batch' in options and '--no-camera-batch' in options
+    assert '--allow-pose-scorer-mismatch' in options
 
 
 @pytest.fixture(scope='module', params=['rat', 'mv'])
@@ -121,6 +123,41 @@ def test_detector_inference_without_keypoint_table(tmp_path):
 
     assert out['pred'].shape == (1, 4, sess.n_keypoints, 2)
     assert out['animal_ids'] == ['det00']
+
+
+def test_scorer_encoder_mismatch_requires_explicit_opt_in():
+    from tests.test_scorer_model import _scorer
+    from tailcyclenet.infer.driver import _share_pose_scorer_encoder
+
+    pose = build_model(SMALL, n_keypoints=5).eval()
+    scorer = _scorer(5, stride_length=4).eval()
+    with pytest.raises(SystemExit, match='--allow-pose-scorer-mismatch'):
+        _share_pose_scorer_encoder(pose, scorer, allow_mismatch=False,
+                                   pose_run='pose-run', scorer_run='scorer-run')
+    assert not _share_pose_scorer_encoder(pose, scorer, allow_mismatch=True,
+                                          pose_run='pose-run', scorer_run='scorer-run')
+    assert scorer.scene_encoder.encoder is not pose.scene_encoder.encoder
+
+
+def test_integrated_scorer_shares_scene_and_preserves_pose(scene):
+    model, sess, registry, name = scene
+    if sess.mode != '2d' or any(sess.rig.moving.values()):
+        pytest.skip('the integrated scorer fixture is a static 2D session')
+    from tests.test_scorer_model import _scorer
+    from tailcyclenet.model import share_video_encoder_if_identical
+
+    scorer = _scorer(registry.n_keypoints, stride_length=4,
+                     output_granularity='frame').eval()
+    scorer.scene_encoder.encoder.load_state_dict(model.scene_encoder.encoder.state_dict())
+    assert share_video_encoder_if_identical(model, scorer)
+    cfg = _cfg(anchor='none', refine=False)
+    pose_only = run_group(model, sess, 'g000', registry, name, cfg)
+    integrated = run_group(model, sess, 'g000', registry, name, cfg, scorer=scorer,
+                           shared_scene_encoder=True)
+    np.testing.assert_array_equal(pose_only['pred'], integrated['pred'])
+    assert integrated['quality'].shape == pose_only['pred'].shape[:-1]
+    assert integrated['quality_precision'].shape == integrated['quality'].shape
+    assert np.isfinite(integrated['quality']).any()
 
 
 @pytest.mark.parametrize('anchor', ['none', 'carry', 'self', 'labels'])
@@ -1727,6 +1764,45 @@ def test_prediction_3d_missing_status_retains_best_guess_coordinates(scene, tmp_
     assert not errs, f'prediction-only 3D rows should validate apart from missing pixels: {errs}'
 
 
+def test_quality_columns_are_optional_and_align_with_pose_rows(scene, tmp_path):
+    import pyarrow.parquet as pq
+    from tailcyclenet.infer.predictions import SessionWriter
+
+    _, sess, registry, _ = scene
+    gid = next(iter(sess.groups))
+    T, K, C = 2, sess.n_keypoints, len(sess.rig)
+    R = 3 if sess.mode == '3d' else 2
+    pred = np.arange(T * K * R, dtype=np.float32).reshape(1, T, K, R) + 1
+    pred2d = (pred[:, :, None] if R == 2 else
+              np.full((1, T, C, K, 2), np.nan, np.float32))
+    quality = np.arange(T * K, dtype=np.float32).reshape(1, T, K) / 10
+    precision = quality + 1
+    blk = {
+        'animal_ids': np.array(['a00'], object), 'pred': pred,
+        'conf': np.ones((1, T, K), np.float32), 'pred2d': pred2d,
+        'conf2d': np.ones((1, T, C, K), np.float32),
+        'model_conf2d': np.ones((1, T, C, K), np.float32),
+        'quality': quality, 'quality_precision': precision,
+        'box_agree': np.full((1, T, C), np.nan, np.float32),
+        'outcome': np.zeros((1, 1), np.int8), 'crop': np.zeros((1, 1, C, 4), np.float32),
+        'outcome_names': ['ok'], 'window_start': np.array([0], np.int32),
+        'window_stop': np.array([T], np.int32), 'owner_window': np.zeros(T, np.int32),
+    }
+    out = tmp_path / f'quality-{sess.mode}'
+    writer = SessionWriter(out, sess, registry, {'n_frames': T}, [gid], quality_enabled=True)
+    writer.write_block(gid, blk, 0, 0)
+    writer.close(complete=True)
+    table_name = 'points3d.pq' if R == 3 else 'points2d.pq'
+    rows = pq.read_table(out / table_name).to_pylist()
+    assert len(rows) == T * K
+    got = {(row['frame'], row['bodypart']):
+           (row['quality_score'], row['quality_precision']) for row in rows}
+    for frame in range(T):
+        for k, bodypart in enumerate(registry.names):
+            assert got[(frame, bodypart)] == pytest.approx((quality[0, frame, k],
+                                                             precision[0, frame, k]))
+
+
 def test_independent_primary_rows_keep_owner_window_identity(scene, tmp_path):
     import pyarrow.parquet as pq
 
@@ -1783,7 +1859,8 @@ def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_pat
     gid = next(iter(sess.groups))
     out = tmp_path / 'pred-with-sidecar'
     writer = SessionWriter(out, sess, registry,
-                           {'n_frames': 4, 'window_predictions': True}, [gid])
+                           {'n_frames': 4, 'window_predictions': True}, [gid],
+                           quality_enabled=True)
     writer.write_window_records([
         {'record_type': 'window', 'group_id': gid, 'frame': None, 'window': 1,
          'window_start': 2, 'window_stop': 4, 'slot': 0, 'animal_id': 'a00',
@@ -1793,7 +1870,8 @@ def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_pat
         {'record_type': 'point3d', 'group_id': gid, 'frame': 2, 'window': 1,
          'window_start': 2, 'window_stop': 4, 'slot': 0, 'animal_id': 'a00',
          'camera': None, 'bodypart': sess.names[0], 'x': 1.5, 'y': 2.5, 'z': 3.5,
-         'status': 'missing', 'score': 0.4, 'score_logit': -0.4, 'gated': True},
+         'status': 'missing', 'score': 0.4, 'score_logit': -0.4,
+         'quality_score': 0.7, 'quality_precision': 0.8, 'gated': True},
     ])
     writer.close(complete=True)
 
@@ -1804,6 +1882,8 @@ def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_pat
     assert rows[0]['refined_x0'] == 5.0
     assert rows[1]['status'] == 'missing' and rows[1]['gated'] is True
     assert (rows[1]['x'], rows[1]['y'], rows[1]['z']) == (1.5, 2.5, 3.5)
+    assert (rows[1]['quality_score'], rows[1]['quality_precision']) == pytest.approx((0.7, 0.8))
+    assert rows[0]['quality_score'] is None
     assert table.schema.field('frame').nullable
     assert table.schema.field('bodypart').nullable
 

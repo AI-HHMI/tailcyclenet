@@ -330,7 +330,7 @@ def _plan_windows(session_id, gid, cam_sizes, n_frames, overlap, T_total, frame_
 
 
 # Frame/window-indexed columns stitched by `merge_blocks`; anything else is a per-group constant.
-_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score', 'owner_window', 'triangulated')
+_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score', 'owner_window', 'triangulated', 'quality', 'quality_precision')
 _WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start', 'window_stop', 'window_ordinal')
 
 
@@ -471,15 +471,18 @@ def merge_blocks(blocks):
 
 @torch.no_grad()
 def run_group(model, session: Session, gid: str, registry, dataset_name: str,
-              cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None) -> dict:
+              cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, *, scorer=None,
+              shared_scene_encoder=False) -> dict:
     """`run_blocks` for a whole group, merged. See both for what a block is."""
     return merge_blocks(run_blocks(model, session, gid, registry, dataset_name, cfg,
-                                   box_points=box_points, boxes_for=boxes_for, n_rows=n_rows))
+                                   box_points=box_points, boxes_for=boxes_for, n_rows=n_rows,
+                                   scorer=scorer, shared_scene_encoder=shared_scene_encoder))
 
 
 @torch.no_grad()
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
-               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None):
+               cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
+               scorer=None, shared_scene_encoder=False):
     """Predict every animal in one group, a block of windows at a time. Yields one dict per block.
 
     Arrays are in the SOURCE coordinate frame. Crops come from exactly one of two sources, not
@@ -719,7 +722,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
-    def forward(frames, plan, crops, wi, window_det=None):
+    def forward(frames, plan, crops, wi, window_det=None, *, score_quality=False):
         """One animal, one window -> its prediction in the SOURCE frame, or None.
 
         `frames` is a parameter for the same reason as `decode_crops`. `carried` is read here on
@@ -758,6 +761,12 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         chunk = cfg.kpt_chunk or None
         views = [v.to(dev) for v in views]
         cgroup_d = _to_device(cgroup, dev)
+        scene_encoding = scene_features = views_norm = None
+        if scorer is not None:
+            input_size = max(int(cam['size'].max()) for cam in cgroup_d)
+            views_norm = model.normalize_scene_views(views, input_size=input_size)
+            scene_encoding = model.encode_scene_backbone(views_norm)
+            scene_features = model.project_scene(scene_encoding)
         mkw = {}
         give_box = _give_box_this_window(cfg, carried[a], prior)
         if give_box:
@@ -778,11 +787,14 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if box_t is not None:
                 mkw['box_prompt'] = box_t
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
-        with share_scene(model) if cfg.anchor == 'self' else nullcontext():
+        scene_ctx = (share_scene(model, scene_features=scene_features)
+                     if cfg.anchor == 'self' else nullcontext())
+        with scene_ctx:
             out = model(views, kpt_ids.to(dev), cgroup_d, mode=mode,
                         kpt_prior=None if prior is None else prior.to(dev),
                         prompt_time=None if prompt_t is None else prompt_t.to(dev),
-                        kpt_chunk=chunk, **mkw)
+                        kpt_chunk=chunk, **({} if scene_features is None else
+                                            {'scene_features': scene_features}), **mkw)
             if cfg.anchor == 'self':
                 out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                   kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
@@ -808,7 +820,19 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 v2 = out['vis_pred_2d'][:, 0].detach().cpu().numpy()
             if out.get('conf_pred_2d') is not None:
                 c2 = out['conf_pred_2d'][:, 0].detach().cpu().numpy()
-        return p, q, out, p2, v2, c2
+        quality = quality_precision = None
+        if scorer is not None and score_quality:
+            if shared_scene_encoder:
+                score_scene = scorer.project_scene(scene_encoding)
+                scores, precision = scorer.score(
+                    views_norm, score_scene, out['coords_pred'], cgroup_d, kpt_ids.to(dev),
+                    kpt_chunk=chunk)
+            else:
+                scores, precision = scorer(
+                    views, out['coords_pred'], cgroup_d, kpt_ids.to(dev), kpt_chunk=chunk)
+            quality = scores[0].detach().cpu().numpy()
+            quality_precision = precision[0].detach().cpu().numpy()
+        return p, q, out, p2, v2, c2, quality, quality_precision
 
     def _process_window(wi, frames, window_cams, plans, crops, window_det=None):
         """Forward and write every column for one window, given already-decoded `crops`.
@@ -883,11 +907,15 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
         for plan in plans:
             a, use, boxes, cgroup, scales, *_ = plan
-            got = forward(frames, plan, crops, wi, window_det)
+            got = forward(frames, plan, crops, wi, window_det,
+                          score_quality=scorer is not None)
             if got is None:
                 continue
-            p, q, out, p2, v2, c2 = got
+            p, q, out, p2, v2, c2, quality_window, precision_window = got
             outcome[a, wi - w0] = OUTCOMES.index('ok')
+            if quality_window is not None:
+                quality[a, frames - f0] = quality_window
+                quality_precision[a, frames - f0] = precision_window
             _fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
             if p2 is not None:
                 for i, ci in enumerate(use):
@@ -934,6 +962,13 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                           'status': ('visible' if logit is not None and
                                                      logit > 0 else 'missing'),
                                           'gated': gated})
+                            if quality_window is not None and mode == '3d':
+                                score_value = float(quality_window[ti, k])
+                                precision_value = float(precision_window[ti, k])
+                                rec_k['quality_score'] = (score_value if np.isfinite(score_value)
+                                                          else None)
+                                rec_k['quality_precision'] = (
+                                    precision_value if np.isfinite(precision_value) else None)
                             if tri_np is not None and np.isfinite(tri_np[ti, k]).all():
                                 rec_k.update({'triangulated_x': float(tri_np[ti, k, 0]),
                                               'triangulated_y': float(tri_np[ti, k, 1]),
@@ -959,6 +994,13 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                              'confidence_probability': (_logit_probability(conf_logit)
                                                                         if conf_logit is not None else None),
                                              'gated': gated if mode == '2d' else False})
+                                if quality_window is not None and mode == '2d':
+                                    score_value = float(quality_window[ti, k])
+                                    precision_value = float(precision_window[ti, k])
+                                    rec2['quality_score'] = (score_value
+                                                             if np.isfinite(score_value) else None)
+                                    rec2['quality_precision'] = (
+                                        precision_value if np.isfinite(precision_value) else None)
                                 window_records.append(rec2)
                     for ci, cam in enumerate(session.cam_names):
                         box = det_box[a, int(frame) - f0, ci]
@@ -978,6 +1020,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                             window_records.append(reci)
             j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
             if cfg.vis_thresh is not None and vlogit is not None:
+                if quality_window is not None:
+                    quality[a, frames[drop] - f0] = np.nan
+                    quality_precision[a, frames[drop] - f0] = np.nan
                 p = p.copy()
                 p[drop] = np.nan
                 conf[a, frames[drop] - f0] = np.nan
@@ -1065,6 +1110,9 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             owner_window = np.full(n_blk, -1, np.int32)
             triangulated = np.full((S, n_blk, K, 3), np.nan, np.float32)
             pred = np.full((S, n_blk, K, R), np.nan, np.float32)
+            quality = (np.full((S, n_blk, K), np.nan, np.float32) if scorer is not None else None)
+            quality_precision = (np.full((S, n_blk, K), np.nan, np.float32)
+                                 if scorer is not None else None)
             conf = np.full((S, n_blk, K), np.nan, np.float32)
             pred2d = np.full((S, n_blk, len(session.rig), K, 2), np.nan, np.float32)
             conf2d = np.full((S, n_blk, len(session.rig), K), np.nan, np.float32)
@@ -1117,6 +1165,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
                 _census_block_boundary(stats, f_read, f_own)
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
+                   **({} if quality is None else {'quality': quality[:, :keep],
+                                                  'quality_precision': quality_precision[:, :keep]}),
                    'pred2d': pred2d[:, :keep], 'conf2d': conf2d[:, :keep],
                    'model_conf2d': model_conf2d[:, :keep],
                    'box_agree': box_agree[:, :keep],

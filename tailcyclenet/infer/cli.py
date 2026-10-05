@@ -53,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path,
                     help='pose run folder or a self-contained pose checkpoint .pth')
+    ap.add_argument('--scorer', type=Path, default=None,
+                    help='optional framewise scorer run folder. Its quality score/precision are '
+                         'written as metadata; pose predictions are not filtered or changed.')
+    ap.add_argument('--scorer-checkpoint', default=None,
+                    help='scorer checkpoint filename; default is the latest training checkpoint. '
+                         'checkpoint_best.pth must be explicitly named.')
+    ap.add_argument('--allow-pose-scorer-mismatch', action='store_true', default=False,
+                    help='allow scorer and pose raw video-encoder weights to differ; this runs '
+                         'two video-encoder passes. By default, differing weights are refused.')
     src = ap.add_mutually_exclusive_group()
     src.add_argument('--data', type=Path,
                      help='ONE session directory (a dataset root works only if it holds a '

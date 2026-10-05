@@ -455,7 +455,8 @@ _FILL_MEAS_COLS = frozenset({'status', 'x', 'y', 'z', 'score', 'score_logit',
                              'box_agree', 'x0', 'y0', 'x1', 'y1',
                              'visibility_logit', 'visibility_probability',
                              'confidence_logit', 'confidence_probability',
-                             'confidence_2d', 'confidence_2d_logit'})
+                             'confidence_2d', 'confidence_2d_logit',
+                             'quality_score', 'quality_precision'})
 
 
 def _key_value(value):

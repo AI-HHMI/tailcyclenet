@@ -19,6 +19,7 @@ from tailcyclenet.dataset import LoaderConfig, PoseDataset
 from tailcyclenet.query_encoder import _tile_to_query_axis
 from tailcyclenet.scorer import build_scorer
 from tailcyclenet.scorer.model import FrameCameraPooling, flatten_sequence_triplet
+from tailcyclenet.model import build_model, share_video_encoder_if_identical
 
 from .test_model import SMALL
 
@@ -53,6 +54,20 @@ def scorer_batch(tmp_path_factory):
     model = _scorer(ds.registry.n_keypoints, stride_length=4).eval()
     return model, views, coords, item[4], ds.registry.n_keypoints, kpt_ids
 
+
+
+def test_video_encoder_weights_are_shared_only_when_exactly_equal():
+    pose = build_model(SMALL, n_keypoints=5).eval()
+    scorer = _scorer(5, stride_length=4).eval()
+    scorer.scene_encoder.encoder.load_state_dict(pose.scene_encoder.encoder.state_dict())
+    assert share_video_encoder_if_identical(pose, scorer)
+    assert scorer.scene_encoder.encoder is pose.scene_encoder.encoder
+
+    other = _scorer(5, stride_length=4).eval()
+    with torch.no_grad():
+        other.scene_encoder.encoder.blocks[0].norm1.weight[0].add_(1)
+    assert not share_video_encoder_if_identical(pose, other)
+    assert other.scene_encoder.encoder is not pose.scene_encoder.encoder
 
 
 def _fully_observed(coords):

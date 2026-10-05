@@ -7,11 +7,12 @@ dedicated fusion term. (2) What the 3D residual is an offset FROM is a switch
 (`gridresid_offset`): `"query"` keeps the native anchor where a real prior anchored it,
 `"triangulated"` re-adds the residual to each frame's own triangulation.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 import warnings
 
 import torch
-from einops import einsum, repeat
+from einops import einsum, rearrange, repeat
 
 from posetail.posetail.cube import from_homogeneous, to_homogeneous, undistort_points
 from posetail.posetail.tracker_encoder import TrackerEncoder
@@ -23,6 +24,17 @@ QUERY_ENCODERS = ('wide',)
 # What the gridresid residual is an offset FROM. See `_query_anchored` / `_reanchor_per_frame`.
 GRIDRESID_OFFSETS = ('query', 'triangulated')
 SCENE_PRECISIONS = ('fp32', 'bf16', 'fp16')
+
+
+@dataclass
+class SceneEncoding:
+    """Raw encoder tokens and the exact camera packing used to produce them."""
+
+    views: list[torch.Tensor]
+    raw_features: list[torch.Tensor]
+    n_cams: int
+    batch_size: int
+    camera_batched: bool
 
 
 # the query-free scene point
@@ -162,18 +174,40 @@ class PoseTrackerEncoder(TrackerEncoder):
         self.scene_precision = precision
         self.camera_batch = bool(camera_batch)
 
-    def encode_scene(self, views_norm):
-        """Encode a window, optionally batching cameras and autocasting only this call.
+    def _scene_autocast(self, views):
+        """The inference autocast scope for both the V-JEPA backbone and its scene tail."""
+        if self.scene_precision == 'fp32':
+            return nullcontext()
+        dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}[self.scene_precision]
+        return torch.autocast(views[0].device.type, dtype=dtype)
 
-        ``SceneRepresentation.forward`` is intentionally left untouched: its operations after
-        the encoder are batch-agnostic, so camera inputs can be concatenated on the batch axis and
-        the returned ``[1, C*B, N, D]`` tensor reshaped back to ``[C, B, N, D]``. Single-camera
-        windows use the original list unchanged, making that case an exact no-op. Under an
-        autocast precision the encoder's output is cast back to float32: the decoder and all
-        geometry must see the historical FP32 boundary.
+    def normalize_scene_views(self, views, input_size=None):
+        """Apply the exact preprocessing `TrackerEncoder.forward` uses before scene encoding.
+
+        Inputs are the inference window's `[B,T,H,W,C]` tensors, uint8 or float in [0,1].
+        Outputs are normalized `[B,T,C,H,W]` tensors on the model device. This helper exists so
+        pose and scorer can share one normalized pixel tensor and one raw encoder pass.
         """
-        batched = self.camera_batch and len(views_norm) > 1
-        if batched:
+        device = next(self.parameters()).device
+        px = self.image_size if input_size is None else int(input_size)
+        out = []
+        for frames in views:
+            frames = frames.to(device)
+            if frames.dtype == torch.uint8:
+                frames = frames.float().div_(255)
+            frames = rearrange(frames, 'b t h w c -> b t c h w')
+            out.append(self.normalize(self.pad_to_size(frames, px)))
+        return out
+
+    def encode_scene_backbone(self, views_norm):
+        """Encode only the common raw video backbone, retaining camera-batch metadata.
+
+        When camera batching is enabled, cameras are concatenated along B exactly as in the
+        deployment path. The returned raw tokens stay in that packed shape so each model's
+        positional/projection tail can run before the final `[C,B,N,D]` reshape.
+        """
+        camera_batched = self.camera_batch and len(views_norm) > 1
+        if camera_batched:
             ref_shape = views_norm[0].shape[1:]
             if not all(view.shape[1:] == ref_shape for view in views_norm):
                 shapes = [tuple(view.shape[1:]) for view in views_norm]
@@ -182,37 +216,72 @@ class PoseTrackerEncoder(TrackerEncoder):
                     f'got {shapes}. Use --no-camera-batch while the upstream resize is fixed.')
             n_cams = len(views_norm)
             batch_size = views_norm[0].shape[0]
-            views = [torch.cat(views_norm, dim=0)]
+            encoder_views = [torch.cat(views_norm, dim=0)]
         else:
-            views = views_norm
+            n_cams = len(views_norm)
+            batch_size = views_norm[0].shape[0]
+            encoder_views = views_norm
 
-        if self.scene_precision == 'fp32':
-            features = self.scene_encoder(views)
-        else:
-            dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16}[self.scene_precision]
-            with torch.autocast(views[0].device.type, dtype=dtype):
-                features = self.scene_encoder(views)
-            features = features.float()
+        raw = []
+        with self._scene_autocast(encoder_views):
+            for view in encoder_views:
+                raw.append(self.scene_encoder.encoder(
+                    rearrange(view, 'b t c h w -> b c t h w')))
+        return SceneEncoding(encoder_views, raw, n_cams, batch_size, camera_batched)
 
-        if batched:
-            features = features[0].reshape(n_cams, batch_size, *features.shape[2:])
-        return features
+    def project_scene(self, encoding: SceneEncoding):
+        """Apply this checkpoint's own SceneRepresentation tail to raw encoder tokens.
+
+        This mirrors the installed posetail implementation using its own positional-embedding
+        helpers and projection modules. In the camera-batched path, every tail operation precedes
+        the `[C,B,N,D]` reshape, matching the historical `SceneRepresentation.forward` order.
+        """
+        scene = self.scene_encoder
+        projected = []
+        with self._scene_autocast(encoding.views):
+            for view, feat in zip(encoding.views, encoding.raw_features):
+                if scene.pos_embed_mode != 'none':
+                    g_h = view.shape[3] // scene.patch_size
+                    g_w = view.shape[4] // scene.patch_size
+                    g_t = feat.shape[1] // (g_h * g_w)
+                    if scene.pos_embed_mode == 'learned':
+                        feat = feat + scene._pos_embed_for(g_t, g_h, g_w)
+                    elif scene.pos_embed_mode == 'spatial':
+                        feat = feat + scene._spatial_pos_embed_for(g_t, g_h, g_w)
+                    else:
+                        feat = feat + scene._sincos_pos_embed_for(
+                            g_t, g_h, g_w, feat.device, feat.dtype)
+                if scene.kv_proj is not None:
+                    if scene.pre_norms is not None:
+                        chunks = torch.chunk(feat, scene.n_proj_levels, dim=-1)
+                        feat = torch.cat([norm(chunk) for norm, chunk in
+                                          zip(scene.pre_norms, chunks)], dim=-1)
+                    feat = scene.kv_proj(feat)
+                    feat = scene.kv_norm(feat)
+                projected.append(feat)
+            features = torch.stack(projected)
+            if encoding.camera_batched:
+                features = features[0].reshape(
+                    encoding.n_cams, encoding.batch_size, *features.shape[2:])
+        return features.float()
+
+    def encode_scene(self, views_norm):
+        """Encode and project one window; autocast ends at the historical FP32 boundary."""
+        return self.project_scene(self.encode_scene_backbone(views_norm))
 
     def _forward_window(self, views_norm, *args, **kwargs):
-        """Route every scene encode through ``encode_scene``.
-
-        Inside ``share_scene`` the first call computes ``scene_features`` and later calls reuse it;
-        only the encode is shareable because decoding derives geometry from the prior-changed
-        query. Keypoint chunking retains the upstream decode loop while sharing one encode.
-        """
-        if self._shared_scene is not None and not kwargs.get('kpt_chunk'):
-            if 'f' not in self._shared_scene:
-                self._shared_scene['f'] = self.encode_scene(views_norm)
+        """Route scene encodes through the local split or reuse caller-provided features."""
+        shared = self._shared_scene
+        supplied = kwargs.get('scene_features')
+        if shared is not None and (not kwargs.get('kpt_chunk') or 'f' in shared or
+                                   supplied is not None):
+            if 'f' not in shared:
+                shared['f'] = supplied if supplied is not None else self.encode_scene(views_norm)
             kwargs.pop('kpt_chunk', None)
             kwargs.pop('scene_features', None)
             return super()._forward_window(views_norm, *args, **kwargs,
-                                           scene_features=self._shared_scene['f'])
-        if kwargs.get('scene_features') is None:
+                                           scene_features=shared['f'])
+        if supplied is None:
             kwargs['scene_features'] = self.encode_scene(views_norm)
         return super()._forward_window(views_norm, *args, **kwargs)
 
@@ -239,7 +308,7 @@ class PoseTrackerEncoder(TrackerEncoder):
         return self._forward(views, kpt_ids, camera_group, mode, input_size=px, **kw)
 
     def _forward(self, views, kpt_ids, camera_group, mode, kpt_prior=None, prompt_time=None,
-                 kpt_chunk=None, box_prompt=None, input_size=None):
+                 kpt_chunk=None, box_prompt=None, input_size=None, scene_features=None):
         """The forward pass, with the derived query, the query-validity mask, and the 2D/3D
         branch post-processing.
 
@@ -317,7 +386,8 @@ class PoseTrackerEncoder(TrackerEncoder):
 
         try:
             out = super().forward(views, coords_q, camera_group, query_times=qt,
-                                  occlusion=None, kpt_chunk=kpt_chunk, input_size=input_size)
+                                  occlusion=None, kpt_chunk=kpt_chunk, input_size=input_size,
+                                  scene_features=scene_features)
             assert self._kpt_cursor == K, (
                 f'{self._kpt_cursor} of {K} keypoints were decoded; _decode_from_scene is not '
                 'being called once per chunk in order, so the id slices are unreliable')
@@ -341,18 +411,44 @@ class PoseTrackerEncoder(TrackerEncoder):
 
 
 @contextmanager
-def share_scene(model):
-    """Encode the scene ONCE for every forward inside the block. The pixels must be identical
-    (the caller owns that precondition, which is why the scope is one window). Only the encode
-    is shared -- `cube_scale`/`scene_center`/`scene_radius` derive from `coords_q`, which the
-    prior changes, so the decode still runs per forward.
+def share_scene(model, scene_features=None):
+    """Reuse scene features across same-window forwards, optionally supplied by a joint caller.
+
+    The pixels must be identical (the caller owns that precondition, hence one-window scope).
+    Only the encode is shared -- geometry derives from `coords_q`, which the prior changes, so
+    every forward still runs its own decoder.
     """
     prev = model._shared_scene
-    model._shared_scene = {}
+    model._shared_scene = {} if scene_features is None else {'f': scene_features}
     try:
         yield model
     finally:
         model._shared_scene = prev
+
+
+def share_video_encoder_if_identical(pose_model, scorer_model):
+    """Tie the raw scene encoders only when every checkpoint tensor is exactly equal.
+
+    Models may be on different devices (the scorer is loaded on CPU to avoid a duplicate encoder
+    peak on GPU); tensors are compared one at a time on CPU. On mismatch, leave both modules
+    independent and return False so inference can encode each model separately.
+    """
+    pose_state = pose_model.scene_encoder.encoder.state_dict()
+    scorer_state = scorer_model.scene_encoder.encoder.state_dict()
+    if pose_state.keys() != scorer_state.keys():
+        return False
+    for key, pose_tensor in pose_state.items():
+        scorer_tensor = scorer_state[key]
+        if pose_tensor.shape != scorer_tensor.shape or pose_tensor.dtype != scorer_tensor.dtype:
+            return False
+        if pose_tensor.device != scorer_tensor.device:
+            equal = torch.equal(pose_tensor.detach().cpu(), scorer_tensor.detach().cpu())
+        else:
+            equal = torch.equal(pose_tensor, scorer_tensor)
+        if not equal:
+            return False
+    scorer_model.scene_encoder.encoder = pose_model.scene_encoder.encoder
+    return True
 
 
 def _rays_fallback(out):

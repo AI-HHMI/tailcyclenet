@@ -19,6 +19,19 @@ from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
 
 
+def _share_pose_scorer_encoder(pose_model, scorer_model, *, allow_mismatch,
+                               pose_run, scorer_run) -> bool:
+    """Share the raw video backbone, refusing unequal weights without explicit opt-in."""
+    from ..model import share_video_encoder_if_identical
+
+    shared = share_video_encoder_if_identical(pose_model, scorer_model)
+    if not shared and not allow_mismatch:
+        raise SystemExit(f'{scorer_run}: raw video-encoder weights do not exactly match '
+                         f'{pose_run}; refusing two different scoring/pose encoders. Pass '
+                         '--allow-pose-scorer-mismatch to opt in to separate encoder passes.')
+    return shared
+
+
 def _dataset_family(name: str) -> str:
     """The leading `-`-token of a dataset name: 'rat-city-combined' and 'rat-city-tracked' are
     both 'rat'; 'johnson-mouse-combined-aug' and 'johnson-mouse-combined' are both 'johnson'.
@@ -432,6 +445,13 @@ def run_dataset(args):
     """
 
     independent = bool(getattr(args, 'independent_windows', False))
+    scorer_path = getattr(args, 'scorer', None)
+    scorer_checkpoint_name = getattr(args, 'scorer_checkpoint', None)
+    allow_pose_scorer_mismatch = bool(getattr(args, 'allow_pose_scorer_mismatch', False))
+    if scorer_path is None and scorer_checkpoint_name is not None:
+        raise SystemExit('--scorer-checkpoint requires --scorer')
+    if scorer_path is None and allow_pose_scorer_mismatch:
+        raise SystemExit('--allow-pose-scorer-mismatch requires --scorer')
     if independent:
         if not args.detector:
             raise SystemExit('--independent-windows requires --detector; labels and --boxes preserve row identity.')
@@ -539,6 +559,16 @@ def run_dataset(args):
                     'source_calibration': '', 'source_cam_regex': '',
                     'source_group_id': '', 'source_videos': []}
 
+    if scorer_path is not None:
+        moving = [name for name, is_moving in sess.rig.moving.items() if is_moving]
+        if moving:
+            raise SystemExit(f'{scorer_path}: scorer does not support moving-camera rigs; '
+                             f'moving camera(s): {moving}')
+        if (sess.mode == '3d' and len(sess.cam_names) == 1
+                and not sess.rig.calibrated[sess.cam_names[0]]):
+            raise SystemExit(f'{scorer_path}: scoring uncalibrated single-view 3D coordinates is '
+                             'unsupported; use a calibrated rig or a 2D session.')
+
     device = args.device if torch.cuda.is_available() else 'cpu'
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
@@ -557,6 +587,48 @@ def run_dataset(args):
                          f'({trained_frames}). Shorter windows are fine; longer is not the same '
                          'model.')
     trained_px = int(config['data'].get('image_size', LoaderConfig.image_size))
+    scorer = None
+    scorer_ckpt = None
+    scorer_config = None
+    scorer_shared_encoder = False
+    scorer_prov = {}
+    if scorer_path is not None:
+        import tomllib
+        from ..checkpoints import load_scorer_run
+        scorer, scorer_config, scorer_registry, scorer_ckpt = load_scorer_run(
+            scorer_path, checkpoint=scorer_checkpoint_name, device='cpu')
+        if scorer.output_granularity != 'frame':
+            raise SystemExit(f'{scorer_path}: integrated inference requires a framewise scorer; '
+                             f'got output_granularity={scorer.output_granularity!r}')
+        if tuple(scorer_registry.names) != tuple(registry.names):
+            pose_names, score_names = set(registry.names), set(scorer_registry.names)
+            raise SystemExit(f'{scorer_path}: scorer keypoint registry differs from pose registry; '
+                             f'missing from scorer={sorted(pose_names - score_names)[:8]}, '
+                             f'extra in scorer={sorted(score_names - pose_names)[:8]}. '
+                             'Train/use a scorer with the pose run registry.')
+        scorer_frames = int(scorer_config['data'].get('n_frames', LoaderConfig.n_frames))
+        scorer_px = int(scorer_config['data'].get('image_size', LoaderConfig.image_size))
+        infer_frames = int(args.n_frames or trained_frames)
+        if scorer_frames != trained_frames or infer_frames != scorer_frames:
+            raise SystemExit(f'{scorer_path}: scorer n_frames={scorer_frames} must equal pose '
+                             f'training/inference n_frames={trained_frames}/{infer_frames}')
+        if scorer_px != trained_px:
+            raise SystemExit(f'{scorer_path}: scorer image_size={scorer_px} must equal pose '
+                             f'image_size={trained_px}')
+        scorer_shared_encoder = _share_pose_scorer_encoder(
+            model, scorer, allow_mismatch=allow_pose_scorer_mismatch,
+            pose_run=args.run, scorer_run=scorer_path)
+        if scorer_shared_encoder:
+            print('scorer: raw video encoder weights exactly match pose; sharing one encoder')
+        else:
+            print('WARNING: pose/scorer raw video-encoder weights differ; running separate '
+                  'encodes by explicit --allow-pose-scorer-mismatch opt-in')
+        scorer = scorer.to(device).eval()
+        scorer.set_scene_speed(precision=precision, camera_batch=camera_batch)
+        scorer_prov_path = Path(scorer_path) / 'provenance.toml'
+        if scorer_prov_path.exists():
+            with scorer_prov_path.open('rb') as f:
+                scorer_prov = tomllib.load(f)
     if args.refine_px and args.refine_px > trained_px:
         raise SystemExit(f'--refine-px {args.refine_px} exceeds the run\'s image_size '
                          f'({trained_px}). A reduced first pass is the lever; a larger one is a '
@@ -723,9 +795,19 @@ def run_dataset(args):
                             'gridresid_offset': str(config['model']['gridresid_offset']),
                             'gridresid_offset_override': str(args.gridresid_offset or ''),
                             **provenance()}.items(),
+                           *([] if scorer is None else [
+                               ('scorer', str(Path(scorer_path).resolve())),
+                               ('scorer_checkpoint', str(Path(scorer_ckpt).resolve())),
+                               ('scorer_checkpoint_name', Path(scorer_ckpt).name),
+                               ('scorer_commit', str(scorer_prov.get('commit', ''))),
+                               ('scorer_dirty', bool(scorer_prov.get('dirty', False))),
+                               ('scorer_precision', precision),
+                               ('scorer_encoder_shared', bool(scorer_shared_encoder)),
+                               ('pose_scorer_mismatch_allowed',
+                                bool(allow_pose_scorer_mismatch))]),
                             *_box_provenance(args, det_tile, det_red, det_boxsrc).items(),
                             *_identity_provenance(args).items()],
-                           gids)
+                           gids, quality_enabled=scorer is not None)
     det_trace_groups = {}
     overlap_rows = {}
     _completed = False
@@ -759,7 +841,8 @@ def run_dataset(args):
                 _stats['capture_overlap_agreement'] = True
             for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
                                   box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want,
-                                  stats=_stats):
+                                  stats=_stats, scorer=scorer,
+                                  shared_scene_encoder=scorer_shared_encoder):
                 assert f0 == int(blk['window_start'][0]), (f0, int(blk['window_start'][0]))
                 writer.write_block(gid, blk, f0, w0)
                 writer.write_window_records(blk.get('window_records', ()))

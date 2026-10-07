@@ -1,11 +1,13 @@
 """Run folders, warm start, save and load.
 
-A run folder holds the config, the keypoint registry and the checkpoints; every consumer takes
-only `--run <folder>`. Schedule-free training keeps two iterates -- `model_state` (raw, resume)
+A run folder holds the config, the keypoint registry and the checkpoints; every checkpoint ALSO
+embeds the config, registry and provenance, so a consumer takes a run folder or one `.pth` file
+(pose, scorer, detector alike). Schedule-free training keeps two iterates -- `model_state` (raw, resume)
 and `model_state_eval` (averaged, evaluate) -- so both are saved explicitly.
 """
 from __future__ import annotations
 
+import copy
 import tomllib
 from importlib.resources import files as _pkg_files
 from pathlib import Path
@@ -410,12 +412,24 @@ def save_run_meta(run: Path, config: dict, registry: Registry,
     import toml
     assert kind in KINDS, f'kind must be one of {KINDS}, got {kind!r}'
     run.mkdir(parents=True, exist_ok=True)
-    config = {**config, 'run': {**config.get('run', {}), 'kind': kind}}
-    (run / 'config.toml').write_text(toml.dumps(config))
+    (run / 'config.toml').write_text(toml.dumps(stamped_config(config, kind)))
     registry.save(run / 'keypoint_registry.toml')
     prov = {**provenance(), **(extra or {})}
     if prov:
         (run / 'provenance.toml').write_text(toml.dumps(prov))
+
+
+def stamped_config(config: dict, kind: str) -> dict:
+    """The config exactly as `save_run_meta` writes it: a deep copy with `[run] kind` stamped.
+
+    A checkpoint embeds THIS, not the caller's dict, so a lone `.pth` carries the same config the
+    run folder's `config.toml` does (including the family guard) and a later in-place mutation of
+    the training config cannot reach a checkpoint already written.
+    """
+    assert kind in KINDS, f'kind must be one of {KINDS}, got {kind!r}'
+    config = copy.deepcopy(config)
+    config['run'] = {**config.get('run', {}), 'kind': kind}
+    return config
 
 
 def full_training_state(ck: dict) -> bool:
@@ -479,9 +493,10 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     payload = {'kind': kind, 'iteration': iteration, 'model_state': state,
                'model_state_eval': eval_state,
                'optimizer_state': optimizer.state_dict(),
-               'config': config,
-               'model_config': config.get('model'),
-               'keypoint_registry': None if registry is None else registry.to_dict()}
+               'config': stamped_config(config, kind),
+               'model_config': copy.deepcopy(config.get('model')),
+               'keypoint_registry': None if registry is None else registry.to_dict(),
+               'provenance': prior_provenance(run) or provenance()}
     if kind == 'pose':
         from .optim import optimizer_metadata
         payload['optimizer_metadata'] = optimizer_metadata(model, optimizer, fresh_names)
@@ -506,6 +521,60 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     return path
 
 
+def _enclosing_run(path: Path) -> Path | None:
+    """The run folder a checkpoint file sits in, or None: `<run>/checkpoints/x.pth` (pose,
+    scorer, and a W&B `files/checkpoints/` mirror) or `<run>/x.pth` (detector)."""
+    for d in (path.parent.parent, path.parent) if path.parent.name == 'checkpoints' else \
+            (path.parent,):
+        if (d / 'config.toml').is_file():
+            return d
+    return None
+
+
+def _file_bundle(path: Path, ckpt: dict, kind: str) -> tuple[dict, Registry, dict]:
+    """(config, registry, provenance) for a checkpoint FILE, without a run folder.
+
+    The checkpoint's own embedded config/registry/provenance win: they were written beside these
+    weights. A file written before one was embedded falls back to the run folder it still sits
+    in (`_enclosing_run`); a lone file missing either is refused by name rather than guessed.
+    """
+    run = _enclosing_run(path)
+    config = ckpt.get('config')
+    if not isinstance(config, dict) and isinstance(ckpt.get('model_config'), dict):
+        config = {'model': ckpt['model_config'], 'data': ckpt.get('data_config', {})}
+    if not isinstance(config, dict) and run is not None:
+        with open(run / 'config.toml', 'rb') as f:
+            config = tomllib.load(f)
+    if not isinstance(config, dict) or not isinstance(config.get('model'), dict):
+        raise ValueError(f'{path}: {kind} checkpoint has no embedded config and sits in no run '
+                         'folder; pass the run folder or a checkpoint written with its config')
+    if 'kind' in config.get('run', {}):
+        require_kind(config, kind, path)
+    registry_doc = ckpt.get('keypoint_registry')
+    if isinstance(registry_doc, dict):
+        registry = Registry.from_dict(registry_doc)
+    elif run is not None and (run / 'keypoint_registry.toml').is_file():
+        registry = Registry.load(run / 'keypoint_registry.toml')
+    else:
+        raise ValueError(f'{path}: {kind} checkpoint has no embedded keypoint_registry and sits '
+                         'in no run folder; pass the run folder or a checkpoint written with '
+                         'its registry')
+    prov = ckpt.get('provenance')
+    if not isinstance(prov, dict):
+        prov = prior_provenance(run) if run is not None else {}
+    return dict(config), registry, prov
+
+
+def _print_provenance(prov: dict, where) -> None:
+    """One line naming the commit the weights were trained at, or that it is unknown."""
+    if prov:
+        print(f'run provenance: {str(prov.get("commit", "?"))[:12]}'
+              f'{" +DIRTY" if prov.get("dirty") else ""}')
+    else:
+        print(f'{where}: no provenance recorded -- which commit trained these weights cannot be '
+              'read back')
+
+
 def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None = None):
     """Load a self-contained pose checkpoint, whether packaged or copied from training."""
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -513,18 +582,8 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
         raise ValueError(f'{path}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
     if ckpt.get('kind', 'pose') != 'pose':
         _require_ckpt_kind(ckpt, 'pose', path)
-    registry_doc = ckpt.get('keypoint_registry')
-    if not isinstance(registry_doc, dict):
-        raise ValueError(f'{path}: pose checkpoint has no embedded keypoint_registry; '
-                         'use a checkpoint written after registry embedding or a run folder')
-    registry = Registry.from_dict(registry_doc)
-
-    config = ckpt.get('config')
-    if not isinstance(config, dict):
-        config = {'model': ckpt.get('model_config'), 'data': ckpt.get('data_config', {})}
-    if not isinstance(config.get('model'), dict):
-        raise ValueError(f'{path}: pose checkpoint has no dictionary model config')
-    config = dict(config)
+    config, registry, prov = _file_bundle(path, ckpt, 'pose')
+    _print_provenance(prov, path)
     check_image_size(config)
     if model_overrides:
         config['model'] = {**config.get('model', {}), **model_overrides}
@@ -542,6 +601,7 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
                         n_keypoints=registry.n_keypoints)
     missing, unexpected = model.load_state_dict(state, strict=False)
     _report('load_run', missing, unexpected, [])
+    model.run_provenance = prov
     return model.to(device).eval(), config, registry, path
 
 
@@ -550,9 +610,9 @@ def peek_registry(run: Path) -> Registry:
     run = Path(run)
     if run.is_file():
         ckpt = torch.load(run, map_location='cpu', weights_only=False)
-        if not isinstance(ckpt, dict) or not isinstance(ckpt.get('keypoint_registry'), dict):
-            raise ValueError(f'{run}: pose checkpoint has no embedded keypoint_registry')
-        return Registry.from_dict(ckpt['keypoint_registry'])
+        if not isinstance(ckpt, dict):
+            raise ValueError(f'{run}: checkpoint must be a dictionary')
+        return _file_bundle(run, ckpt, str(ckpt.get('kind', 'pose')))[1]
     return Registry.load(run / 'keypoint_registry.toml')
 
 
@@ -596,12 +656,9 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
         config['model'] = {**config.get('model', {}), **model_overrides}
         print(f'load_run: [model] OVERRIDDEN {model_overrides} -- this is an assertion about what '
               'the checkpoint was trained with, not something read from it')
-    prov = run / 'provenance.toml'
-    if prov.exists():
-        with open(prov, 'rb') as f:
-            p = tomllib.load(f)
-        print(f'run provenance: {p.get("commit", "?")[:12]}'
-              f'{" +DIRTY" if p.get("dirty") else ""}')
+    prov = prior_provenance(run)
+    if prov:
+        _print_provenance(prov, run)
     else:
         print(f'{run}: no provenance.toml -- this run predates commit recording, so which '
               'architecture the weights were trained under cannot be read back from the folder')
@@ -617,6 +674,7 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
         state = ckpt['model_state']
     missing, unexpected = model.load_state_dict(state, strict=False)
     _report('load_run', missing, unexpected, [])
+    model.run_provenance = prov
     return model.to(device).eval(), config, registry, path
 
 
@@ -682,11 +740,12 @@ def _report(what, missing, unexpected, dropped):
 
 
 def load_scorer_run(run: Path, checkpoint: str | None = None, device='cpu'):
-    """(model, config, registry, checkpoint_path) from a scorer run folder.
+    """(model, config, registry, checkpoint_path) from a scorer run folder or checkpoint file.
 
-    The scorer has NO packaged-checkpoint form: a scorer is always a run folder, because the
-    `kind` guard needs somewhere to live and because a scorer is never a deployment artefact --
-    it is a QC tool that always ships with its registry.
+    A FILE is self-contained when it embeds its config and registry (every scorer checkpoint
+    `save_checkpoint` writes does); an older one falls back to the run folder it sits in. What
+    makes a file safe to load alone is the checkpoint's own `kind`, checked before anything is
+    built, plus the output-granularity and semantic-contract checks a run folder gets.
 
     Resume vs warm start: a checkpoint carrying a full training state is RESUMED by the caller
     (`train_scorer.py`), and a pose checkpoint is a WARM START. Both are readable from here; what
@@ -700,17 +759,29 @@ def load_scorer_run(run: Path, checkpoint: str | None = None, device='cpu'):
     from .scorer.model import build_scorer
 
     run = Path(run)
-    with open(run / 'config.toml', 'rb') as f:
-        config = tomllib.load(f)
-    require_kind(config, 'scorer', run)
+    if run.is_file():
+        if checkpoint is not None:
+            raise ValueError(f'{run}: --scorer-checkpoint selects a file inside a run folder, but '
+                             '--scorer already names a checkpoint file')
+        path = run
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        if not isinstance(ckpt, dict):
+            raise ValueError(f'{path}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
+        _require_ckpt_kind(ckpt, 'scorer', path)
+        config, registry, prov = _file_bundle(path, ckpt, 'scorer')
+    else:
+        with open(run / 'config.toml', 'rb') as f:
+            config = tomllib.load(f)
+        require_kind(config, 'scorer', run)
+        registry = Registry.load(run / 'keypoint_registry.toml')
+        path = resolve_checkpoint(run / 'checkpoints', checkpoint)
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        _require_ckpt_kind(ckpt, 'scorer', path)
+        prov = prior_provenance(run)
     mode = scorer_output_granularity(config)
     config = dict(config)
     config['scorer'] = {**config.get('scorer', {}), 'output_granularity': mode}
     check_image_size(config)
-    registry = Registry.load(run / 'keypoint_registry.toml')
-    path = resolve_checkpoint(run / 'checkpoints', checkpoint)
-    ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    _require_ckpt_kind(ckpt, 'scorer', path)
     checkpoint_mode = scorer_checkpoint_granularity(ckpt)
     embedded = ckpt.get('config')
     if isinstance(embedded, dict) and isinstance(embedded.get('scorer'), dict):
@@ -733,12 +804,9 @@ def load_scorer_run(run: Path, checkpoint: str | None = None, device='cpu'):
         model.load_state_dict(state, strict=True)
     except RuntimeError as e:
         raise ValueError(f'{path}: scorer checkpoint does not exactly match its run model: {e}') from e
-    prov = run / 'provenance.toml'
-    if prov.exists():
-        with open(prov, 'rb') as f:
-            p = tomllib.load(f)
-        print(f'run provenance: {p.get("commit", "?")[:12]}'
-              f'{" +DIRTY" if p.get("dirty") else ""}')
+    if prov:
+        _print_provenance(prov, path)
+    model.run_provenance = prov
     return model.to(device).eval(), config, registry, path
 
 

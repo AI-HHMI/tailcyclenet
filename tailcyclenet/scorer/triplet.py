@@ -893,8 +893,14 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
 
     shift_dense, fired_dense, seg_dense, meta_dense = _draw_shift(
         dense, coords, frames=sel.frames, cfg=cfg, return_metadata=True)
+    frame_mode = str(cfg.get('output_granularity', 'sequence')) == 'frame'
+    sequence_far_gate = bool(cfg.get('sequence_far_gate', False))
+    gated = frame_mode or sequence_far_gate
+    # Gated modes tolerate a sparse keypoint that never moves an observed slot: it cannot become
+    # active, so the gate below drops it from the window. Legacy sequence mode keeps the raise.
     shift_sparse, fired_sparse, seg_sparse, meta_sparse = _draw_sparse_moved(
-        sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True)
+        sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True,
+        allow_stuck=gated)
     pick = is_dense.view(1, 1, K, 1)
     pick_type = is_dense.view(1, K, 1)
     shift = torch.where(pick, shift_dense, shift_sparse)
@@ -920,10 +926,9 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
             reference_a = _source_to_view_2d(reference_a[0], view_a)[None]
         reference_a = reference_a[:, :, alive]
 
-    frame_mode = str(cfg.get('output_granularity', 'sequence')) == 'frame'
-    sequence_far_gate = bool(cfg.get('sequence_far_gate', False))
     mask_data = None
     keep = None
+    unresolved_sparse = torch.zeros_like(is_dense)
     for sparse_attempt in range(SPARSE_DRAW_RETRIES + 1):
         bad = apply_drop_mask(coords + shift, drop_mask)
         source = good if anchor_label > 0 else bad
@@ -940,20 +945,34 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
                 & _visible_points_mask(bad[0], view_a.cgroup, mode, cam_thresh)
                 & _visible_points_mask(anchor[0], view_b.cgroup, mode, cam_thresh))
         sparse_active = mask_data['active_mask'][0].any(dim=0) & (~is_dense)
-        if (not frame_mode and not sequence_far_gate) or bool(
-                sparse_active.all() if bool((~is_dense).any()) else True):
+        # Sparse keypoints with no active (far, observed, in-view) slot under this draw.
+        redo = (~is_dense) & (~sparse_active)
+        if not gated or not bool(redo.any()):
             break
         if sparse_attempt >= SPARSE_DRAW_RETRIES:
-            return None
+            # Drop the still-unresolved sparse keypoints from THIS window (below, via `keep`)
+            # rather than rejecting the whole window. Their corruption is unsupervised (moved
+            # but never active), so they must not stay in `bad` unlabelled either way.
+            # Rejecting the window instead discarded ~90% of rat7m's mocap windows, whose
+            # marker dropouts leave many keypoints observed in only a few frames.
+            unresolved_sparse = redo
+            break
+        # Redraw ONLY the unresolved sparse keypoints, keeping every resolved keypoint's draw.
+        # Points are drawn independently (`tagged_draw*` over b*k points) and the active gate is
+        # per keypoint, so per-keypoint rejection has the same accepted distribution as the old
+        # all-at-once redraw -- whose joint acceptance collapses when many keypoints are sparse.
         shift_sparse, fired_sparse, seg_sparse, meta_sparse = _draw_sparse_moved(
-            sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True)
-        shift = torch.where(pick, shift_dense, shift_sparse)
-        fired = torch.where(pick_type, fired_dense, fired_sparse)
-        seg_gate = torch.where(pick_type[:, None, :, :], seg_dense, seg_sparse)
-        metadata_flat = [meta_dense[i] if bool(is_dense[i]) else meta_sparse[i]
-                         for i in range(K)]
+            sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True,
+            allow_stuck=True)
         if mode == '3d':
-            shift = shift * cube_scale_b[:, None, None, None]
+            shift_sparse = shift_sparse * cube_scale_b[:, None, None, None]
+        shift = torch.where(redo.view(1, 1, K, 1), shift_sparse, shift)
+        fired = torch.where(redo.view(1, K, 1), fired_sparse, fired)
+        seg_gate = torch.where(redo.view(1, 1, K, 1), seg_sparse, seg_gate)
+        metadata_flat = [meta_sparse[i] if bool(redo[i]) else metadata_flat[i]
+                         for i in range(K)]
+    if bool(unresolved_sparse.any()):
+        keep = keep & (~unresolved_sparse)
 
     n_keep = int(keep.sum())
     if n_keep < 2:
@@ -1003,6 +1022,7 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
         'max_clean_px': float(cfg.get('max_clean_px', 0.0)),
         'n_dense': int(is_dense[keep].sum()),
         'n_sparse': int((~is_dense[keep]).sum()),
+        'n_sparse_dropped': int(unresolved_sparse.sum()),
     }
     for key, value in masks.items():
         if key in ('reference_gate', 'reference_source'):
@@ -1078,24 +1098,41 @@ def _sparse_stuck(shift, coords, is_dense):
 
 
 def _draw_sparse_moved(sparse_corruptor, coords, is_dense, frames=None, cfg=None,
-                        return_metadata=False):
+                        return_metadata=False, allow_stuck=False):
     """Draw sparse corruption, redrawing until every sparse point moves an observed slot.
 
     The optional distance-gated retry is handled by ``make_triplet`` after drop/view masks are
     available.  This helper retains the old moved-slot invariant and its two-return-value API by
     default; callers requesting metadata receive ``(shift, fired, segment_mask, metadata)``.
+
+    Only the STUCK keypoints are redrawn; a keypoint that already moved an observed slot keeps
+    its draw. Every point is drawn independently, so this per-keypoint rejection accepts the same
+    distribution as redrawing all keypoints until all succeed at once -- but it does not collapse
+    when many keypoints are sparse (a joint acceptance that is the product of per-keypoint ones).
+    ``allow_stuck`` returns the last draw instead of raising when some keypoint is still stuck;
+    the gated ``make_triplet`` path then drops that keypoint from the window.
     """
     def draw():
         """Draw one sparse candidate on the configured source-frame lattice."""
         return _draw_shift(sparse_corruptor, coords, frames=frames, cfg=cfg,
                            return_metadata=True)
     shift, fired, seg, metadata = draw()
+    k = shift.shape[2]
     for _ in range(SPARSE_DRAW_RETRIES):
         stuck = _sparse_stuck(shift, coords, is_dense)
         if not bool(stuck.any()):
             return ((shift, fired, seg, metadata) if return_metadata else (shift, fired))
-        shift, fired, seg, metadata = draw()
+        new_shift, new_fired, new_seg, new_metadata = draw()
+        redo = stuck.reshape(-1, k)  # [b,k]; the scorer builds b == 1
+        shift = torch.where(redo[:, None, :, None], new_shift, shift)
+        fired = torch.where(redo[:, :, None], new_fired, fired)
+        seg = torch.where(redo[:, None, :, None], new_seg, seg)
+        flat = redo.reshape(-1)
+        metadata = [new_metadata[i] if bool(flat[i]) else metadata[i]
+                    for i in range(len(metadata))]
     stuck = _sparse_stuck(shift, coords, is_dense)
+    if not bool(stuck.any()) or allow_stuck:
+        return ((shift, fired, seg, metadata) if return_metadata else (shift, fired))
     raise ValueError(
         f'{int(stuck.sum())} sparse keypoint(s) still moved no observed slot after '
         f'{SPARSE_DRAW_RETRIES} redraws of a menu restricted to types that cannot cancel. That '

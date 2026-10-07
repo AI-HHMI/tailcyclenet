@@ -19,6 +19,19 @@ from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
 
 
+def _refuse_selector_beside_file(path, selector, flag, selector_flag, default=None):
+    """A checkpoint selector picks a file INSIDE a run folder; beside a file it means nothing.
+
+    Pure (no checkpoint load), so the refusal lands before any model or video is touched.
+    """
+    if path is None:
+        return
+    path = Path(path)
+    if path.is_file() and selector is not None and selector != default:
+        raise SystemExit(f'{flag} {path} is already a checkpoint file; {selector_flag} '
+                         f'{selector!r} selects a file inside a run folder and is refused here')
+
+
 def _share_pose_scorer_encoder(pose_model, scorer_model, *, allow_mismatch,
                                pose_run, scorer_run) -> bool:
     """Share the raw video backbone, refusing unequal weights without explicit opt-in."""
@@ -452,6 +465,12 @@ def run_dataset(args):
         raise SystemExit('--scorer-checkpoint requires --scorer')
     if scorer_path is None and allow_pose_scorer_mismatch:
         raise SystemExit('--allow-pose-scorer-mismatch requires --scorer')
+    _refuse_selector_beside_file(args.run, getattr(args, 'checkpoint', None), '--run',
+                                 '--checkpoint')
+    _refuse_selector_beside_file(scorer_path, scorer_checkpoint_name, '--scorer',
+                                 '--scorer-checkpoint')
+    _refuse_selector_beside_file(args.detector, getattr(args, 'detector_checkpoint', None),
+                                 '--detector', '--detector-checkpoint', default='latest')
     if independent:
         if not args.detector:
             raise SystemExit('--independent-windows requires --detector; labels and --boxes preserve row identity.')
@@ -593,7 +612,6 @@ def run_dataset(args):
     scorer_shared_encoder = False
     scorer_prov = {}
     if scorer_path is not None:
-        import tomllib
         from ..checkpoints import load_scorer_run
         scorer, scorer_config, scorer_registry, scorer_ckpt = load_scorer_run(
             scorer_path, checkpoint=scorer_checkpoint_name, device='cpu')
@@ -625,10 +643,7 @@ def run_dataset(args):
                   'encodes by explicit --allow-pose-scorer-mismatch opt-in')
         scorer = scorer.to(device).eval()
         scorer.set_scene_speed(precision=precision, camera_batch=camera_batch)
-        scorer_prov_path = Path(scorer_path) / 'provenance.toml'
-        if scorer_prov_path.exists():
-            with scorer_prov_path.open('rb') as f:
-                scorer_prov = tomllib.load(f)
+        scorer_prov = dict(getattr(scorer, 'run_provenance', None) or {})
     if args.refine_px and args.refine_px > trained_px:
         raise SystemExit(f'--refine-px {args.refine_px} exceeds the run\'s image_size '
                          f'({trained_px}). A reduced first pass is the lever; a larger one is a '

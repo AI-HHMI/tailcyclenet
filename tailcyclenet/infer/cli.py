@@ -52,12 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog='tailcyclenet infer', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', required=True, type=Path,
-                    help='pose run folder or a self-contained pose checkpoint .pth')
+                    help='pose run folder, or ONE pose checkpoint .pth (packaged, or any '
+                         'checkpoint_*.pth: each embeds its config and keypoint registry)')
     ap.add_argument('--scorer', type=Path, default=None,
-                    help='optional framewise scorer run folder. Its quality score/precision are '
+                    help='optional framewise scorer run folder or ONE scorer checkpoint .pth '
+                         '(it embeds its config and registry). Its quality score/precision are '
                          'written as metadata; pose predictions are not filtered or changed.')
     ap.add_argument('--scorer-checkpoint', default=None,
-                    help='scorer checkpoint filename; default is the latest training checkpoint. '
+                    help='scorer checkpoint filename when --scorer is a run folder (refused '
+                         'beside a file); default is the latest training checkpoint. '
                          'checkpoint_best.pth must be explicitly named.')
     ap.add_argument('--allow-pose-scorer-mismatch', action='store_true', default=False,
                     help='allow scorer and pose raw video-encoder weights to differ; this runs '
@@ -143,7 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help='the prediction SESSION directory: session.toml, calibration.toml, '
                          'groups.pq, points3d.pq and prediction-only points2d.pq. No pixels; '
                          '[provenance] source_session says where they are.')
-    ap.add_argument('--checkpoint', default=None)
+    ap.add_argument('--checkpoint', default=None,
+                    help='pose checkpoint filename when --run is a run folder (refused beside a '
+                         'file); default is the latest training checkpoint.')
     ap.add_argument('--independent-windows', action='store_true',
                     help='reset detector association in every pose window. Requires --detector '
                          'and --anchor none; no query prior reaches the model, and window-local '
@@ -166,7 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
                          'detector_last.pth, best for historical detector.pth, or an explicit '
                          'checkpoint filename.')
     ap.add_argument('--detector-checkpoint', default='latest',
-                    help="detector checkpoint selector when --detector is a run folder: 'latest' "
+                    help="detector checkpoint selector when --detector is a run folder (refused "
+                         "beside a file): 'latest' "
                          "(default, highest complete iteration), 'last' (detector_last.pth), "
                          "'best' (historical detector.pth), or an explicit filename.")
     ap.add_argument('--det-trace', type=Path, default=None,

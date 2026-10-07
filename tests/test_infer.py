@@ -1237,6 +1237,68 @@ def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
     assert meta['anchor'] == 'none'
 
 
+def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
+    """`--run` may be ONE checkpoint file with no run folder anywhere: the file embeds its config,
+    registry and provenance. The prediction must be the run folder's, bit for bit."""
+    import shutil
+
+    import conftest as cf
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    from tailcyclenet.infer.predictions import load_predictions
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    registry = Registry.build([load_dataset(root)])
+    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                       'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    path = save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config,
+                           registry=registry)
+    lone = tmp_path / 'elsewhere' / 'pose.pth'
+    lone.parent.mkdir()
+    shutil.copy(path, lone)
+
+    def infer(where, out):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(where),
+                                          '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                          '--device', 'cpu', '--overlap', '2', '--out', str(out)])
+        cli.main()
+        return load_predictions(out)
+
+    ref, _ = infer(run, tmp_path / 'from-run')
+    shutil.rmtree(run)
+    got, meta = infer(lone, tmp_path / 'from-file')
+    assert meta['run'] == str(lone.resolve())
+    np.testing.assert_array_equal(got['s/g000']['pred'], ref['s/g000']['pred'])
+
+
+@pytest.mark.parametrize('flag,selector_flag,value', [
+    ('--run', '--checkpoint', 'checkpoint_best.pth'),
+    ('--scorer', '--scorer-checkpoint', 'checkpoint_best.pth'),
+    ('--detector', '--detector-checkpoint', 'best'),
+])
+def test_a_checkpoint_selector_beside_a_file_is_refused_before_loading(
+        cli, monkeypatch, tmp_path, flag, selector_flag, value):
+    import conftest as cf
+
+    cf._session_2d(tmp_path / 'rat' / 'test' / 's')
+    f = tmp_path / 'model.pth'
+    torch.save({}, f)
+
+    def boom(*a, **k):
+        raise AssertionError('the refusal must fire before the checkpoint loads')
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    argv = {'--run': str(tmp_path / 'run'), flag: str(f), selector_flag: value}
+    monkeypatch.setattr(sys, 'argv', ['infer.py', *[x for kv in argv.items() for x in kv],
+                                      '--data', str(tmp_path / 'rat' / 'test' / 's'),
+                                      '--device', 'cpu', '--out', str(tmp_path / 'o')])
+    with pytest.raises(SystemExit, match=f'already a checkpoint file; {selector_flag}'):
+        cli.main()
+
+
 def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeypatch, tmp_path):
     """`--out` is ONE session directory, so `--data` must name one session. Refused BEFORE
     `load_run` -- a typo must not cost a 5.6 GB checkpoint load. `sessions_for` reads toml and

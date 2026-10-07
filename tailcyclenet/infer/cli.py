@@ -2,24 +2,25 @@
 """Run a trained model. The only entry point that touches a checkpoint.
 
     # one session directory, cropping from the labels (the GT-crop upper bound)
-    pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> --out pred/
+    pixi run python scripts/infer.py --pose runs/<name> --data <dataset>/test/<session> --out pred/
 
     # one session, query-free
-    pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> \\
+    pixi run python scripts/infer.py --pose runs/<name> --data <dataset>/test/<session> \\
         --anchor none --out pred/
 
     # crops from a detections file (the deployment number)
-    pixi run python scripts/infer.py --run runs/<name> --data <dataset>/test/<session> \\
+    pixi run python scripts/infer.py --pose runs/<name> --data <dataset>/test/<session> \\
         --boxes dets.npz --out pred/
 
     # raw footage plus an anipose calibration, straight off the camera files
-    pixi run python scripts/infer.py --run runs/<name> --out pred/ --videos rec/ \\
+    pixi run python scripts/infer.py --pose runs/<name> --out pred/ --videos rec/ \\
         --calibration anipose/calibration.toml --cam-regex 'cam([0-9]+)_' \\
         --detector runs/det-<name> --max-animals 4
 
 `--out` is a prediction SESSION DIRECTORY (session.toml, calibration.toml, groups.pq and the
 label tables), written a block at a time -- not an npz. A run folder carries its own config and
-keypoint registry, so `--run` is the whole model specification and a config/checkpoint mismatch
+keypoint registry (and so does each of its checkpoint files), so `--pose` -- older spelling
+`--run`, kept -- is the whole model specification and a config/checkpoint mismatch
 cannot happen.
 """
 from __future__ import annotations
@@ -51,9 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     """
     ap = argparse.ArgumentParser(prog='tailcyclenet infer', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--run', required=True, type=Path,
+    ap.add_argument('--pose', '--run', dest='run', required=True, type=Path,
                     help='pose run folder, or ONE pose checkpoint .pth (packaged, or any '
-                         'checkpoint_*.pth: each embeds its config and keypoint registry)')
+                         'checkpoint_*.pth: each embeds its config and keypoint registry). '
+                         '--run is the older spelling of the same option.')
     ap.add_argument('--scorer', type=Path, default=None,
                     help='optional framewise scorer run folder or ONE scorer checkpoint .pth '
                          '(it embeds its config and registry). Its quality score/precision are '
@@ -146,9 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help='the prediction SESSION directory: session.toml, calibration.toml, '
                          'groups.pq, points3d.pq and prediction-only points2d.pq. No pixels; '
                          '[provenance] source_session says where they are.')
-    ap.add_argument('--checkpoint', default=None,
-                    help='pose checkpoint filename when --run is a run folder (refused beside a '
-                         'file); default is the latest training checkpoint.')
+    ap.add_argument('--pose-checkpoint', '--checkpoint', dest='checkpoint', default=None,
+                    help='pose checkpoint filename when --pose is a run folder (refused beside a '
+                         'file); default is the latest training checkpoint. --checkpoint is the '
+                         'older spelling of the same option.')
     ap.add_argument('--independent-windows', action='store_true',
                     help='reset detector association in every pose window. Requires --detector '
                          'and --anchor none; no query prior reaches the model, and window-local '

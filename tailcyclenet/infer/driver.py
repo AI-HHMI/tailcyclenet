@@ -465,8 +465,8 @@ def run_dataset(args):
         raise SystemExit('--scorer-checkpoint requires --scorer')
     if scorer_path is None and allow_pose_scorer_mismatch:
         raise SystemExit('--allow-pose-scorer-mismatch requires --scorer')
-    _refuse_selector_beside_file(args.run, getattr(args, 'checkpoint', None), '--run',
-                                 '--checkpoint')
+    _refuse_selector_beside_file(args.run, getattr(args, 'checkpoint', None), '--pose',
+                                 '--pose-checkpoint')
     _refuse_selector_beside_file(scorer_path, scorer_checkpoint_name, '--scorer',
                                  '--scorer-checkpoint')
     _refuse_selector_beside_file(args.detector, getattr(args, 'detector_checkpoint', None),

@@ -1261,7 +1261,7 @@ def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
     shutil.copy(path, lone)
 
     def infer(where, out):
-        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(where),
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--pose', str(where),
                                           '--data', str(root / 'test' / 's'), '--anchor', 'none',
                                           '--device', 'cpu', '--overlap', '2', '--out', str(out)])
         cli.main()
@@ -1275,6 +1275,7 @@ def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize('flag,selector_flag,value', [
+    ('--pose', '--pose-checkpoint', 'checkpoint_best.pth'),
     ('--run', '--checkpoint', 'checkpoint_best.pth'),
     ('--scorer', '--scorer-checkpoint', 'checkpoint_best.pth'),
     ('--detector', '--detector-checkpoint', 'best'),
@@ -1295,8 +1296,20 @@ def test_a_checkpoint_selector_beside_a_file_is_refused_before_loading(
     monkeypatch.setattr(sys, 'argv', ['infer.py', *[x for kv in argv.items() for x in kv],
                                       '--data', str(tmp_path / 'rat' / 'test' / 's'),
                                       '--device', 'cpu', '--out', str(tmp_path / 'o')])
-    with pytest.raises(SystemExit, match=f'already a checkpoint file; {selector_flag}'):
+    shown = {'--run': '--pose', '--checkpoint': '--pose-checkpoint'}
+    with pytest.raises(SystemExit,
+                       match=f'already a checkpoint file; {shown.get(selector_flag, selector_flag)}'):
         cli.main()
+
+
+def test_pose_and_run_are_one_option():
+    """`--pose`/`--pose-checkpoint` are the names; `--run`/`--checkpoint` stay as aliases."""
+    from tailcyclenet.infer.cli import build_parser
+    ap = build_parser()
+    base = ['--data', 'd', '--out', 'o']
+    new = ap.parse_args(['--pose', 'r', '--pose-checkpoint', 'c.pth', *base])
+    old = ap.parse_args(['--run', 'r', '--checkpoint', 'c.pth', *base])
+    assert (new.run, new.checkpoint) == (old.run, old.checkpoint) == (Path('r'), 'c.pth')
 
 
 def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeypatch, tmp_path):

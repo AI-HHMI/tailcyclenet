@@ -3,6 +3,8 @@
 The point of this detector is not that it finds animals -- it is that it reproduces THE CROP
 RULE'S box. If it learned some other plausible box, every downstream pose number would shift.
 """
+import shutil
+
 import numpy as np
 import pytest
 import torch
@@ -3597,6 +3599,26 @@ kpt_score_weight = 1.0
     assert ckpt['min_crop_dim'] == 16
     assert ckpt['box_source'] == 'keypoints'
     assert tuple(ckpt['input_wh']) == (48, 48)
+    assert ckpt['kind'] == 'detector'
+    assert ckpt['config'] == recorded, 'the embedded config must be what config.toml records'
+    with open(out / 'provenance.toml', 'rb') as f:
+        assert ckpt['provenance'] == tomllib.load(f)
+    lone = tmp_path / 'elsewhere' / 'detector.pth'
+    lone.parent.mkdir()
+    shutil.copy(out / 'detector_it000002.pth', lone)
+    shutil.rmtree(out)
+    lone_model, lone_wh, *_ = load_detector(lone)
+    assert tuple(lone_wh) == (48, 48)
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, lone_model.state_dict()[k]), k
+
+
+def test_load_detector_refuses_a_pose_checkpoint(tmp_path):
+    from tailcyclenet.detector import load_detector
+    p = tmp_path / 'pose.pth'
+    torch.save({'kind': 'pose', 'model_state': {}}, p)
+    with pytest.raises(ValueError, match="'pose' checkpoint, not a detector"):
+        load_detector(p)
 
 
 def test_load_detector_config_out_override_rescues_an_empty_out(tmp_path):

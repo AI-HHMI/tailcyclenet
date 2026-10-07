@@ -47,13 +47,23 @@ def _scorer_model(config):
     return model
 
 
+class _Averaged(torch.optim.AdamW):
+    """AdamW with a (no-op) averaged iterate, so `model_state_eval` is written like a real run's."""
+
+    def eval(self):
+        pass
+
+    def train(self):
+        pass
+
+
 def _train_run(tmp_path, kind):
     """A run folder written by the real writers: `save_run_meta` then `save_checkpoint`."""
     config = _pose_config() if kind == 'pose' else _scorer_config()
     model = (build_model({**config['model'], 'video_encoder_pretrained': False},
                          n_keypoints=REGISTRY.n_keypoints) if kind == 'pose'
              else _scorer_model(config))
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    opt = _Averaged([p for p in model.parameters() if p.requires_grad], lr=1e-3)
     run = tmp_path / f'{kind}-run'
     ck.save_run_meta(run, config, REGISTRY, kind=kind, extra={'world_size': 1})
     path = ck.save_checkpoint(run, 5, model, opt, config, registry=REGISTRY, kind=kind)
@@ -103,7 +113,7 @@ def test_a_lone_checkpoint_loads_the_same_model_as_its_run_folder(tmp_path, kind
     lone = tmp_path / 'elsewhere' / 'model.pth'
     lone.parent.mkdir()
     shutil.copy(path, lone)
-    shutil.rmtree(run)  # nothing to fall back on
+    shutil.rmtree(run)
 
     model, config, registry, got = _load(kind, lone)
     assert got == lone
@@ -157,3 +167,27 @@ def test_a_pose_checkpoint_is_refused_as_a_scorer_and_vice_versa(tmp_path):
 def test_peek_registry_reads_a_lone_checkpoint(tmp_path):
     _, path, _ = _train_run(tmp_path, 'pose')
     assert ck.peek_registry(path) == REGISTRY
+
+
+@pytest.mark.parametrize('kind', ['pose', 'scorer'])
+def test_a_packaged_checkpoint_loads_alone_like_its_run(tmp_path, kind):
+    from scripts.package_checkpoint import package_pose
+    run, _, _ = _train_run(tmp_path, kind)
+    packaged = package_pose(run, tmp_path / f'{kind}.pth', kind=kind)
+    ckpt = torch.load(packaged, map_location='cpu', weights_only=False)
+    assert ckpt['kind'] == kind
+    assert 'optimizer_state' not in ckpt
+    assert ckpt['provenance'].get('world_size') == 1
+    ref, ref_config, _, _ = _load(kind, run)
+    shutil.rmtree(run)
+    model, config, registry, _ = _load(kind, packaged)
+    _same_weights(model, ref)
+    assert config == ref_config
+    assert registry == REGISTRY
+
+
+def test_packaging_refuses_the_wrong_kind(tmp_path):
+    from scripts.package_checkpoint import package_pose
+    run, _, _ = _train_run(tmp_path, 'scorer')
+    with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
+        package_pose(run, tmp_path / 'x.pth', kind='pose')

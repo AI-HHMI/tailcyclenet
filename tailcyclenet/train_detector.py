@@ -252,10 +252,12 @@ def _wandb_eval_metrics(scores, obj_q):
     return metrics
 
 
-def _record_run(run: Path, config: dict) -> None:
+def _record_run(run: Path, config: dict) -> tuple[dict, dict]:
     """Write the run folder's reproducibility record: the effective config + provenance.
 
-    `None` values are dropped so the recorded file round-trips to the same recipe.
+    `None` values are dropped so the recorded file round-trips to the same recipe. Returns
+    `(record, provenance)` -- exactly what every checkpoint embeds, so a lone `.pth` carries
+    the same config `config.toml` does.
     """
     import copy
 
@@ -269,6 +271,7 @@ def _record_run(run: Path, config: dict) -> None:
     prov = provenance()
     if prov:
         (run / 'provenance.toml').write_text(toml.dumps(prov))
+    return record, prov
 
 
 def main(argv: list[str] | None = None):
@@ -327,7 +330,7 @@ def main(argv: list[str] | None = None):
     np.random.seed(train_cfg['seed'])
     device = train_cfg['device'] if torch.cuda.is_available() else 'cpu'
     run = Path(train_cfg['out'])
-    _record_run(run, config)
+    run_record, run_prov = _record_run(run, config)
     wb = _init_detector_wandb(config, run)
 
     all_roots = load_datasets(data_cfg['path'])
@@ -470,6 +473,39 @@ def main(argv: list[str] | None = None):
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
               f'neck/head {train_cfg["lr"]:g}', flush=True)
 
+    ckpt_meta = {
+        'kind': 'detector', 'config': run_record, 'provenance': run_prov,
+        'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
+        'input_norm': data_cfg['input_norm'],
+        'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
+        'input_wh': wh, 'n_keypoints': n_kpts,
+        'norm': 'gn',
+        'yolox_version': model_cfg['yolox'],
+        'optimizer_kind': train_cfg['optimizer'],
+        'bottleneck_expansion': model_cfg['bottleneck_expansion'],
+        'pretrained': model_cfg['pretrained'],
+        'assignment': train_cfg['assignment'],
+        'box_loss': train_cfg['box_loss'],
+        'tal_topk': train_cfg['tal_topk'],
+        'tal_alpha': train_cfg['tal_alpha'],
+        'tal_beta': train_cfg['tal_beta'],
+        'shared_head': train_cfg['shared_head'],
+        'fpn_upsample': train_cfg['fpn_upsample'],
+        'p2': model_cfg['p2'],
+        'seed': train_cfg['seed'],
+        'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
+        'dataset': train.root_names[0] if len(train.root_names) == 1 else '',
+        'datasets': list(train.root_names), 'box_source': data_cfg['boxes'],
+        'box_sources': effective_sources,
+        'balance_datasets': data_cfg['balance_datasets'],
+        'root_mix': root_mix,
+        'annot_frac': data_cfg['annot_frac'],
+        'weight_decay': train_cfg['weight_decay'],
+        'min_crop_dim': data_cfg['min_crop_dim'],
+        'augment': data_cfg['augment'],
+        'augment_strong': data_cfg['augment_strong'],
+        'reduce': data_cfg['reduce'], 'rotate_deg': data_cfg['rotate_deg'],
+    }
     history = []
     best_score = -float('inf')
     it, t0, running = 0, time.time(), []
@@ -546,20 +582,8 @@ def main(argv: list[str] | None = None):
                 eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 if hasattr(opt, 'train'):
                     opt.train()
-                save_ckpt = {
-                    'iteration': it, 'model_state': eval_state, 'config': config,
-                    'model_state_is': 'eval', 'input_wh': wh, 'n_keypoints': n_kpts,
-                    'norm': 'gn', 'yolox_version': model_cfg['yolox'],
-                    'bottleneck_expansion': model_cfg['bottleneck_expansion'],
-                    'pretrained': model_cfg['pretrained'], 'shared_head': train_cfg['shared_head'],
-                    'fpn_upsample': train_cfg['fpn_upsample'], 'p2': model_cfg['p2'],
-                    'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
-                    'input_norm': data_cfg['input_norm'],
-                    'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
-                    'min_crop_dim': data_cfg['min_crop_dim'], 'reduce': data_cfg['reduce'],
-                    'box_source': data_cfg['boxes'], 'dataset': train.root_names[0],
-                    'datasets': list(train.root_names), 'seed': train_cfg['seed'],
-                }
+                save_ckpt = {**ckpt_meta, 'iteration': it, 'model_state': eval_state,
+                             'model_state_is': 'eval'}
                 torch.save(save_ckpt, run / f'detector_it{it:06d}.pth')
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
                 if hasattr(opt, 'eval'):
@@ -615,40 +639,11 @@ def main(argv: list[str] | None = None):
                 selection_metric = (f'{select_split}_{selection_kind}_r50' if multi
                                     else f'{select_split}_r50')
                 selected_score = scores[select_split]['r50']
-                ckpt = {'iteration': it, 'model_state': eval_state, 'config': config,
+                ckpt = {**ckpt_meta, 'iteration': it, 'model_state': eval_state,
                         'model_state_is': 'eval',
                         **({'model_state_train': train_state} if train_state is not None else {}),
-                        'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
-                        'input_norm': data_cfg['input_norm'],
-                        'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
-                        'input_wh': wh, 'n_keypoints': n_kpts,
-                        'norm': 'gn',
-                        'yolox_version': model_cfg['yolox'],
-                        'optimizer_kind': train_cfg['optimizer'],
-                        'bottleneck_expansion': model_cfg['bottleneck_expansion'],
-                        'pretrained': model_cfg['pretrained'],
-                        'assignment': train_cfg['assignment'],
-                        'box_loss': train_cfg['box_loss'],
-                        'tal_topk': train_cfg['tal_topk'],
-                        'tal_alpha': train_cfg['tal_alpha'],
-                        'tal_beta': train_cfg['tal_beta'],
-                        'shared_head': train_cfg['shared_head'],
-                        'fpn_upsample': train_cfg['fpn_upsample'],
-                        'p2': model_cfg['p2'],
-                        'seed': train_cfg['seed'],
-                        'tile_wh': data_cfg['tile_wh'], 'tile_scale': data_cfg['tile_scale'],
-                        'dataset': train.root_names[0] if len(train.root_names) == 1 else '',
-                        'datasets': list(train.root_names), 'box_source': data_cfg['boxes'],
-                        'box_sources': effective_sources,
-                        'balance_datasets': data_cfg['balance_datasets'],
-                        'root_mix': root_mix, 'selection_metric': selection_metric,
+                        'selection_metric': selection_metric,
                         'selection_score': selected_score,
-                        'annot_frac': data_cfg['annot_frac'],
-                        'weight_decay': train_cfg['weight_decay'],
-                        'min_crop_dim': data_cfg['min_crop_dim'],
-                        'augment': data_cfg['augment'],
-                        'augment_strong': data_cfg['augment_strong'],
-                        'reduce': data_cfg['reduce'], 'rotate_deg': data_cfg['rotate_deg'],
                         'obj_quantiles': obj_q,
                         'eval': scores}
                 torch.save(ckpt, run / f'detector_it{it:06d}.pth')

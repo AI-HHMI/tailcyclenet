@@ -104,6 +104,10 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
     import torch
     p = resolve_detector_checkpoint(path, checkpoint=checkpoint)
     ckpt = torch.load(p, map_location='cpu', weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f'{p}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
+    if ckpt.get('kind', 'detector') != 'detector':
+        raise ValueError(f"{p}: this is a {ckpt['kind']!r} checkpoint, not a detector one")
     wh = input_wh or ckpt.get('input_wh') or ckpt.get('det_input_wh')
     if wh is None:
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '

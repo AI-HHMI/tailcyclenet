@@ -7,7 +7,8 @@
 n_frames = 12               # a CEILING: a train window is sized to the labelled span it covers; must equal [model].stride_length (refused otherwise). 12 keeps the full-frame working set across refine passes affordable.
 image_size = 256
 balance_datasets = true
-aug_prob = 0.25
+aug_prob = 0.4
+aug_rotation_deg = 180.0
 # Train-only grayscale conversion; zero disables it.
 grayscale_prob = 0.2
 # Train-only black <-> white color inversion; zero disables it.
@@ -133,8 +134,8 @@ coords_softmax_2d_weight = 0.6
 smoothness_loss_2d_weight = 0.5
 smoothness_loss_order = 4   # a ceiling: train.py clamps to min(order, T-1) per batch, and the derived-T rule makes T = 2 common, i.e. order 1
 smoothness_loss_tolerance = 1.5
-# A REPO-LOCAL term (PoseLoss), the only key here that fires on a 2D session and NOT on a 3D one: default 0.0 so an absent key is bit-identical to every run on record; measure a nonzero arm on allen-mouse-annotated.
-vis_loss_2d_weight = 0.0
+# A REPO-LOCAL term (PoseLoss), the only key here that fires on a 2D session and NOT on a 3D one. Conservative nonzero default; validate on sessions with trustworthy visibility labels (first allen-mouse-annotated).
+vis_loss_2d_weight = 0.1
 # 3D-only from here down. In 2D the vis_pred head gets no gradient from this weight -- `vis_loss_2d_weight` above is the 2D channel.
 vis_loss_weight = 5.0
 vis_loss_3d_weight = 1.0

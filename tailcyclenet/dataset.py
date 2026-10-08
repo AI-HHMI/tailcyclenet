@@ -55,12 +55,12 @@ class LoaderConfig:
     # sample datasets uniformly, not proportionally
     balance_datasets: bool = True
     # in-plane rotation, per-camera appearance, cutout
-    aug_prob: float = 0.25
+    aug_prob: float = 0.4
     # In-plane rotation magnitude and rate, split out of `aug_prob` because they are what a root
     # sets. 180 is a FULL 360 draw and costs nothing over 45 on a wide frame: the border-free
     # canvas is 90-degree periodic (`_rotated_rect_max_inscribed`), and the wider draw covers
     # more heading.
-    aug_rotation_deg: float = 45.0
+    aug_rotation_deg: float = 180.0
     # None means "follow aug_prob"; set it to dial rotation without moving appearance jitter.
     aug_rotation_prob: float | None = None
     # train-only source-canvas reflection for native/forced 2D items; zero is byte/RNG-identical.

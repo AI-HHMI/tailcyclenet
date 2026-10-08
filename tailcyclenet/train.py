@@ -189,8 +189,8 @@ def _tune_smoothness(loss_fn, T, stride=1):
 
 _SMOOTHNESS_KEYS = ('smoothness_3d_loss', 'smoothness_2d_loss')
 # Scalar outputs shared with validation; delta_x_1..16 are per-batch arrays and are omitted by
-# the same scalar filter. The visibility-based 2D values are diagnostic only: that head has no
-# gradient when vis_loss_2d_weight is 0 (the shipped default).
+# the same scalar filter. The visibility-based 2D values are diagnostics alongside the optional
+# 2D visibility-loss head.
 _TRAIN_METRIC_KEYS = (
     'mte', 'delta_x_avg', 'occlusion_acc', 'avg_jaccard', 'survival_rate', 'mpjpe',
     'jaccard_1', 'jaccard_2', 'jaccard_4', 'jaccard_8', 'jaccard_16',

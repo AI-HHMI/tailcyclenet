@@ -27,15 +27,14 @@ def masked_bce_with_logits(pred: torch.Tensor, target: torch.Tensor) -> torch.Te
 
 class PoseLoss(TotalLoss):
     """`TotalLoss` plus a 2D-only visibility term posetail does not carry. `vis_loss_2d_weight`
-    defaults to 0.0, so an absent key is bit-identical to every run on record; other keys reach
-    `TotalLoss` unchanged, so an unknown key still raises `TypeError`.
+    defaults to 0.1, a conservative nonzero weight; other keys reach `TotalLoss` unchanged, so an
+    unknown key still raises `TypeError`.
     """
 
-    def __init__(self, vis_loss_2d_weight: float = 0.0, **kwargs):
+    def __init__(self, vis_loss_2d_weight: float = 0.1, **kwargs):
         """Set the 2D visibility BCE weight; everything else reaches `TotalLoss` unchanged.
 
-        Inputs: vis_loss_2d_weight -- weight of the 2D visibility term; 0.0 (the default)
-                disables it, bit-identical to a run without the key.
+        Inputs: vis_loss_2d_weight -- weight of the 2D visibility term; defaults to 0.1.
         """
         super().__init__(**kwargs)
         self.vis_loss_2d_weight = vis_loss_2d_weight

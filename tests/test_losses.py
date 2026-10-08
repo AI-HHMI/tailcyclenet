@@ -70,12 +70,10 @@ def _patch_total_forward(monkeypatch, value):
     return calls
 
 
-def test_pose_loss_at_default_weight_is_bit_identical_to_totalloss(monkeypatch):
-    """An absent `vis_loss_2d_weight` key must reproduce today's arm exactly -- every run on
-    record used bare `TotalLoss`.
-    """
+def test_pose_loss_at_zero_weight_is_bit_identical_to_totalloss(monkeypatch):
+    """An explicit zero preserves the historical behavior of bare `TotalLoss`."""
     calls = _patch_total_forward(monkeypatch, 0.5)
-    plain = PoseLoss()                      # vis_loss_2d_weight defaults to 0.0
+    plain = PoseLoss(vis_loss_2d_weight=0.0)
     got = plain.forward(None, {'vis_pred_2d': torch.zeros(1, 1, 2, 3)},
                         torch.zeros(1, 2, 3, 2), None, None,
                         vis_2d_true=torch.ones(1, 2, 3, 1, 1), device='cpu')

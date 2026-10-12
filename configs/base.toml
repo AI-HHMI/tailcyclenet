@@ -157,7 +157,7 @@ smoothness_loss_3d_weight = 0.5
 
 # Three keys that used to be here and reach nothing were removed: gamma, feature_loss_weight (both gate on outputs TrackerEncoder never emits) and pixel_thresh (feeds only the conf losses).
 
+# Used only if wandb is installed (`--no-wandb` disables it); an absent `path` logs inside the run folder.
 [wandb]
 project_name = "tailcyclenet"
-path = "/groups/karashchuk/home/karashchukl/results/tailcyclenet"
 mode = "offline"

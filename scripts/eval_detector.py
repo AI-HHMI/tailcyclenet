@@ -156,8 +156,7 @@ def main():
                          '(unrelated to deployment tuning -- this is what the model candidate-'
                          'decoded, not what a deployment run would keep). ALSO used as --det-score '
                          'in --deploy mode, where it means something different: infer.py\'s own '
-                         '--det-score default is now 0.01 (CHANGED from 0.5 then 0.05, dev/reports/'
-                         '44_detector_recommended_defaults.md) -- pass --score-thresh 0.01 '
+                         '--det-score default is 0.01 -- pass --score-thresh 0.01 '
                          'explicitly under --deploy to match it; this flag\'s own default stays '
                          '0.05 for its primary, non-deploy purpose.')
     ap.add_argument('--nms-iou', type=float, default=0.5,

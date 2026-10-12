@@ -88,6 +88,7 @@ def init_wandb(config: dict, run: Path, disabled: bool = False):
     """wandb from the existing `[wandb]` block, or None. The run folder stays `--out`.
 
     The run name carries a timestamp because the folder alone is not unique across resumes.
+    `[wandb].path` (wandb's log directory) defaults to the run folder itself.
     """
     cfg = config.get('wandb')
     if disabled or not cfg:
@@ -97,9 +98,10 @@ def init_wandb(config: dict, run: Path, disabled: bool = False):
     except ImportError:
         print('wandb: not installed, skipping')
         return None
-    Path(cfg.get('path', '.')).mkdir(parents=True, exist_ok=True)
+    log_dir = Path(cfg.get('path') or run)
+    log_dir.mkdir(parents=True, exist_ok=True)
     name = f'{time.strftime("%Y%m%d_%H%M%S")}-{run.name}'
-    wandb.init(project=cfg.get('project_name', 'tailcyclenet'), dir=cfg.get('path'),
+    wandb.init(project=cfg.get('project_name', 'tailcyclenet'), dir=str(log_dir),
                mode=cfg.get('mode', 'offline'), name=name, config=config)
     print(f'wandb: {cfg.get("mode", "offline")} | {wandb.run.name}')
     return wandb

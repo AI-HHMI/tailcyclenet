@@ -578,7 +578,7 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
 
 def test_capture_overlap_agreement_is_off_by_default_and_never_moves_a_prediction(
         multiwindow_scene):
-    """The opt-in overlap-agreement diagnostic (report 53 follow-up) must be a pure side channel:
+    """The opt-in overlap-agreement diagnostic must be a pure side channel:
     off by default, and its presence or absence in `stats` must never change a single predicted
     value, whether or not the flag is set.
     """
@@ -607,8 +607,7 @@ def test_capture_overlap_agreement_is_off_by_default_and_never_moves_a_predictio
 
 def test_capture_overlap_agreement_records_the_discarded_seam_prediction(multiwindow_scene):
     """When enabled, the hook must record one entry per (row, overlap frame) BEFORE the later
-    window's write overwrites it -- the exact value the seam rule discards today (report 53
-    follow-up, the overlap-reuse idea). `multiwindow_scene` (T=16, n_frames=4, overlap=2) gives
+    window's write overwrites it -- the exact value the seam rule discards today. `multiwindow_scene` (T=16, n_frames=4, overlap=2) gives
     several overlapping windows, so every non-edge window contributes overlap frames.
     """
     from tailcyclenet.infer.window import merge_blocks, run_blocks
@@ -2914,8 +2913,8 @@ def test_box_prompt_labels_refuses_a_detector_or_boxes_source(cli, monkeypatch, 
     """The same bug `--anchor labels` already refuses: `run_blocks` seeds the box-prompt term's
     row `a` from LABEL row `a` (`window.py`'s `src[a]`), but a detector's or `--boxes` npz's rows
     are score- or association-ordered, not label rows -- a different animal's ground truth fed
-    in as an oracle. Found empirically (report 56, dev/reports/56_..., Session 20): the
-    detector-slot-to-GT-row correspondence flips over a real clip, so the previously-unguarded
+    in as an oracle. On a real clip, the detector-slot-to-GT-row correspondence flips over time, so the
+    previously-unguarded
     combination silently fed the wrong animal's exact position for roughly half of it. Needs a
     real box-model run (not a bare `--run nope`, unlike the analogous `--anchor labels` test)
     since the refusal only fires once `model_is_box` is known.
@@ -2946,8 +2945,7 @@ def test_box_prompt_labels_refuses_a_detector_or_boxes_source(cli, monkeypatch, 
 def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_one():
     """The gate used to read `carried[a] is None`, which under-withholds: `_build_prior` can ALSO
     decline a non-None carry as stale (a skipped window) or shape-mismatched, and in either case
-    no identity signal reached the model that window. Fixed (report 56 Session 9/13's
-    cross-clip-replicated finding, `window.py`): the gate now also compensates whenever
+    no identity signal reached the model that window. The gate now also compensates whenever
     `_build_prior`'s own verdict for THIS window (`prior`) is None, not just when there was never
     a carry at all.
     """

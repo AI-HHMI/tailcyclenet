@@ -1,6 +1,6 @@
 # The detector training config (`scripts/train_detector.py --config configs/detector.toml`).
-# One shipped recommended recipe (since 2026-10-03 the cross-rig recipe of dev/reports/73_detector_transfer.md). Per-root differences are key overrides in YOUR config, not a
-# second shipped file -- every config layers over this file automatically (`extends` is deleted).
+# The shipped cross-rig recipe is the recommended starting point. Per-root differences are key
+# overrides in YOUR config, not a second shipped file -- every config layers over this file automatically.
 # The recall-v2 assignment/loss defaults
 # below are the selected rat-city training recommendation; set assignment="center" and
 # box_loss="giou" explicitly only when reproducing a legacy control.

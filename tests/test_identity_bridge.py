@@ -186,7 +186,7 @@ def test_an_impossible_margin_refuses_and_quarantines_instead_of_guessing():
 def _nearly_parallel_tracks(n_frames=240, k=3):
     """Two rows moving in almost the same direction -- an AMBIGUOUS case, unlike the cleanly
     separated opposite-direction crossing every other test in this file uses. A swap here scores
-    a real but LOW margin, the shape that damaged a perfectly clean clip in dev/reports/57.
+    a real but LOW margin, the shape that damaged a perfectly clean clip.
     """
     pred = np.full((2, n_frames, k, 3), np.nan, np.float32)
     t = np.arange(n_frames, dtype=np.float32)
@@ -200,11 +200,9 @@ def _nearly_parallel_tracks(n_frames=240, k=3):
 
 
 def test_a_low_margin_release_is_refused_at_the_shipped_default_but_not_at_the_old_one():
-    """dev/reports/57: min_margin=1.0 (report 54's arm) released a real permutation on a
-    PERFECTLY CLEAN 3dpop clip (Sequence42) at margin 43.08, turning idsw 0 into 2 -- CLAUDE.md's
-    own kill condition for the whole mechanism. min_margin=60.0 (the shipped default since) must
-    refuse this shape of low-margin release; the OLD default must still apply it, so this test
-    would have caught the regression before it shipped.
+    """A low threshold released a real permutation on a perfectly clean clip at margin 43.08,
+    turning idsw 0 into 2. The shipped threshold must refuse this shape of low-margin release;
+    the old threshold must still apply it, so this test catches regressions in either direction.
     """
     pred = _nearly_parallel_tracks()
     swap_at = 120

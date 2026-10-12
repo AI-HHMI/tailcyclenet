@@ -28,7 +28,7 @@ from posetail.posetail.cube import project_points_torch
 
 from .associate import _centres, associate
 
-# Measured on 3dpop Sequence 59 frames 1000-1400 (dev/reports/53): a seated duplicate track's
+# On a crowded multiview clip, a seated duplicate track's
 # triangulated points project 0.32-0.73 box sides apart in every camera it claims (per-frame
 # min gap >= 0.32), while a genuine distinct-animal contact sat at 0.82+ max.  0.75 clears the
 # whole measured duplicate band; 0.25 clears its observed floor while still leaving the

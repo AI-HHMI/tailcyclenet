@@ -62,8 +62,7 @@ class BridgeConfig:
     component quarantined rather than guessing. `missing_cost` is what an unobservable pairing
     pays, in the same units as the pose (mm in 3D, px in 2D).
 
-    `min_margin = 60.0` (raised from report 54's 1.0): on a 10-clip 3dpop Wave 1 population
-    (dev/reports/57), 1.0 released a real permutation on Sequence42 at margin 43.08 on a clip
+    `min_margin = 60.0`: a low threshold released a real permutation at margin 43.08 on a clip
     whose baseline was PERFECTLY CLEAN, turning idsw 0 into 2 -- CLAUDE.md's own kill condition
     for the whole mechanism (damaging a clean clip). Every known-good outcome in the same
     population sits far above that (Sequence29's real repair: 140.21/220.86; Sequence10 and

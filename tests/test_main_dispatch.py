@@ -60,3 +60,22 @@ def test_a_first_argument_that_is_not_a_command_is_refused(monkeypatch):
 
     with pytest.raises(SystemExit, match='is not a tailcyclenet command'):
         dispatcher.main()
+
+
+@pytest.mark.parametrize('command, module_name', [
+    ('train-scorer', 'tailcyclenet.scorer.train'),
+    ('score', 'tailcyclenet.scorer.score'),
+])
+def test_scorer_commands_dispatch_to_their_modules(monkeypatch, command, module_name):
+    """The scorer's train and score entry points are reachable from a pip install."""
+    import importlib
+
+    module = importlib.import_module(module_name)
+    seen = []
+    monkeypatch.setattr(module, 'main', lambda argv=None: seen.append(argv))
+    monkeypatch.setattr(sys, 'argv', ['tailcyclenet', command, '--out', 'x'])
+
+    dispatcher.main()
+
+    assert sys.argv[1:] == [command, '--out', 'x']
+    assert seen == [['--out', 'x']]

@@ -1,213 +1,351 @@
 # tailcyclenet
 
-Finetune a [tracktail](https://pypi.org/project/tracktail/) point tracker into an animal pose
-estimator. Three settings, one model: **3D multiview**, **3D single-view**, **2D single-view**.
+Animal pose estimation with temporal priors, for **3D multiview**, **3D single-view**, and
+**2D single-view** video — one model, one data format, one inference path.
 
-The pipeline detects animals, crops them, and decodes per-keypoint poses through a single window
-loop. It reads one annotation format (`docs/annotation_format.md`) that serves both hand annotation
-and bulk training across datasets of differing keypoint sets, camera counts, and dimensionality.
-This README is the committed reference: what this is, how to run it, and the invariants a
-contributor must not break.
+`tailcyclenet` is the pose and quality-scoring half of the Tailcycle framework. It finetunes a
+[tracktail](https://pypi.org/project/tracktail/) point tracker (formerly `posetail`) — a
+V-JEPA 2.1 video encoder plus a query decoder, extended to multiview with calibrated cross-camera
+attention — into:
+
+- a **pose estimator**: each named keypoint becomes a learned query, so one network can train
+  across datasets with different keypoint sets, camera counts, and dimensionality;
+- a **box detector** that finds the animals and gives the pose model its crops;
+- a **track-quality scorer**: trained contrastively on synthetically corrupted trajectories, it
+  scores a pose track per frame and keypoint **without ground truth**, so you can find the
+  frames worth annotating next.
+
+The intended loop: annotate a few clips → train pose → run it on new video → score the output →
+annotate the worst-scoring frames → retrain.
+
+Rough cost: inference runs end to end (including video decode) at about 20 fps per camera on an
+L4 GPU with about 500 MB of GPU memory per camera; finetuning on a new dataset takes about a day
+on one L4.
 
 ---
 
-## Setup
+## Install
 
-### From a checkout (contributors)
-
-Dependencies are managed with [pixi](https://pixi.sh). `posetail==0.4.1` is pinned from PyPI.
+### pip
 
 ```bash
-pixi install
-pixi run python -c "import posetail, tailcyclenet"   # sanity check
-pixi run test                                        # test suite
-pixi run lint                                        # ruff
-```
-
-- The `LD_LIBRARY_PATH` prepend in `pyproject.toml` is load-bearing — the env ships a newer
-  `libstdc++` than some hosts, and without it `import scipy.optimize` dies naming only `CXXABI`.
-- posetail >= 0.4.1 ships every behaviour this repo once monkeypatched (per-frame camera offsets,
-  `crop_box_for_points`, `scene_features=`/`input_size=` on the tracker forward); there is no patch
-  layer anymore.
-
-### From pip (training on your own machine)
-
-`tailcyclenet` is [on PyPI](https://pypi.org/project/tailcyclenet/), but two more things are
-needed before it can train — read both notes, they are not optional extras:
-
-```bash
-# 1. torch, with the CUDA build matching your host -- the plain PyPI wheel is often CPU-only
-#    or the wrong CUDA version. cu128 matches what this repo's own pixi env pins; use whatever
-#    matches your driver.
+# 1. torch built for your CUDA version (the default PyPI wheel is often CPU-only)
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-# 2. tailcyclenet itself
+# 2. tailcyclenet
 pip install tailcyclenet
 
-# 3. aniposelib's PYTORCH branch, not the plain PyPI release posetail's own dependency pulls in.
-#    tailcyclenet.format/crop.py/the detector's cross-view association all construct
-#    aniposelib.cameras.Camera and need the pytorch branch's nn.Module version (GPU
-#    projection/triangulation/Jacobians) for training and inference in EVERY setting -- 2D,
-#    3D single-view, 3D multiview -- not just multiview. This is a live dependency on
-#    lambdaloop/anipose-lib's `pytorch` branch continuing to exist at this URL, not a pinned
-#    release; a known fragility, not an oversight.
+# 3. aniposelib's `pytorch` branch (required: camera geometry runs on the GPU in every setting,
+#    2D included; the PyPI release of aniposelib does not have it)
 pip install "aniposelib @ git+https://github.com/lambdaloop/anipose-lib.git@pytorch"
 ```
 
-Then:
+This installs the `tailcyclenet` command: `train`, `train-detector`, `train-scorer`, `infer`,
+`score`, `eval`, `render`. Run `tailcyclenet <command> --help` for every option. The shipped
+configs are bundled in the package. Only the dataset converters need a source checkout (below).
+
+### From source (pixi)
 
 ```bash
-tailcyclenet train --data /path/to/your/dataset-root
+git clone https://github.com/AI-HHMI/tailcyclenet && cd tailcyclenet
+pixi install
+pixi run python -c "import tailcyclenet"
 ```
 
-`configs/base.toml` (2D and 3D alike) ships inside the package, so `--config` is optional and
-defaults to the shipped recipe unmodified; `--data` must already be in the format
-`docs/annotation_format.md` specifies. `tailcyclenet train-detector`, `tailcyclenet infer`, and
-`tailcyclenet eval` are the pip equivalents of the `scripts/*.py` invocations documented below —
-same flags, same defaults, no repo checkout required. `scripts/convert_*.py` (turning a labelling
-tool's own export into that format) stay repo-only; there is no pip-installed onboarding path
-for unconverted data yet.
+The pixi environment sets `LD_LIBRARY_PATH` so its own `libstdc++` wins over an older system
+copy; without it, `import scipy.optimize` can fail with a `CXXABI` error. From a checkout, every
+command is also available as `pixi run tailcyclenet <command> ...`, or as the script under
+`scripts/` (`train.py`, `train_detector.py`, `train_scorer.py`, `infer.py`, `score_session.py`,
+`eval.py`, `render.py`) with the same flags.
 
-A COCO-pretrained detector backbone (`[model].pretrained = "coco"`, not the shipped default) is
-fetched once from a tagged Megvii GitHub release and cached at `~/.cache/tailcyclenet/weights/`
-(override with `--weights-dir` or `$TAILCYCLENET_CACHE_DIR`) — pre-populate that directory
-yourself on a host with no internet access.
+### Weights that are downloaded
 
-A CPU-only torch install still imports and runs the test suite / tiny smoke checks, just not
-real training — don't install CUDA torch expecting speed you then don't need for that.
+- Pose training warm-starts from the pretrained tracker on Hugging Face
+  (`[training].checkpoint_path`, default `ai-hhmi/posetail-static-animal`), which is downloaded
+  and cached on first use. A local checkpoint folder also works.
+- The detector backbone uses ImageNet weights, which are fetched on first use. If you set
+  `[model].pretrained = "coco"`, the COCO YOLOX weights go to `~/.cache/tailcyclenet/weights/`
+  (override with `--weights-dir` or `$TAILCYCLENET_CACHE_DIR`).
+
+On a machine without internet access, download these on a connected one first.
 
 ---
 
-## Layout
+## 1. Prepare your data
+
+Everything reads one format, specified in [`docs/annotation_format.md`](docs/annotation_format.md).
+In short:
 
 ```
-tailcyclenet/     library: format, dataset, crop rule, model, inference, metrics, detector
-                  train.py/train_detector.py/eval.py are the CLI bodies (`tailcyclenet <cmd>`)
-scripts/          train.py  train_detector.py  infer.py  eval.py  convert_*.py -- thin
-                  dispatchers into tailcyclenet/ for train/train_detector/infer/eval; the
-                  convert_*.py/combine_roots.py/render*.py family stays repo-only
-configs/          base.toml + detector.toml + detector/<root>.toml (every config layers over its
-                  family's base); shipped inside the pip package too (`tailcyclenet.configs`)
-configs/datasets/ per-dataset keypoint and skeleton definitions
-docs/             annotation_format.md — the data format spec (human-owned)
-tests/            invariants (crop rule, converters, geometry)
+my-dataset/
+  train/  val/  test/              # the split is the directory
+    <session_id>/
+      session.toml                 # mode ("2d"/"3d"), units, labels ("annotated"/"tracked"), keypoint names
+      calibration.toml             # aniposelib camera file (+ per-camera `offset`); always present
+      groups.pq                    # one row per clip ("group"), with n_frames and fps
+      keypoints.pq                 # per-camera 2D labels + visibility status   (optional)
+      points3d.pq                  # 3D labels                                  (optional)
+      instances.pq                 # boxes / "an animal is here"                (optional)
+      groups/<group_id>/<cam>.mp4  # or <cam>/000000.jpg ...; symlinks are fine
 ```
+
+- A **session** is one recording setup (one calibration, one mode). A **group** is one
+  contiguous clip, of any length. A clip with only one labelled frame is fine; the unlabelled
+  frames still provide temporal context.
+- Sessions do not need the same keypoints: names are matched by name across sessions and
+  datasets.
+- 2D sessions have one camera and can omit the intrinsics and extrinsics.
+- `status` separates "visible", "assessed and occluded" (`missing`), and "never looked at" (no
+  row). Don't write `missing` for a plain NaN.
+
+`tailcyclenet.format.write_session` writes the tables from arrays, and
+`tailcyclenet.format.validate_dataset(load_dataset(root))` checks a root against the spec:
+
+```python
+from tailcyclenet.format import load_dataset, validate_dataset
+problems = validate_dataset(load_dataset("my-dataset"))
+print("\n".join(problems) or "ok")
+```
+
+`scripts/convert_*.py` are converters for the datasets this project was developed on. They are
+useful examples of how to write one.
 
 ---
 
-## Training
-
-One estimator trains across every dataset root under `[data].path`; a keypoint embedding table is
-what lets roots with different keypoint sets share a model.
+## 2. Train the pose model
 
 ```bash
-# 3D (multiview / single-view) or 2D (single-view); prob_2d_only adds a train-time true-2D
-# image-plane path on 3D sessions, so one config serves both
-pixi run python scripts/train.py --config configs/base.toml --data <root>
-
-# one node, N gpus: one item per rank, gradients averaged by DDP
-pixi run python scripts/train.py --config configs/base.toml --data <root> --devices 4
-
-# pip install (see Setup): --config is optional, defaults to the packaged base.toml
-tailcyclenet train --data <root> [--devices 4]
+tailcyclenet train --data my-dataset --out runs/my-pose
+# from a checkout:
+pixi run python scripts/train.py --data my-dataset --out runs/my-pose
 ```
 
-Facts that are easy to get wrong:
+**The shipped recipe (`configs/base.toml`, used when `--config` is omitted) should work for most
+datasets, 2D and 3D alike. Start with it.** To change something, write a small TOML containing
+only the keys you want to change; it is layered over `base.toml` automatically:
 
-- `cams_to_sample` and `val_cams_to_sample` control camera count; `prob_2d_only` is a train-only
-  true-2D image-plane draw on 3D sessions, with stored 2D labels preferred and 3D projection as
-  fallback. `n_keypoints` is **derived from the data, never configured**.
-- The per-rank batch is structurally **1**; `--devices N` is the only batch dimension this repo has.
-  Every iteration count in a config is a **total across ranks** (60,000 is 60,000 samples on any
-  gpu count) and the learning rate is scaled by `sqrt(N)`, so a multi-gpu run is two levers off a
-  single-gpu one; `provenance.toml` records which it was.
-- `[model].gridresid_offset` has **no default and must be stated** — the two values load the same
-  tensors, so a mismatch produces numbers rather than an exception.
-- A run folder writes `keypoint_registry.toml` (the derived keypoint axis) and `provenance.toml`
-  (commit + dirty flag). A config is not a provenance record.
-- The video encoder unfreezes mid-run per `[model].video_encoder_requires_grad` (a bool, or an int
-  iteration to unfreeze at). A run started before the shipped default (8 blocks at 10,000) is not
-  comparable to one after; `false` restores the old arm.
+```toml
+# my-pose.toml
+[data]
+path = "my-dataset"
 
----
+[training]
+out = "runs/my-pose"
+```
 
-## Detector
+The overrides that are actually useful in practice:
+
+| key | default | when to change it |
+|---|---|---|
+| `[training].n_iterations` | `60000` | Raise it (e.g. 100k–120k) for a large dataset, and to several hundred thousand when training one model across many datasets on several GPUs. |
+| `[training].checkpoint_path` | the pretrained tracker | Point it at an earlier pose run (or its `checkpoints/checkpoint_last.pth`) to finetune from your own model, e.g. a model already trained on the same species. If it holds the full training state and matches this config, training *continues* from its iteration; pass `--no-resume` (or use a packaged `.pth`) to start a fresh schedule from those weights. |
+| `[data].flip_2d_prob`, `[data].flip_2d_modes` | `0.0`, `["horizontal"]` | Set `0.5` to enable left/right flip augmentation; add `"vertical"` for top-down or bottom-up views. Requires `flip_pairs` in every `session.toml`. |
+| `[model].intrinsic_embedding` | `true` | Set `false` to stop conditioning on camera intrinsics when your calibration's intrinsics are only approximate. |
+| `[data].num_workers` | `8` | Lower it if the host runs out of RAM (it is per GPU). |
+
+Everything else (augmentation, prompt corruption, losses, architecture) is tuned and best left
+alone.
+
+- `[data].path` can also be a **folder of dataset roots**. One model then trains across all of
+  them, with keypoint names prefixed by the dataset folder name.
+- **Multiple GPUs** (one node): `--devices N`; the default `-1` uses every visible GPU. Each GPU
+  processes one training item per step, so the number of GPUs is the batch size. Iteration
+  counts are totals across GPUs.
+- **Resuming**: re-running the same command with the same `--out` continues from
+  `checkpoints/checkpoint_last.pth`. `--no-resume` starts over.
+- Logging goes to Weights & Biases if it is installed (configured in `[wandb]`, written inside the
+  run folder by default); `--no-wandb` turns it off.
+
+A run folder contains `checkpoints/`, the effective `config.toml`, `keypoint_registry.toml` (the
+keypoint axis the model was trained on), and `provenance.toml` (the git commit).
+
+## 3. Train the detector
+
+The detector predicts a box per animal per camera and reproduces the crop the pose model was
+trained on. Its recipe lives entirely in a config. Point it at your data:
+
+```toml
+# my-detector.toml   (layered over the shipped configs/detector.toml)
+[data]
+path = "my-dataset"          # a dataset root, or a folder of roots
+
+[training]
+out = "runs/my-detector"
+```
 
 ```bash
-pixi run python scripts/train_detector.py --config configs/detector.toml
-
-# pip install: --config is optional, defaults to the packaged detector.toml
-tailcyclenet train-detector --out runs/det-<name>
+tailcyclenet train-detector --config my-detector.toml
+# from a checkout:
+pixi run python scripts/train_detector.py --config my-detector.toml
 ```
 
-The recipe lives in the config, not on the CLI — every default is there with its evidence, and an
-unknown key raises rather than silently training at a default. Only `--out`, `--iters` and
-`--device` override.
+Only `--out`, `--iters`, and `--device` override the config on the command line. An unknown key
+is an error, not a silent default.
 
-One detector per dataset, and `input_wh` defaults to an aspect-matched size rather than a square:
-a square letterbox on a wide frame wastes most of the canvas and can put the animal below the stride
-the FPN can represent. The regression target is `crop.crop_box_for_points` — the detector
-reproduces *the crop the pose model was trained on*, so `[data].boxes` must equal the pose run's
-`[data].box_source`.
+**As with pose, the shipped recipe should be fine for most people** — it is built to generalise
+across rigs (full-rotation and flip augmentation, photometric augmentation, synthetic
+backgrounds). Useful overrides:
 
----
+| key | default | when to change it |
+|---|---|---|
+| `[training].iters` | `8000` | Enough for one dataset. Raise it (tens of thousands) for a detector trained on a folder of many datasets. |
+| `[data].boxes` | `"instances"` | Boxes come from `instances.pq` where a session has one, and from the keypoints otherwise. Set `"keypoints"` if your stored boxes are drawn differently from the animal's keypoint extent. |
+| `[data].boxes_by_dataset` | `{}` | The same choice per dataset when training on a folder of roots, e.g. `{ my-other-dataset = "keypoints" }`. |
+| `[training].batch_size`, `[training].num_workers` | `8`, `8` | Lower them if you run out of GPU or host memory. |
 
-## Inference and eval
+## 4. Train the scorer (optional)
+
+The scorer is warm-started from a trained pose run and learns, from synthetic corruptions of your
+own labels, to rank a correct track above a corrupted one. It needs no extra annotation.
 
 ```bash
-# one source session (a dataset root works only if it holds a single session in --split)
-pixi run python scripts/infer.py --run runs/<name> --data <session-dir> --split test \
-    --detector runs/det-<name> --out pred/
-
-# or, straight off raw footage + an anipose calibration
-pixi run python scripts/infer.py --run runs/<name> --out pred/ \
-    --videos rec/ --calibration anipose/calibration.toml --cam-regex 'cam([0-9]+)_' \
-    --detector runs/det-<name> --max-animals 4
-
-pixi run python scripts/eval.py pred/ --data <root> --split test --chunk 500
-
-# pip install: `tailcyclenet infer`/`tailcyclenet eval` take identical flags
-tailcyclenet infer --run runs/<name> --data <session-dir> --split test \
-    --detector runs/det-<name> --out pred/
-tailcyclenet eval pred/ --data <root> --split test --chunk 500
+tailcyclenet train-scorer --data my-dataset --checkpoint runs/my-pose --out runs/my-scorer
+# from a checkout:
+pixi run python scripts/train_scorer.py --data my-dataset --checkpoint runs/my-pose --out runs/my-scorer
 ```
 
-- **`--out` is a prediction session directory** (`session.toml`, `calibration.toml`, `groups.pq`,
-  `points3d.pq`, `keypoints.pq`, `instances.pq`, `windows.pq`), written a block at a time so nothing
-  is proportional to clip length. `eval.py` and `render.py` both read it; `render.py` finds its own
-  pixels via the session's `[provenance]`.
-- **`--data` and `--videos` are exactly-one-of**, and a run is **one source session** (which may
-  hold many groups). For `--videos`, the camera name is the regex **capture group** and the session
-  is built in memory — nothing is staged.
-- There is **one** window loop. Box sources: annotations, a detections npz (`--boxes`), or a
-  per-dataset detector (`--detector`). Prompt regimes: `none` (query-free), `carry` (previous
-  window's own prediction — what deployment does), `self` (two passes), `labels` (an oracle, gated
-  off by default).
+`--checkpoint` should be the pose run you will run inference with. The scorer then shares that
+model's video encoder at inference time, so scoring adds little cost.
 
-**Defaults are not the recommendation.** The good settings are root-conditional, so sweep them per
-root. Current values: `--anchor carry`, `--overlap 4`, `--refine` derived (on 3D / off 2D),
-`--track on`, `--box-prompt auto`, `--prefetch-windows 1` (bit-exact, performance only),
-`--max-ram` derived from the host. In particular `--anchor` is root-conditional in 2D (a carried
-prior on a crowded root is often the wrong animal's pose) and `--overlap`'s optimum is seam-count
-against seam-size — sweep per root.
-
-Four rules that are *not* root-conditional:
-
-- **`--vis-thresh` has no meaning in 2D at the shipped default** — the visibility head is only
-  trained when `[training.losses].vis_loss_2d_weight` is nonzero (default `0.0`).
-- **`--box-prompt auto` needs a detector or boxes file.** A box-model run without one refuses rather
-  than silently falling back to the GT oracle. Pass `--detector`/`--boxes`, or `--box-prompt none`
-  to withhold the box.
-- Always run `eval.py` with `--chunk 500` on long clips — the bootstrap resamples groups, so a
-  single long clip returns `DEGENERATE`.
-- Use `--min-match-kpts 0.5` for deltas and `0` for absolutes.
-
-The largest lever is not a flag: pose accuracy on a ground-truth crop is far better, at full
-coverage, than through the detector, and on a long clip essentially all coverage loss is `no box`.
-Fix the crop path before tuning identity flags.
+The shipped `configs/scorer.toml` (used when `--config` is omitted) is meant to be used as is. In
+your own overlay (passed as `--config`, layered over `scorer.toml`), the keys worth setting are `[data].path`, `[training].n_iterations` (default `60000`; larger for
+multi-dataset scorers), and any `[model]` key you changed for the pose run. The scorer's
+architecture must match the pose run it starts from, so if the pose run set
+`intrinsic_embedding = false`, set it here too.
 
 ---
 
-## Reference
+## 5. Run inference
 
-- `docs/annotation_format.md` — the data format spec (human-owned).
+On a session in the dataset format:
+
+```bash
+tailcyclenet infer --pose runs/my-pose --detector runs/my-detector \
+    --data my-dataset/test/<session_id> --out pred/
+```
+
+Straight from raw videos plus an [anipose](https://anipose.readthedocs.io) calibration (nothing
+is converted or copied to disk):
+
+```bash
+tailcyclenet infer --pose runs/my-pose --detector runs/my-detector --out pred/ \
+    --videos recordings/ --calibration calibration.toml --cam-regex 'cam([0-9]+)_' \
+    --max-animals 2
+```
+
+`--cam-regex` is anipose's `cam_regex`: the capture group is the camera name, and the rest of
+the filename is the clip name. A single-camera 2D video needs no calibration.
+
+Add `--scorer runs/my-scorer` to either command to write a per-frame, per-keypoint
+`quality_score` (and `quality_precision`) beside every prediction. Predictions themselves are
+not changed or filtered.
+
+Things to know:
+
+- **Always pass `--detector` (or `--boxes`) for real use.** Without a box source, `--data`
+  inference crops from the ground-truth labels. That is an upper bound on accuracy, not what you
+  would get on new video.
+- `--pose` and `--detector` accept a run folder (the latest checkpoint is used) or a single
+  packaged `.pth` (see below).
+- One inference run reads **one session** (one calibration, one keypoint set), which may contain
+  many clips. `--data` and `--videos` are mutually exclusive.
+- `--start-frame` / `--end-frame` (or `--max-frames`) restrict the range; frame numbers in the
+  output always refer to the source video.
+- `--max-ram GB` caps host memory (by default, it is derived from the job or container limit).
+  It changes speed, never the predictions.
+- The defaults are a reasonable starting point for both 2D and 3D. The flags most worth trying
+  on a new dataset are `--overlap` (frames shared between consecutive windows), `--anchor`
+  (whether each window is seeded with the previous window's prediction: `carry`, the default, or
+  `none`), and `--refine` / `--refine-px` (a second, tighter crop; on by default in 3D).
+
+### Output
+
+`--out` is a **prediction session** in the same format as the input:
+
+| file | contents |
+|---|---|
+| `session.toml` | keypoint names, mode, and `[provenance]` (which run, checkpoint, data, and flags produced it) |
+| `calibration.toml`, `groups.pq` | copied from the source |
+| `points3d.pq` | 3D predictions (3D sessions), in the session's units |
+| `points2d.pq` | per-camera 2D predictions |
+| `instances.pq` | the boxes each animal was cropped from |
+| `windows.pq` | per-window bookkeeping, including why a window produced nothing |
+
+The tables are written as inference proceeds, so memory does not grow with clip length.
+`session.toml` gets `complete = true` only when the run finishes.
+
+---
+
+## 6. Evaluate, score, and visualise
+
+```bash
+# accuracy and tracking metrics against the labels (needs a labelled source session)
+tailcyclenet eval pred/ --data my-dataset --split test
+
+# draw predictions over the original video
+tailcyclenet render --pred pred/ --out clips/ --boxes
+```
+
+- `eval` reports MPJPE (or pixel error in 2D), PCK, coverage, and MOTA/IDF1 for multi-animal
+  data, with bootstrap confidence intervals over clips. For a few very long clips, add
+  `--chunk 500` to split each into 500-frame scoring units. `--vs other_pred/` compares two
+  prediction sessions on the same frames.
+- `render` finds the source video through the prediction's provenance; colour is per animal, so
+  an identity swap shows up as a colour change.
+
+To review an existing **tracked** dataset (for example, machine-tracked labels you are considering
+training on), score it with the scorer and get a worst-first list of windows and keypoints:
+
+```bash
+tailcyclenet score --run runs/my-scorer --data my-tracked-dataset --split train \
+    --out qc/ --device cuda:0
+```
+
+This writes `scores.pq` and `report.txt`. Scores are relative: lower means more likely wrong,
+and the report ranks rather than thresholds.
+
+---
+
+## 7. Share a model
+
+```bash
+pixi run python scripts/package_checkpoint.py --kind pose     --run runs/my-pose     --out my-pose.pth
+pixi run python scripts/package_checkpoint.py --kind detector --run runs/my-detector --out my-detector.pth
+pixi run python scripts/package_checkpoint.py --kind scorer   --run runs/my-scorer   --out my-scorer.pth
+```
+
+A packaged `.pth` contains its config and keypoint registry, without the optimizer state, and
+can be passed directly to `--pose` / `--detector` / `--scorer`.
+
+---
+
+## Repository layout
+
+```
+tailcyclenet/         the library
+  format.py           read/validate/write the data format
+  dataset.py          training data loader (2D, 3D single-view, 3D multiview)
+  model.py            the pose model on top of the tracktail tracker
+  train.py            pose training (tailcyclenet train)
+  detector/           box detector and cross-view association
+  scorer/             track-quality scorer: model, training, QC scoring
+  infer/              the inference window loop and prediction writer
+  adopt.py            raw videos + anipose calibration -> an in-memory session
+  eval.py, metrics.py evaluation
+  render.py           visualisation
+configs/              base.toml (pose), detector.toml, scorer.toml, configs/datasets/ (skeletons)
+scripts/              command-line entry points, dataset converters, utilities
+docs/                 annotation_format.md -- the data format specification
+tests/
+```
+
+## Development
+
+```bash
+pixi run test    # pytest
+pixi run lint    # ruff
+```
+
+## License
+
+BSD-3-Clause.

@@ -1306,8 +1306,12 @@ def main(argv: list[str] | None = None) -> int:
     Outputs: a process exit code.
     Side effects: trains and writes the run folder.
     """
-    parser = argparse.ArgumentParser(description='Train the track-quality scorer.')
-    parser.add_argument('--config', required=True, help='a config over configs/scorer.toml')
+    parser = argparse.ArgumentParser(prog='tailcyclenet train-scorer',
+                                     description='Train the track-quality scorer.')
+    parser.add_argument('--config', type=Path, default=None,
+                        help='defaults to the packaged configs/scorer.toml (the shipped recipe, '
+                             'unmodified) when omitted -- pass one that overlays it for anything '
+                             'else')
     parser.add_argument('--data', default=None, help='dataset root, overriding [data].path')
     parser.add_argument('--out', required=True, help='the run folder, e.g. scorers/scorer-3dpop')
     parser.add_argument('--checkpoint', default=None,
@@ -1327,6 +1331,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="start from iteration 0 even if this run folder holds a "
                              "checkpoint_last")
     args = parser.parse_args(argv)
+    if args.config is None:
+        args.config = _SCORER_CONFIG
     fabric = launch(args)
     run(args.config, args.data, Path(args.out), args.checkpoint, args.device,
         args.iterations, args.no_wandb, args.fresh, fabric=fabric,

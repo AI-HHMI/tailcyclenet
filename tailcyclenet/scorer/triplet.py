@@ -858,6 +858,10 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     with no evaluable active row.  Sparse keypoints redraw their corruption up to the existing
     retry cap when the distance gate leaves them with no active far slot. Pin-memory workers
     require the returned `fired_frame` frame axis to be materialized, not an expanded view.
+
+    Gated modes (framewise or ``sequence_far_gate``) redraw only unresolved sparse keypoints, then
+    drop any still unresolved after the cap via ``keep`` instead of rejecting the whole window
+    (which would discard most mocap windows with marker dropouts); legacy sequence mode raises.
     """
     dense_3d, dense_2d, sparse_3d, sparse_2d = corruptors
     view_a = dataset._realise(sel, rng, world_gauge=False)
@@ -896,8 +900,6 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
     frame_mode = str(cfg.get('output_granularity', 'sequence')) == 'frame'
     sequence_far_gate = bool(cfg.get('sequence_far_gate', False))
     gated = frame_mode or sequence_far_gate
-    # Gated modes tolerate a sparse keypoint that never moves an observed slot: it cannot become
-    # active, so the gate below drops it from the window. Legacy sequence mode keeps the raise.
     shift_sparse, fired_sparse, seg_sparse, meta_sparse = _draw_sparse_moved(
         sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True,
         allow_stuck=gated)
@@ -945,22 +947,12 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1, reference=Non
                 & _visible_points_mask(bad[0], view_a.cgroup, mode, cam_thresh)
                 & _visible_points_mask(anchor[0], view_b.cgroup, mode, cam_thresh))
         sparse_active = mask_data['active_mask'][0].any(dim=0) & (~is_dense)
-        # Sparse keypoints with no active (far, observed, in-view) slot under this draw.
         redo = (~is_dense) & (~sparse_active)
         if not gated or not bool(redo.any()):
             break
         if sparse_attempt >= SPARSE_DRAW_RETRIES:
-            # Drop the still-unresolved sparse keypoints from THIS window (below, via `keep`)
-            # rather than rejecting the whole window. Their corruption is unsupervised (moved
-            # but never active), so they must not stay in `bad` unlabelled either way.
-            # Rejecting the window instead discarded ~90% of rat7m's mocap windows, whose
-            # marker dropouts leave many keypoints observed in only a few frames.
             unresolved_sparse = redo
             break
-        # Redraw ONLY the unresolved sparse keypoints, keeping every resolved keypoint's draw.
-        # Points are drawn independently (`tagged_draw*` over b*k points) and the active gate is
-        # per keypoint, so per-keypoint rejection has the same accepted distribution as the old
-        # all-at-once redraw -- whose joint acceptance collapses when many keypoints are sparse.
         shift_sparse, fired_sparse, seg_sparse, meta_sparse = _draw_sparse_moved(
             sparse, coords, is_dense, frames=sel.frames, cfg=cfg, return_metadata=True,
             allow_stuck=True)
@@ -1110,7 +1102,8 @@ def _draw_sparse_moved(sparse_corruptor, coords, is_dense, frames=None, cfg=None
     distribution as redrawing all keypoints until all succeed at once -- but it does not collapse
     when many keypoints are sparse (a joint acceptance that is the product of per-keypoint ones).
     ``allow_stuck`` returns the last draw instead of raising when some keypoint is still stuck;
-    the gated ``make_triplet`` path then drops that keypoint from the window.
+    the gated ``make_triplet`` path then drops that keypoint from the window. The scorer builds
+    batch size 1, so the stuck mask reshapes to ``[b, k]`` with ``b == 1``.
     """
     def draw():
         """Draw one sparse candidate on the configured source-frame lattice."""
@@ -1123,7 +1116,7 @@ def _draw_sparse_moved(sparse_corruptor, coords, is_dense, frames=None, cfg=None
         if not bool(stuck.any()):
             return ((shift, fired, seg, metadata) if return_metadata else (shift, fired))
         new_shift, new_fired, new_seg, new_metadata = draw()
-        redo = stuck.reshape(-1, k)  # [b,k]; the scorer builds b == 1
+        redo = stuck.reshape(-1, k)
         shift = torch.where(redo[:, None, :, None], new_shift, shift)
         fired = torch.where(redo[:, :, None], new_fired, fired)
         seg = torch.where(redo[:, None, :, None], new_seg, seg)

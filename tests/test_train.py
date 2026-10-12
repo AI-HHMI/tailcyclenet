@@ -362,7 +362,7 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     """
     from schedulefree import AdamWScheduleFree
 
-    from tailcyclenet.checkpoints import save_checkpoint
+    from tailcyclenet.checkpoints import save_checkpoint, stamped_config
     from tailcyclenet.format import Registry
 
     torch.manual_seed(0)
@@ -382,7 +382,7 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
     ck = torch.load(tmp_path / 'run' / 'checkpoints' / 'checkpoint_last.pth',
                     map_location='cpu', weights_only=False)
     assert int(ck['iteration']) == 1234, 'the iteration is what a resume restarts at'
-    assert ck['config'] == config
+    assert ck['config'] == stamped_config(config, 'pose'), 'the config, stamped with its kind'
     assert ck['keypoint_registry'] == registry.to_dict()
     # The two iterates are genuinely different, or "resume from the raw one" is a distinction
     # without a difference and this test would pass on the wrong weights.

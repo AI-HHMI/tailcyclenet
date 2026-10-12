@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from posetail.posetail.muon import DualOptimizer
+from tracktail.model.muon import DualOptimizer
 
 # The one place [training.optimizer] keys are enumerated; an unknown key would otherwise train
 # at the default and the run folder would record the key nobody read.

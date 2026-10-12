@@ -1,6 +1,6 @@
 """Losses for framewise synthetic track-quality triplets.
 
-The installed :class:`posetail...TripletScorerLoss` remains the sequence-mode loss.  This module
+The installed :class:`tracktail...TripletScorerLoss` remains the sequence-mode loss.  This module
 owns the frame-mode contract instead of monkey-patching the installed package: masks are built
 before rows are flattened, duplicate source frames are weighted once, and clean/corrupt labels
 are optionally given a zero-centred signed pointwise term.
@@ -79,7 +79,7 @@ def _weighted_mean(values, mask, weights=None, *, reduction='mean'):
 
 
 def _triplet_values(scores, precisions, labels):
-    """Installed posetail triplet algebra on an already-selected ``[N,3]`` row set."""
+    """Installed tracktail triplet algebra on an already-selected ``[N,3]`` row set."""
     if scores.numel() == 0:
         zero = scores.sum() * 0.0
         return zero, torch.empty(0, device=scores.device), torch.empty(0, device=scores.device)

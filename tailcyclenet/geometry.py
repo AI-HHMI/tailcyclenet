@@ -1,6 +1,6 @@
-"""Full-intrinsic camera geometry compatibility for the pinned posetail release.
+"""Full-intrinsic camera geometry compatibility for the pinned tracktail release.
 
-The installed posetail forward projection already multiplies by the full upper-triangular
+The installed tracktail forward projection already multiplies by the full upper-triangular
 intrinsic matrix. Its inverse path historically extracted only fx/fy/cx/cy, however, which makes
 nonzero-skew cameras inconsistent. This module preserves the old path for zero-skew cameras and
 replaces only the inverse normalization for skewed cameras.
@@ -11,7 +11,7 @@ import sys
 
 import torch
 
-from posetail.posetail import cube
+from tracktail.model import cube
 
 
 if not hasattr(cube, '_tailcyclenet_scalar_undistort_points'):
@@ -31,7 +31,7 @@ def undistort_points(cam, points):
     """Convert pixels to normalized coordinates using full K when skew is nonzero.
 
     `points` are stored-image pixels; camera offsets are added before normalization. Distortion is
-    inverted in normalized coordinates using the same five-iteration model as posetail. Zero-skew
+    inverted in normalized coordinates using the same five-iteration model as tracktail. Zero-skew
     cameras delegate to the installed implementation for exact compatibility.
     """
     matrix = cam['mat']
@@ -78,7 +78,7 @@ def projection_sensitivity(cam, points):
 
     Inputs: cam -- camera dictionary; points -- world points.
     Outputs: the projection Jacobian for each point.
-    Side effects: delegates zero-skew cameras to posetail's original implementation. The
+    Side effects: delegates zero-skew cameras to tracktail's original implementation. The
     normalized-coordinate mask indexes input columns (x and y), not output rows.
     """
     if not _has_skew(cam):
@@ -123,7 +123,7 @@ def projection_sensitivity(cam, points):
 
 
 def install_full_intrinsics() -> None:
-    """Install the skew-aware inverse at posetail's shared geometry boundary.
+    """Install the skew-aware inverse at tracktail's shared geometry boundary.
 
     `TrackerEncoder` imported `undistort_points` into its module namespace, so update that alias
     when the module is already loaded. The shared `points_to_rays` function resolves its inverse
@@ -131,10 +131,10 @@ def install_full_intrinsics() -> None:
     """
     cube.undistort_points = undistort_points
     cube.projection_sensitivity = projection_sensitivity
-    tracker = sys.modules.get('posetail.posetail.tracker_encoder')
+    tracker = sys.modules.get('tracktail.model.tracker_encoder')
     if tracker is not None:
         tracker.undistort_points = undistort_points
-    tapnext = sys.modules.get('posetail.posetail.tracker_tapnext')
+    tapnext = sys.modules.get('tracktail.model.tracker_tapnext')
     if tapnext is not None:
         tapnext.undistort_points = undistort_points
 

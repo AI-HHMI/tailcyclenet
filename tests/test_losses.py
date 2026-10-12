@@ -1,12 +1,12 @@
 """tailcyclenet/losses.py -- `PoseLoss`, the repo-local 2D visibility term.
 
-Scoped to the ONE thing this module adds; `TotalLoss`'s own machinery is posetail's and is not
+Scoped to the ONE thing this module adds; `TotalLoss`'s own machinery is tracktail's and is not
 duplicated here. `TotalLoss.forward` is stubbed out in most of these so each test isolates the
 new code from the library's.
 """
 import pytest
 import torch
-from posetail.posetail.losses import BCELossVis, TotalLoss
+from tracktail.model.losses import BCELossVis, TotalLoss
 
 from tailcyclenet.losses import PoseLoss, masked_bce_with_logits
 

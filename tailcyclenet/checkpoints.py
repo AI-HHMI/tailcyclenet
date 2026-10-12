@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from posetail.posetail.train_utils import (_convert_cross_attn, _filter_shape_mismatch,
+from tracktail.model.train_utils import (_convert_cross_attn, _filter_shape_mismatch,
                                            _interp_res_params)
 
 from .format import Registry
@@ -331,7 +331,7 @@ def is_hf_repo_id(value: str) -> bool:
 
 
 def resolve_hf_checkpoint(repo_id: str, revision: str | None = None) -> Path:
-    """Download a packaged posetail checkpoint and return its local cached path."""
+    """Download a packaged tracktail checkpoint and return its local cached path."""
     from huggingface_hub import hf_hub_download
 
     return Path(hf_hub_download(repo_id=repo_id, filename='model.pth', revision=revision))

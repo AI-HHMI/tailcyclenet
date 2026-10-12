@@ -2,7 +2,7 @@
 
 import torch
 
-from posetail.posetail.losses_scorer import TripletScorerLoss
+from tracktail.model.losses_scorer import TripletScorerLoss
 
 from tailcyclenet.scorer.losses import FrameTripletScorerLoss, signed_pointwise_targets
 

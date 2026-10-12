@@ -1588,7 +1588,7 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
         'the two must differ on a moving rig, or the per-frame extrinsic is not being used'
 
     # AND IT MATCHES THE PROJECTION THE PIPELINE ALREADY TRUSTS -- `infer`'s own, per frame.
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
     cams = sess.cgroup('g000', frames)
     want = project_points_torch([cams[0]], torch.as_tensor(pred[0], dtype=torch.float32))[0]
     np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)

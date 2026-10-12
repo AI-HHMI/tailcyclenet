@@ -6,7 +6,7 @@ hand one chunk's queries another chunk's keypoint identities. Neither shows up i
 so both are pinned here.
 
 The model is built at a deliberately small size -- ViT-base is the smallest scene encoder
-posetail offers, and everything downstream of it is shrunk to the minimum that still exercises
+tracktail offers, and everything downstream of it is shrunk to the minimum that still exercises
 every branch. This is a SHAPE-AND-IDENTITY test, not an accuracy test; the weights are random.
 """
 import tempfile
@@ -197,7 +197,7 @@ def test_share_scene_matches_encoding_every_time(moving_batch):
 
 @pytest.mark.parametrize('pos_mode', ('learned', 'sincos', 'none', 'rope', 'ropepos'))
 def test_camera_batch_scene_encode_is_bit_identical(pos_mode):
-    """Batching cameras must not duplicate posetail's SceneRepresentation implementation."""
+    """Batching cameras must not duplicate tracktail's SceneRepresentation implementation."""
     cfg = small(scene_pos_embed_mode=pos_mode)
     torch.manual_seed(0)
     model = build_model(cfg, n_keypoints=5).eval()
@@ -214,8 +214,8 @@ def test_camera_batch_scene_encode_is_bit_identical(pos_mode):
 
 @pytest.mark.parametrize('camera_batch', [False, True])
 @pytest.mark.parametrize('precision', ['fp32', 'bf16'])
-def test_split_scene_encoding_matches_posetail(camera_batch, precision):
-    """The local backbone/tail split must preserve posetail's complete scene output."""
+def test_split_scene_encoding_matches_tracktail(camera_batch, precision):
+    """The local backbone/tail split must preserve tracktail's complete scene output."""
     torch.manual_seed(0)
     model = build_model(small(scene_pos_embed_mode='ropepos'), n_keypoints=5).eval()
     views = [torch.randn(1, 4, 3, 64, 64) for _ in range(3)]
@@ -491,7 +491,7 @@ def test_moving_camera_query_projects_per_frame(moving_batch):
     that carried one frame's projection everywhere. Guarding the shape alone would pass.
     """
     from einops import rearrange
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
 
     b = moving_batch
     T, N = CFG.n_frames, b.kpt_ids.shape[1]
@@ -558,7 +558,7 @@ def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
     """
     from tailcyclenet.checkpoints import warm_start
 
-    from posetail.posetail.encoder_decoder import PatchProcessor
+    from tracktail.model.encoder_decoder import PatchProcessor
 
     model = build_model(small('wide'), n_keypoints=5)
     # Built at the PRETRAINED width and projected to the fusion width -- not built at `dim`.
@@ -683,7 +683,7 @@ def test_query_free_keeps_the_depth_ce_and_drops_only_the_3d_ce(moving_batch, pr
     the first is query-anchored. Popping would switch off the heavier term on every
     fully-unprompted step.
     """
-    from posetail.posetail.losses import TotalLoss
+    from tracktail.model.losses import TotalLoss
 
     b = moving_batch
     model = build_model(small('wide', query='prior', gridresid_offset='query'),
@@ -729,7 +729,7 @@ def test_prior_points_are_query_anchored_and_others_triangulated(moving_batch):
 def test_direct_head_gets_no_gradient_at_unprompted_points(moving_batch):
     """The loss gate. Substituting the DETACHED triangulation makes the direct term constant at
     unprompted points, so `coords_loss_direct*` contributes exactly zero gradient there -- which
-    is how the direct head is supervised on query points only without forking posetail's loss.
+    is how the direct head is supervised on query points only without forking tracktail's loss.
 
     Multiview only. The single-view path substitutes a different anchor and is covered by
     `test_single_view_substitutes_the_detached_rays`, which checks it by VALUE: at one camera this

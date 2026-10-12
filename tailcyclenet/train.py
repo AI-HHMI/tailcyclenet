@@ -1,4 +1,4 @@
-"""Finetune a posetail tracker into a pose estimator.
+"""Finetune a tracktail tracker into a pose estimator.
 
 Body of `tailcyclenet train` (`tailcyclenet/__main__.py`) and of `scripts/train.py`
 (`pixi run python scripts/train.py --config configs/base.toml [--devices N]`) -- both call this
@@ -211,7 +211,7 @@ def train_metrics(out, batch):
     """
     if 'vis_pred' not in out or 'coords_pred' not in out:
         return {}
-    from posetail.posetail.eval_metrics import get_eval_metrics, get_vis_true
+    from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
 
     coords = batch.coords
     vis_true = batch.vis if batch.vis is not None else get_vis_true(coords)
@@ -288,10 +288,10 @@ def run_batch(model, loss_fn, batch, device, raw=None):
     """One forward + loss; a non-finite sub-loss returns NaN, never raises.
 
     `model` is the DDP-wrapped forward handle; `raw` the unwrapped module the loss reads.
-    posetail raises on a poisoned sub-loss; this converts it to the NaN the loop's skip path
+    tracktail raises on a poisoned sub-loss; this converts it to the NaN the loop's skip path
     already handles. Watch `skipped`: a rising fraction means the run is dead, not intermittent.
     `batch.vis_2d` is `vis_2d_true` (PoseLoss's own 2D term) in 2D and `vis_true_cams`
-    (posetail's per-camera term) in 3D -- the two must never mix.
+    (tracktail's per-camera term) in 3D -- the two must never mix.
     """
     views, cgroup = to_device(batch, device)
     mode = batch.sample_info['mode']
@@ -330,7 +330,7 @@ def evaluate(model, batches, optimizer, device, fabric=None):
     frame-0 prediction and is the deployable regime. `optimizer.eval()` swaps in the averaged
     iterate; the `finally` puts `y` back.
     """
-    from posetail.posetail.eval_metrics import get_eval_metrics, get_vis_true
+    from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
 
     from tailcyclenet.infer import self_prompt
     from tailcyclenet.model import share_scene
@@ -438,7 +438,7 @@ def launch(args):
 
 
 def main(argv: list[str] | None = None):
-    """Finetune a posetail tracker into a pose estimator.
+    """Finetune a tracktail tracker into a pose estimator.
 
     Side effects: trains; writes checkpoints + log.jsonl under the run folder; launches Fabric
                   (re-executes per rank).

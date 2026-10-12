@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from posetail.posetail.cube import project_points_torch
+from tracktail.model.cube import project_points_torch
 
 from . import crop as cropmod
 

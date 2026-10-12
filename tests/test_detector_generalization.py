@@ -59,7 +59,7 @@ def test_extent_target_is_tight_and_gives_back_the_crop_rule(tiny_root):
     checked = 0
     for i in range(len(ext)):
         sess, gid, f, ci = ext.index[i]
-        cam = sess.rig.posetail()[ci]
+        cam = sess.rig.tracktail()[ci]
         img = np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8)
         _, scale, pad = letterbox(img, ext.input_wh)
         got = ext.boxes_for(i)

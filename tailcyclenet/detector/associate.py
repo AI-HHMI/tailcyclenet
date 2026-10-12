@@ -20,7 +20,7 @@ import itertools
 
 import torch
 
-from posetail.posetail.cube import project_points_torch
+from tracktail.model.cube import project_points_torch
 
 
 def _centres(boxes):
@@ -30,7 +30,7 @@ def _centres(boxes):
 
 def _triangulate(cgroup, cams, pts):
     """One point from `len(cams)` views. pts: (n_views, 2) in each camera's own pixels."""
-    from posetail.posetail.cube import undistort_points
+    from tracktail.model.cube import undistort_points
 
     mats, rays = [], []
     for ci, p in zip(cams, pts):
@@ -106,7 +106,7 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
     """Group boxes across cameras into 3D instances.
 
     Inputs:
-        cgroup -- posetail camera dicts, one per camera, in the SOURCE frame (not cropped).
+        cgroup -- tracktail camera dicts, one per camera, in the SOURCE frame (not cropped).
         boxes_per_cam -- list of (N_c, 4) tensors, per camera, in that camera's pixels.
         max_res_px -- a group whose median reprojection residual exceeds this is rejected.
         min_views -- the floor on how many cameras an instance may be built from. 2 is the

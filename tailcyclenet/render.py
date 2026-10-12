@@ -63,7 +63,7 @@ def project(session, pred, cam, gid=None, frames=None):
     """(S,T,K,3) world points -> (S,T,K,2) pixels in camera `cam`'s stored image.
 
     Zero-skew static cameras use aniposelib's established projection. Static cameras with
-    nonzero skew use posetail's full-matrix projection; `offset` is subtracted because `matrix`
+    nonzero skew use tracktail's full-matrix projection; `offset` is subtracted because `matrix`
     is in SENSOR coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
     `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
     `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
@@ -76,7 +76,7 @@ def project(session, pred, cam, gid=None, frames=None):
 
     name = session.cam_names[cam]
     if gid is not None and session.rig.moving.get(name):
-        from posetail.posetail.cube import project_points_torch
+        from tracktail.model.cube import project_points_torch
 
         cams = session.cgroup(gid, frames)
         S = pred.shape[0]
@@ -87,11 +87,11 @@ def project(session, pred, cam, gid=None, frames=None):
     obj = session.rig.by_name(name)
     skew = float(obj.matrix[0, 1].detach().cpu())
     if skew != 0.0:
-        from posetail.posetail.cube import project_points_torch
+        from tracktail.model.cube import project_points_torch
 
         with torch.no_grad():
             p = torch.as_tensor(np.asarray(pred), dtype=torch.float64)
-            xy = project_points_torch([session.rig.posetail()[cam]], p)[0]
+            xy = project_points_torch([session.rig.tracktail()[cam]], p)[0]
         return xy.detach().cpu().numpy().astype(np.float32)
     with torch.no_grad():
         p = torch.as_tensor(np.asarray(pred).reshape(-1, 3),

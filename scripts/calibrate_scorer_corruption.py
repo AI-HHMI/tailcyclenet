@@ -24,8 +24,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from posetail.datasets.scorer_corruption import GENERATORS
-from posetail.posetail.cube import is_point_visible, project_points_torch
+from tracktail.datasets.scorer_corruption import GENERATORS
+from tracktail.model.cube import is_point_visible, project_points_torch
 
 from tailcyclenet.checkpoints import _SCORER_CONFIG, load_config
 from tailcyclenet.dataset import PoseDataset

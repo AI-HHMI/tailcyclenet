@@ -1,14 +1,14 @@
 """THE crop rule.
 
 The pose model trains on crops produced by this rule and the detector is trained to reproduce
-that box, so the two must never drift apart. The arithmetic is int32-exact against posetail
+that box, so the two must never drift apart. The arithmetic is int32-exact against tracktail
 0.3.5's public `crop_box_for_points`; the local copy adds `pad` (0 for an already-padded
 stored extent) and returns None on an all-NaN input.
 """
 import numpy as np
 import torch
 
-from posetail.posetail.cube import project_points_torch
+from tracktail.model.cube import project_points_torch
 
 # What the crop rule bounds, shared by the pose loader, the detector and inference.
 BOX_SOURCES = ('keypoints', 'instances')

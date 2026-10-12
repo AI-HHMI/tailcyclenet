@@ -10,9 +10,9 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from posetail.posetail.cube import project_points_torch
-from posetail.posetail.encoder_decoder import PatchProcessor, sample_patches
-from posetail.posetail.utils import get_fourier_encoding
+from tracktail.model.cube import project_points_torch
+from tracktail.model.encoder_decoder import PatchProcessor, sample_patches
+from tracktail.model.utils import get_fourier_encoding
 
 
 def _tile_to_query_axis(x, n_query, what):

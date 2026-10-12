@@ -987,7 +987,7 @@ def test_targets_are_the_crop_rule(tiny_root):
     assert x.shape == (3, 128, 128)
     sess, gid, f, ci = ds.index[0]
     lab = sess.labels(gid)
-    cam = sess.rig.posetail()[ci]
+    cam = sess.rig.tracktail()[ci]
     for s in range(boxes.shape[0]):
         want = crop_box_for_points(
             torch.as_tensor(lab.points2d[s, f, :, ci], dtype=torch.float32),
@@ -1017,7 +1017,7 @@ def test_augmented_targets_are_still_the_crop_rule(tiny_root):
     plain = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
                        max_frames_per_group=2)
     sess, gid, f, ci = ds.index[0]
-    cam = sess.rig.posetail()[ci]
+    cam = sess.rig.tracktail()[ci]
     warp = random_affine(cam['size'], np.random.default_rng([ds.seed, 0]))
     got = ds.boxes_for(0, warp)
 
@@ -1789,7 +1789,7 @@ def test_box_source_instances_uses_only_labeled_stored_boxes(tmp_path):
     plain_index = next(i for i, (_, _, ff, _) in enumerate(base.index) if ff == frame)
     plain = base[plain_index]['boxes']
     lab = sess.labels(gid)
-    cam = sess.rig.posetail()[cam_ix]
+    cam = sess.rig.tracktail()[cam_ix]
     img = np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8)
     _, scale, pad = letterbox(img, ds.input_wh)
     want = crop_box_for_points(torch.as_tensor(lab.boxes[1, frame, cam_ix]).view(2, 2),
@@ -2092,7 +2092,7 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
     names = [c.get_name() for c in cams]
     cg = fmt.Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
                  moving=dict.fromkeys(names, False),
-                 calibrated=dict.fromkeys(names, True)).posetail()
+                 calibrated=dict.fromkeys(names, True)).tracktail()
 
     tr = CrossViewTracker(1, max_res_px=30.0)
     for t in range(5):
@@ -2522,7 +2522,7 @@ def test_tiled_targets_are_still_the_crop_rule(tiny_root):
         sess, gid, f, ci = ds.index[i]
         boxes = ds.boxes_for(i)
         lab = sess.labels(gid)
-        cam = sess.rig.posetail()[ci]
+        cam = sess.rig.tracktail()[ci]
         ox, oy = ds.origins[i]
         tw, th = ds._tile_extent()
         for s in range(boxes.shape[0]):
@@ -2825,7 +2825,7 @@ def test_support_count_counts_independently_corroborating_cameras():
     names = [c.get_name() for c in cams]
     cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
              moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).posetail()
+             calibrated=dict.fromkeys(names, True)).tracktail()
 
     p3d = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
     proj = [_project(cam, p3d.reshape(1, 3).numpy()) for cam in cg]     # (1,2) per camera
@@ -2865,7 +2865,7 @@ def test_associate_corroborate_flag_is_a_noop_on_the_unambiguous_case():
     names = [c.get_name() for c in cams]
     cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
              moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).posetail()
+             calibrated=dict.fromkeys(names, True)).tracktail()
 
     world = np.array([[0.0, 0.0, 0.0]], np.float32)
     per_cam = []
@@ -2900,7 +2900,7 @@ def test_a_nan_box_is_skipped_by_both_cross_view_paths():
     names = [c.get_name() for c in cams]
     cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
              moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).posetail()
+             calibrated=dict.fromkeys(names, True)).tracktail()
 
     world = np.array([[0.0, 0.0, 0.0]], np.float32)
     nan_row = torch.full((1, 4), float('nan'))
@@ -4845,7 +4845,7 @@ def _lever_rig(specs):
     names = [c.get_name() for c in cams]
     return Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
                moving=dict.fromkeys(names, False),
-               calibrated=dict.fromkeys(names, True)).posetail()
+               calibrated=dict.fromkeys(names, True)).tracktail()
 
 
 def _lever_boxes(cg, worlds, side=200.0):

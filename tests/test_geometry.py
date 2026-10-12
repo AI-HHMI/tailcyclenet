@@ -25,11 +25,11 @@ def _rig(offset=(0.0, 0.0), distortion=None):
 
 
 def test_skew_projection_inverse_and_rays_round_trip():
-    from posetail.posetail.cube import points_to_rays, project_points_torch
+    from tracktail.model.cube import points_to_rays, project_points_torch
 
     rig = _rig(offset=(7.0, -4.0), distortion=[0.01, -0.001, 0.0002, -0.0001, 0.0003])
     world = torch.tensor([[0.2, -0.1, 10.0], [1.1, 0.3, 12.0]], dtype=torch.float64)
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
     pixels = project_points_torch([cam], world)[0]
     normalized = undistort_points(cam, pixels)
     # c0 has identity rotation and zero translation, so the independent normalized oracle is
@@ -44,11 +44,11 @@ def test_skew_projection_inverse_and_rays_round_trip():
 
 
 def test_skew_projection_sensitivity_matches_autograd():
-    from posetail.posetail.cube import project_cam
+    from tracktail.model.cube import project_cam
     from tailcyclenet.geometry import projection_sensitivity
 
     rig = _rig(offset=(7.0, -4.0), distortion=[0.01, -0.001, 0.0002, -0.0001, 0.0003])
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
     points = torch.tensor([[0.2, -0.1, 10.0], [1.1, 0.3, 12.0]], dtype=torch.float64)
     got = projection_sensitivity(cam, points)
     for i, point in enumerate(points):
@@ -63,11 +63,11 @@ def test_skew_projection_sensitivity_matches_autograd():
 
 
 def test_skew_image_rotation_keeps_projection_in_warp_frame():
-    from posetail.posetail.cube import project_cam
+    from tracktail.model.cube import project_cam
     from tailcyclenet.dataset import rotate_camera_image_plane_3d
 
     rig = _rig(offset=(7.0, -4.0))
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
     world = torch.tensor([[0.2, -0.1, 10.0], [1.1, 0.3, 12.0]], dtype=torch.float32)
     before = project_cam(cam, world)
     cam_rot, (matrix, _) = rotate_camera_image_plane_3d(cam, 27.0)
@@ -79,12 +79,12 @@ def test_skew_image_rotation_keeps_projection_in_warp_frame():
 
 
 def test_skew_rotate_crop_resize_matches_pixel_affine():
-    from posetail.posetail.cube import project_cam
+    from tracktail.model.cube import project_cam
     from tailcyclenet.crop import apply_crop
     from tailcyclenet.dataset import _crop_affine, _resize_camera, rotate_camera_image_plane_3d
 
     rig = _rig(offset=(7.0, -4.0))
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
     world = torch.tensor([[0.2, -0.1, 10.0], [1.1, 0.3, 12.0]], dtype=torch.float32)
     rotated, rotation = rotate_camera_image_plane_3d(cam, 27.0)
     w, h = (int(x) for x in rotated['size'])
@@ -99,10 +99,10 @@ def test_skew_rotate_crop_resize_matches_pixel_affine():
 
 
 def test_image_rotation_supports_anisotropic_focal_and_tangential_distortion():
-    from posetail.posetail.cube import project_cam
+    from tracktail.model.cube import project_cam
     from tailcyclenet.dataset import rotate_camera_image_plane_3d
 
-    cam = _rig(offset=(7.0, -4.0)).posetail()[0]
+    cam = _rig(offset=(7.0, -4.0)).tracktail()[0]
     cam['mat'] = cam['mat'].clone()
     cam['mat'][0, 0], cam['mat'][0, 1] = 900.0, 0.0
     cam['dist'] = torch.tensor([0.01, -0.001, 0.0002, -0.0001, 0.0003])
@@ -115,11 +115,11 @@ def test_image_rotation_supports_anisotropic_focal_and_tangential_distortion():
 
 
 def test_skew_detector_association_triangulates_with_full_intrinsics():
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
     from tailcyclenet.detector.associate import _triangulate
 
     rig = _rig(offset=(7.0, -4.0))
-    cameras = rig.posetail()
+    cameras = rig.tracktail()
     world = torch.tensor([0.2, -0.1, 10.0], dtype=torch.float64)
     pixels = project_points_torch(cameras, world[None])[:, 0]
     got = _triangulate(cameras, (0, 1, 2), pixels)
@@ -127,8 +127,8 @@ def test_skew_detector_association_triangulates_with_full_intrinsics():
 
 
 def test_all_production_inverse_aliases_use_full_intrinsics():
-    import posetail.posetail.tracker_encoder as tracker_encoder
-    import posetail.posetail.cube as cube
+    import tracktail.model.tracker_encoder as tracker_encoder
+    import tracktail.model.cube as cube
 
     assert cube.undistort_points is undistort_points
     assert tracker_encoder.undistort_points is undistort_points

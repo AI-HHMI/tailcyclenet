@@ -9,7 +9,7 @@ from importlib import import_module as _import_module
 
 
 # Keep the package import cheap.  In particular, bridge and other table-only utilities should not
-# import the CLI, dataset, or posetail merely because they live below this package.
+# import the CLI, dataset, or tracktail merely because they live below this package.
 _LAZY_EXPORTS = {
     'build_parser': ('.cli', 'build_parser'),
     'main': ('.cli', 'main'),

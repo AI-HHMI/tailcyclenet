@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from posetail.posetail.cube import project_points_torch
+from tracktail.model.cube import project_points_torch
 
 from .. import crop as cropmod
 from .. import memory
@@ -580,7 +580,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         main thread, in window order -- so preparing a future window's pixels changes no pixel
         and no order.
 
-        A too-short window is clamped to 2 frames (T=1 hits posetail's gT = 0 bug), floored at
+        A too-short window is clamped to 2 frames (T=1 hits tracktail's gT = 0 bug), floored at
         `frame_start`; `window_cams` is one camera group per window carrying per-frame
         extrinsics where a camera moves. Geometry first, pixels second: every animal's crop
         boxes are settled before anything decodes, so each (camera, frame) is read once and
@@ -1343,7 +1343,7 @@ def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales=None)
         b = np.asarray(boxes[0], np.float64)
         width = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
     else:
-        from posetail.posetail.cube import get_camera_scale
+        from tracktail.model.cube import get_camera_scale
         fin = p[torch.isfinite(p).all(-1)]
         if not len(fin):
             return p, 0

@@ -49,13 +49,13 @@ def _camera(size=(64, 48), offset=(0.0, 0.0), dist=None):
     cam = fmt.nominal_camera('cam0', size, dist=dist)
     rig = fmt.Rig(CameraGroup([cam]), {'cam0': offset}, {'cam0': False},
                   {'cam0': True})
-    return rig.posetail()[0]
+    return rig.tracktail()[0]
 
 
 @pytest.mark.parametrize('mode', ['horizontal', 'vertical'])
 def test_flip_affine_matches_pixels_and_projection(mode):
     import cv2
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
     from tailcyclenet.dataset import _crop_affine
 
     W, H = 64, 48

@@ -1,4 +1,4 @@
-"""Repo-local loss additions on top of posetail's `TotalLoss`.
+"""Repo-local loss additions on top of tracktail's `TotalLoss`.
 
 `TotalLoss` puts both of its visibility BCE terms inside the R == 3 branch, so it never
 supervises visibility on a 2D session -- this adds that term.
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from posetail.posetail.losses import TotalLoss
+from tracktail.model.losses import TotalLoss
 
 
 def masked_bce_with_logits(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -26,7 +26,7 @@ def masked_bce_with_logits(pred: torch.Tensor, target: torch.Tensor) -> torch.Te
 
 
 class PoseLoss(TotalLoss):
-    """`TotalLoss` plus a 2D-only visibility term posetail does not carry. `vis_loss_2d_weight`
+    """`TotalLoss` plus a 2D-only visibility term tracktail does not carry. `vis_loss_2d_weight`
     defaults to 0.1, a conservative nonzero weight; other keys reach `TotalLoss` unchanged, so an
     unknown key still raises `TypeError`.
     """

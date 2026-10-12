@@ -35,7 +35,7 @@ def _batch():
 
 
 def test_non_finite_loss_becomes_a_skipped_step():
-    """posetail RAISES on a poisoned sub-loss; the loop needs a NaN it can skip. The raise is
+    """tracktail RAISES on a poisoned sub-loss; the loop needs a NaN it can skip. The raise is
     right for its own purpose but killed two sweep jobs in their first 100 seconds over an
     intermittent bad step; `run_batch` converts it into the signal the loop's own
     `torch.isfinite(loss)` guard already reads.
@@ -72,7 +72,7 @@ def test_short_window_survives_the_smoothness_loss():
     0.3.5 clamps `order` to `T - 1` inside the loss; this pins that the repo's per-batch rule
     (`_tune_smoothness`) degrades to a first difference at T = 2 and restores the order after.
     """
-    from posetail.posetail.losses import TotalLoss
+    from tracktail.model.losses import TotalLoss
 
     mod = _train_module()
     loss_fn = TotalLoss(smoothness_loss_3d_weight=0.5, smoothness_loss_2d_weight=0.5,
@@ -103,7 +103,7 @@ def test_stride_is_divided_out_of_the_smoothness_weight():
     own output (a pure ramp reads s times larger at stride s), and idempotent -- re-derived from
     the configured weight each call.
     """
-    from posetail.posetail.losses import TotalLoss
+    from tracktail.model.losses import TotalLoss
 
     mod = _train_module()
     loss_fn = TotalLoss(smoothness_loss_3d_weight=0.5, smoothness_loss_2d_weight=0.5,
@@ -176,7 +176,7 @@ def test_train_metrics_match_validation_metric_names_and_drop_nonfinite(monkeypa
     assert all(isinstance(value, float) and value == value for value in values.values())
     assert tr.train_metrics({'coords_pred': out['coords_pred']}, batch) == {}
 
-    from posetail.posetail import eval_metrics
+    from tracktail.model import eval_metrics
     monkeypatch.setattr(eval_metrics, 'get_eval_metrics',
                         lambda **kwargs: {'mpjpe': 0.0, 'mte': float('nan'),
                                           'jaccard_1': float('inf')})
@@ -318,7 +318,7 @@ def test_smoothness_drain_preserves_lazily_added_loss_keys():
 
 
 def test_run_batch_routes_2d_visibility_on_its_own_wire():
-    """`batch.vis_2d` means a DIFFERENT thing depending on mode: in 3D it is posetail's own
+    """`batch.vis_2d` means a DIFFERENT thing depending on mode: in 3D it is tracktail's own
     per-camera term (`vis_true_cams`, both-or-neither with `vis_true`); in 2D it must reach
     `PoseLoss`'s own `vis_2d_true` keyword, which `TotalLoss.forward` does not have and never sees.
     """
@@ -410,7 +410,7 @@ def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overw
     or a warm-start checkpoint is about to overwrite every tensor it produces; a fresh run (with
     neither) still needs the real pretrained weights, since nothing else supplies them.
 
-    posetail 0.4.2 exposes this as `video_encoder_pretrained` on `TrackerEncoder`/`build_model`
+    tracktail 0.4.2 exposes this as `video_encoder_pretrained` on `TrackerEncoder`/`build_model`
     directly (report 50's `skip_video_encoder_download` monkeypatch is retired) -- so this now
     asserts the cfg-merge expression instead of the old context-manager name.
     """

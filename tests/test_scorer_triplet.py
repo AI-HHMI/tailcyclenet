@@ -355,7 +355,7 @@ def test_the_triplet_scores_end_to_end(roots):
     assert torch.equal(labels[0, :, 0], torch.ones(K))
     assert torch.equal(labels[0, :, 1], -torch.ones(K))
 
-    from posetail.posetail.losses_scorer import TripletScorerLoss
+    from tracktail.model.losses_scorer import TripletScorerLoss
     from tailcyclenet.scorer.model import flatten_sequence_triplet
 
     loss = TripletScorerLoss()
@@ -376,7 +376,7 @@ def test_tagged_draw_matches_the_library_corruptor_exactly():
     the model is trained on, the breakdown would describe a different corruption than the model
     saw. Same seed, same tensors -- not a statistical match.
     """
-    from posetail.datasets.scorer_corruption import PointCorruptor, GENERATORS
+    from tracktail.datasets.scorer_corruption import PointCorruptor, GENERATORS
 
     from tailcyclenet.scorer.triplet import tagged_draw
 
@@ -396,7 +396,7 @@ def test_tagged_draw_matches_the_library_corruptor_exactly():
 
 def test_tagged_draw_tags_every_point_with_at_least_one_type():
     """Every point is corrupted, so every point must carry at least one tag."""
-    from posetail.datasets.scorer_corruption import PointCorruptor, GENERATORS
+    from tracktail.datasets.scorer_corruption import PointCorruptor, GENERATORS
 
     from tailcyclenet.scorer.triplet import tagged_draw
 
@@ -410,7 +410,7 @@ def test_tagged_draw_tags_every_point_with_at_least_one_type():
 
 def test_the_triplet_carries_per_type_tags_for_the_surviving_points(roots):
     """`make_triplet` must return tags aligned with the keypoints it kept."""
-    from posetail.datasets.scorer_corruption import GENERATORS
+    from tracktail.datasets.scorer_corruption import GENERATORS
 
     _ds, trip = _one(roots, 'mouselike', False, 0)
     assert trip is not None

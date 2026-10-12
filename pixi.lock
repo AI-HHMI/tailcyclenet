@@ -453,7 +453,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/8c/99/33a6ed9c1a0b5e42efa98eb0edf617d61dca576c82625947377b1d4540c9/numba-0.66.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/8e/37/efad0257dc6e593a18957422533ff0f87ede7c9c6ea010a2177d738fb82f/pure_eval-0.2.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8e/c2/8fec8e8e2eb920cc2280f569144080cd58622a2eda83bfa4c0c354a63264/anywidget-0.11.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/92/54/d32544ea8ec3ceea85dd707bd205da367c6f091948919352634ae0f923b4/posetail-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/55/be532372738cc4f4e5ce653c381241dade44194bf54d022ad28ec2887d61/jupyter_ui_poll-1.1.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/ef/aac74263f0252806b46f0fd5a52566ee06129744572d0958cd0a77d22b0a/schedulefree-1.4.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/96/42/3e5985a0a7e57de470b320c6d6a1a67c844f6737a587f3d44dd13d1819e7/wcwidth-0.8.2-py3-none-any.whl
@@ -491,6 +490,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/da/35/f2287558c17e29fafc8ef3daf819bb9834061cfa43bff8014f7df7f63bdc/anyio-4.14.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/dd/93/0e1e3a8e1efa8dd4316bc5a6f4b93fd6e34446959d606446212d4a06bc70/tracktail-0.5.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e0/12/b05ba554d2c623bffa59922b94b0775673de251f468a9609bc9e45de95e9/triton-3.6.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e3/dd/cadd6ec43069247d91f6345fa7a0d2858bef6af366dbd7ba8f05d2c77d3b/protobuf-5.29.6-cp38-abi3-manylinux2014_x86_64.whl
@@ -982,7 +982,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/8c/99/33a6ed9c1a0b5e42efa98eb0edf617d61dca576c82625947377b1d4540c9/numba-0.66.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/8e/37/efad0257dc6e593a18957422533ff0f87ede7c9c6ea010a2177d738fb82f/pure_eval-0.2.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/8e/c2/8fec8e8e2eb920cc2280f569144080cd58622a2eda83bfa4c0c354a63264/anywidget-0.11.0-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/92/54/d32544ea8ec3ceea85dd707bd205da367c6f091948919352634ae0f923b4/posetail-0.4.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/55/be532372738cc4f4e5ce653c381241dade44194bf54d022ad28ec2887d61/jupyter_ui_poll-1.1.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/93/ef/aac74263f0252806b46f0fd5a52566ee06129744572d0958cd0a77d22b0a/schedulefree-1.4.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/96/42/3e5985a0a7e57de470b320c6d6a1a67c844f6737a587f3d44dd13d1819e7/wcwidth-0.8.2-py3-none-any.whl
@@ -1020,6 +1019,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/da/35/f2287558c17e29fafc8ef3daf819bb9834061cfa43bff8014f7df7f63bdc/anyio-4.14.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/dd/93/0e1e3a8e1efa8dd4316bc5a6f4b93fd6e34446959d606446212d4a06bc70/tracktail-0.5.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e0/12/b05ba554d2c623bffa59922b94b0775673de251f468a9609bc9e45de95e9/triton-3.6.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e3/dd/cadd6ec43069247d91f6345fa7a0d2858bef6af366dbd7ba8f05d2c77d3b/protobuf-5.29.6-cp38-abi3-manylinux2014_x86_64.whl
@@ -7475,7 +7475,7 @@ packages:
 - pypi: ./
   name: tailcyclenet
   requires_dist:
-  - posetail==0.4.2
+  - tracktail>=0.5.0,<1
   - torch>=2,<3
   - einops
   - numpy>=1.26
@@ -8421,33 +8421,6 @@ packages:
   - typing-extensions>=4.2.0
   - watchfiles>=1.1.0 ; extra == 'dev'
   requires_python: '>=3.10'
-- pypi: https://files.pythonhosted.org/packages/92/54/d32544ea8ec3ceea85dd707bd205da367c6f091948919352634ae0f923b4/posetail-0.4.2-py3-none-any.whl
-  name: posetail
-  version: 0.4.2
-  sha256: e2ad9046ce9e22c7521451f93a2c0db2fbbda11d65e1c3cc9dea8262859c5473
-  requires_dist:
-  - aniposelib>=0.7.0
-  - easydict==1.13
-  - einops==0.7.0
-  - opencv-python==4.9.0.80
-  - toml==0.10.2
-  - tomlkit>=0.12
-  - wandb==0.19.5
-  - lightning>=2.5.6,<3
-  - rerun-sdk[notebook]<=0.22.1
-  - numpy==1.26
-  - imgaug
-  - imagecorruptions
-  - setuptools<81
-  - schedulefree
-  - decord
-  - tqdm
-  - fastapi>=0.111
-  - uvicorn[standard]>=0.29
-  - python-multipart>=0.0.9
-  - requests>=2.31
-  - huggingface-hub>=0.30
-  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/93/55/be532372738cc4f4e5ce653c381241dade44194bf54d022ad28ec2887d61/jupyter_ui_poll-1.1.0-py3-none-any.whl
   name: jupyter-ui-poll
   version: 1.1.0
@@ -9260,6 +9233,33 @@ packages:
   requires_dist:
   - typing-extensions>=4.12.0
   requires_python: '>=3.9'
+- pypi: https://files.pythonhosted.org/packages/dd/93/0e1e3a8e1efa8dd4316bc5a6f4b93fd6e34446959d606446212d4a06bc70/tracktail-0.5.0-py3-none-any.whl
+  name: tracktail
+  version: 0.5.0
+  sha256: 1338dd302c9363d7baf319fb434dc53a199bd7fa0ee1474f5b0606519d526d0e
+  requires_dist:
+  - aniposelib>=0.7.0
+  - easydict==1.13
+  - einops==0.7.0
+  - opencv-python==4.9.0.80
+  - toml==0.10.2
+  - tomlkit>=0.12
+  - wandb==0.19.5
+  - lightning>=2.5.6,<3
+  - rerun-sdk[notebook]<=0.22.1
+  - numpy==1.26
+  - imgaug
+  - imagecorruptions
+  - setuptools<81
+  - schedulefree
+  - decord
+  - tqdm
+  - fastapi>=0.111
+  - uvicorn[standard]>=0.29
+  - python-multipart>=0.0.9
+  - requests>=2.31
+  - huggingface-hub>=0.30
+  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/e0/12/b05ba554d2c623bffa59922b94b0775673de251f468a9609bc9e45de95e9/triton-3.6.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
   name: triton
   version: 3.6.0

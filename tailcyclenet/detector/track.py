@@ -24,7 +24,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from posetail.posetail.cube import project_points_torch
+from tracktail.model.cube import project_points_torch
 
 from .associate import _centres, associate
 
@@ -223,7 +223,7 @@ class CrossViewTracker:
         """Match, update, birth, retire. -> (boxes (S,C,4), scores (S,C), claimed (S,C)) numpy.
 
         Inputs:
-            cgroup -- posetail camera dicts for this frame.
+            cgroup -- tracktail camera dicts for this frame.
             boxes_per_cam -- list of (n_c, 4) tensors in each camera's own pixels.
             scores_per_cam -- matching (n_c,) objectness.
         Outputs:
@@ -605,7 +605,7 @@ def demo():
     names = [c.get_name() for c in cams]
     cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
              moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).posetail()
+             calibrated=dict.fromkeys(names, True)).tracktail()
 
     def boxes_at(worlds, side=40.0):
         """Project `worlds` into every camera as fixed-size square boxes.

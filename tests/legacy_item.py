@@ -21,8 +21,8 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
-from posetail.posetail.cube import (get_camera_scale, is_point_visible, project_points_torch)
+from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
+from tracktail.model.cube import (get_camera_scale, is_point_visible, project_points_torch)
 
 from tailcyclenet import crop as cropmod
 from tailcyclenet.dataset import (_apply_affine, _crop_inflate, _mask_outside, _resize_camera,

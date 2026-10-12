@@ -21,7 +21,7 @@ import polars as pl
 import torch
 
 from ..checkpoints import load_scorer_run, provenance, scorer_contract, scorer_output_granularity
-# Importing dataset eagerly pulls posetail's legacy training dataset. Keep QC's
+# Importing dataset eagerly pulls tracktail's legacy training dataset. Keep QC's
 # table-only import free of pandas; scoring imports the loader only when it actually runs.
 PoseDataset = None
 if TYPE_CHECKING:

@@ -97,7 +97,7 @@ depth_log_max = 2.5
 n_iterations = 60000
 seed = 23
 # The base tracker this finetunes from; this Hugging Face repo is downloaded and cached on first launch. A local checkpoint folder is also accepted.
-checkpoint_path = "ai-hhmi/posetail-static-animal"
+checkpoint_path = "ai-hhmi/tracktail-static-animal"
 max_grad_norm = 10.0
 checkpoint_freq = 1000
 val_freq = 200

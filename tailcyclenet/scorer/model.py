@@ -21,8 +21,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 
-from posetail.posetail.cube import (get_camera_scale, points_to_rays, project_points_torch)
-from posetail.posetail.encoder_decoder import AttentionPooling
+from tracktail.model.cube import (get_camera_scale, points_to_rays, project_points_torch)
+from tracktail.model.encoder_decoder import AttentionPooling
 
 from ..model import PoseTrackerEncoder, build_model
 
@@ -113,7 +113,7 @@ def _refuse_moving_rig(camera_group):
     model construction, which never sees a camera), and it is the same test the query encoder uses
     to decide a rig is moving.
 
-    Inputs: camera_group -- a list of posetail camera dicts.
+    Inputs: camera_group -- a list of tracktail camera dicts.
     Outputs: None, or raises ValueError naming the offending cameras.
     Side effects: none.
     """
@@ -230,7 +230,7 @@ class PoseScorer(PoseTrackerEncoder):
         via `is_point_visible` and `scene_center` uses `nanmean`, so missing slots cannot bias the
         scene scale or centroid.
 
-        Inputs: coords_flat -- [B, T*K, R]; camera_group -- posetail camera dicts;
+        Inputs: coords_flat -- [B, T*K, R]; camera_group -- tracktail camera dicts;
                 device -- where to build constants; times -- per-query-slot frame index or None.
         Outputs: (cube_scale [n_cams,B], cube_scale_shared [B], f_eff [n_cams]|None,
                   scene_center [B,3]|None, scene_radius [B]|None).
@@ -465,7 +465,7 @@ class PoseScorer(PoseTrackerEncoder):
         an exact load and a future box-at-QC-time arm stays buildable.
 
         Inputs: views_norm -- normalised views; scene_features -- their encode; coords_full --
-                [B,T,K,R]; camera_group -- posetail cameras; kpt_ids -- [B,K] global registry ids;
+                [B,T,K,R]; camera_group -- tracktail cameras; kpt_ids -- [B,K] global registry ids;
                 kpt_chunk -- score K in slices of this size, or None; occlusion -- [B,K,n_cams].
         Outputs: (scores [B,K], precision [B,K]) in sequence mode, or
             (scores [B,T,K], precision [B,T,K]) in frame mode.

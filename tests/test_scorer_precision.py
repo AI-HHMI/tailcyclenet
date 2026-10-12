@@ -3,7 +3,7 @@ import math
 
 import torch
 
-from posetail.posetail.losses_scorer import TripletScorerLoss
+from tracktail.model.losses_scorer import TripletScorerLoss
 
 
 def _equal_score_loss(precision_reg_weight, p, margin=0.25):

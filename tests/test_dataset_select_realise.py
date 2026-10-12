@@ -86,7 +86,7 @@ def _seed_all(item_seed, shape_seed, aug_seed, rot_seed):
     FOUR sources, because the loader uses four and only one of them is the item's own rng:
 
     * the item `Generator` (rotation draw, crop jitter, grayscale, cutout, the prompt corruptions);
-    * `np.random` -- `PosetailDataset.rotate_camera_group` draws the 3D world-gauge angle from the
+    * `np.random` -- `TracktailDataset.rotate_camera_group` draws the 3D world-gauge angle from the
       GLOBAL numpy RNG (`rvec = np.random.uniform(...)`), not from the item stream;
     * `imgaug` -- the appearance pipelines draw from imgaug's own global RNG, seeded with entropy
       when the pipelines are built, so two datasets otherwise differ in the PIXELS while every

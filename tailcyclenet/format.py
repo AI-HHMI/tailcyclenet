@@ -110,14 +110,14 @@ class Rig:
         from aniposelib.cameras import FisheyeCamera
         return 'fisheye' if isinstance(self.by_name(name), FisheyeCamera) else 'pinhole'
 
-    def posetail(self, device='cpu', moving_ext: dict | None = None) -> list[dict]:
-        """posetail's camera dicts, DETACHED.
+    def tracktail(self, device='cpu', moving_ext: dict | None = None) -> list[dict]:
+        """tracktail's camera dicts, DETACHED.
 
         On the torch branch aniposelib's intrinsics/extrinsics are `nn.Parameter`s; detaching stops
         gradients flowing into calibration we are not training.
         """
         import torch
-        from posetail.posetail.train_utils import format_camera
+        from tracktail.model.train_utils import format_camera
 
         out = []
         with torch.no_grad():
@@ -143,7 +143,7 @@ def rig_from_doc(doc: dict, where: str) -> Rig:
 
     Split out for `adopt.plan`, which patches missing camera sizes before building the Rig.
     Distortion vectors are padded to five OpenCV coefficients at this load boundary because
-    posetail's projection helper consumes all five; the on-disk calibration is left unchanged.
+    tracktail's projection helper consumes all five; the on-disk calibration is left unchanged.
     """
     from aniposelib.cameras import CameraGroup
 
@@ -744,7 +744,7 @@ class Session:
         self.__dict__.pop('_columns', None)
 
     def cgroup(self, gid: str, frames=None) -> list[dict]:
-        """posetail cameras for a group, carrying per-frame extrinsics where a camera moves.
+        """tracktail cameras for a group, carrying per-frame extrinsics where a camera moves.
 
         The one place a camera group is built. `frames`: None -> whole group (moving `ext` is
         (T,4,4)); a sequence -> (T_win,4,4) aligned to that window; an INT -> static (4,4) at one
@@ -754,14 +754,14 @@ class Session:
         `_decode_from_scene` stacks `cam['ext']` across cameras, so a mixed rig is a stack error.
         """
         if not any(self.rig.moving.values()):
-            return self.rig.posetail()
+            return self.rig.tracktail()
 
         import torch
         ext = self.labels(gid).ext
         sel = slice(None) if frames is None else frames
         moving_ext = {n: torch.as_tensor(ext[i][sel], dtype=torch.float)
                       for i, n in enumerate(self.cam_names)}
-        return self.rig.posetail(moving_ext=moving_ext)
+        return self.rig.tracktail(moving_ext=moving_ext)
 
     def labels(self, gid: str) -> Labels:
         """Scatter one group's rows into dense arrays. See docs/annotation_format.md §12.

@@ -1,4 +1,4 @@
-"""The pose model: posetail's `TrackerEncoder` with a pose-shaped query and a per-frame anchor.
+"""The pose model: tracktail's `TrackerEncoder` with a pose-shaped query and a per-frame anchor.
 
 (1) The query is DERIVED, not given: query-free keypoints are queried at a scene point
 back-projected from the cameras' own crop centres (2D: the crop centre), replaced by a
@@ -14,8 +14,8 @@ import warnings
 import torch
 from einops import einsum, rearrange, repeat
 
-from posetail.posetail.cube import from_homogeneous, to_homogeneous, undistort_points
-from posetail.posetail.tracker_encoder import TrackerEncoder
+from tracktail.model.cube import from_homogeneous, to_homogeneous, undistort_points
+from tracktail.model.tracker_encoder import TrackerEncoder
 
 from .query_encoder import BOX_ENCODERS, BOX_MODES, WideQueryEncoder
 
@@ -80,7 +80,7 @@ def _uncalibrated_singleview_anchor(cam):
 
     A single camera's minimum-norm scene centre is its optical-ray point nearest the origin. For
     an uncalibrated identity camera that is the camera centre itself, where projection sensitivity
-    is undefined and posetail's ``cube_scale`` becomes NaN. The one-unit offset supplies a finite
+    is undefined and tracktail's ``cube_scale`` becomes NaN. The one-unit offset supplies a finite
     gauge for inference only; it cannot recover metric depth or world scale.
     """
     size = cam['size'].to(torch.float64)
@@ -232,7 +232,7 @@ class PoseTrackerEncoder(TrackerEncoder):
     def project_scene(self, encoding: SceneEncoding):
         """Apply this checkpoint's own SceneRepresentation tail to raw encoder tokens.
 
-        This mirrors the installed posetail implementation using its own positional-embedding
+        This mirrors the installed tracktail implementation using its own positional-embedding
         helpers and projection modules. In the camera-batched path, every tail operation precedes
         the `[C,B,N,D]` reshape, matching the historical `SceneRepresentation.forward` order.
         """
@@ -315,7 +315,7 @@ class PoseTrackerEncoder(TrackerEncoder):
         Args:
             views: list of (B,T,H,W,3) float32 in [0,1], one per camera
             kpt_ids: (B,K) long -- GLOBAL registry ids, not positions
-            camera_group: list of posetail camera dicts, one per view
+            camera_group: list of tracktail camera dicts, one per view
             mode: '2d' | '3d' -- a property of the SAMPLED session, not of the run (one run
                 mixes both)
             kpt_prior: (B,K,R) or None; NaN where a keypoint has none. Ignored under

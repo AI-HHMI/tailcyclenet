@@ -1,4 +1,4 @@
-"""The training loader: tailcycle-dataset on disk -> the batch posetail's model consumes.
+"""The training loader: tailcycle-dataset on disk -> the batch tracktail's model consumes.
 
 Three sampling modes, decided per item: 3D multiview (`cams_to_sample` cameras, world-mm targets),
 3D single-view (one camera, world-mm targets, possible when `cams_to_sample` draws one), and 2D
@@ -6,7 +6,7 @@ single-view (crop-pixel targets, including the training-only `prob_2d_only` coin
 property of the sampled SESSION except for that explicit 2D coin, so one `train/` may hold both
 and both head-bank slots get gradient. Two non-negotiable rules: keypoints are never filtered
 (the library's `filter_keypoints` shrinks N so array position stops equalling identity), and
-T >= 2 always (a T=1 window gives posetail a zero-length pos_embed).
+T >= 2 always (a T=1 window gives tracktail a zero-length pos_embed).
 """
 from __future__ import annotations
 
@@ -24,11 +24,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from posetail.datasets.posetail_dataset import (
-    custom_collate, rotate_camera_image_plane_3d as _posetail_rotate_camera_image_plane_3d,
+from tracktail.datasets.tracktail_dataset import (
+    custom_collate, rotate_camera_image_plane_3d as _tracktail_rotate_camera_image_plane_3d,
 )
 from .geometry import _has_skew
-from posetail.posetail.cube import get_camera_scale, is_point_visible, project_points_torch
+from tracktail.model.cube import get_camera_scale, is_point_visible, project_points_torch
 
 from . import crop as cropmod
 from . import memory as _memory
@@ -42,7 +42,7 @@ class LoaderConfig:
     n_frames: int = 24
     # cameras are resized so max(W,H) == this
     image_size: int = 256
-    # int, or a [low, high] pair drawn per item (posetail's own `sample_cameras`); 0 means every
+    # int, or a [low, high] pair drawn per item (tracktail's own `sample_cameras`); 0 means every
     # camera. The pretrained tracker this finetunes from was trained at [1, 8], so a fixed count
     # above that is out of distribution as well as slow.
     cams_to_sample: int | list = 0
@@ -313,14 +313,14 @@ def _needs_full_image_rotation(cam):
 def rotate_camera_image_plane_3d(cam, angle_deg):
     """Rotate a 3D image and keep a full intrinsic matrix projection-consistent.
 
-    posetail's helper implements the equivalent camera update by rolling the camera frame. That
+    tracktail's helper implements the equivalent camera update by rolling the camera frame. That
     relies on the image transform commuting with the intrinsic/distortion model, which is only
     safe for the narrow isotropic, zero-distortion case. For skew, unequal focal lengths, or
     nonzero distortion, leave extrinsics fixed and left-multiply the complete homogeneous `K` by
     the image affine, transforming offsets by its linear part. The projected 3D points then follow
     exactly the same affine as the warped image.
     """
-    cam_rot, rotation = _posetail_rotate_camera_image_plane_3d(cam, angle_deg)
+    cam_rot, rotation = _tracktail_rotate_camera_image_plane_3d(cam, angle_deg)
     if not _needs_full_image_rotation(cam):
         return cam_rot, rotation
 
@@ -338,7 +338,7 @@ def rotate_camera_image_plane_3d(cam, angle_deg):
 
 
 def _rotate_camera_group_with_neighbours(cgroup, coords, others):
-    """`PosetailDataset.rotate_camera_group`, optionally carrying a SECOND point set through the
+    """`TracktailDataset.rotate_camera_group`, optionally carrying a SECOND point set through the
     identical draw. Returns `(cgroup, coords, others)`; `others` is None in, None out.
 
     With `others` None (the default) this is EXACTLY the library call. With it, `others` is one
@@ -347,14 +347,14 @@ def _rotate_camera_group_with_neighbours(cgroup, coords, others):
     combined tensor to `crop_to_points_3d`: the crop is the TARGET's extent, and a neighbour
     would change the item's geometry.
     """
-    from posetail.datasets.posetail_dataset import PosetailDataset
+    from tracktail.datasets.tracktail_dataset import TracktailDataset
 
     if others is None:
-        cgroup, coords = PosetailDataset.rotate_camera_group(None, cgroup, coords)
+        cgroup, coords = TracktailDataset.rotate_camera_group(None, cgroup, coords)
         return cgroup, coords, None
     K = coords.shape[1]
     combined = torch.cat([coords, others], dim=1)
-    cgroup, combined = PosetailDataset.rotate_camera_group(None, cgroup, combined)
+    cgroup, combined = TracktailDataset.rotate_camera_group(None, cgroup, combined)
     return cgroup, combined[:, :K], combined[:, K:]
 
 
@@ -747,7 +747,7 @@ def _crop_inflate(cfg, rng, train):
 def _n_cams(spec, rng):
     """How many cameras this item shows. `spec` is an int, or a [low, high] pair drawn per item.
 
-    The pair form is posetail's (`PosetailDataset.sample_cameras`, `posetail_dataset.py:1258-1266`)
+    The pair form is tracktail's (`TracktailDataset.sample_cameras`, `tracktail_dataset.py:1258-1266`)
     and it is what the pretrained tracker was finetuned with, at [1, 8]. Returning a number larger
     than the session has is fine -- the caller takes every camera in that case, exactly as the
     reference's `if len(cam_names) > num_cams_to_sample` guard does.
@@ -769,7 +769,7 @@ def _even_span(span, ceiling):
 
 
 def _build_augmenters(cfg):
-    """The two appearance pipelines, taken from the reference (`posetail_dataset.py:570-588`).
+    """The two appearance pipelines, taken from the reference (`tracktail_dataset.py:570-588`).
 
     The SPLIT is the point, not the list. `per_camera` is sampled once per camera and replayed
     frame by frame, so a camera's colour, gamma and focus hold steady down a clip: appearance is
@@ -963,7 +963,7 @@ class PoseDataset(Dataset):
         Side effects: reads every requested split label table; prints the box_source coverage per
         dataset.
 
-        `n_frames` must be >= 2 (T = 1 gives posetail `gT = 0` and a zero-length
+        `n_frames` must be >= 2 (T = 1 gives tracktail `gT = 0` and a zero-length
         pos_embed, which the clamp-pad does NOT cover); `box_source` is asserted against
         `BOX_SOURCES` (a typo would silently mean `keypoints`). `registry_base` makes the
         ids APPEND-ONLY so embedding rows survive warm start; `Registry.build` raises if
@@ -978,7 +978,7 @@ class PoseDataset(Dataset):
         train-only, so a window's identity stays tied to its index.
         """
         assert cfg.n_frames >= 2, (
-            f'n_frames = {cfg.n_frames} is not usable: posetail computes gT = T // tubelet_size '
+            f'n_frames = {cfg.n_frames} is not usable: tracktail computes gT = T // tubelet_size '
             '(encoder_decoder.py:748), which is 0 at T=1 and yields a zero-length pos_embed. '
             'Use n_frames >= 2; short groups are clamp-padded up to it.')
         assert cfg.box_source in BOX_SOURCES, \
@@ -1821,7 +1821,7 @@ class SpawnHandoff(Dataset):
     """Hand a big dataset to `spawn` loader workers through shared memory.
 
     Starting a `spawn` worker writes the pickled dataset into a pipe. The child reads that pipe only
-    after it has imported torch/posetail (~4 s), and a pipe holds 64 KB. So for a 361 MB
+    after it has imported torch/tracktail (~4 s), and a pipe holds 64 KB. So for a 361 MB
     PoseDataset each `Process.start()` blocks for that worker's import plus unpickle (~5 s), and
     the workers start ONE AT A TIME: 8 workers took ~40 s, on every rank. Here the dataset is
     pickled once into a shared-memory tensor, and torch's own reducer sends only a handle down
@@ -1871,7 +1871,7 @@ def worker_init(worker_id):
 
 
 def pose_collate(batch):
-    """posetail's collate for the first ten fields, plus this repo's three.
+    """tracktail's collate for the first ten fields, plus this repo's three.
 
     `custom_collate` keeps only item 0's `cgroup` and forbids mixing 2D and 3D -- which is why
     batch_size is structurally 1 PER RANK. The same reason covers K: sessions may carry different

@@ -306,7 +306,7 @@ def _gt_crop_sides(sess, gid, min_crop_dim, max_frames=0, cap=200):
     same as a 500-frame one -- this is a population read, not a census.
     """
     from ..crop import crop_box_for_points
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
     frames = _labelled_frames(sess, gid)
     if max_frames:
         frames = frames[frames < max_frames]

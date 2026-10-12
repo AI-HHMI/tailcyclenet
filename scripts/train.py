@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Finetune a posetail tracker into a pose estimator.
+"""Finetune a tracktail tracker into a pose estimator.
 
     pixi run python scripts/train.py --config configs/base.toml [--devices N]
 

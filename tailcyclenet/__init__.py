@@ -1,6 +1,6 @@
-"""tailcyclenet -- posetail finetuned into an animal pose estimator.
+"""tailcyclenet -- tracktail finetuned into an animal pose estimator.
 
-The pinned posetail release's projection is full-K, but its inverse normalization and projection
+The pinned tracktail release's projection is full-K, but its inverse normalization and projection
 sensitivity historically ignored intrinsic skew. A scoped compatibility layer is installed before
 pose, detector, or scorer modules import those shared geometry helpers.
 """
@@ -12,7 +12,7 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
-# Install before any posetail submodule imports its geometry helpers. The pinned release's
+# Install before any tracktail submodule imports its geometry helpers. The pinned release's
 # projection is full-K, but its inverse normalization is scalar-focal for nonzero skew.
 from .geometry import install_full_intrinsics as _install_full_intrinsics
 

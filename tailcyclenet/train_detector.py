@@ -205,7 +205,7 @@ def build_detector_optimizer(model, train_cfg, model_cfg):
             [g for g in muon_groups if g['params']], lr=lr, weight_decay=0.0,
             momentum=train_cfg['muon_momentum'], adjust_lr_fn='match_rms_adamw')
         opt_muon = ScheduleFreeWrapper(base_muon, momentum=0.9, weight_decay_at_y=wd)
-        from posetail.posetail.muon import DualOptimizer
+        from tracktail.model.muon import DualOptimizer
         opt = DualOptimizer(opt_muon, opt_adam)
     else:
         opt = opt_adam

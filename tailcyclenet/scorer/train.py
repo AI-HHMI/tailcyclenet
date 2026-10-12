@@ -26,8 +26,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from posetail.datasets.scorer_corruption import GENERATORS
-from posetail.posetail.losses_scorer import TripletScorerLoss
+from tracktail.datasets.scorer_corruption import GENERATORS
+from tracktail.model.losses_scorer import TripletScorerLoss
 
 from ..checkpoints import (SCORER_OUTPUT_GRANULARITIES, _SCORER_CONFIG,
                            full_training_state, load_config, require_scorer_granularity,
@@ -435,7 +435,7 @@ def build_scorer_loss(config: dict, output_granularity: str | None = None):
 
     The installed ``TripletScorerLoss`` deliberately remains the sequence compatibility loss.  The
     framewise implementation is repo-owned in ``scorer.losses``; importing it lazily keeps old
-    sequence-only consumers able to import this module with an older posetail install and makes
+    sequence-only consumers able to import this module with an older tracktail install and makes
     the missing implementation fail by name at the first frame run.
     """
     mode = output_granularity or scorer_output_granularity(config)
@@ -469,7 +469,7 @@ def _frame_loss_kwargs(loss_fn, trip: dict) -> dict:
     """Select metadata accepted by the local frame loss from a triplet dictionary.
 
     ``FrameTripletScorerLoss`` is intentionally a normal PyTorch module rather than a change to
-    posetail's installed loss.  Filtering by its signature lets the trainer work with the initial
+    tracktail's installed loss.  Filtering by its signature lets the trainer work with the initial
     mask-only implementation and with later versions that add a diagnostic mask without silently
     dropping the masks both versions understand.
     """

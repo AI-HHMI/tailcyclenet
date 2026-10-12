@@ -5,18 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tailcyclenet"
 version = "0.3.3"
-description = "finetune a posetail tracker into an animal pose estimator (3D multiview, 3D single-view, 2D single-view)"
+description = "finetune a tracktail tracker into an animal pose estimator (3D multiview, 3D single-view, 2D single-view)"
 requires-python = ">=3.11"
 readme = "README.md"
 license = "BSD-3-Clause"
-keywords = ["animal pose estimation", "3d tracking", "multi-view", "posetail"]
+keywords = ["animal pose estimation", "3d tracking", "multi-view", "tracktail"]
 classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Image Recognition",
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "posetail==0.4.2",
+    "tracktail>=0.5.0,<1",
     "torch>=2,<3",
     "einops",
     "numpy>=1.26",
@@ -72,17 +72,19 @@ PYTHONPYCACHEPREFIX = "${HOME}/.cache/tailcyclenet/pycache"
 MALLOC_ARENA_MAX = "2"
 
 [tool.pixi.pypi-dependencies]
-# posetail is a LIBRARY here, never modified: pinned to the PyPI release (a checkout lives at
-# ../posetail-next for READING only). 0.4.1 landed every workaround this repo carried -- the
-# cube.py patches, crop_box_for_points, input_size=/scene_features=, T=1 guard, occlusion/vis guards --
-# and adds loading packaged TrackerEncoder weights from Hugging Face. 0.4.2 lands the three
-# fixes (int64 query/target time indices, removal of the deprecated torch.backends.cuda.sdp_kernel
-# context, and a video_encoder_pretrained flag threaded through TrackerEncoder) -- see
-# checkpoints.py and model.py for the local workarounds this retires.
-posetail = "==0.4.2"
+# tracktail (renamed from posetail at 0.5.0: `posetail.posetail.*` -> `tracktail.model.*`,
+# `posetail.datasets.posetail_dataset` -> `tracktail.datasets.tracktail_dataset`) is a LIBRARY
+# here, never modified, installed from PyPI (a reference checkout lives at
+# ~/ghome/projects/posetail/posetail-next for READING only). Any 0.x release from 0.5.0 on is
+# accepted; pixi.lock records the exact version tested. 0.4.1 landed every workaround this repo
+# carried -- the cube.py patches, crop_box_for_points, input_size=/scene_features=, T=1 guard,
+# occlusion/vis guards -- and packaged TrackerEncoder weights from Hugging Face; 0.4.2 landed
+# int64 query/target time indices, removal of the deprecated torch.backends.cuda.sdp_kernel
+# context, and the video_encoder_pretrained flag threaded through TrackerEncoder.
+tracktail = ">=0.5.0,<1"
 # The pytorch branch, not PyPI's 0.8.0: its Camera is an nn.Module whose projection,
 # triangulation and Jacobians are torch ops, so camera geometry runs on GPU with the model.
-# Declares itself 0.7.2, satisfying posetail's `aniposelib>=0.7.0`.
+# Declares itself 0.7.2, satisfying tracktail's `aniposelib>=0.7.0`.
 aniposelib = { git = "https://github.com/lambdaloop/anipose-lib.git", branch = "pytorch" }
 tailcyclenet = { path = ".", editable = true }
 torch = { version = "<3", index = "https://download.pytorch.org/whl/cu128" }
@@ -128,10 +130,10 @@ pytest-timeout = "*"
 # the note below is about.
 ruff = "*"
 av = ">=18.0.0,<19"
-# Deliberately NOT listed: toml, opencv, pillow, wandb, schedulefree. posetail pins them
-# EXACTLY and is itself pinned, so the versions are already determined in pixi.lock; re-declaring
-# duplicates a pin that conflicts the moment posetail moves, or asks for `*` and conflicts
-# immediately. If posetail ever drops one, add it here at posetail's own version. Video decoding
+# Deliberately NOT listed: toml, opencv, pillow, wandb, schedulefree. tracktail pins them
+# EXACTLY and pixi.lock pins tracktail, so the versions are already determined in pixi.lock; re-declaring
+# duplicates a pin that conflicts the moment tracktail moves, or asks for `*` and conflicts
+# immediately. If tracktail ever drops one, add it here at tracktail's own version. Video decoding
 # is provided directly by PyAV above.
 
 [tool.pixi.tasks]

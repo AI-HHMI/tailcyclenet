@@ -104,15 +104,15 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
 
     from tailcyclenet import format as fmt
     from tailcyclenet.dataset import _crop_affine, _resize_camera
-    from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
+    from tracktail.model.cube import project_points_torch
 
     W, H = 320, 240
     from aniposelib.cameras import CameraGroup
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
                   offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
                   calibrated={'cam0': True})
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
 
     # a point that projects well inside the frame: f = max(W,H) = 320, principal point (160,120)
     pt = torch.tensor([[[0.4, 0.2, 4.0]]])                      # (T=1, K=1, 3)
@@ -154,7 +154,7 @@ def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
     W, H = 4696, 2048
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
                   offset={'cam0': (0.0, 0.0)}, moving={'cam0': False}, calibrated={'cam0': True})
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
     # the four frame corners plus its centre -- if any of these leaves the canvas, an animal can
     corners = torch.tensor([[[0.0, 0.0], [W, 0.0], [W, H], [0.0, H], [W / 2, H / 2]]])
 
@@ -344,7 +344,7 @@ def test_missing_2d_point_supervises_occlusion_despite_nan_coords(tiny_root):
 
 
 def test_vis_and_vis2d_are_both_or_neither_in_3d(tiny_root):
-    """Supplying one without the other dies inside posetail's einops, so the loader must never do it."""
+    """Supplying one without the other dies inside tracktail's einops, so the loader must never do it."""
     ds = PoseDataset(tiny_root / 'mouselike', 'train', CFG)
     for i in range(len(ds)):
         b = pose_collate([ds[i]])
@@ -374,7 +374,7 @@ def test_keypoints_are_never_filtered(tiny_root):
 
 
 def test_window_is_at_least_two_frames(tiny_root):
-    """T=1 routes posetail into a zero-length pos_embed; `n_frames = 1` is refused outright, and
+    """T=1 routes tracktail into a zero-length pos_embed; `n_frames = 1` is refused outright, and
     a group shorter than the ceiling yields its own length, never 1.
     """
     cfg = LoaderConfig(n_frames=1, image_size=64, aug_prob=0.0, crop_jitter=0.0)
@@ -404,7 +404,7 @@ def test_prob_2d_only_uses_true_2d_targets_on_3d_session(tiny_root):
 
 def test_hybrid_2d_targets_respect_visibility_status(tiny_root):
     from types import SimpleNamespace
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
 
     ds = PoseDataset(tiny_root / 'mouselike', 'train',
                      LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0,
@@ -706,7 +706,7 @@ def test_frame_strides_widen_the_window_on_the_lattice(dense_root, centred_root)
 
 
 def test_visibility_stays_three_state(tiny_root):
-    """"Not assessed" must reach the loss as NaN, not as "not visible" -- posetail >= 0.3.2
+    """"Not assessed" must reach the loss as NaN, not as "not visible" -- tracktail >= 0.3.2
     masks non-finite visibility targets, so collapsing to 0 would train the head on labels nobody
     made.
     """
@@ -723,10 +723,10 @@ def test_visibility_stays_three_state(tiny_root):
 
 
 def test_gradients_survive_unassessed_visibility():
-    """The property the loader depends on, asserted against the INSTALLED posetail: a NaN target
+    """The property the loader depends on, asserted against the INSTALLED tracktail: a NaN target
     must leave the loss finite and the gradient finite.
     """
-    from posetail.posetail.losses import BCELossVis
+    from tracktail.model.losses import BCELossVis
 
     pred = torch.zeros(2, 4, 3, 1, requires_grad=True)
     target = torch.randint(0, 2, (2, 4, 3, 1)).float()
@@ -735,7 +735,7 @@ def test_gradients_survive_unassessed_visibility():
     assert torch.isfinite(loss)
     loss.backward()
     assert torch.isfinite(pred.grad).all(), (
-        'installed posetail poisons the gradient on an unassessed visibility target; '
+        'installed tracktail poisons the gradient on an unassessed visibility target; '
         'needs >= 0.3.2')
 
 
@@ -744,7 +744,7 @@ def test_no_visibility_supervision_without_ground_truth(tracked_no_assessment_ro
     not have its visibility head trained -- the per-window NaN-mask cannot see it, so the session
     level gates it.
     """
-    from posetail.posetail.losses import TotalLoss
+    from tracktail.model.losses import TotalLoss
 
     ds = PoseDataset(tracked_no_assessment_root, 'train', CFG)
     b = _batch(ds)
@@ -890,7 +890,7 @@ def test_prompt_noise_is_in_pixels_on_both_modes(tiny_root):
     pixel -- the same conversion the metric losses use -- so the 3D sigma is the pixel sigma
     times it, and the displacement matches by construction.
     """
-    from posetail.posetail.cube import get_camera_scale
+    from tracktail.model.cube import get_camera_scale
 
     SIG = 3.0
 
@@ -1381,8 +1381,8 @@ def test_a_3d_rotation_that_loses_the_animal_is_reverted():
     animal out of the frame; `_item`'s guard must revert such a rotation, not keep it silently.
     """
     from aniposelib.cameras import CameraGroup
-    from posetail.datasets.posetail_dataset import rotate_camera_image_plane_3d
-    from posetail.posetail.cube import is_point_visible
+    from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
+    from tracktail.model.cube import is_point_visible
 
     from tailcyclenet import format as fmt
 
@@ -1390,7 +1390,7 @@ def test_a_3d_rotation_that_loses_the_animal_is_reverted():
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
                   offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
                   calibrated={'cam0': True})
-    cam = rig.posetail()[0]
+    cam = rig.tracktail()[0]
 
     # Two points near opposite frame CORNERS: inside the frame, outside the inscribed rectangle.
     corner = torch.tensor([[[0.45, 0.33, 1.0], [-0.45, -0.33, 1.0]]], dtype=torch.float32)
@@ -1402,7 +1402,7 @@ def test_a_3d_rotation_that_loses_the_animal_is_reverted():
     assert after < 2, f'the inscribed crop must lose the animal here, got {after} still visible'
 
     # WHY IT WAS SILENT: the crop rule clamps, it does not refuse -- so the item was returned.
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
     p2d = project_points_torch([rot_cam], corner)[0]
     assert cropmod.crop_box_for_points(p2d, rot_cam['size'], 16) is not None, \
         'if the rule ever starts refusing this, the guard in _item is belt-and-braces'
@@ -1668,6 +1668,12 @@ def test_pose_only_prob_default_is_byte_identical_to_pre_change_code(tiny_root):
                          capture_output=True, text=True, check=True, cwd=Path(__file__).parent.parent).stdout
     assert 'pose_only_prob' not in src, \
         'the pre-landing source already has this key -- point this test at an earlier commit'
+    # The historical source predates the posetail -> tracktail rename (0.5.0); translate its
+    # library imports and this repo's `Rig.posetail()` so it runs against the installed library.
+    for before, after in (('posetail.datasets.posetail_dataset', 'tracktail.datasets.tracktail_dataset'),
+                          ('posetail.posetail', 'tracktail.model'), ('PosetailDataset', 'TracktailDataset'),
+                          ('.posetail(', '.tracktail(')):
+        src = src.replace(before, after)
 
     spec = importlib.util.spec_from_loader('tailcyclenet._dataset_pre_change', loader=None)
     old_mod = importlib.util.module_from_spec(spec)

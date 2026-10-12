@@ -61,7 +61,7 @@ command is also available as `pixi run tailcyclenet <command> ...`, or as the sc
 ### Weights that are downloaded
 
 - Pose training warm-starts from the pretrained tracker on Hugging Face
-  (`[training].checkpoint_path`, default `ai-hhmi/posetail-static-animal`), which is downloaded
+  (`[training].checkpoint_path`, default `ai-hhmi/tracktail-static-animal`), which is downloaded
   and cached on first use. A local checkpoint folder also works.
 - The detector backbone uses ImageNet weights, which are fetched on first use. If you set
   `[model].pretrained = "coco"`, the COCO YOLOX weights go to `~/.cache/tailcyclenet/weights/`

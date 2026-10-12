@@ -81,7 +81,7 @@ def read_metadata(trial: Path) -> dict | None:
 def rig_from_metadata(meta: dict) -> fmt.Rig:
     """v4's inline calibration -> Rig. 3dpop nests `distortion_matrices` one level deeper."""
     from aniposelib.cameras import Camera, CameraGroup, FisheyeCamera
-    from posetail.datasets.utils import disassemble_extrinsics
+    from tracktail.datasets.utils import disassemble_extrinsics
 
     intr, extr = meta['intrinsic_matrices'], meta['extrinsic_matrices']
     dist, wid, hei = meta['distortion_matrices'], meta['camera_widths'], meta['camera_heights']

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the tailcycle ``deepfly3d-v4`` root to Posetail's legacy training layout.
+"""Convert the tailcycle ``deepfly3d-v4`` root to Tracktail's legacy training layout.
 
 Example::
 
@@ -7,14 +7,14 @@ Example::
         --src /groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/deepfly3d-v4 \
         --out /groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v6/deepfly3d-v4
 
-Each tailcycle session becomes one Posetail trial under its source fly-family session:
+Each tailcycle session becomes one Tracktail trial under its source fly-family session:
 ``<split>/<condition__date__FlyN>/<source-session>/``. The split assignments from
 ``split_manifest.json`` are preserved. Images are symlinked, never copied.
 
 The source 3D labels are already quality-masked and expressed in millimetres. Only positioned
 ``points3d.pq`` rows are copied to ``pose``; non-positioned points remain NaN. Per-camera
 ``vis`` is 1 for ``visible``, 0 for ``missing``, and NaN where no visibility determination was
-made. Posetail currently converts NaN visibility entries to visible when loading, so the 3D
+made. Tracktail currently converts NaN visibility entries to visible when loading, so the 3D
 coordinate mask remains the authoritative quality mask. Camera geometry is copied from the
 source calibration, converting Rodrigues rotations to 4x4 world-to-camera matrices.
 """
@@ -79,7 +79,7 @@ def _camera_blocks(calibration: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _dense_arrays(session_dir: Path, group_id: str, names: list[str],
                   cameras: list[str], n_frames: int) -> tuple[np.ndarray, np.ndarray, list[str], int]:
-    """Scatter one tailcycle session's sparse Parquet tables into Posetail arrays."""
+    """Scatter one tailcycle session's sparse Parquet tables into Tracktail arrays."""
     points = pq.read_table(session_dir / 'points3d.pq').to_pydict()
     keypoints = pq.read_table(session_dir / 'keypoints.pq').to_pydict()
     animal_ids = sorted(set(points['animal_id']) | set(keypoints['animal_id']))
@@ -153,7 +153,7 @@ def _dense_arrays(session_dir: Path, group_id: str, names: list[str],
 def _posetail_metadata(calibration: dict[str, Any], camera_blocks: list[dict[str, Any]],
                        n_frames: int, units: str, calibration_status: str,
                        fps: float | None) -> dict[str, Any]:
-    """Translate tailcycle's camera calibration into Posetail's metadata.yaml schema."""
+    """Translate tailcycle's camera calibration into Tracktail's metadata.yaml schema."""
     metadata: dict[str, Any] = {
         'intrinsic_matrices': {},
         'extrinsic_matrices': {},
@@ -201,7 +201,7 @@ def _posetail_metadata(calibration: dict[str, Any], camera_blocks: list[dict[str
 
 def _convert_trial(source_session: Path, target_trial: Path, *, split: str,
                    family: str, archive: str, verbose: bool = False) -> dict[str, Any]:
-    """Write one source session as one Posetail training trial."""
+    """Write one source session as one Tracktail training trial."""
     session = _read_toml(source_session / 'session.toml')
     calibration = _read_toml(source_session / 'calibration.toml')
     groups = pq.read_table(source_session / 'groups.pq').to_pylist()
@@ -273,7 +273,7 @@ def _convert_trial(source_session: Path, target_trial: Path, *, split: str,
 
 
 def convert(source: Path, output: Path, *, force: bool, verbose: bool) -> None:
-    """Convert all source sessions into a staged Posetail root, then publish it."""
+    """Convert all source sessions into a staged Tracktail root, then publish it."""
     source, output = source.resolve(), output.absolute()
     if not source.is_dir():
         raise SystemExit(f'missing source dataset root: {source}')
@@ -317,7 +317,7 @@ def convert(source: Path, output: Path, *, force: bool, verbose: bool) -> None:
 
         manifest = {
             'dataset': 'deepfly3d-v4',
-            'format': 'Posetail legacy training tree: pose3d.npz + metadata.yaml + img/<camera>',
+            'format': 'Tracktail legacy training tree: pose3d.npz + metadata.yaml + img/<camera>',
             'source_root': str(source),
             'created': date.today().isoformat(),
             'labels': 'tracked',
@@ -328,7 +328,7 @@ def convert(source: Path, output: Path, *, force: bool, verbose: bool) -> None:
             'pose_policy': 'positioned points3d rows copied; all non-positioned coordinates remain NaN',
             'visibility_policy': 'visible=1; missing=0; projected/unlabeled/unassessed=NaN',
             'pixel_policy': 'camera image directories symlinked to source session; no image copy',
-            'camera_policy': 'tailcycle intrinsics and world-to-camera extrinsics converted to Posetail YAML',
+            'camera_policy': 'tailcycle intrinsics and world-to-camera extrinsics converted to Tracktail YAML',
             'fps_policy': 'preserved from groups.pq when declared; otherwise omitted',
             'split_counts': {split: sum(r['split'] == split for r in records)
                              for split in SPLITS},
@@ -357,7 +357,7 @@ def main() -> None:
     parser.add_argument('--src', type=Path, default=DEFAULT_SOURCE,
                         help='tailcycle deepfly3d-v4 dataset root')
     parser.add_argument('--out', type=Path, default=DEFAULT_OUTPUT,
-                        help='Posetail output root (must not exist unless --force is set)')
+                        help='Tracktail output root (must not exist unless --force is set)')
     parser.add_argument('--force', action='store_true',
                         help='replace an existing output (retained as a timestamped backup)')
     parser.add_argument('--verbose', action='store_true', help='print per-trial conversion details')

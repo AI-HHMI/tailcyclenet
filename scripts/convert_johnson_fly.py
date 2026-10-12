@@ -268,8 +268,8 @@ def build_pinhole_rig(src: Path, data: dict, session: str, cameras: list[str],
         calibrated={camera: True for camera in cameras},
     )
     import torch
-    from posetail.posetail.cube import project_points_torch
-    projected = project_points_torch(rig.posetail(), torch.as_tensor(support, dtype=torch.float64))
+    from tracktail.model.cube import project_points_torch
+    projected = project_points_torch(rig.tracktail(), torch.as_tensor(support, dtype=torch.float64))
     projected = projected.detach().cpu().numpy()
     worst_actual = 0.0
     for ci, cam in enumerate(raw):
@@ -288,9 +288,9 @@ def build_pinhole_rig(src: Path, data: dict, session: str, cameras: list[str],
 
 
 def _triangulate_skew_aware(rig: fmt.Rig, p2d: np.ndarray) -> np.ndarray:
-    """Triangulate zero-distortion pixels with full-K normalization and posetail's DLT."""
+    """Triangulate zero-distortion pixels with full-K normalization and tracktail's DLT."""
     import torch
-    from posetail.posetail.cube import triangulate_simple_batch
+    from tracktail.model.cube import triangulate_simple_batch
 
     C, N, _ = p2d.shape
     normalized = np.zeros_like(p2d, dtype=np.float64)
@@ -319,14 +319,14 @@ def _triangulate_skew_aware(rig: fmt.Rig, p2d: np.ndarray) -> np.ndarray:
 
 
 def _reprojection_error(rig: fmt.Rig, p3d: np.ndarray, p2d: np.ndarray) -> np.ndarray:
-    """Pixel residual through posetail's full-matrix projection path."""
+    """Pixel residual through tracktail's full-matrix projection path."""
     import torch
-    from posetail.posetail.cube import project_points_torch
+    from tracktail.model.cube import project_points_torch
 
     finite = np.isfinite(p3d).all(axis=1)
     projected = np.full_like(p2d, np.nan, dtype=np.float64)
     if finite.any():
-        pred = project_points_torch(rig.posetail(), torch.as_tensor(p3d[finite], dtype=torch.float64))
+        pred = project_points_torch(rig.tracktail(), torch.as_tensor(p3d[finite], dtype=torch.float64))
         projected[:, finite] = pred.detach().cpu().numpy()
     return projected - p2d
 

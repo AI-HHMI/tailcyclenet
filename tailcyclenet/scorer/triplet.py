@@ -8,7 +8,7 @@
 coordinates -- which is what makes the good-vs-bad gap a track-quality signal rather than an
 appearance signal. The anchor is the invariance target.
 
-WHAT TRANSFERS FROM THE REFERENCE (`posetail/datasets/scorer_corruption.py`) AND WHAT DOES NOT.
+WHAT TRANSFERS FROM THE REFERENCE (`tracktail/datasets/scorer_corruption.py`) AND WHAT DOES NOT.
 `GENERATORS`, `PointCorruptor`, `apply_drop_mask` and `build_corruptors` are imported verbatim.
 `compute_drop_mask` is FORKED (see `_compute_drop_mask`). `make_triplet` and every
 rotation/crop/resize helper are rewritten: the reference builds them against a loader that returns
@@ -26,9 +26,9 @@ import numpy as np
 import torch
 from einops import rearrange
 
-from posetail.datasets.scorer_corruption import (GENERATORS, PointCorruptor, apply_drop_mask,
+from tracktail.datasets.scorer_corruption import (GENERATORS, PointCorruptor, apply_drop_mask,
                                                  build_corruptors)
-from posetail.posetail.cube import (get_camera_scale, is_point_visible,
+from tracktail.model.cube import (get_camera_scale, is_point_visible,
                                      project_points_torch)
 
 TRIPLET_KEYS = ('good', 'bad', 'anchor')
@@ -41,7 +41,7 @@ TRIPLET_KEYS = ('good', 'bad', 'anchor')
 SPARSE_TYPES = ('const_offset', 'frame_noise')
 
 # Full-trajectory generators are optionally restricted to a contiguous interval.  ``frame_noise``
-# already has this behaviour in posetail and is intentionally not included here.  Keeping the
+# already has this behaviour in tracktail and is intentionally not included here.  Keeping the
 # names in one place also makes the per-type mask's last axis stable (it is the order of
 # ``GENERATORS``, not the reduced sparse menu).
 SEGMENT_TYPES = ('const_offset', 'gradual_drift', 'sinusoid')
@@ -220,7 +220,7 @@ def tagged_draw_segmented(corruptor, P, T, D, device, cfg):
     """`tagged_draw` with optional full-trajectory segment gates.
 
     This deliberately lives beside (rather than inside) :func:`tagged_draw`: the latter is a
-    byte-for-byte reproduction of posetail's draw and is used by the legacy sequence regression.
+    byte-for-byte reproduction of tracktail's draw and is used by the legacy sequence regression.
     """
     names = corruptor.names
     slot = {n: i for i, n in enumerate(GENERATORS)}
@@ -1150,7 +1150,7 @@ def seed_worker(worker_id):
     """DataLoader `worker_init_fn`: decorrelate numpy's RNG across workers.
 
     torch and Python's `random` are auto-seeded per worker, but numpy is NOT -- and
-    `PosetailDataset.rotate_camera_group` draws the 3D world-gauge angle from global numpy.
+    `TracktailDataset.rotate_camera_group` draws the 3D world-gauge angle from global numpy.
 
     Inputs: worker_id -- the DataLoader's worker index.
     Outputs: none.

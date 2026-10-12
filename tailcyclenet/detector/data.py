@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from posetail.posetail.cube import project_points_torch
+from tracktail.model.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import _apply_affine, read_frames
@@ -181,9 +181,9 @@ def _photometric(img, rng, gain=None):
 # THE STRONG SUITE -- `--augment-strong`. Layered AFTER `_photometric`, gated on
 # `self.strong and self.augment and self.train`, off by default and off means none of these draws
 # happen at all. Every op here is APPEARANCE-ONLY or, for cutout, an ERASURE -- neither moves a
-# box target. Mirrors posetail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`.
+# box target. Mirrors tracktail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`.
 def _color_jitter(img, rng):
-    """Gamma contrast, then HSV saturation and hue shifts -- posetail's `aug_per_camera` triplet
+    """Gamma contrast, then HSV saturation and hue shifts -- tracktail's `aug_per_camera` triplet
     (DefocusBlur is folded into `_motion_blur` below rather than duplicated).
     """
     import cv2
@@ -197,7 +197,7 @@ def _color_jitter(img, rng):
 
 
 def _additive_noise(img, rng, sigma_max=10.2):
-    """Per-channel gaussian noise, sigma ~ U(0, sigma_max). posetail's `AdditiveGaussianNoise`
+    """Per-channel gaussian noise, sigma ~ U(0, sigma_max). tracktail's `AdditiveGaussianNoise`
     (scale=(0, 0.04*255), i.e. sigma up to 10.2). Refuted alone on a detector with no capacity
     lever; re-tested here as part of the whole mix.
     """
@@ -207,7 +207,7 @@ def _additive_noise(img, rng, sigma_max=10.2):
 
 
 def _salt_pepper(img, rng, frac=0.004):
-    """posetail's `SaltAndPepper(0.004)`: a fraction of pixels forced to black or white."""
+    """tracktail's `SaltAndPepper(0.004)`: a fraction of pixels forced to black or white."""
     out = img.copy()
     h, w = img.shape[:2]
     n = int(round(frac * h * w))
@@ -222,7 +222,7 @@ def _salt_pepper(img, rng, frac=0.004):
 
 
 def _motion_blur(img, rng, k=(3, 5)):
-    """Horizontal motion kernel, size drawn from `k`. posetail's `MotionBlur(k=(3,5))`."""
+    """Horizontal motion kernel, size drawn from `k`. tracktail's `MotionBlur(k=(3,5))`."""
     import cv2
     ksize = int(rng.choice(k))
     kernel = np.zeros((ksize, ksize), np.float32)
@@ -241,7 +241,7 @@ def _grayscale(img):
 def _cutout_rects(wh, rng, n=(1, 3), frac=0.15):
     """1-3 rects of `frac` x `frac` of `wh` (INPUT pixels), random RGB fill.
 
-    posetail's `cutout_rects`: an erasure, not a geometric transform, so it never touches a box
+    tracktail's `cutout_rects`: an erasure, not a geometric transform, so it never touches a box
     target -- only the pixels under it, and (in `__getitem__`) the keypoints it covers.
     """
     w, h = int(wh[0]), int(wh[1])
@@ -837,7 +837,7 @@ class BoxDataset(Dataset):
         return mask
 
     def _camera(self, sess, gid, f, ci):
-        """One posetail camera dict for `(frame, camera)`, read-only.
+        """One tracktail camera dict for `(frame, camera)`, read-only.
 
         A static rig's cameras are frame-invariant, so they are built once per session: rebuilding
         the whole rig per call was 81% of index-construction time on a 3D multi-root detector.
@@ -848,7 +848,7 @@ class BoxDataset(Dataset):
         cache = self.__dict__.setdefault('_static_cameras', {})
         key = str(sess.path)
         if key not in cache:
-            cache[key] = sess.rig.posetail()
+            cache[key] = sess.rig.tracktail()
         return cache[key][ci]
 
     def _points_2d(self, sess, gid, f, ci):

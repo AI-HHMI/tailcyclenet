@@ -2,7 +2,7 @@
 
 CPU-only, on a small hand-built module carrying one of every shape a router must sort -- a 2D
 Linear weight, a 2D Embedding weight (which must NOT reach Muon), a 4D Conv weight, a 1D LayerNorm
-weight and a bias. No posetail model, no GPU: the thing under test is the router and the
+weight and a bias. No tracktail model, no GPU: the thing under test is the router and the
 checkpoint round-trip, not the network.
 """
 import importlib.util

@@ -344,7 +344,8 @@ scripts/              command-line shims (train.py, infer.py, eval.py, ...) at t
   tools/              lint_comments.py (`pixi run lint`)
   cluster/            LSF launchers (job_l4.sh) and the deeperfly batch scripts + config
 docs/                 annotation_format.md -- the data format specification
-tests/
+tests/                mirrors tailcyclenet/ one folder per package (+ scripts/); helpers.py holds the
+                      shared builders, conftest.py files hold fixtures only
 ```
 
 ## Development

@@ -507,12 +507,8 @@ def test_animal_count_may_vary_between_groups(tmp_path):
     animals that any individual group has never seen. Reading one group must not trip over the
     others' animals.
     """
-    from aniposelib.cameras import CameraGroup
-
     W = H = 32
-    rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
-                  offset={'cam0': (0.0, 0.0)}, moving={'cam0': False},
-                  calibrated={'cam0': False})
+    rig = fmt.nominal_rig('cam0', (W, H))
     groups, labels = {}, {}
     for gid, n_animals in (('g_small', 2), ('g_big', 5)):
         lab = fmt.empty_labels(n_animals, 2, len(KPTS_2D), 1, mode3d=False)
@@ -860,3 +856,14 @@ def test_rule_10_points3d_refuses_status_projected(tmp_path):
     pq.write_table(pa.table(t3), s / 'points3d.pq')
     errs = _rule(_rule_errs(s, False), 10)
     assert errs and 'projected' in errs[0]
+
+
+def test_nominal_rig_is_one_static_uncalibrated_camera_at_no_offset():
+    """The 2D converters' shared rig: one `nominal_camera`, no offset, not moving, not calibrated."""
+    rig = fmt.nominal_rig('A', (64, 48))
+    assert rig.names == ['A'] and rig.size('A') == (64, 48)
+    assert rig.offset == {'A': (0.0, 0.0)}
+    assert rig.moving == {'A': False} and rig.calibrated == {'A': False}
+    np.testing.assert_array_equal(
+        rig.cgroup.cameras[0].get_camera_matrix().detach().cpu().numpy(),
+        fmt.nominal_camera('A', (64, 48)).get_camera_matrix().detach().cpu().numpy())

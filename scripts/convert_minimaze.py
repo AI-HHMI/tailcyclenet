@@ -233,9 +233,7 @@ def convert(src: Path, out: Path, clean: bool = False) -> None:
               f'{len(required)} unique context frames; source has {n_video} frames at {fps:g} Hz')
         _extract(video, required, cache, width, height)
 
-        rig = fmt.Rig(cgroup=__import__('aniposelib.cameras', fromlist=['CameraGroup']).CameraGroup([
-            fmt.nominal_camera('cam0', (width, height))]), offset={'cam0': (0.0, 0.0)},
-            moving={'cam0': False}, calibrated={'cam0': False})
+        rig = fmt.nominal_rig('cam0', (width, height))
         groups = {}
         group_labels = {}
         for gi, ((start, length), cluster) in enumerate(windows):

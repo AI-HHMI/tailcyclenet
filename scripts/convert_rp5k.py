@@ -153,8 +153,6 @@ def main() -> None:
     for i, record in enumerate(records):
         record['split'] = 'val' if i in val_indices else 'train'
 
-    from aniposelib.cameras import CameraGroup
-
     partitions: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for record in records:
         partitions[(record['split'], record['subset'])].append(record)
@@ -177,9 +175,7 @@ def main() -> None:
                 continue
             session_id = f'{subset}__{split}'
             session_path = args.out / split / session_id
-            camera = fmt.nominal_camera(CAMERA, part[0]['size'])
-            rig = fmt.Rig(CameraGroup([camera]), offset={CAMERA: (0.0, 0.0)},
-                          moving={CAMERA: False}, calibrated={CAMERA: False})
+            rig = fmt.nominal_rig(CAMERA, part[0]['size'])
             groups, labels = {}, {}
             for record in part:
                 gid = f"{subset}_{record['stem']}"

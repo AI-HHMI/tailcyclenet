@@ -52,6 +52,14 @@ def nominal_camera(name: str, size, dist=None):
     return cam
 
 
+def nominal_rig(name: str, size, dist=None) -> Rig:
+    """The one-camera, uncalibrated, static `Rig` of a 2D session: `nominal_camera` at no offset."""
+    from aniposelib.cameras import CameraGroup
+
+    return Rig(cgroup=CameraGroup([nominal_camera(name, size, dist)]), offset={name: (0.0, 0.0)},
+               moving={name: False}, calibrated={name: False})
+
+
 @dataclass
 class Rig:
     """An aniposelib `CameraGroup` plus the three per-camera facts it does not model.

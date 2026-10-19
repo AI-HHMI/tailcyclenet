@@ -221,10 +221,7 @@ def convert_session(dst: Path, split: str, difficulty: str, species: str,
         for i in range(T):
             (cam / frame_name(i)).symlink_to(video_dirs[vid] / f'{i:04d}.jpg')
 
-    from aniposelib.cameras import CameraGroup
-    cam = fmt.nominal_camera('cam0', (1920, 1080))
-    rig = fmt.Rig(CameraGroup([cam]), offset={'cam0': (0.0, 0.0)},
-                  moving={'cam0': False}, calibrated={'cam0': False})
+    rig = fmt.nominal_rig('cam0', (1920, 1080))
     fmt.write_session(
         dst, mode='2d', units='px', label_source='annotated', names=NAMES, rig=rig,
         groups=groups, labels=labels, skeleton=SKELETON, flip_pairs=FLIP_PAIRS,

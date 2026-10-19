@@ -513,10 +513,7 @@ def convert_movie(job: Job, out: Path, context: int, mode: str, args) -> dict:
     if clipped:
         stat['warnings'].append(f'{clipped} Label Box(es) clipped away as empty')
 
-    cam = fmt.nominal_camera(CAM, job.wh)
-    from aniposelib.cameras import CameraGroup
-    rig = fmt.Rig(CameraGroup([cam]), offset={CAM: (0.0, 0.0)},
-                  moving={CAM: False}, calibrated={CAM: False})
+    rig = fmt.nominal_rig(CAM, job.wh)
     edges = np.asarray(np.atleast_2d(args.skeleton_edges), int) - 1
     fmt.write_session(
         dst, mode='2d', units='px', label_source='annotated', names=names, rig=rig,

@@ -1,8 +1,8 @@
-"""`scripts/render_dataset.py`: the indexing around the cv2 calls (frame 0's labels drawn on
+"""`scripts/dataset_tools/render_dataset.py`: the indexing around the cv2 calls (frame 0's labels drawn on
 frame 3 would look plausible)."""
 from argparse import Namespace
 
-from scripts import render_dataset
+from scripts.dataset_tools import render_dataset
 from tailcyclenet import format as fmt
 from tests.helpers import _session_2d
 

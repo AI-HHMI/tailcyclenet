@@ -107,8 +107,9 @@ problems = validate_dataset(load_dataset("my-dataset"))
 print("\n".join(problems) or "ok")
 ```
 
-`scripts/convert_*.py` are converters for the datasets this project was developed on. They are
-useful examples of how to write one.
+`scripts/convert/*.py` are converters for the datasets this project was developed on. They are
+useful examples of how to write one; `scripts/convert/README.md` maps each to its old
+`scripts/convert_*.py` name.
 
 ---
 
@@ -335,7 +336,13 @@ tailcyclenet/         the library (one level of packages)
   render/             visualisation
   config.py runtime.py checkpoints.py distributed.py memory.py packaging.py tracktail_compat.py
 configs/              base.toml (pose), detector.toml, scorer.toml, configs/datasets/ (converter skeletons)
-scripts/              command-line shims, dataset converters, utilities
+scripts/              command-line shims (train.py, infer.py, eval.py, ...) at the top level
+  convert/            dataset converters (one file per source root)
+  export/             tailcycle -> other layouts
+  dataset_tools/      check_status, combine_roots, compress_video_groups, render_dataset
+  diagnostics/        detector, scorer and identity diagnostics
+  tools/              lint_comments.py (`pixi run lint`)
+  cluster/            LSF launchers (job_l4.sh) and the deeperfly batch scripts + config
 docs/                 annotation_format.md -- the data format specification
 tests/
 ```

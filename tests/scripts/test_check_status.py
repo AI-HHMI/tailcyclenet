@@ -1,5 +1,5 @@
-"""`scripts/check_status.py`'s structural symlink-farm detection."""
-from scripts import check_status as m
+"""`scripts/dataset_tools/check_status.py`'s structural symlink-farm detection."""
+from scripts.dataset_tools import check_status as m
 
 
 def test_a_root_is_a_symlink_farm_only_if_every_split_is(tmp_path):

@@ -1,9 +1,9 @@
-"""`scripts/render_scored_session.py`: a frame is coloured by the LAST window containing it
+"""`scripts/diagnostics/render_scored_session.py`: a frame is coloured by the LAST window containing it
 (evaluation rule 11), on a fixed colour scale, for the selected animal."""
 
 import numpy as np
 
-from scripts import render_scored_session
+from scripts.diagnostics import render_scored_session
 from tailcyclenet.infer.window import last_window_start
 
 STARTS = np.array([0, 12, 24], dtype=np.int64)

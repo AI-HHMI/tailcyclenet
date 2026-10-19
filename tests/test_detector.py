@@ -2999,7 +2999,6 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     need these checkable from the artifact. Table-driven against `associate_group`'s own
     signature, asserted on the VALUE `_identity_provenance` returns.
     """
-    import argparse
     import inspect
 
     from tailcyclenet.detector import associate_group

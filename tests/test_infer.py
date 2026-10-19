@@ -857,7 +857,7 @@ def test_render_writes_every_predicted_frame(rat, tmp_path):
     """The mp4 holds exactly the predicted frames."""
     import cv2
 
-    from tailcyclenet.render import render_group
+    from tailcyclenet.render.render import render_group
 
     model, sess, registry, name = rat
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
@@ -929,7 +929,7 @@ def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
 def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(mv):
     """`render.project` uses the per-frame extrinsic on a moving rig (matching project_points_torch),
     and reads extrinsic `frames[t]` at column t for a non-identity `frames`."""
-    from tailcyclenet.render import project
+    from tailcyclenet.render.render import project
 
     model, sess, registry, name = mv
     cam_name = sess.cam_names[0]

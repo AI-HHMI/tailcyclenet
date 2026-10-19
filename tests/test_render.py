@@ -12,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import tailcyclenet.render as render_cli
+import tailcyclenet.render.render as render_cli
 from tailcyclenet.format import Registry, load_dataset
 from tailcyclenet.infer import cli as infer_cli
 from tailcyclenet.model import build_model
@@ -112,7 +112,7 @@ def test_static_skew_projection_uses_full_intrinsics(tmp_path):
     """Static 3D rendering must not route a nonzero-skew camera through aniposelib's projection."""
     from aniposelib.cameras import Camera, CameraGroup
     from tailcyclenet import format as fmt
-    from tailcyclenet.render import project
+    from tailcyclenet.render.render import project
 
     K = np.array([[800.0, 40.0, 320.0], [0.0, 780.0, 240.0], [0.0, 0.0, 1.0]])
     cam = Camera(matrix=K, dist=np.zeros(5), rvec=np.zeros(3),
@@ -138,7 +138,7 @@ def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
     import conftest as cf
     from tailcyclenet import adopt
     from tailcyclenet import format as fmt
-    from tailcyclenet.render import render_group
+    from tailcyclenet.render.render import render_group
 
     W, H = 64, 48
     T = 5
@@ -186,7 +186,7 @@ def test_render_group_frames_selects_the_requested_source_indices(monkeypatch, t
     """`frames=` decides which SOURCE frames are decoded."""
     import conftest as cf
     from tailcyclenet import format as fmt
-    from tailcyclenet.render import render_group
+    from tailcyclenet.render.render import render_group
 
     W, H = 64, 48
     T = 8
@@ -202,7 +202,7 @@ def test_render_group_frames_selects_the_requested_source_indices(monkeypatch, t
     sess = fmt.Session.load(sess_path)
 
     seen = []
-    import tailcyclenet.render as render_mod
+    import tailcyclenet.render.render as render_mod
     real_read = render_mod.read_frames
 
     def spy(group, cam, frames_arg, **kw):
@@ -336,7 +336,7 @@ def test_load_predictions_refuses_ambiguous_marker_free_session(tmp_path):
 
 
 def test_skeleton_override_validates_pairs_and_keypoint_names(tmp_path):
-    from tailcyclenet.render import load_skeleton_override
+    from tailcyclenet.render.render import load_skeleton_override
 
     good = tmp_path / 'skeleton.toml'
     good.write_text('skeleton = [["a", "b"], ["b", "c"]]\n')
@@ -360,7 +360,7 @@ def test_skeleton_override_validates_pairs_and_keypoint_names(tmp_path):
 
 def test_render_skeleton_override_replaces_resolved_session(monkeypatch, tmp_path):
     import types
-    import tailcyclenet.render as render
+    import tailcyclenet.render.render as render
     import tailcyclenet.infer.predictions as predictions
 
     pred = tmp_path / 'pred'
@@ -386,7 +386,7 @@ def test_render_writes_h264_yuv420p(tmp_path):
     """Rendered clips are H.264/yuv420p (web-playable), and an odd size is padded, not refused."""
     import av
 
-    from tailcyclenet.video import H264Writer
+    from tailcyclenet.render.h264 import H264Writer
 
     path = tmp_path / 'clip.mp4'
     rng = np.random.default_rng(0)

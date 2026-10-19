@@ -20,7 +20,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from ..metrics import mota
+from ..evaluation.metrics import mota
 from .decode import decode
 from .boxes import NMS_CENTER_DIST_SELECT, box_iou
 from .sampling import ChunkShuffle, box_collate

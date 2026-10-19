@@ -1,6 +1,6 @@
 import numpy as np
 
-from tailcyclenet.identity_diagnostic import switch_diagnostics
+from tailcyclenet.evaluation.identity import switch_diagnostics
 
 
 def test_switch_diagnostic_reports_duplicate_signature():

@@ -27,7 +27,7 @@ from tailcyclenet.evaluation.deployment import deployment_score
 from tailcyclenet.detector.evaluate import score_dataset
 from tailcyclenet.format import load_datasets
 from tailcyclenet.infer.loading import detector_box_source
-from tailcyclenet.metrics import paired_bootstrap
+from tailcyclenet.evaluation.metrics import paired_bootstrap
 
 
 class FixedSplitDataset:

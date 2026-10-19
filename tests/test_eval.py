@@ -12,7 +12,7 @@ def test_chunk_frames_scores_a_trailing_one_frame_remainder():
     chunk instead of being dropped (it used to vanish, labels and all)."""
     import dataclasses
 
-    from tailcyclenet.eval import chunk_frames
+    from tailcyclenet.evaluation.eval import chunk_frames
 
     @dataclasses.dataclass
     class Lab:
@@ -77,7 +77,7 @@ def test_eval_scores_a_ranged_run_only_inside_its_range(tmp_path, capsys):
     are not misses); without a recorded range it is scored whole; `--vs` refuses two ranges."""
     import re
 
-    import tailcyclenet.eval as eval_cli
+    import tailcyclenet.evaluation.eval as eval_cli
 
     root, ranged = _ranged_prediction(tmp_path / 'a', {'frame_start': 2, 'frame_stop': 6})
     _, whole = _ranged_prediction(tmp_path / 'b', {})

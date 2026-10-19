@@ -3,7 +3,7 @@
 
     pixi run python scripts/render.py --pred pred/ --out clips/
 
-The program itself is `tailcyclenet.render`; this file is the documented invocation.
+The program itself is `tailcyclenet.render.render`; this file is the documented invocation.
 `tailcyclenet render` runs the same `main()`.
 """
 import sys
@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.render import main
+from tailcyclenet.render.render import main
 
 if __name__ == '__main__':
     main()

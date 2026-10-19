@@ -15,10 +15,10 @@ from pathlib import Path
 
 import numpy as np
 
-from tailcyclenet.eval import label_lookup
-from tailcyclenet.identity_diagnostic import switch_diagnostics
+from tailcyclenet.evaluation.eval import label_lookup
+from tailcyclenet.evaluation.identity import switch_diagnostics
 from tailcyclenet.infer.predictions import load_predictions
-from tailcyclenet.metrics import label_extent
+from tailcyclenet.evaluation.metrics import label_extent
 
 
 def _scales(points):

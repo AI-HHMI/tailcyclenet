@@ -157,7 +157,7 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
             f'{sorted(FRAME_SELECTION_METRICS)}')
     known_corr = {
         'const_offset_prob', 'frame_noise_prob', 'gradual_drift_prob', 'sinusoid_prob',
-        'point_drop_prob', 'point_drop_max_frac', 'point_drop_bernoulli_rate', 'min_valid_frames',
+        'point_drop_prob', 'point_drop_max_frac', 'point_drop_bernoulli_rate',
         'mag_3d', 'mag_2d', 'min_corrupt_px', 'max_clean_px', 'reference_gate',
         'reference_margin_px', 'sequence_far_gate', 'segment_prob', 'segment_count',
         'n_segments', 'segment_len_frames', 'segment_length_frames', 'full_window_share',
@@ -175,6 +175,10 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         if first in corr and second in corr and corr[first] != corr[second]:
             raise SystemExit(
                 f'[scorer.corruption]: {first} and {second} disagree; set only one alias')
+    if 'min_valid_frames' in corr:
+        raise SystemExit(
+            '[scorer.corruption].min_valid_frames is not read; set [scorer].min_valid_frames, '
+            'which the corruption path copies down')
     unknown_corr = set(corr) - known_corr
     if unknown_corr:
         raise SystemExit(

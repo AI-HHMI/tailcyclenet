@@ -1,9 +1,7 @@
 """A lone checkpoint file is a complete model specification for pose and scorer.
 
-`save_checkpoint` embeds the config (with `[run] kind` stamped, exactly as `config.toml`), the
-keypoint registry and the provenance, so `load_run` / `load_scorer_run` accept the `.pth` alone
-and build the same model as the run folder. A file written before any of those were embedded
-falls back to the run folder it sits in; a lone one missing them is refused by name.
+`save_checkpoint` embeds the kind-stamped config, the registry and the provenance, so the `.pth`
+alone builds the same model as its run folder; an older file falls back to its folder.
 """
 import shutil
 
@@ -86,61 +84,64 @@ def _same_weights(a, b):
         assert torch.equal(sa[k], sb[k]), k
 
 
+@pytest.fixture
+def no_download(monkeypatch):
+    """Loading a finetuned checkpoint must never fetch the VJEPA2 backbone (offline nodes)."""
+    def boom(*a, **k):
+        raise AssertionError('a pretrained VJEPA2 checkpoint was fetched from the network')
+
+    monkeypatch.setattr(torch.hub, 'load_state_dict_from_url', boom)
+
+
 @pytest.mark.parametrize('kind', ['pose', 'scorer'])
-def test_embedded_config_is_the_run_folder_config(tmp_path, kind):
+def test_a_lone_checkpoint_loads_the_same_model_as_its_run_folder(tmp_path, kind, no_download):
+    """The embedded config IS `config.toml` (a snapshot, not a reference), and the `.pth` alone
+    loads the run folder's weights, config, registry and provenance."""
     import tomllib
     run, path, _ = _train_run(tmp_path, kind)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     with open(run / 'config.toml', 'rb') as f:
-        on_disk = tomllib.load(f)
-    assert ckpt['config'] == on_disk
+        assert ckpt['config'] == tomllib.load(f)
     assert ckpt['config']['run']['kind'] == kind
     assert ckpt['keypoint_registry'] == REGISTRY.to_dict()
     assert ckpt['provenance'].get('world_size') == 1
+    assert ck.peek_registry(path) == REGISTRY
 
-
-def test_the_embedded_config_is_a_snapshot_not_a_reference(tmp_path):
-    config = _pose_config()
-    model = build_model({**config['model'], 'video_encoder_pretrained': False}, n_keypoints=2)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    path = ck.save_checkpoint(tmp_path, 0, model, opt, config, registry=REGISTRY)
-    config['model']['latent_dim'] = 999
-    config['data']['image_size'] = 999
-    ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    assert ckpt['config']['model']['latent_dim'] == SMALL['latent_dim']
-    assert 'run' not in config, 'stamping the kind must not mutate the training config'
-
-
-@pytest.mark.parametrize('kind', ['pose', 'scorer'])
-def test_a_lone_checkpoint_loads_the_same_model_as_its_run_folder(tmp_path, kind):
-    run, path, _ = _train_run(tmp_path, kind)
+    ref, ref_config, _, _ = _load(kind, run)
     lone = tmp_path / 'elsewhere' / 'model.pth'
     lone.parent.mkdir()
     shutil.copy(path, lone)
     shutil.rmtree(run)
-
     model, config, registry, got = _load(kind, lone)
-    assert got == lone
-    assert registry == REGISTRY
-    assert config['run']['kind'] == kind
+    assert got == lone and registry == REGISTRY
+    assert config['run']['kind'] == kind and config['model'] == ref_config['model']
     assert model.run_provenance.get('world_size') == 1
-
-    run2, path2, _ = _train_run(tmp_path, kind)
-    ref, ref_config, _, _ = _load(kind, run2)
-    torch.save(torch.load(path2, map_location='cpu', weights_only=False), lone)
-    model, config, _, _ = _load(kind, lone)
     _same_weights(model, ref)
-    assert config['model'] == ref_config['model']
+
+
+def test_the_embedded_config_is_a_snapshot_not_a_reference(tmp_path):
+    config = {'model': {'latent_dim': 64}, 'data': {'image_size': 64}}
+    model = torch.nn.Linear(2, 2)
+    path = ck.save_checkpoint(tmp_path, 0, model, torch.optim.AdamW(model.parameters()), config,
+                              registry=REGISTRY)
+    config['model']['latent_dim'] = 999
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    assert ckpt['config']['model']['latent_dim'] == 64
+    assert 'run' not in config, 'stamping the kind must not mutate the training config'
 
 
 @pytest.mark.parametrize('kind', ['pose', 'scorer'])
 def test_an_old_checkpoint_falls_back_to_its_run_folder(tmp_path, kind):
+    """No embedded config/registry/provenance: read the folder; a lone one is refused by name. A
+    checkpoint selector beside a file path is refused too."""
     run, path, _ = _train_run(tmp_path, kind)
+    with pytest.raises(ValueError, match='already names a checkpoint file'):
+        _load(kind, path, checkpoint='checkpoint_best.pth')
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     for key in ('config', 'keypoint_registry', 'provenance'):
         ckpt.pop(key)
     torch.save(ckpt, path)
-    model, config, registry, _ = _load(kind, path)
+    model, _, registry, _ = _load(kind, path)
     ref, _, _, _ = _load(kind, run)
     _same_weights(model, ref)
     assert registry == REGISTRY
@@ -153,28 +154,7 @@ def test_an_old_checkpoint_falls_back_to_its_run_folder(tmp_path, kind):
 
 
 @pytest.mark.parametrize('kind', ['pose', 'scorer'])
-def test_a_checkpoint_selector_is_refused_beside_a_file(tmp_path, kind):
-    _, path, _ = _train_run(tmp_path, kind)
-    with pytest.raises(ValueError, match='already names a checkpoint file'):
-        _load(kind, path, checkpoint='checkpoint_best.pth')
-
-
-def test_a_pose_checkpoint_is_refused_as_a_scorer_and_vice_versa(tmp_path):
-    _, pose, _ = _train_run(tmp_path, 'pose')
-    _, scorer, _ = _train_run(tmp_path, 'scorer')
-    with pytest.raises(ValueError, match="'pose' checkpoint, not a 'scorer'"):
-        load_scorer_run(pose)
-    with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
-        ck.load_run(scorer)
-
-
-def test_peek_registry_reads_a_lone_checkpoint(tmp_path):
-    _, path, _ = _train_run(tmp_path, 'pose')
-    assert ck.peek_registry(path) == REGISTRY
-
-
-@pytest.mark.parametrize('kind', ['pose', 'scorer'])
-def test_a_packaged_checkpoint_loads_alone_like_its_run(tmp_path, kind):
+def test_a_packaged_checkpoint_loads_alone_like_its_run(tmp_path, kind, no_download):
     from scripts.package_checkpoint import package_pose
     run, _, _ = _train_run(tmp_path, kind)
     packaged = package_pose(run, tmp_path / f'{kind}.pth', kind=kind)
@@ -190,8 +170,14 @@ def test_a_packaged_checkpoint_loads_alone_like_its_run(tmp_path, kind):
     assert registry == REGISTRY
 
 
-def test_packaging_refuses_the_wrong_kind(tmp_path):
+def test_a_checkpoint_of_the_wrong_kind_is_refused(tmp_path):
+    """A scorer IS a pose encoder plus heads, so loading one as the other must raise, not build."""
     from scripts.package_checkpoint import package_pose
-    run, _, _ = _train_run(tmp_path, 'scorer')
+    _, pose, _ = _train_run(tmp_path, 'pose')
+    scorer_run, scorer, _ = _train_run(tmp_path, 'scorer')
+    with pytest.raises(ValueError, match="'pose' checkpoint, not a 'scorer'"):
+        load_scorer_run(pose)
     with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
-        package_pose(run, tmp_path / 'x.pth', kind='pose')
+        ck.load_run(scorer)
+    with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
+        package_pose(scorer_run, tmp_path / 'x.pth', kind='pose')

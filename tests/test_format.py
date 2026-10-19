@@ -564,7 +564,8 @@ def test_table_writer_chunks_match_one_shot(tmp_path):
     dictionaries intact; an empty chunk writes no row group."""
     import pyarrow.parquet as pq
 
-    from tailcyclenet.format import DICT_COLS, TableWriter, _codes, write_table
+    from tailcyclenet.format import DICT_COLS, TableWriter, write_table
+    from tailcyclenet.format.tables import column_codes
 
     n = 500
     rng = np.random.default_rng(0)
@@ -583,7 +584,7 @@ def test_table_writer_chunks_match_one_shot(tmp_path):
     assert a.to_pydict() == b.to_pydict(), 'chunked rows must equal one-shot rows'
     assert pq.ParquetFile(tmp_path / 'many.pq').num_row_groups > 1, 'the chunks must be row groups'
     for col in ('group_id', 'animal_id', 'status'):
-        codes, vals = _codes(b, col)
+        codes, vals = column_codes(b, col)
         assert len(codes) == n and vals
 
     with TableWriter(tmp_path / 't.pq', DICT_COLS) as w:

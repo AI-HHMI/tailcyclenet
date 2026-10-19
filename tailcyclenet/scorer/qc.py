@@ -505,7 +505,7 @@ def write_outputs(out: Path, table: pl.DataFrame, run: Path, data: str, split: s
         for key in ('loss_schema', 'corruption_mask_semantics', 'source_frame_duplicate_policy'):
             if key in scorer_cfg:
                 output_provenance[key] = scorer_cfg[key]
-        for key in ('segment_prob', 'segment_count', 'n_segments', 'segment_len_frames',
+        for key in ('segment_prob', 'segment_count', 'segment_len_frames',
                     'full_window_share', 'segment_types', 'min_corrupt_px', 'max_clean_px',
                     'reference_gate', 'out_of_view_policy'):
             if key in corr_cfg:

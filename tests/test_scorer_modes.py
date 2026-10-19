@@ -89,10 +89,32 @@ def test_legacy_frame_checkpoint_uses_embedded_config_for_new_contract_fields():
     )
 
 
-def test_scorer_window_length_must_match_model_stride():
+def test_scorer_window_length_may_differ_from_model_stride():
+    """`n_frames` and `stride_length` may differ (owner decision 2026-10-19), as on the pose path."""
     config = {'scorer': {}, 'data': {'n_frames': 12}, 'model': {'stride_length': 24}}
-    with pytest.raises(SystemExit, match='n_frames.*stride_length'):
+    assert validate_scorer_config(config) == 'sequence'
+
+
+@pytest.mark.parametrize('key, value', [
+    ('sequence_far_gate', False), ('reference_margin_px', 0.0), ('n_segments', 1),
+    ('segment_length_frames', [2, 6]), ('segment_full_window_share', 0.1),
+    ('segment_full_window_prob', 0.1)])
+def test_a_deleted_corruption_key_is_refused_by_name(key, value):
+    """Deleted `[scorer.corruption]` keys raise naming themselves, whatever value they carry."""
+    config = {'scorer': {'output_granularity': 'frame', 'corruption': {key: value}}}
+    with pytest.raises(SystemExit, match=rf'\[scorer\.corruption\]\.{key} is deleted'):
         validate_scorer_config(config)
+
+
+def test_the_deleted_independent_far_gate_is_refused_by_name():
+    """`reference_gate = "independent_far"` is deleted; `source_far` and `none` remain."""
+    config = {'scorer': {'output_granularity': 'frame',
+                         'corruption': {'reference_gate': 'independent_far'}}}
+    with pytest.raises(SystemExit, match='independent_far" is deleted'):
+        validate_scorer_config(config)
+    for gate in ('source_far', 'none'):
+        config['scorer']['corruption']['reference_gate'] = gate
+        assert validate_scorer_config(config) == 'frame'
 
 
 def test_min_valid_frames_under_corruption_is_refused_not_silently_overridden():
@@ -114,7 +136,7 @@ def test_zero_min_corrupt_threshold_cannot_have_positive_clean_band():
 
 def test_frame_contract_preserves_ranged_segment_count():
     config = {'scorer': {'output_granularity': 'frame',
-                         'corruption': {'n_segments': [1, 2]}}}
+                         'corruption': {'segment_count': [1, 2]}}}
     assert scorer_contract(config)['segment_count'] == [1, 2]
 
 

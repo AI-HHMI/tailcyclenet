@@ -131,7 +131,7 @@ def _no_load(monkeypatch):
     """Make `load_run` fail loudly, so a refusal is proven to fire before the checkpoint loads."""
     def boom(*a, **k):
         raise AssertionError('the refusal must fire before the checkpoint loads')
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    monkeypatch.setattr('tailcyclenet.infer.loading.load_run', boom)
 
 
 def test_parser_defaults_select_the_measured_path():

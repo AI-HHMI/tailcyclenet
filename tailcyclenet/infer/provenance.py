@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..checkpoints import provenance
+
 
 def box_provenance(args, det_tile, det_red, det_boxsrc):
     """Every input the detections depend on, recorded beside the numbers they produced.
@@ -62,3 +64,54 @@ def identity_provenance(args):
         'duplicate_radius': float(args.duplicate_radius),
         'duplicate_persist': int(args.duplicate_persist),
     }
+
+
+def run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov, scorer_run, det_tile, det_red,
+                   det_boxsrc):
+    """The run's provenance as a LIST OF PAIRS (`SessionWriter` raises on a key given twice).
+
+    Inputs: args, the source (sess, ds_name, src_prov), the pose checkpoint/config, cfg,
+        scorer_run = `load_scorer`'s tuple, and the detector facts `box_provenance` records.
+    Outputs: a list of (key, value) pairs. Side effects: reads git state (`provenance()`).
+    """
+    scorer, scorer_ckpt, scorer_shared_encoder, scorer_prov = scorer_run
+    scorer_path = args.scorer
+    allow_pose_scorer_mismatch = bool(args.allow_pose_scorer_mismatch)
+    precision = args.precision
+    camera_batch = args.camera_batch
+    return [*src_prov.items(),
+            *{'source_session_id': sess.session_id,
+            'source_dataset': ds_name,
+            'run': str(Path(args.run).resolve()),
+            'checkpoint': str(Path(ckpt).resolve()),
+            'checkpoint_name': ckpt.name,
+            'anchor': cfg.anchor, 'carry_source': cfg.carry_source,
+            'window_predictions': bool(args.window_predictions),
+            'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
+            'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
+            'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
+            'precision': precision, 'camera_batch': bool(camera_batch),
+            'boxes': (str(args.detector) if args.detector else
+                      (str(args.boxes) if args.boxes else 'labels')),
+            'box_source': ((det_boxsrc or 'keypoints') if args.detector
+                           else cfg.box_source),
+            'vis_thresh': float(cfg.vis_thresh) if cfg.vis_thresh else 0.0,
+            'box_prompt': cfg.box_prompt,
+            'box_prompt_requested': str(args.box_prompt),
+            'box_prompt_first_only': bool(cfg.box_prompt_first_only),
+            'crop_inflate': float(cfg.crop_inflate),
+            'gridresid_offset': str(config['model']['gridresid_offset']),
+            'gridresid_offset_override': str(args.gridresid_offset or ''),
+            **provenance()}.items(),
+           *([] if scorer is None else [
+               ('scorer', str(Path(scorer_path).resolve())),
+               ('scorer_checkpoint', str(Path(scorer_ckpt).resolve())),
+               ('scorer_checkpoint_name', Path(scorer_ckpt).name),
+               ('scorer_commit', str(scorer_prov.get('commit', ''))),
+               ('scorer_dirty', bool(scorer_prov.get('dirty', False))),
+               ('scorer_precision', precision),
+               ('scorer_encoder_shared', bool(scorer_shared_encoder)),
+               ('pose_scorer_mismatch_allowed',
+                bool(allow_pose_scorer_mismatch))]),
+            *box_provenance(args, det_tile, det_red, det_boxsrc).items(),
+            *identity_provenance(args).items()]

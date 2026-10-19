@@ -326,7 +326,7 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
     effect during the probe, and any consumer that asked would have got the HOST figure.
     """
     from tailcyclenet import adopt, memory
-    from tailcyclenet.infer import driver
+    from tailcyclenet.infer import driver, loading
 
     memory.reset()
     seen = {}
@@ -341,7 +341,7 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
     monkeypatch.setattr(adopt, 'dataset_name', lambda r, n: 'ds')
     monkeypatch.setattr('tailcyclenet.format.Registry.load',
                         classmethod(lambda cls, p: _FakeReg()))
-    monkeypatch.setattr(driver, 'load_run',
+    monkeypatch.setattr(loading, 'load_run',
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError('the budget must be resolved before the checkpoint')))
 

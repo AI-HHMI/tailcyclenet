@@ -209,7 +209,7 @@ def _cached_provenance():
     from importlib import import_module
 
     prov = json.loads(os.environ['TAILCYCLENET_TEST_PROVENANCE'])
-    sites = [import_module(m) for m in ('tailcyclenet.checkpoints', 'tailcyclenet.infer.driver',
+    sites = [import_module(m) for m in ('tailcyclenet.checkpoints', 'tailcyclenet.infer.provenance',
                                         'tailcyclenet.infer.score', 'tailcyclenet.detector.train')]
     shipped = [s.provenance for s in sites]
     for s in sites:

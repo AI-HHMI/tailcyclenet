@@ -8,21 +8,18 @@ one mode and one keypoint axis.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
 
-from ..checkpoints import load_run, peek_registry, provenance
-from ..dataset import LoaderConfig
 from .detect import detector_boxes
-from .loading import detector_box_source, detector_matches_source, share_pose_scorer_encoder
-from .predictions import refuse_multi_session
-from .provenance import box_provenance, identity_provenance
-from .resolve import check_frame_range, refuse_selector_beside_file
+from .loading import load_deploy_detector, load_pose, load_scorer, load_source
+from .provenance import run_provenance
+from .resolve import (infer_config, refuse_before_load, refuse_out_dir, refuse_scorer_rig,
+                      select_groups, trained_window)
 from .session_writer import SessionWriter
 from .traces import write_det_trace, write_overlap_trace
-from .window import InferConfig, run_blocks
+from .window import run_blocks
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -72,384 +69,74 @@ class _Progress:
               f'({rate:.1f} frames/s)', flush=True)
 
 
-def run_dataset(args):
-    """One inference run.
+def _report_group(key, wall, stats, det_stats, detected):
+    """Print one group's wall/decode split, box fill, association counts and window outcomes.
 
-    Every pure-argument check runs before the checkpoint loads (a typo should not cost a
-    multi-GB load). The RAM budget is resolved once, before anything allocates, printed
-    rather than inferred, and re-resolved after the weights are resident.
-
-    `--anchor labels` (an oracle prior) is incompatible with detector/boxes rows;
-    `--refine-px` contradicts `--no-refine` and has a 1x1-token-grid floor at 16 px.
-
-    Both input branches contribute the same provenance KEYS with different values --
-    `SessionWriter` raises on a key given twice. The videos branch builds a
-    `format.VideoSession` in memory, stating `ds_name` via `--dataset-name`; the dataset
-    branch is one session per run. `--n-frames` longer than the trained window is not
-    the same model; `--refine-px` larger than the trained `image_size` hits the 2D head.
-    `--assoc-res-max-px` defaults to None so a `--data` session's OWN stored value survives
-    unless given explicitly; an absent flag under `--videos` resolves to the format default.
-
-    The box deployment recipe is the default for a box model and inert otherwise:
-    `--box-prompt auto` resolves to `detector` with a detector/boxes file, never falls
-    back to the GT `labels` oracle, and pulls crop_inflate -> 1.5, refine -> on,
-    refine_px -> 128 unless set. `--det-score` is not portable across detector
-    generations: a warning fires, never an automatic threshold.
-
-    `--dataset-name` overrides the registry key safely because it is CHECKED; a group
-    shorter than `--start-frame` is skipped by name, but a run that predicts NOTHING is
-    a mistyped range. Provenance is a LIST OF PAIRS (a dict would drop duplicates).
-
-    The group loop is STREAMED: each block is written as it finishes, so nothing is
-    proportional to the clip's length; `f0` is a SOURCE frame index, asserted rather
-    than trusted. Decode's share is printed beside the wall clock.
+    Inputs: key ('session/group'), wall (s), stats (`run_blocks`' stats dict), det_stats
+        (`detector_boxes`' stats), detected (a detector ran). Outputs: None. Side effects: prints.
     """
+    _dec, _h, _m = (stats.get('decode_s', 0.0), stats.get('decode_hits', 0),
+                    stats.get('decode_misses', 0))
+    print(f'{key}: {wall:.1f}s wall, {_dec:.1f}s of decode work across threads '
+          f'({_dec / max(wall, 1e-9):.2f}x wall), store {_h}/{_h + _m} hits '
+          f'({_h / max(_h + _m, 1):.2f})')
+    if detected:
+        _sl = det_stats.get('slots', 0)
+        if _sl:
+            filled = det_stats.get('filled', 0) / _sl
+            print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
+                  f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
+        _raw = det_stats.get('association_raw_offered', 0)
+        _pre = det_stats.get('association_pre_link', 0)
+        _kept = det_stats.get('association_kept', 0)
+        if _raw:
+            print(f'{key}: association offered {_raw}, seated before link {_pre}, '
+                  f'kept {_kept}')
+    _window_counts = {k: v for k, v in stats.items() if k.startswith('window_')}
+    if _window_counts:
+        print(f'{key}: window outcomes ' + ' '.join(
+            f'{k.removeprefix("window_")}={v}' for k, v in sorted(_window_counts.items())))
 
-    scorer_path = args.scorer
-    scorer_checkpoint_name = args.scorer_checkpoint
-    allow_pose_scorer_mismatch = bool(args.allow_pose_scorer_mismatch)
-    if scorer_path is None and scorer_checkpoint_name is not None:
-        raise SystemExit('--scorer-checkpoint requires --scorer')
-    if scorer_path is None and allow_pose_scorer_mismatch:
-        raise SystemExit('--allow-pose-scorer-mismatch requires --scorer')
-    refuse_selector_beside_file(args.run, args.checkpoint, '--pose',
-                                 '--pose-checkpoint')
-    refuse_selector_beside_file(scorer_path, scorer_checkpoint_name, '--scorer',
-                                 '--scorer-checkpoint')
-    refuse_selector_beside_file(args.detector, args.detector_checkpoint,
-                                 '--detector', '--detector-checkpoint', default='latest')
-    if args.anchor == 'labels':
-        if args.detector or args.boxes:
-            raise SystemExit(
-                '--anchor labels seeds row `a` from LABEL row `a`, but --detector/--boxes rows are '
-                'score- or association-ordered and are not label rows. That is a different '
-                "animal's ground truth, not an oracle. Use --anchor labels with the label crop "
-                'path (no --detector, no --boxes), or --anchor carry / none with a box source.')
-        print('WARNING: --anchor labels seeds the model with GROUND TRUTH. This is an oracle '
-              'upper bound, not a deployment number. Label it as such wherever you quote it.')
 
-    if args.oracle_corrupt:
-        from .oracle import ORACLE_CORRUPTIONS
-        kind = args.oracle_corrupt.split(':')[0]
-        if kind not in ORACLE_CORRUPTIONS:
-            raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '
-                             f'{ORACLE_CORRUPTIONS} (off:<x> | stale:<n> | other | near | swap:<n>)')
-        if kind in ('off', 'stale', 'swap') and ':' not in args.oracle_corrupt:
-            example = f'{kind}:2' if kind == 'swap' else f'{kind}:0.5'
-            raise SystemExit(f'--oracle-corrupt {kind} needs an amount, e.g. {example}')
-        if args.anchor != 'labels':
-            raise SystemExit('--oracle-corrupt breaks the ORACLE prior, so it only means anything '
-                             f'under --anchor labels; got {args.anchor!r}.')
-        print(f'*** DIAGNOSTIC: the oracle prior is deliberately corrupted '
-              f'({args.oracle_corrupt}). This measures the echo coefficient and is not a '
-              'prediction of anything. ***')
+def run_dataset(args):
+    """One inference run: refuse, load, then predict every group into one prediction session.
 
-    if args.refine_px is not None:
-        if args.refine is False:
-            raise SystemExit('--refine-px sets the resolution of --refine\'s FIRST pass, and '
-                             '--no-refine turns that pass off. Pick one.')
-        if args.refine_px < 32:
-            raise SystemExit(f'--refine-px {args.refine_px} is below the structural floor of 32 '
-                             '(about two patches). Below ~2 patches the forward returns all-NaN '
-                             'with no exception. The measured floor is 96; 64 is already worse '
-                             'than not refining at all.')
+    Inputs: args -- the parsed `infer` namespace (`cli.build_parser`).
+    Outputs: None. Side effects: writes the prediction session under `--out` a block at a time
+        (and the optional traces); prints progress and per-group summaries.
 
-    check_frame_range(args)
+    Every pure-argument check runs before the checkpoint loads. The RAM budget is resolved once
+    before anything allocates and re-resolved after the weights are resident. The group loop is
+    STREAMED: each block is written as it finishes, so nothing is proportional to clip length;
+    `f0` is a SOURCE frame index, asserted rather than trusted.
+    """
+    refuse_before_load(args)
 
     from tailcyclenet import memory as _memory
     _budget = _memory.current(override_gb=args.max_ram)
     print(f'ram: {_budget}')
 
-    if not args.videos and args.data is not None and Path(args.data).resolve() == args.out.resolve():
-        raise SystemExit(
-            f'--out {args.out} names the SOURCE session itself (--data). Writing a prediction '
-            "into the labels it is scored against is not a run -- point --out somewhere else.")
-    if args.out.exists() and any(args.out.iterdir()):
-        raise SystemExit(
-            f'{args.out}: the output session directory is not empty. A run writes a block at a '
-            'time and a table with no NEW rows is never created, so reusing a directory would '
-            'silently mix an old table (or an old identity_events.pq) into the new session as '
-            'if this run had written it. Point --out at a fresh directory; nothing is deleted '
-            'automatically.')
-
-    assoc_res_max_px = (args.assoc_res_max_px if args.assoc_res_max_px is not None else 30.0)
-
-    if args.videos:
-        from .. import adopt
-        adopt.check_flags(args)
-        reg = peek_registry(args.run)
-        vplan = adopt.plan(args.videos, args.calibration, args.cam_regex,
-                          session_id=args.session_id, group_id=args.group_id)
-        if args.units is None:
-            if vplan.mode == '3d':
-                raise SystemExit('--units is required for a 3D --videos run: calibration.toml '
-                                 'has no units field, so state the calibration units explicitly.')
-            units = 'px'
-        else:
-            units = args.units
-        if getattr(vplan, 'mode', None) == '3d' and units == 'px':
-            raise SystemExit('--units px is inconsistent with a 3D --videos run: pixel units '
-                             'describe 2D image coordinates, not calibrated world coordinates.')
-        ds_name = adopt.dataset_name(reg, args.dataset_name)
-        sess = adopt.build(vplan, names=reg.local_names(ds_name), units=units,
-                           fps=args.fps, assoc_res_max_px=assoc_res_max_px,
-                           trim=args.trim_to_shortest)
-        src_prov = adopt.provenance_of(vplan)
-        src_prov['source_split'] = ''
-        if args.dump_session:
-            adopt.dump(sess, args.dump_session)
-    else:
-        args.split = args.split or 'test'
-        ds_name, sess = refuse_multi_session(args.data, args.split)
-        if args.assoc_res_max_px is not None:
-            print(f'assoc_res_max_px: overriding the session\'s own '
-                  f'{sess.assoc_res_max_px:g}px with {assoc_res_max_px:g}px')
-            sess.assoc_res_max_px = float(assoc_res_max_px)
-        src_prov = {'source': 'tailcyclenet infer',
-                    'source_session': str(Path(args.data).resolve()),
-                    'source_split': args.split,
-                    'source_calibration': '', 'source_cam_regex': '',
-                    'source_group_id': '', 'source_videos': []}
-
-    if scorer_path is not None:
-        moving = [name for name, is_moving in sess.rig.moving.items() if is_moving]
-        if moving:
-            raise SystemExit(f'{scorer_path}: scorer does not support moving-camera rigs; '
-                             f'moving camera(s): {moving}')
-        if (sess.mode == '3d' and len(sess.cam_names) == 1
-                and not sess.rig.calibrated[sess.cam_names[0]]):
-            raise SystemExit(f'{scorer_path}: scoring uncalibrated single-view 3D coordinates is '
-                             'unsupported; use a calibrated rig or a 2D session.')
-
+    refuse_out_dir(args)
+    ds_name, sess, src_prov = load_source(args)
+    refuse_scorer_rig(args.scorer, sess)
     device = args.device if torch.cuda.is_available() else 'cpu'
-    over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
-    model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
-                                             model_overrides=over)
-    precision = args.precision
-    camera_batch = args.camera_batch
-    model.set_scene_speed(precision=precision, camera_batch=camera_batch)
-    print(f'speed: precision={precision} camera_batch={camera_batch}')
-    print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)  '
-          f'query={config["model"].get("query", "prior")}  '
-          f'gridresid_offset={config["model"]["gridresid_offset"]}')
-
-    trained_frames = int(config['data'].get('n_frames', LoaderConfig.n_frames))
-    if args.n_frames and args.n_frames > trained_frames:
-        raise SystemExit(f'--n-frames {args.n_frames} exceeds the run\'s trained window '
-                         f'({trained_frames}). Shorter windows are fine; longer is not the same '
-                         'model.')
-    trained_px = int(config['data'].get('image_size', LoaderConfig.image_size))
-    scorer = None
-    scorer_ckpt = None
-    scorer_config = None
-    scorer_shared_encoder = False
-    scorer_prov = {}
-    if scorer_path is not None:
-        from ..scorer.checkpoint import load_scorer_run
-        scorer, scorer_config, scorer_registry, scorer_ckpt = load_scorer_run(
-            scorer_path, checkpoint=scorer_checkpoint_name, device='cpu')
-        if scorer.output_granularity != 'frame':
-            raise SystemExit(f'{scorer_path}: integrated inference requires a framewise scorer; '
-                             f'got output_granularity={scorer.output_granularity!r}')
-        if tuple(scorer_registry.names) != tuple(registry.names):
-            pose_names, score_names = set(registry.names), set(scorer_registry.names)
-            raise SystemExit(f'{scorer_path}: scorer keypoint registry differs from pose registry; '
-                             f'missing from scorer={sorted(pose_names - score_names)[:8]}, '
-                             f'extra in scorer={sorted(score_names - pose_names)[:8]}. '
-                             'Train/use a scorer with the pose run registry.')
-        scorer_frames = int(scorer_config['data'].get('n_frames', LoaderConfig.n_frames))
-        scorer_px = int(scorer_config['data'].get('image_size', LoaderConfig.image_size))
-        infer_frames = int(args.n_frames or trained_frames)
-        if scorer_frames != trained_frames or infer_frames != scorer_frames:
-            raise SystemExit(f'{scorer_path}: scorer n_frames={scorer_frames} must equal pose '
-                             f'training/inference n_frames={trained_frames}/{infer_frames}')
-        if scorer_px != trained_px:
-            raise SystemExit(f'{scorer_path}: scorer image_size={scorer_px} must equal pose '
-                             f'image_size={trained_px}')
-        scorer_shared_encoder = share_pose_scorer_encoder(
-            model, scorer, allow_mismatch=allow_pose_scorer_mismatch,
-            pose_run=args.run, scorer_run=scorer_path)
-        if scorer_shared_encoder:
-            print('scorer: raw video encoder weights exactly match pose; sharing one encoder')
-        else:
-            print('WARNING: pose/scorer raw video-encoder weights differ; running separate '
-                  'encodes by explicit --allow-pose-scorer-mismatch opt-in')
-        scorer = scorer.to(device).eval()
-        scorer.set_scene_speed(precision=precision, camera_batch=camera_batch)
-        scorer_prov = dict(getattr(scorer, 'run_provenance', None) or {})
-    if args.refine_px and args.refine_px > trained_px:
-        raise SystemExit(f'--refine-px {args.refine_px} exceeds the run\'s image_size '
-                         f'({trained_px}). A reduced first pass is the lever; a larger one is a '
-                         'different model.')
-    model_is_box = config.get('model', {}).get('box_prompt', 'none') != 'none'
-    box_prompt = args.box_prompt
-    box_prompt_first_only = (box_prompt == 'firstonly')
-    if box_prompt in ('auto', 'firstonly'):
-        if model_is_box and (args.detector or args.boxes):
-            box_prompt = 'detector'
-        elif model_is_box:
-            raise SystemExit(
-                f'this run is a box model ([model].box_prompt != "none") and --box-prompt '
-                f'{args.box_prompt} must source the box from pixels, but no --detector or '
-                '--boxes file was given. Pass --detector/--boxes (deployment), --box-prompt '
-                'labels to EXPLICITLY use the GROUND-TRUTH oracle, or --box-prompt none to run '
-                'the box model with the box withheld.')
-        else:
-            box_prompt = 'none'
-            box_prompt_first_only = False
-    if box_prompt != 'none' and not model_is_box:
-        print(f'--box-prompt {args.box_prompt}: this run is not a box model '
-              '([model].box_prompt = "none"), so the box is ignored.')
-        box_prompt = 'none'
-        box_prompt_first_only = False
-    if box_prompt == 'labels':
-        if args.detector or args.boxes:
-            raise SystemExit(
-                '--box-prompt labels seeds the box from LABEL row `a`, but --detector/--boxes '
-                'rows are score- or association-ordered and are not label rows. That is a '
-                "different animal's ground truth, not an oracle -- the same reason --anchor "
-                'labels refuses this combination. Use --box-prompt labels with the label crop '
-                'path (no --detector, no --boxes), or --box-prompt detector/none with a box '
-                'source.')
-        print('WARNING: --box-prompt labels seeds the box from GROUND TRUTH. This is an oracle '
-              'upper bound, not a deployment number. Label it as such wherever you quote it.')
-    box_on = box_prompt != 'none'
-    if box_prompt_first_only:
-        print("box prompt: FIRSTONLY -- given at each animal's first window, withheld once a "
-              'carry is available (owner-set default, 2026-09-05; report 55).')
-    crop_inflate = args.crop_inflate if args.crop_inflate is not None else (1.5 if box_on else 1.0)
-    refine = args.refine if args.refine is not None else (True if box_on else sess.mode == '3d')
-    refine_px = args.refine_px if args.refine_px is not None else (128 if box_on else None)
-    if box_on:
-        print(f'box deployment recipe: --box-prompt {box_prompt} '
-              f'--crop-inflate {crop_inflate} --refine{"" if refine else " off"} '
-              f'--refine-px {refine_px}')
-    cfg = InferConfig(
-        n_frames=args.n_frames or trained_frames,
-        overlap=args.overlap, image_size=trained_px,
-        min_crop_dim=int(config['data'].get('min_crop_dim', LoaderConfig.min_crop_dim)),
-        box_source=config['data'].get('box_source', LoaderConfig.box_source),
-        anchor=args.anchor, max_animals=args.max_animals, max_frames=args.max_frames,
-        frame_start=args.frame_start, frame_stop=args.frame_stop,
-        kpt_chunk=args.kpt_chunk,
-        vis_thresh=args.vis_thresh, refine=refine, refine_px=refine_px,
-        carry_source=args.carry_source, min_box_frames=args.min_box_frames,
-        oracle_corrupt=args.oracle_corrupt, device=device,
-        box_prompt=box_prompt, box_prompt_first_only=box_prompt_first_only,
-        crop_inflate=crop_inflate,
-        prefetch_windows=args.prefetch_windows,
-        capture_window_predictions=bool(args.window_predictions))
-    if cfg.box_source != 'keypoints':
-        print(f'crops: box_source={cfg.box_source} (from the run config); a session with no '
-              'instances.pq falls back to its keypoints')
-
+    model, config, registry, ckpt = load_pose(args, device)
+    trained_frames, trained_px = trained_window(args, config)
+    scorer_run = load_scorer(args, model, registry, trained_frames, trained_px, device)
+    scorer, _, scorer_shared_encoder, _ = scorer_run
+    cfg = infer_config(args, config, sess, trained_frames, trained_px, device)
     boxes = dict(np.load(args.boxes, allow_pickle=True)) if args.boxes else {}
-    det = det_wh = det_tile = det_boxsrc = None
-    det_red = False
-    if args.detector:
-        from tailcyclenet.detector.checkpoint import load_detector, resolve_detector_checkpoint
-        det_path = resolve_detector_checkpoint(args.detector, args.detector_checkpoint)
-        args._detector_checkpoint = str(det_path.resolve())
-        loaded = load_detector(det_path, device)
-        det, det_wh, det_ds, det_mcd = (loaded.model, loaded.input_wh, loaded.dataset,
-                                        loaded.min_crop_dim)
-        det_red, det_boxsrc, det_tile, det_objq = (loaded.reduce, loaded.box_source,
-                                                   loaded.tile_scale, loaded.obj_quantiles)
-        if det_objq and args.det_score >= det_objq.get('q50', 0.0):
-            print(f'WARNING: --det-score {args.det_score} is at or above this detector\'s MEDIAN '
-                  f'objectness ({det_objq["q50"]:.4f}), so it discards at least half of the '
-                  f'detections it offers. q01 {det_objq.get("q01", float("nan")):.4f} '
-                  f'q10 {det_objq.get("q10", float("nan")):.4f} '
-                  f'q90 {det_objq.get("q90", float("nan")):.4f}. This detector is NOT saturated; '
-                  'sweep --det-score per checkpoint (the 0.01 default favours recall; raising '
-                  'it was measured to cost coverage).', flush=True)
-        trained_datasets = list(getattr(det, 'trained_datasets', []) or ([det_ds] if det_ds else []))
-        det_boxsrc = detector_box_source(det, ds_name, det_boxsrc)
-        trained_label = (trained_datasets[0] if len(trained_datasets) == 1 else
-                         (', '.join(trained_datasets) if trained_datasets else det_ds))
-        print(f'detector: {det_path} ({det_wh[0]}x{det_wh[1]}'
-              + (f' TILE at scale {det_tile:g}, whole-frame input derived per camera'
-                 if det_tile else '')
-              + f', trained on {trained_label!r}, boxes={det_boxsrc or "keypoints"})')
-        if ds_name and trained_datasets and not detector_matches_source(
-                trained_datasets, det_ds, ds_name) and not args.allow_detector_transfer:
-            if len(trained_datasets) > 1:
-                raise SystemExit(
-                    f'{args.detector}: multi-root detector was trained on {trained_datasets}, '
-                    f'but this session is {ds_name!r}, which is not a member root. Pass '
-                    '--allow-detector-transfer for an explicit, labelled transfer-evaluation run.')
-            raise SystemExit(
-                f'{args.detector}: trained on dataset {det_ds!r}, but this session is '
-                f'{ds_name!r} -- different dataset families. Detectors are trained one per '
-                'dataset -- see CLAUDE.md -- so a cross-dataset deploy risks domain-shift false '
-                'negatives measured as though they were this dataset\'s own coverage. Pass '
-                '--allow-detector-transfer for an explicit, labelled transfer-evaluation run.')
-        if det_mcd != cfg.min_crop_dim:
-            raise SystemExit(
-                f'{args.detector}: trained at min_crop_dim={det_mcd}, but this run\'s '
-                f'[data].min_crop_dim is {cfg.min_crop_dim}. The detector reproduces the crop '
-                'rule; two floors are two rules.')
-        if (det_boxsrc or 'keypoints') != cfg.box_source:
-            print(f'WARNING: detector boxes are {det_boxsrc!r} but this run was trained on '
-                  f'{cfg.box_source!r} crops. Two crop sources are two crop rules -- do not read '
-                  'a delta against a run whose detector matched as a detector-quality result.')
+    det, det_wh, det_red, det_tile, det_boxsrc = load_deploy_detector(args, device, ds_name, cfg)
     if args.dataset_name and not args.videos:
         print(f'registry: reading session keypoints as {args.dataset_name!r}, not {ds_name!r}')
         ds_name = args.dataset_name
     _budget = _memory.rebudget(override_gb=args.max_ram)
     print(f'ram: {_budget}')
 
-    want = set(args.groups.split(',')) if args.groups else None
-
-    gids = [g for g in sess.groups if not want or g in want]
-    if cfg.frame_start:
-        short = [g for g in gids if sess.groups[g].n_frames <= cfg.frame_start]
-        for g in short:
-            print(f'{sess.session_id}/{g}: {sess.groups[g].n_frames} frames, which is at or below '
-                  f'--start-frame {cfg.frame_start}; skipped.')
-        gids = [g for g in gids if g not in set(short)]
-        if not gids:
-            raise SystemExit(
-                f'--start-frame {cfg.frame_start} is past the end of every group '
-                f'({ {g: sess.groups[g].n_frames for g in short} }), so this run would predict '
-                'nothing. An empty session written with exit 0 is worse than a refusal.')
+    gids = select_groups(args, sess, cfg)
     writer = SessionWriter(args.out, sess, registry,
-                           [*src_prov.items(),
-                            *{'source_session_id': sess.session_id,
-                            'source_dataset': ds_name,
-                            'run': str(Path(args.run).resolve()),
-                            'checkpoint': str(Path(ckpt).resolve()),
-                            'checkpoint_name': ckpt.name,
-                            'anchor': cfg.anchor, 'carry_source': cfg.carry_source,
-                            'window_predictions': bool(args.window_predictions),
-                            'n_frames': cfg.n_frames, 'overlap': cfg.overlap,
-                            'frame_start': cfg.frame_start, 'frame_stop': cfg.frame_stop,
-                            'refine': bool(cfg.refine), 'refine_px': cfg.refine_px or 0,
-                            'precision': precision, 'camera_batch': bool(camera_batch),
-                            'boxes': (str(args.detector) if args.detector else
-                                      (str(args.boxes) if args.boxes else 'labels')),
-                            'box_source': ((det_boxsrc or 'keypoints') if args.detector
-                                           else cfg.box_source),
-                            'vis_thresh': float(cfg.vis_thresh) if cfg.vis_thresh else 0.0,
-                            'box_prompt': cfg.box_prompt,
-                            'box_prompt_requested': str(args.box_prompt),
-                            'box_prompt_first_only': bool(cfg.box_prompt_first_only),
-                            'crop_inflate': float(cfg.crop_inflate),
-                            'gridresid_offset': str(config['model']['gridresid_offset']),
-                            'gridresid_offset_override': str(args.gridresid_offset or ''),
-                            **provenance()}.items(),
-                           *([] if scorer is None else [
-                               ('scorer', str(Path(scorer_path).resolve())),
-                               ('scorer_checkpoint', str(Path(scorer_ckpt).resolve())),
-                               ('scorer_checkpoint_name', Path(scorer_ckpt).name),
-                               ('scorer_commit', str(scorer_prov.get('commit', ''))),
-                               ('scorer_dirty', bool(scorer_prov.get('dirty', False))),
-                               ('scorer_precision', precision),
-                               ('scorer_encoder_shared', bool(scorer_shared_encoder)),
-                               ('pose_scorer_mismatch_allowed',
-                                bool(allow_pose_scorer_mismatch))]),
-                            *box_provenance(args, det_tile, det_red, det_boxsrc).items(),
-                            *identity_provenance(args).items()],
+                           run_provenance(args, sess, ds_name, ckpt, cfg, config, src_prov,
+                                          scorer_run, det_tile, det_red, det_boxsrc),
                            gids, quality_enabled=scorer is not None)
     det_trace_groups = {}
     overlap_rows = {}
@@ -506,28 +193,7 @@ def run_dataset(args):
                                      _stats.get('prior_oob', []),
                                      _stats.get('model_conf', []))
             writer.write_identity_events(gid, det_stats.get('identity_events', []))
-            _wall = time.time() - _t_group
-            _dec, _h, _m = (_stats.get('decode_s', 0.0), _stats.get('decode_hits', 0),
-                            _stats.get('decode_misses', 0))
-            print(f'{key}: {_wall:.1f}s wall, {_dec:.1f}s of decode work across threads '
-                  f'({_dec / max(_wall, 1e-9):.2f}x wall), store {_h}/{_h + _m} hits '
-                  f'({_h / max(_h + _m, 1):.2f})')
-            if det is not None:
-                _sl = det_stats.get('slots', 0)
-                if _sl:
-                    filled = det_stats.get('filled', 0) / _sl
-                    print(f'{key}: boxes in {filled:.3f} of (animal, frame, camera) slots'
-                          f'{"   <-- LOW: try a smaller --det-score" if filled < 0.25 else ""}')
-                _raw = det_stats.get('association_raw_offered', 0)
-                _pre = det_stats.get('association_pre_link', 0)
-                _kept = det_stats.get('association_kept', 0)
-                if _raw:
-                    print(f'{key}: association offered {_raw}, seated before link {_pre}, '
-                          f'kept {_kept}')
-            _window_counts = {k: v for k, v in _stats.items() if k.startswith('window_')}
-            if _window_counts:
-                print(f'{key}: window outcomes ' + ' '.join(
-                    f'{k.removeprefix("window_")}={v}' for k, v in sorted(_window_counts.items())))
+            _report_group(key, time.time() - _t_group, _stats, det_stats, det is not None)
         _completed = True
 
     finally:

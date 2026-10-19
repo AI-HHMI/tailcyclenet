@@ -322,37 +322,8 @@ def _mota_for(m, lab, mota_dist, min_kpts_frac=0.0, extent_override=None, match_
                         min_kpts_frac=min_kpts_frac, cost=match_cost, last=last)
 
 
-def main(argv: list[str] | None = None):
-    """Score a prediction file; exit via SystemExit on bad config.
-
-    Inputs: argv (via argparse): predictions, --data, --split, --pck,
-            --mota-dist, --vs, --min-match-kpts, --chunk, --match-cost,
-            --seed.
-    Side effects: prints per-group rows and per-mode aggregates.
-
-    Notes:
-    - One aggregate per mode: a split may hold 2D and 3D sessions, and their units do not mix.
-      No labels in the scored prefix is a diagnosis, not a ZeroDivisionError. A ranged session is
-      scored only inside its `[provenance]` range (`restrict_frames`); `--vs` refuses two ranges. The tail percentiles
-      matter because the mean cannot show one: an arm that declines hard animals has a
-      flattering mean and a p90 that says so. The vis head's TARGET, not its output, is printed: a `base` at
-      1.000 means there is nothing for `--vis-thresh` to learn. PCK reuses the table's own
-      arrays (re-deriving the slicing from the npz got it wrong whenever pred and true
-      disagreed on S or T), excluding `St == 0` groups -- nothing to measure PCK against, and
-      the point COUNT, not just the content, would otherwise disagree. MOTA's FP term splits
-      into `dup` (an already-claimed animal; arbitration removes it) and `none` (no labelled
-      animal; a threshold removes it); both radii show: MPJPE at the full box diagonal, MOTA at
-      half of it.
-    - `--vs`: the second file must be chunked the same way or the pairing finds nothing in
-      common; `labels` is already the chunked lookup, so it is reused. Complete-case pairing
-      flatters the arm that failed more, so the drop count is printed. The shared set is the
-      headline: a delta over points only one arm attempted measures which arm declined more.
-      Coverage is paired too -- `err` means nothing without it, and it was the one column `--vs`
-      could not put an interval on. Motion is paired like the error: a path length over an
-      arm's own matched set rewards declining points, so both are measured against the same
-      label path. The FP split is paired as well: a paired `fp_rate` alone cannot say which
-      term an arm moved.
-    """
+def _parser():
+    """The `eval` command line."""
     ap = argparse.ArgumentParser(prog='tailcyclenet eval', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('predictions', type=Path)
@@ -400,39 +371,19 @@ def main(argv: list[str] | None = None):
                          'from a perfectly-tracked pair depending only on row storage order, and '
                          'idsw has no other documented noise floor; MOTA has had one (+-0.023) '
                          'since CLAUDE.md eval rule 8. 32 is the plan\'s own suggested N.')
-    args = ap.parse_args(argv)
+    return ap
 
-    preds, meta = load_predictions(args.predictions)
-    labels = label_lookup(args.data, args.split)
-    frame_range = (int(meta.get('frame_start', 0)), int(meta.get('frame_stop', 0)))
-    if any(frame_range):
-        preds, labels = restrict_frames(preds, labels, *frame_range)
-        print(f'frame range [{frame_range[0]}, {frame_range[1] or "end"}): scoring only inside '
-              "the run's own [provenance] range")
-    if args.chunk:
-        preds, labels = chunk_frames(preds, labels, args.chunk)
-        print(f'--chunk {args.chunk}: {len(preds)} scoring unit(s) -- WITHIN-clip uncertainty, '
-              'not between-clip')
-    print(f'run={meta["run"]}  anchor={meta["anchor"]}  boxes={meta["boxes"]}'
-          + (f'  box_source={meta["box_source"]}' if meta.get('box_source') else ''))
-    if meta['anchor'] == 'labels':
-        print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
 
-    rows = score(preds, labels, args.mota_dist, min_kpts_frac=args.min_match_kpts,
-                 match_cost=args.match_cost)
-    if not rows:
-        print('nothing scored')
-        return
+def _report_modes(rows, args):
+    """Print the per-mode aggregates: MPJPE (both aggregations), coverage, motion, tails, vis, PCK.
 
-    multi_any = any(m['S'] > 1 for m in rows)
-    if multi_any:
-        print('\nmulti-animal: err is over HUNGARIAN-MATCHED instances. Row index is not '
-              'identity once boxes come from a detector.')
-    print(f'\n{"group":48s} {"S p/t":>7s} {"err":>9s} {"med":>8s} {"cov":>7s} {"unmatched":>10s}')
-    for m in rows:
-        print(f'{m["group"][:48]:48s} {m["S_pred"]:3d}/{m["S_true"]:<3d} {m["err"]:9.3f} '
-              f'{m["median"]:8.3f} {m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
+    One aggregate per mode: a split may hold 2D and 3D sessions, and their units do not mix. The
+    tail percentiles show what a mean cannot (an arm that declines hard animals has a flattering
+    mean and a p90 that says so). The vis head's TARGET base is printed: 1.000 means nothing to
+    learn. PCK reuses the table's own arrays and excludes `St == 0` groups.
 
+    Inputs: rows (`score`'s), args. Side effects: prints.
+    """
     for mode in ('3d', '2d'):
         block = [m for m in rows if m['mode'] == mode]
         if not block:
@@ -499,6 +450,13 @@ def main(argv: list[str] | None = None):
             for k, v in pck(allp, allt, thresholds).items():
                 print(f'[{mode}] {k} ({unit})  {v:.4f}')
 
+
+def _report_identity(rows, args):
+    """Print MOTA (with the FP split into `dup` and `none`), IDF1 and the optional idsw band.
+
+    `dup` FPs land on an already-claimed animal (arbitration removes them), `none` on no labelled
+    animal (a threshold removes them). Inputs: rows, args. Side effects: prints.
+    """
     multi = [m for m in rows if m['S'] > 1 and 'mota' in m]
     if multi:
         print()
@@ -531,88 +489,147 @@ def main(argv: list[str] | None = None):
                   'above maps each scoring unit on its own). idsw counts correspondence CHANGES '
                   'and is blind to a row parked on the wrong animal -- read the two together.')
 
+
+def _report_vs(args, rows, labels, frame_range):
+    """`--vs`: this file minus a second one under a PAIRED bootstrap over the groups both scored.
+
+    The second file is chunked the same way (`labels` is already the chunked lookup). Pairing is
+    complete-case, which flatters the arm that failed more, so the drop count is printed; the
+    headline is over points BOTH matched, and coverage, motion and the FP split are paired too.
+
+    Inputs: args, rows (this file's), labels, frame_range (this file's [provenance] range).
+    Side effects: prints; raises SystemExit when the two ranges differ.
+    """
+    other, ometa = load_predictions(args.vs)
+    other_range = (int(ometa.get('frame_start', 0)), int(ometa.get('frame_stop', 0)))
+    if other_range != frame_range:
+        raise SystemExit(f'--vs pairs two runs over different frame ranges ({frame_range} vs '
+                         f'{other_range}); each is scored only inside its own range, so '
+                         'there are no shared frames to pair. Run both over one range.')
+    if args.chunk or any(other_range):
+        fresh = label_lookup(args.data, args.split)
+        other, fresh = restrict_frames(other, fresh, *other_range)
+        if args.chunk:
+            other, _ = chunk_frames(other, fresh, args.chunk)
+    print(f'\nPAIRED: {args.predictions} minus {args.vs}')
+    print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
+    by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,
+                                          min_kpts_frac=args.min_match_kpts,
+                                          match_cost=args.match_cost)}
+    pairs = [(m, by_key[m['group']]) for m in rows if m['group'] in by_key]
+    if not pairs:
+        print('  no shared groups')
+        return
+    for mode in ('3d', '2d'):
+        block = [(a, b) for a, b in pairs if a['mode'] == mode]
+        if not block:
+            continue
+        unit = 'mm' if mode == '3d' else 'px'
+        ea, eb, shared, nlab = [], [], 0, 0
+        fa_, fb_, fn_ = [], [], []
+        for a, b in block:
+            da, db, n, nl, fa, fb, fn = _shared_error(a, b)
+            ea.append(da)
+            eb.append(db)
+            fa_.append(fa)
+            fb_.append(fb)
+            fn_.append(fn)
+            shared += n
+            nlab += nl
+        d = (paired_bootstrap(fa_, fb_, seed=args.seed, weights=fn_)
+             if args.agg == 'frame' else paired_bootstrap(ea, eb, seed=args.seed))
+        ci = ('DEGENERATE (one group -- no interval exists)' if d['n'] < 2
+              else f'[{d["lo"]:+.4f}, {d["hi"]:+.4f}]'
+                   + ('' if d['lo'] <= 0 <= d['hi'] else '  *'))
+        drop = f"  ({d['n_dropped']} group(s) DROPPED, one side non-finite)" if d.get(
+            'n_dropped') else ''
+        print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}{drop}')
+        frac = f'{shared / nlab:.4f}' if nlab else 'n/a, nothing labelled in the scored frames'
+        print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '
+              f'({frac}) in {len(block)} group(s)')
+
+        def paired(name, get):
+            """Print the paired bootstrap interval of `get(m)` between the two files.
+
+            Inputs: name -- the label for the row.
+                    get -- m -> metric value (None when the arm lacks it).
+            Side effects: prints one interval line when both arms have the metric.
+            """
+            got = [(get(a), get(b)) for a, b in block]
+            got = [(x, y) for x, y in got if x is not None and y is not None]
+            if not got:
+                return
+            dm = paired_bootstrap([x for x, _ in got], [y for _, y in got], seed=args.seed)
+            tail = ('DEGENERATE (one group)' if dm['n'] < 2
+                    else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
+                         + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
+            print(f'[{mode}] {name:>13s} {dm["mean"]:+.4f}  {tail}')
+
+        paired('coverage', lambda m: m['coverage'])
+        mot = [(_shared_motion(a, b)) for a, b in block]
+        mot = [(x, y) for x, y, n in mot if n and np.isfinite(x) and np.isfinite(y)]
+        if mot:
+            dm = paired_bootstrap([x for x, _ in mot], [y for _, y in mot], seed=args.seed)
+            tail = ('DEGENERATE (one group)' if dm['n'] < 2
+                    else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
+                         + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
+            print(f'[{mode}] {"motion_ratio":>13s} {dm["mean"]:+.4f}  {tail}')
+        paired('box_agree', lambda m: m.get('box_agree'))
+        for _k in _PCT_KEYS:
+            paired(f'err {_k}', (lambda k: lambda m: m.get(k))(_k))
+        for name in ('mota', 'miss_rate', 'fp_rate', 'fp_dup_rate', 'fp_none_rate',
+                     'idsw_rate'):
+            paired(name, lambda m, k=name: m['mota'][k] if 'mota' in m else None)
+        paired('idf1', lambda m: m['idf1']['idf1'] if 'idf1' in m else None)
+
+
+def main(argv: list[str] | None = None):
+    """Score a prediction file; exit via SystemExit on bad config.
+
+    Inputs: argv (via argparse; see `_parser`). Side effects: prints per-group rows, per-mode
+        aggregates, identity metrics and the optional `--vs` comparison.
+
+    No labels in the scored prefix is a diagnosis, not a ZeroDivisionError. A ranged session is
+    scored only inside its `[provenance]` range (`restrict_frames`).
+    """
+    ap = _parser()
+    args = ap.parse_args(argv)
+
+    preds, meta = load_predictions(args.predictions)
+    labels = label_lookup(args.data, args.split)
+    frame_range = (int(meta.get('frame_start', 0)), int(meta.get('frame_stop', 0)))
+    if any(frame_range):
+        preds, labels = restrict_frames(preds, labels, *frame_range)
+        print(f'frame range [{frame_range[0]}, {frame_range[1] or "end"}): scoring only inside '
+              "the run's own [provenance] range")
+    if args.chunk:
+        preds, labels = chunk_frames(preds, labels, args.chunk)
+        print(f'--chunk {args.chunk}: {len(preds)} scoring unit(s) -- WITHIN-clip uncertainty, '
+              'not between-clip')
+    print(f'run={meta["run"]}  anchor={meta["anchor"]}  boxes={meta["boxes"]}'
+          + (f'  box_source={meta["box_source"]}' if meta.get('box_source') else ''))
+    if meta['anchor'] == 'labels':
+        print('*** ORACLE: the model was seeded with ground truth. Not a deployment number. ***')
+
+    rows = score(preds, labels, args.mota_dist, min_kpts_frac=args.min_match_kpts,
+                 match_cost=args.match_cost)
+    if not rows:
+        print('nothing scored')
+        return
+
+    multi_any = any(m['S'] > 1 for m in rows)
+    if multi_any:
+        print('\nmulti-animal: err is over HUNGARIAN-MATCHED instances. Row index is not '
+              'identity once boxes come from a detector.')
+    print(f'\n{"group":48s} {"S p/t":>7s} {"err":>9s} {"med":>8s} {"cov":>7s} {"unmatched":>10s}')
+    for m in rows:
+        print(f'{m["group"][:48]:48s} {m["S_pred"]:3d}/{m["S_true"]:<3d} {m["err"]:9.3f} '
+              f'{m["median"]:8.3f} {m["coverage"]:7.3f} {m.get("unmatched", 0):10d}')
+
+    _report_modes(rows, args)
+    _report_identity(rows, args)
     if args.vs:
-        other, ometa = load_predictions(args.vs)
-        other_range = (int(ometa.get('frame_start', 0)), int(ometa.get('frame_stop', 0)))
-        if other_range != frame_range:
-            raise SystemExit(f'--vs pairs two runs over different frame ranges ({frame_range} vs '
-                             f'{other_range}); each is scored only inside its own range, so '
-                             'there are no shared frames to pair. Run both over one range.')
-        if args.chunk or any(other_range):
-            fresh = label_lookup(args.data, args.split)
-            other, fresh = restrict_frames(other, fresh, *other_range)
-            if args.chunk:
-                other, _ = chunk_frames(other, fresh, args.chunk)
-        print(f'\nPAIRED: {args.predictions} minus {args.vs}')
-        print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
-        by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,
-                                              min_kpts_frac=args.min_match_kpts,
-                                              match_cost=args.match_cost)}
-        pairs = [(m, by_key[m['group']]) for m in rows if m['group'] in by_key]
-        if not pairs:
-            print('  no shared groups')
-            return
-        for mode in ('3d', '2d'):
-            block = [(a, b) for a, b in pairs if a['mode'] == mode]
-            if not block:
-                continue
-            unit = 'mm' if mode == '3d' else 'px'
-            ea, eb, shared, nlab = [], [], 0, 0
-            fa_, fb_, fn_ = [], [], []
-            for a, b in block:
-                da, db, n, nl, fa, fb, fn = _shared_error(a, b)
-                ea.append(da)
-                eb.append(db)
-                fa_.append(fa)
-                fb_.append(fb)
-                fn_.append(fn)
-                shared += n
-                nlab += nl
-            d = (paired_bootstrap(fa_, fb_, seed=args.seed, weights=fn_)
-                 if args.agg == 'frame' else paired_bootstrap(ea, eb, seed=args.seed))
-            ci = ('DEGENERATE (one group -- no interval exists)' if d['n'] < 2
-                  else f'[{d["lo"]:+.4f}, {d["hi"]:+.4f}]'
-                       + ('' if d['lo'] <= 0 <= d['hi'] else '  *'))
-            drop = f"  ({d['n_dropped']} group(s) DROPPED, one side non-finite)" if d.get(
-                'n_dropped') else ''
-            print(f'[{mode}] MPJPE {d["mean"]:+.4f} {unit}  {ci}{drop}')
-            frac = f'{shared / nlab:.4f}' if nlab else 'n/a, nothing labelled in the scored frames'
-            print(f'[{mode}] over {shared} points BOTH matched, of {nlab} labelled '
-                  f'({frac}) in {len(block)} group(s)')
-
-            def paired(name, get):
-                """Print the paired bootstrap interval of `get(m)` between the two files.
-
-                Inputs: name -- the label for the row.
-                        get -- m -> metric value (None when the arm lacks it).
-                Side effects: prints one interval line when both arms have the metric.
-                """
-                got = [(get(a), get(b)) for a, b in block]
-                got = [(x, y) for x, y in got if x is not None and y is not None]
-                if not got:
-                    return
-                dm = paired_bootstrap([x for x, _ in got], [y for _, y in got], seed=args.seed)
-                tail = ('DEGENERATE (one group)' if dm['n'] < 2
-                        else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
-                             + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
-                print(f'[{mode}] {name:>13s} {dm["mean"]:+.4f}  {tail}')
-
-            paired('coverage', lambda m: m['coverage'])
-            mot = [(_shared_motion(a, b)) for a, b in block]
-            mot = [(x, y) for x, y, n in mot if n and np.isfinite(x) and np.isfinite(y)]
-            if mot:
-                dm = paired_bootstrap([x for x, _ in mot], [y for _, y in mot], seed=args.seed)
-                tail = ('DEGENERATE (one group)' if dm['n'] < 2
-                        else f'[{dm["lo"]:+.4f}, {dm["hi"]:+.4f}]'
-                             + ('' if dm['lo'] <= 0 <= dm['hi'] else '  *'))
-                print(f'[{mode}] {"motion_ratio":>13s} {dm["mean"]:+.4f}  {tail}')
-            paired('box_agree', lambda m: m.get('box_agree'))
-            for _k in _PCT_KEYS:
-                paired(f'err {_k}', (lambda k: lambda m: m.get(k))(_k))
-            for name in ('mota', 'miss_rate', 'fp_rate', 'fp_dup_rate', 'fp_none_rate',
-                         'idsw_rate'):
-                paired(name, lambda m, k=name: m['mota'][k] if 'mota' in m else None)
-            paired('idf1', lambda m: m['idf1']['idf1'] if 'idf1' in m else None)
+        _report_vs(args, rows, labels, frame_range)
 
 
 def _shared_error(a, b):

@@ -13,36 +13,10 @@ the first one keeps the downstream accuracy.
 import torch
 import torch.nn.functional as F
 
+from .boxes import box_center_dist, box_iou, paired_iou
+
 # In cells; YOLOX's own value.
 CENTER_RADIUS = 2.5
-
-
-def box_iou(a, b, eps=1e-7):
-    """Pairwise IoU. a: (N,4), b: (M,4) -> (N,M)."""
-    area_a = (a[:, 2] - a[:, 0]).clamp(0) * (a[:, 3] - a[:, 1]).clamp(0)
-    area_b = (b[:, 2] - b[:, 0]).clamp(0) * (b[:, 3] - b[:, 1]).clamp(0)
-    lt = torch.max(a[:, None, :2], b[None, :, :2])
-    rb = torch.min(a[:, None, 2:], b[None, :, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[..., 0] * wh[..., 1]
-    return inter / (area_a[:, None] + area_b[None] - inter + eps)
-
-
-def paired_iou(a, b, eps=1e-7):
-    """Elementwise IoU between MATCHED rows -- a[i] against b[i], not every pair.
-
-    `box_iou` above is the cross-product form (`(N,M)`), which is what NMS and evaluation want.
-    Objectness supervision wants the OTHER shape: one IoU per POSITIVE anchor, against the one GT
-    box `assign` gave it -- `box_iou(boxes[pos], gt).diagonal()` would compute N^2 pairs to keep
-    N of them. Same maths as `box_iou`, no broadcasting.
-    """
-    area_a = (a[:, 2] - a[:, 0]).clamp(0) * (a[:, 3] - a[:, 1]).clamp(0)
-    area_b = (b[:, 2] - b[:, 0]).clamp(0) * (b[:, 3] - b[:, 1]).clamp(0)
-    lt = torch.max(a[:, :2], b[:, :2])
-    rb = torch.min(a[:, 2:], b[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, 0] * wh[:, 1]
-    return inter / (area_a + area_b - inter + eps)
 
 
 def giou_loss(pred, target, eps=1e-7):
@@ -260,28 +234,6 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
     if iou_aware:
         parts['iou_target'] = float(target[pos_mask].mean()) if bool(pos_mask.any()) else 0.0
     return total, parts
-
-
-def box_center_dist(a, b, eps=1e-7):
-    """Pairwise centre-distance ratio: Euclidean centre distance / mean box side. a:(N,4), b:(M,4)
-    -> (N,M), scale-free (units of box side, not pixels).
-
-    SLEAP's `min_centroid_distance` / `filters.py`'s own reasoning: IoU and OKS are both
-    degenerate for point-like or near-concentric detections -- two boxes of very different size
-    but (nearly) the same centre score a low IoU and survive NMS, while a duplicate detection on
-    one animal is exactly that shape (report 42 SS3.6's near-concentric `fp_dup` measurement).
-    Centre distance in units of the pair's own mean side catches that case directly and needs no
-    scale calibration across roots -- the same normalisation `link_rows` already uses for its
-    identity gate.
-    """
-    ca = torch.stack([(a[:, 0] + a[:, 2]) / 2, (a[:, 1] + a[:, 3]) / 2], -1)
-    cb = torch.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], -1)
-    d = torch.linalg.norm(ca[:, None] - cb[None], dim=-1)
-    sa = 0.5 * ((a[:, 2] - a[:, 0]) + (a[:, 3] - a[:, 1]))
-    sb = 0.5 * ((b[:, 2] - b[:, 0]) + (b[:, 3] - b[:, 1]))
-    side = (0.5 * (sa[:, None] + sb[None])).clamp_min(eps)
-    return d / side
-
 
 
 def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,

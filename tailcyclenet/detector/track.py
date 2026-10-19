@@ -31,7 +31,9 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-from .associate import _centres, associate
+from .associate import associate
+from .boxes import centres as box_centres
+from .boxes import sides as box_sides
 
 # On a crowded multiview clip, a seated duplicate track's
 # triangulated points project 0.32-0.73 box sides apart in every camera it claims (per-frame
@@ -127,11 +129,6 @@ def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_sh
 # THE MEASURED CONFIGURATION IS THE ONLY ONE NOW: `joint`, max-age 8, and max-move 1.25. On the
 # 3dzef 5-fish clip it has zero identity switches, full coverage, 0.100 mm MPJPE, and 0.309 mm
 # p99.
-
-
-def _sides(boxes):
-    """Mean side of each box, the length every distance here is measured in."""
-    return 0.5 * ((boxes[:, 2] - boxes[:, 0]) + (boxes[:, 3] - boxes[:, 1]))
 
 
 def _project(cam, points):
@@ -238,8 +235,8 @@ class CrossViewTracker:
         out = np.full((self.n, C, 4), np.nan, np.float32)
         sc = np.full((self.n, C), np.nan, np.float32)
         claimed_ix = np.full((self.n, C), -1, np.int32)
-        centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
-        sides = [_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
+        centres = [box_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
+        sides = [box_sides(b) if b.numel() else b.new_zeros((0,)) for b in boxes_per_cam]
         slots = [s for s, t in sorted(self.targets.items())
                  if bool(torch.isfinite(t['point']).all())]
         for s, t in self.targets.items():

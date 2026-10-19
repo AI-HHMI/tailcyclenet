@@ -4,9 +4,9 @@ from pathlib import Path
 
 import torch
 
-from .assign import (assign, assign_tal, box_iou, ciou_loss, decode,
-                     detector_loss, giou_loss, paired_iou)
+from .assign import assign, assign_tal, ciou_loss, decode, detector_loss, giou_loss
 from .associate import associate
+from .boxes import box_iou, paired_iou
 from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
                    letterbox_transform, reduce_factor, split_batch, tile_transform,
                    unletterbox_boxes)
@@ -489,6 +489,9 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, state=None):
     import numpy as np
     from scipy.optimize import linear_sum_assignment
 
+    from .boxes import centres as box_centres
+    from .boxes import sides as box_sides
+
     S, T, C, _ = boxes.shape
     if state is None or 'last' not in state:
         last = boxes[:, 0].copy()
@@ -505,11 +508,8 @@ def link_rows(boxes, scores=None, max_move=1.0, max_age=24, state=None):
             if not (ok_p.any() and ok_c.any()):
                 continue
             a, b = last[ok_p, c], cur[ok_c, c]
-            ca = np.stack([(a[:, 0] + a[:, 2]) / 2, (a[:, 1] + a[:, 3]) / 2], -1)
-            cb = np.stack([(b[:, 0] + b[:, 2]) / 2, (b[:, 1] + b[:, 3]) / 2], -1)
-            d = np.linalg.norm(ca[:, None] - cb[None], axis=-1)
-            sa = 0.5 * ((a[:, 2] - a[:, 0]) + (a[:, 3] - a[:, 1]))
-            sb = 0.5 * ((b[:, 2] - b[:, 0]) + (b[:, 3] - b[:, 1]))
+            d = np.linalg.norm(box_centres(a)[:, None] - box_centres(b)[None], axis=-1)
+            sa, sb = box_sides(a), box_sides(b)
             side = 0.5 * (sa[:, None] + sb[None])
             gap = np.where(side > 0, d / (max_move * np.maximum(side, 1e-6)), np.inf)
             cost[np.ix_(ok_p, ok_c)] += np.clip(1.0 - gap, 0.0, None)

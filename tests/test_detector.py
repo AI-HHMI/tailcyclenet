@@ -4254,3 +4254,14 @@ def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path
     associate_group(raw, ranged, 'g000', 1, track=True, frame_base=6)
     assert ranged.frames == [6, 7, 8, 9], \
         "a moving rig's extrinsics must be fetched at SOURCE frames, not batch-local ones"
+
+
+def test_box_centres_and_sides_agree_across_torch_and_numpy():
+    """`detector.boxes` is the one copy of the centre/side arithmetic: `link_rows` (numpy) and
+    association/tracking/NMS (torch) must read the same numbers off the same boxes."""
+    from tailcyclenet.detector.boxes import centres, sides
+    b = np.array([[0.0, 0.0, 10.0, 20.0], [5.0, 5.0, 7.0, 9.0]], np.float32)
+    np.testing.assert_array_equal(centres(b), centres(torch.from_numpy(b)).numpy())
+    np.testing.assert_array_equal(sides(b), sides(torch.from_numpy(b)).numpy())
+    np.testing.assert_array_equal(centres(b), [[5.0, 10.0], [6.0, 7.0]])
+    np.testing.assert_array_equal(sides(b), [15.0, 3.0])

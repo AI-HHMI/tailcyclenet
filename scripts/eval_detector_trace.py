@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import crop_box_for_points
 from tailcyclenet.detector import detect_raw, load_detector
-from tailcyclenet.detector.assign import box_iou
+from tailcyclenet.detector.boxes import box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
 from tailcyclenet.infer.driver import _detector_box_source
 from tracktail.model.cube import project_points_torch

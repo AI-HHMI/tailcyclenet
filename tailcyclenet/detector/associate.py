@@ -22,10 +22,7 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-
-def _centres(boxes):
-    """Box centres: (N,4) xyxy -> (N,2) (cx, cy)."""
-    return torch.stack([(boxes[:, 0] + boxes[:, 2]) / 2, (boxes[:, 1] + boxes[:, 3]) / 2], -1)
+from .boxes import centres as box_centres
 
 
 def _triangulate(cgroup, cams, pts):
@@ -127,7 +124,7 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
         `not res_fit <= max_res_px`, so a degenerate NaN refit cannot pass.
     """
     assert min_views in (1, 2), f'min_views is 1 or 2, got {min_views}'
-    centres = [_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
+    centres = [box_centres(b) if b.numel() else b.new_zeros((0, 2)) for b in boxes_per_cam]
     n_cams = len(cgroup)
 
     used = {(c, i) for c in range(n_cams)

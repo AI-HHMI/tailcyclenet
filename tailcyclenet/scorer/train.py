@@ -4,7 +4,7 @@ Cloned from `train.py`'s shape but NOT from its loop: the objective is a triplet
 best checkpoint is selected on held-out synthetic triplet accuracy rather than on MPJPE, and the
 staged encoder unfreeze, the pose losses and the pose eval all have no meaning here. What IS
 reused, by import, is the parts that must not diverge: `config.load_config` (so the scorer
-family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose checkpoint),
+family layers over `configs/scorer.toml`), `pose.checkpoint.warm_start` (the pose checkpoint),
 `scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and
 `optim.build_optimizer` (so Muon routing and the fresh-parameter rule are one implementation).
 
@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 
 from tracktail.datasets.scorer_corruption import GENERATORS
 
-from ..checkpoints import full_training_state, prior_provenance, save_run_meta, warm_start
+from ..checkpoints import full_training_state, prior_provenance, save_run_meta
 from .checkpoint import save_scorer_checkpoint
 from .contract import (SCORER_OUTPUT_GRANULARITIES, require_scorer_contract,
                        require_scorer_granularity, scorer_checkpoint_granularity,
@@ -36,7 +36,8 @@ from ..config import SCORER_CONFIG, load_config
 from ..dataset import SCORER_PLUMBING, LoaderConfig, PoseDataset, StepSampler, loader_config_from
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
-from ..optim import build_optimizer, check_resume
+from ..pose.checkpoint import warm_start
+from ..pose.optim import build_optimizer, check_resume
 from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device

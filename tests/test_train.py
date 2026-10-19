@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import tailcyclenet.train as tr
+import tailcyclenet.pose.evaluate as ev
+import tailcyclenet.pose.train as tr
 
 
 def _batch(mode='3d'):
@@ -121,19 +122,19 @@ def test_smoothness_drain_and_logging():
     history = _History({'smoothness_3d_loss': [1.0, 3.0, float('nan'), float('inf')],
                         'smoothness_2d_loss': [0.0, float('nan')]})
     mapping_id = id(history.loss_history)
-    values = tr._drain_smoothness(history)
+    values = ev.drain_smoothness(history)
     assert values == {'smoothness_3d_loss': (4.0, 2), 'smoothness_2d_loss': (0.0, 1)}
     assert history.loss_history == {'smoothness_3d_loss': [], 'smoothness_2d_loss': []}
     history.loss_history['vis_loss_2d'].append(3.0)
     assert id(history.loss_history) == mapping_id
 
     wb = FakeWandb()
-    tr.log(wb, {'train/loss': 2.0, **tr._smoothness_log_values(values)}, step=20)
+    tr.log(wb, {'train/loss': 2.0, **ev.smoothness_log_values(values)}, step=20)
     assert wb.calls == [({'train/loss': 2.0, 'train/smoothness_3d_loss': 2.0,
                           'train/smoothness_2d_loss': 0.0}, 20)]
-    nxt = tr._drain_smoothness(_History({'smoothness_3d_loss': [4.0],
+    nxt = ev.drain_smoothness(_History({'smoothness_3d_loss': [4.0],
                                          'smoothness_2d_loss': [float('nan')]}))
-    assert tr._smoothness_log_values(nxt) == {'train/smoothness_3d_loss': 4.0}
+    assert ev.smoothness_log_values(nxt) == {'train/smoothness_3d_loss': 4.0}
 
 
 def test_train_metrics_match_validation_names_drop_nonfinite_and_keep_zero(monkeypatch):
@@ -141,22 +142,22 @@ def test_train_metrics_match_validation_names_drop_nonfinite_and_keep_zero(monke
     batch = _batch()
     out = {'coords_pred': torch.zeros_like(batch.coords),
            'vis_pred': torch.zeros(*batch.coords.shape[:-1], 1)}
-    values = tr.train_metrics(out, batch)
-    assert set(values) == set(tr._TRAIN_METRIC_KEYS)
+    values = ev.train_metrics(out, batch)
+    assert set(values) == set(ev.TRAIN_METRIC_KEYS)
     assert all(isinstance(v, float) and v == v for v in values.values())
-    assert tr.train_metrics({'coords_pred': out['coords_pred']}, batch) == {}
+    assert ev.train_metrics({'coords_pred': out['coords_pred']}, batch) == {}
 
     from tracktail.model import eval_metrics
     monkeypatch.setattr(eval_metrics, 'get_eval_metrics',
                         lambda **kwargs: {'mpjpe': 0.0, 'mte': float('nan'),
                                           'jaccard_1': float('inf')})
-    assert tr.train_metrics(out, batch) == {'mpjpe': 0.0}
+    assert ev.train_metrics(out, batch) == {'mpjpe': 0.0}
 
-    stats = {mode: {key: [0.0, 0] for key in tr._TRAIN_METRIC_KEYS}
-             for mode in tr._TRAIN_METRIC_MODES}
+    stats = {mode: {key: [0.0, 0] for key in ev.TRAIN_METRIC_KEYS}
+             for mode in ev.TRAIN_METRIC_MODES}
     stats['3d']['mpjpe'] = [0.0, 2]
     stats['2d']['mpjpe'] = [6.0, 2]
-    logged = tr._metric_log_values(stats)
+    logged = ev.metric_log_values(stats)
     assert logged['train/3d/mpjpe'] == 0.0 and logged['train/2d/mpjpe'] == 3.0
     assert 'train/3d/mte' not in logged
 
@@ -180,21 +181,21 @@ def test_metric_reductions_are_one_fixed_shape_collective_on_every_rank():
             out[:4] = torch.tensor(self.result, dtype=tensor.dtype)
             return out
 
-    full = {mode: {key: [0.0, 0] for key in tr._TRAIN_METRIC_KEYS}
-            for mode in tr._TRAIN_METRIC_MODES}
+    full = {mode: {key: [0.0, 0] for key in ev.TRAIN_METRIC_KEYS}
+            for mode in ev.TRAIN_METRIC_MODES}
     full['3d']['mpjpe'] = [1.0, 1]
     f_full, f_empty = FakeFabric(), FakeFabric()
-    tr._metric_log_values(full, f_full)
-    tr._metric_log_values({mode: {} for mode in tr._TRAIN_METRIC_MODES}, f_empty)
-    expected = 2 * len(tr._TRAIN_METRIC_KEYS) * len(tr._TRAIN_METRIC_MODES)
+    ev.metric_log_values(full, f_full)
+    ev.metric_log_values({mode: {} for mode in ev.TRAIN_METRIC_MODES}, f_empty)
+    expected = 2 * len(ev.TRAIN_METRIC_KEYS) * len(ev.TRAIN_METRIC_MODES)
     assert f_full.calls == f_empty.calls == 1 and f_full.numel == f_empty.numel == expected
 
     empty = {'smoothness_3d_loss': (0.0, 0), 'smoothness_2d_loss': (0.0, 0)}
     fabric = FakeFabric((10.0, 4.0, 6.0, 2.0))
-    assert tr._smoothness_log_values(empty, fabric) == {
+    assert ev.smoothness_log_values(empty, fabric) == {
         'train/smoothness_3d_loss': 2.5, 'train/smoothness_2d_loss': 3.0}
     assert fabric.calls == 1
-    assert tr._smoothness_log_values(empty) == {}
+    assert ev.smoothness_log_values(empty) == {}
 
 
 def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):

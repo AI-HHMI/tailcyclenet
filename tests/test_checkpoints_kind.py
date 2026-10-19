@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet.pose import checkpoint as pck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
 from tailcyclenet.scorer.checkpoint import load_scorer_run
@@ -132,7 +133,7 @@ def test_a_run_folder_of_the_other_kind_is_refused(tmp_path):
     (tmp_path / 'pose-run').mkdir()
     (tmp_path / 'pose-run' / 'config.toml').write_text(body)
     with pytest.raises(ValueError, match='scorer'):
-        ck.load_run(tmp_path / 'scorer-run')
+        pck.load_run(tmp_path / 'scorer-run')
     with pytest.raises(ValueError, match='pose'):
         load_scorer_run(tmp_path / 'pose-run')
 

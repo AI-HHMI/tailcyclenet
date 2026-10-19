@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 
 COMMANDS = {
-    'train': ('tailcyclenet.train', 'finetune a pose model'),
+    'train': ('tailcyclenet.pose.train', 'finetune a pose model'),
     'train-detector': ('tailcyclenet.train_detector', 'train a box detector'),
     'train-scorer': ('tailcyclenet.scorer.train', 'train a track-quality scorer'),
     'infer': ('tailcyclenet.infer.cli', 'run a trained model'),

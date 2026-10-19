@@ -13,7 +13,7 @@ import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
 from tailcyclenet.pose.model import build_model
-from tailcyclenet.unfreeze import _norms_in_range, apply_staged_unfreeze
+from tailcyclenet.pose.unfreeze import _norms_in_range, apply_staged_unfreeze
 
 # Everything structural from the shipped configs, everything expensive at its floor.
 SMALL = dict(
@@ -350,7 +350,7 @@ def test_wide_inherits_the_pretrained_patch_cnn(tmp_path):
     """`wide`'s patch CNN is built at the PRETRAINED width and projected, so every tensor loads by
     name (built at the fusion width it would inherit 93k of 5.5M params and retrain the rest).
     """
-    from tailcyclenet.checkpoints import warm_start
+    from tailcyclenet.pose.checkpoint import warm_start
 
     from tracktail.model.encoder_decoder import PatchProcessor
 
@@ -406,7 +406,7 @@ def test_a_grown_registry_keeps_its_trained_keypoint_rows(tmp_path):
     """An appended registry copies the base's trained `kpt_embed` rows (a whole-tensor shape drop
     reset them to noise); a base registry whose length disagrees with the table is refused.
     """
-    from tailcyclenet.checkpoints import warm_start
+    from tailcyclenet.pose.checkpoint import warm_start
 
     base = build_model(small(), n_keypoints=3)
     ckpt = tmp_path / 'base.pth'

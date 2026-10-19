@@ -26,9 +26,10 @@ from pathlib import Path
 
 import torch
 
-from .checkpoints import (enclosing_run, full_training_state, is_hf_repo_id, prior_provenance,
-                          resolve_checkpoint, resolve_hf_checkpoint, warm_start)
-from .format import Registry
+from ..checkpoints import (enclosing_run, full_training_state, is_hf_repo_id, prior_provenance,
+                           resolve_checkpoint, resolve_hf_checkpoint)
+from ..format import Registry
+from .checkpoint import warm_start
 from .optim import OPTIMIZER_LAYOUT_SCHEMA, build_optimizer, check_resume, state_kind
 from .unfreeze import apply_norms_extension, apply_staged_unfreeze
 

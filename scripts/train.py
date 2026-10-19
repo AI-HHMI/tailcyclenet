@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.train import main
+from tailcyclenet.pose.train import main
 
 if __name__ == '__main__':
     main()

@@ -3,8 +3,8 @@ import torch
 
 from tailcyclenet.checkpoints import save_checkpoint
 from tailcyclenet.format import Registry
-from tailcyclenet.optim import build_muon, build_optimizer, check_resume
-from tailcyclenet.unfreeze import apply_staged_unfreeze
+from tailcyclenet.pose.optim import build_muon, build_optimizer, check_resume
+from tailcyclenet.pose.unfreeze import apply_staged_unfreeze
 
 from tests.test_optim import Tiny, _cfg
 

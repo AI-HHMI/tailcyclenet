@@ -13,8 +13,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..checkpoints import load_run, peek_registry, provenance
+from ..checkpoints import peek_registry, provenance
 from ..dataset import LoaderConfig
+from ..pose.checkpoint import load_run
 from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
 

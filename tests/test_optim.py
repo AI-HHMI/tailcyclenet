@@ -5,9 +5,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tailcyclenet.optim import (PoseDualOptimizer, build_muon, build_optimizer, check_resume,
+from tailcyclenet.pose.optim import (PoseDualOptimizer, build_muon, build_optimizer, check_resume,
                                 state_kind)
-from tailcyclenet.unfreeze import apply_staged_unfreeze
+from tailcyclenet.pose.unfreeze import apply_staged_unfreeze
 
 
 class TinyEncoder(nn.Module):

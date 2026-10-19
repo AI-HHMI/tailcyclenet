@@ -19,26 +19,23 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from tailcyclenet import distributed as dist_utils
-from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-from tailcyclenet.config import BASE_CONFIG, check_image_size, load_config
-from tailcyclenet.dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
-                                  pose_collate, worker_init)
-from tailcyclenet.pose.losses import PoseLoss
-from tailcyclenet.pose.model import build_model
-from tailcyclenet.optim import KNOWN_OPTIMIZER_KEYS
-from tailcyclenet.runtime import gpu_peak_gb, init_wandb, launch, log, timed
-from tailcyclenet.start import build_start, plan_start
-from tailcyclenet.unfreeze import apply_staged_unfreeze, trainable_encoder_params
+from .. import distributed as dist_utils
+from ..checkpoints import save_checkpoint, save_run_meta
+from ..config import BASE_CONFIG, check_image_size, load_config
+from ..dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
+                       pose_collate, worker_init)
+from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
+from .evaluate import (SMOOTHNESS_KEYS, TRAIN_METRIC_KEYS, TRAIN_METRIC_MODES, brief,
+                       drain_smoothness, evaluate, metric_log_values, smoothness_log_values,
+                       to_device, train_metrics)
+from .losses import PoseLoss
+from .model import build_model
+from .optim import KNOWN_OPTIMIZER_KEYS
+from .start import build_start, plan_start
+from .unfreeze import apply_staged_unfreeze, trainable_encoder_params
 
 # file_system sharing avoids the default's fd-per-tensor lifetime; harmless, keep it.
 torch.multiprocessing.set_sharing_strategy('file_system')
-
-
-def _brief(m: dict) -> str:
-    """The interesting metric keys of a val dict, space-joined for a one-line print."""
-    keys = ('mpjpe', 'mte', 'delta_x_avg', 'survival_rate', 'n_nonfinite')
-    return ' '.join(f'{k}={m[k]:.4g}' for k in keys if k in m)
 
 
 KNOWN_TRAINING_KEYS = frozenset({
@@ -85,14 +82,6 @@ def sampler_generator(seed: int, rank: int, world: int, first_step: int):
     return None
 
 
-def to_device(batch, device):
-    """Move a batch's views and cgroup onto `device`, non-blocking where safe."""
-    views = [v.to(device, non_blocking=True) for v in batch.views]
-    cgroup = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
-              for c in batch.cgroup]
-    return views, cgroup
-
-
 def _tune_smoothness(loss_fn, T, stride=1):
     """Clamp each smoothness loss's order below the window length and undo the stride, in place.
 
@@ -110,101 +99,6 @@ def _tune_smoothness(loss_fn, T, stride=1):
             sl._configured_order, sl._configured_weight = sl.order, sl.weight
         sl.order = min(sl._configured_order, max(1, T - 1))
         sl.weight = sl._configured_weight / float(stride) ** sl.order
-
-
-_SMOOTHNESS_KEYS = ('smoothness_3d_loss', 'smoothness_2d_loss')
-# Scalar outputs shared with validation; delta_x_1..16 are per-batch arrays and are omitted by
-# the same scalar filter. The visibility-based 2D values are diagnostics alongside the optional
-# 2D visibility-loss head.
-_TRAIN_METRIC_KEYS = (
-    'mte', 'delta_x_avg', 'occlusion_acc', 'avg_jaccard', 'survival_rate', 'mpjpe',
-    'jaccard_1', 'jaccard_2', 'jaccard_4', 'jaccard_8', 'jaccard_16',
-)
-_TRAIN_METRIC_MODES = ('2d', '3d')
-
-
-@torch.no_grad()
-def train_metrics(out, batch):
-    """Return finite pose metrics for one accepted training forward.
-
-    These are the same metrics as validation, but the training forward uses the batch's
-    ground-truth prompt.  They are therefore an easier, prompt-conditioned diagnostic and
-    must not be compared directly with ``val/`` or ``val_self/``.  Metrics are kept separate
-    by mode because 2D values are pixels while 3D values are world units.
-    """
-    if 'vis_pred' not in out or 'coords_pred' not in out:
-        return {}
-    from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
-
-    coords = batch.coords
-    vis_true = batch.vis if batch.vis is not None else get_vis_true(coords)
-    metrics = get_eval_metrics(vis_pred=out['vis_pred'], vis_true=vis_true,
-                               coords_pred=out['coords_pred'], coords_true=coords, prefix='')
-    return {k: float(v) for k, v in metrics.items()
-            if k in _TRAIN_METRIC_KEYS and np.ndim(v) == 0 and np.isfinite(v)}
-
-
-def _clear_loss_history(loss_fn):
-    """Clear recorded loss samples in place, preserving ``defaultdict`` lazy keys."""
-    for samples in loss_fn.loss_history.values():
-        samples.clear()
-
-
-def _drain_smoothness(loss_fn):
-    """Drain one batch's smoothness samples as ``name -> (finite sum, finite count)``.
-
-    The training loop calls this after every batch.  It can therefore discard a skipped batch
-    before adding anything to the print interval, while the in-place clear prevents history growth
-    without replacing ``TotalLoss.loss_history`` with a plain dict.
-    """
-    stats = {}
-    for name in _SMOOTHNESS_KEYS:
-        samples = loss_fn.loss_history.get(name, ())
-        finite = [float(value) for value in samples if np.isfinite(value)]
-        if finite:
-            stats[name] = (float(np.sum(finite)), len(finite))
-    _clear_loss_history(loss_fn)
-    return stats
-
-
-def _interval_means(stats, keys, prefix, fabric=None):
-    """Reduce finite sum/count pairs and return count-weighted interval means.
-
-    The reduction is one fixed-size collective so every rank participates even when its local
-    interval has no samples.  A metric is omitted only when its global count is zero; genuine
-    zero-valued terms are retained.
-    """
-    keys = tuple(keys)
-    if fabric is not None and fabric.world_size > 1:
-        local = []
-        for key in keys:
-            total, count = stats.get(key, (0.0, 0))
-            local.extend((total, float(count)))
-        reduced = fabric.all_reduce(
-            torch.tensor(local, dtype=torch.float64, device=fabric.device), reduce_op='sum')
-        stats = {key: (float(reduced[2 * i]), int(round(float(reduced[2 * i + 1]))))
-                 for i, key in enumerate(keys)}
-    values = {}
-    for key in keys:
-        total, count = stats.get(key, (0.0, 0))
-        if count:
-            values[f'{prefix}{key}'] = total / count
-    return values
-
-
-def _smoothness_log_values(stats, fabric=None):
-    """Reduce smoothness samples and return interval means for the W&B payload."""
-    return _interval_means(stats, _SMOOTHNESS_KEYS, 'train/', fabric)
-
-
-def _metric_log_values(stats, fabric=None):
-    """Return mode-separated training metric interval means for W&B."""
-    flat = {f'{mode}/{key}': pair for mode in _TRAIN_METRIC_MODES
-            for key, pair in stats.get(mode, {}).items()}
-    return _interval_means(flat,
-                           tuple(f'{mode}/{key}' for mode in _TRAIN_METRIC_MODES
-                                 for key in _TRAIN_METRIC_KEYS),
-                           'train/', fabric)
 
 
 def run_batch(model, loss_fn, batch, device, raw=None):
@@ -241,65 +135,6 @@ def run_batch(model, loss_fn, batch, device, raw=None):
         print(f'  non-finite loss -> skipping step: {e}', flush=True)
         loss = torch.tensor(float('nan'), device=device)
     return loss, out
-
-
-@torch.no_grad()
-def evaluate(model, batches, optimizer, device, fabric=None):
-    """Val metrics on a FIXED set of windows, both regimes from one pass -> (prior_free, self).
-
-    Batches are this rank's shard; the per-window dicts are gathered before reducing. `model` is
-    the unwrapped module (no DDP hooks in a no-grad forward). Prior-free is the honest number
-    (GT-derived priors are gated off); the self-prompted pass re-queries at the model's own
-    frame-0 prediction and is the deployable regime. `optimizer.eval()` swaps in the averaged
-    iterate; the `finally` puts `y` back.
-    """
-    from tracktail.model.eval_metrics import get_eval_metrics, get_vis_true
-
-    from tailcyclenet.pose.prompt import self_prompt
-    from tailcyclenet.pose.model import share_scene
-
-    model.eval()
-    if hasattr(optimizer, 'eval'):
-        optimizer.eval()
-    free, prompted = [], []
-    try:
-        for batch in batches:
-            views, cgroup = to_device(batch, device)
-            kpt_ids, coords = batch.kpt_ids.to(device), batch.coords.to(device)
-            mode = batch.sample_info['mode']
-            vis_true = (batch.vis.to(device) if batch.vis is not None else get_vis_true(coords))
-
-            def score(out):
-                """The scalar eval metrics of one forward, as a plain dict."""
-                m = get_eval_metrics(vis_pred=out['vis_pred'], vis_true=vis_true,
-                                     coords_pred=out['coords_pred'], coords_true=coords, prefix='')
-                return {k: float(v) for k, v in m.items() if np.ndim(v) == 0}
-
-            with share_scene(model):
-                bx = getattr(batch, 'box_prompt', None)
-                bx = None if bx is None else bx.to(device)
-                out = model(views, kpt_ids, cgroup, mode=mode, kpt_prior=None, prompt_time=None,
-                            box_prompt=bx)
-                free.append(score(out))
-                prompted.append(score(self_prompt(model, views, kpt_ids, cgroup, mode, out,
-                                                  box_prompt=bx)))
-    finally:
-        model.train()
-        if hasattr(optimizer, 'train'):
-            optimizer.train()
-    return (_reduce(dist_utils.gather_metrics(fabric, free)),
-            _reduce(dist_utils.gather_metrics(fabric, prompted)))
-
-
-def _reduce(mets):
-    """nanmean over windows, with the non-finite count alongside."""
-    if not mets:
-        return {}
-    skipped = sum(not all(np.isfinite(v) for v in m.values()) for m in mets)
-    out = {k: float(np.nanmean([m[k] for m in mets])) for k in mets[0]}
-    out['n_batches'] = len(mets)
-    out['n_nonfinite'] = skipped
-    return out
 
 
 def main(argv: list[str] | None = None):
@@ -523,10 +358,10 @@ def main(argv: list[str] | None = None):
     opt.train()
     step = dist_utils.ceil_div(start_it, world)
     it, skipped, t0, running, clipped = step * world, 0, time.time(), [], []
-    smoothness_running = {name: [0.0, 0] for name in _SMOOTHNESS_KEYS}
+    smoothness_running = {name: [0.0, 0] for name in SMOOTHNESS_KEYS}
     metrics_running = {
-        mode: {name: [0.0, 0] for name in _TRAIN_METRIC_KEYS}
-        for mode in _TRAIN_METRIC_MODES}
+        mode: {name: [0.0, 0] for name in TRAIN_METRIC_KEYS}
+        for mode in TRAIN_METRIC_MODES}
     metric_freq = int(train_cfg.get('train_metric_freq', 1))
     local_metric_freq = dist_utils.per_rank(metric_freq, world) if metric_freq else 0
     best_mpjpe, best_iter, saved_mpjpe = float('inf'), start_it, float('inf')
@@ -570,7 +405,7 @@ def main(argv: list[str] | None = None):
                     record({'iter': it, 'ddp_rewrapped': True})
             loss, out = run_batch(model, loss_fn, batch, device, raw=raw)
             if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(loss))):
-                _drain_smoothness(loss_fn)
+                drain_smoothness(loss_fn)
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
@@ -583,7 +418,7 @@ def main(argv: list[str] | None = None):
             mgn = torch.nn.utils.get_total_norm(mgrads) if mgrads else gn.new_zeros(())
             if not dist_utils.all_ranks_finite(
                     fabric, bool(torch.isfinite(gn) and torch.isfinite(mgn))):
-                _drain_smoothness(loss_fn)
+                drain_smoothness(loss_fn)
                 skipped += 1
                 opt.zero_grad(set_to_none=True)
                 step += 1
@@ -597,7 +432,7 @@ def main(argv: list[str] | None = None):
                     for name, value in train_metrics(out, batch).items():
                         bucket[name][0] += value
                         bucket[name][1] += 1
-            for name, (total, count) in _drain_smoothness(loss_fn).items():
+            for name, (total, count) in drain_smoothness(loss_fn).items():
                 smoothness_running[name][0] += total
                 smoothness_running[name][1] += count
             clipped.append(float(max_grad is not None and float(gn) > max_grad))
@@ -616,8 +451,8 @@ def main(argv: list[str] | None = None):
                              f'peak {peak_gb:5.1f}G  skipped {skipped * world}  '
                              f'[{batch.sample_info["dataset"]}/{batch.sample_info["mode"]}'
                              f'{"/1cam" if batch.sample_info["single_view"] else ""}]', flush=True)
-                smoothness = _smoothness_log_values(smoothness_running, fabric)
-                train_metric_values = _metric_log_values(metrics_running, fabric)
+                smoothness = smoothness_log_values(smoothness_running, fabric)
+                train_metric_values = metric_log_values(metrics_running, fabric)
                 log(wb, {'train/loss': float(np.mean(running)), 'train/grad_norm': float(gn),
                          'train/grad_norm_muon': float(mgn),
                          'train/iteration': it,
@@ -630,10 +465,10 @@ def main(argv: list[str] | None = None):
                          'train/skipped_frac': skipped / max(step, 1),
                          'train/world_size': world, **smoothness, **train_metric_values}, it)
                 record({'iter': it, 'train': train_metric_values})
-                smoothness_running = {name: [0.0, 0] for name in _SMOOTHNESS_KEYS}
+                smoothness_running = {name: [0.0, 0] for name in SMOOTHNESS_KEYS}
                 metrics_running = {
-                    mode: {name: [0.0, 0] for name in _TRAIN_METRIC_KEYS}
-                    for mode in _TRAIN_METRIC_MODES}
+                    mode: {name: [0.0, 0] for name in TRAIN_METRIC_KEYS}
+                    for mode in TRAIN_METRIC_MODES}
                 running, t0 = [], time.time()
                 waited[0] = evalled[0] = ckpted[0] = 0.0
 
@@ -641,8 +476,8 @@ def main(argv: list[str] | None = None):
                 t_val = time.time()
                 m, ms = evaluate(raw, val_batches, opt, device, fabric=fabric)
                 evalled[0] += time.time() - t_val
-                fabric.print(f'  EVAL  ({time.time() - t_val:.0f}s)  prior-free {_brief(m)}\n'
-                             f'        self-prompted {_brief(ms)}', flush=True)
+                fabric.print(f'  EVAL  ({time.time() - t_val:.0f}s)  prior-free {brief(m)}\n'
+                             f'        self-prompted {brief(ms)}', flush=True)
                 log(wb, {f'val/{k}': v for k, v in m.items()}, it)
                 log(wb, {f'val_self/{k}': v for k, v in ms.items()}, it)
                 if np.isfinite(m.get('mpjpe', np.nan)):

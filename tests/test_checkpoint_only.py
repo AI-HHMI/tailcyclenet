@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet.pose import checkpoint as pck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
 from tailcyclenet.scorer.checkpoint import load_scorer_run, save_scorer_checkpoint
@@ -74,7 +75,7 @@ def _train_run(tmp_path, kind):
 
 
 def _load(kind, where, **kw):
-    return (ck.load_run if kind == 'pose' else load_scorer_run)(where, **kw)
+    return (pck.load_run if kind == 'pose' else load_scorer_run)(where, **kw)
 
 
 def _same_weights(a, b):
@@ -178,6 +179,6 @@ def test_a_checkpoint_of_the_wrong_kind_is_refused(tmp_path):
     with pytest.raises(ValueError, match="'pose' checkpoint, not a 'scorer'"):
         load_scorer_run(pose)
     with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
-        ck.load_run(scorer)
+        pck.load_run(scorer)
     with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
         package_pose(scorer_run, tmp_path / 'x.pth', kind='pose')

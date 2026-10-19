@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet.pose import checkpoint as pck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
 from tailcyclenet.scorer.dataset import ScorerDataset
@@ -225,7 +226,7 @@ def test_validation_measures_the_averaged_iterate_and_it_round_trips(tmp_path, m
     raised error leave the model and the optimizer in TRAIN mode.
     """
     from tailcyclenet.scorer import train as st
-    from tailcyclenet.optim import build_optimizer
+    from tailcyclenet.pose.optim import build_optimizer
 
     monkeypatch.setattr(st, 'triplet_to_device', lambda trip, device: trip)
     monkeypatch.setattr(st, '_per_type_accuracy', lambda scores, fired: {'acc': 0.0})
@@ -334,10 +335,10 @@ def test_warm_start_names_is_the_source_registry_and_copies_only_its_rows(tmp_pa
                ckpt)
     wide = _KptModel(5)
     before = wide.query_encoder.kpt_embed.weight.detach().clone()
-    fresh = ck.warm_start(wide, ckpt, verbose=False, base_names=warm_start_names(grown))
+    fresh = pck.warm_start(wide, ckpt, verbose=False, base_names=warm_start_names(grown))
     assert torch.equal(wide.query_encoder.kpt_embed.weight.detach(), before)
     assert name in fresh, 'the whole table is left fresh'
-    fresh = ck.warm_start(wide, ckpt, verbose=False, base_names=warm_start_names(source))
+    fresh = pck.warm_start(wide, ckpt, verbose=False, base_names=warm_start_names(source))
     got = wide.query_encoder.kpt_embed.weight.detach()
     assert torch.equal(got[:3], model.query_encoder.kpt_embed.weight.detach())
     assert torch.equal(got[3:], before[3:]), 'the appended rows must be untouched by the copy'
@@ -380,7 +381,7 @@ def test_widening_the_identity_table_does_not_move_it_between_optimizer_groups()
     and the schedule-free path pins it by NAME (`query_encoder.kpt_`). A change here would
     silently retune the identity table the moment the warm start starts working.
     """
-    from tailcyclenet.optim import build_optimizer
+    from tailcyclenet.pose.optim import build_optimizer
 
     for kind in ('muon', 'schedulefree'):
         cfg = {'optimizer': kind, 'learning_rate': 1e-4, 'kpt_lr': 5e-4, 'encoder_lr_scale': 0.1,

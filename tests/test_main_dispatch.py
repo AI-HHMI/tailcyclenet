@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from tailcyclenet import __main__ as dispatcher
-from tailcyclenet import train as train_module
+from tailcyclenet.pose import train as train_module
 
 
 def test_dispatch_keeps_the_subcommand_and_a_respawn_redispatches(monkeypatch):

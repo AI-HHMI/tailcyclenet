@@ -11,12 +11,12 @@ import pytest
 import torch
 import torch.nn as nn
 
-import tailcyclenet.train as tr
+import tailcyclenet.pose.train as tr
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet import runtime
 from tailcyclenet.dataset import _reader_cache_size
-from tailcyclenet.optim import build_muon, group_lr
-from tailcyclenet.unfreeze import apply_staged_unfreeze
+from tailcyclenet.pose.optim import build_muon, group_lr
+from tailcyclenet.pose.unfreeze import apply_staged_unfreeze
 
 from tests.test_optim import Tiny, _cfg
 
@@ -70,7 +70,7 @@ def test_scaling_touches_only_the_absolute_rates():
 def test_the_live_unfreeze_and_the_resume_replay_read_the_scaled_config(tmp_path):
     """The build, the live unfreeze (thousands of steps later) and the resume replay all read ONE
     scaled dict, so the encoder group lands at the scaled rate on both paths."""
-    from tailcyclenet import start
+    from tailcyclenet.pose import start
     from tailcyclenet.checkpoints import save_checkpoint
     from tailcyclenet.format import Registry
 

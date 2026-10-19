@@ -367,18 +367,73 @@ def test_write_bridge_provenance_merges_into_an_existing_session_toml(tmp_path):
     assert doc['mode'] == '3d' and doc['names'] == ['a', 'b']
 
 
-def test_bridge_session_writes_provenance_before_any_early_return():
-    """`bridge_session` must record the bridge's config even when there is nothing to bridge --
-    an absent identity_events.pq (no tracker events at all) is the FIRST early-return point in
-    the function, so the write must happen before it, not after.
-    """
-    import inspect
+def _bridgeable_session(tmp_path):
+    """A complete prediction session header, a points3d table with `slot`, and windows.pq."""
+    import toml
 
-    src = inspect.getsource(bridge.bridge_session)
-    write_at = src.index('_write_bridge_provenance(')
-    first_return = src.index("if not epath.exists():")
-    assert write_at < first_return, \
-        'provenance must be written before the first early return, not after'
+    from tailcyclenet.format import DICT_COLS, write_table
+
+    (tmp_path / 'session.toml').write_text(toml.dumps({
+        'mode': '3d', 'names': ['n'], 'prediction_session': True, 'complete': True,
+        'provenance': {'run': 'r', 'checkpoint': 'c'}}))
+    frames = np.array([0, 0, 5, 5, 20, 20], np.int32)
+    write_table(tmp_path / 'points3d.pq', {
+        'group_id': np.array(['g'] * 6, dtype=object), 'frame': frames,
+        'animal_id': np.array(['a0', 'a1'] * 3, dtype=object),
+        'bodypart': np.array(['n'] * 6, dtype=object),
+        'status': np.array(['visible'] * 6, dtype=object),
+        'x': np.arange(6, dtype=np.float32), 'y': np.zeros(6, np.float32),
+        'z': np.zeros(6, np.float32), 'slot': np.array([0, 1] * 3, np.int32)},
+        dict_cols=DICT_COLS)
+    write_table(tmp_path / 'windows.pq', {
+        'group_id': np.array(['g', 'g'], dtype=object),
+        'animal_id': np.array(['a0', 'a1'], dtype=object),
+        'slot': np.array([0, 1], np.int32), 'window': np.array([0, 0], np.int32),
+        'frame': np.array([0, 0], np.int32)}, dict_cols=DICT_COLS)
+    return tmp_path
+
+
+def test_a_release_moves_the_slot_with_the_animal_id(tmp_path):
+    """A permutation relabels `animal_id`; `slot` (the animal's row) must follow it, or the two
+    columns disagree on every released row."""
+    path = _bridgeable_session(tmp_path)
+    plan = {'component': [0, 1], 'windows': [0, 1], 'release': 1, 'mapping': [1, 0],
+            'refused': False}
+    bridge.rewrite_tables(path, 'g', ['a0', 'a1'], {0: np.arange(0, 10), 1: np.arange(10, 30)},
+                          [plan], n_frames=30)
+    out = pl.read_parquet(path / 'points3d.pq')
+    pairs = set(zip(out['animal_id'].cast(pl.String).to_list(), out['slot'].to_list()))
+    assert pairs == {('a0', 0), ('a1', 1)}
+    got = dict(zip(out['animal_id'].cast(pl.String).to_list(), out['x'].to_list()))
+    assert got['a0'] == pytest.approx(5.0)
+
+
+def test_bridge_session_marks_the_session_incomplete_while_it_edits(tmp_path, monkeypatch):
+    """The bridge edits a session the writer already marked complete. A crash part-way must
+    leave it `complete = false` (refused by every loader); success restores `complete = true`
+    and records the bridge provenance, even when there is nothing to bridge."""
+    import tomllib
+
+    path = _bridgeable_session(tmp_path)
+
+    def read():
+        """The session header as written."""
+        with open(path / 'session.toml', 'rb') as f:
+            return tomllib.load(f)
+
+    monkeypatch.setattr(bridge, 'load_predictions', lambda p: ({}, {}))
+    assert bridge.bridge_session(path, bridge.BridgeConfig(), 10) == {}
+    doc = read()
+    assert doc['complete'] is True and 'bridge_min_margin' in doc['provenance']
+
+    def boom(*a, **k):
+        """Fail the way a part-way bridge crash would."""
+        raise RuntimeError('crash mid-bridge')
+
+    monkeypatch.setattr(bridge, '_bridge_loaded', boom)
+    with pytest.raises(RuntimeError, match='mid-bridge'):
+        bridge.bridge_session(path, bridge.BridgeConfig(), 10)
+    assert read()['complete'] is False
 
 
 def test_boundary_fill_map_matches_one_to_one_by_centre_distance():

@@ -954,12 +954,14 @@ def test_strong_augment_never_drops_a_box(tiny_root):
 
 
 def test_mosaic_paste_is_fully_interior_and_reencodes_the_crop_rule(tiny_root):
-    """The appended box is `src_box + translation`, entirely inside `input_wh`."""
+    """The appended box is `src_box + translation`, entirely inside `input_wh`. The item's own
+    boxes are dropped so the tiny canvas has empty space (the overlap test is in
+    tests/detector/test_recipe_bump.py)."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
                     max_frames_per_group=2, augment=True, strong=True, seed=0)
     rng = np.random.default_rng(1)
     for i in range(min(3, len(ds))):
-        base = ds.boxes_for(i)
+        base = ds.boxes_for(i)[:0]
         img, _ = ds._load_letterbox(i)
         boxes, img2 = ds._mosaic_paste(i, base.clone(), img.copy(), rng)
         if boxes.shape[0] == base.shape[0]:

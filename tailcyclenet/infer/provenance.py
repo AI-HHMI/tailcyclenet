@@ -4,6 +4,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..checkpoints import provenance
+from ..detector.boxes import NMS_CENTER_DIST
+
+
+def _center_dist(args) -> float:
+    """The centre-distance NMS gate the detections were decoded with: the flag's value, the
+    shared default when a caller's namespace never set it, and 0.0 for an explicit None -- the
+    gate is off, which a 0.0 threshold is (every box is at distance >= 0)."""
+    v = getattr(args, 'det_nms_center_dist', NMS_CENTER_DIST)
+    return 0.0 if v is None else float(v)
 
 
 def box_provenance(args, det_tile, det_red, det_boxsrc):
@@ -24,8 +33,7 @@ def box_provenance(args, det_tile, det_red, det_boxsrc):
         'detector_checkpoint': str(getattr(args, '_detector_checkpoint', '') or ''),
         'det_score': float(args.det_score),
         'det_nms_iou': float(args.det_nms_iou),
-        'det_nms_center_dist': (float(args.det_nms_center_dist)
-                               if args.det_nms_center_dist is not None else 0.0),
+        'det_nms_center_dist': _center_dist(args),
         'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
         'max_animals': int(args.max_animals),
         'max_frames': int(args.max_frames),

@@ -6,11 +6,10 @@ paths (NMS, association, tracking) and the numpy path (`link_rows`) share one fo
 import numpy as np
 import torch
 
-# The centre-distance NMS gate, in box sides: SELECT is what training scores and selects a
-# checkpoint under, DEPLOY what `infer --det-nms-center-dist` and the eval scripts default to.
-# They differ (detector B15, owed as a Tier-B recipe bump); named so the difference is visible.
-NMS_CENTER_DIST_SELECT = 0.5
-NMS_CENTER_DIST_DEPLOY = 0.3
+# The centre-distance NMS gate, in box sides: ONE value for training's scoring and checkpoint
+# selection and for deployment (`infer --det-nms-center-dist`, the eval scripts). Selection used
+# 0.5 before the detector-recipe bump that unified it (detector B15).
+NMS_CENTER_DIST = 0.3
 
 
 def _stack(xs, like):

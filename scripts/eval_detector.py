@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.data.crop import BOX_SOURCES
-from tailcyclenet.detector.boxes import NMS_CENTER_DIST_DEPLOY
+from tailcyclenet.detector.boxes import NMS_CENTER_DIST
 from tailcyclenet.detector.dataset import BoxDataset
 from tailcyclenet.detector.checkpoint import load_detector
 from tailcyclenet.evaluation.deployment import deployment_score
@@ -177,7 +177,7 @@ def main():
                     help="decode's box-NMS IoU threshold; 0.5 was hardcoded and unreachable "
                          'before detector_v2 plan A1. Sweep upward (RTMDet 0.65, DLC/SLEAP '
                          'instance-level 0.8), not around 0.5.')
-    ap.add_argument('--nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
+    ap.add_argument('--nms-center-dist', type=float, default=NMS_CENTER_DIST,
                     help='centre-distance NMS threshold in units of box side (scale-free); a '
                          'candidate is also dropped if its centre sits within this many box '
                          'sides of an already-kept box, regardless of IoU. 0.3 is the deployment '

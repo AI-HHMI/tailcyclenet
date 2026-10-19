@@ -34,7 +34,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..data.crop import BOX_SOURCES
-from .boxes import NMS_CENTER_DIST_SELECT
+from .boxes import NMS_CENTER_DIST
 from .yolox import ARCHITECTURES, PRETRAINED_TRUNKS
 
 # THE ALLOWED KEYS, PER BLOCK. Anything else raises -- see module docstring. These are the
@@ -252,7 +252,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     if train['weight_decay'] < 0:
         raise SystemExit(f"[training].weight_decay must be >= 0, got {train['weight_decay']}.")
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
-    ncd = train.get('nms_center_dist_thresh', NMS_CENTER_DIST_SELECT)
+    ncd = train.get('nms_center_dist_thresh', NMS_CENTER_DIST)
     train['nms_center_dist_thresh'] = None if ncd in (None, '', []) else float(ncd)
     for k in ('rotate_deg', 'tile_scale'):
         data[k] = float(data[k])

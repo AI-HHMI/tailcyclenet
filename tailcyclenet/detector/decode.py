@@ -1,11 +1,11 @@
 """Decoding one image's per-anchor outputs into NMS'd boxes."""
 import torch
 
-from .boxes import NMS_CENTER_DIST_SELECT, box_center_dist, box_iou
+from .boxes import NMS_CENTER_DIST, box_center_dist, box_iou
 
 
 def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
-          center_dist_thresh=NMS_CENTER_DIST_SELECT, return_trace=False):
+          center_dist_thresh=NMS_CENTER_DIST, return_trace=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     Inputs:
@@ -18,7 +18,7 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
             it through.
         center_dist_thresh -- second, independent survival condition in units of box side (see
             `box_center_dist`): suppresses near-concentric duplicates IoU alone lets through.
-            Default `NMS_CENTER_DIST_SELECT` (plan A5; deployment passes `_DEPLOY`); pass
+            Default `NMS_CENTER_DIST` (plan A5; selection and deployment alike); pass
             None for the pre-A5 byte-identical behaviour.
         return_trace -- adds an output-neutral diagnostic dict (candidate counts, pre/post-NMS
             boxes and scores); opt-in because it retains tensors.

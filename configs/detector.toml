@@ -111,7 +111,7 @@ batch_size = 8
 lr = 1e-3
 num_workers = 8
 seed = 23
-# model init, augmentation draws and the train shuffle order; a same-recipe replicate (different seed) is not optional before trusting a detector arm.
+# model init, augmentation draws (per worker, so fixed for a given num_workers) and the train shuffle order; a same-recipe replicate (different seed) is not optional before trusting a detector arm.
 device = "cuda:0"
 
 eval_every = 2000

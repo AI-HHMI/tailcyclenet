@@ -22,7 +22,7 @@ import torch
 
 from ..evaluation.metrics import mota
 from .decode import decode
-from .boxes import NMS_CENTER_DIST_SELECT, box_iou
+from .boxes import NMS_CENTER_DIST, box_iou
 from .sampling import ChunkShuffle, box_collate
 
 
@@ -123,15 +123,15 @@ def _summarise(s):
             'mota': (sum(r['mota'] * r['gt'] for r in m if np.isfinite(r['mota'])) / gt
                      if gt else float('nan')),
             'fp_ignored': sum(r['fp_ignored'] for r in m),
-            'fp_dup': (sum(r['fp_dup'] for r in m) / gt) if gt else float('nan'),
-            'fp_none': (sum(r['fp_none'] for r in m) / gt) if gt else float('nan'),
+            'fp_dup': (sum(r['fp_dup'] for r in m) / max(gt, 1)) if m else float('nan'),
+            'fp_none': (sum(r['fp_none'] for r in m) / max(gt, 1)) if m else float('nan'),
             'miss': (sum(r['misses'] for r in m) / gt) if gt else float('nan')}
 
 
 @torch.no_grad()
 def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_thresh=0.05,
                   num_workers=4, max_animals=None, out_scores=None, iou_thresh=0.5,
-                  center_dist_thresh=NMS_CENTER_DIST_SELECT, subset_indices=None,
+                  center_dist_thresh=NMS_CENTER_DIST, subset_indices=None,
                   root_qualified_keys=False):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
@@ -218,18 +218,23 @@ def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_th
 
 @torch.no_grad()
 def overall(rows):
-    """Weight groups by their labelled-box count. The per-group table is the unweighted view.
+    """Weight groups by their labelled-box count; `fp` pools every group's false positives,
+    including a group with no labelled box (its `fp` is a raw count -- `_summarise` floors the
+    denominator at 1 -- so it is weighted by that floor, not by 0). The per-group table is the
+    unweighted view.
 
     Notes.
 
     `fp_ignored` is a raw count, like every other place it is reported -- see `_summarise`.
-    `fp_dup`/`fp_none`/`miss` are already per-GT rates (see `_summarise`), so they are weighted
-    by `n_gt` the same way `mota` is, and the same way a group with none of `box_mota`'s inputs
+    `fp_dup`/`fp_none`/`miss` are already per-GT rates (see `_summarise`; the two false-positive
+    rates are raw counts on a group with no labelled box), so they are weighted by `n_gt` (floored
+    at 1 for the false positives) the same way `mota` is, and the same way a group with none of `box_mota`'s inputs
     (no `mota` rows at all) drops out rather than contaminating the mean with a NaN.
     """
     n = sum(r['n_gt'] for r in rows.values()) or 1
     out = {k: sum(r[k] * r['n_gt'] for r in rows.values()) / n
-           for k in ('r50', 'r75', 'iou', 'fp')}
+           for k in ('r50', 'r75', 'iou')}
+    out['fp'] = sum(r['fp'] * max(r['n_gt'], 1) for r in rows.values()) / n
     m = [r for r in rows.values() if np.isfinite(r['mota'])]
     out['mota'] = (sum(r['mota'] * r['n_gt'] for r in m) / sum(r['n_gt'] for r in m)
                    if m else float('nan'))
@@ -237,8 +242,9 @@ def overall(rows):
     out['fp_ignored'] = sum(r.get('fp_ignored', 0) for r in rows.values())
     for k in ('fp_dup', 'fp_none', 'miss'):
         mk = [r for r in rows.values() if np.isfinite(r.get(k, float('nan')))]
-        out[k] = (sum(r[k] * r['n_gt'] for r in mk) / sum(r['n_gt'] for r in mk)
-                  if mk else float('nan'))
+        floor = 1 if k != 'miss' else 0
+        out[k] = (sum(r[k] * max(r['n_gt'], floor) for r in mk)
+                  / (sum(r['n_gt'] for r in mk) or 1) if mk else float('nan'))
     return out
 
 

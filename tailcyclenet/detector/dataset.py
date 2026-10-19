@@ -76,6 +76,19 @@ def _floor_extent(boxes, min_side):
     return out
 
 
+def _overlaps_any(region, boxes) -> bool:
+    """Whether the (x0, y0, x1, y1) `region` intersects any row of `boxes` (N, 4) with positive
+    area."""
+    if not len(boxes):
+        return False
+    x0, y0, x1, y1 = region
+    iw = (torch.minimum(boxes[:, 2], torch.tensor(float(x1)))
+          - torch.maximum(boxes[:, 0], torch.tensor(float(x0))))
+    ih = (torch.minimum(boxes[:, 3], torch.tensor(float(y1)))
+          - torch.maximum(boxes[:, 1], torch.tensor(float(y0))))
+    return bool(((iw > 0) & (ih > 0)).any())
+
+
 class BoxDataset(IndexWeights, Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
@@ -152,6 +165,7 @@ class BoxDataset(IndexWeights, Dataset):
         self.strong = bool(strong)
         self.reduce = reduce
         self.seed = seed
+        self._visits = 0
         all_datasets = load_datasets(path) if datasets is None else datasets
         split_datasets = (load_datasets(path, split=split) if datasets is None else
                           [replace(ds, sessions={split: ds.sessions[split]})
@@ -556,8 +570,9 @@ class BoxDataset(IndexWeights, Dataset):
         space of this item's rendered image, at a location fully interior to `input_wh`.
 
         Not a 4-quadrant mosaic: a quadrant clips the animal on its seam, and a clipped extent is
-        not a box the crop rule ever emits. A placement that would not fit is redrawn a few times,
-        and the item is returned unchanged if none fits.
+        not a box the crop rule ever emits. "Empty" is tested: a placement whose pasted region
+        intersects any of this item's own boxes is redrawn (it would cover a real animal whose box
+        stays a positive target), and the item is returned unchanged if none fits.
 
         An `extent` target stops at the outermost POINT,
         not the animal's edge, so its paste carries a quarter-side margin of context.
@@ -585,8 +600,14 @@ class BoxDataset(IndexWeights, Dataset):
             bw, bh = x1 - x0, y1 - y0
             if bw <= 0 or bh <= 0 or bw > self.input_wh[0] or bh > self.input_wh[1]:
                 continue
-            dx = int(rng.integers(0, self.input_wh[0] - bw + 1))
-            dy = int(rng.integers(0, self.input_wh[1] - bh + 1))
+            own = boxes[torch.isfinite(boxes).all(-1)]
+            for _ in range(8):
+                dx = int(rng.integers(0, self.input_wh[0] - bw + 1))
+                dy = int(rng.integers(0, self.input_wh[1] - bh + 1))
+                if not _overlaps_any((dx, dy, dx + bw, dy + bh), own):
+                    break
+            else:
+                continue
             img = img.copy()
             img[dy:dy + bh, dx:dx + bw] = src_img[y0:y1, x0:x1]
             offset = torch.tensor([dx - x0, dy - y0, dx - x0, dy - y0], dtype=boxes.dtype)
@@ -594,18 +615,27 @@ class BoxDataset(IndexWeights, Dataset):
             break
         return boxes, img
 
+    def _visit_rng(self):
+        """The augmentation generator of this process's next train visit (see `__getitem__`)."""
+        info = torch.utils.data.get_worker_info()
+        self._visits += 1
+        return np.random.default_rng([int(self.seed), 0 if info is None else info.id + 1,
+                                      self._visits])
+
     def __getitem__(self, i):
         """Decode item `i`: letterboxed/tiled pixels, boxes, and whether the view's background
         negatives are supervised.
 
-        Fresh entropy is drawn per train visit; evaluation is deterministic. Under tiling the
+        A train visit draws its augmentation from `(seed, worker, visit)`, so `[training].seed`
+        fixes the stream for a given `num_workers` (the DataLoader hands batches to workers in a
+        fixed order); evaluation draws nothing. Under tiling the
         input is the frame at `tile_scale`, not the tile size. One warpAffine composes decode
         scale, augmentation and letterbox-or-tile geometry. The strong suite is appearance-only
         except cutout, which withholds targets it covers.
         """
         sess, gid, f, ci = self.index[i]
         size = tuple(sess.rig.size(sess.cam_names[ci]))
-        rng = np.random.default_rng(None) if self.augment and self.train else None
+        rng = self._visit_rng() if self.augment and self.train else None
         warp = (random_affine(size, rng, scale=self.scale_range, hflip=self.hflip,
                               rotate_deg=self.rotate_deg, centre=self._warp_centre(i),
                               vflip=self.vflip)

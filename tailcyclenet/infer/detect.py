@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from ..detector.boxes import NMS_CENTER_DIST_SELECT
+from ..detector.boxes import NMS_CENTER_DIST
 from ..detector.checkpoint import tiled_input_wh
 from ..detector.decode import decode
 
@@ -13,7 +13,7 @@ from ..detector.decode import decode
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
-               iou_thresh=0.5, center_dist_thresh=NMS_CENTER_DIST_SELECT, trace=None,
+               iou_thresh=0.5, center_dist_thresh=NMS_CENTER_DIST, trace=None,
                trace_detail=False,
                box_source=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.

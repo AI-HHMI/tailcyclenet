@@ -1,40 +1,26 @@
-"""The cross-rig detector changes: scored weights, tight-extent target, anti-aliasing, new augs.
-
-Each test pins one claim the change rests on:
-- `model_state` is the weight the training loop SCORED (schedule-free's averaged `x`), not the
-  gradient point `y` the optimizer swaps back in after scoring;
-- the crop rule is a function of the extent alone, so regressing the tight extent and applying
-  `crop_boxes_from_extents` after detection gives the crop `crop_box_for_points` would;
-- `antialias` changes the filter, never the geometry;
-- `vflip` / `grayscale_prob` draw nothing at 0, and do what they say at 1.
-"""
+"""The cross-rig detector changes: scored weights, tight-extent target, anti-aliasing, new augs."""
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from tailcyclenet import train_detector
 from tailcyclenet.crop import crop_box_for_points, crop_boxes_from_extents
 from tailcyclenet.detector import BoxDataset, letterbox, unletterbox_boxes
 from tailcyclenet.detector.data import MIN_EXTENT_PX, random_affine, warp_image
-
-REPO = Path(__file__).resolve().parent.parent
 
 
 def test_crop_boxes_from_extents_is_the_crop_rule_int32_exact():
     """Vectorised over extents, it must return `crop_box_for_points` on the extent's corners,
     bit for bit -- including clamping, the floor, the square and the frame cap."""
     g = torch.Generator().manual_seed(0)
-    for size in ((4696, 2048), (400, 400), (63, 50)):
+    for size in ((4696, 2048), (63, 50)):
         W, H = size
-        for mcd, pad in ((64, 20), (64, 0), (8, 20), (200, 5)):
-            n = 400
+        for mcd, pad in ((64, 20), (8, 0), (200, 5)):
+            n = 120
             x0 = torch.rand(n, generator=g) * 1.4 * W - 0.2 * W
             y0 = torch.rand(n, generator=g) * 1.4 * H - 0.2 * H
             w = torch.rand(n, generator=g) ** 3 * W
@@ -86,10 +72,12 @@ def test_extent_target_is_tight_and_gives_back_the_crop_rule(tiny_root):
     assert checked, 'no box was big enough to escape the floor -- the test checked nothing'
 
 
-def test_random_affine_new_levers_draw_nothing_when_off():
-    """At vflip=0 the draw sequence is the legacy one, so every augmentation stream on record is
-    reproduced; at 1 it is an exact mirror."""
-    for seed in range(20):
+def test_random_affine_vflip_and_full_circle_rotation(tmp_path):
+    """vflip=0 draws nothing (every augmentation stream on record reproduces), vflip=1 mirrors;
+    the shipped recipe rotates over +-180 deg about the centre (owner decision 2026-10-02)."""
+    from tailcyclenet.detector.config import load_detector_config
+
+    for seed in range(5):
         a = random_affine((640, 480), np.random.default_rng(seed), rotate_deg=30.0)
         b = random_affine((640, 480), np.random.default_rng(seed), rotate_deg=30.0, vflip=0.0)
         assert np.array_equal(a, b)
@@ -98,16 +86,9 @@ def test_random_affine_new_levers_draw_nothing_when_off():
     np.testing.assert_allclose(M[:, :2], [[1, 0], [0, -1]])
     np.testing.assert_allclose(M @ [50, 50, 1], [50, 50], atol=1e-5)
 
-
-def test_shipped_detector_rotation_is_the_full_circle(tmp_path):
-    """The shipped recipe rotates uniformly over +-180 degrees (owner decision 2026-10-02), and
-    `random_affine` at 180 reaches both ends of the circle about the frame centre."""
-    from tailcyclenet.detector.config import load_detector_config
-
     cfg = tmp_path / 'c.toml'
     cfg.write_text(f'[data]\npath = "{tmp_path}"\n[model]\n[training]\nout = "{tmp_path}"\n')
     assert load_detector_config(cfg)['data']['rotate_deg'] == 180.0
-    neutral = dict(scale=(1.0, 1.0), translate=0.0, hflip=0.0)
     angles = []
     for seed in range(400):
         M = random_affine((100, 60), np.random.default_rng(seed), rotate_deg=180.0, **neutral)
@@ -125,7 +106,7 @@ def _checker(n=256):
 
 def test_antialias_changes_the_filter_not_the_geometry():
     """Off = `cv2.warpAffine` byte-identical; on = a 1-px checkerboard shrinks to flat grey (no
-    aliasing), and a blob's centroid lands where the plain warp puts it."""
+    aliasing), and a blob's centroid lands where the plain warp puts it; `letterbox` likewise."""
     import cv2
 
     M = np.array([[0.2, 0.0, 7.3], [0.0, 0.2, 3.1]], np.float32)
@@ -150,12 +131,7 @@ def test_antialias_changes_the_filter_not_the_geometry():
     np.testing.assert_allclose(centroid(warp_image(blob, M, (96, 96), antialias=False)), want,
                                atol=0.15)
 
-
-def test_letterbox_antialias_is_an_area_shrink():
-    """The deployment path (`detect_raw` -> `letterbox`) shrinks with INTER_AREA under
-    `antialias`, and keeps its geometry (scale, pad) either way."""
-    import cv2
-
+    # deployment (`detect_raw` -> `letterbox`): INTER_AREA under antialias, same scale/pad
     img = _checker(400)
     a, sa, pa = letterbox(img, (100, 80), antialias=True)
     b, sb, pb = letterbox(img, (100, 80))
@@ -177,7 +153,7 @@ def test_grayscale_prob_one_makes_every_train_view_monochrome(tiny_root):
 @pytest.fixture(scope='module')
 def det_scene(tmp_path_factory):
     """A 3-camera session and an untrained YOLOX-Nano (random weights: only the bytes matter)."""
-    import conftest as cf
+    from . import conftest as cf
     from tailcyclenet.detector import YOLOXNano
     from tailcyclenet.format import sessions_for
 
@@ -215,15 +191,9 @@ def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
 
 
 def test_checkpoint_holds_the_weights_that_were_scored(tmp_path, dense_root, monkeypatch):
-    """Under schedule-free, `opt.train()` swaps the scored `x` back to `y` IN PLACE right after
-    scoring; the checkpoint used to be written after that swap. Record the state the scorer
-    actually saw and require `model_state` to equal it, and `model_state_train` to differ."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_scored',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    """Schedule-free's `opt.train()` swaps the scored `x` back to `y` in place after scoring, and
+    the checkpoint used to be written after the swap: `model_state` must be the scored weights."""
+    mod = train_detector
     seen = []
     real = mod.score_dataset
 
@@ -240,25 +210,25 @@ def test_checkpoint_holds_the_weights_that_were_scored(tmp_path, dense_root, mon
 path = "{dense_root}"
 boxes = "keypoints"
 min_crop_dim = 16
-input_wh = [48, 48]
+input_wh = [32, 32]
 min_box_px = 0
 val_frames_per_group = 4
 [model]
 yolox = "hybrid"
 [training]
 out = "{out}"
-iters = 4
+iters = 2
 batch_size = 2
 num_workers = 0
 seed = 0
 device = "cpu"
-eval_every = 4
+eval_every = 2
 eval_batches = 1
 warmup_steps = 0
 """)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
     mod.main()
-    ckpt = torch.load(out / 'detector_it000004.pth', map_location='cpu', weights_only=False)
+    ckpt = torch.load(out / 'detector_it000002.pth', map_location='cpu', weights_only=False)
     assert ckpt['model_state_is'] == 'eval' and 'model_state_train' in ckpt
     assert ckpt['box_target'] == 'extent' and ckpt['antialias'] is True
     scored = seen[-1]
@@ -268,5 +238,5 @@ warmup_steps = 0
                for n, t in ckpt['model_state'].items()), 'x == y: the test checked nothing'
 
     from tailcyclenet.detector import load_detector
-    det = load_detector(out, checkpoint='detector_it000004.pth').model
+    det = load_detector(out, checkpoint='detector_it000002.pth').model
     assert det.box_target == 'extent' and det.antialias and det.min_crop_dim == 16

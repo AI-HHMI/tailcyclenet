@@ -213,43 +213,7 @@ def _segment_mask(P, n_unique, device, cfg, names):
     return all_masks, metadata
 
 
-def tagged_draw_segmented(corruptor, P, T, D, device, cfg):
-    """`tagged_draw` with optional full-trajectory segment gates.
-
-    This deliberately lives beside (rather than inside) :func:`tagged_draw`: the latter is a
-    byte-for-byte reproduction of tracktail's draw and is used by the legacy sequence regression.
-    """
-    names = corruptor.names
-    slot = {n: i for i, n in enumerate(GENERATORS)}
-    fired = torch.zeros(P, len(GENERATORS), dtype=torch.bool, device=device)
-    contributions = {}
-    applied = torch.zeros(P, dtype=torch.bool, device=device)
-    total = torch.zeros(P, T, D, device=device)
-    segment_masks, metadata = _segment_mask(P, T, device, cfg, names)
-    for name in names:
-        shift = GENERATORS[name](P, T, D, device, corruptor.mags[name])
-        contributions[name] = shift
-        mask = torch.rand(P, device=device) < corruptor.probs[name]
-        type_ix = slot[name]
-        shift = shift * segment_masks[:, :, type_ix, None].float()
-        total = total + shift * mask[:, None, None].float()
-        applied = applied | mask
-        fired[:, type_ix] |= mask
-
-    need = ~applied
-    if need.any():
-        pick = torch.randint(0, len(names), (P,), device=device)
-        for ci, name in enumerate(names):
-            m = need & (pick == ci)
-            if m.any():
-                type_ix = slot[name]
-                shift = contributions[name] * segment_masks[:, :, type_ix, None].float()
-                total = total + shift * m[:, None, None].float()
-                fired[:, type_ix] |= m
-    return total, fired, segment_masks, metadata
-
-
-def tagged_draw(corruptor, P, T, D, device):
+def tagged_draw(corruptor, P, T, D, device, segment_masks=None):
     """A `PointCorruptor` draw that ALSO reports which types fired for each point.
 
     Gate B needs `triplet_acc` broken out per corruption type: an aggregate that hides
@@ -261,8 +225,12 @@ def tagged_draw(corruptor, P, T, D, device):
     `PointCorruptor` produce the SAME tensor from the same RNG state -- without that, the tags
     would describe a different draw from the one the model was trained on.
 
+    `segment_masks` ([P,T,len(GENERATORS)] bool, from `_segment_mask`, drawn by the caller BEFORE
+    this call so the RNG order is unchanged) restricts each type's contribution to its segments;
+    None is the library's full-trajectory draw, byte for byte.
+
     Inputs: corruptor -- a `PointCorruptor`; P, T, D -- points, frames, coordinate dim;
-            device -- where to build the draw.
+            device -- where to build the draw; segment_masks -- optional per-type segment gates.
     Outputs: (shift [P,T,D] in unit magnitude space, fired [P, len(GENERATORS)] bool).
     Side effects: draws from the ambient torch RNG.
     """
@@ -276,6 +244,8 @@ def tagged_draw(corruptor, P, T, D, device):
         shift = GENERATORS[name](P, T, D, device, corruptor.mags[name])
         contributions[name] = shift
         mask = torch.rand(P, device=device) < corruptor.probs[name]
+        if segment_masks is not None:
+            shift = shift * segment_masks[:, :, slot[name], None].float()
         total = total + shift * mask[:, None, None].float()
         applied = applied | mask
         fired[:, slot[name]] |= mask
@@ -286,7 +256,10 @@ def tagged_draw(corruptor, P, T, D, device):
         for ci, name in enumerate(names):
             m = need & (pick == ci)
             if m.any():
-                total = total + contributions[name] * m[:, None, None].float()
+                shift = contributions[name]
+                if segment_masks is not None:
+                    shift = shift * segment_masks[:, :, slot[name], None].float()
+                total = total + shift * m[:, None, None].float()
                 fired[:, slot[name]] |= m
     return total, fired
 
@@ -950,8 +923,8 @@ def _draw_shift(corruptor, coords, frames=None, cfg=None, return_metadata=False)
         inverse = np.arange(len(unique), dtype=np.int64)
     use_segments = gated_mode and float(cfg.get('segment_prob', 0.0)) > 0.0
     if use_segments:
-        shifts_u, fired, seg_u, metadata = tagged_draw_segmented(
-            corruptor, b * k, len(unique), dim, coords.device, cfg)
+        seg_u, metadata = _segment_mask(b * k, len(unique), coords.device, cfg, corruptor.names)
+        shifts_u, fired = tagged_draw(corruptor, b * k, len(unique), dim, coords.device, seg_u)
     else:
         shifts_u, fired = tagged_draw(corruptor, b * k, len(unique), dim, coords.device)
         seg_u = torch.ones((b * k, len(unique), len(GENERATORS)), dtype=torch.bool,

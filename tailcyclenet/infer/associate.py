@@ -1,4 +1,7 @@
-"""Cross-view association: per-camera boxes -> 3D instances.
+"""Association: per-camera detections -> one row per animal.
+
+`associate` groups one frame's boxes across cameras into 3D instances; `associate_group` runs it
+(or `CrossViewTracker`, or 2D `link_rows`) over a whole clip.
 
 A 3D pose needs to know that the box in `cam088` and the box in `cam091` are the SAME animal.
 With one animal per view that is free; with ten pigeons and four cameras it is the whole problem.
@@ -22,7 +25,7 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-from .boxes import centres as box_centres
+from ..detector.boxes import centres as box_centres
 
 
 def _triangulate(cgroup, cams, pts):
@@ -187,3 +190,180 @@ def associate(cgroup, boxes_per_cam, max_res_px=30.0, min_views=2, max_instances
                             'boxes': {c: boxes_per_cam[c][i]}, 'members': {c: i}})
                 used.add((c, i))
     return out
+
+
+def associate_group(raw, session, gid, max_instances, link=False, min_views=2,
+                    track=True, max_move=1.25, max_age=8, stats=None,
+                    state=None, duplicate_radius=0.75, duplicate_persist=5, frame_base=0):
+    """The ASSOCIATION half: per-camera detections -> ONE ROW PER ANIMAL. Microseconds per frame.
+
+    Inputs:
+        raw -- `detect_raw`'s (boxes, scores); session, gid, max_instances (row count S).
+        track -- 3D multiview default: `CrossViewTracker`, one cross-view target set carried
+            across frames; `False` restores the memoryless per-frame `associate`.
+        link -- adds `link_rows` in 2D only (the tracker builds when `track and C > 1`).
+        min_views / max_move -- passed through to the tracker / `associate`; max_move defaults
+            to the measured 1.25 box-side gate.
+        max_age -- the tracker's and `link_rows`' SHARED patience window: frames without
+            evidence before a slot or row is retired. The measured default is 8.
+        stats -- accumulates association counters when given.
+        state -- makes calls equal to one concatenated call; `None` builds fresh state.
+        duplicate_radius / duplicate_persist -- the 3D --track backstop's duplicate-retirement
+            geometry; inert without a tracker (2D or track=False).
+        frame_base -- the SOURCE frame of `raw`'s own frame 0, threaded to a freshly built
+            tracker so its `identity_events` are source-absolute even on a ranged run whose
+            tracker is first built on an aligned lead-in batch; inert once `state` already
+            holds one (the tracker is built exactly once).
+    Outputs:
+        The same pair re-indexed so row `a` is one animal -- across cameras always, and across
+        frames wherever a tracker or `link_rows` ran. In 2D the row index is the only identity.
+    Notes:
+        Cross-view geometry is built once for a static rig, per frame for a moving one.
+    """
+    import numpy as np
+    import torch
+
+    r_box, r_sc = raw
+    D, T, C = r_sc.shape
+    S = max_instances or 1
+    out = np.full((S, T, C, 4), np.nan, np.float32)
+    sc = np.full((S, T, C), np.nan, np.float32)
+    moving = any(session.rig.moving.values())
+    cgroup = None if moving else session.cgroup(gid)
+    if state is None:
+        state = {}
+    if 'tracker' not in state:
+        tracker = None
+        if track and C > 1:
+            from .track import CrossViewTracker
+            tracker = CrossViewTracker(S, max_res_px=session.assoc_res_max_px,
+                                       min_views=min_views,
+                                       max_move=max_move, max_age=max_age,
+                                       duplicate_radius=duplicate_radius,
+                                       duplicate_persist=duplicate_persist,
+                                       frame_base=frame_base)
+        state['tracker'] = tracker
+    tracker = state['tracker']
+
+    def _cam(t, c):
+        """This frame-camera's decoded detections as torch, plus their raw indices.
+
+        LIVENESS IS THE SCORE, NOT THE BOX: `unletterbox_boxes` returns NaN for a detection clamped
+        to no positive area, so filtering on the box would silently drop detections the unsplit
+        pass kept, shifting every later index and with it the `claimed` gather.
+        """
+        ok = np.flatnonzero(np.isfinite(r_sc[:, t, c]))
+        return torch.from_numpy(r_box[ok, t, c]), torch.from_numpy(r_sc[ok, t, c]), ok
+
+    raw_offered = 0
+    for t in range(T):
+        per_cam = [_cam(t, c) for c in range(C)]
+        raw_offered += sum(len(p[2]) for p in per_cam)
+        if C == 1:
+            b, s, ok = per_cam[0]
+            n = min(S, len(ok))
+            out[:n, t, 0] = b[:n].numpy()
+            sc[:n, t, 0] = s[:n].numpy()
+            continue
+        cams = session.cgroup(gid, frame_base + t) if moving else cgroup
+        if tracker is not None:
+            out[:, t], sc[:, t], _ = tracker.step(
+                cams, [p[0] for p in per_cam], [p[1] for p in per_cam])
+            continue
+        groups = associate(cams, [p[0] for p in per_cam],
+                           max_res_px=session.assoc_res_max_px, max_instances=S,
+                           min_views=min_views)
+        for a, g in enumerate(groups[:S]):
+            for c, box in g['boxes'].items():
+                d = g['members'][c]
+                out[a, t, c] = box.numpy()
+                sc[a, t, c] = float(per_cam[c][1][d])
+    pre_link = int(np.isfinite(out).all(-1).sum())
+    if link and tracker is None:
+        out, sc = link_rows(out, sc, max_move=max_move, max_age=max_age,
+                            state=state.setdefault('link', {}))
+    if stats is not None:
+        stats['association_raw_offered'] = stats.get('association_raw_offered', 0) + raw_offered
+        stats['association_pre_link'] = stats.get('association_pre_link', 0) + pre_link
+    if stats is not None:
+        stats['association_kept'] = stats.get('association_kept', 0) + \
+            int(np.isfinite(out).all(-1).sum())
+
+    return out, sc
+
+
+def link_rows(boxes, scores=None, max_move=1.0, max_age=24, state=None):
+    """Reorder instance rows frame by frame so a row follows ONE animal. In place, returns both.
+
+    Inputs:
+        boxes (S,T,C,4), scores (S,T,C) -- `scores` rides the same permutation.
+        max_move -- the identity gate, in units of the animal's own mean box side (never
+            pixels), gated at one side.
+        max_age -- frames without evidence before a row's last box is forgotten.
+        state -- carries the matcher across a call boundary so a clip processed in blocks links
+            exactly as the whole clip does.
+    Outputs:
+        boxes (and scores when given), reordered so row `a` follows one animal.
+    Side effects:
+        In place on `boxes` and `scores`. An unmatched row stays EMPTY rather than taking
+        an arbitrary leftover (a force-assigned row teleports across the frame and widens the
+        crop union); an unclaimed detection may still START a row, but only an empty or expired
+        one.
+    Notes:
+        Matching is against each row's LAST KNOWN box (not frame t-1), so a one-frame
+        detector miss does not break the chain. Frame 0 of the clip is the only frame
+        nothing is matched against; with carried state a block's frame 0 is permuted
+        against the previous block's `last`, exactly as the whole-clip pass does mid-clip.
+    """
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    from ..detector.boxes import centres as box_centres
+    from ..detector.boxes import sides as box_sides
+
+    S, T, C, _ = boxes.shape
+    if state is None or 'last' not in state:
+        last = boxes[:, 0].copy()
+        age = np.zeros(S, int)
+        t0 = 1
+    else:
+        last, age, t0 = state['last'], state['age'], 0
+    for t in range(t0, T):
+        cur = boxes[:, t]
+        cost = np.zeros((S, S), np.float32)
+        for c in range(C):
+            ok_p = np.isfinite(last[:, c]).all(-1)
+            ok_c = np.isfinite(cur[:, c]).all(-1)
+            if not (ok_p.any() and ok_c.any()):
+                continue
+            a, b = last[ok_p, c], cur[ok_c, c]
+            d = np.linalg.norm(box_centres(a)[:, None] - box_centres(b)[None], axis=-1)
+            sa, sb = box_sides(a), box_sides(b)
+            side = 0.5 * (sa[:, None] + sb[None])
+            gap = np.where(side > 0, d / (max_move * np.maximum(side, 1e-6)), np.inf)
+            cost[np.ix_(ok_p, ok_c)] += np.clip(1.0 - gap, 0.0, None)
+        rows, cols = linear_sum_assignment(-cost)
+        taken = {int(r): int(c) for r, c in zip(rows, cols) if cost[r, c] > 0}
+        claimed = set(taken.values())
+        free_dets = [c for c in range(S)
+                     if c not in claimed and np.isfinite(cur[c]).all(-1).any()]
+        open_rows = [r for r in range(S)
+                     if r not in taken and not np.isfinite(last[r]).all(-1).any()]
+        for r, c in zip(open_rows, free_dets):
+            taken[r] = c
+        out = np.full_like(cur, np.nan)
+        sc = None if scores is None else np.full_like(scores[:, t], np.nan)
+        for r, c in taken.items():
+            out[r] = cur[c]
+            if sc is not None:
+                sc[r] = scores[:, t][c]
+        boxes[:, t] = out
+        if sc is not None:
+            scores[:, t] = sc
+        seen = np.isfinite(boxes[:, t]).all(-1)
+        last = np.where(seen[..., None], boxes[:, t], last)
+        age = np.where(seen.any(-1), 0, age + 1)
+        last[age > max_age] = np.nan
+    if state is not None:
+        state['last'], state['age'] = last, age
+    return boxes if scores is None else (boxes, scores)

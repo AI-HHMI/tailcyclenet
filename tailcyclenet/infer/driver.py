@@ -306,7 +306,8 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
     once per group; leaving the cursor at 0 would decode every frame from 0 to `frame_start`
     into a store sized for the work.
     """
-    from tailcyclenet.detector import associate_group, detect_raw
+    from tailcyclenet.infer.associate import associate_group
+    from tailcyclenet.infer.detect import detect_raw
 
     T = min(sess.groups[gid].n_frames, args.frame_stop or sess.groups[gid].n_frames)
     assoc_state, buf = {}, {}
@@ -649,7 +650,7 @@ def run_dataset(args):
     det = det_wh = det_tile = det_boxsrc = None
     det_red = False
     if args.detector:
-        from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
+        from tailcyclenet.detector.checkpoint import load_detector, resolve_detector_checkpoint
         det_path = resolve_detector_checkpoint(args.detector, args.detector_checkpoint)
         args._detector_checkpoint = str(det_path.resolve())
         loaded = load_detector(det_path, device)

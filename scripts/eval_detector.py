@@ -20,8 +20,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import BOX_SOURCES
-from tailcyclenet.detector import NMS_CENTER_DIST_DEPLOY, BoxDataset, load_detector
-from tailcyclenet.detector.evaluate import deployment_score, score_dataset
+from tailcyclenet.detector.boxes import NMS_CENTER_DIST_DEPLOY
+from tailcyclenet.detector.dataset import BoxDataset
+from tailcyclenet.detector.checkpoint import load_detector
+from tailcyclenet.evaluation.deployment import deployment_score
+from tailcyclenet.detector.evaluate import score_dataset
 from tailcyclenet.format import load_datasets
 from tailcyclenet.infer.driver import detector_box_source
 from tailcyclenet.metrics import paired_bootstrap

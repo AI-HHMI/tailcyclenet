@@ -31,7 +31,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.checkpoints import resolve_checkpoint  # noqa: E402
-from tailcyclenet.detector import resolve_detector_checkpoint  # noqa: E402
+from tailcyclenet.detector.checkpoint import resolve_detector_checkpoint  # noqa: E402
 from tailcyclenet.format import Registry  # noqa: E402
 
 

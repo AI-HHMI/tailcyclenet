@@ -968,7 +968,7 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(mv):
 def test_the_tracker_projects_correctly_on_a_moving_rig(mv):
     """On a moving rig `cgroup(gid, t)` with a scalar t gives a (4,4) ext, which `track._project`
     relies on (a (T,4,4) ext would project target i through frame i's pose)."""
-    from tailcyclenet.detector.track import _project
+    from tailcyclenet.infer.track import _project
 
     _, sess, _, _ = mv
     gid = list(sess.groups)[0]
@@ -1564,7 +1564,8 @@ def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path
     the user's value), and `detect_raw` is told the RANGE end, so a ragged final slice (53) is
     accepted as well as an exact one (64). The driver once passed `max_frames=0` and failed 272 s
     into a 1000-frame run."""
-    import tailcyclenet.detector as detmod
+    import tailcyclenet.infer.associate as assocmod
+    import tailcyclenet.infer.detect as detmod
     from tailcyclenet.infer import driver
     from tailcyclenet.infer.cli import build_parser
 
@@ -1586,9 +1587,9 @@ def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path
         def read(self, ci, cam, fr, pool=None, reduce=1):
             return [None] * len(fr)
 
-    old = (detmod.detect_raw, detmod.associate_group)
+    old = (detmod.detect_raw, assocmod.associate_group)
     detmod.detect_raw = fake_detect_raw
-    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
+    assocmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
     try:
         args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
                                           '--max-move', '1.0'])
@@ -1597,7 +1598,7 @@ def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path
                                            None, 2, 2)
         boxes_for(_Store(), start, stop)
     finally:
-        detmod.detect_raw, detmod.associate_group = old
+        detmod.detect_raw, assocmod.associate_group = old
     assert seen[0][0] == 32, f'the cursor must open on a multiple of 16, got {seen[0][0]}'
     assert seen[-1][1] == stop - 1, f'detection must reach the range end: {seen[-1]}'
 

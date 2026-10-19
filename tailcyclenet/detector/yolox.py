@@ -14,7 +14,7 @@ deleted; v0.3.4 is the last release that builds or loads them (`config.DELETED_Y
 GroupNorm throughout, not BatchNorm -- see `conv_norm_act`. The detector reproduces the SAME crop
 box the pose pipeline uses (`tailcyclenet.crop.crop_box_for_points`): either by regressing it
 directly (`box_target = 'crop'`, legacy) or by regressing the tight extent the rule is a function
-of and applying the rule after detection (`'extent'`, shipped -- see `detector/data.py`).
+of and applying the rule after detection (`'extent'`, shipped -- see `detector/dataset.py`).
 """
 import torch
 import torch.nn as nn
@@ -206,10 +206,10 @@ class YOLOXNano(nn.Module):
         self.version = str(version)
         self.p2 = bool(p2)
         if self.version in PRETRAINED_TRUNKS:
-            from .pretrained_backbones import ConvNeXtBackbone
+            from .convnext import ConvNeXtBackbone
             self.backbone = ConvNeXtBackbone(p2=self.p2)
         elif self.version == 'hybrid':
-            from .vit_backbone import HybridBackbone
+            from .hybrid import HybridBackbone
             self.backbone = HybridBackbone(p2=self.p2)
         else:
             raise ValueError(f'yolox version {version!r}: must be one of {ARCHITECTURES}')

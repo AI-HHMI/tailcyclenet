@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from scripts import eval_detector, eval_detector_trace
-from tailcyclenet import train_detector
+from tailcyclenet.detector import train as train_detector
 
 from .conftest import _session_2d
 
@@ -79,7 +79,7 @@ def test_convnext_config_refuses_an_input_side_not_divisible_by_32(tmp_path):
 def test_load_detector_refuses_a_convnext_size_not_divisible_by_32(tmp_path):
     """B3: a convnext-t checkpoint with a side not divisible by 32 is refused at load, before any
     weights are built, not by an opaque RuntimeError in `detect_raw`'s first forward."""
-    from tailcyclenet.detector import load_detector
+    from tailcyclenet.detector.checkpoint import load_detector
     torch.save({'kind': 'detector', 'input_wh': [120, 96], 'norm': 'gn',
                 'yolox_version': 'convnext-t', 'model_state': {}}, tmp_path / 'det.pth')
     with pytest.raises(ValueError, match='divisible by 32'):
@@ -88,7 +88,7 @@ def test_load_detector_refuses_a_convnext_size_not_divisible_by_32(tmp_path):
 
 def _saved_detector(tmp_path, **meta):
     """A fresh hybrid detector saved as a checkpoint dict with `meta` on top."""
-    from tailcyclenet.detector import YOLOXNano
+    from tailcyclenet.detector.yolox import YOLOXNano
     path = tmp_path / 'det.pth'
     torch.save({'kind': 'detector', 'input_wh': [64, 64], 'norm': 'gn', 'yolox_version': 'hybrid',
                 'model_state': YOLOXNano(version='hybrid').state_dict(), **meta},
@@ -121,7 +121,7 @@ def _spy_box_source(monkeypatch, owner):
 def test_eval_detector_deploy_uses_the_roots_own_box_source(tmp_path, monkeypatch):
     """B10: `--deploy` called `detect_raw` without `box_source`, so a multi-root detector's
     per-root `box_sources` entry was ignored for the checkpoint's global one."""
-    import tailcyclenet.detector as det_pkg
+    import tailcyclenet.evaluation.deployment as det_pkg
     root, path = _multi_root_detector(tmp_path)
     seen = _spy_box_source(monkeypatch, det_pkg)
     monkeypatch.setattr(sys, 'argv', [

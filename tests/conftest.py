@@ -150,9 +150,9 @@ def _small_hybrid_detector(monkeypatch):
     Only widths change (backbone base 8, one transformer block per stage, neck 32); the module
     graph and every code path are the shipped ones, and `load_detector` rebuilds the same width.
     """
-    from tailcyclenet.detector import vit_backbone, yolox
+    from tailcyclenet.detector import hybrid, yolox
     monkeypatch.setattr(yolox, 'NECK_WIDTH', 32)
-    init = vit_backbone.HybridBackbone.__init__
+    init = hybrid.HybridBackbone.__init__
     monkeypatch.setattr(init, '__defaults__', (8, (1, 1), 8, 4.0, True))
 
 
@@ -210,7 +210,7 @@ def _cached_provenance():
 
     prov = json.loads(os.environ['TAILCYCLENET_TEST_PROVENANCE'])
     sites = [import_module(m) for m in ('tailcyclenet.checkpoints', 'tailcyclenet.infer.driver',
-                                        'tailcyclenet.scorer.qc', 'tailcyclenet.train_detector')]
+                                        'tailcyclenet.scorer.qc', 'tailcyclenet.detector.train')]
     shipped = [s.provenance for s in sites]
     for s in sites:
         s.provenance = lambda: dict(prov)

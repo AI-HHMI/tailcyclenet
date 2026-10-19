@@ -268,7 +268,7 @@ def test_det_score_has_one_default():
     """`detect_raw` and the CLI must share one `--det-score` default (two meant two detectors)."""
     import inspect
 
-    from tailcyclenet.detector import detect_raw
+    from tailcyclenet.infer.detect import detect_raw
     from tailcyclenet.infer.cli import build_parser
 
     sig = inspect.signature(detect_raw).parameters['score_thresh'].default

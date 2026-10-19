@@ -111,7 +111,7 @@ def test_skew_rotate_crop_resize_matches_pixel_affine():
 
 def test_skew_detector_association_triangulates_with_full_intrinsics():
     from tracktail.model.cube import project_points_torch
-    from tailcyclenet.detector.associate import _triangulate
+    from tailcyclenet.infer.associate import _triangulate
 
     rig = _rig(offset=(7.0, -4.0))
     cameras = rig.tracktail()

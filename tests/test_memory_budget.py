@@ -89,7 +89,7 @@ def det_scene(tmp_path_factory):
     whether the boxes are any good.
     """
     import conftest as cf
-    from tailcyclenet.detector import YOLOXNano
+    from tailcyclenet.detector.yolox import YOLOXNano
     from tailcyclenet.format import sessions_for
 
     root = tmp_path_factory.mktemp('det')
@@ -107,7 +107,7 @@ def test_detect_raw_is_byte_identical_across_ram_budgets(det_scene):
     room returns. This is what licenses sizing `detect_raw` from free memory at all: two machines
     with different amounts of RAM must not produce different boxes.
     """
-    from tailcyclenet.detector import detect_raw
+    from tailcyclenet.infer.detect import detect_raw
 
     det, sess, gid = det_scene
 
@@ -130,7 +130,7 @@ def test_detection_is_batch_aligned_and_slice_independent(det_scene):
     lets the loop advance detection alongside its window loop. A misaligned slice RAISES rather
     than quietly returning boxes that differ (cuDNN picks algorithms per shape).
     """
-    from tailcyclenet.detector import detect_raw
+    from tailcyclenet.infer.detect import detect_raw
 
     det, sess, gid = det_scene                    # T = 8
     kw = dict(device='cpu', batch=4)

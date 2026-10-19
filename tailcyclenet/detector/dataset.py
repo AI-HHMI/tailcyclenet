@@ -23,20 +23,10 @@ from ..crop import BOX_SOURCES, crop_box_for_points
 from ..dataset import apply_affine, read_frames
 from ..format import (INST_ABSENT, INST_LABELED, INST_NONE, INST_PRESENT, UNLABELED,
                       load_datasets)
-
-
-def reduce_factor(size, out_wh):
-    """The largest `cv2.IMREAD_REDUCED_COLOR_N` that still decodes above the letterbox target.
-
-    libjpeg's DCT-domain decimation is a proper box filter AND halves the decode, where
-    `cv2.resize`'s default INTER_LINEAR at this downscale is aliasing. N stays a power of two at
-    or below 8 and never takes the decode below the letterbox target.
-    """
-    w, h = float(size[0]), float(size[1])
-    n = 1
-    while n < 8 and w / (2 * n) >= out_wh[0] and h / (2 * n) >= out_wh[1]:
-        n *= 2
-    return n
+from .augment import (additive_noise, apply_cutout, color_jitter, cutout_rects, grayscale,
+                      motion_blur, photometric, random_affine, salt_pepper)
+from .letterbox import letterbox, letterbox_transform, reduce_factor, tile_transform, warp_image
+from .sampling import IndexWeights
 
 
 # The smallest TIGHT-extent side (INPUT pixels) a `box_target = 'extent'` target is floored at,
@@ -46,242 +36,6 @@ def reduce_factor(size, out_wh):
 MIN_EXTENT_PX = 8.0
 
 BOX_TARGETS = ('crop', 'extent')
-
-
-def letterbox(img, out_wh, src_wh=None, antialias=False):
-    """Resize preserving aspect ratio, pad with grey. Returns (img, scale, (padx, pady)).
-
-    `src_wh` is the size of the image BEFORE any decode-time reduction. The returned `scale` is
-    then dst<-source rather than dst<-decoded, which is what keeps `unletterbox_boxes` and the box
-    target correct without either of them knowing a reduction happened.
-
-    `antialias=True` shrinks with `INTER_AREA` (a box filter) instead of `cv2.resize`'s default
-    INTER_LINEAR, which at the 3-6x downscales of a 4K rig samples a 2x2 neighbourhood and aliases
-    -- a per-rig texture signature a detector can learn. Upscaling stays linear. A checkpoint
-    records which one it was trained under (`antialias`, absent = False) and deploys the same.
-    """
-    import cv2
-    H, W = img.shape[:2]
-    ow, oh = out_wh
-    sw, sh = (W, H) if src_wh is None else (float(src_wh[0]), float(src_wh[1]))
-    s = min(ow / sw, oh / sh)
-    nw, nh = int(round(sw * s)), int(round(sh * s))
-    if antialias and (nw < W or nh < H):
-        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-    else:
-        resized = cv2.resize(img, (nw, nh))
-    canvas = np.full((oh, ow, 3), 114, np.uint8)
-    px, py = (ow - nw) // 2, (oh - nh) // 2
-    canvas[py:py + nh, px:px + nw] = resized
-    return canvas, s, (px, py)
-
-
-def letterbox_transform(size, out_wh):
-    """The (scale, (padx, pady)) `letterbox` would return for an image of `size` = (w, h).
-
-    Same arithmetic, no pixels: the box target and assignment diagnostics need the transform
-    without paying the source decode to learn it.
-    """
-    w, h = float(size[0]), float(size[1])
-    s = min(out_wh[0] / w, out_wh[1] / h)
-    nw, nh = int(round(w * s)), int(round(h * s))
-    return s, ((out_wh[0] - nw) // 2, (out_wh[1] - nh) // 2)
-
-
-def warp_image(img, M, out_wh, antialias=False):
-    """`cv2.warpAffine(img, M, out_wh)` on the grey border, optionally anti-aliased.
-
-    warpAffine has no area filter: it samples bilinearly however far it shrinks. With `antialias`
-    the shrinking part of `M` (its smaller column norm, a similarity's scale) is done first by an
-    INTER_AREA resize, and `M` is re-composed with the exact pixel-centre map of that resize, so
-    the geometry is unchanged and only the filter differs. A non-shrinking `M` is untouched.
-    """
-    import cv2
-    M = np.asarray(M, np.float64)
-    if antialias:
-        s = min(np.hypot(M[0, 0], M[1, 0]), np.hypot(M[0, 1], M[1, 1]))
-        h, w = img.shape[:2]
-        nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
-        if s < 1.0 and (nw < w or nh < h):
-            img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
-            fx, fy = w / nw, h / nh
-            M = np.vstack([M, [0.0, 0.0, 1.0]]) @ np.array(
-                [[fx, 0.0, 0.5 * fx - 0.5], [0.0, fy, 0.5 * fy - 0.5], [0.0, 0.0, 1.0]])
-            M = M[:2]
-    return cv2.warpAffine(img, M.astype(np.float32), (int(out_wh[0]), int(out_wh[1])),
-                          borderValue=(114, 114, 114))
-
-
-def tile_transform(origin, scale):
-    """The `(scale, (padx, pady))` that renders a source-pixel tile at `origin` into the input.
-
-    Deliberately the SAME two-number form `letterbox_transform` returns: a tile at source origin
-    `(ox, oy)` rendered at scale `s` is exactly `(s, (-ox*s, -oy*s))`, so every geometry line here
-    tiles by substituting this for the letterbox. No padding term: the tile's source extent is
-    `input_wh / scale` by construction, so a letterbox would be a no-op.
-    """
-    s = float(scale)
-    return s, (-float(origin[0]) * s, -float(origin[1]) * s)
-
-
-def unletterbox_boxes(boxes, scale, pad, src_wh=None):
-    """Detector-input boxes -> source-image boxes. With `src_wh`, clamped into the frame.
-
-    THE CHOKE POINT EVERY DETECTOR BOX GOES THROUGH, which is why the bound is here and not in the
-    four callers: a decoded side can be ~12,910 px, and IoU-only NMS cannot suppress a box that
-    big (its IoU with the box it swallows is ~0). Downstream that box becomes a crop, so one such
-    frame delivers the whole arena as a thumbnail. A box with no positive area after clamping
-    comes back NaN, which every consumer already reads as "no box here". `src_wh` is optional
-    only because `BoxDataset`'s training path has no frame to clamp against.
-    """
-    out = boxes.clone().float()
-    out[:, 0::2] = (out[:, 0::2] - pad[0]) / scale
-    out[:, 1::2] = (out[:, 1::2] - pad[1]) / scale
-    if src_wh is not None:
-        w, h = float(src_wh[0]), float(src_wh[1])
-        out[:, 0::2] = out[:, 0::2].clamp(0.0, w)
-        out[:, 1::2] = out[:, 1::2].clamp(0.0, h)
-        dead = (out[:, 2] <= out[:, 0]) | (out[:, 3] <= out[:, 1])
-        out[dead] = float('nan')
-    return out
-
-
-def _photometric(img, rng):
-    """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
-
-    DLC's extended form (additive brightness + per-channel gaussian noise) was built, measured
-    and REFUTED here: it costs accuracy in-domain, and neither shipped split tests the
-    out-of-domain gain it buys.
-    """
-    out = img * rng.uniform(0.7, 1.3)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-# THE STRONG SUITE -- `--augment-strong`. Layered AFTER `_photometric`, gated on
-# `self.strong and self.augment and self.train`, off by default and off means none of these draws
-# happen at all. Every op here is APPEARANCE-ONLY or, for cutout, an ERASURE -- neither moves a
-# box target. Mirrors tracktail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`.
-def _color_jitter(img, rng):
-    """Gamma contrast, then HSV saturation and hue shifts -- tracktail's `aug_per_camera` triplet
-    (DefocusBlur is folded into `_motion_blur` below rather than duplicated).
-    """
-    import cv2
-    gamma = rng.uniform(0.6, 1.8)
-    lut = np.clip((np.arange(256, dtype=np.float64) / 255.0) ** gamma * 255.0, 0, 255)
-    out = cv2.LUT(img, lut.astype(np.uint8))
-    hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV).astype(np.int16)
-    hsv[..., 1] = np.clip(hsv[..., 1] + rng.uniform(-50, 30), 0, 255)
-    hsv[..., 0] = np.mod(hsv[..., 0] + rng.uniform(-10, 10), 180)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-
-def _additive_noise(img, rng, sigma_max=10.2):
-    """Per-channel gaussian noise, sigma ~ U(0, sigma_max). tracktail's `AdditiveGaussianNoise`
-    (scale=(0, 0.04*255), i.e. sigma up to 10.2). Refuted alone on a detector with no capacity
-    lever; re-tested here as part of the whole mix.
-    """
-    sigma = rng.uniform(0.0, sigma_max)
-    noise = rng.normal(0.0, sigma, img.shape)
-    return np.clip(img.astype(np.float64) + noise, 0, 255).astype(np.uint8)
-
-
-def _salt_pepper(img, rng, frac=0.004):
-    """tracktail's `SaltAndPepper(0.004)`: a fraction of pixels forced to black or white."""
-    out = img.copy()
-    h, w = img.shape[:2]
-    n = int(round(frac * h * w))
-    if n <= 0:
-        return out
-    ys = rng.integers(0, h, n)
-    xs = rng.integers(0, w, n)
-    salt = rng.random(n) < 0.5
-    out[ys[salt], xs[salt]] = 255
-    out[ys[~salt], xs[~salt]] = 0
-    return out
-
-
-def _motion_blur(img, rng, k=(3, 5)):
-    """Horizontal motion kernel, size drawn from `k`. tracktail's `MotionBlur(k=(3,5))`."""
-    import cv2
-    ksize = int(rng.choice(k))
-    kernel = np.zeros((ksize, ksize), np.float32)
-    kernel[ksize // 2, :] = 1.0
-    kernel /= kernel.sum()
-    return cv2.filter2D(img, -1, kernel)
-
-
-def _grayscale(img):
-    """RGB -> luminance replicated to 3 channels: an IR / monochrome rig, which no hue or
-    saturation shift reaches. The pose loader draws the same thing (`grayscale_prob`)."""
-    import cv2
-    return np.repeat(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)[..., None], 3, -1)
-
-
-def _cutout_rects(wh, rng, n=(1, 3), frac=0.15):
-    """1-3 rects of `frac` x `frac` of `wh` (INPUT pixels), random RGB fill.
-
-    tracktail's `cutout_rects`: an erasure, not a geometric transform, so it never touches a box
-    target -- only the pixels under it.
-    """
-    w, h = int(wh[0]), int(wh[1])
-    rw, rh = max(1, int(w * frac)), max(1, int(h * frac))
-    out = []
-    for _ in range(int(rng.integers(n[0], n[1] + 1))):
-        rx = int(rng.integers(0, max(w - rw, 1)))
-        ry = int(rng.integers(0, max(h - rh, 1)))
-        fill = tuple(int(v) for v in rng.integers(0, 256, 3))
-        out.append((rx, ry, rx + rw, ry + rh, fill))
-    return out
-
-
-def _apply_cutout(img, rects):
-    """Fill each `(x0, y0, x1, y1, fill)` rect. Never touches a box target -- erasure only."""
-    out = img.copy()
-    for x0, y0, x1, y1, fill in rects:
-        out[y0:y1, x0:x1] = fill
-    return out
-
-
-def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
-                  rotate_deg=0.0, centre=None, vflip=0.0):
-    """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
-
-    Deliberately a similarity and not YOLOX's shear-and-perspective: the target is
-    `crop_box_for_points`, an AXIS-ALIGNED extent, and a shear turns a box into a parallelogram
-    whose extent is no longer the crop rule's box for anything.
-
-    `rotate_deg` REPLACES THE FLIP and is strictly easier: a rotation moves every keypoint through
-    the same affine and permutes nothing, where a mirror needs a `flip_pairs` map. Off by default
-    here; the shipped detector config sets 180 (full circle) for cross-rig generalization, by owner
-    decision 2026-10-02, although 180 was refuted IN-DOMAIN on two roots (report 17). A full circle
-    costs no more retained area than a quarter one.
-
-    `centre` IS WHY TILING AND ROTATION COMPOSE: the tile is cut AFTER this warp, so about the
-    frame centre a scale of 0.8 moves an animal 2,000 px out by 400 -- more than a 640 px tile --
-    and a rotation moves it out of the tile entirely. Passing the tile's own centre pins the tile's
-    content and makes rotation free there; on whole frames the corners pull real pixels in at
-    every angle.
-
-    No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
-    relabelling left to right permutes the set and the extent is unchanged.
-
-    `vflip` (probability of a vertical mirror) is box-only-safe for the same reason. It draws
-    from `rng` ONLY when nonzero, so at 0 the draw sequence -- and every augmentation stream on
-    record -- is unchanged.
-    """
-    w, h = float(size[0]), float(size[1])
-    s = rng.uniform(*scale)
-    sx = -s if rng.random() < hflip else s
-    sy = (-s if rng.random() < vflip else s) if vflip else s
-    cx, cy = (w / 2, h / 2) if centre is None else (float(centre[0]), float(centre[1]))
-    A = np.array([[sx, 0.0], [0.0, sy]], np.float64)
-    if rotate_deg:
-        a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
-        A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
-    t = (np.array([cx, cy]) - A @ np.array([cx, cy])
-         + np.array([rng.uniform(-translate, translate) * w,
-                     rng.uniform(-translate, translate) * h]))
-    return np.concatenate([A, t[:, None]], 1).astype(np.float32)
 
 
 def _drop_outside(x, bounds):
@@ -321,7 +75,7 @@ def _floor_extent(boxes, min_side):
     return out
 
 
-class BoxDataset(Dataset):
+class BoxDataset(IndexWeights, Dataset):
     """One item = one camera view of one frame, with every animal's crop box in it.
 
     Deliberately per-view and per-frame rather than per-window: a box predictor has no temporal
@@ -355,15 +109,13 @@ class BoxDataset(Dataset):
                 extent, floored at MIN_EXTENT_PX input px; `detect_raw` applies the rule.
             antialias / grayscale_prob / vflip -- area-filtered shrinking and the
                 train-augmentation probabilities.
-            input_norm / invert_prob / scale_range / background_prob -- `transfer_aug` (report 73).
-            max_frames_per_group -- per-group cap (0 = uncapped). TRAIN ALWAYS PASSES 0 --
-                `[data].frames_per_group` is deleted and `default_train_weights` weights the
-                draw instead; the parameter survives to carry `val_frames_per_group`.
+            input_norm / invert_prob / scale_range / background_prob -- `augment` (report 73).
+            max_frames_per_group -- per-group cap (0 = uncapped); train passes 0 (the draw is
+                weighted instead), val passes `val_frames_per_group`.
         Outputs:
-            Builds `self.index`, `self.origins` (tile origin or None -- parallel to `index`,
-            not a fifth tuple element), and `self.chunk` (one (group, camera) file's worth of
-            positions -- the locality block `ChunkShuffle` needs). Views with neither a positive
-            box nor supervised background negatives are omitted. No side effects.
+            Builds `self.index`, `self.origins` (tile origin or None, parallel to `index`), and
+            `self.chunk` (one (group, camera) file's positions, `ChunkShuffle`'s locality block).
+            Views with neither a positive box nor supervised negatives are omitted.
         """
 
         assert box_source in BOX_SOURCES, \
@@ -385,7 +137,7 @@ class BoxDataset(Dataset):
             raise ValueError(f'box_target must be one of {BOX_TARGETS}, got {box_target!r}')
         self.box_target = box_target
         self.antialias = bool(antialias)
-        from .transfer_aug import INPUT_NORMS
+        from .augment import INPUT_NORMS
         if input_norm not in INPUT_NORMS:
             raise ValueError(f'input_norm must be one of {INPUT_NORMS}, got {input_norm!r}')
         self.input_norm = input_norm
@@ -535,139 +287,6 @@ class BoxDataset(Dataset):
             return False
         return self.negative_supervision_for(sess, gid, f, ci, lab)
 
-    def _base_weights(self, indices, annot_frac=None):
-        """Existing view/cohort rule applied to the selected index positions."""
-        indices = np.asarray(indices, dtype=np.int64)
-        n = len(indices)
-        src = np.array([self.index[int(i)][0].label_source for i in indices])
-        keys = np.array([f'{self.index[int(i)][0].path}/{self.index[int(i)][1]}/'
-                         f'{self.index[int(i)][3]}' for i in indices])
-        _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
-        per_entry = 1.0 / counts[inv].astype(np.float64)
-        present = [c for c in sorted(set(src.tolist()))]
-        if annot_frac is not None and not 0.0 <= float(annot_frac) <= 1.0:
-            raise ValueError(f'annot_frac must be in [0, 1], got {annot_frac}')
-        w = np.zeros(n, dtype=np.float64)
-        for cohort in present:
-            m = src == cohort
-            if annot_frac is not None and len(present) > 1 and cohort in ('annotated', 'tracked'):
-                share = float(annot_frac) if cohort == 'annotated' else 1.0 - float(annot_frac)
-            else:
-                share = float(m.sum()) / n
-            tot = per_entry[m].sum()
-            if tot > 0:
-                w[m] = per_entry[m] * (share / tot)
-        if not np.isfinite(w).all() or w.sum() <= 0:
-            raise ValueError('default_train_weights: weights are all zero or non-finite')
-        return w / w.sum()
-
-    def default_train_weights(self, annot_frac=None, balance_datasets=True):
-        """View-uniform sampling weights, optionally balanced to equal root shares.
-
-        One-root output is exactly the historical rule. With multiple roots, `annot_frac` applies
-        within each root if balanced, and globally if roots are pooled.
-        """
-        all_indices = np.arange(len(self.index), dtype=np.int64)
-        if not balance_datasets or len(self.datasets) == 1:
-            return self._base_weights(all_indices, annot_frac)
-        w = np.zeros(len(self.index), dtype=np.float64)
-        for root_id in range(len(self.datasets)):
-            ix = np.flatnonzero(np.asarray(self.root_ids) == root_id)
-            if ix.size:
-                w[ix] = self._base_weights(ix, annot_frac) / len(self.datasets)
-        return w
-
-    def cohort_mix(self, weights=None):
-        """Realised share of train draws per cohort. Reporting only -- the mix is invisible in
-        the loss curve, so `train_detector.py` prints it, exactly as `PoseDataset.mix` is.
-        """
-        src = np.array([s.label_source for s, _, _, _ in self.index])
-        w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
-             else np.asarray(weights, dtype=np.float64) / np.sum(weights))
-        return {c: float(w[src == c].sum()) for c in sorted(set(src.tolist()))}
-
-    def root_mix(self, weights=None):
-        """Realised draw probability for each dataset root."""
-        ids = np.asarray(self.root_ids, dtype=np.int64)
-        w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
-             else np.asarray(weights, dtype=np.float64) / np.sum(weights))
-        return {name: float(w[ids == i].sum()) for i, name in enumerate(self.root_names)}
-
-    def root_cohort_mix(self, weights=None):
-        """Realised label-source shares within each dataset root."""
-        ids = np.asarray(self.root_ids, dtype=np.int64)
-        w = (np.full(len(self.index), 1.0 / max(len(self.index), 1)) if weights is None
-             else np.asarray(weights, dtype=np.float64) / np.sum(weights))
-        out = {}
-        for i, name in enumerate(self.root_names):
-            m = ids == i
-            total = w[m].sum()
-            src = np.array([s.label_source for s, _, _, _ in self.index])
-            out[name] = {cohort: float(w[m & (src == cohort)].sum() / total)
-                         for cohort in sorted(set(src[m].tolist()))}
-        return out
-
-    def train_weights(self, annot_frac=None, alpha=None, balance_datasets=True):
-        """Compose cohort/view and alpha weighting, then enforce root balance if requested."""
-        if not balance_datasets or len(self.datasets) == 1:
-            base = self.default_train_weights(annot_frac, balance_datasets=False)
-            alpha_w = self.alpha_weights(alpha)
-            return base if alpha_w is None else base * alpha_w
-        weights = np.zeros(len(self.index), dtype=np.float64)
-        ids = np.asarray(self.root_ids, dtype=np.int64)
-        alpha_w = self.alpha_weights(alpha)
-        for root_id in range(len(self.datasets)):
-            ix = np.flatnonzero(ids == root_id)
-            local = self._base_weights(ix, annot_frac)
-            if alpha_w is not None:
-                local *= alpha_w[ix]
-            total = local.sum()
-            if not np.isfinite(total) or total <= 0:
-                raise ValueError(f'train_weights: root {self.root_names[root_id]!r} has no '
-                                 'positive finite sampling weight')
-            weights[ix] = local / total / len(self.datasets)
-        return weights
-
-    def alpha_weights(self, alpha):
-        """B1b (detector_v2 plan SS2.7): per-entry weights giving each GROUP (session, gid) total
-        draw probability proportional to `n_views ** alpha`, where `n_views` is that group's own
-        (post-cap) entry count. Per-entry weight is `n_views ** (alpha - 1)`, so summing it over
-        one group's `n_views` entries gives `n_views ** alpha` exactly.
-
-        `alpha = 1.0` is FRAME-UNIFORM (every entry weight 1 -- `alpha_weights` returns an
-        all-ones array, and combined with nothing else this is byte-identical to `ChunkShuffle`).
-        `alpha = 0.0` is GROUP-UNIFORM (every group the same TOTAL weight regardless of how many
-        views survived B1a's cap -- the naive "weight by group" scheme SS2.7's own B1 section
-        warns is a trap on its own: it would starve rat-city's one 57,594-view tracked group down
-        to 1/886 of draws). `alpha = 0.5` sqrt-damps between the two. `None` (default) does not
-        weight and returns None.
-
-        PROVABLY A NO-OP wherever every group has the SAME `n_views` -- `n_views ** (alpha - 1)`
-        is then a single constant, and any constant array normalises away. **This is NOT 3dpop as
-        actually converted**: detector_v2 plan B3 measured per-group train view counts of
-        148-160 (median 160, 59 groups) after B1a's uncapped indexing -- close to uniform but not
-        exactly, and that ~7% spread was enough to produce a real, 2-seed-confirmed positive
-        effect from `alpha=0.5` on 3dpop (r75/IoU both significantly better both seeds, see
-        `dev/scratch/wave0/b3_3d_a05_seed{23,1}.log`). The originally-planned "free null control"
-        premise for 3dpop was wrong in practice; treat any root's uniformity as measured, not
-        assumed from group-count tables alone. branson-fly was never re-measured this session --
-        do not assume its uniformity claim still holds either without checking.
-
-        Composes with the default train weights by elementwise product (renormalised) -- see
-        `train_detector.py`'s own composition, SS2.7 B1c.
-        """
-        if alpha is None:
-            return None
-        alpha = float(alpha)
-        keys = np.array([f'{s.path}/{g}' for s, g, _, _ in self.index])
-        _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
-        n_views = counts[inv].astype(np.float64)
-        w = n_views ** (alpha - 1.0)
-        if not np.isfinite(w).all() or w.sum() <= 0:
-            raise ValueError('alpha_weights: sampling weights are all zero or non-finite -- '
-                             'check alpha')
-        return w
-
     # ------------------------------------------------------------------------------------------
     # tiling
     # ------------------------------------------------------------------------------------------
@@ -705,8 +324,7 @@ class BoxDataset(Dataset):
         (`negative_supervision_for`); on an incompletely labelled frame a background tile would
         carry no loss at all.
 
-        A frame with no animal and no background tile still yields ONE tile: dropping the frame
-        would train a detector that has never seen an empty image.
+        A frame with no animal and no background tile still yields ONE tile.
         """
         W, H = (float(v) for v in sess.rig.size(sess.cam_names[ci]))
         tw, th = self._tile_extent()
@@ -756,15 +374,11 @@ class BoxDataset(Dataset):
     def _positioned_views(self, sess, gid, lab):
         """(T, C) bool: whether `_points_2d(sess, gid, f, ci)` has any finite point, for a group.
 
-        The whole-group form of the per-view check `_has_target` makes while indexing: ONE
-        projection per camera per group instead of one rig build + projection per (frame,
-        camera), which was the entire cost of a multi-root index build (~600k views). Same
-        projection function, so finiteness is identical. Shapes: points3d (S, T, K, 3) projects
-        to (C, S, T, K, 2); points2d is (S, T, K, C, 2).
+        The whole-group form of `_has_target`'s per-view check: one projection per camera per
+        group. Shapes: points3d (S, T, K, 3) projects to (C, S, T, K, 2); points2d is (S, T, K, C, 2).
 
-        Cached per group ON THE SESSION, not on this dataset: the mask is pure label geometry,
-        and `train_detector` hands one set of preloaded Sessions to the input-size probe, the
-        train index and val, so the probe's projections are the train index's.
+        Cached per group ON THE SESSION (pure label geometry), so the input-size probe, the
+        train index and val share one set of projections.
         """
         cache = sess.__dict__.setdefault('_detector_positioned_cache', {})
         if gid in cache:
@@ -940,12 +554,9 @@ class BoxDataset(Dataset):
         """Copy-paste one WHOLE, untruncated crop-rule box from a DIFFERENT frame into empty
         space of this item's rendered image, at a location fully interior to `input_wh`.
 
-        Deliberately copy-paste and not true YOLOX 4-quadrant mosaic: a quadrant clips whatever
-        animal sits on its seam, and a clipped extent is not `crop_box_for_points`'s box for
-        anything -- it would train the detector off a target it never emits. A relocated WHOLE box
-        has exactly the crop rule's extent, translated. Never clips: a placement that would not
-        fit entirely inside `input_wh` is redrawn, up to a few tries, and the item is returned
-        unchanged if none fits.
+        Not a 4-quadrant mosaic: a quadrant clips the animal on its seam, and a clipped extent is
+        not a box the crop rule ever emits. A placement that would not fit is redrawn a few times,
+        and the item is returned unchanged if none fits.
 
         An `extent` target stops at the outermost POINT,
         not the animal's edge, so its paste carries a quarter-side margin of context.
@@ -1022,140 +633,36 @@ class BoxDataset(Dataset):
             W = np.vstack([warp, [0, 0, 1]]) if warp is not None else np.eye(3, dtype=np.float32)
             img = warp_image(img, (L @ W @ D)[:2], self.input_wh, self.antialias)
             if warp is not None:
-                img = _photometric(img, rng)
+                img = photometric(img, rng)
                 if self.strong:
                     if rng.random() < 0.5:
-                        img = _color_jitter(img, rng)
+                        img = color_jitter(img, rng)
                     if rng.random() < 0.3:
-                        img = _additive_noise(img, rng)
+                        img = additive_noise(img, rng)
                     if rng.random() < 0.2:
-                        img = _salt_pepper(img, rng)
+                        img = salt_pepper(img, rng)
                     if rng.random() < 0.2:
-                        img = _motion_blur(img, rng)
+                        img = motion_blur(img, rng)
         if self.strong and rng is not None:
             if rng.random() < 0.5:
-                rects = _cutout_rects(self.input_wh, rng)
-                img = _apply_cutout(img, rects)
+                rects = cutout_rects(self.input_wh, rng)
+                img = apply_cutout(img, rects)
             if rng.random() < 0.2:
                 boxes, img = self._mosaic_paste(i, boxes, img, rng)
         if rng is not None and self.invert_prob and rng.random() < self.invert_prob:
-            from .transfer_aug import invert
+            from .augment import invert
             img = invert(img)
         if rng is not None and self.background_prob and rng.random() < self.background_prob:
-            from .transfer_aug import composite
+            from .augment import composite
             img, boxes = composite(img, boxes, rng, self.input_wh,
                                    decoys_ok=bool(negative_supervision))
             negative_supervision = True
         if rng is not None and self.grayscale_prob and rng.random() < self.grayscale_prob:
-            img = _grayscale(img)
+            img = grayscale(img)
         if self.input_norm != 'none':
-            from .transfer_aug import normalize_input
+            from .augment import normalize_input
             img = normalize_input(img, self.input_norm)
         x = torch.as_tensor(img, dtype=torch.float32).permute(2, 0, 1) / 255.0
         return {'x': x, 'boxes': boxes, 'negative_supervision': negative_supervision}
 
 
-class ChunkShuffle(torch.utils.data.Sampler):
-    """A shuffle that keeps a worker inside a few videos at a time.
-
-    `BoxDataset.index` is built session-by-session, so a run of contiguous index positions stays
-    inside one video, and a plain `shuffle=True` would send every item to a different container
-    and thrash `dataset._reader`'s cache (486 ms per batch of 16 against a 16 ms GPU step, on a
-    multi-session root). Shuffling BLOCKS instead, and pooling `mix` of them so a batch still
-    spans several sessions, costs 40 ms -- and a batch drawn from one video is still a correlated
-    gradient step. PASS `chunk=dataset.chunk`; the default 512 was set against a one-group root.
-
-    Image-directory datasets do not need this and are not harmed by it: their frames are separate
-    files, so locality buys nothing and costs nothing.
-    """
-
-    def __init__(self, n, chunk=512, mix=4, seed=23):
-        """Build the block shuffle over `n` items with `chunk`-sized locality blocks."""
-        self.n, self.chunk, self.mix, self.seed = n, chunk, mix, seed
-        self.epoch = 0
-
-    def __len__(self):
-        """Number of items shuffled."""
-        return self.n
-
-    def __iter__(self):
-        """Yield the epoch's shuffled item order, block-local and `mix`-pooled."""
-        rng = np.random.default_rng([self.seed, self.epoch])
-        self.epoch += 1
-        starts = np.arange(0, self.n, self.chunk)
-        rng.shuffle(starts)
-        for i in range(0, len(starts), self.mix):
-            pool = np.concatenate([np.arange(s, min(s + self.chunk, self.n))
-                                   for s in starts[i:i + self.mix]])
-            rng.shuffle(pool)
-            yield from (int(j) for j in pool)
-
-
-class CohortSampler(torch.utils.data.Sampler):
-    """Draw weighted index positions with replacement.
-
-    `default_train_weights` always returns a view-uniform base and `alpha_weights` may modify it.
-    Replacement makes a configured cohort share a property of each draw rather than of a finite
-    epoch. `__len__` remains the index length so `iters` keeps its existing meaning.
-
-    Locality is deliberately traded for the weighted draw. Train inputs for the multi-cohort roots
-    are frame directories; calms21 is the video-backed root and has one cohort.
-    """
-
-    def __init__(self, weights, num_samples=None, seed=23):
-        """Build a replacement sampler over the index from `weights` (see class docstring).
-
-        One cumulative array and one `searchsorted` per draw, as `PoseDataset._pick` does.
-        """
-        w = np.asarray(weights, dtype=np.float64)
-        if w.ndim != 1 or not w.size:
-            raise ValueError(f'weights must be a non-empty 1-D array, got shape {w.shape}')
-        if not np.isfinite(w).all() or (w < 0).any() or w.sum() <= 0:
-            raise ValueError('weights must be finite, non-negative and not all zero')
-        self.cum = np.cumsum(w / w.sum())
-        self.num_samples = int(len(w) if num_samples is None else num_samples)
-        self.seed = seed
-        self.epoch = 0
-
-    def __len__(self):
-        """Number of draws per epoch."""
-        return self.num_samples
-
-    def __iter__(self):
-        """Yield `num_samples` weighted draws with replacement.
-
-        `searchsorted` can return `len(cum)` on a draw of exactly 1.0, so draws are clamped
-        rather than letting a one-in-2^53 sample raise IndexError 14,000 iterations in.
-        """
-        rng = np.random.default_rng([self.seed, self.epoch])
-        self.epoch += 1
-        draws = np.searchsorted(self.cum, rng.random(self.num_samples))
-        yield from (int(j) for j in np.minimum(draws, len(self.cum) - 1))
-
-
-def box_collate(batch):
-    """Collate `BoxDataset` items (named dicts) into one named-dict batch.
-
-    Pad the box axis with NaN so a batch can hold different animal counts. NaN, not zero, and
-    that carries all the way to the loss: a padded row is "no animal", which is the same signal
-    a real animal with no finite point in this view sends.
-
-    Items are explicit named dicts (`x`, `boxes`, `negative_supervision`), dispatched BY NAME,
-    not by rank or tuple length.
-    """
-    xs = torch.stack([b['x'] for b in batch])
-    n = max(b['boxes'].shape[0] for b in batch)
-    boxes = torch.full((len(batch), n, 4), float('nan'))
-    for i, b in enumerate(batch):
-        boxes[i, :b['boxes'].shape[0]] = b['boxes']
-    out = {'x': xs, 'boxes': boxes}
-
-    if any('negative_supervision' in b for b in batch):
-        out['negative_supervision'] = torch.tensor(
-            [bool(b.get('negative_supervision', True)) for b in batch], dtype=torch.bool)
-    return out
-
-
-def split_batch(batch):
-    """A collated batch dict -> `(x, boxes, negative_supervision_or_None)`."""
-    return batch['x'], batch['boxes'], batch.get('negative_supervision')

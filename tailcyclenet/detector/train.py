@@ -1,8 +1,6 @@
 """Train one box predictor on one dataset root or a folder of roots.
 
-Body of `tailcyclenet train-detector` (`tailcyclenet/__main__.py`) and of
-`scripts/train_detector.py` (`pixi run python scripts/train_detector.py --config
-configs/detector.toml`) -- both call this module's `main()` unchanged.
+Body of `tailcyclenet train-detector` and of `scripts/train_detector.py`; both call `main()`.
 
 The recipe lives in the config file; the run folder records the effective config + provenance
 before training starts, and the checkpoint carries its own scores.
@@ -22,10 +20,13 @@ import toml
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.config import DETECTOR_CONFIG
 from tailcyclenet.dataset import worker_init
-from tailcyclenet.detector import (BoxDataset, CohortSampler, YOLOXNano,
-                                   box_collate, detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector.checkpoint import tiled_input_wh
 from tailcyclenet.detector.config import load_detector_config
+from tailcyclenet.detector.dataset import BoxDataset
 from tailcyclenet.detector.evaluate import overall, score_dataset
+from tailcyclenet.detector.loss import detector_loss
+from tailcyclenet.detector.sampling import CohortSampler, box_collate, split_batch
+from tailcyclenet.detector.yolox import YOLOXNano
 from tailcyclenet.format import load_datasets
 
 

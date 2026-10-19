@@ -25,7 +25,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.crop import crop_box_for_points
-from tailcyclenet.detector import detect_raw, load_detector
+from tailcyclenet.infer.detect import detect_raw
+from tailcyclenet.detector.checkpoint import load_detector
 from tailcyclenet.detector.boxes import NMS_CENTER_DIST_DEPLOY, box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
 from tailcyclenet.infer.driver import detector_box_source

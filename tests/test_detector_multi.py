@@ -7,11 +7,11 @@ import sys
 import pytest
 import torch
 
-from tailcyclenet.detector import load_detector
+from tailcyclenet.detector.checkpoint import load_detector
 from tailcyclenet.infer.driver import (detector_box_source, _detector_matches_source)
 from tailcyclenet.format import load_datasets
-from tailcyclenet import train_detector
-from tailcyclenet.train_detector import input_wh_for_roots
+from tailcyclenet.detector import train as train_detector
+from tailcyclenet.detector.train import input_wh_for_roots
 
 
 def _config(tmp_path, root, out):

@@ -32,8 +32,8 @@ import torch
 from tracktail.model.cube import project_points_torch
 
 from .associate import associate
-from .boxes import centres as box_centres
-from .boxes import sides as box_sides
+from ..detector.boxes import centres as box_centres
+from ..detector.boxes import sides as box_sides
 
 # On a crowded multiview clip, a seated duplicate track's
 # triangulated points project 0.32-0.73 box sides apart in every camera it claims (per-frame

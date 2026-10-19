@@ -1035,8 +1035,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 _capture_overlap_agreement(stats, a, frames, f0, pred, p)
             pred[a, frames - f0] = p
             if q is not None:
-                carried[a] = (torch.as_tensor(q[j]), int(frames[j]),
-                              None if vlogit is None else torch.as_tensor(vlogit[j]))
+                carried[a] = (torch.as_tensor(q[j]), int(frames[j]))
 
         if cfg.capture_window_predictions:
             start_w = int(frames[0])

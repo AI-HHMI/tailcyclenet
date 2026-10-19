@@ -94,16 +94,17 @@ class ScorerDataset(torch.utils.data.Dataset):
             return self._build(idx)
 
     def _build(self, idx):
-        """Build one triplet, retrying other windows on a failed build.
+        """Build one triplet; on train, retry other windows on a failed build.
 
         Inputs: idx -- the requested window index (or `(ordinal, idx)` from `StepSampler`, which
                 the base loader consumes and this passes through untouched).
         Outputs: a triplet dict, or None when every retry failed.
         Side effects: decodes video frames; draws from the item, ambient torch and imgaug RNGs.
 
-        Replacement indices use the same deterministic `(seed, idx)` stream as validation items,
-        so a failed build cannot make the scored window depend on earlier failures. Training keeps
-        entropy-seeded replacement for worker decorrelation.
+        Only training replaces a failed window (entropy-seeded, for worker decorrelation). A
+        val/test window is frozen to its index, so a failed build is SKIPPED (None, which
+        `evaluate` counts as `val/n_skipped`) rather than swapped for another window that would
+        then be scored twice.
         """
         ordinal, base_idx = (idx if isinstance(idx, tuple) else (None, idx))
         rejected_draws = 0
@@ -124,10 +125,10 @@ class ScorerDataset(torch.utils.data.Dataset):
                     trip['rejection_reason'] = last_reason if rejected_draws else ''
                     return trip
                 last_reason = 'no_active_or_unscorable'
+            if frozen:
+                return None
             rejected_draws += 1
-            pick = (np.random.default_rng((self.base.seed, 0xC0FFEE, base_idx, attempt))
-                    if frozen else np.random.default_rng())
-            base_idx = int(pick.integers(len(self.base)))
+            base_idx = int(np.random.default_rng().integers(len(self.base)))
         return None
 
 

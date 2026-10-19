@@ -348,10 +348,10 @@ def _probe(path: Path) -> tuple[int, tuple[int, int], float]:
     """(n_frames, (w, h), fps) for one video. OPENS ONE READER AND DROPS IT.
 
     The count comes from the SAME reader the loader uses (a metadata count that disagrees with
-    the decoder fails inside the window loop), and NOT from `dataset._reader`, whose size would
+    the decoder fails inside the window loop), and NOT from `reader_cache.reader`, whose size would
     be fixed before the run's own budget is resolved. The open also warms the page cache.
     """
-    from . import video
+    from .data import video
 
     vr = video.open_reader(str(path))
     try:

@@ -56,7 +56,7 @@ def _camera(size=(64, 48), offset=(0.0, 0.0), dist=None):
 def test_flip_affine_matches_pixels_and_projection(mode):
     import cv2
     from tracktail.model.cube import project_points_torch
-    from tailcyclenet.dataset import crop_affine
+    from tailcyclenet.data.pixels import crop_affine
 
     W, H = 64, 48
     cam = _camera(offset=(4.0, 3.0),

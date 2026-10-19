@@ -72,7 +72,7 @@ def extract(video, out_dirs, windows, quality):
     """Decode `windows` [(start, end)] of `video` into JPEG dirs `out_dirs` (one per window)."""
     import cv2
 
-    from tailcyclenet.video import open_reader
+    from tailcyclenet.data.video import open_reader
 
     r = open_reader(str(video))
     n_written = 0

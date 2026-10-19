@@ -21,7 +21,8 @@ from tracktail.model.cube import project_points_torch
 
 from .. import crop as cropmod
 from .. import memory
-from ..dataset import crop_affine, resize_camera, prior_out_of_bounds
+from ..data.pixels import crop_affine
+from ..dataset import resize_camera, prior_out_of_bounds
 from ..model import self_prompt
 from ..format import Labels, Session
 from ..model import share_scene

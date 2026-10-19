@@ -266,7 +266,7 @@ def test_the_window_union_covers_the_window_and_stays_in_the_image(mv):
 
 def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(rat):
     """One decode per (camera, frame): cropping the decoded frame equals cropping at decode, bit for bit."""
-    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.data.pixels import read_frames
     from tailcyclenet.infer.window import _crop_views
 
     _, sess, _, _ = rat

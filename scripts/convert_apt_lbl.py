@@ -28,7 +28,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet import format as fmt, video
+from tailcyclenet import format as fmt
+from tailcyclenet.data import video
 
 CAM = 'cam0'
 # The crop rule's pad; instances.pq stores the PADDED extent.

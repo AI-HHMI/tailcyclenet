@@ -386,7 +386,7 @@ def test_render_writes_h264_yuv420p(tmp_path):
     """Rendered clips are H.264/yuv420p (web-playable), and an odd size is padded, not refused."""
     import av
 
-    from tailcyclenet.video import H264Writer
+    from tailcyclenet.data.video import H264Writer
 
     path = tmp_path / 'clip.mp4'
     rng = np.random.default_rng(0)

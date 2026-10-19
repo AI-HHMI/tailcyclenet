@@ -86,7 +86,8 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
     import cv2
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import crop_affine, resize_camera
+    from tailcyclenet.data.pixels import crop_affine
+    from tailcyclenet.dataset import resize_camera
     from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
     from tracktail.model.cube import project_points_torch
 
@@ -160,7 +161,7 @@ def test_computed_frame_paths_match_the_listing(dataset_3d, monkeypatch):
     repeated index decodes once but is not aliased (cutout writes in place)."""
     import cv2
 
-    from tailcyclenet.dataset import load_warps, read_frames
+    from tailcyclenet.data.pixels import load_warps, read_frames
 
     sess = dataset_3d.sessions['train'][0]
     group = sess.groups['g000']
@@ -830,7 +831,7 @@ def test_crop_inflate_draw(tiny_root):
 # the reader cache size
 # ----------------------------------------------------------------------------------------------
 
-# `_reader_cache_size` is pure given `ram_gb`, which is the whole point: the sizing rule is
+# `reader_cache_size` is pure given `ram_gb`, which is the whole point: the sizing rule is
 # asserted here on any host, with no video, no decode and no GPU.
 
 def test_reader_cache_size(monkeypatch):
@@ -838,53 +839,53 @@ def test_reader_cache_size(monkeypatch):
     before the OOM killer, never below 1; and the rule opens nothing (gotcha 10)."""
     import builtins
 
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
     def boom(*a, **k):
         raise AssertionError('the sizing rule must not open anything')
 
     monkeypatch.setattr(builtins, 'open', boom)
     monkeypatch.setattr('os.stat', boom)
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16
-    assert _reader_cache_size(1, (1024, 570), None, ram_gb=503) == 4   # narrow rig still gets mix
-    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=503) == 4   # not x worker count
-    assert _reader_cache_size(16, (3208, 2200), 12, ram_gb=32) < 4
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=8) < 16
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=64) == 16
-    assert _reader_cache_size(16, (3208, 2200), 64, ram_gb=1) == 1
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 16
+    assert reader_cache_size(1, (1024, 570), None, ram_gb=503) == 4   # narrow rig still gets mix
+    assert reader_cache_size(16, (3208, 2200), 12, ram_gb=503) == 4   # not x worker count
+    assert reader_cache_size(16, (3208, 2200), 12, ram_gb=32) < 4
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=8) < 16
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=64) == 16
+    assert reader_cache_size(16, (3208, 2200), 64, ram_gb=1) == 1
 
 
 def test_the_advertised_ram_actually_buys_every_reader():
     """The `--max-ram` the warning advertises buys a reader per camera, and is not padded."""
     from tailcyclenet import memory
-    from tailcyclenet.dataset import _reader_cache_size, reader_cache_ram_gb
+    from tailcyclenet.data.reader_cache import reader_cache_size, reader_cache_ram_gb
 
     n_cams, wh = 16, (3208, 2200)                                     # johnson
     need = reader_cache_ram_gb(n_cams, wh)
-    at = _reader_cache_size(n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need).budget_gb)
+    at = reader_cache_size(n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need).budget_gb)
     assert at >= n_cams, f'--max-ram {need:.1f} advertised for {n_cams} cameras but bought {at}'
-    below = _reader_cache_size(
+    below = reader_cache_size(
         n_cams, wh, None, ram_gb=memory.host_budget(override_gb=need - 1).budget_gb)
     assert below < n_cams, f'{need:.1f} GB is padded: {need - 1:.1f} already buys {below}'
 
 
 def test_the_reader_price_is_linear_not_quadratic():
     """Doubling the budget doubles the count; the old quadratic law capped a 16-camera rig at 10."""
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
-    a = _reader_cache_size(64, (3208, 2200), None, ram_gb=16)
-    b = _reader_cache_size(64, (3208, 2200), None, ram_gb=32)
+    a = reader_cache_size(64, (3208, 2200), None, ram_gb=16)
+    b = reader_cache_size(64, (3208, 2200), None, ram_gb=32)
     assert b / a == pytest.approx(2.0, rel=0.2), f'{a} -> {b} is not linear in the budget'
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=32) == 16
+    assert reader_cache_size(16, (3208, 2200), None, ram_gb=32) == 16
 
 
 def test_reader_cache_env_var_is_deleted_and_raises_by_name(monkeypatch):
     """The override is gone; `--max-ram` is the only knob, and a stale export must not be ignored."""
-    from tailcyclenet.dataset import _reader_cache_size
+    from tailcyclenet.data.reader_cache import reader_cache_size
 
     monkeypatch.setenv('TAILCYCLENET_READER_CACHE', '1')
     with pytest.raises(SystemExit, match='TAILCYCLENET_READER_CACHE is deleted'):
-        _reader_cache_size(16, (3208, 2200), None, ram_gb=503)
+        reader_cache_size(16, (3208, 2200), None, ram_gb=503)
 
 
 def test_a_whole_body_offset_moves_every_keypoint_the_same_way(tiny_root):

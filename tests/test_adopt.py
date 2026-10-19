@@ -340,8 +340,8 @@ def _two_cam(tmp_path, T=6, wh=(64, 48), lens=None):
 
 def test_frame_counts_come_from_the_decoder(tmp_path):
     """`n_frames` comes from the decoder (every index in [0, T) decodes), not container metadata."""
-    from tailcyclenet import video
-    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.data import video
+    from tailcyclenet.data.pixels import read_frames
 
     cal = _two_cam(tmp_path, T=7)
     sess = adopt.build(adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_'),

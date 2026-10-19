@@ -18,8 +18,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt
-from tailcyclenet.dataset import read_frames
-from tailcyclenet.video import H264Writer
+from tailcyclenet.data.pixels import read_frames
+from tailcyclenet.data.video import H264Writer
 
 # BGR (cv2's order). Instance-status colours, fixed per-keypoint palette.
 INST_COLOR = {fmt.INST_LABELED: (80, 220, 80), fmt.INST_PRESENT: (60, 200, 255),

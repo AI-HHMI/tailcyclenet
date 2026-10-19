@@ -92,7 +92,8 @@ def test_image_rotation_keeps_projection_in_warp_frame():
 def test_skew_rotate_crop_resize_matches_pixel_affine():
     from tracktail.model.cube import project_cam
     from tailcyclenet.crop import apply_crop
-    from tailcyclenet.dataset import crop_affine, resize_camera, rotate_camera_image_plane_3d
+    from tailcyclenet.data.pixels import crop_affine
+    from tailcyclenet.dataset import resize_camera, rotate_camera_image_plane_3d
 
     rig = _rig(offset=(7.0, -4.0))
     cam = rig.tracktail()[0]

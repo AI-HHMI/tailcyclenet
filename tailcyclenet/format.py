@@ -1001,7 +1001,7 @@ def video_group(group_id: str, n_frames: int, sources: dict[str, Path], *,
     """A Group whose pixels are NAMED FILES rather than a `groups/<gid>/` directory.
 
     Pre-filling `_src` virtualises the pixels: `Group.source` is the only entry point
-    `dataset.read_frames` calls, so `pixels()`, `dir` and `session.path` are never reached.
+    `pixels.read_frames` calls, so `pixels()`, `dir` and `session.path` are never reached.
     Every camera must be present (a missing key falls through to `pixels()` and raises for the
     wrong reason, which `adopt.plan` catches earlier). A function, not "the caller pokes `_src`".
     """
@@ -1299,7 +1299,7 @@ def _rows_without_3d(tk, t3, sel: np.ndarray) -> int:
 def _check_video(path: Path, n_frames: int, size, where: str, bad) -> None:
     """Rules 7/8 for a video: its decodable frame count is `n_frames` and its frame size is the
     calibration `size`. Opens the container (never decodes a frame)."""
-    from . import video
+    from .data import video
     try:
         reader = video.open_reader(str(path))
     except Exception as e:

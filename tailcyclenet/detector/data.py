@@ -20,7 +20,8 @@ from torch.utils.data import Dataset
 from tracktail.model.cube import project_points_torch
 
 from ..crop import BOX_SOURCES, crop_box_for_points
-from ..dataset import apply_affine, read_frames
+from ..dataset import apply_affine
+from ..data.pixels import read_frames
 from ..format import (INST_ABSENT, INST_LABELED, INST_NONE, INST_PRESENT, UNLABELED,
                       load_datasets)
 

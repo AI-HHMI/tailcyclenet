@@ -15,8 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .dataset import read_frames
-from .video import H264Writer
+from .data.pixels import read_frames
+from .data.video import H264Writer
 
 # BGR. Twelve, which is exactly rat-city's rat count -- no two animals share a colour there.
 PALETTE = [(60, 60, 255), (60, 220, 60), (255, 140, 40), (40, 220, 220), (230, 80, 230),

@@ -617,7 +617,7 @@ def _video_session(tmp_path, T=6, cams=('cam0', 'cam1'), where='vids'):
 def test_a_video_group_decodes_with_no_session_directory(tmp_path):
     """The `--videos` invariant: `group.source` (pre-filled by `video_group`) is the only filesystem
     entry, so a session with no directory decodes the right (camera, frame) by VALUE."""
-    from tailcyclenet.dataset import read_frames
+    from tailcyclenet.data.pixels import read_frames
 
     from .conftest import _video_colour
 

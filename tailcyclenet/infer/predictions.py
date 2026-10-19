@@ -161,7 +161,8 @@ class SessionWriter:
 
         Inputs: out -- output session directory (created here).
                 source -- the source session (calibration, mode, keypoint axis).
-                registry -- keypoint registry; its `names` win over the session's.
+                registry -- keypoint registry; not used for the tables: every table writes
+                    the SOURCE session's `names`, the axis the predictions are indexed on.
                 provenance -- dict or (key, value) pairs; duplicate keys with differing
                     values raise.
                 groups -- group ids in run order, recorded in groups.pq.
@@ -574,7 +575,10 @@ def _load_prediction_session(path, sess, cfg, groups=None):
             'anchor': str(provenance.get('anchor', '')),
             'boxes': str(provenance.get('boxes', '')),
             'box_source': str(provenance.get('box_source', '')),
-            'prediction_session': True, 'independent_windows': independent}
+            'prediction_session': True, 'independent_windows': independent,
+            'frame_start': int(provenance.get('frame_start', 0) or 0),
+            'frame_stop': int(provenance.get('frame_stop', 0)
+                              or provenance.get('max_frames', 0) or 0)}
     return output, meta
 
 

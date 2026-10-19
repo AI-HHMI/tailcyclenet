@@ -573,6 +573,7 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
     """
     from ..format import DICT_COLS, write_table
     counts = {}
+    slot_of = _slot_map(path, gid)
     ftables = (fill or {}).get('tables', {})
     fill_ids = (fill or {}).get('animal_ids')
     for stem in _prediction_tables(path):
@@ -634,6 +635,11 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
                 for logical, local in zip(plan['component'], plan['mapping']):
                     sel = inr & (source == str(animal_ids[local]))
                     new_animal[sel] = str(animal_ids[logical])
+        relabelled = np.flatnonzero(new_animal != animal)
+        if 'slot' in values and len(relabelled):
+            for row_idx in relabelled:
+                if new_animal[row_idx] in slot_of:
+                    values['slot'][int(row_idx)] = slot_of[new_animal[row_idx]]
         keep = ~drop
         empty_dtypes = {pl.Int8: np.int8, pl.Int16: np.int16, pl.Int32: np.int32,
                         pl.Int64: np.int64, pl.UInt8: np.uint8, pl.UInt16: np.uint16,
@@ -649,9 +655,33 @@ def rewrite_tables(path: Path, gid: str, animal_ids, segments: dict[int, np.ndar
             else:
                 out[c] = [value for value, keep_row in zip(values[c], keep) if keep_row]
         out['animal_id'] = new_animal[keep]
-        write_table(f, out, dict_cols=DICT_COLS)
+        tmp = f.with_suffix('.pq.tmp')
+        write_table(tmp, out, dict_cols=DICT_COLS)
+        tmp.replace(f)
         counts[stem] = int(drop.sum())
     return counts
+
+
+def _slot_map(path: Path, gid: str) -> dict[str, int]:
+    """`animal_id -> slot` for one group, read from the tables before any rewrite.
+
+    Outside `--independent-windows` (which the bridge refuses) a slot IS its animal's row, so
+    the pairing is one-to-one; a relabelled row takes its new animal's slot with it.
+    """
+    out = {}
+    for stem in (*_prediction_tables(path), 'windows'):
+        f = path / f'{stem}.pq'
+        if not f.exists():
+            continue
+        table = pl.read_parquet(f)
+        if not {'group_id', 'animal_id', 'slot'}.issubset(table.columns):
+            continue
+        table = table.filter(pl.col('group_id').cast(pl.String) == str(gid))
+        for name, slot in zip(table['animal_id'].cast(pl.String).to_list(),
+                              table['slot'].to_list()):
+            if name is not None and slot is not None:
+                out.setdefault(str(name), int(slot))
+    return out
 
 
 def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
@@ -676,7 +706,6 @@ def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
     """
     cfg.validate()
     path = Path(path)
-    _write_bridge_provenance(path, cfg)
     if fill_dir is not None:
         fill_dir = Path(fill_dir)
         if not (fill_dir / 'windows.pq').exists():
@@ -685,6 +714,14 @@ def bridge_session(path: Path, cfg: BridgeConfig, window_length: int,
                 'segment, and without the window table it cannot be bridged first.')
         bridge_session(fill_dir, cfg, window_length)
     predictions, _ = load_predictions(path)
+    _write_bridge_provenance(path, cfg, complete=False)
+    out = _bridge_loaded(path, cfg, window_length, fill_dir, predictions)
+    _write_bridge_provenance(path, cfg, complete=True)
+    return out
+
+
+def _bridge_loaded(path, cfg, window_length, fill_dir, predictions):
+    """`bridge_session`'s body, on a session its caller has marked incomplete for the edit."""
     windows = pl.read_parquet(path / 'windows.pq')
     epath = path / 'identity_events.pq'
     if not epath.exists():
@@ -757,7 +794,7 @@ def config_provenance(cfg: BridgeConfig) -> list[tuple[str, float]]:
     return [(f'bridge_{k}', float(v)) for k, v in asdict(cfg).items()]
 
 
-def _write_bridge_provenance(path: Path, cfg: BridgeConfig) -> None:
+def _write_bridge_provenance(path: Path, cfg: BridgeConfig, complete: bool | None = None) -> None:
     """Merge the bridge's config into an already-written session's `[provenance]`, in place.
 
     `--identity-bridge` runs AFTER `SessionWriter.close()` (`session.toml` is frozen by then, so
@@ -767,9 +804,17 @@ def _write_bridge_provenance(path: Path, cfg: BridgeConfig) -> None:
     unconditionally at the top of `bridge_session`, before any early return, so a run that found
     nothing to bridge still records that the bridge was asked to look -- the same unconditional-
     membership rule `config_provenance` itself follows.
+
+    `complete` (when given) is written as the session's completion marker in the same atomic
+    replace: `bridge_session` sets it False before editing tables and True after, so a bridge
+    that dies part-way leaves a session every loader refuses instead of one marked complete.
     """
     cfg_path = Path(path) / 'session.toml'
     with open(cfg_path, 'rb') as f:
         doc = tomllib.load(f)
     doc.setdefault('provenance', {}).update(dict(config_provenance(cfg)))
-    cfg_path.write_text(toml.dumps(doc))
+    if complete is not None and doc.get('prediction_session'):
+        doc['complete'] = bool(complete)
+    tmp = cfg_path.with_suffix('.toml.tmp')
+    tmp.write_text(toml.dumps(doc))
+    tmp.replace(cfg_path)

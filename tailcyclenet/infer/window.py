@@ -3,7 +3,8 @@
 Per group: for each window of T frames stepping by T - overlap, get a crop box per camera, read
 the pixels, build the prior (none / carry / self / labels), forward, and map the prediction back
 into the source coordinate frame. `carry` seeds from the model's own previous prediction and
-needs `overlap >= 1`; `labels` is a GT oracle, not a deployment number.
+needs `overlap >= 1`; `self` re-queries within one window and carries nothing; `labels` is a GT
+oracle, not a deployment number.
 """
 from __future__ import annotations
 
@@ -519,8 +520,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         raise ValueError('independent_windows requires anchor=none')
     if cfg.independent_windows and (boxes_for is None or not hasattr(boxes_for, 'for_window')):
         raise ValueError('independent_windows requires a per-window detector callback')
-    if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
-        raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
+    if cfg.anchor == 'carry' and cfg.overlap < 1:
+        raise ValueError("anchor='carry' carries a pose across windows and needs "
                          'overlap >= 1; got 0')
 
     group = session.groups[gid]
@@ -722,8 +723,11 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                     list(cpool.map(lambda ci: one(ci, pool), cams))
         return crops
 
-    def forward(frames, plan, crops, wi, window_det=None, *, score_quality=False):
+    def forward(frames, plan, crops, wi, window_det=None, *, score_quality=False, trace=True):
         """One animal, one window -> its prediction in the SOURCE frame, or None.
+
+        `trace` gates the overlap-trace probes (`prior_oob`, `model_conf`); `--refine`'s pass 1
+        passes False so each (animal, window) is recorded once, from the pass it reports.
 
         `frames` is a parameter for the same reason as `decode_crops`. `carried` is read here on
         the main thread only, in window order -- the window-order guarantee lives in the caller.
@@ -755,7 +759,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             return None
         prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
                                        scales, mode, K, R, cgroup)
-        if stats is not None and stats.get('capture_overlap_agreement') and prior is not None:
+        if (trace and stats is not None and stats.get('capture_overlap_agreement')
+                and prior is not None):
             _count_prior_oob(stats, a, int(frames[0]), prior)
         dev = cfg.device
         chunk = cfg.kpt_chunk or None
@@ -778,12 +783,16 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                               cgroup, dev)
             elif cfg.box_prompt == 'detector':
                 _prompt_boxes = window_det[0] if window_det is not None else boxes_stc
-                if _prompt_boxes is None:
+                if _prompt_boxes is None and box_points is not None:
+                    box_t = (_deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
+                                                cgroup, dev) if a < n_lab else None)
+                elif _prompt_boxes is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
-                box_t = _deploy_box_prompt(mode, None, _prompt_boxes,
-                                          np.arange(len(frames)) if window_det is not None else frames - f0,
-                                          a, use, boxes, scales, cgroup, dev)
+                else:
+                    box_t = _deploy_box_prompt(mode, None, _prompt_boxes,
+                                              np.arange(len(frames)) if window_det is not None else frames - f0,
+                                              a, use, boxes, scales, cgroup, dev)
             if box_t is not None:
                 mkw['box_prompt'] = box_t
                 box_cams[a, wi - w0] = int(torch.isfinite(box_t).all(-1).any(1)[0].sum())
@@ -798,7 +807,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if cfg.anchor == 'self':
                 out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                   kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
-        if stats is not None and stats.get('capture_overlap_agreement'):
+        if trace and stats is not None and stats.get('capture_overlap_agreement'):
             _capture_model_confidence(stats, a, frames, out)
         p = out['coords_pred'][0].detach().cpu().numpy()
         q = None
@@ -882,7 +891,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             refined = []
             for plan in plans:
                 a, use, boxes, cgroup, scales, *_ = plan
-                got = forward(frames, plan, crops, wi, window_det)
+                got = forward(frames, plan, crops, wi, window_det, trace=False)
                 if got is None:
                     refined.append(_at_image_size(plan))
                     continue

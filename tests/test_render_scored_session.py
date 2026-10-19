@@ -72,3 +72,33 @@ def test_the_colour_ramp_runs_red_to_green_and_clamps():
     reds = [mod._colour(lo + (hi - lo) * f, lo, hi)[2] for f in (0, 0.25, 0.5, 0.75, 1)]
     assert greens == sorted(greens) and reds == sorted(reds, reverse=True)
     assert mod.UNSCORED == (128, 128, 128) and mod.UNSCORED != mod._colour(0.0, lo, hi)
+
+
+def test_the_selected_animal_is_drawn_not_animal_zero():
+    """`--animal` filters the scores, so the skeleton drawn under them must be that animal's."""
+    from types import SimpleNamespace
+
+    mod = _mod()
+    points2d = np.full((2, 1, 1, 1, 2), np.nan)
+    points2d[1, 0, 0, 0] = (100.0, 100.0)
+    lab = SimpleNamespace(animal_ids=['det00', 'det01'], points2d=points2d, vis2d=None)
+    a = mod.animal_index(lab, 'det01')
+    assert a == 1
+    im = np.zeros((200, 200, 3), dtype=np.uint8)
+    legend = {0: ''}
+    out = mod.draw_scored(im, lab, a, 0, 0, ['nose'], [], {(0, 'nose'): 1.0}, 0, 0.0, 1.0, '', legend)
+    assert out[100, 100].any(), 'animal 1 owns the only finite point; it must be drawn'
+    blank = mod.draw_scored(im, lab, 0, 0, 0, ['nose'], [], {(0, 'nose'): 1.0}, 0, 0.0, 1.0, '', legend)
+    assert not blank[100, 100].any()
+
+
+def test_a_scores_miss_names_the_sessions_that_are_present(tmp_path):
+    """The hint must be read before the filter empties the table."""
+    import polars as pl
+    import pytest
+
+    pl.DataFrame({'session': ['other'], 'group': ['g'], 'animal': ['det00'], 'start': [0],
+                  'keypoint': ['nose'], 'score': [1.0], 'precision': [1.0]}).write_parquet(
+        tmp_path / 'scores.pq')
+    with pytest.raises(SystemExit, match="Sessions present: \\['other'\\]"):
+        _mod().load_scores(tmp_path, 'sess', 'g', 'det00')

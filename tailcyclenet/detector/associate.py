@@ -64,10 +64,10 @@ def _support_count(cgroup, cams_excl, centres, used, p3d, max_res_px):
     """How many cameras OTHER than `cams_excl` have an UNUSED detection within `max_res_px` of
     `p3d`'s reprojection. detector_v2 plan E1a/E3.
 
-    `used` is the SAME set `associate`'s own consumption loop checks -- built once, up front, from
-    every non-finite centre (see `associate`'s own comment on it) and grown as groups are accepted.
-    Filtering by it here means a detection already claimed by an earlier, higher-support group
-    cannot corroborate a later, lower-support candidate for the same box twice.
+    `used` is `associate`'s set as it stands while candidates are RANKED: the non-finite
+    centres only. Support is counted once per candidate, before any group is accepted, so a
+    count can include a detection that a higher-ranked group later consumes; the consumption
+    loop (not this count) is what keeps each detection in one group.
 
     THE MECHANISM E1a REPLACES: `associate`'s candidate list used to sort by the SEEDING PAIR's
     own 2-view epipolar residual alone -- a number two rays can always satisfy near-exactly, so a

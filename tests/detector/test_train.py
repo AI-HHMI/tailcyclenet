@@ -281,3 +281,32 @@ def test_multi_root_auto_input_size_is_root_order_independent(tiny_root):
     reverse = input_wh_for_roots(list(reversed(roots)), 'keypoints', min_box_px=0)
     assert forward == reverse
     assert all(side % 32 == 0 for side in forward)
+
+
+def test_detector_pth_holds_the_best_checkpoint_not_the_last(tmp_path, monkeypatch):
+    """`detector.pth` is the checkpoint with the best selection score (a tie goes to the later
+    one); `detector_last.pth` is always the latest. Driven through `_evaluate_and_save` with a
+    scripted val history, so the selection rule is exercised, not read off the source."""
+    model = torch.nn.Linear(2, 1)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    history_r50 = {1: 0.3, 2: 0.7, 3: 0.5, 4: 0.7, 5: 0.6}
+    split = {'r50': 0.0, 'r75': 0.0, 'iou': 0.0, 'fp': 0.0, 'mota': 0.0}
+
+    def scripted(model, train, val, device, train_cfg, multi, selection_kind):
+        return {'train': dict(split), 'val': {**split, 'r50': history_r50[it]}}, []
+
+    monkeypatch.setattr(train_detector, '_score_splits', scripted)
+    best, best_it, history = -float('inf'), None, []
+    for it in history_r50:
+        with torch.no_grad():
+            model.weight.fill_(float(it))      # each iteration's weights are identifiable
+        best, best_it = train_detector._evaluate_and_save(
+            model, opt, object(), object(), 'cpu', {'balance_datasets': False}, {}, False,
+            {'input_wh': [32, 32]}, it, tmp_path, history, best, best_it, None)
+    assert (best, best_it) == (0.7, 4)
+    kept = torch.load(tmp_path / 'detector.pth', weights_only=False)
+    assert kept['iteration'] == 4 and kept['selection_score'] == 0.7
+    assert float(kept['model_state']['weight'][0, 0]) == 4.0
+    last = torch.load(tmp_path / 'detector_last.pth', weights_only=False)
+    assert last['iteration'] == 5 and float(last['model_state']['weight'][0, 0]) == 5.0
+    assert [h['iteration'] for h in history] == list(history_r50)

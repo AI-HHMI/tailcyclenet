@@ -1,16 +1,6 @@
 #!/usr/bin/env python
-"""Finetune a tracktail tracker into a pose estimator.
-
-    pixi run python scripts/train.py --config configs/base.toml [--devices N]
-
-The program itself is `tailcyclenet.train`; this file is the documented invocation.
-"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from tailcyclenet.pose.train import main
+"""`tailcyclenet train` from a checkout; `--help` lists its options."""
+from tailcyclenet.__main__ import run
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(run('train'))

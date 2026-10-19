@@ -1,17 +1,6 @@
 #!/usr/bin/env python
-"""Draw a prediction over its source pixels; model 2D overlays come from points2d.pq.
-
-    pixi run python scripts/render.py --pred pred/ --out clips/
-
-The program itself is `tailcyclenet.render`; this file is the documented invocation.
-`tailcyclenet render` runs the same `main()`.
-"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from tailcyclenet.render import main
+"""`tailcyclenet render` from a checkout; `--help` lists its options."""
+from tailcyclenet.__main__ import run
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(run('render'))

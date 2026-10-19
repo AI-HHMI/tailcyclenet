@@ -19,6 +19,7 @@ COMMANDS = {
     'score': ('tailcyclenet.scorer.score', "score a dataset root's tracks with a scorer"),
     'eval': ('tailcyclenet.eval', 'score predictions against labels'),
     'render': ('tailcyclenet.render', 'draw a prediction over its own pixels'),
+    'package': ('tailcyclenet.packaging', 'package a run as a portable .pth'),
 }
 
 
@@ -66,6 +67,15 @@ def main(argv: list[str] | None = None) -> None:
     mod = importlib.import_module(module_name)
     sys.argv = [sys.argv[0], command, *rest]
     mod.main(rest)
+
+
+def run(command: str):
+    """Run one command's `main()` on `sys.argv[1:]`: the body of every `scripts/<command>.py` shim.
+
+    `sys.argv` is left untouched, so a DDP rank respawned from the script path re-runs the script.
+    """
+    import importlib
+    return importlib.import_module(COMMANDS[command][0]).main(sys.argv[1:])
 
 
 if __name__ == '__main__':

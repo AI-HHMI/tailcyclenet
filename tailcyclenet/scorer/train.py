@@ -195,6 +195,389 @@ def require_progress(stepped_this_epoch: int, stepped_this_run: int, step: int,
         'visibility, and the training split instead of retrying forever.')
 
 
+def _scorer_config(config_path, out: Path, fresh: bool, data_path, num_workers) -> tuple[dict, str]:
+    """The layered scorer config with the CLI overrides applied -> (config, output_granularity).
+
+    A run folder whose config predates `output_granularity` is a legacy sequence-mode run.
+    """
+    config = load_config(config_path, base=SCORER_CONFIG)
+    prior_config = out / 'config.toml'
+    if prior_config.exists() and not fresh:
+        with prior_config.open('rb') as f:
+            prior = tomllib.load(f)
+        if 'output_granularity' not in prior.get('scorer', {}):
+            config['scorer'] = {**config.get('scorer', {}), 'output_granularity': 'sequence'}
+            print(f'{prior_config}: absent scorer output_granularity -> legacy sequence mode')
+    output_granularity = validate_scorer_config(config)
+    config['scorer'] = {**config.get('scorer', {}),
+                        'output_granularity': output_granularity}
+    if data_path:
+        config['data'] = {**config['data'], 'path': data_path}
+    if num_workers is not None:
+        config['data'] = {**config['data'], 'num_workers': int(num_workers)}
+    return config, output_granularity
+
+
+def _start_reference(out: Path, checkpoint, train_cfg: dict, fresh: bool):
+    """(checkpoint path or None, the registry to append to or None): own folder first."""
+    resumed = out / 'checkpoints' / 'checkpoint_last.pth'
+    if resumed.exists() and not fresh:
+        ckpt_path = str(resumed)
+        registry_ref = out
+        print(f'resuming this run folder: {resumed}')
+    else:
+        ckpt_path = checkpoint or train_cfg.get('checkpoint_path') or None
+        registry_ref = None
+    base_reg = None
+    ref = Path(ckpt_path) if ckpt_path else registry_ref
+    if ref is not None:
+        ref = ref.parent.parent if ref.is_file() else ref
+        if (ref / 'keypoint_registry.toml').exists():
+            base_reg = Registry.load(ref / 'keypoint_registry.toml')
+            print(f'keypoint registry: appending to {ref / "keypoint_registry.toml"}')
+    return ckpt_path, base_reg
+
+
+def _probe_checkpoint(ckpt_path, config: dict, output_granularity: str) -> tuple[bool, bool]:
+    """(contract mismatch, mode mismatch) of a scorer start checkpoint; either forces a warm start."""
+    checkpoint_contract_mismatch = False
+    checkpoint_mode_mismatch = False
+    if ckpt_path:
+        probe = Path(ckpt_path)
+        if probe.is_dir():
+            from ..checkpoints import resolve_checkpoint
+            probe = resolve_checkpoint(probe / 'checkpoints')
+        if probe.exists():
+            checkpoint_probe = torch.load(probe, map_location='cpu', weights_only=False)
+            if checkpoint_probe.get('kind', 'pose') == 'scorer':
+                checkpoint_mode = scorer_checkpoint_granularity(checkpoint_probe)
+                checkpoint_mode_mismatch = scorer_checkpoint_mode_mismatch(output_granularity, checkpoint_probe)
+                if checkpoint_mode_mismatch:
+                    if full_training_state(checkpoint_probe):
+                        print(f'{probe}: scorer mode {checkpoint_mode!r} differs from requested '
+                              f'{output_granularity!r}; refusing full-state resume, using weights-only '
+                              'warm start')
+                    else:
+                        print(f'{probe}: legacy scorer mode {checkpoint_mode!r} differs from '
+                              f'{output_granularity!r}; allowing weights-only warm start')
+                else:
+                    try:
+                        require_scorer_contract(config, checkpoint_probe, where=str(probe))
+                    except ValueError as e:
+                        checkpoint_contract_mismatch = True
+                        print(f'{probe}: {e}; using warm-start weights')
+    return checkpoint_contract_mismatch, checkpoint_mode_mismatch
+
+
+def _started_loaders(train_ds, val_ds, config: dict, seed: int, n_target: int, fabric, world: int,
+                     is0: bool):
+    """(train, val) loaders, with their workers started before the model allocates CUDA memory."""
+    val_batches = int(config['training'].get('val_batches', 20))
+    val_indices = None
+    if val_ds is not None:
+        n_val = min(dist_utils.per_rank(val_batches, world), len(val_ds))
+        val_indices = ([int(i) for i in np.unique(
+            np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
+                       if n_val else [])
+    train_loader, val_loader = _loaders(
+        train_ds, val_ds, config, seed, world=world, rank=(fabric.global_rank if fabric else 0),
+        num_samples=dist_utils.ceil_div(n_target, world), val_indices=val_indices)
+    if train_loader.num_workers or (val_loader is not None and val_loader.num_workers):
+        iter(train_loader)
+        if val_loader is not None and val_loader.num_workers:
+            iter(val_loader)
+        if is0:
+            print(f'loader workers: train={train_loader.num_workers} '
+                  f'val={val_loader.num_workers if val_loader is not None else 0} '
+                  f'prefetch={config["data"].get("prefetch_factor", 1)} '
+                  '(started before model CUDA allocation)')
+    return train_loader, val_loader
+
+
+def _resume_candidate(model, ckpt_path, output_granularity: str, base_reg,
+                      contract_mismatch: bool, mode_mismatch: bool):
+    """(resume_state, resume_file, fresh names): a matching full scorer state, else a warm start."""
+    resume_state = None
+    resume_file = None
+    fresh: set[str] = set()
+    if ckpt_path:
+        ckpt_file = Path(ckpt_path)
+        if ckpt_file.is_dir():
+            from ..checkpoints import resolve_checkpoint
+            ckpt_file = resolve_checkpoint(ckpt_file / 'checkpoints')
+        loaded = torch.load(ckpt_file, map_location='cpu', weights_only=False)
+        if (loaded.get('kind', 'pose') == 'scorer' and full_training_state(loaded)
+                and not contract_mismatch and not mode_mismatch):
+            require_scorer_granularity(output_granularity,
+                                       scorer_checkpoint_granularity(loaded),
+                                       where=str(ckpt_file))
+            resume_state = loaded
+            resume_file = ckpt_file
+            print(f'resume candidate: {ckpt_file} at iteration {loaded.get("iteration", "?")} '
+                  f'(output_granularity={output_granularity})')
+        else:
+            if (loaded.get('kind', 'pose') == 'scorer'
+                    and not mode_mismatch):
+                require_scorer_granularity(output_granularity,
+                                           scorer_checkpoint_granularity(loaded),
+                                           where=str(ckpt_file))
+            fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
+    fresh = set(fresh) | {n for n, _ in model.named_parameters()
+                          if n.startswith(('attn_pool.', 'score_', 'missing_point',
+                                           'precision_head', 'frame_loss.'))}
+    return resume_state, resume_file, fresh
+
+
+def _optimizer_and_resume(model, fresh: set, opt_cfg: dict, resume_state, resume_file, base_reg):
+    """(optimizer, resume_state): a resume that does not load falls back to a clean warm start."""
+    optimizer = build_optimizer(model, fresh, opt_cfg)
+    if resume_state is not None:
+        try:
+            model.load_state_dict(resume_state['model_state'], strict=True)
+            verdict = check_resume(optimizer, resume_state['optimizer_state'])
+            if not verdict:
+                raise ValueError(verdict.reason)
+            optimizer.load_state_dict(resume_state['optimizer_state'])
+            print(f'resuming {resume_file} at iteration {resume_state.get("iteration", "?")}')
+        except (KeyError, RuntimeError, ValueError, SystemExit) as e:
+            print(f'resume: {resume_file} is not reusable ({e}); warm-starting at iteration 0')
+            fresh.update(warm_start(model, resume_file, base_names=warm_start_names(base_reg)))
+            optimizer = build_optimizer(model, fresh, opt_cfg)
+            resume_state = None
+    return optimizer, resume_state
+
+
+def _prior_best(out: Path, config: dict, selection_metric: str, resuming: bool, fabric, is0: bool):
+    """(best value, best iteration, locked) from a resumed run's `checkpoint_best.pth`.
+
+    A best written under a different contract is discarded; one with no comparable value is left
+    untouched and locks the best slot for this run.
+    """
+    best_acc = float('-inf')
+    best_iter = -1
+    best_locked = False
+    prior_best = out / 'checkpoints' / 'checkpoint_best.pth'
+    if resuming and prior_best.exists():
+        prior_best_payload = torch.load(prior_best, map_location='cpu', weights_only=False)
+        prior_contract_ok = not scorer_contract_mismatches(config, prior_best_payload)
+        if (prior_contract_ok
+                and prior_best_payload.get('scorer_selection_metric') == selection_metric
+                and np.isfinite(prior_best_payload.get('scorer_selection_value', np.nan))):
+            best_acc = float(prior_best_payload['scorer_selection_value'])
+            best_iter = int(prior_best_payload.get('iteration', -1))
+            print(f'prior best: val/{selection_metric} {best_acc:.4f} at iteration {best_iter}')
+        elif not prior_contract_ok:
+            if is0:
+                prior_best.unlink(missing_ok=True)
+            if fabric is not None:
+                fabric.barrier()
+            if is0:
+                print(f'prior best {prior_best} uses a different scorer contract; discarding it')
+        else:
+            best_locked = True
+            print(f'prior best {prior_best} has no comparable {selection_metric} value; '
+                  'leaving it untouched')
+    return best_acc, best_iter, best_locked
+
+
+class ScorerLoop:
+    """The scorer's step loop for one run; `run_loop()` trains to this rank's local target.
+
+    A synchronized DDP step advances the headline iteration by `world`; `step` counts completed
+    local steps (a rejected or non-finite triplet still advances it).
+    """
+
+    def __init__(self, *, fabric, world, is0, device, config, out, registry, train_loader,
+                 val_loader, raw_model, wrap, optimizer, loss_fn, val_loss_fn,
+                 output_granularity, wb, start_iter, n_target, best):
+        """Bind the run; the frequencies become per-rank local step counts."""
+        train_cfg = config['training']
+        self.fabric, self.world, self.is0, self.device = fabric, world, is0, device
+        self.config, self.out, self.registry, self.wb = config, out, registry, wb
+        self.train_loader, self.val_loader = train_loader, val_loader
+        self.raw_model, self.wrap, self.optimizer = raw_model, wrap, optimizer
+        self.model = fabric.setup_module(raw_model) if wrap else raw_model
+        self.loss_fn, self.val_loss_fn = loss_fn, val_loss_fn
+        self.output_granularity = output_granularity
+        val_freq = int(train_cfg.get('val_freq', 200))
+        ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
+        self.print_freq = int(train_cfg.get('print_freq', 20))
+        self.max_norm = float(train_cfg.get('max_grad_norm', 10.0))
+        self.step = dist_utils.ceil_div(start_iter, world)
+        self.skipped = 0
+        self.stepped_this_run = 0
+        self.local_val_freq = dist_utils.per_rank(val_freq, world) if val_freq else 0
+        self.local_ckpt_freq = dist_utils.per_rank(ckpt_freq, world)
+        self.local_print_freq = dist_utils.per_rank(self.print_freq, world)
+        self.local_target = dist_utils.ceil_div(n_target, world)
+        self.waited, self.evalled, self.ckpted = [0.0], [0.0], [0.0]
+        self.window: dict[str, list] = {}
+        self.selection_metric = resolve_selection_metric(config, output_granularity)
+        self.best_acc, self.best_iter, self.best_locked = best
+
+    def selected_value(self, values: dict) -> float | None:
+        """Read the explicitly configured validation metric, never infer it from the loss."""
+        candidates = [f'val/{self.selection_metric}', self.selection_metric]
+        if self.output_granularity == 'frame' and self.selection_metric == 'triplet_acc':
+            candidates.insert(0, 'val/active_triplet_acc')
+        for key in candidates:
+            value = values.get(key)
+            if value is not None and np.isfinite(value):
+                return float(value)
+        return None
+
+    def run_loop(self) -> None:
+        """Step until the local target; every pass over the loader must step at least once."""
+        self.model.train()
+        if hasattr(self.optimizer, 'train'):
+            self.optimizer.train()
+        self.t0 = time.time()
+        while self.step < self.local_target:
+            stepped_this_epoch = 0
+            for trip in timed(self.train_loader, self.waited):
+                if self.step >= self.local_target:
+                    break
+                grad_norm = self.train_step(trip)
+                if grad_norm is None:
+                    continue
+                stepped_this_epoch += 1
+                self.after_step(grad_norm)
+            require_progress(stepped_this_epoch, self.stepped_this_run, self.step,
+                             self.local_target)
+
+    def train_step(self, trip):
+        """One optimizer step -> its grad norm, or None when every rank skipped it."""
+        fabric, optimizer = self.fabric, self.optimizer
+        accepted = dist_utils.all_ranks_finite(fabric, trip is not None)
+        if not accepted:
+            self.skipped += 1
+            self.step += 1
+            return None
+        trip = triplet_to_device(trip, self.device)
+        if self.wrap:
+            scores, precision, labels = self.model(trip)
+        else:
+            scores, precision, labels = self.model.score_triplet(trip)
+        total = scorer_loss(self.loss_fn, scores, precision, labels, trip,
+                            self.output_granularity)
+        if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(total))):
+            optimizer.zero_grad(set_to_none=True)
+            self.skipped += 1
+            self.step += 1
+            return None
+        optimizer.zero_grad(set_to_none=True)
+        if fabric is not None:
+            fabric.backward(total)
+        else:
+            total.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.raw_model.parameters(), self.max_norm)
+        if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(grad_norm))):
+            optimizer.zero_grad(set_to_none=True)
+            self.skipped += 1
+            self.step += 1
+            return None
+        optimizer.step()
+        self.step += 1
+        self.stepped_this_run += 1
+        return grad_norm
+
+    def after_step(self, grad_norm) -> None:
+        """Window the train metrics, then validate, report and checkpoint on their cadences."""
+        fabric, step = self.fabric, self.step
+        iteration = step * self.world
+        hist = self.loss_fn.collapse_history(prefix='')
+        self.loss_fn.reset_history()
+        for k, v in hist.items():
+            self.window.setdefault(k, []).append(v)
+        values = {f'train/{k}': float(np.mean(vs)) for k, vs in self.window.items()}
+        if fabric is not None:
+            values = {k: dist_utils.all_ranks_mean(fabric, v) for k, v in values.items()}
+        if step % self.local_print_freq == 0:
+            self.window.clear()
+        if self.val_loader is not None and self.local_val_freq and step % self.local_val_freq == 0:
+            self.validate(values, iteration)
+        if step % self.local_print_freq == 0:
+            self.report(values, iteration, grad_norm)
+        elif self.wb is not None and self.is0:
+            log(self.wb, values, iteration)
+        if step % self.local_ckpt_freq == 0 or step == self.local_target:
+            started = time.time()
+            if fabric is not None:
+                dist_utils.check_ranks_agree(fabric, self.raw_model)
+            save_scorer_checkpoint(self.out, iteration, self.raw_model, self.optimizer,
+                                   self.config, write=self.is0, registry=self.registry)
+            if fabric is not None:
+                fabric.barrier()
+            self.ckpted[0] += time.time() - started
+
+    def validate(self, values: dict, iteration: int) -> None:
+        """The val pass into `values`; a better selected metric writes `checkpoint_best.pth`."""
+        fabric, optimizer = self.fabric, self.optimizer
+        started = time.time()
+        val_values = evaluate(self.raw_model, self.val_loader, self.val_loss_fn, self.device,
+                              len(self.val_loader), optimizer, self.output_granularity)
+        val_values = gather_eval(fabric, val_values)
+        values.update(val_values)
+        self.evalled[0] += time.time() - started
+        val_hist = self.val_loss_fn.collapse_history(prefix='val/')
+        values.update(gather_eval(fabric, val_hist))
+        self.val_loss_fn.reset_history()
+        if hasattr(optimizer, 'train'):
+            optimizer.train()
+        acc = self.selected_value(values)
+        if not self.best_locked and acc is not None and acc > self.best_acc:
+            self.best_acc, self.best_iter = float(acc), iteration
+            started = time.time()
+            save_scorer_checkpoint(self.out, iteration, self.raw_model, optimizer, self.config,
+                                   name='best', write=self.is0, registry=self.registry,
+                                   selection_metric=self.selection_metric,
+                                   selection_value=self.best_acc)
+            if fabric is not None:
+                fabric.barrier()
+            self.ckpted[0] += time.time() - started
+        if self.is0:
+            print(f'[{iteration}] ' + '  '.join(
+                f'{k}={v:.4g}' for k, v in values.items() if k.startswith('val/')))
+            if acc is not None:
+                print(f'[{iteration}] best val/{self.selection_metric} {self.best_acc:.4f} at '
+                      f'iteration {self.best_iter}')
+
+    def report(self, values: dict, iteration: int, grad_norm) -> None:
+        """The print-interval line and W&B payload; then reset the interval clocks."""
+        step = self.step
+        wall = time.time() - self.t0
+        elapsed = max(wall - self.evalled[0] - self.ckpted[0], 1e-9)
+        report_steps = max(1, min(self.local_print_freq, step))
+        dt = elapsed / report_steps
+        wait_frac = self.waited[0] / elapsed
+        eval_frac = self.evalled[0] / wall if wall > 0 else 0.0
+        values.update({
+            'train/iteration': iteration,
+            'train/grad_norm': float(grad_norm),
+            'train/gpu_peak_gb': gpu_peak_gb(self.device, reset=True),
+            'train/cpu_peak_gb': _cpu_peak_gb(),
+            'train/sec_per_it': dt,
+            'train/loader_wait_frac': wait_frac,
+            'train/eval_frac': eval_frac,
+            'train/ckpt_frac': self.ckpted[0] / wall if wall > 0 else 0.0,
+            'train/skipped_frac': self.skipped / max(step, 1),
+            'train/world_size': self.world,
+        })
+        train_acc = values.get('train/active_triplet_acc',
+                               values.get('train/triplet_acc', float('nan')))
+        train_gap = values.get('train/active_score_gap',
+                               values.get('train/score_gap', float('nan')))
+        if self.is0:
+            print(f'[{iteration}] last {self.print_freq} steps: '
+                  f'loss={values.get("train/scorer_loss", float("nan")):.4g} '
+                  f'acc={train_acc:.3f} gap={train_gap:.4g} '
+                  f'({dt:.2f}s/it wait {wait_frac:.0%} eval {eval_frac:.0%})')
+            if self.wb is not None:
+                log(self.wb, values, iteration)
+        self.t0 = time.time()
+        self.waited[0] = self.evalled[0] = self.ckpted[0] = 0.0
+
+
 def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         max_iterations: int | None, no_wandb: bool, fresh: bool = False, fabric=None,
         num_workers: int | None = None, devices_arg: int | None = None) -> None:
@@ -224,152 +607,38 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     world = int(fabric.world_size) if fabric is not None else 1
     is0 = bool(fabric.is_global_zero) if fabric is not None else True
     device = fabric.device if fabric is not None else device
-    config = load_config(config_path, base=SCORER_CONFIG)
-    fresh_requested = fresh
-    prior_config = out / 'config.toml'
-    if prior_config.exists() and not fresh:
-        with prior_config.open('rb') as f:
-            prior = tomllib.load(f)
-        if 'output_granularity' not in prior.get('scorer', {}):
-            config['scorer'] = {**config.get('scorer', {}), 'output_granularity': 'sequence'}
-            print(f'{prior_config}: absent scorer output_granularity -> legacy sequence mode')
-    output_granularity = validate_scorer_config(config)
-    config['scorer'] = {**config.get('scorer', {}),
-                        'output_granularity': output_granularity}
-    if data_path:
-        config['data'] = {**config['data'], 'path': data_path}
-    if num_workers is not None:
-        config['data'] = {**config['data'], 'num_workers': int(num_workers)}
+    config, output_granularity = _scorer_config(config_path, out, fresh, data_path, num_workers)
     train_cfg = config['training']
     seed = int(train_cfg.get('seed', 23))
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    resumed = out / 'checkpoints' / 'checkpoint_last.pth'
-    if resumed.exists() and not fresh:
-        ckpt_path = str(resumed)
-        registry_ref = out
-        print(f'resuming this run folder: {resumed}')
-    else:
-        ckpt_path = checkpoint or train_cfg.get('checkpoint_path') or None
-        registry_ref = None
-    base_reg = None
-    ref = Path(ckpt_path) if ckpt_path else registry_ref
-    if ref is not None:
-        ref = ref.parent.parent if ref.is_file() else ref
-        if (ref / 'keypoint_registry.toml').exists():
-            base_reg = Registry.load(ref / 'keypoint_registry.toml')
-            print(f'keypoint registry: appending to {ref / "keypoint_registry.toml"}')
-
-    checkpoint_probe = None
-    checkpoint_contract_mismatch = False
-    checkpoint_mode_mismatch = False
-    if ckpt_path:
-        probe = Path(ckpt_path)
-        if probe.is_dir():
-            from ..checkpoints import resolve_checkpoint
-            probe = resolve_checkpoint(probe / 'checkpoints')
-        if probe.exists():
-            checkpoint_probe = torch.load(probe, map_location='cpu', weights_only=False)
-            if checkpoint_probe.get('kind', 'pose') == 'scorer':
-                checkpoint_mode = scorer_checkpoint_granularity(checkpoint_probe)
-                checkpoint_mode_mismatch = scorer_checkpoint_mode_mismatch(output_granularity, checkpoint_probe)
-                if checkpoint_mode_mismatch:
-                    if full_training_state(checkpoint_probe):
-                        print(f'{probe}: scorer mode {checkpoint_mode!r} differs from requested '
-                              f'{output_granularity!r}; refusing full-state resume, using weights-only '
-                              'warm start')
-                    else:
-                        print(f'{probe}: legacy scorer mode {checkpoint_mode!r} differs from '
-                              f'{output_granularity!r}; allowing weights-only warm start')
-                else:
-                    try:
-                        require_scorer_contract(config, checkpoint_probe, where=str(probe))
-                    except ValueError as e:
-                        checkpoint_contract_mismatch = True
-                        print(f'{probe}: {e}; using warm-start weights')
+    ckpt_path, base_reg = _start_reference(out, checkpoint, train_cfg, fresh)
+    contract_mismatch, mode_mismatch = _probe_checkpoint(ckpt_path, config, output_granularity)
 
     train_ds, val_ds, registry = build_datasets(
         config, base_reg, rank=(fabric.global_rank if fabric is not None else 0),
         world_size=world)
     if fabric is not None:
         dist_utils.check_registry(fabric, registry.names)
-
-    val_batches = int(train_cfg.get('val_batches', 20))
     n_target = int(max_iterations or train_cfg.get('n_iterations', 10000))
-    val_indices = None
-    if val_ds is not None:
-        n_val = min(dist_utils.per_rank(val_batches, world), len(val_ds))
-        val_indices = ([int(i) for i in np.unique(
-            np.linspace(0, len(val_ds) - 1, n_val).round().astype(int))]
-                       if n_val else [])
-    train_loader, val_loader = _loaders(
-        train_ds, val_ds, config, seed, world=world, rank=(fabric.global_rank if fabric else 0),
-        num_samples=dist_utils.ceil_div(n_target, world), val_indices=val_indices)
-    if train_loader.num_workers or (val_loader is not None and val_loader.num_workers):
-        iter(train_loader)
-        if val_loader is not None and val_loader.num_workers:
-            iter(val_loader)
-        if is0:
-            print(f'loader workers: train={train_loader.num_workers} '
-                  f'val={val_loader.num_workers if val_loader is not None else 0} '
-                  f'prefetch={config["data"].get("prefetch_factor", 1)} '
-                  '(started before model CUDA allocation)')
+    train_loader, val_loader = _started_loaders(train_ds, val_ds, config, seed, n_target,
+                                                fabric, world, is0)
 
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
                          registry.n_keypoints, **scorer_kwargs(config)).to(device)
     loss_fn = build_scorer_loss(config, output_granularity)
     if output_granularity == 'frame':
         model.add_module('frame_loss', loss_fn.to(device))
-
-    resume_state = None
-    resume_file = None
-    fresh: set[str] = set()
-    if ckpt_path:
-        ckpt_file = Path(ckpt_path)
-        if ckpt_file.is_dir():
-            from ..checkpoints import resolve_checkpoint
-            ckpt_file = resolve_checkpoint(ckpt_file / 'checkpoints')
-        loaded = torch.load(ckpt_file, map_location='cpu', weights_only=False)
-        if (loaded.get('kind', 'pose') == 'scorer' and full_training_state(loaded)
-                and not checkpoint_contract_mismatch and not checkpoint_mode_mismatch):
-            require_scorer_granularity(output_granularity,
-                                       scorer_checkpoint_granularity(loaded),
-                                       where=str(ckpt_file))
-            resume_state = loaded
-            resume_file = ckpt_file
-            print(f'resume candidate: {ckpt_file} at iteration {loaded.get("iteration", "?")} '
-                  f'(output_granularity={output_granularity})')
-        else:
-            if (loaded.get('kind', 'pose') == 'scorer'
-                    and not checkpoint_mode_mismatch):
-                require_scorer_granularity(output_granularity,
-                                           scorer_checkpoint_granularity(loaded),
-                                           where=str(ckpt_file))
-            fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
-    fresh = set(fresh) | {n for n, _ in model.named_parameters()
-                          if n.startswith(('attn_pool.', 'score_', 'missing_point',
-                                           'precision_head', 'frame_loss.'))}
+    resume_state, resume_file, fresh_names = _resume_candidate(
+        model, ckpt_path, output_granularity, base_reg, contract_mismatch, mode_mismatch)
 
     opt_cfg = dist_utils.scale_optimizer_cfg(config['training']['optimizer'], world)
     if world > 1 and is0:
         print(f'lr: scaled by sqrt({world}) -> learning_rate {opt_cfg["learning_rate"]:g}'
               + (f', kpt_lr {opt_cfg["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg else ''))
-    optimizer = build_optimizer(model, fresh, opt_cfg)
-    if resume_state is not None:
-        try:
-            model.load_state_dict(resume_state['model_state'], strict=True)
-            verdict = check_resume(optimizer, resume_state['optimizer_state'])
-            if not verdict:
-                raise ValueError(verdict.reason)
-            optimizer.load_state_dict(resume_state['optimizer_state'])
-            print(f'resuming {resume_file} at iteration {resume_state.get("iteration", "?")}')
-        except (KeyError, RuntimeError, ValueError, SystemExit) as e:
-            print(f'resume: {resume_file} is not reusable ({e}); warm-starting at iteration 0')
-            fresh.update(warm_start(model, resume_file, base_names=warm_start_names(base_reg)))
-            optimizer = build_optimizer(model, fresh, opt_cfg)
-            resume_state = None
-            resume_file = None
+    optimizer, resume_state = _optimizer_and_resume(model, fresh_names, opt_cfg, resume_state,
+                                                    resume_file, base_reg)
 
     val_loss_fn = build_scorer_loss(config, output_granularity).to(device)
     if output_granularity == 'frame':
@@ -387,193 +656,25 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     if fabric is not None:
         fabric.barrier()
     wb = None if no_wandb or not is0 else init_wandb(config, out)
-    val_freq = int(train_cfg.get('val_freq', 200))
-    ckpt_freq = int(train_cfg.get('checkpoint_freq', 1000))
-    print_freq = int(train_cfg.get('print_freq', 20))
-    max_norm = float(train_cfg.get('max_grad_norm', 10.0))
     start_iter = int(resume_state.get('iteration', 0)) if resume_state else 0
     n_iter = max(0, n_target - start_iter)
-    raw_model = model
-    wrap = fabric is not None and world > 1
-    model = fabric.setup_module(raw_model) if wrap else raw_model
-    model.train()
-    if hasattr(optimizer, 'train'):
-        optimizer.train()
-    step = dist_utils.ceil_div(start_iter, world)
-    skipped = 0
-    stepped_this_run = 0
-    local_val_freq = dist_utils.per_rank(val_freq, world) if val_freq else 0
-    local_ckpt_freq = dist_utils.per_rank(ckpt_freq, world)
-    local_print_freq = dist_utils.per_rank(print_freq, world)
-    t0 = time.time()
-    waited, evalled, ckpted = [0.0], [0.0], [0.0]
-    window: dict[str, list] = {}
-    selection_metric = resolve_selection_metric(config, output_granularity)
-    best_acc = float('-inf')
-    best_iter = -1
-    best_locked = False
-    prior_best = out / 'checkpoints' / 'checkpoint_best.pth'
-    if resumed.exists() and not fresh_requested and prior_best.exists():
-        prior_best_payload = torch.load(prior_best, map_location='cpu', weights_only=False)
-        prior_contract_ok = not scorer_contract_mismatches(config, prior_best_payload)
-        if (prior_contract_ok
-                and prior_best_payload.get('scorer_selection_metric') == selection_metric
-                and np.isfinite(prior_best_payload.get('scorer_selection_value', np.nan))):
-            best_acc = float(prior_best_payload['scorer_selection_value'])
-            best_iter = int(prior_best_payload.get('iteration', -1))
-            print(f'prior best: val/{selection_metric} {best_acc:.4f} at iteration {best_iter}')
-        elif not prior_contract_ok:
-            if is0:
-                prior_best.unlink(missing_ok=True)
-            if fabric is not None:
-                fabric.barrier()
-            if is0:
-                print(f'prior best {prior_best} uses a different scorer contract; discarding it')
-        else:
-            best_locked = True
-            print(f'prior best {prior_best} has no comparable {selection_metric} value; '
-                  'leaving it untouched')
-
-    def selected_value(values: dict) -> float | None:
-        """Read the explicitly configured validation metric, never infer it from the loss."""
-        candidates = [f'val/{selection_metric}', selection_metric]
-        if output_granularity == 'frame' and selection_metric == 'triplet_acc':
-            candidates.insert(0, 'val/active_triplet_acc')
-        for key in candidates:
-            value = values.get(key)
-            if value is not None and np.isfinite(value):
-                return float(value)
-        return None
-    local_target = dist_utils.ceil_div(n_target, world)
-    while step < local_target:
-        stepped_this_epoch = 0
-        for trip in timed(train_loader, waited):
-            if step >= local_target:
-                break
-            accepted = dist_utils.all_ranks_finite(fabric, trip is not None)
-            if not accepted:
-                skipped += 1
-                step += 1
-                continue
-            trip = triplet_to_device(trip, device)
-            if wrap:
-                scores, precision, labels = model(trip)
-            else:
-                scores, precision, labels = model.score_triplet(trip)
-            total = scorer_loss(loss_fn, scores, precision, labels, trip,
-                                output_granularity)
-            if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(total))):
-                optimizer.zero_grad(set_to_none=True)
-                skipped += 1
-                step += 1
-                continue
-            optimizer.zero_grad(set_to_none=True)
-            if fabric is not None:
-                fabric.backward(total)
-            else:
-                total.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm)
-            if not dist_utils.all_ranks_finite(fabric, bool(torch.isfinite(grad_norm))):
-                optimizer.zero_grad(set_to_none=True)
-                skipped += 1
-                step += 1
-                continue
-            optimizer.step()
-            step += 1
-            stepped_this_epoch += 1
-            stepped_this_run += 1
-            iteration = step * world
-            hist = loss_fn.collapse_history(prefix='')
-            loss_fn.reset_history()
-            for k, v in hist.items():
-                window.setdefault(k, []).append(v)
-            values = {f'train/{k}': float(np.mean(vs)) for k, vs in window.items()}
-            if fabric is not None:
-                values = {k: dist_utils.all_ranks_mean(fabric, v) for k, v in values.items()}
-            if step % local_print_freq == 0:
-                window.clear()
-
-            if val_loader is not None and local_val_freq and step % local_val_freq == 0:
-                started = time.time()
-                val_values = evaluate(raw_model, val_loader, val_loss_fn, device,
-                                      len(val_loader), optimizer, output_granularity)
-                val_values = gather_eval(fabric, val_values)
-                values.update(val_values)
-                evalled[0] += time.time() - started
-                val_hist = val_loss_fn.collapse_history(prefix='val/')
-                values.update(gather_eval(fabric, val_hist))
-                val_loss_fn.reset_history()
-                if hasattr(optimizer, 'train'):
-                    optimizer.train()
-                acc = selected_value(values)
-                if not best_locked and acc is not None and acc > best_acc:
-                    best_acc, best_iter = float(acc), iteration
-                    started = time.time()
-                    save_scorer_checkpoint(out, iteration, raw_model, optimizer, config,
-                                           name='best', write=is0, registry=registry,
-                                           selection_metric=selection_metric,
-                                           selection_value=best_acc)
-                    if fabric is not None:
-                        fabric.barrier()
-                    ckpted[0] += time.time() - started
-                if is0:
-                    print(f'[{iteration}] ' + '  '.join(
-                    f'{k}={v:.4g}' for k, v in values.items() if k.startswith('val/')))
-                    if acc is not None:
-                        print(f'[{iteration}] best val/{selection_metric} {best_acc:.4f} at '
-                              f'iteration {best_iter}')
-
-            if step % local_print_freq == 0:
-                wall = time.time() - t0
-                elapsed = max(wall - evalled[0] - ckpted[0], 1e-9)
-                report_steps = max(1, min(local_print_freq, step))
-                dt = elapsed / report_steps
-                wait_frac = waited[0] / elapsed
-                eval_frac = evalled[0] / wall if wall > 0 else 0.0
-                values.update({
-                    'train/iteration': iteration,
-                    'train/grad_norm': float(grad_norm),
-                    'train/gpu_peak_gb': gpu_peak_gb(device, reset=True),
-                    'train/cpu_peak_gb': _cpu_peak_gb(),
-                    'train/sec_per_it': dt,
-                    'train/loader_wait_frac': wait_frac,
-                    'train/eval_frac': eval_frac,
-                    'train/ckpt_frac': ckpted[0] / wall if wall > 0 else 0.0,
-                    'train/skipped_frac': skipped / max(step, 1),
-                    'train/world_size': world,
-                })
-                train_acc = values.get('train/active_triplet_acc',
-                                        values.get('train/triplet_acc', float('nan')))
-                train_gap = values.get('train/active_score_gap',
-                                       values.get('train/score_gap', float('nan')))
-                if is0:
-                    print(f'[{iteration}] last {print_freq} steps: '
-                          f'loss={values.get("train/scorer_loss", float("nan")):.4g} '
-                          f'acc={train_acc:.3f} gap={train_gap:.4g} '
-                          f'({dt:.2f}s/it wait {wait_frac:.0%} eval {eval_frac:.0%})')
-                    if wb is not None:
-                        log(wb, values, iteration)
-                t0 = time.time()
-                waited[0] = evalled[0] = ckpted[0] = 0.0
-            elif wb is not None and is0:
-                log(wb, values, iteration)
-
-            if step % local_ckpt_freq == 0 or step == local_target:
-                started = time.time()
-                if fabric is not None:
-                    dist_utils.check_ranks_agree(fabric, raw_model)
-                save_scorer_checkpoint(out, iteration, raw_model, optimizer, config, write=is0,
-                                       registry=registry)
-                if fabric is not None:
-                    fabric.barrier()
-                ckpted[0] += time.time() - started
-        require_progress(stepped_this_epoch, stepped_this_run, step, local_target)
+    resuming = (out / 'checkpoints' / 'checkpoint_last.pth').exists() and not fresh
+    loop = ScorerLoop(
+        fabric=fabric, world=world, is0=is0, device=device, config=config, out=out,
+        registry=registry, train_loader=train_loader, val_loader=val_loader, raw_model=model,
+        wrap=fabric is not None and world > 1, optimizer=optimizer, loss_fn=loss_fn,
+        val_loss_fn=val_loss_fn, output_granularity=output_granularity, wb=wb,
+        start_iter=start_iter, n_target=n_target,
+        best=_prior_best(out, config, resolve_selection_metric(config, output_granularity),
+                         resuming, fabric, is0))
+    loop.run_loop()
     if wb is not None:
         wb.finish()
     if is0:
-        if best_iter >= 0:
-            print(f'best: val/{selection_metric} {best_acc:.4f} at iteration {best_iter} '
-                  f'(checkpoints/checkpoint_best.pth; output_granularity={output_granularity})')
+        if loop.best_iter >= 0:
+            print(f'best: val/{loop.selection_metric} {loop.best_acc:.4f} at iteration '
+                  f'{loop.best_iter} (checkpoints/checkpoint_best.pth; '
+                  f'output_granularity={output_granularity})')
         print(f'done: {n_iter} iterations into {out}')
 
 

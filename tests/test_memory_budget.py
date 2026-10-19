@@ -281,7 +281,7 @@ def test_the_frame_cache_changes_no_pixel_at_any_budget(multiwindow_scene, budge
     Run at both ends rather than at the default, because the default on the test host is whatever
     that host happens to have free -- which is exactly the non-determinism being ruled out.
     """
-    from tailcyclenet.infer import InferConfig, run_group
+    from tailcyclenet.infer.window import InferConfig, run_group
 
     model, sess, registry, name = multiwindow_scene
     cfg = InferConfig(n_frames=4, overlap=2, image_size=64, min_crop_dim=16, device='cpu',
@@ -322,7 +322,7 @@ def test_block_size_changes_no_pixel(tmp_path, anchor, refine):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, merge_blocks, run_blocks
+    from tailcyclenet.infer.window import InferConfig, merge_blocks, run_blocks
     from tailcyclenet.model import build_model
     from test_model import SMALL
 
@@ -380,7 +380,7 @@ def test_a_window_that_does_not_fit_is_refused_not_re_decoded(tmp_path):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, run_group
+    from tailcyclenet.infer.window import InferConfig, run_group
     from tailcyclenet.model import build_model
     from test_model import SMALL
 
@@ -412,7 +412,7 @@ def test_the_detection_lookahead_is_what_degrades_on_a_tight_budget(tmp_path):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, merge_blocks, run_blocks
+    from tailcyclenet.infer.window import InferConfig, merge_blocks, run_blocks
     from tailcyclenet.model import build_model
     from test_model import SMALL
 
@@ -617,7 +617,7 @@ def test_plan_windows_matches_run_blocks_on_a_real_group(tmp_path):
     """
     import conftest as cf
     from tailcyclenet.format import Registry, load_dataset
-    from tailcyclenet.infer import InferConfig, run_blocks
+    from tailcyclenet.infer.window import InferConfig, run_blocks
     from tailcyclenet.infer.window import _plan_windows
     from tailcyclenet.model import build_model
     from test_model import SMALL

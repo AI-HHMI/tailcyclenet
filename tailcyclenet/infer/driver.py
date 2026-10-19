@@ -434,7 +434,7 @@ def run_dataset(args):
               'upper bound, not a deployment number. Label it as such wherever you quote it.')
 
     if args.oracle_corrupt:
-        from tailcyclenet.infer import ORACLE_CORRUPTIONS
+        from .window import ORACLE_CORRUPTIONS
         kind = args.oracle_corrupt.split(':')[0]
         if kind not in ORACLE_CORRUPTIONS:
             raise SystemExit(f'--oracle-corrupt {args.oracle_corrupt!r}: kind must be one of '

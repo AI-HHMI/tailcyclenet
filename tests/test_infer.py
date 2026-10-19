@@ -16,7 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from tailcyclenet.format import Registry, load_dataset
-from tailcyclenet.infer import InferConfig, run_group
+from tailcyclenet.infer.window import InferConfig, run_group
 from tailcyclenet.model import build_model
 from test_model import SMALL
 
@@ -252,7 +252,7 @@ def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
     it is bit-identical to what `load_image` produced when it did both at once.
     """
     from tailcyclenet.dataset import read_frames
-    from tailcyclenet.infer import _crop_views
+    from tailcyclenet.infer.window import _crop_views
 
     _, sess, _, _ = scene
     group, cam = sess.groups['g000'], sess.cam_names[0]
@@ -508,7 +508,7 @@ def test_inflate_box_widens_about_its_centre():
 def test_deploy_box_prompt_lands_inside_the_crop_2d():
     """`_deploy_box_prompt` maps an animal's source points into the crop frame and boxes them,
     2D single-camera -- the path this function has always covered, unchanged in result."""
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
     source = np.array([[[[110., 110.], [130., 150.]]]])            # (S=1,T=1,K=2,2) source px
     boxes = [torch.tensor([100, 100, 200, 200], dtype=torch.int32)]
     scales = [2.0]
@@ -527,7 +527,7 @@ def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
     own rig so the projection geometry is exactly what `run_group` builds.
     """
     from tailcyclenet import box_prompt as bpmod
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
 
     _, sess, _, _ = scene
     if sess.mode != '3d':
@@ -579,7 +579,7 @@ def test_box_prompt_detector_per_camera_degradation():
     """3D + 'detector': a camera with NO finite box that frame yields a NaN column, not an
     exception -- the `_sub_missing` no-box token substitutes it in the encoder, which is the
     regime `box_prompt_dropout` trains rather than a silent failure."""
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
 
     T = 3
     cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)) for _ in range(2)]
@@ -605,7 +605,7 @@ def test_box_prompt_column_order_matches_use():
     primitives (`box_corners` + `crop_box_for_points`) for that camera alone, rather than a hand-
     derived expected value."""
     from tailcyclenet import box_prompt as bpmod
-    from tailcyclenet.infer import _deploy_box_prompt
+    from tailcyclenet.infer.window import _deploy_box_prompt
 
     T = 2
     cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)),
@@ -777,7 +777,7 @@ def test_carried_prior_is_bounds_masked_and_dated():
     `window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
     was handed in as a confident prior instead of as "I was not told".
     """
-    from tailcyclenet.infer import _build_prior
+    from tailcyclenet.infer.window import _build_prior
 
     K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -825,7 +825,7 @@ def test_oracle_corrupt_near_picks_nearest_eligible_row():
     """`near` must pick the ELIGIBLE row closest to the target in the MODEL's own frame -- not
     the fixed `a + 1` row `other` uses -- and must be a NO-OP when nothing qualifies.
     """
-    from tailcyclenet.infer import _corrupt_prior
+    from tailcyclenet.infer.window import _corrupt_prior
 
     K, size = 2, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -858,7 +858,7 @@ def test_oracle_corrupt_swap_transposes_keypoints():
     how many pairs -- and must never touch which row or frame the pose came from. The direct
     inference probe for `dataset.py`'s `prompt_swap_kpt_pairs`.
     """
-    from tailcyclenet.infer import _corrupt_prior
+    from tailcyclenet.infer.window import _corrupt_prior
 
     K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]

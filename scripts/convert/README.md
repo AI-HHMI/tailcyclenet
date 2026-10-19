@@ -42,6 +42,9 @@ code. Do not rewrite an existing root's string to "fix" it -- regenerate the roo
 | `scripts/clean_qdmouse4m.py` | `scripts/convert/qdmouse4m_clean.py` |
 | `scripts/add_qdmouse4m_fluo_cameras.py` | `scripts/convert/qdmouse4m_add_fluo_cameras.py` |
 
+`scripts/convert_deepfly3d_v3.py` is now split across `deepfly3d_v3.py` (CLI, discovery,
+conversion), `deepfly3d_h5.py` (HDF5 reading) and `deepfly3d_rig.py` (calibration rig).
+
 ## Other scripts moved in the same change
 
 | old path | new path |

@@ -20,6 +20,7 @@ import torch
 from tailcyclenet import checkpoints as ck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
+from tailcyclenet.scorer.checkpoint import load_scorer_run
 
 
 def _packaged(name):
@@ -186,7 +187,7 @@ image_size = 64
 image_size = 64
 """)
     with pytest.raises(ValueError, match='pose'):
-        ck.load_scorer_run(run)
+        load_scorer_run(run)
 
 
 def test_a_checkpoint_carries_its_kind(tmp_path):

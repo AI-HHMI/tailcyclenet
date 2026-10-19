@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ..checkpoints import scorer_output_granularity
+from .contract import scorer_output_granularity
 from .qc import rank, score_root, write_outputs
 
 

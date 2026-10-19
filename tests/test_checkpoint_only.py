@@ -13,6 +13,7 @@ import torch
 from tailcyclenet import checkpoints as ck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
+from tailcyclenet.scorer.checkpoint import load_scorer_run, save_scorer_checkpoint
 from tailcyclenet.model import build_model
 
 from .test_model import SMALL
@@ -38,7 +39,7 @@ def _scorer_config():
 
 def _scorer_model(config):
     from tailcyclenet.scorer.model import build_scorer
-    from tailcyclenet.scorer.train import build_scorer_loss
+    from tailcyclenet.scorer.losses import build_scorer_loss
     sc = config['scorer']
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
                          REGISTRY.n_keypoints, pool_num_heads=sc['pool_num_heads'],
@@ -67,12 +68,15 @@ def _train_run(tmp_path, kind):
     opt = _Averaged([p for p in model.parameters() if p.requires_grad], lr=1e-3)
     run = tmp_path / f'{kind}-run'
     ck.save_run_meta(run, config, REGISTRY, kind=kind, extra={'world_size': 1})
-    path = ck.save_checkpoint(run, 5, model, opt, config, registry=REGISTRY, kind=kind)
+    if kind == 'pose':
+        path = ck.save_checkpoint(run, 5, model, opt, config, registry=REGISTRY)
+    else:
+        path = save_scorer_checkpoint(run, 5, model, opt, config, registry=REGISTRY)
     return run, path, model
 
 
 def _load(kind, where, **kw):
-    return (ck.load_run if kind == 'pose' else ck.load_scorer_run)(where, **kw)
+    return (ck.load_run if kind == 'pose' else load_scorer_run)(where, **kw)
 
 
 def _same_weights(a, b):
@@ -159,7 +163,7 @@ def test_a_pose_checkpoint_is_refused_as_a_scorer_and_vice_versa(tmp_path):
     _, pose, _ = _train_run(tmp_path, 'pose')
     _, scorer, _ = _train_run(tmp_path, 'scorer')
     with pytest.raises(ValueError, match="'pose' checkpoint, not a 'scorer'"):
-        ck.load_scorer_run(pose)
+        load_scorer_run(pose)
     with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
         ck.load_run(scorer)
 

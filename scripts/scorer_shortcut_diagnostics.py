@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.checkpoints import load_scorer_run  # noqa: E402
+from tailcyclenet.scorer.checkpoint import load_scorer_run  # noqa: E402
 from tailcyclenet.config import SCORER_CONFIG, load_config  # noqa: E402
 from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402

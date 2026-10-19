@@ -39,7 +39,8 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
-from tailcyclenet.checkpoints import load_scorer_run, scorer_output_granularity  # noqa: E402
+from tailcyclenet.scorer.checkpoint import load_scorer_run  # noqa: E402
+from tailcyclenet.scorer.contract import scorer_output_granularity  # noqa: E402
 from tailcyclenet.config import SCORER_CONFIG, load_config  # noqa: E402
 from tailcyclenet.scorer.qc import _loader_config, _to_device  # noqa: E402
 

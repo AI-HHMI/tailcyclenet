@@ -30,7 +30,8 @@ from tailcyclenet.config import load_config, SCORER_CONFIG  # noqa: E402
 from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.model import build_scorer  # noqa: E402
-from tailcyclenet.scorer.train import (build_scorer_loss, corruption_config, loader_config,  # noqa: E402
+from tailcyclenet.scorer.losses import build_scorer_loss  # noqa: E402
+from tailcyclenet.scorer.train import (corruption_config, loader_config,  # noqa: E402
                                        resolve_output_granularity, scorer_kwargs, scorer_loss)
 from tailcyclenet.scorer.triplet import GENERATORS, make_triplet  # noqa: E402
 

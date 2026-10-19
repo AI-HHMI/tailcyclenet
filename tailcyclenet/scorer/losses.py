@@ -13,6 +13,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tracktail.model.losses_scorer import TripletScorerLoss
+
+from .contract import scorer_output_granularity
+
 
 _MASK_KEYS = (
     'active_mask', 'observed_mask', 'anchor_observed_mask', 'in_view_mask', 'far_mask',
@@ -578,3 +582,27 @@ class FrameTripletScorerLoss(nn.Module):
 
 
 __all__ = ['FrameTripletScorerLoss', 'signed_pointwise_targets']
+
+
+def build_scorer_loss(config: dict, output_granularity: str | None = None):
+    """The mode-specific scorer loss: tracktail's `TripletScorerLoss` for `sequence`, this
+    module's `FrameTripletScorerLoss` for `frame`."""
+    mode = output_granularity or scorer_output_granularity(config)
+    cfg = config.get('scorer', {})
+    common = dict(margin=float(cfg.get('triplet_margin', 0.25)),
+                  precision_reg_weight=float(cfg.get('precision_reg_weight', 0.01)),
+                  score_reg_weight=float(cfg.get('score_reg_weight', 0.0)))
+    if mode == 'sequence':
+        return TripletScorerLoss(**common)
+    optional = {
+        'pointwise_weight': float(cfg.get('pointwise_weight', 0.0)),
+        'pointwise_balance': bool(cfg.get('pointwise_balance', True)),
+        'pointwise_label_smoothing': float(cfg.get('pointwise_label_smoothing', 0.0)),
+        'inactive_consistency_weight': float(cfg.get('inactive_consistency_weight', 0.0)),
+        'anchor_consistency_weight': float(cfg.get('anchor_consistency_weight', 0.0)),
+        'max_clean_px': float(cfg.get('corruption', {}).get('max_clean_px', 0.0)),
+    }
+    import inspect
+    params = inspect.signature(FrameTripletScorerLoss).parameters
+    kwargs = {k: v for k, v in {**common, **optional}.items() if k in params}
+    return FrameTripletScorerLoss(**kwargs)

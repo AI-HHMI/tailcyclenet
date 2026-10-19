@@ -5,7 +5,7 @@ best checkpoint is selected on held-out synthetic triplet accuracy rather than o
 staged encoder unfreeze, the pose losses and the pose eval all have no meaning here. What IS
 reused, by import, is the parts that must not diverge: `config.load_config` (so the scorer
 family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose checkpoint),
-`checkpoints.save_checkpoint` / `save_run_meta` with `kind='scorer'`, and `train.build_optimizer`
+`scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and `train.build_optimizer`
 (so Muon routing and the fresh-parameter rule are one implementation).
 
     pixi run python scripts/train_scorer.py --config configs/scorer-3dpop.toml --data <root> \
@@ -25,13 +25,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from tracktail.datasets.scorer_corruption import GENERATORS
-from tracktail.model.losses_scorer import TripletScorerLoss
 
-from ..checkpoints import (SCORER_OUTPUT_GRANULARITIES,
-                           full_training_state, require_scorer_granularity,
-                           save_checkpoint, save_run_meta, scorer_checkpoint_granularity,
-                           scorer_contract_mismatches, scorer_output_granularity, warm_start,
-                           prior_provenance)
+from ..checkpoints import full_training_state, prior_provenance, save_run_meta, warm_start
+from .checkpoint import save_scorer_checkpoint
+from .contract import (SCORER_OUTPUT_GRANULARITIES, require_scorer_contract,
+                       require_scorer_granularity, scorer_checkpoint_granularity,
+                       scorer_contract_mismatches, scorer_output_granularity)
+from .losses import build_scorer_loss
 from ..config import SCORER_CONFIG, load_config
 from ..dataset import LoaderConfig, PoseDataset, StepSampler
 from ..format import Registry
@@ -81,7 +81,7 @@ def resolve_output_granularity(config: dict) -> str:
     """Resolve and validate the scorer output mode for a merged/new config.
 
     New scorer configs inherit an explicit ``frame`` from the family base.  A config read directly
-    from an old run folder is handled by :func:`checkpoints.scorer_output_granularity`, where an
+    from an old run folder is handled by :func:`scorer.contract.scorer_output_granularity`, where an
     absent key means the legacy sequence path.  This small wrapper is kept in the trainer so unit
     tests and callers do not need to know which compatibility helper owns the default.
     """
@@ -419,41 +419,6 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
                             worker_init_fn=worker_init)
     return train_loader, val_loader
 
-
-
-def build_scorer_loss(config: dict, output_granularity: str | None = None):
-    """Construct the mode-specific loss while keeping the legacy path untouched.
-
-    The installed ``TripletScorerLoss`` deliberately remains the sequence compatibility loss.  The
-    framewise implementation is repo-owned in ``scorer.losses``; importing it lazily keeps old
-    sequence-only consumers able to import this module with an older tracktail install and makes
-    the missing implementation fail by name at the first frame run.
-    """
-    mode = output_granularity or scorer_output_granularity(config)
-    cfg = config.get('scorer', {})
-    common = dict(margin=float(cfg.get('triplet_margin', 0.25)),
-                  precision_reg_weight=float(cfg.get('precision_reg_weight', 0.01)),
-                  score_reg_weight=float(cfg.get('score_reg_weight', 0.0)))
-    if mode == 'sequence':
-        return TripletScorerLoss(**common)
-    try:
-        from .losses import FrameTripletScorerLoss
-    except ImportError as e:
-        raise RuntimeError(
-            'frame scorer requested but tailcyclenet.scorer.losses.FrameTripletScorerLoss is '
-            'unavailable; install the framewise scorer implementation') from e
-    optional = {
-        'pointwise_weight': float(cfg.get('pointwise_weight', 0.0)),
-        'pointwise_balance': bool(cfg.get('pointwise_balance', True)),
-        'pointwise_label_smoothing': float(cfg.get('pointwise_label_smoothing', 0.0)),
-        'inactive_consistency_weight': float(cfg.get('inactive_consistency_weight', 0.0)),
-        'anchor_consistency_weight': float(cfg.get('anchor_consistency_weight', 0.0)),
-        'max_clean_px': float(cfg.get('corruption', {}).get('max_clean_px', 0.0)),
-    }
-    import inspect
-    params = inspect.signature(FrameTripletScorerLoss).parameters
-    kwargs = {k: v for k, v in {**common, **optional}.items() if k in params}
-    return FrameTripletScorerLoss(**kwargs)
 
 
 def _frame_loss_kwargs(loss_fn, trip: dict) -> dict:
@@ -981,7 +946,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                               f'{output_granularity!r}; allowing weights-only warm start')
                 else:
                     try:
-                        from ..checkpoints import require_scorer_contract
                         require_scorer_contract(config, checkpoint_probe, where=str(probe))
                     except ValueError as e:
                         checkpoint_contract_mismatch = True
@@ -1211,10 +1175,10 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 if not best_locked and acc is not None and acc > best_acc:
                     best_acc, best_iter = float(acc), iteration
                     started = time.time()
-                    save_checkpoint(out, iteration, raw_model, optimizer, config,
-                                    name='best', write=is0, registry=registry, kind='scorer',
-                                    scorer_selection_metric=selection_metric,
-                                    scorer_selection_value=best_acc)
+                    save_scorer_checkpoint(out, iteration, raw_model, optimizer, config,
+                                           name='best', write=is0, registry=registry,
+                                           selection_metric=selection_metric,
+                                           selection_value=best_acc)
                     if fabric is not None:
                         fabric.barrier()
                     ckpted[0] += time.time() - started
@@ -1264,8 +1228,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 started = time.time()
                 if fabric is not None:
                     dist_utils.check_ranks_agree(fabric, raw_model)
-                save_checkpoint(out, iteration, raw_model, optimizer, config, write=is0,
-                                registry=registry, kind='scorer')
+                save_scorer_checkpoint(out, iteration, raw_model, optimizer, config, write=is0,
+                                       registry=registry)
                 if fabric is not None:
                     fabric.barrier()
                 ckpted[0] += time.time() - started

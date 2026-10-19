@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from tailcyclenet.checkpoints import (
+from tailcyclenet.scorer.checkpoint import save_scorer_checkpoint
+from tailcyclenet.scorer.contract import (
     require_scorer_granularity,
-    save_checkpoint,
     scorer_checkpoint_granularity,
     scorer_contract,
     scorer_contract_mismatches,
@@ -81,7 +81,7 @@ def test_legacy_frame_checkpoint_uses_embedded_config_for_new_contract_fields():
     metadata_contract = scorer_contract(embedded)
     metadata_contract.pop('two_d_sampling')
     metadata_contract.pop('prob_2d_only')
-    from tailcyclenet.checkpoints import require_scorer_contract
+    from tailcyclenet.scorer.contract import require_scorer_contract
     require_scorer_contract(
         config,
         {'config': embedded, 'scorer_metadata': {'contract': metadata_contract}},
@@ -122,7 +122,7 @@ def test_frame_checkpoint_stamps_and_saves_the_loss_scale(tmp_path):
     model.add_module('frame_loss', FrameTripletScorerLoss(pointwise_weight=1.0))
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     config = {'scorer': {'output_granularity': 'frame', 'loss_schema': 'framewise-v1'}}
-    save_checkpoint(tmp_path, 3, model, optimizer, config, kind='scorer')
+    save_scorer_checkpoint(tmp_path, 3, model, optimizer, config)
     checkpoint = torch.load(tmp_path / 'checkpoints' / 'checkpoint_last.pth',
                             map_location='cpu', weights_only=False)
     assert checkpoint['output_granularity'] == 'frame'

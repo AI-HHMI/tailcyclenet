@@ -25,225 +25,6 @@ from .model import build_model
 # `save_checkpoint` rather than declared in the config file, so a family cannot forget to say.
 KINDS = ('pose', 'detector', 'scorer')
 
-# Scorer output mode is part of the model/checkpoint contract.  A scorer run written before
-# framewise output existed has no key at all; treating an absent key as ``sequence`` is what keeps
-# those weights byte-compatible.  New configs get an explicit value from configs/scorer.toml.
-SCORER_OUTPUT_GRANULARITIES = ('sequence', 'frame')
-
-
-def scorer_output_granularity(config: dict | None, *, legacy_default: str = 'sequence') -> str:
-    """Resolve a scorer's output mode without guessing from tensor names.
-
-    ``load_config`` overlays the scorer family base, so a new config normally contains
-    ``[scorer].output_granularity = "frame"``.  Run folders are read back as already-merged
-    TOML and old folders do not contain the key; those deliberately resolve to the legacy
-    sequence contract.  ``legacy_default`` is exposed for callers that need to make the policy
-    explicit while testing a partially-built config.
-    """
-    if legacy_default not in SCORER_OUTPUT_GRANULARITIES:
-        raise ValueError(f'legacy_default must be one of {SCORER_OUTPUT_GRANULARITIES}, '
-                         f'got {legacy_default!r}')
-    value = (config or {}).get('scorer', {}).get('output_granularity')
-    if value is None:
-        value = legacy_default
-    value = str(value).lower()
-    if value not in SCORER_OUTPUT_GRANULARITIES:
-        raise ValueError(
-            f'[scorer].output_granularity = {value!r} is not one of '
-            f'{SCORER_OUTPUT_GRANULARITIES}. Choose "frame" for the new framewise scorer or '
-            '"sequence" for the legacy scorer.')
-    return value
-
-
-def scorer_checkpoint_granularity(ckpt: dict, *, legacy_default: str = 'sequence') -> str:
-    """Resolve a checkpoint's scorer mode from metadata, with an old-file fallback.
-
-    The top-level field is intentionally redundant with the embedded config.  It makes refusal
-    possible before constructing a large scorer, and protects against a caller changing the run
-    config after a checkpoint was written.  Old checkpoints have neither field and are legacy
-    sequence checkpoints.
-    """
-    if not isinstance(ckpt, dict):
-        raise ValueError(f'scorer checkpoint must be a dictionary, got {type(ckpt).__name__}')
-    metadata = ckpt.get('scorer_metadata')
-    candidates = []
-    for key in ('output_granularity', 'scorer_output_granularity'):
-        if key in ckpt:
-            candidates.append((key, ckpt[key]))
-    if isinstance(metadata, dict) and 'output_granularity' in metadata:
-        candidates.append(('scorer_metadata.output_granularity',
-                           metadata['output_granularity']))
-    embedded = ckpt.get('config')
-    if isinstance(embedded, dict) and isinstance(embedded.get('scorer'), dict):
-        if 'output_granularity' in embedded['scorer']:
-            candidates.append(('config.scorer.output_granularity',
-                               embedded['scorer']['output_granularity']))
-    values = {str(v).lower() for _, v in candidates}
-    if len(values) > 1:
-        details = ', '.join(f'{name}={value!r}' for name, value in candidates)
-        raise ValueError(f'scorer checkpoint has conflicting output_granularity metadata: {details}')
-    value = next(iter(values), None)
-    if value is None:
-        value = scorer_output_granularity(embedded, legacy_default=legacy_default)
-    value = str(value).lower()
-    if value not in SCORER_OUTPUT_GRANULARITIES:
-        raise ValueError(
-            f'scorer checkpoint has invalid output_granularity {value!r}; expected '
-            f'{SCORER_OUTPUT_GRANULARITIES}')
-    return value
-
-
-def require_scorer_granularity(requested: str, checkpoint: str, *, where='checkpoint') -> None:
-    """Raise a named refusal when a full scorer state crosses output modes."""
-    requested = str(requested).lower()
-    checkpoint = str(checkpoint).lower()
-    if requested not in SCORER_OUTPUT_GRANULARITIES:
-        raise ValueError(f'requested scorer output_granularity {requested!r} is invalid')
-    if checkpoint not in SCORER_OUTPUT_GRANULARITIES:
-        raise ValueError(f'{where}: checkpoint output_granularity {checkpoint!r} is invalid')
-    if requested != checkpoint:
-        raise ValueError(
-            f'{where}: scorer output_granularity mismatch: checkpoint is {checkpoint!r}, but '
-            f'the requested run is {requested!r}. Full-state scorer resume across sequence/frame '
-            'modes is refused; use a pose checkpoint as a warm start instead.')
-
-
-def scorer_contract(config: dict | None) -> dict:
-    """Extract the scorer loss, mask, and corruption settings that define a run's semantics."""
-    config = config or {}
-    scorer = config.get('scorer', {}) if isinstance(config, dict) else {}
-    corr = scorer.get('corruption', {}) if isinstance(scorer, dict) else {}
-    data = config.get('data', {}) if isinstance(config, dict) else {}
-    model = config.get('model', {}) if isinstance(config, dict) else {}
-    mode = scorer_output_granularity(config)
-    segment_count = corr.get('n_segments', corr.get('segment_count', 1))
-    if isinstance(segment_count, (list, tuple)):
-        segment_count = list(segment_count)
-    else:
-        segment_count = int(segment_count)
-    loss_schema = scorer.get('loss_schema')
-    mask_semantics = scorer.get('corruption_mask_semantics')
-    duplicate_policy = scorer.get('source_frame_duplicate_policy')
-    if mode == 'sequence':
-        if loss_schema in (None, 'framewise-v1'):
-            loss_schema = 'sequence-v0'
-        if mask_semantics in (None, 'far-observed-in-view-anchor-observed'):
-            mask_semantics = 'legacy'
-        if duplicate_policy in (None, 'inverse_multiplicity'):
-            duplicate_policy = 'legacy'
-    else:
-        loss_schema = loss_schema or 'framewise-v1'
-        mask_semantics = mask_semantics or 'far-observed-in-view-anchor-observed'
-        duplicate_policy = duplicate_policy or 'inverse_multiplicity'
-    sequence_gate = bool(corr.get('sequence_far_gate', False))
-    if mode == 'sequence' and not sequence_gate:
-        corruption_values = {
-            'min_corrupt_px': 0.0, 'max_clean_px': 0.0, 'reference_gate': 'legacy',
-            'reference_margin_px': 0.0, 'segment_prob': 0.0, 'segment_count': 1,
-            'segment_len_frames': [1, 1], 'full_window_share': 0.0,
-            'segment_types': None, 'no_active_slot_policy': 'legacy',
-            'out_of_view_policy': 'legacy',
-        }
-    else:
-        corruption_values = {
-            'min_corrupt_px': float(corr.get('min_corrupt_px', 0.0)),
-            'max_clean_px': float(corr.get('max_clean_px', 0.0)),
-            'reference_gate': corr.get('reference_gate', 'source_far'),
-            'reference_margin_px': float(corr.get('reference_margin_px', 0.0)),
-            'segment_prob': float(corr.get('segment_prob', 0.0)),
-            'segment_count': segment_count,
-            'segment_len_frames': corr.get('segment_len_frames',
-                                            corr.get('segment_length_frames', [2, 6])),
-            'full_window_share': float(corr.get(
-                'segment_full_window_share', corr.get(
-                    'full_window_share', corr.get('segment_full_window_prob', 0.0)))),
-            'segment_types': corr.get('segment_types'),
-            'no_active_slot_policy': corr.get('no_active_slot_policy', 'retry'),
-            'out_of_view_policy': corr.get('out_of_view_policy', 'exclude'),
-        }
-    return {
-        'output_granularity': mode,
-        'loss_schema': loss_schema,
-        'corruption_mask_semantics': mask_semantics,
-        'source_frame_duplicate_policy': duplicate_policy,
-        'two_d_sampling': scorer.get('two_d_sampling', 'legacy-3d-single-view'),
-        'prob_2d_only': float(data.get('prob_2d_only', 0.25)),
-        'n_frames': int(data['n_frames']) if 'n_frames' in data else None,
-        'stride_length': int(model['stride_length']) if 'stride_length' in model else None,
-        'frame_strides': list(data['frame_strides']) if 'frame_strides' in data else None,
-        'min_valid_frames': int(scorer.get('min_valid_frames', corr.get('min_valid_frames', 6))),
-        'const_offset_prob': float(corr.get('const_offset_prob', 0.0)),
-        'frame_noise_prob': float(corr.get('frame_noise_prob', 0.0)),
-        'gradual_drift_prob': float(corr.get('gradual_drift_prob', 0.0)),
-        'sinusoid_prob': float(corr.get('sinusoid_prob', 0.0)),
-        'point_drop_prob': float(corr.get('point_drop_prob', 0.0)),
-        'point_drop_max_frac': float(corr.get('point_drop_max_frac', 0.0)),
-        'point_drop_bernoulli_rate': float(corr.get('point_drop_bernoulli_rate', 0.0)),
-        'mag_2d': dict(corr.get('mag_2d', {})),
-        'mag_3d': dict(corr.get('mag_3d', {})),
-        'pointwise_weight': float(scorer.get('pointwise_weight', 0.0)),
-        'pointwise_balance': bool(scorer.get('pointwise_balance', True)),
-        'pointwise_label_smoothing': float(scorer.get('pointwise_label_smoothing', 0.0)),
-        'inactive_consistency_weight': float(scorer.get('inactive_consistency_weight', 0.0)),
-        'anchor_consistency_weight': float(scorer.get('anchor_consistency_weight', 0.0)),
-        **corruption_values,
-        'sequence_far_gate': sequence_gate,
-    }
-
-
-def scorer_contract_mismatches(config: dict, ckpt: dict) -> dict:
-    """Return contract disagreements against the request and within checkpoint sources."""
-    expected = scorer_contract(config)
-    metadata = ckpt.get('scorer_metadata') if isinstance(ckpt, dict) else None
-    embedded = ckpt.get('config') if isinstance(ckpt, dict) else None
-    sources = []
-    if isinstance(metadata, dict) and isinstance(metadata.get('contract'), dict):
-        sources.append(('metadata', metadata['contract']))
-    if isinstance(embedded, dict):
-        sources.append(('config', scorer_contract(embedded)))
-    if isinstance(metadata, dict) and not sources:
-        sources.append(('metadata', {key: metadata[key] for key in (
-            'output_granularity', 'loss_schema', 'corruption_mask_semantics',
-            'source_frame_duplicate_policy') if key in metadata}))
-    mismatches = {}
-    for source_name, source in sources:
-        for key, value in expected.items():
-            if key in source and source[key] != value:
-                mismatches[f'{source_name}.{key}'] = (source[key], value)
-    for left_index, (left_name, left) in enumerate(sources):
-        for right_name, right in sources[left_index + 1:]:
-            for key in set(left) & set(right):
-                if left[key] != right[key]:
-                    mismatches[f'{left_name}.{key} vs {right_name}.{key}'] = (
-                        left[key], right[key])
-    return mismatches
-
-
-def require_scorer_contract(config: dict, ckpt: dict, *, where='checkpoint') -> None:
-    """Refuse a scorer checkpoint whose recorded loss/data contract changed."""
-    if scorer_output_granularity(config) == 'frame':
-        metadata = ckpt.get('scorer_metadata') if isinstance(ckpt, dict) else None
-        metadata_contract = metadata.get('contract') if isinstance(metadata, dict) else None
-        embedded = ckpt.get('config') if isinstance(ckpt, dict) else None
-        required = set(scorer_contract({'scorer': {'output_granularity': 'frame'}}))
-        if isinstance(metadata_contract, dict):
-            missing = required - set(metadata_contract)
-            if missing:
-                embedded_contract = scorer_contract(embedded) if isinstance(embedded, dict) else {}
-                unresolved = missing - set(embedded_contract)
-                if unresolved:
-                    raise ValueError(
-                        f'{where}: incomplete frame scorer contract metadata; missing '
-                        f'{sorted(unresolved)}')
-        elif not isinstance(embedded, dict):
-            raise ValueError(f'{where}: frame scorer checkpoint has no complete semantic contract')
-    mismatches = scorer_contract_mismatches(config, ckpt)
-    if mismatches:
-        details = ', '.join(f'{key}: checkpoint={old!r}, requested={new!r}'
-                            for key, (old, new) in sorted(mismatches.items()))
-        raise ValueError(f'{where}: scorer semantic contract mismatch ({details})')
-
-
 def is_hf_repo_id(value: str) -> bool:
     """Whether ``value`` is a Hugging Face repo id rather than a local path.
 
@@ -372,8 +153,7 @@ def full_training_state(ck: dict) -> bool:
 def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                     name: str = 'last', write: bool = True,
                     registry: Registry | None = None, kind: str = 'pose',
-                    scorer_selection_metric: str | None = None,
-                    scorer_selection_value: float | None = None,
+                    extra: dict | None = None,
                     fresh_names: set[str] | None = None) -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
@@ -424,22 +204,7 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     if kind == 'pose':
         from .optim import optimizer_metadata
         payload['optimizer_metadata'] = optimizer_metadata(model, optimizer, fresh_names)
-    if kind == 'scorer':
-        mode = scorer_output_granularity(config)
-        if scorer_selection_metric is not None:
-            payload['scorer_selection_metric'] = str(scorer_selection_metric)
-        if scorer_selection_value is not None:
-            payload['scorer_selection_value'] = float(scorer_selection_value)
-        payload['output_granularity'] = mode
-        payload['scorer_output_granularity'] = mode
-        contract = scorer_contract(config)
-        payload['scorer_metadata'] = {
-            'output_granularity': mode,
-            'loss_schema': contract['loss_schema'],
-            'corruption_mask_semantics': contract['corruption_mask_semantics'],
-            'source_frame_duplicate_policy': contract['source_frame_duplicate_policy'],
-            'contract': contract,
-        }
+    payload.update(extra or {})
     torch.save(payload, tmp)
     tmp.replace(path)
     return path
@@ -455,7 +220,7 @@ def _enclosing_run(path: Path) -> Path | None:
     return None
 
 
-def _file_bundle(path: Path, ckpt: dict, kind: str) -> tuple[dict, Registry, dict]:
+def file_bundle(path: Path, ckpt: dict, kind: str) -> tuple[dict, Registry, dict]:
     """(config, registry, provenance) for a checkpoint FILE, without a run folder.
 
     The checkpoint's own embedded config/registry/provenance win: they were written beside these
@@ -487,7 +252,7 @@ def _file_bundle(path: Path, ckpt: dict, kind: str) -> tuple[dict, Registry, dic
     return dict(config), registry, prov
 
 
-def _print_provenance(prov: dict, where) -> None:
+def print_provenance(prov: dict, where) -> None:
     """One line naming the commit the weights were trained at, or that it is unknown."""
     if prov:
         print(f'run provenance: {str(prov.get("commit", "?"))[:12]}'
@@ -503,9 +268,9 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
     if not isinstance(ckpt, dict):
         raise ValueError(f'{path}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
     if ckpt.get('kind', 'pose') != 'pose':
-        _require_ckpt_kind(ckpt, 'pose', path)
-    config, registry, prov = _file_bundle(path, ckpt, 'pose')
-    _print_provenance(prov, path)
+        require_ckpt_kind(ckpt, 'pose', path)
+    config, registry, prov = file_bundle(path, ckpt, 'pose')
+    print_provenance(prov, path)
     check_image_size(config)
     if model_overrides:
         config['model'] = {**config.get('model', {}), **model_overrides}
@@ -522,7 +287,7 @@ def _load_packaged_pose(path: Path, device='cpu', model_overrides: dict | None =
     model = build_model({**config['model'], 'video_encoder_pretrained': False},
                         n_keypoints=registry.n_keypoints)
     missing, unexpected = model.load_state_dict(state, strict=False)
-    _report('load_run', missing, unexpected, [])
+    report_load('load_run', missing, unexpected, [])
     model.run_provenance = prov
     return model.to(device).eval(), config, registry, path
 
@@ -534,7 +299,7 @@ def peek_registry(run: Path) -> Registry:
         ckpt = torch.load(run, map_location='cpu', weights_only=False)
         if not isinstance(ckpt, dict):
             raise ValueError(f'{run}: checkpoint must be a dictionary')
-        return _file_bundle(run, ckpt, str(ckpt.get('kind', 'pose')))[1]
+        return file_bundle(run, ckpt, str(ckpt.get('kind', 'pose')))[1]
     return Registry.load(run / 'keypoint_registry.toml')
 
 
@@ -580,7 +345,7 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
               'the checkpoint was trained with, not something read from it')
     prov = prior_provenance(run)
     if prov:
-        _print_provenance(prov, run)
+        print_provenance(prov, run)
     else:
         print(f'{run}: no provenance.toml -- this run predates commit recording, so which '
               'architecture the weights were trained under cannot be read back from the folder')
@@ -595,7 +360,7 @@ def load_run(run: Path, checkpoint: str | None = None, device='cpu',
         print(f'{path.name}: no model_state_eval; falling back to the raw training weights')
         state = ckpt['model_state']
     missing, unexpected = model.load_state_dict(state, strict=False)
-    _report('load_run', missing, unexpected, [])
+    report_load('load_run', missing, unexpected, [])
     model.run_provenance = prov
     return model.to(device).eval(), config, registry, path
 
@@ -640,11 +405,11 @@ def warm_start(model, checkpoint_path: Path, verbose: bool = True,
     state, dropped = _filter_shape_mismatch(state, model)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if verbose:
-        _report('warm start', missing, unexpected, dropped)
+        report_load('warm start', missing, unexpected, dropped)
     return set(missing) | set(dropped)
 
 
-def _report(what, missing, unexpected, dropped):
+def report_load(what, missing, unexpected, dropped):
     """Name everything. A silent drop here is a whole training run spent on the wrong weights."""
     def head(xs, n=8):
         """First `n` names joined, with `… (+k more)` appended when more remain."""
@@ -661,78 +426,7 @@ def _report(what, missing, unexpected, dropped):
         print(f'{what}: exact match, nothing fresh and nothing discarded')
 
 
-def load_scorer_run(run: Path, checkpoint: str | None = None, device='cpu'):
-    """(model, config, registry, checkpoint_path) from a scorer run folder or checkpoint file.
-
-    A FILE is self-contained when it embeds its config and registry (every scorer checkpoint
-    `save_checkpoint` writes does); an older one falls back to the run folder it sits in. What
-    makes a file safe to load alone is the checkpoint's own `kind`, checked before anything is
-    built, plus the output-granularity and semantic-contract checks a run folder gets.
-
-    Resume vs warm start: a checkpoint carrying a full training state is RESUMED by the caller
-    (`train_scorer.py`), and a pose checkpoint is a WARM START. Both are readable from here; what
-    is refused is a run folder of the wrong family, or a checkpoint whose recorded `kind` is not
-    the one the caller asked for.
-
-    The `build_scorer` import is local to keep the package import graph flat: `scorer.model`
-    imports from `..model`, and a module-level import here would make `checkpoints` a dependency
-    of nothing in particular while still working.
-    """
-    from .scorer.model import build_scorer
-
-    run = Path(run)
-    if run.is_file():
-        if checkpoint is not None:
-            raise ValueError(f'{run}: --scorer-checkpoint selects a file inside a run folder, but '
-                             '--scorer already names a checkpoint file')
-        path = run
-        ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        if not isinstance(ckpt, dict):
-            raise ValueError(f'{path}: checkpoint must be a dictionary, got {type(ckpt).__name__}')
-        _require_ckpt_kind(ckpt, 'scorer', path)
-        config, registry, prov = _file_bundle(path, ckpt, 'scorer')
-    else:
-        with open(run / 'config.toml', 'rb') as f:
-            config = tomllib.load(f)
-        require_kind(config, 'scorer', run)
-        registry = Registry.load(run / 'keypoint_registry.toml')
-        path = resolve_checkpoint(run / 'checkpoints', checkpoint)
-        ckpt = torch.load(path, map_location='cpu', weights_only=False)
-        _require_ckpt_kind(ckpt, 'scorer', path)
-        prov = prior_provenance(run)
-    mode = scorer_output_granularity(config)
-    config = dict(config)
-    config['scorer'] = {**config.get('scorer', {}), 'output_granularity': mode}
-    check_image_size(config)
-    checkpoint_mode = scorer_checkpoint_granularity(ckpt)
-    embedded = ckpt.get('config')
-    if isinstance(embedded, dict) and isinstance(embedded.get('scorer'), dict):
-        embedded_mode = scorer_output_granularity(embedded)
-        require_scorer_granularity(embedded_mode, checkpoint_mode,
-                                    where=f'{path} metadata/config')
-    require_scorer_granularity(mode, checkpoint_mode, where=str(path))
-    require_scorer_contract(config, ckpt, where=str(path))
-    scorer_cfg = dict(config.get('scorer', {}))
-    scorer_cfg.pop('corruption', None)
-    model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
-                         registry.n_keypoints, **{k: v for k, v in scorer_cfg.items()
-                                                  if k in ('pool_num_heads', 'score_hidden',
-                                                           'use_precision', 'output_granularity')})
-    if mode == 'frame':
-        from .scorer.train import build_scorer_loss
-        model.add_module('frame_loss', build_scorer_loss(config, mode))
-    state = ckpt.get('model_state_eval') or ckpt['model_state']
-    try:
-        model.load_state_dict(state, strict=True)
-    except RuntimeError as e:
-        raise ValueError(f'{path}: scorer checkpoint does not exactly match its run model: {e}') from e
-    if prov:
-        _print_provenance(prov, path)
-    model.run_provenance = prov
-    return model.to(device).eval(), config, registry, path
-
-
-def _require_ckpt_kind(ckpt: dict, want: str, where) -> None:
+def require_ckpt_kind(ckpt: dict, want: str, where) -> None:
     """A checkpoint's recorded kind. `_load_packaged_pose` reads `ckpt.get('kind', 'pose')`, which
     is why a scorer checkpoint written before this key existed would load as a pose one -- the
     default is a compatibility promise about OLD files, not a licence to write new ones without it.

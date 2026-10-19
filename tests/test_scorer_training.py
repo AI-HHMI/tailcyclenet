@@ -219,6 +219,44 @@ def test_evaluate_frame_metrics_use_active_rows_and_pointwise_labels(monkeypatch
     assert model.mode == 'train'
 
 
+def test_evaluate_frame_out_of_view_fraction_counts_out_of_view_slots(monkeypatch):
+    """The localization count must not erase out-of-view slots from `observed_mask` first."""
+    from tailcyclenet.scorer import train as st
+    from tailcyclenet.scorer.losses import FrameTripletScorerLoss
+
+    class FrameModel:
+        """A stub scorer returning fixed frame scores."""
+
+        def eval(self):
+            """No-op mode switch."""
+
+        def train(self):
+            """No-op mode switch."""
+
+        def score_triplet(self, _trip):
+            """Fixed scores, precisions and labels for two frames of one keypoint."""
+            scores = torch.tensor([[[[1.0, -1.0, 1.0]], [[1.0, 0.5, 1.0]]]])
+            labels = torch.tensor([[[[1.0, -1.0, 1.0]], [[1.0, -1.0, 1.0]]]])
+            return scores, torch.ones_like(scores), labels
+
+    trip = {
+        'active_mask': torch.tensor([[[True], [False]]]),
+        'observed_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'in_view_mask': torch.tensor([[[True], [False]]]),
+        'anchor_observed_mask': torch.ones((1, 2, 1), dtype=torch.bool),
+        'far_mask': torch.tensor([[[True], [False]]]),
+        'near_mask': torch.tensor([[[False], [True]]]),
+        'ambiguous_mask': torch.zeros((1, 2, 1), dtype=torch.bool),
+        'corruption_type_mask': torch.zeros((1, 2, 1, 4), dtype=torch.bool),
+        'source_frame_weight': torch.ones((1, 2, 1)),
+        'anchor_label': 1.0,
+    }
+    monkeypatch.setattr(st, 'triplet_to_device', lambda value, device: value)
+    out = st.evaluate(FrameModel(), [trip], FrameTripletScorerLoss(score_reg_weight=0.0), 'cpu', 1,
+                      output_granularity='frame')
+    assert out['val/out_of_view_fraction'] == 0.5
+    assert bool(trip['observed_mask'].all())
+
 def test_evaluate_restores_train_mode_when_the_pass_raises(monkeypatch):
     """An exception mid-val must not leave the run training an eval-mode model."""
     from tailcyclenet.scorer import train as st
@@ -516,3 +554,38 @@ def test_a_failing_optimizer_restore_still_puts_the_model_back_in_train_mode(mon
         st.evaluate(model, _fake_loader(), lambda *a: None, 'cpu', 1, opt)
     assert opt.calls == ['eval', 'train']
     assert model.mode == 'train', 'the model must be restored even when the optimizer is not'
+
+
+def test_an_all_rejected_epoch_raises_even_though_rejections_advance_the_step():
+    """A skipped triplet still advances `step`, so the guard must count optimizer steps."""
+    from tailcyclenet.scorer.train import require_progress
+
+    with pytest.raises(RuntimeError, match='all samples were rejected'):
+        require_progress(stepped_this_epoch=0, stepped_this_run=0, step=50, local_target=100)
+    with pytest.raises(RuntimeError, match='all samples were rejected'):
+        require_progress(stepped_this_epoch=0, stepped_this_run=0, step=100, local_target=100)
+    require_progress(stepped_this_epoch=3, stepped_this_run=3, step=50, local_target=100)
+    require_progress(stepped_this_epoch=0, stepped_this_run=7, step=100, local_target=100)
+
+
+def test_a_val_item_leaves_the_trainers_torch_rng_untouched(scorer_root):
+    """With `val_num_workers = 0` val items run in the trainer; their per-item seed must not leak."""
+    from tailcyclenet.scorer.dataset import ScorerDataset
+
+    cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
+                       crop_jitter=0.0)
+    corr = {'const_offset_prob': 1.0, 'frame_noise_prob': 0.0, 'gradual_drift_prob': 0.0,
+            'sinusoid_prob': 0.0, 'point_drop_prob': 0.0, 'min_valid_frames': 2,
+            'mag_3d': {'const_offset': 15.0}, 'mag_2d': {'const_offset': 10.0}}
+    val = ScorerDataset(PoseDataset(scorer_root, 'val', cfg, train=False), corr)
+    torch.manual_seed(1234)
+    expected = torch.rand(8)
+    torch.manual_seed(1234)
+    first = val[0]
+    assert torch.equal(torch.rand(8), expected), 'the val item reseeded the global torch RNG'
+    torch.manual_seed(999)
+    second = val[0]
+    assert first is not None and second is not None
+    for key, value in first.items():
+        if torch.is_tensor(value):
+            assert torch.allclose(value, second[key], rtol=0, atol=0, equal_nan=True), key

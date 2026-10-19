@@ -675,6 +675,14 @@ def test_carry_requires_overlap(scene):
         run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', overlap=0))
 
 
+def test_self_anchor_runs_at_overlap_zero(scene):
+    """`--anchor self` re-queries within one window and carries nothing across windows, so
+    `overlap = 0` is a valid setting for it (it used to be refused as if it carried)."""
+    model, sess, registry, name = scene
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='self', overlap=0))
+    assert np.isfinite(out['pred']).any()
+
+
 def test_inflate_box_widens_about_its_centre():
     """THE ONE INFLATION RULE, shared with the wide-crop training regime
     (`dataset.LoaderConfig.crop_inflate`) so the model trains and deploys on the same geometry."""
@@ -935,6 +943,23 @@ def test_box_prompt_detector_with_no_boxes_raises(scene):
     with pytest.raises(ValueError, match='detector'):
         run_group(model, sess, 'g000', registry, name,
                   _cfg(anchor='none', box_prompt='detector'))
+
+
+def test_box_prompt_detector_from_a_boxes_file_uses_its_points(scene):
+    """`--boxes dets.npz` on a box model resolves the box prompt to 'detector', but that path
+    supplies crop POINTS (`box_points`), not detector boxes: the prompt must come from those
+    points (it used to raise "none were supplied"), exactly as the labels prompt would from
+    the same points."""
+    model, sess, registry, name = scene
+    lab = sess.labels('g000')
+    pts = lab.points3d if sess.mode == '3d' else lab.points2d[..., 0, :]
+    got = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='none', box_prompt='detector'), box_points=pts)
+    want = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='none', box_prompt='labels'))
+    assert (got['box_prompt_cams'] >= 1).any()
+    np.testing.assert_array_equal(got['box_prompt_cams'], want['box_prompt_cams'])
+    np.testing.assert_array_equal(got['pred'], want['pred'])
 
 
 def test_carried_prior_is_bounds_masked_and_dated():
@@ -2966,3 +2991,34 @@ def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_o
         'box_prompt_first_only=False must give the box every window regardless of carry/prior'
     assert not _give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
         'box_prompt="none" must never give the box'
+
+
+def test_det_trace_file_is_valid_json(tmp_path):
+    """`--det-trace` writes JSON a reader can load: it used to end in a literal backslash-n."""
+    import json
+
+    from tailcyclenet.infer.driver import _write_det_trace
+
+    path = tmp_path / 'sub' / 'trace.json'
+    _write_det_trace(path, {'s/g000': [{'frame': 0, 'kept': 2}]})
+    assert json.loads(path.read_text()) == {'s/g000': [{'frame': 0, 'kept': 2}]}
+    assert path.read_text().endswith('}\n')
+
+
+def test_refine_records_each_overlap_trace_probe_once(multiwindow_scene):
+    """`--refine` runs `forward` twice per (animal, window); the overlap-trace probes
+    (`prior_oob`, `model_conf`) must record each (animal, window) once, not once per pass."""
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+
+    model, sess, registry, name = multiwindow_scene
+    counts = {}
+    for refine in (False, True):
+        stats = {'capture_overlap_agreement': True}
+        merge_blocks(run_blocks(model, sess, 'g000', registry, name,
+                                _cfg(anchor='carry', refine=refine), stats=stats))
+        oob = [(a, f) for a, f, *_ in stats.get('prior_oob', [])]
+        assert len(oob) == len(set(oob))
+        counts[refine] = (len(oob), len(stats.get('model_conf', [])))
+    assert counts[True][0] == counts[False][0] > 0
+    if counts[False][1]:
+        assert counts[True][1] == counts[False][1]

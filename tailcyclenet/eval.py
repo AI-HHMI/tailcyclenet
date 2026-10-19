@@ -53,7 +53,8 @@ def chunk_frames(preds, labels, n):
     radii are not exchangeable, which a bootstrap needs them to be. The labels' time axis is not
     the prediction's -- a `--max-frames` prefix must slice labels by the LABELS' own length, or
     every chunk past the first re-scores frames 0..n-1. Frame indices are absolute within the
-    group for both sides. T = 1 is not a usable window. Axis 1 is time only for frame-indexed
+    group for both sides. A trailing one-frame remainder joins the chunk before it, so every
+    frame is scored (T = 1 is a model-input rule, not a scoring one). Axis 1 is time only for frame-indexed
     arrays; `outcome`/`crop` are window-indexed and stay whole. `ext` is (C,T,4,4) -- time on
     axis 1 as well, so the same slicing rule covers it.
     """
@@ -71,10 +72,11 @@ def chunk_frames(preds, labels, n):
             span = np.nanmax(full, axis=2) - np.nanmin(full, axis=2)
             extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
         lab_T = int(np.asarray(full).shape[1])
-        for t0 in range(0, T, n):
-            t1 = min(t0 + n, T)
-            if t1 - t0 < 2:
-                continue
+        starts = list(range(0, T, n))
+        if len(starts) > 1 and T - starts[-1] < 2:
+            starts.pop()
+        for i, t0 in enumerate(starts):
+            t1 = starts[i + 1] if i + 1 < len(starts) else T
             sub = {}
             for k, v in out.items():
                 a = np.asarray(v)
@@ -91,6 +93,45 @@ def chunk_frames(preds, labels, n):
             out_l[f'{key}#{t0}'] = (dataclasses.replace(lab, **fields), sess)
     return out_p, out_l
 
+
+
+def restrict_frames(preds, labels, start, stop):
+    """Score a ranged run only inside its `[start, stop)` range. -> (preds, labels).
+
+    A `--start-frame`/`--end-frame` (or `--max-frames`) run predicts nothing outside its range,
+    and the loader densifies the whole group with NaN there; scoring it whole would count every
+    out-of-range label as a miss. Both sides are cut to the range, per group (`stop = 0` = the
+    group's end), on the same frame-indexed fields `chunk_frames` slices; a group the range
+    misses entirely predicted nothing and is dropped. Keys are unchanged, so the range is the
+    clip for every downstream reader (match radius, MOTA, `--chunk`). `(0, 0)` is the identity.
+    """
+    import dataclasses
+
+    if not start and not stop:
+        return preds, labels
+    out_p, out_l = {}, dict(labels)
+    for key, out in preds.items():
+        if key not in labels:
+            out_p[key] = out
+            continue
+        lab, sess = labels[key]
+        T = int(np.asarray(out['pred']).shape[1])
+        t0, t1 = int(start), min(int(stop) or T, T)
+        if t1 <= t0:
+            continue
+        full = lab.points3d if str(out['mode']) == '3d' else lab.points2d[..., 0, :]
+        lab_T = int(np.asarray(full).shape[1])
+        sub = {}
+        for k, v in out.items():
+            a = np.asarray(v)
+            sub[k] = a[:, t0:t1] if (a.ndim >= 2 and a.shape[1] == T) else v
+        fields = {f.name: getattr(lab, f.name) for f in dataclasses.fields(lab)}
+        for k, v in fields.items():
+            if isinstance(v, np.ndarray) and v.ndim >= 2 and v.shape[1] == lab_T:
+                fields[k] = v[:, t0:t1]
+        out_p[key] = sub
+        out_l[key] = (dataclasses.replace(lab, **fields), sess)
+    return out_p, out_l
 
 def score(preds, labels, mota_dist=None, quiet=False, min_kpts_frac=0.0, match_cost='mean',
           identity_metrics=True):
@@ -430,8 +471,8 @@ def main(argv: list[str] | None = None):
 
     Notes:
     - One aggregate per mode: a split may hold 2D and 3D sessions, and their units do not mix.
-      No labels in the scored prefix is a diagnosis, not a ZeroDivisionError -- a short
-      prediction over an annotated root gives every group `n_true = 0`. The tail percentiles
+      No labels in the scored prefix is a diagnosis, not a ZeroDivisionError. A ranged session is
+      scored only inside its `[provenance]` range (`restrict_frames`); `--vs` refuses two ranges. The tail percentiles
       matter because the mean cannot show one: an arm that declines hard animals has a
       flattering mean and a p90 that says so. `kpt_agree` is unbounded in 2D where `box_agree`
       is capped by construction. The vis head's TARGET, not its output, is printed: a `base` at
@@ -511,6 +552,11 @@ def main(argv: list[str] | None = None):
         raise SystemExit('independent-window predictions have window-local identity; MOTA/IDSW options are refused')
     if independent:
         print('independent windows: scoring pose accuracy by explicit slot; identity metrics are unavailable (IDs reset each window)')
+    frame_range = (int(meta.get('frame_start', 0)), int(meta.get('frame_stop', 0)))
+    if any(frame_range):
+        preds, labels = restrict_frames(preds, labels, *frame_range)
+        print(f'frame range [{frame_range[0]}, {frame_range[1] or "end"}): scoring only inside '
+              "the run's own [provenance] range")
     if args.chunk:
         preds, labels = chunk_frames(preds, labels, args.chunk)
         print(f'--chunk {args.chunk}: {len(preds)} scoring unit(s) -- WITHIN-clip uncertainty, '
@@ -642,8 +688,16 @@ def main(argv: list[str] | None = None):
             other_independent = _independent_slots(args.vs, other, labels)
         if other_independent != independent:
             raise SystemExit('--vs cannot pair independent-window predictions with ordinary IDs')
-        if args.chunk:
-            other, _ = chunk_frames(other, label_lookup(args.data, args.split), args.chunk)
+        other_range = (int(ometa.get('frame_start', 0)), int(ometa.get('frame_stop', 0)))
+        if other_range != frame_range:
+            raise SystemExit(f'--vs pairs two runs over different frame ranges ({frame_range} vs '
+                             f'{other_range}); each is scored only inside its own range, so '
+                             'there are no shared frames to pair. Run both over one range.')
+        if args.chunk or any(other_range):
+            fresh = label_lookup(args.data, args.split)
+            other, fresh = restrict_frames(other, fresh, *other_range)
+            if args.chunk:
+                other, _ = chunk_frames(other, fresh, args.chunk)
         print(f'\nPAIRED: {args.predictions} minus {args.vs}')
         print(f'  other: run={ometa["run"]}  anchor={ometa["anchor"]}  boxes={ometa["boxes"]}')
         by_key = {m['group']: m for m in score(other, labels, args.mota_dist, quiet=True,

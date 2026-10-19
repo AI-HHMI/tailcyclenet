@@ -1478,34 +1478,27 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
         'a single ray has no triangulated point, and inventing a depth would be a lie'
 
 
-def test_min_views_1_target_ages_out_through_the_slots_filter():
-    """A `min_views=1` birth has an all-NaN point BY DESIGN (a single ray has no depth). An
-    independent review claimed the resulting slot never dies, contradicting `_birth`'s own
-    docstring ("it ages out through the `slots` filter in `step`") -- settled here directly
-    rather than by argument (identity_review_followthrough plan C4): an all-NaN-point target is
-    excluded from `slots`, so `step` ages it every frame with no evidence and it must be gone
-    well before `max_age + 2` frames of silence.
-    """
+def test_min_views_1_single_view_birth_holds_no_slot():
+    """A `min_views=1` single-view group has an all-NaN point BY DESIGN (a single ray has no
+    depth), so no target can ever match it. It is written for its frame but never seated as a
+    target: seating it held the slot dead for `max_age + 1` frames while the same detection
+    re-birthed into the next free slot, so one animal seen by one camera rotated through every
+    slot and then vanished (T1). It must stay on the lowest free slot every frame instead."""
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    max_age = 5
-    tr = CrossViewTracker(1, max_res_px=30.0, max_age=max_age, min_views=1)
     box = torch.tensor([[100.0, 100.0, 140.0, 140.0]])
-    group = {'point': torch.full((3,), float('nan')), 'residual': float('inf'), 'members': {0: 0}}
-    out = np.full((1, len(cg), 4), np.nan, np.float32)
-    sc = np.full((1, len(cg)), np.nan, np.float32)
-    claimed_ix = np.full((1, len(cg)), -1, np.int32)
     boxes_per_cam = [box] + [torch.zeros((0, 4)) for _ in cg[1:]]
     scores_per_cam = [torch.ones(1)] + [torch.zeros(0) for _ in cg[1:]]
-    tr._birth(0, group, out, sc, claimed_ix, boxes_per_cam, scores_per_cam, lambda c, j: j)
-    assert 0 in tr.targets and torch.isnan(tr.targets[0]['point']).all()
-
-    empty = [torch.zeros((0, 4)) for _ in cg]
-    empty_scores = [s.new_zeros(0) for s in empty]
-    for _ in range(max_age + 2):
-        tr.step(cg, empty, empty_scores)
-    assert not tr.targets, 'a min_views=1 slot with no evidence must age out, not leak forever'
+    tr = CrossViewTracker(4, max_res_px=30.0, max_age=5, min_views=1)
+    for _ in range(12):
+        out, _, claimed = tr.step(cg, boxes_per_cam, scores_per_cam)
+        rows = [s for s in range(4) if np.isfinite(out[s]).all(-1).any()]
+        assert rows == [0]
+        torch.testing.assert_close(torch.as_tensor(out[0, 0]), box[0])
+        assert claimed[0, 0] == 0
+        assert not tr.targets
+    assert not [e for e in tr.events if e['event'] == 'born']
 
 
 def test_link_rows_follows_one_animal():

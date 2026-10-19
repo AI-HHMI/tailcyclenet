@@ -95,6 +95,16 @@ def test_scorer_window_length_must_match_model_stride():
         validate_scorer_config(config)
 
 
+def test_min_valid_frames_under_corruption_is_refused_not_silently_overridden():
+    """The nested key would be overwritten by `[scorer].min_valid_frames`, so it is refused."""
+    config = {'scorer': {'output_granularity': 'frame', 'min_valid_frames': 6,
+                         'corruption': {'min_valid_frames': 2}}}
+    with pytest.raises(SystemExit, match=r'\[scorer\]\.min_valid_frames'):
+        validate_scorer_config(config)
+    del config['scorer']['corruption']['min_valid_frames']
+    validate_scorer_config(config)
+
+
 def test_zero_min_corrupt_threshold_cannot_have_positive_clean_band():
     config = {'scorer': {'output_granularity': 'frame',
                          'corruption': {'min_corrupt_px': 0.0, 'max_clean_px': 0.5}}}

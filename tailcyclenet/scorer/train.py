@@ -157,7 +157,7 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
             f'{sorted(FRAME_SELECTION_METRICS)}')
     known_corr = {
         'const_offset_prob', 'frame_noise_prob', 'gradual_drift_prob', 'sinusoid_prob',
-        'point_drop_prob', 'point_drop_max_frac', 'point_drop_bernoulli_rate', 'min_valid_frames',
+        'point_drop_prob', 'point_drop_max_frac', 'point_drop_bernoulli_rate',
         'mag_3d', 'mag_2d', 'min_corrupt_px', 'max_clean_px', 'reference_gate',
         'reference_margin_px', 'sequence_far_gate', 'segment_prob', 'segment_count',
         'n_segments', 'segment_len_frames', 'segment_length_frames', 'full_window_share',
@@ -175,6 +175,10 @@ def validate_scorer_config(config: dict, *, legacy_run: bool = False) -> str:
         if first in corr and second in corr and corr[first] != corr[second]:
             raise SystemExit(
                 f'[scorer.corruption]: {first} and {second} disagree; set only one alias')
+    if 'min_valid_frames' in corr:
+        raise SystemExit(
+            '[scorer.corruption].min_valid_frames is not read; set [scorer].min_valid_frames, '
+            'which the corruption path copies down')
     unknown_corr = set(corr) - known_corr
     if unknown_corr:
         raise SystemExit(
@@ -648,11 +652,11 @@ def _frame_localization_counts(scores: torch.Tensor, trip: dict):
     if far is None:
         return 0, 0
     far = far.to(device=scores.device, dtype=torch.bool)
-    valid = trip.get('observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
-    valid &= trip.get('in_view_mask', torch.ones_like(far)).to(dtype=torch.bool)
-    valid &= trip.get('anchor_observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
-    valid &= ~trip.get('ambiguous_mask', torch.zeros_like(far)).to(dtype=torch.bool)
-    valid &= ~trip.get('reference_rejected_mask', torch.zeros_like(far)).to(dtype=torch.bool)
+    valid = (trip.get('observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
+             & trip.get('in_view_mask', torch.ones_like(far)).to(dtype=torch.bool)
+             & trip.get('anchor_observed_mask', torch.ones_like(far)).to(dtype=torch.bool)
+             & ~trip.get('ambiguous_mask', torch.zeros_like(far)).to(dtype=torch.bool)
+             & ~trip.get('reference_rejected_mask', torch.zeros_like(far)).to(dtype=torch.bool))
     good = bad = 0
     for bi in range(scores.shape[0]):
         for ki in range(scores.shape[2]):
@@ -884,6 +888,23 @@ def scorer_checkpoint_mode_mismatch(requested: str, checkpoint: dict) -> bool:
     """Whether a scorer checkpoint must take the weights-only warm-start branch."""
     return scorer_checkpoint_granularity(checkpoint) != str(requested).lower()
 
+
+def require_progress(stepped_this_epoch: int, stepped_this_run: int, step: int,
+                     local_target: int) -> None:
+    """Refuse an epoch that took no optimizer step, or a run that reached its budget without one.
+
+    A rejected triplet or a non-finite loss/gradient still advances `step`, so the step counter
+    alone cannot tell an all-rejecting recipe from a training one. An epoch cut short by the
+    budget is excused unless the whole run never stepped.
+    """
+    if stepped_this_epoch or (step >= local_target and stepped_this_run):
+        return
+    raise RuntimeError(
+        'scorer DataLoader produced no successful triplets in an epoch; all samples were '
+        'rejected. Check corruption magnitudes, distance thresholds, segment settings, '
+        'visibility, and the training split instead of retrying forever.')
+
+
 def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         max_iterations: int | None, no_wandb: bool, fresh: bool = False, fabric=None,
         num_workers: int | None = None, devices_arg: int | None = None) -> None:
@@ -1039,8 +1060,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',
-                                           'precision_head', 'pointwise_', 'frame_pool',
-                                           'frame_loss.'))}
+                                           'precision_head', 'frame_loss.'))}
 
     opt_cfg = dist_utils.scale_optimizer_cfg(config['training']['optimizer'], world)
     if world > 1 and is0:
@@ -1095,6 +1115,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         optimizer.train()
     step = dist_utils.ceil_div(start_iter, world)
     skipped = 0
+    stepped_this_run = 0
     local_val_freq = dist_utils.per_rank(val_freq, world) if val_freq else 0
     local_ckpt_freq = dist_utils.per_rank(ckpt_freq, world)
     local_print_freq = dist_utils.per_rank(print_freq, world)
@@ -1139,7 +1160,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         return None
     local_target = dist_utils.ceil_div(n_target, world)
     while step < local_target:
-        epoch_start = step
+        stepped_this_epoch = 0
         for trip in timed(train_loader, waited):
             if step >= local_target:
                 break
@@ -1174,6 +1195,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 continue
             optimizer.step()
             step += 1
+            stepped_this_epoch += 1
+            stepped_this_run += 1
             iteration = step * world
             hist = loss_fn.collapse_history(prefix='')
             loss_fn.reset_history()
@@ -1259,11 +1282,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 if fabric is not None:
                     fabric.barrier()
                 ckpted[0] += time.time() - started
-        if step == epoch_start:
-            raise RuntimeError(
-                'scorer DataLoader produced no successful triplets in an epoch; all samples were '
-                'rejected. Check corruption magnitudes, distance thresholds, segment settings, '
-                'visibility, and the training split instead of retrying forever.')
+        require_progress(stepped_this_epoch, stepped_this_run, step, local_target)
     if wb is not None:
         wb.finish()
     if is0:

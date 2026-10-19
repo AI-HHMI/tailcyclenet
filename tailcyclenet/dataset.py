@@ -171,6 +171,33 @@ class LoaderConfig:
                 'a positive probability has no legal mode to draw')
         self.flip_2d_prob = probability
         self.flip_2d_modes = modes
+        self._check_values()
+
+    def _check_values(self) -> None:
+        """Refuse, at construction, the values the loader would otherwise first trip over inside a
+        worker at the first item -- or, for `box_prompt`, silently read as ON."""
+        from .box_prompt import BOX_PROMPT_FRAMES
+        from .query_encoder import BOX_MODES
+
+        sampling = ('true-2d-hybrid-v1', 'legacy-3d-single-view')
+        if self.two_d_sampling not in sampling:
+            raise ValueError(f'two_d_sampling must be one of {sampling}, '
+                             f'got {self.two_d_sampling!r}')
+        if self.box_prompt_frames not in BOX_PROMPT_FRAMES:
+            raise ValueError(f'box_prompt_frames must be one of {BOX_PROMPT_FRAMES}, '
+                             f'got {self.box_prompt_frames!r}')
+        if self.box_prompt != 'none' and self.box_prompt not in BOX_MODES:
+            raise ValueError(f"box_prompt must be 'none' or one of {BOX_MODES}, "
+                             f'got {self.box_prompt!r}')
+        for name in ('cams_to_sample', 'val_cams_to_sample', 'crop_inflate'):
+            spec = getattr(self, name)
+            if isinstance(spec, (list, tuple)):
+                if len(spec) < 2 or float(spec[0]) > float(spec[1]):
+                    raise ValueError(f'{name} must be a number or a [low, high] pair with '
+                                     f'low <= high, got {spec!r}')
+        p = self.aug_rotation_prob
+        if p is not None and not 0.0 <= float(p) <= 1.0:
+            raise ValueError(f'aug_rotation_prob must be None or in [0, 1], got {p!r}')
 
     # WIDE-CROP TRAINING: widen the crop-rule box about its centre by this factor BEFORE the
     # coords are shifted into it, so the animal sits off-centre in a wider crop and the box

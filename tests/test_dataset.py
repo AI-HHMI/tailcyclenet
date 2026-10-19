@@ -1839,3 +1839,24 @@ def test_an_undecodable_video_frame_skips_the_item_instead_of_killing_the_worker
     assert items[0][0] is not None and not items[0][1]
     assert items[1][0] is None
     assert any('did not decode' in str(w.message) for w in items[1][1])
+
+
+@pytest.mark.parametrize('bad', [{'two_d_sampling': 'true-2d'}, {'box_prompt_frames': 'frist'},
+                                 {'box_prompt': 'flim'}, {'cams_to_sample': [4, 2]},
+                                 {'val_cams_to_sample': [3, 1]}, {'crop_inflate': [2.0, 1.0]},
+                                 {'aug_rotation_prob': 1.5}])
+def test_loader_config_refuses_a_bad_value_at_construction(bad):
+    """These used to surface only at the first item, inside a worker -- or, for a typo'd
+    `box_prompt`, turned the box channel ON."""
+    with pytest.raises(ValueError, match=next(iter(bad))):
+        LoaderConfig(**bad)
+    with pytest.raises(ValueError, match=next(iter(bad))):
+        replace(LoaderConfig(), **bad)
+
+
+def test_loader_config_accepts_every_legal_value():
+    for ok in ({'two_d_sampling': 'legacy-3d-single-view'}, {'box_prompt_frames': 'first'},
+               {'box_prompt': 'film'}, {'cams_to_sample': [1, 8]}, {'cams_to_sample': 3},
+               {'crop_inflate': [1.0, 1.0]}, {'crop_inflate': 1.5}, {'aug_rotation_prob': 0.0},
+               {'aug_rotation_prob': None}):
+        LoaderConfig(**ok)

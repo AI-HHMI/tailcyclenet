@@ -126,7 +126,7 @@ def test_train_hands_the_scaled_config_to_both_unfreeze_entry_points():
     src = (REPO / 'tailcyclenet' / 'train.py').read_text()
     for call in ('build_optimizer(model, fresh, opt_cfg_scaled, layout=resume_layout)',
                  'apply_staged_unfreeze(raw, opt, opt_cfg_scaled',
-                 'replay_staged_unfreeze(model, opt, opt_cfg_scaled'):
+                 'apply_staged_unfreeze(model, opt, opt_cfg_scaled'):
         assert call in src, f'{call!r} is not what scripts/train.py calls'
 
 

@@ -11,7 +11,7 @@ from tailcyclenet.optim import (
     optimizer_layout_matches_metadata,
     optimizer_metadata_from_checkpoint,
 )
-from tailcyclenet.unfreeze import replay_staged_unfreeze
+from tailcyclenet.unfreeze import apply_staged_unfreeze
 
 from tests.test_optim import Tiny, _cfg, _train_module
 
@@ -21,7 +21,7 @@ def _staged_checkpoint(tmp_path):
     fresh = {'decoder.mlps.0.weight'}
     model = Tiny(unfreeze_at=4, n_last=3)
     opt = build_muon(model, fresh, cfg)
-    replay_staged_unfreeze(model, opt, cfg, 14, fresh=fresh)
+    apply_staged_unfreeze(model, opt, cfg, 14, fresh=fresh)
     path = save_checkpoint(tmp_path / 'run', 14, model, opt, {'model': {}, 'data': {}},
                            registry=Registry(names=['a'], datasets={}), fresh_names=fresh)
     return path, model, opt, cfg, fresh
@@ -53,7 +53,7 @@ def test_resume_rebuild_matches_named_layout_and_lrs(tmp_path):
     recovered, layout = optimizer_metadata_from_checkpoint(checkpoint)
     model = Tiny(unfreeze_at=4, n_last=3)
     opt = _train_module().build_optimizer(model, recovered, cfg, layout=layout)
-    replay_staged_unfreeze(model, opt, cfg, 14, fresh=recovered, layout=layout)
+    apply_staged_unfreeze(model, opt, cfg, 14, fresh=recovered, layout=layout)
     assert optimizer_layout_matches_metadata(opt, model, layout)
     assert optimizer_layout_matches(opt, checkpoint['optimizer_state'])
 

@@ -110,15 +110,6 @@ def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
             'muon_groups': n_muon, 'adamw_groups': n_adamw}
 
 
-def replay_staged_unfreeze(model, opt, opt_cfg: dict, start_it: int,
-                           fresh: set[str] | None = None, layout: dict | None = None) -> dict | None:
-    """Reach, at resume, the group layout a fresh run would have at `start_it`. The optimizer is
-    always built in the frozen layout and the unfreeze replayed on top: `load_state_dict`
-    matches groups BY POSITION, so only the same sequence of adds guarantees the same order.
-    """
-    return apply_staged_unfreeze(model, opt, opt_cfg, start_it, fresh=fresh, layout=layout)
-
-
 def trainable_encoder_params(model) -> int:
     """Trainable params inside the video encoder; logged every print so the unfreeze is a
     visible step in the dashboard rather than one line of stdout.

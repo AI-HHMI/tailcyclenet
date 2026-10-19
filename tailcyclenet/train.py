@@ -31,7 +31,7 @@ from tailcyclenet.format import Registry
 from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
 from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
-                                   replay_staged_unfreeze, trainable_encoder_params)
+                                   trainable_encoder_params)
 
 # file_system sharing avoids the default's fd-per-tensor lifetime; harmless, keep it.
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -687,7 +687,7 @@ def main(argv: list[str] | None = None):
     if ck is not None:
         if resume_from == resumed:
             model.load_state_dict(ck['model_state'])
-        info = replay_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh,
+        info = apply_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh,
                                       layout=resume_layout)
         if info:
             print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '

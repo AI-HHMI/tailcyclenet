@@ -111,9 +111,7 @@ def package_pose(run: str | Path, output: str | Path,
         raise ValueError(
             f'{source_path} does not contain model_state_eval; refusing to package raw '
             'training weights as inference weights')
-    model_config = config.get('model')
-    data_config = config.get('data')
-    if not isinstance(model_config, dict) or not isinstance(data_config, dict):
+    if not isinstance(config.get('model'), dict) or not isinstance(config.get('data'), dict):
         raise ValueError(f'{config_path}: pose config must contain [model] and [data] tables')
 
     if source.get('kind', 'pose') != kind:
@@ -130,8 +128,6 @@ def package_pose(run: str | Path, output: str | Path,
                         for name, value in eval_state.items()},
         'config': embedded,
         'provenance': prov or {},
-        'model_config': copy.deepcopy(model_config),
-        'data_config': copy.deepcopy(data_config),
         'keypoint_registry': registry.to_dict(),
         'iteration': int(source.get('iteration', 0)),
         'source_run': _source_run(config, root),

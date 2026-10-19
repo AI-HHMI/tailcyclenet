@@ -103,7 +103,6 @@ def test_the_embedded_config_is_a_snapshot_not_a_reference(tmp_path):
     config['data']['image_size'] = 999
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     assert ckpt['config']['model']['latent_dim'] == SMALL['latent_dim']
-    assert ckpt['model_config']['latent_dim'] == SMALL['latent_dim']
     assert 'run' not in config, 'stamping the kind must not mutate the training config'
 
 
@@ -133,7 +132,7 @@ def test_a_lone_checkpoint_loads_the_same_model_as_its_run_folder(tmp_path, kind
 def test_an_old_checkpoint_falls_back_to_its_run_folder(tmp_path, kind):
     run, path, _ = _train_run(tmp_path, kind)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    for key in ('config', 'model_config', 'keypoint_registry', 'provenance'):
+    for key in ('config', 'keypoint_registry', 'provenance'):
         ckpt.pop(key)
     torch.save(ckpt, path)
     model, config, registry, _ = _load(kind, path)

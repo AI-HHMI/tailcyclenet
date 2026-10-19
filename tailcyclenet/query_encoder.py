@@ -183,8 +183,8 @@ class WideQueryEncoder(nn.Module):
     def _build_terms(self, preprocessed_views, camera_group, query_coords, query_time,
                      target_time):
         """The fusion terms up to (not including) the gate. `ctx` carries what a box subclass
-        needs (`B`, `T_query`, `n_cams`, `sizes`, `uniform`, `qpix`, `qt`); keypoint ids arrive
-        on `self._kpt_ids`, stashed by `PoseTrackerEncoder.forward`.
+        needs (`B`, `T_query`, `n_cams`, `sizes`); keypoint ids arrive on `self._kpt_ids`,
+        stashed by `PoseTrackerEncoder.forward`.
 
         The terms are built in order: identity, time, then the query (in the pixel frame of THIS
         window's crop, computed once and shared by the two query terms), then the rig terms. A
@@ -269,8 +269,6 @@ class WideQueryEncoder(nn.Module):
             if uniform:
                 embed_patch = embed_patch.expand(B, T_query, n_cams, embed_patch.shape[-1])
             terms.append(_sub_unprompted(self, embed_patch, self.missing_patch))
-        else:
-            qt = None
 
         if self.principal_point_embedding:
             ppt = torch.stack([(c["mat"][:2, 2] - c["offset"]).to(query_coords.dtype)
@@ -285,9 +283,7 @@ class WideQueryEncoder(nn.Module):
             terms.append(self.linear_intrinsic(torch.cat(
                 [fn, get_fourier_encoding(fn, min_freq=0, max_freq=self.max_freq)], dim=-1)))
 
-        ctx = dict(B=B, T_query=T_query, n_cams=n_cams, sizes=sizes, uniform=uniform,
-                   qpix=qpix, qt=qt, is_2d=is_2d, target_time=target_time)
-        return terms, ctx
+        return terms, dict(B=B, T_query=T_query, n_cams=n_cams, sizes=sizes)
 
 
 # The box prompt: which-animal-occupies-this-box, as a NON-position channel (the animal's

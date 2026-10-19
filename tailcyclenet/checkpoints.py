@@ -494,7 +494,6 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                'model_state_eval': eval_state,
                'optimizer_state': optimizer.state_dict(),
                'config': stamped_config(config, kind),
-               'model_config': copy.deepcopy(config.get('model')),
                'keypoint_registry': None if registry is None else registry.to_dict(),
                'provenance': prior_provenance(run) or provenance()}
     if kind == 'pose':
@@ -540,8 +539,6 @@ def _file_bundle(path: Path, ckpt: dict, kind: str) -> tuple[dict, Registry, dic
     """
     run = _enclosing_run(path)
     config = ckpt.get('config')
-    if not isinstance(config, dict) and isinstance(ckpt.get('model_config'), dict):
-        config = {'model': ckpt['model_config'], 'data': ckpt.get('data_config', {})}
     if not isinstance(config, dict) and run is not None:
         with open(run / 'config.toml', 'rb') as f:
             config = tomllib.load(f)

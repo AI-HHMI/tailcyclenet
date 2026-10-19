@@ -15,7 +15,7 @@ import torch.nn as nn
 from tailcyclenet.optim import (KNOWN_OPTIMIZER_KEYS, PoseDualOptimizer, build_muon,
                                 optimizer_layout_matches, refuse_group_count_mismatch,
                                 refuse_mismatched_optimizer_state, state_matches_optimizer_kind)
-from tailcyclenet.unfreeze import apply_staged_unfreeze, replay_staged_unfreeze
+from tailcyclenet.unfreeze import apply_staged_unfreeze
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -420,7 +420,7 @@ def test_resume_replays_the_unfreeze_and_round_trips_the_state():
 
     m2 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt2 = build_muon(m2, fresh=set(), cfg=cfg)
-    replay_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
+    apply_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
     opt2.load_state_dict(sd)
     opt2.train()   # a no-op iff train_mode came back True
     for p, s in zip(m.parameters(), saved):
@@ -466,14 +466,14 @@ def test_optimizer_layout_matches_compares_groups_by_position():
     # The replay reproduces the layout a run at the same unfreeze point would have.
     m2 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt2 = build_muon(m2, fresh=set(), cfg=cfg)
-    replay_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
+    apply_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
     assert optimizer_layout_matches(opt2, sd)
 
     # A different lr is a different layout: loading would put the state on the wrong groups.
     m3 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     cfg3 = {**cfg, 'learning_rate': 2e-4}
     opt3 = build_muon(m3, fresh=set(), cfg=cfg3)
-    replay_staged_unfreeze(m3, opt3, cfg3, UNFREEZE_AT + 10)
+    apply_staged_unfreeze(m3, opt3, cfg3, UNFREEZE_AT + 10)
     assert not optimizer_layout_matches(opt3, sd)
 
     # A run that never fired the unfreeze cannot resume one that did.

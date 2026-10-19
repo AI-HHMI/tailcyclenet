@@ -1227,14 +1227,13 @@ def test_the_reader_price_is_linear_not_quadratic():
     assert _reader_cache_size(16, (3208, 2200), None, ram_gb=32) == 16
 
 
-def test_reader_cache_env_var_overrides_everything(monkeypatch):
-    """The knob survives as an OVERRIDE, and is now read at first use rather than at import."""
+def test_reader_cache_env_var_is_deleted_and_raises_by_name(monkeypatch):
+    """The override is gone; `--max-ram` is the only knob, and a stale export must not be ignored."""
     from tailcyclenet.dataset import _reader_cache_size
 
     monkeypatch.setenv('TAILCYCLENET_READER_CACHE', '1')
-    assert _reader_cache_size(16, (3208, 2200), None, ram_gb=503) == 1
-    monkeypatch.setenv('TAILCYCLENET_READER_CACHE', '32')
-    assert _reader_cache_size(1, (1024, 570), 12, ram_gb=64) == 32
+    with pytest.raises(SystemExit, match='TAILCYCLENET_READER_CACHE is deleted'):
+        _reader_cache_size(16, (3208, 2200), None, ram_gb=503)
 
 
 def test_reader_cache_size_does_not_touch_the_filesystem(monkeypatch):

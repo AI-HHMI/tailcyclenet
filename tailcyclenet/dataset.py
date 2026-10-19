@@ -443,7 +443,7 @@ def load_warps(path, specs, target_size=None, reduce=1):
 
 # An OPEN reader retains about a gigabyte, so the cache size is a MEMORY BUDGET, not a hint:
 # 32 live readers across 8 workers is how the calms21 runs got OOM-killed. Sized per process by
-# `_reader_cache_size`; `TAILCYCLENET_READER_CACHE` only overrides it.
+# `_reader_cache_size` from the `--max-ram` budget, the only knob.
 
 
 # GB of retained memory per OPEN reader per megapixel of frame (PyAV, measured, rounded up).
@@ -488,10 +488,13 @@ def _reader_cache_size(n_cams: int, wh, workers: int | None, ram_gb: float | Non
     an explicit `--max-ram` must bind here or it means nothing. The per-reader price is rounded
     UP so the estimate errs toward a smaller cache: the safe direction, since an over-estimate
     costs gigabytes and, inside workers, the job.
+
+    `TAILCYCLENET_READER_CACHE` is deleted: a set value raises rather than being ignored.
     """
-    env = os.environ.get('TAILCYCLENET_READER_CACHE')
-    if env:
-        return max(1, int(env))
+    if os.environ.get('TAILCYCLENET_READER_CACHE'):
+        raise SystemExit('TAILCYCLENET_READER_CACHE is deleted: the reader cache is sized from '
+                         'the RAM budget only. Unset it and use --max-ram / '
+                         'TAILCYCLENET_MAX_RAM_GB instead.')
     if ram_gb is None:
         ram_gb = _memory.current().budget_gb
     if procs is None:
@@ -593,8 +596,7 @@ def _reader(path: str, group, cam: str):
     cycle only pays off once the whole cycle fits (the old 2.5x figure came from a different
     decoder). A silently 5x slower run should say so rather than being diagnosed from a
     stopwatch, and the warning says what it would take -- the price is LINEAR, so it inverts
-    into an actual `--max-ram` figure -- while not blaming the budget when the env var forced
-    the size.
+    into an actual `--max-ram` figure.
     """
     global _readers
     with _cache_lock:
@@ -604,10 +606,7 @@ def _reader(path: str, group, cam: str):
             size = _reader_cache_size(
                 len(rig), rig.size(cam), None if info is None else info.num_workers)
             if info is None and size < len(rig):
-                forced = os.environ.get('TAILCYCLENET_READER_CACHE')
-                why = (f'TAILCYCLENET_READER_CACHE={forced} forced this; unset it to size from '
-                       'the RAM budget instead.' if forced else
-                       f'--max-ram {reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold '
+                why = (f'--max-ram {reader_cache_ram_gb(len(rig), rig.size(cam)):.0f} would hold '
                        f'all {len(rig)}. Raise --max-ram / TAILCYCLENET_MAX_RAM_GB, or accept the '
                        'slowdown.')
                 warnings.warn(

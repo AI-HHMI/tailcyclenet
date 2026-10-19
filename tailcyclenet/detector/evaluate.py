@@ -345,7 +345,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      det_score=0.01, track=True, link=False, min_views=2, max_move=1.25,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
                      n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
-                     center_dist_thresh=0.5):
+                     center_dist_thresh=0.5, box_source=None):
     """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
 
     `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",
@@ -369,6 +369,10 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
         gt_side_px     quantiles of the crop-RULE box side over this group's own labels, as an
                        UNPAIRED population comparison against `union_side_px`.
 
+    `box_source` is this session's root's effective box source (`detect_raw`'s argument; None =
+    the checkpoint's global one). Pass the per-root value deployment resolves, or a multi-root
+    `extent` detector is scored under another root's crop pad.
+
     Returns a dict of floats/arrays; `n_gt` and `n_windows` say how much each rested on.
     """
     from . import detect_raw
@@ -379,7 +383,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
     raw = detect_raw(model, input_wh, sess, gid, top_k=max(top_k, n_animals), device=device,
                      batch=batch, score_thresh=det_score, reduce=reduce, max_frames=max_frames,
                      tile_scale=tile_scale, iou_thresh=iou_thresh,
-                     center_dist_thresh=center_dist_thresh)
+                     center_dist_thresh=center_dist_thresh, box_source=box_source)
     r_box, r_sc, r_kp = raw
     D, T, C = r_sc.shape
     det_fill = float(np.isfinite(r_sc[0]).mean()) if D else 0.0

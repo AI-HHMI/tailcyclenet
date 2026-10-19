@@ -125,3 +125,63 @@ def test_score_fixed_views_restores_augment(tmp_path):
     rows = score_fixed_views(YOLOXNano(version='trimmed', pretrained=''), ds, [0, 1], 'cpu')
     assert len(rows) == 2
     assert ds.augment is True
+
+
+def _saved_detector(tmp_path, **meta):
+    """A fresh trimmed detector saved as a checkpoint dict with `meta` on top."""
+    from tailcyclenet.detector import YOLOXNano
+    path = tmp_path / 'det.pth'
+    torch.save({'kind': 'detector', 'input_wh': [64, 64], 'norm': 'gn', 'yolox_version': 'trimmed',
+                'model_state': YOLOXNano(version='trimmed', pretrained='').state_dict(), **meta},
+               path)
+    return path
+
+
+def test_eval_detector_deploy_uses_the_roots_own_box_source(tmp_path, monkeypatch):
+    """detector B10: `--deploy` called `detect_raw` without `box_source`, so a multi-root
+    detector's per-root source (`box_sources`) was ignored for the checkpoint's global one."""
+    import tailcyclenet.detector as det_pkg
+    from .conftest import _session_2d
+    root = tmp_path / 'myroot'
+    _session_2d(root / 'test' / 's1', T=4, S=2)
+    path = _saved_detector(tmp_path, box_source='keypoints', datasets=['other', 'myroot'],
+                           box_sources={'other': 'keypoints', 'myroot': 'instances'})
+    seen = []
+    real = det_pkg.detect_raw
+
+    def spy(*args, **kwargs):
+        """Record the box source deployment_score forwards."""
+        seen.append(kwargs.get('box_source'))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(det_pkg, 'detect_raw', spy)
+    mod = _module('scripts/eval_detector.py', 'tcn_eval_detector_fixes')
+    monkeypatch.setattr(sys, 'argv', [
+        'eval_detector.py', '--run', str(path), '--data', str(root), '--split', 'test',
+        '--deploy', '--no-track', '--device', 'cpu', '--n-frames', '2', '--overlap', '0'])
+    mod.main()
+    assert seen == ['instances']
+
+
+def test_eval_detector_trace_uses_the_roots_own_box_source(tmp_path, monkeypatch):
+    """detector B10: the trace script likewise passes the root's own `box_sources` entry."""
+    from .conftest import _session_2d
+    root = tmp_path / 'myroot'
+    _session_2d(root / 'test' / 's1', T=4, S=2)
+    path = _saved_detector(tmp_path, box_source='keypoints', datasets=['other', 'myroot'],
+                           box_sources={'other': 'keypoints', 'myroot': 'instances'})
+    mod = _module('scripts/eval_detector_trace.py', 'tcn_eval_detector_trace_fixes')
+    seen = []
+    real = mod.detect_raw
+
+    def spy(*args, **kwargs):
+        """Record the box source the trace script forwards."""
+        seen.append(kwargs.get('box_source'))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, 'detect_raw', spy)
+    monkeypatch.setattr(sys, 'argv', [
+        'eval_detector_trace.py', '--run', str(path), '--data', str(root), '--split', 'test',
+        '--device', 'cpu', '--out', str(tmp_path / 'trace.json')])
+    mod.main()
+    assert seen and set(seen) == {'instances'}

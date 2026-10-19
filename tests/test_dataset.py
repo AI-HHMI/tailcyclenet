@@ -1839,3 +1839,16 @@ def test_loader_config_accepts_every_legal_value():
                {'crop_inflate': [1.0, 1.0]}, {'crop_inflate': 1.5}, {'aug_rotation_prob': 0.0},
                {'aug_rotation_prob': None}):
         LoaderConfig(**ok)
+
+
+def test_loader_config_from_refuses_unknown_keys_and_allows_the_callers_plumbing():
+    """The one `[data]` -> `LoaderConfig` path: a typo is refused by name, plumbing is not passed."""
+    from tailcyclenet.dataset import SCORER_PLUMBING, loader_config_from
+
+    lc = loader_config_from({'path': 'x', 'num_workers': 2, 'n_frames': 6})
+    assert lc.n_frames == 6
+    with pytest.raises(SystemExit, match=r"unknown key\(s\) \['n_frame'\]"):
+        loader_config_from({'n_frame': 6})
+    with pytest.raises(SystemExit, match='prefetch_factor'):
+        loader_config_from({'prefetch_factor': 2})
+    assert loader_config_from({'prefetch_factor': 2}, extra=SCORER_PLUMBING).n_frames == LoaderConfig().n_frames

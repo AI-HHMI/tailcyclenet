@@ -35,16 +35,9 @@ def _loader_config(config: dict) -> LoaderConfig:
     Outputs: a `LoaderConfig`.
     Side effects: none, or raises SystemExit naming unknown keys.
     """
-    from ..dataset import LoaderConfig
+    from ..dataset import SCORER_PLUMBING, loader_config_from
 
-    data_cfg = dict(config.get('data', {}))
-    known = set(LoaderConfig.__dataclass_fields__) | {
-        'path', 'num_workers', 'val_num_workers', 'prefetch_factor', 'worker_cv_threads'}
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(f'[data]: unknown key(s) {sorted(unknown)}')
-    return LoaderConfig(**{k: v for k, v in data_cfg.items()
-                           if k in LoaderConfig.__dataclass_fields__})
+    return loader_config_from(dict(config.get('data', {})), extra=SCORER_PLUMBING)
 
 
 def _check_names(registry, target_registry, data) -> None:

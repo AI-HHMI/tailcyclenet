@@ -211,6 +211,31 @@ class LoaderConfig:
     crop_inflate: float | list = 1.0
 
 
+LOADER_PLUMBING = ('path', 'num_workers')
+SCORER_PLUMBING = LOADER_PLUMBING + ('val_num_workers', 'prefetch_factor', 'worker_cv_threads')
+
+
+def loader_config_from(data_cfg: dict, *, extra=LOADER_PLUMBING) -> LoaderConfig:
+    """`[data]` -> a `LoaderConfig`, refusing any key neither it nor the caller reads.
+
+    An unknown key would otherwise be ignored and the run would report as an arm it is not. The
+    ONE place pose training, scorer training and scorer QC turn a `[data]` block into a loader.
+
+    Inputs: data_cfg -- the `[data]` block; extra -- keys the caller reads itself (plumbing such
+            as `path`/`num_workers`), allowed but not passed to the dataclass.
+    Outputs: a `LoaderConfig`.
+    Side effects: none, or raises SystemExit naming the unknown keys.
+    """
+    fields = LoaderConfig.__dataclass_fields__
+    known = set(fields) | set(extra)
+    unknown = set(data_cfg) - known
+    if unknown:
+        raise SystemExit(
+            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
+            f'train at the defaults and report as the arm it is not. Known keys: {sorted(known)}')
+    return LoaderConfig(**{k: v for k, v in data_cfg.items() if k in fields})
+
+
 # pixels
 
 def _rotate_2d(cam, coords, angle_deg):

@@ -25,7 +25,7 @@ from tailcyclenet.checkpoints import (_BASE_CONFIG, check_image_size, full_train
                                       is_hf_repo_id, load_config, prior_provenance,
                                       resolve_checkpoint, resolve_hf_checkpoint, save_checkpoint,
                                       save_run_meta, warm_start)
-from tailcyclenet.dataset import (LoaderConfig, PoseDataset, SpawnHandoff, StepSampler,
+from tailcyclenet.dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
                                   pose_collate, worker_init)
 from tailcyclenet.format import Registry
 from tailcyclenet.losses import PoseLoss
@@ -528,15 +528,7 @@ def main(argv: list[str] | None = None):
     torch.manual_seed(int(train_cfg.get('seed', 23)))
     np.random.seed(int(train_cfg.get('seed', 23)))
 
-    known = set(LoaderConfig.__dataclass_fields__) | {'path', 'num_workers'}
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(
-            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
-            f'train at the defaults and report as the arm it is not. Known keys: '
-            f'{sorted(known)}')
-    lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
-                         if k in LoaderConfig.__dataclass_fields__})
+    lc = loader_config_from(data_cfg)
     lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'))
     base_reg = base_registry(run, train_cfg.get('checkpoint_path'))
     train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=base_reg)

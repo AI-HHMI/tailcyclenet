@@ -48,19 +48,10 @@ def _no_probe(monkeypatch):
 
 
 @pytest.mark.parametrize('stem,rx,cam,gid', [
-    # anipose's own documented patterns, and its own convention: the CAMERA IS THE CAPTURE GROUP.
-    ('cam0_trial3', r'cam([0-9]+)_', '0', 'trial3'),
-    ('cam12_trial3', r'cam([0-9]+)_', '12', 'trial3'),
-    ('vid_A', r'_([A-Z])$', 'A', 'vid'),
-    ('session1-camB', r'-cam([A-Z])', 'B', 'session1'),
-    # SUPERSET 1: no capture group means the WHOLE match (anipose raises IndexError here --
-    # what johnson's `Cam2005325.mp4` needs). The separator is not consumed: 'cam[0-9]+' leaves
-    # '_trial3' where 'cam([0-9]+)_' leaves 'trial3' -- both stable, asserted on VALUES.
-    ('cam0_trial3', r'cam[0-9]+', 'cam0', '_trial3'),
-    ('cam0_trial3', r'cam[0-9]+_', 'cam0_', 'trial3'),
-    ('Cam2005325', r'Cam[0-9]+', 'Cam2005325', ''),
-    # SUPERSET 2: no regex at all -- the whole stem is the group, the caller names the camera.
-    ('anything_at_all', None, '', 'anything_at_all'),
+    ('cam0_trial3', r'cam([0-9]+)_', '0', 'trial3'),      # anipose: the CAMERA IS THE CAPTURE GROUP
+    ('cam0_trial3', r'cam[0-9]+', 'cam0', '_trial3'),     # no group: the whole match, sep kept
+    ('Cam2005325', r'Cam[0-9]+', 'Cam2005325', ''),       # johnson's raw rig dump
+    ('anything_at_all', None, '', 'anything_at_all'),     # no regex: the stem is the group
 ])
 def test_the_anipose_naming_rule(stem, rx, cam, gid):
     """Both the camera name and the group id come from one regex; either can be silently wrong."""
@@ -68,7 +59,7 @@ def test_the_anipose_naming_rule(stem, rx, cam, gid):
 
 
 def test_one_camera_needs_no_regex(tmp_path, monkeypatch):
-    """The 2D single-view case: demanding a regex to select from one camera is ceremony."""
+    """A one-camera rig needs no regex (2D single view); any larger rig requires one."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['cam0'], calibrated=False)
     _touch(tmp_path / 'rec', 'whatever.mp4', 'other.mp4')
@@ -76,6 +67,8 @@ def test_one_camera_needs_no_regex(tmp_path, monkeypatch):
     assert p.mode == '2d'
     assert sorted(p.videos) == ['other', 'whatever']
     assert all(list(v) == ['cam0'] for v in p.videos.values())
+    with pytest.raises(SystemExit, match='--cam-regex is required'):
+        adopt.plan([tmp_path / 'rec'], _calib(tmp_path, ['0', '1']), None)
 
 
 def test_uncalibrated_single_camera_uses_nominal_camera_from_video_size(tmp_path):
@@ -96,21 +89,15 @@ def test_uncalibrated_single_camera_uses_nominal_camera_from_video_size(tmp_path
         fmt.nominal_camera('cam0', wh).get_camera_matrix().detach().cpu().numpy())
 
 
-def test_multiple_groups_in_one_session_is_free(tmp_path, monkeypatch):
-    """One invocation shares one calibration, mode and keypoint axis; twelve trials is one session."""
+def test_the_empty_remainder_rule_is_about_disagreement(tmp_path, monkeypatch):
+    """Many groups share one session; an all-empty group id is one group, but `Cam1.mp4` beside
+    `Cam1_t3.mp4` is an ambiguity and refused."""
     _no_probe(monkeypatch)
-    cal = _calib(tmp_path, ['0', '1'])
-    _touch(tmp_path / 'rec', *[f'cam{i}_{g}.mp4' for g in ('a', 'b', 'c') for i in (0, 1)])
-    p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
+    p = adopt.plan([_touch(tmp_path / 'rec', *[f'cam{i}_{g}.mp4' for g in 'abc' for i in (0, 1)])],
+                   _calib(tmp_path, ['0', '1']), r'cam([0-9]+)_')
     assert sorted(p.videos) == ['a', 'b', 'c']
     assert p.session_id == 'rec' and p.group_id == ''
 
-
-def test_the_empty_remainder_rule_is_about_disagreement(tmp_path, monkeypatch):
-    """A raw rig dump names the whole stem as the camera; an all-empty group id is then one group.
-    But `cam0.mp4` beside `cam0_trial3.mp4` is a genuine ambiguity -- refusing the mix is the rule.
-    """
-    _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['Cam1', 'Cam2'])
     _touch(tmp_path / 'raw', 'Cam1.mp4', 'Cam2.mp4')
     p = adopt.plan([tmp_path / 'raw'], cal, r'Cam[0-9]+', group_id='rec42')
@@ -136,8 +123,9 @@ def test_refusal_1_no_video_matches_the_regex(tmp_path, monkeypatch):
     assert 'matched none' in str(e.value) and 're.search' in str(e.value)
 
 
-def test_refusal_2_no_parsed_camera_is_in_the_calibration(tmp_path, monkeypatch):
-    """The most common error: `cam([0-9]+)_` yields '0' while the calibration names it 'cam0'."""
+def test_refusal_2_no_parsed_camera_is_in_the_calibration(tmp_path, monkeypatch, capsys):
+    """The most common error: `cam([0-9]+)_` yields '0' while the calibration names it 'cam0'. None
+    matched refuses; some matched skips the rest by name."""
     _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['cam0', 'cam1'])
     _touch(tmp_path / 'rec', 'cam0_t.mp4', 'cam1_t.mp4')
@@ -149,10 +137,6 @@ def test_refusal_2_no_parsed_camera_is_in_the_calibration(tmp_path, monkeypatch)
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam[0-9]+')
     assert sorted(p.videos['_t']) == ['cam0', 'cam1']
 
-
-def test_refusal_2_some_matched_skips_rather_than_refusing(tmp_path, monkeypatch, capsys):
-    """A camera with video and no geometry can never join a group: none matched -> refuse, some -> skip."""
-    _no_probe(monkeypatch)
     cal = _calib(tmp_path, ['Cam1', 'Cam2'])
     _touch(tmp_path / 'raw', 'Cam1.mp4', 'Cam2.mp4', 'Cam9.mp4')
     p = adopt.plan([tmp_path / 'raw'], cal, r'Cam[0-9]+')
@@ -211,14 +195,6 @@ def test_a_moving_rig_is_refused(tmp_path, monkeypatch):
         adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
 
 
-def test_the_regex_is_required_when_the_rig_is_not_a_singleton(tmp_path, monkeypatch):
-    _no_probe(monkeypatch)
-    cal = _calib(tmp_path, ['0', '1'])
-    _touch(tmp_path / 'rec', 'a.mp4', 'b.mp4')
-    with pytest.raises(SystemExit, match='--cam-regex is required'):
-        adopt.plan([tmp_path / 'rec'], cal, None)
-
-
 # refusals 7-11: flags that mean something on a labelled session and nothing here
 
 
@@ -273,9 +249,8 @@ def _fake_probe(n=6, wh=(64, 48), fps=20.0):
 
 
 def test_the_three_source_keys_reconstruct_the_session(tmp_path):
-    """`plan()` is pure over the filenames, so calibration + regex + file list re-derive the map
-    exactly; a flat list has no key to collide. Round-tripped through TOML on purpose.
-    """
+    """`plan()` is pure over filenames, so calibration + regex + file list (through TOML) re-derive
+    the map exactly; an underscore group id cannot collide in a flat list."""
     import tomllib
 
     import toml
@@ -300,45 +275,56 @@ def test_the_three_source_keys_reconstruct_the_session(tmp_path):
     assert back.videos == p.videos and back.rig.names == p.rig.names
 
 
-def test_a_renamed_video_is_caught_at_reconstruction(tmp_path):
-    """The self-check: a video renamed, moved or added since the run raises instead of rendering
-    a prediction over the wrong pixels.
-    """
+def _pred_session(tmp_path, p, dirname, groups, fps=True):
+    """A minimal prediction session over plan `p` with these `groups.pq` rows."""
     import toml
 
-    def _pred(dirname, groups):
-        pred = tmp_path / dirname
-        pred.mkdir()
-        prov = adopt.provenance_of(p)
-        prov['source_session_id'] = p.session_id
-        (pred / 'session.toml').write_text(toml.dumps(
-            {'mode': '3d', 'units': 'mm', 'labels': 'tracked', 'names': list(KPTS_3D),
-             'provenance': prov}))
-        fmt.dump_calibration(pred / 'calibration.toml', p.rig)
-        fmt.write_table(pred / 'groups.pq', {
-            'group_id': np.array(groups, dtype=object),
-            'n_frames': np.array([6] * len(groups), np.int32),
-            'fps': np.array([20.0] * len(groups), np.float32)}, dict_cols=())
-        return pred
+    pred = tmp_path / dirname
+    pred.mkdir()
+    prov = adopt.provenance_of(p)
+    prov['source_session_id'] = p.session_id
+    (pred / 'session.toml').write_text(toml.dumps(
+        {'mode': '3d', 'units': 'mm', 'labels': 'tracked', 'names': list(KPTS_3D),
+         'provenance': prov}))
+    fmt.dump_calibration(pred / 'calibration.toml', p.rig)
+    cols = {'group_id': np.array(groups, dtype=object),
+            'n_frames': np.array([6] * len(groups), np.int32)}
+    if fps:
+        cols['fps'] = np.array([20.0] * len(groups), np.float32)
+    fmt.write_table(pred / 'groups.pq', cols, dict_cols=())
+    return pred
 
+
+def test_a_renamed_video_is_caught_at_reconstruction(tmp_path):
+    """`session_from_prediction` re-derives the session and raises on a renamed, moved or added
+    video instead of rendering over the wrong pixels."""
     cal = _calib(tmp_path, ['0', '1'])
     _touch(tmp_path / 'rec', 'cam0_t.mp4', 'cam1_t.mp4')
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
     sess = adopt.build(p, names=KPTS_3D, probe=_fake_probe(), verbose=False)
 
-    good = _pred('pred', ['t'])
+    good = _pred_session(tmp_path, p, 'pred', ['t'])
     back = adopt.session_from_prediction(good)
     assert list(back.groups) == ['t'] and back.groups['t'].n_frames == 6
     assert back.groups['t'].source('0') == sess.groups['t'].source('0')
-
-    # (a) THE GROUPS DISAGREE -- the self-check the stored map could not do.
     with pytest.raises(fmt.FormatError, match='renamed, moved or added'):
-        adopt.session_from_prediction(_pred('pred_wrong_group', ['somethingelse']))
-
-    # (b) A VIDEO MOVED: the resolved file list is replayed, so a missing one is refused by name.
+        adopt.session_from_prediction(_pred_session(tmp_path, p, 'wrong', ['somethingelse']))
     (tmp_path / 'rec' / 'cam1_t.mp4').rename(tmp_path / 'rec' / 'cam1_u.mp4')
     with pytest.raises(SystemExit, match='no such file'):
         adopt.session_from_prediction(good)
+
+
+def test_a_prediction_groups_table_without_fps_reconstructs(tmp_path):
+    """`fps` is optional in groups.pq; its fallback was sized by the COLUMN count (3 groups, 2
+    columns raised IndexError)."""
+    import math
+
+    gids = ['t', 'u', 'v']
+    _touch(tmp_path / 'rec', *[f'cam{c}_{g}.mp4' for g in gids for c in (0, 1)])
+    p = adopt.plan([tmp_path / 'rec'], _calib(tmp_path, ['0', '1']), r'cam([0-9]+)_')
+    back = adopt.session_from_prediction(_pred_session(tmp_path, p, 'pred', gids, fps=False))
+    assert sorted(back.groups) == gids
+    assert all(math.isnan(g.fps) for g in back.groups.values())
 
 
 # with pixels
@@ -353,9 +339,7 @@ def _two_cam(tmp_path, T=6, wh=(64, 48), lens=None):
 
 
 def test_frame_counts_come_from_the_decoder(tmp_path):
-    """`n_frames` is a promise that every index in [0, T) decodes; a metadata count that disagrees
-    would fail deep inside the window loop, after the checkpoint has loaded.
-    """
+    """`n_frames` comes from the decoder (every index in [0, T) decodes), not container metadata."""
     from tailcyclenet import video
     from tailcyclenet.dataset import read_frames
 
@@ -372,7 +356,8 @@ def test_frame_counts_come_from_the_decoder(tmp_path):
 
 
 def test_length_mismatch_is_refused_and_trims_only_on_request(tmp_path, capsys):
-    """A one-frame offset is a dropped trigger; a 40,000-frame one is two recordings sharing an id."""
+    """A ragged group is refused (`--trim-to-shortest` opts in); a size mismatch with the calibration
+    is refused (it projects wrong with no symptom)."""
     cal = _two_cam(tmp_path, lens=(6, 9))
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
     with pytest.raises(SystemExit, match='disagree on length'):
@@ -381,13 +366,11 @@ def test_length_mismatch_is_refused_and_trims_only_on_request(tmp_path, capsys):
     assert sess.groups['t'].n_frames == 6
     assert 'trimmed to 6' in capsys.readouterr().out
 
-
-def test_size_mismatch_is_refused(tmp_path):
-    """Calibration at twice the deployment resolution projects to the wrong place with no symptom."""
-    cal = _calib(tmp_path, ['0', '1'], wh=(64, 48))
+    (tmp_path / 'small').mkdir()
+    cal = _calib(tmp_path / 'small', ['0', '1'], wh=(64, 48))
     for i in (0, 1):
-        _write_video(tmp_path / 'rec' / f'cam{i}_t.mp4', i, 6, (32, 24))
-    p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
+        _write_video(tmp_path / 'small' / 'rec' / f'cam{i}_t.mp4', i, 6, (32, 24))
+    p = adopt.plan([tmp_path / 'small' / 'rec'], cal, r'cam([0-9]+)_')
     with pytest.raises(SystemExit) as e:
         adopt.build(p, names=KPTS_3D, verbose=False)
     assert '32x24' in str(e.value) and '64x48' in str(e.value)
@@ -415,9 +398,8 @@ def test_a_camera_block_with_no_size_is_filled_from_the_pixels(tmp_path, capsys)
 
 
 def test_the_in_memory_session_matches_the_written_one(tmp_path):
-    """The replacement for `validate_session` as the acceptance test: build in memory, write the
-    same plan out with symlinked pixels, and assert the validator certifies it and the two agree.
-    """
+    """The acceptance test `validate_session` cannot run on a `VideoSession`: the in-memory session,
+    dumped with symlinked pixels, validates and agrees field by field."""
     cal = _two_cam(tmp_path, T=6)
     p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
     mem = adopt.build(p, names=KPTS_3D, units='mm', assoc_res_max_px=17.5, verbose=False)
@@ -458,28 +440,3 @@ def test_the_in_memory_session_matches_the_written_one(tmp_path):
                     == Path(mem.groups[gid].source(cam)[1]).resolve())
 
 
-def test_a_prediction_groups_table_without_fps_reconstructs(tmp_path):
-    """`fps` is optional in groups.pq; its fallback used to be sized by the COLUMN count, so three
-    groups and two columns raised IndexError."""
-    import math
-
-    import toml
-
-    cal = _calib(tmp_path, ['0', '1'])
-    gids = ['t', 'u', 'v']
-    _touch(tmp_path / 'rec', *[f'cam{c}_{g}.mp4' for g in gids for c in (0, 1)])
-    p = adopt.plan([tmp_path / 'rec'], cal, r'cam([0-9]+)_')
-    pred = tmp_path / 'pred'
-    pred.mkdir()
-    prov = adopt.provenance_of(p)
-    prov['source_session_id'] = p.session_id
-    (pred / 'session.toml').write_text(toml.dumps(
-        {'mode': '3d', 'units': 'mm', 'labels': 'tracked', 'names': list(KPTS_3D),
-         'provenance': prov}))
-    fmt.dump_calibration(pred / 'calibration.toml', p.rig)
-    fmt.write_table(pred / 'groups.pq', {'group_id': np.array(gids, dtype=object),
-                                         'n_frames': np.array([6, 6, 6], np.int32)},
-                    dict_cols=())
-    back = adopt.session_from_prediction(pred)
-    assert sorted(back.groups) == gids
-    assert all(math.isnan(g.fps) for g in back.groups.values())

@@ -205,3 +205,28 @@ def test_affinity_2d_prefers_the_slot_that_continues_its_own_camera_tracks():
         out, _, _ = tr.step(cg, boxes, scores)
         picks[w2] = [s for s in range(2) if np.isfinite(out[s]).all()]
     assert picks[0.5] == [1]
+
+
+def test_fast_associate_is_identical_to_the_reference():
+    """TR7: `fast=True` returns the same groups, bit for bit (points, residuals, members), under
+    every gate and order switch, on crowded jittered scenes with double-fires and NaN boxes."""
+    from tailcyclenet.infer.associate import associate
+
+    cg = _rig(RIG3 + [(0.1, 0.3, 40.0)])
+    rng = np.random.default_rng(3)
+    for trial in range(6):
+        W = rng.uniform(-200, 200, (8, 3))
+        boxes = _boxes(cg, W, 100.0, [rng.normal(0, 8, (8, 2)) for _ in cg])
+        boxes = [torch.cat([b, b[:2] + 7.0]) for b in boxes]
+        boxes[trial % 4][1] = float('nan')
+        scores = [torch.as_tensor(rng.uniform(0, 1, len(b)), dtype=torch.float32)
+                  for b in boxes]
+        for kw in ({}, {'max_res_sides': 0.2}, {'score_order': True}, {'min_views': 1},
+                   {'max_instances': 3}):
+            ref = associate(cg, boxes, scores_per_cam=scores, **kw)
+            got = associate(cg, boxes, scores_per_cam=scores, fast=True, **kw)
+            assert len(ref) == len(got)
+            for g, h in zip(ref, got):
+                assert g['members'] == h['members'] and g['residual'] == h['residual']
+                assert torch.equal(torch.nan_to_num(g['point'], nan=1e30),
+                                   torch.nan_to_num(h['point'], nan=1e30))

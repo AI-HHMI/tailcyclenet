@@ -70,6 +70,7 @@ def identity_provenance(args):
                             if args.track_age_decay is not None else -1.0),
         'track_affinity_2d': float(args.track_affinity_2d),
         'track_camera_claims': bool(args.track_camera_claims),
+        'assoc_fast': bool(args.assoc_fast),
     }
 
 

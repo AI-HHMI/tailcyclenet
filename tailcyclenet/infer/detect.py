@@ -263,6 +263,7 @@ def detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_de
                                    track_age_decay=args.track_age_decay,
                                    track_affinity_2d=args.track_affinity_2d,
                                    track_camera_claims=args.track_camera_claims,
+                                   assoc_fast=args.assoc_fast,
                                    frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j])

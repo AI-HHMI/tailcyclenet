@@ -12,7 +12,7 @@ def box_provenance(args, det_tile, det_red, det_boxsrc):
     Unconditional and always complete (a provenance record has no cache-invalidation pressure),
     so two runs that look alike differ in their output file where a reader can see it. Keyed by
     the CLI name where it differs from `detect_raw`'s parameter name -- that is what a reader has
-    to type to reproduce it. `tests/test_detector.py` walks `detect_raw`'s signature against this
+    to type to reproduce it. `tests/infer/test_provenance.py` walks `detect_raw`'s signature against this
     dict, so a new box-affecting parameter must land here too. The frame range is recorded because
     it changes the detections (which frames, and the aligned lead-in); the detector's box target
     is recorded as `det_box_source`, NOT `box_source`, because the two are the detector's training
@@ -50,7 +50,7 @@ def identity_provenance(args):
     checkable from the artifact rather than assumed.
 
     Unconditional and always complete, exactly as `box_provenance` is: the same keys at every
-    value, since conditional membership is what makes a record lie. `tests/test_detector.py`
+    value, since conditional membership is what makes a record lie. `tests/infer/test_provenance.py`
     walks `associate_group`'s signature against this dict, so a new identity-affecting parameter
     must land here too.
     """

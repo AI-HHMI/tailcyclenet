@@ -1,5 +1,5 @@
 """The query prior and its training corruptions, in DRAW ORDER (the order is RNG-load-bearing;
-`tests/test_dataset_select_realise.py` guards it).
+`tests/loader/test_select_realise.py` guards it).
 
 `kpt_prior` is the pose at `prompt_t`, the first labelled frame per keypoint. Corruptions, in
 order: `prompt_dropout` (PER ITEM, not per keypoint, because scene geometry derives from the whole

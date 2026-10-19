@@ -9,7 +9,7 @@ PyAV provides bounded-memory, frame-accurate decoding. Frame accuracy is by cons
 Rate arithmetic is wrong in both directions: `guessed_rate` is read off the time base, so a 20 fps
 camera writing onto a 1/30 grid (pts 0,2,3,5,6,...) had every third index never decode; and the
 derived `average_rate` drifts to an off-by-one part way through a `-vsync vfr` remux
-(`tests/test_video.py` pins both). The table is built ONCE per file per process:
+(`tests/data/test_video.py` pins both). The table is built ONCE per file per process:
 
 - **MP4/MOV: from the container's own sample index** (`stream.index_entries`), which libavformat
   already parsed from the header at open -- no packet data is read, so a 600,000-frame file costs

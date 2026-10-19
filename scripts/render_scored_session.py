@@ -143,12 +143,26 @@ def _colour(score: float, lo: float, hi: float):
     return tuple(int(round(a + (b - a) * frac)) for a, b in zip(BAD, GOOD))
 
 
-def draw_scored(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[str],
+def animal_index(lab: fmt.Labels, animal: str) -> int:
+    """The position of `animal` on the labels' animal axis, or SystemExit naming the ids present.
+
+    Inputs: lab -- the group's dense labels; animal -- the `--animal` id the scores were filtered on.
+    Outputs: the integer index into `lab.points2d`'s first axis.
+    Side effects: none.
+    """
+    ids = [str(a) for a in lab.animal_ids]
+    if animal not in ids:
+        raise SystemExit(f'--animal {animal!r} is not in this group; animals present: {ids}')
+    return ids.index(animal)
+
+
+def draw_scored(im: np.ndarray, lab: fmt.Labels, a: int, t: int, ci: int, names: list[str],
                 skeleton: list[list[str]], scores: dict, start: int | None, lo: float, hi: float,
                 note: str, stats: dict) -> np.ndarray:
-    """One frame with every plotted keypoint coloured by its window's score.
+    """One frame with every plotted keypoint of animal `a` coloured by its window's score.
 
-    Inputs: im -- a BGR frame; lab -- the group's dense labels; t -- the frame; ci -- the camera
+    Inputs: im -- a BGR frame; lab -- the group's dense labels; a -- the animal index (the one the
+            scores were selected for, see `animal_index`); t -- the frame; ci -- the camera
             index; names/skeleton -- the session's axis; scores -- `(start, keypoint)` -> score;
             start -- the covering window (None = unscored); lo/hi -- the colour range; note -- the
             first legend line; stats -- per-window (min, median, mean precision).
@@ -160,7 +174,6 @@ def draw_scored(im: np.ndarray, lab: fmt.Labels, t: int, ci: int, names: list[st
     im = np.ascontiguousarray(im).copy()
     s = max(1, int(round(im.shape[1] / 1200)))
     ix = {n: i for i, n in enumerate(names)}
-    a = 0
     pts = lab.points2d[a, t, :, ci] if lab.points2d is not None else None
     vis = lab.vis2d[a, t, :, ci] if lab.vis2d is not None else None
 
@@ -263,6 +276,7 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     stats = window_stats(scores, table['precision'], lo, hi)
     labels = session.labels(args.group)
+    animal = animal_index(labels, args.animal)
     frames = list(range(args.start, args.end, args.stride))
     for cam in cameras:
         ci = session.cam_names.index(cam)
@@ -280,7 +294,7 @@ def main() -> int:
                 else:
                     score_key = frame_to_window(starts, n_frames, t)
                     note = f'{args.animal} {cam}  frame {t}  {t / group.fps:.2f}s  window {score_key}'
-                out_im = draw_scored(im, labels, t, ci, session.names, session.skeleton,
+                out_im = draw_scored(im, labels, animal, t, ci, session.names, session.skeleton,
                                      scores, score_key, lo, hi, note, stats)
                 h = int(round(out_im.shape[0] * args.width / out_im.shape[1]))
                 out_im = cv2.resize(out_im, (args.width, h), interpolation=cv2.INTER_AREA)

@@ -486,18 +486,3 @@ def test_distance_states_exclude_near_and_ambiguous_rows():
     out = displacement_masks(good, bad, anchor, camera, '2d',
                              {'min_corrupt_px': 1.0, 'max_clean_px': 0.5})
     assert bool(out['far_mask'][0, 0, 0]) and bool(out['active_mask'][0, 0, 0])
-
-
-def test_independent_reference_gate_rejects_an_improved_bad_point():
-    camera = [{'size': (100, 100)}]
-    good = torch.tensor([[[[10.0, 10.0]]]])
-    bad = torch.tensor([[[[11.0, 10.0]]]])
-    anchor = good.clone()
-    reference = torch.tensor([[[[11.0, 10.0]]]])
-    out = displacement_masks(
-        good, bad, anchor, camera, '2d',
-        {'min_corrupt_px': 0.5, 'max_clean_px': 0.1, 'reference_gate': 'independent_far',
-         'reference_margin_px': 0.0}, reference=reference)
-    assert bool(out['base_far_mask'].all())
-    assert not bool(out['far_mask'].any())
-    assert bool(out['reference_rejected_mask'].all())

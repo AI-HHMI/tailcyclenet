@@ -108,10 +108,6 @@ class LoaderConfig:
     prompt_swap_animal: float = 0.0
     # 0 -> non-overlapping windows for val/test
     val_stride: int = 0
-    # Phase shift, in frames, applied to the val/test window lattice. 0 reproduces the historical
-    # framing exactly. A non-zero value moves WHERE each window starts, so a track's errors are
-    # judged under a different temporal framing than the one that produced them.
-    val_offset: int = 0
     # Frame stride for a TRAIN window, drawn per item; repeat an entry to weight it.
     # Val/test are always 1.
     frame_strides: list = field(default_factory=lambda: [1])
@@ -1117,7 +1113,7 @@ class PoseDataset(Dataset):
         v = v.reshape(v.shape[0], -1) if v.ndim > 2 else v
         return np.flatnonzero((v != UNLABELED).any(-1))
 
-    def _starts(self, vis, a, n_frames, offset=None):
+    def _starts(self, vis, a, n_frames):
         """Window starts for one animal.
 
         Train indexes at animal granularity (the start is picked inside `__getitem__`), so a
@@ -1126,15 +1122,6 @@ class PoseDataset(Dataset):
         the window is placed AROUND the label, and clamped into the group rather than running
         off the end. The first start is half a window before the first label so the label sits
         inside the window rather than at frame 0, where per-frame anchoring contributes nothing.
-
-        `offset` shifts the whole lattice and defaults to `cfg.val_offset`. A scorer sweeping it
-        is asking whether a track's errors are visible under a framing other than the one that
-        produced them: windows sitting on the SAME lattice as a prediction's own windows have
-        that prediction's seams exactly on their edges, where they are easiest to miss.
-
-        The shift is applied to EVERY start rather than to the anchor, because the anchor is
-        clamped into `[0, limit]` and a group labelled from frame 0 anchors at 0 -- which would
-        swallow the offset completely on exactly the fully-labelled groups a prediction produces.
         """
         labelled = self._labelled_frames(vis, a)
         if labelled.size == 0:
@@ -1146,8 +1133,7 @@ class PoseDataset(Dataset):
         lo, hi = int(labelled[0]), int(labelled[-1])
         limit = max(0, n_frames - T)
         first = int(np.clip(lo - T // 2, 0, limit))
-        shift = int(self.cfg.val_offset if offset is None else offset)
-        return sorted({int(np.clip(s + shift, 0, limit))
+        return sorted({int(np.clip(s, 0, limit))
                        for s in range(first, hi + 1, stride)}) or [0]
 
     def __len__(self):

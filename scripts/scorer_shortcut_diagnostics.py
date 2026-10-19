@@ -42,7 +42,8 @@ from tailcyclenet.scorer.model import flatten_sequence_triplet  # noqa: E402
 from tailcyclenet.scorer.train import (corruption_config, loader_config,  # noqa: E402
                                        _frame_pointwise_arrays, _weighted_binary_metrics,
                                        scorer_output_granularity)
-from tailcyclenet.scorer.triplet import GENERATORS, seed_worker  # noqa: E402
+from tailcyclenet.scorer.corruption import GENERATORS  # noqa: E402
+from tailcyclenet.scorer.triplet import seed_worker  # noqa: E402
 
 
 def _shapes_match(a, b):

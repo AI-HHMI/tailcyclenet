@@ -8,7 +8,7 @@ import torch
 
 from tailcyclenet import format as fmt
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, _flip_2d
-from tailcyclenet.scorer.triplet import _make_anchor
+from tailcyclenet.scorer.views import make_anchor
 
 
 def _cfg(**over):
@@ -230,7 +230,7 @@ def test_scorer_anchor_transfer_handles_independent_semantic_flips():
     view_a = _fake_view([0, 2, 1])
     view_b = _fake_view([0, 1, 2])
     source_a = torch.tensor([[[[10.0, 0.0], [20.0, 0.0], [30.0, 0.0]]]])
-    anchor = _make_anchor(source_a, 1.0, '2d', view_a, view_b,
+    anchor = make_anchor(source_a, 1.0, '2d', view_a, view_b,
                           source_slots=torch.tensor([0, 1, 2]))
     expected = torch.tensor([[[[10.0, 0.0], [30.0, 0.0], [20.0, 0.0]]]])
     torch.testing.assert_close(anchor, expected)

@@ -230,7 +230,7 @@ class FrameTripletScorerLoss(nn.Module):
         frames = self._metadata(triplet, 'frames', None)
         if frames is None:
             return torch.ones(shape, dtype=torch.float32, device=device)
-        from .triplet import source_frame_weights
+        from .corruption import source_frame_weights
         return source_frame_weights(frames, eligible=eligible, device=device)
 
     def _pointwise_loss(self, scores, labels, *, observed, in_view, anchor_observed,

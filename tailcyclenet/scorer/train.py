@@ -43,7 +43,8 @@ from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer, flatten_sequence_triplet
 from .qc import refuse_deleted_data_keys
-from .triplet import SEGMENT_TYPES, seed_worker
+from .corruption import SEGMENT_TYPES
+from .triplet import seed_worker
 
 SCORER_HEAD_KEYS = ('pool_num_heads', 'score_hidden', 'use_precision', 'output_granularity')
 

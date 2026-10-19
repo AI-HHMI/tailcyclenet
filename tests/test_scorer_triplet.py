@@ -11,9 +11,10 @@ import pytest
 import torch
 
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
-from tailcyclenet.scorer.triplet import (build_corruptors_for, displacement_masks, make_triplet,
-                                         observed_frame_counts, transfer_points_2d,
-                                         view_affine_2d, _draw_shift)
+from tailcyclenet.scorer.corruption import build_corruptors_for, draw_shift, observed_frame_counts
+from tailcyclenet.scorer.masks import displacement_masks
+from tailcyclenet.scorer.triplet import make_triplet
+from tailcyclenet.scorer.views import transfer_points_2d, view_affine_2d
 
 CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0)
 
@@ -193,7 +194,7 @@ def test_sparse_windows_still_build_and_still_carry_signal(roots):
 
 def test_sparse_stuck_detects_a_corruption_that_moves_no_observed_slot():
     """A shift that moves only never-observed slots is a corruption in name only."""
-    from tailcyclenet.scorer.triplet import _sparse_stuck
+    from tailcyclenet.scorer.corruption import _sparse_stuck
 
     coords = torch.zeros(1, 4, 2, 3)
     coords[0, 0, 1] = float('nan')
@@ -210,7 +211,7 @@ def test_sparse_stuck_detects_a_corruption_that_moves_no_observed_slot():
 
 def test_the_forced_sparse_menu_moves_every_sparse_keypoint(roots):
     """Regression for the first 3dpop probe: with `const_offset` forced no sparse keypoint is stuck."""
-    from tailcyclenet.scorer.triplet import _draw_sparse_moved, _sparse_stuck
+    from tailcyclenet.scorer.corruption import _sparse_stuck, draw_sparse_moved
 
     ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
     _d3, _d2, sparse_3d, _s2 = build_corruptors_for(CORRUPTION)
@@ -232,7 +233,7 @@ def test_the_forced_sparse_menu_moves_every_sparse_keypoint(roots):
         is_dense = (counts[:, alive] >= 6)[0]
         if bool(is_dense.all()):
             is_dense = torch.zeros_like(is_dense)      # force the sparse path for the test
-        shift, _fired = _draw_sparse_moved(sparse_3d, c, is_dense)
+        shift, _fired = draw_sparse_moved(sparse_3d, c, is_dense)
         assert not bool(_sparse_stuck(shift, c, is_dense).any()), \
             f'seed {seed}: a sparse keypoint was left uncorrupted'
         checked += 1
@@ -278,7 +279,7 @@ def test_tagged_draw_matches_the_library_corruptor_and_tags_every_point():
     every point carries at least one tag even when no type fires on its own."""
     from tracktail.datasets.scorer_corruption import PointCorruptor, GENERATORS
 
-    from tailcyclenet.scorer.triplet import tagged_draw
+    from tailcyclenet.scorer.corruption import tagged_draw
 
     probs = {n: 0.5 for n in GENERATORS}
     mags = {n: 10.0 for n in GENERATORS}
@@ -342,7 +343,7 @@ def test_frame_corruption_gathers_one_shift_for_duplicate_source_frames():
     coords = torch.zeros((1, 4, 1, 2))
     frames = np.array([0, 1, 1, 2], dtype=np.int64)
     torch.manual_seed(5)
-    shift, _fired = _draw_shift(
+    shift, _fired = draw_shift(
         dense_2d, coords, frames=frames,
         cfg={'output_granularity': 'frame', 'segment_prob': 0.0})
     assert torch.equal(shift[:, 1], shift[:, 2])

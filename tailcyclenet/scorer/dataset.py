@@ -12,7 +12,8 @@ checkpoint. Without that, `checkpoint_best` would be selected on a moving target
 import numpy as np
 import torch
 
-from .triplet import build_corruptors_for, make_triplet, triplet_collate
+from .corruption import build_corruptors_for
+from .triplet import make_triplet, triplet_collate
 
 GETITEM_MAX_RETRIES = 8
 

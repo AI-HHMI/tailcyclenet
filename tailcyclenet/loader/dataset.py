@@ -536,7 +536,7 @@ class PoseDataset(Dataset):
         realised into more than one view (`tailcyclenet/scorer/`), which a fused `_item` cannot
         express. The three parts share ONE `rng` stream and consume it in the same order they
         did when this was a single function, so the pose path is byte-identical -- asserted by
-        `tests/test_dataset_select_realise.py`, which is the condition the split was approved
+        `tests/loader/test_select_realise.py`, which is the condition the split was approved
         on, not a nicety.
         """
         sel = self.select(idx, rng, shape)
@@ -652,7 +652,7 @@ class PoseDataset(Dataset):
         configured probability.
         Returns the `View`, or None when the crop or the decode fails.
         `sel` is NOT mutated, so one selection may be realised repeatedly (the scorer's anchor);
-        asserted in `tests/test_dataset_select_realise.py`.
+        asserted in `tests/loader/test_select_realise.py`.
 
         Geometry: camera and crop-inflate draws are one per item (camera draw sorted). Points
         outside the source frame or the FINAL crop are flipped out of `vis_2d`; a rotation that

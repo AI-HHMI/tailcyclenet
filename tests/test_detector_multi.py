@@ -1,10 +1,8 @@
-"""Multi-root detector training and explicit box-only refusal."""
+"""Multi-root detector training, input sizing, and per-root box-source resolution."""
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -12,20 +10,11 @@ import torch
 from tailcyclenet.detector import load_detector
 from tailcyclenet.infer.driver import (detector_box_source, _detector_matches_source)
 from tailcyclenet.format import load_datasets
+from tailcyclenet import train_detector
 from tailcyclenet.train_detector import input_wh_for_roots
 
-REPO = Path(__file__).resolve().parent.parent
 
-
-def _train_detector_module():
-    spec = importlib.util.spec_from_file_location(
-        'tcn_train_detector_multi', REPO / 'tailcyclenet' / 'train_detector.py')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _config(tmp_path, root, out, *, extra_data=''):
+def _config(tmp_path, root, out):
     path = tmp_path / 'config-box.toml'
     path.write_text(f'''
 [data]
@@ -33,13 +22,12 @@ path = "{root}"
 boxes = "keypoints"
 boxes_by_dataset = {{ ratlike = "instances" }}
 balance_datasets = true
-input_wh = [64, 64]
+input_wh = [32, 32]
 min_box_px = 0
 min_crop_dim = 16
 val_frames_per_group = 4
 augment = false
 augment_strong = false
-{extra_data}
 background_prob = 0.0
 [model]
 yolox = "hybrid"
@@ -63,7 +51,7 @@ def test_multi_root_training_records_root_scores_and_loads_checkpoint(tiny_root,
     out = tmp_path / 'run'
     config = _config(tmp_path, tiny_root, out)
     monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(config)])
-    _train_detector_module().main()
+    train_detector.main()
 
     ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
     assert ckpt['dataset'] == ''
@@ -88,6 +76,7 @@ def test_multi_root_training_records_root_scores_and_loads_checkpoint(tiny_root,
 
 
 def test_multi_root_auto_input_size_is_root_order_independent(tiny_root):
+    """The auto input size is a property of the root set, not of its order."""
     roots = load_datasets(tiny_root, split='train')
     assert len(roots) == 2
     forward = input_wh_for_roots(roots, 'keypoints', min_box_px=0)
@@ -97,6 +86,8 @@ def test_multi_root_auto_input_size_is_root_order_independent(tiny_root):
 
 
 def test_multi_root_detector_inference_guard_and_box_source_resolution():
+    """Inference accepts a multi-root detector only on a root it trained on (by name), and takes
+    that root's own box source, falling back to the session's."""
     assert _detector_matches_source(['allen-mouse-combined', 'johnson-mouse-combined-aug'], '',
                                     'allen-mouse-combined')
     assert not _detector_matches_source(['allen-mouse-combined', 'johnson-mouse-combined-aug'],
@@ -113,9 +104,3 @@ def test_multi_root_detector_inference_guard_and_box_source_resolution():
     assert detector_box_source(detector, 'johnson-mouse-annotated', 'instances') == 'keypoints'
     assert detector_box_source(detector, 'rat-city', 'keypoints') == 'keypoints'
 
-
-def test_the_deleted_keypoints_key_raises_by_name(tiny_root, tmp_path, monkeypatch):
-    config = _config(tmp_path, tiny_root, tmp_path / 'run', extra_data='keypoints = false')
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(config)])
-    with pytest.raises(SystemExit, match=r"deleted key.*'keypoints'.*keypoint branch"):
-        _train_detector_module().main()

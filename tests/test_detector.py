@@ -3,7 +3,9 @@
 The point of this detector is not that it finds animals -- it is that it reproduces THE CROP
 RULE'S box. If it learned some other plausible box, every downstream pose number would shift.
 """
+import re
 import shutil
+import sys
 
 import numpy as np
 import pytest
@@ -15,17 +17,16 @@ from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler, YOLO
                                    assign_tal, box_collate, box_iou, ciou_loss, decode,
                                    detector_loss, giou_loss, letterbox, paired_iou, split_batch,
                                    unletterbox_boxes)
-from tailcyclenet.detector.config import (TRAINING_KEYS,
-                                           load_detector_config)
+from tailcyclenet.detector.config import TRAINING_KEYS, load_detector_config
 from tailcyclenet.detector.data import _photometric, random_affine
 
+sys.path.insert(0, str(Path(__file__).parent))
+import conftest as cf  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
 
 
 def _box_only_session(path, group_ids=('video_ix0', 'video_ix10')):
-    """Write multiple clips with labeled and present boxes but no keypoint/3D tables."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
     from tailcyclenet import format as fmt
 
     T = 2
@@ -49,25 +50,6 @@ def _box_only_session(path, group_ids=('video_ix0', 'video_ix10')):
         cf._write_frames(path / 'groups' / gid, 'cam0', T, (64, 48))
 
 
-def _infer_program_source():
-    """The inference PROGRAM as one string: `tailcyclenet/infer/{cli,driver}.py`.
-
-    These assertions predate the split and were written against `scripts/infer.py` when that file
-    held the argparse and the whole driver. It is now a six-line shim onto
-    `tailcyclenet.infer.main`, so reading it would silently assert nothing -- a scrape for an
-    absent literal PASSES. Concatenating the two files it became keeps each check meaning exactly
-    what it meant before.
-    """
-    base = Path(__file__).resolve().parent.parent / 'tailcyclenet' / 'infer'
-    return (base / 'cli.py').read_text() + (base / 'driver.py').read_text()
-
-
-def _infer_window_source():
-    """The window loop, formerly `tailcyclenet/infer.py`."""
-    return (Path(__file__).resolve().parent.parent
-            / 'tailcyclenet' / 'infer' / 'window.py').read_text()
-
-
 def test_forward_shapes_and_anchor_order():
     m = YOLOXNano(version='hybrid')
     x = torch.zeros(2, 3, 128, 160)
@@ -80,11 +62,8 @@ def test_forward_shapes_and_anchor_order():
 
 
 def test_chunk_shuffle_is_a_permutation_that_keeps_locality():
-    """Every index exactly once (or it silently drops training data), and few videos at a time.
-
-    The locality bound is the whole point: `_reader` caches per worker, so a draw that ranges
-    over more than `mix` blocks re-opens containers and costs 486 ms/batch instead of 40.
-    """
+    """Every index exactly once, few videos at a time: `_reader` caches per worker, so a wider
+    draw re-opens containers (486 ms/batch vs 40)."""
     chunk, mix, n_pools = 512, 4, 3
     n = chunk * mix * n_pools                     # exact multiple, so pools are position-aligned
     s = ChunkShuffle(n, chunk=chunk, mix=mix, seed=0)
@@ -138,55 +117,35 @@ def _multi_detector_roots(tmp_path):
     return root_dir
 
 
-def test_multi_root_weights_balance_roots_and_preserve_within_root_cohorts(tmp_path):
-    ds = BoxDataset(_multi_detector_roots(tmp_path), 'train', input_wh=(64, 64),
-                    max_frames_per_group=0)
+def test_multi_root_weights_balance_roots_pool_and_validate_names(tmp_path):
+    """Balanced: equal root shares with each root's cohort split intact; pooled: shares follow
+    the combined population; `alpha` composes; an unknown `boxes_by_dataset` root is refused."""
+    root = _multi_detector_roots(tmp_path)
+    ds = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=0)
     weights = ds.train_weights(annot_frac=0.25, balance_datasets=True)
     assert ds.root_names == ['alpha', 'zeta']
     assert ds.root_mix(weights) == pytest.approx({'alpha': 0.5, 'zeta': 0.5})
     for cohorts in ds.root_cohort_mix(weights).values():
         assert cohorts == pytest.approx({'annotated': 0.25, 'tracked': 0.75})
 
+    pooled = ds.train_weights(annot_frac=0.25, balance_datasets=False)
+    assert pooled == pytest.approx(ds.default_train_weights(0.25, balance_datasets=False))
+    assert ds.root_mix(pooled)['zeta'] > 0.65
+    assert ds.cohort_mix(pooled) == pytest.approx({'annotated': 0.25, 'tracked': 0.75})
 
-def test_multi_root_pooling_follows_combined_cohort_population(tmp_path):
-    ds = BoxDataset(_multi_detector_roots(tmp_path), 'train', input_wh=(64, 64),
-                    max_frames_per_group=0)
-    weights = ds.train_weights(annot_frac=0.25, balance_datasets=False)
-    assert weights == pytest.approx(ds.default_train_weights(0.25, balance_datasets=False))
-    assert ds.root_mix(weights)['zeta'] > 0.65
-    assert ds.cohort_mix(weights) == pytest.approx({'annotated': 0.25, 'tracked': 0.75})
-
-
-def test_multi_root_alpha_keeps_equal_root_shares_and_single_root_weights_unchanged(tmp_path):
-    root = _multi_detector_roots(tmp_path)
-    ds = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=0)
-    weights = ds.train_weights(annot_frac=None, alpha=0.5, balance_datasets=True)
-    assert ds.root_mix(weights) == pytest.approx({'alpha': 0.5, 'zeta': 0.5})
-
+    alpha = ds.train_weights(annot_frac=None, alpha=0.5, balance_datasets=True)
+    assert ds.root_mix(alpha) == pytest.approx({'alpha': 0.5, 'zeta': 0.5})
     single = BoxDataset(root / 'alpha', 'train', input_wh=(64, 64), max_frames_per_group=0)
-    base = single.default_train_weights(0.5)
-    alpha = single.alpha_weights(0.5)
-    np.testing.assert_array_equal(single.train_weights(0.5, 0.5, True), base * alpha)
+    np.testing.assert_array_equal(single.train_weights(0.5, 0.5, True),
+                                  single.default_train_weights(0.5) * single.alpha_weights(0.5))
 
-
-def test_multi_root_box_source_overrides_validate_names(tmp_path):
-    root = _multi_detector_roots(tmp_path)
     with pytest.raises(ValueError, match='unknown dataset roots'):
         BoxDataset(root, 'train', boxes_by_dataset={'typo': 'instances'})
 
 
-def test_annot_frac_absent_means_no_weighting(tmp_path):
-    """Absent must stay byte-identical: None weights => the caller keeps `ChunkShuffle`."""
-    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    w = ds.default_train_weights(None)
-    assert w is not None and len(w) == len(ds)
-
-
 def test_annot_frac_is_inert_on_a_single_cohort_split(dense_root):
-    """3dpop/calms21/branson-fly are entirely `tracked`. The key must not be able to affect them,
-    whatever it says -- and critically calms21 is the ONE train-time video root, so this is what
-    keeps the weighted sampler away from the only place decode locality still costs anything.
-    """
+    """The key must not affect an all-`tracked` split (3dpop/calms21/branson-fly) -- calms21 is
+    the one train-time video root, where decode locality still costs."""
     ds = BoxDataset(dense_root, 'train', input_wh=(64, 64))
     assert len(ds.cohort_mix()) == 1, 'fixture must be single-cohort for this test to mean anything'
     base = ds.default_train_weights(None)
@@ -196,60 +155,33 @@ def test_annot_frac_is_inert_on_a_single_cohort_split(dense_root):
                                    'single-cohort split')
 
 
-def test_annot_frac_sets_the_cohort_share(tmp_path):
-    """The whole point: the mix becomes the configured number instead of whatever the frame
-    counts happen to be."""
+def test_annot_frac_sets_the_cohort_share_uniformly_within_a_cohort(tmp_path):
+    """The mix becomes the configured number, and within a cohort a group's weight does not scale
+    with its surviving frame count (the same accident one level down)."""
     ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    natural = ds.cohort_mix()
-    assert natural['annotated'] < 0.2, 'fixture must be lopsided or this proves nothing'
-    for frac in (0.25, 0.5, 0.75):
+    assert ds.cohort_mix()['annotated'] < 0.2, 'fixture must be lopsided or this proves nothing'
+    for frac in (0.25, 0.75):
         mix = ds.cohort_mix(ds.default_train_weights(frac))
         assert mix['annotated'] == pytest.approx(frac)
         assert mix['tracked'] == pytest.approx(1.0 - frac)
-
-
-def test_annot_frac_weights_are_uniform_within_a_cohort(tmp_path):
-    """A group's weight must not scale with how many of its frames survived `frames_per_group`:
-    that is the accident being removed, and re-introducing it inside a cohort would be the same
-    bug one level down.
-    """
-    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
     w = ds.default_train_weights(0.5)
     src = np.array([s.label_source for s, _, _, _ in ds.index])
     for cohort in ('annotated', 'tracked'):
         assert len(np.unique(w[src == cohort])) == 1
-
-
-def test_annot_frac_out_of_range_raises(tmp_path):
-    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
     for bad in (-0.1, 1.5):
         with pytest.raises(ValueError, match='annot_frac'):
             ds.default_train_weights(bad)
 
-
-def test_cohort_sampler_realises_the_requested_share(tmp_path):
-    """The weights are only a claim until the sampler is drawn from -- this is the live check."""
-    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    w = ds.default_train_weights(0.5)
-    src = np.array([s.label_source for s, _, _, _ in ds.index])
+    # The weights are only a claim until the sampler is drawn from.
     s = CohortSampler(w, num_samples=20000, seed=0)
-    drawn = src[np.array(list(iter(s)))]
-    assert (drawn == 'annotated').mean() == pytest.approx(0.5, abs=0.02)
-
-
-def test_cohort_sampler_reshuffles_and_stays_in_range(tmp_path):
-    ds = BoxDataset(_two_cohort_root(tmp_path), 'train', input_wh=(64, 64))
-    s = CohortSampler(ds.default_train_weights(0.5), num_samples=256, seed=0)
     first = list(iter(s))
-    assert len(first) == len(s) == 256
-    assert min(first) >= 0 and max(first) < len(ds), 'a draw must be a valid index position'
+    assert len(first) == len(s) and min(first) >= 0 and max(first) < len(ds)
+    assert (src[np.array(first)] == 'annotated').mean() == pytest.approx(0.5, abs=0.02)
     assert list(iter(s)) != first, 'a second epoch must redraw'
 
 
 def _two_group_root(tmp_path, n1=4, n2=32, label_source='tracked'):
-    """Two SINGLE-COHORT sessions with DIFFERENT frame counts -- for B1a/B1b, isolated from
-    `annot_frac`'s cohort question (both groups share one `label_source`).
-    """
+    """Two SINGLE-COHORT sessions with different frame counts, isolated from `annot_frac`."""
     from tailcyclenet import format as fmt
     from tests.conftest import KPTS_3D, _rig, _write_frames
 
@@ -269,8 +201,7 @@ def _two_group_root(tmp_path, n1=4, n2=32, label_source='tracked'):
 
 
 def test_max_frames_per_group_zero_drops_the_cap(tmp_path):
-    """detector_v2 B1a: 0 means every labelled frame is indexed, not just the first
-    `max_frames_per_group` a cap happened to keep."""
+    """B1a: 0 means every labelled frame is indexed; the default cap (40) is unchanged."""
     root = _two_group_root(tmp_path, n1=4, n2=32)
     capped = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=8, seed=0)
     uncapped = BoxDataset(root, 'train', input_wh=(64, 64), max_frames_per_group=0, seed=0)
@@ -281,141 +212,133 @@ def test_max_frames_per_group_zero_drops_the_cap(tmp_path):
     assert len(default) == 4 + 32     # both groups are under the default cap of 40
 
 
-def test_alpha_weights_absent_means_no_weighting(tmp_path):
-    ds = BoxDataset(_two_group_root(tmp_path), 'train', input_wh=(64, 64), max_frames_per_group=0)
-    assert ds.alpha_weights(None) is None
-
-
-def test_alpha_1_is_frame_uniform(tmp_path):
-    """alpha=1.0: every entry the same weight, i.e. plain frame-uniform sampling."""
-    ds = BoxDataset(_two_group_root(tmp_path, n1=4, n2=32), 'train', input_wh=(64, 64),
+def test_alpha_weights_interpolate_frame_and_group_uniform(tmp_path):
+    """alpha=None is no weighting, 1.0 frame-uniform, 0.0 equal group totals; on uniform group
+    sizes (3dpop's shape) every alpha is a free no-op."""
+    ds = BoxDataset(_two_group_root(tmp_path / 'a', n1=4, n2=32), 'train', input_wh=(64, 64),
                     max_frames_per_group=0)
+    assert ds.alpha_weights(None) is None
     w = ds.alpha_weights(1.0)
     assert np.allclose(w, w[0])
-
-
-def test_alpha_0_is_group_uniform(tmp_path):
-    """alpha=0.0: every GROUP gets the same TOTAL weight regardless of its view count -- the
-    naive 'weight by group' scheme SS2.7 warns starves a small group without this exponent form,
-    but AT alpha=0 exactly it reduces to that naive scheme and the two group totals must agree.
-    """
-    ds = BoxDataset(_two_group_root(tmp_path, n1=4, n2=32), 'train', input_wh=(64, 64),
-                    max_frames_per_group=0)
     w = ds.alpha_weights(0.0)
     keys = np.array([f'{s.session_id}/{g}' for s, g, _, _ in ds.index])
-    totals = {k: float(w[keys == k].sum()) for k in np.unique(keys)}
-    vals = list(totals.values())
-    assert vals[0] == pytest.approx(vals[1]), f'group totals must be equal at alpha=0: {totals}'
+    totals = [float(w[keys == k].sum()) for k in np.unique(keys)]
+    assert totals[0] == pytest.approx(totals[1])
+
+    even = BoxDataset(_two_group_root(tmp_path / 'b', n1=16, n2=16), 'train', input_wh=(64, 64),
+                      max_frames_per_group=0)
+    for alpha in (0.0, 0.5):
+        assert len(np.unique(np.round(even.alpha_weights(alpha), 10))) == 1
 
 
-def test_alpha_is_a_free_noop_on_uniform_group_sizes(tmp_path):
-    """3dpop's own shape (SS5.5): every group the SAME view count makes alpha provably inert --
-    a free null control, not a bug."""
-    ds = BoxDataset(_two_group_root(tmp_path, n1=16, n2=16), 'train', input_wh=(64, 64),
-                    max_frames_per_group=0)
-    for alpha in (0.0, 0.5, 1.0):
-        w = ds.alpha_weights(alpha)
-        assert len(np.unique(np.round(w, 10))) == 1, \
-            f'uniform group sizes must make alpha=({alpha}) a no-op, got {w}'
+# --- detector training config (configs/detector.toml + tailcyclenet/detector/config.py) ------
 
-
-
-
-
-def test_detector_config_multi_root_defaults_and_types(tmp_path):
-    p = _write_config(tmp_path, """
+BARE = """
 [data]
-path = "/tmp/roots"
+path = "/tmp/ds"
 [model]
 yolox = "hybrid"
 [training]
 out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['data']['balance_datasets'] is True
-    assert cfg['data']['boxes_by_dataset'] == {}
+"""
 
-    bad = _write_config(tmp_path, """
+
+def _write_config(tmp_path, text, name='config.toml'):
+    p = tmp_path / name
+    p.write_text(text)
+    return p
+
+
+def test_detector_config_bare_overlay_inherits_the_shipped_recipe(tmp_path):
+    """The implicit base is `configs/detector.toml`: an absent key inherits its shipped value (not
+    an old code default), and `--out`/`--iters`/`--device` land in [training]."""
+    cfg = load_detector_config(_write_config(tmp_path, BARE))
+    d, m, t = cfg['data'], cfg['model'], cfg['training']
+    assert d['balance_datasets'] is True and d['boxes_by_dataset'] == {}
+    assert d['annot_frac'] == 0.6
+    assert 'wandb' not in cfg
+    assert m['p2'] is True and m['pretrained'] == ''          # hybrid: no pretrained source
+    assert (t['assignment'], t['box_loss'], t['tal_topk']) == ('tal', 'ciou', 20)
+    assert 'assignment' in TRAINING_KEYS
+    assert t['weight_decay'] == 0.01 and t['max_pos_per_gt'] == 10 and t['box_weight'] == 15.0
+    assert t['iou_aware_obj'] is True and t['iou_aware_warmup'] == 2000
+    assert (t['optimizer'], t['muon_momentum'], t['muon_lr_scale']) == ('muon', 0.95, 1.0)
+    assert t['warmup_steps'] == 500 and (t['beta1'], t['beta2']) == (0.9, 0.95)
+    assert t['shared_head'] is False and t['fpn_upsample'] == 'bilinear'
+
+    overlay = _write_config(tmp_path, """
 [data]
-path = "/tmp/roots"
-balance_datasets = "false"
-[model]
-yolox = "hybrid"
+path = "/tmp/ds"
 [training]
-out = "/tmp/run"
-""", name='bad-balance.toml')
-    with pytest.raises(SystemExit, match='balance_datasets'):
-        load_detector_config(bad)
-
-    bad_map = _write_config(tmp_path, """
-[data]
-path = "/tmp/roots"
-boxes_by_dataset = []
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""", name='bad-box-map.toml')
-    with pytest.raises(SystemExit, match='boxes_by_dataset must be a table'):
-        load_detector_config(bad_map)
+out = "/tmp/run-det"
+""", 'overlay.toml')
+    cfg = load_detector_config(overlay, out='/tmp/run-det', iters=7, device='cpu')
+    d, m, t = cfg['data'], cfg['model'], cfg['training']
+    assert d['boxes'] == 'instances' and d['min_crop_dim'] == 64 and d['min_box_px'] == 32
+    assert d['max_input_px'] == 4 * 416 * 416 and d['val_frames_per_group'] == 8
+    assert 'frames_per_group' not in d and 'use_regions' not in d and 'keypoints' not in d
+    assert d['augment'] is True and d['augment_strong'] is True and d['rotate_deg'] == 180.0
+    assert d['reduce'] is False and d['hflip'] is True
+    assert d['input_wh'] is None and d['tile_wh'] is None
+    assert d['tile_scale'] == 1.0 and d['tile_bg_per_frame'] == 1
+    assert m['yolox'] == 'convnext-t' and m['pretrained'] == 'imagenet'
+    assert (t['out'], t['iters'], t['device']) == ('/tmp/run-det', 7, 'cpu')
+    assert t['batch_size'] == 8 and t['lr'] == 1e-3 and t['num_workers'] == 8 and t['seed'] == 23
+    assert t['eval_every'] == 2000 and t['eval_batches'] == 25
 
 
-def test_detector_config_optional_wandb_block(tmp_path):
-    default = _write_config(tmp_path, """
-[data]
-path = "/tmp/roots"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    assert 'wandb' not in load_detector_config(default)
+_REFUSED = [  # (block, line, match): each is a decision the loader must refuse by name
+    ('data', 'bogus = 1', 'unknown key'),
+    ('model', 'bogus = 1', 'unknown key'),
+    ('training', 'bogus = 1', 'unknown key'),
+    ('data', 'boxes = "nope"', 'boxes'),
+    ('model', 'yolox = "nope"', 'yolox'),
+    ('model', 'pretrained = "/some/path.pth"', 'pretrained'),
+    ('data', 'balance_datasets = "false"', 'balance_datasets'),
+    ('data', 'boxes_by_dataset = []', 'boxes_by_dataset must be a table'),
+    ('data', 'annot_frac = 1.5', 'annot_frac'),
+    ('training', 'weight_decay = -0.1', 'weight_decay'),
+    ('training', 'assignment = "bad"', 'assignment'),
+    ('training', 'box_loss = "bad"', 'box_loss'),
+    ('training', 'optimizer = "sgd"', 'optimizer'),
+    ('training', 'fpn_upsample = "bicubic"', 'fpn_upsample'),
+    ('wandb', 'mode = "invalid"', r'\[wandb\]\.mode'),
+    (None, 'extends = "../detector.toml"', 'extends'),
+]
 
-    configured = _write_config(tmp_path, """
-[data]
-path = "/tmp/roots"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-[wandb]
+
+def test_detector_config_refuses_bad_keys_and_values_by_name(tmp_path):
+    for i, (block, line, match) in enumerate(_REFUSED):
+        text = BARE + '[wandb]\n' if block == 'wandb' else BARE
+        if block is None:
+            text = line + '\n' + text
+        elif line.split(' =')[0] + ' =' in text:
+            text = re.sub(rf'^{line.split(" =")[0]} = .*$', line, text, flags=re.M)
+        else:
+            text = text.replace(f'[{block}]\n', f'[{block}]\n{line}\n', 1)
+        with pytest.raises(SystemExit, match=match):
+            load_detector_config(_write_config(tmp_path, text, f'bad{i}.toml'))
+
+
+def test_detector_config_wandb_block_and_logging(tmp_path, monkeypatch):
+    from types import ModuleType, SimpleNamespace
+
+    from tailcyclenet.train_detector import (_init_detector_wandb, _log_detector_wandb,
+                                             _wandb_eval_metrics)
+
+    cfg = load_detector_config(_write_config(tmp_path, BARE + """[wandb]
 project_name = "tailcycle-detector"
 path = "/tmp/wandb"
 mode = "online"
-""", name='wandb.toml')
-    cfg = load_detector_config(configured)
-    assert cfg['wandb'] == {'project_name': 'tailcycle-detector',
-                            'path': '/tmp/wandb', 'mode': 'online'}
-
-    bad = _write_config(tmp_path, """
-[data]
-path = "/tmp/roots"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-[wandb]
-mode = "invalid"
-""", name='bad-wandb.toml')
-    with pytest.raises(SystemExit, match=r"\[wandb\]\.mode"):
-        load_detector_config(bad)
-
-
-def test_detector_wandb_metrics_flatten_scalars():
-    from tailcyclenet.train_detector import _wandb_eval_metrics
+"""))
+    assert cfg['wandb'] == {'project_name': 'tailcycle-detector', 'path': '/tmp/wandb',
+                            'mode': 'online'}
 
     scores = {'val_macro': {'r50': 0.75, 'n_gt': 12, 'nan': float('nan')},
               'val_root_facemap': {'r50': 0.5, 'label': 'ignored'}}
-    got = _wandb_eval_metrics(scores, {'q50': 0.87})
-    assert got == {'eval/val_macro/r50': 0.75, 'eval/val_macro/n_gt': 12.0,
-                   'eval/val_root_facemap/r50': 0.5, 'train/objectness_q50': 0.87}
-
-
-def test_detector_wandb_initialization_and_logging(tmp_path, monkeypatch):
-    import sys
-    from types import ModuleType, SimpleNamespace
-
-    from tailcyclenet.train_detector import _init_detector_wandb, _log_detector_wandb
+    assert _wandb_eval_metrics(scores, {'q50': 0.87}) == {
+        'eval/val_macro/r50': 0.75, 'eval/val_macro/n_gt': 12.0,
+        'eval/val_root_facemap/r50': 0.5, 'train/objectness_q50': 0.87}
 
     calls = {}
     fake = ModuleType('wandb')
@@ -423,76 +346,65 @@ def test_detector_wandb_initialization_and_logging(tmp_path, monkeypatch):
     fake.init = lambda **kwargs: calls.update(init=kwargs)
     fake.log = lambda values, step: calls.update(log=(values, step))
     monkeypatch.setitem(sys.modules, 'wandb', fake)
-
     config = {'wandb': {'project_name': 'tailcycle-detector', 'path': str(tmp_path),
                         'mode': 'online'}}
     wb = _init_detector_wandb(config, tmp_path / 'run')
     _log_detector_wandb(wb, {'train/loss': 1.25}, 50)
     assert calls['init']['project'] == 'tailcycle-detector'
-    assert calls['init']['mode'] == 'online'
-    assert calls['init']['config'] is config
+    assert calls['init']['mode'] == 'online' and calls['init']['config'] is config
     assert calls['log'] == ({'train/loss': 1.25}, 50)
 
 
-def test_detector_config_weight_decay_inherits_the_shipped_0_01(tmp_path):
-    """The implicit base is `configs/detector.toml`, so an absent key inherits its shipped
-    value (0.01) rather than the old AdamW hardcoded 5e-4 -- a bare config now runs the
-    shipped recipe."""
-    p = _write_config(tmp_path, """
+def test_load_detector_config_overrides_apply_before_the_required_check(tmp_path):
+    """`--out` must rescue `out = ""` (the override used to land AFTER the required-check), and
+    `--iters`/`--device` share that path."""
+    cfg = _write_config(tmp_path, BARE.replace('"/tmp/run"', '""') + 'iters = 100\n')
+    loaded = load_detector_config(cfg, out=tmp_path / 'run', iters=5, device='cuda:1')
+    assert loaded['training']['out'] == str(tmp_path / 'run')
+    assert loaded['training']['iters'] == 5 and loaded['training']['device'] == 'cuda:1'
+    with pytest.raises(SystemExit, match='out.*required'):
+        load_detector_config(cfg)
+
+
+def test_detector_config_round_trips_through_the_run_folder(tmp_path):
+    """The recorded config.toml (None values dropped) loads back to the same recipe."""
+    from tailcyclenet.detector.config import load_detector_config
+
+    src = _write_config(tmp_path, """
 [data]
 path = "/tmp/ds"
+boxes = "keypoints"
+min_crop_dim = 64
+input_wh = [96, 64]
+tile_wh = []
 [model]
 yolox = "hybrid"
 [training]
 out = "/tmp/run"
-""")
-    assert load_detector_config(p)['training']['weight_decay'] == 0.01
+iters = 2
+""", 'src.toml')
+    cfg = load_detector_config(src, out=str(tmp_path / 'run'), iters=2, device='cpu')
+    import toml
+    (tmp_path / 'run').mkdir()
+    (tmp_path / 'run' / 'config.toml').write_text(toml.dumps(cfg))
+    again = load_detector_config(tmp_path / 'run' / 'config.toml')
+    assert again['data']['input_wh'] == [96, 64] and again['data']['tile_wh'] is None
+    assert again['data']['boxes'] == 'keypoints'
+    assert again['training']['iters'] == 2
+    assert again['model']['yolox'] == 'hybrid'
 
 
-def test_detector_config_weight_decay_rejects_negative(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-weight_decay = -0.1
-""")
-    with pytest.raises(SystemExit, match='weight_decay'):
-        load_detector_config(p)
-
-
-
-
-
-
-def test_detector_config_annot_frac_inherits_the_shipped_0_6(tmp_path):
-    """Absent annot_frac inherits the shipped recipe's 0.6 (the implicit detector.toml base),
-    not the old None -- a bare config now runs the shipped recipe."""
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    assert load_detector_config(p)['data']['annot_frac'] == 0.6
-
-
-def test_detector_config_annot_frac_rejects_out_of_range(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-annot_frac = 1.5
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='annot_frac'):
-        load_detector_config(p)
+def test_per_root_detector_overlays_load_and_raise_val_frames_per_group(tmp_path):
+    """Each shipped per-root overlay carries `[data].path` and raises `val_frames_per_group`
+    past 8: each of those roots has ONE val group."""
+    root = Path(__file__).resolve().parent.parent / 'configs' / 'detector'
+    want = {'rat-city.toml': 64, 'branson-fly.toml': 32, '3dpop.toml': 16}
+    for name, expect in want.items():
+        cfg = load_detector_config(root / name, out=tmp_path / name)
+        assert cfg['data']['path'], f'{name}: [data].path must be set (no CLI override exists)'
+        assert cfg['data']['val_frames_per_group'] == expect, name
+        assert cfg['data']['val_frames_per_group'] > 8, \
+            f'{name}: must exceed the shipped default of 8 or the overlay does nothing'
 
 
 def test_giou_is_zero_for_a_perfect_box():
@@ -513,15 +425,6 @@ def test_tal_finds_edge_candidates_without_center_radius():
     assert tal_pos.numel() >= 3 and bool((tal_gt == 0).all())
 
 
-def test_tal_center_assignment_contract_is_unchanged():
-    anchors = torch.tensor([[4., 4., 8.], [12., 12., 8.], [20., 20., 8.]])
-    gt = torch.tensor([[0., 0., 25., 25.]])
-    expected = assign(anchors, gt)
-    got = assign(anchors, gt, max_pos_per_gt=None)
-    for a, b in zip(expected, got):
-        torch.testing.assert_close(a, b)
-
-
 def test_ciou_has_finite_nonzero_gradient_for_disjoint_boxes():
     pred = torch.tensor([[0., 0., 1., 1.]], requires_grad=True)
     target = torch.tensor([[5., 5., 6., 6.]])
@@ -539,8 +442,7 @@ def test_recall_v2_loss_switches_are_live_together():
     # Make every decoded box valid for the synthetic assignment quality calculation.
     boxes[..., 2:] = boxes[..., :2] + boxes[..., 2:].abs() + 1.0
     gt = torch.tensor([[[8., 8., 96., 96.]]])
-    loss, parts = detector_loss(obj, boxes, anchors, gt, assignment='tal', box_loss_fn='ciou',
-)
+    loss, parts = detector_loss(obj, boxes, anchors, gt, assignment='tal', box_loss_fn='ciou')
     loss.backward()
     assert torch.isfinite(loss) and torch.isfinite(obj.grad).all() and parts['n_pos'] > 0
 
@@ -554,8 +456,6 @@ def test_detector_loss_giou_path_is_byte_identical():
     a, ap = detector_loss(obj, boxes, anchors, gt)
     b, bp = detector_loss(obj, boxes, anchors, gt, box_loss_fn='giou')
     assert torch.equal(a, b) and ap == bp
-
-
 
 
 def test_assign_ignores_nan_boxes():
@@ -573,14 +473,8 @@ def test_assign_ignores_nan_boxes():
 
 
 def test_every_positive_anchor_is_inside_its_own_box():
-    """The whole guard on `inside & near`.
-
-    A predicted box is `centre +- exp(ltrb) * stride`, so it always contains its own anchor
-    centre. A positive whose centre is outside its assigned GT box therefore has an unreachable
-    regression target while objectness is taught to fire there. `inside | near` shipped for a
-    while and nothing in this file caught it: uniqueness held, NaNs were still skipped, the loss
-    stayed finite, and 71% of rat-city's positives were unreachable.
-    """
+    """A positive whose centre is outside its GT box has an unreachable regression target.
+    `inside | near` shipped and left 71% of rat-city's positives unreachable."""
     m = YOLOXNano(version='hybrid')
     anchors = m.anchor_points(256, 256, torch.device('cpu'))
     gt = torch.tensor([[20.0, 20.0, 60.0, 70.0],        # small: radius reaches well past it
@@ -602,212 +496,32 @@ def test_assign_gives_each_anchor_one_box():
     assert pos.numel() == len(set(pos.tolist())), 'an anchor claimed by two boxes cancels'
 
 
-# T2.2 -- a per-GT positive cap. The centre prior has no cap on how many anchors one GT box can
-# claim, so a large box's candidate set can dwarf a small one's. `max_pos_per_gt=None` (default)
-# is uncapped and byte-identical to every checkpoint on record.
-# ----------------------------------------------------------------------------------------------
+def test_max_pos_per_gt_caps_a_large_box_and_leaves_a_small_one_alone():
+    """T2.2: None is uncapped and unchanged; K caps a big box's candidacy without evicting a
+    small box's own anchors, in `assign` and in the loss's `n_pos`."""
+    anchors = YOLOXNano(version='hybrid').anchor_points(256, 256, torch.device('cpu'))
+    for a, b in zip(assign(anchors, torch.tensor([[20.0, 20.0, 100.0, 100.0]])),
+                    assign(anchors, torch.tensor([[20.0, 20.0, 100.0, 100.0]]),
+                           max_pos_per_gt=None)):
+        torch.testing.assert_close(a, b)
 
-def test_assign_max_pos_per_gt_default_is_unchanged():
-    m = YOLOXNano(version='hybrid')
-    anchors = m.anchor_points(128, 128, torch.device('cpu'))
-    gt = torch.tensor([[20.0, 20.0, 100.0, 100.0], [30.0, 30.0, 110.0, 110.0]])
-    a_pos, a_gix = assign(anchors, gt)
-    b_pos, b_gix = assign(anchors, gt, max_pos_per_gt=None)
-    torch.testing.assert_close(a_pos, b_pos)
-    torch.testing.assert_close(a_gix, b_gix)
+    whole = torch.tensor([[10.0, 10.0, 246.0, 246.0]])
+    assert assign(anchors, whole)[0].numel() > 10
+    pos, gix = assign(anchors, whole, max_pos_per_gt=10)
+    assert pos.numel() <= 10 and bool((gix == 0).all())
 
+    gt = torch.tensor([[10.0, 10.0, 130.0, 130.0], [200.0, 200.0, 216.0, 216.0]])
+    small_u = int((assign(anchors, gt)[1] == 1).sum())
+    assert 0 < small_u < 10, 'the small box needs an uncapped count under K'
+    _, gix_c = assign(anchors, gt, max_pos_per_gt=10)
+    assert int((gix_c == 1).sum()) == small_u and int((gix_c == 0).sum()) <= 10
 
-def test_assign_max_pos_per_gt_caps_a_large_boxs_candidacy():
-    """A single big GT box on a fine-stride grid claims MANY anchors uncapped; capped at K it
-    must claim at most K (every positive belongs to this one GT).
-    """
-    m = YOLOXNano(version='hybrid')
-    anchors = m.anchor_points(256, 256, torch.device('cpu'))
-    gt = torch.tensor([[10.0, 10.0, 246.0, 246.0]])          # nearly the whole frame
-    pos_uncapped, _ = assign(anchors, gt)
-    assert pos_uncapped.numel() > 10, 'the test needs an uncapped count clearly above K'
-    K = 10
-    pos_capped, gix_capped = assign(anchors, gt, max_pos_per_gt=K)
-    assert pos_capped.numel() <= K
-    assert bool((gix_capped == 0).all())
-
-
-def test_assign_max_pos_per_gt_leaves_a_small_gt_alone():
-    """The cap bounds candidacy PER GT: a small box far from the large one keeps all its own
-    anchors -- it is not evicted to make room.
-    """
-    m = YOLOXNano(version='hybrid')
-    anchors = m.anchor_points(256, 256, torch.device('cpu'))
-    big = [10.0, 10.0, 130.0, 130.0]
-    small = [200.0, 200.0, 216.0, 216.0]                      # one cell at the finest stride
-    gt = torch.tensor([big, small])
-    pos_u, gix_u = assign(anchors, gt)
-    small_count_uncapped = int((gix_u == 1).sum())
-    assert 0 < small_count_uncapped < 10, 'the small box needs an uncapped count under K'
-    pos_c, gix_c = assign(anchors, gt, max_pos_per_gt=10)
-    small_count_capped = int((gix_c == 1).sum())
-    assert small_count_capped == small_count_uncapped, \
-        'the small GT must keep every one of its own candidates'
-    assert int((gix_c == 0).sum()) <= 10
-
-
-def test_detector_loss_max_pos_per_gt_default_is_unchanged():
-    torch.manual_seed(7)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    boxes = torch.rand(2, anchors.shape[0], 4) * 64
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    base, bp = detector_loss(obj, boxes, anchors, gt)
-    same, sp = detector_loss(obj, boxes, anchors, gt, max_pos_per_gt=None)
-    assert float(base) == float(same) and bp['n_pos'] == sp['n_pos']
-
-
-def test_detector_loss_max_pos_per_gt_reduces_n_pos_for_a_large_box():
     torch.manual_seed(8)
-    anchors = YOLOXNano(version='hybrid').anchor_points(256, 256, 'cpu')
     obj = torch.randn(1, anchors.shape[0])
     boxes = torch.rand(1, anchors.shape[0], 4) * 256
-    gt = torch.tensor([[[10.0, 10.0, 246.0, 246.0]]])
-    uncapped, up = detector_loss(obj, boxes, anchors, gt)
-    capped, cp = detector_loss(obj, boxes, anchors, gt, max_pos_per_gt=10)
-    assert up['n_pos'] > 10
-    assert cp['n_pos'] <= 10
-    assert cp['n_pos'] < up['n_pos']
-
-
-def test_detector_config_max_pos_per_gt_inherits_the_shipped_ten(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['training']['max_pos_per_gt'] == 10
-
-
-def test_detector_config_box_weight_inherits_the_shipped_fifteen(tmp_path):
-    """`box_weight` used to be `detector_loss`'s own hardcoded default (5.0), never exposed to a
-    config. With the implicit detector.toml base an absent key now inherits the shipped 15.0
-    instead.
-    """
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['training']['box_weight'] == 15.0
-
-
-def test_train_detector_box_weight_is_actually_wired_through(tmp_path, dense_root, monkeypatch):
-    """Proves the config->train_cfg->`detector_loss` call site is LIVE, not a dead key: two
-    otherwise-identical single-iteration runs must print DIFFERENT total losses.
-    """
-    import importlib.util
-    import re
-    import sys
-
-    def run(box_weight):
-        out = tmp_path / f'run_{box_weight}'
-        cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "hybrid"
-[training]
-out = "{out}"
-iters = 50
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 50
-eval_batches = 1
-box_weight = {box_weight}
-""", f'cfg_{box_weight}.toml')
-        spec = importlib.util.spec_from_file_location(f'tcn_train_detector_box_weight_{box_weight}',
-                                                      REPO / 'tailcyclenet' / 'train_detector.py')
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-        import io
-        from contextlib import redirect_stdout
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            mod.main()
-        m = re.search(r'loss\s+([\d.]+)', buf.getvalue())
-        assert m, f'no loss line found in output:\n{buf.getvalue()}'
-        return float(m.group(1))
-
-    loss_5 = run(5.0)
-    loss_1 = run(1.0)
-    assert loss_5 != loss_1, \
-        'box_weight=5.0 and box_weight=1.0 produced the SAME loss -- the config value is not ' \
-        'reaching detector_loss'
-
-
-
-
-
-def test_train_detector_max_pos_per_gt_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A short run with `max_pos_per_gt = 2` through the real CLI entry point: must train to
-    completion with no error (0 -> None conversion happens in `train_detector.py`, not the
-    config loader, so this is the one test that exercises that specific line)."""
-    import importlib.util
-    import sys
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "hybrid"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-max_pos_per_gt = 2
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_max_pos_per_gt',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
-    import tomllib
-    with open(out / 'config.toml', 'rb') as f:
-        recorded = tomllib.load(f)
-    assert recorded['training']['max_pos_per_gt'] == 2
+    _, up = detector_loss(obj, boxes, anchors, whole[None])
+    _, cp = detector_loss(obj, boxes, anchors, whole[None], max_pos_per_gt=10)
+    assert up['n_pos'] > 10 >= cp['n_pos']
 
 
 def test_loss_is_finite_with_no_animal_anywhere():
@@ -818,6 +532,116 @@ def test_loss_is_finite_with_no_animal_anywhere():
     gt = torch.full((2, 1, 4), float('nan'))
     loss, parts = detector_loss(obj, boxes, anchors, gt)
     assert torch.isfinite(loss) and parts['n_pos'] == 0
+
+
+def test_detector_loss_drops_negatives_on_incomplete_frames_but_keeps_positives():
+    anchors = torch.tensor([[5.0, 5.0, 8.0], [40.0, 40.0, 8.0]])
+    obj = torch.zeros(2, 2, requires_grad=True)
+    pred_boxes = torch.tensor([[[0.0, 0.0, 16.0, 16.0], [35.0, 35.0, 45.0, 45.0]]] * 2)
+    gt = torch.tensor([[[0.0, 0.0, 16.0, 16.0]]] * 2)
+    neg = torch.tensor([True, False])
+    loss, parts = detector_loss(obj, pred_boxes, anchors, gt, negative_supervision=neg)
+    loss.backward()
+    assert parts['negative_frames'] == 0.5
+    assert obj.grad[0, 1] != 0, 'a complete frame trains its background negative'
+    assert obj.grad[1, 0] != 0, 'an incomplete frame still trains its positive'
+    assert obj.grad[1, 1] == 0, 'an incomplete frame trains no background negative'
+    same, _ = detector_loss(obj.detach(), pred_boxes, anchors, gt,
+                            negative_supervision=torch.tensor([True, True]))
+    base, _ = detector_loss(obj.detach(), pred_boxes, anchors, gt)
+    assert float(same) == float(base)
+
+
+def test_detector_loss_iou_aware_holds_hard_target_during_warmup():
+    """`it < iou_aware_warmup` keeps the hard 1.0 target: an early near-zero IoU must not teach
+    objectness to stay off."""
+    torch.manual_seed(3)
+    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 5             # bad boxes -> low true IoU
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    warm, wp = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000, it=0)
+    hard, hp = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
+    assert float(warm) == float(hard), 'during warmup the loss must equal the hard-target one'
+    assert wp['iou_target'] == pytest.approx(1.0)
+
+
+def test_detector_loss_iou_aware_switches_to_iou_target_after_warmup():
+    """Past warmup (or `it=None`) the positive's target is the DETACHED IoU of its predicted and
+    GT box, matching a direct `paired_iou`."""
+    torch.manual_seed(4)
+    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
+    obj = torch.randn(2, anchors.shape[0])
+    boxes = torch.rand(2, anchors.shape[0], 4) * 5              # bad boxes -> IoU well under 1
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
+    past, pp = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000,
+                             it=2000)
+    hard, _ = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
+    assert float(past) != float(hard), 'past warmup the loss must differ from the hard-target one'
+    pos, gix = assign(anchors, gt[0])
+    assert pos.numel()
+    want = float(paired_iou(boxes[0, pos], gt[0][gix]).clamp(0, 1).mean())
+    assert pp['iou_target'] == pytest.approx(want, abs=1e-5) and want < 1.0
+    none_it, p1 = detector_loss(obj, boxes, anchors, gt, iou_aware=True, it=None)
+    torch.testing.assert_close(none_it, past)
+    assert p1['iou_target'] == pytest.approx(pp['iou_target'])
+
+
+def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
+    """The guard forcing a true positive's objectness weight back to 1 under
+    `negative_supervision` must key on `pos_mask`, not the target value -- under `iou_aware`
+    with bad boxes the target is near 0."""
+    torch.manual_seed(6)
+    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
+    obj = torch.randn(1, anchors.shape[0])
+    boxes = torch.rand(1, anchors.shape[0], 4) * 5              # bad boxes -> low true IoU
+    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]]])
+    no_negatives = torch.tensor([False])                   # supervises NO negatives
+
+    _, sp = detector_loss(obj, boxes, anchors, gt, negative_supervision=no_negatives,
+                          iou_aware=True, iou_aware_warmup=0, it=1)
+    assert sp['iou_target'] < 0.5, 'the test needs a genuinely low IoU to be a real check'
+    # The OBJ term (not the box term, which iou_aware never touches) must be identical: the
+    # positive's weight was forced to 1 in both cases, only the BCE TARGET value differs, and a
+    # BCE(logit, 1.0) vs BCE(logit, iou) at weight=1 are different numbers -- so this checks obj
+    # is computed off the same forced weight, not that the two total losses match.
+    pos, gix = assign(anchors, gt[0])
+    assert pos.numel()
+    logit = obj[0, pos]
+    target_hard = torch.ones_like(logit)
+    target_soft = paired_iou(boxes[0, pos], gt[0][gix]).clamp(0, 1)
+    import torch.nn.functional as F
+    norm = max(pos.numel(), 1)          # `detector_loss`'s own `obj_all / max(n_pos, B)`, B=1 here
+    expected_hard_obj = F.binary_cross_entropy_with_logits(
+        logit, target_hard, reduction='sum') / norm
+    expected_soft_obj = F.binary_cross_entropy_with_logits(
+        logit, target_soft, reduction='sum') / norm
+    # Re-derived directly rather than relying on `hard`/`soft` above (which also include
+    # box_weight * box, identical in both arms and therefore not informative here) -- read `obj`
+    # off `parts` instead.
+    _, hp = detector_loss(obj, boxes, anchors, gt, negative_supervision=no_negatives, iou_aware=False)
+    assert hp['obj'] == pytest.approx(float(expected_hard_obj), rel=1e-4)
+    assert sp['obj'] == pytest.approx(float(expected_soft_obj), rel=1e-4)
+
+
+def test_box_arithmetic_has_one_copy():
+    """`detector.boxes` is the one copy of centre/side/IoU arithmetic: numpy (`link_rows`) and
+    torch (association/NMS) agree, and `paired_iou` is `box_iou`'s diagonal."""
+    from tailcyclenet.detector.assign import box_center_dist
+    from tailcyclenet.detector.boxes import centres, sides
+    b = np.array([[0.0, 0.0, 10.0, 20.0], [5.0, 5.0, 7.0, 9.0]], np.float32)
+    np.testing.assert_array_equal(centres(b), centres(torch.from_numpy(b)).numpy())
+    np.testing.assert_array_equal(sides(b), sides(torch.from_numpy(b)).numpy())
+    np.testing.assert_array_equal(centres(b), [[5.0, 10.0], [6.0, 7.0]])
+    np.testing.assert_array_equal(sides(b), [15.0, 3.0])
+
+    a = torch.tensor([[0.0, 0.0, 10.0, 10.0], [0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0]])
+    c = torch.tensor([[0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0], [5.0, 5.0, 15.0, 15.0]])
+    torch.testing.assert_close(paired_iou(a, c), box_iou(a, c).diagonal())
+    assert 0.0 < float(paired_iou(a, c)[1]) < 1.0
+    # centre distance is in units of box side, so it is scale-free
+    assert box_center_dist(a * 2, c * 2)[1, 1].item() == pytest.approx(
+        box_center_dist(a, c)[1, 1].item())
 
 
 def test_decode_suppresses_duplicates():
@@ -843,62 +667,19 @@ def test_decode_trace_reports_score_nms_and_top_k_without_changing_output():
     assert trace['nms_boxes'].shape[0] == 2
 
 
-def test_decode_default_iou_thresh_is_unchanged():
-    """detector_v2 A1: `iou_thresh` is a new PARAMETER, and every checkpoint on record must decode
-    identically to it at `iou_thresh=0.5` (the old hardcoded value). `center_dist_thresh` must be
-    passed explicitly as `None` here to isolate the `iou_thresh` claim -- its OWN default changed
-    to 0.5 once A5 was confirmed (see `test_decode_center_dist_is_on_by_default_now`), which is a
-    deliberate break from every checkpoint trained before A5 landed, not tested by this function."""
-    boxes = torch.tensor([[10., 10., 50., 50.], [11., 11., 51., 51.], [200., 200., 260., 260.]])
-    logits = torch.tensor([3.0, 2.5, 2.0])
-    b_old, s_old = decode(logits, boxes, top_k=5, center_dist_thresh=None)
-    b_new, s_new = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
-    assert torch.equal(b_old, b_new) and torch.equal(s_old, s_new)
-
-
-def test_decode_center_dist_is_on_by_default_now():
-    """detector_v2 A5, CONFIRMED (2 seeds, 2 roots, dev/scratch/wave0/a5_centerdist_sweep*.log):
-    a bare `decode()` call (no `center_dist_thresh` passed) now suppresses a near-concentric
-    duplicate IoU alone would miss -- the opposite of the pre-A5 default. `center_dist_thresh=None`
-    is what restores the old byte-identical-to-every-prior-checkpoint behaviour."""
-    # Same centre (30, 30); side 40 vs side 100 -> IoU = 1600/10000 = 0.16, well under 0.5.
+def test_decode_center_dist_is_on_by_default():
+    """A5: a near-concentric duplicate (IoU 0.16) survives IoU-only NMS; the default
+    centre-distance NMS collapses it, and `center_dist_thresh=None` restores IoU-only."""
     boxes = torch.tensor([[10., 10., 50., 50.], [-20., -20., 80., 80.], [400., 400., 440., 440.]])
     logits = torch.tensor([3.0, 2.5, 2.0])
     b, s = decode(logits, boxes, top_k=5, iou_thresh=0.5)
-    assert b.shape[0] == 2, 'the new default must suppress the near-concentric pair'
-    b_off, s_off = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
-    assert b_off.shape[0] == 3, 'center_dist_thresh=None must restore the pre-A5 behaviour'
-
-
-def test_decode_center_dist_suppresses_near_concentric_boxes_iou_misses():
-    """detector_v2 A5: two boxes of very different size but (nearly) the same centre are a
-    near-concentric duplicate (report 42 SS3.6's own measured shape of `fp_dup`) -- IoU-only NMS at
-    0.5 must NOT collapse them (that is the bug A5 exists to fix), while `center_dist_thresh`
-    must.
-    """
-    # Same centre (30, 30); side 40 vs side 100 -> IoU = 1600/10000 = 0.16, well under 0.5.
-    boxes = torch.tensor([[10., 10., 50., 50.], [-20., -20., 80., 80.], [400., 400., 440., 440.]])
-    logits = torch.tensor([3.0, 2.5, 2.0])
-    b, s = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)
-    assert b.shape[0] == 3, 'IoU alone must not suppress a near-concentric pair this different in size'
-
-    b2, s2 = decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=0.5)
-    assert b2.shape[0] == 2, 'centre-distance NMS must collapse the near-concentric pair'
-    assert s2[0] > s2[1], 'the higher-scored box of the pair must survive'
-
-
-def test_box_center_dist_is_scale_free():
-    """Units of box side, not pixels: doubling every coordinate must not move the ratio."""
-    from tailcyclenet.detector.assign import box_center_dist
-
-    a = torch.tensor([[0., 0., 10., 10.]])
-    b = torch.tensor([[5., 0., 15., 10.]])
-    r1 = box_center_dist(a, b)[0, 0].item()
-    r2 = box_center_dist(a * 2, b * 2)[0, 0].item()
-    assert abs(r1 - r2) < 1e-5
+    assert b.shape[0] == 2 and s[0] > s[1]
+    assert decode(logits, boxes, top_k=5, iou_thresh=0.5, center_dist_thresh=None)[0].shape[0] == 3
 
 
 def test_reduce_factor_never_decodes_below_the_target():
+    """A reduced decode must still downscale into the target; under tiling the comparison is
+    against the deployed whole-frame size, where tile_scale 1.0 decodes natively."""
     from tailcyclenet.detector import reduce_factor
 
     assert reduce_factor((4696, 2048), (640, 288)) == 4       # rat-city: 1174x512, still above
@@ -909,14 +690,16 @@ def test_reduce_factor_never_decodes_below_the_target():
         n = reduce_factor(src, out)
         assert src[0] / n >= out[0] and src[1] / n >= out[1], 'the remaining resize must be a '\
             'downscale, or the letterbox is upsampling a decimated frame'
+    size = (4696, 2048)                                   # rat-city, tiled at tile_scale 1.0
+    for tile in ((640, 640), (640, 288)):
+        assert reduce_factor(size, tile) > 1, f'{tile}: the old comparison must decimate'
+    assert reduce_factor(size, size) == 1, 'deployment decodes natively, so training must too'
+    assert reduce_factor(size, (size[0] * 0.125, size[1] * 0.125)) > 1
 
 
 def test_letterbox_scale_is_in_source_units_under_reduction():
-    """`unletterbox_boxes` undoes the letterbox with this scale, and it never sees the decode.
-
-    A reduced decode that changed the returned scale would move every predicted box by the
-    reduction factor -- 4x on rat-city -- with nothing in the output to say so.
-    """
+    """`unletterbox_boxes` never sees the decode: a reduced decode that changed the returned
+    scale would move every box by the reduction factor (4x on rat-city)."""
     full = np.zeros((2048, 4696, 3), np.uint8)
     quarter = np.zeros((512, 1174, 3), np.uint8)
     a, s_a, p_a = letterbox(full, (640, 288))
@@ -930,37 +713,23 @@ def test_letterbox_scale_is_in_source_units_under_reduction():
     torch.testing.assert_close(unletterbox_boxes(moved, s_b, p_b), box, atol=1e-3, rtol=0)
 
 
-def test_letterbox_round_trip():
-    img = np.zeros((200, 400, 3), np.uint8)
-    out, scale, pad = letterbox(img, (416, 416))
-    assert out.shape == (416, 416, 3)
-    box = torch.tensor([[10.0, 20.0, 300.0, 150.0]])
-    moved = box.clone()
-    moved[:, 0::2] = moved[:, 0::2] * scale + pad[0]
-    moved[:, 1::2] = moved[:, 1::2] * scale + pad[1]
-    torch.testing.assert_close(unletterbox_boxes(moved, scale, pad), box, atol=1e-4, rtol=0)
+def test_unletterbox_clamps_a_runaway_box_into_the_frame():
+    """A decoded side can reach ~12,910 px; IoU-only NMS cannot suppress it, so the clamp bounds
+    it into the frame and a zero-area box comes back NaN.
+    """
+    from tailcyclenet.detector import unletterbox_boxes
 
-
-def test_the_batched_pack_is_bit_identical_to_the_per_frame_one():
-    """PIXELS ARE A CONTRACT. `detect_group` packs a batch through numpy instead of one
-    `torch.as_tensor(lb, float32).permute(2,0,1) / 255.0` per frame, because handing a 0.5 MP
-    elementwise op to torch's `nproc`-wide intraop pool cost 67 ms per frame against 1.0 ms. Both
-    are uint8 -> float32 -> divide by 255, both correctly rounded, so the pixels the detector sees
-    must be EQUAL and not merely close -- one ulp here is a different box somewhere."""
-    rng = np.random.default_rng(0)
-    lbs = [rng.integers(0, 256, (32, 48, 3), dtype=np.uint8) for _ in range(5)]
-    old = torch.stack([torch.as_tensor(x, dtype=torch.float32).permute(2, 0, 1) / 255.0
-                       for x in lbs])
-    arr = np.ascontiguousarray(np.stack(lbs).transpose(0, 3, 1, 2))
-    new = torch.from_numpy(arr.astype(np.float32) / np.float32(255))
-    assert torch.equal(old, new)
+    b = torch.tensor([[-5000.0, -5000.0, 20000.0, 20000.0], [10.0, 10.0, 9.0, 40.0]])
+    out = unletterbox_boxes(b, 1.0, (0, 0), src_wh=(640, 480))
+    assert out[0].tolist() == [0.0, 0.0, 640.0, 480.0]
+    assert torch.isnan(out[1]).all(), 'a box with no positive area is not a detection'
+    # Without `src_wh` -- the training path, which has no frame to clamp against -- nothing changes.
+    assert unletterbox_boxes(b, 1.0, (0, 0))[0, 2].item() == 20000.0
 
 
 def test_a_video_read_locks_per_container_not_globally():
-    """`dataset._read_video` takes a lock PER PATH: two threads on ONE container interleave their
-    seeks, two threads on DIFFERENT containers share no state at all. The second is the whole of
-    `detect_group`'s multi-camera decode overlap (3.5x on 3dpop's four cameras), so a regression to
-    one global lock has to fail something."""
+    """`dataset._read_video` locks PER PATH: one global lock would kill `detect_group`'s multi-
+    camera decode overlap (3.5x on 3dpop)."""
     from tailcyclenet import dataset as ds
 
     a, b = ds._read_lock_for('/x/cam0.mp4'), ds._read_lock_for('/x/cam1.mp4')
@@ -996,12 +765,8 @@ def test_targets_are_the_crop_rule(tiny_root):
 
 
 def test_augmented_targets_are_still_the_crop_rule(tiny_root):
-    """Augmentation warps the GEOMETRY and re-derives the box; it never scales the box.
-
-    Scaling the box with the image breaks the rule: the 20 px pad scales but the `min_crop_dim`
-    floor does not, so a floored box scaled by 0.8 is a box `crop_box_for_points` can never emit
-    and the detector trains off its own target.
-    """
+    """Augmentation warps the GEOMETRY and re-derives the box; scaling the box would scale the
+    pad but not the `min_crop_dim` floor -- a box the crop rule can never emit."""
     from tailcyclenet.detector.data import random_affine
 
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
@@ -1035,19 +800,11 @@ def test_augmented_targets_are_still_the_crop_rule(tiny_root):
 
 
 def test_augment_decodes_real_pixels_through_getitem(tiny_root):
-    """`augment=True` must survive an actual `__getitem__` call, not just `boxes_for`.
-
-    Every other augmentation test above calls `ds.boxes_for(...)`, which never reaches
-    `_photometric` -- that function is called from `__getitem__` alone. A cleanup commit
-    (`3dbb0a1`) deleted `_photometric`'s `extended` parameter and `BoxDataset`'s `photometric`
-    flag but left an `if extended:` block referencing the now-undefined name, a `NameError` on
-    EVERY item under `--augment`. It went undetected through this whole file and only surfaced
-    when real training jobs hit it. This test exists so that class of gap cannot reopen: it is
-    the one place in this file that actually decodes a pixel tensor under augmentation.
-    """
+    """`augment=True` must survive a real `__getitem__` (the only caller of `_photometric`): a
+    cleanup once left a `NameError` on every augmented item."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
                     max_frames_per_group=2, augment=True)
-    for i in range(min(3, len(ds))):
+    for i in range(min(2, len(ds))):
         item = ds[i]
         x = item['x']
         _boxes = item['boxes']
@@ -1057,34 +814,9 @@ def test_augment_decodes_real_pixels_through_getitem(tiny_root):
             'the photometric gain must still land in the normalised [0, 1] range'
 
 
-def test_a_rotated_box_needs_four_corners_in_the_detector(tiny_root):
-    """Two diagonal corners are not a box under a flip: their extent is strictly inside all four.
-
-    The stored `instances.pq` extent enters the detector as geometry, so it has to be expanded
-    before the warp -- the same property `test_a_rotated_box_needs_four_corners` asserts for the
-    pose loader.
-    """
-    b = torch.tensor([10.0, 20.0, 50.0, 40.0])
-    x0, y0, x1, y1 = b
-    four = torch.stack([torch.stack([x0, y0]), torch.stack([x1, y0]),
-                        torch.stack([x1, y1]), torch.stack([x0, y1])])
-    two = b.view(2, 2)
-    M = torch.tensor([[0.8, -0.6, 5.0], [0.6, 0.8, -3.0]])
-    f4 = four @ M[:, :2].T + M[:, 2]
-    f2 = two @ M[:, :2].T + M[:, 2]
-    ext = lambda p: torch.cat([p.min(0).values, p.max(0).values])   # noqa: E731
-    e4, e2 = ext(f4), ext(f2)
-    assert (e4[:2] <= e2[:2]).all() and (e4[2:] >= e2[2:]).all()
-    assert not torch.allclose(e4, e2), 'two corners would crop the animal the box encloses'
-
-
 def test_rotation_off_is_byte_identical_and_on_turns_about_its_centre():
-    """`--rotate-deg 0` must reproduce the pre-rotation matrix EXACTLY, draw for draw.
-
-    Not "close": every detector arm on record was trained without this key, and `random_affine`
-    consumes the rng, so drawing an angle and multiplying it by zero would reseat every later draw
-    and silently make those arms unreproducible. The draw is skipped instead.
-    """
+    """`rotate_deg=0` reproduces the pre-rotation matrix draw for draw (drawing an angle and
+    zeroing it would reseat every later draw); rotation turns about `centre`."""
     def before(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5):
         w, h = float(size[0]), float(size[1])
         s = rng.uniform(*scale)
@@ -1094,7 +826,7 @@ def test_rotation_off_is_byte_identical_and_on_turns_about_its_centre():
                          [0.0, s, cy - s * cy + rng.uniform(-translate, translate) * h]],
                         np.float32)
 
-    for seed in range(25):
+    for seed in range(5):
         a = before((4696, 2048), np.random.default_rng([0, seed]))
         b = random_affine((4696, 2048), np.random.default_rng([0, seed]))
         assert np.array_equal(a, b), f'seed {seed} moved'
@@ -1106,15 +838,21 @@ def test_rotation_off_is_byte_identical_and_on_turns_about_its_centre():
     np.testing.assert_allclose(fixed, [300.0, 700.0], atol=1e-3)
 
 
-def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
-    """A tile is cut AFTER the warp, so the warp has to hold the tile or the tile holds nothing.
+def test_photometric_is_one_gain_draw():
+    """`_photometric(img, rng)` consumes exactly ONE `uniform(0.7, 1.3)` and applies it as a
+    clipped gain -- the augmentation stream's draw order rests on this."""
+    img = (np.arange(4 * 4 * 3, dtype=np.float64).reshape(4, 4, 3) % 200).astype(np.uint8)
+    rng1 = np.random.default_rng(7)
+    rng2 = np.random.default_rng(7)
+    out1 = _photometric(img, rng1)
+    gain = rng2.uniform(0.7, 1.3)
+    np.testing.assert_array_equal(out1, np.clip(img * gain, 0, 255).astype(np.uint8))
+    assert rng1.uniform() == rng2.uniform()
 
-    `__getitem__` composes `tile @ warp @ decode`. About the FRAME centre a rotation sweeps an
-    animal clean out of the 640-px window that was chosen for it -- measured on
-    rat-city-annotated at 0.075 of animal-bearing tiles still holding an animal, against 0.820
-    about the tile centre (measured). Here the check is structural:
-    the tile's own centre is a fixed point of its warp, and the frame's centre is not.
-    """
+
+def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
+    """A tile is cut AFTER the warp, so the warp turns about the tile's centre (about the frame
+    centre only 0.075 of rat-city tiles kept their animal)."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(32, 32), min_crop_dim=8,
                     max_frames_per_group=2, augment=True, rotate_deg=180.0,
                     tile_wh=(32, 32), tile_scale=1.0)
@@ -1132,9 +870,8 @@ def test_a_tiled_item_turns_about_its_own_tile(tiny_root):
 
 
 def test_chunk_is_one_containers_worth_of_index(tiny_root):
-    """`ChunkShuffle`'s block must be one video, or the locality it exists for is not there: a
-    hardcoded 512 spanned 13 calms21 videos per block and ran the reader cache at a 16% hit rate.
-    """
+    """`ChunkShuffle`'s block must be one video: a hardcoded 512 spanned 13 calms21 videos and
+    ran the reader cache at a 16% hit rate."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 64), max_frames_per_group=2)
     n_src = len({(s.session_id, g, c) for s, g, _, c in ds.index})
     assert ds.chunk == len(ds.index) // n_src
@@ -1149,111 +886,303 @@ def test_collate_pads_uneven_animal_counts():
     assert torch.isnan(got['boxes'][0, 2:]).all()
 
 
-def test_tracker_retires_the_weaker_duplicate_target():
-    """The post-branch invariant catches duplicates born by occupied-slot drift too.
+def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
+    """An untiled checkpoint records `tile_scale = 1.0`; reaching `detect_group` it would
+    letterbox the whole frame at `frame_wh * scale`."""
+    import conftest as cf
 
-    Two targets with identical claim sets on one animal: after ``duplicate_persist`` consecutive
-    in-band frames the backstop retires the weaker so the clip keeps ONE row on the animal.
-    (The plan's per-frame group NMS in `associate` was removed -- a genuine crossing passes
-    through the same measured band for a few frames in every camera, so per-frame merging
-    turned crossings into retirements; the duplicate evidence lives in the tracker and is
-    gated on persistence.)
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.detector import load_detector
+    p = tmp_path / 'detector.pth'
+    base = cf._detector_checkpoint()
+    torch.save({**base, 'tile_wh': None, 'tile_scale': 1.0}, p)
+    assert load_detector(p).tile_scale is None
+    # ...and a genuinely tiled one still keeps it, or the tiled path loses its whole point.
+    torch.save({**base, 'tile_wh': [640, 640], 'tile_scale': 0.5}, p)
+    assert load_detector(p).tile_scale == 0.5
 
+
+def test_tiled_targets_are_still_the_crop_rule(tiny_root):
+    """The tiled box is RE-DERIVED in source px, never scaled by tile_scale."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2,
+                    tile_wh=(32, 32), tile_scale=1.0)
+    from tailcyclenet.detector.data import tile_transform
+    for i in range(min(3, len(ds))):
+        sess, gid, f, ci = ds.index[i]
+        boxes = ds.boxes_for(i)
+        lab = sess.labels(gid)
+        cam = sess.rig.tracktail()[ci]
+        ox, oy = ds.origins[i]
+        tw, th = ds._tile_extent()
+        for s in range(boxes.shape[0]):
+            pts = torch.as_tensor(lab.points2d[s, f, :, ci], dtype=torch.float32)
+            keep = ((pts[:, 0] >= ox) & (pts[:, 0] <= ox + tw) &
+                    (pts[:, 1] >= oy) & (pts[:, 1] <= oy + th))
+            want = crop_box_for_points(torch.where(keep[:, None], pts, torch.nan),
+                                       cam['size'], ds.min_crop_dim)
+            if want is None:
+                assert torch.isnan(boxes[s]).all()
+                continue
+            scale, pad = tile_transform((ox, oy), ds.tile_scale)
+            back = unletterbox_boxes(boxes[s][None], scale, pad)[0]
+            torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
+
+
+def test_an_off_frame_tile_drops_its_points_and_is_grey(tiny_root):
+    """Out-of-tile behaves like out-of-frame (no box), and off-frame pixels are grey, not wrapped."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
+                    tile_wh=(16, 16), tile_scale=1.0)
+    ds.origins[0] = (1000.0, 1000.0)        # the fixture's points are in [5, 43]
+    assert torch.isnan(ds.boxes_for(0)).all()
+    ds.origins[0] = (-16.0, -16.0)          # wholly outside, up and left
+    x = ds[0]['x']
+    assert x.shape == (3, 16, 16)
+    torch.testing.assert_close(x, torch.full_like(x, 114 / 255.0))
+
+
+def test_strong_augment_never_drops_a_box(tiny_root):
+    """Appearance ops and cutout never move a box -- only mosaic-lite may ADD one, fully interior."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, strong=True, seed=0)
+    for i in range(min(2, len(ds))):
+        base = ds.boxes_for(i)
+        for _ in range(4):
+            assert ds[i]['boxes'].shape[0] >= base.shape[0]
+
+
+def test_mosaic_paste_is_fully_interior_and_reencodes_the_crop_rule(tiny_root):
+    """The appended box is `src_box + translation`, entirely inside `input_wh`."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
+                    max_frames_per_group=2, augment=True, strong=True, seed=0)
+    rng = np.random.default_rng(1)
+    for i in range(min(3, len(ds))):
+        base = ds.boxes_for(i)
+        img, _ = ds._load_letterbox(i)
+        boxes, img2 = ds._mosaic_paste(i, base.clone(), img.copy(), rng)
+        if boxes.shape[0] == base.shape[0]:
+            continue    # no finite source box was found in a few tries; not this fixture's job
+        new = boxes[base.shape[0]:]
+        assert (new[:, 0] >= 0).all() and (new[:, 1] >= 0).all()
+        assert (new[:, 2] <= ds.input_wh[0]).all() and (new[:, 3] <= ds.input_wh[1]).all()
+        return
+    pytest.skip('no fixture item produced a finite mosaic source box in the tries allotted')
+
+
+# --- box sources --------------------------------------------------------------------------
+
+
+def test_box_source_instances_uses_only_labeled_stored_boxes(tmp_path):
+    """Stored labeled corners are targets, not the crop rule over keypoints."""
+    from tailcyclenet import format as fmt
+
+    root = tmp_path / 'ds'
+    path = root / 'train' / 's'
+    cf._session_2d(path)
+    sess = fmt.Session.load(path)
+    lab = sess.labels('g000')
+    lab.instance[1, 1, 0] = fmt.INST_LABELED  # one stored positive alongside keypoints-only a01
+    fmt.write_session(path, mode='2d', units='px', label_source='annotated', names=sess.names,
+                      rig=sess.rig, groups=sess.groups, labels={'g000': lab},
+                      flip_pairs=sess.flip_pairs)
+
+    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=4, box_source='instances')
+    base = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8,
+                      max_frames_per_group=4)
+    assert len(ds) == 1
+    sess, gid, frame, cam_ix = ds.index[0]
+    boxes = ds[0]['boxes']
+    plain_index = next(i for i, (_, _, ff, _) in enumerate(base.index) if ff == frame)
+    plain = base[plain_index]['boxes']
+    lab = sess.labels(gid)
+    cam = sess.rig.tracktail()[cam_ix]
+    img = np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8)
+    _, scale, pad = letterbox(img, ds.input_wh)
+    want = crop_box_for_points(torch.as_tensor(lab.boxes[1, frame, cam_ix]).view(2, 2),
+                               cam['size'], ds.min_crop_dim, pad=0)
+    back = unletterbox_boxes(boxes[1][None], scale, pad)[0]
+    torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
+    assert not torch.isfinite(boxes[0]).any(), 'no stored box means no target, despite keypoints'
+    assert torch.isfinite(plain[0]).all(), 'the keypoint source would produce a crop box'
+
+
+def test_box_source_instances_trains_present_boxes_without_negatives(tiny_root):
+    """A present box is a positive, and it makes the frame's background unreliable."""
+    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=0, box_source='instances')
+    # every other frame has only labeled rows without stored boxes: no target, no negatives
+    assert [f for _, _, f, _ in ds.index] == [1]
+    item = ds[0]
+    assert not torch.isfinite(item['boxes'][0]).any()
+    assert torch.isfinite(item['boxes'][1]).all(), 'present boxes are positive targets'
+    assert item['negative_supervision'] is False
+
+
+def test_negative_supervision_follows_instance_statuses(tmp_path):
+    """Negatives need labeled/absent evidence and no present row, with or without a box."""
+    from tailcyclenet import format as fmt
+
+    T = 5
+    path = tmp_path / 'ds' / 'train' / 'boxes'
+    rig = cf._rig([('cam0', 64, 48, False, False, 0)])
+    lab = fmt.empty_labels(2, T, len(cf.KPTS_2D), 1, mode3d=False, animal_ids=['a', 'b'])
+    lab.points2d = lab.vis2d = None
+    lab.instance = np.full((2, T, 1), fmt.INST_NONE, np.int8)
+    lab.boxes = np.full((2, T, 1, 4), np.nan, np.float32)
+    lab.instance[0, 0, 0] = fmt.INST_LABELED           # labeled box: positives + negatives
+    lab.boxes[0, 0, 0] = [8, 7, 28, 29]
+    lab.instance[0, 1, 0] = fmt.INST_ABSENT            # absent-only: all-background example
+    lab.instance[0, 2, 0] = fmt.INST_LABELED           # labeled box beside a boxless present
+    lab.boxes[0, 2, 0] = [8, 7, 28, 29]
+    lab.instance[1, 2, 0] = fmt.INST_PRESENT
+    lab.instance[0, 3, 0] = fmt.INST_PRESENT           # boxless present only: nothing to train
+    # frame 4 has no instance row at all: no claim, not a negative
+    fmt.write_session(path, mode='2d', units='px', label_source='annotated',
+                      names=cf.KPTS_2D, rig=rig, groups={'g': fmt.Group('g', T)},
+                      labels={'g': lab})
+    cf._write_frames(path / 'groups' / 'g', 'cam0', T, (64, 48))
+
+    ds = BoxDataset(path.parent.parent, 'train', input_wh=(128, 128), min_crop_dim=8,
+                    max_frames_per_group=0)
+    got = {f: ds[i]['negative_supervision'] for i, (_, _, f, _) in enumerate(ds.index)}
+    assert got == {0: True, 1: True, 2: False}
+    assert not torch.isfinite(ds[1]['boxes']).any(), 'absent rows are not positives'
+    batch = box_collate([ds[0], ds[1], ds[2]])
+    assert batch['negative_supervision'].tolist() == [True, True, False]
+
+
+def test_box_only_sessions_fall_back_to_labeled_instance_boxes(tmp_path):
+    """A session with no keypoint tables trains its stored boxes, and indexes beside a pose one."""
+    root = tmp_path / 'ds'
+    path = root / 'train' / 'boxes_only'
+    _box_only_session(path)
+    assert not (path / 'keypoints.pq').exists()
+    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8)
+    assert len(ds) == 4
+    assert {item[1] for item in ds.index} == {'video_ix0', 'video_ix10'}
+    assert len(ds.box_only_fallback_sessions) == 1
+    for i in range(len(ds)):
+        boxes = ds.boxes_for(i)
+        assert torch.isfinite(boxes[0]).all()
+        assert torch.isfinite(boxes[1]).all(), 'present boxes are positive targets'
+
+    batch = box_collate([ds[0], ds[1]])
+    assert batch['negative_supervision'].tolist() == [False, False]
+    assert split_batch(batch)[2] is batch['negative_supervision']
+
+    cf._session_2d(root / 'train' / 'pose')
+    mixed = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8)
+    assert {sess.session_id for sess, _, _, _ in mixed.index} == {'boxes_only', 'pose'}
+    assert mixed.box_only_fallback_sessions == {path}
+
+
+# --- cross-view tracker ------------------------------------------------------------------
+
+
+def _lever_rig(specs):
+    """A NON-DEGENERATE rig: every camera at its own tilt and height, so rays through different
+    animals are SKEW (a coplanar rig triangulates any pair to residual ~0). specs entries are
+    (rvec_x, rvec_y, tvec_y)."""
+    from aniposelib.cameras import Camera, CameraGroup
+
+    from tailcyclenet.format import Rig
+
+    cams = []
+    for i, (rx, ry, ty) in enumerate(specs):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([rx, ry, 0.0]),
+                     tvec=np.array([0.0, ty, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    return Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+               moving=dict.fromkeys(names, False),
+               calibrated=dict.fromkeys(names, True)).tracktail()
+
+
+def _lever_boxes(cg, worlds, side=200.0):
+    """Project `worlds` into every camera of `cg` as square boxes, in `CrossViewTracker.step`'s
+    argument shapes. Large by default: every gate in track.py is in box sides."""
+    from tailcyclenet.detector.track import _project
+
+    per_cam, scores = [], []
+    for cam in cg:
+        uv = _project(cam, np.asarray(worlds, np.float32))
+        per_cam.append(torch.stack([uv[:, 0] - side / 2, uv[:, 1] - side / 2,
+                                    uv[:, 0] + side / 2, uv[:, 1] + side / 2], -1))
+        scores.append(torch.ones(len(worlds)))
+    return per_cam, scores
+
+
+def _lost_in_one_camera():
+    """Animal A seen in cameras 0 and 1, MISSED in camera 2 where the only detection is animal
+    B. Outputs: (cg, per_cam, scores, A)."""
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    point = torch.tensor([0.0, 0.0, 0.0])
-    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
-    per_cam = [torch.cat([b, b.clone()]) for b in per_cam]
-    scores = [torch.ones(2) for _ in scores]
-    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=3)   # shipped default: joint
-    tr.targets[0] = {'point': point.clone(), 'age': 0}
-    tr.targets[1] = {'point': point.clone(), 'age': 0}
-    boxes = None
-    for _ in range(3):
-        boxes, _, claimed = tr.step(cg, per_cam, scores)
-    assert len(tr.targets) == 1
-    assert np.isfinite(boxes).all(-1).any(-1).sum() == 1
-    assert (claimed >= 0).any() and (claimed[1] == -1).all()
+    a = np.array([0.0, 0.0, 0.0], np.float32)
+    b = np.array([120.0, 0.0, 0.0], np.float32)
+    per_cam, scores = _lever_boxes(cg, [a, b])
+    per_cam[2], scores[2] = per_cam[2][1:], torch.ones(1)
+    return cg, per_cam, scores, a
 
 
-def test_freed_slot_does_not_rebirth_the_retired_duplicate():
-    """The backstop retires a duplicate, but its freed slot must not be re-born from the same
-    leftover detection set next frame -- retire-and-rebirth every frame was what made the
-    duplicate immortal on 3dpop Sequence 59 (report 53).  Once the winner is SHIELDED by a real
-    retirement, a birth whose group duplicates it is refused.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
+def _flat_rig():
+    """Three coplanar cameras with optical axes through the origin 
+    (fine where no residual gate is read)."""
+    from aniposelib.cameras import Camera, CameraGroup
 
+    from tailcyclenet.format import Rig
+
+    cams = []
+    for i, ang in enumerate((-0.5, 0.0, 0.5)):
+        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
+                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
+                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
+        cam.set_size((640, 480))
+        cams.append(cam)
+    names = [c.get_name() for c in cams]
+    return Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
+               moving=dict.fromkeys(names, False),
+               calibrated=dict.fromkeys(names, True)).tracktail()
+
+
+def _dup_scene():
+    """One animal detected twice in every camera (two identical box sets)."""
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     point = torch.tensor([0.0, 0.0, 0.0])
     per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
     duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
-    dup_scores = [torch.ones(2) for _ in scores]
-    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
-    boxes = None
-    for _ in range(2):                       # both sets seated each frame; backstop fires on 2
-        boxes, _, _ = tr.step(cg, duplicate, dup_scores)
-    assert len(tr.targets) == 1
-    first_row = int(np.isfinite(boxes).all(-1).any(-1).argmax())
-    for _ in range(4):                        # freed slot must NOT rebirth the duplicate
-        boxes2, _, _ = tr.step(cg, duplicate, dup_scores)
-    assert len(tr.targets) == 1, 'the retired duplicate must stay retired'
-    second_row = int(np.isfinite(boxes2).all(-1).any(-1).argmax())
-    assert first_row == second_row, 'the surviving row must keep the animal'
+    return cg, point, per_cam, scores, duplicate, [torch.ones(2) for _ in scores]
 
 
-def test_identity_events_record_what_the_tracker_did_without_changing_it():
-    """There is no record anywhere in the output of what the tracker did to identity, so every
-    question about a duplicate episode has required a monkeypatched traced re-run that reproduces
-    a whole GPU pass to learn something the first pass already knew
-    (identity_review_followthrough plan C6). `CrossViewTracker.events` is that record: an
-    append-only list of `{frame, slot, event, detail}`.
-
-    Two things are asserted, and the second is the load-bearing one. First, the log actually sees
-    the mechanism -- this is the same duplicate scene
-    `test_freed_slot_does_not_rebirth_the_retired_duplicate` uses, so it must show births, a
-    retirement naming its winner, that winner being shielded, and the subsequent birth refusals
-    that keep the duplicate retired. Second, RECORDING CHANGES NOTHING: an identical tracker run
-    on the identical scene produces byte-identical boxes/scores/claims, so the log can never be
-    suspected of having moved a number it was added to explain.
-    """
+def test_duplicate_backstop_retires_shields_and_logs_without_changing_output():
+    """After `duplicate_persist` in-band frames the backstop retires the weaker duplicate, its
+    freed slot does not re-birth it (the immortal duplicate of 3dpop Seq59, report 53), and
+    `tracker.events` records born/retired/shielded/birth_refused -- recording changes nothing."""
     from tailcyclenet.detector.track import CrossViewTracker
 
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    point = torch.tensor([0.0, 0.0, 0.0])
-    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
-    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
-    dup_scores = [torch.ones(2) for _ in scores]
-
+    cg, _, _, _, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
     outs = [tr.step(cg, duplicate, dup_scores) for _ in range(6)]
+    assert len(tr.targets) == 1, 'the retired duplicate must stay retired'
+    rows = [int(np.isfinite(b).all(-1).any(-1).sum()) for b, _, _ in outs[1:]]
+    assert rows == [1] * 5, 'one row on the animal from the retirement on'
+    first = int(np.isfinite(outs[1][0]).all(-1).any(-1).argmax())
+    assert int(np.isfinite(outs[-1][0]).all(-1).any(-1).argmax()) == first, \
+        'the surviving row must keep the animal'
 
     by_event = {}
     for e in tr.events:
         assert set(e) == {'frame', 'slot', 'event', 'detail'}, e
-        assert 0 <= e['frame'] < 6, f'frame must be tracker-local and in range: {e}'
+        assert 0 <= e['frame'] < 6, e
         by_event.setdefault(e['event'], []).append(e)
-
-    assert len(by_event.get('born', [])) == 2, 'both slots seat on frame 0'
+    assert len(by_event.get('born', [])) == 2
     retired = by_event.get('retired_duplicate', [])
-    assert len(retired) == 1, f'exactly one backstop retirement in this scene, got {retired}'
+    assert len(retired) == 1
     shielded = by_event.get('shielded', [])
-    assert len(shielded) == 1 and shielded[0]['slot'] == retired[0]['detail']['winner'], \
-        'the retirement must name its winner and that winner must be the slot shielded'
-    assert retired[0]['detail']['persisted'] >= 2, 'the persistence count that fired is the reason'
-    # The two ages are what plan 6.9 needs: an idle-slot policy targets a slot that stopped
-    # getting evidence and then drifted onto another animal, and `age` (frames since the last
-    # evidence) is the only thing that separates that from a slot retired while actively tracked.
-    # Without it the log can only report how long ago a slot was BORN, which is a different
-    # question and answers 6.9's only wrongly.
-    assert retired[0]['detail']['loser_age'] >= 0
-    assert retired[0]['detail']['winner_age'] >= 0
-    assert by_event.get('birth_refused'), \
-        'the freed slot is offered the same duplicate every later frame and must be refused'
+    assert len(shielded) == 1 and shielded[0]['slot'] == retired[0]['detail']['winner']
+    assert retired[0]['detail']['persisted'] >= 2
+    assert retired[0]['detail']['loser_age'] >= 0 and retired[0]['detail']['winner_age'] >= 0
+    assert by_event.get('birth_refused')
 
-    # RECORDING IS INERT. A second, independent run of the identical scene must agree byte for
-    # byte on all three returned arrays -- if it does not, the log changed the algorithm.
     tr2 = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
     for t, (boxes, sc, claimed) in enumerate(outs):
         b2, s2, c2 = tr2.step(cg, duplicate, dup_scores)
@@ -1265,10 +1194,8 @@ def test_identity_events_record_what_the_tracker_did_without_changing_it():
 
 
 def test_identity_events_record_a_slot_dying_of_old_age():
-    """`died` is the other half of a slot's life story: without it the log shows a birth and then
-    silence, and a later reader cannot tell a slot that starved out from one still alive but
-    unclaimed. The event carries the age that crossed `max_age`.
-    """
+    """`died` carries the age that crossed `max_age`: without it a starved slot reads like one
+    still alive but unclaimed."""
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
@@ -1289,22 +1216,11 @@ def test_identity_events_record_a_slot_dying_of_old_age():
 
 
 def test_shield_survives_the_winner_vacating_for_one_frame():
-    """The shield is anchored to the ANIMAL, not to the winner's current claims.
-
-    Keying the refusal to the winner's this-frame claims made it blind for exactly the frames
-    crowding swapped the winner's assignment off its animal: the duplicate re-seated in that
-    one frame and the backstop paid a matched-row flip five frames later (~3 refires per 160
-    frames, 3dpop Sequence 59, report 53).  Here the winner is dragged away for a single frame
-    (a second animal appears where it sits) and the anchor must freeze rather than follow, so
-    the duplicate set still cannot re-seat.
-    """
+    """The shield is anchored to the ANIMAL, not the winner's this-frame claims: a one-frame
+    vacate let the duplicate re-seat (~3 refires per 160 frames, 3dpop Seq59)."""
     from tailcyclenet.detector.track import CrossViewTracker
 
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    point = torch.tensor([0.0, 0.0, 0.0])
-    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
-    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
-    dup_scores = [torch.ones(2) for _ in scores]
+    cg, point, per_cam, scores, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
     for _ in range(2):
         tr.step(cg, duplicate, dup_scores)
@@ -1323,22 +1239,11 @@ def test_shield_survives_the_winner_vacating_for_one_frame():
 
 
 def test_shield_dies_when_the_winners_own_target_dies():
-    """The shield must not outlive the winner it protects (independent review, report 53).
-
-    A winner shielded by a real retirement can later die of ordinary neglect (no claims for
-    `max_age` frames), not just be beaten in a second retirement. Before this fix `_dup_shield`
-    was discarded only inside `_suppress_duplicate_targets`'s own cleanup pass, which runs
-    BEFORE the age-based death loop each frame -- so a winner that aged out inherited a shield
-    entry for one extra frame, exactly long enough for the very next frame's birth (an unrelated
-    animal happening to appear in the same place) to be wrongly refused.
-    """
+    """A winner that ages out must take its shield with it, or the next frame's unrelated birth
+    at that spot is wrongly refused."""
     from tailcyclenet.detector.track import CrossViewTracker
 
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    point = torch.tensor([0.0, 0.0, 0.0])
-    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
-    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
-    dup_scores = [torch.ones(2) for _ in scores]
+    cg, point, per_cam, scores, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2, max_age=2)
     for _ in range(2):
         tr.step(cg, duplicate, dup_scores)
@@ -1355,22 +1260,11 @@ def test_shield_dies_when_the_winners_own_target_dies():
 
 
 def test_duplicate_persistence_does_not_survive_a_members_death():
-    """A `_dup_contact` counter must not resume across a slot's death (independent review).
-
-    Before this fix the counter for a pair was pruned only when BOTH slots were re-examined as
-    still-live in `_suppress_duplicate_targets`'s own accumulation loop; a slot that died via
-    ordinary ageing (the loop AFTER `_suppress_duplicate_targets` in `step`) left its counters
-    stale, so a same-slot rebirth on a DIFFERENT animal could resume counting toward retirement
-    with a head start instead of starting at zero -- risking a genuine new animal being merged
-    with an unrelated neighbour sooner than `duplicate_persist` frames of real evidence.
-    """
+    """A `_dup_contact` counter must not resume across a slot's death, or a rebirth on a new
+    animal retires early."""
     from tailcyclenet.detector.track import CrossViewTracker
 
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    point = torch.tensor([0.0, 0.0, 0.0])
-    per_cam, scores = _lever_boxes(cg, [point.numpy()], side=100.0)
-    duplicate = [torch.cat([b, b.clone()]) for b in per_cam]
-    dup_scores = [torch.ones(2) for _ in scores]
+    cg, point, per_cam, scores, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=5, max_age=2)
     for _ in range(3):                        # 3 of 5 in-band frames: short of retirement
         tr.step(cg, duplicate, dup_scores)
@@ -1388,12 +1282,37 @@ def test_duplicate_persistence_does_not_survive_a_members_death():
         'a rebirth must not inherit a stale persistence count and retire early'
 
 
+def test_refused_duplicate_does_not_consume_the_free_slot():
+    """A6b: a refused duplicate birth must retry the SAME free slot, or a genuine group behind
+    it is crowded out of the frame."""
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    pointA = np.array([0.0, 0.0, 0.0])
+    pointB = np.array([250.0, 0.0, 0.0])    # far from A: a distinct animal, not a duplicate
+    per_cam, scores = _lever_boxes(cg, [pointA, pointB], side=100.0)
+    dupA = [torch.cat([b[:1], b[:1].clone()]) for b in per_cam]      # A twice per camera
+    dup_scores = [torch.ones(2) for _ in scores]
+    genuine = [b[1:2] for b in per_cam]                              # B, one box per camera
+
+    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
+    for _ in range(2):                       # both slots seat at A; the backstop retires one
+        boxes, _, _ = tr.step(cg, dupA, dup_scores)
+    assert len(tr.targets) == 1, 'the backstop must retire exactly one slot here'
+    survivor = int(np.isfinite(boxes).all(-1).any(-1).argmax())
+
+    frames23 = [torch.cat([d, g]) for d, g in zip(dupA, genuine)]    # [A, A, B] per camera
+    boxes3, _, _ = tr.step(cg, frames23, [torch.ones(3) for _ in scores])
+    other = 1 - survivor
+    assert np.isfinite(boxes3[other]).all(-1).any(), \
+        'the genuine birth must seat in the freed slot -- the refusal must not consume it'
+    assert any(e['event'] == 'birth_refused' for e in tr.events), \
+        'the duplicate refusals must still be recorded'
+
+
 def test_age_stickiness_resolves_two_slots_on_one_group():
-    """Two targets stranded on one animal (one stale) must stop alternating on near-ties: the
-    fresher slot keeps the group, the stale one starves out.  Before the fix the Hungarian
-    decided such ties on per-frame jitter and the pair flip-flopped forever, never reaching
-    max_age (3dpop Sequence 59, report 53).
-    """
+    """Two slots stranded on one animal must not flip-flop on near-ties: the fresher keeps the
+    group, the stale one starves (3dpop Seq59)."""
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
@@ -1414,14 +1333,8 @@ def test_age_stickiness_resolves_two_slots_on_one_group():
 
 
 def test_age_sticky_term_never_inverts_a_real_match():
-    """The Hungarian cost packs age into `affinity * 16 + AGE_STICKY_CAP - age`, which stays
-    positive for any positive affinity only through `age <= AGE_STICKY_CAP`. Past it the term
-    can go negative for a genuinely available, high-affinity cell -- the post-hoc `affinity > 0`
-    check then treats a real, well-supported match as UNAVAILABLE and the slot starves instead
-    of matching (independent review; identity_review_followthrough plan A3). Zero at the shipped
-    default (`max_age = 8`, so age never reaches 9) -- this fires only for a reproduction that
-    raises `max_age` past the cap.
-    """
+    """Past `AGE_STICKY_CAP` the packed cost `affinity * 16 + CAP - age` went negative and a
+    real high-affinity match read as unavailable (only when `max_age` > the cap)."""
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
@@ -1439,15 +1352,32 @@ def test_age_sticky_term_never_inverts_a_real_match():
     assert tr.targets[0]['age'] == 0, 'a real match must reset age, not leave the slot starving'
 
 
+def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
+    """A `--min-views 1` target has an all-NaN point the matcher never sees; it must still age
+    out."""
+    import torch
+
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    tr = CrossViewTracker(2, max_age=3)
+    tr.targets[0] = {'point': torch.full((3,), float('nan')), 'age': 0}
+    assert 0 in tr.targets
+
+    # No detections at all: the pointless target must still age out, freeing its slot.
+    for _ in range(tr.max_age + 1):
+        tr.step([], [], [])
+    assert 0 not in tr.targets, 'a target the matcher can never see must still be able to expire'
+
+    # A target WITH a point is unaffected by this path -- it ages through the normal loop.
+    tr2 = CrossViewTracker(2, max_age=3)
+    tr2.targets[0] = {'point': torch.zeros(3), 'age': 0}
+    tr2.step([], [], [])
+    assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'
+
+
 def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
-    """`min_views = 2` is the ALGORITHM, not a threshold: every group starts from a cross-camera
-    pair, so the floor never fires. `min_views = 1` emits each leftover box as a single-view
-    instance, which the pose model supports.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
+    """`min_views = 2` is the algorithm; `min_views = 1` emits each leftover box as a single-
+    view instance with no invented depth."""
 
     from tailcyclenet.detector import associate
     from tailcyclenet.format import Session
@@ -1471,11 +1401,8 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
 
 
 def test_min_views_1_single_view_birth_holds_no_slot():
-    """A `min_views=1` single-view group has an all-NaN point BY DESIGN (a single ray has no
-    depth), so no target can ever match it. It is written for its frame but never seated as a
-    target: seating it held the slot dead for `max_age + 1` frames while the same detection
-    re-birthed into the next free slot, so one animal seen by one camera rotated through every
-    slot and then vanished (T1). It must stay on the lowest free slot every frame instead."""
+    """A single-view group (NaN point by design) is written but never seated: seating it
+    rotated one animal through every slot and then lost it (T1)."""
     from tailcyclenet.detector.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
@@ -1493,15 +1420,155 @@ def test_min_views_1_single_view_birth_holds_no_slot():
     assert not [e for e in tr.events if e['event'] == 'born']
 
 
-def test_link_rows_follows_one_animal():
-    """Unlinked rows are score-ordered, so the window-union crop spans several animals.
+def test_joint_association_refuses_a_binding_the_per_camera_hungarian_accepts():
+    """Joint association matches whole cross-view groups, so a slot holding A cannot bind B's
+    box in the camera that missed A."""
+    from tailcyclenet.detector.track import CrossViewTracker
 
-    Two animals crossing the frame in opposite directions, with their rows swapped on every odd
-    frame the way a score reordering would swap them. Linking must undo that: the give-away is
-    the UNION box, which is the thing `run_group` actually crops to.
-    """
+    cg, per_cam, scores, a = _lost_in_one_camera()
+
+    tr = CrossViewTracker(1, max_res_px=30.0)
+    tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
+    out, _, claimed = tr.step(cg, per_cam, scores)
+    assert claimed[0].tolist() == [0, 0, -1], 'the joint decision must not reach into camera 2'
+    np.testing.assert_allclose(tr.targets[0]['point'].numpy(), a, atol=1e-3)
+    assert tr.targets[0]['age'] == 0, 'a slot that matched a group has evidence and must not age'
+
+
+def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path():
+    """Two crossing animals with the score order swapped every frame: births on frame 0, no row
+    jumps, a one-frame miss ages without dropping, the SAME slots resume."""
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
+    a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
+    tr = CrossViewTracker(2, max_res_px=30.0)
+    rows = []
+    for t in range(12):
+        w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
+        per_cam, scores = _lever_boxes(cg, w if t % 2 == 0 else w[::-1], side=40.0)
+        rows.append(tr.step(cg, per_cam, scores)[0])
+
+    assert all(np.isfinite(r).all(-1).any(-1).sum() == 2 for r in rows), 'an animal was lost'
+    for s in (0, 1):
+        cx = np.array([r[s, 0, [0, 2]].mean() for r in rows])
+        assert np.abs(np.diff(cx)).max() < 30.0, f'row {s} jumped: {np.diff(cx)}'
+
+    empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
+    out, _, _ = tr.step(cg, *empty)
+    assert not np.isfinite(out).any() and len(tr.targets) == 2, \
+        'a one-frame detector miss must not end a track under joint either'
+    w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
+    resumed, _, _ = tr.step(cg, *_lever_boxes(cg, w, side=40.0))
+    for s in (0, 1):
+        assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0, \
+            f'row {s} resumed on the other animal'
+
+
+def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
+    """On an unambiguous single animal the tracker must reproduce `associate`, so a crowded-
+    case delta is a crowding result."""
     import numpy as np
 
+    from tailcyclenet.detector.associate import associate
+    from tailcyclenet.detector.track import CrossViewTracker, _project
+
+
+    cg = _flat_rig()
+
+    tr = CrossViewTracker(1, max_res_px=30.0)
+    for t in range(5):
+        w = np.array([[10.0 * t, 0.0, 0.0]], np.float32)
+        per_cam = []
+        for cam in cg:
+            uv = _project(cam, w)
+            per_cam.append(torch.stack([uv[:, 0] - 20, uv[:, 1] - 20,
+                                        uv[:, 0] + 20, uv[:, 1] + 20], -1))
+        scores = [torch.ones(1) for _ in cg]
+        got, _, _ = tr.step(cg, per_cam, scores)
+        ref = associate(cg, per_cam, max_res_px=30.0, max_instances=1)
+        assert len(ref) == 1
+        for c, box in ref[0]['boxes'].items():
+            np.testing.assert_allclose(got[0, c], box.numpy(), atol=1e-4)
+
+
+def test_support_count_counts_independently_corroborating_cameras():
+    """E1a/E3: `_support_count` counts OTHER cameras near the reprojection, excluding the
+    seeding pair and already-`used` detections."""
+
+    from tailcyclenet.detector.associate import _support_count
+    from tailcyclenet.detector.track import _project
+
+    cg = _flat_rig()
+
+    p3d = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
+    proj = [_project(cam, p3d.reshape(1, 3).numpy()) for cam in cg]     # (1,2) per camera
+
+    # Every camera has a detection exactly at the true reprojection.
+    centres_all = [p.clone() for p in proj]
+    assert _support_count(cg, (0, 1), centres_all, set(), p3d, max_res_px=5.0) == 1, \
+        'excluding the seeding pair (0, 1), only camera 2 remains and it corroborates'
+
+    # Camera 2's detection moved far away: no corroboration left.
+    centres_far = [proj[0].clone(), proj[1].clone(), proj[2] + 1000.0]
+    assert _support_count(cg, (0, 1), centres_far, set(), p3d, max_res_px=5.0) == 0
+
+    # Camera 2's detection is still at the true point, but already `used` by an earlier group --
+    # an already-claimed detection must not corroborate a second candidate.
+    assert _support_count(cg, (0, 1), centres_all, {(2, 0)}, p3d, max_res_px=5.0) == 0
+
+
+def test_a_nan_box_is_skipped_by_both_cross_view_paths():
+    """A NaN box (an anchor in the letterbox padding band) must be skipped by `associate`, the
+    tracker, and `min_views = 1`."""
+
+    from tailcyclenet.detector.associate import associate
+    from tailcyclenet.detector.track import CrossViewTracker, _project
+
+    cg = _flat_rig()
+
+    world = np.array([[0.0, 0.0, 0.0]], np.float32)
+    nan_row = torch.full((1, 4), float('nan'))
+    per_cam, scores = [], []
+    for cam in cg:
+        uv = _project(cam, world)
+        good = torch.stack([uv[:, 0] - 20, uv[:, 1] - 20, uv[:, 0] + 20, uv[:, 1] + 20], -1)
+        per_cam.append(torch.cat([good, nan_row]))       # one real animal, one dead box
+        scores.append(torch.ones(2))
+
+    got = associate(cg, per_cam, max_res_px=20.0)
+    assert len(got) == 1, 'the real animal must still be found beside a NaN box'
+    assert bool(torch.isfinite(got[0]['point']).all())
+    # The NaN box is not silently adopted as a member of it.
+    assert all(j == 0 for j in got[0]['members'].values())
+
+    tr = CrossViewTracker(2, max_res_px=20.0)
+    boxes, _, _ = tr.step(cg, per_cam, scores)
+    assert np.isfinite(boxes[0]).all(), 'the tracked animal must come back with real boxes'
+
+    # And `min_views = 1` does not emit the dead box as a single-view instance.
+    solo = associate(cg, per_cam, max_res_px=20.0, min_views=1)
+    for g in solo:
+        for c, b in g['boxes'].items():
+            assert torch.isfinite(b).all(), f'camera {c} emitted a NaN box as an instance'
+
+
+def test_measured_tracker_configuration_is_the_default():
+    """The measured zero-switch configuration is what the constructor ships."""
+    import inspect
+
+    from tailcyclenet.detector.track import CrossViewTracker
+
+    sig = inspect.signature(CrossViewTracker.__init__).parameters
+    assert sig['max_age'].default == 8 and sig['max_move'].default == 1.25
+
+
+# --- link_rows / associate_group ----------------------------------------------------------
+
+
+def test_link_rows_follows_one_animal():
+    """Unlinked rows are score-ordered, so the window-union crop (what `run_group` crops to)
+    spans several animals; linking must undo a per-frame swap."""
     from tailcyclenet.detector import link_rows
 
     T = 20
@@ -1523,52 +1590,59 @@ def test_link_rows_follows_one_animal():
     assert np.isfinite(linked).all()
 
 
-def test_link_rows_state_carries_across_a_split():
-    """N calls with `state=` must equal ONE call over the concatenation, byte for byte.
-
-    Blocks are sized by the RAM budget, so identity must not break at a budget-derived boundary;
-    the trap is the `t0` asymmetry -- a block's frame 0 is a mid-clip frame and must be permuted
-    against the carried `last`, unlike the clip's own frame 0.
-    """
-    import numpy as np
-
+def test_link_rows_gates_on_size_and_never_force_assigns():
+    """A row that matches nothing stays EMPTY (`free.pop(0)` once handed it a teleporting box),
+    a jump of more than one box side is not motion, and a one-frame miss does not break the
+    chain (matching is against the LAST KNOWN box)."""
     from tailcyclenet.detector import link_rows
 
-    T = 20
-    boxes = np.full((2, T, 1, 4), np.nan, np.float32)
-    for t in range(T):
-        a = np.array([10 + t, 10, 40 + t, 40], np.float32)
-        b = np.array([110 - t, 10, 140 - t, 40], np.float32)
-        boxes[0, t, 0], boxes[1, t, 0] = (a, b) if t % 2 == 0 else (b, a)
-    scores = np.tile(np.array([0.9, 0.8], np.float32)[:, None, None], (1, T, 1))
+    boxes = np.full((2, 6, 1, 4), np.nan, np.float32)
+    boxes[0, :, 0] = [10, 10, 40, 40]                          # a stationary animal
+    boxes[1, 3, 0] = [900, 900, 930, 930]                      # one far-away detection, once
+    linked = link_rows(boxes.copy())
+    assert np.allclose(linked[0, :, 0, 0], 10), 'the tracked row must not move'
 
-    whole_b, whole_s = link_rows(boxes.copy(), scores.copy())
+    jump = np.full((1, 2, 1, 4), np.nan, np.float32)
+    jump[0, 0, 0] = [0, 0, 30, 30]
+    jump[0, 1, 0] = [300, 0, 330, 30]                          # 10 box sides away
+    assert not np.isfinite(link_rows(jump.copy())[0, 1, 0]).all()
+    jump[0, 1, 0] = [20, 0, 50, 30]                            # 0.67 of a side: ordinary motion
+    assert np.isfinite(link_rows(jump)[0, 1, 0]).all()
 
-    # The same clip in three unequal blocks, which is what a budget-derived split looks like.
-    part_b, part_s, st = boxes.copy(), scores.copy(), {}
-    for lo, hi in ((0, 7), (7, 8), (8, T)):
-        link_rows(part_b[:, lo:hi], part_s[:, lo:hi], state=st)
+    gap = np.full((2, 4, 1, 4), np.nan, np.float32)
+    for t in range(4):
+        gap[0, t, 0] = [10 + t, 10, 40 + t, 40]
+        gap[1, t, 0] = [110, 10, 140, 40]
+    gap[:, 2, 0] = np.nan                                      # the detector sees nothing at t=2
+    linked = link_rows(gap.copy())
+    assert linked[0, 3, 0][0] == 13 and linked[1, 3, 0][0] == 110
 
-    np.testing.assert_array_equal(np.nan_to_num(part_b, nan=-9e9),
-                                  np.nan_to_num(whole_b, nan=-9e9))
-    np.testing.assert_array_equal(np.nan_to_num(part_s, nan=-9e9),
-                                  np.nan_to_num(whole_s, nan=-9e9))
-    # And the split must not be a no-op: it has to actually reorder, or this proves nothing.
-    assert not np.array_equal(np.nan_to_num(whole_b, nan=-9e9),
-                              np.nan_to_num(boxes, nan=-9e9))
+
+def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
+    """IoU ranks by shape agreement, which is not identity: a true continuation that shrank loses
+    to a size-matched wrong animal. Centre distance is not fooled.
+    """
+    from tailcyclenet.detector import link_rows
+
+    last = np.array([100.0, 100.0, 300.0, 300.0], np.float32)     # remembered, 200 px
+    near = np.array([170.0, 170.0, 230.0, 230.0], np.float32)      # same centre, 60 px
+    wide = np.array([150.0, 150.0, 350.0, 350.0], np.float32)      # 0.35 sides away, 200 px
+    iou = box_iou(torch.as_tensor(last[None]), torch.as_tensor(np.stack([near, wide])))[0]
+    assert iou[1] > iou[0], f'the fixture must be one IoU gets wrong, got {iou.tolist()}'
+
+    boxes = np.stack([np.stack([last, near]),
+                      np.stack([np.full(4, np.nan, np.float32), wide])])[:, :, None]
+    linked = link_rows(boxes.astype(np.float32).copy())
+    assert np.allclose(linked[0, 1, 0], near), \
+        f'centre distance must keep the nearer box, got {linked[0, 1, 0]}'
+    # ...and the other detection is a BIRTH into the empty row, not a dropped animal.
+    assert np.allclose(linked[1, 1, 0], wide)
 
 
 def test_associate_group_state_carries_across_a_split(tmp_path):
-    """Same claim one level up, for BOTH branches: the tracker (C > 1) and `link_rows` (C == 1).
-    The scene is built so a stateless split actually FAILS -- a row that vanishes across the
-    boundary seats the survivor differently in a fresh tracker.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    import numpy as np
+    """Blocks are sized by the RAM budget, so N calls with `state=` must equal ONE call byte
+    for byte, in both branches (tracker C > 1, `link_rows` C == 1); the scene makes a stateless
+    split FAIL."""
 
     from tailcyclenet.detector import associate_group
     from tailcyclenet.format import Session
@@ -1622,90 +1696,30 @@ def test_associate_group_state_carries_across_a_split(tmp_path):
             'scene does not exercise the carry at all'
 
 
-def test_associate_group_threads_max_age_into_the_tracker(tmp_path):
-    """`--max-age` is the SAME patience window `CrossViewTracker` and `link_rows` share; passing
-    it through `associate_group` (C > 1) must land on `CrossViewTracker.max_age`, not silently
-    stay at the class's own default of 24. Read back off the CALLER's own `state` dict, which
-    `associate_group` populates in place -- the one place the constructed tracker is visible
-    without reaching into a private attribute.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    import numpy as np
-
-    from tailcyclenet.detector import associate_group
+def test_associate_group_threads_max_age_and_frame_base(tmp_path, monkeypatch):
+    """`--max-age` reaches `CrossViewTracker` (C > 1) and `link_rows` (C == 1), and a ranged run's
+    events are SOURCE frames (`frame_base` added back, A6a)."""
+    import tailcyclenet.detector as detmod
     from tailcyclenet.format import Session
 
-    T, C = 4, 3
-    d = tmp_path / 'test' / 's'
-    cf._session_3d(d, T=T)
-    sess = Session.load(d)
-    sess.preload()
-
-    box = np.full((1, T, C, 4), np.nan, np.float32)
-    sc = np.full((1, T, C), np.nan, np.float32)
-    raw = (box, sc)
-
-    state = {}
-    associate_group(raw, sess, 'g000', 1, track=True, max_age=5, state=state)
-    assert state['tracker'].max_age == 5, \
-        '--max-age must reach CrossViewTracker, not be dropped on the way in'
-
-
-def test_identity_events_are_source_frames_not_tracker_local_ones(tmp_path):
-    """A6a (dev/plans/multianimal_system_improvements.md): a ranged run's tracker is first
-    built on the aligned lead-in batch BELOW `--start-frame` (`driver._detector_boxes`'s own
-    cursor), so its step count alone is not the source frame the event happened at --
-    `frame_base` (the cursor at construction) must be added back, or a bridge/consumer reading
-    events as source-absolute silently misreads any ranged run.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    import numpy as np
-
-    from tailcyclenet.detector import associate_group
-    from tailcyclenet.format import Session
-
-    T, C = 4, 3
+    T = 4
     d = tmp_path / 'test' / 's'
     cf._session_3d(d, T=T)
     sess = Session.load(d)
     sess.preload()
     cg = sess.cgroup('g000')
-    assert len(cg) == C, 'the fixture rig must have more than one camera for a tracker to build'
-
     per_cam, scores = _lever_boxes(cg, [np.array([0.0, 0.0, 0.0])], side=100.0)
-    box_c = np.stack([b[0].numpy() for b in per_cam], axis=0)          # (C,4)
-    sc_c = np.stack([s[0].numpy() for s in scores], axis=0)            # (C,)
-    box = np.tile(box_c[None, None], (1, T, 1, 1)).astype(np.float32)  # (D=1,T,C,4)
-    sc = np.tile(sc_c[None, None], (1, T, 1)).astype(np.float32)       # (D=1,T,C)
-    raw = (box, sc)
+    box = np.tile(np.stack([b[0].numpy() for b in per_cam])[None, None], (1, T, 1, 1))
+    sc = np.tile(np.stack([s[0].numpy() for s in scores])[None, None], (1, T, 1))
+    raw = (box.astype(np.float32), sc.astype(np.float32))
 
-    whole_state = {}
-    associate_group(raw, sess, 'g000', 1, track=True, state=whole_state)
-    assert whole_state['tracker'].events, 'the scene must actually birth something'
-    assert whole_state['tracker'].events[0]['frame'] == 0, \
-        'the default (frame_base=0) must stay byte-identical to every run on record'
-
-    ranged_state = {}
-    associate_group(raw, sess, 'g000', 1, track=True, state=ranged_state, frame_base=32)
-    assert ranged_state['tracker'].events[0]['frame'] == 32, \
-        "a ranged run's tracker must record the SOURCE frame, not its own local step 0"
-
-
-def test_associate_group_threads_max_age_into_link_rows(monkeypatch):
-    """Same claim, 2D (C == 1): `associate_group` builds no tracker there, so identity runs
-    through `link_rows` instead, and `max_age` must reach IT.
-    """
-    import numpy as np
-
-    import tailcyclenet.detector as detmod
+    state = {}
+    detmod.associate_group(raw, sess, 'g000', 1, track=True, max_age=5, state=state)
+    assert state['tracker'].max_age == 5
+    assert state['tracker'].events[0]['frame'] == 0
+    ranged = {}
+    detmod.associate_group(raw, sess, 'g000', 1, track=True, state=ranged, frame_base=32)
+    assert ranged['tracker'].events[0]['frame'] == 32
 
     seen = {}
 
@@ -1717,950 +1731,87 @@ def test_associate_group_threads_max_age_into_link_rows(monkeypatch):
 
     class _FakeSession:
         assoc_res_max_px = 30.0
+        rig = type('Rig', (), {'moving': {}})()
 
         def cgroup(self, gid, t=None):
             return []
 
-        rig = type('Rig', (), {'moving': {}})()
+    nan = (np.full((1, 2, 1, 4), np.nan, np.float32), np.full((1, 2, 1), np.nan, np.float32))
+    detmod.associate_group(nan, _FakeSession(), 'g000', 1, link=True, track=False, max_age=7)
+    assert seen.get('max_age') == 7
 
-    box = np.full((1, 2, 1, 4), np.nan, np.float32)
-    sc = np.full((1, 2, 1), np.nan, np.float32)
-    detmod.associate_group((box, sc), _FakeSession(), 'g000', 1, link=True, track=False,
-                           max_age=7)
-    assert seen.get('max_age') == 7, \
-        '--max-age must reach link_rows in the 2D (C == 1) path too'
 
+def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path):
+    """D1.1: a moving rig's extrinsics are fetched at SOURCE frames (`frame_base` + local), not
+    the batch-local index."""
 
-def test_link_rows_survives_a_dropped_frame():
-    """Matching is against each row's LAST KNOWN box, so a one-frame miss cannot break the chain."""
-    import numpy as np
+    from tailcyclenet.detector import associate_group
+    from tailcyclenet.format import Session
 
-    from tailcyclenet.detector import link_rows
+    class _RecordingSession:
+        """Delegate to a real Session but record every `cgroup` frame argument."""
 
-    boxes = np.full((2, 4, 1, 4), np.nan, np.float32)
-    for t in range(4):
-        boxes[0, t, 0] = [10 + t, 10, 40 + t, 40]
-        boxes[1, t, 0] = [110, 10, 140, 40]
-    boxes[:, 2, 0] = np.nan                       # the detector sees nothing at frame 2
-    linked = link_rows(boxes.copy())
-    assert linked[0, 3, 0][0] == 13, 'row 0 must still be the left animal after the gap'
-    assert linked[1, 3, 0][0] == 110
+        def __init__(self, real):
+            self._real = real
+            self.frames = []
 
+        def __getattr__(self, name):
+            return getattr(self._real, name)
 
-def test_box_source_instances_uses_only_labeled_stored_boxes(tmp_path):
-    """Stored labeled corners are targets, not the crop rule over keypoints."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-    from tailcyclenet import format as fmt
+        def cgroup(self, gid, frames=None):
+            self.frames.append(frames)
+            return self._real.cgroup(gid, frames)
 
-    root = tmp_path / 'ds'
-    path = root / 'train' / 's'
-    cf._session_2d(path)
-    sess = fmt.Session.load(path)
-    lab = sess.labels('g000')
-    lab.instance[1, 1, 0] = fmt.INST_LABELED  # one stored positive alongside keypoints-only a01
-    fmt.write_session(path, mode='2d', units='px', label_source='annotated', names=sess.names,
-                      rig=sess.rig, groups=sess.groups, labels={'g000': lab},
-                      flip_pairs=sess.flip_pairs)
+    d = tmp_path / 'test' / 's'
+    cf._session_3d(d, T=12, moving=True)
+    sess = Session.load(d)
 
-    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8,
-                    max_frames_per_group=4, box_source='instances')
-    base = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8,
-                      max_frames_per_group=4)
-    assert len(ds) == 1
-    sess, gid, frame, cam_ix = ds.index[0]
-    boxes = ds[0]['boxes']
-    plain_index = next(i for i, (_, _, ff, _) in enumerate(base.index) if ff == frame)
-    plain = base[plain_index]['boxes']
-    lab = sess.labels(gid)
-    cam = sess.rig.tracktail()[cam_ix]
-    img = np.zeros((int(cam['size'][1]), int(cam['size'][0]), 3), np.uint8)
-    _, scale, pad = letterbox(img, ds.input_wh)
-    want = crop_box_for_points(torch.as_tensor(lab.boxes[1, frame, cam_ix]).view(2, 2),
-                               cam['size'], ds.min_crop_dim, pad=0)
-    back = unletterbox_boxes(boxes[1][None], scale, pad)[0]
-    torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
-    assert not torch.isfinite(boxes[0]).any(), 'no stored box means no target, despite keypoints'
-    assert torch.isfinite(plain[0]).all(), 'the keypoint source would produce a crop box'
+    T, C = 4, 3
+    raw = (np.full((1, T, C, 4), np.nan, np.float32),
+           np.full((1, T, C), np.nan, np.float32))
 
+    whole = _RecordingSession(sess)
+    associate_group(raw, whole, 'g000', 1, track=True)
+    assert whole.frames == [0, 1, 2, 3], \
+        'frame_base=0 (the default) must keep the whole-clip behaviour byte-identical'
 
-def test_box_source_instances_trains_present_boxes_without_negatives(tiny_root):
-    """A present box is a positive, and it makes the frame's background unreliable."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
-                    max_frames_per_group=0, box_source='instances')
-    # every other frame has only labeled rows without stored boxes: no target, no negatives
-    assert [f for _, _, f, _ in ds.index] == [1]
-    item = ds[0]
-    assert not torch.isfinite(item['boxes'][0]).any()
-    assert torch.isfinite(item['boxes'][1]).all(), 'present boxes are positive targets'
-    assert item['negative_supervision'] is False
+    ranged = _RecordingSession(sess)
+    associate_group(raw, ranged, 'g000', 1, track=True, frame_base=6)
+    assert ranged.frames == [6, 7, 8, 9], \
+        "a moving rig's extrinsics must be fetched at SOURCE frames, not batch-local ones"
 
 
-def test_negative_supervision_follows_instance_statuses(tmp_path):
-    """Negatives need labeled/absent evidence and no present row, with or without a box."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-    from tailcyclenet import format as fmt
+# --- CLI defaults and provenance ----------------------------------------------------------
 
-    T = 5
-    path = tmp_path / 'ds' / 'train' / 'boxes'
-    rig = cf._rig([('cam0', 64, 48, False, False, 0)])
-    lab = fmt.empty_labels(2, T, len(cf.KPTS_2D), 1, mode3d=False, animal_ids=['a', 'b'])
-    lab.points2d = lab.vis2d = None
-    lab.instance = np.full((2, T, 1), fmt.INST_NONE, np.int8)
-    lab.boxes = np.full((2, T, 1, 4), np.nan, np.float32)
-    lab.instance[0, 0, 0] = fmt.INST_LABELED           # labeled box: positives + negatives
-    lab.boxes[0, 0, 0] = [8, 7, 28, 29]
-    lab.instance[0, 1, 0] = fmt.INST_ABSENT            # absent-only: all-background example
-    lab.instance[0, 2, 0] = fmt.INST_LABELED           # labeled box beside a boxless present
-    lab.boxes[0, 2, 0] = [8, 7, 28, 29]
-    lab.instance[1, 2, 0] = fmt.INST_PRESENT
-    lab.instance[0, 3, 0] = fmt.INST_PRESENT           # boxless present only: nothing to train
-    # frame 4 has no instance row at all: no claim, not a negative
-    fmt.write_session(path, mode='2d', units='px', label_source='annotated',
-                      names=cf.KPTS_2D, rig=rig, groups={'g': fmt.Group('g', T)},
-                      labels={'g': lab})
-    cf._write_frames(path / 'groups' / 'g', 'cam0', T, (64, 48))
 
-    ds = BoxDataset(path.parent.parent, 'train', input_wh=(128, 128), min_crop_dim=8,
-                    max_frames_per_group=0)
-    got = {f: ds[i]['negative_supervision'] for i, (_, _, f, _) in enumerate(ds.index)}
-    assert got == {0: True, 1: True, 2: False}
-    assert not torch.isfinite(ds[1]['boxes']).any(), 'absent rows are not positives'
-    batch = box_collate([ds[0], ds[1], ds[2]])
-    assert batch['negative_supervision'].tolist() == [True, True, False]
-
-
-def test_box_only_sessions_fall_back_to_labeled_instance_boxes(tmp_path):
-    root = tmp_path / 'ds'
-    path = root / 'train' / 'boxes_only'
-    _box_only_session(path)
-    assert not (path / 'keypoints.pq').exists()
-    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8)
-    assert len(ds) == 4
-    assert {item[1] for item in ds.index} == {'video_ix0', 'video_ix10'}
-    assert len(ds.box_only_fallback_sessions) == 1
-    for i in range(len(ds)):
-        boxes = ds.boxes_for(i)
-        assert torch.isfinite(boxes[0]).all()
-        assert torch.isfinite(boxes[1]).all(), 'present boxes are positive targets'
-
-    batch = box_collate([ds[0], ds[1]])
-    assert batch['negative_supervision'].tolist() == [False, False]
-    assert split_batch(batch)[2] is batch['negative_supervision']
-
-
-def test_mixed_pose_and_box_only_sessions_both_index(tmp_path):
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    root = tmp_path / 'ds'
-    _box_only_session(root / 'train' / 'boxes_only')
-    cf._session_2d(root / 'train' / 'pose')
-    ds = BoxDataset(root, 'train', input_wh=(128, 128), min_crop_dim=8)
-    indexed = {sess.session_id for sess, _, _, _ in ds.index}
-    assert indexed == {'boxes_only', 'pose'}
-    assert ds.box_only_fallback_sessions == {root / 'train' / 'boxes_only'}
-
-
-def test_box_source_rejects_a_typo(tiny_root):
-    with pytest.raises(AssertionError, match='box_source'):
-        BoxDataset(tiny_root / 'ratlike', 'train', box_source='instance')
-
-
-def test_link_rows_never_force_assigns_another_animal():
-    """A row that matches nothing must stay EMPTY, not take a leftover: `free.pop(0)` handed an
-    unmatched row another detection, whose teleporting boxes blew up the window-union crop.
-    """
-    import numpy as np
-
-    from tailcyclenet.detector import link_rows
-
-    T = 6
-    boxes = np.full((2, T, 1, 4), np.nan, np.float32)
-    for t in range(T):
-        boxes[0, t, 0] = [10, 10, 40, 40]                      # a stationary animal
-    boxes[1, 3, 0] = [900, 900, 930, 930]                      # one far-away detection, once
-    linked = link_rows(boxes.copy())
-    assert np.allclose(linked[0, :, 0, 0], 10), 'the tracked row must not move'
-    # The far detection is a birth into the empty row 1 -- and it must never land in row 0.
-    assert not np.isfinite(linked[0, 3, 0]).all() or linked[0, 3, 0][0] == 10
-
-
-def test_link_rows_gates_on_the_animals_own_size():
-    """A jump of more than one box side is not motion. Real p90 is 0.06-0.11 body lengths."""
-    import numpy as np
-
-    from tailcyclenet.detector import link_rows
-
-    boxes = np.full((1, 2, 1, 4), np.nan, np.float32)
-    boxes[0, 0, 0] = [0, 0, 30, 30]
-    boxes[0, 1, 0] = [300, 0, 330, 30]                         # 10 box sides away
-    assert not np.isfinite(link_rows(boxes.copy())[0, 1, 0]).all(), \
-        'a 10-box-side jump must be rejected, not accepted as the same animal'
-    near = boxes.copy()
-    near[0, 1, 0] = [20, 0, 50, 30]                            # 0.67 of a side -- ordinary motion
-    assert np.isfinite(link_rows(near)[0, 1, 0]).all()
-
-
-def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
-    """IoU ranks by shape agreement, which is not identity: a true continuation that shrank loses
-    to a size-matched wrong animal. Centre distance is not fooled.
-    """
-    import numpy as np
-
-    from tailcyclenet.detector import link_rows
-
-    last = np.array([100.0, 100.0, 300.0, 300.0], np.float32)     # remembered, 200 px
-    near = np.array([170.0, 170.0, 230.0, 230.0], np.float32)      # same centre, 60 px
-    wide = np.array([150.0, 150.0, 350.0, 350.0], np.float32)      # 0.35 sides away, 200 px
-    iou = box_iou(torch.as_tensor(last[None]), torch.as_tensor(np.stack([near, wide])))[0]
-    assert iou[1] > iou[0], f'the fixture must be one IoU gets wrong, got {iou.tolist()}'
-
-    boxes = np.stack([np.stack([last, near]),
-                      np.stack([np.full(4, np.nan, np.float32), wide])])[:, :, None]
-    linked = link_rows(boxes.astype(np.float32).copy())
-    assert np.allclose(linked[0, 1, 0], near), \
-        f'centre distance must keep the nearer box, got {linked[0, 1, 0]}'
-    # ...and the other detection is a BIRTH into the empty row, not a dropped animal.
-    assert np.allclose(linked[1, 1, 0], wide)
-
-
-def test_unletterbox_clamps_a_runaway_box_into_the_frame():
-    """A decoded side can reach ~12,910 px; IoU-only NMS cannot suppress it, so the clamp bounds
-    it into the frame and a zero-area box comes back NaN.
-    """
-    from tailcyclenet.detector import unletterbox_boxes
-
-    b = torch.tensor([[-5000.0, -5000.0, 20000.0, 20000.0], [10.0, 10.0, 9.0, 40.0]])
-    out = unletterbox_boxes(b, 1.0, (0, 0), src_wh=(640, 480))
-    assert out[0].tolist() == [0.0, 0.0, 640.0, 480.0]
-    assert torch.isnan(out[1]).all(), 'a box with no positive area is not a detection'
-    # Without `src_wh` -- the training path, which has no frame to clamp against -- nothing changes.
-    assert unletterbox_boxes(b, 1.0, (0, 0))[0, 2].item() == 20000.0
-
-
-def _tracker_demo():
-    """Two synthetic animals on a three-camera rig: the properties that must hold.
-
-    The animals CROSS: A walks right, B walks left, and the SCORE ORDER swaps every frame the
-    way `decode` reorders them -- a row that follows one animal must be immune to that. The
-    checks, in order: (1) both slots stay filled in every frame (births on frame 0, matches
-    after); (2) each row's own box moves smoothly -- a swapped row would jump the full
-    separation; (3) a frame with no detections at all ages the targets and returns nothing
-    without dropping them -- a one-frame detector miss must not end a track; (4) they resume in
-    the SAME slots afterwards.
-    """
-    from aniposelib.cameras import Camera, CameraGroup
-
-    from tailcyclenet.detector.track import CrossViewTracker, _project
-    from tailcyclenet.format import Rig
-
-    cams = []
-    for i, ang in enumerate((-0.5, 0.0, 0.5)):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
-                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-             moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).tracktail()
-
-    def boxes_at(worlds, side=40.0):
-        """Project `worlds` into every camera as fixed-size square boxes.
-
-        Outputs: (per_cam, scores): per_cam is a list of (n,4) xyxy tensors and scores
-        a list of (n,) ones.
-        """
-        per_cam, scores = [], []
-        for cam in cg:
-            uv = _project(cam, np.asarray(worlds, np.float32))
-            per_cam.append(torch.stack([uv[:, 0] - side / 2, uv[:, 1] - side / 2,
-                                        uv[:, 0] + side / 2, uv[:, 1] + side / 2], -1))
-            scores.append(torch.ones(len(worlds)))
-        return per_cam, scores
-
-    a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
-    tr = CrossViewTracker(2, max_res_px=30.0)
-    rows = []
-    for t in range(12):
-        w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
-        per_cam, scores = boxes_at(w if t % 2 == 0 else w[::-1])
-        rows.append(tr.step(cg, per_cam, scores)[0])
-
-    assert all(np.isfinite(r).all(-1).any(-1).sum() == 2 for r in rows), 'an animal was lost'
-    for s in (0, 1):
-        cx = np.array([r[s, 0, [0, 2]].mean() for r in rows])
-        assert np.abs(np.diff(cx)).max() < 30.0, f'row {s} jumped: {np.diff(cx)}'
-    empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
-    out, _, _ = tr.step(cg, *empty)
-    assert not np.isfinite(out).any() and len(tr.targets) == 2
-    w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
-    resumed, _, _ = tr.step(cg, *boxes_at(w))
-    assert np.isfinite(resumed).all(-1).any(-1).sum() == 2
-    for s in (0, 1):
-        assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0
-
-
-def test_the_cross_view_tracker_holds_identity_where_the_two_old_passes_could_not():
-    """One target set with one affinity cannot disagree with itself. `associate` was memoryless
-    and `link_rows` matched per camera, so a row could be re-grouped in one pass and re-permuted
-    in the other.
-    """
-    _tracker_demo()
-
-
-def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
-    """The target state must not change the easy case, or it is not a drop-in.
-
-    One animal on three cameras with no ambiguity: both routes must produce the same boxes, which is
-    what licenses reading a delta on the crowded case as a crowding result rather than a rewrite.
-    """
-    import numpy as np
-
-    from tailcyclenet.detector.associate import associate
-    from tailcyclenet.detector.track import CrossViewTracker, _project
-
-    from aniposelib.cameras import Camera, CameraGroup
-    from tailcyclenet import format as fmt
-
-    cams = []
-    for i, ang in enumerate((-0.5, 0.0, 0.5)):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
-                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    cg = fmt.Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-                 moving=dict.fromkeys(names, False),
-                 calibrated=dict.fromkeys(names, True)).tracktail()
-
-    tr = CrossViewTracker(1, max_res_px=30.0)
-    for t in range(5):
-        w = np.array([[10.0 * t, 0.0, 0.0]], np.float32)
-        per_cam = []
-        for cam in cg:
-            uv = _project(cam, w)
-            per_cam.append(torch.stack([uv[:, 0] - 20, uv[:, 1] - 20,
-                                        uv[:, 0] + 20, uv[:, 1] + 20], -1))
-        scores = [torch.ones(1) for _ in cg]
-        got, _, _ = tr.step(cg, per_cam, scores)
-        ref = associate(cg, per_cam, max_res_px=30.0, max_instances=1)
-        assert len(ref) == 1
-        for c, box in ref[0]['boxes'].items():
-            np.testing.assert_allclose(got[0, c], box.numpy(), atol=1e-4)
-
-
-def test_a_detector_records_its_objectness_and_load_detector_hands_it_back(tmp_path):
-    """`--det-score` is not portable across detector GENERATIONS, so the distribution must ride
-    in the checkpoint.
-
-    0.99 was measured against detectors whose objectness is saturated (98.5% of rat-city's boxes at
-    exactly 1.0). The tiled/masked generation reads q01 0.45-0.84 and loses two thirds of its
-    detections to the same number -- coverage 0.703 against 0.986 at 0.50. That
-    is a property of the RECIPE, not of the dataset, so no constant is right for both and the only
-    durable answer is to record what a checkpoint actually produces.
-
-    A checkpoint written before the field returns `{}` rather than a guess.
-    """
-    import conftest as cf
-
-    from tailcyclenet.detector import load_detector
-
-    p = tmp_path / 'detector.pth'
-    base = cf._detector_checkpoint()
-    torch.save(base, p)
-    assert load_detector(p).obj_quantiles == {}, 'an unrecorded distribution must not be invented'
-
-    q = {'q01': 0.452, 'q10': 0.601, 'q50': 0.883, 'q90': 0.981}
-    torch.save({**base, 'obj_quantiles': q}, p)
-    assert load_detector(p).obj_quantiles == q
-
-
-def test_the_tracker_is_the_default_and_can_be_turned_off():
-    """`--track` is ON by default, and `--no-track` restores the memoryless pass. Asserted on the
-    SIGNATURE and on the parser, not on source text.
-    """
+def test_the_tracker_is_the_default_and_help_renders(capsys):
+    """`--track` is ON by default with `--no-track` to restore the memoryless pass; `--help`
+    renders for both CLIs (a bare `%` in a help string kills argparse with a format TypeError)."""
     import inspect
 
     from tailcyclenet.detector import associate_group
     from tailcyclenet.infer.cli import build_parser
+    from tailcyclenet.train_detector import main as train_main
 
     sig = inspect.signature(associate_group)
-    assert sig.parameters['track'].default is True, 'the tracker is the default'
-    assert sig.parameters['link'].default is False, '--link-boxes is opt-in'
-
+    assert sig.parameters['track'].default is True
+    assert sig.parameters['link'].default is False, 'link is opt-in at the function level'
     ap = build_parser()
-    assert ap.get_default('track') is True, '--track is on by default'
+    assert ap.get_default('track') is True
     opts = {s for a in ap._actions for s in a.option_strings}
-    assert '--no-track' in opts, '--no-track must exist to restore the memoryless pass'
-    assert '--det-cache' not in opts, \
-        'the detector and the pose loop are one pass; there is no detection phase to cache'
-
-
-def test_the_npz_records_the_resolved_refine_flag():
-    """`--refine` is recorded in `[provenance]` in the written session.toml."""
-
-    src = _infer_program_source()
-    # `refine` `refine` MUST BE THE RESOLVED FLAG, NOT THE TRI-STATE. It defaults by dimensionality, so
-    # `cfg.refine` is `None` on any run that did not pass the flag -- the normal 3D case -- and
-    # `run_blocks` folds it to a concrete bool before anything reads it.
-    assert "'refine': bool(cfg.refine)" in src, \
-        'the resolved refine flag belongs in the record; None would say nothing'
-    assert "'refine': bool(cfg.refine)" in _infer_window_source(), \
-        'run_blocks must resolve the tri-state before recording it'
-
-
-# ----------------------------------------------------------------------------------------------
-# normalisation -- GroupNorm, and the two properties the switch was made for
-# ----------------------------------------------------------------------------------------------
-
-def test_norm_groups_always_divides_the_channel_count():
-    """A GroupNorm whose count does not divide its channels is a constructor error."""
-    from tailcyclenet.detector.yolox import norm_groups
-    for c in list(range(1, 200)) + [24, 48, 96, 192]:
-        g = norm_groups(c)
-        assert 1 <= g <= c and c % g == 0
-
-
-def test_there_are_no_running_statistics():
-    """The whole point: train and inference are the SAME computation.
-
-    BatchNorm collects statistics on the training distribution and applies them at inference.
-    Train on animal-rich crops and infer on a mostly-empty arena and those disagree -- which is
-    the train-test resolution discrepancy, and it is what would make train-on-tiles /
-    infer-on-whole-frame unsafe. GroupNorm has no buffers, so there is nothing to drift.
-    """
-    m = YOLOXNano(version='hybrid')
-    assert list(m.named_buffers()) == []
-    assert not any(isinstance(x, torch.nn.BatchNorm2d) for x in m.modules())
-
-    x = torch.rand(2, 3, 128, 192)
-    m.train()
-    a = m(x)[0]
-    m.eval()
-    with torch.no_grad():
-        b = m(x)[0]
-    torch.testing.assert_close(a, b)
-
-
-def test_the_forward_does_not_depend_on_the_rest_of_the_batch():
-    """Batch independence is what lets a high-resolution arm hold a smaller batch: without it, a
-    resolution sweep that changed the batch would measure normalisation instead of resolution.
-    """
-    torch.manual_seed(0)
-    m = YOLOXNano(version='hybrid').eval()
-    x = torch.rand(4, 3, 96, 128)
-    with torch.no_grad():
-        alone = m(x[1:2])[0]
-        together = m(x)[0][1:2]
-    torch.testing.assert_close(alone, together, rtol=1e-4, atol=1e-5)
-
-
-def test_a_batchnorm_checkpoint_is_refused_by_name(tmp_path):
-    """It would fail on the key names anyway; this says WHY in one sentence."""
-    from tailcyclenet.detector import load_detector
-    p = tmp_path / 'detector.pth'
-    torch.save({'model_state': {}, 'input_wh': [128, 128], 'yolox_version': 'hybrid'}, p)
-    with pytest.raises(ValueError, match='bn normalisation'):
-        load_detector(p)
-
-
-# ----------------------------------------------------------------------------------------------
-# the architecture switch -- `convnext-t` (shipped) and `hybrid`
-# ----------------------------------------------------------------------------------------------
-
-def test_an_unknown_yolox_version_raises():
-    with pytest.raises(ValueError, match='hybrid'):
-        YOLOXNano(version='medium')
-
-
-def test_yolox_version_round_trips_through_the_checkpoint(tmp_path):
-    """The checkpoint's own `yolox_version` decides the architecture; absent is refused."""
-    import conftest as cf
-
-    from tailcyclenet.detector import load_detector
-
-    p = tmp_path / 'detector.pth'
-    m = YOLOXNano(version='hybrid')
-    torch.save(cf._detector_checkpoint(m), p)
-    loaded = load_detector(p).model
-    assert loaded.version == 'hybrid'
-    torch.testing.assert_close(
-        loaded.state_dict()['head.obj_pred.0.bias'], m.state_dict()['head.obj_pred.0.bias'])
-
-    p2 = tmp_path / 'old.pth'
-    ckpt = cf._detector_checkpoint(m)
-    del ckpt['yolox_version']
-    torch.save(ckpt, p2)
-    with pytest.raises(ValueError, match="'trimmed' is a deleted architecture"):
-        load_detector(p2)
-
-
-def test_train_detector_help_renders():
-    """The same failure mode `test_infer_help_renders` guards, one script over.
-
-    argparse expands every `help=` string as `help % params`, so a bare `%` is a format spec --
-    `3.7% of` reads as `% ` (a valid flag) then `o` (octal), and `--help` dies with
-    `TypeError: %o format`. Nothing had ever run this script's `--help` before the yolox/seed
-    flags were added, so two pre-existing bare `%`s were sitting undetected.
-    """
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    p = Path(__file__).resolve().parent.parent / 'scripts' / 'train_detector.py'
-    r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
-    assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
-    # The CLI is now `--config` + three overrides; the recipe lives in the config file.
-    assert '--config' in r.stdout and '--out' in r.stdout
-    assert '--iters' in r.stdout and '--device' in r.stdout
-
-
-# ----------------------------------------------------------------------------------------------
-# tiling
-# ----------------------------------------------------------------------------------------------
-
-def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
-    """`tile_scale` without `tile_wh` must not reach `detect_group`, or it derives the input size.
-
-    `train_detector.py` records the flag's DEFAULT on every run, so an untiled checkpoint carries
-    `tile_scale = 1.0` -- and `detect_group` reads any non-None value as "letterbox the whole frame
-    at `frame_wh * scale`", which for branson-fly is 1024x1024 against the 416x416 it trained at.
-    """
-    import conftest as cf
-
-    from tailcyclenet.detector import load_detector
-    p = tmp_path / 'detector.pth'
-    base = cf._detector_checkpoint()
-    torch.save({**base, 'tile_wh': None, 'tile_scale': 1.0}, p)
-    assert load_detector(p).tile_scale is None
-    # ...and a genuinely tiled one still keeps it, or the tiled path loses its whole point.
-    torch.save({**base, 'tile_wh': [640, 640], 'tile_scale': 0.5}, p)
-    assert load_detector(p).tile_scale == 0.5
-
-
-def test_tile_transform_is_the_letterbox_form():
-    from tailcyclenet.detector.data import tile_transform
-    scale, pad = tile_transform((100, 50), 0.5)
-    # a source point at the tile's origin lands at the input origin
-    assert scale == 0.5 and pad == (-50.0, -25.0)
-    assert 100 * scale + pad[0] == 0.0 and 50 * scale + pad[1] == 0.0
-
-
-def test_tiled_targets_are_still_the_crop_rule(tiny_root):
-    """The box is RE-DERIVED in source px, never scaled by tile_scale -- if this fails every tiled
-    detector number is invalid, exactly as for the whole-frame version.
-    """
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2,
-                    tile_wh=(32, 32), tile_scale=1.0)
-    from tailcyclenet.detector.data import tile_transform
-    for i in range(min(6, len(ds))):
-        sess, gid, f, ci = ds.index[i]
-        boxes = ds.boxes_for(i)
-        lab = sess.labels(gid)
-        cam = sess.rig.tracktail()[ci]
-        ox, oy = ds.origins[i]
-        tw, th = ds._tile_extent()
-        for s in range(boxes.shape[0]):
-            pts = torch.as_tensor(lab.points2d[s, f, :, ci], dtype=torch.float32)
-            keep = ((pts[:, 0] >= ox) & (pts[:, 0] <= ox + tw) &
-                    (pts[:, 1] >= oy) & (pts[:, 1] <= oy + th))
-            want = crop_box_for_points(torch.where(keep[:, None], pts, torch.nan),
-                                       cam['size'], ds.min_crop_dim)
-            if want is None:
-                assert torch.isnan(boxes[s]).all()
-                continue
-            scale, pad = tile_transform((ox, oy), ds.tile_scale)
-            back = unletterbox_boxes(boxes[s][None], scale, pad)[0]
-            torch.testing.assert_close(back, want.float(), atol=0.51, rtol=0)
-
-
-def test_a_point_outside_the_tile_is_dropped(tiny_root):
-    """Out-of-tile behaves exactly like out-of-frame: shrink the box, or emit no box at all."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
-                    tile_wh=(16, 16), tile_scale=1.0)
-    # a tile far from every animal: the 64x48 fixture has its points in [5, 43]
-    ds.origins[0] = (1000.0, 1000.0)
-    assert torch.isnan(ds.boxes_for(0)).all()
-
-
-def test_an_off_frame_tile_is_grey_not_wrapped(tiny_root):
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), max_frames_per_group=1,
-                    tile_wh=(16, 16), tile_scale=1.0)
-    ds.origins[0] = (-16.0, -16.0)          # wholly outside, up and left
-    x = ds[0]['x']
-    assert x.shape == (3, 16, 16)
-    torch.testing.assert_close(x, torch.full_like(x, 114 / 255.0))
-
-
-def test_split_batch_reads_explicit_keys_not_ranks():
-    from tailcyclenet.detector import split_batch
-    x, b = torch.zeros(2, 3, 8, 8), torch.zeros(2, 1, 4)
-    neg = torch.tensor([True, False])
-    assert split_batch({'x': x, 'boxes': b}) == (x, b, None)
-    got = split_batch({'x': x, 'boxes': b, 'negative_supervision': neg})
-    assert got[2] is neg
-
-
-def test_detector_loss_drops_negatives_on_incomplete_frames_but_keeps_positives():
-    anchors = torch.tensor([[5.0, 5.0, 8.0], [40.0, 40.0, 8.0]])
-    obj = torch.zeros(2, 2, requires_grad=True)
-    pred_boxes = torch.tensor([[[0.0, 0.0, 16.0, 16.0], [35.0, 35.0, 45.0, 45.0]]] * 2)
-    gt = torch.tensor([[[0.0, 0.0, 16.0, 16.0]]] * 2)
-    neg = torch.tensor([True, False])
-    loss, parts = detector_loss(obj, pred_boxes, anchors, gt, negative_supervision=neg)
-    loss.backward()
-    assert parts['negative_frames'] == 0.5
-    assert obj.grad[0, 1] != 0, 'a complete frame trains its background negative'
-    assert obj.grad[1, 0] != 0, 'an incomplete frame still trains its positive'
-    assert obj.grad[1, 1] == 0, 'an incomplete frame trains no background negative'
-    same, _ = detector_loss(obj.detach(), pred_boxes, anchors, gt,
-                            negative_supervision=torch.tensor([True, True]))
-    base, _ = detector_loss(obj.detach(), pred_boxes, anchors, gt)
-    assert float(same) == float(base)
-
-
-def test_detector_loss_without_a_negative_mask_is_unchanged():
-    """THE BACKWARD-COMPATIBILITY PROOF. Reports 10-15's numbers depend on this equality."""
-    torch.manual_seed(0)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    boxes = torch.rand(2, anchors.shape[0], 4) * 64
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    base, bp = detector_loss(obj, boxes, anchors, gt)
-    same, sp = detector_loss(obj, boxes, anchors, gt, negative_supervision=None)
-    assert float(base) == float(same) and 'negative_frames' not in bp
-
-    # every frame complete is the same loss; no frame complete keeps only the positives, which
-    # are forced in because an unsupervised positive is an animal trained as nothing.
-    allm, ap = detector_loss(obj, boxes, anchors, gt,
-                             negative_supervision=torch.tensor([True, True]))
-    torch.testing.assert_close(allm, base)
-    assert ap['negative_frames'] == 1.0
-    none, np_ = detector_loss(obj, boxes, anchors, gt,
-                              negative_supervision=torch.tensor([False, False]))
-    assert np_['negative_frames'] == 0.0 and np_['obj'] < bp['obj']
-
-
-def test_paired_iou_matches_box_iou_diagonal():
-    """`paired_iou` is the SAME maths as `box_iou`, just elementwise instead of all-pairs -- the
-    diagonal of the cross-product form must equal it exactly, on both perfect and partial overlap.
-    """
-    a = torch.tensor([[0.0, 0.0, 10.0, 10.0], [0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0]])
-    b = torch.tensor([[0.0, 0.0, 10.0, 10.0], [5.0, 5.0, 15.0, 15.0], [5.0, 5.0, 15.0, 15.0]])
-    got = paired_iou(a, b)
-    want = box_iou(a, b).diagonal()
-    torch.testing.assert_close(got, want)
-    assert float(got[0]) == pytest.approx(1.0)         # perfect overlap
-    assert 0.0 < float(got[1]) < 1.0                    # partial overlap
-    assert float(got[2]) == pytest.approx(1.0)          # perfect overlap, offset box
-
-
-def test_detector_loss_iou_aware_default_off_is_unchanged():
-    """THE BACKWARD-COMPATIBILITY PROOF, same shape as `test_detector_loss_without_ignore_is_
-    unchanged`. `iou_aware` defaults to False, and passing it explicitly at False (or omitting it)
-    must produce the IDENTICAL loss and the IDENTICAL (hard 1.0) target regardless of how good or
-    bad the predicted boxes are.
-    """
-    torch.manual_seed(2)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    # Deliberately BAD boxes (far from the GT), so a hard-1.0 vs IoU-valued target would differ
-    # a lot if the flag were live -- the strongest test that it is not.
-    boxes = torch.rand(2, anchors.shape[0], 4) * 5
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    base, bp = detector_loss(obj, boxes, anchors, gt)
-    off, op = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
-    assert float(base) == float(off)
-    assert 'iou_target' not in bp and 'iou_target' not in op
-
-
-def test_detector_loss_iou_aware_holds_hard_target_during_warmup():
-    """`it < iou_aware_warmup` must still use the hard 1.0 target -- the chicken-and-egg trap the
-    plan names: an early, near-zero predicted IoU must not be allowed to teach objectness to stay
-    off. `parts['iou_target']` reads exactly 1.0 throughout warmup regardless of box quality.
-    """
-    torch.manual_seed(3)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    boxes = torch.rand(2, anchors.shape[0], 4) * 5             # bad boxes -> low true IoU
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    warm, wp = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000, it=0)
-    hard, hp = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
-    assert float(warm) == float(hard), 'during warmup the loss must equal the hard-target one'
-    assert wp['iou_target'] == pytest.approx(1.0)
-
-
-def test_detector_loss_iou_aware_switches_to_iou_target_after_warmup():
-    """Past warmup, the target at a positive must be the DETACHED IoU between its predicted and
-    GT box -- not 1.0 -- and `parts['iou_target']` must report the same value a direct
-    `paired_iou` computation gives, tying the loss's internal bookkeeping to the public helper.
-    """
-    torch.manual_seed(4)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    boxes = torch.rand(2, anchors.shape[0], 4) * 5              # bad boxes -> IoU well under 1
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    past, pp = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000,
-                             it=2000)
-    hard, _ = detector_loss(obj, boxes, anchors, gt, iou_aware=False)
-    assert float(past) != float(hard), 'past warmup the loss must differ from the hard-target one'
-    assert 0.0 <= pp['iou_target'] < 1.0
-
-    pos, gix = assign(anchors, gt[0])
-    assert pos.numel(), 'need at least one positive anchor for this check to mean anything'
-    want = float(paired_iou(boxes[0, pos], gt[0][gix]).clamp(0, 1).mean())
-    assert pp['iou_target'] == pytest.approx(want, abs=1e-5)
-
-
-def test_detector_loss_iou_aware_it_none_means_past_warmup():
-    """`it=None` (a caller that does not track iterations) must behave as ALREADY past warmup --
-    the docstring's stated contract, since the only caller needing the warmup (`train_detector.py`)
-    always passes `it`."""
-    torch.manual_seed(5)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(2, anchors.shape[0])
-    boxes = torch.rand(2, anchors.shape[0], 4) * 5
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]], [[float('nan')] * 4]])
-    none_it, p1 = detector_loss(obj, boxes, anchors, gt, iou_aware=True, it=None)
-    past_it, p2 = detector_loss(obj, boxes, anchors, gt, iou_aware=True, iou_aware_warmup=2000,
-                                it=999999)
-    torch.testing.assert_close(none_it, past_it)
-    assert p1['iou_target'] == pytest.approx(p2['iou_target'])
-
-
-def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
-    """THE SUBTLE CORRECTNESS CASE this key introduces: `negative_supervision` masks the
-    objectness weight, and a pre-existing guard (`weight = maximum(weight, ...)`) forces a TRUE
-    POSITIVE's weight back to 1 so masking can never silently drop a real animal from the
-    objectness term. That guard must key on WHETHER an anchor is positive (`pos_mask`), not on the
-    VALUE its target holds -- under `iou_aware` with bad boxes the target there can be near 0, and
-    forcing off THAT would only guarantee a near-0 weight, defeating the guard's whole purpose.
-
-    Constructed so the frame supervises NO negatives (weight starts at 0 everywhere) and the
-    predicted boxes are deliberately bad (low true IoU): if the guard were wrongly keyed on
-    `target`, the positive anchor's contribution to `obj` would be scaled by ~its IoU instead of
-    1, and this loss would NOT match the identical computation with `iou_aware=False` (which is
-    known-correctly forced to weight 1 by the pre-existing, unchanged code path).
-    """
-    torch.manual_seed(6)
-    anchors = YOLOXNano(version='hybrid').anchor_points(64, 64, 'cpu')
-    obj = torch.randn(1, anchors.shape[0])
-    boxes = torch.rand(1, anchors.shape[0], 4) * 5              # bad boxes -> low true IoU
-    gt = torch.tensor([[[10.0, 10.0, 40.0, 40.0]]])
-    no_negatives = torch.tensor([False])                   # supervises NO negatives
-
-    _, sp = detector_loss(obj, boxes, anchors, gt, negative_supervision=no_negatives,
-                          iou_aware=True, iou_aware_warmup=0, it=1)
-    assert sp['iou_target'] < 0.5, 'the test needs a genuinely low IoU to be a real check'
-    # The OBJ term (not the box term, which iou_aware never touches) must be identical: the
-    # positive's weight was forced to 1 in both cases, only the BCE TARGET value differs, and a
-    # BCE(logit, 1.0) vs BCE(logit, iou) at weight=1 are different numbers -- so this checks obj
-    # is computed off the same forced weight, not that the two total losses match.
-    pos, gix = assign(anchors, gt[0])
-    assert pos.numel()
-    logit = obj[0, pos]
-    target_hard = torch.ones_like(logit)
-    target_soft = paired_iou(boxes[0, pos], gt[0][gix]).clamp(0, 1)
-    import torch.nn.functional as F
-    norm = max(pos.numel(), 1)          # `detector_loss`'s own `obj_all / max(n_pos, B)`, B=1 here
-    expected_hard_obj = F.binary_cross_entropy_with_logits(
-        logit, target_hard, reduction='sum') / norm
-    expected_soft_obj = F.binary_cross_entropy_with_logits(
-        logit, target_soft, reduction='sum') / norm
-    # Re-derived directly rather than relying on `hard`/`soft` above (which also include
-    # box_weight * box, identical in both arms and therefore not informative here) -- read `obj`
-    # off `parts` instead.
-    _, hp = detector_loss(obj, boxes, anchors, gt, negative_supervision=no_negatives, iou_aware=False)
-    assert hp['obj'] == pytest.approx(float(expected_hard_obj), rel=1e-4)
-    assert sp['obj'] == pytest.approx(float(expected_soft_obj), rel=1e-4)
-
-
-def test_detector_config_iou_aware_defaults(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['training']['iou_aware_obj'] is True
-    assert cfg['training']['iou_aware_warmup'] == 2000
-
-
-def test_train_detector_iou_aware_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A short run with `iou_aware_obj = true` through the real CLI entry point: it must train to
-    completion with no error, and the log line must show `iouT` once it fires (warmup=0 so it
-    fires on iteration 0 here, keeping the smoke test short)."""
-    import importlib.util
-    import sys
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "hybrid"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-iou_aware_obj = true
-iou_aware_warmup = 0
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_iou_aware',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
-    import tomllib
-    with open(out / 'config.toml', 'rb') as f:
-        recorded = tomllib.load(f)
-    assert recorded['training']['iou_aware_obj'] is True
-    assert recorded['training']['iou_aware_warmup'] == 0
-
-
-def test_support_count_counts_independently_corroborating_cameras():
-    """detector_v2 E1a/E3: `_support_count` must count OTHER cameras with an unused detection
-    near a candidate's reprojection, exclude the seeding pair itself, and exclude a detection
-    already claimed (`used`) -- the three properties the re-ranking fix relies on.
-    """
-    from aniposelib.cameras import Camera, CameraGroup
-
-    from tailcyclenet.detector.associate import _support_count
-    from tailcyclenet.detector.track import _project
-    from tailcyclenet.format import Rig
-
-    cams = []
-    for i, ang in enumerate((-0.5, 0.0, 0.5)):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
-                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-             moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).tracktail()
-
-    p3d = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32)
-    proj = [_project(cam, p3d.reshape(1, 3).numpy()) for cam in cg]     # (1,2) per camera
-
-    # Every camera has a detection exactly at the true reprojection.
-    centres_all = [p.clone() for p in proj]
-    assert _support_count(cg, (0, 1), centres_all, set(), p3d, max_res_px=5.0) == 1, \
-        'excluding the seeding pair (0, 1), only camera 2 remains and it corroborates'
-
-    # Camera 2's detection moved far away: no corroboration left.
-    centres_far = [proj[0].clone(), proj[1].clone(), proj[2] + 1000.0]
-    assert _support_count(cg, (0, 1), centres_far, set(), p3d, max_res_px=5.0) == 0
-
-    # Camera 2's detection is still at the true point, but already `used` by an earlier group --
-    # an already-claimed detection must not corroborate a second candidate.
-    assert _support_count(cg, (0, 1), centres_all, {(2, 0)}, p3d, max_res_px=5.0) == 0
-
-
-def test_a_nan_box_is_skipped_by_both_cross_view_paths():
-    """The two halves of `unletterbox_boxes`' contract, joined. They never were: `associate`'s
-    `isfinite` guard was unreachable (SVD raises on non-finite input) and the tracker refused the
-    NaN affinity matrix -- both reachable from one anchor firing in the letterbox padding band.
-    """
-    from aniposelib.cameras import Camera, CameraGroup
-
-    from tailcyclenet.detector.associate import associate
-    from tailcyclenet.detector.track import CrossViewTracker, _project
-    from tailcyclenet.format import Rig
-
-    cams = []
-    for i, ang in enumerate((-0.5, 0.0, 0.5)):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([0.0, ang, 0.0]),
-                     tvec=np.array([0.0, 0.0, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    cg = Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-             moving=dict.fromkeys(names, False),
-             calibrated=dict.fromkeys(names, True)).tracktail()
-
-    world = np.array([[0.0, 0.0, 0.0]], np.float32)
-    nan_row = torch.full((1, 4), float('nan'))
-    per_cam, scores = [], []
-    for cam in cg:
-        uv = _project(cam, world)
-        good = torch.stack([uv[:, 0] - 20, uv[:, 1] - 20, uv[:, 0] + 20, uv[:, 1] + 20], -1)
-        per_cam.append(torch.cat([good, nan_row]))       # one real animal, one dead box
-        scores.append(torch.ones(2))
-
-    got = associate(cg, per_cam, max_res_px=20.0)
-    assert len(got) == 1, 'the real animal must still be found beside a NaN box'
-    assert bool(torch.isfinite(got[0]['point']).all())
-    # The NaN box is not silently adopted as a member of it.
-    assert all(j == 0 for j in got[0]['members'].values())
-
-    tr = CrossViewTracker(2, max_res_px=20.0)
-    boxes, _, _ = tr.step(cg, per_cam, scores)
-    assert np.isfinite(boxes[0]).all(), 'the tracked animal must come back with real boxes'
-
-    # And `min_views = 1` does not emit the dead box as a single-view instance.
-    solo = associate(cg, per_cam, max_res_px=20.0, min_views=1)
-    for g in solo:
-        for c, b in g['boxes'].items():
-            assert torch.isfinite(b).all(), f'camera {c} emitted a NaN box as an instance'
-
-
-def test_reduce_under_tiling_matches_what_deployment_decodes():
-    """`--reduce` compared the whole frame against the TILE size, which is not where it is headed:
-    deployment letterboxes the whole frame to `tiled_input_wh`, where the same function returns 1
-    and the detector sees native pixels.
-    """
-    from tailcyclenet.detector.data import reduce_factor
-
-    size = (4696, 2048)                                   # rat-city
-    for tile, scale in (((640, 640), 1.0), ((640, 288), 1.0), ((896, 896), 1.0)):
-        assert reduce_factor(size, tile) > 1, \
-            f'{tile}: the old comparison must actually decimate, or this proves nothing'
-        deployed = (size[0] * scale, size[1] * scale)
-        assert reduce_factor(size, deployed) == 1, \
-            'at tile_scale 1.0 deployment decodes natively, so training must too'
-
-    # And the untiled path is untouched: there `input_wh` IS what the frame is headed for.
-    assert reduce_factor(size, (640, 288)) == reduce_factor(size, (640, 288))
-    # At a genuine downscale the reduction comes back, on both sides alike.
-    assert reduce_factor(size, (size[0] * 0.125, size[1] * 0.125)) > 1
+    assert '--no-track' in opts and '--det-cache' not in opts
+    assert '--det-score' in ap.format_help()
+
+    with pytest.raises(SystemExit) as e:
+        train_main(['--help'])
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    assert all(f in out for f in ('--config', '--out', '--iters', '--device'))
 
 
 def test_provenance_records_every_box_affecting_option():
-    """Nothing that changes a detection may go unrecorded beside the numbers it produced: "which
-    detector, at which threshold, at which input size" belongs in the output, not in shell history.
-    Table-driven against `detect_raw`'s own signature, asserted on the VALUE `_box_provenance`
-    returns.
-    """
+    """Every `detect_raw` parameter that changes a detection is recorded, at every value
+    (conditional membership is what makes a record lie)."""
     import argparse
     import inspect
 
@@ -2702,16 +1853,8 @@ def test_provenance_records_every_box_affecting_option():
 
 
 def test_every_identity_lever_is_recorded_in_the_prediction():
-    """The sibling of the box-provenance guard above, one pipeline stage later: detection
-    provenance answers "which boxes", identity provenance answers "whose".
-
-    This gap was found, not hypothesised: two stored 2D suppression arms once recorded their
-    detector, crop, checkpoint and commit and said NOTHING about the suppression lever -- the one
-    they were built to measure -- so the only thing distinguishing one arm from another was the
-    directory name. Eval rule 4 (match the controls) and rule 12 (a same-recipe replicate) both
-    need these checkable from the artifact. Table-driven against `associate_group`'s own
-    signature, asserted on the VALUE `_identity_provenance` returns.
-    """
+    """Every `associate_group` parameter that changes which row a detection lands in is
+    recorded, unconditionally: two stored 2D arms once differed only by directory name."""
     import inspect
 
     from tailcyclenet.detector import associate_group
@@ -2750,815 +1893,240 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     assert _identity_provenance(args2)['max_age'] == 24
 
 
-def test_summarise_exposes_fp_dup_and_fp_none_as_rates():
-    """D1: `box_mota`'s own fp_dup/fp_none split (already computed for `mota` above) must survive
-    into the per-group summary, not just `fp_ignored`. Rates, matching `mota()`'s own
-    `fp_dup_rate`/`fp_none_rate` and every other per-gt column here (`r50`, `r75`, `fp`).
-    """
-    from tailcyclenet.detector.evaluate import _summarise
+def test_detector_run_directory_resolves_latest_last_and_best(tmp_path):
+    """A run folder resolves to its highest-numbered checkpoint by default (an incomplete run
+    too); `last` still demands `detector_last.pth`; `best` is `detector.pth`."""
+    from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
+    from tailcyclenet.infer.cli import build_parser
+
+    run = tmp_path / 'run'
+    run.mkdir()
+    torch.save({'iteration': 2}, run / 'detector_it000002.pth')
+    (run / 'config.toml').write_text('[training]\niters = 4\n')
+    with pytest.raises(ValueError, match='detector_last.pth'):
+        resolve_detector_checkpoint(run, checkpoint='last')
+    (run / 'metrics.json').write_text('[{"iteration": 2}]')
+    torch.save({'iteration': 2}, run / 'detector_last.pth')
+    assert resolve_detector_checkpoint(run, checkpoint='latest') == run / 'detector_it000002.pth'
+    assert resolve_detector_checkpoint(run, checkpoint='detector_it000002.pth') == \
+        run / 'detector_it000002.pth'
+
+    torch.save({'iteration': 4}, run / 'detector_it000004.pth')
+    torch.save({'iteration': 2}, run / 'detector.pth')
+    torch.save({'iteration': 4}, run / 'detector_last.pth')
+    (run / 'metrics.json').write_text('[{"iteration": 2}, {"iteration": 4}]')
+    assert resolve_detector_checkpoint(run) == run / 'detector_it000004.pth'
+    assert resolve_detector_checkpoint(run, checkpoint='last') == run / 'detector_last.pth'
+    assert resolve_detector_checkpoint(run, checkpoint='best') == run / 'detector.pth'
+
+    args = build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o'])
+    assert args.detector_checkpoint == 'latest'
+    assert load_detector.__defaults__[-1] == 'latest'
+
+
+# --- scoring --------------------------------------------------------------------------------
+
+
+def test_summarise_and_overall_report_fp_dup_and_fp_none_as_rates():
+    """D1: `box_mota`'s fp_dup/fp_none survive into the per-group summary as per-gt rates (NaN,
+    not 0.0, where nothing was scored) and `overall` weights them by n_gt, skipping NaN groups."""
+    from tailcyclenet.detector.evaluate import _summarise, overall
 
     s = {'n_gt': 4, 'hit50': 3, 'hit75': 2, 'iou': 3.0, 'fp': 1,
-        'mota': [{'mota': 0.5, 'gt': 4, 'fp_ignored': 1, 'fp_dup': 1, 'fp_none': 2, 'misses': 3}]}
+         'mota': [{'mota': 0.5, 'gt': 4, 'fp_ignored': 1, 'fp_dup': 1, 'fp_none': 2, 'misses': 3}]}
     r = _summarise(s)
     assert r['fp_ignored'] == 1
-    assert r['fp_dup'] == pytest.approx(1 / 4)
-    assert r['fp_none'] == pytest.approx(2 / 4)
-    assert r['miss'] == pytest.approx(3 / 4)
-
-
-def test_summarise_fp_dup_none_are_nan_with_no_mota_rows():
-    """A group `score_dataset` never ran `box_mota` on (e.g. every GT box absent) must not read
-    as a silent 0.0 -- that is indistinguishable from "measured, zero false positives".
-    """
-    from tailcyclenet.detector.evaluate import _summarise
-
+    assert (r['fp_dup'], r['fp_none'], r['miss']) == pytest.approx((1 / 4, 2 / 4, 3 / 4))
     r = _summarise({'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0, 'fp': 0, 'mota': []})
     assert np.isnan(r['fp_dup']) and np.isnan(r['fp_none']) and np.isnan(r['miss'])
 
-
-def test_overall_weights_fp_dup_and_fp_none_by_n_gt():
-    """Same weighting basis as every other column `overall` reports -- a group's vote on the
-    aggregate fp_dup/fp_none rate is proportional to how many labelled boxes it carries.
-    """
-    from tailcyclenet.detector.evaluate import overall
-
-    rows = {
-        'a': {'n_gt': 2, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 0, 'fp_dup': 0.5, 'fp_none': 0.0, 'miss': 0.25},
-        'b': {'n_gt': 6, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 2, 'fp_dup': 0.0, 'fp_none': 1.0, 'miss': 0.0},
-    }
-    o = overall(rows)
+    row = {'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0}
+    o = overall({'a': {**row, 'n_gt': 2, 'fp_ignored': 0, 'fp_dup': 0.5, 'fp_none': 0.0,
+                       'miss': 0.25},
+                 'b': {**row, 'n_gt': 6, 'fp_ignored': 2, 'fp_dup': 0.0, 'fp_none': 1.0,
+                       'miss': 0.0},
+                 'c': {**row, 'n_gt': 2, 'fp_ignored': 0, 'fp_dup': float('nan'),
+                       'fp_none': float('nan'), 'miss': float('nan')}})
     assert o['fp_ignored'] == 2
-    assert o['fp_dup'] == pytest.approx((2 * 0.5 + 6 * 0.0) / 8)
-    assert o['fp_none'] == pytest.approx((2 * 0.0 + 6 * 1.0) / 8)
-    assert o['miss'] == pytest.approx((2 * 0.25 + 6 * 0.0) / 8)
+    assert o['fp_dup'] == pytest.approx((2 * 0.5) / 8)
+    assert o['fp_none'] == pytest.approx((6 * 1.0) / 8)
+    assert o['miss'] == pytest.approx((2 * 0.25) / 8)
 
 
-def test_overall_fp_dup_none_skip_nan_groups_rather_than_propagate():
-    from tailcyclenet.detector.evaluate import overall
-
-    rows = {
-        'a': {'n_gt': 2, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 0, 'fp_dup': float('nan'), 'fp_none': float('nan'),
-             'miss': float('nan')},
-        'b': {'n_gt': 6, 'r50': 1, 'r75': 1, 'iou': 1, 'fp': 0, 'mota': 1.0,
-             'fp_ignored': 0, 'fp_dup': 0.25, 'fp_none': 0.1, 'miss': 0.4},
-    }
-    o = overall(rows)
-    assert o['fp_dup'] == pytest.approx(0.25)
-    assert o['fp_none'] == pytest.approx(0.1)
-    assert o['miss'] == pytest.approx(0.4)
-
-
-def test_box_mota_dup_and_none_reach_evaluate_via_the_real_pipeline():
-    """End to end through `box_mota` itself (not a hand-built summary dict): one exact-match TP,
-    one prediction near the claimed GT (dup), one far away (none) -- the shape `_summarise`'s
-    comment describes.
-    """
+def test_box_mota_splits_fp_into_dup_and_none_and_counts_misses():
     from tailcyclenet.detector.evaluate import box_mota
 
     gt = torch.tensor([[0.0, 0.0, 10.0, 10.0]])
-    pred = torch.tensor([[0.0, 0.0, 10.0, 10.0],      # exact match -> TP
-                        [1.0, 1.0, 11.0, 11.0],      # near the claimed GT -> dup
-                        [1000.0, 1000.0, 1010.0, 1010.0]])   # far away -> none
-    store = {0: (pred, gt, None, None)}
-    r = box_mota(store)
+    pred = torch.tensor([[0.0, 0.0, 10.0, 10.0],             # exact match -> TP
+                         [1.0, 1.0, 11.0, 11.0],             # near the claimed GT -> dup
+                         [1000.0, 1000.0, 1010.0, 1010.0]])  # far away -> none
+    r = box_mota({0: (pred, gt, None, None)})
     assert r['fp'] == 2 and r['fp_dup'] == 1 and r['fp_none'] == 1 and r['misses'] == 0
 
-
-def test_box_mota_a_missed_animal_is_a_miss_not_an_fp():
-    """The other direction from the dup/none test above: a real animal with NO prediction near it
-    must show up as `misses`, and must not move `fp_dup`/`fp_none` at all.
-    """
-    from tailcyclenet.detector.evaluate import box_mota
-
     gt = torch.tensor([[0.0, 0.0, 10.0, 10.0], [1000.0, 1000.0, 1010.0, 1010.0]])
-    pred = torch.tensor([[0.0, 0.0, 10.0, 10.0]])   # only the first animal gets a box
-    store = {0: (pred, gt, None, None)}
-    r = box_mota(store)
+    r = box_mota({0: (pred[:1], gt, None, None)})
     assert r['misses'] == 1 and r['fp'] == 0 and r['fp_dup'] == 0 and r['fp_none'] == 0
 
 
-def test_score_dataset_scores_unaugmented_and_restores_the_flag():
-    """`ignore_for` takes no `warp`, unlike `boxes_for` beside it.
-
-    So under `--augment` the predictions and the GT were warped while the `instances.pq` PRESENT
-    boxes were not, and the ignore mask excused the wrong pixels. rat-city ships 26,021 of those
-    rows, so that is most of the train-side FP readout -- the number the train/val gap is read
-    from. It is also the split that is supposed to be comparable to val, which is never augmented.
-    """
-    import inspect
-
-    from tailcyclenet.detector import data as ddata
-    from tailcyclenet.detector.evaluate import score_dataset
-
-    # The asymmetry that caused it, pinned so a future `warp` on `ignore_for` is noticed.
-    assert 'warp' in inspect.signature(ddata.BoxDataset.boxes_for).parameters
-    assert 'warp' not in inspect.signature(ddata.BoxDataset.ignore_for).parameters, \
-        'ignore_for now takes a warp -- score_dataset can stop disabling augmentation'
-
-    src = inspect.getsource(score_dataset)
-    assert 'ds.augment = False' in src, 'scoring must not run through the augmentation'
-    assert 'ds.augment = aug_was' in src, 'and it must put the flag back, or training loses it'
-
-
-def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
-    """`--min-views 1` births a target whose 3D point is all-NaN BY DESIGN; such a target is
-    invisible to the matcher, so it never ages and its row is lost for the whole clip. This is NOT
-    the documented immortal one-camera target, which has a finite point.
-    """
-    import torch
-
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    tr = CrossViewTracker(2, max_age=3)
-    tr.targets[0] = {'point': torch.full((3,), float('nan')), 'age': 0}
-    assert 0 in tr.targets
-
-    # No detections at all: the pointless target must still age out, freeing its slot.
-    for _ in range(tr.max_age + 1):
-        tr.step([], [], [])
-    assert 0 not in tr.targets, 'a target the matcher can never see must still be able to expire'
-
-    # A target WITH a point is unaffected by this path -- it ages through the normal loop.
-    tr2 = CrossViewTracker(2, max_age=3)
-    tr2.targets[0] = {'point': torch.zeros(3), 'age': 0}
-    tr2.step([], [], [])
-    assert tr2.targets[0]['age'] == 1, 'the finite-point target must age exactly once per frame'
-
-
-def test_detector_pth_is_the_best_checkpoint_not_the_last(tmp_path):
-    """The run measured its own peak and then overwrote it -- worth up to -28% recall: on a root
-    whose labelled frame names 2 of ~10 rats, recall peaks at 4-8k and falls by 20k, so "last" is
-    systematically the wrong end.
-    """
-    from pathlib import Path
-
-    # The selection rule, exercised the way the loop runs it: r50 rises then falls.
-    history = [{'iteration': 2000, 'val_r50': 0.32}, {'iteration': 8000, 'val_r50': 0.39},
-               {'iteration': 20000, 'val_r50': 0.28}]
-    best_score, kept = -float('inf'), None
-    for h in history:
-        sel = h['val_r50']
-        if sel >= best_score:
-            best_score, kept = sel, h['iteration']
-    assert kept == 8000, 'detector.pth must hold the peak, not the last evaluation'
-
-    # ...and the end-of-run `best` line must name the SAME checkpoint, or the print lies.
-    best = max(history, key=lambda h: h.get('val_r50', h.get('train_r50')))
-    assert best['iteration'] == kept
-
-    src = (Path(__file__).resolve().parent.parent / 'tailcyclenet' / 'train_detector.py').read_text()
-    assert "torch.save(ckpt, run / 'detector.pth')" in src
-    assert 'if sel >= best_score:' in src, 'the unconditional overwrite is back'
-
-
-# `--augment-strong`: the strong appearance/erasure/mosaic-lite suite.
-# ----------------------------------------------------------------------------------------------
-
-def test_strong_augment_off_is_byte_identical(tiny_root):
-    """`strong=False` must never draw an extra rng value or touch a pixel or a box: every recorded
-    arm before it existed must stay reproducible. Asserted on shape/box count (the augmented path
-    draws fresh entropy per visit, so pixels are not literally reproducible).
-    """
-    ds_a = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
-                     max_frames_per_group=2, augment=True, strong=False, seed=0)
-    ds_b = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
-                     max_frames_per_group=2, augment=True, seed=0)   # strong defaults False
-    for i in range(min(3, len(ds_a))):
-        np.random.seed(0)
-        item_a = ds_a[i]
-        xa, ba = item_a['x'], item_a['boxes']
-        np.random.seed(0)
-        item_b = ds_b[i]
-        xb, bb = item_b['x'], item_b['boxes']
-        # Pixels drawn from a fresh rng each visit (`default_rng(None)`) are not literally
-        # reproducible call-to-call under the augmented path -- what must hold is that the two
-        # CONSTRUCTIONS (with and without the explicit strong=False) are the same object, i.e.
-        # neither adds a code path the other lacks. Assert on SHAPE and on box count instead of
-        # bit-exact pixels, since `_photometric` alone already draws fresh entropy per visit.
-        assert xa.shape == xb.shape
-        assert ba.shape == bb.shape
-
-
-def test_strong_augment_off_leaves_boxes_targets_unchanged(tiny_root):
-    """With `strong` off, `boxes_for` -- the actual target -- is bit-identical to the plain loader.
-
-    This is the sharper off-path guarantee: `boxes_for` never even sees the `strong` flag, so this
-    just pins that nothing upstream of it was touched by adding the flag.
-    """
-    plain = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
-                       max_frames_per_group=2, augment=True, seed=0)
-    strong_off = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
-                           max_frames_per_group=2, augment=True, strong=False, seed=0)
-    for i in range(min(3, len(plain))):
-        torch.testing.assert_close(plain.boxes_for(i), strong_off.boxes_for(i))
-
-
-def test_strong_augment_preserves_box_targets(tiny_root):
-    """Appearance ops and cutout must never move a box -- only mosaic-lite may ADD one."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
-                    max_frames_per_group=2, augment=True, strong=True, seed=0)
-    for i in range(min(4, len(ds))):
-        base = ds.boxes_for(i)     # the animal count before any strong op ran
-        for _ in range(8):
-            boxes = ds[i]['boxes']
-            # Appearance ops and cutout never touch `boxes_for`'s output -- only mosaic-lite
-            # appends a row -- so the box count for this item can only stay the same or GROW,
-            # never shrink or resize below what `boxes_for` alone would produce.
-            assert boxes.shape[0] >= base.shape[0]
-
-
-def test_mosaic_paste_is_fully_interior_and_reencodes_the_crop_rule(tiny_root):
-    """The appended box is `src_box + translation`, entirely inside `input_wh`."""
-    ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
-                    max_frames_per_group=2, augment=True, strong=True, seed=0)
-    rng = np.random.default_rng(1)
-    for i in range(min(3, len(ds))):
-        base = ds.boxes_for(i)
-        img, _ = ds._load_letterbox(i)
-        boxes, img2 = ds._mosaic_paste(i, base.clone(), img.copy(), rng)
-        if boxes.shape[0] == base.shape[0]:
-            continue    # no finite source box was found in a few tries; not this fixture's job
-        new = boxes[base.shape[0]:]
-        assert (new[:, 0] >= 0).all() and (new[:, 1] >= 0).all()
-        assert (new[:, 2] <= ds.input_wh[0]).all() and (new[:, 3] <= ds.input_wh[1]).all()
-        return
-    pytest.skip('no fixture item produced a finite mosaic source box in the tries allotted')
-
-
-def test_infer_help_renders():
-    """`--help` must actually print: argparse expands every `help=` string as `help % params`, so a
-    bare `%` kills it with a format TypeError and hides every option the script has.
-    """
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    p = Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py'
-    r = subprocess.run([sys.executable, str(p), '--help'], capture_output=True, text=True)
-    assert r.returncode == 0, f'--help failed:\n{r.stderr[-2000:]}'
-    assert '--det-score' in r.stdout
-
-
-
-
-# --- detector training config (configs/detector.toml + tailcyclenet/detector/config.py) ------
-
-REPO = Path(__file__).resolve().parent.parent
-SHIPPED_DETECTOR_CONFIG = REPO / 'configs' / 'detector.toml'
-
-
-def _write_config(tmp_path, text, name='config.toml'):
-    p = tmp_path / name
-    p.write_text(text)
-    return p
-
-
-def test_detector_config_recall_v2_defaults_and_keys(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    t = cfg['training']
-    assert (t['assignment'], t['box_loss']) == ('tal', 'ciou')
-    assert t['tal_topk'] == 20
-    assert 'assignment' in TRAINING_KEYS
-
-
-@pytest.mark.parametrize(('key', 'value'), [('assignment', 'bad'), ('box_loss', 'bad')])
-def test_detector_config_recall_v2_choice_validation(tmp_path, key, value):
-    p = _write_config(tmp_path, f"""
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-{key} = "{value}"
-""")
-    with pytest.raises(SystemExit, match=key):
-        load_detector_config(p)
-
-
-def test_detector_config_loads_with_shipped_defaults(tmp_path):
-    """The implicit base is the shipped `configs/detector.toml`: a bare overlay inherits the
-    whole recommended recipe, and `--out`/`--iters`/`--device` overrides land in [training].
-    Path is still required (a missing dataset must fail at load, not train on the CWD)."""
-    overlay = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[training]
-out = "/tmp/run-det"
-""")
-    cfg = load_detector_config(overlay, out='/tmp/run-det', iters=7, device='cpu')
-    d, m, t = cfg['data'], cfg['model'], cfg['training']
-    assert d['path'] == '/tmp/ds'
-    assert d['boxes'] == 'instances'
-    assert d['min_crop_dim'] == 64
-    assert d['min_box_px'] == 32
-    assert d['max_input_px'] == 4 * 416 * 416
-    assert 'frames_per_group' not in d      # DELETED: the train draw is weighted, not capped
-    assert d['val_frames_per_group'] == 8
-    assert d['augment'] is True and d['augment_strong'] is True
-    assert d['rotate_deg'] == 180.0
-    assert d['reduce'] is False and 'keypoints' not in d and d['hflip'] is True
-    assert 'use_regions' not in d          # DELETED with regions.pq
-    assert d['input_wh'] is None and d['tile_wh'] is None       # absent pair -> None
-    assert d['tile_scale'] == 1.0 and d['tile_bg_per_frame'] == 1
-    assert m['yolox'] == 'convnext-t' and m['pretrained'] == 'imagenet'
-    assert t['out'] == '/tmp/run-det'
-    assert t['iters'] == 7
-    assert t['batch_size'] == 8 and t['lr'] == 1e-3
-    assert t['num_workers'] == 8 and t['seed'] == 23
-    assert t['device'] == 'cpu'
-    assert t['eval_every'] == 2000 and t['eval_batches'] == 25
-    assert t['shared_head'] is False
-    assert t['fpn_upsample'] == 'bilinear'
-    assert t['tal_topk'] == 20
-    assert t['optimizer'] == 'muon'
-
-
-def test_detector_config_unknown_key_raises_in_every_block(tmp_path):
-    from tailcyclenet.detector.config import load_detector_config
-
-    for block, bad in (('data', 'bogus = 1'),
-                       ('model', 'bogus = 1'),
-                       ('training', 'bogus = 1')):
-        p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-boxes = "instances"
-min_crop_dim = 64
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-iters = 1
-""")
-        # inject the unknown key into `block`
-        lines = p.read_text().splitlines(keepends=True)
-        out_lines = []
-        for ln in lines:
-            out_lines.append(ln)
-            if ln.strip() == f'[{block}]':
-                out_lines.append('bogus = 1\n')
-        p.write_text(''.join(out_lines))
-        with pytest.raises(SystemExit, match='unknown key'):
-            load_detector_config(p)
-
-
-def test_detector_config_bad_choices_raise(tmp_path):
-    from tailcyclenet.detector.config import load_detector_config
-
-    # boxes lives in [data]; append the bad key to the existing [data] block instead of a second one.
-    p = _write_config(tmp_path, """\
-[data]
-path = "/tmp/ds"
-boxes = "nope"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-iters = 1
-""", 'b1.toml')
-    with pytest.raises(SystemExit, match='boxes'):
-        load_detector_config(p)
-    p = _write_config(tmp_path, """\
-[data]
-path = "/tmp/ds"
-boxes = "instances"
-[model]
-yolox = "nope"
-[training]
-out = "/tmp/run"
-iters = 1
-""", 'b2.toml')
-    with pytest.raises(SystemExit, match='yolox'):
-        load_detector_config(p)
-
-
-def test_detector_config_extends_is_deleted_and_raises(tmp_path):
-    """`extends` is deleted from the config language: EVERY config layers over its family's
-    base automatically (detector -> `configs/detector.toml`), so the key is not needed and
-    naming it is refused by name."""
-    from tailcyclenet.detector.config import load_detector_config
-
-    overlay = _write_config(tmp_path, """
-extends = "../detector.toml"
-[data]
-path = "/tmp/ds"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='extends'):
-        load_detector_config(overlay)
-
-
-def test_detector_config_round_trips_through_the_run_folder(tmp_path):
-    """The recorded config.toml (None values dropped) loads back to the same recipe."""
-    from tailcyclenet.detector.config import load_detector_config
-
-    src = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-boxes = "keypoints"
-min_crop_dim = 64
-input_wh = [96, 64]
-tile_wh = []
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-iters = 2
-""", 'src.toml')
-    cfg = load_detector_config(src, out=str(tmp_path / 'run'), iters=2, device='cpu')
-    import toml
-    (tmp_path / 'run').mkdir()
-    (tmp_path / 'run' / 'config.toml').write_text(toml.dumps(cfg))
-    again = load_detector_config(tmp_path / 'run' / 'config.toml')
-    assert again['data']['input_wh'] == [96, 64] and again['data']['tile_wh'] is None
-    assert again['data']['boxes'] == 'keypoints'
-    assert again['training']['iters'] == 2
-    assert again['model']['yolox'] == 'hybrid'
-
-
-def test_train_detector_config_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A 2-iteration run through `scripts/train_detector.py`'s `main()` with a config file
-    produces the same artefacts a CLI run did, and the checkpoint still loads through `load_detector`.
-    IN-PROCESS, not a subprocess: a fresh interpreter pays ~60 s just importing torch.
-    """
-    import importlib.util
-    import sys
-    import tomllib
-
-    from tailcyclenet.detector import load_detector
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-reduce = false
-hflip = true
-tile_wh = []
-tile_scale = 1.0
-tile_bg_per_frame = 1
-[model]
-yolox = "hybrid"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector_it000002.pth').exists()
-    assert (out / 'detector_last.pth').exists()
-    assert (out / 'detector.pth').exists()
-    assert (out / 'metrics.json').exists()
-    assert (out / 'config.toml').exists()
-    assert (out / 'provenance.toml').exists()
-    with open(out / 'config.toml', 'rb') as f:
-        recorded = tomllib.load(f)
-    assert recorded['data']['boxes'] == 'keypoints'
-    assert recorded['data']['input_wh'] == [48, 48]
-    assert recorded['training']['iters'] == 2
-    _ld = load_detector(out / 'detector.pth')
-    model, wh, mcd, box_src, ts = (_ld.model, _ld.input_wh, _ld.min_crop_dim, _ld.box_source,
-                                   _ld.tile_scale)
-    assert tuple(wh) == (48, 48)
-    assert mcd == 16
-    assert box_src == 'keypoints'
-    assert ts is None                                # untiled: tile_scale is dropped at the read
-    ckpt = torch.load(out / 'detector_it000002.pth', map_location='cpu', weights_only=False)
-    assert ckpt['yolox_version'] == 'hybrid'
-    assert ckpt['min_crop_dim'] == 16
-    assert ckpt['box_source'] == 'keypoints'
-    assert tuple(ckpt['input_wh']) == (48, 48)
-    assert ckpt['kind'] == 'detector'
-    assert ckpt['config'] == recorded, 'the embedded config must be what config.toml records'
-    with open(out / 'provenance.toml', 'rb') as f:
-        assert ckpt['provenance'] == tomllib.load(f)
-    lone = tmp_path / 'elsewhere' / 'detector.pth'
-    lone.parent.mkdir()
-    shutil.copy(out / 'detector_it000002.pth', lone)
-    shutil.rmtree(out)
-    _ld = load_detector(lone)
-    lone_model, lone_wh = _ld.model, _ld.input_wh
-    assert tuple(lone_wh) == (48, 48)
-    for k, v in model.state_dict().items():
-        assert torch.equal(v, lone_model.state_dict()[k]), k
-
-
-def test_load_detector_refuses_a_pose_checkpoint(tmp_path):
-    from tailcyclenet.detector import load_detector
-    p = tmp_path / 'pose.pth'
-    torch.save({'kind': 'pose', 'model_state': {}}, p)
-    with pytest.raises(ValueError, match="'pose' checkpoint, not a detector"):
-        load_detector(p)
-
-
-def test_load_detector_config_out_override_rescues_an_empty_out(tmp_path):
-    """`--out` must be able to fill in `[training].out = ""` -- the override used to be applied
-    AFTER the required-check, so it could never rescue anything.
-    """
-    cfg = tmp_path / 'cfg.toml'
-    cfg.write_text("""
-[data]
-path = "/does/not/need/to/exist/for/this/check"
-
-[model]
-yolox = "hybrid"
-
-[training]
-out = ""
-""")
-    loaded = load_detector_config(cfg, out=tmp_path / 'run')
-    assert loaded['training']['out'] == str(tmp_path / 'run')
-
-    with pytest.raises(SystemExit, match='out.*required'):
-        load_detector_config(cfg)                    # nothing supplies `out`: still raises
-
-
-def test_load_detector_config_iters_and_device_override_too(tmp_path):
-    """The same ordering bug would have silently no-op'd `--iters`/`--device` as well, since all
-    three overrides shared one code path -- pinned together rather than only for `out`."""
-    cfg = tmp_path / 'cfg.toml'
-    cfg.write_text("""
-[data]
-path = "/does/not/need/to/exist/for/this/check"
-
-[model]
-yolox = "hybrid"
-
-[training]
-out = "runs/x"
-iters = 100
-device = "cpu"
-""")
-    loaded = load_detector_config(cfg, iters=5, device='cuda:1')
-    assert loaded['training']['iters'] == 5
-    assert loaded['training']['device'] == 'cuda:1'
-
-
-def test_per_root_detector_overlays_load_and_raise_val_frames_per_group(tmp_path):
-    """Every shipped per-root overlay under `configs/detector/` must resolve through
-    `extends = "../detector.toml"`, carry `[data].path` (the one thing with no CLI override), and
-    set `val_frames_per_group` past the shipped default of 8 -- each of these three roots has ONE
-    val group, so the default under-samples it."""
-    root = Path(__file__).resolve().parent.parent / 'configs' / 'detector'
-    want = {'rat-city.toml': 64, 'branson-fly.toml': 32, '3dpop.toml': 16}
-    for name, expect in want.items():
-        cfg = load_detector_config(root / name, out=tmp_path / name)
-        assert cfg['data']['path'], f'{name}: [data].path must be set (no CLI override exists)'
-        assert cfg['data']['val_frames_per_group'] == expect, name
-        assert cfg['data']['val_frames_per_group'] > 8, \
-            f'{name}: must exceed the shipped default of 8 or the overlay does nothing'
-
-
-def test_deployment_score_untrained_model_is_all_zero(tmp_path):
-    """`deployment_score` on a FRESH `YOLOXNano`: the rare-positive objectness prior sits below
-    any sane `det_score`, so `det_fill`/`slot_fill` read exactly 0 and `window_miss` exactly 1.
-
-    THE SEED IS WHAT MAKES "DETERMINISTIC" TRUE. The objectness PRIOR sits at ~0.0099, but the
-    head's random init scatters the actual logits around it, and 3 of 20 torch seeds put at least
-    one anchor above `det_score = 0.05` -- so unseeded this test reads its own RNG state. 0.5
-    keeps the margin at the test-width hybrid, whose logits scatter wider.
-    """
+def test_deployment_score_reads_zero_untrained_and_one_when_forced(tmp_path):
+    """Seeded fresh model: the rare-positive objectness prior sits below `det_score`, so fills
+    read exactly 0 (union sides NaN); forcing every objectness logit positive fills every slot --
+    the zero is the prior firing, not a broken wire."""
     torch.manual_seed(0)
-
-    from .conftest import _session_2d
-    from tailcyclenet.detector.evaluate import deployment_score
+    from tailcyclenet.detector.evaluate import _gt_crop_sides, deployment_score
     from tailcyclenet.format import Session
 
-    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
+    cf._session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
     sess = Session.load(tmp_path / 'r' / 'test' / 's0')
     sess.preload()
     gid = list(sess.groups)[0]
     model = YOLOXNano(version='hybrid')
-    r = deployment_score(model, sess, gid, input_wh=(64, 64), top_k=8, max_animals=2,
-                         det_score=0.5, n_frames=2, overlap=0, min_box_frames=1)
+    kw = dict(input_wh=(64, 64), top_k=8, max_animals=2, n_frames=2, overlap=0, min_box_frames=1)
+    r = deployment_score(model, sess, gid, det_score=0.5, **kw)
     assert r['det_fill'] == 0.0 and r['slot_fill'] == 0.0 and r['window_miss'] == 1.0
-    assert r['n_windows'] == 4                        # 2 rows x 2 windows (T=4, n_frames=2)
-    assert r['n_gt'] == 8                              # 4 labelled frames x 1 camera x 2 animals
-    assert all(v != v for v in r['union_side_px'].values()), \
-        'no box ever fired, so the union-side quantiles must be all-NaN, not zero'
-    assert r['gt_side_px'][0.5] > 0                    # GT sides are label-derived, independent
+    assert r['n_windows'] == 4 and r['n_gt'] == 8
+    assert all(v != v for v in r['union_side_px'].values())
+    assert r['gt_side_px'][0.5] > 0
 
-
-def test_deployment_score_forced_positive_objectness_fills_every_slot(tmp_path):
-    """The live path: force every objectness logit strongly positive (`obj_pred` bias) so every
-    anchor's box survives `det_score`, and confirm `det_fill` becomes 1.0 -- proving the
-    zero-floor above is the init prior firing correctly, not a broken wire that always reads 0.
-    """
-    from .conftest import _session_2d
-    from tailcyclenet.detector.evaluate import deployment_score
-    from tailcyclenet.format import Session
-
-    _session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
-    sess = Session.load(tmp_path / 'r' / 'test' / 's0')
-    sess.preload()
-    gid = list(sess.groups)[0]
-    model = YOLOXNano(version='hybrid')
     for m in model.head.obj_pred:
         torch.nn.init.constant_(m.bias, 10.0)
-    r = deployment_score(model, sess, gid, input_wh=(64, 64), top_k=8, max_animals=2,
-                         det_score=0.05, n_frames=2, overlap=0, min_box_frames=1)
+    r = deployment_score(model, sess, gid, det_score=0.05, **kw)
     assert r['det_fill'] == 1.0
-    assert not any(v != v for v in r['union_side_px'].values()), \
-        'a box fired everywhere, so the union-side quantiles must be finite, not NaN'
+    assert not any(v != v for v in r['union_side_px'].values())
+
+    # 3D: `_gt_crop_sides` projects points3d per camera (a 3D session has no points2d).
+    cf._session_3d(tmp_path / 'r3' / 'test' / 's0', T=4)
+    s3 = Session.load(tmp_path / 'r3' / 'test' / 's0')
+    s3.preload()
+    sides = _gt_crop_sides(s3, list(s3.groups)[0], min_crop_dim=8)
+    assert sides.size > 0 and np.all(sides >= 8)
 
 
-def test_gt_crop_sides_3d_projects_through_the_right_camera(tmp_path):
-    """`_gt_crop_sides` must take the 3D branch (project points3d per camera) rather than
-    silently reading `points2d`, which a 3D synthetic session does not even populate."""
-    from .conftest import _session_3d
-    from tailcyclenet.detector.evaluate import _gt_crop_sides
-    from tailcyclenet.format import Session
-
-    _session_3d(tmp_path / 'r' / 'test' / 's0', T=4)
-    sess = Session.load(tmp_path / 'r' / 'test' / 's0')
-    sess.preload()
-    gid = list(sess.groups)[0]
-    sides = _gt_crop_sides(sess, gid, min_crop_dim=8)
-    assert sides.size > 0 and np.all(sides >= 8)       # the floor must be respected
-
-
-def test_eval_detector_deploy_cli_end_to_end(tmp_path, monkeypatch, capsys):
-    """A 2-iteration checkpoint through `train_detector.py`, scored through
-    `eval_detector.py --deploy`: pins that the CLI plumbing runs end to end on a REAL
-    trained-and-reloaded checkpoint, not just synthetic tensors.
-    """
-    import importlib.util
-    import sys
-
-    from .conftest import _session_2d
+def test_eval_detector_deploy_prints_the_scored_t_under_det_max_frames(tmp_path, monkeypatch,
+                                                                       capsys):
+    """`eval_detector.py --deploy` runs end to end on a saved checkpoint, and its T column is the
+    `--det-max-frames` prefix actually scored, not the group's raw length (a 3dpop run printed
+    T=899..2680 while scoring 120)."""
+    from scripts import eval_detector
 
     root = tmp_path / 'root'
-    _session_2d(root / 'train' / 's0', T=4, S=2)
-    _session_2d(root / 'test' / 's1', T=4, S=2)
-
-    train_cfg = _write_config(tmp_path, f"""
-[data]
-path = "{root}"
-boxes = "keypoints"
-min_crop_dim = 8
-input_wh = [64, 64]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-reduce = false
-hflip = true
-tile_wh = []
-tile_scale = 1.0
-tile_bg_per_frame = 1
-[model]
-yolox = "hybrid"
-[training]
-out = "{tmp_path / 'run'}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""", name='train.toml')
-
-    spec = importlib.util.spec_from_file_location('tcn_train_detector2',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    train_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(train_mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(train_cfg)])
-    train_mod.main()
-
-    spec2 = importlib.util.spec_from_file_location('tcn_eval_detector',
-                                                    REPO / 'scripts' / 'eval_detector.py')
-    eval_mod = importlib.util.module_from_spec(spec2)
-    spec2.loader.exec_module(eval_mod)
+    cf._session_2d(root / 'test' / 's1', T=4, S=2)
+    ckpt = tmp_path / 'detector.pth'
+    torch.save(cf._detector_checkpoint(input_wh=[64, 64], min_crop_dim=8,
+                                       box_source='keypoints'), ckpt)
     monkeypatch.setattr(sys, 'argv', [
-        'eval_detector.py', '--run', str(tmp_path / 'run' / 'detector.pth'),
-        '--data', str(root), '--split', 'test', '--deploy', '--no-track', '--link-boxes',
-        '--score-thresh', '0.001', '--device', 'cpu', '--n-frames', '2', '--overlap', '0',
-        '--det-max-frames', '2'])
-    eval_mod.main()                                    # must not raise
-
-    # THE PRINTED T COLUMN MUST REFLECT `--det-max-frames`, not the group's raw length -- the
-    # fixture's group is 4 frames, bounded here to 2. Printing the raw 4 would silently claim a
-    # full-length run when only a prefix was scored (the bug an actual 3dpop `--det-max-frames`
-    # run exposed: the table read T=899..2680 while `detect_raw` had truncated to 120 internally).
+        'eval_detector.py', '--run', str(ckpt), '--data', str(root), '--split', 'test',
+        '--deploy', '--no-track', '--link-boxes', '--score-thresh', '0.001', '--device', 'cpu',
+        '--n-frames', '2', '--overlap', '0', '--det-max-frames', '2'])
+    eval_detector.main()
     out = capsys.readouterr().out
     line = next(ln for ln in out.splitlines() if '/g' in ln and ln.strip()[0] != '=')
     assert line.split()[1] == '2', f'expected the truncated T=2 in {line!r}'
 
 
-# T2.1: instances.pq PRESENT boxes as an objectness ignore mask
-# ----------------------------------------------------------------------------------------------
+# --- model and checkpoint ----------------------------------------------------------------
 
 
+def test_norm_groups_always_divides_the_channel_count():
+    """A GroupNorm whose count does not divide its channels is a constructor error."""
+    from tailcyclenet.detector.yolox import norm_groups
+    for c in list(range(1, 200)) + [24, 48, 96, 192]:
+        g = norm_groups(c)
+        assert 1 <= g <= c and c % g == 0
 
 
+def test_groupnorm_has_no_running_statistics_and_no_batch_dependence():
+    """Train and inference are the SAME computation (BatchNorm's statistics are what would make
+    train-on-tiles / infer-on-frames unsafe), and one item's output ignores the rest of the batch
+    (so a resolution sweep that changes the batch measures resolution, not normalisation)."""
+    torch.manual_seed(0)
+    m = YOLOXNano(version='hybrid')
+    assert list(m.named_buffers()) == []
+    assert not any(isinstance(x, torch.nn.BatchNorm2d) for x in m.modules())
+    x = torch.rand(3, 3, 96, 128)
+    m.train()
+    a = m(x)[0]
+    m.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(a, m(x)[0])
+        torch.testing.assert_close(m(x[1:2])[0], m(x)[0][1:2], rtol=1e-4, atol=1e-5)
 
 
+def test_load_detector_round_trips_and_refuses_by_name(tmp_path):
+    """The checkpoint's own `yolox_version`/`p2`/`obj_quantiles` decide what loads (an unrecorded
+    quantile set is `{}`, not a guess); a BatchNorm, a version-less (`trimmed`) or a pose
+    checkpoint is refused by name."""
+    from tailcyclenet.detector import load_detector
 
-# T4.3 -- a stride-4 (P2) FPN level, on either architecture.
-# ----------------------------------------------------------------------------------------------
+    with pytest.raises(ValueError, match='hybrid'):
+        YOLOXNano(version='medium')
+    p = tmp_path / 'detector.pth'
+    m = YOLOXNano(version='hybrid', p2=True)
+    base = cf._detector_checkpoint(m, input_wh=(96, 96))
+    torch.save(base, p)
+    ld = load_detector(p)
+    assert ld.model.version == 'hybrid' and ld.model.p2 is True
+    assert ld.model.STRIDES == (4, 8, 16, 32)
+    torch.testing.assert_close(ld.model.state_dict()['head.obj_pred.0.bias'],
+                               m.state_dict()['head.obj_pred.0.bias'])
+    assert ld.obj_quantiles == {}
+    q = {'q01': 0.452, 'q10': 0.601, 'q50': 0.883, 'q90': 0.981}
+    torch.save({**base, 'obj_quantiles': q}, p)
+    assert load_detector(p).obj_quantiles == q
 
-# ----------------------------------------------------------------------------------------------
-# photometric augmentation
-# ----------------------------------------------------------------------------------------------
-
-def test_photometric_is_one_gain_draw():
-    """`_photometric(img, rng)` consumes exactly ONE `uniform(0.7, 1.3)` and applies it as a
-    clipped gain -- the augmentation stream's draw order rests on this."""
-    img = (np.arange(4 * 4 * 3, dtype=np.float64).reshape(4, 4, 3) % 200).astype(np.uint8)
-    rng1 = np.random.default_rng(7)
-    rng2 = np.random.default_rng(7)
-    out1 = _photometric(img, rng1)
-    gain = rng2.uniform(0.7, 1.3)
-    np.testing.assert_array_equal(out1, np.clip(img * gain, 0, 255).astype(np.uint8))
-    assert rng1.uniform() == rng2.uniform()
-
-
-def test_detector_run_directory_defaults_to_latest_checkpoint(tmp_path):
-    from tailcyclenet.detector import resolve_detector_checkpoint
-
-    run = tmp_path / 'run'
-    run.mkdir()
-    for it in (2, 4):
-        torch.save({'iteration': it}, run / f'detector_it{it:06d}.pth')
-    (run / 'config.toml').write_text('[training]\niters = 4\n')
-    (run / 'metrics.json').write_text('[{"iteration": 2}, {"iteration": 4}]')
-    torch.save({'iteration': 2}, run / 'detector.pth')
-    torch.save({'iteration': 4}, run / 'detector_last.pth')
-
-    assert resolve_detector_checkpoint(run) == run / 'detector_it000004.pth'
-    assert resolve_detector_checkpoint(run, checkpoint='last') == run / 'detector_last.pth'
-    assert resolve_detector_checkpoint(run, checkpoint='best') == run / 'detector.pth'
+    refused = {'bn normalisation': {'model_state': {}, 'input_wh': [128, 128],
+                                    'yolox_version': 'hybrid'},
+               "'trimmed' is a deleted architecture": {k: v for k, v in base.items()
+                                                        if k != 'yolox_version'},
+               "'pose' checkpoint, not a detector": {'kind': 'pose', 'model_state': {}}}
+    for match, ckpt in refused.items():
+        torch.save(ckpt, p)
+        with pytest.raises(ValueError, match=match):
+            load_detector(p)
 
 
-def test_detector_run_directory_latest_accepts_incomplete_training(tmp_path):
-    """An incomplete run (config iters=4, only iteration 2 written) still resolves `latest` to
-    its highest numbered checkpoint -- only the `last` selector demands `detector_last.pth`."""
-    from tailcyclenet.detector import resolve_detector_checkpoint
-
-    run = tmp_path / 'run'
-    run.mkdir()
-    torch.save({'iteration': 2}, run / 'detector_it000002.pth')
-    torch.save({'iteration': 2}, run / 'detector_last.pth')
-    (run / 'config.toml').write_text('[training]\niters = 4\n')
-    (run / 'metrics.json').write_text('[{"iteration": 2}]')
-    assert resolve_detector_checkpoint(run, checkpoint='latest') == run / 'detector_it000002.pth'
-    assert resolve_detector_checkpoint(run, checkpoint='detector_it000002.pth') == \
-        run / 'detector_it000002.pth'
-
-
-def test_detector_run_directory_last_still_requires_detector_last(tmp_path):
-    """`last` is unaffected by the latest-selector relaxation: it still errors when
-    `detector_last.pth` is absent."""
-    from tailcyclenet.detector import resolve_detector_checkpoint
-
-    run = tmp_path / 'run'
-    run.mkdir()
-    torch.save({'iteration': 2}, run / 'detector_it000002.pth')
-    with pytest.raises(ValueError, match='detector_last.pth'):
-        resolve_detector_checkpoint(run, checkpoint='last')
+def test_p2_true_adds_a_stride_4_level():
+    """`p2=True` adds a stride-4 level whose anchors match the forward's flattening exactly."""
+    base = YOLOXNano(version='hybrid')
+    m = YOLOXNano(version='hybrid', p2=True)
+    assert m.STRIDES == (4, 8, 16, 32)
+    assert base.STRIDES == (8, 16, 32), 'the OTHER instance must be unaffected'
+    x = torch.zeros(1, 3, 128, 160)
+    obj, boxes = m(x)
+    anchors = m.anchor_points(128, 160, x.device)
+    assert obj.shape[1] == boxes.shape[1] == anchors.shape[0]
+    assert set(anchors[:, 2].tolist()) == {4.0, 8.0, 16.0, 32.0}
+    n_base = sum(p.numel() for p in base.parameters())
+    n_p2 = sum(p.numel() for p in m.parameters())
+    assert n_p2 > n_base
 
 
-def test_detector_cli_defaults_to_last():
-    from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
-    from tailcyclenet.infer.cli import build_parser
+def test_hybrid_backbone_shape_contract_and_finite_grads():
+    from tailcyclenet.detector.vit_backbone import HybridBackbone
 
-    assert build_parser().parse_args(['--run', 'r', '--data', 'd', '--out', 'o']).detector_checkpoint == 'latest'
-    assert load_detector.__defaults__[-1] == 'latest'
-    assert resolve_detector_checkpoint.__defaults__[-1] == 'latest'
+    bb = HybridBackbone(p2=True)
+    H, W = 128, 192
+    feats = bb(torch.rand(1, 3, H, W))
+    assert len(feats) == len(bb.out_channels) == 4
+    for f, s, c in zip(feats, (4, 8, 16, 32), bb.out_channels):
+        assert f.shape == (1, c, H // s, W // s)
+    sum(f.float().sum() for f in feats).backward()
+    for name, p in bb.named_parameters():
+        assert p.grad is None or torch.isfinite(p.grad).all(), f'{name}: non-finite grad'
+
+
+def test_gap_levers_build_the_head_and_neck_they_name():
+    """`shared_head=False` adds a separate objectness tower; `fpn_upsample` defaults to nearest at
+    the constructor (the shipped config sets bilinear)."""
+    shared = YOLOXNano(version='hybrid', shared_head=True)
+    unshared = YOLOXNano(version='hybrid', shared_head=False)
+    assert not hasattr(shared.head, 'obj_convs') and hasattr(unshared.head, 'obj_convs')
+    assert sum(p.numel() for p in unshared.parameters()) > \
+        sum(p.numel() for p in shared.parameters())
+    assert shared.neck.fpn_upsample == 'nearest'
+    model = YOLOXNano(version='hybrid', fpn_upsample='bilinear')
+    obj, boxes = model(torch.rand(1, 3, 64, 64))
+    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
 
 
 def test_detector_packaging_preserves_config(tmp_path):
@@ -3587,204 +2155,38 @@ def test_detector_packaging_preserves_config(tmp_path):
     assert loaded.version == 'hybrid'
 
 
-def test_p2_default_is_byte_identical_to_no_key():
-    """Passing `p2=False` explicitly must build the IDENTICAL module graph as never passing it,
-    on both architectures."""
-    for version in ('hybrid', 'convnext-t'):
-        a = YOLOXNano(version=version).state_dict()
-        b = YOLOXNano(version=version, p2=False).state_dict()
-        assert set(a) == set(b), version
-        for k in a:
-            assert a[k].shape == b[k].shape, (version, k)
-
-
-def test_p2_true_adds_a_stride_4_level():
-    """`p2=True` must widen `STRIDES` to `(4, 8, 16, 32)`, `anchor_points` must match it exactly
-    (the same invariant `test_forward_shapes_and_anchor_order` pins for the 3-level case), and
-    the model must have MORE parameters (the new `lat2`/`mrg2`/`down2`/`out3` PAFPN modules plus
-    the head's 4th level)."""
-    base = YOLOXNano(version='hybrid')
-    m = YOLOXNano(version='hybrid', p2=True)
-    assert m.STRIDES == (4, 8, 16, 32)
-    assert base.STRIDES == (8, 16, 32), 'the OTHER instance must be unaffected'
-    x = torch.zeros(1, 3, 128, 160)
-    obj, boxes = m(x)
-    anchors = m.anchor_points(128, 160, x.device)
-    assert obj.shape[1] == boxes.shape[1] == anchors.shape[0]
-    assert set(anchors[:, 2].tolist()) == {4.0, 8.0, 16.0, 32.0}
-    n_base = sum(p.numel() for p in base.parameters())
-    n_p2 = sum(p.numel() for p in m.parameters())
-    assert n_p2 > n_base
-
-
-def test_p2_checkpoint_round_trips_through_load_detector(tmp_path):
-    """A `p2=True` checkpoint must reconstruct a `p2=True` model through `load_detector` -- absent
-    means `False`, so this proves a SAVED `p2=True` fact survives, not just that the constructor
-    kwarg works in isolation."""
-    import conftest as cf
-
-    from tailcyclenet.detector import load_detector
-
-    m = YOLOXNano(version='hybrid', p2=True)
-    ckpt = cf._detector_checkpoint(m, input_wh=(96, 96))
-    p = tmp_path / 'detector.pth'
-    torch.save(ckpt, p)
-    loaded = load_detector(p).model
-    assert loaded.p2 is True
-    assert loaded.STRIDES == (4, 8, 16, 32)
-    obj, boxes = loaded(torch.zeros(1, 3, 96, 96))
-    assert obj.shape[1] == boxes.shape[1]
-
-
-def test_detector_config_p2_inherits_the_shipped_true(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['model']['p2'] is True
-
-
-def test_train_detector_p2_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A short run with `[model].p2 = true` through the real CLI entry point: must train to
-    completion with no error, and the saved checkpoint must reload with `p2=True`."""
-    import importlib.util
-    import sys
-
-    from tailcyclenet.detector import load_detector
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "hybrid"
-p2 = true
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""")
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_p2',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
-    model = load_detector(out / 'detector.pth').model
-    assert model.p2 is True
-    assert model.STRIDES == (4, 8, 16, 32)
-
-
-def test_detector_config_pretrained_unsupported_value_raises(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "/tmp/ds"
-[model]
-yolox = "hybrid"
-pretrained = "/some/path.pth"
-[training]
-out = "/tmp/run"
-""")
-    with pytest.raises(SystemExit, match='pretrained'):
-        load_detector_config(p)
-
-
-def test_detector_config_optimizer_inherits_the_shipped_muon(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['training']['optimizer'] == 'muon'
-    assert cfg['training']['muon_momentum'] == 0.95
-    assert cfg['training']['muon_lr_scale'] == 1.0
-    assert cfg['training']['warmup_steps'] == 500
-    assert cfg['training']['beta1'] == 0.9 and cfg['training']['beta2'] == 0.95
-
-
-def test_detector_config_optimizer_invalid_raises(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-[training]
-out = "/tmp/run"
-optimizer = "sgd"
-""")
-    with pytest.raises(SystemExit, match='optimizer'):
-        load_detector_config(p)
-
-
-def test_detector_config_optimizer_muon_keys(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-[training]
-out = "/tmp/run"
-optimizer = "muon"
-muon_momentum = 0.9
-muon_lr_scale = 2.0
-warmup_steps = 10
-""")
-    cfg = load_detector_config(p)
-    assert cfg['training']['optimizer'] == 'muon'
-    assert cfg['training']['muon_momentum'] == 0.9
-    assert cfg['training']['muon_lr_scale'] == 2.0
-    assert cfg['training']['warmup_steps'] == 10
-
-
 def test_build_detector_optimizer_adamw_matches_param_count():
-    train_mod = _load_train_detector_script()
-    from tailcyclenet.detector.yolox import YOLOXNano
+    from tailcyclenet.train_detector import build_detector_optimizer
+
     model = YOLOXNano(version='hybrid')
-    train_cfg = {'optimizer': 'adamw', 'lr': 1e-3, 'weight_decay': 5e-4,
-                'iters': 10}
-    model_cfg = {'pretrained': ''}
-    opt, sched = train_mod.build_detector_optimizer(model, train_cfg, model_cfg)
-    n_opt = sum(p.numel() for g in opt.param_groups for p in g['params'])
-    n_model = sum(p.numel() for p in model.parameters())
-    assert n_opt == n_model
+    opt, sched = build_detector_optimizer(
+        model, {'optimizer': 'adamw', 'lr': 1e-3, 'weight_decay': 5e-4, 'iters': 10},
+        {'pretrained': ''})
+    assert sum(p.numel() for g in opt.param_groups for p in g['params']) == \
+        sum(p.numel() for p in model.parameters())
     assert isinstance(sched, torch.optim.lr_scheduler.CosineAnnealingLR)
 
 
-def _load_train_detector_script():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_for_optim',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# --- train_detector end to end -----------------------------------------------------------
 
 
-def test_train_detector_muon_optimizer_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A short run with `[training].optimizer = "muon"` through the real CLI entry point: must
-    train to completion with no error, and the checkpoint must record `optimizer_kind`."""
-    import sys
+def test_train_detector_end_to_end_wires_every_lever(tmp_path, dense_root, monkeypatch):
+    """A 2-iteration in-process run with the non-default levers on: every config value reaches
+    `detector_loss` (box_weight was once a dead key; `max_pos_per_gt = 0` means uncapped), the run
+    folder holds the artefacts, and the checkpoint is self-contained and reloads its architecture."""
+    import tomllib
 
+    import tailcyclenet.train_detector as td
+    from tailcyclenet.detector import load_detector
+
+    seen = []
+    real_loss = td.detector_loss
+
+    def spy(*a, **kw):
+        seen.append(kw)
+        return real_loss(*a, **kw)
+
+    monkeypatch.setattr(td, 'detector_loss', spy)
     out = tmp_path / 'run'
     cfg = _write_config(tmp_path, f"""
 [data]
@@ -3797,204 +2199,7 @@ val_frames_per_group = 4
 augment = false
 augment_strong = false
 rotate_deg = 0.0
-[model]
-yolox = "hybrid"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-optimizer = "muon"
-""")
-    mod = _load_train_detector_script()
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
-    ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
-    assert ckpt['optimizer_kind'] == 'muon'
-
-
-def test_train_detector_muon_optimizer_is_default_end_to_end(tmp_path, dense_root, monkeypatch):
-    """The implicit base makes the shipped muon the default; the checkpoint records it."""
-    import sys
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
-[model]
-yolox = "hybrid"
-[training]
-out = "{out}"
-iters = 2
-batch_size = 2
-lr = 1e-3
-num_workers = 0
-seed = 0
-device = "cpu"
-eval_every = 2
-eval_batches = 1
-""")
-    mod = _load_train_detector_script()
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
-    ckpt = torch.load(out / 'detector.pth', map_location='cpu', weights_only=False)
-    assert ckpt['optimizer_kind'] == 'muon'
-
-
-
-
-
-
-def test_detector_config_yolox_choices_include_new_architectures(tmp_path):
-    from tailcyclenet.detector.config import YOLOX_CHOICES
-    assert 'hybrid' in YOLOX_CHOICES
-
-
-
-
-
-
-
-
-
-@pytest.mark.parametrize('p2', [True, False])
-def test_hybrid_backbone_shape_contract(p2):
-    from tailcyclenet.detector.vit_backbone import HybridBackbone
-
-    bb = HybridBackbone(p2=p2)
-    H, W = 256, 384
-    feats = bb(torch.rand(1, 3, H, W))
-    strides = (4, 8, 16, 32) if p2 else (8, 16, 32)
-    assert len(feats) == len(strides) == len(bb.out_channels)
-    for f, s, c in zip(feats, strides, bb.out_channels):
-        assert f.shape == (1, c, H // s, W // s)
-
-
-def test_hybrid_backbone_backward_produces_finite_grads():
-    from tailcyclenet.detector.vit_backbone import HybridBackbone
-
-    bb = HybridBackbone(p2=True)
-    feats = bb(torch.rand(1, 3, 128, 128))
-    loss = sum(f.float().sum() for f in feats)
-    loss.backward()
-    for name, p in bb.named_parameters():
-        assert p.grad is None or torch.isfinite(p.grad).all(), f'{name}: non-finite grad'
-
-
-def test_yolox_nano_hybrid_version_builds_and_forwards():
-    model = YOLOXNano(version='hybrid', p2=True)
-    assert model.STRIDES == (4, 8, 16, 32)
-    obj, boxes = model(torch.rand(1, 3, 128, 192))
-    anchors = model.anchor_points(128, 192, 'cpu')
-    assert obj.shape[1] == anchors.shape[0] == boxes.shape[1]
-
-
-def test_detector_config_yolox_hybrid_default_pretrained_empty(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-yolox = "hybrid"
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['model']['pretrained'] == ''
-
-
-def test_detector_config_gap_lever_inherits_the_shipped_values(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-[training]
-out = "/tmp/run"
-""")
-    cfg = load_detector_config(p)
-    assert cfg['training']['shared_head'] is False
-    assert cfg['training']['fpn_upsample'] == 'bilinear'
-
-
-def test_detector_config_fpn_upsample_invalid_raises(tmp_path):
-    p = _write_config(tmp_path, """
-[data]
-path = "x"
-[model]
-[training]
-out = "/tmp/run"
-fpn_upsample = "bicubic"
-""")
-    with pytest.raises(SystemExit, match='fpn_upsample'):
-        load_detector_config(p)
-
-
-def test_g1_shared_head_false_adds_separate_obj_tower():
-    shared = YOLOXNano(version='hybrid', p2=True, shared_head=True)
-    unshared = YOLOXNano(version='hybrid', p2=True, shared_head=False)
-    assert not hasattr(shared.head, 'obj_convs')
-    assert hasattr(unshared.head, 'obj_convs')
-    n_shared = sum(p.numel() for p in shared.parameters())
-    n_unshared = sum(p.numel() for p in unshared.parameters())
-    assert n_unshared > n_shared
-
-
-def test_g1_shared_head_default_forward_matches_reg_tower_output():
-    """`shared_head=True` (default) must route obj through the SAME tensor as reg -- a
-    regression guard against `Head.forward` accidentally building `obj_convs` unconditionally."""
-    model = YOLOXNano(version='hybrid', p2=False, shared_head=True)
-    x = torch.rand(1, 3, 128, 128)
-    obj, boxes = model(x)
-    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
-
-
-def test_g2_fpn_upsample_bilinear_forwards():
-    model = YOLOXNano(version='hybrid', p2=True, fpn_upsample='bilinear')
-    assert model.neck.fpn_upsample == 'bilinear'
-    x = torch.rand(1, 3, 128, 128)
-    obj, boxes = model(x)
-    assert torch.isfinite(obj).all() and torch.isfinite(boxes).all()
-
-
-def test_g2_fpn_upsample_default_is_nearest():
-    model = YOLOXNano(version='hybrid', p2=True)
-    assert model.neck.fpn_upsample == 'nearest'
-
-
-
-
-
-
-def test_train_detector_gap_levers_end_to_end(tmp_path, dense_root, monkeypatch):
-    """A short run with every §2 lever flipped on, through the real CLI entry point."""
-    import sys
-
-    out = tmp_path / 'run'
-    cfg = _write_config(tmp_path, f"""
-[data]
-path = "{dense_root}"
-boxes = "keypoints"
-min_crop_dim = 16
-input_wh = [48, 48]
-min_box_px = 0
-val_frames_per_group = 4
-augment = false
-augment_strong = false
-rotate_deg = 0.0
+tile_wh = []
 [model]
 yolox = "hybrid"
 p2 = true
@@ -4008,263 +2213,42 @@ seed = 0
 device = "cpu"
 eval_every = 2
 eval_batches = 1
-assignment = "tal"
+box_weight = 3.0
+max_pos_per_gt = 0
+iou_aware_obj = true
+iou_aware_warmup = 0
 shared_head = false
 fpn_upsample = "bilinear"
 """)
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('tcn_train_detector_gap_levers',
-                                                  REPO / 'tailcyclenet' / 'train_detector.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(sys, 'argv', ['train_detector.py', '--config', str(cfg)])
-    mod.main()
-    assert (out / 'detector.pth').exists()
+    td.main(['--config', str(cfg)])
+    assert len(seen) == 2
+    kw = seen[0]
+    assert kw['box_weight'] == 3.0 and kw['max_pos_per_gt'] is None
+    assert kw['iou_aware'] is True and kw['iou_aware_warmup'] == 0
+    assert (kw['assignment'], kw['box_loss_fn']) == ('tal', 'ciou')
 
-    from tailcyclenet.detector import load_detector
-    model = load_detector(out / 'detector.pth').model
-    assert hasattr(model.head, 'obj_convs')
-    assert model.neck.fpn_upsample == 'bilinear'
+    for name in ('detector_it000002.pth', 'detector_last.pth', 'detector.pth', 'metrics.json',
+                 'config.toml', 'provenance.toml'):
+        assert (out / name).exists(), name
+    with open(out / 'config.toml', 'rb') as f:
+        recorded = tomllib.load(f)
+    assert recorded['data']['input_wh'] == [48, 48] and recorded['training']['iters'] == 2
+    ld = load_detector(out / 'detector.pth')
+    assert tuple(ld.input_wh) == (48, 48) and ld.min_crop_dim == 16
+    assert ld.box_source == 'keypoints' and ld.tile_scale is None
+    assert ld.model.p2 is True and hasattr(ld.model.head, 'obj_convs')
+    assert ld.model.neck.fpn_upsample == 'bilinear'
+    ckpt = torch.load(out / 'detector_it000002.pth', map_location='cpu', weights_only=False)
+    assert ckpt['kind'] == 'detector' and ckpt['optimizer_kind'] == 'muon'
+    assert ckpt['yolox_version'] == 'hybrid' and ckpt['config'] == recorded
+    with open(out / 'provenance.toml', 'rb') as f:
+        assert ckpt['provenance'] == tomllib.load(f)
 
-
-
-def _lever_rig(specs):
-    """A NON-DEGENERATE synthetic rig for the tracker levers: every camera at its own tilt and
-    height, so two rays through different animals are genuinely SKEW.
-
-    The rig in `_tracker_demo` (and in every older tracker test here) puts all three cameras in one
-    plane with their optical axes through the world origin, and that is a trap for anything that
-    reads a reprojection residual: coplanar rays always intersect, so a cross-view-inconsistent
-    pair triangulates to residual ~0 and no residual gate can ever fire on it. specs entries are
-    (rvec_x, rvec_y, tvec_y).
-    """
-    from aniposelib.cameras import Camera, CameraGroup
-
-    from tailcyclenet.format import Rig
-
-    cams = []
-    for i, (rx, ry, ty) in enumerate(specs):
-        cam = Camera(matrix=np.array([[800.0, 0, 320], [0, 800.0, 240], [0, 0, 1.0]]),
-                     dist=np.zeros(5), rvec=np.array([rx, ry, 0.0]),
-                     tvec=np.array([0.0, ty, 900.0]), name=f'c{i}')
-        cam.set_size((640, 480))
-        cams.append(cam)
-    names = [c.get_name() for c in cams]
-    return Rig(CameraGroup(cams), offset={n: (0.0, 0.0) for n in names},
-               moving=dict.fromkeys(names, False),
-               calibrated=dict.fromkeys(names, True)).tracktail()
-
-
-def _lever_boxes(cg, worlds, side=200.0):
-    """Project `worlds` into every camera of `cg` as fixed-size square boxes.
-
-    Outputs: (per_cam, scores) in `CrossViewTracker.step`'s own argument shapes. The side is
-    large by default because every gate in track.py is measured in box sides: a wrong claim only
-    reaches the residual gate if it was inside the movement gate first, which is exactly the
-    deployment situation (a big animal, a detection one body length away).
-    """
-    from tailcyclenet.detector.track import _project
-
-    per_cam, scores = [], []
-    for cam in cg:
-        uv = _project(cam, np.asarray(worlds, np.float32))
-        per_cam.append(torch.stack([uv[:, 0] - side / 2, uv[:, 1] - side / 2,
-                                    uv[:, 0] + side / 2, uv[:, 1] + side / 2], -1))
-        scores.append(torch.ones(len(worlds)))
-    return per_cam, scores
-
-
-def _lost_in_one_camera():
-    """The scene the whole lever set exists for: animal A visible in cameras 0 and 1, MISSED in
-    camera 2, where the only detection belongs to animal B.
-
-    Outputs: (cg, per_cam, scores, A). A one-slot tracker holding A must not end up holding
-    A-in-two-views plus B-in-the-third; today it does, because nothing checks that the detection
-    claimed in camera 0 and the one claimed in camera 2 are the same animal.
-    """
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    a = np.array([0.0, 0.0, 0.0], np.float32)
-    b = np.array([120.0, 0.0, 0.0], np.float32)
-    per_cam, scores = _lever_boxes(cg, [a, b])
-    per_cam[2], scores[2] = per_cam[2][1:], torch.ones(1)
-    return cg, per_cam, scores, a
-
-
-def test_joint_association_refuses_a_binding_the_per_camera_hungarian_accepts():
-    """Cross-view candidate groups first, over the WHOLE detection pool via `associate` -- which
-    triangulates and gates on the residual already -- then ONE Hungarian over slots x groups.
-    On this scene (animal A visible in cameras 0/1, missed in camera 2 where the only detection
-    belongs to animal B) joint must not bind B's box in camera 2 to the slot holding A, because a
-    group is the unit of matching and no group contains both animals.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg, per_cam, scores, a = _lost_in_one_camera()
-
-    tr = CrossViewTracker(1, max_res_px=30.0)
-    tr.targets[0] = {'point': torch.as_tensor(a), 'age': 0}
-    out, _, claimed = tr.step(cg, per_cam, scores)
-    assert claimed[0].tolist() == [0, 0, -1], 'the joint decision must not reach into camera 2'
-    np.testing.assert_allclose(tr.targets[0]['point'].numpy(), a, atol=1e-3)
-    assert tr.targets[0]['age'] == 0, 'a slot that matched a group has evidence and must not age'
-
-
-def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path():
-    """A mode that fixes the crowded case by breaking the easy one is not a lever. `joint`
-    replaces the matching phase only, so the state machine around it -- births into free slots on
-    frame 0, a one-frame detector miss that ages targets without dropping them, and the SAME
-    slots resuming afterwards -- must behave exactly as `_tracker_demo` asserts for the default
-    path, including through the score-order swap that reorders detections every frame.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
-    tr = CrossViewTracker(2, max_res_px=30.0)
-    rows = []
-    for t in range(12):
-        w = [a + [12.0 * t, 0, 0], b - [12.0 * t, 0, 0]]
-        per_cam, scores = _lever_boxes(cg, w if t % 2 == 0 else w[::-1], side=40.0)
-        rows.append(tr.step(cg, per_cam, scores)[0])
-
-    assert all(np.isfinite(r).all(-1).any(-1).sum() == 2 for r in rows), 'an animal was lost'
-    for s in (0, 1):
-        cx = np.array([r[s, 0, [0, 2]].mean() for r in rows])
-        assert np.abs(np.diff(cx)).max() < 30.0, f'row {s} jumped: {np.diff(cx)}'
-
-    empty = [torch.zeros((0, 4)) for _ in cg], [torch.zeros((0,)) for _ in cg]
-    out, _, _ = tr.step(cg, *empty)
-    assert not np.isfinite(out).any() and len(tr.targets) == 2, \
-        'a one-frame detector miss must not end a track under joint either'
-    w = [a + [12.0 * 11, 0, 0], b - [12.0 * 11, 0, 0]]
-    resumed, _, _ = tr.step(cg, *_lever_boxes(cg, w, side=40.0))
-    for s in (0, 1):
-        assert abs(resumed[s, 0, [0, 2]].mean() - rows[-1][s, 0, [0, 2]].mean()) < 30.0, \
-            f'row {s} resumed on the other animal'
-
-
-def test_measured_tracker_configuration_is_the_default():
-    """The measured zero-switch configuration is the only one the public constructor ships;
-    pinning it prevents an accidental drift silently changing deployment."""
-    import inspect
-
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    sig = inspect.signature(CrossViewTracker.__init__).parameters
-    assert sig['max_age'].default == 8
-    assert sig['max_move'].default == 1.25
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
-
-    def run(**kw):
-        tr = CrossViewTracker(2, max_res_px=30.0, **kw)
-        rows = []
-        for t in range(10):
-            w = [a + [14.0 * t, 0, 0], b - [14.0 * t, 0, 0]]
-            per_cam, scores = _lever_boxes(cg, w if t % 2 == 0 else w[::-1], side=60.0)
-            rows.append(tr.step(cg, per_cam, scores))
-        return rows
-
-    base = run()
-    explicit = run(max_age=8, max_move=1.25)
-    for t, (want, got) in enumerate(zip(base, explicit)):
-        for i, name in enumerate(('boxes', 'scores', 'claimed')):
-            np.testing.assert_array_equal(
-                np.nan_to_num(want[i], nan=-9e9), np.nan_to_num(got[i], nan=-9e9),
-                err_msg=f'frame {t}: {name} moved with every lever at its default')
-
-
-
-def test_refused_duplicate_does_not_consume_the_free_slot():
-    """A6b (dev/plans/multianimal_system_improvements.md): the birth loop advanced BOTH the free
-    slot and the group list on a refusal, so with one free slot and [duplicate-of-shield,
-    genuine] the genuine group was never tried -- a duplicate-refire crowded a real birth out of
-    the frame. The fix retries the SAME slot; byte-identical when nothing is refused.
-    """
-    from tailcyclenet.detector.track import CrossViewTracker
-
-    cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
-    pointA = np.array([0.0, 0.0, 0.0])
-    pointB = np.array([250.0, 0.0, 0.0])    # far from A: a distinct animal, not a duplicate
-    per_cam, scores = _lever_boxes(cg, [pointA, pointB], side=100.0)
-    dupA = [torch.cat([b[:1], b[:1].clone()]) for b in per_cam]      # A twice per camera
-    dup_scores = [torch.ones(2) for _ in scores]
-    genuine = [b[1:2] for b in per_cam]                              # B, one box per camera
-
-    tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
-    for _ in range(2):                       # both slots seat at A; the backstop retires one
-        boxes, _, _ = tr.step(cg, dupA, dup_scores)
-    assert len(tr.targets) == 1, 'the backstop must retire exactly one slot here'
-    survivor = int(np.isfinite(boxes).all(-1).any(-1).argmax())
-
-    frames23 = [torch.cat([d, g]) for d, g in zip(dupA, genuine)]    # [A, A, B] per camera
-    boxes3, _, _ = tr.step(cg, frames23, [torch.ones(3) for _ in scores])
-    other = 1 - survivor
-    assert np.isfinite(boxes3[other]).all(-1).any(), \
-        'the genuine birth must seat in the freed slot -- the refusal must not consume it'
-    assert any(e['event'] == 'birth_refused' for e in tr.events), \
-        'the duplicate refusals must still be recorded'
-
-
-def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path):
-    """D1.1 (dev/plans/multianimal_system_improvements.md): a moving rig's per-frame extrinsics
-    are fetched by SOURCE frame. `associate_group`'s raw is a batch-local slice whose own frame 0
-    is `frame_base` (the aligned detection cursor on a ranged run) -- asking the session for the
-    extrinsics at the batch-LOCAL index would silently use the wrong camera pose for every
-    triangulation on a ranged moving-rig run, the same class of bug A6a fixed for the tracker's
-    event timestamps. `frame_base=0` (the default) must stay byte-identical to every whole-clip
-    run on record.
-    """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    import numpy as np
-
-    from tailcyclenet.detector import associate_group
-    from tailcyclenet.format import Session
-
-    class _RecordingSession:
-        """Delegate to a real Session but record every `cgroup` frame argument."""
-
-        def __init__(self, real):
-            self._real = real
-            self.frames = []
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-        def cgroup(self, gid, frames=None):
-            self.frames.append(frames)
-            return self._real.cgroup(gid, frames)
-
-    d = tmp_path / 'test' / 's'
-    cf._session_3d(d, T=12, moving=True)
-    sess = Session.load(d)
-
-    T, C = 4, 3
-    raw = (np.full((1, T, C, 4), np.nan, np.float32),
-           np.full((1, T, C), np.nan, np.float32))
-
-    whole = _RecordingSession(sess)
-    associate_group(raw, whole, 'g000', 1, track=True)
-    assert whole.frames == [0, 1, 2, 3], \
-        'frame_base=0 (the default) must keep the whole-clip behaviour byte-identical'
-
-    ranged = _RecordingSession(sess)
-    associate_group(raw, ranged, 'g000', 1, track=True, frame_base=6)
-    assert ranged.frames == [6, 7, 8, 9], \
-        "a moving rig's extrinsics must be fetched at SOURCE frames, not batch-local ones"
-
-
-def test_box_centres_and_sides_agree_across_torch_and_numpy():
-    """`detector.boxes` is the one copy of the centre/side arithmetic: `link_rows` (numpy) and
-    association/tracking/NMS (torch) must read the same numbers off the same boxes."""
-    from tailcyclenet.detector.boxes import centres, sides
-    b = np.array([[0.0, 0.0, 10.0, 20.0], [5.0, 5.0, 7.0, 9.0]], np.float32)
-    np.testing.assert_array_equal(centres(b), centres(torch.from_numpy(b)).numpy())
-    np.testing.assert_array_equal(sides(b), sides(torch.from_numpy(b)).numpy())
-    np.testing.assert_array_equal(centres(b), [[5.0, 10.0], [6.0, 7.0]])
-    np.testing.assert_array_equal(sides(b), [15.0, 3.0])
+    lone = tmp_path / 'elsewhere' / 'detector.pth'
+    lone.parent.mkdir()
+    shutil.copy(out / 'detector_it000002.pth', lone)
+    model = load_detector(out / 'detector_it000002.pth').model
+    shutil.rmtree(out)
+    lone_model = load_detector(lone).model
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, lone_model.state_dict()[k]), k

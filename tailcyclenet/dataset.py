@@ -654,6 +654,27 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
     return out
 
 
+def _decode_errors() -> tuple[type[BaseException], ...]:
+    """What a video decode raises for a frame it cannot deliver: `PyAVReader`'s own RuntimeError
+    (a frame that did not decode, an index past the table) and libav's errors."""
+    import av.error
+    return (RuntimeError, av.error.FFmpegError)
+
+
+def _warn_decode_failure(group, cam, err: BaseException) -> None:
+    """Say, once per (group, camera), that a loader item was skipped because its pixels did not
+    decode -- the image path's unreadable file returns None and is retried the same way."""
+    key = (getattr(group, 'group_id', None), cam, id(getattr(group, 'session', None)))
+    if key in _decode_warned:
+        return
+    _decode_warned.add(key)
+    warnings.warn(f'group {key[0]!r} camera {cam!r}: a frame did not decode, so this item is '
+                  f'skipped and another drawn ({err})', stacklevel=3)
+
+
+_decode_warned: set = set()
+
+
 def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation=None,
                 pool: ThreadPoolExecutor | None = None, reduce=1):
     """(T,H,W,3) uint8 RGB for one camera, from an image directory or a video.
@@ -1583,9 +1604,15 @@ class PoseDataset(Dataset):
         with (ThreadPoolExecutor(max_workers=16) if use_pool else nullcontext()) as pool:
             views = []
             for cnum, cam_name in enumerate(cam_names):
-                imgs = read_frames(group, cam_name, frames, crop_coords=boxes[cnum],
-                                   target_size=cgroup[cnum]['size'].tolist(),
-                                   rotation=rotation_info[cnum], pool=pool)
+                try:
+                    imgs = read_frames(group, cam_name, frames, crop_coords=boxes[cnum],
+                                       target_size=cgroup[cnum]['size'].tolist(),
+                                       rotation=rotation_info[cnum], pool=pool)
+                except _decode_errors() as e:
+                    if use_pool:
+                        raise
+                    _warn_decode_failure(group, cam_name, e)
+                    return None
                 if any(im is None for im in imgs):
                     return None
                 if self._aug is not None:

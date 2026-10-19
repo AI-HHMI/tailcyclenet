@@ -3,6 +3,7 @@
 The crop rule is shared between the pose model and the detector -- the detector is trained to
 reproduce the pose crop -- and `test_crop_rule_is_int32_exact` is what licenses that.
 """
+import warnings
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -1815,3 +1816,26 @@ def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
     loader = torch.utils.data.DataLoader(wrapped, batch_size=None, num_workers=2,
                                          multiprocessing_context='spawn')
     assert [float(x) for x in loader] == [float(ds[i]) for i in range(6)]
+
+
+def test_an_undecodable_video_frame_skips_the_item_instead_of_killing_the_worker(tmp_path):
+    """The image path returns None for an unreadable frame and the loader draws another item;
+    the video path used to RAISE out of `_realise`, killing the DataLoader worker."""
+    import shutil
+
+    from .conftest import _session_2d, _write_video
+
+    items = []
+    for n in (4, 2):
+        s = tmp_path / f'ds{n}' / 'train' / 'a'
+        _session_2d(s, T=4)
+        shutil.rmtree(s / 'groups' / 'g000' / 'cam0')
+        _write_video(s / 'groups' / 'g000' / 'cam0.mp4', 0, n, (64, 48))
+        ds = PoseDataset(tmp_path / f'ds{n}', 'train', CFG)
+        rng = np.random.default_rng(0)
+        with warnings.catch_warnings(record=True) as got:
+            warnings.simplefilter('always')
+            items.append((ds._item(0, rng, ds._shape(rng)), got))
+    assert items[0][0] is not None and not items[0][1]
+    assert items[1][0] is None
+    assert any('did not decode' in str(w.message) for w in items[1][1])

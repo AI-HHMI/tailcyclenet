@@ -6,11 +6,16 @@ artifact of the old deployment path is a consequence of that split: a row that t
 its own last-known box was matched by IoU in one camera while the cross-view grouping was rebuilt
 from scratch, a real animal starved of a slot because a greedy pass consumed its box.
 
-**One state, one affinity, one Hungarian.** A TARGET is a 3D point with a slot. Each frame every
-target reprojects into every camera and is matched, per camera, against that camera's detections;
-whatever nobody claims goes to `associate` as a BIRTH, which is the one place a memoryless
-pairwise search is the right algorithm. A target that claimed two or more cameras re-triangulates;
-one that claimed fewer HOLDS its point (no velocity model -- measured not worth it, report 53/54).
+**One state, one affinity, one Hungarian.** A TARGET is a 3D point with a slot. Each frame
+`associate` first groups the WHOLE detection pool across cameras (triangulated, residual-gated at
+`max_res_px`, `min_views` honoured); then one Hungarian matches targets to those GROUPS, scoring a
+target by its point's reprojection against each group's own detection centres (`_joint`). A group
+no target takes is a BIRTH into a free slot. A matched group with a triangulated point updates the
+target's point; otherwise the target HOLDS its point (no velocity model -- measured not worth it,
+report 53/54). Matching is O(slots x groups) after `associate`'s own O(C^2) pairwise search, so
+the tracker inherits that cost; it does not claim boxes per camera that `associate` left
+unclaimed. This is not the per-camera matcher of Chen et al. 2020, which an earlier version of
+this file implemented (deleted, reports 53/54).
 
 **THE AFFINITY IS IN PIXELS, over the detection's own box side**, a deliberate simplification of
 world-space point-to-ray distance: a point-to-ray distance is its reprojection error times depth
@@ -121,8 +126,7 @@ def _groups_are_duplicate(cgroup, first, second, radius=DUPLICATE_RADIUS, min_sh
 #
 # THE MEASURED CONFIGURATION IS THE ONLY ONE NOW: `joint`, max-age 8, and max-move 1.25. On the
 # 3dzef 5-fish clip it has zero identity switches, full coverage, 0.100 mm MPJPE, and 0.309 mm
-# p99. View arbitration remains opt-in because it did not improve this two-camera clip; it is
-# independently toggleable so a different rig can measure its own trade-off.
+# p99.
 
 
 def _sides(boxes):
@@ -161,13 +165,14 @@ class CrossViewTracker:
         """Create an empty tracker with `n_slots` rows.
 
         Inputs: n_slots -- number of animal rows (slots).
-                max_res_px -- max reprojection residual (px) for a birth's triangulation, and
-                    (lever 1 only) for an individual per-camera claim.
+                max_res_px -- max reprojection residual (px) of every `associate` group,
+                    births and matches alike.
                 max_move -- per-frame box-centre displacement gate, in box sides; 1.25 is the
                     measured default.
                 max_age -- frames without evidence before a slot is retired; 8 is the measured
                     default.
-                min_views -- minimum cameras a birth must be seen in.
+                min_views -- minimum cameras an `associate` group is built from (2, or 1 for
+                    single-view rows, which have no point and are never kept as targets).
                 duplicate_radius -- cross-view duplicate radius in box-side units; 0.75 is the
                     scale-free default (measured band, report 53).
                 duplicate_persist -- consecutive in-band frames (5-35+ measured, contact <=4)
@@ -370,8 +375,8 @@ class CrossViewTracker:
     def _suppress_duplicate_targets(self, cgroup, out, sc, claimed_ix):
         """Retire the weaker of two targets that have been duplicates for enough frames.
 
-        Deliberately after `_joint`/`_per_camera`: both branches may produce a target pair
-        before their different matching logic is visible here, and a pair is only judged on
+        Deliberately after `_joint`: matching can leave two targets on one animal (each matched
+        to a different group of its detections), and a pair is only judged on
         the claims either target holds (this frame's, or its last claimed boxes while it
         lives) -- so per-frame geometry alone cannot tell a seated duplicate from a genuine
         crossing.  The discriminator is persistence: a duplicate stays within the measured
@@ -483,8 +488,8 @@ class CrossViewTracker:
         point, even though that is the obvious quantity: a millimetre gate is a second unit
         system, un-normalised by animal size, and this file's whole affinity design exists to
         avoid exactly that. So the slot point is projected into every camera the group holds and
-        compared against that group's own detection centre in box sides -- the same number the
-        per-camera path computes, just averaged over the group instead of decided per camera.
+        compared against that group's own detection centre in box sides, averaged over the
+        cameras the group holds.
 
         The average is over cameras: one camera beyond the gate therefore does not by itself veto
         the match, but it does drag the mean; a pair whose mean gap exceeds one box side scores 0
@@ -502,18 +507,21 @@ class CrossViewTracker:
 
     def _joint(self, cgroup, boxes_per_cam, scores_per_cam, centres, sides, slots, pts,
                out, sc, claimed_ix):
-        """Lever 2: cross-view groups first, then ONE Hungarian over slots x groups.
+        """Cross-view groups first, then ONE Hungarian over slots x groups.
 
-        Inputs and outputs: as `_per_camera`.
+        Inputs: cgroup, boxes_per_cam, scores_per_cam -- as `step`; centres / sides -- per-camera
+            detection centres and box sides; slots -- the slots with a finite point, in order;
+            pts -- their stacked points (None when no slot); out / sc / claimed_ix -- the
+            frame's output arrays, written in place.
+        Outputs: the set of slots whose point was re-triangulated this frame.
         Side effects: mutates `self.targets` and the output arrays.
 
-        The shipped path consumes detections per camera and only the LEFTOVERS ever reach
-        `associate`, so the one routine in the repo that checks a group's cross-view consistency
-        sees only what the tracker did not want. Here `associate` runs first, over the WHOLE
-        pool: every group it returns has already been triangulated and had its reprojection
-        residual gated at `max_res_px`, honouring `min_views`. Identity is then a choice among
-        objects that are internally consistent by construction, which is precisely the property
-        `--no-track` has and the tracker threw away (0.081 mm vs 0.291 mm on the fish clip).
+        `associate` runs first, over the WHOLE detection pool: every group it returns has already
+        been triangulated and had its reprojection residual gated at `max_res_px`, honouring
+        `min_views`. Identity is then a choice among objects that are internally consistent by
+        construction, which is the property the memoryless `--no-track` path has (0.081 mm vs
+        0.291 mm for the deleted per-camera matcher on the fish clip). A detection `associate`
+        leaves ungrouped is not claimed by any target.
 
         A slot that matches nothing ages exactly as before. A group no slot wanted is a BIRTH
         into a free slot, in `associate`'s own support-then-residual order, so the strongest

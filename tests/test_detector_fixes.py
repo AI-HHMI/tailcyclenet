@@ -185,3 +185,42 @@ def test_eval_detector_trace_uses_the_roots_own_box_source(tmp_path, monkeypatch
         '--device', 'cpu', '--out', str(tmp_path / 'trace.json')])
     mod.main()
     assert seen and set(seen) == {'instances'}
+
+
+def test_eval_detector_compare_scores_the_same_views(tmp_path, monkeypatch, capsys):
+    """detector B9: under `--evalset`, `--compare` scored the default sampled views while `--run`
+    scored the fixed subset, and a comma `--split` crashed it; the PAIRED delta compared
+    different frames. Both arms now share one dataset/subset builder."""
+    import json as _json
+    from .conftest import _session_2d
+    from tailcyclenet.format import Session
+    root = tmp_path / 'root'
+    _session_2d(root / 'train' / 's0', T=4, S=2)
+    _session_2d(root / 'test' / 's1', T=4, S=2)
+    sess = Session.load(root / 'test' / 's1')
+    gid = list(sess.groups)[0]
+    evalset = tmp_path / 'evalset.json'
+    evalset.write_text(_json.dumps({'frames': [
+        {'session': sess.session_id, 'group': gid, 'frame': 1, 'split': 'test'}]}))
+    path = _saved_detector(tmp_path)
+    mod = _module('scripts/eval_detector.py', 'tcn_eval_detector_compare')
+    calls = []
+    real = mod.score_dataset
+
+    def spy(model, ds, *args, **kwargs):
+        """Record which views each scoring call covers."""
+        subset = kwargs.get('subset_indices')
+        idx = range(len(ds)) if subset is None else sorted(subset)
+        calls.append(sorted((s.session_id, g, f, c) for s, g, f, c in (ds.index[i] for i in idx)))
+        return real(model, ds, *args, **kwargs)
+
+    monkeypatch.setattr(mod, 'score_dataset', spy)
+    for extra in (['--evalset', str(evalset)], ['--split', 'train,test']):
+        calls.clear()
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_detector.py', '--run', str(path), '--compare', str(path), '--data', str(root),
+            '--device', 'cpu', '--num-workers', '0', '--batches', '1', '--batch-size', '2',
+            *extra])
+        mod.main()
+        assert calls[-1] == calls[-2]
+        assert 'PAIRED' in capsys.readouterr().out

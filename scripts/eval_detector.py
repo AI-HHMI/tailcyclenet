@@ -105,6 +105,55 @@ def _tiled(run, tile_scale):
             'Score it through scripts/infer.py, which derives the input size per camera.')
 
 
+def _eval_dataset(args, model, wh, mcd, red):
+    """Build the scored dataset and the `--evalset` subset (None without one) for one run.
+
+    Both `--run` and `--compare` go through here, so a paired delta compares the same views:
+    the index depends only on the data, the split(s) and the evalset, never on the checkpoint.
+    """
+    eval_spec = json.loads(args.evalset.read_text()) if args.evalset else None
+    split_names = sorted({item.get('split', args.split) for item in eval_spec['frames']}) if eval_spec else args.split.split(',')
+    parts = [BoxDataset(args.data, split, input_wh=wh, box_source=args.boxes,
+                        min_crop_dim=args.min_crop_dim or mcd, reduce=red,
+                        max_frames_per_group=args.frames_per_group,
+                        box_target=getattr(model, 'box_target', 'crop'),
+                        antialias=getattr(model, 'antialias', False),
+                        input_norm=getattr(model, 'input_norm', 'none')) for split in split_names]
+    if eval_spec:
+        for split in split_names:
+            part = parts[split_names.index(split)]
+            present = {(sess.session_id, gid, frame, ci) for sess, gid, frame, ci in part.index}
+            for entry in eval_spec['frames']:
+                if entry.get('split', args.split) != split:
+                    continue
+                sess = next((sess for root in part.datasets for sess in root.all_sessions()
+                             if sess.session_id == entry['session']), None)
+                if sess is None:
+                    raise SystemExit(f"{entry['session']}: session not found in split {split}")
+                for ci in range(len(sess.cam_names)):
+                    key = (sess.session_id, entry['group'], int(entry['frame']), ci)
+                    if key not in present:
+                        part.index.append((sess, entry['group'], int(entry['frame']), ci))
+                        part.origins.append(None)
+                        part.root_ids.append(0)
+                        present.add(key)
+    ds = parts[0] if len(parts) == 1 else FixedSplitDataset(parts)
+    index_splits = [split for split, part in zip(split_names, parts) for _ in part.index]
+    fixed = None
+    if args.evalset:
+        spec = eval_spec
+        fixed = set()
+        for item in spec['frames']:
+            for i, (sess, gid, frame, ci) in enumerate(ds.index):
+                if (sess.session_id == item['session'] and gid == item['group']
+                        and frame == int(item['frame'])
+                        and index_splits[i] == item.get('split', split_names[0])):
+                    fixed.add(i)
+        if not fixed:
+            raise SystemExit(f'{args.evalset}: no matching views in {args.data}/{args.split}')
+    return ds, fixed
+
+
 def main():
     """Score a detector run against crop-rule boxes; exit via SystemExit on bad config.
 
@@ -205,46 +254,7 @@ def main():
         print(f'WARNING: {args.run} was trained on {trained_on!r} boxes and is being scored '
               f'against {args.boxes!r} ones. That measures the crop source, not accuracy.')
     from tailcyclenet.detector.data import tt_photometric_transform
-    eval_spec = json.loads(args.evalset.read_text()) if args.evalset else None
-    split_names = sorted({item.get('split', args.split) for item in eval_spec['frames']}) if eval_spec else args.split.split(',')
-    parts = [BoxDataset(args.data, split, input_wh=wh, box_source=args.boxes,
-                        min_crop_dim=args.min_crop_dim or mcd, reduce=red,
-                        max_frames_per_group=args.frames_per_group,
-                        box_target=getattr(model, 'box_target', 'crop'),
-                        antialias=getattr(model, 'antialias', False),
-                        input_norm=getattr(model, 'input_norm', 'none')) for split in split_names]
-    if eval_spec:
-        for split in split_names:
-            part = parts[split_names.index(split)]
-            present = {(sess.session_id, gid, frame, ci) for sess, gid, frame, ci in part.index}
-            for entry in eval_spec['frames']:
-                if entry.get('split', args.split) != split:
-                    continue
-                sess = next((sess for root in part.datasets for sess in root.all_sessions()
-                             if sess.session_id == entry['session']), None)
-                if sess is None:
-                    raise SystemExit(f"{entry['session']}: session not found in split {split}")
-                for ci in range(len(sess.cam_names)):
-                    key = (sess.session_id, entry['group'], int(entry['frame']), ci)
-                    if key not in present:
-                        part.index.append((sess, entry['group'], int(entry['frame']), ci))
-                        part.origins.append(None)
-                        part.root_ids.append(0)
-                        present.add(key)
-    ds = parts[0] if len(parts) == 1 else FixedSplitDataset(parts)
-    index_splits = [split for split, part in zip(split_names, parts) for _ in part.index]
-    fixed = None
-    if args.evalset:
-        spec = eval_spec
-        fixed = set()
-        for item in spec['frames']:
-            for i, (sess, gid, frame, ci) in enumerate(ds.index):
-                if (sess.session_id == item['session'] and gid == item['group']
-                        and frame == int(item['frame'])
-                        and index_splits[i] == item.get('split', split_names[0])):
-                    fixed.add(i)
-        if not fixed:
-            raise SystemExit(f'{args.evalset}: no matching views in {args.data}/{args.split}')
+    ds, fixed = _eval_dataset(args, model, wh, mcd, red)
     workers = 0 if fixed is not None else args.num_workers
     result_blocks = []
     for gain in args.tt_gain:
@@ -306,8 +316,8 @@ def main():
     print(f'fp_ignored (raw count, quote beside MOTA on any 3D root -- CLAUDE.md): {fp_ig}')
 
     if args.compare:
-        m2, wh2, _, mcd2, red2, trained_on2, tile2, _ = load_detector(args.compare,
-                                                          device=device)
+        m2, wh2, _, mcd2, red2, trained_on2, tile2, _ = load_detector(
+            args.compare, device=device, checkpoint=args.checkpoint)
         _tiled(args.compare, tile2)
         if trained_on2 != trained_on:
             print(f'note: {args.run} was trained on {trained_on!r} boxes and {args.compare} on '
@@ -321,16 +331,12 @@ def main():
                   f'{args.compare} {getattr(m2, "box_target", "crop")!r} ones; each is scored '
                   'against its own target, so IoU/r@.75 compare different boxes. Use --deploy '
                   '(crop-rule boxes for both) for a like-for-like comparison.')
-        ds2 = BoxDataset(args.data, args.split, input_wh=wh2, box_source=args.boxes,
-                         min_crop_dim=args.min_crop_dim or mcd2, reduce=red2,
-                         max_frames_per_group=args.frames_per_group,
-                         box_target=getattr(m2, 'box_target', 'crop'),
-                         antialias=getattr(m2, 'antialias', False),
-                         input_norm=getattr(m2, 'input_norm', 'none'))
+        ds2, fixed2 = _eval_dataset(args, m2, wh2, mcd2, red2)
         other = score_dataset(m2, ds2, device, batch_size=args.batch_size, batches=args.batches,
-                              seed=args.seed, score_thresh=args.score_thresh[0],
-                              num_workers=args.num_workers, max_animals=args.max_animals,
-                              iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist)
+                              seed=args.seed, score_thresh=score_thresh,
+                              num_workers=workers, max_animals=args.max_animals,
+                              iou_thresh=args.nms_iou, center_dist_thresh=args.nms_center_dist,
+                              subset_indices=fixed2)
         keys = sorted(set(rows) & set(other))
         print(f'\nPAIRED: {args.run} minus {args.compare}, over {len(keys)} shared group(s)')
         for name in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):

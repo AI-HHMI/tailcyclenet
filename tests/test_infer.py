@@ -2983,3 +2983,16 @@ def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_o
         'box_prompt_first_only=False must give the box every window regardless of carry/prior'
     assert not _give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
         'box_prompt="none" must never give the box'
+
+
+def test_det_trace_file_is_valid_json(tmp_path):
+    """`--det-trace` writes JSON a reader can load: it used to end in a literal backslash-n."""
+    import json
+
+    from tailcyclenet.infer.driver import _write_det_trace
+
+    path = tmp_path / 'sub' / 'trace.json'
+    _write_det_trace(path, {'s/g000': [{'frame': 0, 'kept': 2}]})
+    assert json.loads(path.read_text()) == {'s/g000': [{'frame': 0, 'kept': 2}]}
+    assert path.read_text().endswith('}\n')
+

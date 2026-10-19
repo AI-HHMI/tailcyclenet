@@ -424,6 +424,14 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
     return boxes_for
 
 
+def _write_det_trace(path, groups):
+    """Write the `--det-trace` JSON: one decode trace list per group key, newline-terminated."""
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(groups, indent=1) + '\n')
+
+
 def run_dataset(args):
     """One inference run.
 
@@ -911,9 +919,7 @@ def run_dataset(args):
         writer.close(complete=_completed)
     progress.update(0, force=True)
     if args.det_trace:
-        import json
-        args.det_trace.parent.mkdir(parents=True, exist_ok=True)
-        args.det_trace.write_text(json.dumps(det_trace_groups, indent=1) + '\\n')
+        _write_det_trace(args.det_trace, det_trace_groups)
         print(f'wrote detector trace {args.det_trace}')
     if getattr(args, 'overlap_trace', None):
         _write_overlap_trace(args.overlap_trace, overlap_rows)

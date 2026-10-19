@@ -79,17 +79,6 @@ def resolve_selection_metric(config: dict, output_granularity: str) -> str:
     return configured
 
 
-def resolve_output_granularity(config: dict) -> str:
-    """Resolve and validate the scorer output mode for a merged/new config.
-
-    New scorer configs inherit an explicit ``frame`` from the family base.  A config read directly
-    from an old run folder is handled by :func:`checkpoints.scorer_output_granularity`, where an
-    absent key means the legacy sequence path.  This small wrapper is kept in the trainer so unit
-    tests and callers do not need to know which compatibility helper owns the default.
-    """
-    return scorer_output_granularity(config)
-
-
 _ALIAS = 'a duplicate spelling no config or run folder ever used; set '
 DELETED_CORRUPTION_KEYS = {
     'sequence_far_gate': 'no run folder ever enabled it; frame mode is the gated scorer, and '

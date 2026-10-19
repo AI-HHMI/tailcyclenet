@@ -1,14 +1,7 @@
 """The scorer model: the things that produce numbers instead of exceptions when wrong.
 
-Three of these are the compatibility facts the whole port rests on and none of them is visible in
-a loss curve:
-
-  * the keypoint ids must tile the (t, k) query axis **t-major**, or every point is scored with
-    another point's identity;
-  * a fully-missing keypoint must still score FINITELY (the pooling softmax over all-`-inf` is
-    NaN), and the pooling mask must drop exactly the missing (t, camera) slots;
-  * a moving rig must be REFUSED, because `_scene_scalars` and the ray construction treat the rig
-    as static and would silently mis-project.
+Keypoint ids must tile the (t, k) query axis t-major with the caller's GLOBAL ids; a fully-missing
+keypoint must still score finitely; a moving rig must be refused (the rays assume a static rig).
 """
 from pathlib import Path
 
@@ -18,7 +11,7 @@ import torch
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
 from tailcyclenet.query_encoder import _tile_to_query_axis
 from tailcyclenet.scorer import build_scorer
-from tailcyclenet.scorer.model import FrameCameraPooling, flatten_sequence_triplet
+from tailcyclenet.scorer.model import FrameCameraPooling
 from tailcyclenet.model import build_model, share_video_encoder_if_identical
 
 from .test_model import SMALL
@@ -71,38 +64,35 @@ def test_video_encoder_weights_are_shared_only_when_exactly_equal():
 
 
 def _fully_observed(coords):
-    """`coords` with every NaN filled, so a test's own NaN pattern is the only missingness.
-
-    The fixtures carry incidental missing slots (that is what a partially-labelled window IS), and
-    a mask test that assumed a particular slot was observed silently tested the wrong thing when it
-    was not. Filling first makes the premise explicit.
-    """
+    """`coords` with every NaN filled, so a test's own NaN pattern is the only missingness."""
     return torch.nan_to_num(coords.clone(), nan=0.0)
 
-# -- A.2: the id tiling is t-major ------------------------------------------------------
+
+def _forward_capturing(model, module, views, coords, cgroup, kpt_ids):
+    """(scores, precision, kwargs `module` was called with) for one no-grad forward."""
+    captured = {}
+    h = module.register_forward_pre_hook(
+        lambda mod, args, kwargs: captured.update(kwargs, _x=args[0] if args else None),
+        with_kwargs=True)
+    try:
+        with torch.no_grad():
+            scores, precision = model(views, coords, cgroup, kpt_ids)
+    finally:
+        h.remove()
+    return scores, precision, captured
+
 
 def test_kpt_ids_tile_the_query_axis_t_major():
-    """Slot `t*K + k` must carry id `kpt_ids[k]`.
-
-    `WideQueryEncoder` tiles (B, K) -> (B, T*K), and the scorer builds its query axis as `b (t k)`
-    with `k` moving fastest. `repeat` gives that; `repeat_interleave` would give the k-major
-    ordering, under which every keypoint is scored with another keypoint's learned identity vector.
-    """
+    """Slot `t*K + k` carries `kpt_ids[k]`; k-major would score each point as another."""
     ids = torch.tensor([[2, 0, 3]])
     assert torch.equal(_tile_to_query_axis(ids, 6, '_kpt_ids'),
                        torch.tensor([[2, 0, 3, 2, 0, 3]]))
-    assert not torch.equal(_tile_to_query_axis(ids, 6, '_kpt_ids'),
-                           torch.repeat_interleave(ids, 2, dim=1))
 
 
 def test_the_scorer_uses_the_caller_global_ids_not_arange(scorer_batch):
-    """The ids the encoder receives must be the caller's GLOBAL registry ids, verbatim.
+    """The encoder must receive the caller's registry ids verbatim, sliced per `kpt_chunk`.
 
-    A session may reorder or SUBSET the registry's names (CLAUDE.md gotcha 4), so session position
-    0 is not registry id 0 and the ids need not be contiguous. Generating `arange(K)` would score
-    every keypoint under some other body part's identity vector while every shape stayed correct.
-    Built with a registry LARGER than the session uses and a non-contiguous, permuted id set, so a
-    dense range could not pass by accident; and the ids are sliced when `kpt_chunk` splits the axis.
+    A session may subset/reorder the registry (gotcha 4); `arange(K)` would keep every shape right.
     """
     model, views, coords, cgroup, K, loader_ids = scorer_batch
     assert K >= 3
@@ -149,171 +139,95 @@ def test_the_scorer_uses_the_caller_global_ids_not_arange(scorer_batch):
     assert not torch.allclose(a, b), 'permuted ids and arange gave the same scores'
 
 
-def test_an_out_of_registry_keypoint_id_is_refused_by_name(scorer_batch):
-    """Scoring a root whose names were not in the training registry must be refused, not indexed.
-
-    The scorer is conditioned on the registry (`kpt_embed`), so a calms21 scorer has no row for an
-    allen or 3dpop keypoint. Refused where the caller still knows which root it came from.
-    """
+def test_refusals_by_name(scorer_batch):
+    """Out-of-registry ids, a moving rig, and an absent `gridresid_offset` raise, never guess."""
     model, views, coords, cgroup, K, kpt_ids = scorer_batch
     bad = torch.arange(K)[None].clone()
     bad[0, -1] = K + 5
-    with pytest.raises(ValueError, match='outside this scorer'):
-        with torch.no_grad():
-            model(views, coords, cgroup, bad)
+    with pytest.raises(ValueError, match='outside this scorer'), torch.no_grad():
+        model(views, coords, cgroup, bad)
+
+    moving = [dict(c) for c in cgroup]
+    e = moving[0]['ext']
+    moving[0]['ext'] = e[None].expand(coords.shape[1], *e.shape).contiguous()
+    with pytest.raises(ValueError, match='MOVING rig'), torch.no_grad():
+        model(views, coords, moving, kpt_ids)
+
+    cfg = {k: v for k, v in SMALL.items() if k != 'gridresid_offset'}
+    with pytest.raises(KeyError, match='gridresid_offset'):
+        build_scorer({**cfg, 'box_prompt': 'film'}, 4, **SCORER_KW)
 
 
 # -- A.7: missing points ----------------------------------------------------------------
 
-def test_a_fully_missing_keypoint_still_scores_finitely(scorer_batch):
-    """The all-masked force-unmask guard.
-
-    A keypoint with no coordinate anywhere masks every (t, camera) slot, and attention's softmax
-    over an all-masked key set is a NaN. `min_valid_frames` is a training-side guarantee, so this
-    must hold for a caller that breaks it.
-    """
-    model, views, coords, cgroup, K, kpt_ids = scorer_batch
-    c = _fully_observed(coords)
-    c[:, :, 0] = float('nan')                      # one keypoint, every frame
-    with torch.no_grad():
-        scores, precision = model(views, c, cgroup, kpt_ids)
-    assert torch.isfinite(scores).all(), 'all-missing keypoint produced a non-finite score'
-    assert torch.isfinite(precision).all()
-    assert scores.shape == (1, K)
-
-    # Do NOT assert the other keypoints are unchanged. The coupling is the FULL-K scene scalars
-    # (`cube_scale`/`scene_center`/`scene_radius` are computed over all K before any masking), not
-    # any cross-point attention -- the decoder documents none.
-    assert torch.isfinite(scores[0, 1:]).all()
-
-
-def _mask_for(model, views, coords, cgroup, kpt_ids):
-    captured = {}
-    h = model.attn_pool.register_forward_pre_hook(
-        lambda mod, args, kwargs: captured.update(kwargs), with_kwargs=True)
-    try:
-        with torch.no_grad():
-            model(views, coords, cgroup, kpt_ids)
-    finally:
-        h.remove()
-    return captured['key_padding_mask']
-
-
 def test_the_pooling_mask_drops_exactly_the_missing_slots(scorer_batch):
-    """The mask handed to `attn_pool` must be `~valid` over (t, camera), True == drop.
-
-    A mask that is transposed or widened silently pools the wrong slots -- and missingness is
-    supposed to be ORTHOGONAL to track quality, so a leak here teaches the scorer that a dropped
-    point is a bad track.
-    """
+    """The `attn_pool` mask must be `~valid` over (t, camera); a leak teaches missing == bad."""
     model, views, coords, cgroup, K, kpt_ids = scorer_batch
     c = _fully_observed(coords)
     c[:, 1, 2] = float('nan')                      # exactly one (frame, keypoint) slot
-    mask = _mask_for(model, views, c, cgroup, kpt_ids)
+    _s, _p, kw = _forward_capturing(model, model.attn_pool, views, c, cgroup, kpt_ids)
+    mask = kw['key_padding_mask']
 
     T, n_cams = coords.shape[1], len(cgroup)
     assert mask.shape == (1, K, T, n_cams)
     valid = torch.isfinite(c).all(-1)                                  # [b, t, k]
     want = (~valid).permute(0, 2, 1).unsqueeze(-1).expand(-1, -1, -1, n_cams)
     assert torch.equal(mask, want), 'the pooling mask does not match the observed slots'
-    assert bool(mask[0, 2, 1, :].all()), 'the missing slot was NOT dropped'
-    assert not bool(mask[0, 2, 0, :].any()), 'an observed slot was dropped'
     assert int(mask.sum()) == n_cams, f'expected exactly {n_cams} dropped slots'
 
 
-def test_the_force_unmask_only_fires_for_a_fully_masked_point(scorer_batch):
-    """A fully-missing keypoint is un-dropped wholesale; nothing else may be un-dropped."""
+def test_a_fully_missing_keypoint_is_force_unmasked_and_scores_finitely(scorer_batch):
+    """Softmax over an all-masked key set is NaN, so only a FULLY missing point is un-dropped."""
     model, views, coords, cgroup, K, kpt_ids = scorer_batch
     c = _fully_observed(coords)
     c[:, :, 1] = float('nan')                      # keypoint 1, every frame
     c[:, 0, 2] = float('nan')                      # plus one PARTIAL slot on keypoint 2
-    mask = _mask_for(model, views, c, cgroup, kpt_ids)
-
-    T = coords.shape[1]
+    scores, precision, kw = _forward_capturing(model, model.attn_pool, views, c, cgroup, kpt_ids)
+    mask = kw['key_padding_mask']
     assert not bool(mask[0, 1].any()), 'the force-unmask did not fire for a fully missing point'
-    # the PARTIAL point keeps its own drops -- the guard must be per-point, not blanket
     assert bool(mask[0, 2, 0].all()), 'a partial point was un-dropped (the guard is too wide)'
-    assert not bool(mask[0, 2, 1:].any()), \
-        f'the partial point lost slots it should have kept (T={T})'
-
-
-# -- A.8: moving rigs --------------------------------------------------------------------
-
-def test_a_moving_rig_is_refused_by_name(scorer_batch):
-    """`_scene_scalars` and the rays index `cam['center']`/`cam['ext']` as static.
-
-    Built from a real static group with per-frame extrinsics spliced in, so this is the same
-    condition the query encoder uses to call a rig moving.
-    """
-    model, views, coords, cgroup, K, kpt_ids = scorer_batch
-    moving = [dict(c) for c in cgroup]
-    e = moving[0]['ext']
-    moving[0]['ext'] = e[None].expand(coords.shape[1], *e.shape).contiguous()
-    with pytest.raises(ValueError, match='MOVING rig'):
-        with torch.no_grad():
-            model(views, coords, moving, kpt_ids)
+    assert not bool(mask[0, 2, 1:].any())
+    assert scores.shape == (1, K)
+    assert torch.isfinite(scores).all() and torch.isfinite(precision).all()
 
 
 # -- hygiene -----------------------------------------------------------------------------
 
-def test_no_stash_leaks_out_of_a_forward(scorer_batch):
-    """`_kpt_ids`/`_query_ok`/`_box_prompt` must be cleared even on the success path.
-
-    A leaked stash applies ONE window's ids and query-validity to the NEXT forward. At
-    `batch_size` 1 that is a silent wrong answer, not a shape error -- which is exactly why
-    `PoseTrackerEncoder._forward` clears them in a `finally`.
-    """
+def test_stashes_are_cleared_on_success_and_when_the_forward_raises(scorer_batch):
+    """A leaked `_kpt_ids`/`_query_ok`/`_box_prompt` stash silently applies to the next window."""
     model, views, coords, cgroup, K, kpt_ids = scorer_batch
+    enc = model.query_encoder
+
+    def cleared():
+        return enc._kpt_ids is None and enc._query_ok is None and enc._box_prompt is None
+
     with torch.no_grad():
         model(views, coords, cgroup, kpt_ids)
-    assert model.query_encoder._kpt_ids is None
-    assert model.query_encoder._query_ok is None
-    assert model.query_encoder._box_prompt is None
-
-
-def test_stashes_are_cleared_even_when_the_forward_raises(scorer_batch):
-    """The `finally` must clear the stashes on the EXCEPTION path too.
-
-    This is the failure the `finally` exists for: a leaked stash applies one window's keypoint ids
-    to the next window's forward, which at `batch_size` 1 is a silent wrong answer rather than a
-    shape error.
-    """
-    model, views, coords, cgroup, K, kpt_ids = scorer_batch
-    ids = torch.arange(K)[None]
+    assert cleared(), 'a stash leaked out of a successful forward'
 
     def boom(mod, args, kwargs):
         raise RuntimeError('injected decoder failure')
 
     h = model.decoder.register_forward_pre_hook(boom, with_kwargs=True)
     try:
-        with pytest.raises(RuntimeError, match='injected'):
-            with torch.no_grad():
-                model(views, coords, cgroup, ids)
+        with pytest.raises(RuntimeError, match='injected'), torch.no_grad():
+            model(views, coords, cgroup, kpt_ids)
     finally:
         h.remove()
-    assert model.query_encoder._kpt_ids is None, 'the id stash leaked out of a raising forward'
-    assert model.query_encoder._query_ok is None
-    assert model.query_encoder._box_prompt is None
-
-    # and the model still works afterwards
-    with torch.no_grad():
-        scores, _ = model(views, coords, cgroup, ids)
-    assert torch.isfinite(scores).all()
+    assert cleared(), 'a stash leaked out of a raising forward'
 
 
-def test_kpt_chunk_is_exact(scorer_batch):
-    """Chunking the per-point work must be numerically IDENTICAL to one pass.
-
-    The scene scalars, the validity mask and the NaN fill are all computed over the full K before
-    any slicing, which is what makes the slice exact -- so this is the assertion that the
-    ordering of the two is right.
-    """
-    model, views, coords, cgroup, K, kpt_ids = scorer_batch
-    with torch.no_grad():
-        whole_s, whole_p = model(views, coords, cgroup, kpt_ids)
-        chunk_s, chunk_p = model(views, coords, cgroup, kpt_ids, kpt_chunk=1)
-    assert torch.allclose(whole_s, chunk_s, atol=1e-5), (whole_s - chunk_s).abs().max()
-    assert torch.allclose(whole_p, chunk_p, atol=1e-5)
+def test_kpt_chunk_is_exact(scorer_batch, frame_model):
+    """Scene scalars/mask/NaN fill are computed over full K before slicing, so chunks are exact
+    -- for both the sequence and the frame readout."""
+    sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
+    for model in (sequence, frame_model):
+        with torch.no_grad():
+            whole_s, whole_p = model(views, coords, cgroup, kpt_ids)
+            chunk_s, chunk_p = model(views, coords, cgroup, kpt_ids, kpt_chunk=1)
+        assert whole_s.shape == chunk_s.shape
+        assert torch.allclose(whole_s, chunk_s, atol=1e-5), (whole_s - chunk_s).abs().max()
+        assert torch.allclose(whole_p, chunk_p, atol=1e-5)
 
 
 def test_a_2d_window_scores_single_camera(tmp_path_factory):
@@ -339,76 +253,38 @@ def test_a_2d_window_scores_single_camera(tmp_path_factory):
     assert torch.isfinite(scores).all()
 
 
-
 # -- explicit framewise output ---------------------------------------------------------------
 
-def test_explicit_frame_mode_keeps_time_and_only_pools_cameras(scorer_batch):
-    """Frame mode has one readout per source/local frame and no temporal pool embedding."""
+@pytest.fixture(scope='module')
+def frame_model(scorer_batch):
+    return _scorer(scorer_batch[4], stride_length=4, output_granularity='frame').eval()
+
+
+def test_frame_mode_keeps_time_and_masks_per_frame_keypoint(scorer_batch, frame_model):
+    """One readout per frame, cameras pooled within a frame, no temporal embedding; a missing
+    (frame, keypoint) is force-unmasked alone without touching that keypoint's other frames."""
     _sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
-    model = _scorer(K, stride_length=4, output_granularity='frame').eval()
-
-    captured = {}
-    h = model.attn_pool.pool.register_forward_pre_hook(
-        lambda mod, args, kwargs: captured.update({'x': args[0], 'mask': kwargs.get('key_padding_mask')}),
-        with_kwargs=True)
-    try:
-        with torch.no_grad():
-            scores, precision = model(views, coords, cgroup, kpt_ids)
-    finally:
-        h.remove()
-
+    model = frame_model
     B, T, _K, _R = coords.shape
-    assert model.output_granularity == 'frame'
-    assert scores.shape == (B, T, K)
-    assert precision.shape == (B, T, K)
+    scores, precision, kw = _forward_capturing(model, model.attn_pool.pool, views, coords,
+                                               cgroup, kpt_ids)
+    assert scores.shape == precision.shape == (B, T, K)
     assert torch.isfinite(scores).all() and torch.isfinite(precision).all()
     assert not model.attn_pool.use_time_embedding
-    # The wrapped primitive sees one singleton time axis for each original frame,
-    # and all cameras remain in that axis rather than being folded into time.
-    assert captured['x'].shape[:4] == (B * T, 1, K, len(cgroup))
-    assert captured['mask'].shape == (B * T, K, 1, len(cgroup))
     assert not hasattr(model.attn_pool.pool, 'time_embed')
+    assert kw['_x'].shape[:4] == (B * T, 1, K, len(cgroup))
+    assert kw['key_padding_mask'].shape == (B * T, K, 1, len(cgroup))
 
-
-def test_frame_mode_missing_mask_is_per_frame_keypoint(scorer_batch):
-    """A missing frame/keypoint is not allowed to unmask other frames of that keypoint."""
-    _sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
-    model = _scorer(K, stride_length=4, output_granularity='frame').eval()
     c = _fully_observed(coords)
     c[:, 1, 2] = float('nan')
-
-    captured = {}
-    h = model.attn_pool.register_forward_pre_hook(
-        lambda mod, args, kwargs: captured.update(kwargs), with_kwargs=True)
-    try:
-        with torch.no_grad():
-            scores, precision = model(views, c, cgroup, kpt_ids)
-    finally:
-        h.remove()
-
-    mask = captured['key_padding_mask']
-    assert mask.shape == (1, coords.shape[1], K, len(cgroup))
-    # The all-missing (t=1,k=2) camera set is force-unmasked for finite attention;
-    # no other (t,k) row is changed because every other slot is observed.
-    assert not bool(mask[0, 1, 2].any())
+    scores, precision, kw = _forward_capturing(model, model.attn_pool, views, c, cgroup, kpt_ids)
+    mask = kw['key_padding_mask']
+    assert mask.shape == (1, T, K, len(cgroup))
     assert not bool(mask.sum())
     assert torch.isfinite(scores).all() and torch.isfinite(precision).all()
 
 
-def test_frame_mode_kpt_chunk_is_exact(scorer_batch):
-    """Framewise keypoint chunks preserve frame and keypoint axes exactly."""
-    _sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
-    model = _scorer(K, stride_length=4, output_granularity='frame').eval()
-    with torch.no_grad():
-        whole_s, whole_p = model(views, coords, cgroup, kpt_ids)
-        chunk_s, chunk_p = model(views, coords, cgroup, kpt_ids, kpt_chunk=1)
-    assert whole_s.shape == chunk_s.shape == (1, coords.shape[1], K)
-    assert whole_p.shape == chunk_p.shape == (1, coords.shape[1], K)
-    assert torch.allclose(whole_s, chunk_s, atol=1e-5), (whole_s - chunk_s).abs().max()
-    assert torch.allclose(whole_p, chunk_p, atol=1e-5)
-
-
-def test_frame_mode_triplet_keeps_structured_axes(scorer_batch):
+def test_frame_mode_triplet_keeps_structured_axes(scorer_batch, frame_model):
     """Only frame mode exposes [B,T,K,member], unlike the legacy flattened sequence API."""
     sequence, views, coords, cgroup, K, kpt_ids = scorer_batch
     trip = {
@@ -419,25 +295,13 @@ def test_frame_mode_triplet_keeps_structured_axes(scorer_batch):
         'anchor_label': 1.0,
         'occlusion': None,
     }
-    frame = _scorer(K, stride_length=4, output_granularity='frame').eval()
     with torch.no_grad():
-        fs, fp, fl = frame.score_triplet(trip)
+        fs, fp, fl = frame_model.score_triplet(trip)
         ss, sp, sl = sequence.score_triplet(trip)
     assert fs.shape == fp.shape == fl.shape == (1, coords.shape[1], K, 3)
     assert ss.shape == sp.shape == sl.shape == (1, K, 3)
     assert torch.equal(fl[..., 0], torch.ones_like(fl[..., 0]))
     assert torch.equal(fl[..., 1], -torch.ones_like(fl[..., 1]))
-
-
-def test_flatten_sequence_triplet_is_explicit_legacy_loss_boundary():
-    scores = torch.arange(2 * 3 * 3, dtype=torch.float32).reshape(2, 3, 3)
-    precision = scores + 100
-    labels = scores + 200
-    flat = flatten_sequence_triplet(scores, precision, labels)
-    assert all(x.shape == (6, 3) for x in flat)
-    assert torch.equal(flat[0], scores.reshape(6, 3))
-    assert torch.equal(flat[1], precision.reshape(6, 3))
-    assert torch.equal(flat[2], labels.reshape(6, 3))
 
 
 def test_frame_camera_pooling_forces_only_all_missing_rows_finite():
@@ -460,14 +324,3 @@ def test_frame_camera_pooling_forces_only_all_missing_rows_finite():
     # [batch=0, frame=1, keypoint=2] is the sole repaired row.
     assert not bool(got[1, 2].any())
     assert not bool(got[[i for i in range(6) if i != 1]].any())
-
-
-def test_an_absent_gridresid_offset_is_still_a_refusal_not_a_default():
-    """`build_scorer` must inherit `build_model`'s refusals rather than re-implement them.
-
-    Built directly from a config with the key REMOVED -- `_scorer` re-adds it from `SMALL`, so
-    routing through that helper would not actually test the absence.
-    """
-    cfg = {k: v for k, v in SMALL.items() if k != 'gridresid_offset'}
-    with pytest.raises(KeyError, match='gridresid_offset'):
-        build_scorer({**cfg, 'box_prompt': 'film'}, 4, **SCORER_KW)

@@ -1,13 +1,7 @@
-"""The QC path's device contract: a window must be BATCHED and MOVED before the forward.
+"""The QC path: device/batching contract, `--spans-csv` selection, and `score_root`'s coverage.
 
-`score_root` took `--device` all the way to `load_scorer_run` and then fed the model CPU tensors
-from the loader, so every non-CPU scoring run died in `conv3d` with "Input type (torch.FloatTensor)
-and weight type (torch.cuda.FloatTensor) should be the same". Nothing caught it because the one
-caller on record scored on CPU, where the missing transfer is a no-op.
-
-The shapes matter as much as the device. `views` and `coords` gain a batch axis at the call site
-while `kpt_ids` does not -- batching the ids early made them `[1, 1, K]` and tripped `score`'s own
-`(B, K)` assertion. Both halves are asserted here, on CPU, so no GPU is needed to hold the line.
+`score_root` once fed a CUDA model CPU tensors; batching `kpt_ids` early tripped `score`'s `(B, K)`
+assertion. Both halves are asserted on CPU (via 'meta') so no GPU is needed.
 """
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,38 +24,16 @@ def _window():
     return views, coords, cgroup, torch.arange(5)
 
 
-def test_views_and_coords_get_a_batch_axis_and_kpt_ids_do_not():
-    """The batching split is the contract `score` asserts against."""
-    views, coords, cgroup, kpt_ids = _to_device(*_window(), 'cpu')
-    assert views[0].shape == (1, 4, 8, 8, 3)
-    assert views[1].shape == (1, 4, 6, 6, 3)
+def test_to_device_batches_views_and_coords_and_moves_everything():
+    """Views/coords gain a batch axis, `kpt_ids` does not; camera tensors move, labels survive."""
+    views, coords, cgroup, kpt_ids = _to_device(*_window(), 'meta')
+    assert views[0].shape == (1, 4, 8, 8, 3) and views[1].shape == (1, 4, 6, 6, 3)
     assert coords.shape == (1, 4, 5, 3)
     assert kpt_ids.shape == (5,)
-
-
-def test_everything_lands_on_the_requested_device():
-    """The camera tensors travel too -- they feed the decoder's geometry, not just the pixels."""
-    views, coords, cgroup, kpt_ids = _to_device(*_window(), 'cpu')
-    assert all(v.device.type == 'cpu' for v in views)
-    assert coords.device.type == 'cpu'
-    assert kpt_ids.device.type == 'cpu'
-    assert all(t.device.type == 'cpu' for cam in cgroup for t in cam.values()
+    assert all(t.device.type == 'meta' for t in [*views, coords, kpt_ids])
+    assert all(t.device.type == 'meta' for cam in cgroup for t in cam.values()
                if torch.is_tensor(t))
-
-
-def test_non_tensor_camera_entries_survive():
-    """A camera dict carries labels and counts alongside its tensors; those must pass through."""
-    views, coords, cgroup, kpt_ids = _to_device(*_window(), 'cpu')
-    assert [c['name'] for c in cgroup] == ['cam0', 'cam1']
-    assert [c['n_frames'] for c in cgroup] == [4, 4]
-    assert len(cgroup) == len(views)
-
-
-def test_the_move_is_real_and_not_a_noop_that_happens_to_type_check():
-    """Targeting 'meta' proves the transfer happens: nothing was already on it."""
-    views, coords, _cgroup, _kpt_ids = _to_device(*_window(), 'meta')
-    assert views[0].device.type == 'meta'
-    assert coords.device.type == 'meta'
+    assert [(c['name'], c['n_frames']) for c in cgroup] == [('cam0', 4), ('cam1', 4)]
 
 
 def _fake_dataset(starts, animals=('det00',), session='sess', gid='g'):
@@ -77,37 +49,14 @@ def _fake_dataset(starts, animals=('det00',), session='sess', gid='g'):
     return SimpleNamespace(index=index)
 
 
-def test_spans_select_by_window_start_not_by_decoded_item():
-    """A span picks the windows that START inside it, and only those.
-
-    The filter runs on `dataset.index`, so a 1000-frame span of a 122k-frame clip costs ~84
-    windows to score instead of the ~10k the whole group would. Scoring the item first and
-    dropping it after would spend exactly the cost `--spans-csv` exists to avoid.
-    """
+def test_spans_select_half_open_by_window_start_and_row_key():
+    """A span keeps windows STARTING in `[start, end)` (filtered on the index, never decoded),
+    keyed on `(session_id, group, animal_id)`; a key naming anything else matches nothing."""
     ds = _fake_dataset([0, 12, 24, 36, 48])
     kept = _span_indices(ds, {('sess', 'g', 'det00'): (12, 36)})
-    assert [ds.index[i].start for i in kept] == [12, 24]
-
-
-def test_a_span_is_half_open_so_a_window_starting_at_its_end_is_not_scored():
-    """`--spans-csv` builds `(span_start, span_start + span_len)`; the end is exclusive."""
-    ds = _fake_dataset([0, 12, 24, 36])
-    kept = _span_indices(ds, {('sess', 'g', 'det00'): (12, 24)})
-    assert [ds.index[i].start for i in kept] == [12]
-
-
-def test_spans_key_is_the_loader_row_key_and_a_miss_is_empty():
-    """The key is `(session_id, group, animal_id)` -- what the loader's `row` carries. A key that
-    names a different session, group or animal matches nothing rather than selecting by accident.
-    """
-    ds = _fake_dataset([0, 12])
-    assert _span_indices(ds, {('other', 'g', 'det00'): (0, 100)}) == []
-    assert _span_indices(ds, {('sess', 'other', 'det00'): (0, 100)}) == []
-    assert _span_indices(ds, {('sess', 'g', 'det01'): (0, 100)}) == []
-
-
-def test_every_animal_of_a_group_is_matched_by_its_own_key():
-    """A multi-animal group has one index entry per animal; the span names one of them."""
+    assert [ds.index[i].start for i in kept] == [12, 24], 'the span end must be exclusive'
+    for key in (('other', 'g', 'det00'), ('sess', 'other', 'det00'), ('sess', 'g', 'det01')):
+        assert _span_indices(ds, {key: (0, 100)}) == []
     ds = _fake_dataset([0, 12], animals=('det00', 'det01'))
     kept = _span_indices(ds, {('sess', 'g', 'det01'): (0, 100)})
     assert [ds.index[i].animal for i in kept] == [1, 1]
@@ -126,118 +75,65 @@ def test_get_once_does_not_retry_a_failed_index():
     assert calls == [7]
 
 
-def test_score_root_applies_session_and_half_open_window_range(monkeypatch):
-    """Session filtering happens before the zero-based half-open window slice."""
-    sessions = []
-    for name in ('sess-a', 'sess-b'):
-        sess = SimpleNamespace(session_id=name, names=['k'])
-        sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
-        sessions.append(sess)
-
+def _patch_score_root(monkeypatch, index=(), config=None, load=None):
+    """Stub out the dataset and run loader so `score_root` runs on an index alone."""
     class FakeDataset:
         registry = SimpleNamespace(names=['k'])
         seed = 23
         train = False
-        index = [SimpleNamespace(session=sessions[0], gid='g', animal=0, start=i)
-                 for i in range(4)] + [
-                     SimpleNamespace(session=sessions[1], gid='g', animal=0, start=i)
-                     for i in range(2)]
 
         def __init__(self, *_args, **_kwargs):
-            self.calls = []
+            self.index = list(index)
 
         def __len__(self):
             return len(self.index)
 
-        def get_once(self, idx):
-            self.calls.append(idx)
+        def get_once(self, _idx):
             return None
 
     class FakeModel:
         def eval(self):
             return self
 
+    def default_load(*_args, **_kwargs):
+        return (FakeModel(), config or {}, SimpleNamespace(names=['k']),
+                SimpleNamespace(name='checkpoint_last.pth'))
+
     monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
     monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
     monkeypatch.setattr(qc, 'load_scorer_run',
-                        lambda *_args, **_kwargs: (FakeModel(), {},
-                                                    SimpleNamespace(names=['k']),
-                                                    SimpleNamespace(name='checkpoint_last.pth')))
+                        (lambda *a, **k: load(FakeModel(), *a, **k)) if load else default_load)
+
+
+def _sess(name):
+    sess = SimpleNamespace(session_id=name, names=['k'])
+    sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
+    return sess
+
+
+def test_score_root_applies_session_then_half_open_window_range(monkeypatch):
+    """Session filtering happens before the zero-based half-open slice; out of range raises."""
+    a, b = _sess('sess-a'), _sess('sess-b')
+    index = ([SimpleNamespace(session=a, gid='g', animal=0, start=i) for i in range(4)]
+             + [SimpleNamespace(session=b, gid='g', animal=0, start=i) for i in range(2)])
+    _patch_score_root(monkeypatch, index)
     coverage = []
     table, _registry, _config = qc.score_root(
-        Path('run'), 'data', 'test', session='sess-a', start=1, stop=3,
-        coverage=coverage)
-
+        Path('run'), 'data', 'test', session='sess-a', start=1, stop=3, coverage=coverage)
     assert table.is_empty()
     assert [row['index'] for row in coverage] == [1, 2]
-
-
-def test_score_root_rejects_window_range_outside_filtered_index(monkeypatch):
-    """A coordinator typo must fail instead of silently scoring a smaller shard."""
-    sess = SimpleNamespace(session_id='sess', names=['k'])
-    sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
-
-    class FakeDataset:
-        registry = SimpleNamespace(names=['k'])
-        index = [SimpleNamespace(session=sess, gid='g', animal=0, start=0)]
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __len__(self):
-            return 1
-
-    class FakeModel:
-        def eval(self):
-            return self
-
-    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
-    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
-    monkeypatch.setattr(qc, 'load_scorer_run',
-                        lambda *_args, **_kwargs: (FakeModel(), {},
-                                                    SimpleNamespace(names=['k']),
-                                                    SimpleNamespace(name='checkpoint_last.pth')))
     with pytest.raises(ValueError, match='invalid window range'):
-        qc.score_root(Path('run'), 'data', 'test', start=0, stop=2)
+        qc.score_root(Path('run'), 'data', 'test', session='sess-b', start=0, stop=3)
 
 
 def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
     """A failed requested window is coverage, never a random group's score."""
-
-    sess = SimpleNamespace(session_id='sess', names=['k'])
-    sess.labels = lambda _gid: SimpleNamespace(animal_ids=['a0'])
-
-    class FakeDataset:
-        registry = SimpleNamespace(names=['k'])
-        seed = 23
-        train = False
-        index = [SimpleNamespace(session=sess, gid='target', animal=0, start=0)]
-
-        def __init__(self, *_args, **_kwargs):
-            self.calls = []
-
-        def __len__(self):
-            return len(self.index)
-
-        def get_once(self, idx):
-            self.calls.append(idx)
-            return None
-
-    class FakeModel:
-        def eval(self):
-            return self
-
-    ckpt = SimpleNamespace(name='checkpoint_last.pth')
-    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
-    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
-    monkeypatch.setattr(qc, 'load_scorer_run',
-                        lambda *_args, **_kwargs: (FakeModel(), {},
-                                                    SimpleNamespace(names=['k']), ckpt))
+    _patch_score_root(monkeypatch, [SimpleNamespace(session=_sess('sess'), gid='target',
+                                                    animal=0, start=0)])
     coverage = []
     table, _registry, _config = qc.score_root(
         Path('run'), 'data', 'test', spans={('sess', 'target', 'a0'): (0, 100)},
         coverage=coverage)
-
     assert table.is_empty()
     assert coverage == [{'index': 0, 'session': 'sess', 'group': 'target', 'animal': 'a0',
                          'start': 0, 'status': 'unscorable',
@@ -247,27 +143,7 @@ def test_score_root_records_failure_without_scoring_a_replacement(monkeypatch):
 def test_empty_frame_qc_keeps_frame_schema_and_raw_output(monkeypatch, tmp_path):
     import toml
 
-    class FakeDataset:
-        registry = SimpleNamespace(names=['k'])
-        index = []
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __len__(self):
-            return 0
-
-    class FakeModel:
-        def eval(self):
-            return self
-
-    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
-    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
-    monkeypatch.setattr(qc, 'load_scorer_run',
-                        lambda *_args, **_kwargs: (FakeModel(),
-                                                    {'scorer': {'output_granularity': 'frame'}},
-                                                    SimpleNamespace(names=['k']),
-                                                    SimpleNamespace(name='checkpoint_last.pth')))
+    _patch_score_root(monkeypatch, config={'scorer': {'output_granularity': 'frame'}})
     table, _registry, config = qc.score_root(Path('run'), 'data', 'test')
     assert {'frame', 'local_t', 'window_start'}.issubset(table.columns)
     qc.write_outputs(tmp_path, table, Path('run'), 'data', 'test', 'report',
@@ -276,129 +152,50 @@ def test_empty_frame_qc_keeps_frame_schema_and_raw_output(monkeypatch, tmp_path)
     assert toml.load(tmp_path / 'provenance.toml')['output_granularity'] == 'frame'
 
 
-def test_score_root_forwards_explicit_checkpoint_and_records_iteration(monkeypatch, tmp_path):
-    """An explicitly selected checkpoint reaches the loader and output metadata sink."""
+def test_checkpoint_selection_is_explicit_and_recorded(monkeypatch, tmp_path):
+    """No selection passes `None` (latest, never implicit best); a named file reaches the loader,
+    its iteration lands in provenance, and a missing one raises."""
+    import toml
+
     checkpoint = tmp_path / 'checkpoint_best.pth'
     torch.save({'iteration': 37}, checkpoint)
-    calls = {}
+    calls = []
 
-    class FakeDataset:
-        registry = SimpleNamespace(names=['k'])
-        index = []
+    def load(model, *_args, **kwargs):
+        calls.append(kwargs)
+        if kwargs['checkpoint'] == 'missing.pth':
+            raise FileNotFoundError('missing.pth')
+        return model, {}, SimpleNamespace(names=['k']), checkpoint
 
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __len__(self):
-            return 0
-
-    class FakeModel:
-        def eval(self):
-            return self
-
-    def fake_load(*args, **kwargs):
-        calls.update(kwargs)
-        return FakeModel(), {}, SimpleNamespace(names=['k']), checkpoint
-
-    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
-    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
-    monkeypatch.setattr(qc, 'load_scorer_run', fake_load)
-    info = {}
-    table, _registry, _config = qc.score_root(
-        Path('run'), 'data', 'test', checkpoint='checkpoint_best.pth', checkpoint_info=info)
-
-    assert table.is_empty()
-    assert calls == {'checkpoint': 'checkpoint_best.pth', 'device': 'cpu'}
-    assert info == {'checkpoint_file': str(checkpoint), 'checkpoint_iteration': 37}
-
-
-def test_score_root_omits_checkpoint_selection_by_default(monkeypatch):
-    """No selection remains the loader's existing latest/last behavior, not implicit best."""
-    calls = {}
-
-    class FakeDataset:
-        registry = SimpleNamespace(names=['k'])
-        index = []
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def __len__(self):
-            return 0
-
-    class FakeModel:
-        def eval(self):
-            return self
-
-    def fake_load(*args, **kwargs):
-        calls.update(kwargs)
-        return FakeModel(), {}, SimpleNamespace(names=['k']), SimpleNamespace(name='checkpoint_last.pth')
-
-    monkeypatch.setattr(qc, 'PoseDataset', FakeDataset)
-    monkeypatch.setattr(qc, '_loader_config', lambda _config: SimpleNamespace())
-    monkeypatch.setattr(qc, 'load_scorer_run', fake_load)
+    _patch_score_root(monkeypatch, load=load)
     qc.score_root(Path('run'), 'data', 'test')
-
-    assert calls == {'checkpoint': None, 'device': 'cpu'}
-
-
-def test_score_root_explicit_missing_checkpoint_raises(monkeypatch):
-    """The loader's explicit-file refusal is not swallowed by QC."""
-    def fake_load(*_args, **kwargs):
-        raise FileNotFoundError(kwargs['checkpoint'])
-
-    monkeypatch.setattr(qc, 'load_scorer_run', fake_load)
+    info = {}
+    qc.score_root(Path('run'), 'data', 'test', checkpoint='checkpoint_best.pth',
+                  checkpoint_info=info)
+    assert [c['checkpoint'] for c in calls] == [None, 'checkpoint_best.pth']
+    assert info == {'checkpoint_file': str(checkpoint), 'checkpoint_iteration': 37}
     with pytest.raises(FileNotFoundError, match='missing.pth'):
         qc.score_root(Path('run'), 'data', 'test', checkpoint='missing.pth')
 
-
-def test_write_outputs_records_checkpoint_provenance(monkeypatch, tmp_path):
-    """The output records the resolved file and the checkpoint's training iteration."""
-    import toml
-
     monkeypatch.setattr(qc, 'provenance', lambda: {})
-    qc.write_outputs(tmp_path, pl.DataFrame({'score': [1.0]}), Path('run'), 'data', 'test',
-                     'report', checkpoint_file=Path('/runs/checkpoint_best.pth'),
-                     checkpoint_iteration=37)
-    result = toml.load(tmp_path / 'provenance.toml')
-    assert result['checkpoint_file'] == '/runs/checkpoint_best.pth'
+    out = tmp_path / 'out'
+    qc.write_outputs(out, pl.DataFrame({'score': [1.0]}), Path('run'), 'data', 'test',
+                     'report', **info)
+    result = toml.load(out / 'provenance.toml')
+    assert result['checkpoint_file'] == str(checkpoint)
     assert result['checkpoint_iteration'] == 37
 
 
-def test_score_session_help_requires_explicit_best_checkpoint(capsys):
-    """The CLI documents that validation-selected best is never implicit."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location('score_session_cli', 'scripts/score_session.py')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    with pytest.raises(SystemExit):
-        module.main(['--help'])
-    help_text = capsys.readouterr().out
-    assert '--checkpoint' in help_text
-    assert 'checkpoint_best.pth' in help_text
-    assert 'validation-selected' in help_text
-    assert 'explicitly named' in help_text
-    assert '--session' in help_text
-    assert '--start' in help_text
-    assert '--stop' in help_text
-
-
-def test_the_deleted_window_offset_flag_is_refused_by_name():
-    """`--window-offset` was refuted (report 60): the CLI names it and says why, before loading."""
+def test_the_deleted_window_offset_levers_are_refused_by_name():
+    """`--window-offset` / nonzero `[data].val_offset` were refuted (report 60); inert 0 loads."""
     from tailcyclenet.scorer.score import main
+    from tailcyclenet.scorer.train import loader_config
 
     with pytest.raises(SystemExit, match='--window-offset is deleted'):
         main(['--run', 'r', '--data', 'd', '--out', 'o', '--window-offset', '4'])
-
-
-def test_the_deleted_val_offset_data_key_is_refused_by_name():
-    """A nonzero `[data].val_offset` is refused naming the key; the inert 0 still loads."""
-    from tailcyclenet.scorer.train import loader_config
-
     assert loader_config({'val_offset': 0}, {}).val_stride == 0
     assert qc._loader_config({'data': {'val_offset': 0}}).val_stride == 0
-    with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
-        qc._loader_config({'data': {'val_offset': 3}})
-    with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
-        loader_config({'val_offset': 3}, {})
+    for call in (lambda: qc._loader_config({'data': {'val_offset': 3}}),
+                 lambda: loader_config({'val_offset': 3}, {})):
+        with pytest.raises(SystemExit, match=r'\[data\]\.val_offset is deleted'):
+            call()

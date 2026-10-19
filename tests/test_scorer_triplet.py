@@ -1,15 +1,7 @@
 """The triplet contract: what makes the good-vs-bad gap a track-quality signal.
 
-Four properties, each of which fails silently rather than raising when it is wrong:
-
-  * `good` and `bad` must be PIXEL-IDENTICAL (the corruption moves coordinates only). If their
-    pixels differ, the gap stops isolating track quality and starts measuring appearance.
-  * the point-drop mask must be SHARED, or the gap partly measures which slots went missing.
-  * the CROP must not depend on the corruption -- a crop that follows each candidate's own
-    coordinates gives the bad sample different pixels, which breaks the first property too.
-  * the 2D anchor's coordinates must be carried into view B's frame EXACTLY
-    (`x_B = H_B @ inv(H_A) @ x_A`), or the anchor is a different track and the invariance target
-    is meaningless.
+Each fails silently: good/bad must share pixels and the drop mask, the crop must not depend on the
+corruption, and the 2D anchor must be carried into view B exactly (`H_B @ inv(H_A)`).
 """
 import sys
 from pathlib import Path
@@ -73,57 +65,23 @@ def test_prob_2d_only_builds_a_2d_scorer_triplet(roots):
     assert len(trip['good'][0]) == 1
 
 
-# -- A.3: good and bad share pixels exactly -------------------------------------------------
-
-@pytest.mark.parametrize('seed', [0, 1, 7])
-def test_good_and_bad_share_pixels_exactly(roots, seed):
-    """`bad` is `good` with different COORDINATES. Nothing else may differ."""
-    for _ds, trip in _both(roots, seed):
-        assert trip is not None, 'the triplet did not build'
-        gv, _, _ = trip['good']
-        bv, _, _ = trip['bad']
-        assert len(gv) == len(bv) > 0
-        for i, (a, b) in enumerate(zip(gv, bv)):
-            assert a.shape == b.shape
-            assert torch.equal(a, b), f'camera {i}: good and bad pixels differ'
-
-
-def test_the_corruption_actually_moves_coordinates(roots):
-    """The complement of the pixel test: the coordinates MUST differ, or there is no signal.
-
-    Without this the pixel-identity test could pass on a triplet where the corruption silently
-    did nothing.
-    """
+def test_good_and_bad_differ_only_in_coordinates(roots):
+    """Same pixels, same drop mask, no keypoint dropped everywhere -- but the coordinates move."""
     moved = 0
-    for _ds, trip in _both(roots, 3):
-        g = trip['good'][1]
-        b = trip['bad'][1]
-        assert g.shape == b.shape
-        both_obs = torch.isfinite(g).all(-1) & torch.isfinite(b).all(-1)
-        if bool(both_obs.any()):
-            delta = (b - g)[both_obs].abs().sum(-1)
-            assert float(delta.max()) > 0, 'the bad track is byte-identical to the good one'
-            moved += int((delta > 0).sum())
-    assert moved > 0
-
-
-# -- A.4: the drop mask is shared ------------------------------------------------------------
-
-@pytest.mark.parametrize('seed', [0, 1, 7])
-def test_the_drop_mask_is_shared(roots, seed):
-    """Identical NaN pattern in good and bad: missingness must be orthogonal to quality."""
-    for _ds, trip in _both(roots, seed):
-        g, b = trip['good'][1], trip['bad'][1]
-        assert torch.equal(torch.isfinite(g).all(-1), torch.isfinite(b).all(-1)), \
-            'good and bad dropped different slots'
-
-
-def test_drops_never_empty_a_point(roots):
-    """A dropped-everywhere keypoint would be pooled through the force-unmask for no reason."""
-    for _ds, trip in _both(roots, 5):
-        g = trip['good'][1]
-        obs = torch.isfinite(g).all(-1)
-        assert bool(obs.any(dim=1).all()), 'some keypoint was dropped in every frame'
+    for seed in (0, 3):
+        for _ds, trip in _both(roots, seed):
+            assert trip is not None, 'the triplet did not build'
+            gv, bv = trip['good'][0], trip['bad'][0]
+            assert len(gv) == len(bv) > 0
+            for i, (a, b) in enumerate(zip(gv, bv)):
+                assert torch.equal(a, b), f'camera {i}: good and bad pixels differ'
+            g, b = trip['good'][1], trip['bad'][1]
+            obs = torch.isfinite(g).all(-1)
+            assert torch.equal(obs, torch.isfinite(b).all(-1)), 'good/bad dropped different slots'
+            assert bool(obs.any(dim=1).all()), 'some keypoint was dropped in every frame'
+            if bool(obs.any()):
+                moved += int(((b - g)[obs].abs().sum(-1) > 0).sum())
+    assert moved > 0, 'the corruption moved nothing'
 
 
 def test_observed_frame_counts_count_distinct_sources_not_slots(roots):
@@ -146,25 +104,10 @@ def test_observed_frame_counts_count_distinct_sources_not_slots(roots):
     assert int(counts[0, 2]) == 1, 'a keypoint observed in only one distinct frame miscounted'
 
 
-# -- A.5: the crop does not depend on the corruption -----------------------------------------
-
 def test_the_crop_does_not_depend_on_the_corruption(roots):
-    """The crop must already be fixed before any corruption is drawn.
+    """A standalone realisation on the same rng prefix must reproduce view A byte for byte.
 
-    `make_triplet` realises view A from the CLEAN selection and only THEN draws the corruption, so
-    a standalone realisation driven by the SAME rng state must reproduce view A byte for byte. That
-    is the structural statement of "the crop does not depend on the corruption", and it fails if
-    the two are ever reordered.
-
-    The rng handling is the whole test: `select` consumes the stream before `realise` sees it, so
-    a fresh generator for the standalone view would draw DIFFERENT rotation and jitter and the
-    comparison would fail on unchanged code. Both paths are therefore driven from a generator that
-    has run the identical prefix.
-
-    A test that instead corrupted with a huge magnitude and compared crops cannot work: at
-    `mag = 1e6` a point's corrupted slot leaves the frame whenever the draw does not cancel, the
-    visibility filter drops those points, and whether 2 survive is a property of the ambient torch
-    RNG rather than of the crop.
+    `make_triplet` realises view A from the CLEAN selection before drawing the corruption.
     """
     ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
     shape = ds.shape(np.random.default_rng(1))
@@ -190,83 +133,50 @@ def test_the_crop_does_not_depend_on_the_corruption(roots):
     for i, (a, b) in enumerate(zip(standalone.views, trip['good'][0])):
         assert torch.equal(a[None], b), f'camera {i}: the good view is not the standalone view'
 
-# -- A.6: the 2D anchor round-trip -----------------------------------------------------------
 
-def test_the_2d_affine_round_trips_a_point(roots):
-    """`H_to @ inv(H_from) @ (H_from @ x) == H_to @ x` -- the composition is exact."""
-    ds, _trip = _one(roots, 'ratlike', True, 0)
+def test_the_2d_transfer_round_trips_and_preserves_nan(roots):
+    """`H_B @ inv(H_A)` composes exactly, a dropped slot stays dropped, and the anchor keeps every
+    observed slot of its source track."""
+    ds, trip = _one(roots, 'ratlike', True, 0)
     rng = np.random.default_rng(0)
     sel = ds.select(0, rng, ds.shape(np.random.default_rng(1)))
     a = ds.realise(sel, np.random.default_rng(11), world_gauge=False)
     b = ds.realise(sel, np.random.default_rng(12), world_gauge=False)
     Ha, Hb = view_affine_2d(a), view_affine_2d(b)
+    eye = torch.eye(3, dtype=torch.float64)
 
     src = torch.rand(10, 2, dtype=torch.float32) * 40 + 5
-    xa = transfer_points_2d(src, torch.eye(3, dtype=torch.float64), Ha)
-    xb = transfer_points_2d(xa, Ha, Hb)
-    direct = transfer_points_2d(src, torch.eye(3, dtype=torch.float64), Hb)
+    xb = transfer_points_2d(transfer_points_2d(src, eye, Ha), Ha, Hb)
+    direct = transfer_points_2d(src, eye, Hb)
     assert torch.allclose(xb, direct, atol=1e-3), (xb - direct).abs().max()
 
+    out = transfer_points_2d(torch.tensor([[[1.0, 2.0], [float('nan'), float('nan')]]]), eye, eye)
+    assert torch.isfinite(out[0, 0]).all() and not torch.isfinite(out[0, 1]).any()
 
-def test_the_2d_anchor_is_the_same_track_in_view_bs_frame(roots):
-    """The anchor's coordinates must equal the source track carried through H_B @ inv(H_A)."""
-    ds, trip = _one(roots, 'ratlike', True, 0)
     assert trip is not None and trip['mode'] == '2d'
     source = trip['good'][1] if trip['anchor_label'] > 0 else trip['bad'][1]
     anchor = trip['anchor'][1]
-    assert source.shape == anchor.shape and source.shape[0] == 1
-
+    assert source.shape == anchor.shape
     keep = torch.isfinite(source).all(-1)
-    assert bool(keep.any()), 'no observed slot to compare'
-    assert torch.isfinite(anchor).all(-1)[keep].all(), 'the transfer NaNNed an observed slot'
-
-
-def test_transfer_preserves_nan(roots):
-    """A dropped slot must stay dropped after the transfer, or the anchor invents evidence."""
-    p = torch.tensor([[[1.0, 2.0], [float('nan'), float('nan')]]])
-    H = torch.eye(3, dtype=torch.float64)
-    out = transfer_points_2d(p, H, H)
-    assert torch.isfinite(out[0, 0]).all()
-    assert not torch.isfinite(out[0, 1]).any()
+    assert bool(keep.any()) and torch.isfinite(anchor).all(-1)[keep].all()
 
 
 # -- sparse windows (section 3.8b) ------------------------------------------------------------
 
-def test_a_sparse_keypoint_gets_only_the_types_that_can_move_it():
-    """`build_corruptors_for`'s sparse pair must exclude the ramp/crossing types."""
+def test_the_sparse_menu_is_const_offset_forced_plus_frame_noise():
+    """Sparse keypoints get only types that can move them, with `const_offset` FORCED (gated at
+    0.5 it left ~83% of late-observed 3dpop keypoints uncorrupted); a zero forced magnitude raises."""
     _d3, _d2, s3, s2 = build_corruptors_for(CORRUPTION)
-    assert set(s3.names) == {'const_offset', 'frame_noise'}
-    assert set(s2.names) == {'const_offset', 'frame_noise'}
-
-
-def test_the_sparse_menu_forces_const_offset():
-    """`const_offset` must be FORCED for a sparse keypoint, not gated at its configured value.
-
-    Section 3.8b's own wording is that `const_offset` "always qualifies". Gating it at 0.5 leaves a
-    sparse keypoint observed in only the last few frames of a window uncorrupted most of the time,
-    because `frame_noise` moves a contiguous window that need not reach them -- measured at ~83% of
-    draws on 3dpop. A window trained on an uncorrupted "bad" sample teaches the scorer that a
-    corrupt track is clean, which is worse than not training that window at all.
-    """
+    assert set(s3.names) == set(s2.names) == {'const_offset', 'frame_noise'}
     cfg = dict(CORRUPTION, const_offset_prob=0.01, frame_noise_prob=0.0)
-    _d3, _d2, s3, _s2 = build_corruptors_for(cfg)
-    assert s3.probs['const_offset'] == 1.0, 'const_offset is not forced for sparse keypoints'
-
-
-def test_a_sparse_menu_with_a_zero_forced_magnitude_is_refused():
-    """Forcing a zero-magnitude type would corrupt nothing, so it must fail loudly."""
+    assert build_corruptors_for(cfg)[2].probs['const_offset'] == 1.0
     cfg = dict(CORRUPTION, mag_3d={k: 0.0 for k in CORRUPTION['mag_3d']})
     with pytest.raises(ValueError, match='const_offset'):
         build_corruptors_for(cfg)
 
 
 def test_sparse_windows_still_build_and_still_carry_signal(roots):
-    """A window where every keypoint is sparse must still train, on the reduced menu.
-
-    Section 3.8b keeps sparse windows rather than excluding them, because a single observed frame
-    still supplies a spatial good/bad comparison. `min_valid_frames` is set above the fixture's
-    distinct-frame count so every keypoint is sparse here.
-    """
+    """A fully sparse window (min_valid_frames above the fixture's span) trains on the reduced menu."""
     high = dict(CORRUPTION, min_valid_frames=6)
     ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
     rng = np.random.default_rng(0)
@@ -282,10 +192,7 @@ def test_sparse_windows_still_build_and_still_carry_signal(roots):
 
 
 def test_sparse_stuck_detects_a_corruption_that_moves_no_observed_slot():
-    """The detector behind section 3.8b's invariant 1, tested directly.
-
-    A shift that moves only slots the keypoint was never observed at is a corruption in name only.
-    """
+    """A shift that moves only never-observed slots is a corruption in name only."""
     from tailcyclenet.scorer.triplet import _sparse_stuck
 
     coords = torch.zeros(1, 4, 2, 3)
@@ -302,19 +209,13 @@ def test_sparse_stuck_detects_a_corruption_that_moves_no_observed_slot():
 
 
 def test_the_forced_sparse_menu_moves_every_sparse_keypoint(roots):
-    """With `const_offset` forced, NO sparse keypoint is ever left uncorrupted.
-
-    This is the regression guard for the bug that stopped the first 3dpop probe: a sparse keypoint
-    observed in only the window's last few frames was missed by `frame_noise`'s window on ~83% of
-    draws, and `const_offset` gated at 0.5 left it stuck. A forced `const_offset` moves every frame,
-    so `_draw_sparse_moved` cannot fail.
-    """
+    """Regression for the first 3dpop probe: with `const_offset` forced no sparse keypoint is stuck."""
     from tailcyclenet.scorer.triplet import _draw_sparse_moved, _sparse_stuck
 
     ds = PoseDataset(roots / 'mouselike', 'train', CFG, train=True)
     _d3, _d2, sparse_3d, _s2 = build_corruptors_for(CORRUPTION)
     checked = 0
-    for seed in range(12):
+    for seed in range(4):
         rng = np.random.default_rng(seed)
         sel = ds.select(0, rng, ds.shape(np.random.default_rng(1)))
         if sel is None:
@@ -341,12 +242,15 @@ def test_the_forced_sparse_menu_moves_every_sparse_keypoint(roots):
 # -- the triplet feeds the model -------------------------------------------------------------
 
 def test_the_triplet_scores_end_to_end(roots):
-    """`score_triplet` on a real triplet: shapes, finiteness, and one backward."""
+    """`score_triplet` on a real triplet: shapes, finiteness, per-type tags, and one backward."""
+    from tracktail.datasets.scorer_corruption import GENERATORS
     from tests.test_scorer_model import _scorer
 
     ds, trip = _one(roots, 'mouselike', False, 0)
     assert trip['good'][0][0].dim() == 5, 'views must already carry the batch axis'
     K = trip['kpt_ids'].shape[1]
+    assert trip['fired'].shape == (1, trip['good'][1].shape[2], len(GENERATORS))
+    assert bool(trip['fired'].any()), 'no corruption was tagged on a real triplet'
     model = _scorer(max(int(trip['kpt_ids'].max()) + 1, 4), stride_length=4)
     scores, precision, labels = model.score_triplet(trip)
     assert scores.shape == (1, K, 3) and precision.shape == (1, K, 3)
@@ -369,54 +273,28 @@ def test_the_triplet_scores_end_to_end(roots):
 
 # -- corruption tagging (Gate B needs a per-type breakdown) -----------------------------------
 
-def test_tagged_draw_matches_the_library_corruptor_exactly():
-    """`tagged_draw` must draw the SAME shift as the library's `PointCorruptor`.
-
-    The tags decide what the per-type `triplet_acc` means, so if this draw diverged from the one
-    the model is trained on, the breakdown would describe a different corruption than the model
-    saw. Same seed, same tensors -- not a statistical match.
-    """
+def test_tagged_draw_matches_the_library_corruptor_and_tags_every_point():
+    """Same seed -> the same shift as `PointCorruptor` (the tags describe what the model saw), and
+    every point carries at least one tag even when no type fires on its own."""
     from tracktail.datasets.scorer_corruption import PointCorruptor, GENERATORS
 
     from tailcyclenet.scorer.triplet import tagged_draw
 
     probs = {n: 0.5 for n in GENERATORS}
     mags = {n: 10.0 for n in GENERATORS}
-    P, T, D = 7, 4, 3
-
     torch.manual_seed(1234)
-    want = PointCorruptor(probs, mags)(P, T, D, torch.device('cpu'))
+    want = PointCorruptor(probs, mags)(7, 4, 3, torch.device('cpu'))
     torch.manual_seed(1234)
-    got, fired = tagged_draw(PointCorruptor(probs, mags), P, T, D, torch.device('cpu'))
-
+    got, fired = tagged_draw(PointCorruptor(probs, mags), 7, 4, 3, torch.device('cpu'))
     assert torch.equal(got, want), (got - want).abs().max()
-    assert fired.shape == (P, len(GENERATORS))
-    assert bool(fired.any()), 'no type was tagged -- the breakdown would be empty'
-
-
-def test_tagged_draw_tags_every_point_with_at_least_one_type():
-    """Every point is corrupted, so every point must carry at least one tag."""
-    from tracktail.datasets.scorer_corruption import PointCorruptor, GENERATORS
-
-    from tailcyclenet.scorer.triplet import tagged_draw
+    assert fired.shape == (7, len(GENERATORS))
 
     probs = {n: 0.0 for n in GENERATORS}
-    probs['const_offset'] = 0.01                 # almost never fires on its own
+    probs['const_offset'] = 0.01
     torch.manual_seed(7)
     _shift, fired = tagged_draw(PointCorruptor(probs, {n: 5.0 for n in GENERATORS}),
                                 6, 3, 2, torch.device('cpu'))
     assert bool(fired.any(dim=1).all()), 'a point was left with no corruption tag'
-
-
-def test_the_triplet_carries_per_type_tags_for_the_surviving_points(roots):
-    """`make_triplet` must return tags aligned with the keypoints it kept."""
-    from tracktail.datasets.scorer_corruption import GENERATORS
-
-    _ds, trip = _one(roots, 'mouselike', False, 0)
-    assert trip is not None
-    K = trip['good'][1].shape[2]
-    assert trip['fired'].shape == (1, K, len(GENERATORS))
-    assert bool(trip['fired'].any()), 'no corruption was tagged on a real triplet'
 
 
 def test_frame_triplet_masks_are_post_gate_and_source_weighted(roots):

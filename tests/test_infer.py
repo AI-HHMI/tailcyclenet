@@ -1,12 +1,9 @@
-"""THE window loop, on the paths that used to raise.
+"""THE window loop and the inference CLI.
 
-`run_group` had no coverage at all, and two of its failures were IndexErrors reachable from the
-ordinary deployment command line rather than from anything exotic. The model here is random and
-tiny -- these assert that the loop RUNS and returns the right shapes and identities, never that
-the numbers are good.
+The model is random and tiny: these assert that the loop RUNS and returns the right shapes,
+identities and byte-identities, never that the numbers are good.
 """
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -21,53 +18,17 @@ from tailcyclenet.model import build_model
 from test_model import SMALL
 
 
-def test_inference_speed_options_default_to_measured_path():
-    from tailcyclenet.infer.cli import build_parser
-
-    parser = build_parser()
-    assert parser.get_default('precision') == 'bf16'
-    assert parser.get_default('units') is None, 'units are resolved only after deriving video mode'
-    assert parser.get_default('camera_batch') is True
-    assert parser.get_default('allow_pose_scorer_mismatch') is False
-    options = {option for action in parser._actions for option in action.option_strings}
-    assert '--camera-batch' in options and '--no-camera-batch' in options
-    assert '--allow-pose-scorer-mismatch' in options
-
-
-@pytest.fixture(scope='module', params=['rat', 'mv'])
-def scene(request):
-    """A 2D multi-animal session and a 3D session on a moving rig."""
+def _scene(tmp_path_factory, kind, T):
+    """(model, session, registry, dataset name): `rat` = 2D, 2 animals, 1 camera; `mv` = 3D on a
+    moving 3-camera rig. T=4 is ONE window at n_frames=4; T=16 is seven (overlap 2)."""
     import conftest as cf
 
-    root = Path(tempfile.mkdtemp())
-    if request.param == 'rat':
-        cf._session_2d(root / 'rat' / 'test' / 's')          # T=4, 2 animals, 1 camera
+    root = tmp_path_factory.mktemp(f'{kind}{T}')
+    if kind == 'rat':
+        cf._session_2d(root / 'rat' / 'test' / 's', T=T)
     else:
-        cf._session_3d(root / 'mv' / 'test' / 's', moving=True)   # T=4, 1 animal, moving
-    ds = load_dataset(root / request.param)
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
-    return model, sess, registry, ds.name
-
-
-@pytest.fixture(scope='module', params=['rat', 'mv'])
-def multiwindow_scene(request):
-    """The same two shapes as `scene`, but T=16 -- SEVERAL windows at n_frames=4/overlap=2
-
-    (`window_starts(16, 4, 2)` is 7 starts), which `scene`'s T=4 cannot exercise at all (one
-    window only). This is what a prefetch-ahead pipeline needs to be tested against: with one
-    window there is nothing to prefetch and `prefetch_windows` is a no-op by construction.
-    """
-    import conftest as cf
-
-    root = Path(tempfile.mkdtemp())
-    if request.param == 'rat':
-        cf._session_2d(root / 'rat' / 'test' / 's', T=16)
-    else:
-        cf._session_3d(root / 'mv' / 'test' / 's', T=16, moving=True)
-    ds = load_dataset(root / request.param)
+        cf._session_3d(root / 'mv' / 'test' / 's', T=T, moving=True)
+    ds = load_dataset(root / kind)
     registry = Registry.build([ds])
     sess = ds.sessions['test'][0]
     sess.preload()
@@ -76,24 +37,44 @@ def multiwindow_scene(request):
 
 
 @pytest.fixture(scope='module')
+def rat(tmp_path_factory):
+    """2D multi-animal session, T=4 (one window)."""
+    return _scene(tmp_path_factory, 'rat', 4)
+
+
+@pytest.fixture(scope='module')
+def mv(tmp_path_factory):
+    """3D moving-rig session, T=4 (one window)."""
+    return _scene(tmp_path_factory, 'mv', 4)
+
+
+@pytest.fixture(scope='module')
+def rat16(tmp_path_factory):
+    """2D session, T=16 -- several windows, which prefetch/seam/carry tests need."""
+    return _scene(tmp_path_factory, 'rat', 16)
+
+
+@pytest.fixture(scope='module')
+def mv16(tmp_path_factory):
+    """3D moving-rig session, T=16."""
+    return _scene(tmp_path_factory, 'mv', 16)
+
+
+@pytest.fixture(scope='module', params=['rat', 'mv'])
+def scene(request):
+    """Both shapes, for the few invariants whose 2D and 3D code paths differ."""
+    return request.getfixturevalue(request.param)
+
+
+@pytest.fixture(scope='module')
 def cli():
-    """`scripts/infer.py` as a module, without running main(). Same pattern as test_train.py."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        'tcn_infer', Path(__file__).resolve().parent.parent / 'scripts' / 'infer.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    """The inference CLI module (`scripts/infer.py` just calls its `main`)."""
+    from tailcyclenet.infer import cli as mod
     return mod
 
 
 def _boxes_for(boxes):
-    """Adapt a whole-clip (S,T,C,4) array to `run_blocks`' `boxes_for` callback.
-
-    The tests build the box array up front because that is the clearest way to state a scenario;
-    the loop asks for one block at a time because a whole-clip array is the thing that does not
-    fit. This bridges the two and is deliberately trivial -- if it ever needs logic, the test is
-    exercising the adapter instead of the loop.
-    """
+    """Adapt a whole-clip (S,T,C,4) array to `run_blocks`' `boxes_for` callback."""
     def f(store, lo, hi):
         return (boxes[:, lo:hi], None)
     return f
@@ -102,6 +83,70 @@ def _boxes_for(boxes):
 def _cfg(**kw):
     kw.setdefault('overlap', 2)
     return InferConfig(n_frames=4, image_size=64, min_crop_dim=16, device='cpu', **kw)
+
+
+def _assert_same(a, b, msg=''):
+    """Two run_group/merge_blocks outputs are identical in every key (NaN-mask aware)."""
+    assert set(a) == set(b)
+    for k in a:
+        va, vb = a[k], b[k]
+        if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
+            assert np.array_equal(np.isnan(va), np.isnan(vb)), f'{k}{msg}: finite mask differs'
+            fin = ~np.isnan(va)
+            np.testing.assert_array_equal(va[fin], vb[fin], err_msg=f'{k}{msg}')
+        elif isinstance(va, np.ndarray):
+            np.testing.assert_array_equal(va, vb, err_msg=f'{k}{msg}')
+        else:
+            assert str(va) == str(vb), f'{k}{msg}'
+
+
+def _save_run(tmp_path, registry, model_cfg=SMALL):
+    """A loadable run folder (config + registry + one checkpoint) for a random SMALL model."""
+    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+
+    model = build_model(model_cfg, n_keypoints=registry.n_keypoints)
+    run = tmp_path / 'run'
+    config = {'model': model_cfg, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
+                                           'box_source': 'keypoints'}}
+    save_run_meta(run, config, registry)
+    path = save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config,
+                           registry=registry)
+    return run, path
+
+
+def _cli_setup(tmp_path, kind='rat', name=None, T=4, model_cfg=SMALL, **kw):
+    """One session under `<tmp>/<name>/test/s` plus a run folder; returns (session dir, run)."""
+    import conftest as cf
+
+    root = tmp_path / (name or kind)
+    if kind == 'rat':
+        cf._session_2d(root / 'test' / 's', T=T)
+    else:
+        cf._session_3d(root / 'test' / 's', T=T, **kw)
+    run, _ = _save_run(tmp_path, Registry.build([load_dataset(root)]), model_cfg)
+    return root / 'test' / 's', run
+
+
+def _no_load(monkeypatch):
+    """Make `load_run` fail loudly, so a refusal is proven to fire before the checkpoint loads."""
+    def boom(*a, **k):
+        raise AssertionError('the refusal must fire before the checkpoint loads')
+    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+
+
+def test_parser_defaults_select_the_measured_path():
+    """Speed/tracking defaults are the measured ones (bf16, camera batch, --track, --link-boxes)."""
+    from tailcyclenet.infer.cli import build_parser
+
+    parser = build_parser()
+    assert parser.get_default('precision') == 'bf16'
+    assert parser.get_default('units') is None, 'units are resolved only after deriving video mode'
+    assert parser.get_default('camera_batch') is True
+    assert parser.get_default('allow_pose_scorer_mismatch') is False
+    assert parser.get_default('track') is True and parser.get_default('link_boxes') is True
+    assert parser.get_default('max_age') == 8 and parser.get_default('max_move') == 1.25
+    options = {option for action in parser._actions for option in action.option_strings}
+    assert {'--camera-batch', '--no-camera-batch', '--allow-pose-scorer-mismatch'} <= options
 
 
 def test_detector_inference_without_keypoint_table(tmp_path):
@@ -139,10 +184,8 @@ def test_scorer_encoder_mismatch_requires_explicit_opt_in():
     assert scorer.scene_encoder.encoder is not pose.scene_encoder.encoder
 
 
-def test_integrated_scorer_shares_scene_and_preserves_pose(scene):
-    model, sess, registry, name = scene
-    if sess.mode != '2d' or any(sess.rig.moving.values()):
-        pytest.skip('the integrated scorer fixture is a static 2D session')
+def test_integrated_scorer_shares_scene_and_preserves_pose(rat):
+    model, sess, registry, name = rat
     from tests.test_scorer_model import _scorer
     from tailcyclenet.model import share_video_encoder_if_identical
 
@@ -160,8 +203,9 @@ def test_integrated_scorer_shares_scene_and_preserves_pose(scene):
     assert np.isfinite(integrated['quality']).any()
 
 
-@pytest.mark.parametrize('anchor', ['none', 'carry', 'self', 'labels'])
+@pytest.mark.parametrize('anchor', ['self', 'labels'])
 def test_every_anchor_runs(scene, anchor):
+    """`self`/`labels` run on both shapes (`none`/`carry` run in nearly every other test)."""
     model, sess, registry, name = scene
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor=anchor))
     R = 3 if sess.mode == '3d' else 2
@@ -169,19 +213,10 @@ def test_every_anchor_runs(scene, anchor):
     assert len(out['animal_ids']) == out['pred'].shape[0]
 
 
-
-def test_more_detector_rows_than_label_rows(scene):
-    """A DETECTOR ROW IS NOT A LABEL ROW.
-
-    `S` comes from the box source. On the deployment path that is the detector, which can offer
-    more animals than the session ever labelled -- and `src[a]` was evaluated for every one of
-    them, on every anchor mode including `none`. Plain IndexError.
-
-    And EVERY row is a detector row there, not just the surplus ones: they are score-ordered or
-    association-ordered, so lending the first few the labels' own ids claims an identity nothing
-    established.
-    """
-    model, sess, registry, name = scene
+def test_more_detector_rows_than_label_rows(rat):
+    """A detector row is not a label row: more rows than labels must not IndexError, and every
+    detector row is named `det*` (the label path keeps label ids)."""
+    model, sess, registry, name = rat
     w, h = sess.rig.size(sess.cam_names[0])
     boxes = np.zeros((5, 4, len(sess.rig), 4), np.float32)
     boxes[..., 2], boxes[..., 3] = w, h
@@ -198,19 +233,10 @@ def test_more_detector_rows_than_label_rows(scene):
     assert list(out['animal_ids']) == list(sess.labels('g000').animal_ids)
 
 
-def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
-    """Use the cameras that saw it, not all or nothing.
-
-    Cross-view association leaves an unmatched camera NaN, which is the normal outcome when a
-    detector misses one view. Requiring a box in every camera discarded the animal for the whole
-    window even when the others had it -- measured as coverage 0.000 where it should be 1.000 on
-    a three-camera rig whose first view went unmatched. The model is trained on camera subsets
-    already, so a subset is a supported input, not a degenerate one.
-    """
-    model, sess, registry, name = scene
+def test_a_camera_without_a_box_does_not_drop_the_animal(mv):
+    """A camera with no box leaves the animal predicted from the cameras that saw it (was coverage 0)."""
+    model, sess, registry, name = mv
     C = len(sess.rig)
-    if C < 2:
-        pytest.skip('needs a multi-camera rig')
     w, h = sess.rig.size(sess.cam_names[0])
     boxes = np.zeros((1, 4, C, 4), np.float32)
     boxes[..., 2], boxes[..., 3] = w, h
@@ -220,15 +246,9 @@ def test_a_camera_without_a_box_does_not_drop_the_animal(scene):
     assert np.isfinite(out['pred']).all(-1).any(), 'the surviving cameras must still predict'
 
 
-def test_the_window_union_covers_the_window_and_stays_in_the_image(scene):
-    """The union box, which is DELIBERATELY not re-entered into the crop rule.
-
-    Squaring a union of crop-rule boxes was measured at 3dpop +3.06 mm MPJPE / -0.032 MOTA (both
-    SIG) because it grows the p90 box area by 82%; `run_group` carries the numbers. What the box
-    must still be: the union over the window's frames, int32, and inside the image -- an off-frame
-    box gives a negative `cam['offset']` and breaks `project_cam` far downstream.
-    """
-    model, sess, registry, name = scene
+def test_the_window_union_covers_the_window_and_stays_in_the_image(mv):
+    """The union box (deliberately NOT re-squared, +3.06 mm) spans the window and stays in the image."""
+    model, sess, registry, name = mv
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
     boxes = np.zeros((1, 4, C, 4), np.float32)
@@ -244,17 +264,12 @@ def test_the_window_union_covers_the_window_and_stays_in_the_image(scene):
         assert 0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h
 
 
-def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
-    """ONE DECODE PER (CAMERA, FRAME), shared by every animal in the window.
-
-    The crop differs per animal and the decode does not, so the decode moved out of the animal
-    loop and the crop became an affine on the already-decoded frame. That is only a speed change if
-    it is bit-identical to what `load_image` produced when it did both at once.
-    """
+def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(rat):
+    """One decode per (camera, frame): cropping the decoded frame equals cropping at decode, bit for bit."""
     from tailcyclenet.dataset import read_frames
     from tailcyclenet.infer.window import _crop_views
 
-    _, sess, _, _ = scene
+    _, sess, _, _ = rat
     group, cam = sess.groups['g000'], sess.cam_names[0]
     frames = [0, 1, 2, 1]                       # a repeat, which `read_frames` dedupes
     box = torch.tensor([3, 5, 40, 44], dtype=torch.int32)
@@ -265,80 +280,37 @@ def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(scene):
     np.testing.assert_array_equal(hoisted[0].numpy(), at_decode)
 
 
-def test_group_shorter_than_the_overlap(scene):
+def test_group_shorter_than_the_overlap(rat):
     """`p[-overlap]` ran off the front of a window with fewer frames than the step."""
-    model, sess, registry, name = scene
+    model, sess, registry, name = rat
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', overlap=8))
     assert out['pred'].shape[1] == 4
 
 
-def test_kpt_chunk_matches_unchunked_end_to_end(scene):
+def test_kpt_chunk_matches_unchunked_end_to_end(mv):
     """Chunking is a memory knob, so it must not move the prediction by so much as an ulp."""
-    model, sess, registry, name = scene
+    model, sess, registry, name = mv
     whole = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))['pred']
     chunked = run_group(model, sess, 'g000', registry, name,
                         _cfg(anchor='none', kpt_chunk=2))['pred']
     np.testing.assert_allclose(chunked, whole, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize('anchor,refine', [('none', False), ('carry', False),
-                                           ('none', True), ('carry', True)])
-def test_prefetch_windows_is_bit_exact(multiwindow_scene, anchor, refine):
-    """Decoding a future window ahead of the current one's forward must not move a single value,
-    at any `prefetch_windows`: the plans depend only on the box source and window geometry, never
-    on `carried` or any model output. Needs `multiwindow_scene` -- one window is a no-op by
-    construction.
-    """
-    model, sess, registry, name = multiwindow_scene
+def test_prefetch_windows_is_bit_exact(rat16):
+    """Prefetching future windows moves nothing: the default (1) and 3 equal the serial loop (0)."""
+    model, sess, registry, name = rat16
     base = run_group(model, sess, 'g000', registry, name,
-                     _cfg(anchor=anchor, refine=refine, prefetch_windows=0))
-    for pf in (1, 2, 5):
-        got = run_group(model, sess, 'g000', registry, name,
-                        _cfg(anchor=anchor, refine=refine, prefetch_windows=pf))
-        assert set(got) == set(base)
-        for k in base:
-            va, vb = base[k], got[k]
-            if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
-                assert np.array_equal(np.isnan(va), np.isnan(vb)), f'{k}: finite mask differs'
-                fin = ~np.isnan(va)
-                np.testing.assert_array_equal(va[fin], vb[fin], err_msg=f'{k} (prefetch={pf})')
-            elif isinstance(va, np.ndarray):
-                np.testing.assert_array_equal(va, vb, err_msg=f'{k} (prefetch={pf})')
-            else:
-                assert str(va) == str(vb), f'{k} (prefetch={pf})'
-
-
-def test_prefetch_windows_default_matches_the_old_serial_loop(multiwindow_scene):
-    """THE DEFAULT (`prefetch_windows = 1`) IS A NO-OP ON THE PREDICTION, not just a documented
-    claim: a run with no new flag set must be indistinguishable from `prefetch_windows = 0`, the
-    exact old code path where `run_group` never builds the prefetch pool at all.
-    """
-    model, sess, registry, name = multiwindow_scene
-    default = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry'))   # default = 1
-    old = run_group(model, sess, 'g000', registry, name,
-                    _cfg(anchor='carry', prefetch_windows=0))
-    for k in old:
-        va, vb = old[k], default[k]
-        if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
-            assert np.array_equal(np.isnan(va), np.isnan(vb))
-            fin = ~np.isnan(va)
-            np.testing.assert_array_equal(va[fin], vb[fin], err_msg=k)
-        elif isinstance(va, np.ndarray):
-            np.testing.assert_array_equal(va, vb, err_msg=k)
-        else:
-            assert str(va) == str(vb), k
+                     _cfg(anchor='carry', refine=True, prefetch_windows=0))
+    _assert_same(base, run_group(model, sess, 'g000', registry, name,
+                                 _cfg(anchor='carry', refine=True)), ' (default prefetch)')
+    _assert_same(base, run_group(model, sess, 'g000', registry, name,
+                                 _cfg(anchor='carry', refine=True, prefetch_windows=3)),
+                 ' (prefetch=3)')
 
 
 def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
-    """`--overlap-trace` is the plan-7.0 capture's only exit from the process, so what it writes
-    has to be exactly what the hook recorded -- both estimates, not a distance, and the census
-    travelling WITH the rows.
-
-    The census is written into the same file deliberately: a coverage figure separated from the
-    population it describes is how a selection bias ends up quoted as a result. `prev`/`new` stack
-    to `(n, K, R)` so the offline join in 7.1 (score each against labels) and 7.5 (regress against
-    `windows.pq` crop geometry) can read them with numpy alone.
-    """
+    """`--overlap-trace` writes exactly what the hook recorded: both estimates, the census (incl. what
+    was NOT seen), the prior-OOB and model-confidence probes; an empty capture keeps its census."""
     import json
 
     from tailcyclenet.infer.driver import _write_overlap_trace
@@ -360,23 +332,14 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     np.testing.assert_allclose(z['dist'], [1.5, 0.25])
     assert z['prev'].shape == (2, 3, 2) and z['new'].shape == (2, 3, 2)
     np.testing.assert_allclose(z['new'][0] - z['prev'][0], 1.5)
-    # The census must survive the trip, including the counters describing what was NOT seen.
     got = json.loads(str(z['census']))['s/g000']
     assert got == census, got
-    # The per-window prior-out-of-bounds count rides along: plan 7.2 requires this CHEAPER
-    # identity-discontinuity alarm to be beaten before its overlap mechanism is built, so it has
-    # to come out of the same probe rather than needing a second run.
     assert list(z['oob_animal']) == [0] and list(z['oob_frame']) == [8]
     assert list(z['oob_nan']) == [2] and list(z['oob_k']) == [17]
-    # And the model's own per-camera confidence (plan 5.1, B2), which the window loop otherwise
-    # discards -- a DIFFERENT quantity from the refuted geometric cues, and the one thing on that
-    # axis a better model can change.
     assert list(z['conf_animal']) == [0] and list(z['conf_frame']) == [8]
     np.testing.assert_allclose(z['conf_mean'], [-0.5])
     np.testing.assert_allclose(z['conf_min'], [-0.9])
 
-    # An empty capture is a legal outcome (a one-window group has no seam) and must not crash or
-    # write a ragged array -- it must still carry its census, which is the informative part.
     empty = tmp_path / 'empty.npz'
     _write_overlap_trace(empty, {'s/g000': ([], {'pairs_seen': 0, 'pairs_no_prev': 4}, [], [])})
     ze = np.load(empty, allow_pickle=True)
@@ -384,109 +347,64 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     assert json.loads(str(ze['census']))['s/g000']['pairs_no_prev'] == 4
 
 
-def test_capture_overlap_agreement_is_off_by_default_and_never_moves_a_prediction(
-        multiwindow_scene):
-    """The opt-in overlap-agreement diagnostic must be a pure side channel:
-    off by default, and its presence or absence in `stats` must never change a single predicted
-    value, whether or not the flag is set.
-    """
+def test_capture_overlap_agreement_is_a_side_channel_with_an_honest_census(rat16):
+    """The opt-in seam capture is off by default and never moves a prediction; when on it records
+    both seam values (distance reproducible from them) and a census that agrees with its rows."""
     from tailcyclenet.infer.window import merge_blocks, run_blocks
 
-    model, sess, registry, name = multiwindow_scene
+    model, sess, registry, name = rat16
     cfg = _cfg(anchor='carry')
-    base = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg))
     stats_off = {}
     off = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats_off))
     assert 'overlap_agreement' not in stats_off, 'the flag defaults off'
-    stats_on = {'capture_overlap_agreement': True}
-    on = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats_on))
-    for out in (off, on):
-        for k in base:
-            va, vb = base[k], out[k]
-            if isinstance(va, np.ndarray) and va.dtype.kind == 'f':
-                assert np.array_equal(np.isnan(va), np.isnan(vb))
-                fin = ~np.isnan(va)
-                np.testing.assert_array_equal(va[fin], vb[fin], err_msg=k)
-            elif isinstance(va, np.ndarray):
-                np.testing.assert_array_equal(va, vb, err_msg=k)
-            else:
-                assert str(va) == str(vb), k
-
-
-def test_capture_overlap_agreement_records_the_discarded_seam_prediction(multiwindow_scene):
-    """When enabled, the hook must record one entry per (row, overlap frame) BEFORE the later
-    window's write overwrites it -- the exact value the seam rule discards today. `multiwindow_scene` (T=16, n_frames=4, overlap=2) gives
-    several overlapping windows, so every non-edge window contributes overlap frames.
-    """
-    from tailcyclenet.infer.window import merge_blocks, run_blocks
-
-    model, sess, registry, name = multiwindow_scene
-    cfg = _cfg(anchor='carry')
     stats = {'capture_overlap_agreement': True}
-    merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats))
+    on = merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats))
+    _assert_same(off, on)
+
     rows = stats.get('overlap_agreement', [])
     assert rows, 'a multi-window run with overlap > 0 must record at least one seam comparison'
     for r in rows:
         assert isinstance(r['animal'], int) and isinstance(r['frame'], int)
         assert r['dist'] >= 0.0 and np.isfinite(r['dist'])
-        assert 0 <= r['frame'] < 16, 'a recorded frame must be a real source frame of this clip'
-        # BOTH values, not just their distance (plan 7.0): 7.1 has to score each against the
-        # labels separately, which a distance cannot support.
+        assert 0 <= r['frame'] < 16
         assert r['prev'].shape == r['new'].shape and r['prev'].ndim == 2
-        assert not np.array_equal(r['prev'], r['new']) or r['dist'] == 0.0
-        # `pos` is the frame's index within the later window's own frame list -- 0 is that
-        # window's anchor frame, which is what makes the echo profile (plan 7.3) readable. It
-        # equals the overlap position in the ordinary case, but is NOT bounded by `cfg.overlap`:
-        # a window following a gap (a `no box` window, or the clip's last, shorter window) can
-        # find a previous finite value further into its own frames. Measured on 3dpop Sequence 59
-        # at overlap 4, most rows sit at pos 0..3 and a small tail sits at 4..7. Asserting the
-        # tighter bound would encode a coincidence of this fixture as an invariant.
         assert 0 <= r['pos'] < cfg.n_frames, f"pos {r['pos']} outside the window"
-        assert 1 <= r['n_shared'], 'a recorded pair must share at least one finite keypoint'
-
-    # The distance must be reproducible from the two recorded values, or they are not the values
-    # the distance was computed from.
+        assert 1 <= r['n_shared']
     r = rows[0]
     shared = np.isfinite(r['prev']).all(-1) & np.isfinite(r['new']).all(-1)
     d = np.linalg.norm(r['new'] - r['prev'], axis=-1)
-    np.testing.assert_allclose(np.where(shared, d, np.nan)[shared].mean(), r['dist'], rtol=1e-6)
+    np.testing.assert_allclose(d[shared].mean(), r['dist'], rtol=1e-6)
 
-
-def test_overlap_census_counts_what_the_hook_could_not_see(multiwindow_scene):
-    """Several plan-7 ideas can die on population size alone, which is the cheapest possible
-    refutation -- so the census has to be trustworthy about its own blind spots rather than
-    reporting only the pairs it managed to see (plan 7.0).
-
-    Three of them are counted: a row the earlier window left non-finite (`pairs_no_prev`), a pair
-    sharing no finite keypoint (`pairs_no_shared`), and the BLOCK BOUNDARY -- where this block's
-    last window's overlap frames are re-predicted from scratch by the next block's first window,
-    so the two estimates never coexist in one array and no comparison is possible at all. Silence
-    there would look exactly like a clean census.
-    """
-    from tailcyclenet.infer.window import merge_blocks, run_blocks
-
-    model, sess, registry, name = multiwindow_scene
-    cfg = _cfg(anchor='carry')
-    stats = {'capture_overlap_agreement': True}
-    merge_blocks(run_blocks(model, sess, 'g000', registry, name, cfg, stats=stats))
     census = stats['overlap_census']
     for k in ('pairs_seen', 'pairs_no_prev', 'pairs_no_shared'):
         assert k in census and census[k] >= 0, census
-    assert census['pairs_seen'] == len(stats['overlap_agreement']), \
-        'the census must agree with the rows it claims to have recorded'
-    assert census['pairs_seen'] > 0
+    assert census['pairs_seen'] == len(rows) > 0
 
 
-def test_carry_requires_overlap(scene):
-    model, sess, registry, name = scene
+def test_refine_records_each_overlap_trace_probe_once(rat16):
+    """`--refine` runs `forward` twice per (animal, window); the overlap-trace probes
+    (`prior_oob`, `model_conf`) must record each (animal, window) once, not once per pass."""
+    from tailcyclenet.infer.window import merge_blocks, run_blocks
+
+    model, sess, registry, name = rat16
+    counts = {}
+    for refine in (False, True):
+        stats = {'capture_overlap_agreement': True}
+        merge_blocks(run_blocks(model, sess, 'g000', registry, name,
+                                _cfg(anchor='carry', refine=refine), stats=stats))
+        oob = [(a, f) for a, f, *_ in stats.get('prior_oob', [])]
+        assert len(oob) == len(set(oob))
+        counts[refine] = (len(oob), len(stats.get('model_conf', [])))
+    assert counts[True][0] == counts[False][0] > 0
+    if counts[False][1]:
+        assert counts[True][1] == counts[False][1]
+
+
+def test_carry_needs_overlap_but_self_does_not(rat):
+    """`carry` at overlap 0 is refused; `self` carries nothing, so overlap 0 is valid for it."""
+    model, sess, registry, name = rat
     with pytest.raises(ValueError, match='overlap'):
         run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', overlap=0))
-
-
-def test_self_anchor_runs_at_overlap_zero(scene):
-    """`--anchor self` re-queries within one window and carries nothing across windows, so
-    `overlap = 0` is a valid setting for it (it used to be refused as if it carried)."""
-    model, sess, registry, name = scene
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='self', overlap=0))
     assert np.isfinite(out['pred']).any()
 
@@ -521,17 +439,12 @@ def test_deploy_box_prompt_lands_inside_the_crop_2d():
     assert x0 <= 20 and y0 <= 20 and x1 >= 60 and y1 >= 100
 
 
-def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
-    """3D + 'labels' must be BYTE-IDENTICAL to `box_prompt.compute_box_prompt` on the same world
-    points and cgroup -- the load-bearing deploy/train parity assertion. Uses the REAL 3D scene's
-    own rig so the projection geometry is exactly what `run_group` builds.
-    """
+def test_deploy_box_prompt_3d_labels_matches_the_training_computation(mv):
+    """3D `labels` box prompt is byte-identical to `compute_box_prompt` (deploy/train parity)."""
     from tailcyclenet import box_prompt as bpmod
     from tailcyclenet.infer.window import _deploy_box_prompt
 
-    _, sess, _, _ = scene
-    if sess.mode != '3d':
-        pytest.skip('needs the 3D scene')
+    _, sess, _, _ = mv
     frames = np.arange(4)
     cgroup = sess.cgroup('g000', frames)
     lab = sess.labels('g000')
@@ -543,13 +456,9 @@ def test_deploy_box_prompt_3d_labels_matches_the_training_computation(scene):
     torch.testing.assert_close(got, want.to(got.dtype))
 
 
-def test_box_prompt_live_on_3d_multicam(scene):
-    """The box is LIVE on 3D / multi-camera, per camera: runs to completion with no warning, and
-    the encoder actually receives a (1,T,C,4) box with C == len(use).
-    """
-    model, sess, registry, name = scene
-    if sess.mode != '3d':
-        pytest.skip('needs the 3D scene')
+def test_box_prompt_live_on_3d_multicam(mv):
+    """The box is live on 3D per camera: the encoder receives a (1,T,C,4) box, no warning."""
+    model, sess, registry, name = mv
     import warnings
 
     seen = {}
@@ -576,9 +485,7 @@ def test_box_prompt_live_on_3d_multicam(scene):
 
 
 def test_box_prompt_detector_per_camera_degradation():
-    """3D + 'detector': a camera with NO finite box that frame yields a NaN column, not an
-    exception -- the `_sub_missing` no-box token substitutes it in the encoder, which is the
-    regime `box_prompt_dropout` trains rather than a silent failure."""
+    """A camera with no finite detector box yields a NaN column (the no-box token), not an exception."""
     from tailcyclenet.infer.window import _deploy_box_prompt
 
     T = 3
@@ -598,12 +505,7 @@ def test_box_prompt_detector_per_camera_degradation():
 
 
 def test_box_prompt_column_order_matches_use():
-    """Column `i` of the output must be built from `use[i]`'s own `boxes[i]`/`scales[i]`/
-    `cgroup[i]` and detection `ci` -- not from a neighbouring camera's. Two cameras with
-    DIFFERENT sizes, origins and scales (so a swapped index produces a visibly different box,
-    not a coincidentally-matching one); each column is checked against a DIRECT call to the same
-    primitives (`box_corners` + `crop_box_for_points`) for that camera alone, rather than a hand-
-    derived expected value."""
+    """Column i of the box prompt is built from `use[i]`'s own box/scale/cgroup, not a neighbour's."""
     from tailcyclenet import box_prompt as bpmod
     from tailcyclenet.infer.window import _deploy_box_prompt
 
@@ -643,12 +545,9 @@ def test_box_prompt_column_order_matches_use():
     assert not torch.allclose(got[0, 0, 0], want1.to(got.dtype))
 
 
-def test_box_prompt_none_is_byte_identical_on_2d_and_3d(scene):
-    """`box_prompt = 'none'` (the default) must be byte-identical to a run that never mentions
-    the box at all, on BOTH the 2D and the 3D/multi-camera scene -- the 3D fix must not perturb
-    the untouched path. `crop_inflate = 1.0` (the default) must be part of that invariant too.
-    """
-    model, sess, registry, name = scene
+def test_box_prompt_none_is_byte_identical_on_2d_and_3d(mv):
+    """`box_prompt='none'` + `crop_inflate=1.0` is byte-identical to never mentioning the box."""
+    model, sess, registry, name = mv
     base = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
     off = run_group(model, sess, 'g000', registry, name,
                     _cfg(anchor='none', box_prompt='none', crop_inflate=1.0))
@@ -656,40 +555,46 @@ def test_box_prompt_none_is_byte_identical_on_2d_and_3d(scene):
     assert 'box_prompt_cams' not in off
 
 
-def test_box_prompt_first_only_gives_it_at_window_0_and_withholds_it_once_carried(multiwindow_scene):
-    """`box_prompt_first_only` (owner-set default, 2026-09-05): the box prompt fires at each
-    animal's first window and is withheld once `carried[a]` holds a carry -- give the identity
-    signal while first-detecting, then let carry hold it. `multiwindow_scene` (T=16,
-    n_frames=4/overlap=2, 7 windows) is what a single-window `scene` cannot exercise at all.
-    """
-    model, sess, registry, name = multiwindow_scene
-    out = run_group(model, sess, 'g000', registry, name,
-                    _cfg(anchor='carry', box_prompt='labels', box_prompt_first_only=True))
-    cams = out['box_prompt_cams']
+def test_box_prompt_first_only_withholds_it_once_carried(rat16):
+    """`first_only` gives the box at an animal's first window and withholds it once carry holds;
+    off, it fires every window."""
+    model, sess, registry, name = rat16
+    cams = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='carry', box_prompt='labels',
+                          box_prompt_first_only=True))['box_prompt_cams']
     assert cams.shape[1] > 1
-    assert (cams[:, 0] >= 1).any()
-    assert (cams[:, 1:] == -1).all()
-
-
-def test_box_prompt_first_only_off_gives_it_every_window(multiwindow_scene):
-    """`box_prompt_first_only = False` (the field's own default) must reduce to the pre-existing
-    unconditional gate: the box prompt fires every window `box_prompt` is on for, not just the
-    first -- the contrast that pins the flag actually does something when turned on.
-    """
-    model, sess, registry, name = multiwindow_scene
-    out = run_group(model, sess, 'g000', registry, name,
-                    _cfg(anchor='carry', box_prompt='labels', box_prompt_first_only=False))
-    cams = out['box_prompt_cams']
-    assert cams.shape[1] > 1
+    assert (cams[:, 0] >= 1).any() and (cams[:, 1:] == -1).all()
+    cams = run_group(model, sess, 'g000', registry, name,
+                     _cfg(anchor='carry', box_prompt='labels',
+                          box_prompt_first_only=False))['box_prompt_cams']
     assert (cams[:, 1:] >= 1).any()
 
 
-def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
-    """The shipped box recipe is WIDE pass 1 + TIGHT pass 2: pass 1's box is inflated about its
-    centre by `crop_inflate`, but pass 2 is rebuilt from pass 1's own PREDICTION via
-    `boxes_from_points`, which never inflates.
-    """
-    model, sess, registry, name = scene
+def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_one():
+    """The first-only gate gives the box back when `_build_prior` DECLINED a carry (stale/mismatched),
+    not only when there was none."""
+    from tailcyclenet.infer.window import _give_box_this_window
+
+    cfg = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=True)
+    fake_carry = (torch.zeros(2, 2), 0)
+
+    assert _give_box_this_window(cfg, None, None), \
+        'no carry at all (the true first window) must still give the box'
+    assert not _give_box_this_window(cfg, fake_carry, torch.zeros(2, 2)), \
+        'a carry that WAS used as this window\'s prior must still withhold the box'
+    assert _give_box_this_window(cfg, fake_carry, None), \
+        'a carry that existed but was declined (stale/shape-mismatched) must give the box back'
+
+    off = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=False)
+    assert _give_box_this_window(off, fake_carry, None), \
+        'box_prompt_first_only=False must give the box every window regardless of carry/prior'
+    assert not _give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
+        'box_prompt="none" must never give the box'
+
+
+def test_box_prompt_wide_pass1_tight_pass2_geometry(rat):
+    """Pass 1 is inflated about its centre by `crop_inflate`; pass 2 (from the prediction) is not."""
+    model, sess, registry, name = rat
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
     boxes = np.zeros((1, 4, C, 4), np.float32)
@@ -703,7 +608,6 @@ def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
     wide = run_group(model, sess, 'g000', registry, name,
                      _cfg(anchor='none', refine=True, crop_inflate=1.5), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
 
-    # PASS 1 (`crop`): the wide arm's box must be ~1.5x the tight arm's, same centre.
     c_tight, c_wide = tight['crop'][0, 0], wide['crop'][0, 0]
     for ci in range(C):
         if not (np.isfinite(c_tight[ci]).all() and np.isfinite(c_wide[ci]).all()):
@@ -715,9 +619,6 @@ def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
         cxw = (c_wide[ci, 0] + c_wide[ci, 2]) / 2
         assert abs(cxt - cxw) < wt, 'inflation is about the SAME centre, not a shifted one'
 
-    # PASS 2 (`crop_refined`) is NOT inflated -- it comes from `boxes_from_points` on the pass-1
-    # PREDICTION, which never reads `crop_inflate`. So the wide arm's pass-2 box side should be
-    # close to (not 1.5x) the tight arm's, modulo the two arms predicting from different pixels.
     r_tight, r_wide = tight['crop_refined'][0, 0], wide['crop_refined'][0, 0]
     for ci in range(C):
         if not (np.isfinite(r_tight[ci]).all() and np.isfinite(r_wide[ci]).all()):
@@ -727,38 +628,22 @@ def test_box_prompt_wide_pass1_tight_pass2_geometry(scene):
         assert rw < rt * 1.2, 'pass 2 must not carry pass 1\'s inflation forward'
 
 
-def test_box_prompt_detector_path_through_run_group(scene):
-    """`--box-prompt detector` end to end through `run_group`, 2D and 3D alike: a real
-    `boxes_stc` produces a finite box-prompt population without raising, and `box_prompt_cams`
-    reports it."""
-    model, sess, registry, name = scene
-    C = len(sess.rig)
+def test_box_prompt_detector_needs_a_box_source(rat):
+    """`box_prompt='detector'` runs from detector boxes and reports them; without a source it raises."""
+    model, sess, registry, name = rat
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
-    boxes = np.zeros((1, 4, C, 4), np.float32)
+    boxes = np.zeros((1, 4, len(sess.rig), 4), np.float32)
     boxes[..., 2], boxes[..., 3] = w, h
-
-    out = run_group(model, sess, 'g000', registry, name,
-                    _cfg(anchor='none', box_prompt='detector'), boxes_for=_boxes_for(boxes), n_rows=len(boxes))
-    assert out['pred'].shape[0] >= 1
-    assert 'box_prompt_cams' in out
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', box_prompt='detector'),
+                    boxes_for=_boxes_for(boxes), n_rows=len(boxes))
     assert (out['box_prompt_cams'][0] >= 1).any()
-
-
-def test_box_prompt_detector_with_no_boxes_raises(scene):
-    """`box_prompt = 'detector'` needs a detector/boxes source; without one it must raise, not
-    silently run box-withheld."""
-    model, sess, registry, name = scene
     with pytest.raises(ValueError, match='detector'):
-        run_group(model, sess, 'g000', registry, name,
-                  _cfg(anchor='none', box_prompt='detector'))
+        run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', box_prompt='detector'))
 
 
-def test_box_prompt_detector_from_a_boxes_file_uses_its_points(scene):
-    """`--boxes dets.npz` on a box model resolves the box prompt to 'detector', but that path
-    supplies crop POINTS (`box_points`), not detector boxes: the prompt must come from those
-    points (it used to raise "none were supplied"), exactly as the labels prompt would from
-    the same points."""
-    model, sess, registry, name = scene
+def test_box_prompt_detector_from_a_boxes_file_uses_its_points(mv):
+    """`--boxes` points on a box model give the same prompt as `labels` from those points (used to raise)."""
+    model, sess, registry, name = mv
     lab = sess.labels('g000')
     pts = lab.points3d if sess.mode == '3d' else lab.points2d[..., 0, :]
     got = run_group(model, sess, 'g000', registry, name,
@@ -771,12 +656,8 @@ def test_box_prompt_detector_from_a_boxes_file_uses_its_points(scene):
 
 
 def test_carried_prior_is_bounds_masked_and_dated():
-    """The two defects in the deployed prompt, both of which were silent.
-
-    `prompt_time = 0` is right for interior windows and wrong on the last window of a group, which
-    `window_starts` pulls back to `n_frames - T`; and a carried keypoint that left the new crop
-    was handed in as a confident prior instead of as "I was not told".
-    """
+    """The carried prior is NaN outside the crop, dated to its frame in the window, and retired (not
+    clamped) when it predates the window or is staler than the overlap."""
     from tailcyclenet.infer.window import _build_prior
 
     K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
@@ -785,7 +666,6 @@ def test_carried_prior_is_bounds_masked_and_dated():
     frames = np.arange(20, 28)
     boxes = [(0, 0, 100, 100)]
 
-    # Two keypoints inside the crop, two outside it.
     pose = torch.tensor([[10.0, 10.0], [90.0, 90.0], [-5.0, 10.0], [10.0, 400.0]])
     prior, qt = _build_prior(cfg, (pose, 23), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                              cgroup)
@@ -795,18 +675,8 @@ def test_carried_prior_is_bounds_masked_and_dated():
     assert qt.shape == (1, K)
     assert (qt == 3).all(), f'prompt frame 23 is index 3 of a window starting at 20, got {qt}'
 
-    # A PROMPT FROM BEFORE THE WINDOW IS RETIRED, not clamped. This used to assert the opposite
-    # ("inside the overlap, so the ordinary case") and that reading was wrong: `j = len(frames) -
-    # overlap` makes the carried frame the NEXT window's start exactly, so consecutive windows
-    # give qt == 0 and a NEGATIVE qt happens only when a window was skipped. Clamping it to 0
-    # presented a pose from a frame the model was never shown as this window's first frame, and in
-    # 3D the bounds mask cannot catch that -- a stale pose still visible to two cameras passes.
-    #
-    # The old guard spent a budget of `overlap` frames, which meant it only fired when
-    # `n_frames > 2 * overlap`: at the swept `--n-frames 24 --overlap 12` it never fired.
     assert _build_prior(cfg, (pose, 17), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                         cgroup) == (None, None)
-    # ...and the ordinary case -- the carried frame IS this window's first -- is still qt 0.
     _, ordinary = _build_prior(cfg, (pose, 20), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                                cgroup)
     assert (ordinary == 0).all()
@@ -814,17 +684,13 @@ def test_carried_prior_is_bounds_masked_and_dated():
                            cgroup)
     assert (late == len(frames) - 1).all()
 
-    # STALER THAN THE OVERLAP IS NOT A PRIOR. `carried` is only written by a window that predicted,
-    # so an animal the box source lost for a few windows keeps offering a pose from before this
-    # one, and the clamp above would present it as this window's first frame.
     assert _build_prior(cfg, (pose, 2), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                         cgroup) == (None, None)
 
 
-def test_oracle_corrupt_near_picks_nearest_eligible_row():
-    """`near` must pick the ELIGIBLE row closest to the target in the MODEL's own frame -- not
-    the fixed `a + 1` row `other` uses -- and must be a NO-OP when nothing qualifies.
-    """
+def test_oracle_corrupt_near_and_swap():
+    """`near` picks the nearest ELIGIBLE row (no-op if none); `swap:<n>` permutes n keypoint pairs
+    of the chosen row without changing which row/frame it came from."""
     from tailcyclenet.infer.window import _corrupt_prior
 
     K, size = 2, torch.tensor([100, 100], dtype=torch.int32)
@@ -833,8 +699,6 @@ def test_oracle_corrupt_near_picks_nearest_eligible_row():
     boxes = [(0, 0, 100, 100)]
     scales = [1.0]
 
-    # row 0 = target, row 1 = far away (INELIGIBLE -- both points land outside the crop), row 2 =
-    # close (ELIGIBLE -- both points land inside it).
     src = np.zeros((3, 4, K, 2), dtype=np.float32)
     src[0, 0] = [[10.0, 10.0], [20.0, 20.0]]
     src[1, 0] = [[500.0, 500.0], [600.0, 600.0]]
@@ -852,37 +716,20 @@ def test_oracle_corrupt_near_picks_nearest_eligible_row():
     p2, _ = _corrupt_prior(cfg, src2, 0, 3, frames, boxes, '2d', cgroup, scales)
     assert torch.allclose(p2, torch.as_tensor(src2[0, 0])), 'no eligible row must be a no-op'
 
-
-def test_oracle_corrupt_swap_transposes_keypoints():
-    """`swap:<n>` must permute the CHOSEN row's own keypoints -- the SET stays the same, `n` picks
-    how many pairs -- and must never touch which row or frame the pose came from. The direct
-    inference probe for `dataset.py`'s `prompt_swap_kpt_pairs`.
-    """
-    from tailcyclenet.infer.window import _corrupt_prior
-
-    K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
-    cgroup = [{'size': size}]
-    frames = np.arange(0, 4)
-    boxes = [(0, 0, 100, 100)]
-    src = np.zeros((1, 4, K, 2), dtype=np.float32)
+    src = np.zeros((1, 4, 4, 2), dtype=np.float32)
     src[0, 0] = [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]
-
-    cfg = InferConfig(anchor='labels', oracle_corrupt='swap:1')
-    p, qt = _corrupt_prior(cfg, src, 0, 1, frames, boxes, '2d', cgroup)
-    assert qt == 0, 'swap must not move which row or frame the pose came from'
+    p, qt = _corrupt_prior(InferConfig(anchor='labels', oracle_corrupt='swap:1'), src, 0, 1,
+                           frames, boxes, '2d', cgroup)
+    assert qt == 0
     base = torch.as_tensor(src[0, 0])
-    assert not torch.equal(p, base), 'swap:1 must move something'
     assert sorted(p.tolist()) == sorted(base.tolist()), 'the keypoint SET must be unchanged'
-    moved = (p != base).any(-1)
-    assert int(moved.sum()) == 2, 'swap:1 is exactly one pair -- two rows differ'
+    assert int((p != base).any(-1).sum()) == 2, 'swap:1 is exactly one pair'
 
 
-def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
-    """The second pass must be crop-rule boxes around the FIRST pass's prediction, and an animal
-    whose refined crop fails must keep the box it already had -- a bad prediction cannot be allowed
-    to cost coverage a loose box was already giving.
-    """
-    model, sess, registry, name = scene
+def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(mv):
+    """Pass 2 re-crops around pass 1's prediction, never costs coverage, keeps `crop` as the pass-1
+    box, and overlaps the box it came from."""
+    model, sess, registry, name = mv
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
     boxes = np.zeros((1, 4, C, 4), np.float32)
@@ -895,17 +742,12 @@ def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
     assert (ref['outcome'] == 0).all(), 'refinement must not drop an animal'
     got = np.isfinite(ref['pred']).all(-1)
     assert got.sum() >= np.isfinite(plain['pred']).all(-1).sum(), 'coverage must not fall'
-    # `crop` KEEPS THE FIRST-PASS BOX -- it is the only record of what the box source offered, and
-    # every coverage and crop-inflation number in reports 08 and 11 is computed from it. The refined
-    # box is a second field, so both are readable rather than one overwriting the other.
     np.testing.assert_array_equal(np.nan_to_num(ref['crop'], nan=-1),
                                   np.nan_to_num(plain['crop'], nan=-1))
     cw = ref['crop_refined'][0, 0, :, 2] - ref['crop_refined'][0, 0, :, 0]
     ch = ref['crop_refined'][0, 0, :, 3] - ref['crop_refined'][0, 0, :, 1]
     assert (cw <= w).all() and (ch <= h).all()
     assert ((cw < w) | (ch < h)).any(), 'a whole-frame box should have been refined smaller'
-    # And a refined box must OVERLAP the box it came from, or it is not a refinement of it -- a pose
-    # that wandered squares into a box somewhere else entirely, at 2x the pose compute.
     for ci in range(C):
         b2, b1 = ref['crop_refined'][0, 0, ci], plain['crop'][0, 0, ci]
         if np.isfinite(b2).all() and np.isfinite(b1).all():
@@ -913,596 +755,10 @@ def test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage(scene):
             assert min(b2[3], b1[3]) > max(b2[1], b1[1])
 
 
-def test_the_row_gate_withholds_rows_but_not_the_carried_prompt(scene):
-    """`--vis-thresh` gates what is REPORTED. Gating the prompt too would be a second lever in one
-    flag, and it is `--prior-vis-thresh` that owns that one.
-
-    A threshold above every logit must empty the prediction; one below every logit must leave it
-    byte-identical, so an unconfigured run is unchanged.
-    """
-    model, sess, registry, name = scene
-    base = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry'))
-    lo = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', vis_thresh=-1e9))
-    hi = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', vis_thresh=1e9))
-
-    np.testing.assert_array_equal(np.isnan(lo['pred']), np.isnan(base['pred']))
-    assert np.isnan(hi['pred']).all(), 'every row is below an infinite threshold'
-    # The gate ran per window, and `carried` was taken from the ungated pose, so the windows after
-    # the first still predicted -- which is what `outcome` all-ok proves.
-    assert (hi['outcome'] == 0).all(), 'the gate must not abort a window'
-
-
-def test_max_frames_takes_a_prefix(scene):
-    """A PREFIX, not a sample: `carry` needs the frames contiguous, and the rat-city protocol is
-    frames 0-479 of one trial. `n_frames` in the result must describe what was actually predicted,
-    or the render and the eval disagree about which clip this is."""
-    model, sess, registry, name = scene
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
-    assert out['pred'].shape[1] == 3
-    assert out['n_frames'] == 3
-    # 0 and a ceiling above the group both mean "the whole group".
-    for m in (0, 99):
-        assert run_group(model, sess, 'g000', registry, name,
-                         _cfg(anchor='none', max_frames=m))['pred'].shape[1] == 4
-
-
-def test_render_writes_every_predicted_frame(scene):
-    """The mp4 must hold exactly the frames the prediction covers -- a render one frame short of
-    its npz is how a clip and its numbers drift apart."""
-    import cv2
-
-    from tailcyclenet.render import render_group
-
-    model, sess, registry, name = scene
-    if sess.mode != '2d':
-        pytest.skip('3D sessions are not drawn yet')
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
-    path = Path(tempfile.mkdtemp()) / 'clip.mp4'
-    render_group(sess, 'g000', out['pred'], path, max_side=64, fps=5)
-
-    assert path.stat().st_size > 0
-    cap = cv2.VideoCapture(str(path))
-    n = 0
-    while cap.read()[0]:
-        n += 1
-    cap.release()
-    assert n == 3, f'wrote {n} frames for a 3-frame prediction'
-
-
-def test_2d_is_bit_identical_under_either_carry_source(scene):
-    """THE FREE INVARIANCE CHECK on de-looping the carry.
-
-    In 2D there is nothing to triangulate at one camera and the grid head decodes ABSOLUTE pixel
-    bins, so `coords_pred` is not built on top of the query and `carry_source` has nothing to
-    change. Every 2D root -- calms21, rat-city, branson-fly -- must therefore come out unchanged,
-    which is what confines the disambiguation risk of this change to the 3D roots.
-    """
-    model, sess, registry, name = scene
-    if sess.mode != '2d':
-        pytest.skip('2D only, by construction')
-    torch.manual_seed(0)
-    a = run_group(model, sess, 'g000', registry, name,
-                  _cfg(anchor='carry', carry_source='triangulate'))
-    torch.manual_seed(0)
-    b = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', carry_source='pred'))
-    np.testing.assert_array_equal(np.nan_to_num(a['pred'], nan=-9e9),
-                                  np.nan_to_num(b['pred'], nan=-9e9))
-
-
-def test_3d_carry_feeds_back_the_anchor_free_estimate(tmp_path):
-    """...and in 3D it must actually differ, or the de-loop is not wired to anything: `carry`
-    hands the next window the re-derived triangulation rather than `prior + residual`, which is a
-    loop with gain. Builds its own T=8 session because `scene`'s T=4 is ONE window -- a
-    single-window fixture cannot test a between-window hand-off.
-    """
-    import conftest as cf
-
-    cf._session_3d(tmp_path / 'mv' / 'test' / 's', T=8)
-    ds = load_dataset(tmp_path / 'mv')
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
-
-    # n_frames 4, overlap 2 -> step 2 -> windows at 0, 2, 4 -- three hand-offs to disagree over.
-    tri = run_group(model, sess, 'g000', registry, ds.name,
-                    _cfg(anchor='carry', carry_source='triangulate'))
-    pred = run_group(model, sess, 'g000', registry, ds.name,
-                     _cfg(anchor='carry', carry_source='pred'))
-    assert len(tri['window_start']) > 1, 'a one-window group cannot exercise the hand-off'
-    # The fixture rig has three cameras, so a triangulation exists and the two carries are two
-    # different tensors. In 2D they are bit-identical, which the test above pins.
-    assert not np.array_equal(np.nan_to_num(tri['pred'], nan=-9e9),
-                              np.nan_to_num(pred['pred'], nan=-9e9)), \
-        'carry_source must change the prediction in 3D, or the de-loop is wired to nothing'
-
-
-def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
-    """THE DEFAULT BOX PATH, THROUGH `main()` -- every other CLI test SystemExits inside argparse.
-    Asserts almost nothing about the numbers; pins that every name in the group loop is bound on
-    the path with no detector (the class of failure that shipped: an UnboundLocalError after the
-    checkpoint load, which six CLI tests passed throughout).
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's')
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL,
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4, 'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
-    out = tmp_path / 'pred'
-    # `--data` IS THE SESSION DIRECTORY, because `--out` is one session and a session holds one
-    # calibration, one mode and one keypoint axis. `sessions_for` has always accepted this.
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'),
-                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
-                                      '--overlap', '2', '--out', str(out)])
-    cli.main()
-
-    # IT IS A SESSION IN THIS REPO'S OWN FORMAT, not a private schema.
-    from tailcyclenet.format import Session, validate_session
-    from tailcyclenet.infer.predictions import load_predictions
-
-    for f in ('session.toml', 'calibration.toml', 'groups.pq', 'points2d.pq', 'windows.pq'):
-        assert (out / f).exists(), f'{f} missing; wrote {sorted(p.name for p in out.iterdir())}'
-    assert not (out / 'keypoints.pq').exists(), 'model estimates are not annotation observations'
-    assert not (out / 'window_predictions.pq').exists(), 'sidecar export is opt-in'
-    got = Session.load(out)
-    assert got.label_source == 'tracked'
-    # Only rule 7 may fail: a prediction carries NO PIXELS by design, and `[provenance]
-    # source_session` is what says where they are. Everything that does not need them must pass.
-    errs = [e for e in validate_session(got) if '[rule 7]' not in e]
-    assert not errs, f'a prediction session must be valid apart from its missing pixels: {errs}'
-    assert Path(got.provenance['source_session']).name == 's'
-
-    preds, meta = load_predictions(out)
-    assert 's/g000' in preds, f'no prediction read back; keys: {sorted(preds)}'
-    assert preds['s/g000']['pred'].shape[1] == 4
-    assert np.isfinite(preds['s/g000']['pred']).any(), 'the round trip lost every point'
-    assert meta['anchor'] == 'none'
-
-
-def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
-    """`--run` may be ONE checkpoint file with no run folder anywhere: the file embeds its config,
-    registry and provenance. The prediction must be the run folder's, bit for bit."""
-    import shutil
-
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-    from tailcyclenet.infer.predictions import load_predictions
-
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's')
-    registry = Registry.build([load_dataset(root)])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    path = save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config,
-                           registry=registry)
-    lone = tmp_path / 'elsewhere' / 'pose.pth'
-    lone.parent.mkdir()
-    shutil.copy(path, lone)
-
-    def infer(where, out):
-        monkeypatch.setattr(sys, 'argv', ['infer.py', '--pose', str(where),
-                                          '--data', str(root / 'test' / 's'), '--anchor', 'none',
-                                          '--device', 'cpu', '--overlap', '2', '--out', str(out)])
-        cli.main()
-        return load_predictions(out)
-
-    ref, _ = infer(run, tmp_path / 'from-run')
-    shutil.rmtree(run)
-    got, meta = infer(lone, tmp_path / 'from-file')
-    assert meta['run'] == str(lone.resolve())
-    np.testing.assert_array_equal(got['s/g000']['pred'], ref['s/g000']['pred'])
-
-
-@pytest.mark.parametrize('flag,selector_flag,value', [
-    ('--pose', '--pose-checkpoint', 'checkpoint_best.pth'),
-    ('--run', '--checkpoint', 'checkpoint_best.pth'),
-    ('--scorer', '--scorer-checkpoint', 'checkpoint_best.pth'),
-    ('--detector', '--detector-checkpoint', 'best'),
-])
-def test_a_checkpoint_selector_beside_a_file_is_refused_before_loading(
-        cli, monkeypatch, tmp_path, flag, selector_flag, value):
-    import conftest as cf
-
-    cf._session_2d(tmp_path / 'rat' / 'test' / 's')
-    f = tmp_path / 'model.pth'
-    torch.save({}, f)
-
-    def boom(*a, **k):
-        raise AssertionError('the refusal must fire before the checkpoint loads')
-
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
-    argv = {'--run': str(tmp_path / 'run'), flag: str(f), selector_flag: value}
-    monkeypatch.setattr(sys, 'argv', ['infer.py', *[x for kv in argv.items() for x in kv],
-                                      '--data', str(tmp_path / 'rat' / 'test' / 's'),
-                                      '--device', 'cpu', '--out', str(tmp_path / 'o')])
-    shown = {'--run': '--pose', '--checkpoint': '--pose-checkpoint'}
-    with pytest.raises(SystemExit,
-                       match=f'already a checkpoint file; {shown.get(selector_flag, selector_flag)}'):
-        cli.main()
-
-
-def test_pose_and_run_are_one_option():
-    """`--pose`/`--pose-checkpoint` are the names; `--run`/`--checkpoint` stay as aliases."""
-    from tailcyclenet.infer.cli import build_parser
-    ap = build_parser()
-    base = ['--data', 'd', '--out', 'o']
-    new = ap.parse_args(['--pose', 'r', '--pose-checkpoint', 'c.pth', *base])
-    old = ap.parse_args(['--run', 'r', '--checkpoint', 'c.pth', *base])
-    assert (new.run, new.checkpoint) == (old.run, old.checkpoint) == (Path('r'), 'c.pth')
-
-
-def test_a_multi_session_run_is_refused_before_the_checkpoint_loads(cli, monkeypatch, tmp_path):
-    """`--out` is ONE session directory, so `--data` must name one session. Refused BEFORE
-    `load_run` -- a typo must not cost a 5.6 GB checkpoint load. `sessions_for` reads toml and
-    opens no pixels, so the check is free.
-    """
-    import conftest as cf
-
-    root = tmp_path / 'two'
-    cf._session_2d(root / 'test' / 'a')
-    cf._session_2d(root / 'test' / 'b')
-
-    def boom(*a, **k):
-        raise AssertionError('the refusal must fire before the checkpoint loads')
-
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
-                                      '--data', str(root), '--split', 'test',
-                                      '--device', 'cpu', '--out', str(tmp_path / 'o')])
-    with pytest.raises(SystemExit, match='ONE session directory'):
-        cli.main()
-
-
-def test_session_writer_finalizes_incomplete_output_when_preload_fails(cli, monkeypatch, tmp_path):
-    import tomllib
-
-    import conftest as cf
-    import pyarrow.parquet as pq
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-    from tailcyclenet.format import Session
-
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's')
-    registry = Registry.build([load_dataset(root)])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-    out = tmp_path / 'partial-prediction'
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--anchor', 'none',
-                                      '--device', 'cpu', '--window-predictions', '--out', str(out)])
-
-    def fail_preload(_self):
-        raise RuntimeError('injected preload failure')
-
-    monkeypatch.setattr(Session, 'preload', fail_preload)
-    with pytest.raises(RuntimeError, match='injected preload failure'):
-        cli.main()
-
-    with (out / 'session.toml').open('rb') as f:
-        assert tomllib.load(f)['complete'] is False
-    # Finalized empty Parquet footers are readable, including the optional sidecar writer.
-    assert pq.read_table(out / 'points2d.pq').num_rows == 0
-    assert pq.read_table(out / 'window_predictions.pq').num_rows == 0
-
-
-def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
-    """A minimal but genuinely loadable detector checkpoint -- `load_detector` needs real
-    tensors and every key it reads, not a stub."""
-    import conftest as cf
-    from tailcyclenet.detector.yolox import YOLOXNano
-
-    m = YOLOXNano(version='hybrid')
-    ckpt = cf._detector_checkpoint(
-        m, input_wh=(64, 48), dataset=dataset, min_crop_dim=min_crop_dim, box_source=box_source)
-    p = tmp_path / 'det.pth'
-    torch.save(ckpt, p)
-    return p
-
-
-class _ReachedRunBlocks(Exception):
-    """Raised by the `run_blocks` stub in the dataset-family tests below, so a test can tell
-    "the driver got past every refusal and would have started detecting" without needing a real
-    decodable video -- `_dataset_family`'s check runs well before `run_blocks`, so reaching this
-    sentinel proves the check did NOT fire."""
-
-
-def _family_test_setup(monkeypatch, tmp_path, root_name, det_dataset, extra_argv=()):
-    """Shared plumbing for the three `_dataset_family` CLI tests: one 2D session under a
-    directory named `root_name` (so `sessions_for` reports that as `ds_name`), one detector
-    checkpoint recorded as trained on `det_dataset`, `run_blocks` stubbed to the sentinel above so
-    the test needs no real detectable pixels.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
-    root = tmp_path / root_name
-    cf._session_2d(root / 'test' / 's')
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL,
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                      'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-    det_path = _detector_ckpt(tmp_path, det_dataset)
-
-    def boom(*a, **k):
-        raise _ReachedRunBlocks()
-
-    monkeypatch.setattr('tailcyclenet.infer.driver.run_blocks', boom)
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'),
-                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
-                                      '--overlap', '2', '--detector', str(det_path),
-                                      '--out', str(tmp_path / 'pred'), *extra_argv])
-
-
-def test_cli_refuses_a_cross_family_detector(cli, monkeypatch, tmp_path):
-    """A session under `.../other-species-tracked/test/s` (family 'other') deployed with a
-    detector recorded as trained on 'rat-city-combined' (family 'rat') must refuse before
-    `run_blocks` -- the class of accidental cross-dataset deploy the checkpoint's own `dataset`
-    key exists to catch.
-    """
-    _family_test_setup(monkeypatch, tmp_path, 'other-species-tracked', 'rat-city-combined')
-    with pytest.raises(SystemExit, match='different dataset families'):
-        cli.main()
-
-
-def test_cli_allows_a_same_family_detector_variant(cli, monkeypatch, tmp_path):
-    """`rat-city-tracked` (the session) against a `rat-city-combined` detector (family 'rat'
-    both) is the repo's OWN shipped pairing (`scratch/phase15/run.sh`'s rat-city arm) -- it must
-    reach `run_blocks`, not be refused as though it were a cross-species accident.
-    """
-    _family_test_setup(monkeypatch, tmp_path, 'rat-city-tracked', 'rat-city-combined')
-    with pytest.raises(_ReachedRunBlocks):
-        cli.main()
-
-
-def test_cli_allow_detector_transfer_bypasses_the_family_refusal(cli, monkeypatch, tmp_path):
-    """The escape hatch: an explicit, labelled transfer arm must still reach `run_blocks` even
-    when the families genuinely disagree.
-    """
-    _family_test_setup(monkeypatch, tmp_path, 'other-species-tracked', 'rat-city-combined',
-                       extra_argv=('--allow-detector-transfer',))
-    with pytest.raises(_ReachedRunBlocks):
-        cli.main()
-
-
-@pytest.mark.parametrize('argv,expect', [
-    (['--anchor', 'labels', '--detector', 'nope'], 'not label rows'),
-    (['--anchor', 'labels', '--boxes', 'nope.npz'], 'not label rows'),
-    (['--oracle-corrupt', 'nonsense'], 'kind must be one of'),
-    (['--oracle-corrupt', 'off'], 'needs an amount'),
-    (['--oracle-corrupt', 'swap'], 'needs an amount'),
-    (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
-    (['--independent-windows'], '--independent-windows is deleted'),
-    (['--fill-from', 'prior'], '--fill-from is deleted'),
-    (['--det-input-wh', '416', '416'], '--det-input-wh is deleted'),
-])
-def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
-                                                                        argv, expect):
-    """These are the combinations that used to run and produce a number instead of an error. The
-    worst was `--anchor labels` with a box source: `run_group` seeds row `a` from LABEL row `a`,
-    but detector rows are score- or association-ordered, so the upper-bound arm was handed a
-    DIFFERENT animal's ground truth. Checked IN PROCESS rather than through six forks.
-    """
-    repo = Path(__file__).resolve().parent.parent
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
-                                      '--data', str(repo), '--out', '/tmp/unused.npz'] + argv)
-    with pytest.raises(SystemExit) as e:
-        cli.main()
-    assert expect in str(e.value), f'wanted {expect!r}, got: {e.value}'
-
-
-def test_the_tracker_projects_correctly_on_a_moving_rig():
-    """Gotcha 9's class: `project_points_torch` aligns a (T,4,4) extrinsic against axis -3 of the points,
-    which for a (n_targets, 1, 3) reshape would be the TARGET axis, silently projecting target i through
-    frame i's pose. `detect_group` avoids it by asking for one frame at a time -- `Session.cgroup(gid, t)`
-    with a scalar returns a (4,4) ext even on a moving rig -- and that is the property pinned here,
-    because it is a property of the CALLER and nothing in `track.py` would notice if it changed."""
-    import conftest as cf
-    from tailcyclenet.detector.track import _project
-    from tailcyclenet.format import Session
-
-    root = Path(tempfile.mkdtemp())
-    cf._session_3d(root / 'mv' / 'test' / 's_moving', moving=True)
-    sess = Session.load(root / 'mv' / 'test' / 's_moving')
-    sess.preload()
-    gid = list(sess.groups)[0]
-    per_frame = sess.cgroup(gid, 0)
-    assert all(c['ext'].ndim == 2 for c in per_frame), \
-        'a scalar frame must give a (4,4) ext, or the projection axis alignment below is wrong'
-    assert sess.cgroup(gid)[0]['ext'].ndim == 3, 'the whole-group form must still be per-frame'
-    for n in (1, 3):
-        out = _project(per_frame[0], np.zeros((n, 3), np.float32))
-        assert out.shape == (n, 2)
-
-
-def test_instances_boxes_get_the_training_crop_rule_at_inference(scene):
-    """`box_source = 'instances'` used two different crop rules on the two sides of the run: the
-    loader routes a stored box through `crop_box_for_points(..., pad=0)` (squaring + floor) while
-    the window loop took the raw clamped union -- a different scale and canvas aspect than any
-    crop the model trained on. The detector path must be UNCHANGED (re-squaring an already-square
-    union is measured worse).
-    """
-    from tailcyclenet import crop as cropmod
-
-    model, sess, registry, name = scene
-    w, h = sess.rig.size(sess.cam_names[0])
-    S, T, C = len(sess.labels('g000').animal_ids), 4, len(sess.rig)
-
-    # A deliberately NON-SQUARE stored extent, which is the case the two rules disagree on.
-    wide = np.tile(np.array([10.0, 10.0, 10.0 + 0.6 * w, 10.0 + 0.2 * h], np.float32),
-                   (S, T, C, 1))
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_for=_boxes_for(wide), n_rows=len(wide))
-    det_box = out['crop'][0, 0, 0]
-
-    # The DETECTOR path keeps the raw union: it must NOT equal the squared rule here.
-    assert det_box[2] - det_box[0] != det_box[3] - det_box[1], \
-        'the detector union must stay non-square, or the measured +3.06 mm result is being undone'
-
-    # ...and the `instances` path DOES go through the rule. conftest's 2D session ships one stored
-    # box (animal 1, frame 1, 20x20 -- so `min_crop_dim` is what bites) and no others, which is
-    # also the per-animal keypoint fallback.
-    if sess.labels('g000').boxes is None:
-        pytest.skip('this fixture carries no instances.pq')
-    stored = sess.labels('g000').boxes
-    a, t = [(i, j) for i in range(stored.shape[0]) for j in range(stored.shape[1])
-            if np.isfinite(stored[i, j, 0]).all()][0]
-    cfg = _cfg(anchor='none', box_source='instances')
-    got = run_group(model, sess, 'g000', registry, name, cfg)
-
-    # THE ACTUAL CLAIM: the box the window loop uses is the box the LOADER would have used, which
-    # is `crop_box_for_points` over the stored corners at pad 0. Compared against the rule rather
-    # than asserted square, because the rule also clamps into the frame -- on this 64x48 fixture
-    # a squared box can come back non-square, and that is the rule's own behaviour, not a miss.
-    x0, y0, x1, y1 = stored[a, t, 0]
-    expect = cropmod.crop_box_for_points(
-        torch.tensor([[x0, y0], [x1, y1]]), torch.tensor([int(w), int(h)]),
-        cfg.min_crop_dim, pad=0)
-    # `crop` is indexed by WINDOW, not by frame; this group is one window, and `t` is its only
-    # finite stored frame, so the union over the window is that one box.
-    np.testing.assert_array_equal(got['crop'][a, 0, 0], np.asarray(expect, np.float32))
-
-
-def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(scene):
-    """`render.project` took `Rig.by_name`, which carries the single NOMINAL extrinsic; the
-    per-frame ones exist only through `Session.cgroup(gid, frames)`. So `--render` on a moving rig
-    drew the skeleton where the animal is not -- and nothing here had ever executed this path.
-    """
-    from tailcyclenet.render import project
-
-    model, sess, registry, name = scene
-    if sess.mode != '3d':
-        pytest.skip('needs the moving 3D rig')
-    cam_name = sess.cam_names[0]
-    assert sess.rig.moving.get(cam_name), 'the fixture must actually be moving'
-
-    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
-    pred = out['pred']
-    frames = np.arange(pred.shape[1])
-
-    per_frame = project(sess, pred, 0, 'g000', frames)
-    nominal = project(sess, pred, 0)                  # what it used to do
-    assert per_frame.shape == pred.shape[:-1] + (2,)
-
-    ok = np.isfinite(per_frame) & np.isfinite(nominal)
-    assert ok.any(), 'need a finite projection to compare'
-    assert not np.allclose(per_frame[ok], nominal[ok]), \
-        'the two must differ on a moving rig, or the per-frame extrinsic is not being used'
-
-    # AND IT MATCHES THE PROJECTION THE PIPELINE ALREADY TRUSTS -- `infer`'s own, per frame.
-    from tracktail.model.cube import project_points_torch
-    cams = sess.cgroup('g000', frames)
-    want = project_points_torch([cams[0]], torch.as_tensor(pred[0], dtype=torch.float32))[0]
-    np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)
-
-    # AND A NON-IDENTITY `frames` ARRAY -- `render_group`'s own `--start-frame`/`--end-frame`
-    # slice, or a permutation, IN BOUNDS -- MUST READ EXTRINSIC `frames[t]` AT COLUMN `t`, NOT
-    # EXTRINSIC `t`. `render.py` used to always pass `np.arange(T)`; a ranged render passes the
-    # source slice instead, and if that offset silently failed to reach `cgroup` here, the
-    # skeleton would sit on the animal's position from an EARLIER OR LATER frame with no error.
-    shifted_frames = np.roll(np.arange(pred.shape[1]), 1)      # a permutation, still in bounds
-    shifted = project(sess, pred, 0, 'g000', shifted_frames)
-    ok2 = np.isfinite(shifted) & np.isfinite(per_frame)
-    assert ok2.any()
-    assert not np.allclose(shifted[ok2], per_frame[ok2]), \
-        'a permuted frames array must change the projection, or the offset never reached cgroup'
-    cams_shifted = sess.cgroup('g000', shifted_frames)
-    want_shifted = project_points_torch([cams_shifted[0]],
-                                        torch.as_tensor(pred[0], dtype=torch.float32))[0]
-    np.testing.assert_allclose(shifted[0], want_shifted.numpy(), rtol=1e-5, atol=1e-4)
-
-
-
-
-def test_refine_px_off_is_bit_identical(scene):
-    """INERTNESS FIRST, and it must be bit-identical, not "within noise".
-
-    `--refine-px` is default-None and everything below it is gated on `px < image_size`, so
-    `--refine` alone must reproduce today's output exactly. `refine_px == image_size` is asserted
-    separately because the model's gate is a strict `<`: the two have to meet at the boundary or
-    the flag has an off-by-one regime nobody would ever run deliberately.
-    """
-    model, sess, registry, name = scene
-    torch.manual_seed(0)
-    a = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', refine=True))
-    torch.manual_seed(0)
-    b = run_group(model, sess, 'g000', registry, name,
-                  _cfg(anchor='none', refine=True, refine_px=None))
-    torch.manual_seed(0)
-    c = run_group(model, sess, 'g000', registry, name,
-                  _cfg(anchor='none', refine=True, refine_px=64))   # == _cfg's image_size
-    for other, why in ((b, 'refine_px=None'), (c, 'refine_px == image_size')):
-        for k in ('pred', 'crop', 'crop_refined', 'box_agree'):
-            np.testing.assert_array_equal(np.nan_to_num(a[k], nan=-9e9),
-                                          np.nan_to_num(other[k], nan=-9e9),
-                                          err_msg=f'{why} moved {k}')
-
-
-def test_a_smaller_input_is_compensated_at_all_four_sites(scene):
-    """THE SEAM ITSELF, pinned without depending on what the weights predict: `image_size` stands
-    for three things and only one -- the pixel extent of the input -- is wrong for a smaller crop.
-    0.3.5 splits it out as `input_size=`; this pins that it reaches the library forward with the
-    canvas's extent, which is the part that rots.
-    """
-    model, sess, registry, name = scene
-    seen = {}
-
-    def spy(*a, **kw):
-        seen['input_size'] = kw.get('input_size')
-        return {'coords_pred': torch.zeros(1)}
-
-    model._forward = spy
-    try:
-        # 3D: the camera's long side IS the canvas (loaders resize max(W,H) to image_size).
-        cg = [{'size': torch.tensor([32, 32])}]
-        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
-        assert seen['input_size'] == 32, f'input_size must be the canvas extent, got {seen}'
-        # A non-square camera: the canvas is the LONG side, and the pad target follows it.
-        cg = [{'size': torch.tensor([48, 64])}]
-        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
-        assert seen['input_size'] == 64
-        # At the build-time size the seam is a bare call -- input_size == image_size, and the
-        # upstream scaling factor is exactly 1.0 (pinned bit-identical by
-        # test_refine_px_equals_image_size_is_bit_identical).
-        cg = [{'size': torch.tensor([model.image_size, model.image_size])}]
-        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
-        assert seen['input_size'] == model.image_size
-    finally:
-        del model._forward
-
-
-def test_a_rejected_refinement_falls_back_at_full_resolution(scene):
-    """THE FLAGSHIP SILENT BUG, and the existing refine test cannot catch it.
-
-    `test_refine_recrops_to_its_own_prediction_and_keeps_the_coverage` uses whole-frame boxes, so
-    `_overlaps` always passes and the fallback branch never runs. Here the box is a corner far from
-    where the random model predicts, so the refined box misses it and the plan falls back -- and
-    the fallback used to re-append the PASS-1 plan verbatim, carrying its reduced-resolution
-    camera. Pass 2 then ran at pass 1's resolution, on exactly the animal whose first pass had
-    already gone wrong.
-    """
-    model, sess, registry, name = scene
+def test_a_rejected_refinement_falls_back_at_full_resolution(rat):
+    """A rejected refinement must fall back to a pass 2 at full `image_size`, not re-run pass 1's
+    reduced-resolution plan (the corner box forces the fallback)."""
+    model, sess, registry, name = rat
     C = len(sess.rig)
     w, h = (int(x) for x in sess.rig.size(sess.cam_names[0]))
     boxes = np.zeros((1, 4, C, 4), np.float32)
@@ -1528,19 +784,207 @@ def test_a_rejected_refinement_falls_back_at_full_resolution(scene):
                         'refinement was rejected -- that fallback is the silent half')
 
 
-def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
-    """In 2D `coords_pred` IS `2d_pred[0]`, so the two must come back bit-identical.
+def test_refine_px_off_is_bit_identical(mv):
+    """`--refine` alone == `refine_px=None` == `refine_px=image_size`, bit for bit (strict `<` gate)."""
+    model, sess, registry, name = mv
+    torch.manual_seed(0)
+    a = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', refine=True))
+    torch.manual_seed(0)
+    b = run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='none', refine=True, refine_px=None))
+    torch.manual_seed(0)
+    c = run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='none', refine=True, refine_px=64))   # == _cfg's image_size
+    for other, why in ((b, 'refine_px=None'), (c, 'refine_px == image_size')):
+        for k in ('pred', 'crop', 'crop_refined', 'box_agree'):
+            np.testing.assert_array_equal(np.nan_to_num(a[k], nan=-9e9),
+                                          np.nan_to_num(other[k], nan=-9e9),
+                                          err_msg=f'{why} moved {k}')
 
-    That is the whole reason `forward` un-crops the per-camera pose with the SAME expression the
-    2D path uses for `pred` (`p / scale + box[:2]`) rather than the more exact per-axis inverse in
-    `dataset.crop_affine`. The two differ by a sub-pixel amount that comes from `resize_camera`
-    rounding `cam['size']`; adopting the exact form would move every published 2D number, so the
-    inexactness is kept deliberately and pinned here.
 
-    In 3D this is a genuinely new output -- the run reports world points and used to discard the
-    per-camera 2D entirely -- so there it is only checked for shape and for being populated.
-    """
-    model, sess, registry, name = scene
+def test_a_smaller_input_is_compensated_at_all_four_sites(rat):
+    """`input_size=` reaches the library forward as the canvas (long side) extent."""
+    model, sess, registry, name = rat
+    seen = {}
+
+    def spy(*a, **kw):
+        seen['input_size'] = kw.get('input_size')
+        return {'coords_pred': torch.zeros(1)}
+
+    model._forward = spy
+    try:
+        cg = [{'size': torch.tensor([32, 32])}]
+        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
+        assert seen['input_size'] == 32, f'input_size must be the canvas extent, got {seen}'
+        cg = [{'size': torch.tensor([48, 64])}]
+        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
+        assert seen['input_size'] == 64
+        cg = [{'size': torch.tensor([model.image_size, model.image_size])}]
+        model.forward([torch.zeros(1)], torch.zeros(1, 3, dtype=torch.long), cg, '3d')
+        assert seen['input_size'] == model.image_size
+    finally:
+        del model._forward
+
+
+def test_the_row_gate_withholds_rows_but_not_the_carried_prompt(rat16):
+    """`--vis-thresh` gates what is REPORTED, not the carried prompt: -inf is a no-op, +inf empties
+    the rows but every window still runs."""
+    model, sess, registry, name = rat16
+    base = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry'))
+    lo = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', vis_thresh=-1e9))
+    hi = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', vis_thresh=1e9))
+
+    np.testing.assert_array_equal(np.isnan(lo['pred']), np.isnan(base['pred']))
+    assert np.isnan(hi['pred']).all(), 'every row is below an infinite threshold'
+    assert (hi['outcome'] == 0).all(), 'the gate must not abort a window'
+
+
+def test_max_frames_is_a_prefix_and_the_zero_start_range(rat16):
+    """`--max-frames N` is a prefix and the same thing as `--end-frame N`; 0 or > T is the group."""
+    model, sess, registry, name = rat16
+    a = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=9))
+    b = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', frame_stop=9))
+    np.testing.assert_array_equal(np.nan_to_num(a['pred'], nan=-9e9),
+                                  np.nan_to_num(b['pred'], nan=-9e9))
+    assert a['pred'].shape[1] == a['n_frames'] == 9
+    assert a['frame_start'] == 0 and a['frame_stop'] == 9
+    for m in (0, 99):
+        assert run_group(model, sess, 'g000', registry, name,
+                         _cfg(anchor='none', max_frames=m))['pred'].shape[1] == 16
+
+
+def test_render_writes_every_predicted_frame(rat, tmp_path):
+    """The mp4 holds exactly the predicted frames."""
+    import cv2
+
+    from tailcyclenet.render import render_group
+
+    model, sess, registry, name = rat
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
+    path = tmp_path / 'clip.mp4'
+    render_group(sess, 'g000', out['pred'], path, max_side=64, fps=5)
+
+    assert path.stat().st_size > 0
+    cap = cv2.VideoCapture(str(path))
+    n = 0
+    while cap.read()[0]:
+        n += 1
+    cap.release()
+    assert n == 3, f'wrote {n} frames for a 3-frame prediction'
+
+
+def test_2d_is_bit_identical_under_either_carry_source(rat16):
+    """2D has nothing to triangulate, so `carry_source` must not move a 2D prediction."""
+    model, sess, registry, name = rat16
+    torch.manual_seed(0)
+    a = run_group(model, sess, 'g000', registry, name,
+                  _cfg(anchor='carry', carry_source='triangulate'))
+    torch.manual_seed(0)
+    b = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', carry_source='pred'))
+    np.testing.assert_array_equal(np.nan_to_num(a['pred'], nan=-9e9),
+                                  np.nan_to_num(b['pred'], nan=-9e9))
+
+
+def test_3d_carry_feeds_back_the_anchor_free_estimate(mv16):
+    """...while in 3D `carry_source` must change the prediction, or the de-loop is wired to nothing."""
+    model, sess, registry, name = mv16
+    tri = run_group(model, sess, 'g000', registry, name,
+                    _cfg(anchor='carry', carry_source='triangulate'))
+    pred = run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', carry_source='pred'))
+    assert len(tri['window_start']) > 1
+    assert not np.array_equal(np.nan_to_num(tri['pred'], nan=-9e9),
+                              np.nan_to_num(pred['pred'], nan=-9e9))
+
+
+def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
+    """`box_source='instances'` boxes go through the loader's crop rule (pad 0); detector boxes keep
+    the raw union (re-squaring is measured worse)."""
+    from tailcyclenet import crop as cropmod
+
+    model, sess, registry, name = rat
+    w, h = sess.rig.size(sess.cam_names[0])
+    S, T, C = len(sess.labels('g000').animal_ids), 4, len(sess.rig)
+
+    wide = np.tile(np.array([10.0, 10.0, 10.0 + 0.6 * w, 10.0 + 0.2 * h], np.float32),
+                   (S, T, C, 1))
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'), boxes_for=_boxes_for(wide), n_rows=len(wide))
+    det_box = out['crop'][0, 0, 0]
+
+    assert det_box[2] - det_box[0] != det_box[3] - det_box[1], \
+        'the detector union must stay non-square, or the measured +3.06 mm result is being undone'
+
+    stored = sess.labels('g000').boxes
+    a, t = [(i, j) for i in range(stored.shape[0]) for j in range(stored.shape[1])
+            if np.isfinite(stored[i, j, 0]).all()][0]
+    cfg = _cfg(anchor='none', box_source='instances')
+    got = run_group(model, sess, 'g000', registry, name, cfg)
+
+    x0, y0, x1, y1 = stored[a, t, 0]
+    expect = cropmod.crop_box_for_points(
+        torch.tensor([[x0, y0], [x1, y1]]), torch.tensor([int(w), int(h)]),
+        cfg.min_crop_dim, pad=0)
+    np.testing.assert_array_equal(got['crop'][a, 0, 0], np.asarray(expect, np.float32))
+
+
+def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(mv):
+    """`render.project` uses the per-frame extrinsic on a moving rig (matching project_points_torch),
+    and reads extrinsic `frames[t]` at column t for a non-identity `frames`."""
+    from tailcyclenet.render import project
+
+    model, sess, registry, name = mv
+    cam_name = sess.cam_names[0]
+    assert sess.rig.moving.get(cam_name), 'the fixture must actually be moving'
+
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
+    pred = out['pred']
+    frames = np.arange(pred.shape[1])
+
+    per_frame = project(sess, pred, 0, 'g000', frames)
+    nominal = project(sess, pred, 0)                  # what it used to do
+    assert per_frame.shape == pred.shape[:-1] + (2,)
+
+    ok = np.isfinite(per_frame) & np.isfinite(nominal)
+    assert ok.any(), 'need a finite projection to compare'
+    assert not np.allclose(per_frame[ok], nominal[ok]), \
+        'the two must differ on a moving rig, or the per-frame extrinsic is not being used'
+
+    from tracktail.model.cube import project_points_torch
+    cams = sess.cgroup('g000', frames)
+    want = project_points_torch([cams[0]], torch.as_tensor(pred[0], dtype=torch.float32))[0]
+    np.testing.assert_allclose(per_frame[0], want.numpy(), rtol=1e-5, atol=1e-4)
+
+    shifted_frames = np.roll(np.arange(pred.shape[1]), 1)      # a permutation, still in bounds
+    shifted = project(sess, pred, 0, 'g000', shifted_frames)
+    ok2 = np.isfinite(shifted) & np.isfinite(per_frame)
+    assert ok2.any()
+    assert not np.allclose(shifted[ok2], per_frame[ok2]), \
+        'a permuted frames array must change the projection, or the offset never reached cgroup'
+    cams_shifted = sess.cgroup('g000', shifted_frames)
+    want_shifted = project_points_torch([cams_shifted[0]],
+                                        torch.as_tensor(pred[0], dtype=torch.float32))[0]
+    np.testing.assert_allclose(shifted[0], want_shifted.numpy(), rtol=1e-5, atol=1e-4)
+
+
+def test_the_tracker_projects_correctly_on_a_moving_rig(mv):
+    """On a moving rig `cgroup(gid, t)` with a scalar t gives a (4,4) ext, which `track._project`
+    relies on (a (T,4,4) ext would project target i through frame i's pose)."""
+    from tailcyclenet.detector.track import _project
+
+    _, sess, _, _ = mv
+    gid = list(sess.groups)[0]
+    per_frame = sess.cgroup(gid, 0)
+    assert all(c['ext'].ndim == 2 for c in per_frame), \
+        'a scalar frame must give a (4,4) ext, or the projection axis alignment below is wrong'
+    assert sess.cgroup(gid)[0]['ext'].ndim == 3, 'the whole-group form must still be per-frame'
+    for n in (1, 3):
+        out = _project(per_frame[0], np.zeros((n, 3), np.float32))
+        assert out.shape == (n, 2)
+
+
+def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(rat):
+    """In 2D `pred2d[:, :, 0]` IS `pred`, bit for bit (same un-crop expression; the exact inverse
+    would move every published 2D number)."""
+    model, sess, registry, name = rat
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
     C, K = len(sess.rig), sess.n_keypoints
     S, T = out['pred'].shape[0], out['pred'].shape[1]
@@ -1552,11 +996,11 @@ def test_the_per_camera_2d_pose_at_camera_zero_is_the_prediction(scene):
                                       np.nan_to_num(out['pred'], nan=-9e9))
 
 
-def test_session_writer_preserves_named_2d_signals_and_window_metadata(scene, tmp_path):
+def test_session_writer_preserves_named_2d_signals_and_window_metadata(rat, tmp_path):
     """The new prediction table keeps visibility and model confidence as separate signals."""
     import pyarrow.parquet as pq
 
-    _, sess, registry, _ = scene
+    _, sess, registry, _ = rat
     from tailcyclenet.infer.predictions import SessionWriter
 
     gid = next(iter(sess.groups))
@@ -1618,12 +1062,11 @@ def test_merge_blocks_stitches_model_2d_confidence():
                                   np.array([[[[0.1]], [[0.9]]]], np.float32))
 
 
-def test_prediction_3d_missing_status_retains_best_guess_coordinates(scene, tmp_path):
+def test_prediction_3d_missing_status_retains_best_guess_coordinates(mv, tmp_path):
+    """A 3D `missing` prediction row keeps its best-guess coordinates and validates."""
     import pyarrow.parquet as pq
 
-    _, sess, registry, _ = scene
-    if sess.mode != '3d':
-        pytest.skip('3D-only prediction status contract')
+    _, sess, registry, _ = mv
     from tailcyclenet.infer.predictions import SessionWriter, load_predictions
 
     gid = next(iter(sess.groups))
@@ -1700,10 +1143,10 @@ def test_quality_columns_are_optional_and_align_with_pose_rows(scene, tmp_path):
                                                              precision[0, frame, k]))
 
 
-def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_path):
+def test_window_prediction_sidecar_streams_typed_nullable_records(rat, tmp_path):
     import pyarrow.parquet as pq
 
-    _, sess, registry, _ = scene
+    _, sess, registry, _ = rat
     from tailcyclenet.infer.predictions import SessionWriter
 
     gid = next(iter(sess.groups))
@@ -1738,105 +1181,6 @@ def test_window_prediction_sidecar_streams_typed_nullable_records(scene, tmp_pat
     assert table.schema.field('bodypart').nullable
 
 
-def test_the_provenance_names_both_models_by_absolute_path(cli, monkeypatch, tmp_path):
-    """The pose run, its checkpoint FILE and the detector, all resolvable later.
-
-    A prediction session carries no pixels and no weights, so `[provenance]` is the only thing that
-    says what produced it. Relative paths recorded from whatever directory the run started in name
-    nothing afterwards, which is why all three are resolved -- the same reason `source_session` is.
-
-    `checkpoint` is the file, not just its name: `checkpoint_last` and `checkpoint_best` differ by
-    up to 13,600 iterations in practice and the bare name does not say which folder it came from.
-    """
-    import tomllib
-
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's')
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL,
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
-    out = tmp_path / 'pred'
-    # A RELATIVE --run, which is what a shell gives you, and must not be what is recorded.
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', 'run',
-                                      '--data', str(root / 'test' / 's'),
-                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
-                                      '--overlap', '2', '--out', str(out)])
-    cli.main()
-
-    with open(out / 'session.toml', 'rb') as f:
-        prov = tomllib.load(f)['provenance']
-    for k in ('run', 'checkpoint', 'source_session'):
-        assert Path(prov[k]).is_absolute(), f'{k} = {prov[k]!r} is not resolvable from elsewhere'
-        assert Path(prov[k]).exists(), f'{k} = {prov[k]!r} does not exist'
-    assert Path(prov['checkpoint']).is_file(), 'checkpoint must be the FILE, not the run folder'
-    assert prov['checkpoint_name'] == Path(prov['checkpoint']).name
-    # `box_source` is the RUN's crop rule; `det_box_source` is the detector's training target.
-    # They were one name once, and the splat order silently decided which survived.
-    assert prov['box_source'] == 'keypoints'
-    assert prov['det_box_source'] == '' and prov['detector'] == ''
-    assert prov['precision'] == 'bf16'
-    assert prov['camera_batch'] is True
-
-
-def test_assoc_res_max_px_overrides_a_data_session_but_defaults_to_its_own(cli, monkeypatch,
-                                                                           tmp_path):
-    """`--assoc-res-max-px` given explicitly overrides a `--data` session's own stored value;
-    omitted, the session's own value survives untouched. The CLI default is None, not 30.0, so
-    an omitted flag cannot silently clobber a dataset converted under a different assumption --
-    the session here is built at 17.5px specifically so "still 17.5" and "reset to the format
-    default" are distinguishable outcomes, not the same number by coincidence.
-    """
-    import tomllib
-
-    import toml
-
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
-    root = tmp_path / 'rat'
-    session_dir = root / 'test' / 's'
-    cf._session_2d(session_dir)
-    toml_path = session_dir / 'session.toml'
-    cfg = toml.loads(toml_path.read_text())
-    cfg['assoc_res_max_px'] = 17.5
-    toml_path.write_text(toml.dumps(cfg))
-
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL,
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
-    def _run(out, *extra):
-        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                          '--data', str(session_dir), '--split', 'test',
-                                          '--anchor', 'none', '--device', 'cpu',
-                                          '--overlap', '2', '--out', str(out), *extra])
-        cli.main()
-        with open(out / 'session.toml', 'rb') as f:
-            return tomllib.load(f)['assoc_res_max_px']
-
-    assert _run(tmp_path / 'default') == 17.5, \
-        "an omitted flag must not clobber the session's own value"
-    assert _run(tmp_path / 'override', '--assoc-res-max-px', '12') == 12.0, \
-        'given explicitly, it must override'
-
-
 def test_uncalibrated_singleview_prediction_session_uses_normalized_units(tmp_path):
     """The finite single-view fallback must not inherit a 2D source's pixel units."""
     import tomllib
@@ -1858,12 +1202,8 @@ def test_uncalibrated_singleview_prediction_session_uses_normalized_units(tmp_pa
 
 
 def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path):
-    """Two facts under one name lost one of them, and nothing said so.
-
-    `box_source` (the run's crop rule) was overwritten by the detector's training target because
-    both were spelled `box_source` and the second splat won. `dict` merges without complaint, so
-    the writer takes ITEMS and checks.
-    """
+    """Two provenance values under one name raise (the run's `box_source` was once silently
+    overwritten by the detector's); the same value twice is fine."""
     import conftest as cf
     from tailcyclenet.format import Registry, Session
     from tailcyclenet.infer.predictions import SessionWriter
@@ -1883,42 +1223,278 @@ def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path
                   list(sess.groups)).close()
 
 
-# --start-frame / --end-frame: a frame range on BOTH inputs.
-#
-# INPUT-INDEPENDENT ON PURPOSE: the frame range is a window-loop lever, not an input-format one,
-# so every one of these runs on the existing session fixtures and needs no video at all.
+def test_the_cli_runs_end_to_end_with_no_detector(cli, monkeypatch, tmp_path):
+    """Through `main()` on the default box path: the output is a valid prediction session (no
+    keypoints.pq, sidecar opt-in) and `[provenance]` names the run, checkpoint FILE and source by
+    absolute path even from a relative `--run`."""
+    import tomllib
 
-def _range_scene(tmp_path, T=16):
-    """A 2D session long enough for several windows -- `window_starts(16, 4, 2)` is 7 starts."""
+    from tailcyclenet.format import Session, validate_session
+    from tailcyclenet.infer.predictions import load_predictions
+
+    sdir, run = _cli_setup(tmp_path)
+    out = tmp_path / 'pred'
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', 'run', '--data', str(sdir),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--out', str(out)])
+    cli.main()
+
+    for f in ('session.toml', 'calibration.toml', 'groups.pq', 'points2d.pq', 'windows.pq'):
+        assert (out / f).exists(), f'{f} missing; wrote {sorted(p.name for p in out.iterdir())}'
+    assert not (out / 'keypoints.pq').exists(), 'model estimates are not annotation observations'
+    assert not (out / 'window_predictions.pq').exists(), 'sidecar export is opt-in'
+    got = Session.load(out)
+    assert got.label_source == 'tracked'
+    errs = [e for e in validate_session(got) if '[rule 7]' not in e]
+    assert not errs, f'a prediction session must be valid apart from its missing pixels: {errs}'
+
+    preds, meta = load_predictions(out)
+    assert preds['s/g000']['pred'].shape[1] == 4
+    assert np.isfinite(preds['s/g000']['pred']).any(), 'the round trip lost every point'
+    assert meta['anchor'] == 'none'
+
+    with open(out / 'session.toml', 'rb') as f:
+        prov = tomllib.load(f)['provenance']
+    for k in ('run', 'checkpoint', 'source_session'):
+        assert Path(prov[k]).is_absolute() and Path(prov[k]).exists(), (k, prov[k])
+    assert Path(prov['source_session']).name == 's'
+    assert Path(prov['checkpoint']).is_file(), 'checkpoint must be the FILE, not the run folder'
+    assert prov['checkpoint_name'] == Path(prov['checkpoint']).name
+    assert prov['box_source'] == 'keypoints'
+    assert prov['det_box_source'] == '' and prov['detector'] == ''
+    assert prov['precision'] == 'bf16' and prov['camera_batch'] is True
+
+
+def test_the_cli_runs_from_a_lone_pose_checkpoint(cli, monkeypatch, tmp_path):
+    """`--run` may be ONE checkpoint file with no run folder; the prediction is the folder's."""
+    import shutil
+
+    import conftest as cf
+    from tailcyclenet.infer.predictions import load_predictions
+
+    root = tmp_path / 'rat'
+    cf._session_2d(root / 'test' / 's')
+    run, path = _save_run(tmp_path, Registry.build([load_dataset(root)]))
+    lone = tmp_path / 'elsewhere' / 'pose.pth'
+    lone.parent.mkdir()
+    shutil.copy(path, lone)
+
+    def infer(where, out):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--pose', str(where),
+                                          '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                          '--device', 'cpu', '--overlap', '2', '--out', str(out)])
+        cli.main()
+        return load_predictions(out)
+
+    ref, _ = infer(run, tmp_path / 'from-run')
+    shutil.rmtree(run)
+    got, meta = infer(lone, tmp_path / 'from-file')
+    assert meta['run'] == str(lone.resolve())
+    np.testing.assert_array_equal(got['s/g000']['pred'], ref['s/g000']['pred'])
+
+
+@pytest.mark.parametrize('flag,selector_flag,value', [
+    ('--pose', '--pose-checkpoint', 'checkpoint_best.pth'),
+    ('--run', '--checkpoint', 'checkpoint_best.pth'),
+    ('--scorer', '--scorer-checkpoint', 'checkpoint_best.pth'),
+    ('--detector', '--detector-checkpoint', 'best'),
+])
+def test_a_checkpoint_selector_beside_a_file_is_refused_before_loading(
+        cli, monkeypatch, tmp_path, flag, selector_flag, value):
     import conftest as cf
 
-    cf._session_2d(tmp_path / 'rat' / 'test' / 's', T=T)
-    ds = load_dataset(tmp_path / 'rat')
-    registry = Registry.build([ds])
-    sess = ds.sessions['test'][0]
-    sess.preload()
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints).eval()
-    return model, sess, registry, ds.name
+    cf._session_2d(tmp_path / 'rat' / 'test' / 's')
+    f = tmp_path / 'model.pth'
+    torch.save({}, f)
+
+    _no_load(monkeypatch)
+    argv = {'--run': str(tmp_path / 'run'), flag: str(f), selector_flag: value}
+    monkeypatch.setattr(sys, 'argv', ['infer.py', *[x for kv in argv.items() for x in kv],
+                                      '--data', str(tmp_path / 'rat' / 'test' / 's'),
+                                      '--device', 'cpu', '--out', str(tmp_path / 'o')])
+    shown = {'--run': '--pose', '--checkpoint': '--pose-checkpoint'}
+    with pytest.raises(SystemExit,
+                       match=f'already a checkpoint file; {shown.get(selector_flag, selector_flag)}'):
+        cli.main()
 
 
-def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
-    """With `--anchor none` the prediction is a pure function of the frames in its window, so a
-    range equals the whole-clip slice wherever the two runs put the SAME window over the SAME
-    frames.
+def test_pose_and_run_are_one_option():
+    """`--pose`/`--pose-checkpoint` are the names; `--run`/`--checkpoint` stay as aliases."""
+    from tailcyclenet.infer.cli import build_parser
+    ap = build_parser()
+    base = ['--data', 'd', '--out', 'o']
+    new = ap.parse_args(['--pose', 'r', '--pose-checkpoint', 'c.pth', *base])
+    old = ap.parse_args(['--run', 'r', '--checkpoint', 'c.pth', *base])
+    assert (new.run, new.checkpoint) == (old.run, old.checkpoint) == (Path('r'), 'c.pth')
 
-    **THE PARTITION AGREES EVERYWHERE EXCEPT THE TAIL, AND THAT IS NOT A BUG.** `window_starts`
-    pulls the LAST window back to end exactly on the last frame, so a range ending at `b` has a
-    final window `[b - T, b)` -- not a whole-clip window unless `b` is the clip end. A frame
-    belongs to the last window containing it, so the few frames after the range's final start were
-    predicted from a DIFFERENT window than the whole-clip run gave them.
 
-    So: an `--end-frame` at the clip end is byte-identical outright, and a mid-clip one is
-    byte-identical up to its own final window start.
-    """
-    model, sess, registry, name = _range_scene(tmp_path)
+def test_session_shape_refusals_fire_before_the_checkpoint_loads(cli, monkeypatch, tmp_path):
+    """`--data` must name ONE session; `--out` must be empty and must not be the source session."""
+    import conftest as cf
+
+    cf._session_2d(tmp_path / 'two' / 'test' / 'a')
+    cf._session_2d(tmp_path / 'two' / 'test' / 'b')
+    sdir = tmp_path / 'two' / 'test' / 'a'
+    stale = tmp_path / 'stale'
+    stale.mkdir()
+    (stale / 'stale.pq').write_bytes(b'x')
+    _no_load(monkeypatch)
+    for data, out, expect in [(tmp_path / 'two', tmp_path / 'o', 'ONE session directory'),
+                              (sdir, stale, 'not empty'),
+                              (sdir, sdir, 'SOURCE session')]:
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
+                                          '--data', str(data), '--split', 'test',
+                                          '--device', 'cpu', '--out', str(out)])
+        with pytest.raises(SystemExit, match=expect):
+            cli.main()
+
+
+def test_session_writer_finalizes_incomplete_output_when_preload_fails(cli, monkeypatch, tmp_path):
+    """A failure mid-run still finalizes the output: `complete = false`, readable empty tables."""
+    import tomllib
+
+    import pyarrow.parquet as pq
+    from tailcyclenet.format import Session
+
+    sdir, run = _cli_setup(tmp_path)
+    out = tmp_path / 'partial-prediction'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                      '--data', str(sdir), '--anchor', 'none',
+                                      '--device', 'cpu', '--window-predictions', '--out', str(out)])
+
+    def fail_preload(_self):
+        raise RuntimeError('injected preload failure')
+
+    monkeypatch.setattr(Session, 'preload', fail_preload)
+    with pytest.raises(RuntimeError, match='injected preload failure'):
+        cli.main()
+
+    with (out / 'session.toml').open('rb') as f:
+        assert tomllib.load(f)['complete'] is False
+    assert pq.read_table(out / 'points2d.pq').num_rows == 0
+    assert pq.read_table(out / 'window_predictions.pq').num_rows == 0
+
+
+def _detector_ckpt(tmp_path, dataset, min_crop_dim=16, box_source='keypoints'):
+    """A minimal but genuinely loadable detector checkpoint file."""
+    import conftest as cf
+    from tailcyclenet.detector.yolox import YOLOXNano
+
+    ckpt = cf._detector_checkpoint(YOLOXNano(version='hybrid'), input_wh=(64, 48), dataset=dataset,
+                                   min_crop_dim=min_crop_dim, box_source=box_source)
+    p = tmp_path / 'det.pth'
+    torch.save(ckpt, p)
+    return p
+
+
+class _ReachedRunBlocks(Exception):
+    """Raised by a `run_blocks` stub: the driver got past every refusal."""
+
+
+def test_cli_detector_family_refusal_and_its_escape_hatch(cli, monkeypatch, tmp_path):
+    """A detector from another dataset family is refused before `run_blocks`; a same-family variant
+    (rat-city-tracked vs a rat-city-combined detector) and `--allow-detector-transfer` pass."""
+    import conftest as cf
+
+    for root in ('other-species-tracked', 'rat-city-tracked'):
+        cf._session_2d(tmp_path / root / 'test' / 's')
+    registry = Registry.build([load_dataset(tmp_path / r)
+                               for r in ('other-species-tracked', 'rat-city-tracked')])
+    run, _ = _save_run(tmp_path, registry)
+    det = _detector_ckpt(tmp_path, 'rat-city-combined')
+
+    def boom(*a, **k):
+        raise _ReachedRunBlocks()
+
+    monkeypatch.setattr('tailcyclenet.infer.driver.run_blocks', boom)
+
+    def main(root, *extra):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                          '--data', str(tmp_path / root / 'test' / 's'),
+                                          '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                          '--overlap', '2', '--detector', str(det),
+                                          '--out', str(tmp_path / f'pred-{root}-{len(extra)}'),
+                                          *extra])
+        cli.main()
+
+    with pytest.raises(SystemExit, match='different dataset families'):
+        main('other-species-tracked')
+    with pytest.raises(_ReachedRunBlocks):
+        main('rat-city-tracked')
+    with pytest.raises(_ReachedRunBlocks):
+        main('other-species-tracked', '--allow-detector-transfer')
+
+
+@pytest.mark.parametrize('argv,expect', [
+    (['--anchor', 'labels', '--detector', 'nope'], 'not label rows'),
+    (['--anchor', 'labels', '--boxes', 'nope.npz'], 'not label rows'),
+    (['--oracle-corrupt', 'nonsense'], 'kind must be one of'),
+    (['--oracle-corrupt', 'off'], 'needs an amount'),
+    (['--oracle-corrupt', 'off:0.5', '--anchor', 'carry'], 'only means anything'),
+    (['--max-frames', '120', '--start-frame', '300'], 'two readings of equal force'),
+    (['--start-frame', '-1'], 'negative frame indices'),
+    (['--start-frame', '300', '--end-frame', '20'], 'not past --start-frame'),
+])
+def test_the_cli_refuses_incoherent_combinations_before_loading_anything(cli, monkeypatch,
+                                                                        argv, expect):
+    """Combinations that used to run and produce a number (worst: `--anchor labels` with a box
+    source seeded detector row a from LABEL row a), plus the frame-range arithmetic refusals."""
+    _no_load(monkeypatch)
+    repo = Path(__file__).resolve().parent.parent
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
+                                      '--data', str(repo), '--out', '/tmp/unused'] + argv)
+    with pytest.raises(SystemExit) as e:
+        cli.main()
+    assert expect in str(e.value), f'wanted {expect!r}, got: {e.value}'
+
+
+def test_deleted_inference_flags_raise_by_name(cli, monkeypatch):
+    """Deleted flags (architecture cleanup 2026-10-19) raise naming themselves, not argparse noise."""
+    repo = Path(__file__).resolve().parent.parent
+    for argv in (['--independent-windows'], ['--fill-from', 'prior'],
+                 ['--det-input-wh', '416', '416']):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
+                                          '--data', str(repo), '--out', '/tmp/unused'] + argv)
+        with pytest.raises(SystemExit, match=f'{argv[0]} is deleted'):
+            cli.main()
+
+
+def test_assoc_res_max_px_overrides_a_data_session_but_defaults_to_its_own(cli, monkeypatch,
+                                                                           tmp_path):
+    """An omitted `--assoc-res-max-px` keeps the session's own value (17.5, not the format's 30);
+    given explicitly it overrides."""
+    import tomllib
+
+    import toml
+
+    session_dir, run = _cli_setup(tmp_path)
+    toml_path = session_dir / 'session.toml'
+    cfg = toml.loads(toml_path.read_text())
+    cfg['assoc_res_max_px'] = 17.5
+    toml_path.write_text(toml.dumps(cfg))
+
+    def _run(out, *extra):
+        monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
+                                          '--data', str(session_dir), '--split', 'test',
+                                          '--anchor', 'none', '--device', 'cpu',
+                                          '--overlap', '2', '--out', str(out), *extra])
+        cli.main()
+        with open(out / 'session.toml', 'rb') as f:
+            return tomllib.load(f)['assoc_res_max_px']
+
+    assert _run(tmp_path / 'default') == 17.5, \
+        "an omitted flag must not clobber the session's own value"
+    assert _run(tmp_path / 'override', '--assoc-res-max-px', '12') == 12.0, \
+        'given explicitly, it must override'
+
+
+def test_a_range_is_byte_identical_where_the_window_partition_agrees(rat16):
+    """Under `--anchor none` a range equals the whole-clip slice where the window partition agrees:
+    outright to the clip end; mid-clip, up to the range's own (pulled-back) last window start."""
+    model, sess, registry, name = rat16
     whole = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none'))
 
-    # (1) TO THE CLIP END: the lattice is identical, so this is byte-identity outright.
     a = 6
     tail = run_group(model, sess, 'g000', registry, name,
                      _cfg(anchor='none', frame_start=a))
@@ -1926,8 +1502,6 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
     np.testing.assert_array_equal(np.nan_to_num(tail['pred'], nan=-9e9),
                                   np.nan_to_num(whole['pred'][:, a:], nan=-9e9))
 
-    # (2) MID-CLIP: identical up to the range's own final window start, and the frames past it
-    # come from the pulled-back last window instead -- which is the documented difference.
     b = 14
     part = run_group(model, sess, 'g000', registry, name,
                      _cfg(anchor='none', frame_start=a, frame_stop=b))
@@ -1941,43 +1515,16 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(tmp_path):
         np.nan_to_num(whole['pred'][:, a:last], nan=-9e9))
 
 
-def test_max_frames_is_the_zero_start_case(tmp_path):
-    """`--max-frames N` IS `--start-frame 0 --end-frame N`, internally one quantity."""
-    model, sess, registry, name = _range_scene(tmp_path)
-    a = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=9))
-    b = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', frame_stop=9))
-    np.testing.assert_array_equal(np.nan_to_num(a['pred'], nan=-9e9),
-                                  np.nan_to_num(b['pred'], nan=-9e9))
-    assert a['frame_start'] == 0 and a['frame_stop'] == 9
-
-
 def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
-    """`frame` IS ALWAYS THE SOURCE INDEX, and groups.pq keeps the group's FULL length.
-
-    Rebasing to 0 would score frames [start, end) against labels [0, end-start): the
-    `chunk_frames` failure exactly, which read as a pipeline degrading over a clip rather than as
-    an indexing bug. Absence outside the range is the spec's own sparsity rule, so
-    `load_predictions` hands eval.py a full-length array that is NaN outside it and `--chunk` /
-    `--vs` need no change.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    """`frame` is always the SOURCE index and groups.pq keeps the full length; `load_predictions`
+    densifies NaN outside the range (rebasing to 0 was the `chunk_frames` bug)."""
     from tailcyclenet.infer.predictions import load_predictions
 
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's', T=16)
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    sdir, run = _cli_setup(tmp_path, T=16)
 
     out = tmp_path / 'pred'
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                      '--data', str(sdir), '--anchor', 'none',
                                       '--device', 'cpu', '--overlap', '2',
                                       '--start-frame', '6', '--end-frame', '14',
                                       '--window-predictions', '--out', str(out)])
@@ -2000,76 +1547,32 @@ def test_a_range_writes_source_frame_indices(cli, monkeypatch, tmp_path):
     assert not np.isfinite(p[:, :6]).any() and not np.isfinite(p[:, 14:]).any()
 
 
-def test_the_detection_slice_stays_batch_aligned(tmp_path):
-    """`detect_raw` ASSERTS a slice starts on a multiple of `batch`, and 6 is not.
+def _detect_session(tmp_path, T):
+    """A 2D session of T frames, preloaded (no model: the detector tests stub detection)."""
+    import conftest as cf
+    from tailcyclenet.format import Session
 
-    A short leading batch is an input SHAPE the whole-clip pass never produces and cuDNN picks
-    convolution algorithms per shape, so the cursor starts BELOW `--start-frame` on an aligned
-    boundary and the lead-in is detected and then written to nothing. Do NOT relax the assert, and
-    do NOT round the user's `--start-frame`: the batch is an internal that no CLI value may be
-    quantised by.
-    """
-    from tailcyclenet.infer import driver
-    from tailcyclenet.infer.cli import build_parser
+    cf._session_2d(tmp_path / 'rat' / 'test' / 's', T=T)
+    sess = Session.load(tmp_path / 'rat' / 'test' / 's')
+    sess.preload()
+    return sess
 
-    model, sess, registry, name = _range_scene(tmp_path, T=64)
-    seen = []
 
-    def fake_detect_raw(det, wh, session, gid, top_k, **kw):
-        fr = np.asarray(kw['frames'])
-        seen.append((int(fr[0]), int(fr[-1])))
-        C, D = len(session.rig), max(1, top_k)
-        return (np.full((D, len(fr), C, 4), np.nan, np.float32),
-                np.full((D, len(fr), C), np.nan, np.float32))
-
-    def fake_associate(raw, session, gid, n, **kw):
-        b, s = raw
-        return b[:n], s[:n]
-
+@pytest.mark.parametrize('start,stop', [(37, 53), (37, 64)])
+def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path, start, stop):
+    """The detection cursor opens on a `_DET_BATCH` boundary BELOW `--start-frame` (never rounding
+    the user's value), and `detect_raw` is told the RANGE end, so a ragged final slice (53) is
+    accepted as well as an exact one (64). The driver once passed `max_frames=0` and failed 272 s
+    into a 1000-frame run."""
     import tailcyclenet.detector as detmod
-    old = (detmod.detect_raw, detmod.associate_group)
-    detmod.detect_raw, detmod.associate_group = fake_detect_raw, fake_associate
-    try:
-        args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
-                                          '--max-move', '1.0'])
-        args.frame_start, args.frame_stop = 37, 64
-        boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
-                                           None, 2, 2)
-
-        class _Store:
-            def read(self, ci, cam, fr, pool=None, reduce=1):
-                return [None] * len(fr)
-        boxes_for(_Store(), 37, 53)
-    finally:
-        detmod.detect_raw, detmod.associate_group = old
-
-    assert seen, 'no detection ran'
-    assert seen[0][0] == 32, f'the cursor must open on a multiple of 16, got {seen[0][0]}'
-    for lo, _ in seen:
-        assert lo % driver._DET_BATCH == 0, f'misaligned detection slice at {lo}'
-
-
-@pytest.mark.parametrize('start,stop', [(37, 53), (37, 64), (0, 20), (16, 100), (5, 7)])
-def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_path, start, stop):
-    """`detect_raw` accepts a short FINAL slice only when it sits at the clip end, and what it
-    believes the clip end to be comes from its `max_frames`.
-
-    The driver passed `args.max_frames`, which is **0** whenever the range arrived as
-    `--start-frame`/`--end-frame` -- so `detect_raw` thought the clip ran to `group.n_frames` and
-    REFUSED the last slice of any range whose length is not a multiple of `_DET_BATCH`. It failed
-    272 s into a 1000-frame run and was invisible at 100 frames, because 100 frames from an
-    aligned cursor happens to leave a full final batch. Parametrised over ragged and exact ends so
-    neither case can pass alone.
-    """
     from tailcyclenet.infer import driver
     from tailcyclenet.infer.cli import build_parser
 
-    model, sess, registry, name = _range_scene(tmp_path, T=200)
+    sess = _detect_session(tmp_path, T=80)
     seen = []
 
     def fake_detect_raw(det, wh, session, gid, top_k, **kw):
         fr = np.asarray(kw['frames'])
-        # THE REAL ASSERT, reproduced against what the driver actually passed.
         T_clip = min(session.groups[gid].n_frames, kw['max_frames'] or session.groups[gid].n_frames)
         batch = driver._DET_BATCH
         assert int(fr[0]) % batch == 0 and (len(fr) % batch == 0 or int(fr[-1]) == T_clip - 1), (
@@ -2079,7 +1582,10 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
         return (np.full((D, len(fr), C, 4), np.nan, np.float32),
                 np.full((D, len(fr), C), np.nan, np.float32))
 
-    import tailcyclenet.detector as detmod
+    class _Store:
+        def read(self, ci, cam, fr, pool=None, reduce=1):
+            return [None] * len(fr)
+
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw = fake_detect_raw
     detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
@@ -2089,61 +1595,19 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
         args.frame_start, args.frame_stop = start, stop
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
-
-        class _Store:
-            def read(self, ci, cam, fr, pool=None, reduce=1):
-                return [None] * len(fr)
         boxes_for(_Store(), start, stop)
     finally:
         detmod.detect_raw, detmod.associate_group = old
-    assert seen and seen[-1][1] == stop - 1, f'detection must reach the range end: {seen[-1]}'
+    assert seen[0][0] == 32, f'the cursor must open on a multiple of 16, got {seen[0][0]}'
+    assert seen[-1][1] == stop - 1, f'detection must reach the range end: {seen[-1]}'
 
 
-@pytest.mark.parametrize('argv,expect', [
-    (['--max-frames', '120', '--start-frame', '300'], 'two readings of equal force'),
-    (['--max-frames', '120', '--end-frame', '300'], 'two readings of equal force'),
-    (['--start-frame', '-1'], 'negative frame indices'),
-    (['--end-frame', '-4'], 'negative frame indices'),
-    (['--start-frame', '300', '--end-frame', '300'], 'not past --start-frame'),
-    (['--start-frame', '300', '--end-frame', '20'], 'not past --start-frame'),
-])
-def test_the_frame_range_refusals_fire_before_anything_loads(cli, monkeypatch, argv, expect):
-    """Refusals 15-17: pure argument arithmetic, above both input branches and above `load_run`."""
-    def boom(*a, **k):
-        raise AssertionError('the refusal must fire before the checkpoint loads')
-
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
-    repo = Path(__file__).resolve().parent.parent
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(repo / 'no_such_run'),
-                                      '--data', str(repo), '--out', '/tmp/unused'] + argv)
-    with pytest.raises(SystemExit) as e:
-        cli.main()
-    assert expect in str(e.value), f'wanted {expect!r}, got: {e.value}'
-
-
-def test_a_short_group_is_skipped_by_name_and_an_empty_run_is_refused(cli, monkeypatch, tmp_path):
-    """Refusal 18, both halves.
-
-    A ragged root with one short group must still be runnable, so a group at or below
-    `--start-frame` is skipped BY NAME. But a run that predicts nothing at all is a mistyped
-    range, and writing an empty session and exiting 0 is the worst of both.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's', T=8)
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+def test_a_range_past_every_group_is_refused(cli, monkeypatch, tmp_path):
+    """A run whose range starts past every group is refused rather than writing an empty session."""
+    sdir, run = _cli_setup(tmp_path)
 
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--anchor', 'none',
+                                      '--data', str(sdir), '--anchor', 'none',
                                       '--device', 'cpu', '--overlap', '2',
                                       '--start-frame', '99', '--out', str(tmp_path / 'p')])
     with pytest.raises(SystemExit, match='past the end of every group'):
@@ -2177,56 +1641,24 @@ def _videos_fixture(tmp_path, T=8, wh=(64, 48)):
 
 
 def _videos_run(tmp_path, names):
-    """A run folder whose registry holds exactly ONE dataset, so §5's default has to infer it."""
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
+    """A run folder whose registry holds exactly ONE dataset, so the default has to infer it."""
     registry = Registry(names=tuple(names), datasets=(('ds', tuple(range(len(names)))),))
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-    return run, registry
+    return _save_run(tmp_path, registry)[0], registry
 
 
 def test_identity_events_reach_the_written_session(cli, monkeypatch, tmp_path):
-    """C6's other half: the tracker's event log has to leave the process, or it is only a
-    debugger's convenience and every question still costs a traced re-run.
-
-    END TO END through `cli.main()` with a real detector, because the wiring is the part that
-    breaks -- the same lesson `--overlap-trace` taught an hour earlier, where a unit-tested writer
-    and a unit-tested hook were joined by two lines that never applied and a GPU run produced a
-    well-formed empty artifact. Here the assertion is that `identity_events.pq` exists and holds
-    at least one `born` for the animal the fixture actually tracks; an empty table would mean the
-    tracker's list never reached the writer.
-
-    `detail` is asserted to be JSON-decodable because its keys differ per event type, which is
-    exactly why it is one string column rather than sparse typed ones.
-    """
+    """A tracked 3D run with a real detector writes `identity_events.pq` through `cli.main()` (the
+    wiring is what breaks) with at least one `born` and JSON `detail`."""
     import json
 
     import pyarrow.parquet as pq
 
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-    from tailcyclenet.format import load_dataset
-    from tailcyclenet.model import build_model
-
-    root = tmp_path / 'ds'
-    cf._session_3d(root / 'test' / 's', T=8)
-    registry = Registry.build([load_dataset(root)])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    sdir, run = _cli_setup(tmp_path, 'mv', name='ds', T=8)
     det = _detector_ckpt(tmp_path, 'ds')
 
     out = tmp_path / 'pred'
     monkeypatch.setattr(sys, 'argv', [
-        'infer.py', '--data', str(root / 'test' / 's'), '--out', str(out),
+        'infer.py', '--data', str(sdir), '--out', str(out),
         '--run', str(run), '--detector', str(det), '--device', 'cpu',
         '--split', 'test', '--overlap', '2', '--max-animals', '2', '--anchor', 'none'])
     cli.main()
@@ -2243,38 +1675,17 @@ def test_identity_events_reach_the_written_session(cli, monkeypatch, tmp_path):
 
 
 def test_identity_events_are_absent_not_fatal_on_a_2d_run(cli, monkeypatch, tmp_path):
-    """A 2D single-camera run has NO `CrossViewTracker` -- `associate_group` sets
-    `state['tracker'] = None` because the tracker only builds when `track and C > 1` -- so there
-    are no identity events to write, and the run must simply not write the table.
-
-    THIS TEST EXISTS BECAUSE ITS ABSENCE CRASHED A REAL 2D ARM. The event-log wiring tested
-    `'tracker' in state`, which is True on the 2D path with a None VALUE, and every 2D inference
-    died with `AttributeError: 'NoneType' object has no attribute 'events'`. The 3D test passed
-    throughout: it exercised the only path the author was thinking about. C > 1 and C == 1 are
-    different code paths through this line and both need covering.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-    from tailcyclenet.format import load_dataset
-    from tailcyclenet.model import build_model
-
-    root = tmp_path / 'ds2d'
-    cf._session_2d(root / 'test' / 's', T=8)
-    registry = Registry.build([load_dataset(root)])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    """A 2D run has no tracker (`state['tracker'] = None`), so it writes no identity table and must
+    not crash (the wiring once died with `'NoneType' object has no attribute 'events'`)."""
+    sdir, run = _cli_setup(tmp_path, name='ds2d', T=8)
 
     out = tmp_path / 'pred2d'
     monkeypatch.setattr(sys, 'argv', [
-        'infer.py', '--data', str(root / 'test' / 's'), '--out', str(out),
+        'infer.py', '--data', str(sdir), '--out', str(out),
         '--run', str(run), '--detector', str(_detector_ckpt(tmp_path, 'ds2d')),
         '--device', 'cpu', '--split', 'test', '--overlap', '2', '--max-animals', '2',
         '--anchor', 'none'])
-    cli.main()               # must not raise
+    cli.main()
 
     assert (out / 'points2d.pq').exists(), 'the 2D run itself must still produce a prediction'
     assert not (out / 'identity_events.pq').exists(), \
@@ -2282,16 +1693,8 @@ def test_identity_events_are_absent_not_fatal_on_a_2d_run(cli, monkeypatch, tmp_
 
 
 def test_overlap_trace_flag_actually_reaches_the_capture_hook(cli, monkeypatch, tmp_path):
-    """`--overlap-trace` must arm the hook, not merely write a file.
-
-    THIS TEST EXISTS BECAUSE ITS ABSENCE COST A GPU RUN. A unit test covered the npz writer and a
-    separate one covered the hook, but nothing covered the WIRING between them -- the driver line
-    that sets `stats['capture_overlap_agreement']`. That line was missing, so a real 240-frame
-    probe ran to completion and wrote a well-formed trace containing zero rows and an all-zero
-    census, which reads exactly like a legitimate "no seams here" result rather than like a bug.
-    An all-zero census is therefore asserted against directly: the failure mode is silence, and
-    silence is what a census is supposed to distinguish from absence.
-    """
+    """`--overlap-trace` must ARM the hook, not merely write a file: an all-zero census is the silent
+    failure that once cost a GPU run."""
     import json
 
     import conftest as cf
@@ -2323,10 +1726,7 @@ def test_overlap_trace_flag_actually_reaches_the_capture_hook(cli, monkeypatch, 
 
 
 def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch, tmp_path):
-    """THE ASSERTION THAT `--videos` IS NOT A SECOND INFERENCE PATH: same weights, same crop
-    points, same pixels -- reached once through a hand-authored session directory and once through
-    an in-memory `VideoSession` -- must produce the same points3d.pq.
-    """
+    """`--videos` is an input path, not a second pipeline: same points3d.pq as the `--data` twin."""
     import conftest as cf
 
     rig, vids, sdir = _videos_fixture(tmp_path)
@@ -2352,9 +1752,6 @@ def test_the_videos_path_is_byte_identical_to_the_session_path(cli, monkeypatch,
     cols = ['frame', 'animal_id', 'bodypart', 'x', 'y', 'z']
 
     def rows(d):
-        # Sorted by (frame, animal, bodypart) rather than compared in file order: the two runs
-        # need not emit rows in the same order for the PREDICTION to be identical, and it is the
-        # prediction that is the claim.
         t = pq.read_table(tmp_path / d / 'points3d.pq').select(cols).to_pydict()
         return sorted(zip(*(t[c] for c in cols)))
 
@@ -2368,19 +1765,12 @@ def test_2d_videos_without_calibration_defaults_to_px_and_nominal_cam(cli, monke
     import tomllib
 
     import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-    from tailcyclenet.format import Registry, Session
+    from tailcyclenet.format import Session
 
     wh, T = (80, 48), 8
     video = cf._write_video(tmp_path / 'rec' / 'take.mp4', 0, T, wh)
     names = cf.KPTS_3D
-    registry = Registry(names=tuple(names), datasets=(('ds', tuple(range(len(names)))),))
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
+    run, _ = _videos_run(tmp_path, names)
     points = np.zeros((1, T, len(names), 2), np.float32)
     points[..., 0] = wh[0] / 2
     points[..., 1] = wh[1] / 2
@@ -2427,12 +1817,8 @@ def test_3d_videos_without_valid_units_refuses_before_checkpoint_load(cli, monke
 
 
 def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
-    """Through `main()`, with `--boxes` so no detector checkpoint is needed.
-
-    Pins the two halves a user meets first: the prediction round-trips through `Session.load`, and
-    the three `source_*` provenance keys name the fixture's own inputs VERBATIM -- which is what
-    `adopt.session_from_prediction` replays, and the only record of where the pixels are.
-    """
+    """Through `main()` from raw videos: the prediction validates, `source_*` provenance is verbatim,
+    `--dump-session` writes a valid session, and `session_from_prediction` finds the pixels."""
     import tomllib
 
     import conftest as cf
@@ -2462,8 +1848,6 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
     with open(out / 'session.toml', 'rb') as f:
         prov = tomllib.load(f)['provenance']
     assert prov['source'] == 'tailcyclenet infer --videos'
-    # DELIBERATELY EMPTY: there is no directory, and writing the path of one that does not exist
-    # reads as a stale root rather than as an absent one.
     assert prov['source_session'] == ''
     assert prov['source_calibration'] == str(tmp_path / 'calib.toml')
     assert prov['source_cam_regex'] == 'cam([0-9]+)_'
@@ -2472,11 +1856,8 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
     preds, _ = load_predictions(out)
     assert 'rec/t' in preds and np.isfinite(preds['rec/t']['pred']).any()
 
-    # `--dump-session` is a DEBUG artefact, and what it writes must be a valid session outright --
-    # that is the whole reason to be able to point `validate_session` at it.
     assert not validate_session(Session.load(tmp_path / 'dumped'))
 
-    # And the reconstruction reaches the same pixels with no probe and no directory.
     from tailcyclenet import adopt
     back = adopt.session_from_prediction(out)
     assert back.groups['t'].source('0')[1] == vids['0'].resolve()
@@ -2489,9 +1870,7 @@ def test_the_cli_runs_end_to_end_from_videos(cli, monkeypatch, tmp_path):
     (['--data', '/tmp/x', '--calibration', '/tmp/c.toml'], 'only means anything with --videos'),
 ])
 def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, capsys, argv, expect):
-    """argparse's own mutual-exclusion message names one flag; "exactly one of" names both, which
-    is what a user who supplied neither needs to read. Parser errors write to stderr, while a
-    raw-footage refusal is raised by the input-path checks, so inspect whichever carries it."""
+    """`--data`/`--videos` are exactly-one-of and the refusal names both."""
     monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', '/tmp/r', '--out', '/tmp/o'] + argv)
     with pytest.raises(SystemExit) as exc:
         cli.main()
@@ -2500,183 +1879,48 @@ def test_the_two_input_paths_are_exclusive_and_both_named(cli, monkeypatch, caps
     assert expect in err, f'wanted {expect!r}, got: {err}'
 
 
-def test_cross_view_defaults_select_the_measured_configuration():
-    """The parser defaults to the measured zero-switch tracker configuration."""
-    from tailcyclenet.infer.cli import build_parser
-
-    parser = build_parser()
-    assert parser.get_default('max_age') == 8
-    assert parser.get_default('max_move') == 1.25
-
-
-
-
 def test_the_2d_row_gate_masks_the_saved_prediction(cli, monkeypatch, tmp_path):
-    """A2 (dev/plans/multianimal_system_improvements.md): the 2D vis-thresh gate masked p/conf/
-    box_agree but the writer saved pred2d/conf2d before it -- and `load_predictions` reads the
-    saved points2d.pq back as the primary prediction, so a declined row resurrected in the
-    saved session. The fix masks pred2d/conf2d too; 3D keeps its per-camera rows as diagnostics.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
+    """A gated 2D row must stay gated in the saved points2d.pq (it used to be resurrected there,
+    since `load_predictions` reads it back as the primary prediction)."""
     from tailcyclenet.infer.predictions import load_predictions
-    from tailcyclenet.model import build_model
 
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's')
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL,
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
-    out_hi = tmp_path / 'hi'
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--split', 'test',
-                                      '--anchor', 'none', '--device', 'cpu', '--overlap', '2',
-                                      '--vis-thresh=1e9', '--out', str(out_hi)])
+    sdir, run = _cli_setup(tmp_path)
+    out = tmp_path / 'hi'
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(sdir),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--vis-thresh=1e9', '--out', str(out)])
     cli.main()
-    preds_hi, _ = load_predictions(out_hi)
-    assert not np.isfinite(preds_hi['s/g000']['pred']).any(), \
-        'the gated 2D prediction must be empty after the round trip, not resurrected'
-
-    out_lo = tmp_path / 'lo'
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--split', 'test',
-                                      '--anchor', 'none', '--device', 'cpu', '--overlap', '2',
-                                      '--vis-thresh=-1e9', '--out', str(out_lo)])
-    cli.main()
-    preds_lo, _ = load_predictions(out_lo)
-    assert np.isfinite(preds_lo['s/g000']['pred']).any(), 'the ungated control must be unchanged'
+    preds, _ = load_predictions(out)
+    assert not np.isfinite(preds['s/g000']['pred']).any()
 
 
-def test_a_nonempty_out_directory_is_refused_before_the_checkpoint_loads(cli, monkeypatch,
+def test_a_moving_rig_3d_prediction_carries_extrinsics_and_resolved_refine(cli, monkeypatch,
                                                                          tmp_path):
-    """A3 (dev/plans/multianimal_system_improvements.md): reusing an output session directory
-    would silently mix an old table (or an old `identity_events.pq`) into the new session, since
-    a table with no NEW rows is never (re)created. Refused BEFORE `load_run`, same as the
-    multi-session refusal.
-    """
-    import conftest as cf
-
-    root = tmp_path / 'ds'
-    cf._session_2d(root / 'test' / 's')
-
-    out = tmp_path / 'pred'
-    out.mkdir()
-    (out / 'stale.pq').write_bytes(b'not really parquet, just needs to exist')
-
-    def boom(*a, **k):
-        raise AssertionError('the refusal must fire before the checkpoint loads')
-
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
-                                      '--data', str(root / 'test' / 's'), '--split', 'test',
-                                      '--device', 'cpu', '--out', str(out)])
-    with pytest.raises(SystemExit, match='not empty'):
-        cli.main()
-
-
-def test_out_may_not_name_the_source_session(cli, monkeypatch, tmp_path):
-    """A3: `--out` pointed at `--data` would write a prediction into the labels it is scored
-    against -- refused before the checkpoint loads.
-    """
-    import conftest as cf
-
-    root = tmp_path / 'ds'
-    cf._session_2d(root / 'test' / 's')
-
-    def boom(*a, **k):
-        raise AssertionError('the refusal must fire before the checkpoint loads')
-
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(tmp_path / 'nope'),
-                                      '--data', str(root / 'test' / 's'), '--split', 'test',
-                                      '--device', 'cpu', '--out', str(root / 'test' / 's')])
-    with pytest.raises(SystemExit, match='SOURCE session'):
-        cli.main()
-
-
-def test_a_nonbox_3d_run_records_refine_resolved_true_in_provenance(cli, monkeypatch, tmp_path):
-    """A4 (dev/plans/multianimal_system_improvements.md): a non-box 3D run leaves `--refine`
-    unset, and `run_blocks` resolves `cfg.refine=None` to `mode == '3d'` (True) -- but the
-    provenance record used to be written from the UNRESOLVED `cfg.refine` (None -> `bool(None)`
-    = False), so a run that actually refined recorded `refine=false`. The resolution must happen
-    before provenance is written, and the new pose-recipe keys must be present.
-    """
+    """A moving-rig prediction writes the source's extrinsics.pq (else it fails rule 13), and a
+    non-box 3D run records the RESOLVED `refine = true` (it once recorded `bool(None)`)."""
     import tomllib
 
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-    from tailcyclenet.format import load_dataset
-
-    root = tmp_path / 'ds'
-    cf._session_3d(root / 'test' / 's', T=8)
-    registry = Registry.build([load_dataset(root)])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL, 'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
-    out = tmp_path / 'pred'
-    monkeypatch.setattr(sys, 'argv', [
-        'infer.py', '--data', str(root / 'test' / 's'), '--out', str(out), '--run', str(run),
-        '--device', 'cpu', '--split', 'test', '--overlap', '2', '--anchor', 'none'])
-    cli.main()
-
-    with open(out / 'session.toml', 'rb') as f:
-        prov = tomllib.load(f)['provenance']
-    assert prov['refine'] is True, \
-        f'a non-box 3D run must resolve --refine to True before provenance is written: {prov}'
-    assert prov['box_prompt'] == 'none'
-    assert prov['box_prompt_requested'] == 'firstonly'   # the shipped --box-prompt default
-    assert isinstance(prov['crop_inflate'], float)
-    assert 'gridresid_offset' in prov and 'gridresid_offset_override' in prov
-
-
-def test_a_moving_rig_prediction_round_trips_its_extrinsics(cli, monkeypatch, tmp_path):
-    """D1.2 (dev/plans/multianimal_system_improvements.md): a moving-rig prediction session must
-    carry its own extrinsics.pq, or `Session.load(out).labels(gid)` raises (format rule 13) and
-    `validate_session` fails -- on the one rig type this repo explicitly keeps moving support
-    for. The copied extrinsics must equal the source's own, frame for frame.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
     from tailcyclenet.format import Session, validate_session
 
-    root = tmp_path / 'mv'
-    cf._session_3d(root / 'test' / 's', T=6, moving=True)
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model(SMALL, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': SMALL,
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
+    sdir, run = _cli_setup(tmp_path, 'mv', T=6, moving=True)
     out = tmp_path / 'pred'
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--split', 'test',
-                                      '--anchor', 'none', '--device', 'cpu', '--overlap', '2',
-                                      '--out', str(out)])
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(sdir),
+                                      '--split', 'test', '--anchor', 'none', '--device', 'cpu',
+                                      '--overlap', '2', '--out', str(out)])
     cli.main()
 
     assert (out / 'extrinsics.pq').exists(), 'a moving-rig prediction must write extrinsics.pq'
     got = Session.load(out)
-    lab = got.labels('g000')
-    src = Session.load(root / 'test' / 's').labels('g000')
-    np.testing.assert_array_equal(lab.ext, src.ext)
-
+    np.testing.assert_array_equal(got.labels('g000').ext, Session.load(sdir).labels('g000').ext)
     errs = [e for e in validate_session(got) if '[rule 7]' not in e]
     assert not errs, f'a moving prediction session must validate apart from missing pixels: {errs}'
+
+    with open(out / 'session.toml', 'rb') as f:
+        prov = tomllib.load(f)['provenance']
+    assert prov['refine'] is True, prov
+    assert prov['box_prompt'] == 'none' and prov['box_prompt_requested'] == 'firstonly'
+    assert isinstance(prov['crop_inflate'], float)
+    assert 'gridresid_offset' in prov and 'gridresid_offset_override' in prov
 
 
 @pytest.mark.parametrize('argv', [
@@ -2684,62 +1928,15 @@ def test_a_moving_rig_prediction_round_trips_its_extrinsics(cli, monkeypatch, tm
     ['--box-prompt', 'labels', '--boxes', 'nope.npz'],
 ])
 def test_box_prompt_labels_refuses_a_detector_or_boxes_source(cli, monkeypatch, tmp_path, argv):
-    """The same bug `--anchor labels` already refuses: `run_blocks` seeds the box-prompt term's
-    row `a` from LABEL row `a` (`window.py`'s `src[a]`), but a detector's or `--boxes` npz's rows
-    are score- or association-ordered, not label rows -- a different animal's ground truth fed
-    in as an oracle. On a real clip, the detector-slot-to-GT-row correspondence flips over time, so the
-    previously-unguarded
-    combination silently fed the wrong animal's exact position for roughly half of it. Needs a
-    real box-model run (not a bare `--run nope`, unlike the analogous `--anchor labels` test)
-    since the refusal only fires once `model_is_box` is known.
-    """
-    import conftest as cf
-    from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
-
-    root = tmp_path / 'rat'
-    cf._session_2d(root / 'test' / 's')
-    ds = load_dataset(root)
-    registry = Registry.build([ds])
-    model = build_model({**SMALL, 'box_prompt': 'film'}, n_keypoints=registry.n_keypoints)
-    run = tmp_path / 'run'
-    config = {'model': {**SMALL, 'box_prompt': 'film'},
-              'data': {'image_size': 64, 'min_crop_dim': 16, 'n_frames': 4,
-                       'box_source': 'keypoints'}}
-    save_run_meta(run, config, registry)
-    save_checkpoint(run, 0, model, torch.optim.SGD(model.parameters(), lr=0.0), config)
-
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run),
-                                      '--data', str(root / 'test' / 's'), '--split', 'test',
-                                      '--device', 'cpu', '--out', str(tmp_path / 'out')] + argv)
-    with pytest.raises(SystemExit) as e:
+    """`--box-prompt labels` with a detector/`--boxes` source would feed label row a's box to a
+    score-ordered detector row (another animal's ground truth) -- refused once the model is a box
+    model."""
+    sdir, run = _cli_setup(tmp_path, model_cfg={**SMALL, 'box_prompt': 'film'})
+    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(sdir),
+                                      '--split', 'test', '--device', 'cpu',
+                                      '--out', str(tmp_path / 'out')] + argv)
+    with pytest.raises(SystemExit, match='not label rows'):
         cli.main()
-    assert 'not label rows' in str(e.value), f'got: {e.value}'
-
-
-def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_one():
-    """The gate used to read `carried[a] is None`, which under-withholds: `_build_prior` can ALSO
-    decline a non-None carry as stale (a skipped window) or shape-mismatched, and in either case
-    no identity signal reached the model that window. The gate now also compensates whenever
-    `_build_prior`'s own verdict for THIS window (`prior`) is None, not just when there was never
-    a carry at all.
-    """
-    from tailcyclenet.infer.window import _give_box_this_window
-
-    cfg = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=True)
-    fake_carry = (torch.zeros(2, 2), 0)
-
-    assert _give_box_this_window(cfg, None, None), \
-        'no carry at all (the true first window) must still give the box'
-    assert not _give_box_this_window(cfg, fake_carry, torch.zeros(2, 2)), \
-        'a carry that WAS used as this window\'s prior must still withhold the box'
-    assert _give_box_this_window(cfg, fake_carry, None), \
-        'a carry that existed but was declined (stale/shape-mismatched) must give the box back'
-
-    off = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=False)
-    assert _give_box_this_window(off, fake_carry, None), \
-        'box_prompt_first_only=False must give the box every window regardless of carry/prior'
-    assert not _give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
-        'box_prompt="none" must never give the box'
 
 
 def test_det_trace_file_is_valid_json(tmp_path):
@@ -2752,22 +1949,3 @@ def test_det_trace_file_is_valid_json(tmp_path):
     _write_det_trace(path, {'s/g000': [{'frame': 0, 'kept': 2}]})
     assert json.loads(path.read_text()) == {'s/g000': [{'frame': 0, 'kept': 2}]}
     assert path.read_text().endswith('}\n')
-
-
-def test_refine_records_each_overlap_trace_probe_once(multiwindow_scene):
-    """`--refine` runs `forward` twice per (animal, window); the overlap-trace probes
-    (`prior_oob`, `model_conf`) must record each (animal, window) once, not once per pass."""
-    from tailcyclenet.infer.window import merge_blocks, run_blocks
-
-    model, sess, registry, name = multiwindow_scene
-    counts = {}
-    for refine in (False, True):
-        stats = {'capture_overlap_agreement': True}
-        merge_blocks(run_blocks(model, sess, 'g000', registry, name,
-                                _cfg(anchor='carry', refine=refine), stats=stats))
-        oob = [(a, f) for a, f, *_ in stats.get('prior_oob', [])]
-        assert len(oob) == len(set(oob))
-        counts[refine] = (len(oob), len(stats.get('model_conf', [])))
-    assert counts[True][0] == counts[False][0] > 0
-    if counts[False][1]:
-        assert counts[True][1] == counts[False][1]

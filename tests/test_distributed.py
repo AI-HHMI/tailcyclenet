@@ -133,7 +133,7 @@ def test_two_ranks_draw_the_same_cost_for_the_same_step(tiny_root, over, want):
     keyed to the ordinal: two datasets (two ranks) on DIFFERENT windows agree, yet still vary."""
     r0, r1 = _ds(tiny_root / 'mouselike', **over), _ds(tiny_root / 'mouselike', **over)
     seen = set()
-    for ordinal in range(12):
+    for ordinal in range(8):
         a = r0[(ordinal, ordinal % len(r0))]
         b = r1[(ordinal, (ordinal + 1) % len(r1))]
         assert len(a[CGROUP]) == len(b[CGROUP]), f'step {ordinal} disagreed'

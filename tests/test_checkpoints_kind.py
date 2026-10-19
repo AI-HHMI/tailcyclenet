@@ -11,9 +11,9 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
-from tailcyclenet.pose import checkpoint as pck
 from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
+from tailcyclenet.pose import checkpoint as pck
 from tailcyclenet.scorer.checkpoint import load_scorer_run
 
 

@@ -20,7 +20,7 @@
 # positions instead of learning an (n_frames, d) table, and `time_embed_mode = "fourier_rel"`
 # builds its time terms as `Linear(2*max_freq+1, dim)` over relative-time Fourier features.
 # `time_embed_mode = "learned"` would reintroduce a T-shaped tensor and break the load;
-# `tests/test_scorer_model.py` pins the shape invariance so a config change cannot do that
+# `tests/scorer/test_model.py` pins the shape invariance so a config change cannot do that
 # silently.
 #
 # The scorer supplies NO PRIOR and NO BOX. Every prompt-corruption lever in [data] is stated as 0

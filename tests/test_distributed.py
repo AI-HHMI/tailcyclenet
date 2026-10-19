@@ -17,9 +17,7 @@ from tailcyclenet import runtime
 from tailcyclenet.data.reader_cache import reader_cache_size
 from tailcyclenet.pose.optim import build_muon, group_lr
 from tailcyclenet.pose.unfreeze import apply_staged_unfreeze
-
-from tests.test_optim import Tiny, _cfg
-
+from tests.helpers import Tiny, _optim_cfg
 
 # -- what a count means on N gpus ----------------------------------------------------------
 
@@ -70,11 +68,11 @@ def test_scaling_touches_only_the_absolute_rates():
 def test_the_live_unfreeze_and_the_resume_replay_read_the_scaled_config(tmp_path):
     """The build, the live unfreeze (thousands of steps later) and the resume replay all read ONE
     scaled dict, so the encoder group lands at the scaled rate on both paths."""
-    from tailcyclenet.pose import start
     from tailcyclenet.checkpoints import save_checkpoint
     from tailcyclenet.format import Registry
+    from tailcyclenet.pose import start
 
-    cfg = dist_utils.scale_optimizer_cfg(_cfg(learning_rate=1e-4, encoder_lr_scale=0.1), 4)
+    cfg = dist_utils.scale_optimizer_cfg(_optim_cfg(learning_rate=1e-4, encoder_lr_scale=0.1), 4)
     want = pytest.approx(1e-4 * 2 * 0.1)
     m = Tiny(unfreeze_at=10, n_last=3)
     opt = build_muon(m, fresh=set(), cfg=cfg)

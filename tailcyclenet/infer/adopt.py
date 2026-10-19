@@ -3,7 +3,7 @@
 `plan` turns filenames into a group -> camera -> path map; `build` probes each video and returns
 a `format.VideoSession`, with nothing staged (`Group.source` is the one filesystem entry point
 and is pre-filled). The cost: `validate_session` cannot be the acceptance test, so
-`tests/test_adopt.py` compares the in-memory session against the on-disk one in CI.
+`tests/infer/test_adopt.py` compares the in-memory session against the on-disk one in CI.
 
 `build` opens video containers in the PARENT process (the fork deadlock), so this module is safe
 from `scripts/infer.py` -- which never forks -- and NOWHERE ELSE.

@@ -201,7 +201,7 @@ def tagged_draw(corruptor, P, T, D, device, segment_masks=None):
     corruption is invisible and its magnitude is wrong. The library's `PointCorruptor.__call__`
     returns only the summed shift, so this reproduces its algorithm exactly and adds tags.
 
-    Kept in step with the library by `tests/test_scorer_triplet.py`, which asserts this and
+    Kept in step with the library by `tests/scorer/test_triplet.py`, which asserts this and
     `PointCorruptor` produce the SAME tensor from the same RNG state -- without that, the tags
     would describe a different draw from the one the model was trained on.
 

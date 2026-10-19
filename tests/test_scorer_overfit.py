@@ -22,6 +22,8 @@ from tailcyclenet.scorer.dataset import ScorerDataset, scorer_collate, triplet_t
 
 from .test_scorer_model import SMALL
 
+pytestmark = pytest.mark.slow
+
 CFG = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0)
 
 CORRUPTION = {

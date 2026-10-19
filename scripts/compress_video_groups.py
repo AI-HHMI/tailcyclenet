@@ -30,7 +30,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 LABEL_TABLES = ('keypoints.pq', 'points3d.pq', 'points2d.pq', 'instances.pq', 'extrinsics.pq')
-CHUNK = 64  # frames decoded per get_batch call
+CHUNK = 64
 
 
 def plan_groups(frames, n_frames, context, merge_gap):
@@ -48,6 +48,7 @@ def plan_groups(frames, n_frames, context, merge_gap):
 
 
 def _labelled_frames(sess_dir, gid):
+    """Every frame of group `gid` that any label table of `sess_dir` has a row for."""
     frames = set()
     for t in LABEL_TABLES:
         p = sess_dir / t
@@ -59,6 +60,7 @@ def _labelled_frames(sess_dir, gid):
 
 
 def _video_for(gdir, cam):
+    """The video file of camera `cam` in group directory `gdir`."""
     for ext in ('.mp4', '.avi', '.mov', '.mkv'):
         p = gdir / f'{cam}{ext}'
         if p.exists():
@@ -78,7 +80,7 @@ def extract(video, out_dirs, windows, quality):
         for (a, b), od in zip(windows, out_dirs):
             od = Path(od)
             if od.is_dir() and len(list(od.glob('*.jpg'))) == b - a:
-                continue  # done on an earlier run
+                continue
             tmp = od.with_name(od.name + '.tmp')
             shutil.rmtree(tmp, ignore_errors=True)
             tmp.mkdir(parents=True)
@@ -146,6 +148,7 @@ def rewrite_tables(sess_dir, out_dir, plan):
 
 
 def main():
+    """Plan the new groups for every session under --src and write them to --dst."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument('--src', required=True, type=Path)
     ap.add_argument('--dst', required=True, type=Path)

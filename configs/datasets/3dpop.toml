@@ -9,8 +9,8 @@
 name = "3dpop"
 mode = "3d"
 units = "mm"
-# 3-POP frames are 3840 px wide, so the association gate is looser than a 256 px rig would need.
-assoc_res_max_px = 40.0
+# The association gate, in pixels; 30.0 matches the 2026-09-05 data edit to every 3dpop session.toml (swept on Seq59).
+assoc_res_max_px = 30.0
 
 names = [
   "bp1", "bp2", "bp3",

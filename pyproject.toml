@@ -17,7 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "tracktail>=0.5.0,<1",
-    "torch>=2,<3",
+    "torch>=2.9,<3",
     "einops",
     "numpy>=1.26",
     "scipy",
@@ -34,21 +34,19 @@ Repository = "https://github.com/AI-HHMI/tailcyclenet"
 tailcyclenet = "tailcyclenet.__main__:main"
 
 [tool.setuptools]
-# `tailcyclenet.configs`/`.configs.datasets` map the repo-root `configs/` directory into the
-# wheel under a dotted name (package-dir below) -- configs/ itself does not move, stays
-# human-edited and git-tracked exactly where CLAUDE.md's layout section says it lives.
+# `tailcyclenet.configs` maps the repo-root `configs/` directory into the wheel under a dotted
+# name; only the three family base configs ship. configs/datasets/ is converter input and stays
+# in the repo only.
 packages = [
     "tailcyclenet", "tailcyclenet.detector", "tailcyclenet.infer", "tailcyclenet.scorer",
-    "tailcyclenet.configs", "tailcyclenet.configs.datasets",
+    "tailcyclenet.configs",
 ]
 
 [tool.setuptools.package-dir]
 "tailcyclenet.configs" = "configs"
-"tailcyclenet.configs.datasets" = "configs/datasets"
 
 [tool.setuptools.package-data]
-"tailcyclenet.configs" = ["*.toml"]
-"tailcyclenet.configs.datasets" = ["*.toml"]
+"tailcyclenet.configs" = ["base.toml", "detector.toml", "scorer.toml"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -137,9 +135,10 @@ av = ">=18.0.0,<19"
 # is provided directly by PyAV above.
 
 [tool.pixi.tasks]
-# `-n 8`, default per-test distribution (loadfile pins all 29 model builds to one worker and the
+# `-n 32` (~1 min without the slow marker), default per-test distribution (loadfile pins all 29 model builds to one worker and the
 # wall clock barely moves); each worker re-pays the ~14 s torch import, which is the floor.
-test = "pytest tests/ -q -n 8"
+test = "pytest tests/ -q -n 32 -m 'not slow'"
+test-all = "pytest tests/ -q -n 32"
 lint = "ruff check . && python scripts/lint_comments.py"
 
 [tool.ruff]
@@ -154,3 +153,4 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: over ~30 s alone; run by `pixi run test-all`, skipped by `pixi run test`"]

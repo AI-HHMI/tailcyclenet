@@ -675,6 +675,14 @@ def test_carry_requires_overlap(scene):
         run_group(model, sess, 'g000', registry, name, _cfg(anchor='carry', overlap=0))
 
 
+def test_self_anchor_runs_at_overlap_zero(scene):
+    """`--anchor self` re-queries within one window and carries nothing across windows, so
+    `overlap = 0` is a valid setting for it (it used to be refused as if it carried)."""
+    model, sess, registry, name = scene
+    out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='self', overlap=0))
+    assert np.isfinite(out['pred']).any()
+
+
 def test_inflate_box_widens_about_its_centre():
     """THE ONE INFLATION RULE, shared with the wide-crop training regime
     (`dataset.LoaderConfig.crop_inflate`) so the model trains and deploys on the same geometry."""

@@ -3,7 +3,8 @@
 Per group: for each window of T frames stepping by T - overlap, get a crop box per camera, read
 the pixels, build the prior (none / carry / self / labels), forward, and map the prediction back
 into the source coordinate frame. `carry` seeds from the model's own previous prediction and
-needs `overlap >= 1`; `labels` is a GT oracle, not a deployment number.
+needs `overlap >= 1`; `self` re-queries within one window and carries nothing; `labels` is a GT
+oracle, not a deployment number.
 """
 from __future__ import annotations
 
@@ -519,8 +520,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         raise ValueError('independent_windows requires anchor=none')
     if cfg.independent_windows and (boxes_for is None or not hasattr(boxes_for, 'for_window')):
         raise ValueError('independent_windows requires a per-window detector callback')
-    if cfg.anchor in ('carry', 'self') and cfg.overlap < 1:
-        raise ValueError(f'anchor={cfg.anchor!r} carries a pose across windows and needs '
+    if cfg.anchor == 'carry' and cfg.overlap < 1:
+        raise ValueError("anchor='carry' carries a pose across windows and needs "
                          'overlap >= 1; got 0')
 
     group = session.groups[gid]

@@ -1,10 +1,5 @@
-"""The frame -> window rule of `scripts/render_scored_session.py`.
-
-A render colours each frame by the score of "its" window, so the assignment rule IS the rendering's
-correctness: two windows overlap on their seam frames, and picking the earlier one would attribute
-a frame to a window the scorer's lattice did not place it in (eval's rule is the LAST window
-containing the frame -- `docs`/`CLAUDE.md` evaluation rule 11).
-"""
+"""`scripts/render_scored_session.py`: a frame is coloured by the LAST window containing it
+(evaluation rule 11), on a fixed colour scale, for the selected animal."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -29,37 +24,17 @@ def _mod():
 STARTS = np.array([0, 12, 24], dtype=np.int64)
 
 
-def test_a_seam_frame_belongs_to_the_later_window():
-    """Frame 12 starts window 12 and is also the last frame of window 0; the later one wins."""
-    assert last_window_start(STARTS, 12, 12) == 12
-    assert last_window_start(STARTS, 12, 23) == 12
-    assert last_window_start(STARTS, 12, 24) == 24
-
-
-def test_interior_frames_and_the_first_frame():
-    """Frame 0 belongs to window 0; frame 11 (still inside it) does too."""
-    assert last_window_start(STARTS, 12, 0) == 0
-    assert last_window_start(STARTS, 12, 11) == 0
-
-
-def test_a_frame_nobody_scored_is_unscored_rather_than_extrapolated():
-    """Before the first start and past the last window's end there is no window, so no colour.
-
-    A render that smeared the nearest score over these frames would show quality where none was
-    measured.
-    """
+def test_the_seam_rule_and_unscored_frames():
+    """A seam frame belongs to the later window; a frame no window covers is unscored, not
+    extrapolated (a smeared score would show quality where none was measured)."""
+    assert [last_window_start(STARTS, 12, f) for f in (0, 11, 12, 23, 24)] == [0, 0, 12, 12, 24]
     assert last_window_start(np.array([88008, 88020]), 12, 88000) is None
     assert last_window_start(np.array([88008, 88020]), 12, 88032) is None
     assert last_window_start(np.array([], dtype=np.int64), 12, 5) is None
 
 
 def test_the_colour_ramp_runs_red_to_green_and_clamps():
-    """BGR red at the low end, green at the high end, linear between, clamped outside.
-
-    The scale is FIXED (`SCORE_RANGE`), not normalised per clip: scores are relative, so a
-    per-clip ramp would repaint the same track differently in a different clip and two renders
-    could not be compared.
-    """
+    """Red->green, monotone, clamped, on a FIXED scale so two renders compare."""
     mod = _mod()
     lo, hi = mod.SCORE_RANGE
     assert mod._colour(lo, lo, hi) == mod.BAD == (0, 0, 255)      # red

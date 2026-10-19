@@ -6,6 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+
 def test_chunk_frames_scores_a_trailing_one_frame_remainder():
     """`--chunk 4` on a 9-frame group scores all 9 frames: the one-frame tail joins the last
     chunk instead of being dropped (it used to vanish, labels and all)."""
@@ -72,33 +73,23 @@ def _ranged_prediction(tmp_path, provenance):
 
 
 def test_eval_scores_a_ranged_run_only_inside_its_range(tmp_path, capsys):
-    """A `--start-frame 2 --end-frame 6` session is scored on frames [2, 6) only (Q-D3): the
-    labels outside the range are not misses. The same tables without a recorded range are
-    scored whole, so the out-of-range labels do count."""
+    """A `--start-frame 2 --end-frame 6` session is scored on [2, 6) only (out-of-range labels
+    are not misses); without a recorded range it is scored whole; `--vs` refuses two ranges."""
     import re
 
     import tailcyclenet.eval as eval_cli
 
-    def coverage(provenance, sub):
-        """Run `eval` on one prediction and parse its `[2d] coverage` line."""
-        root, out = _ranged_prediction(tmp_path / sub, provenance)
+    root, ranged = _ranged_prediction(tmp_path / 'a', {'frame_start': 2, 'frame_stop': 6})
+    _, whole = _ranged_prediction(tmp_path / 'b', {})
+
+    def coverage(out):
         eval_cli.main([str(out), '--data', str(root), '--split', 'test'])
         text = capsys.readouterr().out
         return text, float(re.search(r'\[2d\] coverage ([0-9.]+)', text).group(1))
 
-    text, ranged = coverage({'frame_start': 2, 'frame_stop': 6}, 'ranged')
-    assert 'frame range [2, 6)' in text
-    assert ranged == 1.0
-    _, whole = coverage({}, 'whole')
-    assert whole < 0.75
-
-
-def test_eval_vs_refuses_two_different_frame_ranges(tmp_path, capsys):
-    """Each arm is scored inside its own range, so `--vs` across two ranges has nothing shared."""
-    import tailcyclenet.eval as eval_cli
-
-    root, ranged = _ranged_prediction(tmp_path / 'a', {'frame_start': 2, 'frame_stop': 6})
-    _, whole = _ranged_prediction(tmp_path / 'b', {})
+    text, cov = coverage(ranged)
+    assert 'frame range [2, 6)' in text and cov == 1.0
+    assert coverage(whole)[1] < 0.75
     with pytest.raises(SystemExit, match='different frame ranges'):
         eval_cli.main([str(ranged), '--data', str(root), '--split', 'test', '--vs', str(whole)])
     eval_cli.main([str(ranged), '--data', str(root), '--split', 'test', '--vs', str(ranged)])

@@ -509,10 +509,8 @@ class CrossViewTracker:
                out, sc, claimed_ix):
         """Cross-view groups first, then ONE Hungarian over slots x groups.
 
-        Inputs: cgroup, boxes_per_cam, scores_per_cam -- as `step`; centres / sides -- per-camera
-            detection centres and box sides; slots -- the slots with a finite point, in order;
-            pts -- their stacked points (None when no slot); out / sc / claimed_ix -- the
-            frame's output arrays, written in place.
+        Inputs: as `step`, plus per-camera detection `centres`/`sides`, the finite-point `slots`
+            and their stacked `pts` (None when empty), and the output arrays to write in place.
         Outputs: the set of slots whose point was re-triangulated this frame.
         Side effects: mutates `self.targets` and the output arrays.
 

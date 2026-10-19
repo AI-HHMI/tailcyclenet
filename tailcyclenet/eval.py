@@ -471,10 +471,8 @@ def main(argv: list[str] | None = None):
 
     Notes:
     - One aggregate per mode: a split may hold 2D and 3D sessions, and their units do not mix.
-      No labels in the scored prefix is a diagnosis, not a ZeroDivisionError -- a short npz
-      prediction over an annotated root gives every group `n_true = 0`. A prediction session
-      from a ranged run is scored only inside its `[provenance]` `frame_start`/`frame_stop`
-      (`restrict_frames`); `--vs` refuses two different ranges. The tail percentiles
+      No labels in the scored prefix is a diagnosis, not a ZeroDivisionError. A ranged session is
+      scored only inside its `[provenance]` range (`restrict_frames`); `--vs` refuses two ranges. The tail percentiles
       matter because the mean cannot show one: an arm that declines hard animals has a
       flattering mean and a p90 that says so. `kpt_agree` is unbounded in 2D where `box_agree`
       is capped by construction. The vis head's TARGET, not its output, is printed: a `base` at

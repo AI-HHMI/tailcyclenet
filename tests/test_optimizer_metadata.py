@@ -1,19 +1,12 @@
 """Named optimizer-layout metadata used to make pose resumes state-safe."""
-import copy
-
 import torch
 
 from tailcyclenet.checkpoints import save_checkpoint
 from tailcyclenet.format import Registry
-from tailcyclenet.optim import (
-    build_muon,
-    optimizer_layout_matches,
-    optimizer_layout_matches_metadata,
-    optimizer_metadata_from_checkpoint,
-)
-from tailcyclenet.unfreeze import replay_staged_unfreeze
+from tailcyclenet.optim import build_muon, build_optimizer, check_resume
+from tailcyclenet.unfreeze import apply_staged_unfreeze
 
-from tests.test_optim import Tiny, _cfg, _train_module
+from tests.test_optim import Tiny, _cfg
 
 
 def _staged_checkpoint(tmp_path):
@@ -21,21 +14,20 @@ def _staged_checkpoint(tmp_path):
     fresh = {'decoder.mlps.0.weight'}
     model = Tiny(unfreeze_at=4, n_last=3)
     opt = build_muon(model, fresh, cfg)
-    replay_staged_unfreeze(model, opt, cfg, 14, fresh=fresh)
+    apply_staged_unfreeze(model, opt, cfg, 14, fresh=fresh)
     path = save_checkpoint(tmp_path / 'run', 14, model, opt, {'model': {}, 'data': {}},
-                           registry=Registry(names=['a'], datasets={}), fresh_names=fresh)
+                           registry=Registry(names=['a'], datasets={}), fresh_names=fresh,
+                           world_size=2)
     return path, model, opt, cfg, fresh
 
 
-def test_optimizer_metadata_round_trip_and_source_is_unchanged(tmp_path):
+def test_optimizer_metadata_records_fresh_names_and_world_size(tmp_path):
     path, _, _, _, fresh = _staged_checkpoint(tmp_path)
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    original = copy.deepcopy(checkpoint)
-    got_fresh, layout = optimizer_metadata_from_checkpoint(checkpoint)
-    assert got_fresh == fresh
+    layout = checkpoint['optimizer_metadata']
+    assert set(layout['fresh_names']) == fresh
     assert layout['schema'] == 'tailcyclenet.optimizer-layout.v1'
-    assert checkpoint.keys() == original.keys()
-    assert checkpoint['optimizer_metadata'] == original['optimizer_metadata']
+    assert layout['world_size'] == 2
 
 
 def test_staged_layout_records_three_muon_and_two_adamw_groups(tmp_path):
@@ -50,19 +42,17 @@ def test_staged_layout_records_three_muon_and_two_adamw_groups(tmp_path):
 def test_resume_rebuild_matches_named_layout_and_lrs(tmp_path):
     path, _, _, cfg, fresh = _staged_checkpoint(tmp_path)
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-    recovered, layout = optimizer_metadata_from_checkpoint(checkpoint)
+    layout = checkpoint['optimizer_metadata']
+    recovered = set(layout['fresh_names'])
     model = Tiny(unfreeze_at=4, n_last=3)
-    opt = _train_module().build_optimizer(model, recovered, cfg, layout=layout)
-    replay_staged_unfreeze(model, opt, cfg, 14, fresh=recovered, layout=layout)
-    assert optimizer_layout_matches_metadata(opt, model, layout)
-    assert optimizer_layout_matches(opt, checkpoint['optimizer_state'])
-
-
-def test_old_checkpoint_without_metadata_uses_legacy_fallback():
-    old = {'model_state': {}, 'optimizer_state': {'muon': {}, 'adam': {}}, 'iteration': 1}
-    fresh, layout = optimizer_metadata_from_checkpoint(old)
-    assert fresh == set()
-    assert layout is None
+    opt = build_optimizer(model, recovered, cfg)
+    apply_staged_unfreeze(model, opt, cfg, 14, fresh=recovered)
+    assert check_resume(opt, checkpoint['optimizer_state'], model, layout)
+    other = Tiny(unfreeze_at=4, n_last=3)
+    opt2 = build_optimizer(other, set(), cfg)
+    apply_staged_unfreeze(other, opt2, cfg, 14, fresh=set())
+    verdict = check_resume(opt2, checkpoint['optimizer_state'], other, layout)
+    assert not verdict, 'a run routed with different fresh names must not resume'
 
 
 def test_muon_warmup_state_round_trip_preserves_next_rate():
@@ -76,7 +66,7 @@ def test_muon_warmup_state_round_trip_preserves_next_rate():
         opt.step()
     state = opt.state_dict()
     resumed = build_muon(Tiny(), set(), cfg)
-    assert optimizer_layout_matches(resumed, state)
+    assert check_resume(resumed, state)
     resumed.load_state_dict(state)
     assert resumed._gstep == 3
     resumed.train()

@@ -3,10 +3,10 @@
 Cloned from `train.py`'s shape but NOT from its loop: the objective is a triplet ranking loss, the
 best checkpoint is selected on held-out synthetic triplet accuracy rather than on MPJPE, and the
 staged encoder unfreeze, the pose losses and the pose eval all have no meaning here. What IS
-reused, by import, is the parts that must not diverge: `checkpoints.load_config` (so the scorer
+reused, by import, is the parts that must not diverge: `config.load_config` (so the scorer
 family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose checkpoint),
-`checkpoints.save_checkpoint` / `save_run_meta` with `kind='scorer'`, and `train.build_optimizer`
-(so Muon routing and the fresh-parameter rule are one implementation).
+`scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and
+`optim.build_optimizer` (so Muon routing and the fresh-parameter rule are one implementation).
 
     pixi run python scripts/train_scorer.py --config configs/scorer.toml --data <root> \
         --out <results>/scorers/scorer-3dpop --checkpoint <pose run folder>
@@ -14,8 +14,6 @@ family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose ch
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import time
 import tomllib
 from dataclasses import replace
@@ -27,20 +25,21 @@ import torch
 from torch.utils.data import DataLoader
 
 from tracktail.datasets.scorer_corruption import GENERATORS
-from tracktail.model.losses_scorer import TripletScorerLoss
 
-from ..checkpoints import (SCORER_OUTPUT_GRANULARITIES, _SCORER_CONFIG,
-                           full_training_state, load_config, require_scorer_granularity,
-                           save_checkpoint, save_run_meta, scorer_checkpoint_granularity,
-                           scorer_contract_mismatches, scorer_output_granularity, warm_start,
-                           prior_provenance)
+from ..checkpoints import full_training_state, prior_provenance, save_run_meta, warm_start
+from .checkpoint import save_scorer_checkpoint
+from .contract import (SCORER_OUTPUT_GRANULARITIES, require_scorer_contract,
+                       require_scorer_granularity, scorer_checkpoint_granularity,
+                       scorer_contract_mismatches, scorer_output_granularity)
+from .losses import build_scorer_loss
+from ..config import SCORER_CONFIG, load_config
 from ..dataset import SCORER_PLUMBING, LoaderConfig, PoseDataset, StepSampler, loader_config_from
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
-from ..train import _gpu_peak_gb, build_optimizer, init_wandb, log
+from ..optim import build_optimizer, check_resume
+from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
-from .losses import FrameTripletScorerLoss
 from .model import build_scorer, flatten_sequence_triplet
 from .qc import refuse_deleted_data_keys
 from .triplet import SEGMENT_TYPES, seed_worker
@@ -334,19 +333,6 @@ def build_datasets(config: dict, registry_base: Registry | None, *, rank: int = 
     return train_ds, ScorerDataset(val_base, corr), registry
 
 
-def timed(loader, wait: list[float]):
-    """Yield loader items while accumulating time blocked in ``next()``."""
-    iterator = iter(loader)
-    while True:
-        started = time.time()
-        try:
-            item = next(iterator)
-        except StopIteration:
-            return
-        wait[0] += time.time() - started
-        yield item
-
-
 def scorer_worker_init(worker_id: int, *, cv_threads: int = 2):
     """Initialise a scorer worker without disabling useful OpenCV parallelism.
 
@@ -408,26 +394,6 @@ def _loaders(train_ds, val_ds, config: dict, seed: int, *, world: int = 1,
 
 
 
-def build_scorer_loss(config: dict, output_granularity: str | None = None):
-    """Construct the mode-specific loss while keeping the legacy path untouched.
-
-    The installed ``TripletScorerLoss`` deliberately remains the sequence compatibility loss; the
-    framewise implementation is repo-owned in ``scorer.losses``.
-    """
-    mode = output_granularity or scorer_output_granularity(config)
-    cfg = config.get('scorer', {})
-    common = dict(margin=float(cfg.get('triplet_margin', 0.25)),
-                  precision_reg_weight=float(cfg.get('precision_reg_weight', 0.01)),
-                  score_reg_weight=float(cfg.get('score_reg_weight', 0.0)))
-    if mode == 'sequence':
-        return TripletScorerLoss(**common)
-    return FrameTripletScorerLoss(
-        **common,
-        pointwise_weight=float(cfg.get('pointwise_weight', 0.0)),
-        pointwise_balance=bool(cfg.get('pointwise_balance', True)),
-        pointwise_label_smoothing=float(cfg.get('pointwise_label_smoothing', 0.0)),
-        inactive_consistency_weight=float(cfg.get('inactive_consistency_weight', 0.0)),
-        anchor_consistency_weight=float(cfg.get('anchor_consistency_weight', 0.0)))
 
 
 def scorer_loss(loss_fn, scores, precision, labels, trip=None, output_granularity='sequence'):
@@ -802,7 +768,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     world = int(fabric.world_size) if fabric is not None else 1
     is0 = bool(fabric.is_global_zero) if fabric is not None else True
     device = fabric.device if fabric is not None else device
-    config = load_config(config_path, base=_SCORER_CONFIG)
+    config = load_config(config_path, base=SCORER_CONFIG)
     fresh_requested = fresh
     prior_config = out / 'config.toml'
     if prior_config.exists() and not fresh:
@@ -862,7 +828,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                               f'{output_granularity!r}; allowing weights-only warm start')
                 else:
                     try:
-                        from ..checkpoints import require_scorer_contract
                         require_scorer_contract(config, checkpoint_probe, where=str(probe))
                     except ValueError as e:
                         checkpoint_contract_mismatch = True
@@ -936,14 +901,11 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
               + (f', kpt_lr {opt_cfg["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg else ''))
     optimizer = build_optimizer(model, fresh, opt_cfg)
     if resume_state is not None:
-        from tailcyclenet.optim import optimizer_layout_matches, state_matches_optimizer_kind
-        opt_kind = str(config['training']['optimizer'].get('optimizer', 'muon'))
         try:
             model.load_state_dict(resume_state['model_state'], strict=True)
-            if not state_matches_optimizer_kind(resume_state['optimizer_state'], opt_kind):
-                raise ValueError(f'optimizer kind does not match config optimizer={opt_kind!r}')
-            if not optimizer_layout_matches(optimizer, resume_state['optimizer_state']):
-                raise ValueError('optimizer param-group layout does not match the current config')
+            verdict = check_resume(optimizer, resume_state['optimizer_state'])
+            if not verdict:
+                raise ValueError(verdict.reason)
             optimizer.load_state_dict(resume_state['optimizer_state'])
             print(f'resuming {resume_file} at iteration {resume_state.get("iteration", "?")}')
         except (KeyError, RuntimeError, ValueError, SystemExit) as e:
@@ -1091,10 +1053,10 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 if not best_locked and acc is not None and acc > best_acc:
                     best_acc, best_iter = float(acc), iteration
                     started = time.time()
-                    save_checkpoint(out, iteration, raw_model, optimizer, config,
-                                    name='best', write=is0, registry=registry, kind='scorer',
-                                    scorer_selection_metric=selection_metric,
-                                    scorer_selection_value=best_acc)
+                    save_scorer_checkpoint(out, iteration, raw_model, optimizer, config,
+                                           name='best', write=is0, registry=registry,
+                                           selection_metric=selection_metric,
+                                           selection_value=best_acc)
                     if fabric is not None:
                         fabric.barrier()
                     ckpted[0] += time.time() - started
@@ -1115,7 +1077,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 values.update({
                     'train/iteration': iteration,
                     'train/grad_norm': float(grad_norm),
-                    'train/gpu_peak_gb': _gpu_peak_gb(device, reset=True),
+                    'train/gpu_peak_gb': gpu_peak_gb(device, reset=True),
                     'train/cpu_peak_gb': _cpu_peak_gb(),
                     'train/sec_per_it': dt,
                     'train/loader_wait_frac': wait_frac,
@@ -1144,8 +1106,8 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 started = time.time()
                 if fabric is not None:
                     dist_utils.check_ranks_agree(fabric, raw_model)
-                save_checkpoint(out, iteration, raw_model, optimizer, config, write=is0,
-                                registry=registry, kind='scorer')
+                save_scorer_checkpoint(out, iteration, raw_model, optimizer, config, write=is0,
+                                       registry=registry)
                 if fabric is not None:
                     fabric.barrier()
                 ckpted[0] += time.time() - started
@@ -1158,32 +1120,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                   f'(checkpoints/checkpoint_best.pth; output_granularity={output_granularity})')
         print(f'done: {n_iter} iterations into {out}')
 
-
-def launch(args):
-    """Launch Fabric once per rank; one triplet remains the per-rank batch."""
-    from lightning.fabric import Fabric
-    devices = int(args.devices)
-    if devices < 1:
-        raise SystemExit('--devices must be a positive count (scorer defaults to one)')
-    if devices != 1 and str(args.device).startswith('cuda:') and str(args.device) != 'cuda:0':
-        raise SystemExit('--device names one GPU and cannot be combined with --devices > 1')
-    if args.precision == '16-mixed':
-        raise SystemExit('--precision 16-mixed is unsupported by the scorer optimizer; use 32-true')
-    cpu = str(args.device).startswith('cpu') or not torch.cuda.is_available()
-    accelerator = 'cpu' if cpu else 'gpu'
-    dev_arg = 1 if cpu and devices == 1 else (1 if devices == 1 else devices)
-    strategy = args.strategy or ('auto' if devices == 1 else 'ddp_find_unused_parameters_true')
-    fabric = Fabric(accelerator=accelerator, devices=dev_arg, strategy=strategy,
-                    precision=args.precision)
-    fabric.launch()
-    os.environ['TAILCYCLENET_LOCAL_WORLD_SIZE'] = str(fabric.world_size)
-    if not fabric.is_global_zero:
-        sys.stdout = dist_utils.RankPrefix(sys.stdout, fabric.global_rank)
-    if fabric.world_size > 1:
-        fabric.print(f'distributed: {fabric.world_size} ranks, strategy {strategy!r}; '
-                     f'n_iterations are totals and absolute learning rates scale by '
-                     f'sqrt({fabric.world_size})')
-    return fabric
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
@@ -1218,7 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
                              "checkpoint_last")
     args = parser.parse_args(argv)
     if args.config is None:
-        args.config = _SCORER_CONFIG
+        args.config = SCORER_CONFIG
     fabric = launch(args)
     run(args.config, args.data, Path(args.out), args.checkpoint, args.device,
         args.iterations, args.no_wandb, args.fresh, fabric=fabric,

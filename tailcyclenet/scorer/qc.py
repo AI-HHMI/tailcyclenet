@@ -20,7 +20,9 @@ import numpy as np
 import polars as pl
 import torch
 
-from ..checkpoints import load_scorer_run, provenance, scorer_contract, scorer_output_granularity
+from ..checkpoints import provenance
+from .checkpoint import load_scorer_run
+from .contract import scorer_contract, scorer_output_granularity
 # Importing dataset eagerly pulls tracktail's legacy training dataset. Keep QC's
 # table-only import free of pandas; scoring imports the loader only when it actually runs.
 PoseDataset = None

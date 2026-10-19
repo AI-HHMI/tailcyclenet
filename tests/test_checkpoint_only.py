@@ -11,7 +11,9 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
+from tailcyclenet.scorer.checkpoint import load_scorer_run, save_scorer_checkpoint
 from tailcyclenet.model import build_model
 
 from .test_model import SMALL
@@ -26,7 +28,7 @@ def _pose_config():
 
 
 def _scorer_config():
-    config = ck.load_config(ck._SCORER_CONFIG, base=ck._SCORER_CONFIG)
+    config = cfgmod.load_config(cfgmod.SCORER_CONFIG, base=cfgmod.SCORER_CONFIG)
     model = {**SMALL, 'box_prompt': 'film'}
     model.pop('query_encoder', None)
     config['model'] = model
@@ -37,7 +39,7 @@ def _scorer_config():
 
 def _scorer_model(config):
     from tailcyclenet.scorer.model import build_scorer
-    from tailcyclenet.scorer.train import build_scorer_loss
+    from tailcyclenet.scorer.losses import build_scorer_loss
     sc = config['scorer']
     model = build_scorer({**config['model'], 'video_encoder_pretrained': False},
                          REGISTRY.n_keypoints, pool_num_heads=sc['pool_num_heads'],
@@ -66,12 +68,15 @@ def _train_run(tmp_path, kind):
     opt = _Averaged([p for p in model.parameters() if p.requires_grad], lr=1e-3)
     run = tmp_path / f'{kind}-run'
     ck.save_run_meta(run, config, REGISTRY, kind=kind, extra={'world_size': 1})
-    path = ck.save_checkpoint(run, 5, model, opt, config, registry=REGISTRY, kind=kind)
+    if kind == 'pose':
+        path = ck.save_checkpoint(run, 5, model, opt, config, registry=REGISTRY)
+    else:
+        path = save_scorer_checkpoint(run, 5, model, opt, config, registry=REGISTRY)
     return run, path, model
 
 
 def _load(kind, where, **kw):
-    return (ck.load_run if kind == 'pose' else ck.load_scorer_run)(where, **kw)
+    return (ck.load_run if kind == 'pose' else load_scorer_run)(where, **kw)
 
 
 def _same_weights(a, b):
@@ -103,7 +108,6 @@ def test_the_embedded_config_is_a_snapshot_not_a_reference(tmp_path):
     config['data']['image_size'] = 999
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     assert ckpt['config']['model']['latent_dim'] == SMALL['latent_dim']
-    assert ckpt['model_config']['latent_dim'] == SMALL['latent_dim']
     assert 'run' not in config, 'stamping the kind must not mutate the training config'
 
 
@@ -133,7 +137,7 @@ def test_a_lone_checkpoint_loads_the_same_model_as_its_run_folder(tmp_path, kind
 def test_an_old_checkpoint_falls_back_to_its_run_folder(tmp_path, kind):
     run, path, _ = _train_run(tmp_path, kind)
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    for key in ('config', 'model_config', 'keypoint_registry', 'provenance'):
+    for key in ('config', 'keypoint_registry', 'provenance'):
         ckpt.pop(key)
     torch.save(ckpt, path)
     model, config, registry, _ = _load(kind, path)
@@ -159,7 +163,7 @@ def test_a_pose_checkpoint_is_refused_as_a_scorer_and_vice_versa(tmp_path):
     _, pose, _ = _train_run(tmp_path, 'pose')
     _, scorer, _ = _train_run(tmp_path, 'scorer')
     with pytest.raises(ValueError, match="'pose' checkpoint, not a 'scorer'"):
-        ck.load_scorer_run(pose)
+        load_scorer_run(pose)
     with pytest.raises(ValueError, match="'scorer' checkpoint, not a 'pose'"):
         ck.load_run(scorer)
 

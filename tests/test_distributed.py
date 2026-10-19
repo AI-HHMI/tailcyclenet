@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from tailcyclenet import distributed as dist_utils
+from tailcyclenet import runtime
 from tailcyclenet.dataset import _reader_cache_size
 from tailcyclenet.optim import group_lr
 from tailcyclenet.unfreeze import apply_staged_unfreeze
@@ -30,7 +31,8 @@ def _module(path, name):
 
 
 def _train_module():
-    return _module(REPO / 'tailcyclenet' / 'train.py', 'tcn_train')
+    import tailcyclenet.train
+    return tailcyclenet.train
 
 
 def _optim_tests():
@@ -119,15 +121,25 @@ def test_the_staged_unfreeze_reads_the_scaled_rates():
     assert pytest.approx(1e-4 * 2 * 0.1) in lrs, f'no encoder group at the scaled rate: {lrs}'
 
 
-def test_train_hands_the_scaled_config_to_both_unfreeze_entry_points():
-    """The build, the live unfreeze and the resume replay must all read ONE dict. Checked on the
-    source because the alternative -- noticing at iteration 10,000 of a 60,000-iteration job -- is
-    the failure this test exists to prevent."""
-    src = (REPO / 'tailcyclenet' / 'train.py').read_text()
-    for call in ('build_optimizer(model, fresh, opt_cfg_scaled, layout=resume_layout)',
-                 'apply_staged_unfreeze(raw, opt, opt_cfg_scaled',
-                 'replay_staged_unfreeze(model, opt, opt_cfg_scaled'):
-        assert call in src, f'{call!r} is not what scripts/train.py calls'
+def test_the_resume_replay_and_the_live_unfreeze_read_the_scaled_config(tmp_path):
+    """The build, the resume replay and the live unfreeze must all read ONE dict: a resumed
+    4-gpu run past its unfreeze holds its encoder group at the SCALED rate, and the state loads."""
+    from tailcyclenet import start
+    from tailcyclenet.checkpoints import save_checkpoint
+    from tailcyclenet.format import Registry
+    from tailcyclenet.optim import build_muon
+
+    tests = _optim_tests()
+    cfg = dist_utils.scale_optimizer_cfg(tests._cfg(learning_rate=1e-4, encoder_lr_scale=0.1), 4)
+    m = tests.Tiny(unfreeze_at=10, n_last=3)
+    opt = build_muon(m, fresh=set(), cfg=cfg)
+    apply_staged_unfreeze(m, opt, cfg, 12, fresh=set())
+    save_checkpoint(tmp_path / 'run', 12, m, opt, {'model': {}, 'data': {}},
+                    registry=Registry(names=('a',), datasets=(('d', (0,)),)), world_size=4)
+    got = start.build_start(start.plan_start(tmp_path / 'run', world=4),
+                            lambda pretrained: tests.Tiny(unfreeze_at=10, n_last=3), cfg)
+    lrs = [g['lr'] for g in got.optimizer.opt_muon.param_groups]
+    assert pytest.approx(1e-4 * 2 * 0.1) in lrs, f'no encoder group at the scaled rate: {lrs}'
 
 
 # -- host resources ------------------------------------------------------------------------
@@ -468,13 +480,13 @@ def test_16_mixed_is_refused_by_name():
     handing it to Fabric. Refused loudly instead of silently training without the scaler.
     """
     with pytest.raises(SystemExit, match='GradScaler'):
-        _train_module().launch(_args(precision='16-mixed'))
+        runtime.launch(_args(precision='16-mixed'))
 
 
 def test_device_cpu_still_means_cpu():
     """`--device cpu` is how a smoke test runs on a box whose gpus are busy, and it predates
     `--devices`. An accelerator chosen from `cuda.is_available()` alone would overrule it."""
-    fabric = _train_module().launch(_args(device='cpu'))
+    fabric = runtime.launch(_args(device='cpu'))
     assert str(fabric.device) == 'cpu'
 
 
@@ -482,7 +494,7 @@ def test_one_device_and_many_devices_together_are_refused():
     """`--device cuda:1 --devices 4` would silently ignore the first: at more than one device the
     launcher places every rank."""
     with pytest.raises(SystemExit, match='--devices'):
-        _train_module().launch(_args(device='cuda:1', devices=4))
+        runtime.launch(_args(device='cuda:1', devices=4))
 
 
 def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
@@ -499,7 +511,7 @@ def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
         raise SystemExit('stop-before-fabric-launch')
 
     monkeypatch.setattr(lf.Fabric, '__init__', spy)
-    tr = _train_module()
+    tr = runtime
 
     monkeypatch.setattr('torch.cuda.device_count', lambda: 1)
     monkeypatch.setattr('torch.cuda.is_available', lambda: True)
@@ -528,6 +540,26 @@ def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
         tr.launch(_args(devices=-1, device='cpu'))
     assert seen['devices'] == 1 and seen['strategy'] == 'auto' \
         and seen['accelerator'] == 'cpu', '--device cpu must not trip the multi-device refusal'
+
+
+def test_device_cuda_n_selects_that_gpu_at_one_device(monkeypatch):
+    """`--device cuda:2 --devices 1` runs on gpu 2 for every trainer that launches through
+    `runtime.launch` (the scorer's own copy used to hand Fabric `devices=1`, i.e. gpu 0)."""
+    import lightning.fabric as lf
+
+    seen = {}
+
+    def spy(self, *a, **k):
+        seen.update(k)
+        raise SystemExit('stop-before-fabric-launch')
+
+    monkeypatch.setattr(lf.Fabric, '__init__', spy)
+    monkeypatch.setattr('torch.cuda.is_available', lambda: True)
+    with pytest.raises(SystemExit, match='stop-before-fabric-launch'):
+        runtime.launch(_args(device='cuda:2', devices=1))
+    assert seen['devices'] == [2] and seen['accelerator'] == 'gpu'
+    from tailcyclenet.scorer import train as scorer_train
+    assert scorer_train.launch is runtime.launch
 
 
 # -- the two handles -----------------------------------------------------------------------

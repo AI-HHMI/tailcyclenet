@@ -351,7 +351,7 @@ def test_unsupported_config_is_rejected():
 
 def test_mismatched_image_size_is_rejected():
     """Two keys named image_size that must agree, and nothing else notices when they do not."""
-    from tailcyclenet.checkpoints import check_image_size
+    from tailcyclenet.config import check_image_size
 
     check_image_size({'model': {'image_size': 256}, 'data': {'image_size': 256}})
     check_image_size({'model': {'image_size': 256}})                 # absent -> nothing to check
@@ -407,7 +407,7 @@ def test_self_contained_pose_checkpoint_round_trips(tmp_path):
     model = build_model(SMALL, n_keypoints=1).eval()
     state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     torch.save({'iteration': 12, 'model_state': state, 'model_state_eval': state,
-                'config': config, 'model_config': SMALL,
+                'config': config,
                 'keypoint_registry': registry.to_dict()},
                run / 'checkpoints' / 'checkpoint_last.pth')
 
@@ -445,7 +445,7 @@ def test_load_run_skips_the_video_encoder_download(tmp_path, monkeypatch):
     model = build_model(SMALL, n_keypoints=1).eval()
     state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     torch.save({'iteration': 12, 'model_state': state, 'model_state_eval': state,
-                'config': config, 'model_config': SMALL,
+                'config': config,
                 'keypoint_registry': registry.to_dict()},
                run / 'checkpoints' / 'checkpoint_last.pth')
     packaged_path = tmp_path / 'pose.pth'

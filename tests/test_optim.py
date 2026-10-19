@@ -1,16 +1,17 @@
-"""SF-Muon routing, the staged encoder unfreeze, and the resume contract, on a tiny CPU module
-carrying every shape the router sorts (2D Linear, 2D Embedding that must NOT reach Muon, 4D Conv,
-1D norm, bias)."""
+"""SF-Muon routing and the resume contract the new default makes load-bearing.
+
+CPU-only, on a small hand-built module carrying one of every shape a router must sort -- a 2D
+Linear weight, a 2D Embedding weight (which must NOT reach Muon), a 4D Conv weight, a 1D LayerNorm
+weight and a bias. No tracktail model, no GPU: the thing under test is the router and the
+checkpoint round-trip, not the network.
+"""
 import pytest
 import torch
 import torch.nn as nn
 
-import tailcyclenet.train as tr
-from tailcyclenet.optim import (PoseDualOptimizer, build_muon, optimizer_layout_matches,
-                                refuse_group_count_mismatch, refuse_mismatched_optimizer_state,
-                                state_matches_optimizer_kind)
-from tailcyclenet.unfreeze import apply_staged_unfreeze, replay_staged_unfreeze
-
+from tailcyclenet.optim import (KNOWN_OPTIMIZER_KEYS, PoseDualOptimizer, build_muon,
+                                build_optimizer, check_resume, state_kind)
+from tailcyclenet.unfreeze import apply_staged_unfreeze
 
 class TinyEncoder(nn.Module):
     """The shape `unfreeze.py` reads: `blocks`, `norms_block` and `hierarchical_layers`.
@@ -84,9 +85,7 @@ def _all_params(opt):
     return [p for o in opt._opts for g in o.param_groups for p in g['params']]
 
 
-def test_routing_is_2d_disjoint_complete_and_clips_only_adamw():
-    """Muon gets only 2D non-Embedding params; groups partition the trainable set; the clip target
-    is the AdamW half only (Muon orthogonalises its own gradients)."""
+def test_routing_is_2d_disjoint_and_complete():
     m = Tiny()
     opt = build_muon(m, fresh=set(), cfg=_cfg())
 
@@ -103,6 +102,10 @@ def test_routing_is_2d_disjoint_complete_and_clips_only_adamw():
     assert set(routed) == trainable, 'the groups must partition the trainable params'
     assert len(routed) == len(set(routed)), 'a param routed to two groups is stepped twice'
 
+
+def test_adamw_and_muon_param_sets_partition_and_clip_target_is_adamw_only():
+    """The clip must target the AdamW half only. `adamw_params` ∪ `muon_params` is the
+    full trainable set, disjoint, and no Muon-routed 2D matrix is in the clip target."""
     m = Tiny()
     opt = build_muon(m, fresh=set(), cfg=_cfg())
     a = {id(p) for p in opt.adamw_params}
@@ -118,8 +121,7 @@ def test_routing_is_2d_disjoint_complete_and_clips_only_adamw():
     assert id(m.query_encoder.kpt_embed.weight) in a
 
 
-def test_frozen_encoder_is_unrouted_and_fresh_2d_goes_to_muon_at_kpt_lr():
-    """A frozen param is in no group (Muon would raise); a fresh 2D weight is Muon at kpt_lr."""
+def test_frozen_encoder_contributes_no_muon_group():
     m = Tiny()
     for p in m.scene_encoder.encoder.parameters():
         p.requires_grad_(False)
@@ -129,6 +131,8 @@ def test_frozen_encoder_is_unrouted_and_fresh_2d_goes_to_muon_at_kpt_lr():
         assert id(p) not in routed, 'a frozen encoder param was handed to an optimizer'
     # And Muon got no frozen tensor (it would raise at construction) -- reaching here proves it.
 
+
+def test_fresh_2d_weight_routes_to_muon_at_kpt_lr():
     m = Tiny()
     fresh = {'decoder.heads_3d.0.weight'}   # pretend a head was freshly initialised
     opt = build_muon(m, fresh=fresh, cfg=_cfg())
@@ -140,7 +144,6 @@ def test_frozen_encoder_is_unrouted_and_fresh_2d_goes_to_muon_at_kpt_lr():
 
 
 def test_step_moves_every_param_and_raises_nothing():
-    """One step moves every trainable param."""
     torch.manual_seed(0)
     m = Tiny()
     opt = build_muon(m, fresh=set(), cfg=_cfg())
@@ -166,34 +169,51 @@ def test_step_moves_every_param_and_raises_nothing():
     assert moved == len(before), f'only {moved}/{len(before)} params moved'
 
 
-def test_optimizer_kind_mismatch_is_soft_gated_and_hard_refused():
-    """A kind mismatch is a warm start for checkpoint_path (soft gate) and a named SystemExit for
-    the run folder's own checkpoint, both directions."""
-    dual = {'muon': {'param_groups': []}, 'adam': {'param_groups': []}}
-    plain = {'param_groups': []}
-    assert state_matches_optimizer_kind(dual, 'muon')
-    assert not state_matches_optimizer_kind(dual, 'schedulefree')
-    assert state_matches_optimizer_kind(plain, 'schedulefree')
-    assert not state_matches_optimizer_kind(plain, 'muon')
+def test_load_state_dict_restores_train_mode_by_value():
+    """The double-lerp is invisible in any structural check, so assert on the WEIGHTS.
 
+    Save y-iterate params + optimizer state; load into a fresh optimizer; `train()`. If
+    `train_mode` came back False (the ScheduleFreeWrapper resume bug), `train()` would lerp y
+    toward z a second time and the params would differ.
+    """
+    torch.manual_seed(0)
     m = Tiny()
-    sf = tr.build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
+    opt = build_muon(m, fresh=set(), cfg=_cfg())
+    opt.train()
+    x = torch.randn(2, 8)
+    m.decoder.mlps[0](x).pow(2).sum().backward()
+    opt.step()
+    sd = opt.state_dict()
+    saved = [p.detach().clone() for p in m.parameters()]
+
+    opt2 = build_muon(m, fresh=set(), cfg=_cfg())
+    opt2.load_state_dict(sd)
+    opt2.train()   # a no-op iff train_mode is already True
+    for p, s in zip(m.parameters(), saved):
+        assert torch.equal(p, s), 'train() after load moved params -> train_mode came back False'
+
+
+def test_adamwsf_state_into_muon_is_refused_by_name():
+    m = Tiny()
+    sf = build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
     sf_state = sf.state_dict()
     muon = build_muon(m, set(), _cfg())
+    verdict = check_resume(muon, sf_state)
+    assert not verdict and 'schedulefree' in verdict.reason
     with pytest.raises(SystemExit, match='schedulefree'):
-        refuse_mismatched_optimizer_state(muon, sf_state, 'ck.pth', resolved='muon', explicit=False)
+        muon.load_state_dict(sf_state)
 
+
+def test_muon_state_into_adamwsf_is_refused_by_name():
     m = Tiny()
     muon = build_muon(m, set(), _cfg())
     muon_state = muon.state_dict()
-    sf = tr.build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
-    with pytest.raises(SystemExit, match='muon'):
-        refuse_mismatched_optimizer_state(sf, muon_state, 'ck.pth', resolved='schedulefree',
-                                          explicit=True)
+    sf = build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
+    verdict = check_resume(sf, muon_state)
+    assert not verdict and '"muon"' in verdict.reason
 
 
 def test_eval_train_swap_and_has_averaged_iterate():
-    """eval() swaps to the averaged iterate and train() restores y; bare Muon has none."""
     torch.manual_seed(0)
     m = Tiny()
     opt = build_muon(m, fresh=set(), cfg=_cfg(muon_schedulefree=True))
@@ -211,6 +231,14 @@ def test_eval_train_swap_and_has_averaged_iterate():
 
     plain = build_muon(Tiny(), fresh=set(), cfg=_cfg(muon_schedulefree=False))
     assert plain.has_averaged_iterate is False, 'a bare Muon half carries no averaged iterate'
+
+
+def test_unknown_optimizer_key_raises():
+    assert 'muon_lr' not in KNOWN_OPTIMIZER_KEYS
+    # The guard lives in main(); replicate it exactly rather than standing up a full run.
+    cfg = _cfg(muon_lr=1e-4)
+    unknown = set(cfg) - KNOWN_OPTIMIZER_KEYS
+    assert unknown == {'muon_lr'}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -231,9 +259,10 @@ def _enc_tensors(m):
     return dict(m.scene_encoder.encoder.named_parameters())
 
 
-def test_unfreeze_routes_every_new_param_once_including_hierarchical_norms():
-    """A param frozen at step 0 is in no group, so the flag flip alone is a no-op; the fire adds it
-    exactly once, and extends to norms_block taps in range (taps [1,3,4,5], N=3 -> norms 1-3)."""
+def test_unfreeze_puts_every_new_param_in_exactly_one_group():
+    """THE NO-OP THIS FIXES: `build_muon` filters `requires_grad`, so a param frozen at step 0 is
+    in no group -- flipping the flag alone would give it gradients that nothing steps.
+    """
     m, opt, cfg = _staged()
     routed = {id(p) for p in _all_params(opt)}
     assert not (routed & {id(p) for p in m.scene_encoder.encoder.parameters()}), \
@@ -250,6 +279,11 @@ def test_unfreeze_routes_every_new_param_once_including_hierarchical_norms():
     mu = {id(p) for p in opt.muon_params}
     assert not (a & mu) and a | mu == trainable
 
+
+def test_unfreeze_extends_to_the_hierarchical_norms_in_range():
+    """Upstream unfreezes blocks plus an `encoder.norm` VJEPA 2.1 does not have, so `norms_block`
+    -- which feeds the decoder -- would stay frozen behind a trainable block. Taps are [1,3,4,5];
+    at N = 3 the trainable range starts at block 3, so norms 1,2,3 qualify and norm 0 does not."""
     m, opt, cfg = _staged()
     info = apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     assert info['norms'] == [1, 2, 3], info['norms']
@@ -260,7 +294,6 @@ def test_unfreeze_routes_every_new_param_once_including_hierarchical_norms():
 
 
 def test_unfreeze_is_gated_and_idempotent():
-    """Fires at its iteration, once."""
     m, opt, cfg = _staged()
     before = (len(opt.opt_muon.param_groups), len(opt.opt_adam.param_groups))
     assert apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT - 1) is None, 'fired early'
@@ -272,9 +305,11 @@ def test_unfreeze_is_gated_and_idempotent():
     assert (len(opt.opt_muon.param_groups), len(opt.opt_adam.param_groups)) == after
 
 
-def test_added_groups_start_a_fresh_schedule_in_phase():
-    """Added groups are NEW (k=0; a pre-registered grad-less group would fold in at ~1/k) and share
-    train_mode with the rest, so eval()+train() round-trips every value."""
+def test_added_groups_start_a_fresh_schedule():
+    """NEW GROUPS, NOT PRE-REGISTERED ONES: both schedule-free impls advance `k`/`weight_sum` on
+    every `step()` regardless of grad, and the averaging weight is ~1/k -- so a group that sat
+    grad-less would fold its encoder into the averaged iterate at ~1/k.
+    """
     m, opt, cfg = _staged()
     opt.train()
     for _ in range(UNFREEZE_AT):
@@ -285,6 +320,18 @@ def test_added_groups_start_a_fresh_schedule_in_phase():
     apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     new = opt.opt_adam.param_groups[-1]
     assert new['k'] == 0 and new['weight_sum'] == 0.0, 'the added group must start its own average'
+
+
+def test_added_adamw_group_is_in_phase_with_the_existing_ones():
+    """`eval()`/`train()` read `train_mode` PER GROUP, so a group added out of phase is lerped the
+    wrong way at the next checkpoint write. Asserted on VALUES, like the resume test."""
+    m, opt, cfg = _staged()
+    opt.train()
+    for _ in range(UNFREEZE_AT):
+        opt.zero_grad()
+        m.decoder.mlps[0](torch.randn(2, 8)).pow(2).sum().backward()
+        opt.step()
+    apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     assert all(g['train_mode'] for g in opt.opt_adam.param_groups), 'a group is out of phase'
     before = [p.detach().clone() for p in m.parameters()]
     opt.eval()
@@ -294,7 +341,6 @@ def test_added_groups_start_a_fresh_schedule_in_phase():
 
 
 def test_step_moves_the_unfrozen_blocks_and_leaves_the_rest():
-    """Frozen tensors never move; after the fire exactly the requires_grad ones do."""
     m, opt, cfg = _staged()
     opt.train()
 
@@ -325,12 +371,17 @@ def test_step_moves_the_unfrozen_blocks_and_leaves_the_rest():
         assert moved == should, f'{k}: moved={moved} but requires_grad={should}'
 
 
-def test_muon_add_guards():
-    """add_param_group skips Muon's 2D check (would fail deep in step()), and `_muon_base_lrs`
-    must grow with the groups (zip truncates silently in the warmup rescale)."""
+def test_add_muon_group_refuses_a_non_2d_param():
+    """`torch.optim.Muon` validates ndim in `__init__` only; `add_param_group` does not re-check,
+    so without this the slip surfaces as a shape error deep inside `step()`."""
     m, opt, _ = _staged()
     with pytest.raises(AssertionError, match='2D'):
         opt.add_muon_group([torch.zeros(4, requires_grad=True)], lr=1e-5, weight_decay=0.0)
+
+
+def test_muon_base_lrs_stays_aligned_after_an_add():
+    """`DualOptimizer.step` zips `_muon_base_lrs` against `opt_muon.param_groups` for the warmup
+    rescale, and `zip` truncates SILENTLY -- an unappended group escapes the rescale unannounced."""
     m, opt, cfg = _staged(muon_warmup_steps=2)
     apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     assert len(opt._muon_base_lrs) == len(opt.opt_muon.param_groups)
@@ -339,8 +390,10 @@ def test_muon_add_guards():
 
 
 def test_resume_replays_the_unfreeze_and_round_trips_the_state():
-    """Resumed past the unfreeze, the replay reproduces the group order and train() after load
-    moves nothing (the ScheduleFreeWrapper train_mode bug)."""
+    """A run resumed past its unfreeze must reach the layout a fresh run holds at that iteration:
+    groups match BY POSITION, so this asserts the replay produces the same order AND that
+    `train()` after the load moves nothing (the ScheduleFreeWrapper `train_mode` bug).
+    """
     torch.manual_seed(0)
     m, opt, cfg = _staged()
     opt.train()
@@ -352,7 +405,7 @@ def test_resume_replays_the_unfreeze_and_round_trips_the_state():
 
     m2 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt2 = build_muon(m2, fresh=set(), cfg=cfg)
-    replay_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
+    apply_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
     opt2.load_state_dict(sd)
     opt2.train()   # a no-op iff train_mode came back True
     for p, s in zip(m.parameters(), saved):
@@ -360,66 +413,73 @@ def test_resume_replays_the_unfreeze_and_round_trips_the_state():
 
 
 def test_resume_without_replay_raises_a_named_group_count_error():
-    """Torch's group-count message is true and useless; ours names the key."""
+    """Torch's own message ('different number of parameter groups') is true and useless about the
+    cause. This is the gridresid_offset rule for the group layout."""
     m, opt, cfg = _staged()
     apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     sd = opt.state_dict()
     fresh_opt = build_muon(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), fresh=set(), cfg=cfg)
-    with pytest.raises(SystemExit, match='video_encoder_finetune_last_n_layers'):
-        refuse_group_count_mismatch(fresh_opt, sd)
+    assert 'video_encoder_finetune_last_n_layers' in check_resume(fresh_opt, sd).reason
     with pytest.raises(SystemExit, match='video_encoder_finetune_last_n_layers'):
         fresh_opt.load_state_dict(sd)
 
 
-def test_optimizer_layout_matches_compares_groups_by_position():
-    """Groups load BY POSITION, so the per-group lr sequence must match on both halves."""
+def test_state_kind_reads_the_optimizer_that_wrote_a_state():
+    """Muon checkpoints carry the dual {'muon','adam'} structure, AdamW-SF ones a plain one."""
+    assert state_kind({'muon': {'param_groups': []}, 'adam': {'param_groups': []}}) == 'muon'
+    assert state_kind({'param_groups': []}) == 'schedulefree'
+
+
+def test_a_state_from_before_the_dual_schema_is_refused():
+    """Pre-`pose-dual.v1` states are not resumed any more (v0.3.4 is the last release that did)."""
+    m, opt, cfg = _staged()
+    sd = opt.state_dict()
+    sd.pop('_tailcyclenet')
+    verdict = check_resume(opt, sd)
+    assert not verdict and 'v0.3.4' in verdict.reason
+
+
+def test_check_resume_compares_groups_by_position():
+    """`load_state_dict` matches groups BY POSITION, so counts alone cannot tell a kpt group
+    from an encoder group: the per-group lr sequence must match too, on both halves. A
+    checkpoint whose layout differs is a warm start, never a silently mis-routed resume."""
     torch.manual_seed(0)
     m, opt, cfg = _staged()
     apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     sd = opt.state_dict()
-    assert optimizer_layout_matches(opt, sd)
+    assert check_resume(opt, sd)
 
     # The replay reproduces the layout a run at the same unfreeze point would have.
     m2 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt2 = build_muon(m2, fresh=set(), cfg=cfg)
-    replay_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
-    assert optimizer_layout_matches(opt2, sd)
+    apply_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
+    assert check_resume(opt2, sd)
 
     # A different lr is a different layout: loading would put the state on the wrong groups.
     m3 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     cfg3 = {**cfg, 'learning_rate': 2e-4}
     opt3 = build_muon(m3, fresh=set(), cfg=cfg3)
-    replay_staged_unfreeze(m3, opt3, cfg3, UNFREEZE_AT + 10)
-    assert not optimizer_layout_matches(opt3, sd)
+    apply_staged_unfreeze(m3, opt3, cfg3, UNFREEZE_AT + 10)
+    assert not check_resume(opt3, sd)
 
     # A run that never fired the unfreeze cannot resume one that did.
     m4 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt4 = build_muon(m4, fresh=set(), cfg=cfg)
-    assert not optimizer_layout_matches(opt4, sd)
+    assert not check_resume(opt4, sd)
 
     # Same rule on the plain AdamW-SF optimizer.
-    opt5 = tr.build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
+    opt5 = build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
                               {**cfg, 'optimizer': 'schedulefree'})
-    assert optimizer_layout_matches(opt5, opt5.state_dict())
-    opt6 = tr.build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
+    assert check_resume(opt5, opt5.state_dict())
+    opt6 = build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
                               {**cfg, 'optimizer': 'schedulefree', 'kpt_lr': 9e-4})
-    assert not optimizer_layout_matches(opt6, opt5.state_dict())
+    assert not check_resume(opt6, opt5.state_dict())
 
 
-def test_schedulefree_escape_hatch_three_groups_and_staged_path():
-    """optimizer = "schedulefree" builds fresh@kpt_lr / rest@lr / encoder@lr*scale and takes the
-    same staged unfreeze as one new encoder group."""
-    m = Tiny()
-    fresh = {'decoder.mlps.0.weight'}
-    opt = tr.build_optimizer(m, fresh, _cfg(optimizer='schedulefree'))
-    assert not isinstance(opt, PoseDualOptimizer)
-    lrs = sorted(g['lr'] for g in opt.param_groups)
-    # fresh @ kpt_lr, rest @ lr, encoder @ lr*enc_scale -- three groups, no Muon.
-    assert lrs == pytest.approx(sorted({1e-4 * 0.1, 1e-4, 5e-4})), lrs
-
+def test_schedulefree_optimizer_takes_the_same_staged_path():
     m = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     cfg = _cfg(optimizer='schedulefree')
-    opt = tr.build_optimizer(m, set(), cfg)
+    opt = build_optimizer(m, set(), cfg)
     assert not isinstance(opt, PoseDualOptimizer)
     before = len(opt.param_groups)
     info = apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
@@ -429,3 +489,16 @@ def test_schedulefree_escape_hatch_three_groups_and_staged_path():
     assert opt.param_groups[-1]['k'] == 0
     routed = {id(p) for g in opt.param_groups for p in g['params']}
     assert routed == {id(p) for p in m.parameters() if p.requires_grad}
+
+
+def test_schedulefree_escape_hatch_is_the_current_three_group_optimizer():
+    """`optimizer = "schedulefree"` must build the exact AdamW-SF optimizer that exists today:
+    fresh @ kpt_lr, rest @ lr, encoder @ lr*enc_scale -- three groups, no Muon.
+    """
+    m = Tiny()
+    fresh = {'decoder.mlps.0.weight'}
+    opt = build_optimizer(m, fresh, _cfg(optimizer='schedulefree'))
+    assert not isinstance(opt, PoseDualOptimizer)
+    lrs = sorted(g['lr'] for g in opt.param_groups)
+    # fresh @ kpt_lr, rest @ lr, encoder @ lr*enc_scale -- three groups, no Muon.
+    assert lrs == pytest.approx(sorted({1e-4 * 0.1, 1e-4, 5e-4})), lrs

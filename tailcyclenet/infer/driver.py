@@ -547,7 +547,7 @@ def run_dataset(args):
     scorer_shared_encoder = False
     scorer_prov = {}
     if scorer_path is not None:
-        from ..checkpoints import load_scorer_run
+        from ..scorer.checkpoint import load_scorer_run
         scorer, scorer_config, scorer_registry, scorer_ckpt = load_scorer_run(
             scorer_path, checkpoint=scorer_checkpoint_name, device='cpu')
         if scorer.output_granularity != 'frame':

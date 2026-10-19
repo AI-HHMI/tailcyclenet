@@ -1,9 +1,9 @@
 # Dataset converters
 
 One file per source root, flat, prefixed by family. Run each from the repo root:
-`pixi run python scripts/convert/<name>.py --help`. Sibling imports are plain
-(`from johnson_mouse import ...`), which works because Python puts the script's own folder on
-`sys.path`. Converters have no unit tests by rule; check one with
+`pixi run python scripts/convert/<name>.py --help`. Shared helpers live in `_common.py`
+(sibling imports are plain `from _common import ...`, which works because Python puts the
+script's own folder on `sys.path`). Converters have no unit tests by rule; check one with
 `--help`, `--dry-run` where it has one, and `--validate` / `scripts/dataset_tools/check_status.py`
 on its output.
 

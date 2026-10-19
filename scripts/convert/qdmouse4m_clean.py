@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import shutil
@@ -22,6 +21,7 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from tailcyclenet import format as fmt
+from _common import sha256
 
 SOURCE = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/qdmouse4m')
 SCORES = Path('/groups/karashchuk/home/karashchukl/projects/tailcycle/tailcyclenet/'
@@ -95,15 +95,6 @@ def read_manifest(path: Path) -> pl.DataFrame:
         raise RuntimeError(f'{path}: expected cleaning manifest columns {MANIFEST_COLUMNS}, '
                            f'got {frame.columns}')
     return frame
-
-
-def sha256(path: Path) -> str:
-    """Return a file's SHA256 digest."""
-    h = hashlib.sha256()
-    with path.open('rb') as f:
-        for block in iter(lambda: f.read(1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
 
 
 def source_rate(stream) -> float:

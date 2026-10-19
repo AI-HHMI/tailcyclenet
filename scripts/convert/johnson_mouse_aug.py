@@ -25,6 +25,7 @@ import numpy as np
 
 
 from tailcyclenet import format as fmt
+from _common import validate_root
 from johnson_mouse import (build_labels, build_rig, check_reprojection, modal_step,
                              read_split, runs, triangulate_robust)
 
@@ -529,12 +530,7 @@ def main() -> None:
     if args.dry_run:
         return
 
-    errs = fmt.validate_dataset(fmt.load_dataset(args.out),
-                                check_images=not args.no_image_check)
-    hard = [e for e in errs if 'WARNING' not in e]
-    for e in errs:
-        print(('  WARN ' if 'WARNING' in e else '  FAIL ') + e)
-    print(f'validate: {len(hard)} error(s), {len(errs) - len(hard)} warning(s)')
+    hard = validate_root(args.out, check_images=not args.no_image_check)
 
     bad = check_aug_equals_original(args.out, args.aug_check_limit)
     bad += check_no_dangling(args.out)

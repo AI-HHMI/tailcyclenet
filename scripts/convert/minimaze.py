@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -15,10 +14,10 @@ from pathlib import Path
 import av
 import h5py
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
 from tailcyclenet import format as fmt
+from _common import link_numbered_frames, valid_png, write_png
 from tailcyclenet.data.video import PyAVReader
 
 SRC = Path('/groups/voigts/voigtslab/alison_temp/minimaze_calibration_test_data/sleap/minimaze.v004.slp')
@@ -104,33 +103,10 @@ def _window(cluster: list[int], n_video: int) -> tuple[int, int]:
     return int(start), WINDOW
 
 
-def _write_png(path: Path, rgb: np.ndarray) -> None:
-    """Atomically write one decoded RGB frame, compacting grayscale frames to L PNG."""
-    if np.array_equal(rgb[..., 0], rgb[..., 1]) and np.array_equal(rgb[..., 0], rgb[..., 2]):
-        image = Image.fromarray(rgb[..., 0], mode='L')
-    else:
-        image = Image.fromarray(rgb, mode='RGB')
-    tmp = path.parent / f'.{path.name}.tmp'
-    image.save(tmp, format='PNG', compress_level=1)
-    os.replace(tmp, path)
-
-
-def _valid_png(path: Path, width: int, height: int) -> bool:
-    """Return whether an existing cache PNG decodes with the expected dimensions and mode."""
-    try:
-        with Image.open(path) as image:
-            if image.size != (width, height) or image.mode not in {'L', 'RGB'}:
-                return False
-            image.load()
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 def _extract(video: Path, indices: set[int], cache: Path, width: int, height: int) -> None:
     """Extract only requested frames, seeking to each contiguous requested range with PyAV."""
     cache.mkdir(parents=True, exist_ok=True)
-    valid = {i for i in indices if _valid_png(cache / f'{i:06d}.png', width, height)}
+    valid = {i for i in indices if valid_png(cache / f'{i:06d}.png', width, height)}
     missing = indices - valid
     if not missing:
         return
@@ -159,7 +135,7 @@ def _extract(video: Path, indices: set[int], cache: Path, width: int, height: in
                 frames = reader.get_batch(range(start, end + 1))
                 for index, rgb in zip(range(start, end + 1), frames):
                     if index in missing:
-                        _write_png(cache / f'{index:06d}.png', rgb)
+                        write_png(cache / f'{index:06d}.png', rgb)
                         valid.add(index)
                         progress.update(1)
     finally:
@@ -171,16 +147,11 @@ def _extract(video: Path, indices: set[int], cache: Path, width: int, height: in
 
 def _link_frames(session: Path, gid: str, start: int, cache: Path) -> None:
     """Link one group's local frame names to its source-indexed cache entries."""
-    target = session / 'groups' / gid / 'cam0'
-    target.mkdir(parents=True, exist_ok=True)
-    for local in range(WINDOW):
-        src = cache / f'{start + local:06d}.png'
+    sources = [cache / f'{start + local:06d}.png' for local in range(WINDOW)]
+    for src in sources:
         if not src.is_file():
             raise RuntimeError(f'missing extracted frame {src}')
-        dst = target / f'{local:06d}.png'
-        if dst.is_symlink() or dst.exists():
-            dst.unlink()
-        dst.symlink_to(Path(os.path.relpath(src, target)))
+    link_numbered_frames(session / 'groups' / gid / 'cam0', sources, relative=True, replace=True)
 
 
 def _make_labels(group_anchors: list[dict], start: int, names: list[str]) -> fmt.Labels:

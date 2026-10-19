@@ -25,6 +25,7 @@ import numpy as np
 
 
 from tailcyclenet import format as fmt
+from _common import validate_root
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/johnson-mouse/merge')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/'
@@ -382,12 +383,7 @@ def main() -> None:
     if args.dry_run:
         return
 
-    errs = fmt.validate_dataset(fmt.load_dataset(args.out),
-                                check_images=not args.no_image_check)
-    hard = [e for e in errs if 'WARNING' not in e]
-    for e in errs:
-        print(('  WARN ' if 'WARNING' in e else '  FAIL ') + e)
-    print(f'validate: {len(hard)} error(s), {len(errs) - len(hard)} warning(s)')
+    hard = validate_root(args.out, check_images=not args.no_image_check)
 
     bad = 0 if args.no_check else check_reprojection(args.out, args.max_reproj_px)
     sys.exit(1 if hard or bad else 0)

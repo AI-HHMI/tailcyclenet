@@ -27,6 +27,7 @@ import numpy as np
 
 
 from tailcyclenet import format as fmt
+from _common import add_output_args, validate_root
 from tailcyclenet.data import video
 
 CAM = 'cam0'
@@ -560,7 +561,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--lbl', type=Path, required=True)
-    ap.add_argument('--out', type=Path, required=True)
+    add_output_args(ap, image_check=True)
     ap.add_argument('--context', type=int, default=65,
                     help='frames per group, label centered (default 65, allen-mouse\'s shape)')
     ap.add_argument('--extract', choices=('copy', 'decode'), default='copy')
@@ -571,10 +572,6 @@ def main() -> int:
                     help='rewrite the tables against the frames already on disk -- no ffmpeg. '
                          'The existing groups.pq is the authority for n_frames and '
                          'source_frame_start, so a truncated or dropped group stays as extracted.')
-    ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--clean', action='store_true', help='remove each session dir first')
-    ap.add_argument('--validate', action='store_true')
-    ap.add_argument('--no-image-check', action='store_true')
     args = ap.parse_args()
     if args.context < 2:
         raise SystemExit('--context must be >= 2 (T=1 gives a zero-length pos_embed)')
@@ -639,13 +636,7 @@ def main() -> int:
         return 0
 
     if args.validate:
-        errs = fmt.validate_dataset(fmt.load_dataset(args.out),
-                                   check_images=not args.no_image_check)
-        hard = [e for e in errs if 'WARNING' not in e]
-        for e in errs:
-            print(f'  {e}')
-        print(f'validate: {len(hard)} hard, {len(errs) - len(hard)} warnings')
-        return 1 if hard else 0
+        return 1 if validate_root(args.out, check_images=not args.no_image_check) else 0
     return 0
 
 

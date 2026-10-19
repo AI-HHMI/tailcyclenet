@@ -41,6 +41,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from tailcyclenet import format as fmt
+from _common import link_numbered_frames, sha256
 
 # The condition names and family split rule are shared conventions; v3 has its own HDF5 and
 # pixel path handling.
@@ -115,15 +116,6 @@ class NativeResult:
 
 
 # ----------------------------- small, deterministic helpers -----------------------------
-
-
-def sha256(path: Path, chunk: int = 1 << 20) -> str:
-    """Hash one file without loading it all into memory."""
-    h = hashlib.sha256()
-    with path.open('rb') as f:
-        while data := f.read(chunk):
-            h.update(data)
-    return h.hexdigest()
 
 
 def _scalar(value: Any) -> Any:
@@ -604,27 +596,6 @@ def _source_files_for(result: NativeResult, images: Path) -> list[list[Path]]:
     return out
 
 
-def link_pixels(view_dir: Path, source_files: list[Path]) -> None:
-    """Create a deterministic numbered symlink farm without copying image bytes.
-
-    New farms are empty by construction, so avoid an existence/stat/resolve round trip for every
-    frame on the shared filesystem.  The slower collision-checking path remains for idempotent
-    reruns or manually resumed sessions.
-    """
-    fresh = not view_dir.exists()
-    view_dir.mkdir(parents=True, exist_ok=True)
-    for i, source in enumerate(source_files):
-        dst = view_dir / f'{i:06d}{source.suffix.lower()}'
-        if fresh:
-            os.symlink(os.fspath(source), os.fspath(dst))
-            continue
-        if dst.exists() or dst.is_symlink():
-            if not dst.is_symlink() or dst.resolve() != source.resolve():
-                raise RuntimeError(f'pixel link collision: {dst}')
-            continue
-        dst.symlink_to(source)
-
-
 def _append_scores(path: Path, scores: np.ndarray) -> None:
     """Add native detector confidence to keypoints.pq (the generic Labels API has no score)."""
     table = pq.read_table(path)
@@ -773,7 +744,7 @@ def convert_record(record: Record, split: str, root: Path, *, force: bool = Fals
         for c, cname in enumerate(result.camera_names):
             farm = root / '.pixel_views' / f'{session_id}__{cname}'
             farms.append(farm)
-            link_pixels(farm, source_files[c])
+            link_numbered_frames(farm, source_files[c])
             target = temp / 'groups' / 'g000' / cname
             target.parent.mkdir(parents=True, exist_ok=True)
             target.symlink_to(farm.resolve())

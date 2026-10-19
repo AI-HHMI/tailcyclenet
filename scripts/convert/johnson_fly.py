@@ -26,6 +26,7 @@ import numpy as np
 
 
 from tailcyclenet import format as fmt
+from _common import validate_root
 
 SRC = Path('/groups/johnson/johnsonlab/flypose/releases/Fly50_V7')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/'
@@ -515,13 +516,7 @@ def main() -> None:
             args.max_groups, args.dry_run)
     if args.dry_run:
         return
-    ds = fmt.load_dataset(args.out)
-    errors = fmt.validate_dataset(ds, check_images=True)
-    for error in errors:
-        print(('WARN ' if 'WARNING' in error else 'FAIL ') + error)
-    hard = [error for error in errors if 'WARNING' not in error]
-    print(f'validate: {len(hard)} error(s), {len(errors) - len(hard)} warning(s)')
-    sys.exit(1 if hard else 0)
+    sys.exit(1 if validate_root(args.out) else 0)
 
 
 if __name__ == '__main__':

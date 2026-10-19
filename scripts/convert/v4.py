@@ -21,6 +21,7 @@ import yaml
 
 
 from tailcyclenet import format as fmt
+from _common import add_output_args, validate_root
 
 V4 = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/posetail-finetuning-v4')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets')
@@ -335,14 +336,9 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dataset', default='all', choices=('all',) + DATASETS, nargs='+')
     ap.add_argument('--src', type=Path, default=V4)
-    ap.add_argument('--out', type=Path, default=OUT)
+    add_output_args(ap, OUT, image_check=True)
     ap.add_argument('--max-groups', type=int, default=None,
                     help='cap groups per v4 session; for smoke tests')
-    ap.add_argument('--dry-run', action='store_true', help='report shapes, write nothing')
-    ap.add_argument('--validate', action='store_true', help='validate after writing')
-    ap.add_argument('--no-image-check', action='store_true',
-                    help='skip opening one image per group during validation')
-    ap.add_argument('--clean', action='store_true', help='remove the output dataset dir first')
     args = ap.parse_args()
 
     names = DATASETS if 'all' in args.dataset else tuple(args.dataset)
@@ -354,13 +350,8 @@ def main() -> None:
     if args.validate and not args.dry_run:
         bad = 0
         for name in names:
-            errs = fmt.validate_dataset(fmt.load_dataset(out_dir(name, args.out)),
-                                        check_images=not args.no_image_check)
-            hard = [e for e in errs if 'WARNING' not in e]
-            for e in errs:
-                print(('  WARN ' if 'WARNING' in e else '  FAIL ') + e)
-            print(f'{name}: {len(hard)} error(s), {len(errs) - len(hard)} warning(s)')
-            bad += len(hard)
+            bad += validate_root(out_dir(name, args.out), name,
+                                 check_images=not args.no_image_check)
         sys.exit(1 if bad else 0)
 
 

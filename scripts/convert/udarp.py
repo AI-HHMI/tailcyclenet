@@ -22,6 +22,7 @@ from PIL import Image
 
 
 from tailcyclenet import format as fmt
+from _common import validate_root
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/rat-udarp-9.4k/UDARP-9.4K')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/'
@@ -254,12 +255,7 @@ def convert(src: Path, out: Path, *, val_frames: int = VAL_FRAMES,
 
     if validate:
         print('\n-- validation')
-        errors = fmt.validate_dataset(fmt.load_dataset(out), check_images=True)
-        for error in errors:
-            print(('WARN ' if 'WARNING' in error else 'FAIL ') + error)
-        hard = [error for error in errors if 'WARNING' not in error]
-        print(f'{len(hard)} error(s), {len(errors) - len(hard)} warning(s)')
-        if hard:
+        if validate_root(out):
             raise SystemExit(1)
 
 

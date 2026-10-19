@@ -21,6 +21,7 @@ from PIL import Image
 
 
 from tailcyclenet import format as fmt
+from _common import validate_root
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/rat-rp-5.7k')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/'
@@ -228,12 +229,7 @@ def main() -> None:
     print(f"\nSplit totals: train={total['train']}, val={total['val']}, "
           f"all={len(records)} (seed={args.seed})")
     print(f'Split manifest: {manifest}')
-    errors = fmt.validate_dataset(fmt.load_dataset(args.out), check_images=True)
-    for error in errors:
-        print(('WARN ' if 'WARNING' in error else 'FAIL ') + error)
-    failures = [e for e in errors if 'WARNING' not in e]
-    print(f'Validation: {len(failures)} errors, {len(errors) - len(failures)} warnings')
-    if failures:
+    if validate_root(args.out):
         raise SystemExit(1)
 
 

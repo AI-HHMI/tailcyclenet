@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from tailcyclenet import format as fmt
+from _common import add_output_args, validate_root
 
 NAMES = [
     'left_eye', 'right_eye', 'nose', 'neck', 'root_of_tail',
@@ -243,11 +244,7 @@ def main() -> None:
     """Parse converter arguments and write the requested APTv2 dataset."""
     ap = argparse.ArgumentParser()
     ap.add_argument('--src', type=Path, required=True)
-    ap.add_argument('--out', type=Path, required=True)
-    ap.add_argument('--clean', action='store_true')
-    ap.add_argument('--dry-run', action='store_true')
-    ap.add_argument('--validate', action='store_true')
-    ap.add_argument('--no-image-check', action='store_true')
+    add_output_args(ap, image_check=True)
     args = ap.parse_args()
     docs = {split: load_json(args.src / 'annotations' / fn)
             for split, fn in SPLIT_FILES.items()}
@@ -285,13 +282,7 @@ def main() -> None:
     print(f'total: {total["groups"]} groups, {total["frames"]} frames, '
           f'{total["annotations"]} annotations')
     if args.validate and not args.dry_run:
-        errs = fmt.validate_dataset(fmt.load_dataset(args.out),
-                                    check_images=not args.no_image_check)
-        hard = [e for e in errs if 'WARNING' not in e]
-        for e in errs:
-            print(e)
-        print(f'validate: {len(hard)} hard, {len(errs) - len(hard)} warnings')
-        raise SystemExit(1 if hard else 0)
+        raise SystemExit(1 if validate_root(args.out, check_images=not args.no_image_check) else 0)
 
 
 if __name__ == '__main__':

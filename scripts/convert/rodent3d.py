@@ -43,6 +43,7 @@ import yaml
 
 
 from tailcyclenet import format as fmt
+from _common import add_output_args, validate_root
 
 SRC = Path('/groups/karashchuk/karashchuklab/animal-datasets/rodent-3d/Rodent3D/Rodent3D_V3')
 OUT = Path('/groups/karashchuk/karashchuklab/animal-datasets-processed/tailcycle-datasets/rodent-3d')
@@ -280,10 +281,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--src', type=Path, default=SRC)
-    ap.add_argument('--out', type=Path, default=OUT)
-    ap.add_argument('--dry-run', action='store_true', help='report, write nothing')
-    ap.add_argument('--validate', action='store_true', help='validate after writing')
-    ap.add_argument('--clean', action='store_true', help='remove --out first')
+    add_output_args(ap, OUT)
     args = ap.parse_args()
 
     if args.clean and args.out.exists() and not args.dry_run:
@@ -295,12 +293,7 @@ def main() -> None:
         convert_recording(rec, args.out, args.dry_run)
 
     if args.validate and not args.dry_run:
-        errs = fmt.validate_dataset(fmt.load_dataset(args.out))
-        hard = [e for e in errs if 'WARNING' not in e]
-        for e in errs:
-            print(('  WARN ' if 'WARNING' in e else '  FAIL ') + e)
-        print(f'rodent-3d: {len(hard)} error(s), {len(errs) - len(hard)} warning(s)')
-        sys.exit(1 if hard else 0)
+        sys.exit(1 if validate_root(args.out, 'rodent-3d') else 0)
 
 
 if __name__ == '__main__':

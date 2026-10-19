@@ -26,11 +26,11 @@ from pathlib import Path
 import av
 import numpy as np
 import torch
-from PIL import Image
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 from tailcyclenet import format as fmt
+from _common import valid_png, write_png
 from tailcyclenet.data.crop import crop_box_for_points
 
 SRC_ROOT = Path('/nrs/schulze/Users/Lisanne/Data/sleap_DC_tracking')
@@ -420,18 +420,6 @@ def build_labels(anchors: list[int], rows_by_frame: dict[int, list[dict]], names
                       points2d=points, vis2d=status, boxes=boxes, instance=instance), complete
 
 
-def _valid_png(path: Path, width: int, height: int) -> bool:
-    """Fully decode an existing cache entry and check its dimensions and pixel mode."""
-    try:
-        with Image.open(path) as image:
-            if image.size != (width, height) or image.mode not in {'L', 'RGB'}:
-                return False
-            image.load()
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 def validate_cache(cache: Path, indices: set[int], width: int, height: int) -> set[int]:
     """Validate unique cache files in bounded parallel workers before resuming."""
     paths = sorted((i, cache / f'{i:06d}.png') for i in indices)
@@ -440,23 +428,11 @@ def validate_cache(cache: Path, indices: set[int], width: int, height: int) -> s
             total=len(paths), desc=f'check {cache.parent.name}', unit='PNG',
             dynamic_ncols=True) as progress:
         for index, ok in zip((i for i, _ in paths), workers.map(
-                lambda pair: _valid_png(pair[1], width, height), paths)):
+                lambda pair: valid_png(pair[1], width, height), paths)):
             progress.update(1)
             if ok:
                 valid.add(index)
     return valid
-
-
-def _write_png(path: Path, rgb: np.ndarray) -> None:
-    """Encode one decoded frame atomically; called by a bounded writer pool."""
-    if np.array_equal(rgb[..., 0], rgb[..., 1]) \
-            and np.array_equal(rgb[..., 0], rgb[..., 2]):
-        image = Image.fromarray(rgb[..., 0], mode='L')
-    else:
-        image = Image.fromarray(rgb, mode='RGB')
-    tmp = path.parent / f'.{path.name}.tmp'
-    image.save(tmp, format='PNG', compress_level=1)
-    os.replace(tmp, path)
 
 
 def extract_cache(video: Path, indices: set[int], cache: Path,
@@ -492,7 +468,7 @@ def extract_cache(video: Path, indices: set[int], cache: Path,
                 if index in missing:
                     rgb = frame.to_ndarray(format='rgb24')
                     path = cache / f'{index:06d}.png'
-                    pending.append((index, writers.submit(_write_png, path, rgb)))
+                    pending.append((index, writers.submit(write_png, path, rgb)))
                     if len(pending) >= 4:
                         done_index, future = pending.pop(0)
                         future.result()

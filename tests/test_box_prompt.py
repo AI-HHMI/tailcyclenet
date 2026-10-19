@@ -1,7 +1,5 @@
-"""The box prompt: the two encoders, the data helper, and the build guards.
-
-The inference-loop wiring is pinned by `test_infer.py`; this pins the encoder and the data side.
-"""
+"""The box prompt: the FiLM encoder, the data helper, and the build guards (loop wiring is in
+`test_infer.py`)."""
 import sys
 from pathlib import Path
 
@@ -31,19 +29,14 @@ def _wide_cfg(**kw):
 
 # -- build_model wiring ---------------------------------------------------------------------
 
-def test_plain_wide_has_no_box_and_film_matches_term_count():
+def test_build_wiring_and_refusals():
+    """film keeps the plain encoder's term count; the deleted 'term' raises by name."""
     plain = build_model(_wide_cfg(), n_keypoints=4).query_encoder
     film = build_model(_wide_cfg(box_prompt='film'), n_keypoints=4).query_encoder
     assert type(plain) is WideQueryEncoder and not hasattr(plain, 'film')
     assert isinstance(film, BoxFilmEncoder) and film.n_fusion_terms == plain.n_fusion_terms
-
-
-def test_removed_box_prompt_term_raises_by_name():
     with pytest.raises(SystemExit, match='term'):
         build_model(_wide_cfg(box_prompt='term'), n_keypoints=4)
-
-
-def test_unknown_box_prompt_raises():
     with pytest.raises(AssertionError, match='box_prompt'):
         build_model(_wide_cfg(box_prompt='bogus'), n_keypoints=4)
 
@@ -63,9 +56,6 @@ def test_compute_box_prompt_2d_matches_the_crop_rule():
         ref = cropmod.crop_box_for_points(coords[t], _cam()['size'],
                                           bpmod.BOX_PROMPT_MIN_DIM, bpmod.BOX_PROMPT_PAD)
         assert torch.allclose(box[t, 0], ref.float())
-
-
-def test_compute_box_prompt_all_nan_frame_is_nan():
     box = bpmod.compute_box_prompt(torch.full((2, 3, 2), float('nan')), [_cam()], '2d')
     assert torch.isnan(box).all()
 
@@ -79,9 +69,6 @@ def test_frames_mode_first_holds_frame_zero_and_jitter_preserves_nan():
     nanbox = torch.tensor([[[10., 10., 50., 50.]], [[float('nan')] * 4]])
     j = bpmod.apply_jitter(nanbox, np.random.default_rng(0), 0.3, 0.3)
     assert torch.isfinite(j[0]).all() and torch.isnan(j[1]).all()
-
-
-def test_normalize_box_roundtrip():
     n = _normalize_box(torch.tensor([[[0., 0., 100., 200.]]]), torch.tensor([[[200., 200.]]]))
     assert torch.allclose(n[0, 0], torch.tensor([-0.5, 0.0, 1.0, 2.0]))
 
@@ -107,17 +94,6 @@ def _make(cls, **kw):
                patch_size=9, query_pos_embedding=True, query_patch_embedding=True, **kw)
 
 
-@pytest.mark.parametrize('cls', [BoxFilmEncoder])
-def test_none_box_is_finite_and_idempotent(cls):
-    torch.manual_seed(0)
-    enc = _make(cls).eval()
-    args = _enc_inputs(enc)
-    enc._box_prompt = None
-    a = enc(*args)
-    enc._box_prompt = None
-    assert torch.allclose(a, enc(*args)) and torch.isfinite(a).all()
-
-
 def test_film_is_a_no_op_at_init_and_diverges_once_trained():
     torch.manual_seed(0)
     enc = _make(BoxFilmEncoder).eval()
@@ -131,14 +107,13 @@ def test_film_is_a_no_op_at_init_and_diverges_once_trained():
     assert not torch.allclose(out_none, enc(views, cg, qc, qt, tt, cs))
 
 
-def test_nan_box_substitutes_the_missing_token_not_nan():
-    for cls in (BoxFilmEncoder,):
-        torch.manual_seed(0)
-        enc = _make(cls).eval()
-        views, cg, qc, qt, tt, cs = _enc_inputs(enc)
-        enc._box_prompt = torch.full((1, 2, 1, 4), float('nan'))
-        assert torch.isfinite(enc(views, cg, qc, qt, tt, cs)).all()
-
-
-if __name__ == '__main__':
-    sys.exit(pytest.main([__file__, '-v']))
+def test_none_and_nan_boxes_are_finite():
+    """No box is finite and idempotent; a NaN box substitutes the missing token, not NaN."""
+    torch.manual_seed(0)
+    enc = _make(BoxFilmEncoder).eval()
+    args = _enc_inputs(enc)
+    enc._box_prompt = None
+    a = enc(*args)
+    assert torch.allclose(a, enc(*args)) and torch.isfinite(a).all()
+    enc._box_prompt = torch.full((1, 2, 1, 4), float('nan'))
+    assert torch.isfinite(enc(*args)).all()

@@ -41,7 +41,7 @@ from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer, flatten_sequence_triplet
-from .qc import refuse_deleted_data_keys
+from .contract import refuse_deleted_data_keys
 from .triplet import SEGMENT_TYPES, seed_worker
 
 SCORER_HEAD_KEYS = ('pool_num_heads', 'score_hidden', 'use_precision', 'output_granularity')

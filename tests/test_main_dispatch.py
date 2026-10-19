@@ -38,7 +38,7 @@ def test_scorer_commands_dispatch_to_their_modules(monkeypatch):
     import importlib
 
     for command, module_name in [('train-scorer', 'tailcyclenet.scorer.train'),
-                                 ('score', 'tailcyclenet.scorer.score')]:
+                                 ('score', 'tailcyclenet.infer.score')]:
         module = importlib.import_module(module_name)
         seen = []
         monkeypatch.setattr(module, 'main', lambda argv=None, seen=seen: seen.append(argv))

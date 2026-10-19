@@ -161,8 +161,15 @@ def _frame_localization_counts(scores: torch.Tensor, trip: dict):
 
 
 def evaluate(model, loader, loss_fn, device, max_batches: int,
-             optimizer=None, output_granularity: str = 'sequence') -> dict:
-    """The held-out synthetic pass, with count-based frame metrics in frame mode."""
+             optimizer=None, output_granularity: str = 'sequence', fabric=None) -> dict:
+    """The held-out synthetic pass, with count-based frame metrics in frame mode.
+
+    Under DDP (`fabric` with world > 1) every rank's raw accumulators -- weighted counts and the
+    pointwise score arrays -- are gathered and pooled BEFORE any ratio is taken, so each metric is
+    the one a single process scoring every rank's windows would report, at any world size. A
+    window the dataset could not build (None) is skipped and counted in `val/n_skipped` and in
+    the rejection rate.
+    """
     model.eval()
     averaged = optimizer is not None and hasattr(optimizer, 'eval')
     per_type: dict[str, list] = {}
@@ -175,13 +182,14 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
     frame_totals = {'active_weight': 0.0, 'active_correct': 0.0, 'active_gap': 0.0,
                     'valid_weight': 0.0}
     rejection_draws = 0
-    seen = 0
+    seen = skipped = 0
     try:
         if averaged:
             optimizer.eval()
         with torch.no_grad():
             for trip in loader:
                 if trip is None:
+                    skipped += 1
                     continue
                 rejection_draws += int(trip.get('rejected_draws', 0))
                 trip = triplet_to_device(trip, device)
@@ -248,6 +256,55 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
                 optimizer.train()
         finally:
             model.train()
+    state = {'per_type': per_type, 'type_totals': type_totals,
+             'pointwise_chunks': pointwise_chunks, 'pointwise_type_chunks': pointwise_type_chunks,
+             'localization': localization, 'view_counts': view_counts,
+             'frame_totals': frame_totals, 'rejection_draws': rejection_draws + skipped,
+             'seen': seen, 'skipped': skipped}
+    return _finalize(gather_state(fabric, state), output_granularity)
+
+
+def gather_state(fabric, state: dict) -> dict:
+    """Pool every rank's `evaluate` accumulators into one (identity on one process)."""
+    if fabric is None or fabric.world_size <= 1:
+        return state
+    import torch.distributed as dist
+    gathered = [None] * fabric.world_size
+    dist.all_gather_object(gathered, state)
+    out = {'per_type': {}, 'type_totals': {}, 'pointwise_chunks': [],
+           'pointwise_type_chunks': {}, 'localization': [0, 0],
+           'view_counts': dict.fromkeys(state['view_counts'], 0),
+           'frame_totals': dict.fromkeys(state['frame_totals'], 0.0),
+           'rejection_draws': 0, 'seen': 0, 'skipped': 0}
+    for g in gathered:
+        for k, v in g['per_type'].items():
+            out['per_type'].setdefault(k, []).extend(v)
+        for k, (denom, hits) in g['type_totals'].items():
+            tot = out['type_totals'].setdefault(k, [0.0, 0.0])
+            tot[0] += denom
+            tot[1] += hits
+        out['pointwise_chunks'].extend(g['pointwise_chunks'])
+        for k, v in g['pointwise_type_chunks'].items():
+            out['pointwise_type_chunks'].setdefault(k, []).extend(v)
+        out['localization'] = [a + b for a, b in zip(out['localization'], g['localization'])]
+        for k, v in g['view_counts'].items():
+            out['view_counts'][k] += v
+        for k, v in g['frame_totals'].items():
+            out['frame_totals'][k] += v
+        out['rejection_draws'] += g['rejection_draws']
+        out['seen'] += g['seen']
+        out['skipped'] += g['skipped']
+    return out
+
+
+def _finalize(state: dict, output_granularity: str) -> dict:
+    """The val metrics from (pooled) `evaluate` accumulators."""
+    per_type, type_totals = state['per_type'], state['type_totals']
+    pointwise_chunks, pointwise_type_chunks = (state['pointwise_chunks'],
+                                               state['pointwise_type_chunks'])
+    localization, view_counts = state['localization'], state['view_counts']
+    frame_totals = state['frame_totals']
+    rejection_draws, seen = state['rejection_draws'], state['seen']
     out = {k: float(np.mean(v)) for k, v in per_type.items()}
     if output_granularity == 'frame':
         active_weight = frame_totals['active_weight']
@@ -288,46 +345,29 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
             out['val/reference_rejected_fraction'] = (
                 view_counts['reference_rejected'] / view_counts['base_far'])
     out['val/n_scored'] = float(seen)
+    out['val/n_skipped'] = float(state['skipped'])
     out['val/n_rejected_draws'] = float(rejection_draws)
     out['val/rejection_rate'] = float(rejection_draws / (rejection_draws + seen)
                                       if rejection_draws + seen else 0.0)
     return out
 
 
-def gather_eval(fabric, metrics: dict) -> dict:
-    """Reduce rank-local validation dictionaries to one deterministic world result."""
+def gather_history(fabric, loss_fn, prefix: str = 'val/') -> dict:
+    """`loss_fn.collapse_history(prefix)` over every rank's history: the per-window lists and the
+    weighted count totals are pooled first, so the count-based ratios are exact at any world size
+    (identity on one process)."""
     if fabric is None or fabric.world_size <= 1:
-        return metrics
+        return loss_fn.collapse_history(prefix=prefix)
+    import copy
+
     import torch.distributed as dist
     gathered = [None] * fabric.world_size
-    dist.all_gather_object(gathered, metrics)
-    gathered = [m for m in gathered if isinstance(m, dict)]
-    if not gathered:
-        return {}
-    out = {}
-    keys = set().union(*(m for m in gathered))
-    for key in keys:
-        vals = [float(m[key]) for m in gathered
-                if key in m and np.isfinite(m[key])]
-        if not vals:
-            continue
-        if key in {'val/n_scored', 'val/n_rejected_draws', 'val/n_active_rows'}:
-            out[key] = float(sum(vals))
-            continue
-        if key == 'val/rejection_rate':
-            n = sum(float(m.get('val/n_scored', 0.0)) for m in gathered)
-            r = sum(float(m.get('val/n_rejected_draws', 0.0)) for m in gathered)
-            out[key] = r / (r + n) if r + n else 0.0
-            continue
-        if key == 'val/active_fraction':
-            active = sum(float(m.get('val/n_active_rows', 0.0)) for m in gathered)
-            valid = sum(float(m.get('val/n_active_rows', 0.0)) /
-                        float(m[key]) for m in gathered if m.get(key, 0.0))
-            out[key] = active / valid if valid else float('nan')
-            continue
-        weights = [float(m.get('val/n_active_rows', m.get('val/n_scored', 0.0)))
-                   for m in gathered if key in m and np.isfinite(m[key])]
-        den = sum(weights)
-        out[key] = (sum(v * w for v, w in zip(vals, weights)) / den
-                    if den else float(np.mean(vals)))
-    return out
+    dist.all_gather_object(gathered, (dict(loss_fn.loss_history or {}), dict(loss_fn._totals)))
+    pooled = copy.copy(loss_fn)
+    pooled.loss_history, pooled._totals = {}, {}
+    for hist, totals in gathered:
+        for k, v in hist.items():
+            pooled.loss_history.setdefault(k, []).extend(v)
+        for k, v in totals.items():
+            pooled._totals[k] = pooled._totals.get(k, 0.0) + v
+    return pooled.collapse_history(prefix=prefix)

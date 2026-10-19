@@ -217,7 +217,8 @@ def build_datasets(data_cfg: dict, lc, plan):
 
 
 def fixed_val_batches(val_ds, train_cfg: dict, fabric) -> tuple[list, list[int]]:
-    """This rank's shard of the fixed val windows, decoded in a one-worker child -> (batches, idxs)."""
+    """This rank's shard of the fixed val windows, decoded in a one-worker child -> (batches, idxs).
+    A window that fails to build is skipped (named), never replaced by another."""
     world = fabric.world_size
     val_freq = int(train_cfg.get('val_freq', 0))
     val_batches, idxs = [], []
@@ -228,6 +229,11 @@ def fixed_val_batches(val_ds, train_cfg: dict, fabric) -> tuple[list, list[int]]
         val_batches = list(torch.utils.data.DataLoader(
             torch.utils.data.Subset(val_ds, mine), batch_size=1,
             num_workers=1, collate_fn=pose_collate, worker_init_fn=worker_init))
+        failed = [i for i, b in zip(mine, val_batches) if b is None]
+        if failed:
+            fabric.print(f'val: {len(failed)} window(s) failed to build and are SKIPPED: '
+                         f'{failed[:10]}')
+        val_batches = [b for b in val_batches if b is not None]
         seen = Counter(val_ds.index[int(i)].session.session_id for i in idxs)
         fabric.print(f'val:   {len(idxs)} fixed window(s) every {val_freq} iterations, over '
                      f'{len(seen)}/{len({it.session.session_id for it in val_ds.index})} '

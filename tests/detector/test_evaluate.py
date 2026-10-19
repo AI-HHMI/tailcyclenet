@@ -70,3 +70,13 @@ def test_score_dataset_scores_unaugmented_and_restores_augmentation(tiny_root, m
         score_dataset(model, ds, 'cpu', batch_size=2, batches=1, num_workers=0)
     assert seen and not any(seen), f'scored items saw augment={seen}'
     assert ds.augment is True and model.training
+
+
+def test_overall_counts_false_positives_on_a_group_with_no_labelled_box():
+    """detector B1: an all-negative group's FPs are pooled, not weighted by its zero GT count."""
+    from tailcyclenet.detector.evaluate import _summarise, overall
+
+    with_gt = _summarise({'n_gt': 10, 'hit50': 10, 'hit75': 10, 'iou': 9.0, 'fp': 0, 'mota': []})
+    empty = _summarise({'n_gt': 0, 'hit50': 0, 'hit75': 0, 'iou': 0.0, 'fp': 50, 'mota': []})
+    assert overall({'a': with_gt, 'b': empty})['fp'] == 5.0
+    assert overall({'a': with_gt})['fp'] == 0.0

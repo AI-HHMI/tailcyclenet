@@ -364,3 +364,50 @@ def test_schedulefree_escape_hatch_three_groups_and_staged_path():
     assert opt.param_groups[-1]['k'] == 0
     routed = {id(p) for g in opt.param_groups for p in g['params']}
     assert routed == {id(p) for p in m.parameters() if p.requires_grad}
+
+
+# --- fresh non-matrix params at kpt_lr under Muon (model_train B5) ----------------------------
+
+class _Fresh(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.decoder = torch.nn.Module()
+        self.decoder.mlps = torch.nn.ModuleList([torch.nn.Linear(8, 8)])
+        self.query_encoder = torch.nn.Module()
+        self.query_encoder.kpt_embed = torch.nn.Embedding(5, 8)
+        self.query_encoder.missing_qpos = torch.nn.Parameter(torch.zeros(8))
+        self.head = torch.nn.Linear(8, 3)
+
+
+_KPT_CFG = dict(learning_rate=1e-4, kpt_lr=5e-4, weight_decay=0.0)
+
+
+def _lr_of(opt, p):
+    for o in opt._opts if hasattr(opt, '_opts') else [opt]:
+        for g in o.param_groups:
+            if any(q is p for q in g['params']):
+                return g['lr']
+    raise AssertionError('param not routed')
+
+
+@pytest.mark.parametrize('kind', ['muon', 'schedulefree'])
+def test_identity_table_and_missing_tokens_train_at_kpt_lr(kind):
+    m = _Fresh()
+    opt = build_optimizer(m, {'query_encoder.missing_qpos'}, dict(_KPT_CFG, optimizer=kind))
+    assert _lr_of(opt, m.query_encoder.kpt_embed.weight) == pytest.approx(5e-4)
+    assert _lr_of(opt, m.query_encoder.missing_qpos) == pytest.approx(5e-4)
+    assert _lr_of(opt, m.head.bias) == pytest.approx(1e-4)
+
+
+def test_adamw_fresh_route_and_its_build_order():
+    from tailcyclenet.pose.optim import ROUTES, group_lr, route_param
+
+    m = _Fresh()
+    embed = {id(m.query_encoder.kpt_embed.weight)}
+    assert route_param('query_encoder.kpt_embed.weight', m.query_encoder.kpt_embed.weight,
+                       set(), embed) == 'adamw_fresh'
+    assert ROUTES == ('muon_dec', 'muon_fresh', 'muon_enc', 'adamw_fresh', 'adamw_base',
+                      'adamw_enc')
+    assert group_lr('adamw_fresh', _KPT_CFG) == pytest.approx(5e-4)
+    opt = build_muon(m, {'query_encoder.missing_qpos'}, _KPT_CFG)
+    assert [g['lr'] for g in opt.opt_adam.param_groups] == pytest.approx([5e-4, 1e-4])

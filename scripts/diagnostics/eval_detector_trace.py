@@ -25,7 +25,7 @@ import torch
 from tailcyclenet.data.crop import crop_box_for_points
 from tailcyclenet.infer.detect import detect_raw
 from tailcyclenet.detector.checkpoint import load_detector
-from tailcyclenet.detector.boxes import NMS_CENTER_DIST_DEPLOY, box_iou
+from tailcyclenet.detector.boxes import NMS_CENTER_DIST, box_iou
 from tailcyclenet.format import VISIBLE, load_datasets, sessions_for
 from tailcyclenet.infer.loading import detector_box_source
 from tracktail.model.cube import project_points_torch
@@ -131,7 +131,7 @@ def main():
     ap.add_argument('--min-crop-dim', type=int, default=None)
     ap.add_argument('--score-thresh', type=float, default=0.01)
     ap.add_argument('--nms-iou', type=float, default=0.5)
-    ap.add_argument('--nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY)
+    ap.add_argument('--nms-center-dist', type=float, default=NMS_CENTER_DIST)
     ap.add_argument('--top-k', type=int, default=24)
     ap.add_argument('--max-frames', type=int, default=0,
                     help='prefix length when --start-frame is zero')

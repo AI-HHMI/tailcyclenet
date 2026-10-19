@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..detector.boxes import NMS_CENTER_DIST_SELECT
+from ..detector.boxes import NMS_CENTER_DIST
 from ..detector.diagnostics import gt_crop_sides
 from ..infer.associate import associate_group
 from ..infer.detect import detect_raw
@@ -19,7 +19,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      det_score=0.01, track=True, link=False, min_views=2, max_move=1.25,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
                      n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
-                     center_dist_thresh=NMS_CENTER_DIST_SELECT, box_source=None):
+                     center_dist_thresh=NMS_CENTER_DIST, box_source=None):
     """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
 
     `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",

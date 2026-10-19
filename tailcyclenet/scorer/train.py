@@ -39,7 +39,7 @@ from .. import distributed as dist_utils
 from .config import (corruption_config, resolve_selection_metric, scorer_kwargs,
                      validate_scorer_config)
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
-from .evaluate import evaluate, gather_eval, scorer_loss
+from .evaluate import evaluate, gather_history, scorer_loss
 from .model import build_scorer
 from .contract import refuse_deleted_data_keys
 from .triplet import seed_worker
@@ -510,16 +510,20 @@ class ScorerLoop:
             self.ckpted[0] += time.time() - started
 
     def validate(self, values: dict, iteration: int) -> None:
-        """The val pass into `values`; a better selected metric writes `checkpoint_best.pth`."""
+        """The val pass into `values`; a better selected metric writes `checkpoint_best.pth`.
+
+        A key both `evaluate` and the val loss history emit (`active_triplet_acc`,
+        `active_fraction`, `n_active_rows`) is taken from `evaluate` -- its source-frame-weighted
+        value -- and the history's copy is dropped, so the two never collide.
+        """
         fabric, optimizer = self.fabric, self.optimizer
         started = time.time()
         val_values = evaluate(self.raw_model, self.val_loader, self.val_loss_fn, self.device,
-                              len(self.val_loader), optimizer, self.output_granularity)
-        val_values = gather_eval(fabric, val_values)
-        values.update(val_values)
+                              len(self.val_loader), optimizer, self.output_granularity, fabric)
         self.evalled[0] += time.time() - started
-        val_hist = self.val_loss_fn.collapse_history(prefix='val/')
-        values.update(gather_eval(fabric, val_hist))
+        hist = gather_history(fabric, self.val_loss_fn, prefix='val/')
+        values.update({k: v for k, v in hist.items() if k not in val_values})
+        values.update(val_values)
         self.val_loss_fn.reset_history()
         if hasattr(optimizer, 'train'):
             optimizer.train()

@@ -53,8 +53,8 @@ def test_build_datasets_skips_test_and_scores_val_at_val_cams_to_sample(scorer_r
 
 
 def test_val_retries_never_use_an_entropy_seeded_rng(scorer_root, monkeypatch):
-    """A failed val build retries on seeded RNGs only (the metric names a fixed window); train
-    keeps an entropy seed so workers do not replay each other."""
+    """A failed val build is SKIPPED, not swapped, and draws from seeded RNGs only (the metric
+    names a fixed window); train retries on an entropy seed so workers do not replay each other."""
     seeds: list = []
     real = np.random.default_rng
 
@@ -76,7 +76,8 @@ def test_val_retries_never_use_an_entropy_seeded_rng(scorer_root, monkeypatch):
 
     val = build('val')
     seeds.clear()
-    assert val[0] is not None, 'window 0 always fails, so this must come from a retry'
+    assert val[0] is None, 'window 0 always fails, so val must skip it rather than swap'
+    assert val[1] is not None
     assert seeds and all(s is not None for s in seeds), f'val used an entropy seed: {seeds}'
 
     train = build('train')

@@ -406,13 +406,17 @@ class PoseDataset(Dataset):
         is untouched, and it applies at every world size. Drawn ONCE, outside the retry loop, or
         ranks would fall out of step. The item RNG is entropy-seeded on train so workers do not
         replay one another's augmentation, and index-seeded on val/test so a metric is
-        reproducible.
+        reproducible. Only train replaces a window that fails to build; a val/test window
+        returns None (SKIPPED -- `pose_collate` drops it) rather than a random other window that
+        the metric would then count twice.
         """
         ordinal, idx = idx if isinstance(idx, tuple) else (None, idx)
         rng = np.random.default_rng(None if self.train else (self.seed, idx))
         shape_rng = (rng if ordinal is None
                      else np.random.default_rng((self.seed, 0x5AFE, int(ordinal))))
         shape = self.shape(shape_rng)
+        if not self.train:
+            return self._item(idx, rng, shape)
         for _ in range(8):
             out = self._item(idx, rng, shape)
             if out is not None:
@@ -424,8 +428,8 @@ class PoseDataset(Dataset):
         """Build exactly the indexed item once, without the ordinary retry replacement.
 
         This is for deterministic QC/evaluation callers that must not silently substitute a
-        different window when decoding or realisation fails. Training and the normal Dataset
-        protocol continue to use :meth:`__getitem__`, including its retry behavior.
+        different window when decoding or realisation fails -- what `__getitem__` also does off
+        the train split; on train `__getitem__` retries.
 
         Inputs: idx -- an integer index into ``self.index``.
         Outputs: the indexed item, or ``None`` when that item cannot be built.
@@ -746,7 +750,8 @@ class PoseDataset(Dataset):
                 if vis_2d is not None:
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
-                            vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
+                            gone = ~is_point_visible(cam, coords) & (vis_2d[:, :, cnum] == 1)
+                            vis_2d[:, :, cnum][gone] = 0
             others_raw = None
             if attempt_swap_animal:
                 others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],

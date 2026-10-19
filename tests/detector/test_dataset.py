@@ -170,12 +170,14 @@ def test_strong_augment_never_drops_a_box(tiny_root):
 
 
 def test_mosaic_paste_is_fully_interior_and_reencodes_the_crop_rule(tiny_root):
-    """The appended box is `src_box + translation`, entirely inside `input_wh`."""
+    """The appended box is `src_box + translation`, entirely inside `input_wh`. The item's own
+    boxes are dropped so the tiny canvas has empty space (the overlap test is
+    `test_mosaic_paste_never_covers_the_items_own_boxes`)."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(96, 72), min_crop_dim=8,
                     max_frames_per_group=2, augment=True, strong=True, seed=0)
     rng = np.random.default_rng(1)
     for i in range(min(3, len(ds))):
-        base = ds.boxes_for(i)
+        base = ds.boxes_for(i)[:0]
         img, _ = ds._load_letterbox(i)
         boxes, img2 = ds._mosaic_paste(i, base.clone(), img.copy(), rng)
         if boxes.shape[0] == base.shape[0]:
@@ -243,3 +245,46 @@ def test_dataset_item_matches_deployment_normalisation(tiny_root):
     want = torch.as_tensor(normalize_input(lb, 'equalize'), dtype=torch.float32)
     got = ds[0]['x'].permute(1, 2, 0) * 255.0
     torch.testing.assert_close(got, want, atol=1e-3, rtol=0)
+
+
+def test_mosaic_paste_never_covers_the_items_own_boxes():
+    """detector B4: the paste lands in EMPTY space, never over a real animal's box."""
+    from tailcyclenet.detector.dataset import _overlaps_any
+
+    class Stub:
+        input_wh, box_target = (100, 100), 'crop'
+        _mosaic_paste = BoxDataset._mosaic_paste
+
+        def __len__(self):
+            return 2
+
+        def _load_letterbox(self, j):
+            return np.full((100, 100, 3), 255, np.uint8), torch.tensor([[10., 10., 50., 50.]])
+
+    own = torch.tensor([[0., 0., 55., 100.]])
+    rng = np.random.default_rng(0)
+    pasted = 0
+    for _ in range(200):
+        out, img = Stub()._mosaic_paste(0, own.clone(), np.zeros((100, 100, 3), np.uint8), rng)
+        if len(out) > 1:
+            pasted += 1
+            assert not _overlaps_any(tuple(out[1].tolist()), own)
+            assert not img[:, :55].any(), 'the paste covered the real animal'
+    assert pasted > 100
+
+
+def test_training_seed_fixes_the_augmentation_stream(tmp_path):
+    """detector B5: `[training].seed` seeds augmentation; another seed draws another stream."""
+    from tests.helpers import _session_3d
+
+    root = tmp_path / 'ds'
+    _session_3d(root / 'train' / 's')
+
+    def first_views(seed):
+        ds = BoxDataset(root, 'train', input_wh=(64, 64), augment=True, strong=True, seed=seed,
+                        max_frames_per_group=0)
+        return [ds[i % len(ds)]['x'] for i in range(4)]
+
+    a, b, c = first_views(5), first_views(5), first_views(6)
+    assert all(torch.equal(x, y) for x, y in zip(a, b))
+    assert not all(torch.equal(x, y) for x, y in zip(a, c))

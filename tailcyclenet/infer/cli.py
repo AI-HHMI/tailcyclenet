@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ..detector.boxes import NMS_CENTER_DIST_DEPLOY
+from ..detector.boxes import NMS_CENTER_DIST
 from .window import ANCHORS, CARRY_SOURCES
 
 REMOVED_FLAGS = {
@@ -179,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
                           'reprojection gate and NMS filter downstream). Sweep per checkpoint.')
     det.add_argument('--det-nms-iou', type=float, default=0.5,
                      help="decode's box-NMS IoU threshold.")
-    det.add_argument('--det-nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
+    det.add_argument('--det-nms-center-dist', type=float, default=NMS_CENTER_DIST,
                      help='second NMS test in box sides: suppress a candidate whose centre is '
                           'this close to a kept box; negative disables.')
     det.add_argument('--max-animals', type=int, default=0)

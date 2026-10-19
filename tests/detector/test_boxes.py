@@ -23,3 +23,17 @@ def test_box_arithmetic_has_one_copy():
     # centre distance is in units of box side, so it is scale-free
     assert box_center_dist(a * 2, c * 2)[1, 1].item() == pytest.approx(
         box_center_dist(a, c)[1, 1].item())
+
+
+def test_one_nms_centre_distance_and_its_provenance():
+    """detector B15: one centre distance for selection and deployment, recorded as used."""
+    import argparse
+
+    from tailcyclenet.detector import boxes as boxes_mod
+    from tailcyclenet.infer.provenance import _center_dist
+
+    assert boxes_mod.NMS_CENTER_DIST == 0.3
+    assert not hasattr(boxes_mod, 'NMS_CENTER_DIST_SELECT')
+    assert not hasattr(boxes_mod, 'NMS_CENTER_DIST_DEPLOY')
+    assert _center_dist(argparse.Namespace()) == 0.3
+    assert _center_dist(argparse.Namespace(det_nms_center_dist=0.25)) == 0.25

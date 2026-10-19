@@ -454,10 +454,12 @@ def test_cutout_marks_covered_keypoints_not_visible():
     assert covered_nan, 'never covered the NaN keypoint -- the NaN -> 0 path went untested'
 
 
+@pytest.mark.slow
 @pytest.mark.timeout(60)
 def test_workers_do_not_share_a_random_stream(tiny_root):
     """Two workers must not produce identically-augmented items: torch reseeds per worker, but
-    imgaug's own global RNG is fork-copied and needs `worker_init`.
+    imgaug's own global RNG is fork-copied and needs `worker_init`. Workers come from a forkserver:
+    a plain fork inside a threaded xdist worker could deadlock (gotcha 10), which read as a flaky timeout.
     """
     from tailcyclenet.loader.sampling import worker_init
 
@@ -467,7 +469,7 @@ def test_workers_do_not_share_a_random_stream(tiny_root):
     ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=1, num_workers=2, collate_fn=pose_collate,
-        sampler=[0, 0, 0, 0], worker_init_fn=worker_init)
+        sampler=[0, 0, 0, 0], worker_init_fn=worker_init, multiprocessing_context='forkserver')
     got = [(float(b.cgroup[0]['ext'].sum()), b.views[0].float().mean().item())
            for b in loader]
     # items 0 and 1 land on different workers; equality would mean one shared stream
@@ -1303,3 +1305,69 @@ def test_loader_config_from_refuses_unknown_keys_and_allows_the_callers_plumbing
     with pytest.raises(SystemExit, match='prefetch_factor'):
         loader_config_from({'prefetch_factor': 2})
     assert loader_config_from({'prefetch_factor': 2}, extra=SCORER_PLUMBING).n_frames == LoaderConfig().n_frames
+
+
+# ----------------------------------------------------------------------------------------------
+# rotated 3D cameras zero only asserted visibility (data B1); val/test skips a failed window (B7)
+# ----------------------------------------------------------------------------------------------
+
+_SKIP_CFG = LoaderConfig(n_frames=4, prob_2d_only=0.0, aug_prob=0.0, crop_jitter=0.0,
+                         prompt_dropout=0.0, min_crop_dim=8, cams_to_sample=0,
+                         box_source='keypoints')
+
+
+def _unlabelled_slot_targets(root, rot_prob):
+    cfg = replace(_SKIP_CFG, aug_rotation_prob=rot_prob, aug_rotation_deg=5.0)
+    ds = PoseDataset(root, 'train', cfg)
+    vals = []
+    for _ in range(20):
+        it = ds[0]
+        for t, f in enumerate(it[3].tolist()):
+            if f == 1:
+                vals.append(it[7][t, 2])
+    return vals
+
+
+def test_rotation_keeps_unassessed_visibility_nan(tmp_path):
+    """Keypoint 2 at frame 1 is UNLABELED in every camera: no assessment, rotated or not."""
+    root = tmp_path / 'ds'
+    _session_3d(root / 'train' / 's')
+    plain = _unlabelled_slot_targets(root, 0.0)
+    rotated = _unlabelled_slot_targets(root, 1.0)
+    assert plain and rotated
+    assert all(torch.isnan(v).all() for v in plain)
+    assert all(torch.isnan(v).all() for v in rotated)
+
+
+def _failing_first(root, split, monkeypatch):
+    ds = PoseDataset(root, split, _SKIP_CFG)
+    real = ds._item
+    calls = []
+
+    def item(idx, rng, shape):
+        calls.append(idx)
+        return None if idx == 0 else real(idx, rng, shape)
+
+    monkeypatch.setattr(ds, '_item', item)
+    return ds, calls
+
+
+def test_a_failed_val_window_is_skipped(tmp_path, monkeypatch):
+    root = tmp_path / 'ds'
+    _session_3d(root / 'val' / 's')
+    ds, calls = _failing_first(root, 'val', monkeypatch)
+    assert ds[0] is None and calls == [0]
+    assert pose_collate([ds[0]]) is None
+
+
+def test_a_failed_train_window_is_still_replaced(tmp_path, monkeypatch):
+    root = tmp_path / 'ds'
+    _session_3d(root / 'train' / 's')
+    ds, calls = _failing_first(root, 'train', monkeypatch)
+    if len(ds) < 2:
+        return
+    for _ in range(20):
+        calls.clear()
+        if ds[0] is not None and len(calls) > 1:
+            return
+    raise AssertionError('train never retried another window')

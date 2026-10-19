@@ -122,9 +122,12 @@ def pose_collate(batch):
     batch_size 1.
 
     The box prompt field exists only when a box model is training (`_item` appends a 14th field
-    then); it is absent for a plain run, so nothing downstream sees it.
+    then); it is absent for a plain run, so nothing downstream sees it. A batch whose every item
+    is None (a skipped val/test window) collates to None.
     """
     batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
     out = custom_collate([b[:10] for b in batch])
     out['kpt_ids'] = torch.stack([b[10] for b in batch])
     out['kpt_prior'] = torch.stack([b[11] for b in batch])

@@ -97,9 +97,9 @@ def _box_provenance(args, det_tile, det_red, det_boxsrc):
         'detector': str(Path(args.detector).resolve()) if args.detector else '',
         'detector_checkpoint': str(getattr(args, '_detector_checkpoint', '') or ''),
         'det_score': float(args.det_score),
-        'det_nms_iou': float(getattr(args, 'det_nms_iou', 0.5)),
+        'det_nms_iou': float(args.det_nms_iou),
         'det_nms_center_dist': (float(args.det_nms_center_dist)
-                               if getattr(args, 'det_nms_center_dist', None) is not None else 0.0),
+                               if args.det_nms_center_dist is not None else 0.0),
         'det_top_k': int(args.det_top_k) if args.det_top_k else 0,
         'max_animals': int(args.max_animals),
         'max_frames': int(args.max_frames),
@@ -133,12 +133,12 @@ def _identity_provenance(args):
         'link_boxes': bool(args.link_boxes),
         'min_views': int(args.min_views),
         'max_move': float(args.max_move),
-        'max_age': int(getattr(args, 'max_age', 8)),
-        'identity_bridge': bool(getattr(args, 'identity_bridge', False)),
+        'max_age': int(args.max_age),
+        'identity_bridge': bool(args.identity_bridge),
         'pose_nms': (float(args.pose_nms) if getattr(args, 'pose_nms', None) is not None
                      else 0.0),
-        'duplicate_radius': float(getattr(args, 'duplicate_radius', 0.75)),
-        'duplicate_persist': int(getattr(args, 'duplicate_persist', 5)),
+        'duplicate_radius': float(args.duplicate_radius),
+        'duplicate_persist': int(args.duplicate_persist),
     }
 
 
@@ -335,23 +335,21 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             end = min(cursor + _DET_BATCH, T)
             raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                              score_thresh=args.det_score, reduce=det_red,
-                             iou_thresh=getattr(args, 'det_nms_iou', 0.5),
-                             center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
+                             iou_thresh=args.det_nms_iou,
+                             center_dist_thresh=args.det_nms_center_dist,
                              max_frames=T, tile_scale=det_tile, box_source=box_source,
                              frames=np.arange(cursor, end),
                              trace=(stats.setdefault('decode_trace', [])
-                                    if getattr(args, 'det_trace', None) else None),
+                                    if args.det_trace else None),
                              read=lambda ci, cam, fr, pool=None, reduce=1: store.read(
                                  ci, cam, fr, pool=pool, reduce=reduce))
             b, s, k = associate_group(raw, sess, gid, n_want, link=args.link_boxes,
                                       min_views=args.min_views, track=args.track,
                                       max_move=args.max_move,
-                                      max_age=getattr(args, 'max_age', 8), stats=stats,
+                                      max_age=args.max_age, stats=stats,
                                       pose_nms=args.pose_nms, state=assoc_state,
-                                      duplicate_radius=getattr(
-                                          args, 'duplicate_radius', 0.75),
-                                      duplicate_persist=getattr(
-                                          args, 'duplicate_persist', 5),
+                                      duplicate_radius=args.duplicate_radius,
+                                      duplicate_persist=args.duplicate_persist,
                                       frame_base=cursor)
             for j, t in enumerate(range(cursor, end)):
                 buf[t] = (b[:, j], s[:, j], None if k is None else k[:, j])
@@ -412,18 +410,18 @@ def run_dataset(args):
     than trusted. Decode's share is printed beside the wall clock.
     """
 
-    scorer_path = getattr(args, 'scorer', None)
-    scorer_checkpoint_name = getattr(args, 'scorer_checkpoint', None)
-    allow_pose_scorer_mismatch = bool(getattr(args, 'allow_pose_scorer_mismatch', False))
+    scorer_path = args.scorer
+    scorer_checkpoint_name = args.scorer_checkpoint
+    allow_pose_scorer_mismatch = bool(args.allow_pose_scorer_mismatch)
     if scorer_path is None and scorer_checkpoint_name is not None:
         raise SystemExit('--scorer-checkpoint requires --scorer')
     if scorer_path is None and allow_pose_scorer_mismatch:
         raise SystemExit('--allow-pose-scorer-mismatch requires --scorer')
-    _refuse_selector_beside_file(args.run, getattr(args, 'checkpoint', None), '--pose',
+    _refuse_selector_beside_file(args.run, args.checkpoint, '--pose',
                                  '--pose-checkpoint')
     _refuse_selector_beside_file(scorer_path, scorer_checkpoint_name, '--scorer',
                                  '--scorer-checkpoint')
-    _refuse_selector_beside_file(args.detector, getattr(args, 'detector_checkpoint', None),
+    _refuse_selector_beside_file(args.detector, args.detector_checkpoint,
                                  '--detector', '--detector-checkpoint', default='latest')
     if args.anchor == 'labels':
         if args.detector or args.boxes:
@@ -532,8 +530,8 @@ def run_dataset(args):
     over = ({'gridresid_offset': args.gridresid_offset} if args.gridresid_offset else None)
     model, config, registry, ckpt = load_run(args.run, args.checkpoint, device=device,
                                              model_overrides=over)
-    precision = getattr(args, 'precision', 'bf16')
-    camera_batch = getattr(args, 'camera_batch', True)
+    precision = args.precision
+    camera_batch = args.camera_batch
     model.set_scene_speed(precision=precision, camera_batch=camera_batch)
     print(f'speed: precision={precision} camera_batch={camera_batch}')
     print(f'model: {ckpt.name}  ({registry.n_keypoints} keypoints)  '
@@ -792,7 +790,7 @@ def run_dataset(args):
             f0, w0 = cfg.frame_start, 0
             n_frames = n_fin = n_pt = 0
             _t_group, _stats = time.time(), {}
-            if getattr(args, 'overlap_trace', None):
+            if args.overlap_trace:
                 _stats['capture_overlap_agreement'] = True
             for blk in run_blocks(model, sess, gid, registry, ds_name, cfg,
                                   box_points=boxes.get(key), boxes_for=boxes_for, n_rows=n_want,
@@ -812,7 +810,7 @@ def run_dataset(args):
             print(f'{key}: {n_frames} frames{span}, {n_fin / max(n_pt, 1):.3f} finite')
             if args.det_trace and det is not None:
                 det_trace_groups[key] = det_stats.get('decode_trace', [])
-            if getattr(args, 'overlap_trace', None):
+            if args.overlap_trace:
                 overlap_rows[key] = (_stats.get('overlap_agreement', []),
                                      _stats.get('overlap_census', {}),
                                      _stats.get('prior_oob', []),
@@ -853,9 +851,9 @@ def run_dataset(args):
     if args.det_trace:
         _write_det_trace(args.det_trace, det_trace_groups)
         print(f'wrote detector trace {args.det_trace}')
-    if getattr(args, 'overlap_trace', None):
+    if args.overlap_trace:
         _write_overlap_trace(args.overlap_trace, overlap_rows)
-    if getattr(args, 'identity_bridge', False):
+    if args.identity_bridge:
         from . import bridge as _bridge
         _cfg = _bridge.BridgeConfig()
         _decisions = _bridge.bridge_session(args.out, _cfg, int(cfg.n_frames))

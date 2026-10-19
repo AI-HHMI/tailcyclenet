@@ -3005,8 +3005,9 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     from tailcyclenet.detector import associate_group
     from tailcyclenet.infer.driver import _identity_provenance
 
-    args = argparse.Namespace(track=True, link_boxes=True, min_views=2, max_move=1.25,
-                              max_age=8, pose_nms=None)
+    from tailcyclenet.infer.cli import build_parser
+
+    args = build_parser().parse_args(['--run', 'r', '--out', 'o'])
     prov = _identity_provenance(args)
 
     # Everything `associate_group` takes that can change which row a detection lands in. The rest
@@ -3028,9 +3029,10 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
 
     # UNCONDITIONAL, every key, always -- same rule as `_box_provenance`: conditional membership
     # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
-    args2 = argparse.Namespace(track=False, link_boxes=False, min_views=1, max_move=2.0,
-                               max_age=24, pose_nms=0.6,
-                               duplicate_radius=0.9, duplicate_persist=8)
+    args2 = build_parser().parse_args([
+        '--run', 'r', '--out', 'o', '--no-track', '--no-link-boxes', '--min-views', '1',
+        '--max-move', '2.0', '--max-age', '24', '--pose-nms', '0.6', '--duplicate-radius', '0.9',
+        '--duplicate-persist', '8', '--identity-bridge'])
     assert set(_identity_provenance(args2)) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
     assert _identity_provenance(args2)['pose_nms'] == 0.6

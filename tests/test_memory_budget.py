@@ -476,8 +476,6 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
     process-wide -- so with the budget resolved BELOW the input branch the override was not in
     effect during the probe, and any consumer that asked would have got the HOST figure.
     """
-    import argparse
-
     from tailcyclenet import adopt, memory
     from tailcyclenet.infer import driver
 
@@ -498,15 +496,13 @@ def test_the_budget_is_resolved_above_both_input_branches(monkeypatch, tmp_path)
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError('the budget must be resolved before the checkpoint')))
 
-    args = argparse.Namespace(
-        run=tmp_path / 'run',
-        videos=[tmp_path / 'v.mp4'], calibration=tmp_path / 'c.toml', cam_regex=None,
-        session_id=None, group_id=None, units='mm', fps=None, assoc_res_max_px=30.0,
-        trim_to_shortest=False, dump_session=None, data=None, split=None,
-        anchor='none', oracle_corrupt=None, refine_px=None, refine=None,
-        max_frames=0, start_frame=0, end_frame=0, max_ram=17.0, dataset_name=None,
-        box_prompt='none', detector=None, boxes='b.npz', max_animals=1,
-        out=tmp_path / 'out')
+    from tailcyclenet.infer.cli import build_parser
+
+    args = build_parser().parse_args([
+        '--run', str(tmp_path / 'run'), '--videos', str(tmp_path / 'v.mp4'),
+        '--calibration', str(tmp_path / 'c.toml'), '--units', 'mm', '--anchor', 'none',
+        '--max-ram', '17.0', '--box-prompt', 'none', '--boxes', 'b.npz',
+        '--max-animals', '1', '--out', str(tmp_path / 'out')])
     try:
         with pytest.raises(SystemExit, match='the budget has been observed'):
             driver.run_dataset(args)

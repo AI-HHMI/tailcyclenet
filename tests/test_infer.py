@@ -2010,9 +2010,8 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
     do NOT round the user's `--start-frame`: the batch is an internal that no CLI value may be
     quantised by.
     """
-    import argparse
-
     from tailcyclenet.infer import driver
+    from tailcyclenet.infer.cli import build_parser
 
     model, sess, registry, name = _range_scene(tmp_path, T=64)
     seen = []
@@ -2032,9 +2031,9 @@ def test_the_detection_slice_stays_batch_aligned(tmp_path):
     old = (detmod.detect_raw, detmod.associate_group)
     detmod.detect_raw, detmod.associate_group = fake_detect_raw, fake_associate
     try:
-        args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
-                                  max_move=1.0, pose_nms=None, max_frames=0,
-                                  frame_start=37, frame_stop=64)
+        args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
+                                          '--max-move', '1.0'])
+        args.frame_start, args.frame_stop = 37, 64
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
 
@@ -2063,9 +2062,8 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
     aligned cursor happens to leave a full final batch. Parametrised over ragged and exact ends so
     neither case can pass alone.
     """
-    import argparse
-
     from tailcyclenet.infer import driver
+    from tailcyclenet.infer.cli import build_parser
 
     model, sess, registry, name = _range_scene(tmp_path, T=200)
     seen = []
@@ -2087,9 +2085,9 @@ def test_the_detector_is_told_where_the_RANGE_ends_not_where_the_GROUP_does(tmp_
     detmod.detect_raw = fake_detect_raw
     detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n], None)
     try:
-        args = argparse.Namespace(det_score=0.5, link_boxes=True, min_views=2, track=True,
-                                  max_move=1.0, pose_nms=None, max_frames=0,
-                                  frame_start=start, frame_stop=stop)
+        args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
+                                          '--max-move', '1.0'])
+        args.frame_start, args.frame_stop = start, stop
         boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
 

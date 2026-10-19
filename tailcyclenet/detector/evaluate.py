@@ -21,7 +21,8 @@ import numpy as np
 import torch
 
 from ..metrics import mota
-from .assign import box_iou, decode
+from .assign import decode
+from .boxes import NMS_CENTER_DIST_SELECT, box_iou
 from .data import ChunkShuffle, box_collate
 
 
@@ -130,7 +131,8 @@ def _summarise(s):
 @torch.no_grad()
 def score_dataset(model, ds, device, batch_size=16, batches=40, seed=0, score_thresh=0.05,
                   num_workers=4, max_animals=None, out_scores=None, iou_thresh=0.5,
-                  center_dist_thresh=0.5, subset_indices=None, root_qualified_keys=False):
+                  center_dist_thresh=NMS_CENTER_DIST_SELECT, subset_indices=None,
+                  root_qualified_keys=False):
     """{group_key: metrics} for `model` over a sample of `ds`. Leaves the model in eval mode.
 
     Inputs:
@@ -302,7 +304,7 @@ def deployment_score(model, sess, gid, input_wh, device='cpu', top_k=24, max_ani
                      det_score=0.01, track=True, link=False, min_views=2, max_move=1.25,
                      min_crop_dim=64, reduce=False, tile_scale=None, max_frames=0,
                      n_frames=24, overlap=4, min_box_frames=1, batch=16, iou_thresh=0.5,
-                     center_dist_thresh=0.5, box_source=None):
+                     center_dist_thresh=NMS_CENTER_DIST_SELECT, box_source=None):
     """Deployment-shaped detector quality over ONE WHOLE CLIP, no frame sampling.
 
     `score_dataset` answers "what fraction of SAMPLED frames does the detector recall a box on",

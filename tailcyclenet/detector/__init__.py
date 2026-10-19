@@ -6,7 +6,7 @@ import torch
 
 from .assign import assign, assign_tal, ciou_loss, decode, detector_loss, giou_loss
 from .associate import associate
-from .boxes import box_iou, paired_iou
+from .boxes import NMS_CENTER_DIST_DEPLOY, NMS_CENTER_DIST_SELECT, box_iou, paired_iou
 from .data import (BoxDataset, ChunkShuffle, CohortSampler, box_collate, letterbox,
                    letterbox_transform, reduce_factor, split_batch, tile_transform,
                    unletterbox_boxes)
@@ -64,7 +64,7 @@ def resolve_detector_checkpoint(path, checkpoint='latest'):
     raise ValueError(f'{p}: no numbered detector checkpoint has matching iteration metadata')
 
 
-__all__ = ['YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
+__all__ = ['NMS_CENTER_DIST_DEPLOY', 'NMS_CENTER_DIST_SELECT', 'YOLOXNano', 'BoxDataset', 'ChunkShuffle', 'CohortSampler',
            'box_collate', 'letterbox',
            'letterbox_transform', 'reduce_factor', 'split_batch', 'tile_transform',
            'unletterbox_boxes', 'assign', 'assign_tal', 'box_iou',
@@ -184,7 +184,8 @@ def tiled_input_wh(src_wh, tile_scale):
 @torch.no_grad()
 def detect_raw(det, input_wh, session, gid, top_k, device='cpu', batch=16, score_thresh=0.01,
                reduce=False, max_frames=0, tile_scale=None, frames=None, read=None,
-               iou_thresh=0.5, center_dist_thresh=0.5, trace=None, trace_detail=False,
+               iou_thresh=0.5, center_dist_thresh=NMS_CENTER_DIST_SELECT, trace=None,
+               trace_detail=False,
                box_source=None):
     """The DETECTION half: pixels -> per-camera detections, ranked by score, unassociated.
 

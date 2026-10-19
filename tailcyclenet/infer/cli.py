@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from ..detector.boxes import NMS_CENTER_DIST_DEPLOY
 from .window import ANCHORS, CARRY_SOURCES
 
 
@@ -262,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
                          'before detector_v2 plan A1; every external detector (RTMDet 0.65, '
                          'DLC/SLEAP instance-level 0.8) ships higher -- sweep upward, not around '
                          '0.5.')
-    ap.add_argument('--det-nms-center-dist', type=float, default=0.3,
+    ap.add_argument('--det-nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
                     help='SECOND, independent NMS survival test in units of box side (scale-free): '
                          'a candidate is also suppressed if its centre sits within this many box '
                          'sides of an already-kept box, regardless of IoU -- catches '

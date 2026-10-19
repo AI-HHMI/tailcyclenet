@@ -13,7 +13,7 @@ the first one keeps the downstream accuracy.
 import torch
 import torch.nn.functional as F
 
-from .boxes import box_center_dist, box_iou, paired_iou
+from .boxes import NMS_CENTER_DIST_SELECT, box_center_dist, box_iou, paired_iou
 
 # In cells; YOLOX's own value.
 CENTER_RADIUS = 2.5
@@ -237,7 +237,7 @@ def detector_loss(obj_logits, boxes, anchors, gt_boxes, box_weight=5.0,
 
 
 def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
-          center_dist_thresh=0.5, return_trace=False):
+          center_dist_thresh=NMS_CENTER_DIST_SELECT, return_trace=False):
     """Top boxes for one image, NMS'd. Returns (boxes (N,4), scores (N,)).
 
     Inputs:
@@ -250,7 +250,7 @@ def decode(obj_logits, boxes, top_k=1, score_thresh=0.05, iou_thresh=0.5,
             it through.
         center_dist_thresh -- second, independent survival condition in units of box side (see
             `box_center_dist`): suppresses near-concentric duplicates IoU alone lets through.
-            Default 0.5 (plan A5, CONFIRMED -- a deliberate break from older checkpoints); pass
+            Default `NMS_CENTER_DIST_SELECT` (plan A5; deployment passes `_DEPLOY`); pass
             None for the pre-A5 byte-identical behaviour.
         return_trace -- adds an output-neutral diagnostic dict (candidate counts, pre/post-NMS
             boxes and scores); opt-in because it retains tensors.

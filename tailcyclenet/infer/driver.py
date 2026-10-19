@@ -15,6 +15,7 @@ import torch
 
 from ..checkpoints import load_run, peek_registry, provenance
 from ..dataset import LoaderConfig
+from ..detector.boxes import NMS_CENTER_DIST_DEPLOY
 from .predictions import SessionWriter, refuse_multi_session
 from .window import InferConfig, run_blocks
 
@@ -337,7 +338,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
             raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                              score_thresh=args.det_score, reduce=det_red,
                              iou_thresh=getattr(args, 'det_nms_iou', 0.5),
-                             center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
+                             center_dist_thresh=getattr(args, 'det_nms_center_dist', NMS_CENTER_DIST_DEPLOY),
                              max_frames=T, tile_scale=det_tile, box_source=box_source,
                              frames=np.arange(cursor, end),
                              trace=(stats.setdefault('decode_trace', [])
@@ -377,7 +378,7 @@ def _detector_boxes(det, det_wh, sess, gid, args, device, det_red, det_tile, n_d
                 raw = detect_raw(det, det_wh, sess, gid, n_det, device=device,
                                  score_thresh=args.det_score, reduce=det_red,
                                  iou_thresh=getattr(args, 'det_nms_iou', 0.5),
-                                 center_dist_thresh=getattr(args, 'det_nms_center_dist', 0.3),
+                                 center_dist_thresh=getattr(args, 'det_nms_center_dist', NMS_CENTER_DIST_DEPLOY),
                                  max_frames=T, tile_scale=det_tile, box_source=box_source,
                                  frames=np.arange(window_cursor, end),
                                  trace=(stats.setdefault('decode_trace', [])

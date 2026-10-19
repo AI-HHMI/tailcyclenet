@@ -11,7 +11,6 @@ import ctypes
 import gc
 import json
 import os
-import sys
 import time
 from collections import Counter
 from dataclasses import replace
@@ -21,15 +20,17 @@ import numpy as np
 import torch
 
 from tailcyclenet import distributed as dist_utils
-from tailcyclenet.checkpoints import (_BASE_CONFIG, check_image_size, full_training_state,
-                                      is_hf_repo_id, load_config, prior_provenance,
+from tailcyclenet.checkpoints import (full_training_state,
+                                      is_hf_repo_id, prior_provenance,
                                       resolve_checkpoint, resolve_hf_checkpoint, save_checkpoint,
                                       save_run_meta, warm_start)
+from tailcyclenet.config import BASE_CONFIG, check_image_size, load_config
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, SpawnHandoff, StepSampler,
                                   pose_collate, worker_init)
 from tailcyclenet.format import Registry
 from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
+from tailcyclenet.runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
                                    trainable_encoder_params)
 
@@ -84,49 +85,6 @@ def build_optimizer(model, fresh: set[str], cfg: dict, layout: dict | None = Non
     return opt
 
 
-def init_wandb(config: dict, run: Path, disabled: bool = False):
-    """wandb from the existing `[wandb]` block, or None. The run folder stays `--out`.
-
-    The run name carries a timestamp because the folder alone is not unique across resumes.
-    `[wandb].path` (wandb's log directory) defaults to the run folder itself.
-    """
-    cfg = config.get('wandb')
-    if disabled or not cfg:
-        return None
-    try:
-        import wandb
-    except ImportError:
-        print('wandb: not installed, skipping')
-        return None
-    log_dir = Path(cfg.get('path') or run)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    name = f'{time.strftime("%Y%m%d_%H%M%S")}-{run.name}'
-    wandb.init(project=cfg.get('project_name', 'tailcyclenet'), dir=str(log_dir),
-               mode=cfg.get('mode', 'offline'), name=name, config=config)
-    print(f'wandb: {cfg.get("mode", "offline")} | {wandb.run.name}')
-    return wandb
-
-
-def log(wb, values: dict, step: int) -> None:
-    """Log `values` at `step` if wandb is active."""
-    if wb is not None:
-        wb.log(values, step=step)
-
-
-def _gpu_peak_gb(device, reset: bool = False) -> float:
-    """Peak allocator bytes since the last reset, in GB (0.0 on CPU); max, not current.
-
-    `device` may be a `torch.device` (the loop passes `fabric.device`) or a `str` (tests and
-    older callers), so it is compared as a string.
-    """
-    if str(device).split(':')[0] != 'cuda' or not torch.cuda.is_available():
-        return 0.0
-    peak = torch.cuda.max_memory_allocated(device) / 1e9
-    if reset:
-        torch.cuda.reset_peak_memory_stats(device)
-    return peak
-
-
 def _brief(m: dict) -> str:
     """The interesting metric keys of a val dict, space-joined for a one-line print."""
     keys = ('mpjpe', 'mte', 'delta_x_avg', 'survival_rate', 'n_nonfinite')
@@ -146,20 +104,6 @@ def base_registry(run: Path, checkpoint_path):
             print(f'keypoint registry: appending to {p}')
             return Registry.load(p)
     return None
-
-
-def timed(loader, acc):
-    """Yield from `loader`, accumulating seconds blocked on `next()` into `acc[0]` -- the loader
-    starvation canary. Wrapping the iterator stays correct across `continue` paths."""
-    it = iter(loader)
-    while True:
-        t = time.time()
-        try:
-            batch = next(it)
-        except StopIteration:
-            return
-        acc[0] += time.time() - t
-        yield batch
 
 
 def to_device(batch, device):
@@ -379,64 +323,6 @@ def _reduce(mets):
     return out
 
 
-def launch(args):
-    """The Fabric, launched. Everything after this call runs once PER RANK.
-
-    `--devices 1` is strategy `auto` (no wrapper); above it, `ddp_find_unused_parameters_true`
-    because 2D and 3D items genuinely drive different parameters. `--devices -1` (the default)
-    means every visible GPU and resolves to the visible count first, so a one-GPU box takes the
-    exact `--devices 1` path instead of wrapping one rank in DDP; `--device cpu` resolves to
-    the one-process CPU path the same way. Fabric re-executes this script
-    per rank, so everything above `launch()` runs on every rank -- keep it video-free (forked
-    workers deadlock on an open container). CPU is still CPU even when CUDA is available, and
-    `--device cuda:2` still selects that gpu at one device. Non-zero ranks TAG their stdout
-    rather than silencing it: the setup phase's prints are the evidence when one rank disagrees.
-    The RAM ceiling divides by the world size (reader caches and workers are per process) and is
-    set before any dataset exists, so its derivation never probes video.
-    """
-    from lightning.fabric import Fabric
-
-    devices = int(args.devices)
-    if devices == -1:
-        devices = (1 if str(args.device).startswith('cpu') or not torch.cuda.is_available()
-                   else torch.cuda.device_count())
-    if args.precision == '16-mixed':
-        raise SystemExit(
-            '--precision 16-mixed needs a GradScaler applied to the optimizer, and this loop steps\n'
-            'its own optimizer rather than handing it to Fabric (PoseDualOptimizer is not an\n'
-            'Optimizer subclass, and at 32-true/bf16-mixed a Fabric optimizer wrapper adds\n'
-            'nothing). Use --precision 32-true, or bf16-mixed.')
-    if devices != 1 and args.device != 'cuda:0':
-        raise SystemExit(
-            f'--device {args.device} names ONE gpu and --devices {args.devices} asks for several. '
-            'At --devices != 1 the launcher places every rank, so --device would be silently '
-            'ignored -- pick one (CUDA_VISIBLE_DEVICES selects WHICH gpus).')
-    strategy = args.strategy or ('auto' if devices == 1 else 'ddp_find_unused_parameters_true')
-    if not torch.cuda.is_available() or (devices == 1 and str(args.device).startswith('cpu')):
-        accelerator, dev_arg = 'cpu', 1
-    elif devices == 1:
-        accelerator = 'gpu'
-        dev_arg = [int(str(args.device).rsplit(':', 1)[-1])] if ':' in str(args.device) else 1
-    else:
-        accelerator, dev_arg = 'gpu', devices
-    fabric = Fabric(accelerator=accelerator, devices=dev_arg, strategy=strategy,
-                    precision=args.precision)
-    fabric.launch()
-    if not fabric.is_global_zero:
-        sys.stdout = dist_utils.RankPrefix(sys.stdout, fabric.global_rank)
-    os.environ['TAILCYCLENET_LOCAL_WORLD_SIZE'] = str(fabric.world_size)
-    if fabric.world_size > 1:
-        fabric.print(f'distributed: {fabric.world_size} ranks, strategy {strategy!r}, '
-                     f'precision {args.precision}. n_iterations/val_freq/checkpoint_freq/'
-                     f'print_freq and the unfreeze iteration are TOTALS across ranks; the '
-                     f'learning rate is scaled by sqrt({fabric.world_size}) = '
-                     f'{fabric.world_size ** 0.5:.3f}')
-    if args.precision == 'bf16-mixed':
-        fabric.print('--precision bf16-mixed is UNMEASURED on this repo\'s roots: every number in '
-                     'every number on record was measured at 32-true.')
-    return fabric
-
-
 def main(argv: list[str] | None = None):
     """Finetune a tracktail tracker into a pose estimator.
 
@@ -505,7 +391,7 @@ def main(argv: list[str] | None = None):
     fabric = launch(args)
     world, is0 = fabric.world_size, fabric.is_global_zero
 
-    config = load_config(args.config or _BASE_CONFIG)
+    config = load_config(args.config or BASE_CONFIG)
     check_image_size(config)
     data_cfg, train_cfg = config['data'], config['training']
     if args.data:
@@ -867,7 +753,7 @@ def main(argv: list[str] | None = None):
                 dt = elapsed / local_print_freq
                 wait_frac = waited[0] / elapsed
                 eval_frac = evalled[0] / wall if wall > 0 else 0.0
-                peak_gb = _gpu_peak_gb(device)
+                peak_gb = gpu_peak_gb(device)
                 fabric.print(f'{it:7d}/{n_iter}  loss {np.mean(running):8.4f}  '
                              f'{dt:5.2f}s/it  wait {wait_frac:4.0%}  eval {eval_frac:4.0%}  '
                              f'peak {peak_gb:5.1f}G  skipped {skipped * world}  '
@@ -879,7 +765,7 @@ def main(argv: list[str] | None = None):
                          'train/grad_norm_muon': float(mgn),
                          'train/iteration': it,
                          'train/encoder_trainable_params': trainable_encoder_params(raw),
-                         'train/gpu_peak_gb': _gpu_peak_gb(device, reset=True),
+                         'train/gpu_peak_gb': gpu_peak_gb(device, reset=True),
                          'train/clipped': float(np.mean(clipped[-200:])) if clipped else 0.0,
                          'train/sec_per_it': dt, 'train/loader_wait_frac': wait_frac,
                          'train/eval_frac': eval_frac,

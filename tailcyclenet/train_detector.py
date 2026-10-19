@@ -19,7 +19,8 @@ import torch
 
 import toml
 
-from tailcyclenet.checkpoints import _DETECTOR_CONFIG, provenance
+from tailcyclenet.checkpoints import provenance
+from tailcyclenet.config import DETECTOR_CONFIG
 from tailcyclenet.dataset import worker_init
 from tailcyclenet.detector import (BoxDataset, CohortSampler, YOLOXNano,
                                    box_collate, detector_loss, split_batch, tiled_input_wh)
@@ -322,7 +323,7 @@ def main(argv: list[str] | None = None):
                          'pre-staged directory instead (e.g. on a host with no internet access).')
     args = ap.parse_args(argv)
 
-    config = load_detector_config(args.config or _DETECTOR_CONFIG, out=args.out,
+    config = load_detector_config(args.config or DETECTOR_CONFIG, out=args.out,
                                   iters=args.iters, device=args.device)
     data_cfg, model_cfg, train_cfg = config['data'], config['model'], config['training']
 

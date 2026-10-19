@@ -26,7 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.checkpoints import load_config, _SCORER_CONFIG  # noqa: E402
+from tailcyclenet.config import load_config, SCORER_CONFIG  # noqa: E402
 from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.model import build_scorer  # noqa: E402
@@ -157,7 +157,7 @@ def main(argv=None) -> int:
     ap.add_argument('--device', default='cpu')
     args = ap.parse_args(argv)
 
-    config = load_config(args.config, base=_SCORER_CONFIG)
+    config = load_config(args.config, base=SCORER_CONFIG)
     ds = _open(config, args.split)
     print(f'split={args.split}  windows={len(ds)}  K={ds.base.registry.n_keypoints}')
     print(f'requested mix: {ds.mix()}')

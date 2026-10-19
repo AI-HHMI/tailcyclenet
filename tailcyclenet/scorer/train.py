@@ -3,7 +3,7 @@
 Cloned from `train.py`'s shape but NOT from its loop: the objective is a triplet ranking loss, the
 best checkpoint is selected on held-out synthetic triplet accuracy rather than on MPJPE, and the
 staged encoder unfreeze, the pose losses and the pose eval all have no meaning here. What IS
-reused, by import, is the parts that must not diverge: `checkpoints.load_config` (so the scorer
+reused, by import, is the parts that must not diverge: `config.load_config` (so the scorer
 family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose checkpoint),
 `checkpoints.save_checkpoint` / `save_run_meta` with `kind='scorer'`, and `train.build_optimizer`
 (so Muon routing and the fresh-parameter rule are one implementation).
@@ -14,8 +14,6 @@ family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose ch
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import time
 import tomllib
 from dataclasses import replace
@@ -29,15 +27,17 @@ from torch.utils.data import DataLoader
 from tracktail.datasets.scorer_corruption import GENERATORS
 from tracktail.model.losses_scorer import TripletScorerLoss
 
-from ..checkpoints import (SCORER_OUTPUT_GRANULARITIES, _SCORER_CONFIG,
-                           full_training_state, load_config, require_scorer_granularity,
+from ..checkpoints import (SCORER_OUTPUT_GRANULARITIES,
+                           full_training_state, require_scorer_granularity,
                            save_checkpoint, save_run_meta, scorer_checkpoint_granularity,
                            scorer_contract_mismatches, scorer_output_granularity, warm_start,
                            prior_provenance)
+from ..config import SCORER_CONFIG, load_config
 from ..dataset import LoaderConfig, PoseDataset, StepSampler
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
-from ..train import _gpu_peak_gb, build_optimizer, init_wandb, log
+from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
+from ..train import build_optimizer
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer, flatten_sequence_triplet
@@ -358,19 +358,6 @@ def build_datasets(config: dict, registry_base: Registry | None, *, rank: int = 
     val_base = PoseDataset(data_cfg['path'], 'val', val_lc, registry=registry,
                            rank=rank, world_size=world_size)
     return train_ds, ScorerDataset(val_base, corr), registry
-
-
-def timed(loader, wait: list[float]):
-    """Yield loader items while accumulating time blocked in ``next()``."""
-    iterator = iter(loader)
-    while True:
-        started = time.time()
-        try:
-            item = next(iterator)
-        except StopIteration:
-            return
-        wait[0] += time.time() - started
-        yield item
 
 
 def scorer_worker_init(worker_id: int, *, cv_threads: int = 2):
@@ -934,7 +921,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
     world = int(fabric.world_size) if fabric is not None else 1
     is0 = bool(fabric.is_global_zero) if fabric is not None else True
     device = fabric.device if fabric is not None else device
-    config = load_config(config_path, base=_SCORER_CONFIG)
+    config = load_config(config_path, base=SCORER_CONFIG)
     fresh_requested = fresh
     prior_config = out / 'config.toml'
     if prior_config.exists() and not fresh:
@@ -1248,7 +1235,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 values.update({
                     'train/iteration': iteration,
                     'train/grad_norm': float(grad_norm),
-                    'train/gpu_peak_gb': _gpu_peak_gb(device, reset=True),
+                    'train/gpu_peak_gb': gpu_peak_gb(device, reset=True),
                     'train/cpu_peak_gb': _cpu_peak_gb(),
                     'train/sec_per_it': dt,
                     'train/loader_wait_frac': wait_frac,
@@ -1292,32 +1279,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
         print(f'done: {n_iter} iterations into {out}')
 
 
-def launch(args):
-    """Launch Fabric once per rank; one triplet remains the per-rank batch."""
-    from lightning.fabric import Fabric
-    devices = int(args.devices)
-    if devices < 1:
-        raise SystemExit('--devices must be a positive count (scorer defaults to one)')
-    if devices != 1 and str(args.device).startswith('cuda:') and str(args.device) != 'cuda:0':
-        raise SystemExit('--device names one GPU and cannot be combined with --devices > 1')
-    if args.precision == '16-mixed':
-        raise SystemExit('--precision 16-mixed is unsupported by the scorer optimizer; use 32-true')
-    cpu = str(args.device).startswith('cpu') or not torch.cuda.is_available()
-    accelerator = 'cpu' if cpu else 'gpu'
-    dev_arg = 1 if cpu and devices == 1 else (1 if devices == 1 else devices)
-    strategy = args.strategy or ('auto' if devices == 1 else 'ddp_find_unused_parameters_true')
-    fabric = Fabric(accelerator=accelerator, devices=dev_arg, strategy=strategy,
-                    precision=args.precision)
-    fabric.launch()
-    os.environ['TAILCYCLENET_LOCAL_WORLD_SIZE'] = str(fabric.world_size)
-    if not fabric.is_global_zero:
-        sys.stdout = dist_utils.RankPrefix(sys.stdout, fabric.global_rank)
-    if fabric.world_size > 1:
-        fabric.print(f'distributed: {fabric.world_size} ranks, strategy {strategy!r}; '
-                     f'n_iterations are totals and absolute learning rates scale by '
-                     f'sqrt({fabric.world_size})')
-    return fabric
-
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
@@ -1351,7 +1312,7 @@ def main(argv: list[str] | None = None) -> int:
                              "checkpoint_last")
     args = parser.parse_args(argv)
     if args.config is None:
-        args.config = _SCORER_CONFIG
+        args.config = SCORER_CONFIG
     fabric = launch(args)
     run(args.config, args.data, Path(args.out), args.checkpoint, args.device,
         args.iterations, args.no_wandb, args.fresh, fabric=fabric,

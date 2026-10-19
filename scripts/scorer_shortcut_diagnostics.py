@@ -33,7 +33,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.checkpoints import load_config, load_scorer_run, _SCORER_CONFIG  # noqa: E402
+from tailcyclenet.checkpoints import load_scorer_run  # noqa: E402
+from tailcyclenet.config import SCORER_CONFIG, load_config  # noqa: E402
 from tailcyclenet.dataset import PoseDataset  # noqa: E402
 from tailcyclenet.scorer.dataset import ScorerDataset, triplet_to_device  # noqa: E402
 from tailcyclenet.scorer.dataset import scorer_collate  # noqa: E402
@@ -210,7 +211,7 @@ def main(argv=None) -> int:
     model, _rcfg, registry, ckpt = load_scorer_run(Path(args.run), device=args.device)
     model.eval()
     output_granularity = scorer_output_granularity(_rcfg)
-    config = load_config(args.config, base=_SCORER_CONFIG)
+    config = load_config(args.config, base=SCORER_CONFIG)
     config['scorer'] = {**config.get('scorer', {}),
                         'output_granularity': output_granularity}
     config['scorer']['corruption'] = {

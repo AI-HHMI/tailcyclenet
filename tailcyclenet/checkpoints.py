@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import copy
 import tomllib
-from importlib.resources import files as _pkg_files
 from pathlib import Path
 
 import torch
@@ -17,17 +16,9 @@ import torch
 from tracktail.model.train_utils import (_convert_cross_attn, _filter_shape_mismatch,
                                            _interp_res_params)
 
+from .config import check_image_size
 from .format import Registry
 from .model import build_model
-
-# Packaged, not repo-relative (`Path(__file__).resolve().parent.parent / 'configs' / ...` broke
-# under a pip install, whose site-packages tree has no `configs/` two levels up): `configs/` is
-# mapped into the wheel as `tailcyclenet.configs` (pyproject.toml `[tool.setuptools.package-dir]`)
-# and read back via importlib.resources, which resolves correctly under both an editable install
-# (reads the real repo-root `configs/` directly) and a built wheel (reads the packaged copy).
-_BASE_CONFIG = _pkg_files('tailcyclenet.configs') / 'base.toml'
-_DETECTOR_CONFIG = _pkg_files('tailcyclenet.configs') / 'detector.toml'
-_SCORER_CONFIG = _pkg_files('tailcyclenet.configs') / 'scorer.toml'
 
 # What a checkpoint or run folder is a checkpoint OF. A run folder's kind lives in its config as
 # `[run] kind`; a checkpoint's lives in the file. Both are written by `save_run_meta` /
@@ -251,72 +242,6 @@ def require_scorer_contract(config: dict, ckpt: dict, *, where='checkpoint') -> 
         details = ', '.join(f'{key}: checkpoint={old!r}, requested={new!r}'
                             for key, (old, new) in sorted(mismatches.items()))
         raise ValueError(f'{where}: scorer semantic contract mismatch ({details})')
-
-
-def _deep_merge(base: dict, over: dict) -> dict:
-    """Merge `over` into `base`, RECURSING when both sides are dicts.
-
-    The merge used to be one level per block (`base[block].update(over)`), so an overlay that set
-    `[training.optimizer] learning_rate` replaced the whole `optimizer` sub-dict and silently
-    wiped `muon_schedulefree`, `beta1`, `beta2` and both warmup keys -- the run then trained under
-    Muon's defaults with nothing saying so. The scorer's `[scorer.corruption.mag_3d]` is where it
-    would have bitten next: setting one magnitude replaced `corruption` entirely.
-
-    A DELIBERATE semantic change: a block can no longer be replaced wholesale, only merged into.
-    A config that wants replacement has to say so another way.
-
-    Blast radius was VERIFIED zero for everything shipped: the detector overlays use only flat
-    top-level blocks, `configs/datasets/*.toml` are `DatasetSpec` files that never reach
-    `load_config`, and run folders store their already-merged config.
-    """
-    out = dict(base)
-    for key, val in over.items():
-        if isinstance(val, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_merge(out[key], val)
-        else:
-            out[key] = val
-    return out
-
-
-def load_config(path, base: Path | None = None) -> dict:
-    """A run config layered over a base file -- the pose default is the packaged
-    `configs/base.toml`; the detector loader passes `configs/detector.toml` and the scorer loader
-    `configs/scorer.toml` (all via `_BASE_CONFIG`/`_DETECTOR_CONFIG`/`_SCORER_CONFIG`, never a
-    repo-relative path).
-
-    EVERY config layers over its family's base automatically: the `extends` key is deleted and
-    RAISES by name, and the overlay IS the whole difference. The merge RECURSES when both sides
-    of a key are dicts (see `_deep_merge`), so an overlay may set one key deep inside a block
-    without restating its siblings.
-    """
-    path = Path(path)
-    with open(path, 'rb') as f:
-        cfg = tomllib.load(f)
-    if 'extends' in cfg:
-        raise SystemExit(
-            f'{path.name}: `extends` is deleted -- every config layers over '
-            f'`{(base or _BASE_CONFIG).name}` automatically, so the key is not needed. '
-            'Delete the line and the recipe is unchanged.')
-    with open(base or _BASE_CONFIG, 'rb') as f:
-        base_cfg = tomllib.load(f)
-    return _deep_merge(base_cfg, cfg)
-
-
-def check_image_size(config: dict) -> None:
-    """`[model].image_size` and `[data].image_size` must agree; nothing else notices if they do
-    not. The loader resizes crops to the data value while the weights bake the model value into
-    the decode arithmetic -- both silent otherwise. `--refine-px` is the only thing that may walk
-    past this, because `model.PoseTrackerEncoder.forward` compensates for it.
-    """
-    model_px = config.get('model', {}).get('image_size')
-    data_px = config.get('data', {}).get('image_size')
-    if model_px is None or data_px is None or int(model_px) == int(data_px):
-        return
-    raise ValueError(
-        f'[model].image_size = {model_px} but [data].image_size = {data_px}. These must agree: '
-        f'the loader resizes crops to {data_px} while the model decodes as if they were '
-        f'{model_px}, shifting 2D predictions by {(int(model_px) - int(data_px)) // 2} px and '
-        f'scaling the 3D residual by {int(model_px) / int(data_px):g}.')
 
 
 def is_hf_repo_id(value: str) -> bool:

@@ -1,7 +1,7 @@
 """Detector training config: load, validate, apply CLI overrides.
 
 The detector is trained from a TOML config, the same way the pose side is (`scripts/train.py` +
-`checkpoints.load_config`). One shipped recipe lives in `configs/detector.toml`; EVERY detector
+`config.load_config`). One shipped recipe lives in `configs/detector.toml`; EVERY detector
 config layers over it automatically via `load_config`'s `base` argument.
 Absent keys inherit the shipped recipe; `extends` is deleted and raises by name. Keys are
 validated against an explicit allowed set so typos cannot silently train at defaults.
@@ -153,14 +153,14 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         their reason. The recommended shipped recipe is TAL + CIoU.
         The remaining keys (iou_aware_obj, box_weight, weight_decay, annot_frac, alpha,
         bottleneck_expansion, p2, optimizer, shared_head, fpn_upsample) each only matter
-        once a config states something else. The implicit base is `checkpoints._DETECTOR_CONFIG`
-        (one source of truth with the pose side's `_BASE_CONFIG`, both resolved via
+        once a config states something else. The implicit base is `config.DETECTOR_CONFIG`
+        (one source of truth with the pose side's `BASE_CONFIG`, both resolved via
         `importlib.resources` rather than a repo-relative path recomputed here, so a pip install
         works too), not a path this module computes on its own.
     """
-    from tailcyclenet.checkpoints import _DETECTOR_CONFIG, load_config
+    from tailcyclenet.config import DETECTOR_CONFIG, load_config
 
-    cfg = load_config(Path(path), base=_DETECTOR_CONFIG)
+    cfg = load_config(Path(path), base=DETECTOR_CONFIG)
     missing = [b for b, _ in BLOCKS if b not in cfg]
     if missing:
         raise SystemExit(f'{path}: missing block(s) {missing}. A detector config needs '

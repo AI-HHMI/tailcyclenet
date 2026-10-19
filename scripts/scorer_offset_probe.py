@@ -39,8 +39,8 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
-from tailcyclenet.checkpoints import (load_config, load_scorer_run, scorer_output_granularity,
-                                      _SCORER_CONFIG)  # noqa: E402
+from tailcyclenet.checkpoints import load_scorer_run, scorer_output_granularity  # noqa: E402
+from tailcyclenet.config import SCORER_CONFIG, load_config  # noqa: E402
 from tailcyclenet.scorer.qc import _loader_config, _to_device  # noqa: E402
 
 
@@ -143,7 +143,7 @@ def main(argv=None) -> int:
     spans = _load_spans(args.spans_csv)
     print(f'{len(spans)} span(s) requested')
 
-    config = load_config(args.config, base=_SCORER_CONFIG)
+    config = load_config(args.config, base=SCORER_CONFIG)
     T = int(config['data']['n_frames'])
     model, rcfg, registry, ckpt = load_scorer_run(Path(args.run), device=args.device)
     model.eval()

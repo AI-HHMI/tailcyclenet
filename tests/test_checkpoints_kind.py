@@ -5,7 +5,7 @@ a run that quietly means something else.
 
   * The merge was one level deep, so an overlay setting `[training.optimizer] learning_rate`
     replaced the whole `optimizer` sub-dict and silently discarded `muon_schedulefree`, `beta1`,
-    `beta2` and both warmup keys. `_deep_merge` recurses; a block can no longer be replaced
+    `beta2` and both warmup keys. `deep_merge` recurses; a block can no longer be replaced
     wholesale.
   * A checkpoint recorded no `kind` at all, and `_load_packaged_pose` defaulted a missing one to
     `'pose'`. A scorer IS a pose encoder plus heads, so a scorer checkpoint would have loaded as a
@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
 
 
@@ -48,7 +49,7 @@ warmup_steps = 500
 [training.optimizer]
 learning_rate = 2e-4
 """)
-    cfg = ck.load_config(over, base=base)
+    cfg = cfgmod.load_config(over, base=base)
     opt = cfg['training']['optimizer']
     assert opt['learning_rate'] == 2e-4, 'the overlay did not win'
     # every sibling survives -- under the old shallow merge all five of these vanished
@@ -78,7 +79,7 @@ sinusoid = 16.0
 [scorer.corruption.mag_3d]
 gradual_drift = 40.0
 """)
-    cfg = ck.load_config(over, base=base)
+    cfg = cfgmod.load_config(over, base=base)
     corr = cfg['scorer']['corruption']
     assert corr['mag_3d']['gradual_drift'] == 40.0, 'the overlay did not win'
     assert corr['mag_3d']['const_offset'] == 15.0, 'a sibling magnitude was discarded'
@@ -92,7 +93,7 @@ def test_an_overlay_that_did_not_exist_in_the_base_is_added_whole(tmp_path):
     base.write_text('[training]\nn_iterations = 10\n')
     over = tmp_path / 'over.toml'
     over.write_text('[scorer]\npool_num_heads = 4\n\n[scorer.corruption]\nconst_offset_prob = 1.0\n')
-    cfg = ck.load_config(over, base=base)
+    cfg = cfgmod.load_config(over, base=base)
     assert cfg['scorer']['pool_num_heads'] == 4
     assert cfg['scorer']['corruption']['const_offset_prob'] == 1.0
 
@@ -114,9 +115,9 @@ def test_the_shipped_configs_still_merge_to_the_same_dict(tmp_path):
         return out
 
     checked = 0
-    for overlay, base in (('detector/3dpop.toml', ck._DETECTOR_CONFIG),
-                          ('detector/branson-fly.toml', ck._DETECTOR_CONFIG),
-                          ('detector/rat-city.toml', ck._DETECTOR_CONFIG)):
+    for overlay, base in (('detector/3dpop.toml', cfgmod.DETECTOR_CONFIG),
+                          ('detector/branson-fly.toml', cfgmod.DETECTOR_CONFIG),
+                          ('detector/rat-city.toml', cfgmod.DETECTOR_CONFIG)):
         p = _packaged(overlay)
         if not p.exists():
             continue
@@ -124,7 +125,7 @@ def test_the_shipped_configs_still_merge_to_the_same_dict(tmp_path):
             over = tomllib.load(f)
         with open(base, 'rb') as f:
             base_cfg = tomllib.load(f)
-        assert ck._deep_merge(base_cfg, over) == shallow(base_cfg, over), \
+        assert cfgmod.deep_merge(base_cfg, over) == shallow(base_cfg, over), \
             f'{overlay}: the deepened merge changed this shipped config'
         checked += 1
     assert checked > 0, 'no shipped overlay was checked -- this test proves nothing'
@@ -132,7 +133,7 @@ def test_the_shipped_configs_still_merge_to_the_same_dict(tmp_path):
 
 def test_the_scorer_family_base_loads_and_its_kind_is_scorer():
     """`configs/scorer.toml` must be a real, loadable member of the scorer family."""
-    cfg = ck.load_config(_packaged('scorer.toml'), base=_packaged('scorer.toml'))
+    cfg = cfgmod.load_config(_packaged('scorer.toml'), base=_packaged('scorer.toml'))
     assert ck.run_kind(cfg) == 'scorer'
     assert cfg['model']['stride_length'] == cfg['data']['n_frames'] == 12
     assert cfg['model']['video_encoder_requires_grad'] is False

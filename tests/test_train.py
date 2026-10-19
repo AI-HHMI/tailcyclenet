@@ -445,7 +445,7 @@ def test_checkpoint_path_is_a_resume_only_for_full_training_state():
 def test_load_config_layers_over_the_repo_base_by_default(tmp_path):
     """A pose config that names no base still gets `configs/base.toml` as its defaults -- the
     `extends` line is gone, not needed: the overlay IS the whole difference."""
-    from tailcyclenet.checkpoints import load_config
+    from tailcyclenet.config import load_config
 
     overlay = tmp_path / 'overlay.toml'
     overlay.write_text('[data]\npath = "/some/root"\n')
@@ -463,7 +463,7 @@ def test_load_config_extends_is_deleted_and_raises(tmp_path):
     """`extends` is deleted from the config language: EVERY config layers over its family's
     base automatically (pose -> `configs/base.toml`, detector -> `configs/detector.toml`), so
     the key is not needed and naming it is refused by name."""
-    from tailcyclenet.checkpoints import load_config
+    from tailcyclenet.config import load_config
 
     p = tmp_path / 'old.toml'
     p.write_text('extends = "base.toml"\n[data]\npath = "/x"\n')
@@ -474,7 +474,7 @@ def test_load_config_extends_is_deleted_and_raises(tmp_path):
 def test_load_config_layers_over_an_explicit_base(tmp_path):
     """The detector loader passes `configs/detector.toml` as `base`; a config layered over a
     non-pose base must not inherit the pose base's blocks."""
-    from tailcyclenet.checkpoints import load_config
+    from tailcyclenet.config import load_config
 
     base = tmp_path / 'det_base.toml'
     base.write_text('[data]\nboxes = "instances"\n')

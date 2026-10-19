@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tracktail.datasets.scorer_corruption import GENERATORS
 from tracktail.model.cube import is_point_visible, project_points_torch
 
-from tailcyclenet.checkpoints import _SCORER_CONFIG, load_config
+from tailcyclenet.config import SCORER_CONFIG, load_config
 from tailcyclenet.dataset import PoseDataset
 from tailcyclenet.scorer.dataset import ScorerDataset
 from tailcyclenet.scorer.train import corruption_config, loader_config
@@ -89,7 +89,7 @@ def measure(config_path, windows: int, seed: int) -> dict:
     Outputs: {type_name: {'n', 'disp_px' (median), 'disp_px_p90', 'off_view_frac'}}.
     Side effects: reads the dataset root and decodes video.
     """
-    config = load_config(config_path, base=_SCORER_CONFIG)
+    config = load_config(config_path, base=SCORER_CONFIG)
     lc = loader_config(config['data'], config['model'])
     base = PoseDataset(config['data']['path'], 'train', lc, train=True)
     ds = ScorerDataset(base, corruption_config(config))

@@ -4,8 +4,6 @@ import pytest
 import torch
 
 from tailcyclenet.checkpoints import (
-    _SCORER_CONFIG,
-    load_config,
     require_scorer_granularity,
     save_checkpoint,
     scorer_checkpoint_granularity,
@@ -13,12 +11,13 @@ from tailcyclenet.checkpoints import (
     scorer_contract_mismatches,
     scorer_output_granularity,
 )
+from tailcyclenet.config import SCORER_CONFIG, load_config
 from tailcyclenet.scorer.losses import FrameTripletScorerLoss
 from tailcyclenet.scorer.train import validate_scorer_config
 
 
 def test_new_family_config_defaults_to_frame_but_absent_run_key_is_sequence():
-    config = load_config('configs/scorer.toml', base=_SCORER_CONFIG)
+    config = load_config('configs/scorer.toml', base=SCORER_CONFIG)
     assert scorer_output_granularity(config) == 'frame'
     assert scorer_output_granularity({'scorer': {}}) == 'sequence'
     assert validate_scorer_config({'scorer': {}, 'model': {}, 'data': {}}) == 'sequence'

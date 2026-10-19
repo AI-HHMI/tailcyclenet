@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from tailcyclenet import distributed as dist_utils
+from tailcyclenet import runtime
 from tailcyclenet.dataset import _reader_cache_size
 from tailcyclenet.optim import group_lr
 from tailcyclenet.unfreeze import apply_staged_unfreeze
@@ -468,13 +469,13 @@ def test_16_mixed_is_refused_by_name():
     handing it to Fabric. Refused loudly instead of silently training without the scaler.
     """
     with pytest.raises(SystemExit, match='GradScaler'):
-        _train_module().launch(_args(precision='16-mixed'))
+        runtime.launch(_args(precision='16-mixed'))
 
 
 def test_device_cpu_still_means_cpu():
     """`--device cpu` is how a smoke test runs on a box whose gpus are busy, and it predates
     `--devices`. An accelerator chosen from `cuda.is_available()` alone would overrule it."""
-    fabric = _train_module().launch(_args(device='cpu'))
+    fabric = runtime.launch(_args(device='cpu'))
     assert str(fabric.device) == 'cpu'
 
 
@@ -482,7 +483,7 @@ def test_one_device_and_many_devices_together_are_refused():
     """`--device cuda:1 --devices 4` would silently ignore the first: at more than one device the
     launcher places every rank."""
     with pytest.raises(SystemExit, match='--devices'):
-        _train_module().launch(_args(device='cuda:1', devices=4))
+        runtime.launch(_args(device='cuda:1', devices=4))
 
 
 def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
@@ -499,7 +500,7 @@ def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
         raise SystemExit('stop-before-fabric-launch')
 
     monkeypatch.setattr(lf.Fabric, '__init__', spy)
-    tr = _train_module()
+    tr = runtime
 
     monkeypatch.setattr('torch.cuda.device_count', lambda: 1)
     monkeypatch.setattr('torch.cuda.is_available', lambda: True)
@@ -528,6 +529,26 @@ def test_devices_minus_one_resolves_to_the_visible_count(monkeypatch):
         tr.launch(_args(devices=-1, device='cpu'))
     assert seen['devices'] == 1 and seen['strategy'] == 'auto' \
         and seen['accelerator'] == 'cpu', '--device cpu must not trip the multi-device refusal'
+
+
+def test_device_cuda_n_selects_that_gpu_at_one_device(monkeypatch):
+    """`--device cuda:2 --devices 1` runs on gpu 2 for every trainer that launches through
+    `runtime.launch` (the scorer's own copy used to hand Fabric `devices=1`, i.e. gpu 0)."""
+    import lightning.fabric as lf
+
+    seen = {}
+
+    def spy(self, *a, **k):
+        seen.update(k)
+        raise SystemExit('stop-before-fabric-launch')
+
+    monkeypatch.setattr(lf.Fabric, '__init__', spy)
+    monkeypatch.setattr('torch.cuda.is_available', lambda: True)
+    with pytest.raises(SystemExit, match='stop-before-fabric-launch'):
+        runtime.launch(_args(device='cuda:2', devices=1))
+    assert seen['devices'] == [2] and seen['accelerator'] == 'gpu'
+    from tailcyclenet.scorer import train as scorer_train
+    assert scorer_train.launch is runtime.launch
 
 
 # -- the two handles -----------------------------------------------------------------------

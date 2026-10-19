@@ -351,7 +351,7 @@ def test_unsupported_config_is_rejected():
 
 def test_mismatched_image_size_is_rejected():
     """Two keys named image_size that must agree, and nothing else notices when they do not."""
-    from tailcyclenet.checkpoints import check_image_size
+    from tailcyclenet.config import check_image_size
 
     check_image_size({'model': {'image_size': 256}, 'data': {'image_size': 256}})
     check_image_size({'model': {'image_size': 256}})                 # absent -> nothing to check

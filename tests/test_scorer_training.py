@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet import config as cfgmod
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
 from tailcyclenet.scorer.dataset import ScorerDataset
 
@@ -50,7 +51,7 @@ def test_scorer_build_datasets_excludes_test_split(scorer_root):
     """The scorer must not parse test metadata while building train and val datasets."""
     from tailcyclenet.scorer.train import build_datasets
 
-    cfg = ck.load_config(str(REPO / 'configs/scorer.toml'), base=ck._SCORER_CONFIG)
+    cfg = cfgmod.load_config(str(REPO / 'configs/scorer.toml'), base=cfgmod.SCORER_CONFIG)
     cfg['data'] = {**cfg['data'], 'path': str(scorer_root), 'num_workers': 0,
                    'val_num_workers': 0, 'n_frames': 4, 'image_size': 64,
                    'prob_2d_only': 0.0, 'aug_prob': 0.0, 'per_image_aug_prob': 0.0,
@@ -71,7 +72,7 @@ def test_val_uses_the_fixed_val_camera_count_not_the_train_range(scorer_root):
     """
     from tailcyclenet.scorer.train import build_datasets
 
-    cfg = ck.load_config(str(REPO / 'configs/scorer.toml'), base=ck._SCORER_CONFIG)
+    cfg = cfgmod.load_config(str(REPO / 'configs/scorer.toml'), base=cfgmod.SCORER_CONFIG)
     def val_counts_for(fixed: int) -> set[int]:
         cfg['data'] = {**cfg['data'], 'path': str(scorer_root), 'num_workers': 0,
                        'cams_to_sample': [1, 3], 'val_cams_to_sample': fixed,

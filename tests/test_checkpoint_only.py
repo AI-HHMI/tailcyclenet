@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from tailcyclenet import checkpoints as ck
+from tailcyclenet import config as cfgmod
 from tailcyclenet.format import Registry
 from tailcyclenet.model import build_model
 
@@ -26,7 +27,7 @@ def _pose_config():
 
 
 def _scorer_config():
-    config = ck.load_config(ck._SCORER_CONFIG, base=ck._SCORER_CONFIG)
+    config = cfgmod.load_config(cfgmod.SCORER_CONFIG, base=cfgmod.SCORER_CONFIG)
     model = {**SMALL, 'box_prompt': 'film'}
     model.pop('query_encoder', None)
     config['model'] = model

@@ -33,7 +33,7 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
-from tailcyclenet.checkpoints import load_config, _SCORER_CONFIG  # noqa: E402
+from tailcyclenet.config import load_config, SCORER_CONFIG  # noqa: E402
 
 
 def _frame_to_window(starts, n_frames, T):
@@ -151,7 +151,7 @@ def main(argv=None) -> int:
                     help='skip a keypoint with fewer than this many scored windows')
     args = ap.parse_args(argv)
 
-    config = load_config(args.config, base=_SCORER_CONFIG)
+    config = load_config(args.config, base=SCORER_CONFIG)
     T = int(config['data']['n_frames'])
     table = pl.read_parquet(args.scores)
     frame_mode = {'frame', 'local_t'}.issubset(table.columns)

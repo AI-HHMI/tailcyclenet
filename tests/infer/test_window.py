@@ -563,3 +563,18 @@ def test_a_range_is_byte_identical_where_the_window_partition_agrees(rat16):
     np.testing.assert_array_equal(
         np.nan_to_num(part['pred'][:, :last - a], nan=-9e9),
         np.nan_to_num(whole['pred'][:, a:last], nan=-9e9))
+
+
+def test_vis_gate_is_per_camera_and_drops_3d_only_when_every_camera_is_gated():
+    """One occluded camera withholds only its own 2D row; the 3D row needs every camera gated."""
+    import numpy as np
+
+    from tailcyclenet.infer.window import vis_gate
+
+    v2 = np.array([[[5.0, 5.0], [-5.0, -5.0]],
+                   [[-5.0, -5.0], [-5.0, -5.0]]])
+    drop, cam_drop = vis_gate(v2, None, 0.0)
+    assert cam_drop.tolist() == [[False, True], [True, True]]
+    assert drop.tolist() == [False, True]
+    drop, cam_drop = vis_gate(None, np.array([[1.0, 1.0], [-1.0, -1.0]]), 0.0)
+    assert cam_drop is None and drop.tolist() == [False, True]

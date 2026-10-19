@@ -153,8 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help='inflate every crop about its centre. Default 1.5 with the box on, '
                           'else 1.0.')
     win.add_argument('--vis-thresh', type=float, default=None,
-                     help="withhold an (animal, frame) row whose median `vis_pred` logit is "
-                          'below this (reported rows only, never the carried prompt).')
+                     help='PER-CAMERA gate: withhold an (animal, frame, camera) 2D row whose median '
+                          'per-camera visibility logit (`vis_pred_2d`) is below this; the 3D row is '
+                          'withheld only when every camera is gated (reported rows only, never the '
+                          'carried prompt).')
     win.add_argument('--min-box-frames', type=int, default=1,
                      help='finite (frame, camera) boxes a row needs before it gets a window '
                           'crop; raising it lowers reported coverage on purpose.')

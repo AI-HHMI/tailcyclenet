@@ -244,6 +244,25 @@ def run_group(model, session: Session, gid: str, registry, dataset_name: str,
 
 
 @torch.no_grad()
+
+def vis_gate(v2, vlogit, thresh):
+    """The `--vis-thresh` gate for one (animal, window): which rows are withheld.
+
+    Per camera: a camera's 2D row at a frame is gated when the median over keypoints of its own
+    visibility logit (`vis_pred_2d`) is below `thresh`; the frame's 3D row is gated only when EVERY
+    camera is (per-camera AUROC 0.975 vs 0.687 for the noisy-OR aggregate, dev/plans/vis_thresh_head.md).
+    Without per-camera logits it falls back to the median of the aggregate `vis_pred`.
+
+    Inputs: v2 -- (C, T, K) per-camera logits or None; vlogit -- (T, K) aggregate logits or None.
+    Outputs: (drop (T,) bool, cam_drop (C, T) bool or None).
+    """
+    with warnings.catch_warnings(), np.errstate(all='ignore'):
+        warnings.simplefilter('ignore', RuntimeWarning)
+        if v2 is not None:
+            cam_drop = ~(np.nanmedian(np.asarray(v2, dtype=np.float64), axis=-1) >= thresh)
+            return cam_drop.all(axis=0), cam_drop
+        return ~(np.nanmedian(vlogit, axis=-1) >= thresh), None
+
 def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                cfg: InferConfig, box_points=None, boxes_for=None, n_rows=None, stats=None, *,
                scorer=None, shared_scene_encoder=False):
@@ -686,11 +705,10 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 conf[a, frames - f0] = v
                 vlogit = v
             drop = np.zeros(len(frames), dtype=bool)
-            if cfg.vis_thresh is not None and vlogit is not None:
-                with warnings.catch_warnings(), np.errstate(all='ignore'):
-                    warnings.simplefilter('ignore', RuntimeWarning)
-                    med = np.nanmedian(vlogit, axis=-1)
-                drop = ~(med >= cfg.vis_thresh)
+            cam_drop = None
+            gate = cfg.vis_thresh is not None and (v2 is not None or vlogit is not None)
+            if gate:
+                drop, cam_drop = vis_gate(v2, vlogit, cfg.vis_thresh)
             if cfg.capture_window_predictions:
                 start_w = int(frames[0])
                 stop_w = min(start_w + cfg.n_frames, T_total)
@@ -745,7 +763,8 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                              'confidence_logit': conf_logit,
                                              'confidence_probability': (logit_probability(conf_logit)
                                                                         if conf_logit is not None else None),
-                                             'gated': gated if mode == '2d' else False})
+                                             'gated': bool(cam_drop[i, ti]) if cam_drop is not None
+                                             else (gated if mode == '2d' else False)})
                                 if quality_window is not None and mode == '2d':
                                     score_value = float(quality_window[ti, k])
                                     precision_value = float(precision_window[ti, k])
@@ -771,7 +790,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                          'box_agree': float(agree) if np.isfinite(agree) else None})
                             window_records.append(reci)
             j = max(0, len(frames) - cfg.overlap) if cfg.overlap else len(frames) - 1
-            if cfg.vis_thresh is not None and vlogit is not None:
+            if gate:
                 if quality_window is not None:
                     quality[a, frames[drop] - f0] = np.nan
                     quality_precision[a, frames[drop] - f0] = np.nan
@@ -779,13 +798,15 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 p[drop] = np.nan
                 conf[a, frames[drop] - f0] = np.nan
                 box_agree[a, frames[drop] - f0] = np.nan
-                if mode == '2d' and p2 is not None:
+                if p2 is not None and (cam_drop is not None or mode == '2d'):
                     for i, ci in enumerate(use):
-                        pred2d[a, frames[drop] - f0, ci] = np.nan
+                        off = frames[cam_drop[i] if cam_drop is not None else drop] - f0
+                        pred2d[a, off, ci] = np.nan
+                        box_agree[a, off, ci] = np.nan
                         if v2 is not None:
-                            conf2d[a, frames[drop] - f0, ci] = np.nan
+                            conf2d[a, off, ci] = np.nan
                         if c2 is not None:
-                            model_conf2d[a, frames[drop] - f0, ci] = np.nan
+                            model_conf2d[a, off, ci] = np.nan
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
                 capture_overlap_agreement(stats, a, frames, f0, pred, p)
             pred[a, frames - f0] = p

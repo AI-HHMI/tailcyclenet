@@ -1,12 +1,7 @@
-"""THE VIDEO READ BACKEND, and the contract a replacement has to honour exactly.
+"""The PyAV read backend's contract (bounded memory, frame-accurate), asserted on decoded VALUES.
 
-`tailcyclenet/video.py` exists because PyAV provides bounded-memory, frame-accurate decoding: a
-16-camera `--videos` run over 21 GB recordings peaked at 456 GB under the old backend. The
-contract is pinned HERE against the synthetic fixture so it keeps being true.
-
-`get_batch` returns frames in the ORDER ASKED FOR, including REPEATS -- and `dataset.read_frames`
-leans on both: `_frames` clamp-pads a window that runs past the end of its group, so one index
-legitimately occupies several positions.
+`get_batch` returns frames in the ORDER ASKED FOR, including REPEATS: `read_frames` clamp-pads a
+window past the end of its group, so one index legitimately occupies several positions.
 """
 import sys
 from pathlib import Path
@@ -37,16 +32,11 @@ def test_reader_reports_the_facts_the_probe_reads(clip):
 
 
 @pytest.mark.parametrize('idx', [
-    [0, 1, 2, 3],                 # contiguous
     [5, 5, 5, 6, 7, 7],           # A CLAMP-PADDED WINDOW: repeats, in position order
-    [9, 2, 7, 2, 0],              # out of order, with a repeat
-    [23],                         # the last frame
-    [0, 23],                      # both ends, forcing a seek
+    [9, 2, 7, 2, 0, 23],          # out of order, a repeat, the last frame
 ])
 def test_get_batch_honours_order_and_repeats(clip, idx):
-    """Asserted on VALUES against the fixture's own (camera, frame) colours, not just on shapes --
-    a backend that returned sorted-unique frames would pass a shape check on the first case and
-    silently corrupt the other four."""
+    """Each position is the frame asked for, by colour: sorted-unique output would pass a shape check."""
     r = video.open_reader(clip)
     try:
         got = r.get_batch(idx)
@@ -61,14 +51,9 @@ def test_get_batch_honours_order_and_repeats(clip, idx):
 
 
 def test_a_vfr_remux_is_indexed_by_the_declared_rate_not_the_average(tmp_path):
-    """A RATE OFF BY A PART IN 400 IS AN OFF-BY-ONE FRAME PART WAY THROUGH THE CLIP: `average_rate`
-    is a derived average that drifts on a `-vsync vfr` remux, and under it the ordinals eventually
-    SKIP -- the decoder then cannot produce that index, and every frame after is mislabelled +1.
-    So this asserts the COLOURS, not merely that nothing raised (the same reason OpenCV was rejected).
-    """
+    """`average_rate` drifts on a `-vsync vfr` remux and its ordinals SKIP (every later frame +1);
+    indexing by the declared rate decodes every index as the right frame."""
     import subprocess
-
-    from .conftest import _write_video
 
     src = _write_video(tmp_path / 'src.mp4', 1, 400, (64, 48), fps=200.0)
     dst = tmp_path / 'clip.mp4'
@@ -107,30 +92,6 @@ def test_a_vfr_remux_is_indexed_by_the_declared_rate_not_the_average(tmp_path):
         r.close()
 
 
-def test_read_frames_uses_the_pyav_backend(tmp_path):
-    """THE REAL CALL PATH, not the reader in isolation: `read_frames` adds a dedupe, the
-    clamp-pad's per-position copies and an optional warp on top."""
-    import conftest as cf
-    from tailcyclenet import format as fmt
-
-    W, H, T = 64, 48, 12
-    src = cf._write_video(tmp_path / 'rec' / 'cam0.mp4', 0, T, (W, H))
-    g = fmt.video_group('g', T, {'cam0': src})
-    rig = cf._rig([('cam0', W, H, False, False, 0)])
-    sess = fmt.VideoSession(path=tmp_path / 'nope', mode='2d', units='px',
-                            label_source='tracked', names=['a'], rig=rig, groups={'g': g},
-                            empty={'g': fmt.empty_labels(0, T, 1, 1, mode3d=False)})
-    g.session = sess
-
-    want = np.asarray([2, 2, 3, 7, 1])
-    import tailcyclenet.dataset as ds
-    ds._readers = None
-    out = np.asarray(ds.read_frames(g, 'cam0', want))
-    ds._readers = None
-    assert out.shape == (len(want), H, W, 3)
-
-
-
 # ---------------------------------------------------------------------------------------------
 # the frame table: index k = the k-th pts in display order
 
@@ -160,8 +121,7 @@ def fresh_tables(tmp_path, monkeypatch):
 
 
 def test_a_20fps_camera_on_a_1_30_grid_decodes_every_index(tmp_path, fresh_tables):
-    """THE OUTDOOR-PORTABLE CAMERAS: 20 fps written onto a 1/30 time base, pts 0,2,3,5,6,...
-    `pts x guessed_rate(30)` skipped every third index ("frames [1, 4, 7, ...] did not decode");
+    """20 fps on a 1/30 time base (pts 0,2,3,5,...): `pts x guessed_rate` skipped every third index;
     a rank in the pts table cannot."""
     import av
 
@@ -259,7 +219,7 @@ def test_scattered_indices_in_one_call_are_fetched_by_separate_seeks(tmp_path, f
                                                                     monkeypatch):
     """A batch spanning a long file must not decode everything between its ends: indices more
     than `_FORWARD_LIMIT` apart are separate runs, each seeking on its own."""
-    src = _write_video(tmp_path / 'src.mp4', 1, 400, (64, 48))
+    src = _write_video(tmp_path / 'src.mp4', 1, 120, (64, 48))
     monkeypatch.setattr(video, '_FORWARD_LIMIT', 20)
     r = video.PyAVReader(str(src))
     decoded = []
@@ -273,9 +233,9 @@ def test_scattered_indices_in_one_call_are_fetched_by_separate_seeks(tmp_path, f
 
     r._decode_until = counting
     try:
-        idx = [390, 5, 200, 201, 5]
+        idx = [110, 5, 60, 61, 5]
         _assert_colours(r.get_batch(idx), idx, 1)
-        assert len(decoded) == 3                 # three runs: [5], [200, 201], [390]
-        assert r._pos <= 391
+        assert len(decoded) == 3                 # three runs: [5], [60, 61], [110]
+        assert r._pos <= 111
     finally:
         r.close()

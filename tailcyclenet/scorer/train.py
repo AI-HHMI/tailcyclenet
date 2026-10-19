@@ -585,42 +585,12 @@ def _frame_localization_counts(scores: torch.Tensor, trip: dict):
     return good, bad
 
 
-def _frame_direct_metrics(scores: torch.Tensor, trip: dict) -> dict:
-    """Count-based active metrics for one framewise triplet (not a window average)."""
-    active = trip.get('active_mask')
-    if active is None:
-        active = torch.ones(scores.shape[:-1], dtype=torch.bool, device=scores.device)
-    active = active.bool()
-    if active.ndim == scores.ndim - 1 and active.shape != scores.shape[:-1]:
-        active = active.reshape(scores.shape[:-1])
-    correct = scores[..., 0] > scores[..., 1]
-    gap = scores[..., 0] - scores[..., 1]
-    n = int(active.sum())
-    out = {
-        'val/n_active_rows': float(n),
-        'val/active_fraction': float(active.float().mean()),
-    }
-    if n:
-        out['val/active_triplet_acc'] = float(correct[active].float().mean())
-        out['val/active_score_gap'] = float(gap[active].mean())
-    return out
-
-
-def _move_triplet_metadata(trip: dict, device) -> dict:
-    """Move framewise masks/weights that are not part of the three model members."""
-    for key, value in list(trip.items()):
-        if torch.is_tensor(value):
-            trip[key] = value.to(device)
-    return trip
-
-
 def evaluate(model, loader, loss_fn, device, max_batches: int,
              optimizer=None, output_granularity: str = 'sequence') -> dict:
     """The held-out synthetic pass, with count-based frame metrics in frame mode."""
     model.eval()
     averaged = optimizer is not None and hasattr(optimizer, 'eval')
     per_type: dict[str, list] = {}
-    direct: dict[str, list] = {}
     type_totals: dict[str, list[float]] = {}
     pointwise_chunks = []
     pointwise_type_chunks: dict[str, list] = {}
@@ -640,7 +610,6 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
                     continue
                 rejection_draws += int(trip.get('rejected_draws', 0))
                 trip = triplet_to_device(trip, device)
-                trip = _move_triplet_metadata(trip, device)
                 scores, precision, labels = model.score_triplet(trip)
                 scorer_loss(loss_fn, scores, precision, labels, trip, output_granularity)
                 if output_granularity == 'frame':
@@ -743,8 +712,6 @@ def evaluate(model, loader, loss_fn, device, max_batches: int,
         if view_counts['base_far']:
             out['val/reference_rejected_fraction'] = (
                 view_counts['reference_rejected'] / view_counts['base_far'])
-    else:
-        out.update({k: float(np.mean(v)) for k, v in direct.items()})
     out['val/n_scored'] = float(seen)
     out['val/n_rejected_draws'] = float(rejection_draws)
     out['val/rejection_rate'] = float(rejection_draws / (rejection_draws + seen)
@@ -1076,7 +1043,6 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
                 step += 1
                 continue
             trip = triplet_to_device(trip, device)
-            trip = _move_triplet_metadata(trip, device)
             if wrap:
                 scores, precision, labels = model(trip)
             else:

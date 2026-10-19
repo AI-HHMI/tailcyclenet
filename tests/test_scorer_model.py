@@ -418,7 +418,6 @@ def test_frame_mode_triplet_keeps_structured_axes(scorer_batch):
         'kpt_ids': kpt_ids,
         'anchor_label': 1.0,
         'occlusion': None,
-        'reuse_scene_for_anchor': False,
     }
     frame = _scorer(K, stride_length=4, output_granularity='frame').eval()
     with torch.no_grad():

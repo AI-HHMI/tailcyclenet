@@ -31,7 +31,6 @@ from tracktail.datasets.scorer_corruption import (GENERATORS, PointCorruptor, ap
 from tracktail.model.cube import (get_camera_scale, is_point_visible,
                                      project_points_torch)
 
-TRIPLET_KEYS = ('good', 'bad', 'anchor')
 
 # The corruption types that can move a SINGLE observed slot, which is all a sparse window can be
 # trained on. `gradual_drift` and `sinusoid` ramp from or through zero, so at one observed frame
@@ -904,7 +903,6 @@ def make_triplet(dataset, sel, rng, cfg, corruptors, cam_thresh=1):
         'anchor_label': anchor_label,
         'mode': mode,
         'source': sel.sess.label_source,
-        'reuse_scene_for_anchor': False,
         'occlusion': None,
         'counts': counts[:, keep],
         'fired': fired_keep,

@@ -82,3 +82,33 @@ def test_train_detector_prints_the_iteration_detector_pth_holds(tmp_path, monkey
     assert saved == max(h['iteration'] for h in history if h['selection_score'] == best_score)
     printed = re.search(r'best: it (\d+)', capsys.readouterr().out)
     assert printed and int(printed.group(1)) == saved
+
+
+@pytest.mark.parametrize('key', ['input_wh', 'tile_wh'])
+def test_convnext_config_refuses_an_input_side_not_divisible_by_32(tmp_path, key):
+    """detector B3: convnext-t floors `side / stride`, so [120, 96] crashed in the first forward
+    (PAFPN concat); the config now refuses it by name. 128 x 96 still loads."""
+    from tailcyclenet.detector.config import load_detector_config
+    cfg = tmp_path / 'c.toml'
+    body = '[model]\nyolox = "convnext-t"\npretrained = ""\n[training]\nout = "{o}"\n'
+    cfg.write_text(f'[data]\npath = "{tmp_path}"\n{key} = [120, 96]\n' + body.format(o=tmp_path))
+    with pytest.raises(SystemExit, match=f'{key}.*divisible by 32'):
+        load_detector_config(cfg)
+    cfg.write_text(f'[data]\npath = "{tmp_path}"\n{key} = [128, 96]\n' + body.format(o=tmp_path))
+    assert load_detector_config(cfg)['data'][key] == [128, 96]
+    cfg.write_text(f'[data]\npath = "{tmp_path}"\n{key} = [120, 96]\n'
+                   + body.replace('convnext-t', 'trimmed').format(o=tmp_path))
+    assert load_detector_config(cfg)['data'][key] == [120, 96]
+
+
+def test_load_detector_refuses_a_convnext_override_not_divisible_by_32(tmp_path):
+    """detector B3: an `input_wh` override reaching a convnext-t checkpoint is refused at load,
+    not by an opaque RuntimeError in `detect_raw`'s first forward."""
+    from tailcyclenet.detector import YOLOXNano, load_detector
+    model = YOLOXNano(version='convnext-t', pretrained='')
+    path = tmp_path / 'det.pth'
+    torch.save({'kind': 'detector', 'input_wh': [128, 96], 'norm': 'gn',
+                'yolox_version': 'convnext-t', 'model_state': model.state_dict()}, path)
+    assert load_detector(path)[1] == (128, 96)
+    with pytest.raises(ValueError, match='divisible by 32'):
+        load_detector(path, input_wh=(120, 96))

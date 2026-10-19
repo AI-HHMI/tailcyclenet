@@ -96,6 +96,23 @@ def _raise_unknown(block: str, cfg: dict, known: frozenset) -> None:
             f'{sorted(known)}')
 
 
+INPUT_MULTIPLE = {'convnext-t': 32}
+
+
+def input_size_error(version: str, wh):
+    """Why `wh` cannot be fed to a `version` backbone, or None when it can.
+
+    ConvNeXt's patchify/downsample convs floor `side / stride`, so a side that is not a multiple
+    of the coarsest stride (32) breaks the PAFPN concat in the first forward. Every other
+    architecture pads its strided convs and takes any size.
+    """
+    multiple = INPUT_MULTIPLE.get(str(version))
+    if not multiple or wh is None or all(int(v) % multiple == 0 for v in wh):
+        return None
+    return (f'yolox={version!r} needs both input sides divisible by {multiple}, got '
+            f'{list(wh)}; round each side to a multiple of {multiple}.')
+
+
 def _pair(key: str, value):
     """A `[w, h]` list from TOML, or None when empty. Any other shape raises."""
     if value in (None, [], ''):
@@ -313,6 +330,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                              f"pretrained={model['pretrained']!r} does not match it.")
 
     model['p2'] = bool(model.get('p2', False))
+    for key in ('input_wh', 'tile_wh'):
+        why = input_size_error(model['yolox'], data[key])
+        if why:
+            raise SystemExit(f'[data].{key}: {why}')
 
     train['assignment'] = str(train.get('assignment', 'tal'))
     if train['assignment'] not in ('center', 'tal'):

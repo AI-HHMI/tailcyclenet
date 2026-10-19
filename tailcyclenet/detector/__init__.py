@@ -82,20 +82,18 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
 
     The input size, min_crop_dim, box_source and tile_scale are recorded in the checkpoint because
     each is part of the weights: the letterbox a detector was trained under decides what an animal
-    looks like to it, and a mismatch serves boxes from a different crop rule silently. `input_wh`
-    supplies the size for checkpoints that predate the field. `yolox_version`,
-    `bottleneck_expansion`, `p2` and `in_channels` similarly record the architecture the weights
-    were shaped for (absent = the pre-key default), used only to build the right model internally.
+    looks like to it, and a mismatch serves boxes from a different crop rule silently. `input_wh`,
+    when given, OVERRIDES the recorded size (and supplies one for checkpoints that predate the
+    field); a size the architecture cannot take is refused here, not in the first forward.
+    `yolox_version`, `bottleneck_expansion`, `p2` and `in_channels` similarly record the
+    architecture the weights were shaped for (absent = the pre-key default), used only to build
+    the right model internally.
     For a run directory, `checkpoint='latest'` selects and verifies the highest complete
     `detector_it*.pth`; `checkpoint='last'` explicitly selects `detector_last.pth`; `checkpoint='best'`
     explicitly selects historical `detector.pth`.
 
-    A ViT backbone's own DINOv2 patch embedding needs both input dims divisible by 14 and the
-    coarsest FPN stride needs 32 -- LCM 224. `train_detector.py` already rounds to this at
-    training time, so the check here only bites an explicit `--det-input-wh` override (or a
-    checkpoint that predates the `input_wh` field). Absent `norm` means BatchNorm: the key only
-    exists since the model became GroupNorm, and there are no running statistics to load into a
-    GroupNorm model. `tile_scale` is meaningless without `tile_wh`, so it is dropped (untiled runs
+    Absent `norm` means BatchNorm: the key only exists since the model became GroupNorm, and
+    there are no running statistics to load into a GroupNorm model. `tile_scale` is meaningless without `tile_wh`, so it is dropped (untiled runs
     record 1.0). The trailing objectness quantiles describe the distribution this checkpoint
     produces; `--det-score` is not portable across detector generations, so callers warn rather
     than guess a threshold. `box_target`/`antialias` (what the head regresses, how its input was
@@ -113,11 +111,14 @@ def load_detector(path, device='cpu', input_wh=None, checkpoint='latest'):
         raise ValueError(f'{p}: no input_wh in the checkpoint -- a posetail-pose detector keeps '
                          'it in its dataset config. Pass --det-input-wh W H (rat-city 896 384, '
                          'branson-fly 416 416).')
-    from .config import deleted_yolox_reason
+    from .config import deleted_yolox_reason, input_size_error
     why = deleted_yolox_reason(ckpt.get('yolox_version', ''))
     if why:
         raise ValueError(f"{p}: yolox={ckpt.get('yolox_version')!r} is a deleted architecture "
                          f'({why}); retrain this detector on the default (convnext-t).')
+    why = input_size_error(ckpt.get('yolox_version', 'trimmed'), wh)
+    if why:
+        raise ValueError(f'{p}: input_wh {list(wh)}: {why}')
     norm = str(ckpt.get('norm', 'bn'))
     if norm != 'gn':
         raise ValueError(

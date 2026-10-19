@@ -17,7 +17,6 @@ from einops import einsum, rearrange, repeat
 from tracktail.model.cube import from_homogeneous, to_homogeneous, undistort_points
 from tracktail.model.tracker_encoder import TrackerEncoder
 
-from .dataset import prior_out_of_bounds
 from .query_encoder import BOX_ENCODERS, BOX_MODES, WideQueryEncoder
 
 QUERY_MODES = ('prior', 'none')
@@ -649,8 +648,12 @@ def self_prompt(model, views, kpt_ids, cgroup, mode, first, kpt_chunk=None, box_
     already in the model's own frame (the pose is `(1,K,R)`). It gets the same bounds mask
     `carry` gets: a keypoint outside its own crop is NaN, which is what the no-query tokens key
     off. The box prompt carries into the second pass unchanged: the window has not moved. Shared
-    with the trainer so training and inference report the same number.
+    with the trainer so training and inference report the same number. `prior_out_of_bounds` is
+    imported here, not at module level: `dataset` pulls pandas through tracktail, and table-only
+    modules that import the model must not.
     """
+    from .dataset import prior_out_of_bounds
+
     p = first['coords_pred'][0].detach()
     prior = p[0][None].clone()
     prior[0, prior_out_of_bounds(prior[0], mode, cgroup)] = float('nan')

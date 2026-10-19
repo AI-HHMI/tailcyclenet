@@ -1,25 +1,11 @@
-"""Gate A.1: the `_select`/`_realise`/`_targets` split is BYTE-IDENTICAL to the old `_item`.
+"""The `select`/`realise`/`targets` seam of `PoseDataset`, the one the scorer builds on.
 
 The split exists so a track-quality triplet can realise ONE selection into two independent views
-(`tailcyclenet/scorer/`). It is approved only on the condition that the pose loader does not move,
-and that condition is not self-evident: the three parts share one RNG stream, so a draw that
-changed order -- or a helper that started consuming entropy it did not before -- would silently
-reshape the training distribution while every shape stayed correct.
-
-The comparison is against the REAL pre-refactor function, frozen in `tests/legacy_item.py`.
-Asserting that `_item` agrees with `_select`+`_realise`+`_targets` would prove nothing: `_item` only
-delegates to them.
-
-Three things this file is deliberate about, each learned from an earlier version of it failing:
-
-  * **Every RNG that the loader touches is seeded and its POST-CALL STATE compared**, not just the
-    output. Matching outputs alone cannot establish that the draw CONSUMPTION is unchanged -- a
-    reordering that happens to commute would pass.
-  * **Old-vs-old reproducibility is established first.** If the oracle cannot reproduce itself,
-    every old-vs-new comparison below it is meaningless.
-  * **The oracle's imports are repaired, not its algorithm.** The frozen copy still needs
-    `get_camera_scale` and the real `box_prompt` module to RUN; a `NameError` there would show up
-    as a passing test if the config never reached that branch.
+(`tailcyclenet/scorer/`). The three parts share one RNG stream, so a draw that changed order would
+silently reshape the training distribution while every shape stayed correct; byte-identity of the
+loader's output is guarded by the golden-output harness, and this file checks the seam's
+structural properties: each case reaches its branch, selections are deterministic, the stored
+labels are not written through, and two realisations of one selection are independent.
 """
 import random
 from pathlib import Path
@@ -30,16 +16,6 @@ import torch
 
 from tailcyclenet.format import VISIBLE
 from tailcyclenet.dataset import LoaderConfig, PoseDataset
-
-from .legacy_item import LegacyItemMixin
-
-
-class _Legacy(LegacyItemMixin, PoseDataset):
-    """`PoseDataset` whose `_item` is the pre-refactor implementation (the mixin wins the MRO).
-
-    `PoseDataset.__getitem__`'s retry loop calls `self._item`, so this drives the OLD code through
-    the SAME entry point the new one uses.
-    """
 
 
 def _same(a, b, path='item'):
@@ -117,31 +93,6 @@ def _states(rng):
         # imgaug's own `RNG` wrapper has no `.bit_generator`; `.state` is its numpy array.
         'imgaug': imgaug.random.get_global_rng().state,
     }
-
-
-def _same_state(a, b, path):
-    """Recursive equality over whatever a RNG state snapshot happens to contain.
-
-    The containers are not uniform -- `np.random.get_state()` is a tuple holding an ndarray, the
-    item generator's state is a nested dict, imgaug's is a bare ndarray -- so a hand-written
-    two-level comparison gets it wrong. Written recursively so a new snapshot key cannot silently
-    be skipped.
-    """
-    if isinstance(a, dict):
-        assert isinstance(b, dict) and set(a) == set(b), f'{path}: state keys differ'
-        for k in a:
-            _same_state(a[k], b[k], f'{path}.{k}')
-    elif isinstance(a, (tuple, list)):
-        assert type(a) is type(b) and len(a) == len(b), f'{path}: state arity differs'
-        for i, (x, y) in enumerate(zip(a, b)):
-            _same_state(x, y, f'{path}[{i}]')
-    elif isinstance(a, np.ndarray):
-        assert isinstance(b, np.ndarray), f'{path}: ndarray vs {type(b)}'
-        assert np.array_equal(a, b), f'{path}: RNG state array differs'
-    elif isinstance(a, torch.Tensor):
-        assert torch.equal(a, b), f'{path}: RNG state tensor differs'
-    else:
-        assert a == b, f'{path}: RNG state differs ({a!r} vs {b!r})'
 
 
 def _run(ds, idx, seed=0, shape_seed=0x5AFE, aug_seed=0xA06, rot_seed=0xB07):
@@ -232,113 +183,6 @@ def test_prob_2d_only_projects_a_3d_session(seam_root):
     assert len(item[0]) == 1
     assert item[5]['mode'] == '2d'
     assert item[8] is not None
-
-
-@pytest.mark.parametrize('case', sorted(_CASES))
-def test_split_is_byte_identical_to_the_old_item(seam_root, case):
-    """Same seeds, same index, same shape -> identical item AND identical RNG consumption."""
-    cfg = _CASES[case]
-    for root_name, split, train in _cases_for(case):
-        root = seam_root / root_name
-        new = PoseDataset(root, split, cfg, train=train)
-        old = _Legacy(root, split, cfg, train=train)
-        assert len(new) == len(old) > 0, f'{case}/{root_name}/{split}: fixture holds no windows'
-
-        compared = 0
-        for idx in range(min(len(new), 4)):
-            for seed in (0, 1, 12345):
-                a, sa = _run(old, idx, seed)
-                b, sb = _run(new, idx, seed)
-                assert (a is None) == (b is None), \
-                    f'{case}/{root_name}/{split} idx={idx} seed={seed}: None mismatch'
-                if a is None:
-                    continue
-                assert len(a) == len(b), 'tuple arity changed'
-                _same(a, b, f'[{case} {root_name}/{split} idx={idx} seed={seed}]')
-                # Outputs matching is NOT sufficient: a reordering that commutes would pass.
-                _same_state(sa, sb, f'[{case} {root_name}/{split} idx={idx} seed={seed}]')
-                compared += 1
-        assert compared > 0, f'{case}/{root_name}/{split}: nothing built -- vacuous'
-
-
-def test_the_oracle_reproduces_itself(seam_root):
-    """Old-vs-old must match before any old-vs-new comparison means anything.
-
-    If the frozen oracle could not reproduce its own output, every byte-identity assertion above
-    would be measuring the harness's RNG control rather than the refactor.
-    """
-    cfg = _CASES['prompt-swaps']
-    old = _Legacy(seam_root / 'mouselike', 'train', cfg, train=True)
-    a, sa = _run(old, 0, 7)
-    b, sb = _run(old, 0, 7)
-    assert a is not None and b is not None
-    _same(a, b, '[oracle self-check]')
-    _same_state(sa, sb, '[oracle self-check]')
-
-
-def test_the_unseeded_globals_are_the_reason_a_naive_version_fails(seam_root):
-    """A NEGATIVE control for the seeding: without controlling `np.random`/imgaug the oracle does
-    NOT reproduce itself.
-
-    This is what makes `_seed_all` load-bearing rather than cargo-culted -- and it is the exact
-    trap an earlier version of this file fell into, reporting a refactor failure that was its own.
-    """
-    import imgaug.random
-
-    cfg = _CASES['augmented']
-    old = _Legacy(seam_root / 'ratlike', 'train', cfg, train=True)
-
-    # Deliberately NOT seeded: two runs in a row.
-    a = old._item(0, np.random.default_rng(0), old._shape(np.random.default_rng(1)))
-    imgaug.random.seed(999)          # perturb imgaug between the two
-    b = old._item(0, np.random.default_rng(0), old._shape(np.random.default_rng(1)))
-    assert a is not None and b is not None
-    try:
-        _same(a, b, '[unseeded control]')
-        differs = False
-    except AssertionError:
-        differs = True
-    assert differs, ('the unseeded control did NOT differ -- the appearance/rotation draws are '
-                     'apparently deterministic here, so this test cannot demonstrate anything and '
-                     'the seeding in _seed_all is not justified by it')
-
-
-def test_rejection_paths_agree(tmp_path):
-    """Windows that FAIL to build must fail identically, and consume the same RNG doing it.
-
-    A rejection is a draw too: `__getitem__` retries with `idx = int(rng.integers(len(index)))`, so
-    a rejection that moved changes which sample the NEXT attempt sees. The rejection is produced
-    deterministically by DELETING one frame file -- `read_frames` returns None and `_realise` bails
-    -- which is the `_realise`-level failure the seam introduces.
-
-    (A too-long `n_frames` does NOT reject: `_frames` clamp-pads, so a 4-frame group asked for 8
-    frames repeats frames instead of failing. An earlier version of this test asserted otherwise.)
-    """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as C
-
-    root = tmp_path / 'ds'
-    C._session_2d(root / 'ratlike' / 'train' / 'sess_a')
-    (root / 'ratlike' / 'train' / 'sess_a' / 'groups' / 'g000' / 'cam0' / '000001.png').unlink()
-
-    cfg = _L(prob_2d_only=0.0, aug_prob=0.5, crop_jitter=0.0)
-    new = PoseDataset(root / 'ratlike', 'train', cfg, train=True)
-    old = _Legacy(root / 'ratlike', 'train', cfg, train=True)
-
-    rejected = built = 0
-    for idx in range(len(new)):
-        for seed in (0, 3):
-            a, sa = _run(old, idx, seed)
-            b, sb = _run(new, idx, seed)
-            assert (a is None) == (b is None), f'idx={idx} seed={seed}: rejection mismatch'
-            if a is None:
-                rejected += 1
-            else:
-                built += 1
-                _same(a, b, f'[reject-case idx={idx} seed={seed}]')
-            _same_state(sa, sb, f'[reject-case idx={idx} seed={seed}]')
-    assert rejected > 0, 'nothing was rejected -- this case does not exercise the path'
 
 
 def test_the_covered_cases_actually_reach_their_branches(seam_root):

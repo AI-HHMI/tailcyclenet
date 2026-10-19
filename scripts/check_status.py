@@ -30,6 +30,8 @@ MISSING_OK = {
     'allen-mouse-tracked': ('keypoints',),
     # points3d `missing` only where 0 views were visible and every camera assessed the point.
     'allen-mouse-annotated': ('keypoints', 'points3d'),
+    # Human-annotated (not predicted): its `missing` rows are annotator occlusion judgements (owner, 2026-10-19).
+    'allen-mouse-annotated-outliers': ('keypoints',),
     # APT's Inf sentinel (fully occluded) stays `missing`; its NaN skip stays absent.
     'rat-city-annotated': ('keypoints',),
     'rat-city-annotated-present': ('keypoints',),

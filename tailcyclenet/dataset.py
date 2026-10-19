@@ -299,14 +299,10 @@ def _flip_2d(cam, coords, mode, prior_rotation=None, perm=None):
 def _apply_affine(pts, rotation):
     """Move (...,2) pixel points through a rotation/reflection's own 2x3, or pass through untouched.
 
-    Shared so a stored box and the labels can never end up in different frames; a list is a
-    per-frame rotation over `pts`' leading (time) axis.
+    Shared so a stored box and the labels can never end up in different frames.
     """
     if pts is None or rotation is None:
         return pts
-    if isinstance(rotation, list):
-        return torch.stack([_apply_affine(pts[t], rotation[min(t, len(rotation) - 1)])
-                            for t in range(pts.shape[0])])
     M = torch.as_tensor(rotation[0], dtype=pts.dtype)
     return pts @ M[:, :2].T + M[:, 2]
 
@@ -552,28 +548,14 @@ class _ReaderCache:
         self.misses += 1
         if len(self._d) >= self.maxsize:
             del self._d[self._rng.choice(list(self._d))]
-        got = self._d[path] = _open_reader(path)
+        from . import video
+
+        got = self._d[path] = video.open_reader(path)
         return got
 
 
-def _open_reader(path: str):
-    """One reader per file per process. Opening the container and building its frame index is not
-    per-window work, but `read_frames` is called once per window per camera -- so a windowed pass
-    over 3dpop's test videos paid it hundreds of times.
-
-    **THE BACKEND IS `tailcyclenet/video.py`, AND THAT IS A MEMORY FIX.** PyAV keeps decoded
-    frames bounded instead of loading whole containers into memory, which is survivable on a
-    600-frame clip but matters on a 21 GB recording -- a 16-camera `--videos` run peaked at
-    456 GB under `--max-ram 24`. PyAV is bit-identical on every video root here, so nothing
-    downstream moves.
-    """
-    from . import video
-
-    return video.open_reader(path)
-
-
 def _reader(path: str, group, cam: str):
-    """The cached `_open_reader`, sized on first use from the rig this group belongs to.
+    """The cached `video.open_reader`, sized on first use from the rig this group belongs to.
 
     `group.session` is not checked: `group.source(cam)` reached us through `Group.dir`, which
     already dereferences `self.session.path`, so a session-less Group cannot get this far.
@@ -644,14 +626,12 @@ def _read_lock_for(path: str) -> threading.Lock:
 
 
 def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
-    """Frames from a video file. Only 3dpop's test split needs this.
+    """Frames from a video file, under one crop box and one rotation for the whole window.
 
-    Each DISTINCT index is decoded once: a clamp-padded window repeats its last frame, and a
-    synthetic-motion window is ONE index T times under T different crops -- handing `get_batch`
-    the repeats decodes them. A (T,4) `crop_coords` or a list of rotations is a MOVING crop: one
-    affine per frame rather than one for the window, with the same count of `warpAffine` calls.
-    A repeat gets a COPY, not a shared buffer: `_augment`'s cutout writes in place, and the
-    dedupe would otherwise make repeats alias one buffer (same rule as `read_frames`).
+    Each DISTINCT index is decoded once: a clamp-padded window repeats its last frame, and handing
+    `get_batch` the repeats would decode them. A repeat gets a COPY, not a shared buffer:
+    `_augment`'s cutout writes in place, and the dedupe would otherwise make repeats alias one
+    buffer (same rule as `read_frames`).
     """
     import cv2
 
@@ -662,15 +642,9 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
         dec = _reader(key, group, cam).get_batch(uniq)
     at = {i: dec[n] for n, i in enumerate(uniq)}
     src_wh = (dec.shape[2], dec.shape[1])
-    cc = None if crop_coords is None else np.asarray(crop_coords)
-    per_box = cc is not None and cc.ndim == 2
-    per_rot = isinstance(rotation, list)
+    aff = _crop_affine(src_wh, crop_coords, target_size, rotation)
     out, seen = [], set()
-    for t, i in enumerate(want):
-        aff = _crop_affine(src_wh,
-                           cc[min(t, len(cc) - 1)] if per_box else crop_coords,
-                           target_size,
-                           rotation[min(t, len(rotation) - 1)] if per_rot else rotation)
+    for i in want:
         im = at[i]
         if aff is not None:
             out.append(cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
@@ -713,44 +687,27 @@ def read_frames(group, cam, frames, crop_coords=None, target_size=None, rotation
     §12) -- listing a directory to select T frames cost 0.90 s of a 1.06 s rat-city item. Each
     DISTINCT frame is decoded once: `_frames` clamp-pads a window that runs past its group's end,
     and a group shorter than `n_frames` pads entirely, so the dedupe turns 384 decodes into 16.
-
-    Per-frame crops move the dedupe key: a per-frame box is a function of the POSITION in the
-    window, not of the source index, so the key is (index, box, rotation slot) -- with one box
-    and one rotation those halves are constant and this is the old behaviour exactly. But the
-    dedupe key is not the decode key: a synthetic-motion window is ONE index under T distinct
-    crops, so keys group by source index and `load_warps` decodes once per group. A repeat gets a
-    COPY, not the same array object: `_augment`'s cutout writes in place, and an aliased list
-    would make every repeat share one buffer (the copy is ~20 us against the 27 ms decode).
+    One crop box and one rotation apply to the whole window. A repeat gets a COPY, not the same
+    array object: `_augment`'s cutout writes in place, and an aliased list would make every repeat
+    share one buffer (the copy is ~20 us against the 27 ms decode).
     """
     kind, src, ext = group.source(cam)
     if kind == 'video':
         return _read_video(src, group, cam, frames, crop_coords, target_size, rotation)
     want = [int(i) for i in frames]
     path = lambda i: os.path.join(src, f'{i:06d}{ext}')           # noqa: E731
-    cc = None if crop_coords is None else np.asarray(crop_coords)
-    per_box = cc is not None and cc.ndim == 2
-    per_rot = isinstance(rotation, list)
-    keys = [(w, tuple(int(v) for v in cc[min(t, len(cc) - 1)]) if per_box else None,
-             min(t, len(rotation) - 1) if per_rot else None)
-            for t, w in enumerate(want)]
-    uniq = list(dict.fromkeys(keys))
-    by_index = {}
-    for k in uniq:
-        by_index.setdefault(k[0], []).append(k)
-    spec = lambda k: (list(k[1]) if per_box else crop_coords,          # noqa: E731
-                      rotation[k[2]] if per_rot else rotation)
-    batch = lambda i, ks: load_warps(path(i), [spec(k) for k in ks],   # noqa: E731
-                                     target_size, reduce)
+    uniq = list(dict.fromkeys(want))
+    batch = lambda i: load_warps(path(i), [(crop_coords, rotation)],   # noqa: E731
+                                 target_size, reduce)[0]
     if pool is None:
-        res = {i: batch(i, ks) for i, ks in by_index.items()}
+        got = {i: batch(i) for i in uniq}
     else:
-        fs = {i: pool.submit(batch, i, ks) for i, ks in by_index.items()}
-        res = {i: f.result() for i, f in fs.items()}
-    got = {k: im for i, ks in by_index.items() for k, im in zip(ks, res[i])}
+        fs = {i: pool.submit(batch, i) for i in uniq}
+        got = {i: f.result() for i, f in fs.items()}
     if any(v is None for v in got.values()):
-        return [got[k] for k in keys]
+        return [got[i] for i in want]
     seen, out = set(), []
-    for i in keys:
+    for i in want:
         out.append(got[i].copy() if i in seen else got[i])
         seen.add(i)
     return out

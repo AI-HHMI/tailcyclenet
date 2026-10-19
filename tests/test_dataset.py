@@ -226,26 +226,6 @@ def test_repeated_frames_are_decoded_once(dataset_3d, monkeypatch):
         np.testing.assert_array_equal(im, out[0])
 
 
-def test_one_frame_under_many_crops_decodes_once(dataset_3d, monkeypatch):
-    """A per-frame-box window pays one decode for T crops: `load_warps` splits decode from warp."""
-    import cv2
-
-    from tailcyclenet import dataset as dsmod
-
-    sess = dataset_3d.sessions['train'][0]
-    group = sess.groups['g000']
-    calls, real = [], cv2.imread
-    monkeypatch.setattr(cv2, 'imread', lambda p, *a, **k: (calls.append(p), real(p, *a, **k))[1])
-
-    boxes = np.stack([np.array([i, i, i + 16, i + 16], np.int32) for i in range(8)])
-    out = dsmod.read_frames(group, sess.cam_names[0], [0] * 8, crop_coords=boxes,
-                            target_size=[16, 16])
-    assert len(calls) == 1, f'decoded {len(calls)} times for one distinct frame'
-    assert [im.shape for im in out] == [(16, 16, 3)] * 8
-    # ... and they are not all the same picture, or the dedupe collapsed the crops instead.
-    assert any(not np.array_equal(out[0], im) for im in out[1:])
-
-
 # ----------------------------------------------------------------------------------------------
 # the loader
 # ----------------------------------------------------------------------------------------------

@@ -20,7 +20,7 @@ GATED="$REPO/scratch/gated"
 cd "$REPO"
 
 echo "### scoring the prediction tracks $(date +%H:%M:%S)"
-/bin/bash scripts/job_l4_run.sh scripts/score_session.py \
+/bin/bash scripts/job_l4.sh run scripts/score_session.py \
     --run "$SCORER_RUN" \
     --data "$GATED/hybrid" \
     --split test \
@@ -29,7 +29,7 @@ echo "### scoring the prediction tracks $(date +%H:%M:%S)"
     --top 8
 
 echo "### correlation vs reference disagreement $(date +%H:%M:%S)"
-/bin/bash scripts/job_l4_run.sh scripts/scorer_error_correlation.py \
+/bin/bash scripts/job_l4.sh run scripts/scorer_error_correlation.py \
     --scores "$GATED/qc/scores.pq" \
     --pred-root "$GATED/hybrid" \
     --ref-root "$REF_ROOT" \

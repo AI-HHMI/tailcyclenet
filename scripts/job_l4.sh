@@ -5,8 +5,11 @@
 #   bsub -q gpu_l4 -gpu "num=1" -n 8 -R "span[hosts=1] rusage[mem=122880]" \
 #        -J tcn-infer-<clip> -o ~/logs/tailcyclenet/<clip>.out \
 #        bash scripts/job_l4.sh infer --data <session> --run <run> --out <pred-dir>
+#        bash scripts/job_l4.sh run scripts/<any>.py [args...]
 #
-# `KIND` selects the script; everything after it is forwarded verbatim. Pass `--max-ram`
+# `KIND` selects the script (`run` takes it as the next argument); everything after it is
+# forwarded verbatim. Every `pixi run` is `--frozen`: a compute node has no network, and an
+# unfrozen pixi re-solves the lock whenever it looks stale and dies there with a DNS error. Pass `--max-ram`
 # explicitly on every LSF invocation (CLAUDE.md: an under-detected cgroup/LSF memory limit
 # silently re-sizes the reader cache and the block store -- verify the `ram:` line in the first
 # job's log before submitting the rest). Never request `-n 16`: the L4 limit is `-n 8` per GPU.
@@ -22,7 +25,8 @@ case "$KIND" in
     train_detector)    SCRIPT=scripts/train_detector.py ;;
     train_detector_eval) SCRIPT='' ;;
     eval)              SCRIPT=scripts/eval.py ;;
-    *) echo "FATAL: expected infer|train|train_detector|train_detector_eval|eval, got $KIND" >&2
+    run)               SCRIPT=$1; shift ;;
+    *) echo "FATAL: expected infer|train|train_detector|train_detector_eval|eval|run, got $KIND" >&2
        exit 2 ;;
 esac
 
@@ -36,12 +40,13 @@ export PATH="/groups/karashchuk/home/karashchukl/bin:/home/karashchukl@hhmi.org/
 # from the log alone. This makes every job's progress line land as soon as it is printed.
 export PYTHONUNBUFFERED=1
 
-nvidia-smi
+echo "host $(hostname)  kind: $KIND  argv: $*"
+nvidia-smi || true
 if [[ "$KIND" == train_detector_eval ]]; then
     CONFIG=$1; OUT=$2; EVALSPEC=$3
     shift 3
-    pixi run python scripts/train_detector.py --config "$CONFIG" --out "$OUT" "$@"
-    pixi run python - "$OUT" "$EVALSPEC" <<'PY'
+    pixi run --frozen python scripts/train_detector.py --config "$CONFIG" --out "$OUT" "$@"
+    pixi run --frozen python - "$OUT" "$EVALSPEC" <<'PY'
 import sys, tomllib
 from pathlib import Path
 out, spec = Path(sys.argv[1]), tomllib.loads(Path(sys.argv[2]).read_text())
@@ -55,11 +60,11 @@ for entry in spec.get('eval', []):
         dest = out / 'eval' / f'{name}__{path.stem}.json'
         dest.parent.mkdir(parents=True, exist_ok=True)
         import subprocess
-        cmd = ['pixi', 'run', 'python', 'scripts/eval_detector.py', '--run', str(out), '--checkpoint', ckpt, '--data', data, '--split', split, '--evalset', evalset, '--out', str(dest), '--boxes', 'keypoints', *extra]
+        cmd = ['pixi', 'run', '--frozen', 'python', 'scripts/eval_detector.py', '--run', str(out), '--checkpoint', ckpt, '--data', data, '--split', split, '--evalset', evalset, '--out', str(dest), '--boxes', 'keypoints', *extra]
         with dest.with_suffix('.log').open('w') as log:
             rc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT).returncode
         print(f'eval {name} {ckpt}: exit {rc} -> {dest}', flush=True)
 PY
 else
-    exec pixi run python "$SCRIPT" "$@"
+    exec pixi run --frozen python "$SCRIPT" "$@"
 fi

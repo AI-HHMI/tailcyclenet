@@ -386,7 +386,7 @@ def test_widening_the_identity_table_does_not_move_it_between_optimizer_groups(k
     and the schedule-free path pins it by NAME (`query_encoder.kpt_`). A change here would
     silently retune the identity table the moment the warm start starts working.
     """
-    from tailcyclenet.train import build_optimizer
+    from tailcyclenet.optim import build_optimizer
 
     cfg = {'optimizer': kind, 'learning_rate': 1e-4, 'kpt_lr': 5e-4, 'encoder_lr_scale': 0.1,
            'weight_decay': 0.002, 'warmup_steps': 0, 'muon_schedulefree': True,
@@ -444,7 +444,7 @@ def test_validation_measures_the_averaged_iterate_and_it_round_trips(tmp_path, m
     raised error leave the model and the optimizer in TRAIN mode.
     """
     from tailcyclenet.scorer import train as st
-    from tailcyclenet.train import build_optimizer
+    from tailcyclenet.optim import build_optimizer
 
     monkeypatch.setattr(st, 'triplet_to_device', lambda trip, device: trip)
     monkeypatch.setattr(st, '_per_type_accuracy', lambda scores, fired: {'acc': 0.0})

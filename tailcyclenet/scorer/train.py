@@ -5,8 +5,8 @@ best checkpoint is selected on held-out synthetic triplet accuracy rather than o
 staged encoder unfreeze, the pose losses and the pose eval all have no meaning here. What IS
 reused, by import, is the parts that must not diverge: `config.load_config` (so the scorer
 family layers over `configs/scorer.toml`), `checkpoints.warm_start` (the pose checkpoint),
-`scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and `train.build_optimizer`
-(so Muon routing and the fresh-parameter rule are one implementation).
+`scorer.checkpoint.save_scorer_checkpoint` / `save_run_meta` with `kind='scorer'`, and
+`optim.build_optimizer` (so Muon routing and the fresh-parameter rule are one implementation).
 
     pixi run python scripts/train_scorer.py --config configs/scorer-3dpop.toml --data <root> \
         --out <results>/scorers/scorer-3dpop --checkpoint <pose run folder>
@@ -36,8 +36,8 @@ from ..config import SCORER_CONFIG, load_config
 from ..dataset import LoaderConfig, PoseDataset, StepSampler
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
+from ..optim import build_optimizer, check_resume
 from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
-from ..train import build_optimizer
 from .. import distributed as dist_utils
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .model import build_scorer, flatten_sequence_triplet
@@ -1019,14 +1019,11 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
               + (f', kpt_lr {opt_cfg["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg else ''))
     optimizer = build_optimizer(model, fresh, opt_cfg)
     if resume_state is not None:
-        from tailcyclenet.optim import optimizer_layout_matches, state_matches_optimizer_kind
-        opt_kind = str(config['training']['optimizer'].get('optimizer', 'muon'))
         try:
             model.load_state_dict(resume_state['model_state'], strict=True)
-            if not state_matches_optimizer_kind(resume_state['optimizer_state'], opt_kind):
-                raise ValueError(f'optimizer kind does not match config optimizer={opt_kind!r}')
-            if not optimizer_layout_matches(optimizer, resume_state['optimizer_state']):
-                raise ValueError('optimizer param-group layout does not match the current config')
+            verdict = check_resume(optimizer, resume_state['optimizer_state'])
+            if not verdict:
+                raise ValueError(verdict.reason)
             optimizer.load_state_dict(resume_state['optimizer_state'])
             print(f'resuming {resume_file} at iteration {resume_state.get("iteration", "?")}')
         except (KeyError, RuntimeError, ValueError, SystemExit) as e:

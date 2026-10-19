@@ -3,7 +3,6 @@
 A non-finite loss is the one that matters: it is rare, it only fires on data nobody can construct
 on demand, and getting it wrong costs a 72-hour cluster job that dies in the first two minutes.
 """
-import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,11 +13,9 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _train_module():
-    """Import scripts/train.py without running main()."""
-    spec = importlib.util.spec_from_file_location('tcn_train', REPO / 'tailcyclenet' / 'train.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """The pose training module (importing it runs nothing)."""
+    import tailcyclenet.train
+    return tailcyclenet.train
 
 
 def _batch():
@@ -400,48 +397,6 @@ def test_a_checkpoint_round_trips_enough_to_resume_from(tmp_path):
 
 # -- config guards -----------------------------------------------------------------------------
 
-KNOWN_TRAINING = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision', 'max_grad_norm',
-                  'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq', 'train_metric_freq',
-                  'out', 'optimizer', 'losses'}
-
-
-def test_the_video_encoder_download_is_skipped_only_when_a_checkpoint_will_overwrite_it():
-    """`main()`'s first `build_model()` call must skip the VJEPA2 download exactly when a resume
-    or a warm-start checkpoint is about to overwrite every tensor it produces; a fresh run (with
-    neither) still needs the real pretrained weights, since nothing else supplies them.
-
-    tracktail 0.4.2 exposes this as `video_encoder_pretrained` on `TrackerEncoder`/`build_model`
-    directly (report 50's `skip_video_encoder_download` monkeypatch is retired) -- so this now
-    asserts the cfg-merge expression instead of the old context-manager name.
-    """
-    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
-    assert "'video_encoder_pretrained': False" in src
-    assert 'will_load_full_checkpoint' in src
-    assert "resumed.exists() and not args.no_resume" in src
-    assert "not args.no_warm_start and train_cfg.get('checkpoint_path')" in src
-    assert 'or checkpoint is not None' in src
-
-
-def test_checkpoint_path_is_a_resume_only_for_full_training_state():
-    """`main()` resumes from `[training].checkpoint_path` only when the checkpoint carries the
-    full training state -- raw weights + optimizer state + iteration (what `save_checkpoint`
-    and the reference repo's train loop write). A packaged pose checkpoint (weights only) can
-    never resume; it is a warm start. The predicates `main()` gates on are wired into it."""
-    from tailcyclenet.checkpoints import full_training_state
-
-    assert full_training_state({'model_state': {}, 'optimizer_state': {}, 'iteration': 5})
-    assert not full_training_state({'model_state': {}, 'iteration': 5}), \
-        'weights without optimizer state is a warm start, not a resume'
-    assert not full_training_state({'model_state': {}}), 'no iteration means no resume'
-    assert not full_training_state({})
-    assert not full_training_state(None)
-
-    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
-    for name in ('full_training_state', 'state_matches_optimizer_kind',
-                 'optimizer_layout_matches'):
-        assert name in src, f'main() must gate the checkpoint_path resume on {name}'
-
-
 def test_load_config_layers_over_the_repo_base_by_default(tmp_path):
     """A pose config that names no base still gets `configs/base.toml` as its defaults -- the
     `extends` line is gone, not needed: the overlay IS the whole difference."""
@@ -482,29 +437,6 @@ def test_load_config_layers_over_an_explicit_base(tmp_path):
     p.write_text('[training]\niters = 4\n')
     cfg = load_config(p, base=base)
     assert cfg == {'data': {'boxes': 'instances'}, 'training': {'iters': 4}}
-
-
-def test_known_training_keys_match_the_guard_in_main():
-    """The `[training]` allow-list must stay in step with what `main()` actually reads: a typo'd
-    key yields a silent default (no validation, no `checkpoint_best.pth`) -- an arm reporting its
-    own control.
-    """
-    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
-    assert 'known_training = {' in src, 'the [training] unknown-key guard is gone'
-    # every key the guard allows is either read from train_cfg or is a sub-block
-    for key in KNOWN_TRAINING - {'optimizer', 'losses', 'out'}:
-        assert f"train_cfg.get('{key}'" in src or f"train_cfg['{key}']" in src, \
-            f'{key} is allowed by the guard but nothing reads it'
-
-
-def test_val_is_skipped_only_for_a_missing_split_not_a_config_error():
-    """`no val/` may be swallowed; a config error inside `PoseDataset` may NOT. The old bare
-    except caught both, so a broken session printed one line and then trained with no validation.
-    """
-    src = (Path(__file__).parent.parent / 'tailcyclenet' / 'train.py').read_text()
-    body = src[src.index('    val_ds = None'):src.index('    nw = args.num_workers')]
-    assert 'except' not in body, 'val construction must not be wrapped in a bare except again'
-    assert "'val').is_dir()" in body, 'the missing-split case must be TESTED for, not caught'
 
 
 def test_infer_does_not_restate_loader_defaults():

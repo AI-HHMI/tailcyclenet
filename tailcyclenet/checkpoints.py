@@ -51,6 +51,8 @@ def resolve_checkpoint(folder: Path, checkpoint: str | None = None):
     the fallback for runs that only maintain the rolling last file.
     """
     folder = Path(folder)
+    if (folder / 'checkpoints').is_dir() and not any(folder.glob('checkpoint_*.pth')):
+        folder = folder / 'checkpoints'
     if checkpoint:
         p = folder / checkpoint if not Path(checkpoint).is_absolute() else Path(checkpoint)
         if not p.exists():
@@ -154,7 +156,8 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                     name: str = 'last', write: bool = True,
                     registry: Registry | None = None, kind: str = 'pose',
                     extra: dict | None = None,
-                    fresh_names: set[str] | None = None) -> Path | None:
+                    fresh_names: set[str] | None = None,
+                    world_size: int | None = None) -> Path | None:
     """Save both schedule-free iterates to `checkpoint_<name>.pth`, overwriting.
 
     `model_state` is the raw training weight (resume); `model_state_eval` is the averaged weight
@@ -162,7 +165,9 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
     `best` are ever written; the write renames a sibling temp file into place.
 
     Pose checkpoints also store optimizer metadata keyed by parameter name because state loading
-    matches optimizer groups by position.
+    matches optimizer groups by position, with `world_size` (the rates are sqrt(world)-scaled, so
+    a resume on another world size is refused by `start.plan_start`). `extra` joins the payload
+    (the scorer's contract fields).
 
     `write = False` runs the eval/train toggle but skips the clone and disk write -- correctness,
     not an optimisation: the float32 toggle round trip is not bit-exact, so every rank must pay
@@ -203,14 +208,15 @@ def save_checkpoint(run: Path, iteration: int, model, optimizer, config: dict,
                'provenance': prior_provenance(run) or provenance()}
     if kind == 'pose':
         from .optim import optimizer_metadata
-        payload['optimizer_metadata'] = optimizer_metadata(model, optimizer, fresh_names)
+        payload['optimizer_metadata'] = optimizer_metadata(model, optimizer, fresh_names,
+                                                           world_size)
     payload.update(extra or {})
     torch.save(payload, tmp)
     tmp.replace(path)
     return path
 
 
-def _enclosing_run(path: Path) -> Path | None:
+def enclosing_run(path: Path) -> Path | None:
     """The run folder a checkpoint file sits in, or None: `<run>/checkpoints/x.pth` (pose,
     scorer, and a W&B `files/checkpoints/` mirror) or `<run>/x.pth` (detector)."""
     for d in (path.parent.parent, path.parent) if path.parent.name == 'checkpoints' else \
@@ -225,9 +231,9 @@ def file_bundle(path: Path, ckpt: dict, kind: str) -> tuple[dict, Registry, dict
 
     The checkpoint's own embedded config/registry/provenance win: they were written beside these
     weights. A file written before one was embedded falls back to the run folder it still sits
-    in (`_enclosing_run`); a lone file missing either is refused by name rather than guessed.
+    in (`enclosing_run`); a lone file missing either is refused by name rather than guessed.
     """
-    run = _enclosing_run(path)
+    run = enclosing_run(path)
     config = ckpt.get('config')
     if not isinstance(config, dict) and run is not None:
         with open(run / 'config.toml', 'rb') as f:

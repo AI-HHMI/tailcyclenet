@@ -44,7 +44,7 @@ def apply_norms_extension(model) -> list[int]:
 
 
 def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
-                          fresh: set[str] | None = None, layout: dict | None = None) -> dict | None:
+                          fresh: set[str] | None = None) -> dict | None:
     """Fire the staged unfreeze if `iteration` reaches it, and tell the optimizer about it.
     Returns None when nothing fired; idempotent by delegation (upstream flips the flag on the
     first fire and returns False forever after).
@@ -57,8 +57,6 @@ def apply_staged_unfreeze(model, opt, opt_cfg: dict, iteration: int,
     at one identical rate. Only AdamW-SF carries a per-group `train_mode`; the `.get` keeps this
     usable from a test or probe that builds a plain optimizer.
     """
-    if isinstance(layout, dict) and isinstance(layout.get('fresh_names'), list):
-        fresh = set(layout['fresh_names'])
     if not hasattr(model, 'unfreeze_video_encoder'):
         return None
     if not model.unfreeze_video_encoder(int(iteration)):

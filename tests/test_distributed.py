@@ -31,7 +31,8 @@ def _module(path, name):
 
 
 def _train_module():
-    return _module(REPO / 'tailcyclenet' / 'train.py', 'tcn_train')
+    import tailcyclenet.train
+    return tailcyclenet.train
 
 
 def _optim_tests():
@@ -120,15 +121,25 @@ def test_the_staged_unfreeze_reads_the_scaled_rates():
     assert pytest.approx(1e-4 * 2 * 0.1) in lrs, f'no encoder group at the scaled rate: {lrs}'
 
 
-def test_train_hands_the_scaled_config_to_both_unfreeze_entry_points():
-    """The build, the live unfreeze and the resume replay must all read ONE dict. Checked on the
-    source because the alternative -- noticing at iteration 10,000 of a 60,000-iteration job -- is
-    the failure this test exists to prevent."""
-    src = (REPO / 'tailcyclenet' / 'train.py').read_text()
-    for call in ('build_optimizer(model, fresh, opt_cfg_scaled, layout=resume_layout)',
-                 'apply_staged_unfreeze(raw, opt, opt_cfg_scaled',
-                 'apply_staged_unfreeze(model, opt, opt_cfg_scaled'):
-        assert call in src, f'{call!r} is not what scripts/train.py calls'
+def test_the_resume_replay_and_the_live_unfreeze_read_the_scaled_config(tmp_path):
+    """The build, the resume replay and the live unfreeze must all read ONE dict: a resumed
+    4-gpu run past its unfreeze holds its encoder group at the SCALED rate, and the state loads."""
+    from tailcyclenet import start
+    from tailcyclenet.checkpoints import save_checkpoint
+    from tailcyclenet.format import Registry
+    from tailcyclenet.optim import build_muon
+
+    tests = _optim_tests()
+    cfg = dist_utils.scale_optimizer_cfg(tests._cfg(learning_rate=1e-4, encoder_lr_scale=0.1), 4)
+    m = tests.Tiny(unfreeze_at=10, n_last=3)
+    opt = build_muon(m, fresh=set(), cfg=cfg)
+    apply_staged_unfreeze(m, opt, cfg, 12, fresh=set())
+    save_checkpoint(tmp_path / 'run', 12, m, opt, {'model': {}, 'data': {}},
+                    registry=Registry(names=('a',), datasets=(('d', (0,)),)), world_size=4)
+    got = start.build_start(start.plan_start(tmp_path / 'run', world=4),
+                            lambda pretrained: tests.Tiny(unfreeze_at=10, n_last=3), cfg)
+    lrs = [g['lr'] for g in got.optimizer.opt_muon.param_groups]
+    assert pytest.approx(1e-4 * 2 * 0.1) in lrs, f'no encoder group at the scaled rate: {lrs}'
 
 
 # -- host resources ------------------------------------------------------------------------

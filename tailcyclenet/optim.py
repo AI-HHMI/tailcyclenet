@@ -1,11 +1,12 @@
-"""SF-Muon for the pose network, ported from ../posetail-next.
+"""The pose optimizers: SF-Muon (the default) and the AdamW-SF escape hatch, plus the resume check.
 
-Muon orthogonalizes 2D hidden matrices and RAISES on non-2D params, so it is paired with
-AdamW-SF for the rest. This module adds what this repo's checkpointing needs: `has_averaged_iterate`, a `load_state_dict` that restores `train_mode` (a resume bug), and a named refusal on optimizer-state mismatch. World-size scaling lives in `tailcyclenet.distributed`.
+Muon orthogonalizes 2D hidden matrices and RAISES on non-2D params, so it is paired with AdamW-SF
+for the rest. Beyond upstream: `has_averaged_iterate`, a `load_state_dict` that restores
+`train_mode`, name-keyed layout metadata, and `check_resume`, the one verdict on whether a saved
+optimizer state belongs to the optimizer this config builds. World-size scaling lives in
+`tailcyclenet.distributed`.
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 import torch
 
@@ -28,6 +29,7 @@ ROUTES = ('muon_dec', 'muon_fresh', 'muon_enc', 'adamw_base', 'adamw_enc')
 # Checkpoint metadata is deliberately versioned: optimizer state matches groups by position,
 # so a name-level layout is needed before state loading can be trusted.
 OPTIMIZER_LAYOUT_SCHEMA = 'tailcyclenet.optimizer-layout.v1'
+DUAL_STATE_SCHEMA = 'tailcyclenet.pose-dual.v1'
 
 _DEC_SUBSTR = ('decoder.cross_attns', 'decoder.mlps', 'decoder.camera_attns',
                'decoder.temporal_attns')
@@ -117,7 +119,7 @@ class PoseDualOptimizer(DualOptimizer):
         """Persist Muon's scheduler state, which the upstream DualOptimizer omits."""
         state = super().state_dict()
         state['_tailcyclenet'] = {
-            'schema': 'tailcyclenet.pose-dual.v1',
+            'schema': DUAL_STATE_SCHEMA,
             'muon_warmup_steps': int(self.muon_warmup_steps),
             'gstep': int(self._gstep),
             'muon_base_lrs': [float(lr) for lr in self._muon_base_lrs],
@@ -125,29 +127,14 @@ class PoseDualOptimizer(DualOptimizer):
         return state
 
     def load_state_dict(self, sd):
-        """Restore upstream state and Muon warmup without mutating ``sd``.
-
-        The upstream loader consumes only the two optimizer halves; copying the filtered state
-        preserves the caller's checkpoint metadata. Older states recover the global step from
-        the Muon groups' persisted ``k`` values.
-        """
+        """Restore upstream state and the Muon warmup step without mutating ``sd``, after
+        `check_resume` has accepted it (a refusal is a `SystemExit` naming why)."""
         from schedulefree import ScheduleFreeWrapper
-        _refuse_state_shape(self, sd)
-        refuse_group_count_mismatch(self, sd)
-        extra = sd.get('_tailcyclenet') if isinstance(sd, dict) else None
-        if isinstance(extra, dict) and extra.get('schema') == 'tailcyclenet.pose-dual.v1':
-            if int(extra.get('muon_warmup_steps', self.muon_warmup_steps)) != self.muon_warmup_steps:
-                raise SystemExit('optimizer state has a different muon_warmup_steps; start a warm start')
-            saved_base = [float(x) for x in extra.get('muon_base_lrs', [])]
-            if saved_base and saved_base != [float(x) for x in self._muon_base_lrs]:
-                raise SystemExit('optimizer state has a different Muon base learning-rate layout; '
-                                  'start a warm start')
+        verdict = check_resume(self, sd)
+        if not verdict:
+            raise SystemExit(f'optimizer state does not resume: {verdict.reason}')
         super().load_state_dict({k: v for k, v in sd.items() if k != '_tailcyclenet'})
-        if isinstance(extra, dict) and extra.get('schema') == 'tailcyclenet.pose-dual.v1':
-            self._gstep = int(extra.get('gstep', 0))
-        elif self.muon_warmup_steps:
-            self._gstep = max((int(g.get('k', 0)) for g in
-                               sd.get('muon', {}).get('param_groups', [])), default=0)
+        self._gstep = int(sd['_tailcyclenet'].get('gstep', 0))
         for o in self._opts:
             if isinstance(o, ScheduleFreeWrapper):
                 o.train_mode = True
@@ -226,8 +213,10 @@ def group_lr(route: str, cfg: dict) -> float:
     return lr
 
 
-def optimizer_metadata(model, optimizer, fresh_names: set[str] | None = None) -> dict:
-    """Return stable, name-based optimizer layout metadata for a pose checkpoint."""
+def optimizer_metadata(model, optimizer, fresh_names: set[str] | None = None,
+                       world_size: int | None = None) -> dict:
+    """Stable, name-based optimizer layout metadata for a pose checkpoint, with the world size
+    whose sqrt-scaled rates the groups carry (None: not recorded)."""
     names = {id(p): name for name, p in model.named_parameters()}
 
     def groups_doc(groups, lrs=None):
@@ -243,51 +232,73 @@ def optimizer_metadata(model, optimizer, fresh_names: set[str] | None = None) ->
     else:
         groups = {'muon': [], 'adamw': groups_doc(optimizer.param_groups)}
         kind = 'schedulefree'
-    return {'schema': OPTIMIZER_LAYOUT_SCHEMA, 'optimizer': kind,
-            'fresh_names': sorted(str(n) for n in (fresh_names or set())),
-            'groups': groups}
+    out = {'schema': OPTIMIZER_LAYOUT_SCHEMA, 'optimizer': kind,
+           'fresh_names': sorted(str(n) for n in (fresh_names or set())),
+           'groups': groups}
+    if world_size is not None:
+        out['world_size'] = int(world_size)
+    return out
 
 
-def optimizer_metadata_from_checkpoint(checkpoint: dict) -> tuple[set[str], dict | None]:
-    """Read optimizer metadata without modifying ``checkpoint``.
+def build_optimizer(model, fresh: set[str], cfg: dict):
+    """The run's optimizer, selected by `[training.optimizer].optimizer`; an absent key is "muon".
 
-    Old checkpoints intentionally fall back to the pre-metadata behavior.
+    `"schedulefree"` is the AdamW-SF recipe a resume needs. Fresh params (identity table,
+    no-query tokens, fusion gate) get `kpt_lr`; a trainable encoder gets a lower one. A resume
+    passes the checkpoint's own recorded `fresh_names` (see `start.plan_start`).
     """
-    metadata = checkpoint.get('optimizer_metadata') if isinstance(checkpoint, dict) else None
-    if not isinstance(metadata, dict) or metadata.get('schema') != OPTIMIZER_LAYOUT_SCHEMA:
-        return set(), None
-    fresh = metadata.get('fresh_names', [])
-    groups = metadata.get('groups')
-    if not isinstance(fresh, list) or not all(isinstance(n, str) for n in fresh):
-        return set(), None
-    if not isinstance(groups, dict):
-        return set(), None
-    if not all(isinstance(groups.get(key), list) for key in ('muon', 'adamw')):
-        return set(), None
-    return set(fresh), metadata
+    kind = str(cfg.get('optimizer', 'muon'))
+    if kind == 'muon':
+        return build_muon(model, fresh, cfg)
+    if kind != 'schedulefree':
+        raise SystemExit(f'[training.optimizer].optimizer = {kind!r} is not one of '
+                         '"muon" | "schedulefree".')
+    lr = float(cfg['learning_rate'])
+    kpt_lr = float(cfg.get('kpt_lr', lr))
+    enc_scale = float(cfg.get('encoder_lr_scale', 1.0))
+    groups = {'fresh': [], 'encoder': [], 'rest': []}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name in fresh or name.startswith('query_encoder.kpt_'):
+            groups['fresh'].append(p)
+        elif name.startswith('scene_encoder.encoder.'):
+            groups['encoder'].append(p)
+        else:
+            groups['rest'].append(p)
+
+    from schedulefree import AdamWScheduleFree
+    param_groups = [
+        {'params': groups['fresh'], 'lr': kpt_lr},
+        {'params': groups['encoder'], 'lr': lr * enc_scale},
+        {'params': groups['rest'], 'lr': lr},
+    ]
+    opt = AdamWScheduleFree(
+        [g for g in param_groups if g['params']], lr=lr,
+        weight_decay=float(cfg.get('weight_decay', 0.0)),
+        warmup_steps=int(cfg.get('warmup_steps', 0)),
+        betas=(float(cfg.get('beta1', 0.9)), float(cfg.get('beta2', 0.95))))
+    print(f'optimizer: {len(groups["fresh"])} fresh @ {kpt_lr:g}, '
+          f'{len(groups["encoder"])} encoder @ {lr * enc_scale:g}, '
+          f'{len(groups["rest"])} rest @ {lr:g}')
+    return opt
 
 
-def optimizer_layout_matches_metadata(opt, model, metadata: dict | None) -> bool:
-    """Check current named groups and rates against saved layout metadata."""
-    if not isinstance(metadata, dict) or metadata.get('schema') != OPTIMIZER_LAYOUT_SCHEMA:
-        return True
-    names = {id(p): name for name, p in model.named_parameters()}
+class Verdict:
+    """Whether a saved optimizer state can be loaded into this run's optimizer; falsy with the
+    reason when it cannot."""
 
-    def current(groups):
-        """Describe the current groups with their parameter names and rates."""
-        return [{'lr': float(g['lr']),
-                 'names': [names.get(id(p)) for p in g['params']]} for g in groups]
+    def __init__(self, ok: bool, reason: str = ''):
+        """`ok` is the verdict, `reason` the human sentence naming what differs."""
+        self.ok, self.reason = bool(ok), str(reason)
 
-    if isinstance(opt, PoseDualOptimizer):
-        actual = {'muon': current(opt.opt_muon.param_groups)}
-        for i, lr in enumerate(opt._muon_base_lrs):
-            actual['muon'][i]['lr'] = float(lr)
-        actual['adamw'] = current(opt.opt_adam.param_groups)
-        kind = 'muon'
-    else:
-        actual = {'muon': [], 'adamw': current(opt.param_groups)}
-        kind = 'schedulefree'
-    return kind == metadata.get('optimizer') and actual == metadata.get('groups')
+    def __bool__(self):
+        """Truthy iff the state resumes."""
+        return self.ok
+
+    def __repr__(self):
+        """`Verdict(ok)` or `Verdict(refused: reason)`."""
+        return 'Verdict(ok)' if self.ok else f'Verdict(refused: {self.reason})'
 
 
 def _is_dual_state(state) -> bool:
@@ -295,114 +306,88 @@ def _is_dual_state(state) -> bool:
     return isinstance(state, dict) and 'muon' in state and 'adam' in state
 
 
-def _refuse_state_shape(opt, state) -> None:
-    """Raise if the state dict's shape does not match the optimizer kind. Path-free fallback."""
-    if isinstance(opt, PoseDualOptimizer) and not _is_dual_state(state):
-        raise SystemExit(
-            'optimizer state is AdamW-schedule-free but this config builds a Muon optimizer. '
-            'Set optimizer = "schedulefree" in the config to resume, or --no-resume to start over.')
-    if not isinstance(opt, PoseDualOptimizer) and _is_dual_state(state):
-        raise SystemExit(
-            'optimizer state is Muon but this config builds an AdamW-schedule-free optimizer. '
-            'Set optimizer = "muon" in the config to resume, or --no-resume to start over.')
+def state_kind(state) -> str:
+    """The optimizer kind an `optimizer_state` was written by: `'muon'` or `'schedulefree'`."""
+    return 'muon' if _is_dual_state(state) else 'schedulefree'
 
 
-def _group_counts(opt) -> tuple[int, int]:
-    """The (Muon, AdamW) param-group counts of the CURRENT optimizer."""
+def _lrs(groups) -> list[float]:
+    """Group learning rates in their stored order."""
+    return [float(g['lr']) for g in groups]
+
+
+def _named_layout(opt, model) -> tuple[str, dict]:
+    """(kind, groups) of the CURRENT optimizer in `optimizer_metadata`'s name-keyed form."""
+    names = {id(p): name for name, p in model.named_parameters()}
+
+    def current(groups, lrs):
+        """One `{lr, names}` entry per group."""
+        return [{'lr': float(lr), 'names': [names.get(id(p)) for p in g['params']]}
+                for g, lr in zip(groups, lrs)]
+
     if isinstance(opt, PoseDualOptimizer):
-        return len(opt.opt_muon.param_groups), len(opt.opt_adam.param_groups)
-    return 0, len(opt.param_groups)
+        return 'muon', {'muon': current(opt.opt_muon.param_groups, opt._muon_base_lrs),
+                        'adamw': current(opt.opt_adam.param_groups,
+                                         _lrs(opt.opt_adam.param_groups))}
+    return 'schedulefree', {'muon': [], 'adamw': current(opt.param_groups, _lrs(opt.param_groups))}
 
 
-def _state_group_counts(state) -> tuple[int, int]:
-    """The (Muon, AdamW) param-group counts recorded in a saved state dict."""
-    if _is_dual_state(state):
-        return len(state['muon']['param_groups']), len(state['adam']['param_groups'])
-    return 0, len(state['param_groups'])
+def check_resume(opt, state, model=None, metadata: dict | None = None) -> Verdict:
+    """Whether `state` (an `optimizer_state`) belongs to `opt`, the optimizer this config built --
+    the one resume-compatibility check, replacing seven overlapping predicates.
 
-
-def refuse_group_count_mismatch(opt, state) -> None:
-    """Raise a NAMED error when the saved state has a different number of param groups. The
-    staged unfreeze ADDS groups mid-run, so a resumed run must replay the unfreeze before
-    loading -- torch's own message would not name the config key that caused it.
+    In order: the optimizer KIND (Muon's dual `{'muon', 'adam'}` state vs AdamW-SF's plain one);
+    the param-group COUNT (the staged unfreeze adds groups, so a resume must replay it first);
+    for Muon the `pose-dual.v1` schema, `muon_warmup_steps` and the base rates; the AdamW rates;
+    and, given `model` and the checkpoint's `optimizer_metadata`, the name-keyed layout. Groups
+    are matched BY POSITION on load, so a rate or membership difference is a refusal, not a
+    warning. A state from before `pose-dual.v1` is refused: v0.3.4 is the last release that
+    resumes it (a warm start from it still works).
     """
-    have, want = _group_counts(opt), _state_group_counts(state)
-    if have == want:
-        return
-    raise SystemExit(
-        f'optimizer state holds {want[0]} Muon + {want[1]} AdamW param group(s) but this run built '
-        f'{have[0]} + {have[1]}. The group layout changes when the staged encoder unfreeze fires, '
-        f'so a resumed run must reach the same layout as the run it continues. Check that '
-        f'[model].video_encoder_requires_grad and [model].video_encoder_finetune_last_n_layers '
-        f'still hold the values this run folder was trained with, or --no-resume to start over '
-        f'(which OVERWRITES both checkpoints).')
-
-
-def refuse_mismatched_optimizer_state(opt, state, path, resolved: str, explicit: bool) -> None:
-    """Refuse to load an optimizer state written by a DIFFERENT optimizer, by name. The model
-    tensors load either way, so only an explicit shape check can tell you the resume is wrong.
-    Fires in both directions.
-    """
-    dual_opt = isinstance(opt, PoseDualOptimizer)
-    dual_state = _is_dual_state(state)
-    if dual_opt == dual_state:
-        return
-    path = Path(path)
-    held = 'Muon' if dual_state else 'AdamW-schedule-free'
-    builds = 'a Muon' if dual_opt else 'an AdamW-schedule-free'
-    why_default = (' (`[training.optimizer].optimizer` is absent, which now means "muon")'
-                   if dual_opt and not explicit else f' (optimizer = {resolved!r})')
-    fix = 'schedulefree' if dual_opt else 'muon'
-    raise SystemExit(
-        f'{path} holds {held} optimizer state, but this config builds {builds} optimizer'
-        f'{why_default}. The model tensors load either way, so nothing else can tell you. Set '
-        f'optimizer = "{fix}" in the config to resume this run as it was trained, or --no-resume '
-        f'to start over (which OVERWRITES both checkpoints).')
-
-
-def state_matches_optimizer_kind(state, kind: str) -> bool:
-    """Whether `state` is the optimizer_state a config with `optimizer = kind` builds: Muon
-    checkpoints carry the dual {'muon', 'adam'} structure, AdamW-SF ones a plain one. The soft
-    half of the resume decision -- a kind mismatch is a warm start, not an error
-    (`refuse_mismatched_optimizer_state` keeps the hard version for the run folder's own
-    checkpoint).
-    """
-    return _is_dual_state(state) == (str(kind) == 'muon')
-
-
-def optimizer_layout_matches(opt, state) -> bool:
-    """Whether saved and current optimizer groups have the same stable layout and rates.
-
-    Legacy dual-optimizer state stores the global step in each Muon group's ``k`` value;
-    transient warmup is removed before comparing saved and configured base rates.
-    """
-    def lrs(groups):
-        """Return group learning rates in their stored order."""
-        return [float(g['lr']) for g in groups]
-
-    if _is_dual_state(state):
-        if not isinstance(opt, PoseDualOptimizer):
-            return False
+    if not isinstance(state, dict):
+        return Verdict(False, 'the checkpoint holds no optimizer state')
+    dual_opt, dual_state = isinstance(opt, PoseDualOptimizer), _is_dual_state(state)
+    if dual_opt != dual_state:
+        held = 'Muon' if dual_state else 'AdamW-schedule-free'
+        builds = 'Muon' if dual_opt else 'AdamW-schedule-free'
+        fix = 'muon' if dual_state else 'schedulefree'
+        return Verdict(False, f'it holds {held} optimizer state but this config builds a {builds} '
+                              f'optimizer; set [training.optimizer].optimizer = "{fix}" to resume '
+                              'it as it was trained')
+    have = ((len(opt.opt_muon.param_groups), len(opt.opt_adam.param_groups)) if dual_opt
+            else (0, len(opt.param_groups)))
+    want = ((len(state['muon']['param_groups']), len(state['adam']['param_groups'])) if dual_state
+            else (0, len(state['param_groups'])))
+    if have != want:
+        return Verdict(False, (
+            f'it holds {want[0]} Muon + {want[1]} AdamW param group(s) but this run built '
+            f'{have[0]} + {have[1]}. The group layout changes when the staged encoder unfreeze '
+            'fires, so check that [model].video_encoder_requires_grad and '
+            '[model].video_encoder_finetune_last_n_layers still hold the values it was trained '
+            'with'))
+    if dual_opt:
         extra = state.get('_tailcyclenet')
-        if not isinstance(extra, dict) or extra.get('schema') != 'tailcyclenet.pose-dual.v1':
-            groups = state['muon']['param_groups']
-            gstep = max((int(g.get('k', 0)) for g in groups), default=0)
-            if opt.muon_warmup_steps and not any('k' in g for g in groups):
-                return False
-            factor = (min(1.0, gstep / opt.muon_warmup_steps)
-                      if opt.muon_warmup_steps else 1.0)
-            if factor == 0.0:
-                return (not gstep and
-                        lrs(groups) == [float(x) for x in opt._muon_base_lrs] and
-                        lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
-            saved_base = [float(g['lr']) / factor for g in groups]
-            return (saved_base == [float(x) for x in opt._muon_base_lrs]
-                    and lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
+        if not isinstance(extra, dict) or extra.get('schema') != DUAL_STATE_SCHEMA:
+            return Verdict(False, f'its Muon state predates {DUAL_STATE_SCHEMA}; v0.3.4 is the '
+                                  'last release that resumes it')
         if int(extra.get('muon_warmup_steps', -1)) != int(opt.muon_warmup_steps):
-            return False
-        saved_base = [float(x) for x in extra.get('muon_base_lrs', [])]
-        return (saved_base == [float(x) for x in opt._muon_base_lrs]
-                and lrs(opt.opt_adam.param_groups) == lrs(state['adam']['param_groups']))
-    if isinstance(opt, PoseDualOptimizer):
-        return False
-    return lrs(opt.param_groups) == lrs(state['param_groups'])
+            return Verdict(False, f'muon_warmup_steps was {extra.get("muon_warmup_steps")}, this '
+                                  f'config has {opt.muon_warmup_steps}')
+        saved = [float(x) for x in extra.get('muon_base_lrs', [])]
+        if saved != [float(x) for x in opt._muon_base_lrs]:
+            return Verdict(False, f'the Muon group learning rates were {saved}, this run builds '
+                                  f'{[float(x) for x in opt._muon_base_lrs]}')
+        adam_have, adam_want = _lrs(opt.opt_adam.param_groups), _lrs(state['adam']['param_groups'])
+    else:
+        adam_have, adam_want = _lrs(opt.param_groups), _lrs(state['param_groups'])
+    if adam_have != adam_want:
+        return Verdict(False, f'the AdamW group learning rates were {adam_want}, this run builds '
+                              f'{adam_have}')
+    if metadata is not None and model is not None:
+        if metadata.get('schema') != OPTIMIZER_LAYOUT_SCHEMA:
+            return Verdict(False, f'its optimizer metadata is not {OPTIMIZER_LAYOUT_SCHEMA}')
+        kind, groups = _named_layout(opt, model)
+        if kind != metadata.get('optimizer') or groups != metadata.get('groups'):
+            return Verdict(False, 'its named param-group layout (which parameter sits in which '
+                                  'group, at which rate) differs from the one this run builds')
+    return Verdict(True)

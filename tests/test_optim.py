@@ -5,27 +5,13 @@ Linear weight, a 2D Embedding weight (which must NOT reach Muon), a 4D Conv weig
 weight and a bias. No tracktail model, no GPU: the thing under test is the router and the
 checkpoint round-trip, not the network.
 """
-import importlib.util
-from pathlib import Path
-
 import pytest
 import torch
 import torch.nn as nn
 
 from tailcyclenet.optim import (KNOWN_OPTIMIZER_KEYS, PoseDualOptimizer, build_muon,
-                                optimizer_layout_matches, refuse_group_count_mismatch,
-                                refuse_mismatched_optimizer_state, state_matches_optimizer_kind)
+                                build_optimizer, check_resume, state_kind)
 from tailcyclenet.unfreeze import apply_staged_unfreeze
-
-REPO = Path(__file__).resolve().parent.parent
-
-
-def _train_module():
-    spec = importlib.util.spec_from_file_location('tcn_train', REPO / 'tailcyclenet' / 'train.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
 
 class TinyEncoder(nn.Module):
     """The shape `unfreeze.py` reads: `blocks`, `norms_block` and `hierarchical_layers`.
@@ -207,25 +193,24 @@ def test_load_state_dict_restores_train_mode_by_value():
         assert torch.equal(p, s), 'train() after load moved params -> train_mode came back False'
 
 
-def test_adamwsf_state_into_muon_raises_named_systemexit():
-    tr = _train_module()
+def test_adamwsf_state_into_muon_is_refused_by_name():
     m = Tiny()
-    sf = tr.build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
+    sf = build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
     sf_state = sf.state_dict()
     muon = build_muon(m, set(), _cfg())
+    verdict = check_resume(muon, sf_state)
+    assert not verdict and 'schedulefree' in verdict.reason
     with pytest.raises(SystemExit, match='schedulefree'):
-        refuse_mismatched_optimizer_state(muon, sf_state, 'ck.pth', resolved='muon', explicit=False)
+        muon.load_state_dict(sf_state)
 
 
-def test_muon_state_into_adamwsf_raises_named_systemexit():
-    tr = _train_module()
+def test_muon_state_into_adamwsf_is_refused_by_name():
     m = Tiny()
     muon = build_muon(m, set(), _cfg())
     muon_state = muon.state_dict()
-    sf = tr.build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
-    with pytest.raises(SystemExit, match='muon'):
-        refuse_mismatched_optimizer_state(sf, muon_state, 'ck.pth', resolved='schedulefree',
-                                          explicit=True)
+    sf = build_optimizer(m, set(), _cfg(optimizer='schedulefree'))
+    verdict = check_resume(sf, muon_state)
+    assert not verdict and '"muon"' in verdict.reason
 
 
 def test_eval_train_swap_and_has_averaged_iterate():
@@ -434,26 +419,27 @@ def test_resume_without_replay_raises_a_named_group_count_error():
     apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     sd = opt.state_dict()
     fresh_opt = build_muon(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), fresh=set(), cfg=cfg)
-    with pytest.raises(SystemExit, match='video_encoder_finetune_last_n_layers'):
-        refuse_group_count_mismatch(fresh_opt, sd)
+    assert 'video_encoder_finetune_last_n_layers' in check_resume(fresh_opt, sd).reason
     with pytest.raises(SystemExit, match='video_encoder_finetune_last_n_layers'):
         fresh_opt.load_state_dict(sd)
 
 
-def test_state_matches_optimizer_kind_is_the_soft_resume_gate():
-    """A checkpoint_path resume is only possible when the checkpoint's optimizer KIND matches
-    what the config builds: Muon checkpoints carry the dual {'muon','adam'} structure, AdamW-SF
-    ones a plain one. A kind mismatch is a warm start, not an error -- the hard refusal is for
-    the run folder's own checkpoint, where a mismatch is a real bug."""
-    dual = {'muon': {'param_groups': []}, 'adam': {'param_groups': []}}
-    plain = {'param_groups': []}
-    assert state_matches_optimizer_kind(dual, 'muon')
-    assert not state_matches_optimizer_kind(dual, 'schedulefree')
-    assert state_matches_optimizer_kind(plain, 'schedulefree')
-    assert not state_matches_optimizer_kind(plain, 'muon')
+def test_state_kind_reads_the_optimizer_that_wrote_a_state():
+    """Muon checkpoints carry the dual {'muon','adam'} structure, AdamW-SF ones a plain one."""
+    assert state_kind({'muon': {'param_groups': []}, 'adam': {'param_groups': []}}) == 'muon'
+    assert state_kind({'param_groups': []}) == 'schedulefree'
 
 
-def test_optimizer_layout_matches_compares_groups_by_position():
+def test_a_state_from_before_the_dual_schema_is_refused():
+    """Pre-`pose-dual.v1` states are not resumed any more (v0.3.4 is the last release that did)."""
+    m, opt, cfg = _staged()
+    sd = opt.state_dict()
+    sd.pop('_tailcyclenet')
+    verdict = check_resume(opt, sd)
+    assert not verdict and 'v0.3.4' in verdict.reason
+
+
+def test_check_resume_compares_groups_by_position():
     """`load_state_dict` matches groups BY POSITION, so counts alone cannot tell a kpt group
     from an encoder group: the per-group lr sequence must match too, on both halves. A
     checkpoint whose layout differs is a warm start, never a silently mis-routed resume."""
@@ -461,41 +447,39 @@ def test_optimizer_layout_matches_compares_groups_by_position():
     m, opt, cfg = _staged()
     apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
     sd = opt.state_dict()
-    assert optimizer_layout_matches(opt, sd)
+    assert check_resume(opt, sd)
 
     # The replay reproduces the layout a run at the same unfreeze point would have.
     m2 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt2 = build_muon(m2, fresh=set(), cfg=cfg)
     apply_staged_unfreeze(m2, opt2, cfg, UNFREEZE_AT + 10)
-    assert optimizer_layout_matches(opt2, sd)
+    assert check_resume(opt2, sd)
 
     # A different lr is a different layout: loading would put the state on the wrong groups.
     m3 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     cfg3 = {**cfg, 'learning_rate': 2e-4}
     opt3 = build_muon(m3, fresh=set(), cfg=cfg3)
     apply_staged_unfreeze(m3, opt3, cfg3, UNFREEZE_AT + 10)
-    assert not optimizer_layout_matches(opt3, sd)
+    assert not check_resume(opt3, sd)
 
     # A run that never fired the unfreeze cannot resume one that did.
     m4 = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     opt4 = build_muon(m4, fresh=set(), cfg=cfg)
-    assert not optimizer_layout_matches(opt4, sd)
+    assert not check_resume(opt4, sd)
 
     # Same rule on the plain AdamW-SF optimizer.
-    tr = _train_module()
-    opt5 = tr.build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
+    opt5 = build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
                               {**cfg, 'optimizer': 'schedulefree'})
-    assert optimizer_layout_matches(opt5, opt5.state_dict())
-    opt6 = tr.build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
+    assert check_resume(opt5, opt5.state_dict())
+    opt6 = build_optimizer(Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST), set(),
                               {**cfg, 'optimizer': 'schedulefree', 'kpt_lr': 9e-4})
-    assert not optimizer_layout_matches(opt6, opt5.state_dict())
+    assert not check_resume(opt6, opt5.state_dict())
 
 
 def test_schedulefree_optimizer_takes_the_same_staged_path():
-    tr = _train_module()
     m = Tiny(unfreeze_at=UNFREEZE_AT, n_last=N_LAST)
     cfg = _cfg(optimizer='schedulefree')
-    opt = tr.build_optimizer(m, set(), cfg)
+    opt = build_optimizer(m, set(), cfg)
     assert not isinstance(opt, PoseDualOptimizer)
     before = len(opt.param_groups)
     info = apply_staged_unfreeze(m, opt, cfg, UNFREEZE_AT)
@@ -511,10 +495,9 @@ def test_schedulefree_escape_hatch_is_the_current_three_group_optimizer():
     """`optimizer = "schedulefree"` must build the exact AdamW-SF optimizer that exists today:
     fresh @ kpt_lr, rest @ lr, encoder @ lr*enc_scale -- three groups, no Muon.
     """
-    tr = _train_module()
     m = Tiny()
     fresh = {'decoder.mlps.0.weight'}
-    opt = tr.build_optimizer(m, fresh, _cfg(optimizer='schedulefree'))
+    opt = build_optimizer(m, fresh, _cfg(optimizer='schedulefree'))
     assert not isinstance(opt, PoseDualOptimizer)
     lrs = sorted(g['lr'] for g in opt.param_groups)
     # fresh @ kpt_lr, rest @ lr, encoder @ lr*enc_scale -- three groups, no Muon.

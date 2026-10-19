@@ -20,69 +20,19 @@ import numpy as np
 import torch
 
 from tailcyclenet import distributed as dist_utils
-from tailcyclenet.checkpoints import (full_training_state,
-                                      is_hf_repo_id, prior_provenance,
-                                      resolve_checkpoint, resolve_hf_checkpoint, save_checkpoint,
-                                      save_run_meta, warm_start)
+from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
 from tailcyclenet.config import BASE_CONFIG, check_image_size, load_config
 from tailcyclenet.dataset import (LoaderConfig, PoseDataset, SpawnHandoff, StepSampler,
                                   pose_collate, worker_init)
-from tailcyclenet.format import Registry
 from tailcyclenet.losses import PoseLoss
 from tailcyclenet.model import build_model
+from tailcyclenet.optim import KNOWN_OPTIMIZER_KEYS
 from tailcyclenet.runtime import gpu_peak_gb, init_wandb, launch, log, timed
-from tailcyclenet.unfreeze import (apply_norms_extension, apply_staged_unfreeze,
-                                   trainable_encoder_params)
+from tailcyclenet.start import build_start, plan_start
+from tailcyclenet.unfreeze import apply_staged_unfreeze, trainable_encoder_params
 
 # file_system sharing avoids the default's fd-per-tensor lifetime; harmless, keep it.
 torch.multiprocessing.set_sharing_strategy('file_system')
-
-
-def build_optimizer(model, fresh: set[str], cfg: dict, layout: dict | None = None):
-    """The run's optimizer, selected by `[training.optimizer].optimizer`; an absent key is "muon".
-
-    `"schedulefree"` is the AdamW-SF recipe a resume needs. Fresh params (identity table,
-    no-query tokens, fusion gate) get `kpt_lr`; a trainable encoder gets a lower one. Checkpoint
-    metadata is authoritative for historical fresh parameters; older checkpoints have no layout.
-    """
-    if isinstance(layout, dict) and isinstance(layout.get('fresh_names'), list):
-        fresh = set(layout['fresh_names'])
-    kind = str(cfg.get('optimizer', 'muon'))
-    if kind == 'muon':
-        from tailcyclenet.optim import build_muon
-        return build_muon(model, fresh, cfg)
-    if kind != 'schedulefree':
-        raise SystemExit(f'[training.optimizer].optimizer = {kind!r} is not one of '
-                         '"muon" | "schedulefree".')
-    lr = float(cfg['learning_rate'])
-    kpt_lr = float(cfg.get('kpt_lr', lr))
-    enc_scale = float(cfg.get('encoder_lr_scale', 1.0))
-    groups = {'fresh': [], 'encoder': [], 'rest': []}
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if name in fresh or name.startswith('query_encoder.kpt_'):
-            groups['fresh'].append(p)
-        elif name.startswith('scene_encoder.encoder.'):
-            groups['encoder'].append(p)
-        else:
-            groups['rest'].append(p)
-
-    from schedulefree import AdamWScheduleFree
-    param_groups = [
-        {'params': groups['fresh'], 'lr': kpt_lr},
-        {'params': groups['encoder'], 'lr': lr * enc_scale},
-        {'params': groups['rest'], 'lr': lr},
-    ]
-    opt = AdamWScheduleFree(
-        [g for g in param_groups if g['params']], lr=lr,
-        weight_decay=float(cfg.get('weight_decay', 0.0)),
-        warmup_steps=int(cfg.get('warmup_steps', 0)),
-        betas=(float(cfg.get('beta1', 0.9)), float(cfg.get('beta2', 0.95))))
-    print(f'optimizer: {len(groups["fresh"])} fresh @ {kpt_lr:g}, '
-          f'{len(groups["encoder"])} encoder @ {lr * enc_scale:g}, '
-          f'{len(groups["rest"])} rest @ {lr:g}')
-    return opt
 
 
 def _brief(m: dict) -> str:
@@ -91,18 +41,47 @@ def _brief(m: dict) -> str:
     return ' '.join(f'{k}={m[k]:.4g}' for k in keys if k in m)
 
 
-def base_registry(run: Path, checkpoint_path):
-    """An existing keypoint registry to append to, or None: run folder first, then the warm-start
-    checkpoint's folder. Renumbering would point embedding rows at different body parts."""
-    candidates = [run / 'keypoint_registry.toml']
-    if checkpoint_path:
-        ref = Path(checkpoint_path)
-        ref = ref.parent.parent if ref.is_file() else ref
-        candidates.append(ref / 'keypoint_registry.toml')
-    for p in candidates:
-        if p.exists():
-            print(f'keypoint registry: appending to {p}')
-            return Registry.load(p)
+KNOWN_TRAINING_KEYS = frozenset({
+    'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision', 'max_grad_norm',
+    'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq', 'train_metric_freq', 'out',
+    'optimizer', 'losses'})
+
+
+def check_training_keys(train_cfg: dict) -> None:
+    """Refuse an unknown `[training]` key (a typo would train at the defaults and report as the
+    arm it is not), and the deleted `freeze_encoder` by name."""
+    if 'freeze_encoder' in train_cfg:
+        raise SystemExit(
+            '[training].freeze_encoder was removed: it re-froze the encoder AFTER build_model, so '
+            'it silently overrode [model].video_encoder_requires_grad and would defeat the staged '
+            'unfreeze. Set [model].video_encoder_requires_grad instead -- false (never train the '
+            'encoder), true (from step 0), or an ITERATION to unfreeze at -- with '
+            '[model].video_encoder_finetune_last_n_layers for how many trailing blocks.')
+    unknown = set(train_cfg) - KNOWN_TRAINING_KEYS
+    if unknown:
+        raise SystemExit(
+            f'[training]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
+            f'train at the defaults and report as the arm it is not. Known keys: '
+            f'{sorted(KNOWN_TRAINING_KEYS)}')
+
+
+def has_val_split(root: Path) -> bool:
+    """Whether a dataset root (or any root in a folder of roots) has a `val/` split. Only a
+    MISSING split skips validation; an error building a present one propagates."""
+    root = Path(root)
+    return (root / 'val').is_dir() or any(
+        (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())
+
+
+def sampler_generator(seed: int, rank: int, world: int, first_step: int):
+    """The train sampler's RNG. A fresh run keeps the stream it always had (the global RNG at one
+    rank, `seed + rank` above); a resume at `first_step > 0` draws a NEW stream keyed on where it
+    resumes, instead of replaying the indices the run already saw."""
+    if first_step:
+        return torch.Generator().manual_seed(
+            int(seed) * 1_000_003 + int(rank) * 7_919 + int(first_step))
+    if world > 1:
+        return torch.Generator().manual_seed(int(seed) + int(rank))
     return None
 
 
@@ -333,20 +312,16 @@ def main(argv: list[str] | None = None):
     - Unknown `[training]`/`[data]` keys are refused (a typo would train at the
       defaults and report as the arm it is not); a missing `val/` split is the
       only error swallowed.
-    - Every rank builds the same registry; `warm_start` reuses it to prove the
-      checkpoint's keypoint table is a prefix of this run's.
+    - Every rank builds the same registry, appended to the start checkpoint's own, so
+      `warm_start` can prove the checkpoint's keypoint table is a prefix of this run's.
     - One epoch for the whole run (sampling is with replacement); `num_workers` and the RAM
-      ceiling are per rank. Val windows decode in a one-worker child, not the parent.
-    - The checkpoint is read before the optimizer is built (`start_it` decides whether the
-      staged unfreeze has fired); resume restores `model_state`, not `model_state_eval`.
-      `build_model()` skips the VJEPA2 download when a warm start or that resume is pending.
-    - `[training].checkpoint_path` resumes when it can: a checkpoint carrying `optimizer_state`
-      and `iteration` whose optimizer kind and param-group layout match this config continues
-      at its recorded iteration; otherwise it prints why and warm-starts from iteration 0. The
-      run folder's own `checkpoints/checkpoint_last.pth` still wins when present; its warm
-      start still runs, because `fresh` must route the optimizer as the checkpoint's run did.
-    - DDP registers parameters at wrap time, so the module is re-wrapped after
-      the resume replay and after an unfreeze.
+      ceiling are per rank. Val windows decode in a one-worker child, not the parent. A resumed
+      run's sampler continues at its step (`StepSampler(start=)`) on a new index stream.
+    - How the run starts -- fresh, warm start, or resume -- is `start.plan_start`'s decision,
+      made before anything is built; `start.build_start` carries it out (resume restores
+      `model_state`, not `model_state_eval`, and replays the staged unfreeze).
+    - DDP registers parameters at wrap time, so the module is wrapped after the resume replay
+      and re-wrapped after an unfreeze.
     - The resolved `box_source`, optimizer kind and world size are recorded in
       `provenance.toml`; metrics always go to log.jsonl.
     - `train/{2d,3d}/*` uses the batch's GT prompt (`kpt_prior`/`prompt_t`); `val/*` is prompt-free, so do not plot them on one axis.
@@ -401,15 +376,14 @@ def main(argv: list[str] | None = None):
     run = Path(args.out or train_cfg['out'])
     n_iter = int(train_cfg['n_iterations'])
     device = fabric.device
-    known_training = {'n_iterations', 'seed', 'checkpoint_path', 'checkpoint_revision',
-                      'max_grad_norm', 'checkpoint_freq', 'val_freq', 'val_batches', 'print_freq',
-                      'train_metric_freq', 'out', 'optimizer', 'losses'}
-    unknown_training = set(train_cfg) - known_training - {'freeze_encoder'}
-    if unknown_training:
+    check_training_keys(train_cfg)
+    opt_cfg = config['training']['optimizer']
+    opt_unknown = set(opt_cfg) - KNOWN_OPTIMIZER_KEYS
+    if opt_unknown:
         raise SystemExit(
-            f'[training]: unknown key(s) {sorted(unknown_training)}. Nothing reads them, so this '
-            f'run would train at the defaults and report as the arm it is not. Known keys: '
-            f'{sorted(known_training)}')
+            f'[training.optimizer]: unknown key(s) {sorted(opt_unknown)}. Nothing reads them, so '
+            f'this run would train at the defaults and report as the arm it is not. Known keys: '
+            f'{sorted(KNOWN_OPTIMIZER_KEYS)}')
 
     torch.manual_seed(int(train_cfg.get('seed', 23)))
     np.random.seed(int(train_cfg.get('seed', 23)))
@@ -424,8 +398,13 @@ def main(argv: list[str] | None = None):
     lc = LoaderConfig(**{k: v for k, v in data_cfg.items()
                          if k in LoaderConfig.__dataclass_fields__})
     lc = replace(lc, box_prompt=config['model'].get('box_prompt', 'none'))
-    base_reg = base_registry(run, train_cfg.get('checkpoint_path'))
-    train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=base_reg)
+    plan = plan_start(run, train_cfg.get('checkpoint_path'),
+                      revision=train_cfg.get('checkpoint_revision'), no_resume=args.no_resume,
+                      no_warm_start=args.no_warm_start,
+                      opt_kind=str(opt_cfg.get('optimizer', 'muon')), world=world)
+    if plan.registry is not None:
+        print(f'keypoint registry: appending to the {plan.mode} checkpoint\'s ({plan.path})')
+    train_ds = PoseDataset(data_cfg['path'], 'train', lc, registry_base=plan.registry)
     registry = train_ds.registry
     dist_utils.check_registry(fabric, registry.names)
     print(f'train: {len(train_ds)} windows across {len(train_ds.datasets)} dataset(s), '
@@ -433,9 +412,7 @@ def main(argv: list[str] | None = None):
     print('train: mix ' + '  '.join(f'{k}={v:.1%}' for k, v in train_ds.mix().items()))
     val_ds = None
     root = Path(data_cfg['path'])
-    has_val = (root / 'val').is_dir() or any(
-        (c / 'val').is_dir() for c in root.iterdir() if c.is_dir())
-    if not has_val:
+    if not has_val_split(root):
         print(f'val:   none (no val/ split under {root})')
     else:
         val_lc = replace(lc, cams_to_sample=lc.val_cams_to_sample)
@@ -448,17 +425,6 @@ def main(argv: list[str] | None = None):
                      f'processes on {os.cpu_count()} cores. Lower [data].num_workers or '
                      f'--num-workers; the loader is this repo\'s documented bottleneck and '
                      f'oversubscribing it is not free.')
-    gen = None
-    if world > 1:
-        gen = torch.Generator().manual_seed(int(train_cfg.get('seed', 23)) + fabric.global_rank)
-    local_iters = dist_utils.per_rank(n_iter, world)
-    loader = torch.utils.data.DataLoader(
-        SpawnHandoff(train_ds), batch_size=1, num_workers=nw, collate_fn=pose_collate,
-        sampler=StepSampler(len(train_ds), num_samples=local_iters, generator=gen),
-        generator=gen,
-        persistent_workers=nw > 0, pin_memory=True, drop_last=True,
-        prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init,
-        multiprocessing_context='spawn' if nw > 0 else None)
 
     val_freq = int(train_cfg.get('val_freq', 0))
     val_batches, idxs = [], []
@@ -476,87 +442,6 @@ def main(argv: list[str] | None = None):
         for sid, n in sorted(seen.items()):
             fabric.print(f'         {n:3d}  {sid}')
 
-    resumed = run / 'checkpoints' / 'checkpoint_last.pth'
-    opt_kind = str(config['training']['optimizer'].get('optimizer', 'muon'))
-    from tailcyclenet.optim import (optimizer_layout_matches, optimizer_layout_matches_metadata,
-                                    optimizer_metadata_from_checkpoint,
-                                    state_matches_optimizer_kind)
-    checkpoint = None
-    if not args.no_warm_start and train_cfg.get('checkpoint_path'):
-        checkpoint_ref = train_cfg['checkpoint_path']
-        if is_hf_repo_id(checkpoint_ref):
-            checkpoint = resolve_hf_checkpoint(checkpoint_ref,
-                                               revision=train_cfg.get('checkpoint_revision'))
-        else:
-            ref = Path(checkpoint_ref)
-            checkpoint = ref if ref.is_file() else resolve_checkpoint(ref)
-    will_load_full_checkpoint = ((resumed.exists() and not args.no_resume)
-                                  or checkpoint is not None)
-    model_cfg = ({**config['model'], 'video_encoder_pretrained': False} if will_load_full_checkpoint
-                else config['model'])
-    model = build_model(model_cfg, n_keypoints=registry.n_keypoints)
-    fresh: set[str] = set()
-    resume_layout: dict | None = None
-    start_it, ck, resume_from = 0, None, None
-    if resumed.exists() and not args.no_resume:
-        resume_from = resumed
-        ck = torch.load(resumed, map_location=device, weights_only=False)
-        start_it = int(ck['iteration'])
-    elif checkpoint is not None and not args.no_resume:
-        ck = torch.load(checkpoint, map_location='cpu', weights_only=False)
-        if full_training_state(ck) and state_matches_optimizer_kind(ck['optimizer_state'],
-                                                                    opt_kind):
-            resume_from = checkpoint
-            start_it = int(ck['iteration'])
-    if ck is not None and resume_from is not None:
-        fresh, resume_layout = optimizer_metadata_from_checkpoint(ck)
-        if resume_layout is None:
-            fresh = set()
-
-    if ck is not None and resume_from != resumed:
-        try:
-            model.load_state_dict(ck['model_state'])
-        except RuntimeError as e:
-            print(f'checkpoint_path: {resume_from} does not resume -- weights do not load '
-                  f'into this model ({type(e).__name__}: {str(e).splitlines()[0]}); '
-                  'continuing as a warm start')
-            ck, start_it, resume_from, resume_layout = None, 0, None, None
-    if checkpoint is not None and (ck is None or resume_from == resumed):
-        fresh = warm_start(model, checkpoint, base_names=base_reg.names if base_reg else None)
-    if 'freeze_encoder' in train_cfg:
-        raise SystemExit(
-            '[training].freeze_encoder was removed: it re-froze the encoder AFTER build_model, so '
-            'it silently overrode [model].video_encoder_requires_grad and would defeat the staged '
-            'unfreeze. Set [model].video_encoder_requires_grad instead -- false (never train the '
-            'encoder), true (from step 0), or an ITERATION to unfreeze at -- with '
-            '[model].video_encoder_finetune_last_n_layers for how many trailing blocks.')
-    enc_grad = config['model'].get('video_encoder_requires_grad', False)
-    n_last = config['model'].get('video_encoder_finetune_last_n_layers')
-    n_frozen = sum(1 for n, p in model.named_parameters()
-                   if n.startswith('scene_encoder.encoder.') and not p.requires_grad)
-    if isinstance(enc_grad, bool):
-        ext = apply_norms_extension(model)
-        n_frozen = sum(1 for n, p in model.named_parameters()
-                       if n.startswith('scene_encoder.encoder.') and not p.requires_grad)
-        if not enc_grad:
-            print(f'encoder: frozen for the whole run ({n_frozen} frozen tensors)')
-        else:
-            print(f'encoder: trainable from step 0, last '
-                  f'{n_last if n_last is not None else "all"} block(s)'
-                  f'{f" + norms {ext}" if ext else ""} ({n_frozen} frozen tensors)')
-    else:
-        print(f'encoder: frozen now, last {n_last if n_last is not None else "all"} block(s) '
-              f'unfreeze at iteration {int(enc_grad)} ({n_frozen} frozen tensors)')
-    model = model.to(device)
-
-    opt_cfg = config['training']['optimizer']
-    from tailcyclenet.optim import KNOWN_OPTIMIZER_KEYS
-    opt_unknown = set(opt_cfg) - KNOWN_OPTIMIZER_KEYS
-    if opt_unknown:
-        raise SystemExit(
-            f'[training.optimizer]: unknown key(s) {sorted(opt_unknown)}. Nothing reads them, so '
-            f'this run would train at the defaults and report as the arm it is not. Known keys: '
-            f'{sorted(KNOWN_OPTIMIZER_KEYS)}')
     opt_cfg_scaled = dist_utils.scale_optimizer_cfg(opt_cfg, world)
     if world > 1:
         fabric.print(f'lr: scaled by sqrt({world}) -> learning_rate '
@@ -564,47 +449,35 @@ def main(argv: list[str] | None = None):
                      + (f', kpt_lr {opt_cfg_scaled["kpt_lr"]:g}' if 'kpt_lr' in opt_cfg_scaled
                         else '')
                      + ' (the multipliers -- encoder_lr_scale, muon_lr_scale -- are unchanged)')
-    opt = build_optimizer(model, fresh, opt_cfg_scaled, layout=resume_layout)
+
+    def make_model(pretrained):
+        """This run's pose model; the backbone download is skipped when a checkpoint overwrites it."""
+        cfg = config['model'] if pretrained else {**config['model'],
+                                                  'video_encoder_pretrained': False}
+        return build_model(cfg, n_keypoints=registry.n_keypoints)
+
+    started = build_start(plan, make_model, opt_cfg_scaled, config['model'], device)
+    model, opt, fresh, plan = started.model, started.optimizer, started.fresh, started.plan
+    start_it = plan.start_it
+    if not plan.resumes and (run / 'checkpoints' / 'checkpoint_last.pth').exists():
+        print(f'--no-resume: {run / "checkpoints"} checkpoint_last.pth and any checkpoint_best.pth '
+              'beside it WILL be overwritten')
     losses = dict(config['training']['losses'])
     losses.setdefault('per_camera_cube_scale',
                       bool(config['model'].get('per_camera_cube_scale', False)))
     loss_fn = PoseLoss(**losses)
 
-    if ck is not None:
-        if resume_from == resumed:
-            model.load_state_dict(ck['model_state'])
-        info = apply_staged_unfreeze(model, opt, opt_cfg_scaled, start_it, fresh=fresh,
-                                      layout=resume_layout)
-        if info:
-            print(f'resume: replayed the encoder unfreeze (blocks {info["blocks"]}, '
-                  f'norms {info["norms"]}, {info["n_params"]:,} params)')
-        metadata_ok = (resume_layout is None or
-                       optimizer_layout_matches_metadata(opt, model, resume_layout))
-        if not metadata_ok:
-            if resume_from == resumed:
-                raise SystemExit(
-                    f'{resume_from} has a different named optimizer layout than this run builds; '
-                    'start a warm start or restore the matching configuration')
-            print(f'checkpoint_path: {resume_from} has a different named optimizer layout; '
-                  'the weights stand, the optimizer starts fresh at iteration 0')
-            ck, start_it = None, 0
-        else:
-            from tailcyclenet.optim import refuse_mismatched_optimizer_state
-            refuse_mismatched_optimizer_state(
-                opt, ck['optimizer_state'], resume_from,
-                resolved=opt_kind,
-                explicit='optimizer' in config['training']['optimizer'])
-            if resume_from != resumed and not optimizer_layout_matches(opt, ck['optimizer_state']):
-                print(f'checkpoint_path: {resume_from} was trained with a different optimizer '
-                      'param-group layout than this config builds (group count or per-group lr); '
-                      'the weights stand, the optimizer starts fresh at iteration 0')
-                ck, start_it = None, 0
-            else:
-                opt.load_state_dict(ck['optimizer_state'])
-                print(f'resuming {resume_from} at iteration {start_it} of {n_iter} '
-                      '(--no-resume to start over, which OVERWRITES both checkpoints)')
-    elif resumed.exists():
-        print(f'--no-resume: {resumed} and any checkpoint_best.pth beside it WILL be overwritten')
+    local_iters = dist_utils.per_rank(n_iter, world)
+    first_step = dist_utils.ceil_div(start_it, world)
+    gen = sampler_generator(int(train_cfg.get('seed', 23)), fabric.global_rank, world, first_step)
+    loader = torch.utils.data.DataLoader(
+        SpawnHandoff(train_ds), batch_size=1, num_workers=nw, collate_fn=pose_collate,
+        sampler=StepSampler(len(train_ds), num_samples=max(local_iters - first_step, 0),
+                            generator=gen, start=first_step),
+        generator=gen,
+        persistent_workers=nw > 0, pin_memory=True, drop_last=True,
+        prefetch_factor=4 if nw > 0 else None, worker_init_fn=worker_init,
+        multiprocessing_context='spawn' if nw > 0 else None)
 
     raw = model
     wrap = world > 1 or args.precision != '32-true'
@@ -612,14 +485,6 @@ def main(argv: list[str] | None = None):
 
     config.setdefault('data', {})['box_source'] = train_ds.cfg.box_source
     opt_cfg['optimizer'] = str(opt_cfg.get('optimizer', 'muon'))
-    prior = prior_provenance(run)
-    if prior.get('world_size') and int(prior['world_size']) != world:
-        fabric.print(
-            f'WARNING: this run folder was written by a {prior["world_size"]}-rank run and this '
-            f'is a {world}-rank one. The learning rate (sqrt of the world size) and the '
-            f'iteration-to-sample mapping both change, so the continued run is not the run it '
-            f'continues. Allowed on purpose -- a preempted job often comes back on fewer gpus -- '
-            f'but say so when reporting it.')
     if is0:
         save_run_meta(run, config, registry, extra={
             'world_size': world, 'devices': str(args.devices), 'precision': args.precision,
@@ -804,11 +669,11 @@ def main(argv: list[str] | None = None):
                 drift, p = dist_utils.check_ranks_agree(fabric, raw), None
                 if not args.no_checkpoints:
                     p = save_checkpoint(run, it, raw, opt, config, write=is0, registry=registry,
-                                     fresh_names=fresh)
+                                        fresh_names=fresh, world_size=world)
                     if latest[1] == it and latest[0] < saved_mpjpe:
                         saved_mpjpe = latest[0]
-                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0, registry=registry,
-                                         fresh_names=fresh)
+                        save_checkpoint(run, it, raw, opt, config, name='best', write=is0,
+                                        registry=registry, fresh_names=fresh, world_size=world)
                         fabric.print(f'  new best: mpjpe {saved_mpjpe:.4g} -> '
                                      f'checkpoint_best.pth')
                         record({'iter': it, 'saved_mpjpe': saved_mpjpe})

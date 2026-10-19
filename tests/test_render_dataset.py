@@ -1,4 +1,4 @@
-"""`scripts/render_dataset.py`: the indexing around the cv2 calls (frame 0's labels drawn on
+"""`scripts/dataset_tools/render_dataset.py`: the indexing around the cv2 calls (frame 0's labels drawn on
 frame 3 would look plausible)."""
 import importlib.util
 import sys
@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 def _mod():
     spec = importlib.util.spec_from_file_location(
-        'tcn_render', REPO / 'scripts' / 'render_dataset.py')
+        'tcn_render', REPO / 'scripts' / 'dataset_tools' / 'render_dataset.py')
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)

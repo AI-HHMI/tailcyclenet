@@ -328,7 +328,7 @@ def test_cams_to_sample_takes_a_range(tiny_root):
         ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
         return [len(ds[i % len(ds)][0]) for i in range(n)]
 
-    assert set(counts([1, 8])) == {1, 2, 3}      # every value occurs, clamped to the session
+    assert set(counts([1, 8], 160)) == {1, 2, 3}  # P(missing a value) ~ 2 * (7/8)^160 ~ 1e-9
     assert set(counts([2, 2], 6)) == {2}         # a degenerate range is a fixed count
     assert set(counts(0, 3)) == {3}              # 0 still means "all cameras"
 

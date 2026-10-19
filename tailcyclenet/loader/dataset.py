@@ -1,4 +1,4 @@
-"""The training loader: tailcycle-dataset on disk -> the batch tracktail's model consumes.
+"""The pose training Dataset: tailcycle-dataset on disk -> the item tracktail's model consumes.
 
 Three sampling modes, decided per item: 3D multiview (`cams_to_sample` cameras, world-mm targets),
 3D single-view (one camera, world-mm targets, possible when `cams_to_sample` draws one), and 2D
@@ -10,245 +10,27 @@ T >= 2 always (a T=1 window gives tracktail a zero-length pos_embed).
 """
 from __future__ import annotations
 
-import pickle
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from tracktail.datasets.tracktail_dataset import custom_collate
-from .tracktail_compat import rotate_camera_image_plane_3d
-from tracktail.model.cube import get_camera_scale, is_point_visible, project_points_torch
+from tracktail.model.cube import is_point_visible, project_points_torch
 
-from .data import crop as cropmod
-from .data.camera import apply_affine, flip_2d, mask_outside, prior_out_of_bounds, resize_camera, rotate_2d
-from .data.pixels import decode_errors, read_frames, warn_decode_failure
-from .data.crop import BOX_SOURCES
-from .format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
-
-
-@dataclass
-class LoaderConfig:
-    """Everything the loader is allowed to vary. Deliberately short."""
-    n_frames: int = 24
-    # cameras are resized so max(W,H) == this
-    image_size: int = 256
-    # int, or a [low, high] pair drawn per item (tracktail's own `sample_cameras`); 0 means every
-    # camera. The pretrained tracker this finetunes from was trained at [1, 8], so a fixed count
-    # above that is out of distribution as well as slow.
-    cams_to_sample: int | list = 0
-    # the reference's [dataset.val] value
-    val_cams_to_sample: int | list = 5
-    # rate at which a training item uses the single-camera image-plane 2D path
-    prob_2d_only: float = 0.25
-    # semantic switch for 3D single-view sampling; legacy keeps 3D targets in one camera
-    two_d_sampling: str = 'true-2d-hybrid-v1'
-    # sample datasets uniformly, not proportionally
-    balance_datasets: bool = True
-    # in-plane rotation, per-camera appearance, cutout
-    aug_prob: float = 0.4
-    # In-plane rotation magnitude and rate, split out of `aug_prob` because they are what a root
-    # sets. 180 is a FULL 360 draw and costs nothing over 45 on a wide frame: the border-free
-    # canvas is 90-degree periodic (`_rotated_rect_max_inscribed`), and the wider draw covers
-    # more heading.
-    aug_rotation_deg: float = 180.0
-    # None means "follow aug_prob"; set it to dial rotation without moving appearance jitter.
-    aug_rotation_prob: float | None = None
-    # train-only source-canvas reflection for native/forced 2D items; zero is byte/RNG-identical.
-    flip_2d_prob: float = 0.0
-    flip_2d_modes: list = field(default_factory=lambda: ['horizontal'])
-    # per-FRAME appearance: motion blur, sensor noise
-    per_image_aug_prob: float = 0.25
-    # rate at which a train item drops colour entirely
-    grayscale_prob: float = 0.2
-    # rate at which a train item inverts colour (black <-> white)
-    invert_prob: float = 0.0
-    # box centre jitter, fraction of box size
-    crop_jitter: float = 0.3
-    # box scale jitter
-    crop_jitter_scale: float = 0.3
-    min_crop_dim: int = 64
-    # What the crop rule bounds: `keypoints` (the labels) or `instances` (the `instances.pq`
-    # box), for a root whose stored keypoints are too sparse to enclose the animal. INERT where
-    # a root ships no table (falls back to keypoints per view).
-    box_source: str = 'instances'
-    # fraction of TRAINING STEPS that run fully query-free
-    prompt_dropout: float = 0.4
-    # sigma on the prior, in PIXELS (3D scales by cube_scale)
-    prompt_noise_px: float = 0.0
-    # The two corruptions that have the SHAPE of a deployment failure, both off by default.
-    # sigma of a WHOLE-BODY offset, one vector per item
-    prompt_offset_px: float = 0.0
-    # max frames the prior may describe away from `prompt_t`
-    prompt_stale_frames: int = 0
-    # TWO MORE FAILURES WITH THE SHAPE OF A DEPLOYMENT ERROR, both off by default and both aimed
-    # at `--anchor carry` specifically: a carried pose that swapped two keypoints, or latched
-    # onto the wrong animal. BOTH ARE PER-KEYPOINT PROBABILITIES -- every prompted keypoint
-    # independently draws its own Bernoulli, not a single per-item coin.
-    #
-    # A SELECTED keypoint is REPLACED by another finite keypoint's ORIGINAL position, drawn
-    # UNIFORMLY and INDEPENDENTLY per selected point -- not a permutation, so the prior SET is
-    # not preserved (the same way `prompt_noise_px`/`prompt_offset_px` already perturb it).
-    prompt_swap_kpt_pairs: float = 0.0
-    # Bernoulli(`prompt_swap_animal`), independently PER KEYPOINT, against the ONE neighbour
-    # animal picked for this item -- so P(a given keypoint's prior becomes that neighbour's own
-    # point) is `prompt_swap_animal`, CONDITIONAL on that point itself being usable there
-    # (`prior_out_of_bounds`, the same rule `--anchor carry` uses). The CONFIGURED rate is
-    # therefore an upper bound on the PRESENTED one. A session with fewer than two animals never
-    # reaches for this key at all.
-    prompt_swap_animal: float = 0.0
-    # 0 -> non-overlapping windows for val/test
-    val_stride: int = 0
-    # Frame stride for a TRAIN window, drawn per item; repeat an entry to weight it.
-    # Val/test are always 1.
-    frame_strides: list = field(default_factory=lambda: [1])
-    # Train sampling mix, a TWO-LEVEL draw: source first, then mode within that source. Either
-    # level is skipped where a dataset offers no choice; None leaves that level alone (entries
-    # keep their natural share).
-    # P(a step comes from an `annotated` session)
-    annot_frac: float | None = None
-    # P(3d | source), i.e. applied WITHIN each source
-    mode_3d_frac: float | None = None
-    # THE BOX PROMPT, the DATA side. 'none' | 'film': when not 'none' the loader emits a
-    # per-frame animal box (`box_prompt.compute_box_prompt`) as a non-position channel; 'none'
-    # emits nothing, so a plain run is byte-identical. Set by `scripts/train.py` from
-    # `[model].box_prompt` so the two cannot disagree.
-    box_prompt: str = 'none'
-    # 'all' (per frame) | 'first' (the starting frame's box)
-    box_prompt_frames: str = 'all'
-    # fraction of STEPS the box is withheld (no-box token)
-    box_prompt_dropout: float = 0.0
-    # plan section 6.3: of the items ALREADY box-dropped (a subset of box_prompt_dropout, not an
-    # additional draw -- REPLACES some of that fraction's corrupted priors with clean ones,
-    # keeping the total box-free fraction unchanged), the fraction that ALSO get a CLEAN pose
-    # prior (no prompt_dropout / prompt_offset_px / prompt_noise_px corruption applied), so the
-    # model has a genuine pose-only training signal instead of one where every box-free item is
-    # ALSO independently pose-corrupted by chance. Default 0.0 = OFF = today's behaviour,
-    # BYTE-IDENTICAL: the coupling logic below is entered only when this is > 0, so at 0.0 not one
-    # extra `rng` call is made and every corruption site draws exactly where it always has.
-    pose_only_prob: float = 0.0
-    # exposure bias: the deployed box is a DETECTOR box
-    box_prompt_jitter: float = 0.0
-    box_prompt_scale_jitter: float = 0.0
-
-    def __post_init__(self):
-        """Validate the opt-in 2D reflection configuration at construction time."""
-        try:
-            probability = float(self.flip_2d_prob)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f'flip_2d_prob must be a number in [0, 1], got {self.flip_2d_prob!r}') from exc
-        if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
-            raise ValueError(f'flip_2d_prob must be in [0, 1], got {self.flip_2d_prob!r}')
-        if not isinstance(self.flip_2d_modes, (list, tuple)):
-            raise ValueError(
-                f'flip_2d_modes must be a list of "horizontal"/"vertical" values, '
-                f'got {self.flip_2d_modes!r}')
-        modes = list(self.flip_2d_modes)
-        allowed = ('horizontal', 'vertical')
-        unknown = [mode for mode in modes if not isinstance(mode, str) or mode not in allowed]
-        if unknown:
-            raise ValueError(
-                f'flip_2d_modes must contain only {allowed}, got {unknown[0]!r}')
-        if len(set(modes)) != len(modes):
-            raise ValueError(f'flip_2d_modes must contain no duplicate entries, got {modes!r}')
-        if probability > 0 and not modes:
-            raise AssertionError(
-                'flip_2d_modes must be non-empty when flip_2d_prob > 0; '
-                'a positive probability has no legal mode to draw')
-        self.flip_2d_prob = probability
-        self.flip_2d_modes = modes
-        self._check_values()
-
-    def _check_values(self) -> None:
-        """Refuse, at construction, the values the loader would otherwise first trip over inside a
-        worker at the first item -- or, for `box_prompt`, silently read as ON."""
-        from .box_prompt import BOX_PROMPT_FRAMES
-        from .query_encoder import BOX_MODES
-
-        sampling = ('true-2d-hybrid-v1', 'legacy-3d-single-view')
-        if self.two_d_sampling not in sampling:
-            raise ValueError(f'two_d_sampling must be one of {sampling}, '
-                             f'got {self.two_d_sampling!r}')
-        if self.box_prompt_frames not in BOX_PROMPT_FRAMES:
-            raise ValueError(f'box_prompt_frames must be one of {BOX_PROMPT_FRAMES}, '
-                             f'got {self.box_prompt_frames!r}')
-        if self.box_prompt != 'none' and self.box_prompt not in BOX_MODES:
-            raise ValueError(f"box_prompt must be 'none' or one of {BOX_MODES}, "
-                             f'got {self.box_prompt!r}')
-        for name in ('cams_to_sample', 'val_cams_to_sample', 'crop_inflate'):
-            spec = getattr(self, name)
-            if isinstance(spec, (list, tuple)):
-                if len(spec) < 2 or float(spec[0]) > float(spec[1]):
-                    raise ValueError(f'{name} must be a number or a [low, high] pair with '
-                                     f'low <= high, got {spec!r}')
-        p = self.aug_rotation_prob
-        if p is not None and not 0.0 <= float(p) <= 1.0:
-            raise ValueError(f'aug_rotation_prob must be None or in [0, 1], got {p!r}')
-
-    # WIDE-CROP TRAINING: widen the crop-rule box about its centre by this factor BEFORE the
-    # coords are shifted into it, so the animal sits off-centre in a wider crop and the box
-    # (computed post-hoc from the returned coords) is the only non-centred cue for which animal.
-    # 1.0 is INERT and byte-identical to a config without this key.
-    #
-    # A float, or a `[low, high]` pair drawn per TRAIN item (the same `cams_to_sample` contract);
-    # VAL/TEST NEVER DRAW: `_crop_inflate` returns the range's MIDPOINT there, exactly as
-    # `crop_jitter` is gated to train-only -- `checkpoint_best` selection has to read the SAME
-    # crop geometry every val pass, or the val curve would be noise from the geometry draw.
-    crop_inflate: float | list = 1.0
-
-
-LOADER_PLUMBING = ('path', 'num_workers')
-SCORER_PLUMBING = LOADER_PLUMBING + ('val_num_workers', 'prefetch_factor', 'worker_cv_threads')
-
-
-def loader_config_from(data_cfg: dict, *, extra=LOADER_PLUMBING) -> LoaderConfig:
-    """`[data]` -> a `LoaderConfig`, refusing any key neither it nor the caller reads.
-
-    An unknown key would otherwise be ignored and the run would report as an arm it is not. The
-    ONE place pose training, scorer training and scorer QC turn a `[data]` block into a loader.
-
-    Inputs: data_cfg -- the `[data]` block; extra -- keys the caller reads itself (plumbing such
-            as `path`/`num_workers`), allowed but not passed to the dataclass.
-    Outputs: a `LoaderConfig`.
-    Side effects: none, or raises SystemExit naming the unknown keys.
-    """
-    fields = LoaderConfig.__dataclass_fields__
-    known = set(fields) | set(extra)
-    unknown = set(data_cfg) - known
-    if unknown:
-        raise SystemExit(
-            f'[data]: unknown key(s) {sorted(unknown)}. Nothing reads them, so this run would '
-            f'train at the defaults and report as the arm it is not. Known keys: {sorted(known)}')
-    return LoaderConfig(**{k: v for k, v in data_cfg.items() if k in fields})
-
-
-# pixels
-
-
-def _rotate_camera_group_with_neighbours(cgroup, coords, others):
-    """`TracktailDataset.rotate_camera_group`, optionally carrying a SECOND point set through the
-    identical draw. Returns `(cgroup, coords, others)`; `others` is None in, None out.
-
-    With `others` None (the default) this is EXACTLY the library call. With it, `others` is one
-    neighbour's (T,K,R) pose and rides the same `rotmat` via a temporary concatenation on the
-    keypoint axis, which changes nothing about `coords`' own output. Callers must NOT pass the
-    combined tensor to `crop_to_points_3d`: the crop is the TARGET's extent, and a neighbour
-    would change the item's geometry.
-    """
-    from tracktail.datasets.tracktail_dataset import TracktailDataset
-
-    if others is None:
-        cgroup, coords = TracktailDataset.rotate_camera_group(None, cgroup, coords)
-        return cgroup, coords, None
-    K = coords.shape[1]
-    combined = torch.cat([coords, others], dim=1)
-    cgroup, combined = TracktailDataset.rotate_camera_group(None, cgroup, combined)
-    return cgroup, combined[:, :K], combined[:, K:]
+from ..data import crop as cropmod
+from ..data.camera import apply_affine, flip_2d, mask_outside, resize_camera, rotate_2d
+from ..data.crop import BOX_SOURCES
+from ..data.pixels import decode_errors, read_frames, warn_decode_failure
+from ..format import MISSING, PROJECTED, UNLABELED, VISIBLE, Registry, load_datasets
+from ..tracktail_compat import rotate_camera_image_plane_3d
+from .augment import augment_views, build_augmenters, crop_inflate, n_cams, rotate_camera_group_with_neighbours
+from .config import LoaderConfig
+from .prior import corrupt_prior
+from .sampling import shard_sessions
 
 
 def _vis2d_target(v2):
@@ -264,42 +46,6 @@ def _vis2d_target(v2):
                                     (v2 == VISIBLE).astype(np.float32)))
 
 
-# appearance augmentation
-
-def _crop_inflate(cfg, rng, train):
-    """THIS item's crop-inflate factor. `cfg.crop_inflate` is a float, or a `[low, high]` pair --
-    same contract as `_n_cams`/`cams_to_sample`, one continuous draw instead of `_n_cams`'
-    integer one.
-
-    TRAIN draws uniformly in `[low, high]` per item, so a wide-crop run shows the model a RANGE of
-    context rather than one fixed geometry every step. VAL/TEST NEVER DRAW -- they get the range's
-    MIDPOINT, for the same reason `_jitter` is gated to `self.train` alone: `checkpoint_best` is
-    selected on the val curve, and a val geometry that moved step to step would put noise from the
-    crop draw into a number that is supposed to isolate the weights. A plain scalar has no
-    range to be a midpoint of and returns unchanged either way, so a scalar config -- everything
-    shipped before this key existed a range -- is untouched.
-    """
-    spec = cfg.crop_inflate
-    if not isinstance(spec, (list, tuple)):
-        return float(spec)
-    lo, hi = float(spec[0]), float(spec[1])
-    return float(rng.uniform(lo, hi)) if train else (lo + hi) / 2.0
-
-
-def _n_cams(spec, rng):
-    """How many cameras this item shows. `spec` is an int, or a [low, high] pair drawn per item.
-
-    The pair form is tracktail's (`TracktailDataset.sample_cameras`, `tracktail_dataset.py:1258-1266`)
-    and it is what the pretrained tracker was finetuned with, at [1, 8]. Returning a number larger
-    than the session has is fine -- the caller takes every camera in that case, exactly as the
-    reference's `if len(cam_names) > num_cams_to_sample` guard does.
-    """
-    if isinstance(spec, (list, tuple)):
-        lo, hi = int(spec[0]), int(spec[1])
-        return int(rng.integers(lo, hi + 1))
-    return int(spec)
-
-
 def _even_span(span, ceiling):
     """Round a labelled span up to an even window length in [2, ceiling].
 
@@ -309,63 +55,6 @@ def _even_span(span, ceiling):
     hi = max(2, int(ceiling) - int(ceiling) % 2)
     return min(max(2, int(span) + int(span) % 2), hi)
 
-
-def _build_augmenters(cfg):
-    """The two appearance pipelines, taken from the reference (`tracktail_dataset.py:570-588`).
-
-    The SPLIT is the point, not the list. `per_camera` is sampled once per camera and replayed
-    frame by frame, so a camera's colour, gamma and focus hold steady down a clip: appearance is
-    an identity cue for a tracker, and re-rolling hue every frame teaches that it is noise.
-    `per_image` is resampled per frame, which is what sensor noise and motion blur actually are.
-
-    Cost was last measured at 0.141 s for `per_camera` and 0.052 s for `per_image` on 24 crops of
-    256x256 with every augmenter firing, but that predates dropping `DefocusBlur` -- which was
-    4.2 ms/frame, the most expensive single entry -- so `per_camera` is now well under it. Watch
-    `train/loader_wait_frac`; re-measure the same way before blaming augmentation for it.
-    """
-    import imgaug.augmenters as iaa
-
-    p, q = cfg.aug_prob, cfg.per_image_aug_prob
-    per_camera = iaa.Sequential([
-        iaa.Sometimes(p, iaa.GammaContrast((0.6, 1.8))),
-        iaa.Sometimes(p, iaa.AddToSaturation((-50, 30))),
-        iaa.Sometimes(p, iaa.AddToHue((-10, 10))),
-    ])
-    per_image = iaa.Sequential([
-        iaa.Sometimes(q, iaa.MotionBlur(k=(3, 5))),
-        iaa.Sometimes(q, iaa.AdditiveGaussianNoise(scale=(0, 0.04 * 255))),
-        iaa.Sometimes(q, iaa.Multiply((0.9, 1.1))),
-    ])
-    return per_camera, per_image
-
-
-def _cutout_rects(rng, size, p2d, vis_2d, cnum):
-    """Random-erasing rectangles for one camera, in crop pixels. Mutates `vis_2d` in place.
-
-    A keypoint underneath a rect is no longer visible, and saying so is the whole point: without
-    it the model is asked to report "visible" for a patch that has been painted over, which is the
-    one label that is definitely wrong.
-
-    `vis_2d` here is THREE-state -- NaN means "no one assessed this camera". Cutout overwrites
-    NaN with 0, and that is right rather than an invention: the pixels are now literally covered,
-    so "not visible" became a fact about the image we just produced.
-    """
-    w, h = int(size[0]), int(size[1])
-    rects = []
-    for _ in range(int(rng.integers(1, 4))):
-        rw, rh = int(w * 0.15), int(h * 0.15)
-        rx = int(rng.integers(0, max(w - rw, 1)))
-        ry = int(rng.integers(0, max(h - rh, 1)))
-        rects.append((rx, ry, rx + rw, ry + rh, rng.integers(0, 256, 3).tolist()))
-        if vis_2d is not None:
-            pts = p2d[cnum]
-            inside = ((pts[..., 0] >= rx) & (pts[..., 0] <= rx + rw) &
-                      (pts[..., 1] >= ry) & (pts[..., 1] <= ry + rh))
-            vis_2d[:, :, cnum][inside] = 0
-    return rects
-
-
-# the dataset
 
 @dataclass
 class _Item:
@@ -471,18 +160,6 @@ def _session_flip_permutation(sess):
     return torch.as_tensor(perm, dtype=torch.long), [n for n in sess.names if n not in paired]
 
 
-def shard_sessions(sessions, rank: int = 0, world_size: int = 1):
-    """Return a deterministic disjoint session shard, preserving source order.
-
-    ``world_size=1`` is exactly the historical list.  Session metadata remains visible to
-    registry construction; only the returned sessions are preloaded by ``PoseDataset``.
-    """
-    world_size, rank = int(world_size), int(rank)
-    if world_size < 1 or not 0 <= rank < world_size:
-        raise ValueError(f'invalid session shard rank={rank}, world_size={world_size}')
-    return list(sessions)[rank::world_size]
-
-
 class PoseDataset(Dataset):
     """The pose training loader: one item is `shape` -> `select` -> `realise` -> `_targets`.
 
@@ -513,19 +190,11 @@ class PoseDataset(Dataset):
         Side effects: reads every requested split label table; prints the box_source coverage per
         dataset.
 
-        `n_frames` must be >= 2 (T = 1 gives tracktail `gT = 0` and a zero-length
-        pos_embed, which the clamp-pad does NOT cover); `box_source` is asserted against
-        `BOX_SOURCES` (a typo would silently mean `keypoints`). `registry_base` makes the
-        ids APPEND-ONLY so embedding rows survive warm start; `Registry.build` raises if
-        an old id would move. Only the requested split is discovered, and its parquet is
-        scattered HERE, in the parent process, so
-        forked workers share the dense arrays copy-on-write. Keypoint ids are per SESSION,
-        not per dataset (a session may reorder or subset the root's names), so an
-        unmappable root fails at construction rather than mid-epoch; a mode/table mismatch
-        is refused here too (`_item` picks its target off `sess.mode` alone, and a 3d
-        session carrying only keypoints.pq would crash mid-epoch). With
-        `box_source = 'instances'` prints roots reached by the switch. Dataset balancing is
-        train-only, so a window's identity stays tied to its index.
+        `n_frames >= 2` (T = 1 gives a zero-length pos_embed); `box_source` is checked against
+        `BOX_SOURCES`. `registry_base` makes ids APPEND-ONLY so embedding rows survive warm start.
+        Keypoint ids are per SESSION (a session may reorder or subset the root's names), so an
+        unmappable root, and a mode/table mismatch, fail here rather than mid-epoch. Dataset
+        balancing is train-only, so a val/test window's identity stays tied to its index.
         """
         assert cfg.n_frames >= 2, (
             f'n_frames = {cfg.n_frames} is not usable: tracktail computes gT = T // tubelet_size '
@@ -547,7 +216,7 @@ class PoseDataset(Dataset):
             raise ValueError(f'invalid dataset shard rank={self.rank}, world_size={self.world_size}')
         self.registry = registry or Registry.build(self.datasets, registry_base)
         self.seed = seed
-        self._aug = _build_augmenters(cfg) if self.train and cfg.aug_prob > 0 else None
+        self._aug = build_augmenters(cfg) if self.train and cfg.aug_prob > 0 else None
 
         self.index: list[_Item] = []
         self.by_dataset: list[list[int]] = []
@@ -775,7 +444,7 @@ class PoseDataset(Dataset):
         count and the 2-D path coin. The cell, session, start, T and every augmentation stay on
         the item's own stream.
         """
-        return {'n_cams': _n_cams(self.cfg.cams_to_sample, rng),
+        return {'n_cams': n_cams(self.cfg.cams_to_sample, rng),
                 'single_view_draw': float(rng.random())}
 
     def _frames(self, item, lab, group, rng):
@@ -789,15 +458,10 @@ class PoseDataset(Dataset):
         s. VAL AND TEST ARE UNTOUCHED -- fixed `cfg.n_frames` windows at stride 1, so a metric is
         comparable across checkpoints.
 
-        On train, a stride is admissible if the group holds the FLOOR window of two frames at it;
-        T is then capped by what the group has room for on that anchor's lattice. The window is
-        anchored on a labelled frame and placed AROUND it (the old loader required the FIRST
-        frame to be labelled, silently discarding mid-group labels), and T is shrunk to the
-        labelled frames some placement could reach -- off-lattice labels are unreachable at this
-        stride. If the span exceeds the ceiling, no placement covers it, so the draw falls back
-        to the anchor and lets the placement pick which end of the span it lands on. Bounds COVER
-        first..last rather than merely containing the anchor -- sizing T to a span and placing
-        the window off it would pay for frames it never reads.
+        On train, a stride is admissible if the group holds two frames at it; the window is
+        anchored on a labelled frame and placed AROUND it, with T shrunk to the labelled frames
+        some placement on that lattice could reach (falling back to the anchor when the span
+        exceeds the ceiling).
         """
         T = self.cfg.n_frames
         vis = lab.vis3d if lab.vis3d is not None else lab.vis2d
@@ -921,7 +585,7 @@ class PoseDataset(Dataset):
             neighbour_row = other_rows[int(rng.integers(len(other_rows)))]
 
         cgroup = sess.cgroup(item.gid, frames)
-        inflate = _crop_inflate(self.cfg, rng, self.train)
+        inflate = crop_inflate(self.cfg, rng, self.train)
 
         session_2d = sess.mode == '2d'
         if self.cfg.two_d_sampling == 'true-2d-hybrid-v1':
@@ -987,10 +651,7 @@ class PoseDataset(Dataset):
         The flip draw follows the complete 2D rotation block and is made only for positive
         configured probability.
         Returns the `View`, or None when the crop or the decode fails.
-        `sel` is NOT mutated: `vis_2d` is cloned on entry and no library helper in this path
-        writes through a camera dict or through `coords`, so the same selection may be realised
-        repeatedly (the scorer's independently-viewed anchor) without the first view
-        contaminating the second. That property is what makes the seam worth having; it is
+        `sel` is NOT mutated, so one selection may be realised repeatedly (the scorer's anchor);
         asserted in `tests/test_dataset_select_realise.py`.
 
         Geometry: camera and crop-inflate draws are one per item (camera draw sorted). Points
@@ -1000,12 +661,9 @@ class PoseDataset(Dataset):
         Pixels: appearance augmentation runs on the final ~256 px crops; views are UINT8 (4x
         fewer bytes to collate/queue/pin; the model divides on device).
 
-        `world_gauge` gates the 3D WORLD-GAUGE rotation (the `_rotate_camera_group_with_neighbours`
-        calls), NOT the per-camera image-plane rotation, and defaults True -- the pose path
-        unchanged. A scorer sets it False because the gauge rotation moves `coords` as well as the
-        cameras, so two independent realisations would put the good/bad track and the anchor's
-        track in DIFFERENT world gauges, and one coord tensor could then not serve all three
-        members.
+        `world_gauge` gates the 3D WORLD-GAUGE rotation (`rotate_camera_group_with_neighbours`),
+        not the per-camera image-plane rotation. The scorer sets it False: the gauge rotation moves
+        `coords` too, so two realisations would land in different world gauges.
 
         Inputs: sel -- a `Selection`; rng -- this view's own stream; world_gauge -- see above.
         Outputs: the `View`, or None when the crop fails or a frame will not decode; side effects:
@@ -1094,7 +752,7 @@ class PoseDataset(Dataset):
                 others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],
                                              dtype=torch.float32)
             if self.train and world_gauge:
-                cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
+                cgroup, coords, others_raw = rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
             cp3 = None if crop_pts is None else [
                 apply_affine(crop_pts[:, i], rotation_info[i]) for i in range(len(cgroup))]
@@ -1108,7 +766,7 @@ class PoseDataset(Dataset):
             cgroup = [c for c, _ in resized]
             scales = [s for _, s in resized]
             if self.train and world_gauge:
-                cgroup, coords, others_raw = _rotate_camera_group_with_neighbours(
+                cgroup, coords, others_raw = rotate_camera_group_with_neighbours(
                     cgroup, coords, others_raw)
             if others_raw is not None:
                 neighbour_full = others_raw
@@ -1135,8 +793,8 @@ class PoseDataset(Dataset):
                 if any(im is None for im in imgs):
                     return None
                 if self._aug is not None:
-                    imgs = self._augment(imgs, cnum, cgroup[cnum]['size'], p2d_all, vis_2d,
-                                         gray, rng, invert=invert)
+                    imgs = augment_views(self._aug, self.cfg, imgs, cnum, cgroup[cnum]['size'], p2d_all,
+                                         vis_2d, gray, rng, invert=invert)
                 views.append(torch.from_numpy(np.asarray(imgs)))
 
         if vis is not None and vis_2d is not None:
@@ -1151,18 +809,11 @@ class PoseDataset(Dataset):
     def _targets(self, sel, view, rng):
         """Turn a realised `View` into the pose training targets and the item tuple.
 
-        The query prior: `kpt_prior` is the pose at the prompt frame (GT at training, the
-        previous window's own prediction at deployment); `prompt_t` is the first labelled frame;
-        `prompt_dropout` is PER ITEM, not per keypoint. Corruptions, in order: exposure bias,
-        noise/offset in PIXELS, stale priors, `prompt_swap_animal`, `prompt_swap_kpt_pairs`
-        (finite entries independently replaced by another keypoint's ORIGINAL position), and a
-        whole-body offset -- ONE vector per item. `pose_only_prob` (0 = byte-identical) hoists
-        the box-dropout coin EARLY so a box-dropped item can also skip these corruptions,
-        REPLACING not adding to `box_prompt_dropout`'s fraction; the box-prompt block reuses it.
-
-        The stride is read back off `frames` (MEDIAN: a group-edge window repeats its
-        last frame); the final 3D noisy-OR is over the FINAL `vis_2d` (done in `realise`).
-        The scorer never calls this: it supplies no prior and no box.
+        The query prior and its corruptions are `prior.corrupt_prior` (draw order there).
+        `pose_only_prob` (0 = byte-identical) hoists the box-dropout coin EARLY so a box-dropped
+        item can also skip the corruptions, REPLACING not adding to `box_prompt_dropout`'s
+        fraction; the box-prompt block reuses it. The stride is read back off `frames` (MEDIAN: a
+        group-edge window repeats its last frame). The scorer never calls this.
         """
         item, sess, lab, frames = sel.item, sel.sess, sel.lab, sel.frames
         a, K = sel.animal, sel.n_keypoints
@@ -1180,60 +831,8 @@ class PoseDataset(Dataset):
             if box_dropped_early:
                 pose_only_active = rng.random() < self.cfg.pose_only_prob
 
-        finite = torch.isfinite(coords).all(-1)
-        prompt_t = torch.where(finite.any(0), finite.float().argmax(0), torch.zeros(K).long())
-        prompt_t = prompt_t.to(torch.int32)
-        kpt_prior = coords[prompt_t, torch.arange(K)].clone()
-        kpt_prior[~finite.any(0)] = float('nan')
-        dropped_fully = False
-        if self.train and not pose_only_active and rng.random() < self.cfg.prompt_dropout:
-            kpt_prior[:] = float('nan')
-            dropped_fully = True
-        px = 1.0
-        if R == 3 and (self.cfg.prompt_noise_px > 0 or self.cfg.prompt_offset_px > 0) \
-                and bool(torch.isfinite(kpt_prior).any()):
-            pts = kpt_prior[torch.isfinite(kpt_prior).all(-1)][None]
-            px = float(torch.nanmedian(get_camera_scale(cgroup, pts)))
-            if not np.isfinite(px):
-                px = 1.0
-        if self.train and self.cfg.prompt_stale_frames > 0 \
-                and bool(torch.isfinite(kpt_prior).any()):
-            d = int(rng.integers(0, int(self.cfg.prompt_stale_frames) + 1))
-            if d:
-                t_alt = torch.clamp(prompt_t.long() + d, max=coords.shape[0] - 1)
-                alt = coords[t_alt, torch.arange(K)]
-                swap = torch.isfinite(alt).all(-1) & torch.isfinite(kpt_prior).all(-1)
-                kpt_prior = torch.where(swap[:, None], alt, kpt_prior)
-        if neighbour_full is not None:
-            mode_str = '2d' if R == 2 else '3d'
-            neighbour_prior = neighbour_full[prompt_t, torch.arange(K)].clone()
-            neighbour_prior[prior_out_of_bounds(neighbour_prior, mode_str, cgroup)] = float('nan')
-            jump = (torch.as_tensor(rng.random(K)) < self.cfg.prompt_swap_animal) \
-                & torch.isfinite(neighbour_prior).all(-1)
-            if not dropped_fully:
-                kpt_prior = torch.where(jump[:, None], neighbour_prior, kpt_prior)
-        if self.train and self.cfg.prompt_swap_kpt_pairs > 0:
-            finite_idx = torch.isfinite(kpt_prior).all(-1).nonzero(as_tuple=True)[0]
-            m = len(finite_idx)
-            if m >= 2:
-                sel = torch.as_tensor(rng.random(m)) < self.cfg.prompt_swap_kpt_pairs
-                if bool(sel.any()):
-                    local = torch.arange(m)[sel]
-                    offset = torch.from_numpy(rng.integers(1, m, size=int(sel.sum())))
-                    src_idx = finite_idx[(local + offset) % m]
-                    original = kpt_prior
-                    kpt_prior = kpt_prior.clone()
-                    kpt_prior[finite_idx[sel]] = original[src_idx]
-        if self.train and not pose_only_active and self.cfg.prompt_offset_px > 0 \
-                and bool(torch.isfinite(kpt_prior).any()):
-            kpt_prior += torch.as_tensor(
-                rng.normal(0.0, float(self.cfg.prompt_offset_px) * px, (1, R)),
-                dtype=kpt_prior.dtype)
-        if self.train and not pose_only_active and self.cfg.prompt_noise_px > 0 \
-                and bool(torch.isfinite(kpt_prior).any()):
-            kpt_prior += torch.as_tensor(
-                rng.normal(0.0, float(self.cfg.prompt_noise_px) * px, kpt_prior.shape),
-                dtype=kpt_prior.dtype)
+        kpt_prior, prompt_t = corrupt_prior(self.cfg, self.train, coords, cgroup, neighbour_full,
+                                            K, R, rng, pose_only_active)
 
         kpt_ids = self._kpt_ids[sess.path]
         query_times = torch.zeros(K, dtype=torch.int32)
@@ -1251,7 +850,7 @@ class PoseDataset(Dataset):
         out = [views, coords, vis, torch.as_tensor(frames), cgroup, row, query_times,
                vis_2d, p2d, query_occlusion, kpt_ids, kpt_prior, prompt_t]
         if self.cfg.box_prompt != 'none':
-            from . import box_prompt as bpmod
+            from .. import box_prompt as bpmod
             box = bpmod.compute_box_prompt(coords, cgroup, '2d' if R == 2 else '3d')
             box = bpmod.apply_frames_mode(box, self.cfg.box_prompt_frames)
             if self.train:
@@ -1266,140 +865,8 @@ class PoseDataset(Dataset):
             out.append(box)
         return tuple(out)
 
-    def _augment(self, imgs, cnum, size, p2d, vis_2d, gray, rng, invert=False):
-        """Appearance augmentation for one camera's T crops. `vis_2d` is mutated by cutout.
-
-        `to_deterministic()` freezes this camera's sampled parameters so every frame gets the
-        SAME gamma/hue; only the apply is per-frame. `invert` is one item-level color-inversion
-        decision, shared by every frame and camera in the item.
-        """
-        import cv2
-
-        per_camera, per_image = self._aug
-        cam_det = per_camera.to_deterministic()
-        imgs = [per_image(image=cam_det(image=im)) for im in imgs]
-        if rng.random() < self.cfg.aug_prob:
-            for x1, y1, x2, y2, fill in _cutout_rects(rng, size, p2d, vis_2d, cnum):
-                for im in imgs:
-                    im[y1:y2, x1:x2] = fill
-        if gray:
-            imgs = [np.stack([cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)] * 3, -1) for im in imgs]
-        if invert:
-            imgs = [255 - im for im in imgs]
-        return imgs
-
     def _jitter(self, rng):
         """A crop jitter box for this item, or None when jitter is off (val/test)."""
         if not self.train or self.cfg.crop_jitter <= 0:
             return None
         return cropmod.jitter_box(rng, self.cfg.crop_jitter, self.cfg.crop_jitter_scale)
-
-
-class StepSampler(torch.utils.data.Sampler):
-    """Draws indices with replacement and yields `(ordinal, index)`.
-
-    The ordinal is the global training step -- the SAME on every rank while the index is not --
-    and `PoseDataset.__getitem__` keys its cost-determining draws on it. Replacement, and no
-    `DistributedSampler`: an index entry is one (session, group, animal) whatever the group's
-    length, so it is a poor sampling weight and `_pick` re-draws inside `__getitem__`;
-    independent per-rank streams is what the single-gpu loop already did.
-    """
-
-    def __init__(self, n: int, num_samples: int, generator=None, start: int = 0):
-        """A sampler yielding `(ordinal, index)` pairs, drawing indices with replacement.
-
-        Inputs: n -- the number of index entries.
-                num_samples -- how many steps to yield.
-                generator -- torch RNG for the index draws.
-                start -- the first ordinal (the global step).
-        """
-        self.n, self.num_samples, self.generator, self.start = int(n), int(num_samples), generator, int(start)
-
-    def __len__(self):
-        """Number of steps this sampler will yield."""
-        return self.num_samples
-
-    def __iter__(self):
-        """Yield `(start + k, index)` for k over `num_samples` random draws."""
-        idx = torch.randint(0, self.n, (self.num_samples,), generator=self.generator)
-        for k, i in enumerate(idx.tolist()):
-            yield (self.start + k, i)
-
-
-def _from_shared_pickle(buf: torch.Tensor):
-    """Unpickle the object `SpawnHandoff` wrote into a shared-memory byte tensor."""
-    return pickle.loads(memoryview(buf.numpy()))
-
-
-class SpawnHandoff(Dataset):
-    """Hand a big dataset to `spawn` loader workers through shared memory.
-
-    Starting a `spawn` worker writes the pickled dataset into a pipe. The child reads that pipe only
-    after it has imported torch/tracktail (~4 s), and a pipe holds 64 KB. So for a 361 MB
-    PoseDataset each `Process.start()` blocks for that worker's import plus unpickle (~5 s), and
-    the workers start ONE AT A TIME: 8 workers took ~40 s, on every rank. Here the dataset is
-    pickled once into a shared-memory tensor, and torch's own reducer sends only a handle down
-    the pipe. Every start then returns at once, the imports run in parallel, and each worker
-    unpickles the same bytes it would have read from the pipe. A worker receives the wrapped
-    dataset itself, not this wrapper.
-    """
-
-    def __init__(self, dataset):
-        """Wrap `dataset`; nothing is pickled until the first worker starts."""
-        self.dataset = dataset
-        self._buf = None
-
-    def __len__(self):
-        """Length of the wrapped dataset."""
-        return len(self.dataset)
-
-    def __getitem__(self, i):
-        """Item `i` of the wrapped dataset (the in-process / `num_workers=0` path)."""
-        return self.dataset[i]
-
-    def __reduce__(self):
-        """Pickle as (unpickle, shared bytes); the bytes are written once for all workers."""
-        if self._buf is None:
-            data = pickle.dumps(self.dataset, protocol=pickle.HIGHEST_PROTOCOL)
-            self._buf = torch.empty(len(data), dtype=torch.uint8).share_memory_()
-            self._buf.numpy()[:] = np.frombuffer(data, dtype=np.uint8)
-        return _from_shared_pickle, (self._buf,)
-
-
-def worker_init(worker_id):
-    """A DataLoader `worker_init_fn`: pin cv2's and torch's thread pools to one thread, reseed
-    imgaug (its global RNG survives fork otherwise, so every worker draws the same augmentations),
-    and force imgaug's hue LUT cache to build here (a `spawn`ed dataset never re-runs `__init__`).
-    numpy is deliberately NOT reseeded -- torch already decorrelates it per worker.
-    """
-    import cv2
-    cv2.setNumThreads(1)
-    torch.set_num_threads(1)
-    try:
-        import imgaug
-        import imgaug.augmenters as iaa
-    except ImportError:
-        return
-    imgaug.random.seed(int(np.random.randint(2 ** 31)))
-    iaa.AddToHue()
-
-
-def pose_collate(batch):
-    """tracktail's collate for the first ten fields, plus this repo's three.
-
-    `custom_collate` keeps only item 0's `cgroup` and forbids mixing 2D and 3D -- which is why
-    batch_size is structurally 1 PER RANK. The same reason covers K: sessions may carry different
-    keypoint subsets, so a mixed batch would fail the `kpt_ids` stack. Loud, and unreachable at
-    batch_size 1.
-
-    The box prompt field exists only when a box model is training (`_item` appends a 14th field
-    then); it is absent for a plain run, so nothing downstream sees it.
-    """
-    batch = [b for b in batch if b is not None]
-    out = custom_collate([b[:10] for b in batch])
-    out['kpt_ids'] = torch.stack([b[10] for b in batch])
-    out['kpt_prior'] = torch.stack([b[11] for b in batch])
-    out['prompt_t'] = torch.stack([b[12] for b in batch])
-    if len(batch[0]) > 13:
-        out['box_prompt'] = torch.stack([b[13] for b in batch])
-    return out

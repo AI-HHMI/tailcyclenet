@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from tailcyclenet import format as fmt
-from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.data.camera import flip_2d
 from tailcyclenet.scorer.triplet import _make_anchor
 

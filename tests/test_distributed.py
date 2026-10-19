@@ -110,14 +110,15 @@ CGROUP = 4          # `_item`'s field order: views, coords, vis, frames, cgroup,
 
 def _ds(root, **over):
     """`prob_2d_only = 0` unless stated, so camera-count variation comes from `cams_to_sample`."""
-    from tailcyclenet.dataset import LoaderConfig, PoseDataset
+    from tailcyclenet.loader.config import LoaderConfig
+    from tailcyclenet.loader.dataset import PoseDataset
     return PoseDataset(root, 'train', LoaderConfig(**{'prob_2d_only': 0.0, **over}))
 
 
 def test_the_sampler_yields_an_ordinal_that_is_the_step_number():
     """The ordinal is the STREAM position (what every rank agrees on); the index stream stays
     per-rank."""
-    from tailcyclenet.dataset import StepSampler
+    from tailcyclenet.loader.sampling import StepSampler
     a = list(StepSampler(100, num_samples=8, generator=torch.Generator().manual_seed(23)))
     b = list(StepSampler(100, num_samples=8, generator=torch.Generator().manual_seed(24)))
     assert [k for k, _ in a] == [k for k, _ in b] == list(range(8)), 'ordinals must agree'

@@ -13,7 +13,9 @@ import pytest
 import torch
 
 from tailcyclenet.data import crop as cropmod
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
+from tailcyclenet.loader.sampling import pose_collate
 from tailcyclenet.format import MISSING, UNLABELED, VISIBLE, Registry, load_dataset
 
 from .conftest import KPTS_2D
@@ -377,9 +379,9 @@ class _FakeDataset:
 def test_per_camera_augmentation_is_constant_down_a_clip(tiny_root):
     """A camera's appearance holds steady down a clip (an identity cue) while per-image noise varies;
     val pixels are never augmented."""
-    from tailcyclenet.dataset import _build_augmenters
+    from tailcyclenet.loader.augment import build_augmenters
 
-    per_camera, per_image = _build_augmenters(
+    per_camera, per_image = build_augmenters(
         LoaderConfig(aug_prob=1.0, per_image_aug_prob=1.0))
     img = (np.mgrid[0:64, 0:64][0][..., None] * np.ones((1, 1, 3))).astype(np.uint8)
 
@@ -416,15 +418,16 @@ def test_invert_augmentation_complements_pixels(tiny_root):
     # Keep this unit test focused on inversion rather than imgaug's independent appearance draws.
     ds._aug = (_Identity(), _Identity())
     imgs = [np.array([[[0, 1, 127], [128, 254, 255]]], dtype=np.uint8)]
-    got = ds._augment([imgs[0].copy()], 0, torch.tensor([2, 1]), None, None, False,
-                      np.random.default_rng(0), invert=True)
+    from tailcyclenet.loader.augment import augment_views
+    got = augment_views(ds._aug, ds.cfg, [imgs[0].copy()], 0, torch.tensor([2, 1]), None, None,
+                        False, np.random.default_rng(0), invert=True)
     np.testing.assert_array_equal(got[0], 255 - imgs[0])
     assert got[0].dtype == np.uint8
 
 
 def test_cutout_marks_covered_keypoints_not_visible():
     """A keypoint under a cutout rect must be labelled not-visible, including where it was NaN."""
-    from tailcyclenet.dataset import _cutout_rects
+    from tailcyclenet.loader.augment import cutout_rects
 
     rng = np.random.default_rng(0)
     T, K, C = 4, 6, 2
@@ -436,7 +439,7 @@ def test_cutout_marks_covered_keypoints_not_visible():
     covered_nan = False
     for _ in range(40):                            # rects are random; drive it until NaN is hit
         v = vis_2d.clone()
-        rects = _cutout_rects(rng, size, p2d, v, 0)
+        rects = cutout_rects(rng, size, p2d, v, 0)
         assert rects, 'cutout produced no rectangles'
         for x1, y1, x2, y2, fill in rects:
             assert 0 <= x1 < x2 <= 200 and 0 <= y1 < y2 <= 160
@@ -455,7 +458,7 @@ def test_workers_do_not_share_a_random_stream(tiny_root):
     """Two workers must not produce identically-augmented items: torch reseeds per worker, but
     imgaug's own global RNG is fork-copied and needs `worker_init`.
     """
-    from tailcyclenet.dataset import worker_init
+    from tailcyclenet.loader.sampling import worker_init
 
     cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=1.0,
                        per_image_aug_prob=0.0, grayscale_prob=0.0,
@@ -790,15 +793,15 @@ def test_crop_inflate_widens_the_crop(tiny_root):
 def test_crop_inflate_draw(tiny_root):
     """A scalar is returned as-is; `[low, high]` draws in range on train and is the exact midpoint on
     val (so `checkpoint_best` reads one geometry) -- also end to end through a real item."""
-    from tailcyclenet.dataset import _crop_inflate
+    from tailcyclenet.loader.augment import crop_inflate
 
     rng = np.random.default_rng(0)
     cfg = LoaderConfig(crop_inflate=1.3)
-    assert _crop_inflate(cfg, rng, True) == _crop_inflate(cfg, rng, False) == 1.3
+    assert crop_inflate(cfg, rng, True) == crop_inflate(cfg, rng, False) == 1.3
     cfg = LoaderConfig(crop_inflate=[0.9, 1.5])
-    train_draws = [_crop_inflate(cfg, rng, True) for _ in range(50)]
+    train_draws = [crop_inflate(cfg, rng, True) for _ in range(50)]
     assert all(0.9 <= v <= 1.5 for v in train_draws) and len(set(train_draws)) > 1
-    assert _crop_inflate(cfg, rng, False) == pytest.approx(1.2)
+    assert crop_inflate(cfg, rng, False) == pytest.approx(1.2)
 
     range_cfg = LoaderConfig(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
                              crop_jitter=0.0, prompt_dropout=0.0, min_crop_dim=8,
@@ -1289,7 +1292,7 @@ def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
 
     import torch.multiprocessing  # noqa: F401  (registers torch's shared-memory reducers)
 
-    from tailcyclenet.dataset import SpawnHandoff
+    from tailcyclenet.loader.sampling import SpawnHandoff
 
     ds = _Squares()
     wrapped = SpawnHandoff(ds)
@@ -1303,7 +1306,7 @@ def test_spawn_handoff_sends_a_handle_and_the_same_dataset():
 @pytest.mark.slow
 def test_a_spawn_worker_sees_the_wrapped_dataset():
     """A real spawn DataLoader worker (~5 s of interpreter start-up) reads the wrapped dataset."""
-    from tailcyclenet.dataset import SpawnHandoff
+    from tailcyclenet.loader.sampling import SpawnHandoff
 
     ds = _Squares()
     loader = torch.utils.data.DataLoader(SpawnHandoff(ds), batch_size=None, num_workers=2,
@@ -1357,7 +1360,7 @@ def test_loader_config_accepts_every_legal_value():
 
 def test_loader_config_from_refuses_unknown_keys_and_allows_the_callers_plumbing():
     """The one `[data]` -> `LoaderConfig` path: a typo is refused by name, plumbing is not passed."""
-    from tailcyclenet.dataset import SCORER_PLUMBING, loader_config_from
+    from tailcyclenet.loader.config import SCORER_PLUMBING, loader_config_from
 
     lc = loader_config_from({'path': 'x', 'num_workers': 2, 'n_frames': 6})
     assert lc.n_frames == 6

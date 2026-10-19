@@ -17,7 +17,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from tracktail.model.losses_scorer import TripletScorerLoss
-from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.scorer.dataset import ScorerDataset, scorer_collate, triplet_to_device
 
 from .test_scorer_model import SMALL

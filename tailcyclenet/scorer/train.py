@@ -33,7 +33,9 @@ from .contract import (SCORER_OUTPUT_GRANULARITIES, require_scorer_contract,
                        scorer_contract_mismatches, scorer_output_granularity)
 from .losses import build_scorer_loss
 from ..config import SCORER_CONFIG, load_config
-from ..dataset import SCORER_PLUMBING, LoaderConfig, PoseDataset, StepSampler, loader_config_from
+from ..loader.config import SCORER_PLUMBING, LoaderConfig, loader_config_from
+from ..loader.dataset import PoseDataset
+from ..loader.sampling import StepSampler
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
 from ..optim import build_optimizer, check_resume

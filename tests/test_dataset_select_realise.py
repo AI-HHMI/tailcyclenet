@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
 
 
 def _same(a, b, path='item'):

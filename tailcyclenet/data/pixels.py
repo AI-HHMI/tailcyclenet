@@ -3,7 +3,7 @@
 
 Video goes through `reader_cache` (one decode per distinct index, under a per-container lock);
 image directories are decoded with OpenCV. Each DISTINCT frame index is decoded once and a repeat
-gets a COPY, because `_augment`'s cutout writes in place.
+gets a COPY, because `augment_views`' cutout writes in place.
 """
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ def _read_video(path, group, cam, frames, crop_coords, target_size, rotation):
 
     Each DISTINCT index is decoded once: a clamp-padded window repeats its last frame, and handing
     `get_batch` the repeats would decode them. A repeat gets a COPY, not a shared buffer:
-    `_augment`'s cutout writes in place, and the dedupe would otherwise make repeats alias one
+    `augment_views`' cutout writes in place, and the dedupe would otherwise make repeats alias one
     buffer (same rule as `read_frames`).
     """
     import cv2

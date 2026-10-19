@@ -11,7 +11,7 @@ import polars as pl
 import torch
 
 import tailcyclenet.scorer.qc as qc
-from tailcyclenet.dataset import PoseDataset
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.scorer.qc import _span_indices, _to_device
 
 

@@ -86,7 +86,14 @@ def test_spans_select_by_window_start_not_by_decoded_item():
     """
     ds = _fake_dataset([0, 12, 24, 36, 48])
     kept = _span_indices(ds, {('sess', 'g', 'det00'): (12, 36)})
-    assert [ds.index[i].start for i in kept] == [12, 24, 36]
+    assert [ds.index[i].start for i in kept] == [12, 24]
+
+
+def test_a_span_is_half_open_so_a_window_starting_at_its_end_is_not_scored():
+    """`--spans-csv` builds `(span_start, span_start + span_len)`; the end is exclusive."""
+    ds = _fake_dataset([0, 12, 24, 36])
+    kept = _span_indices(ds, {('sess', 'g', 'det00'): (12, 24)})
+    assert [ds.index[i].start for i in kept] == [12]
 
 
 def test_spans_key_is_the_loader_row_key_and_a_miss_is_empty():

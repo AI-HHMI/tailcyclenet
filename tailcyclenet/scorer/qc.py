@@ -78,7 +78,7 @@ def _span_indices(dataset, spans: dict) -> list[int]:
     windows, and a root is many groups).
 
     Inputs: dataset -- a `PoseDataset` built with `train=False`; spans -- `{(session, group,
-            animal): (lo, hi)}`, the keys spelled as the loader's own `row` carries them.
+            animal): (lo, hi)}`, a half-open start range `[lo, hi)`, the keys spelled as the loader's own `row` carries them.
     Outputs: the kept index positions, in index order.
     Side effects: none -- no window is realised, so no frame is decoded.
     """
@@ -92,7 +92,7 @@ def _span_indices(dataset, spans: dict) -> list[int]:
         if item.animal >= len(ids):
             continue
         rng = spans.get((key[0], key[1], ids[item.animal]))
-        if rng is not None and rng[0] <= int(item.start) <= rng[1]:
+        if rng is not None and rng[0] <= int(item.start) < rng[1]:
             out.append(i)
     return out
 
@@ -136,8 +136,8 @@ def score_root(run: Path, data: str, split: str, device='cpu', limit: int | None
             spacing, defaulting to the run's `n_frames` (non-overlapping); session -- score only
             the exact session id; start/stop -- zero-based half-open positions in the resulting
             window index (after session and span filtering); spans -- restrict
-            scoring to windows starting inside a frame range, as {(session, group, animal):
-            (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable;
+            scoring to windows starting inside a half-open frame range, as {(session, group,
+            animal): (lo, hi)}, which is what makes a targeted look at a clip's bad stretch affordable;
             coverage -- optional list populated with one record per requested window; checkpoint --
             an explicit checkpoint filename passed to the scorer loader (for example
             ``checkpoint_best.pth``); checkpoint_info -- optional mutable mapping populated with

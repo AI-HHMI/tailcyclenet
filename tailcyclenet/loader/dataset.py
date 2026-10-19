@@ -746,7 +746,8 @@ class PoseDataset(Dataset):
                 if vis_2d is not None:
                     for cnum, cam in enumerate(cgroup):
                         if rotation_info[cnum] is not None:
-                            vis_2d[:, :, cnum][~is_point_visible(cam, coords)] = 0
+                            gone = ~is_point_visible(cam, coords) & (vis_2d[:, :, cnum] == 1)
+                            vis_2d[:, :, cnum][gone] = 0
             others_raw = None
             if attempt_swap_animal:
                 others_raw = torch.as_tensor(lab.points3d[neighbour_row][frames],

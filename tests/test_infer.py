@@ -131,7 +131,7 @@ def _no_load(monkeypatch):
     """Make `load_run` fail loudly, so a refusal is proven to fire before the checkpoint loads."""
     def boom(*a, **k):
         raise AssertionError('the refusal must fire before the checkpoint loads')
-    monkeypatch.setattr('tailcyclenet.infer.driver.load_run', boom)
+    monkeypatch.setattr('tailcyclenet.infer.loading.load_run', boom)
 
 
 def test_parser_defaults_select_the_measured_path():
@@ -172,14 +172,14 @@ def test_detector_inference_without_keypoint_table(tmp_path):
 
 def test_scorer_encoder_mismatch_requires_explicit_opt_in():
     from tests.test_scorer_model import _scorer
-    from tailcyclenet.infer.driver import _share_pose_scorer_encoder
+    from tailcyclenet.infer.loading import share_pose_scorer_encoder
 
     pose = build_model(SMALL, n_keypoints=5).eval()
     scorer = _scorer(5, stride_length=4).eval()
     with pytest.raises(SystemExit, match='--allow-pose-scorer-mismatch'):
-        _share_pose_scorer_encoder(pose, scorer, allow_mismatch=False,
+        share_pose_scorer_encoder(pose, scorer, allow_mismatch=False,
                                    pose_run='pose-run', scorer_run='scorer-run')
-    assert not _share_pose_scorer_encoder(pose, scorer, allow_mismatch=True,
+    assert not share_pose_scorer_encoder(pose, scorer, allow_mismatch=True,
                                           pose_run='pose-run', scorer_run='scorer-run')
     assert scorer.scene_encoder.encoder is not pose.scene_encoder.encoder
 
@@ -267,7 +267,7 @@ def test_the_window_union_covers_the_window_and_stays_in_the_image(mv):
 def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(rat):
     """One decode per (camera, frame): cropping the decoded frame equals cropping at decode, bit for bit."""
     from tailcyclenet.data.pixels import read_frames
-    from tailcyclenet.infer.window import _crop_views
+    from tailcyclenet.infer.crops import crop_views
 
     _, sess, _, _ = rat
     group, cam = sess.groups['g000'], sess.cam_names[0]
@@ -276,7 +276,7 @@ def test_the_hoisted_decode_gives_the_same_pixels_as_cropping_at_decode(rat):
     target = [32, 32]
 
     at_decode = np.asarray(read_frames(group, cam, frames, crop_coords=box, target_size=target))
-    hoisted = _crop_views(read_frames(group, cam, frames), box, target)
+    hoisted = crop_views(read_frames(group, cam, frames), box, target)
     np.testing.assert_array_equal(hoisted[0].numpy(), at_decode)
 
 
@@ -313,7 +313,7 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     was NOT seen), the prior-OOB and model-confidence probes; an empty capture keeps its census."""
     import json
 
-    from tailcyclenet.infer.driver import _write_overlap_trace
+    from tailcyclenet.infer.traces import write_overlap_trace
 
     rows = [{'animal': 0, 'frame': 12, 'pos': 0, 'dist': 1.5, 'n_shared': 3,
              'prev': np.arange(6, dtype=np.float32).reshape(3, 2),
@@ -324,7 +324,7 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     census = {'pairs_seen': 2, 'pairs_no_prev': 7, 'pairs_no_shared': 1,
               'block_boundary_seams': 3, 'block_boundary_frames': 12}
     out = tmp_path / 'sub' / 'ovl.npz'
-    _write_overlap_trace(out, {"s/g000": (rows, census, [(0, 8, 2, 17)], [(0, 8, -0.5, -0.9, 3)])})
+    write_overlap_trace(out, {"s/g000": (rows, census, [(0, 8, 2, 17)], [(0, 8, -0.5, -0.9, 3)])})
 
     z = np.load(out, allow_pickle=True)
     assert list(z['animal']) == [0, 1] and list(z['frame']) == [12, 13]
@@ -341,7 +341,7 @@ def test_overlap_trace_round_trips_both_estimates_and_its_census(tmp_path):
     np.testing.assert_allclose(z['conf_min'], [-0.9])
 
     empty = tmp_path / 'empty.npz'
-    _write_overlap_trace(empty, {'s/g000': ([], {'pairs_seen': 0, 'pairs_no_prev': 4}, [], [])})
+    write_overlap_trace(empty, {'s/g000': ([], {'pairs_seen': 0, 'pairs_no_prev': 4}, [], [])})
     ze = np.load(empty, allow_pickle=True)
     assert ze['dist'].size == 0 and ze['prev'].size == 0
     assert json.loads(str(ze['census']))['s/g000']['pairs_no_prev'] == 4
@@ -424,14 +424,14 @@ def test_inflate_box_widens_about_its_centre():
 
 
 def test_deploy_box_prompt_lands_inside_the_crop_2d():
-    """`_deploy_box_prompt` maps an animal's source points into the crop frame and boxes them,
+    """`deploy_box_prompt` maps an animal's source points into the crop frame and boxes them,
     2D single-camera -- the path this function has always covered, unchanged in result."""
-    from tailcyclenet.infer.window import _deploy_box_prompt
+    from tailcyclenet.infer.prior import deploy_box_prompt
     source = np.array([[[[110., 110.], [130., 150.]]]])            # (S=1,T=1,K=2,2) source px
     boxes = [torch.tensor([100, 100, 200, 200], dtype=torch.int32)]
     scales = [2.0]
     cam = {'size': torch.tensor([200, 200], dtype=torch.int32)}
-    out = _deploy_box_prompt('2d', source, None, np.array([0]), 0, [0], boxes, scales, [cam],
+    out = deploy_box_prompt('2d', source, None, np.array([0]), 0, [0], boxes, scales, [cam],
                              'cpu')
     assert out.shape == (1, 1, 1, 4)
     x0, y0, x1, y1 = out[0, 0, 0].tolist()
@@ -442,7 +442,7 @@ def test_deploy_box_prompt_lands_inside_the_crop_2d():
 def test_deploy_box_prompt_3d_labels_matches_the_training_computation(mv):
     """3D `labels` box prompt is byte-identical to `compute_box_prompt` (deploy/train parity)."""
     from tailcyclenet.pose import box_prompt as bpmod
-    from tailcyclenet.infer.window import _deploy_box_prompt
+    from tailcyclenet.infer.prior import deploy_box_prompt
 
     _, sess, _, _ = mv
     frames = np.arange(4)
@@ -450,7 +450,7 @@ def test_deploy_box_prompt_3d_labels_matches_the_training_computation(mv):
     lab = sess.labels('g000')
     world = lab.points3d                                # (S,T,K,3)
 
-    got = _deploy_box_prompt('3d', world, None, frames, 0, list(range(len(cgroup))), None, None,
+    got = deploy_box_prompt('3d', world, None, frames, 0, list(range(len(cgroup))), None, None,
                              cgroup, 'cpu')
     want = bpmod.compute_box_prompt(torch.as_tensor(world[0]), cgroup, '3d')[None]
     torch.testing.assert_close(got, want.to(got.dtype))
@@ -486,7 +486,7 @@ def test_box_prompt_live_on_3d_multicam(mv):
 
 def test_box_prompt_detector_per_camera_degradation():
     """A camera with no finite detector box yields a NaN column (the no-box token), not an exception."""
-    from tailcyclenet.infer.window import _deploy_box_prompt
+    from tailcyclenet.infer.prior import deploy_box_prompt
 
     T = 3
     cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)) for _ in range(2)]
@@ -497,7 +497,7 @@ def test_box_prompt_detector_per_camera_degradation():
     boxes_stc[0, :, 0] = [10., 10., 30., 30.]
     frames = np.arange(T)
 
-    got = _deploy_box_prompt('3d', None, boxes_stc, frames, 0, [0, 1], boxes, scales, cgroup,
+    got = deploy_box_prompt('3d', None, boxes_stc, frames, 0, [0, 1], boxes, scales, cgroup,
                              'cpu')
     assert got.shape == (1, T, 2, 4)
     assert torch.isfinite(got[:, :, 0]).all()           # camera 0: real box every frame
@@ -507,7 +507,7 @@ def test_box_prompt_detector_per_camera_degradation():
 def test_box_prompt_column_order_matches_use():
     """Column i of the box prompt is built from `use[i]`'s own box/scale/cgroup, not a neighbour's."""
     from tailcyclenet.pose import box_prompt as bpmod
-    from tailcyclenet.infer.window import _deploy_box_prompt
+    from tailcyclenet.infer.prior import deploy_box_prompt
 
     T = 2
     cgroup = [dict(size=torch.tensor([64, 48], dtype=torch.int32)),
@@ -521,7 +521,7 @@ def test_box_prompt_column_order_matches_use():
     boxes_stc[0, :, 1] = [110., 104., 126., 140.]       # source cam 1's own detector box
     frames = np.arange(T)
 
-    got = _deploy_box_prompt('3d', None, boxes_stc, frames, 0, [1, 0],
+    got = deploy_box_prompt('3d', None, boxes_stc, frames, 0, [1, 0],
                              [boxes[1], boxes[0]], [scales[1], scales[0]],
                              [cgroup[1], cgroup[0]], 'cpu')
     assert got.shape == (1, T, 2, 4)
@@ -571,24 +571,24 @@ def test_box_prompt_first_only_withholds_it_once_carried(rat16):
 
 
 def test_give_box_this_window_compensates_for_a_stale_carry_not_just_a_missing_one():
-    """The first-only gate gives the box back when `_build_prior` DECLINED a carry (stale/mismatched),
+    """The first-only gate gives the box back when `build_prior` DECLINED a carry (stale/mismatched),
     not only when there was none."""
-    from tailcyclenet.infer.window import _give_box_this_window
+    from tailcyclenet.infer.prior import give_box_this_window
 
     cfg = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=True)
     fake_carry = (torch.zeros(2, 2), 0)
 
-    assert _give_box_this_window(cfg, None, None), \
+    assert give_box_this_window(cfg, None, None), \
         'no carry at all (the true first window) must still give the box'
-    assert not _give_box_this_window(cfg, fake_carry, torch.zeros(2, 2)), \
+    assert not give_box_this_window(cfg, fake_carry, torch.zeros(2, 2)), \
         'a carry that WAS used as this window\'s prior must still withhold the box'
-    assert _give_box_this_window(cfg, fake_carry, None), \
+    assert give_box_this_window(cfg, fake_carry, None), \
         'a carry that existed but was declined (stale/shape-mismatched) must give the box back'
 
     off = _cfg(anchor='carry', box_prompt='detector', box_prompt_first_only=False)
-    assert _give_box_this_window(off, fake_carry, None), \
+    assert give_box_this_window(off, fake_carry, None), \
         'box_prompt_first_only=False must give the box every window regardless of carry/prior'
-    assert not _give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
+    assert not give_box_this_window(_cfg(anchor='carry', box_prompt='none'), None, None), \
         'box_prompt="none" must never give the box'
 
 
@@ -658,7 +658,7 @@ def test_box_prompt_detector_from_a_boxes_file_uses_its_points(mv):
 def test_carried_prior_is_bounds_masked_and_dated():
     """The carried prior is NaN outside the crop, dated to its frame in the window, and retired (not
     clamped) when it predates the window or is staler than the overlap."""
-    from tailcyclenet.infer.window import _build_prior
+    from tailcyclenet.infer.prior import build_prior
 
     K, size = 4, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -667,7 +667,7 @@ def test_carried_prior_is_bounds_masked_and_dated():
     boxes = [(0, 0, 100, 100)]
 
     pose = torch.tensor([[10.0, 10.0], [90.0, 90.0], [-5.0, 10.0], [10.0, 400.0]])
-    prior, qt = _build_prior(cfg, (pose, 23), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+    prior, qt = build_prior(cfg, (pose, 23), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                              cgroup)
 
     assert torch.isfinite(prior[0, :2]).all(), 'in-crop keypoints must survive'
@@ -675,23 +675,23 @@ def test_carried_prior_is_bounds_masked_and_dated():
     assert qt.shape == (1, K)
     assert (qt == 3).all(), f'prompt frame 23 is index 3 of a window starting at 20, got {qt}'
 
-    assert _build_prior(cfg, (pose, 17), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+    assert build_prior(cfg, (pose, 17), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                         cgroup) == (None, None)
-    _, ordinary = _build_prior(cfg, (pose, 20), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+    _, ordinary = build_prior(cfg, (pose, 20), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                                cgroup)
     assert (ordinary == 0).all()
-    _, late = _build_prior(cfg, (pose, 999), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+    _, late = build_prior(cfg, (pose, 999), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                            cgroup)
     assert (late == len(frames) - 1).all()
 
-    assert _build_prior(cfg, (pose, 2), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
+    assert build_prior(cfg, (pose, 2), None, 0, 0, frames, boxes, [1.0], '2d', K, 2,
                         cgroup) == (None, None)
 
 
 def test_oracle_corrupt_near_and_swap():
     """`near` picks the nearest ELIGIBLE row (no-op if none); `swap:<n>` permutes n keypoint pairs
     of the chosen row without changing which row/frame it came from."""
-    from tailcyclenet.infer.window import _corrupt_prior
+    from tailcyclenet.infer.oracle import corrupt_prior
 
     K, size = 2, torch.tensor([100, 100], dtype=torch.int32)
     cgroup = [{'size': size}]
@@ -705,7 +705,7 @@ def test_oracle_corrupt_near_and_swap():
     src[2, 0] = [[15.0, 15.0], [25.0, 25.0]]
 
     cfg = InferConfig(anchor='labels', oracle_corrupt='near')
-    p, qt = _corrupt_prior(cfg, src, 0, 3, frames, boxes, '2d', cgroup, scales)
+    p, qt = corrupt_prior(cfg, src, 0, 3, frames, boxes, '2d', cgroup, scales)
     assert torch.allclose(p, torch.as_tensor(src[2, 0])), \
         'near must pick the ELIGIBLE row, never the out-of-bounds one'
     assert qt == 0
@@ -713,12 +713,12 @@ def test_oracle_corrupt_near_and_swap():
     # Nothing eligible -> a no-op, the target's own row comes back unchanged.
     src2 = src.copy()
     src2[2, 0] = [[500.0, 500.0], [600.0, 600.0]]     # make row 2 ineligible too
-    p2, _ = _corrupt_prior(cfg, src2, 0, 3, frames, boxes, '2d', cgroup, scales)
+    p2, _ = corrupt_prior(cfg, src2, 0, 3, frames, boxes, '2d', cgroup, scales)
     assert torch.allclose(p2, torch.as_tensor(src2[0, 0])), 'no eligible row must be a no-op'
 
     src = np.zeros((1, 4, 4, 2), dtype=np.float32)
     src[0, 0] = [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]
-    p, qt = _corrupt_prior(InferConfig(anchor='labels', oracle_corrupt='swap:1'), src, 0, 1,
+    p, qt = corrupt_prior(InferConfig(anchor='labels', oracle_corrupt='swap:1'), src, 0, 1,
                            frames, boxes, '2d', cgroup)
     assert qt == 0
     base = torch.as_tensor(src[0, 0])
@@ -857,7 +857,7 @@ def test_render_writes_every_predicted_frame(rat, tmp_path):
     """The mp4 holds exactly the predicted frames."""
     import cv2
 
-    from tailcyclenet.render import render_group
+    from tailcyclenet.render.render import render_group
 
     model, sess, registry, name = rat
     out = run_group(model, sess, 'g000', registry, name, _cfg(anchor='none', max_frames=3))
@@ -929,7 +929,7 @@ def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
 def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(mv):
     """`render.project` uses the per-frame extrinsic on a moving rig (matching project_points_torch),
     and reads extrinsic `frames[t]` at column t for a non-identity `frames`."""
-    from tailcyclenet.render import project
+    from tailcyclenet.render.render import project
 
     model, sess, registry, name = mv
     cam_name = sess.cam_names[0]
@@ -968,7 +968,7 @@ def test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig(mv):
 def test_the_tracker_projects_correctly_on_a_moving_rig(mv):
     """On a moving rig `cgroup(gid, t)` with a scalar t gives a (4,4) ext, which `track._project`
     relies on (a (T,4,4) ext would project target i through frame i's pose)."""
-    from tailcyclenet.detector.track import _project
+    from tailcyclenet.infer.track import _project
 
     _, sess, _, _ = mv
     gid = list(sess.groups)[0]
@@ -1001,7 +1001,7 @@ def test_session_writer_preserves_named_2d_signals_and_window_metadata(rat, tmp_
     import pyarrow.parquet as pq
 
     _, sess, registry, _ = rat
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
 
     gid = next(iter(sess.groups))
     K = sess.n_keypoints
@@ -1067,7 +1067,7 @@ def test_prediction_3d_missing_status_retains_best_guess_coordinates(mv, tmp_pat
     import pyarrow.parquet as pq
 
     _, sess, registry, _ = mv
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
     from tailcyclenet.format.prediction import load_predictions
 
     gid = next(iter(sess.groups))
@@ -1107,7 +1107,7 @@ def test_prediction_3d_missing_status_retains_best_guess_coordinates(mv, tmp_pat
 
 def test_quality_columns_are_optional_and_align_with_pose_rows(scene, tmp_path):
     import pyarrow.parquet as pq
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
 
     _, sess, registry, _ = scene
     gid = next(iter(sess.groups))
@@ -1148,7 +1148,7 @@ def test_window_prediction_sidecar_streams_typed_nullable_records(rat, tmp_path)
     import pyarrow.parquet as pq
 
     _, sess, registry, _ = rat
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
 
     gid = next(iter(sess.groups))
     out = tmp_path / 'pred-with-sidecar'
@@ -1187,7 +1187,7 @@ def test_uncalibrated_singleview_prediction_session_uses_normalized_units(tmp_pa
     import tomllib
     import conftest as cf
     from tailcyclenet.format import Session
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
 
     source_path = tmp_path / 'r' / 'train' / 's'
     cf._session_2d(source_path, T=4)
@@ -1207,7 +1207,7 @@ def test_a_duplicate_provenance_key_raises_rather_than_silently_winning(tmp_path
     overwritten by the detector's); the same value twice is fine."""
     import conftest as cf
     from tailcyclenet.format import Registry, Session
-    from tailcyclenet.infer.predictions import SessionWriter
+    from tailcyclenet.infer.session_writer import SessionWriter
 
     cf._session_2d(tmp_path / 'r' / 'test' / 's')
     sess = Session.load(tmp_path / 'r' / 'test' / 's')
@@ -1561,12 +1561,12 @@ def _detect_session(tmp_path, T):
 
 @pytest.mark.parametrize('start,stop', [(37, 53), (37, 64)])
 def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path, start, stop):
-    """The detection cursor opens on a `_DET_BATCH` boundary BELOW `--start-frame` (never rounding
+    """The detection cursor opens on a `DET_BATCH` boundary BELOW `--start-frame` (never rounding
     the user's value), and `detect_raw` is told the RANGE end, so a ragged final slice (53) is
     accepted as well as an exact one (64). The driver once passed `max_frames=0` and failed 272 s
     into a 1000-frame run."""
-    import tailcyclenet.detector as detmod
-    from tailcyclenet.infer import driver
+    import tailcyclenet.infer.associate as assocmod
+    import tailcyclenet.infer.detect as detmod
     from tailcyclenet.infer.cli import build_parser
 
     sess = _detect_session(tmp_path, T=80)
@@ -1575,7 +1575,7 @@ def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path
     def fake_detect_raw(det, wh, session, gid, top_k, **kw):
         fr = np.asarray(kw['frames'])
         T_clip = min(session.groups[gid].n_frames, kw['max_frames'] or session.groups[gid].n_frames)
-        batch = driver._DET_BATCH
+        batch = detmod.DET_BATCH
         assert int(fr[0]) % batch == 0 and (len(fr) % batch == 0 or int(fr[-1]) == T_clip - 1), (
             f'slice {fr[0]}..{fr[-1]} of T_clip={T_clip} would be refused by detect_raw')
         seen.append((int(fr[0]), int(fr[-1])))
@@ -1587,18 +1587,18 @@ def test_the_detection_slice_is_batch_aligned_and_reaches_the_range_end(tmp_path
         def read(self, ci, cam, fr, pool=None, reduce=1):
             return [None] * len(fr)
 
-    old = (detmod.detect_raw, detmod.associate_group)
+    old = (detmod.detect_raw, assocmod.associate_group)
     detmod.detect_raw = fake_detect_raw
-    detmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
+    assocmod.associate_group = lambda raw, s, g, n, **kw: (raw[0][:n], raw[1][:n])
     try:
         args = build_parser().parse_args(['--run', 'r', '--out', 'o', '--det-score', '0.5',
                                           '--max-move', '1.0'])
         args.frame_start, args.frame_stop = start, stop
-        boxes_for = driver._detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
+        boxes_for = detmod.detector_boxes(None, (64, 64), sess, 'g000', args, 'cpu', False,
                                            None, 2, 2)
         boxes_for(_Store(), start, stop)
     finally:
-        detmod.detect_raw, detmod.associate_group = old
+        detmod.detect_raw, assocmod.associate_group = old
     assert seen[0][0] == 32, f'the cursor must open on a multiple of 16, got {seen[0][0]}'
     assert seen[-1][1] == stop - 1, f'detection must reach the range end: {seen[-1]}'
 
@@ -1944,9 +1944,9 @@ def test_det_trace_file_is_valid_json(tmp_path):
     """`--det-trace` writes JSON a reader can load: it used to end in a literal backslash-n."""
     import json
 
-    from tailcyclenet.infer.driver import _write_det_trace
+    from tailcyclenet.infer.traces import write_det_trace
 
     path = tmp_path / 'sub' / 'trace.json'
-    _write_det_trace(path, {'s/g000': [{'frame': 0, 'kept': 2}]})
+    write_det_trace(path, {'s/g000': [{'frame': 0, 'kept': 2}]})
     assert json.loads(path.read_text()) == {'s/g000': [{'frame': 0, 'kept': 2}]}
     assert path.read_text().endswith('}\n')

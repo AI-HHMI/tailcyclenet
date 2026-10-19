@@ -17,16 +17,19 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from tracktail.model.cube import project_points_torch
-
 from ..data import crop as cropmod
 from .. import memory
-from ..data.pixels import crop_affine
-from ..data.camera import resize_camera, prior_out_of_bounds
+from ..data.camera import resize_camera
 from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene
+from .crops import (boxes_from_points, crop_views, fill_box_agreement, overlaps,
+                    to_device)
+from .prior import build_prior, deploy_box_prompt, give_box_this_window
 from .store import FrameStore
+from .traces import (FRAME_KEYS, WINDOW_KEYS, capture_model_confidence,
+                     capture_overlap_agreement, census_block_boundary, count_prior_oob)
+from .window_records import logit_probability, window_record_base
 
 ANCHORS = ('none', 'carry', 'self', 'labels')
 CARRY_SOURCES = ('triangulate', 'pred')
@@ -86,7 +89,7 @@ class InferConfig:
     # loop); 'pred' is the reported prediction, which under gridresid_offset = "query" is
     # `prior + residual` and integrates its own error. 2D is identical either way.
     carry_source: str = 'triangulate'
-    # Deliberately break the oracle prior to measure the echo coefficient; see `_corrupt_prior`.
+    # Deliberately break the oracle prior to measure the echo coefficient; see `corrupt_prior`.
     # Never a deployment arm.
     oracle_corrupt: str | None = None
     device: str = 'cuda:0'
@@ -101,7 +104,7 @@ class InferConfig:
     # withholding it once a carry is ACTUALLY USED as this window's prior -- give it while
     # first-detecting, then let carry hold identity. False (the pre-existing behaviour) gives the
     # box prompt every window `box_prompt` is on for; the gate is `not box_prompt_first_only or
-    # carried[a] is None or prior is None` (fixed: a stale/out-of-bounds carry that `_build_prior`
+    # carried[a] is None or prior is None` (fixed: a stale/out-of-bounds carry that `build_prior`
     # itself declined to use no longer silently withholds the box too -- report 56 Session 9/13's
     # cross-clip-replicated finding), which reduces to the old unconditional check when this is
     # False.
@@ -145,117 +148,6 @@ def last_window_start(starts, window: int, t: int) -> int | None:
         return None
     start = int(starts[pos - 1])
     return start if t < start + window else None
-
-
-def boxes_from_points(points, cgroup, min_crop_dim, mode):
-    """Crop boxes for one animal in one window, from points -- the crop rule, shared with training.
-
-    3D points are world coordinates and get projected; 2D are already pixels. None when nothing
-    is finite. `cgroup` is built by the caller once per window (per-animal builds dropped the
-    per-frame extrinsics).
-    """
-    if mode == '3d':
-        cg, boxes = cropmod.crop_to_points_3d(cgroup, points, min_crop_dim)
-        return (cg, boxes) if cg is not None else (None, None)
-    cam, box, _ = cropmod.crop_to_points_2d(cgroup[0], points, min_crop_dim)
-    return ([cam], [box]) if cam is not None else (None, None)
-
-
-def _give_box_this_window(cfg, carried_a, prior):
-    """Whether this animal's window should receive a box prompt this call.
-
-    `box_prompt_first_only` withholds the box once a carry EXISTS and IS ACTUALLY USED as this
-    window's prior -- `carried_a is None` alone under-withholds: `_build_prior` can ALSO decline
-    a non-None carry as stale (a skipped window, `qt < 0`) or shape-mismatched, in which case no
-    identity signal reached the model at all and the box should compensate, exactly as it would
-    at the animal's true first window. `prior is None` is `_build_prior`'s own verdict for THIS
-    window, so this can never disagree with what the model actually received.
-    """
-    return (cfg.box_prompt != 'none'
-            and (not cfg.box_prompt_first_only or carried_a is None or prior is None))
-
-
-def _deploy_box_prompt(mode, src_pts, boxes_stc, frames, a, use, boxes, scales, cgroup, dev):
-    """The box-prompt tensor for one animal's window, per camera, 2D or 3D: (1,T,C,4) in crop
-    pixels, C = len(use) -- column order matches cgroup/views/use.
-
-    `src_pts` names which animal: the GT points under 'labels' (an oracle), or None under
-    'detector', where boxes_stc[a] supplies per-camera boxes. 3D + labels reuses the exact
-    training-time `compute_box_prompt` on the window's cropped cgroup -- identical to what
-    `_item` computes at training time. 3D + detector boxes each camera's own box corners in its
-    crop frame: a 2D computation per camera, since the detector box is a per-camera detection
-    to begin with. 2D is the single-camera case. A camera absent from `use` is absent from the
-    output too (never a NaN at the wrong index).
-    """
-    from ..pose import box_prompt as bpmod
-
-    if mode == '3d' and src_pts is not None:
-        pts = torch.as_tensor(src_pts[a][frames], dtype=torch.float32)
-        return bpmod.compute_box_prompt(pts, cgroup, '3d')[None].to(dev)
-
-    if mode == '3d':
-        T = len(frames)
-        C = len(use)
-        out = torch.full((T, C, 4), float('nan'), dtype=torch.float32)
-        for i, ci in enumerate(use):
-            db = torch.as_tensor(boxes_stc[a][frames][:, ci], dtype=torch.float32)
-            if not torch.isfinite(db).any():
-                continue
-            corners = cropmod.box_corners(db)
-            origin = torch.as_tensor(boxes[i][:2], dtype=torch.float32)
-            cf = (corners - origin) * torch.as_tensor(scales[i], dtype=corners.dtype)
-            size = cgroup[i]['size']
-            for t in range(T):
-                bx = cropmod.crop_box_for_points(cf[t], size,
-                                                 bpmod.BOX_PROMPT_MIN_DIM, bpmod.BOX_PROMPT_PAD)
-                if bx is not None:
-                    out[t, i] = bx.to(torch.float32)
-        return out[None].to(dev)
-
-    source = (torch.as_tensor(src_pts[a][frames], dtype=torch.float32) if src_pts is not None
-              else cropmod.box_corners(torch.as_tensor(boxes_stc[a][frames][:, use[0]],
-                                                       dtype=torch.float32)))
-    origin = torch.as_tensor(boxes[0][:2], dtype=torch.float32)
-    cf = (source - origin) * torch.as_tensor(scales[0], dtype=source.dtype)
-    size = cgroup[0]['size']
-    T = cf.shape[0]
-    out = torch.full((T, 1, 4), float('nan'), dtype=torch.float32)
-    for t in range(T):
-        bx = cropmod.crop_box_for_points(cf[t], size, bpmod.BOX_PROMPT_MIN_DIM,
-                                         bpmod.BOX_PROMPT_PAD)
-        if bx is not None:
-            out[t, 0] = bx.to(torch.float32)
-    return out[None].to(dev)
-
-
-def _to_device(cgroup, device):
-    """Move each camera's tensors to `device`; non-tensors (e.g. `size`) are left as-is."""
-    return [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
-            for c in cgroup]
-
-
-def _crop_views(imgs, box, target_size):
-    """Crop+resize one camera's already-decoded window -> (1,T,H,W,3) uint8.
-
-    Decode is per (camera, frame) and crop is per (animal, camera, frame), so cropping inside the
-    animal loop paid the full-frame decode once per animal. `box` is one [x1,y1,x2,y2] for the
-    whole window or a (T,4) of per-frame boxes (kept for the loader's per-frame crops).
-    """
-    import cv2
-
-    b = np.asarray(box)
-    src_wh = (imgs[0].shape[1], imgs[0].shape[0])
-    if b.ndim == 1:
-        aff = crop_affine(src_wh, box, target_size, None)
-        out = [im if aff is None else cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR)
-               for im in imgs]
-    else:
-        out = []
-        for t, im in enumerate(imgs):
-            aff = crop_affine(src_wh, b[min(t, len(b) - 1)], target_size, None)
-            out.append(im if aff is None else
-                       cv2.warpAffine(im, aff[0], aff[1], flags=cv2.INTER_LINEAR))
-    return torch.from_numpy(np.asarray(out))[None]
 
 
 def _plan_blocks(starts, n_frames, T_total, frame_cost, store_bytes):
@@ -323,128 +215,6 @@ def _plan_windows(session_id, gid, cam_sizes, n_frames, overlap, T_total, frame_
     return starts, blocks, cam_decode, _pipeline_det
 
 
-# Frame/window-indexed columns stitched by `merge_blocks`; anything else is a per-group constant.
-_FRAME_KEYS = ('pred', 'conf', 'pred2d', 'conf2d', 'model_conf2d', 'box_agree', 'det_box', 'det_score', 'owner_window', 'triangulated', 'quality', 'quality_precision')
-_WINDOW_KEYS = ('outcome', 'crop', 'crop_refined', 'box_prompt_cams', 'window_start', 'window_stop', 'window_ordinal')
-
-
-def _capture_overlap_agreement(stats, a, frames, f0, pred, p):
-    """Compare this window's overlap-region prediction against the PREVIOUS window's, before it
-    is overwritten by the seam rule (report 53 follow-up, independent review's overlap-reuse
-    idea).  A frame in `frames` may already hold a finite prediction from the window before this
-    one -- the exact quantity the seam rule discards -- so this is a free test-retest signal: the
-    same physical frame predicted from two different crop framings and partially different
-    `carried` context, with zero extra forward passes.  Opt-in
-    (`stats['capture_overlap_agreement']`) since the comparison is cheap but the accumulated
-    list is not needed on a normal run.
-
-    BOTH VALUES are recorded, not only their distance (plan 7.0): the seam rule always keeps the
-    LATER window's estimate, and asking whether that is the better choice (plan 7.1) requires
-    scoring each against the labels separately, which a distance cannot support.  `pos` is the
-    frame's position WITHIN the overlap region, counted from the later window's own start -- 0 is
-    that window's anchor frame, where `carried` was read, so disagreement as a function of `pos`
-    reads out prior influence directly on unlabelled footage (plan 7.3, the echo coefficient).
-
-    A census is accumulated beside the rows because several plan-7 ideas can die on population
-    size alone, and that is the cheapest possible refutation: `pairs_seen` counts (row, seam)
-    pairs actually compared, `pairs_no_prev` those skipped because the earlier window wrote
-    nothing finite for that row, and `pairs_no_shared` those where the two estimates share no
-    finite keypoint.  The last two are a SELECTION BIAS toward easy rows -- the hook only ever
-    sees a seam where the earlier window already succeeded -- so they are counted rather than
-    silently dropped.
-    """
-    census = stats.setdefault('overlap_census', {'pairs_seen': 0, 'pairs_no_prev': 0,
-                                                'pairs_no_shared': 0})
-    prev = pred[a, frames - f0]
-    had_prev = np.isfinite(prev).all(-1).any(-1)
-    census['pairs_no_prev'] += int((~had_prev).sum())
-    if not had_prev.any():
-        return
-    shared = np.isfinite(p[had_prev]).all(-1) & np.isfinite(prev[had_prev]).all(-1)
-    d = np.linalg.norm(p[had_prev] - prev[had_prev], axis=-1)
-    rows = stats.setdefault('overlap_agreement', [])
-    where = np.flatnonzero(had_prev)
-    for row, t, dist, n_sh in zip(where, frames[had_prev],
-                                  np.where(shared, d, np.nan).mean(-1), shared.sum(-1)):
-        if not np.isfinite(dist):
-            census['pairs_no_shared'] += 1
-            continue
-        census['pairs_seen'] += 1
-        rows.append({'animal': int(a), 'frame': int(t), 'pos': int(row),
-                     'dist': float(dist), 'n_shared': int(n_sh),
-                     'prev': prev[row].copy(), 'new': p[row].copy()})
-
-
-def _capture_model_confidence(stats, a, frames, out):
-    """Record the model's OWN per-camera confidence, which the window loop otherwise discards.
-
-    Plan 5.1 (B2). `window.py` reads `coords_pred`, `2d_pred`, `vis_pred`, `vis_pred_2d` and
-    `3d_pred_triangulate` and throws the rest away; `conf_pred_2d` is a per-(camera, frame,
-    keypoint) logit the model already computed. It is a different QUANTITY from everything the
-    refuted geometric identity levers spent (`--kpt-affinity`, `--kpt-centre`, `--axis-*`,
-    `--dup-res-px`), all of which derive from output COORDINATES: this is the model's own
-    uncertainty, and it is the one thing on that axis a better model can actually change -- the
-    standing objection to spending a weak cue.
-
-    `conf_pred_2d` is `(C, B, T, K)` logits; `v` takes batch 0 to `(C, T, K)` and `per_cam` is its
-    per-keypoint median, `(C, T)`. Recorded per (animal, frame) as the mean and min over cameras,
-    plus the camera count, so the offline question (is confidence depressed on the
-    duplicate-implicated rows during the known episode, relative to the same rows outside it AND
-    to non-implicated rows in the same frames?) can be asked without keeping a (C, T, K) tensor
-    per window. Opt-in under the same flag as the overlap capture, and read-only.
-    """
-    c2 = out.get('conf_pred_2d')
-    if c2 is None:
-        return
-    v = c2[:, 0].detach().float().cpu().numpy()
-    if v.ndim != 3 or v.shape[1] != len(frames):
-        return
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', RuntimeWarning)
-        per_cam = np.nanmedian(v, axis=-1)
-        mean_t = np.nanmean(per_cam, axis=0)
-        min_t = np.nanmin(per_cam, axis=0)
-    rows = stats.setdefault('model_conf', [])
-    for i, t in enumerate(frames):
-        rows.append((int(a), int(t), float(mean_t[i]), float(min_t[i]), int(v.shape[0])))
-
-
-def _count_prior_oob(stats, a, f0, prior):
-    """Count the prior keypoints `prior_out_of_bounds` NaN'd for this (animal, window).
-
-    THE CHEAPER ALTERNATIVE plan 7.2 says must be beaten before its overlap mechanism is built:
-    "count how many prior keypoints `prior_out_of_bounds` NaN'd per window -- a free
-    identity-discontinuity smoke alarm needing no overlap mechanism at all. If that alone finds
-    the known switches, this idea is redundant and should not be built."
-
-    The reasoning is that a carried prior lands outside its own crop exactly when the slot's crop
-    and its remembered pose stopped describing the same animal -- which is what an identity
-    discontinuity IS, seen from inside the pipeline and needing no second forward pass. Recorded
-    under the same opt-in flag as the overlap capture so one probe answers both questions, and
-    counted rather than acted on: rule 12 makes this a smoke alarm, never an arm-ranker.
-    """
-    n_nan = int(torch.isnan(prior[0]).all(-1).sum())
-    stats.setdefault('prior_oob', []).append((int(a), int(f0), n_nan,
-                                              int(prior.shape[1])))
-
-
-def _census_block_boundary(stats, f_read, f_own):
-    """Count the seam a block boundary makes uncomparable, so the census cannot overstate itself.
-
-    `_capture_overlap_agreement` is BLIND HERE, and silence would look exactly like clean
-    coverage. A block emits only `[f0, f_own)`; the frames in `[f_own, f_read)` were predicted by
-    this block's last window and are re-predicted from scratch by the NEXT block's first window,
-    so that seam's two estimates never coexist in one array and no comparison is possible at all.
-    Plan 7.0 asks for this number by name -- a census that reported only what it managed to see
-    would understate how much of the overlap population is structurally invisible.
-    """
-    c = stats.setdefault('overlap_census', {'pairs_seen': 0, 'pairs_no_prev': 0,
-                                            'pairs_no_shared': 0})
-    if f_read > f_own:
-        c['block_boundary_seams'] = c.get('block_boundary_seams', 0) + 1
-        c['block_boundary_frames'] = c.get('block_boundary_frames', 0) + int(f_read - f_own)
-
-
 def merge_blocks(blocks):
     """Every block of `run_blocks` stitched into the one dict `run_group` used to return.
 
@@ -453,7 +223,7 @@ def merge_blocks(blocks):
     """
     blocks = list(blocks)
     out = dict(blocks[0])
-    for k in _FRAME_KEYS + _WINDOW_KEYS:
+    for k in FRAME_KEYS + WINDOW_KEYS:
         if k not in out:
             continue
         axis = 0 if np.asarray(out[k]).ndim == 1 else 1
@@ -678,7 +448,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
 
             `store` is keyed by (camera, SOURCE frame) and holds the FULL decoded frame, which
             is what lets one decode serve every consumer: refine wants the same pixels under a
-            different crop, and `_crop_views` never mutates what it is given. A file that will
+            different crop, and `crop_views` never mutates what it is given. A file that will
             not decode takes out every animal that wanted this camera.
             """
             imgs = store.read(ci, session.cam_names[ci], frames, pool=pool)
@@ -687,7 +457,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 if ci in use:
                     i = use.index(ci)
                     bx = boxes[i]
-                    crops[a, ci] = (_crop_views(imgs, bx, cgroup[i]['size'].tolist())
+                    crops[a, ci] = (crop_views(imgs, bx, cgroup[i]['size'].tolist())
                                     if ok else None)
             del imgs
 
@@ -724,7 +494,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         reported output untouched and breaks the feedback path only. In 2D, `q` is deliberately
         the same tensor as `p`: at one camera there is nothing to triangulate, so every 2D root
         is bit-identical under either `carry_source`. In 3D single-view no key is written, so
-        `carried[a]` is left alone and the staleness bound in `_build_prior` retires it. The
+        `carried[a]` is left alone and the staleness bound in `build_prior` retires it. The
         2D->source conversion undoes the resize, then adds the crop origin; the per-camera 2D
         pose takes the same expression per camera, so camera 0's per-camera pose is bit-identical
         to the reported prediction (a free exact check).
@@ -733,15 +503,15 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         views = [crops[a, ci] for ci in use]
         if any(v is None for v in views):
             return None
-        prior, prompt_t = _build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
+        prior, prompt_t = build_prior(cfg, carried[a], src, a, n_lab, frames, boxes,
                                        scales, mode, K, R, cgroup)
         if (trace and stats is not None and stats.get('capture_overlap_agreement')
                 and prior is not None):
-            _count_prior_oob(stats, a, int(frames[0]), prior)
+            count_prior_oob(stats, a, int(frames[0]), prior)
         dev = cfg.device
         chunk = cfg.kpt_chunk or None
         views = [v.to(dev) for v in views]
-        cgroup_d = _to_device(cgroup, dev)
+        cgroup_d = to_device(cgroup, dev)
         scene_encoding = scene_features = views_norm = None
         if scorer is not None:
             input_size = max(int(cam['size'].max()) for cam in cgroup_d)
@@ -749,23 +519,23 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             scene_encoding = model.encode_scene_backbone(views_norm)
             scene_features = model.project_scene(scene_encoding)
         mkw = {}
-        give_box = _give_box_this_window(cfg, carried[a], prior)
+        give_box = give_box_this_window(cfg, carried[a], prior)
         if give_box:
             if cfg.box_prompt == 'labels':
                 if src is None or a >= n_lab:
                     box_t = None
                 else:
-                    box_t = _deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
+                    box_t = deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
                                               cgroup, dev)
             elif cfg.box_prompt == 'detector':
                 if boxes_stc is None and box_points is not None:
-                    box_t = (_deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
+                    box_t = (deploy_box_prompt(mode, src, None, frames, a, use, boxes, scales,
                                                 cgroup, dev) if a < n_lab else None)
                 elif boxes_stc is None:
                     raise ValueError('box_prompt = "detector" needs detector boxes '
                                      '(--detector or --boxes); none were supplied.')
                 else:
-                    box_t = _deploy_box_prompt(mode, None, boxes_stc, frames - f0,
+                    box_t = deploy_box_prompt(mode, None, boxes_stc, frames - f0,
                                               a, use, boxes, scales, cgroup, dev)
             if box_t is not None:
                 mkw['box_prompt'] = box_t
@@ -782,7 +552,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 out = self_prompt(model, views, kpt_ids.to(dev), cgroup_d, mode, out,
                                   kpt_chunk=chunk, box_prompt=mkw.get('box_prompt'))
         if trace and stats is not None and stats.get('capture_overlap_agreement'):
-            _capture_model_confidence(stats, a, frames, out)
+            capture_model_confidence(stats, a, frames, out)
         p = out['coords_pred'][0].detach().cpu().numpy()
         q = None
         if mode == '2d':
@@ -875,7 +645,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 if cg2 is None:
                     refined.append(_at_image_size(plan))
                     continue
-                if any(not _overlaps(b2[i], boxes[i]) for i in range(len(use))):
+                if any(not overlaps(b2[i], boxes[i]) for i in range(len(use))):
                     refined.append(_at_image_size(plan))
                     continue
                 uncropped2, sc2 = list(cg2), []
@@ -899,7 +669,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             if quality_window is not None:
                 quality[a, frames - f0] = quality_window
                 quality_precision[a, frames - f0] = precision_window
-            _fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
+            fill_box_agreement(box_agree, a, frames - f0, use, boxes, p, mode, window_cams)
             if p2 is not None:
                 for i, ci in enumerate(use):
                     pred2d[a, frames - f0, ci] = p2[i]
@@ -932,14 +702,14 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         for k in range(K):
                             if not np.isfinite(p[ti, k]).all():
                                 continue
-                            rec_k = _window_record_base(gid, wi, start_w, stop_w, a, animal_id,
+                            rec_k = window_record_base(gid, wi, start_w, stop_w, a, animal_id,
                                                         int(frame), str(session.names[k]), 'point3d')
                             logit = float(vlogit[ti, k]) if vlogit is not None else None
                             rec_k.update({'x': float(p[ti, k, 0]),
                                           'y': float(p[ti, k, 1]),
                                           'z': float(p[ti, k, 2]),
                                           'score_logit': logit,
-                                          'score': (_logit_probability(logit)
+                                          'score': (logit_probability(logit)
                                                     if logit is not None else None),
                                           'status': ('visible' if logit is not None and
                                                      logit > 0 else 'missing'),
@@ -963,17 +733,17 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                                     continue
                                 vis_logit = (float(v2[i, ti, k]) if v2 is not None else None)
                                 conf_logit = (float(c2[i, ti, k]) if c2 is not None else None)
-                                rec2 = _window_record_base(
+                                rec2 = window_record_base(
                                     gid, wi, start_w, stop_w, a, animal_id, int(frame),
                                     str(session.names[k]), 'point2d')
                                 rec2.update({'camera': str(session.cam_names[ci]),
                                              'x': float(p2[i, ti, k, 0]),
                                              'y': float(p2[i, ti, k, 1]),
                                              'visibility_logit': vis_logit,
-                                             'visibility_probability': (_logit_probability(vis_logit)
+                                             'visibility_probability': (logit_probability(vis_logit)
                                                                         if vis_logit is not None else None),
                                              'confidence_logit': conf_logit,
-                                             'confidence_probability': (_logit_probability(conf_logit)
+                                             'confidence_probability': (logit_probability(conf_logit)
                                                                         if conf_logit is not None else None),
                                              'gated': gated if mode == '2d' else False})
                                 if quality_window is not None and mode == '2d':
@@ -988,7 +758,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         box = det_box[a, int(frame) - f0, ci]
                         agree = box_agree[a, int(frame) - f0, ci]
                         if np.isfinite(box).all() or np.isfinite(agree):
-                            reci = _window_record_base(
+                            reci = window_record_base(
                                 gid, wi, start_w, stop_w, a, animal_id, int(frame), None,
                                 'instance', str(cam))
                             reci.update({'x0': float(box[0]) if np.isfinite(box[0]) else None,
@@ -1017,7 +787,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                         if c2 is not None:
                             model_conf2d[a, frames[drop] - f0, ci] = np.nan
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
-                _capture_overlap_agreement(stats, a, frames, f0, pred, p)
+                capture_overlap_agreement(stats, a, frames, f0, pred, p)
             pred[a, frames - f0] = p
             if q is not None:
                 carried[a] = (torch.as_tensor(q[j]), int(frames[j]))
@@ -1029,7 +799,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
                 animal_id = str(animal_ids[animal])
                 outcome_name = OUTCOMES[int(outcome[animal, wi - w0])]
                 for ci, cam in enumerate(session.cam_names):
-                    recw = _window_record_base(gid, wi, start_w, stop_w, animal,
+                    recw = window_record_base(gid, wi, start_w, stop_w, animal,
                                                animal_id, None, None, 'window', str(cam))
                     recw['outcome'] = outcome_name
                     crop_box = crop[animal, wi - w0, ci]
@@ -1132,7 +902,7 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
             memory.check_peak(f'the window loop ({session.session_id}/{gid})')
             keep = f_own - f0
             if stats is not None and stats.get('capture_overlap_agreement') and cfg.overlap:
-                _census_block_boundary(stats, f_read, f_own)
+                census_block_boundary(stats, f_read, f_own)
             yield {'pred': pred[:, :keep], 'conf': conf[:, :keep],
                    **({} if quality is None else {'quality': quality[:, :keep],
                                                   'quality_precision': quality_precision[:, :keep]}),
@@ -1167,197 +937,3 @@ def run_blocks(model, session: Session, gid: str, registry, dataset_name: str,
         store.clear()
 
 
-def _logit_probability(value):
-    """Stable scalar logit-to-probability conversion for optional window records."""
-    return float(1.0 / (1.0 + np.exp(-np.clip(float(value), -80.0, 80.0))))
-
-
-def _window_record_base(gid, window, start, stop, slot, animal_id, frame, bodypart,
-                        record_type, camera=None):
-    """Common long-form sidecar keys; absent dimensions are explicit nulls."""
-    return {'record_type': record_type, 'group_id': str(gid), 'frame': frame,
-            'window': int(window), 'window_start': int(start), 'window_stop': int(stop),
-            'slot': int(slot), 'animal_id': str(animal_id), 'camera': camera,
-            'bodypart': bodypart}
-
-
-def _overlaps(a, b):
-    """Do two xyxy boxes share any area? Either being non-finite is not an overlap."""
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    if not (np.isfinite(a).all() and np.isfinite(b).all()):
-        return False
-    return bool(min(a[2], b[2]) > max(a[0], b[0]) and min(a[3], b[3]) > max(a[1], b[1]))
-
-
-def _fill_box_agreement(box_agree, a, frames, use, boxes, p, mode, window_cams):
-    """Distance from the predicted centroid to each crop box's centre, in units of one box side.
-
-    A 3D pose is reprojected through the source camera per frame (a moving rig is handled by
-    `project_points_torch`'s own (T,4,4) alignment). The box is the window's union box, i.e. what
-    the pixels were cut with. In 2D `p` is already source pixels. A frame with no finite
-    keypoint makes `nanmean` warn, which is suppressed.
-    """
-    for i, ci in enumerate(use):
-        b = np.asarray(boxes[i], np.float64)
-        side = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
-        if not (np.isfinite(b).all() and side > 0):
-            continue
-        if mode == '2d':
-            q = np.asarray(p, np.float64)
-        else:
-            q = project_points_torch([window_cams[ci]],
-                                     torch.as_tensor(p, dtype=torch.float32))[0].numpy()
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', RuntimeWarning)
-            c = np.nanmean(q, axis=-2)
-        centre = np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2])
-        box_agree[a, frames, ci] = np.linalg.norm(c - centre, axis=-1) / side
-
-
-ORACLE_CORRUPTIONS = ('off', 'stale', 'other', 'near', 'swap')
-
-
-def _prior_to_model_frame(p, mode, boxes, scales):
-    """Source pixels/world -> the model's own crop frame (3D passes straight through). Factored
-    out so `_corrupt_prior`'s `near` applies the identical conversion to a candidate neighbour.
-    """
-    if mode == '2d':
-        return (p - torch.as_tensor(np.asarray(boxes[0][:2], np.float32))) * scales[0]
-    return p
-
-
-def _nearest_eligible_row(src, a, t0, boxes, scales, mode, cgroup):
-    """The nearest other label row whose pose at this frame would survive `prior_out_of_bounds` --
-    the same eligibility test `dataset.py`'s `prompt_swap_animal` applies. Returns a row index, or
-    None if no other row qualifies.
-
-    "Nearest" is measured in the model's own frame over keypoints both rows have finite and in
-    bounds -- the frame the model will see the corrupted prior in.
-    """
-    target = _prior_to_model_frame(torch.as_tensor(src[a][t0], dtype=torch.float32),
-                                   mode, boxes, scales)
-    best_row, best_dist = None, None
-    for row in range(len(src)):
-        if row == a:
-            continue
-        cand = _prior_to_model_frame(torch.as_tensor(src[row][t0], dtype=torch.float32),
-                                     mode, boxes, scales)
-        oob = prior_out_of_bounds(cand, mode, cgroup)
-        if int((~oob).sum()) < 2:
-            continue
-        both = torch.isfinite(target).all(-1) & torch.isfinite(cand).all(-1) & ~oob
-        if int(both.sum()) < 1:
-            continue
-        d = float(torch.linalg.norm((cand - target)[both], dim=-1).mean())
-        if best_dist is None or d < best_dist:
-            best_row, best_dist = row, d
-    return best_row
-
-
-def _swap_kpt_pairs(p, n_pairs, seed):
-    """`swap:<n>` -- n transpositions among `p`'s own finite keypoints: the direct inference probe
-    for `dataset.py`'s `prompt_swap_kpt_pairs`.
-    """
-    finite = torch.isfinite(p).all(-1).nonzero(as_tuple=True)[0]
-    if len(finite) < 2:
-        return p
-    rng = np.random.default_rng(seed)
-    idx = finite[torch.from_numpy(rng.permutation(len(finite)))]
-    n = min(n_pairs, len(idx) // 2)
-    p = p.clone()
-    for i in range(n):
-        j, k = int(idx[2 * i]), int(idx[2 * i + 1])
-        p[j], p[k] = p[k].clone(), p[j].clone()
-    return p
-
-
-def _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales=None):
-    """The oracle prior, optionally broken on purpose. Returns (pose in the SOURCE frame, qt).
-
-    Measures alpha = d(output)/d(prior), the echo coefficient, which decides whether the prompt
-    needs retraining. None of the corruptions is in training except through `dataset.py`'s
-    `prompt_swap_kpt_pairs` / `prompt_swap_animal`, which `swap` and `near` probe directly:
-
-    - `off:<x>`   a whole-body offset of x crop widths (the shape of a lag)
-    - `stale:<n>` the pose from n frames earlier
-    - `other`     the neighbouring animal's pose (`a + 1 % n_lab`)
-    - `near`      the nearest eligible animal's pose instead of the fixed `a + 1` row
-    - `swap:<n>`  n transpositions of this row's own keypoints
-
-    Magnitudes are in CROP WIDTHS: sessions in one root mix pixels and millimetres. The direction
-    is drawn from a generator seeded on (row, window), so two arms over one clip corrupt
-    identically and the comparison is matched.
-
-    `off` displaces by ONE crop width converted into whatever units the prior lives in:
-    `get_camera_scale` is offset-invariant (a Jacobian), and 0.3.5 collapses a per-frame offset
-    inside `get_camera_scale` itself; the width is the camera's own (`cgroup`'s camera is the
-    reduced pass-1 one under `--refine-px`), not `cfg.image_size`.
-    """
-    kind, _, amt = (cfg.oracle_corrupt or '').partition(':')
-    row, t0 = a, int(frames[0])
-    if kind == 'other' and n_lab > 1:
-        row = (a + 1) % n_lab
-    elif kind == 'near' and n_lab > 1:
-        nr = _nearest_eligible_row(src, a, t0, boxes, scales, mode, cgroup)
-        if nr is not None:
-            row = nr
-    elif kind == 'stale':
-        t0 = max(0, t0 - int(amt))
-    p = torch.as_tensor(src[row][t0], dtype=torch.float32)
-    if kind == 'swap':
-        p = _swap_kpt_pairs(p, max(1, int(amt) if amt else 1), [a, t0, 0x5A7])
-    if kind != 'off':
-        return p, int(t0) - int(frames[0]) if kind == 'stale' else 0
-    if mode == '2d':
-        b = np.asarray(boxes[0], np.float64)
-        width = 0.5 * ((b[2] - b[0]) + (b[3] - b[1]))
-    else:
-        from tracktail.model.cube import get_camera_scale
-        fin = p[torch.isfinite(p).all(-1)]
-        if not len(fin):
-            return p, 0
-        scale = torch.nanmedian(get_camera_scale(cgroup, fin[None]))
-        if not torch.isfinite(scale):
-            return p, 0
-        width = float(scale) * int(cgroup[0]['size'].max())
-    rng = np.random.default_rng([a, int(frames[0])])
-    v = rng.normal(size=p.shape[-1])
-    v = v / max(float(np.linalg.norm(v)), 1e-9)
-    return p + torch.as_tensor(float(amt) * width * v, dtype=p.dtype), 0
-
-
-def _build_prior(cfg, carried, src, a, n_lab, frames, boxes, scales, mode, K, R, cgroup):
-    """The per-keypoint prior for this window, in the model's coordinate frame.
-
-    The prompt frame is not always 0: `carried[1]` holds the frame the carried pose describes,
-    which differs on the last window of a group. And a prior outside the crop is not a prior --
-    NaN is the right value, since it is what the no-query tokens key off.
-
-    `labels` is an ORACLE: ground truth as the prior, not a deployment number, and a detector row
-    with no label row behind it gets none. `carry` treats a stale prior as no prior: `carried` is
-    only written on a window that predicted, so a lost animal hands back a pose from before this
-    window; `qt < 0` (not `-qt > overlap`) is the exact test -- consecutive windows give qt == 0
-    and a pulled-back last window qt > 0, so a negative qt happens iff a window was skipped.
-    """
-    if cfg.anchor in ('none', 'self'):
-        return None, None
-    if cfg.anchor == 'labels':
-        if src is None or a >= n_lab:
-            return None, None
-        p, qt = _corrupt_prior(cfg, src, a, n_lab, frames, boxes, mode, cgroup, scales)
-        if p is None:
-            return None, None
-    else:
-        if carried is None:
-            return None, None
-        p = carried[0].clone().float()
-        qt = int(carried[1]) - int(frames[0])
-        if qt < 0:
-            return None, None
-    if p.shape != (K, R):
-        return None, None
-    p = _prior_to_model_frame(p, mode, boxes, scales)
-    p = p.clone()
-    p[prior_out_of_bounds(p, mode, cgroup)] = float('nan')
-    qt = min(max(qt, 0), len(frames) - 1)
-    return p[None], torch.full((1, K), qt, dtype=torch.int32)

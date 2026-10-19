@@ -10,9 +10,9 @@ import pytest
 import polars as pl
 import torch
 
-import tailcyclenet.scorer.qc as qc
+import tailcyclenet.infer.score as qc
 from tailcyclenet.loader.dataset import PoseDataset
-from tailcyclenet.scorer.qc import _span_indices, _to_device
+from tailcyclenet.infer.score import _span_indices, _to_device
 
 
 def _window():
@@ -188,7 +188,7 @@ def test_checkpoint_selection_is_explicit_and_recorded(monkeypatch, tmp_path):
 
 def test_the_deleted_window_offset_levers_are_refused_by_name():
     """`--window-offset` / nonzero `[data].val_offset` were refuted (report 60); inert 0 loads."""
-    from tailcyclenet.scorer.score import main
+    from tailcyclenet.infer.score import main
     from tailcyclenet.scorer.train import loader_config
 
     with pytest.raises(SystemExit, match='--window-offset is deleted'):

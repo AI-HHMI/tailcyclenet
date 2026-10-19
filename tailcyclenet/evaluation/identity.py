@@ -1,7 +1,7 @@
 """Diagnostics for duplicate-track identity switches.
 
 This module is intentionally model-free.  It compares the row-level Hungarian matches used by
-``tailcyclenet.metrics.mota`` with the prediction rows, so it can distinguish a genuine crossing
+``tailcyclenet.evaluation.metrics.mota`` with the prediction rows, so it can distinguish a genuine crossing
 from two prediction rows sitting on one labelled animal.  Every reported distance is divided by
 the labelled body extent (the per-frame median labelled span, in the labels' own units), so a
 ``near_scale`` threshold means "fraction of a body length" for 2D pixels and 3D millimetres

@@ -7,11 +7,11 @@ import sys
 import pytest
 import torch
 
-from tailcyclenet.detector import load_detector
-from tailcyclenet.infer.driver import (detector_box_source, _detector_matches_source)
+from tailcyclenet.detector.checkpoint import load_detector
+from tailcyclenet.infer.loading import detector_box_source, detector_matches_source
 from tailcyclenet.format import load_datasets
-from tailcyclenet import train_detector
-from tailcyclenet.train_detector import input_wh_for_roots
+from tailcyclenet.detector import train as train_detector
+from tailcyclenet.detector.train import input_wh_for_roots
 
 
 def _config(tmp_path, root, out):
@@ -88,11 +88,11 @@ def test_multi_root_auto_input_size_is_root_order_independent(tiny_root):
 def test_multi_root_detector_inference_guard_and_box_source_resolution():
     """Inference accepts a multi-root detector only on a root it trained on (by name), and takes
     that root's own box source, falling back to the session's."""
-    assert _detector_matches_source(['allen-mouse-combined', 'johnson-mouse-combined-aug'], '',
+    assert detector_matches_source(['allen-mouse-combined', 'johnson-mouse-combined-aug'], '',
                                     'allen-mouse-combined')
-    assert not _detector_matches_source(['allen-mouse-combined', 'johnson-mouse-combined-aug'],
+    assert not detector_matches_source(['allen-mouse-combined', 'johnson-mouse-combined-aug'],
                                         '', 'allen-mouse-annotated')
-    assert _detector_matches_source(['allen-mouse-combined'], 'allen-mouse-combined',
+    assert detector_matches_source(['allen-mouse-combined'], 'allen-mouse-combined',
                                     'allen-mouse-annotated')
 
     class Detector:

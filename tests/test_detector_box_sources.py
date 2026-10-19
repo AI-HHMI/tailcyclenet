@@ -9,7 +9,7 @@ import torch
 from aniposelib.cameras import CameraGroup
 
 from tailcyclenet import format as fmt
-from tailcyclenet.detector.data import BoxDataset
+from tailcyclenet.detector.dataset import BoxDataset
 
 NAMES = ['a', 'b']
 W, H = 64, 48

@@ -1,20 +1,13 @@
-"""Cross-rig detector levers (report 73): input normalisation, photometric negative, compositing.
+"""Detector augmentations and input normalisation: geometry, photometric suite, cutout, transfer levers.
 
-Each lever is a `[data]` key; at its off value it draws nothing.
-
-- `normalize_input` -- a DETERMINISTIC per-image map applied to the model INPUT (after the
-  letterbox/warp) at training AND deployment (`detect_raw`), recorded in the checkpoint like
-  `antialias`. `equalize` = histogram equalisation of luma; `percentile` = a 0.5/99.5 stretch.
-  The grey letterbox/warp border (exactly 114,114,114) is excluded from the statistics and kept
-  at 114, so padding means the same thing on every rig.
-- `invert` -- a photometric negative (`invert_prob`).
-- `composite` -- copy-paste the item's own (already warped) animals onto a procedural
-  `synthetic_canvas` with animal-sized dark distractors (`background_prob`). Decoy patches cut
-  from the same frame's animal-free area are pasted too, so a pasted rectangle is not itself the
-  cue. Synthetic canvases only: report 73 §9 measured the root's own estimated empty-arena
-  backgrounds and a generic COCO image pack and neither beat synthetic, so both were deleted
-  (with `scripts/estimate_backgrounds.py` / `build_generic_backgrounds.py`). `exposure` (a wide
-  gain/gamma augmentation) was deleted too -- null on both transfer pairs (report 73 §5).
+- `random_affine` / `photometric` and the strong suite (`color_jitter`, `additive_noise`,
+  `salt_pepper`, `motion_blur`, `grayscale`, `cutout_rects`) -- the in-domain recipe; their RNG
+  draw order is part of the training stream.
+- `normalize_input` -- a DETERMINISTIC per-image map on the model INPUT at training AND deployment
+  (`detect_raw`), recorded in the checkpoint like `antialias`. The grey letterbox/warp border
+  (exactly 114,114,114) is excluded from the statistics and kept at 114.
+- `invert` (photometric negative) and `composite` (the item's animals pasted onto a procedural
+  `synthetic_canvas` with decoys) -- the cross-rig levers (report 73).
 """
 from __future__ import annotations
 
@@ -183,3 +176,141 @@ def composite(img, boxes, rng, wh, empty_prob=0.25, decoys=(0, 2), decoys_ok=Tru
                     break
     new = torch.stack(out) if out else torch.full((0, 4), float('nan'), dtype=boxes.dtype)
     return canvas, new
+
+
+def photometric(img, rng):
+    """The appearance half of `--augment`: one multiplicative gain, exactly as shipped.
+
+    DLC's extended form (additive brightness + per-channel gaussian noise) was built, measured
+    and REFUTED here: it costs accuracy in-domain, and neither shipped split tests the
+    out-of-domain gain it buys.
+    """
+    out = img * rng.uniform(0.7, 1.3)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# THE STRONG SUITE -- `--augment-strong`. Layered AFTER `photometric`, gated on
+# `self.strong and self.augment and self.train`, off by default and off means none of these draws
+# happen at all. Every op here is APPEARANCE-ONLY or, for cutout, an ERASURE -- neither moves a
+# box target. Mirrors tracktail's own `aug_per_camera` / `aug_per_image` / `cutout_rects`.
+def color_jitter(img, rng):
+    """Gamma contrast, then HSV saturation and hue shifts -- tracktail's `aug_per_camera` triplet
+    (DefocusBlur is folded into `motion_blur` below rather than duplicated).
+    """
+    import cv2
+    gamma = rng.uniform(0.6, 1.8)
+    lut = np.clip((np.arange(256, dtype=np.float64) / 255.0) ** gamma * 255.0, 0, 255)
+    out = cv2.LUT(img, lut.astype(np.uint8))
+    hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV).astype(np.int16)
+    hsv[..., 1] = np.clip(hsv[..., 1] + rng.uniform(-50, 30), 0, 255)
+    hsv[..., 0] = np.mod(hsv[..., 0] + rng.uniform(-10, 10), 180)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+
+def additive_noise(img, rng, sigma_max=10.2):
+    """Per-channel gaussian noise, sigma ~ U(0, sigma_max). tracktail's `AdditiveGaussianNoise`
+    (scale=(0, 0.04*255), i.e. sigma up to 10.2). Refuted alone on a detector with no capacity
+    lever; re-tested here as part of the whole mix.
+    """
+    sigma = rng.uniform(0.0, sigma_max)
+    noise = rng.normal(0.0, sigma, img.shape)
+    return np.clip(img.astype(np.float64) + noise, 0, 255).astype(np.uint8)
+
+
+def salt_pepper(img, rng, frac=0.004):
+    """tracktail's `SaltAndPepper(0.004)`: a fraction of pixels forced to black or white."""
+    out = img.copy()
+    h, w = img.shape[:2]
+    n = int(round(frac * h * w))
+    if n <= 0:
+        return out
+    ys = rng.integers(0, h, n)
+    xs = rng.integers(0, w, n)
+    salt = rng.random(n) < 0.5
+    out[ys[salt], xs[salt]] = 255
+    out[ys[~salt], xs[~salt]] = 0
+    return out
+
+
+def motion_blur(img, rng, k=(3, 5)):
+    """Horizontal motion kernel, size drawn from `k`. tracktail's `MotionBlur(k=(3,5))`."""
+    import cv2
+    ksize = int(rng.choice(k))
+    kernel = np.zeros((ksize, ksize), np.float32)
+    kernel[ksize // 2, :] = 1.0
+    kernel /= kernel.sum()
+    return cv2.filter2D(img, -1, kernel)
+
+
+def grayscale(img):
+    """RGB -> luminance replicated to 3 channels: an IR / monochrome rig, which no hue or
+    saturation shift reaches. The pose loader draws the same thing (`grayscale_prob`)."""
+    import cv2
+    return np.repeat(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)[..., None], 3, -1)
+
+
+def cutout_rects(wh, rng, n=(1, 3), frac=0.15):
+    """1-3 rects of `frac` x `frac` of `wh` (INPUT pixels), random RGB fill.
+
+    tracktail's `cutout_rects`: an erasure, not a geometric transform, so it never touches a box
+    target -- only the pixels under it.
+    """
+    w, h = int(wh[0]), int(wh[1])
+    rw, rh = max(1, int(w * frac)), max(1, int(h * frac))
+    out = []
+    for _ in range(int(rng.integers(n[0], n[1] + 1))):
+        rx = int(rng.integers(0, max(w - rw, 1)))
+        ry = int(rng.integers(0, max(h - rh, 1)))
+        fill = tuple(int(v) for v in rng.integers(0, 256, 3))
+        out.append((rx, ry, rx + rw, ry + rh, fill))
+    return out
+
+
+def apply_cutout(img, rects):
+    """Fill each `(x0, y0, x1, y1, fill)` rect. Never touches a box target -- erasure only."""
+    out = img.copy()
+    for x0, y0, x1, y1, fill in rects:
+        out[y0:y1, x0:x1] = fill
+    return out
+
+
+def random_affine(size, rng, scale=(0.8, 1.25), translate=0.08, hflip=0.5,
+                  rotate_deg=0.0, centre=None, vflip=0.0):
+    """A random similarity about `centre` (default the image centre), source px in and out, 2x3.
+
+    Deliberately a similarity and not YOLOX's shear-and-perspective: the target is
+    `crop_box_for_points`, an AXIS-ALIGNED extent, and a shear turns a box into a parallelogram
+    whose extent is no longer the crop rule's box for anything.
+
+    `rotate_deg` REPLACES THE FLIP and is strictly easier: a rotation moves every keypoint through
+    the same affine and permutes nothing, where a mirror needs a `flip_pairs` map. Off by default
+    here; the shipped detector config sets 180 (full circle) for cross-rig generalization, by owner
+    decision 2026-10-02, although 180 was refuted IN-DOMAIN on two roots (report 17). A full circle
+    costs no more retained area than a quarter one.
+
+    `centre` IS WHY TILING AND ROTATION COMPOSE: the tile is cut AFTER this warp, so about the
+    frame centre a scale of 0.8 moves an animal 2,000 px out by 400 -- more than a 640 px tile --
+    and a rotation moves it out of the tile entirely. Passing the tile's own centre pins the tile's
+    content and makes rotation free there; on whole frames the corners pull real pixels in at
+    every angle.
+
+    No `flip_pairs`. The detector emits one box, and a box is the extent of a SET of points, so
+    relabelling left to right permutes the set and the extent is unchanged.
+
+    `vflip` (probability of a vertical mirror) is box-only-safe for the same reason. It draws
+    from `rng` ONLY when nonzero, so at 0 the draw sequence -- and every augmentation stream on
+    record -- is unchanged.
+    """
+    w, h = float(size[0]), float(size[1])
+    s = rng.uniform(*scale)
+    sx = -s if rng.random() < hflip else s
+    sy = (-s if rng.random() < vflip else s) if vflip else s
+    cx, cy = (w / 2, h / 2) if centre is None else (float(centre[0]), float(centre[1]))
+    A = np.array([[sx, 0.0], [0.0, sy]], np.float64)
+    if rotate_deg:
+        a = np.radians(rng.uniform(-rotate_deg, rotate_deg))
+        A = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ A
+    t = (np.array([cx, cy]) - A @ np.array([cx, cy])
+         + np.array([rng.uniform(-translate, translate) * w,
+                     rng.uniform(-translate, translate) * h]))
+    return np.concatenate([A, t[:, None]], 1).astype(np.float32)

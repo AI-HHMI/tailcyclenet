@@ -7,10 +7,13 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet import train_detector
+from tailcyclenet.detector import train as train_detector
 from tailcyclenet.data.crop import crop_box_for_points, crop_boxes_from_extents
-from tailcyclenet.detector import BoxDataset, letterbox, unletterbox_boxes
-from tailcyclenet.detector.data import MIN_EXTENT_PX, random_affine, warp_image
+from tailcyclenet.detector.dataset import BoxDataset
+from tailcyclenet.detector.letterbox import letterbox, unletterbox_boxes
+from tailcyclenet.detector.dataset import MIN_EXTENT_PX
+from tailcyclenet.detector.augment import random_affine
+from tailcyclenet.detector.letterbox import warp_image
 
 
 def test_crop_boxes_from_extents_is_the_crop_rule_int32_exact():
@@ -154,7 +157,7 @@ def test_grayscale_prob_one_makes_every_train_view_monochrome(tiny_root):
 def det_scene(tmp_path_factory):
     """A 3-camera session and an untrained YOLOX-Nano (random weights: only the bytes matter)."""
     from . import conftest as cf
-    from tailcyclenet.detector import YOLOXNano
+    from tailcyclenet.detector.yolox import YOLOXNano
     from tailcyclenet.format import sessions_for
 
     root = tmp_path_factory.mktemp('det')
@@ -168,7 +171,7 @@ def det_scene(tmp_path_factory):
 def test_detect_raw_applies_the_crop_rule_to_an_extent_head(det_scene):
     """An `extent` checkpoint's boxes leave `detect_raw` as crop-rule boxes in SOURCE pixels,
     padded by the session's own box source; a `crop` checkpoint's are untouched."""
-    from tailcyclenet.detector import detect_raw
+    from tailcyclenet.infer.detect import detect_raw
 
     det, sess, gid = det_scene
     det.box_target = 'crop'
@@ -237,6 +240,6 @@ warmup_steps = 0
     assert any(not torch.equal(t, ckpt['model_state_train'][n])
                for n, t in ckpt['model_state'].items()), 'x == y: the test checked nothing'
 
-    from tailcyclenet.detector import load_detector
+    from tailcyclenet.detector.checkpoint import load_detector
     det = load_detector(out, checkpoint='detector_it000002.pth').model
     assert det.box_target == 'extent' and det.antialias and det.min_crop_dim == 16

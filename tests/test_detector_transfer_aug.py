@@ -1,4 +1,4 @@
-"""Cross-rig detector levers (`tailcyclenet/detector/transfer_aug.py`) and the report-73 config."""
+"""Cross-rig detector levers (`tailcyclenet/detector/augment.py`) and the report-73 config."""
 from __future__ import annotations
 
 import numpy as np
@@ -6,9 +6,10 @@ import pytest
 import torch
 
 from tailcyclenet.data.pixels import read_frames
-from tailcyclenet.detector import BoxDataset, letterbox
+from tailcyclenet.detector.dataset import BoxDataset
+from tailcyclenet.detector.letterbox import letterbox
 from tailcyclenet.detector.config import load_detector_config
-from tailcyclenet.detector.transfer_aug import PAD, composite, invert, normalize_input
+from tailcyclenet.detector.augment import PAD, composite, invert, normalize_input
 
 
 def _scene(seed=0):
@@ -55,7 +56,7 @@ def test_dataset_item_matches_deployment_normalisation(tiny_root):
 @pytest.fixture
 def flat_canvas(monkeypatch):
     """Make `composite`'s synthetic canvas a flat grey, so pasted pixels are checkable."""
-    from tailcyclenet.detector import transfer_aug
+    from tailcyclenet.detector import augment as transfer_aug
     monkeypatch.setattr(transfer_aug, 'synthetic_canvas',
                         lambda wh, rng, blob_side=40.0: np.full((wh[1], wh[0], 3), 90, np.uint8))
 
@@ -119,7 +120,7 @@ def test_deleted_and_mismatched_keys_raise_by_name(tmp_path, extra, model, match
     ({'yolox_version': 'hybrid', 'n_keypoints': 17}, 'keypoint branch is deleted'),
     ({'yolox_version': 'hybrid', 'in_channels': 6}, 'in_channels=6')])
 def test_load_detector_refuses_retired_checkpoints_by_name(tmp_path, meta, match):
-    from tailcyclenet.detector import load_detector
+    from tailcyclenet.detector.checkpoint import load_detector
     p = tmp_path / 'detector_it000010.pth'
     torch.save({'input_wh': [64, 64], 'norm': 'gn', 'model_state': {}, **meta}, p)
     with pytest.raises(ValueError, match=match):
@@ -130,7 +131,7 @@ def test_convnext_meets_the_backbone_contract():
     """Strides 4/8/16/32 at exactly H//s x W//s; the ImageNet trunk is what gets the backbone LR
     scale. Architecture only -- no weight download in CI."""
     from tailcyclenet.detector.yolox import YOLOXNano
-    from tailcyclenet.train_detector import _pretrained_params
+    from tailcyclenet.detector.train import _pretrained_params
     m = YOLOXNano(version='convnext-t', p2=True)
     feats = m.backbone(torch.rand(1, 3, 96, 160))
     assert [tuple(f.shape[2:]) for f in feats] == [(96 // s, 160 // s) for s in (4, 8, 16, 32)]

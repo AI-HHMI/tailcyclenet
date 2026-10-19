@@ -15,8 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .data.pixels import read_frames
-from .data.video import H264Writer
+from ..data.pixels import read_frames
+from .h264 import H264Writer
 
 # BGR. Twelve, which is exactly rat-city's rat count -- no two animals share a colour there.
 PALETTE = [(60, 60, 255), (60, 220, 60), (255, 140, 40), (40, 220, 220), (230, 80, 230),
@@ -67,7 +67,7 @@ def project(session, pred, cam, gid=None, frames=None):
     is in SENSOR coordinates. ON A MOVING RIG this needs `gid`: the per-frame extrinsics exist only through
     `Session.cgroup(gid, frames)`, and without them the skeleton draws off the animal silently.
     `format_camera` folds `offset` into the dict, so the moving-rig path comes back in image
-    pixels already -- the same call `infer._fill_box_agreement` makes, for the same reason. The
+    pixels already -- the same call `infer.crops.fill_box_agreement` makes, for the same reason. The
     projection is PER ANIMAL: `project_points_torch` aligns the (T,4,4) extrinsic against axis
     -3, so flattening (S,T) would project animal i through frame i's pose. Static cameras
     retain aniposelib's projection at zero skew; skewed cameras use the full-matrix path.
@@ -276,8 +276,8 @@ def session_for_prediction(pred, data=None, split=None):
 
     import pyarrow.parquet as pq
 
-    from .infer import adopt
-    from .format import sessions_for
+    from ..infer import adopt
+    from ..format import sessions_for
 
     pred = Path(pred)
     with open(pred / 'session.toml', 'rb') as f:
@@ -409,7 +409,7 @@ def main(argv=None):
     """
     import tomllib
 
-    from .format.prediction import load_predictions
+    from ..format.prediction import load_predictions
 
     ap = build_parser()
     args = ap.parse_args(argv)

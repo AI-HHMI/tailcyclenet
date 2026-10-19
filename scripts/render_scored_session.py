@@ -13,7 +13,7 @@ to the last window that contains it (the same seam rule the eval code uses -- a 
 frame is shared with the previous window, and letting the EARLIER window win would leave the seam
 frames scored by a window the lattice did not place there).
 
-Scores are RELATIVE (`qc.py`'s own contract): the colour map is the fixed `SCORE_RANGE` (or
+Scores are RELATIVE (`infer/score.py`'s own contract): the colour map is the fixed `SCORE_RANGE` (or
 `--score-range`), a legend is burned in, and absolute numbers are printed rather than implied.
 Nothing here writes to the dataset -- output is one mp4 per camera under `--out`.
 
@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tailcyclenet import format as fmt
 from tailcyclenet.data.pixels import read_frames
 from tailcyclenet.infer.window import last_window_start
-from tailcyclenet.data.video import H264Writer
+from tailcyclenet.render.h264 import H264Writer
 
 
 def window_length(scores: Path, override: int | None) -> int:

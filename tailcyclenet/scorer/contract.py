@@ -241,3 +241,24 @@ def scorer_checkpoint_fields(config: dict, selection_metric: str | None = None,
     if selection_value is not None:
         out['scorer_selection_value'] = float(selection_value)
     return out
+
+
+DELETED_DATA_KEYS = {
+    'val_offset': (0, 'the scorer window-offset lever is deleted: report 60 measured that offsetting '
+                  'the window lattice does not make the scorer catch more errors'),
+}
+
+
+def refuse_deleted_data_keys(data_cfg: dict) -> None:
+    """Refuse a deleted `[data]` key by name, with the reason it was deleted.
+
+    Its inert value is accepted and removed, so an old run folder's config still loads.
+
+    Inputs: data_cfg -- a `[data]` block, edited in place.
+    Outputs: None.
+    Side effects: pops inert deleted keys; raises SystemExit naming a deleted key set otherwise.
+    """
+    for key, (inert, why) in DELETED_DATA_KEYS.items():
+        if key in data_cfg and data_cfg.pop(key) != inert:
+            raise SystemExit(f'[data].{key} is deleted: {why}; only {key} = {inert!r} is still '
+                             f'accepted')

@@ -33,7 +33,7 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet import format as fmt  # noqa: E402
-from tailcyclenet.scorer.qc import non_missing  # noqa: E402
+from tailcyclenet.infer.score import non_missing  # noqa: E402
 from tailcyclenet.config import load_config, SCORER_CONFIG  # noqa: E402
 from tailcyclenet.infer.window import last_window_start  # noqa: E402
 

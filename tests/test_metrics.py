@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
-import tailcyclenet.eval as ev
+import tailcyclenet.evaluation.eval as ev
 from tailcyclenet import format as fmt
 from tailcyclenet.format import Labels, Session
-from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, idf1, idsw_stability_band,
+from tailcyclenet.evaluation.metrics import (ERR_PCTS, _dist, error_and_coverage, idf1, idsw_stability_band,
                                   label_extent, match_instances, matched_error, mota, motion_ratio,
                                   paired_bootstrap)
 

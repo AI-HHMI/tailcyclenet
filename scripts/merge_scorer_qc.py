@@ -10,7 +10,7 @@ import toml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tailcyclenet.scorer.qc import _canonical_frame_table, rank
+from tailcyclenet.infer.score import _canonical_frame_table, rank
 
 
 def _load_provenance(part: Path) -> dict:

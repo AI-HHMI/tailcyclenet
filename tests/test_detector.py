@@ -13,12 +13,16 @@ import torch
 from pathlib import Path
 
 from tailcyclenet.data.crop import crop_box_for_points
-from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler, YOLOXNano, assign,
-                                   assign_tal, box_collate, box_iou, ciou_loss, decode,
-                                   detector_loss, giou_loss, letterbox, paired_iou, split_batch,
-                                   unletterbox_boxes)
+from tailcyclenet.detector.dataset import BoxDataset
+from tailcyclenet.detector.sampling import ChunkShuffle, CohortSampler, box_collate, split_batch
+from tailcyclenet.detector.yolox import YOLOXNano
+from tailcyclenet.detector.assign import assign, assign_tal
+from tailcyclenet.detector.boxes import box_iou, paired_iou
+from tailcyclenet.detector.loss import ciou_loss, detector_loss, giou_loss
+from tailcyclenet.detector.decode import decode
+from tailcyclenet.detector.letterbox import letterbox, unletterbox_boxes
 from tailcyclenet.detector.config import TRAINING_KEYS, load_detector_config
-from tailcyclenet.detector.data import _photometric, random_affine
+from tailcyclenet.detector.augment import photometric, random_affine
 
 sys.path.insert(0, str(Path(__file__).parent))
 import conftest as cf  # noqa: E402
@@ -323,7 +327,7 @@ def test_detector_config_refuses_bad_keys_and_values_by_name(tmp_path):
 def test_detector_config_wandb_block_and_logging(tmp_path, monkeypatch):
     from types import ModuleType, SimpleNamespace
 
-    from tailcyclenet.train_detector import (_init_detector_wandb, _log_detector_wandb,
+    from tailcyclenet.detector.train import (_init_detector_wandb, _log_detector_wandb,
                                              _wandb_eval_metrics)
 
     cfg = load_detector_config(_write_config(tmp_path, BARE + """[wandb]
@@ -627,7 +631,7 @@ def test_iou_aware_weight_forcing_is_keyed_on_pos_mask_not_target_value():
 def test_box_arithmetic_has_one_copy():
     """`detector.boxes` is the one copy of centre/side/IoU arithmetic: numpy (`link_rows`) and
     torch (association/NMS) agree, and `paired_iou` is `box_iou`'s diagonal."""
-    from tailcyclenet.detector.assign import box_center_dist
+    from tailcyclenet.detector.boxes import box_center_dist
     from tailcyclenet.detector.boxes import centres, sides
     b = np.array([[0.0, 0.0, 10.0, 20.0], [5.0, 5.0, 7.0, 9.0]], np.float32)
     np.testing.assert_array_equal(centres(b), centres(torch.from_numpy(b)).numpy())
@@ -680,7 +684,7 @@ def test_decode_center_dist_is_on_by_default():
 def test_reduce_factor_never_decodes_below_the_target():
     """A reduced decode must still downscale into the target; under tiling the comparison is
     against the deployed whole-frame size, where tile_scale 1.0 decodes natively."""
-    from tailcyclenet.detector import reduce_factor
+    from tailcyclenet.detector.letterbox import reduce_factor
 
     assert reduce_factor((4696, 2048), (640, 288)) == 4       # rat-city: 1174x512, still above
     assert reduce_factor((4696, 2048), (896, 384)) == 4       # 1174x512 still clears 896x384
@@ -717,7 +721,7 @@ def test_unletterbox_clamps_a_runaway_box_into_the_frame():
     """A decoded side can reach ~12,910 px; IoU-only NMS cannot suppress it, so the clamp bounds
     it into the frame and a zero-area box comes back NaN.
     """
-    from tailcyclenet.detector import unletterbox_boxes
+    from tailcyclenet.detector.letterbox import unletterbox_boxes
 
     b = torch.tensor([[-5000.0, -5000.0, 20000.0, 20000.0], [10.0, 10.0, 9.0, 40.0]])
     out = unletterbox_boxes(b, 1.0, (0, 0), src_wh=(640, 480))
@@ -767,7 +771,7 @@ def test_targets_are_the_crop_rule(tiny_root):
 def test_augmented_targets_are_still_the_crop_rule(tiny_root):
     """Augmentation warps the GEOMETRY and re-derives the box; scaling the box would scale the
     pad but not the `min_crop_dim` floor -- a box the crop rule can never emit."""
-    from tailcyclenet.detector.data import random_affine
+    from tailcyclenet.detector.augment import random_affine
 
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), min_crop_dim=8,
                     max_frames_per_group=2, augment=True)
@@ -800,7 +804,7 @@ def test_augmented_targets_are_still_the_crop_rule(tiny_root):
 
 
 def test_augment_decodes_real_pixels_through_getitem(tiny_root):
-    """`augment=True` must survive a real `__getitem__` (the only caller of `_photometric`): a
+    """`augment=True` must survive a real `__getitem__` (the only caller of `photometric`): a
     cleanup once left a `NameError` on every augmented item."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(64, 48), min_crop_dim=8,
                     max_frames_per_group=2, augment=True)
@@ -839,12 +843,12 @@ def test_rotation_off_is_byte_identical_and_on_turns_about_its_centre():
 
 
 def test_photometric_is_one_gain_draw():
-    """`_photometric(img, rng)` consumes exactly ONE `uniform(0.7, 1.3)` and applies it as a
+    """`photometric(img, rng)` consumes exactly ONE `uniform(0.7, 1.3)` and applies it as a
     clipped gain -- the augmentation stream's draw order rests on this."""
     img = (np.arange(4 * 4 * 3, dtype=np.float64).reshape(4, 4, 3) % 200).astype(np.uint8)
     rng1 = np.random.default_rng(7)
     rng2 = np.random.default_rng(7)
-    out1 = _photometric(img, rng1)
+    out1 = photometric(img, rng1)
     gain = rng2.uniform(0.7, 1.3)
     np.testing.assert_array_equal(out1, np.clip(img * gain, 0, 255).astype(np.uint8))
     assert rng1.uniform() == rng2.uniform()
@@ -891,7 +895,7 @@ def test_an_untiled_checkpoints_tile_scale_is_dropped(tmp_path):
     letterbox the whole frame at `frame_wh * scale`."""
     import conftest as cf
 
-    from tailcyclenet.detector import load_detector
+    from tailcyclenet.detector.checkpoint import load_detector
     p = tmp_path / 'detector.pth'
     base = cf._detector_checkpoint()
     torch.save({**base, 'tile_wh': None, 'tile_scale': 1.0}, p)
@@ -905,7 +909,7 @@ def test_tiled_targets_are_still_the_crop_rule(tiny_root):
     """The tiled box is RE-DERIVED in source px, never scaled by tile_scale."""
     ds = BoxDataset(tiny_root / 'ratlike', 'train', input_wh=(128, 128), max_frames_per_group=2,
                     tile_wh=(32, 32), tile_scale=1.0)
-    from tailcyclenet.detector.data import tile_transform
+    from tailcyclenet.detector.letterbox import tile_transform
     for i in range(min(3, len(ds))):
         sess, gid, f, ci = ds.index[i]
         boxes = ds.boxes_for(i)
@@ -1102,7 +1106,7 @@ def _lever_rig(specs):
 def _lever_boxes(cg, worlds, side=200.0):
     """Project `worlds` into every camera of `cg` as square boxes, in `CrossViewTracker.step`'s
     argument shapes. Large by default: every gate in track.py is in box sides."""
-    from tailcyclenet.detector.track import _project
+    from tailcyclenet.infer.track import _project
 
     per_cam, scores = [], []
     for cam in cg:
@@ -1157,7 +1161,7 @@ def test_duplicate_backstop_retires_shields_and_logs_without_changing_output():
     """After `duplicate_persist` in-band frames the backstop retires the weaker duplicate, its
     freed slot does not re-birth it (the immortal duplicate of 3dpop Seq59, report 53), and
     `tracker.events` records born/retired/shielded/birth_refused -- recording changes nothing."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg, _, _, _, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
@@ -1196,7 +1200,7 @@ def test_duplicate_backstop_retires_shields_and_logs_without_changing_output():
 def test_identity_events_record_a_slot_dying_of_old_age():
     """`died` carries the age that crossed `max_age`: without it a starved slot reads like one
     still alive but unclaimed."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     point = torch.tensor([0.0, 0.0, 0.0])
@@ -1218,7 +1222,7 @@ def test_identity_events_record_a_slot_dying_of_old_age():
 def test_shield_survives_the_winner_vacating_for_one_frame():
     """The shield is anchored to the ANIMAL, not the winner's this-frame claims: a one-frame
     vacate let the duplicate re-seat (~3 refires per 160 frames, 3dpop Seq59)."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg, point, per_cam, scores, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2)
@@ -1241,7 +1245,7 @@ def test_shield_survives_the_winner_vacating_for_one_frame():
 def test_shield_dies_when_the_winners_own_target_dies():
     """A winner that ages out must take its shield with it, or the next frame's unrelated birth
     at that spot is wrongly refused."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg, point, per_cam, scores, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=2, max_age=2)
@@ -1262,7 +1266,7 @@ def test_shield_dies_when_the_winners_own_target_dies():
 def test_duplicate_persistence_does_not_survive_a_members_death():
     """A `_dup_contact` counter must not resume across a slot's death, or a rebirth on a new
     animal retires early."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg, point, per_cam, scores, duplicate, dup_scores = _dup_scene()
     tr = CrossViewTracker(2, max_res_px=30.0, duplicate_persist=5, max_age=2)
@@ -1285,7 +1289,7 @@ def test_duplicate_persistence_does_not_survive_a_members_death():
 def test_refused_duplicate_does_not_consume_the_free_slot():
     """A6b: a refused duplicate birth must retry the SAME free slot, or a genuine group behind
     it is crowded out of the frame."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     pointA = np.array([0.0, 0.0, 0.0])
@@ -1313,7 +1317,7 @@ def test_refused_duplicate_does_not_consume_the_free_slot():
 def test_age_stickiness_resolves_two_slots_on_one_group():
     """Two slots stranded on one animal must not flip-flop on near-ties: the fresher keeps the
     group, the stale one starves (3dpop Seq59)."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     point = torch.tensor([0.0, 0.0, 0.0])
@@ -1335,7 +1339,7 @@ def test_age_stickiness_resolves_two_slots_on_one_group():
 def test_age_sticky_term_never_inverts_a_real_match():
     """Past `AGE_STICKY_CAP` the packed cost `affinity * 16 + CAP - age` went negative and a
     real high-affinity match read as unavailable (only when `max_age` > the cap)."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     point = torch.tensor([0.0, 0.0, 0.0])
@@ -1357,7 +1361,7 @@ def test_a_pointless_target_expires_instead_of_burning_a_slot_forever():
     out."""
     import torch
 
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     tr = CrossViewTracker(2, max_age=3)
     tr.targets[0] = {'point': torch.full((3,), float('nan')), 'age': 0}
@@ -1379,7 +1383,7 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
     """`min_views = 2` is the algorithm; `min_views = 1` emits each leftover box as a single-
     view instance with no invented depth."""
 
-    from tailcyclenet.detector import associate
+    from tailcyclenet.infer.associate import associate
     from tailcyclenet.format import Session
 
     cf._session_3d(tmp_path / 'ds' / 'test' / 's')
@@ -1403,7 +1407,7 @@ def test_min_views_1_admits_the_box_no_pair_claimed(tmp_path):
 def test_min_views_1_single_view_birth_holds_no_slot():
     """A single-view group (NaN point by design) is written but never seated: seating it
     rotated one animal through every slot and then lost it (T1)."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     box = torch.tensor([[100.0, 100.0, 140.0, 140.0]])
@@ -1423,7 +1427,7 @@ def test_min_views_1_single_view_birth_holds_no_slot():
 def test_joint_association_refuses_a_binding_the_per_camera_hungarian_accepts():
     """Joint association matches whole cross-view groups, so a slot holding A cannot bind B's
     box in the camera that missed A."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg, per_cam, scores, a = _lost_in_one_camera()
 
@@ -1438,7 +1442,7 @@ def test_joint_association_refuses_a_binding_the_per_camera_hungarian_accepts():
 def test_joint_association_still_births_ages_and_resumes_like_the_shipped_path():
     """Two crossing animals with the score order swapped every frame: births on frame 0, no row
     jumps, a one-frame miss ages without dropping, the SAME slots resume."""
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     cg = _lever_rig([(0.0, -0.5, 0.0), (0.3, 0.0, 120.0), (-0.2, 0.5, -80.0)])
     a, b = np.array([-80.0, 0.0, 0.0]), np.array([80.0, 0.0, 0.0])
@@ -1470,8 +1474,8 @@ def test_the_tracker_and_associate_agree_on_a_single_uncrowded_animal():
     case delta is a crowding result."""
     import numpy as np
 
-    from tailcyclenet.detector.associate import associate
-    from tailcyclenet.detector.track import CrossViewTracker, _project
+    from tailcyclenet.infer.associate import associate
+    from tailcyclenet.infer.track import CrossViewTracker, _project
 
 
     cg = _flat_rig()
@@ -1496,8 +1500,8 @@ def test_support_count_counts_independently_corroborating_cameras():
     """E1a/E3: `_support_count` counts OTHER cameras near the reprojection, excluding the
     seeding pair and already-`used` detections."""
 
-    from tailcyclenet.detector.associate import _support_count
-    from tailcyclenet.detector.track import _project
+    from tailcyclenet.infer.associate import _support_count
+    from tailcyclenet.infer.track import _project
 
     cg = _flat_rig()
 
@@ -1522,8 +1526,8 @@ def test_a_nan_box_is_skipped_by_both_cross_view_paths():
     """A NaN box (an anchor in the letterbox padding band) must be skipped by `associate`, the
     tracker, and `min_views = 1`."""
 
-    from tailcyclenet.detector.associate import associate
-    from tailcyclenet.detector.track import CrossViewTracker, _project
+    from tailcyclenet.infer.associate import associate
+    from tailcyclenet.infer.track import CrossViewTracker, _project
 
     cg = _flat_rig()
 
@@ -1557,7 +1561,7 @@ def test_measured_tracker_configuration_is_the_default():
     """The measured zero-switch configuration is what the constructor ships."""
     import inspect
 
-    from tailcyclenet.detector.track import CrossViewTracker
+    from tailcyclenet.infer.track import CrossViewTracker
 
     sig = inspect.signature(CrossViewTracker.__init__).parameters
     assert sig['max_age'].default == 8 and sig['max_move'].default == 1.25
@@ -1569,7 +1573,7 @@ def test_measured_tracker_configuration_is_the_default():
 def test_link_rows_follows_one_animal():
     """Unlinked rows are score-ordered, so the window-union crop (what `run_group` crops to)
     spans several animals; linking must undo a per-frame swap."""
-    from tailcyclenet.detector import link_rows
+    from tailcyclenet.infer.associate import link_rows
 
     T = 20
     boxes = np.full((2, T, 1, 4), np.nan, np.float32)
@@ -1594,7 +1598,7 @@ def test_link_rows_gates_on_size_and_never_force_assigns():
     """A row that matches nothing stays EMPTY (`free.pop(0)` once handed it a teleporting box),
     a jump of more than one box side is not motion, and a one-frame miss does not break the
     chain (matching is against the LAST KNOWN box)."""
-    from tailcyclenet.detector import link_rows
+    from tailcyclenet.infer.associate import link_rows
 
     boxes = np.full((2, 6, 1, 4), np.nan, np.float32)
     boxes[0, :, 0] = [10, 10, 40, 40]                          # a stationary animal
@@ -1622,7 +1626,7 @@ def test_link_rows_prefers_the_nearer_box_where_iou_prefers_the_wrong_one():
     """IoU ranks by shape agreement, which is not identity: a true continuation that shrank loses
     to a size-matched wrong animal. Centre distance is not fooled.
     """
-    from tailcyclenet.detector import link_rows
+    from tailcyclenet.infer.associate import link_rows
 
     last = np.array([100.0, 100.0, 300.0, 300.0], np.float32)     # remembered, 200 px
     near = np.array([170.0, 170.0, 230.0, 230.0], np.float32)      # same centre, 60 px
@@ -1644,7 +1648,7 @@ def test_associate_group_state_carries_across_a_split(tmp_path):
     for byte, in both branches (tracker C > 1, `link_rows` C == 1); the scene makes a stateless
     split FAIL."""
 
-    from tailcyclenet.detector import associate_group
+    from tailcyclenet.infer.associate import associate_group
     from tailcyclenet.format import Session
 
     T = 12
@@ -1699,7 +1703,7 @@ def test_associate_group_state_carries_across_a_split(tmp_path):
 def test_associate_group_threads_max_age_and_frame_base(tmp_path, monkeypatch):
     """`--max-age` reaches `CrossViewTracker` (C > 1) and `link_rows` (C == 1), and a ranged run's
     events are SOURCE frames (`frame_base` added back, A6a)."""
-    import tailcyclenet.detector as detmod
+    import tailcyclenet.infer.associate as detmod
     from tailcyclenet.format import Session
 
     T = 4
@@ -1745,7 +1749,7 @@ def test_moving_rig_associate_group_fetches_extrinsics_at_source_frames(tmp_path
     """D1.1: a moving rig's extrinsics are fetched at SOURCE frames (`frame_base` + local), not
     the batch-local index."""
 
-    from tailcyclenet.detector import associate_group
+    from tailcyclenet.infer.associate import associate_group
     from tailcyclenet.format import Session
 
     class _RecordingSession:
@@ -1789,9 +1793,9 @@ def test_the_tracker_is_the_default_and_help_renders(capsys):
     renders for both CLIs (a bare `%` in a help string kills argparse with a format TypeError)."""
     import inspect
 
-    from tailcyclenet.detector import associate_group
+    from tailcyclenet.infer.associate import associate_group
     from tailcyclenet.infer.cli import build_parser
-    from tailcyclenet.train_detector import main as train_main
+    from tailcyclenet.detector.train import main as train_main
 
     sig = inspect.signature(associate_group)
     assert sig.parameters['track'].default is True
@@ -1815,13 +1819,13 @@ def test_provenance_records_every_box_affecting_option():
     import argparse
     import inspect
 
-    from tailcyclenet.detector import detect_raw
-    from tailcyclenet.infer.driver import _box_provenance
+    from tailcyclenet.infer.detect import detect_raw
+    from tailcyclenet.infer.provenance import box_provenance
 
     args = argparse.Namespace(detector=None, det_score=0.5, det_top_k=0,
                               max_animals=0, max_frames=0, frame_start=0, frame_stop=0,
                               det_nms_iou=0.5, det_nms_center_dist=None)
-    prov = _box_provenance(args, None, False, None)
+    prov = box_provenance(args, None, False, None)
 
     # Everything `detect_raw` takes that can change the detections. The rest are plumbing --
     # `batch` is in there under protest: it is NOT inert but it is pinned rather
@@ -1848,7 +1852,7 @@ def test_provenance_records_every_box_affecting_option():
                                det_top_k=24, max_animals=2, max_frames=120,
                                frame_start=300, frame_stop=500, det_nms_iou=0.65,
                                det_nms_center_dist=0.25)
-    assert set(_box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
+    assert set(box_provenance(args2, 1.0, True, 'instances')) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
 
 
@@ -1857,20 +1861,20 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
     recorded, unconditionally: two stored 2D arms once differed only by directory name."""
     import inspect
 
-    from tailcyclenet.detector import associate_group
-    from tailcyclenet.infer.driver import _identity_provenance
+    from tailcyclenet.infer.associate import associate_group
+    from tailcyclenet.infer.provenance import identity_provenance
 
     from tailcyclenet.infer.cli import build_parser
 
     args = build_parser().parse_args(['--run', 'r', '--out', 'o'])
-    prov = _identity_provenance(args)
+    prov = identity_provenance(args)
 
     # Everything `associate_group` takes that can change which row a detection lands in. The rest
     # is plumbing: `raw`/`session`/`gid` are the inputs themselves, `max_instances` is already
-    # recorded as `max_animals` by `_box_provenance`, `stats` is a diagnostic sink, `state` is
+    # recorded as `max_animals` by `box_provenance`, `stats` is a diagnostic sink, `state` is
     # the block-boundary carry (recorded nowhere because it is derived, not chosen), and
     # `frame_base` is derived from `--start-frame`, already recorded as `frame_start` by
-    # `_box_provenance` -- it does not choose which row a detection lands in, only which
+    # `box_provenance` -- it does not choose which row a detection lands in, only which
     # SOURCE frame the tracker's own step 0 is (A6a).
     plumbing = {'raw', 'session', 'gid', 'max_instances', 'stats', 'state', 'frame_base'}
     params = set(inspect.signature(associate_group).parameters) - plumbing
@@ -1882,21 +1886,21 @@ def test_every_identity_lever_is_recorded_in_the_prediction():
         f'{missing}. Two runs differing in one of them would be indistinguishable from their '
         'output alone, which is exactly how the stored 2D suppression arms became unmatchable.')
 
-    # UNCONDITIONAL, every key, always -- same rule as `_box_provenance`: conditional membership
+    # UNCONDITIONAL, every key, always -- same rule as `box_provenance`: conditional membership
     # is what makes a record lie, because an absent key reads as "not used" and not as "unknown".
     args2 = build_parser().parse_args([
         '--run', 'r', '--out', 'o', '--no-track', '--no-link-boxes', '--min-views', '1',
         '--max-move', '2.0', '--max-age', '24', '--duplicate-radius', '0.9',
         '--duplicate-persist', '8', '--identity-bridge'])
-    assert set(_identity_provenance(args2)) == set(prov), \
+    assert set(identity_provenance(args2)) == set(prov), \
         'the same keys at every value -- conditional membership is what makes a record lie'
-    assert _identity_provenance(args2)['max_age'] == 24
+    assert identity_provenance(args2)['max_age'] == 24
 
 
 def test_detector_run_directory_resolves_latest_last_and_best(tmp_path):
     """A run folder resolves to its highest-numbered checkpoint by default (an incomplete run
     too); `last` still demands `detector_last.pth`; `best` is `detector.pth`."""
-    from tailcyclenet.detector import load_detector, resolve_detector_checkpoint
+    from tailcyclenet.detector.checkpoint import load_detector, resolve_detector_checkpoint
     from tailcyclenet.infer.cli import build_parser
 
     run = tmp_path / 'run'
@@ -1973,7 +1977,8 @@ def test_deployment_score_reads_zero_untrained_and_one_when_forced(tmp_path):
     read exactly 0 (union sides NaN); forcing every objectness logit positive fills every slot --
     the zero is the prior firing, not a broken wire."""
     torch.manual_seed(0)
-    from tailcyclenet.detector.evaluate import _gt_crop_sides, deployment_score
+    from tailcyclenet.detector.diagnostics import gt_crop_sides
+    from tailcyclenet.evaluation.deployment import deployment_score
     from tailcyclenet.format import Session
 
     cf._session_2d(tmp_path / 'r' / 'test' / 's0', T=4, S=2)
@@ -1994,11 +1999,11 @@ def test_deployment_score_reads_zero_untrained_and_one_when_forced(tmp_path):
     assert r['det_fill'] == 1.0
     assert not any(v != v for v in r['union_side_px'].values())
 
-    # 3D: `_gt_crop_sides` projects points3d per camera (a 3D session has no points2d).
+    # 3D: `gt_crop_sides` projects points3d per camera (a 3D session has no points2d).
     cf._session_3d(tmp_path / 'r3' / 'test' / 's0', T=4)
     s3 = Session.load(tmp_path / 'r3' / 'test' / 's0')
     s3.preload()
-    sides = _gt_crop_sides(s3, list(s3.groups)[0], min_crop_dim=8)
+    sides = gt_crop_sides(s3, list(s3.groups)[0], min_crop_dim=8)
     assert sides.size > 0 and np.all(sides >= 8)
 
 
@@ -2056,7 +2061,7 @@ def test_load_detector_round_trips_and_refuses_by_name(tmp_path):
     """The checkpoint's own `yolox_version`/`p2`/`obj_quantiles` decide what loads (an unrecorded
     quantile set is `{}`, not a guess); a BatchNorm, a version-less (`trimmed`) or a pose
     checkpoint is refused by name."""
-    from tailcyclenet.detector import load_detector
+    from tailcyclenet.detector.checkpoint import load_detector
 
     with pytest.raises(ValueError, match='hybrid'):
         YOLOXNano(version='medium')
@@ -2102,7 +2107,7 @@ def test_p2_true_adds_a_stride_4_level():
 
 
 def test_hybrid_backbone_shape_contract_and_finite_grads():
-    from tailcyclenet.detector.vit_backbone import HybridBackbone
+    from tailcyclenet.detector.hybrid import HybridBackbone
 
     bb = HybridBackbone(p2=True)
     H, W = 128, 192
@@ -2131,7 +2136,7 @@ def test_gap_levers_build_the_head_and_neck_they_name():
 
 def test_detector_packaging_preserves_config(tmp_path):
     from tailcyclenet.packaging import package_detector
-    from tailcyclenet.detector import load_detector
+    from tailcyclenet.detector.checkpoint import load_detector
 
     run = tmp_path / 'run'
     run.mkdir()
@@ -2156,7 +2161,7 @@ def test_detector_packaging_preserves_config(tmp_path):
 
 
 def test_build_detector_optimizer_adamw_matches_param_count():
-    from tailcyclenet.train_detector import build_detector_optimizer
+    from tailcyclenet.detector.train import build_detector_optimizer
 
     model = YOLOXNano(version='hybrid')
     opt, sched = build_detector_optimizer(
@@ -2176,8 +2181,8 @@ def test_train_detector_end_to_end_wires_every_lever(tmp_path, dense_root, monke
     folder holds the artefacts, and the checkpoint is self-contained and reloads its architecture."""
     import tomllib
 
-    import tailcyclenet.train_detector as td
-    from tailcyclenet.detector import load_detector
+    import tailcyclenet.detector.train as td
+    from tailcyclenet.detector.checkpoint import load_detector
 
     seen = []
     real_loss = td.detector_loss

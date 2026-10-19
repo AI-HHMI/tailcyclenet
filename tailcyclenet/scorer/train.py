@@ -41,7 +41,7 @@ from .config import (corruption_config, resolve_selection_metric, scorer_kwargs,
 from .dataset import ScorerDataset, scorer_collate, triplet_to_device
 from .evaluate import evaluate, gather_eval, scorer_loss
 from .model import build_scorer
-from .qc import refuse_deleted_data_keys
+from .contract import refuse_deleted_data_keys
 from .triplet import seed_worker
 
 

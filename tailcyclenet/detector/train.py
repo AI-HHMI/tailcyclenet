@@ -1,8 +1,6 @@
 """Train one box predictor on one dataset root or a folder of roots.
 
-Body of `tailcyclenet train-detector` (`tailcyclenet/__main__.py`) and of
-`scripts/train_detector.py` (`pixi run python scripts/train_detector.py --config
-configs/detector.toml`) -- both call this module's `main()` unchanged.
+Body of `tailcyclenet train-detector` and of `scripts/train_detector.py`; both call `main()`.
 
 The recipe lives in the config file; the run folder records the effective config + provenance
 before training starts, and the checkpoint carries its own scores.
@@ -22,10 +20,13 @@ import toml
 from tailcyclenet.checkpoints import provenance
 from tailcyclenet.config import DETECTOR_CONFIG
 from tailcyclenet.loader.sampling import worker_init
-from tailcyclenet.detector import (BoxDataset, CohortSampler, YOLOXNano,
-                                   box_collate, detector_loss, split_batch, tiled_input_wh)
+from tailcyclenet.detector.checkpoint import tiled_input_wh
 from tailcyclenet.detector.config import load_detector_config
+from tailcyclenet.detector.dataset import BoxDataset
 from tailcyclenet.detector.evaluate import overall, score_dataset
+from tailcyclenet.detector.loss import detector_loss
+from tailcyclenet.detector.sampling import CohortSampler, box_collate, split_batch
+from tailcyclenet.detector.yolox import YOLOXNano
 from tailcyclenet.format import load_datasets
 
 
@@ -281,66 +282,11 @@ class _RemovedFlag(argparse.Action):
                          'last release that has them).')
 
 
-def main(argv: list[str] | None = None):
-    """Train the box predictor; exit via SystemExit on bad config.
+def _select_input_wh(data_cfg, roots, all_roots, multi, root_names):
+    """The detector input size: `[data].input_wh`, else derived from the roots' box sizes.
 
-    Inputs: argv (via argparse): --config, --out, --iters, --device.
-    Side effects: writes checkpoints + metrics.json + config/provenance under
-                  the run folder; prints progress and eval lines.
-
-    Notes:
-    - A tiled checkpoint's `input_wh` is its TILE size, read back from `BoxDataset`.
-    - THE TRAIN LOADER IS UNCAPPED AND WEIGHTED, NEVER SUBSAMPLED.
-      `[data].frames_per_group` is DELETED: every labelled frame is indexed and
-      `BoxDataset.default_train_weights` draws view-uniformly WITHIN a cohort, so
-      a 57,594-frame tracked group neither freezes to 40 images nor swamps the
-      split. `CohortSampler` therefore ALWAYS runs, `ChunkShuffle` is no longer a
-      train fallback, `annot_frac` overrides the otherwise-natural cohort share,
-      and `alpha`/W1.1/A6/A6c compose on top. The realised mix is PRINTED.
-    - No `val/` is the only thing swallowed; config errors fail at construction. A
-      pretrained (ImageNet) trunk gets BACKBONE_LR_SCALE x lr.
-    - `detector.pth` is the BEST checkpoint, not the last one (recall peaks
-      early on partially-labelled roots); every `detector_it*.pth` is still
-      written. Evaluation scores both splits, stores the score beside the
-      weights, and selects on `val` where there is one (`train` otherwise);
-      the loader does NOT trust `detector_last.pth`.
-    - `obj_quantiles` come from the selection split only (`val` where there is one, else `train`).
-    - `model_state` IS THE SCORED WEIGHT. Under schedule-free, `opt.eval()` swaps in the
-      averaged `x` for scoring and `opt.train()` swaps the SAME tensors back to the gradient point
-      `y` in place, so `x` is cloned before the swap; saving after it deployed weights nobody had
-      scored. `model_state_train` keeps `y`; a plain-AdamW run has one state and writes one.
+    Outputs: (w, h). Side effects: prints the size and the training roots.
     """
-    ap = argparse.ArgumentParser(prog='tailcyclenet train-detector', description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--config', type=Path, default=None,
-                    help='defaults to the packaged configs/detector.toml (the shipped recipe, '
-                         'unmodified) when omitted -- pass one that overlays it for anything else')
-    ap.add_argument('--out', type=Path, default=None, help='override [training].out')
-    ap.add_argument('--iters', type=int, default=None, help='override [training].iters')
-    ap.add_argument('--device', default=None, help='override [training].device')
-    ap.add_argument('--weights-dir', action=_RemovedFlag, nargs='?', help=argparse.SUPPRESS)
-    args = ap.parse_args(argv)
-
-    config = load_detector_config(args.config or DETECTOR_CONFIG, out=args.out,
-                                  iters=args.iters, device=args.device)
-    data_cfg, model_cfg, train_cfg = config['data'], config['model'], config['training']
-
-    torch.manual_seed(train_cfg['seed'])
-    np.random.seed(train_cfg['seed'])
-    device = train_cfg['device'] if torch.cuda.is_available() else 'cpu'
-    run = Path(train_cfg['out'])
-    run_record, run_prov = _record_run(run, config)
-    wb = _init_detector_wandb(config, run)
-
-    all_roots = load_datasets(data_cfg['path'])
-    roots = [ds for ds in all_roots if 'train' in ds.sessions]
-    multi = len(roots) > 1
-    root_names = [ds.name for ds in roots]
-    unknown_box_roots = set(data_cfg['boxes_by_dataset']) - {ds.name for ds in all_roots}
-    if unknown_box_roots:
-        raise SystemExit(f'[data].boxes_by_dataset names unknown dataset roots '
-                         f'{sorted(unknown_box_roots)}.')
-    probe_sess = roots[0].all_sessions()[0]
     if data_cfg['input_wh']:
         wh = tuple(data_cfg['input_wh'])
     elif multi:
@@ -350,9 +296,18 @@ def main(argv: list[str] | None = None):
         wh = input_wh_for(data_cfg['path'], roots[0], data_cfg['boxes'],
                           data_cfg['min_box_px'], data_cfg['max_input_px'], datasets=all_roots)
     print(f'input {wh[0]}x{wh[1]}  training roots={root_names}')
+    return wh
 
-    tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
-                  tile_bg_per_frame=data_cfg['tile_bg_per_frame'])
+
+def _train_data(data_cfg, train_cfg, all_roots, wh, multi, probe_sess, tiling):
+    """The train `BoxDataset`, its weighted sampler and loader.
+
+    The train loader is UNCAPPED AND WEIGHTED, never subsampled: every labelled frame is indexed
+    and `CohortSampler` draws by `train_weights` (view-uniform within a cohort, `annot_frac`,
+    `alpha`, root balance). The realised mix is printed.
+
+    Outputs: (train, its input_wh, loader, effective_sources, root_mix). Side effects: prints.
+    """
     train = BoxDataset(data_cfg['path'], 'train', input_wh=wh,
                        box_source=data_cfg['boxes'], boxes_by_dataset=data_cfg['boxes_by_dataset'],
                        min_crop_dim=data_cfg['min_crop_dim'], augment=data_cfg['augment'],
@@ -409,6 +364,14 @@ def main(argv: list[str] | None = None):
         train, batch_size=train_cfg['batch_size'], sampler=sampler,
         num_workers=train_cfg['num_workers'], collate_fn=box_collate, drop_last=True,
         persistent_workers=train_cfg['num_workers'] > 0, worker_init_fn=worker_init)
+    return train, wh, loader, effective_sources, root_mix
+
+
+def _val_data(data_cfg, train_cfg, all_roots, root_names, wh, tiling):
+    """The val `BoxDataset` over the training roots that have a `val/` split, or None.
+
+    Side effects: prints.
+    """
     val_roots = [ds for ds in all_roots if ds.name in root_names and (ds.root / 'val').is_dir()]
     val = None
     if not val_roots:
@@ -426,10 +389,14 @@ def main(argv: list[str] | None = None):
         missing_val = sorted(set(root_names) - set(val.root_names))
         print(f'val:   {len(val)} views across {val.root_names}; '
               f'no val split: {missing_val or "none"}')
-    eval_roots = len(train.root_names) + (0 if val is None else len(val.root_names))
-    print(f'eval work/pass: up to {train_cfg["eval_batches"]} batches x {eval_roots} '
-          f'root/split evaluations')
+    return val
 
+
+def _build_model(model_cfg, train_cfg, device):
+    """The detector, its pretrained trunk (when configured), optimizer and scheduler.
+
+    Outputs: (model, opt, sched). Side effects: may download/load trunk weights; prints.
+    """
     model = YOLOXNano(version=model_cfg['yolox'], p2=model_cfg['p2'],
                       shared_head=train_cfg['shared_head'],
                       fpn_upsample=train_cfg['fpn_upsample']).to(device)
@@ -443,9 +410,14 @@ def main(argv: list[str] | None = None):
     if model_cfg['pretrained'] and train_cfg['optimizer'] == 'adamw':
         print(f'  differential LR: backbone {train_cfg["lr"] * BACKBONE_LR_SCALE:g}  '
               f'neck/head {train_cfg["lr"]:g}', flush=True)
+    return model, opt, sched
 
+
+def _checkpoint_meta(config_record, run_prov, data_cfg, model_cfg, train_cfg, wh, train,
+                     effective_sources, root_mix):
+    """The fields every detector checkpoint of this run carries beside its weights."""
     ckpt_meta = {
-        'kind': 'detector', 'config': run_record, 'provenance': run_prov,
+        'kind': 'detector', 'config': config_record, 'provenance': run_prov,
         'box_target': data_cfg['box_target'], 'antialias': data_cfg['antialias'],
         'input_norm': data_cfg['input_norm'],
         'grayscale_prob': data_cfg['grayscale_prob'], 'vflip': data_cfg['vflip'],
@@ -476,6 +448,167 @@ def main(argv: list[str] | None = None):
         'augment_strong': data_cfg['augment_strong'],
         'reduce': data_cfg['reduce'], 'rotate_deg': data_cfg['rotate_deg'],
     }
+    return ckpt_meta
+
+
+def _score_splits(model, train, val, device, train_cfg, multi, selection_kind):
+    """Score train and val (per root, then macro/pooled for a multi-root run).
+
+    Outputs: (scores by split key, the last split's objectness samples). Side effects: none.
+    """
+    scores, obj_scores = {}, []
+    for split_name, ds in (('train', train), ('val', val)):
+        if ds is None:
+            continue
+        split_obj_scores, root_rows, root_scores = [], {}, {}
+        for root_id, root_name in enumerate(ds.root_names):
+            subset = (np.flatnonzero(np.asarray(ds.root_ids) == root_id)
+                      if multi else None)
+            root_obj_scores = []
+            rows = score_dataset(
+                model, ds, device, batch_size=train_cfg['batch_size'],
+                batches=train_cfg['eval_batches'], num_workers=2,
+                out_scores=root_obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
+                center_dist_thresh=train_cfg['nms_center_dist_thresh'],
+                subset_indices=subset, root_qualified_keys=multi)
+            root_rows[root_name] = rows
+            root_scores[root_name] = overall(rows)
+            split_obj_scores.extend(root_obj_scores)
+        obj_scores = split_obj_scores
+        if not multi:
+            scores[split_name] = root_scores[ds.root_names[0]]
+            continue
+        pooled_rows = {key: row for rows in root_rows.values()
+                       for key, row in rows.items()}
+        pooled = overall(pooled_rows)
+        macro = {'n_gt': sum(v['n_gt'] for v in root_scores.values()),
+                 'fp_ignored': sum(v['fp_ignored'] for v in root_scores.values())}
+        for metric in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
+            vals = [v[metric] for v in root_scores.values()]
+            macro[metric] = float(np.mean(vals)) if vals else float('nan')
+        scores[f'{split_name}_macro'] = macro
+        scores[f'{split_name}_pooled'] = pooled
+        for root_name, value in root_scores.items():
+            scores[f'{split_name}_root_{root_name}'] = value
+        scores[split_name] = macro if selection_kind == 'macro' else pooled
+    return scores, obj_scores
+
+
+def _evaluate_and_save(model, opt, train, val, device, data_cfg, train_cfg, multi, ckpt_meta, it,
+                       run, history, best_score, best_iteration, wb):
+    """Score both splits on the SCORED weights and write this iteration's checkpoints.
+
+    `model_state` IS THE SCORED WEIGHT: under schedule-free `opt.eval()` swaps in the averaged
+    `x` and `opt.train()` swaps the same tensors back to `y`, so `x` is cloned before the swap
+    (`model_state_train` keeps `y`). `detector.pth` is the BEST checkpoint on the selection split
+    (`val` where there is one, else `train`; a tie goes to the later one); `detector_it*.pth`
+    and `detector_last.pth` are always written; `obj_quantiles` come from the last split scored.
+
+    Outputs: (best_score, best_iteration), updated. Side effects: writes checkpoints and
+        `metrics.json`, appends to `history`, logs to wandb, prints the scores.
+    """
+    if hasattr(opt, 'eval'):
+        opt.eval()
+    selection_kind = ('macro' if data_cfg['balance_datasets'] else 'pooled')
+    scores, obj_scores = _score_splits(model, train, val, device, train_cfg, multi,
+                                       selection_kind)
+    eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    if hasattr(opt, 'train'):
+        opt.train()
+    train_state = model.state_dict() if hasattr(opt, 'eval') else None
+    obj_q = {}
+    if obj_scores:
+        a = np.concatenate(obj_scores)
+        obj_q = {f'q{int(q * 100):02d}': float(np.quantile(a, q))
+                 for q in (0.01, 0.10, 0.50, 0.90)}
+        print(f'   objectness q01 {obj_q["q01"]:.4f}  q10 {obj_q["q10"]:.4f}  '
+              f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}', flush=True)
+    select_split = 'val' if val is not None else 'train'
+    selection_metric = (f'{select_split}_{selection_kind}_r50' if multi
+                        else f'{select_split}_r50')
+    selected_score = scores[select_split]['r50']
+    ckpt = {**ckpt_meta, 'iteration': it, 'model_state': eval_state,
+            'model_state_is': 'eval',
+            **({'model_state_train': train_state} if train_state is not None else {}),
+            'selection_metric': selection_metric,
+            'selection_score': selected_score,
+            'obj_quantiles': obj_q,
+            'eval': scores}
+    torch.save(ckpt, run / f'detector_it{it:06d}.pth')
+    torch.save(ckpt, run / 'detector_last.pth')
+    sel = selected_score
+    if sel >= best_score:
+        best_score = sel
+        best_iteration = it
+        torch.save(ckpt, run / 'detector.pth')
+    history.append({'iteration': it, 'selection_metric': selection_metric,
+                    'selection_score': selected_score,
+                    **{f'{k}_{m}': v[m] for k, v in scores.items()
+                       for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
+    (run / 'metrics.json').write_text(json.dumps(history, indent=1))
+    _log_detector_wandb(wb, _wandb_eval_metrics(scores, obj_q), it)
+    for name, s in scores.items():
+        print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
+              f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
+              flush=True)
+    return best_score, best_iteration
+
+
+def main(argv: list[str] | None = None):
+    """Train the box predictor; exit via SystemExit on bad config.
+
+    Inputs: argv (via argparse): --config, --out, --iters, --device.
+    Side effects: writes checkpoints + metrics.json + config/provenance under the run folder;
+        prints progress and eval lines.
+
+    A tiled checkpoint's `input_wh` is its TILE size. No `val/` is the only thing swallowed;
+    config errors fail at construction. A pretrained (ImageNet) trunk gets BACKBONE_LR_SCALE x lr.
+    """
+    ap = argparse.ArgumentParser(prog='tailcyclenet train-detector', description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--config', type=Path, default=None,
+                    help='defaults to the packaged configs/detector.toml (the shipped recipe, '
+                         'unmodified) when omitted -- pass one that overlays it for anything else')
+    ap.add_argument('--out', type=Path, default=None, help='override [training].out')
+    ap.add_argument('--iters', type=int, default=None, help='override [training].iters')
+    ap.add_argument('--device', default=None, help='override [training].device')
+    ap.add_argument('--weights-dir', action=_RemovedFlag, nargs='?', help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+
+    config = load_detector_config(args.config or DETECTOR_CONFIG, out=args.out,
+                                  iters=args.iters, device=args.device)
+    data_cfg, model_cfg, train_cfg = config['data'], config['model'], config['training']
+
+    torch.manual_seed(train_cfg['seed'])
+    np.random.seed(train_cfg['seed'])
+    device = train_cfg['device'] if torch.cuda.is_available() else 'cpu'
+    run = Path(train_cfg['out'])
+    run_record, run_prov = _record_run(run, config)
+    wb = _init_detector_wandb(config, run)
+
+    all_roots = load_datasets(data_cfg['path'])
+    roots = [ds for ds in all_roots if 'train' in ds.sessions]
+    multi = len(roots) > 1
+    root_names = [ds.name for ds in roots]
+    unknown_box_roots = set(data_cfg['boxes_by_dataset']) - {ds.name for ds in all_roots}
+    if unknown_box_roots:
+        raise SystemExit(f'[data].boxes_by_dataset names unknown dataset roots '
+                         f'{sorted(unknown_box_roots)}.')
+    probe_sess = roots[0].all_sessions()[0]
+    wh = _select_input_wh(data_cfg, roots, all_roots, multi, root_names)
+
+    tiling = dict(tile_wh=data_cfg['tile_wh'], tile_scale=data_cfg['tile_scale'],
+                  tile_bg_per_frame=data_cfg['tile_bg_per_frame'])
+    train, wh, loader, effective_sources, root_mix = _train_data(
+        data_cfg, train_cfg, all_roots, wh, multi, probe_sess, tiling)
+    val = _val_data(data_cfg, train_cfg, all_roots, root_names, wh, tiling)
+    eval_roots = len(train.root_names) + (0 if val is None else len(val.root_names))
+    print(f'eval work/pass: up to {train_cfg["eval_batches"]} batches x {eval_roots} '
+          f'root/split evaluations')
+
+    model, opt, sched = _build_model(model_cfg, train_cfg, device)
+    ckpt_meta = _checkpoint_meta(run_record, run_prov, data_cfg, model_cfg, train_cfg, wh, train,
+                                 effective_sources, root_mix)
     history = []
     best_score = -float('inf')
     best_iteration = None
@@ -550,83 +683,9 @@ def main(argv: list[str] | None = None):
                              'model_state_is': 'eval'}
                 torch.save(save_ckpt, run / f'detector_it{it:06d}.pth')
             if it % train_cfg['eval_every'] == 0 or it == train_cfg['iters']:
-                if hasattr(opt, 'eval'):
-                    opt.eval()
-                scores, obj_scores = {}, []
-                selection_kind = ('macro' if data_cfg['balance_datasets'] else 'pooled')
-                for split_name, ds in (('train', train), ('val', val)):
-                    if ds is None:
-                        continue
-                    split_obj_scores, root_rows, root_scores = [], {}, {}
-                    for root_id, root_name in enumerate(ds.root_names):
-                        subset = (np.flatnonzero(np.asarray(ds.root_ids) == root_id)
-                                  if multi else None)
-                        root_obj_scores = []
-                        rows = score_dataset(
-                            model, ds, device, batch_size=train_cfg['batch_size'],
-                            batches=train_cfg['eval_batches'], num_workers=2,
-                            out_scores=root_obj_scores, iou_thresh=train_cfg['nms_iou_thresh'],
-                            center_dist_thresh=train_cfg['nms_center_dist_thresh'],
-                            subset_indices=subset, root_qualified_keys=multi)
-                        root_rows[root_name] = rows
-                        root_scores[root_name] = overall(rows)
-                        split_obj_scores.extend(root_obj_scores)
-                    obj_scores = split_obj_scores
-                    if not multi:
-                        scores[split_name] = root_scores[ds.root_names[0]]
-                        continue
-                    pooled_rows = {key: row for rows in root_rows.values()
-                                   for key, row in rows.items()}
-                    pooled = overall(pooled_rows)
-                    macro = {'n_gt': sum(v['n_gt'] for v in root_scores.values()),
-                             'fp_ignored': sum(v['fp_ignored'] for v in root_scores.values())}
-                    for metric in ('r50', 'r75', 'iou', 'fp', 'mota', 'fp_dup', 'fp_none', 'miss'):
-                        vals = [v[metric] for v in root_scores.values()]
-                        macro[metric] = float(np.mean(vals)) if vals else float('nan')
-                    scores[f'{split_name}_macro'] = macro
-                    scores[f'{split_name}_pooled'] = pooled
-                    for root_name, value in root_scores.items():
-                        scores[f'{split_name}_root_{root_name}'] = value
-                    scores[split_name] = macro if selection_kind == 'macro' else pooled
-                eval_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                if hasattr(opt, 'train'):
-                    opt.train()
-                train_state = model.state_dict() if hasattr(opt, 'eval') else None
-                obj_q = {}
-                if obj_scores:
-                    a = np.concatenate(obj_scores)
-                    obj_q = {f'q{int(q * 100):02d}': float(np.quantile(a, q))
-                             for q in (0.01, 0.10, 0.50, 0.90)}
-                    print(f'   objectness q01 {obj_q["q01"]:.4f}  q10 {obj_q["q10"]:.4f}  '
-                          f'q50 {obj_q["q50"]:.4f}  q90 {obj_q["q90"]:.4f}', flush=True)
-                select_split = 'val' if val is not None else 'train'
-                selection_metric = (f'{select_split}_{selection_kind}_r50' if multi
-                                    else f'{select_split}_r50')
-                selected_score = scores[select_split]['r50']
-                ckpt = {**ckpt_meta, 'iteration': it, 'model_state': eval_state,
-                        'model_state_is': 'eval',
-                        **({'model_state_train': train_state} if train_state is not None else {}),
-                        'selection_metric': selection_metric,
-                        'selection_score': selected_score,
-                        'obj_quantiles': obj_q,
-                        'eval': scores}
-                torch.save(ckpt, run / f'detector_it{it:06d}.pth')
-                torch.save(ckpt, run / 'detector_last.pth')
-                sel = selected_score
-                if sel >= best_score:
-                    best_score = sel
-                    best_iteration = it
-                    torch.save(ckpt, run / 'detector.pth')
-                history.append({'iteration': it, 'selection_metric': selection_metric,
-                                'selection_score': selected_score,
-                                **{f'{k}_{m}': v[m] for k, v in scores.items()
-                                   for m in ('r50', 'r75', 'iou', 'fp', 'mota')}})
-                (run / 'metrics.json').write_text(json.dumps(history, indent=1))
-                _log_detector_wandb(wb, _wandb_eval_metrics(scores, obj_q), it)
-                for name, s in scores.items():
-                    print(f'   {name:5s} r@.5 {s["r50"]:.4f}  r@.75 {s["r75"]:.4f}  '
-                          f'IoU {s["iou"]:.4f}  fp {s["fp"]:.3f}  MOTA {s["mota"]:.3f}',
-                          flush=True)
+                best_score, best_iteration = _evaluate_and_save(
+                    model, opt, train, val, device, data_cfg, train_cfg, multi, ckpt_meta, it,
+                    run, history, best_score, best_iteration, wb)
                 t0 = time.time()
     best = next((h for h in history if h['iteration'] == best_iteration), None)
     print(f'done: {it} iterations -> {run}')

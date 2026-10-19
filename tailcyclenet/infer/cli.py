@@ -62,349 +62,200 @@ def _add_removed_flags(ap):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The command line. A function, not a module-level block, so a test can assert against the
-    parser object rather than regex this file.
+    """The `infer` command line, as a parser object (tests assert against it).
 
-    The mutual exclusion of `--data`/`--videos` is checked by hand below `parse_args` so the
-    error names BOTH flags rather than argparse's one-sided message. `--split` defaults to None,
-    NOT 'test', because the videos path has to tell whether it was passed (it is inert there and
-    would otherwise be silently ignored). The `--calibration` help uses `%%` because argparse
-    expands every help string as `help % params`, so a bare `%Y` would be a format spec and
-    `--help` would die for every flag at once. `--det-top-k` is a separate detection budget from
-    the row count -- `--max-animals` used to set both, so neither lever could be read alone (0
-    follows `--max-animals`). Deleted flags stay registered (`REMOVED_FLAGS`) and exit naming
-    themselves and why. The frame-range flags sit outside
-    any input-specific group because the range serves both input paths -- it is a window-loop
-    lever, not an input-format one.
+    `--data`/`--videos` exclusion is re-checked by hand in `main` so the error names both flags.
+    `--split` defaults to None so the videos path can tell it was passed. Help strings use `%%`
+    for a literal percent (argparse expands `help % params`). Deleted flags stay registered
+    (`REMOVED_FLAGS`) and exit naming themselves. Advanced and diagnostic flags sit in their own
+    groups; measurements behind each default live in CLAUDE.md and dev/reports.
     """
     ap = argparse.ArgumentParser(prog='tailcyclenet infer', description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--pose', '--run', dest='run', required=True, type=Path,
-                    help='pose run folder, or ONE pose checkpoint .pth (packaged, or any '
-                         'checkpoint_*.pth: each embeds its config and keypoint registry). '
-                         '--run is the older spelling of the same option.')
-    ap.add_argument('--scorer', type=Path, default=None,
-                    help='optional framewise scorer run folder or ONE scorer checkpoint .pth '
-                         '(it embeds its config and registry). Its quality score/precision are '
-                         'written as metadata; pose predictions are not filtered or changed.')
-    ap.add_argument('--scorer-checkpoint', default=None,
-                    help='scorer checkpoint filename when --scorer is a run folder (refused '
-                         'beside a file); default is the latest training checkpoint. '
-                         'checkpoint_best.pth must be explicitly named.')
-    ap.add_argument('--allow-pose-scorer-mismatch', action='store_true', default=False,
-                    help='allow scorer and pose raw video-encoder weights to differ; this runs '
-                         'two video-encoder passes. By default, differing weights are refused.')
+                    help='pose run folder, or ONE pose checkpoint .pth (each embeds its config '
+                         'and keypoint registry). --run is the older spelling.')
+    ap.add_argument('--pose-checkpoint', '--checkpoint', dest='checkpoint', default=None,
+                    help='checkpoint filename when --pose is a run folder (refused beside a '
+                         'file); default: the latest training checkpoint.')
     src = ap.add_mutually_exclusive_group()
     src.add_argument('--data', type=Path,
-                     help='ONE session directory (a dataset root works only if it holds a '
-                          'single session in --split). --out is one session, and a session '
-                          'carries one calibration, one mode and one keypoint axis.')
+                     help='ONE session directory (a dataset root only if it holds a single '
+                          'session in --split).')
     src.add_argument('--videos', type=Path, nargs='+', default=None,
-                     help='RAW FOOTAGE INSTEAD OF A SESSION DIRECTORY: files and/or directories '
-                          '(a directory expands to its .mp4/.avi children, sorted, NOT '
-                          'recursively). THE SESSION IS BUILT IN MEMORY -- nothing is staged, and '
-                          'nothing is written but --out. A single-camera 2D run may omit '
-                          '--calibration and uses a nominal cam0; 3D needs --calibration and '
-                          '--cam-regex unless the calibration names exactly one camera. NO LABELS, '
-                          'therefore '
-                          'NO SCORING: scripts/eval.py has nothing to compare a video-sourced '
-                          'prediction against, and a number needs annotations, i.e. a converter. '
-                          'It also makes --max-animals and a box source (--detector/--boxes) '
-                          'mandatory, since neither can be recovered from footage.')
-    ap.add_argument('--calibration', type=Path, default=None,
-                    help='with --videos: an ANIPOSELIB-LAYOUT calibration.toml -- what '
-                         '`format.load_calibration` reads, which anipose itself writes and this '
-                         'repo dumps. "It is a toml" is NOT the same claim as "it is THIS toml": '
-                         'a multiview_calib / OpenCV-YAML rig (`%%YAML:1.0` Cam*.yaml, `rc_ext` '
-                         'as '
-                         'a rotation MATRIX) needs a conversion script ending in '
-                         '`format.dump_calibration`. That is a converter\'s job and stays out of '
-                         'this flag.')
-    ap.add_argument('--cam-regex', default=None,
-                    help="with --videos: anipose's own `[triangulation] cam_regex`, applied to "
-                         "each video's STEM -- the camera is `search(rx, stem).group(1)` and the "
-                         'group id is `sub(rx, "", stem)`. So `cam0_trial3.mp4` under '
-                         "'cam([0-9]+)_' is camera '0', group 'trial3', and `cam1_trial3.mp4` "
-                         'joins it as the same group\'s second camera. THE CAMERA NAME IS THE '
-                         "CAPTURE GROUP, so it is '0' and not 'cam0' -- the calibration must name "
-                         'it that way, and this is the number-one thing to get wrong. Two '
-                         'documented supersets of anipose: a pattern with NO capture group '
-                         "matches the whole string ('Cam[0-9]+' -> 'Cam2005325', which is what a "
-                         'raw rig dump needs), and a one-camera calibration needs no regex at '
-                         'all. Several groups in one invocation is expected and free.')
-    ap.add_argument('--session-id', default=None,
-                    help='with --videos: the `session/group` key every downstream table is '
-                         "written under. Default: the videos' common parent directory name.")
-    ap.add_argument('--group-id', default=None,
-                    help='with --videos: used ONLY when the regex leaves every remainder empty, '
-                         'i.e. one raw recording per invocation (`Cam2005325.mp4` under '
-                         "'Cam[0-9]+' leaves ''). INERT otherwise. Some empty and some not is a "
-                         'genuine ambiguity and is refused. Default: the session id.')
-    ap.add_argument('--units', default=None,
-                    help='with --videos: the units declaration. Defaults to px for a derived 2D '
-                         'single-camera session; a 3D run MUST state --units explicitly because '
-                         'calibration.toml has no units field and the declaration cannot be checked '
-                         'against it. A calibration in metres declared as mm produces a prediction '
-                         '1000x off with no symptom, because '
-                         "nothing downstream knows the animal's size.")
-    ap.add_argument('--fps', type=float, default=None,
-                    help="with --videos: override the container's own fps. Reaches groups.pq "
-                         'only; nothing in inference reads it.')
-    ap.add_argument('--assoc-res-max-px', type=float, default=None,
-                    help='`Session.assoc_res_max_px`, which `CrossViewTracker` and `associate` '
-                         "both read as their reprojection gate. Default: the session's own "
-                         'value -- 30.0 (the format default) for a fresh --videos build, or '
-                         "whatever --data's session.toml already carries. Given explicitly, "
-                         'OVERRIDES either path: it is a PIXEL gate on a reprojection residual, '
-                         'so a 4K rig and a 640x480 rig should not share it, and a dataset '
-                         'converted under one assumption should not be stuck at it forever. '
-                         'Sweep per rig, exactly as --det-score is swept per checkpoint.')
-    ap.add_argument('--trim-to-shortest', action='store_true',
-                    help="with --videos: opt in to n_frames = min over a group's cameras. "
-                         'Without it a length disagreement is REFUSED, because a one-frame offset '
-                         '(a dropped trigger, usually harmless) and a 40,000-frame one (two '
-                         'different recordings sharing a group id) look identical to a min().')
-    ap.add_argument('--dump-session', type=Path, default=None,
-                    help='DEBUG ONLY: write the constructed --videos session out through '
-                         '`format.write_session`, pixels symlinked, and carry on -- so '
-                         '`validate_session` and your own eyes can be pointed at what the flags '
-                         'produced. Not the mechanism, and on no default path.')
+                     help='raw footage instead of a session: files and/or directories (a '
+                          'directory expands to its .mp4/.avi children, not recursively). The '
+                          'session is built in memory; with no labels there is no scoring, and '
+                          '--max-animals plus a box source (--detector/--boxes) are mandatory.')
+    ap.add_argument('--out', required=True, type=Path,
+                    help='the prediction SESSION directory (session.toml, calibration.toml, '
+                         'groups.pq, points3d.pq, points2d.pq); no pixels.')
     ap.add_argument('--split', default=None,
                     help='default: test. Inert with --videos, and refused rather than ignored.')
-    ap.add_argument('--out', required=True, type=Path,
-                    help='the prediction SESSION directory: session.toml, calibration.toml, '
-                         'groups.pq, points3d.pq and prediction-only points2d.pq. No pixels; '
-                         '[provenance] source_session says where they are.')
-    ap.add_argument('--pose-checkpoint', '--checkpoint', dest='checkpoint', default=None,
-                    help='pose checkpoint filename when --pose is a run folder (refused beside a '
-                         'file); default is the latest training checkpoint. --checkpoint is the '
-                         'older spelling of the same option.')
-    ap.add_argument('--window-predictions', action='store_true',
-                    help='write pre-gate predictions from every processed window to '
-                         '<out>/window_predictions.pq (default: off)')
-    ap.add_argument('--anchor', default='carry', choices=ANCHORS,
-                    help="'labels' is an ORACLE, not a deployment number")
-    ap.add_argument('--overlap', type=int, default=4,
-                    help='frames each window shares with its predecessor. Default 4; 8 suits 3D, '
-                         '2D improves through 12 (seam count vs seam size -- sweep per root).')
-    ap.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
-    ap.add_argument('--boxes', type=Path, default=None,
-                    help='npz of crop points per group; default is to crop from the labels')
-    ap.add_argument('--detector', type=Path, default=None,
-                    help='a detector run folder or a single packaged .pth file. THE deployment '
-                         'path: boxes come from pixels, not from labels. A run folder defaults to '
-                         'detector_it*.pth; pass --detector-checkpoint last for the rolling '
-                         'detector_last.pth, best for historical detector.pth, or an explicit '
-                         'checkpoint filename.')
-    ap.add_argument('--detector-checkpoint', default='latest',
-                    help="detector checkpoint selector when --detector is a run folder (refused "
-                         "beside a file): 'latest' "
-                         "(default, highest complete iteration), 'last' (detector_last.pth), "
-                         "'best' (historical detector.pth), or an explicit filename.")
-    ap.add_argument('--det-trace', type=Path, default=None,
-                    help='write output-neutral per-frame/camera detector decode-stage counts as '
-                         'JSON for coverage attribution (scratch diagnostic, not a prediction '
-                         'session file).')
-    ap.add_argument('--identity-bridge', action='store_true',
-                    help='OPT-IN post-pass that repairs the slot PERMUTATION a hard interaction '
-                         'leaves behind: quarantine the rows a duplicate episode implicates, then '
-                         're-release them under a one-to-one mapping chosen by reciprocal motion. '
-                         'TRADES MISSES FOR IDENTITY -- measured 3dpop Sequence 59 idsw 16 -> 2 '
-                         'at 11 -> 563 misses, Sequence 29 9 -> 4 at 32 -> 250. Worth it only '
-                         'when identity outranks coverage; quote miss and coverage with any idsw '
-                         'from it. Edits the written session in place, after it is written.')
-    ap.add_argument('--overlap-trace', type=Path, default=None,
-                    help='write the OUTPUT-NEUTRAL overlap test-retest capture as an npz: for '
-                         'every seam frame, the earlier window\'s discarded estimate and the '
-                         'later window\'s kept one, their distance, the frame\'s position within '
-                         'the overlap, plus a census of the pairs the hook could NOT see. Costs '
-                         'nothing when unset and changes no prediction either way (scratch '
-                         'diagnostic, not a prediction session file).')
-    ap.add_argument('--allow-detector-transfer', action='store_true', default=False,
-                    help='permit a detector checkpoint whose recorded [dataset] does not match '
-                         'this session\'s own dataset root. A detector is trained per dataset '
-                         '(scale/appearance are dataset-specific), so this is refused by default; '
-                         'pass this flag only for an explicit, labelled transfer-evaluation arm.')
-    ap.add_argument('--det-score', type=float, default=0.01,
-                    help='objectness floor for a detection. 0.01 (default, CHANGED from 0.5 then '
-                         '0.05) is measured against the current iou_aware_obj+COCO-pretrained '
-                         'recipe: on rat-city-combined, MOTA peaks at 0.01 (0.795, dev/scratch/'
-                         'detscore/ratcity_v2best_lowend_sweep.log) -- clearly above 0.05 (0.640) '
-                         'and above 0.0 (0.747, more false positives with no MOTA gain); on '
-                         'allen-mouse-combined and 3dpop, 0.01 is BYTE-IDENTICAL to 0.05 (no '
-                         'detections score in that band at all), so lowering further is free '
-                         'there. False negatives cost more than the extra false positives this '
-                         'invites -- accepted deliberately: 3D multiview already rejects a '
-                         'candidate whose reprojection residual exceeds `assoc_res_max_px` '
-                         '(default 30px, Session.assoc_res_max_px) after association, and NMS '
-                         '(centre-distance + IoU) already suppresses duplicates before it: a '
-                         'looser floor feeds MORE candidates into filters that already exist, not '
-                         'an unfiltered flood. 2D single-camera has no reprojection check to fall '
-                         'back on. Still sweep per checkpoint.')
-    ap.add_argument('--det-nms-iou', type=float, default=0.5,
-                    help="decode's box-NMS IoU threshold. 0.5 was HARDCODED and unreachable "
-                         'before detector_v2 plan A1; every external detector (RTMDet 0.65, '
-                         'DLC/SLEAP instance-level 0.8) ships higher -- sweep upward, not around '
-                         '0.5.')
-    ap.add_argument('--det-nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
-                    help='SECOND, independent NMS survival test in units of box side (scale-free): '
-                         'a candidate is also suppressed if its centre sits within this many box '
-                         'sides of an already-kept box, regardless of IoU -- catches '
-                         'near-concentric duplicates IoU-only NMS misses. 0.3 is the deployment '
-                         'default: matched CALMS/rat-city coverage and MOTA controls beat 0.5; '
-                         'pass 0.5 for the historical A5 operating point or a negative value to '
-                         'disable.')
-    ap.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
-                    help='follow one animal per instance row across frames -- per-frame Hungarian '
-                         'on centre distance in units of the box side, gated at one side. The '
-                         'whole of 2D single-view identity; `--no-link-boxes` restores the '
-                         'memoryless pass.')
-    ap.add_argument('--box-prompt', default='firstonly',
-                    choices=('auto', 'firstonly', 'none', 'labels', 'detector'),
-                    help='DEPLOYMENT box prompt, 2D single-camera. `auto` deploys a box model with '
-                         'the detector box (--crop-inflate 1.5 + --refine) and REFUSES to run a '
-                         "box model without a detector/boxes file; `firstonly` (DEFAULT, owner-set "
-                         '2026-09-05) resolves the source the same way `auto` does but gives it '
-                         "only at each animal's FIRST window, withholding it once a carry is "
-                         "available -- give the identity signal while first-detecting, then let "
-                         "carry hold it; unmeasured to help beyond the one clip tested (report 55) "
-                         "but measured not to HURT there either; `labels` is an explicit ORACLE; "
-                         "`none` forces the box off.")
-    ap.add_argument('--crop-inflate', type=float, default=None,
-                    help='inflate every crop about its centre. DEFAULT 1.5 when the box is on, '
-                         'else 1.0.')
-    ap.add_argument('--max-move', type=float, default=1.25,
-                    help='THE GATE, in box sides, shared by `--track` and `--link-boxes`: a pair '
-                         'further apart than this is not the same animal. 1.25 is the measured '
-                         'default on 3dzef and retains ~10x headroom on every multi-animal root.')
-    ap.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
-                    help='3D multiview only, ON BY DEFAULT: ONE cross-view target set with one '
-                         'affinity and one Hungarian, replacing per-frame `associate` plus '
-                         '`link_rows`. Buys scale and flat error over long clips; `--no-track` '
-                         'restores the memoryless pass.')
-    ap.add_argument('--min-views', type=int, default=2, choices=(1, 2),
-                    help='3D only. 2 builds every instance from a camera PAIR (single-view animals '
-                         'dropped); 1 also emits leftover boxes as single-view instances. Whether '
-                         'the pose model can use one is [data].cams_to_sample.')
-    ap.add_argument('--max-age', type=int, default=8,
-                    help='frames without evidence before a lost identity is retired: '
-                         '`CrossViewTracker` (3D, `--track`) and `link_rows` (2D, `--link-boxes`) '
-                         'both read this as the SAME patience window. Past it a reappearing '
-                         'animal is a new birth, not a resumed row -- but a slot held LONGER is a '
-                         'STALER point (a one-camera `CrossViewTracker` target never '
-                         're-triangulates while idle, and `link_rows` matches a row against its '
-                         'own last-known box, not frame t-1). The measured default is 8; raising '
-                         'it trades a hard identity loss for a longer-lived stale anchor that a '
-                         'nearby animal can be wrongly matched onto.')
-    ap.add_argument('--max-animals', type=int, default=0)
-    ap.add_argument('--det-top-k', type=int, default=0,
-                    help='detections kept per frame-camera; 0 follows --max-animals')
-    ap.add_argument('--duplicate-radius', type=float, default=0.75,
-                    help='duplicate proximity in box sides, for the 3D --track backstop '
-                         '(always on).')
-    ap.add_argument('--duplicate-persist', type=int, default=5,
-                    help='consecutive in-band frames before a duplicate pair is resolved by the '
-                         '3D --track backstop (always on). Measured default 5 on 3dpop '
-                         'Sequence 59 (report 53); not yet swept on a second root.')
-    ap.add_argument('--max-frames', type=int, default=0,
-                    help='predict only the first N frames of each group (a PREFIX, so `carry` '
-                         'stays contiguous). = --start-frame 0 --end-frame N; refused together '
-                         'with either.')
-    ap.add_argument('--start-frame', type=int, default=0,
-                    help='first SOURCE frame to predict, per group (half-open [start, end)). The '
-                         'output `frame` column is always the source index. A ranged run is not a '
-                         'slice of the whole-clip answer: identity columns are comparable only '
-                         'between runs that start at the same frame.')
-    ap.add_argument('--end-frame', type=int, default=0,
-                    help='one past the last SOURCE frame to predict, per group; 0 = to the end, '
-                         'past the end clamps. A group shorter than --start-frame is skipped by '
-                         'name; every group skipped is refused. NOT A RESUME.')
-    ap.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
-                    help='DEFAULT: on in 3D, off in 2D (derived from the session\'s own mode). '
-                         'Re-crops each window to the first pass\'s OWN prediction and predicts '
-                         'again, label-free. Costs one extra forward + decode per animal per '
-                         'window.')
-    ap.add_argument('--refine-px', type=int, default=None,
-                    help='run --refine\'s FIRST pass at this resolution instead of the run\'s '
-                         'image_size (the gain is magnification; pass 1 only localises). 96-192 is '
-                         'the plateau, 64 the cliff. No default.')
-    ap.add_argument('--vis-thresh', type=float, default=None,
-                    help='withhold an (animal, frame) row whose median `vis_pred` logit is below '
-                         'this. A logit, not portable across datasets; applies to what is '
-                         'reported, never the carried prompt.')
-    ap.add_argument('--kpt-chunk', type=int, default=0,
-                    help='decode keypoints in slices of this size, reusing one scene encode. '
-                         'Lowers peak memory on large keypoint sets; the prediction is '
-                         'unchanged. 0 = one pass.')
-    ap.add_argument('--precision', choices=('fp32', 'bf16', 'fp16'), default='bf16',
-                    help='autocast dtype for the scene encode only. The query encoder, decoder, '
-                         'camera geometry and triangulation stay at their existing precision. '
-                         'Default bf16 is the measured deployment path; --precision fp32 restores '
-                         'the historical path.')
-    ap.add_argument('--camera-batch', action=argparse.BooleanOptionalAction, default=True,
-                    help='encode all cameras in one batched scene-encoder call per window. '
-                         'Default on; single-camera windows are unchanged. --no-camera-batch '
-                         'restores one encoder call per camera.')
-    ap.add_argument('--prefetch-windows', type=int, default=1,
-                    help='decode this many windows AHEAD of the one forwarding. BIT-EXACT: the '
-                         'prediction is unchanged at any value. 0 restores the serial loop.')
-    ap.add_argument('--oracle-corrupt', default=None,
-                    help='ONLY with --anchor labels, and never a deployment arm: break the oracle '
-                         'prior on purpose and see how far the output follows it. `off:<x>` offsets '
-                         'the WHOLE pose by x crop widths in one direction (the shape of a lag, '
-                         'which i.i.d. training jitter never is); `stale:<n>` supplies the pose from '
-                         'n frames earlier; `other` supplies the NEIGHBOURING animal\'s (row a+1); '
-                         '`near` supplies the NEAREST ELIGIBLE animal\'s pose instead of the fixed '
-                         'a+1 row; `swap:<n>` transposes n pairs of this row\'s own keypoints. '
-                         'None of these is in training except through dataset.py\'s '
-                         'prompt_swap_kpt_pairs / prompt_swap_animal, which swap/near are the '
-                         'direct probes for. The ratio of output displacement to prior displacement '
-                         'is the echo coefficient alpha, and alpha is what decides whether the '
-                         'prompt needs retraining.')
-    ap.add_argument('--min-box-frames', type=int, default=1,
-                    help='how many finite (frame, camera) boxes a row needs before it gets a window '
-                         'crop. 1 is what the loop always did, and it is how coverage gets '
-                         'FABRICATED: one box out of T x C positions the crop for all 24 frames and '
-                         'every one is marked `ok` -- 3dpop reports 0.000 of (row, frame) with no '
-                         'pose against 2.1-2.2%% of (row, frame) with no camera at all. Raising this '
-                         'LOWERS reported coverage on purpose.')
-    ap.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
-                    help='3D only, and only under --anchor carry: what the next window is seeded '
-                         'with. "triangulate" (default) hands back the ANCHOR-FREE estimate, '
-                         're-derived from this window\'s pixels every frame. "pred" hands back the '
-                         'reported prediction, which under gridresid_offset = "query" is '
-                         '`prior + residual` -- a loop with gain, measured on johnson-mouse as a '
-                         'sawtooth locked to the window boundary that costs 30%% of the animal\'s '
-                         'motion. "pred" is what every arm before this flag existed did; it is kept '
-                         'so that comparison can be made. 2D is identical either way.')
-    ap.add_argument('--gridresid-offset', default=None, choices=('query', 'triangulated'),
-                    help='STATE what this run\'s 3D residual was anchored on, for a run folder '
-                         'written before `[model].gridresid_offset` existed. Those weights were '
-                         'trained under unconditional per-frame re-anchoring, i.e. '
-                         '"triangulated"; loading them as "query" infers `world = prior + '
-                         'residual` from a head that learned `world = tri_t + residual_t`. Not a '
-                         'sweep knob: on a run whose config names the key this must agree with it.')
     ap.add_argument('--dataset-name', default=None,
-                    help='the registry entry to read this data\'s keypoints as, when the folder '
-                         'name is not it. `rat-city` served by a `rat-city-annotated` run: same '
-                         'names, same ids, different directory. Checked against the session\'s '
-                         'own names, so a wrong value raises rather than relabelling.')
+                    help="the registry entry to read this data's keypoints as, when the folder "
+                         "name is not it; checked against the session's own names.")
     ap.add_argument('--groups', default=None, help='comma-separated group ids to restrict to')
     ap.add_argument('--device', default='cuda:0')
-    ap.add_argument('--max-ram', type=float, default=None, metavar='GB',
-                    help='HOST RAM this run may spend on its own pixel buffers -- the video '
-                         'reader cache, how many CAMERAS the detector decodes at once, and the '
-                         "window loop's camera concurrency and frame cache. DEFAULT: derived, as "
-                         'the smallest of the cgroup limit (walked up EVERY ancestor), LSF\'s own '
-                         'LSB_CG_MEMLIMIT/LSB_MEMLIMIT, MemAvailable and MemTotal -- never '
-                         'SC_PHYS_PAGES, which is the MACHINE\'s memory and under a 16 GB cap '
-                         'still reported this host\'s 503 GB, a 20x over-estimate and exactly the '
-                         'case an LSF job dies in. EVERY KNOB THIS SIZES IS OUTPUT-NEUTRAL, so '
-                         'lowering it costs wall clock and never a predicted number -- which is '
-                         'why it sizes the CAMERA axis and never the detector batch: batch is NOT '
-                         'inert (16 vs 3 moves boxes 0.204 px, scores 1.7e-03), see '
-                         'tests/test_memory_budget.py. '
-                         'TAILCYCLENET_MAX_RAM_GB does the same for paths with no CLI.')
+
+    vid = ap.add_argument_group('--videos input')
+    vid.add_argument('--calibration', type=Path, default=None,
+                     help='an ANIPOSELIB-layout calibration.toml (what `format.load_calibration` '
+                          'reads). Another rig format needs a converter ending in '
+                          '`format.dump_calibration`.')
+    vid.add_argument('--cam-regex', default=None,
+                     help="anipose's `[triangulation] cam_regex`, applied to each video's stem: "
+                          'the camera is the CAPTURE GROUP (`cam([0-9]+)_` -> camera "0", not '
+                          '"cam0") and the group id is the remainder. A pattern with no capture '
+                          'group matches the whole string; a one-camera calibration needs none.')
+    vid.add_argument('--session-id', default=None,
+                     help="the session key every table is written under. Default: the videos' "
+                          'common parent directory name.')
+    vid.add_argument('--group-id', default=None,
+                     help='used ONLY when the regex leaves every remainder empty; some empty and '
+                          'some not is refused. Default: the session id.')
+    vid.add_argument('--units', default=None,
+                     help='units declaration. Default px for a 2D single-camera session; a 3D '
+                          'run MUST state it (calibration.toml has no units field).')
+    vid.add_argument('--fps', type=float, default=None,
+                     help="override the container's fps (reaches groups.pq only).")
+    vid.add_argument('--trim-to-shortest', action='store_true',
+                     help="opt in to n_frames = min over a group's cameras; a length "
+                          'disagreement is refused without it.')
+
+    win = ap.add_argument_group('window loop')
+    win.add_argument('--anchor', default='carry', choices=ANCHORS,
+                     help="'labels' is an ORACLE, not a deployment number")
+    win.add_argument('--overlap', type=int, default=4,
+                     help='frames each window shares with its predecessor (sweep per root).')
+    win.add_argument('--n-frames', type=int, default=None, help='default: the run\'s own')
+    win.add_argument('--max-frames', type=int, default=0,
+                     help='predict only the first N frames of each group; = --start-frame 0 '
+                          '--end-frame N, refused together with either.')
+    win.add_argument('--start-frame', type=int, default=0,
+                     help='first SOURCE frame to predict, per group (half-open [start, end)). '
+                          'Identity columns compare only between runs that start together.')
+    win.add_argument('--end-frame', type=int, default=0,
+                     help='one past the last SOURCE frame per group; 0 = to the end. Not a '
+                          'resume.')
+    win.add_argument('--refine', action=argparse.BooleanOptionalAction, default=None,
+                     help="re-crop each window to the first pass's own prediction and predict "
+                          'again. Default: on in 3D, off in 2D (on for a box model).')
+    win.add_argument('--refine-px', type=int, default=None,
+                     help="run --refine's FIRST pass at this resolution (96-192 plateau, 64 "
+                          'cliff). No default.')
+    win.add_argument('--box-prompt', default='firstonly',
+                     choices=('auto', 'firstonly', 'none', 'labels', 'detector'),
+                     help='box prompt for a box model: `auto` uses the detector/boxes file and '
+                          "refuses without one; `firstonly` (default) gives it only at each "
+                          "animal's first window; `labels` is an ORACLE; `none` forces it off.")
+    win.add_argument('--crop-inflate', type=float, default=None,
+                     help='inflate every crop about its centre. Default 1.5 with the box on, '
+                          'else 1.0.')
+    win.add_argument('--vis-thresh', type=float, default=None,
+                     help="withhold an (animal, frame) row whose median `vis_pred` logit is "
+                          'below this (reported rows only, never the carried prompt).')
+    win.add_argument('--min-box-frames', type=int, default=1,
+                     help='finite (frame, camera) boxes a row needs before it gets a window '
+                          'crop; raising it lowers reported coverage on purpose.')
+
+    det = ap.add_argument_group('boxes and detection')
+    det.add_argument('--boxes', type=Path, default=None,
+                     help='npz of crop points per group; default is to crop from the labels')
+    det.add_argument('--detector', type=Path, default=None,
+                     help='a detector run folder or packaged .pth: THE deployment path (boxes '
+                          'from pixels).')
+    det.add_argument('--detector-checkpoint', default='latest',
+                     help="selector when --detector is a run folder: 'latest' (default), 'last', "
+                          "'best' (historical detector.pth), or a filename.")
+    det.add_argument('--det-score', type=float, default=0.01,
+                     help='objectness floor for a detection; favours recall (the 3D '
+                          'reprojection gate and NMS filter downstream). Sweep per checkpoint.')
+    det.add_argument('--det-nms-iou', type=float, default=0.5,
+                     help="decode's box-NMS IoU threshold.")
+    det.add_argument('--det-nms-center-dist', type=float, default=NMS_CENTER_DIST_DEPLOY,
+                     help='second NMS test in box sides: suppress a candidate whose centre is '
+                          'this close to a kept box; negative disables.')
+    det.add_argument('--max-animals', type=int, default=0)
+    det.add_argument('--det-top-k', type=int, default=0,
+                     help='detections kept per frame-camera; 0 follows --max-animals')
+    det.add_argument('--allow-detector-transfer', action='store_true', default=False,
+                     help="permit a detector trained on another dataset (a labelled transfer "
+                          'arm only).')
+
+    ident = ap.add_argument_group('identity and association')
+    ident.add_argument('--link-boxes', action=argparse.BooleanOptionalAction, default=True,
+                       help='2D: follow one animal per row across frames (per-frame Hungarian on '
+                            'centre distance, gated at --max-move).')
+    ident.add_argument('--track', action=argparse.BooleanOptionalAction, default=True,
+                       help='3D multiview: one cross-view target set across frames; --no-track '
+                            'restores per-frame association.')
+    ident.add_argument('--max-move', type=float, default=1.25,
+                       help='the identity gate in box sides, shared by --track and --link-boxes.')
+    ident.add_argument('--min-views', type=int, default=2, choices=(1, 2),
+                       help='3D: 2 builds every instance from a camera pair; 1 also emits '
+                            'single-view instances.')
+    ident.add_argument('--max-age', type=int, default=8,
+                       help='frames without evidence before a lost identity is retired (--track '
+                            'and --link-boxes).')
+    ident.add_argument('--duplicate-radius', type=float, default=0.75,
+                       help='duplicate proximity in box sides for the 3D --track backstop.')
+    ident.add_argument('--duplicate-persist', type=int, default=5,
+                       help='in-band frames before the 3D --track backstop resolves a duplicate.')
+    ident.add_argument('--assoc-res-max-px', type=float, default=None,
+                       help="override the session's reprojection gate (a PIXEL gate: sweep per "
+                            "rig). Default: the session's own value.")
+    ident.add_argument('--identity-bridge', action='store_true',
+                       help='OPT-IN post-pass repairing the slot permutation a hard interaction '
+                            'leaves; TRADES MISSES FOR IDENTITY (quote miss and coverage with '
+                            'its idsw). Edits the written session in place.')
+
+    sco = ap.add_argument_group('scorer')
+    sco.add_argument('--scorer', type=Path, default=None,
+                     help='optional framewise scorer run folder or .pth; its scores are written '
+                          'as metadata, predictions are unchanged.')
+    sco.add_argument('--scorer-checkpoint', default=None,
+                     help='checkpoint filename when --scorer is a run folder; default: latest.')
+    sco.add_argument('--allow-pose-scorer-mismatch', action='store_true', default=False,
+                     help='allow different pose/scorer video-encoder weights (two encodes).')
+
+    spd = ap.add_argument_group('speed and memory (output-neutral)')
+    spd.add_argument('--precision', choices=('fp32', 'bf16', 'fp16'), default='bf16',
+                     help='autocast dtype for the scene encode only.')
+    spd.add_argument('--camera-batch', action=argparse.BooleanOptionalAction, default=True,
+                     help='encode all cameras in one scene-encoder call per window.')
+    spd.add_argument('--kpt-chunk', type=int, default=0,
+                     help='decode keypoints in slices of this size (lower peak memory); 0 = one '
+                          'pass.')
+    spd.add_argument('--prefetch-windows', type=int, default=1,
+                     help='decode this many windows ahead (bit-exact at any value).')
+    spd.add_argument('--max-ram', type=float, default=None, metavar='GB',
+                     help='host RAM this run may spend on pixel buffers. Default: the smallest '
+                          'of the cgroup limit, LSF limit, MemAvailable and MemTotal. Every '
+                          'knob it sizes is output-neutral. TAILCYCLENET_MAX_RAM_GB does the same '
+                          'without a CLI.')
+
+    adv = ap.add_argument_group('advanced and diagnostic')
+    adv.add_argument('--carry-source', default='triangulate', choices=CARRY_SOURCES,
+                     help='3D --anchor carry: seed the next window with the anchor-free '
+                          'estimate (default) or the reported prediction (`pred`, the old arm).')
+    adv.add_argument('--gridresid-offset', default=None, choices=('query', 'triangulated'),
+                     help='state the 3D residual anchor of a run folder written before '
+                          '`[model].gridresid_offset` existed. Not a sweep knob.')
+    adv.add_argument('--window-predictions', action='store_true',
+                     help='write every window\'s pre-gate predictions to '
+                          '<out>/window_predictions.pq')
+    adv.add_argument('--det-trace', type=Path, default=None,
+                     help='write per-frame/camera detector decode-stage counts as JSON.')
+    adv.add_argument('--overlap-trace', type=Path, default=None,
+                     help='write the output-neutral overlap test-retest capture as an npz.')
+    adv.add_argument('--oracle-corrupt', default=None,
+                     help='ONLY with --anchor labels: break the oracle prior on purpose to '
+                          'measure the echo coefficient: off:<x> (whole-body offset, crop '
+                          'widths), stale:<n>, other, near, swap:<n>.')
+    adv.add_argument('--dump-session', type=Path, default=None,
+                     help='DEBUG: write the constructed --videos session (pixels symlinked) and '
+                          'carry on.')
     _add_removed_flags(ap)
     return ap
 

@@ -1,13 +1,6 @@
-"""`scripts/render.py` on a real prediction session, from both `--data` and `--videos` runs.
-
-Companion to `tests/test_infer.py`'s `test_render_writes_every_predicted_frame` /
-`test_a_3d_render_uses_the_per_frame_camera_on_a_moving_rig`, which pin `render_group` itself
-against `run_group`'s raw output. This file pins the CLI end to end: a prediction SESSION
-directory in, an mp4 out, with no `--data` required and an npz refused outright.
-"""
+"""`scripts/render.py` end to end: a prediction SESSION directory in, an mp4 out; npz refused."""
 from __future__ import annotations
 
-import importlib.util
 import sys
 from fractions import Fraction
 from pathlib import Path
@@ -19,39 +12,22 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import tailcyclenet.render as render_cli
 from tailcyclenet.format import Registry, load_dataset
+from tailcyclenet.infer import cli as infer_cli
 from tailcyclenet.model import build_model
 from test_model import SMALL
 
 
-def _load_script(name):
-    """`scripts/{name}.py` as a module, without running main() -- test_infer.py's `cli` pattern."""
-    spec = importlib.util.spec_from_file_location(
-        f'tcn_{name}', Path(__file__).resolve().parent.parent / 'scripts' / f'{name}.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-@pytest.fixture(scope='module')
-def infer_cli():
-    return _load_script('infer')
-
-
-@pytest.fixture(scope='module')
-def render_cli():
-    return _load_script('render')
-
-
-def _run_and_predict(tmp_path, cf, mode='2d', moving=False):
-    """A tiny checkpoint + a prediction session, through the real CLI both ways."""
+def _run_and_predict(tmp_path, cf, mode='2d'):
+    """A tiny checkpoint + a source root."""
     from tailcyclenet.checkpoints import save_checkpoint, save_run_meta
 
     root = tmp_path / 'ds'
     if mode == '2d':
         cf._session_2d(root / 'test' / 's')
     else:
-        cf._session_3d(root / 'test' / 's', moving=moving)
+        cf._session_3d(root / 'test' / 's')
     ds = load_dataset(root)
     registry = Registry.build([ds])
     model = build_model(SMALL, n_keypoints=registry.n_keypoints)
@@ -64,11 +40,9 @@ def _run_and_predict(tmp_path, cf, mode='2d', moving=False):
     return root, run
 
 
-def _predict(infer_cli, monkeypatch, run, data, out, split='test', extra=()):
-    monkeypatch.setattr(sys, 'argv', ['infer.py', '--run', str(run), '--data', str(data),
-                                      '--split', split, '--anchor', 'none', '--device', 'cpu',
-                                      '--overlap', '2', '--out', str(out), *extra])
-    infer_cli.main()
+def _predict(run, data, out, split='test'):
+    infer_cli.main(['--run', str(run), '--data', str(data), '--split', split, '--anchor', 'none',
+                    '--device', 'cpu', '--overlap', '2', '--out', str(out)])
     return out
 
 
@@ -84,43 +58,54 @@ def _decode(path):
     return out
 
 
-# 1-2. rendering a real prediction session, in both modes, with no --data
-
-
-def test_a_2d_prediction_renders_with_no_data(infer_cli, render_cli, monkeypatch, tmp_path):
-    """The prediction says where its own pixels are -- no --data, no --split, nothing restated."""
+@pytest.fixture(scope='module')
+def pred_2d(tmp_path_factory):
+    """One 2D prediction session shared by every CLI test that only reads it."""
     import conftest as cf
 
-    root, run = _run_and_predict(tmp_path, cf, mode='2d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
+    tmp = tmp_path_factory.mktemp('pred2d')
+    root, run = _run_and_predict(tmp, cf, mode='2d')
+    return _predict(run, root / 'test' / 's', tmp / 'pred')
 
-    clips = tmp_path / 'clips'
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out), '--out', str(clips)])
-    render_cli.main()
 
-    mp4s = sorted(clips.glob('*.mp4'))
+def _render_one(args, out):
+    render_cli.main(args + ['--out', str(out)])
+    mp4s = sorted(out.glob('*.mp4'))
     assert len(mp4s) == 1, f'expected one mp4, got {[p.name for p in mp4s]}'
-    frames = _decode(mp4s[0])
-    assert len(frames) == 4, f'wrote {len(frames)} frames for a 4-frame prediction'
+    return _decode(mp4s[0])
 
 
-def test_a_3d_prediction_renders_with_no_data(infer_cli, render_cli, monkeypatch, tmp_path):
-    """The projection path (pred.shape[-1] == 3) run from a session DIRECTORY, not from
-    `run_group`'s raw array -- `test_render_writes_every_predicted_frame` skips 3D entirely."""
+def test_a_2d_prediction_renders_with_no_data(pred_2d, tmp_path):
+    """The prediction says where its own pixels are -- no --data, no --split; a range only narrows."""
+    assert len(_render_one(['--pred', str(pred_2d)], tmp_path / 'all')) == 4
+    ranged = _render_one(['--pred', str(pred_2d), '--start-frame', '1', '--end-frame', '3'],
+                         tmp_path / 'ranged')
+    assert len(ranged) == 2
+
+
+def test_a_3d_prediction_renders_with_no_data(tmp_path):
+    """The projection path (pred.shape[-1] == 3) run from a session directory."""
     import conftest as cf
 
     root, run = _run_and_predict(tmp_path, cf, mode='3d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
-
-    clips = tmp_path / 'clips'
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out), '--out', str(clips)])
-    render_cli.main()
-
-    mp4s = sorted(clips.glob('*.mp4'))
-    assert len(mp4s) == 1
-    frames = _decode(mp4s[0])
+    out = _predict(run, root / 'test' / 's', tmp_path / 'pred')
+    frames = _render_one(['--pred', str(out)], tmp_path / 'clips')
     assert len(frames) == 4
     assert any(f.std() > 0 for f in frames), 'a blank render would pass the frame-count check too'
+
+
+def test_render_refusals_on_a_real_prediction(pred_2d, tmp_path):
+    """Bad --cams/--groups/range, and a --data whose session id is not the recorded source."""
+    import conftest as cf
+
+    cf._session_2d(tmp_path / 'ds2' / 'test' / 'other')
+    for extra, match in [
+            (['--cams', 'bogus'], 'neither a camera name nor a valid index'),
+            (['--groups', 'nope'], 'none of the requested groups'),
+            (['--start-frame', '10', '--end-frame', '12'], 'requested range is empty'),
+            (['--data', str(tmp_path / 'ds2' / 'test' / 'other')], 'was made from session')]:
+        with pytest.raises(SystemExit, match=match):
+            render_cli.main(['--pred', str(pred_2d), '--out', str(tmp_path / 'c'), *extra])
 
 
 def test_static_skew_projection_uses_full_intrinsics(tmp_path):
@@ -147,14 +132,9 @@ def test_static_skew_projection_uses_full_intrinsics(tmp_path):
     np.testing.assert_allclose(got, expected, rtol=0.0, atol=2e-4)
 
 
-# 3. byte identity: a directory session and a --videos session reading the SAME file
-
-
 def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
-    """THE ONE TEST THAT MAKES `--videos` REAL FOR RENDERING: two `Session` objects -- one
-    hand-authored on disk, one built by `adopt.build` from raw footage -- pointed at the literal
-    SAME mp4, drawing the same prediction array, must decode to identical frames.
-    """
+    """A directory session and an `adopt.build` (--videos) session over the SAME mp4 render
+    byte-identical frames."""
     import conftest as cf
     from tailcyclenet import adopt
     from tailcyclenet import format as fmt
@@ -202,12 +182,8 @@ def test_videos_and_directory_sessions_render_the_identical_pixels(tmp_path):
         np.testing.assert_array_equal(a, b)
 
 
-# 4. the frame range
-
-
 def test_render_group_frames_selects_the_requested_source_indices(monkeypatch, tmp_path):
-    """A unit test on `frames=`: it decides which SOURCE frames are decoded and what the caption
-    reads, independent of the CLI."""
+    """`frames=` decides which SOURCE frames are decoded."""
     import conftest as cf
     from tailcyclenet import format as fmt
     from tailcyclenet.render import render_group
@@ -243,39 +219,17 @@ def test_render_group_frames_selects_the_requested_source_indices(monkeypatch, t
     assert len(_decode(out)) == 3
 
 
-def test_the_cli_start_end_frame_narrows_the_predicted_range(infer_cli, render_cli, monkeypatch,
-                                                              tmp_path):
-    """A `--start-frame`/`--end-frame` run renders EXACTLY the frames it predicted with no flags
-    at all, and an explicit flag can only narrow that further -- never extend into NaN frames."""
-    import conftest as cf
-
-    root, run = _run_and_predict(tmp_path, cf, mode='2d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
-
-    clips = tmp_path / 'clips'
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out), '--out', str(clips),
-                                      '--start-frame', '1', '--end-frame', '3'])
-    render_cli.main()
-    mp4s = sorted(clips.glob('*.mp4'))
-    assert len(mp4s) == 1
-    assert len(_decode(mp4s[0])) == 2, '--start-frame 1 --end-frame 3 must draw exactly 2 frames'
-
-
-# 6. the refusals
-
-
-def test_an_npz_is_refused_by_name(render_cli, monkeypatch, tmp_path):
-    npz = tmp_path / 'old.npz'
-    npz.write_bytes(b'')
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(npz), '--out', str(tmp_path)])
-    with pytest.raises(SystemExit, match='carries no provenance'):
-        render_cli.main()
+@pytest.mark.parametrize('pred, match', [('old.npz', 'carries no provenance'),
+                                         ('nope', 'no session.toml')])
+def test_a_non_session_pred_is_refused_by_name(tmp_path, pred, match):
+    if pred.endswith('.npz'):
+        (tmp_path / pred).write_bytes(b'')
+    with pytest.raises(SystemExit, match=match):
+        render_cli.main(['--pred', str(tmp_path / pred), '--out', str(tmp_path)])
 
 
 def test_eval_still_scores_an_npz(tmp_path):
-    """THE OTHER HALF OF THE SAME CLAIM: render dropped npz, scoring did not. This pins that
-    `eval.py`'s caller still works on an npz after render.py stopped accepting one.
-    """
+    """Render dropped npz; scoring (`load_predictions`) did not."""
     from tailcyclenet.infer.predictions import load_predictions
 
     npz = tmp_path / 'p.npz'
@@ -287,80 +241,16 @@ def test_eval_still_scores_an_npz(tmp_path):
     assert meta['anchor'] == 'none'
 
 
-def test_not_a_directory_is_refused(render_cli, monkeypatch, tmp_path):
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(tmp_path / 'nope'),
-                                      '--out', str(tmp_path)])
-    with pytest.raises(SystemExit, match='no session.toml'):
-        render_cli.main()
-
-
-def test_an_unknown_camera_token_is_refused(infer_cli, render_cli, monkeypatch, tmp_path):
-    import conftest as cf
-
-    root, run = _run_and_predict(tmp_path, cf, mode='2d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out), '--out', str(tmp_path / 'c'),
-                                      '--cams', 'bogus'])
-    with pytest.raises(SystemExit, match='neither a camera name nor a valid index'):
-        render_cli.main()
-
-
-def test_an_unknown_group_is_refused(infer_cli, render_cli, monkeypatch, tmp_path):
-    import conftest as cf
-
-    root, run = _run_and_predict(tmp_path, cf, mode='2d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out), '--out', str(tmp_path / 'c'),
-                                      '--groups', 'nope'])
-    with pytest.raises(SystemExit, match='none of the requested groups'):
-        render_cli.main()
-
-
-def test_an_empty_range_is_refused(infer_cli, render_cli, monkeypatch, tmp_path):
-    import conftest as cf
-
-    root, run = _run_and_predict(tmp_path, cf, mode='2d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out), '--out', str(tmp_path / 'c'),
-                                      '--start-frame', '10', '--end-frame', '12'])
-    with pytest.raises(SystemExit, match='requested range is empty'):
-        render_cli.main()
-
-
-def test_a_prediction_over_the_wrong_root_is_refused(infer_cli, render_cli, monkeypatch, tmp_path):
-    """The recorded `source_session_id` must match the resolved session's own -- whether reached
-    through provenance or through an explicit `--data` override.
-    """
-    import conftest as cf
-
-    root, run = _run_and_predict(tmp_path, cf, mode='2d')
-    out = _predict(infer_cli, monkeypatch, run, root / 'test' / 's', tmp_path / 'pred')
-
-    other_root = tmp_path / 'ds2'
-    cf._session_2d(other_root / 'test' / 'other')
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(out),
-                                      '--data', str(other_root / 'test' / 'other'),
-                                      '--out', str(tmp_path / 'clips')])
-    with pytest.raises(SystemExit, match='was made from session'):
-        render_cli.main()
-
-
-def test_a_prediction_with_no_provenance_needs_data(render_cli, monkeypatch, tmp_path):
-    """A hand-written or pre-provenance prediction has neither source_session nor source_videos
-    -- refused naming both, pointed at --data.
-    """
+def test_a_prediction_with_no_provenance_needs_data(tmp_path):
+    """No source_session nor source_videos -- refused naming both, pointed at --data."""
     import toml
 
     pred = tmp_path / 'pred'
     pred.mkdir()
     (pred / 'session.toml').write_text(toml.dumps(
         {'mode': '2d', 'units': 'px', 'labels': 'tracked', 'names': ['nose'], 'provenance': {}}))
-    monkeypatch.setattr(sys, 'argv', ['render.py', '--pred', str(pred), '--out', str(tmp_path / 'c')])
     with pytest.raises(SystemExit, match='neither source_session nor source_videos'):
-        render_cli.main()
-
-
-# 8. load_predictions(groups=...)
+        render_cli.main(['--pred', str(pred), '--out', str(tmp_path / 'c')])
 
 
 def _two_group_session(path):
@@ -412,23 +302,16 @@ def test_load_predictions_groups_filter_matches_the_unfiltered_read(tmp_path):
     assert np.isfinite(full['sess/g000']['pred']).any()
 
 
-def test_a_pre_marker_prediction_session_is_refused_by_name(tmp_path):
-    """Its reader was deleted; reading it must name why rather than misread the tables."""
-    from tailcyclenet.infer.predictions import load_predictions
-
-    _two_group_session(tmp_path / 'sess')
-    with pytest.raises(ValueError, match='pre-marker prediction session'):
-        load_predictions(tmp_path / 'sess')
-
-
-def test_an_independent_windows_session_is_refused_by_name(tmp_path):
-    """`--independent-windows` output carries window-local ids; its reader was deleted."""
+def test_deleted_prediction_readers_are_refused_by_name(tmp_path):
+    """Pre-marker and --independent-windows sessions lost their readers; reading names why."""
     import toml
 
     from tailcyclenet.infer.predictions import load_predictions
 
     path = tmp_path / 'sess'
     _two_group_session(path)
+    with pytest.raises(ValueError, match='pre-marker prediction session'):
+        load_predictions(path)
     _as_marked_prediction(path)
     doc = toml.loads((path / 'session.toml').read_text())
     doc['provenance']['independent_windows'] = True

@@ -12,7 +12,7 @@ import pytest
 import torch
 from pathlib import Path
 
-from tailcyclenet.crop import crop_box_for_points
+from tailcyclenet.data.crop import crop_box_for_points
 from tailcyclenet.detector import (BoxDataset, ChunkShuffle, CohortSampler, YOLOXNano, assign,
                                    assign_tal, box_collate, box_iou, ciou_loss, decode,
                                    detector_loss, giou_loss, letterbox, paired_iou, split_batch,

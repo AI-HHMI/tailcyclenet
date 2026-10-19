@@ -11,7 +11,7 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-from . import crop as cropmod
+from .data import crop as cropmod
 
 BOX_PROMPT_MIN_DIM = 32
 BOX_PROMPT_PAD = 10

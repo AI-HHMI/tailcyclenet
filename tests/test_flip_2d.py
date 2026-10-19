@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from tailcyclenet import format as fmt
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, _flip_2d
+from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.data.camera import flip_2d
 from tailcyclenet.scorer.triplet import _make_anchor
 
 
@@ -64,7 +65,7 @@ def test_flip_affine_matches_pixels_and_projection(mode):
     points = torch.tensor([[[0.4, 0.2, 4.0]]])
     source = project_points_torch([cam], points)[0]
     perm = torch.arange(1)
-    flipped_cam, flipped, rotation = _flip_2d(cam, source, mode, None, perm)
+    flipped_cam, flipped, rotation = flip_2d(cam, source, mode, None, perm)
     expected = source.clone()
     if mode == 'horizontal':
         expected[..., 0] = W - 1 - expected[..., 0]

@@ -412,7 +412,7 @@ def test_carry_needs_overlap_but_self_does_not(rat):
 def test_inflate_box_widens_about_its_centre():
     """THE ONE INFLATION RULE, shared with the wide-crop training regime
     (`dataset.LoaderConfig.crop_inflate`) so the model trains and deploys on the same geometry."""
-    from tailcyclenet.crop import inflate_box as _inflate_box
+    from tailcyclenet.data.crop import inflate_box as _inflate_box
     box = torch.tensor([100, 100, 140, 160], dtype=torch.int32)     # 40x60, centre (120,130)
     size = torch.tensor([1000, 1000])
     out = _inflate_box(box, size, 1.5)
@@ -526,7 +526,7 @@ def test_box_prompt_column_order_matches_use():
                              [cgroup[1], cgroup[0]], 'cpu')
     assert got.shape == (1, T, 2, 4)
 
-    from tailcyclenet import crop as cropmod
+    from tailcyclenet.data import crop as cropmod
 
     def expected(src_ci, origin, scale, size):
         db = torch.as_tensor(boxes_stc[0, 0, src_ci], dtype=torch.float32)
@@ -899,7 +899,7 @@ def test_3d_carry_feeds_back_the_anchor_free_estimate(mv16):
 def test_instances_boxes_get_the_training_crop_rule_at_inference(rat):
     """`box_source='instances'` boxes go through the loader's crop rule (pad 0); detector boxes keep
     the raw union (re-squaring is measured worse)."""
-    from tailcyclenet import crop as cropmod
+    from tailcyclenet.data import crop as cropmod
 
     model, sess, registry, name = rat
     w, h = sess.rig.size(sess.cam_names[0])

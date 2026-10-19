@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from tailcyclenet import crop as cropmod
+from tailcyclenet.data import crop as cropmod
 from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
 from tailcyclenet.format import MISSING, UNLABELED, VISIBLE, Registry, load_dataset
 
@@ -87,7 +87,7 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
 
     from tailcyclenet import format as fmt
     from tailcyclenet.data.pixels import crop_affine
-    from tailcyclenet.dataset import resize_camera
+    from tailcyclenet.data.camera import resize_camera
     from tracktail.datasets.tracktail_dataset import rotate_camera_image_plane_3d
     from tracktail.model.cube import project_points_torch
 
@@ -125,12 +125,12 @@ def test_the_fused_warp_agrees_with_the_camera(angle):
 
 @pytest.mark.parametrize('angle', [-128.0])
 def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
-    """`_rotate_2d` loses no source pixel (unlike the library's inscribed crop) and its 2x3 matches
+    """`rotate_2d` loses no source pixel (unlike the library's inscribed crop) and its 2x3 matches
     the camera it returns."""
     from aniposelib.cameras import CameraGroup
 
     from tailcyclenet import format as fmt
-    from tailcyclenet.dataset import _rotate_2d
+    from tailcyclenet.data.camera import rotate_2d
 
     W, H = 4696, 2048
     rig = fmt.Rig(CameraGroup([fmt.nominal_camera('cam0', (W, H))]),
@@ -139,7 +139,7 @@ def test_the_2d_rotation_keeps_every_pixel_and_agrees_with_its_camera(angle):
     # the four frame corners plus its centre -- if any of these leaves the canvas, an animal can
     corners = torch.tensor([[[0.0, 0.0], [W, 0.0], [W, H], [0.0, H], [W / 2, H / 2]]])
 
-    out, moved, (M, size) = _rotate_2d(cam, corners, angle)
+    out, moved, (M, size) = rotate_2d(cam, corners, angle)
 
     assert tuple(out['size'].tolist()) == tuple(size)
     # TIGHT: the rotated frame's bounding box is the canvas EXACTLY -- nothing lost off an edge and
@@ -936,7 +936,7 @@ def test_an_extreme_aspect_crop_never_resizes_to_a_zero_side():
     """
     import cv2
 
-    from tailcyclenet.dataset import resize_camera
+    from tailcyclenet.data.camera import resize_camera
 
     cam = {'size': torch.tensor([2000, 1], dtype=torch.int32),
            'mat': torch.eye(3), 'offset': torch.zeros(2)}

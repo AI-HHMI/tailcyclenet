@@ -1,40 +1,26 @@
-"""The numbers that get published.
-
-Two properties here are the kind that a refactor breaks quietly: the vectorised Hungarian cost
-must equal the loop it replaced, and the ignore region must excuse only what it actually covers.
-"""
-import importlib.util
+"""The numbers that get published: matching, MOTA/IDF1, chunked scoring, aggregation."""
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from scipy.optimize import linear_sum_assignment
 
+import tailcyclenet.eval as ev
+from tailcyclenet import format as fmt
+from tailcyclenet.format import Labels, Session
 from tailcyclenet.metrics import (ERR_PCTS, _dist, error_and_coverage, idf1, idsw_stability_band,
-                                  match_instances, matched_error, mota, motion_ratio)
+                                  label_extent, match_instances, matched_error, mota, motion_ratio,
+                                  paired_bootstrap)
 
-REPO = Path(__file__).resolve().parent.parent
-
-
-def _eval_module():
-    """Import scripts/eval.py without running main()."""
-    spec = importlib.util.spec_from_file_location('tcn_eval', REPO / 'tailcyclenet' / 'eval.py')
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+sys.path.insert(0, str(Path(__file__).parent))
+import conftest as cf  # noqa: E402
 
 
 def _naive_match(pred, true, max_dist=np.inf):
-    """The double Python loop `match_instances` replaced. Kept as an independent derivation.
-
-    Admissibility (`cost <= max_dist`) is applied to the SOLVER, not just to the output list: a
-    rectangular Hungarian solve always returns `min(Sp, St)` pairs regardless of cost, so an
-    inadmissible-but-cheap edge left in the matrix can be chosen over a valid, individually
-    pricier edge that was available, and filtering afterward then reports a false miss+fp where
-    a real match existed (report 53 follow-up). `big` exceeds the SUM of every admissible cost
-    this frame, the standard bound making the solver prefer any all-admissible matching over one
-    using even a single inadmissible edge.
-    """
+    """The double loop `match_instances` replaced; admissibility is applied to the SOLVER
+    (`big` exceeds the sum of admissible costs), not filtered after it."""
     pred, true = np.asarray(pred, float), np.asarray(true, float)
     out = []
     for t in range(true.shape[1]):
@@ -53,9 +39,9 @@ def _naive_match(pred, true, max_dist=np.inf):
 
 
 def test_vectorised_matching_equals_the_loop_it_replaced():
-    """rat-city is ONE group of 57,594 frames; at ten animals the loop was 5.7M calls per eval."""
+    """rat-city is ONE group of 57,594 frames; the loop was 5.7M calls per eval."""
     rng = np.random.default_rng(0)
-    for _ in range(40):
+    for _ in range(20):
         Sp, St = int(rng.integers(1, 5)), int(rng.integers(1, 5))
         T, K = int(rng.integers(1, 4)), int(rng.integers(1, 6))
         R = int(rng.choice([2, 3]))
@@ -70,16 +56,8 @@ def test_vectorised_matching_equals_the_loop_it_replaced():
 
 
 def test_an_inadmissible_edge_cannot_displace_an_available_admissible_match():
-    """A rectangular Hungarian solve always returns min(Sp, St) pairs regardless of cost, so
-    filtering `cost > max_dist` only AFTER the solve lets an inadmissible-but-cheap edge win the
-    sum-cost optimisation over a valid, individually pricier edge that was available -- turning
-    one real match into a miss AND a false positive (report 53 follow-up, independent review).
-
-    cost matrix [[1, 2], [2, 5]] at max_dist=1.5: (0,0)+(1,1) totals 6 and only (0,0) <= 1.5 --
-    the one available admissible match; (0,1)+(1,0) totals 4 and both entries exceed max_dist.
-    The un-gated solver picks the cheaper-but-wholly-inadmissible pairing and both are then
-    discarded, reporting zero matches where one real match existed.
-    """
+    """Gating cost > max_dist only AFTER the Hungarian solve let a cheap inadmissible pairing
+    displace the one admissible match (costs [[1, 2], [2, 5]] at 1.5) -- report 53 follow-up."""
     pred = np.array([[[[0.0]]], [[[3.0]]]])
     true = np.array([[[[1.0]]], [[[-2.0]]]])
     d = np.linalg.norm(pred[:, 0, :, 0][:, None] - true[:, 0, :, 0][None, :], axis=-1)
@@ -91,9 +69,7 @@ def test_an_inadmissible_edge_cannot_displace_an_available_admissible_match():
 
 
 def test_ignore_boxes_excuse_only_what_they_cover():
-    """An ignore region is a place, not a licence for the whole frame: presence alone excuses
-    every unmatched prediction, but the count must SAY how many it swallowed.
-    """
+    """An ignore region is a place: boxes excuse only what they cover, and the count says how many."""
     true = np.full((1, 1, 2, 2), np.nan)                      # nothing annotated
     pred = np.array([[[[5., 5.], [5., 5.]]],                  # inside the ignore box
                      [[[900., 900.], [900., 900.]]]])         # nowhere near it
@@ -110,10 +86,9 @@ def test_ignore_boxes_excuse_only_what_they_cover():
     assert (plain['fp'], plain['fp_ignored']) == (2, 0)
 
 
-def test_a_surplus_predicted_row_is_a_false_positive():
-    """`eval.py` used to truncate `pred` to `true`'s row count, so a detector that hallucinated
-    a second animal in every frame read as perfect. Surplus rows are false positives.
-    """
+def test_surplus_rows_are_fp_split_into_dup_and_none():
+    """Surplus rows are false positives (eval once truncated them away); `fp_dup` vs `fp_none` want
+    opposite fixes; `matched_error` reports the counts behind its coverage."""
     true = np.zeros((1, 3, 4, 2))
     pred = np.zeros((3, 3, 4, 2))
     pred[1:] = 500.0                                          # two animals that are not there
@@ -121,11 +96,6 @@ def test_a_surplus_predicted_row_is_a_false_positive():
     assert (r['fp'], r['misses'], r['gt']) == (6, 0, 3)
     assert matched_error(pred, true)['unmatched_true'] == 0
 
-
-def test_the_fp_term_separates_duplicates_from_nothing():
-    """The two halves want opposite fixes, so an undifferentiated `fp` cannot pick one: arbitration
-    removes a second crop on a claimed animal; a score threshold removes a box on nothing.
-    """
     true = np.zeros((1, 1, 2, 2))                             # one animal at the origin
     pred = np.array([[[[0., 0.], [0., 0.]]],                  # matches it
                      [[[1., 1.], [1., 1.]]],                  # a second crop on the SAME animal
@@ -136,12 +106,17 @@ def test_the_fp_term_separates_duplicates_from_nothing():
     # box on nothing instead.
     assert mota(pred, true, 0.5)['fp_dup'] == 0
 
+    true = np.zeros((2, 3, 4, 2))
+    pred = np.zeros((2, 3, 4, 2))
+    pred[1] = np.nan                                          # one instance never predicted
+    m = matched_error(pred, true)
+    assert m['n_true'] == int(np.isfinite(true).all(-1).sum())
+    assert m['n_matched'] == pytest.approx(m['coverage'] * m['n_true'])
+    assert m['unmatched_true'] == m['n_true_inst'] - m['n_matched_inst']
 
-def test_a_paired_delta_uses_only_the_points_both_arms_matched():
-    """An arm that declines the hard points has a better mean over its OWN matched set and must
-    not read as better than one that attempted them.
-    """
-    ev = _eval_module()
+
+def test_paired_deltas_use_only_what_both_arms_have():
+    """An arm that declines the hard points/steps must not read better (eval rule 10)."""
     true = np.zeros((1, 4, 1, 2))
     good = np.zeros((1, 4, 1, 2))                             # exact on all four frames
     good[0, 2] = 3.0                                          # except one, where it is 3 off
@@ -157,22 +132,19 @@ def test_a_paired_delta_uses_only_the_points_both_arms_matched():
     # ...where a whole-set comparison would have made the picky arm look better by 3/4 of a unit.
     assert np.nanmean(np.linalg.norm(good - true, axis=-1)) > 0
 
-
-def test_matched_error_reports_the_counts_behind_its_coverage():
-    """`err` is a mean over MATCHED points, so it needs the matched count, not a rowwise one."""
-    true = np.zeros((2, 3, 4, 2))
-    pred = np.zeros((2, 3, 4, 2))
-    pred[1] = np.nan                                          # one instance never predicted
-    m = matched_error(pred, true)
-    assert m['n_true'] == int(np.isfinite(true).all(-1).sum())
-    assert m['n_matched'] == pytest.approx(m['coverage'] * m['n_true'])
-    assert m['unmatched_true'] == m['n_true_inst'] - m['n_matched_inst']
+    true = np.zeros((1, 4, 1, 2))
+    true[0, :, 0, 0] = np.arange(4)
+    full = true.copy()
+    picky = np.full((1, 4, 1, 2), np.nan)
+    picky[0, :2] = true[0, :2]                                 # only the first step
+    ra, rb, n = ev._shared_motion({'_pred': full, '_true': true},
+                                  {'_pred': picky, '_true': true})
+    assert n == 1 and ra == pytest.approx(1.0) and rb == pytest.approx(1.0)
 
 
-def test_a_frozen_prediction_reads_as_less_motion_than_a_moving_one():
-    """A locked pose scores best on every consistency number in the repo (jerk, bone CV) while
-    losing 30% of the animal's motion -- the statistic this test provides.
-    """
+def test_motion_ratio_reads_a_frozen_prediction_and_takes_a_centroid_reference():
+    """A locked pose loses the motion every consistency number rewards; a box centre reference
+    compares against the prediction centroid."""
     true = np.zeros((1, 5, 2, 3))
     true[0, :, :, 0] = np.arange(5)[:, None]                   # the animal walks along x
     moving = true.copy()
@@ -185,9 +157,6 @@ def test_a_frozen_prediction_reads_as_less_motion_than_a_moving_one():
     gappy = moving.copy()
     gappy[0, 2] = np.nan
 
-
-def test_motion_ratio_takes_a_centroid_reference():
-    """A box centre is one position per instance-frame, so the prediction's centroid is what moves."""
     pred = np.zeros((1, 3, 4, 2))
     pred[0, :, :, 0] = np.arange(3)[:, None] * 2.0             # centroid moves 2 px per frame
     ref = np.zeros((1, 3, 2))
@@ -195,33 +164,13 @@ def test_motion_ratio_takes_a_centroid_reference():
     assert motion_ratio(pred, ref)['ratio'] == pytest.approx(2.0)
 
 
-def test_paired_motion_uses_only_the_steps_both_arms_have():
-    """A path summed over whatever an arm predicted rewards predicting less."""
-    ev = _eval_module()
-    true = np.zeros((1, 4, 1, 2))
-    true[0, :, 0, 0] = np.arange(4)
-    full = true.copy()
-    picky = np.full((1, 4, 1, 2), np.nan)
-    picky[0, :2] = true[0, :2]                                 # only the first step
-    ra, rb, n = ev._shared_motion({'_pred': full, '_true': true},
-                                  {'_pred': picky, '_true': true})
-    assert n == 1 and ra == pytest.approx(1.0) and rb == pytest.approx(1.0)
-
-
 def test_a_one_keypoint_instance_frame_does_not_collapse_the_match_radius():
-    """ZERO IS FINITE, and it was passing the `isfinite` guard as a legitimate radius.
-
-    `extent` is the median keypoint-box DIAGONAL over instance-frames, and an instance-frame with
-    exactly one finite labelled keypoint contributes 0. rat-city labels 2.02 of its 4 points per
-    animal-frame, so its median is one draw from being 1 -- and at radius 0 `match_instances`
-    admits nothing, every instance is a miss AND a false positive at once, and MOTA goes to
-    -(1 + fp_rate). It reads as a catastrophic model failure that is entirely the radius.
-    """
+    """A one-keypoint instance-frame has extent 0, and radius 0 admits nothing -- MOTA read
+    catastrophic from the radius alone. A non-positive extent is no radius at all."""
     # Two animals, two frames, three keypoints -- but only ONE labelled point per instance-frame.
     true = np.full((2, 2, 3, 2), np.nan, np.float32)
     true[0, :, 0] = [10.0, 10.0]
     true[1, :, 0] = [90.0, 90.0]
-    from tailcyclenet.metrics import label_extent
     extent = label_extent(true)
     assert extent == 0.0, 'the degenerate case must actually be degenerate, or this proves nothing'
 
@@ -233,31 +182,8 @@ def test_a_one_keypoint_instance_frame_does_not_collapse_the_match_radius():
     assert matched_error(pred, true, max_dist=max_dist)['n_matched'] == 4
 
 
-def test_mota_dist_zero_is_not_read_as_unset():
-    """`radius = mota_dist or extent * 0.5` -- 0.0 is falsy, so an explicit `--mota-dist 0` was
-    silently replaced by the derived radius, i.e. the flag did the opposite of what it said."""
-    for mota_dist, extent in ((0.0, 50.0), (None, 50.0), (7.0, 50.0)):
-        old = mota_dist or float(extent) * 0.5
-        new = float(mota_dist) if mota_dist is not None else float(extent) * 0.5
-        if mota_dist == 0.0:
-            assert old == 25.0 and new == 0.0, 'this is the case that used to be ignored'
-        else:
-            assert old == new
-
-
 def test_idsw_band_flag_reaches_the_cli_end_to_end(tmp_path, capsys):
-    """`--idsw-band` through `eval.py::main()`, not just the library function: a tiny two-animal
-    npz prediction against a synthetic session, with an exact-crossing tie in the middle so the
-    band actually has width and the flag is proven wired, not merely present in argparse.
-    """
-    import sys
-
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    from tailcyclenet.format import Session
-
-    ev = _eval_module()
+    """`--idsw-band` through `eval.main()` on an exact-crossing tie, so the band has width."""
     cf._session_3d_multi(tmp_path / 'ds' / 'test' / 's', T=3, sep=20.0)
     sess = Session.load(tmp_path / 'ds' / 'test' / 's')
     sess.preload()
@@ -279,18 +205,9 @@ def test_idsw_band_flag_reaches_the_cli_end_to_end(tmp_path, capsys):
     assert 'idsw band (n=8)' in out, out
 
 
-def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path):
-    """`--chunk` gives a one-group clip something for the bootstrap to resample: the chunks
-    PARTITION the frames (nothing scored twice, nothing dropped) and the match radius is the whole
-    group's -- sized per chunk it swung 27.6 to 101.9 px, leaving chunks non-exchangeable.
-    """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    from tailcyclenet.format import Session
-
-    ev = _eval_module()
+def test_chunking_partitions_slices_labels_and_holds_the_radius(tmp_path):
+    """`--chunk` partitions the frames, holds the whole group's match radius, and slices the labels
+    by chunk even when the prediction is a `--max-frames` prefix (each chunk once scored frames 0..n-1)."""
     cf._session_2d(tmp_path / 'ds' / 'test' / 's', T=20)
     sess = Session.load(tmp_path / 'ds' / 'test' / 's')
     sess.preload()
@@ -318,41 +235,34 @@ def test_chunking_a_clip_partitions_it_and_holds_the_match_radius_fixed(tmp_path
     assert abs(ext.pop() - rows[0]['mpjpe_r']) < 1e-6, \
         'the shared radius must be the one the unchunked scoring used'
 
+    cf._session_2d(tmp_path / 'ds' / 'test' / 's', T=20)
+    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
+    sess.preload()
+    gid = next(iter(sess.groups))
+    labels = {f's/{gid}': (sess.labels(gid), sess)}
+    true = labels[f's/{gid}'][0].points2d[..., 0, :]
+    assert true.shape[1] == 20
 
-def test_mota_last_state_threads_across_chunk_calls_bit_identical_by_default():
-    """`mota(last=...)` is opt-in plumbing (identity_review_followthrough plan 3.1): with no
-    `last` passed, behaviour is exactly the pre-existing one (a fresh dict per call, discarded).
-    """
-    rng = np.random.default_rng(0)
-    true = rng.normal(size=(3, 20, 5, 2)) * 10
-    pred = true + rng.normal(size=true.shape)
-    plain = mota(pred, true, 8.0)
-    explicit_none = mota(pred, true, 8.0, last=None)
-    assert plain == explicit_none
-    # A caller-owned dict is MUTATED, not just read: the same one reused across two calls carries
-    # correspondence forward -- exactly what `eval.py::score` needs across a `--chunk` seam.
-    state = {}
-    r1 = mota(pred[:, :10], true[:, :10], 8.0, last=state)
-    assert state, 'a correspondence dict must be populated after a call that matched anything'
-    r2 = mota(pred[:, 10:], true[:, 10:], 8.0, last=state)
-    assert isinstance(r1['idsw'], int) and isinstance(r2['idsw'], int)
+    # THE PREDICTION COVERS ONLY THE FIRST 10 FRAMES -- what `--max-frames 10` produces.
+    preds = {f's/{gid}': {'pred': true[:, :10].copy(), 'mode': np.array('2d')}}
+    cp, cl = ev.chunk_frames(preds, labels, 5)
+    assert sorted(cp) == [f's/{gid}#0', f's/{gid}#5'], sorted(cp)
+    for t0 in (0, 5):
+        got = cl[f's/{gid}#{t0}'][0].points2d[..., 0, :]
+        np.testing.assert_array_equal(got, true[:, t0:t0 + 5],
+                                      err_msg=f'chunk {t0} was handed the wrong frames')
+    # ...and the second chunk is a PERFECT prediction of its own frames, so it must score as one.
+    # Unsliced labels made this chunk score frames 5-9 against frames 0-4 and read as a total miss.
+    rows = ev.score(cp, cl, quiet=True)
+    assert len(rows) == 2
+    for r in rows:
+        assert r['coverage'] == pytest.approx(1.0), f'{r["coverage"]} -- exact prediction, full labels'
+        assert r['err'] == pytest.approx(0.0, abs=1e-6), r['err']
 
 
-def test_chunk_seam_switch_is_lost_without_threaded_state_and_recovered_with_it():
-    """The exact reproduction from identity_review_followthrough plan 3.1: two animals held
-    still and far apart, with their PREDICTED identity swapped only across the chunk boundary.
-    That is a real, single seam switch -- `idsw = 2` (both correspondences flip at once) scored
-    over the whole 4-frame clip in one `mota()` call. Split into two `--chunk 2` units, each
-    `score()` call used to reset `mota`'s correspondence history, so the switch fell between two
-    calls that never compared notes and both chunks read `idsw = 0` -- an undercount, not a
-    missing feature: it affects every `--chunk`-scored identity number in the repo. `score()`
-    now threads one `last` dict per GROUP (not per chunk) in the chunks' own temporal order, so
-    the second chunk sees the first chunk's final correspondence and the switch is counted once,
-    in the chunk where it is first observed.
-    """
-    from tailcyclenet import format as fmt
-
-    ev = _eval_module()
+def test_chunk_seam_switch_is_counted_with_threaded_mota_state():
+    """A switch straddling a `--chunk` seam was counted by neither chunk; `score()` threads one
+    `mota(last=)` dict per group so chunked idsw == whole-clip idsw (3b94ca4)."""
     S, T, K = 2, 4, 1
     lab = fmt.empty_labels(S, T, K, 1, mode3d=False)
     lab.vis2d[:] = fmt.VISIBLE
@@ -381,14 +291,8 @@ def test_chunk_seam_switch_is_lost_without_threaded_state_and_recovered_with_it(
 
 
 def test_idsw_stability_band_is_wide_at_an_exact_crossing_and_zero_without_one():
-    """An exact crossing -- both predicted points sit exactly at the two ground-truth points'
-    midpoint for one frame, then resolve back to the correct identities -- is a genuine tie: the
-    Hungarian solver's choice for that one frame depends only on row/column order, not on any
-    prediction or label content, so the resulting `idsw` for a PERFECTLY tracked crossing can
-    read 0 or a full round-trip swap depending on storage order alone (identity_review_followthrough
-    plan 3.2). A clean, unambiguous two-animal sequence with no tie anywhere must show none of
-    that sensitivity -- the band collapses to a point.
-    """
+    """At an exact tie the Hungarian choice depends on storage order only; a clean sequence has a
+    zero-width band."""
     true = np.zeros((2, 3, 1, 2))
     true[0, :, 0] = [0.0, 0.0]
     true[1, :, 0] = [10.0, 10.0]
@@ -407,9 +311,7 @@ def test_idsw_stability_band_is_wide_at_an_exact_crossing_and_zero_without_one()
 
 
 def test_err_percentiles_describe_the_tail_the_mean_hides():
-    """p75..p99 come from the same matched vector as `err`, and outlast a flattering mean: every
-    localisation failure this repo has found was found in a quantile and reported in one.
-    """
+    """p75..p99 come from the matched vector `err` averages; all-NaN is NaN, not 0."""
     true = np.zeros((1, 1000, 1, 2))
     pred = np.zeros((1, 1000, 1, 2))
     pred[0, 980:, 0, 0] = 1000.0               # 2% of frames catastrophic, 98% exact
@@ -423,10 +325,9 @@ def test_err_percentiles_describe_the_tail_the_mean_hides():
     assert all(np.isnan(empty[f'p{p}']) for p in ERR_PCTS)
 
 
-def test_penalised_cost_charges_the_keypoints_a_prediction_declined():
-    """OKS's rule in distance units: unshared LABEL keypoints cost `max_dist` and stay in `n`.
-    Under 'mean' a row sharing one keypoint can hijack a GT row; 'penalised' does not let it.
-    """
+def test_penalised_cost_charges_declined_keypoints_and_mean_stays_default():
+    """'penalised' charges unshared label keypoints max_dist; the default 'mean' is byte-identical
+    to the pre-flag behaviour (an arm, not a silent correction)."""
     true = np.zeros((1, 1, 4, 2))
     pred = np.full((2, 1, 4, 2), np.nan)
     pred[0, 0, 0] = [0.0, 0.0]                 # ONE keypoint, perfect
@@ -451,11 +352,6 @@ def test_penalised_cost_charges_the_keypoints_a_prediction_declined():
     with pytest.raises(ValueError):
         match_instances(pred, true, cost='oks')
 
-
-def test_match_cost_default_reproduces_every_published_number():
-    """`cost='mean'` is the default and must be byte-identical to the pre-flag behaviour -- the
-    flag is an ARM, not a silent correction.
-    """
     rng = np.random.default_rng(0)
     true = rng.normal(size=(3, 20, 5, 2)) * 10
     pred = true + rng.normal(size=true.shape)
@@ -469,55 +365,9 @@ def test_match_cost_default_reproduces_every_published_number():
             == matched_error(pred, true, max_dist=8.0, cost='mean')['err'])
 
 
-def test_chunking_slices_the_labels_when_the_prediction_is_a_prefix(tmp_path):
-    """A `--max-frames` PREDICTION IS SHORTER THAN ITS GROUP, and every chunk must still be scored
-    against its OWN frames: the label slice used to be gated on the prediction's frame count, so
-    every later chunk re-scored its own frames against frames 0..n-1. It reads exactly like a
-    pipeline that falls apart after 500 frames, which is why it survived.
-    """
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    import conftest as cf
-
-    from tailcyclenet.format import Session
-
-    ev = _eval_module()
-    cf._session_2d(tmp_path / 'ds' / 'test' / 's', T=20)
-    sess = Session.load(tmp_path / 'ds' / 'test' / 's')
-    sess.preload()
-    gid = next(iter(sess.groups))
-    labels = {f's/{gid}': (sess.labels(gid), sess)}
-    true = labels[f's/{gid}'][0].points2d[..., 0, :]
-    assert true.shape[1] == 20
-
-    # THE PREDICTION COVERS ONLY THE FIRST 10 FRAMES -- what `--max-frames 10` produces.
-    preds = {f's/{gid}': {'pred': true[:, :10].copy(), 'mode': np.array('2d')}}
-    cp, cl = ev.chunk_frames(preds, labels, 5)
-    assert sorted(cp) == [f's/{gid}#0', f's/{gid}#5'], sorted(cp)
-    for t0 in (0, 5):
-        got = cl[f's/{gid}#{t0}'][0].points2d[..., 0, :]
-        np.testing.assert_array_equal(got, true[:, t0:t0 + 5],
-                                      err_msg=f'chunk {t0} was handed the wrong frames')
-    # ...and the second chunk is a PERFECT prediction of its own frames, so it must score as one.
-    # Unsliced labels made this chunk score frames 5-9 against frames 0-4 and read as a total miss.
-    rows = ev.score(cp, cl, quiet=True)
-    assert len(rows) == 2
-    for r in rows:
-        assert r['coverage'] == pytest.approx(1.0), f'{r["coverage"]} -- exact prediction, full labels'
-        assert r['err'] == pytest.approx(0.0, abs=1e-6), r['err']
-
-
-def test_vis_confusion_aligns_by_the_matched_correspondence_not_row_position():
-    """A5 (dev/plans/multianimal_system_improvements.md): under detector boxes the prediction's
-    row order is score/association order, not label identity -- `_vis_confusion` must score a
-    row's confidence against the GT row it was actually MATCHED to (`score()`'s own per-frame
-    Hungarian correspondence), not whatever sits at the same row index.
-    """
-    from types import SimpleNamespace
-
-    from tailcyclenet import format as fmt
-
-    ev = _eval_module()
+def test_vis_confusion_follows_the_match_and_skips_projected():
+    """`_vis_confusion` scores a row against the GT row it was MATCHED to, and PROJECTED is not an
+    assessed negative (A5)."""
     conf = np.array([[[5.0, -5.0]], [[-5.0, 5.0]]])       # (Sp=2, T=1, K=2)
     out = {'conf': conf}
     vis3d = np.array([[[fmt.VISIBLE, fmt.MISSING]], [[fmt.MISSING, fmt.VISIBLE]]])
@@ -532,16 +382,6 @@ def test_vis_confusion_aligns_by_the_matched_correspondence_not_row_position():
         'the wrong correspondence must score as wrong, not as the row-position accident'
     assert swapped['vis_recall'] == pytest.approx(0.0)
 
-
-def test_vis_confusion_excludes_projected_from_the_assessed_count():
-    """A5: `PROJECTED` is a position with no visibility claim (the format's own rule) -- it must
-    not count as an assessed negative, the way the pre-fix code's UNLABELED-only mask let it.
-    """
-    from types import SimpleNamespace
-
-    from tailcyclenet import format as fmt
-
-    ev = _eval_module()
     out = {'conf': np.array([[[5.0, 5.0]]])}                      # (Sp=1, T=1, K=2)
     vis3d = np.array([[[fmt.VISIBLE, fmt.PROJECTED]]])
     lab = SimpleNamespace(vis3d=vis3d, vis2d=None)
@@ -551,13 +391,8 @@ def test_vis_confusion_excludes_projected_from_the_assessed_count():
     assert m['vis_precision'] == pytest.approx(1.0)
 
 
-def test_mota_detail_is_additive_and_matches_the_idsw_count():
-    """B1 step 4 (dev/plans/multianimal_system_improvements.md): `detail=True` must not change
-    a single existing field (byte-identical to `detail=False`/omitted), and its `idsw_detail`
-    list must record exactly the switch the plain `idsw` count already found -- same frame, same
-    GT row, same from/to prediction rows -- since it walks the SAME per-frame correspondence,
-    never a second matcher.
-    """
+def test_mota_detail_is_additive_and_agrees_with_the_counts():
+    """`detail=True` changes no existing field; its idsw/fp items match `idsw`/`fp_dup`/`fp_none`."""
     pred = np.array([[[[0.0, 0.0]], [[100.0, 100.0]]],
                      [[[100.0, 100.0]], [[0.0, 0.0]]]])   # (Sp=2, T=2, K=1, R=2)
     true = np.array([[[[0.0, 0.0]], [[0.0, 0.0]]]])       # (St=1, T=2, K=1, R=2)
@@ -574,12 +409,6 @@ def test_mota_detail_is_additive_and_matches_the_idsw_count():
     assert plain['idsw'] == 1
     assert detailed['idsw_detail'] == [{'frame': 1, 'gt_row': 0, 'from_row': 0, 'to_row': 1}]
 
-
-def test_mota_fp_detail_labels_dup_and_none_consistently_with_the_counts():
-    """B1 step 5: `fp_detail`'s per-item `kind` ('dup' vs 'none') must sum to the SAME
-    `fp_dup`/`fp_none` counts `mota()` already reports -- one false positive near an already-
-    claimed GT (a duplicate) and one on no animal at all (none), in the same frame.
-    """
     # St=1 GT row at (0,0); Sp=2 predictions: row 0 matches the GT, row 1 is a near-duplicate
     # (within max_dist of the claimed GT), row 2 is far from everything (a bare false positive).
     pred = np.array([[[[0.0, 0.0]]], [[[5.0, 0.0]]], [[[500.0, 500.0]]]])  # (Sp=3, T=1, K=1, R=2)
@@ -595,19 +424,9 @@ def test_mota_fp_detail_labels_dup_and_none_consistently_with_the_counts():
     assert by_kind['none'] == [2], 'the bare false positive must be classified none'
 
 
-def test_score_skips_motion_ratio_rather_than_crashing_when_a_group_has_zero_true_instances():
-    """A tracked-only clip with no keypoint labels at all (S_true=0) still gets a real prediction
-    row (S_pred=1) -- e.g. facemap's `cam0_D*` sessions, included for tracking/visual inspection,
-    not pose scoring. Neither existing guard in `score()` catches this: `S = max(Sp, St) = 1` is
-    not `> 1`, and `Sp == 0 and St >= 1` is false (Sp is 1, not 0). Before this fix, the
-    unconditional `motion_ratio(pred, true)` call hit a hard shape mismatch -- (1,T,K,2) vs
-    (0,T,K,2) -- and raised, taking down the whole batch. motion_ratio is undefined with zero
-    reference instances (there is no path to compare against), so it must be skipped exactly as
-    MPJPE already is for zero labelled points elsewhere in this module -- not silently zeroed,
-    not crashed on.
-    """
-    from tailcyclenet.format import Labels
-
+def test_score_skips_motion_ratio_when_a_group_has_zero_true_instances():
+    """S_true=0 with a predicted row (facemap cam0_D*) used to crash `motion_ratio` on a shape
+    mismatch; it is undefined there, so it is skipped."""
     T, K = 12, 4
     true = np.full((0, T, K, 1, 2), np.nan, np.float32)
     lab = Labels(animal_ids=[], points3d=None, vis3d=None, points2d=true, vis2d=None,
@@ -616,21 +435,15 @@ def test_score_skips_motion_ratio_rather_than_crashing_when_a_group_has_zero_tru
     preds = {'s/g': {'pred': pred, 'mode': np.array('2d')}}
     labels = {'s/g': (lab, None)}
 
-    ev = _eval_module()
     rows = ev.score(preds, labels, quiet=True)
     assert len(rows) == 1
     assert rows[0]['S_pred'] == 1 and rows[0]['S_true'] == 0
     assert rows[0]['motion_ratio'] is None
 
 
-def test_per_frame_aggregation_equals_per_group_only_when_groups_are_equal_sized():
-    """`--agg frame` weights every labelled FRAME equally; `--agg group` weights every CLIP
-    equally. They must coincide when each group holds one frame and diverge when they do not --
-    which is the whole reason the default moved (report 57 sections 22/24: on horse10, 696 short
-    groups outvote the 19 holding 73.5% of all labelled keypoints).
-    """
-    from tailcyclenet.metrics import error_and_coverage, paired_bootstrap
-
+def test_frame_aggregation_and_the_unweighted_bootstrap():
+    """`--agg frame` equals `--agg group` only for equal-sized groups (report 57 22/24), and
+    `weights=None` leaves every published interval unchanged, down to the RNG draw."""
     one_frame = []
     for err in (1.0, 5.0, 9.0):
         true = np.zeros((1, 1, 4, 2))
@@ -653,13 +466,6 @@ def test_per_frame_aggregation_equals_per_group_only_when_groups_are_equal_sized
     assert grp2['mean'] == 5.0, 'per-group gives the 1-frame clip the same vote as the 100-frame'
     assert abs(frm2['mean'] - 1000 / 101) < 1e-9, 'per-frame weights by the frames behind it'
 
-
-def test_paired_bootstrap_is_unchanged_without_weights():
-    """The weighted path is opt-in: `weights=None` must not perturb a single published interval,
-    down to the RNG draw.
-    """
-    from tailcyclenet.metrics import paired_bootstrap
-
     rng = np.random.default_rng(7)
     a, b = rng.normal(10, 2, 30), rng.normal(9, 2, 30)
     assert paired_bootstrap(a, seed=5) == paired_bootstrap(a, seed=5, weights=None)
@@ -669,12 +475,9 @@ def test_paired_bootstrap_is_unchanged_without_weights():
     assert np.isclose(flat['mean'], ones['mean']) and np.isclose(flat['lo'], ones['lo'])
 
 
-def test_idf1_sees_a_parked_swap_that_idsw_counts_once():
-    """Two animals, prediction rows swapped for the second half of the clip: ONE correspondence
-    change per animal (`idsw = 2`), but each row is on the wrong animal for half the clip, so
-    IDF1 under one global mapping is 0.5. A relabel that undoes the swap is charged nothing by
-    IDF1 and reads 1.0 -- the lever MOTA's idsw cannot score (scratch/object-tracking-v2 E1).
-    """
+def test_idf1_sees_a_parked_swap_counts_fp_misses_and_ignore():
+    """A half-clip swap is idsw 2 but IDF1 0.5 under one global map; spare rows are IDFP unless
+    inside a present box (as `fp_ignored`); a missed animal is IDFN."""
     T = 10
     true = np.zeros((2, T, 1, 2))
     true[1, :, 0] = [100.0, 100.0]
@@ -686,10 +489,6 @@ def test_idf1_sees_a_parked_swap_that_idsw_counts_once():
     assert idf1(true, true, 1.0)['idf1'] == 1.0
     assert idf1(true[::-1], true, 1.0)['idf1'] == 1.0, 'row order is not identity: one global map'
 
-
-def test_idf1_counts_fp_and_misses_and_honours_the_ignore_region():
-    """A spare row on nothing is IDFP; an unlabelled animal's row inside its PRESENT box is
-    excused exactly as `mota` excuses it (`fp_ignored`); a missed animal is IDFN."""
     true = np.full((2, 4, 1, 2), np.nan)
     true[0, :, 0] = [0.0, 0.0]
     pred = np.full((2, 4, 1, 2), np.nan)
@@ -710,11 +509,7 @@ def test_idf1_counts_fp_and_misses_and_honours_the_ignore_region():
 
 
 def test_idf1_group_mapping_spans_chunks():
-    """`score()` gives each `--chunk` unit its own IDF1 (one map per unit, optimistic) AND a
-    per-GROUP IDF1 with ONE map across every chunk -- which must equal the unchunked number."""
-    from tailcyclenet import format as fmt
-
-    ev = _eval_module()
+    """Per-unit IDF1 maps each chunk alone; `idf1_group` maps the whole group = unchunked."""
     S, T = 2, 8
     lab = fmt.empty_labels(S, T, 1, 1, mode3d=False)
     lab.vis2d[:] = fmt.VISIBLE

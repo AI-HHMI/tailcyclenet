@@ -138,7 +138,7 @@ def stamped_config(config: dict, kind: str) -> dict:
 def full_training_state(ck: dict) -> bool:
     """Whether `ck` is a full training checkpoint -- raw weights, optimizer state and the
     iteration -- rather than a packaged pose checkpoint (weights only). `save_checkpoint` and
-    the reference repo's train loop write the former; `package_checkpoint.py` writes the latter.
+    the reference repo's train loop write the former; `tailcyclenet.packaging` writes the latter.
     Only a full training checkpoint can be resumed from; anything else is a warm start.
     """
     return (isinstance(ck, dict)

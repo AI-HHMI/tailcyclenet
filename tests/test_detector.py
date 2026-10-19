@@ -2130,7 +2130,7 @@ def test_gap_levers_build_the_head_and_neck_they_name():
 
 
 def test_detector_packaging_preserves_config(tmp_path):
-    from scripts.package_checkpoint import package_detector
+    from tailcyclenet.packaging import package_detector
     from tailcyclenet.detector import load_detector
 
     run = tmp_path / 'run'

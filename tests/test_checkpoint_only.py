@@ -156,7 +156,7 @@ def test_an_old_checkpoint_falls_back_to_its_run_folder(tmp_path, kind):
 
 @pytest.mark.parametrize('kind', ['pose', 'scorer'])
 def test_a_packaged_checkpoint_loads_alone_like_its_run(tmp_path, kind, no_download):
-    from scripts.package_checkpoint import package_pose
+    from tailcyclenet.packaging import package_pose
     run, _, _ = _train_run(tmp_path, kind)
     packaged = package_pose(run, tmp_path / f'{kind}.pth', kind=kind)
     ckpt = torch.load(packaged, map_location='cpu', weights_only=False)
@@ -173,7 +173,7 @@ def test_a_packaged_checkpoint_loads_alone_like_its_run(tmp_path, kind, no_downl
 
 def test_a_checkpoint_of_the_wrong_kind_is_refused(tmp_path):
     """A scorer IS a pose encoder plus heads, so loading one as the other must raise, not build."""
-    from scripts.package_checkpoint import package_pose
+    from tailcyclenet.packaging import package_pose
     _, pose, _ = _train_run(tmp_path, 'pose')
     scorer_run, scorer, _ = _train_run(tmp_path, 'scorer')
     with pytest.raises(ValueError, match="'pose' checkpoint, not a 'scorer'"):

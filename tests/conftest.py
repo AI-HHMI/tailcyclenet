@@ -189,6 +189,36 @@ def _small_video_encoder():
     vjepa2._make_vjepa2_1_encoder = shipped
 
 
+def pytest_configure(config):
+    """Compute the git provenance ONCE, in the controller, before xdist spawns its workers (they
+    inherit the environment). `git status` takes the index lock, so every checkpoint save running
+    it concurrently serialised the suite: 32 concurrent calls on this NFS tree take ~13 s."""
+    import json
+    import os
+
+    if 'TAILCYCLENET_TEST_PROVENANCE' not in os.environ:
+        from tailcyclenet import checkpoints
+        os.environ['TAILCYCLENET_TEST_PROVENANCE'] = json.dumps(checkpoints.provenance())
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _cached_provenance():
+    """Every `provenance()` call returns the controller's one answer (see `pytest_configure`)."""
+    import json
+    import os
+    from importlib import import_module
+
+    prov = json.loads(os.environ['TAILCYCLENET_TEST_PROVENANCE'])
+    sites = [import_module(m) for m in ('tailcyclenet.checkpoints', 'tailcyclenet.infer.driver',
+                                        'tailcyclenet.scorer.qc', 'tailcyclenet.train_detector')]
+    shipped = [s.provenance for s in sites]
+    for s in sites:
+        s.provenance = lambda: dict(prov)
+    yield
+    for s, f in zip(sites, shipped):
+        s.provenance = f
+
+
 @pytest.fixture(scope='session')
 def tracked_no_assessment_root(tmp_path_factory):
     root = tmp_path_factory.mktemp('tracked_dense')

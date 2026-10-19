@@ -454,10 +454,12 @@ def test_cutout_marks_covered_keypoints_not_visible():
     assert covered_nan, 'never covered the NaN keypoint -- the NaN -> 0 path went untested'
 
 
+@pytest.mark.slow
 @pytest.mark.timeout(60)
 def test_workers_do_not_share_a_random_stream(tiny_root):
     """Two workers must not produce identically-augmented items: torch reseeds per worker, but
-    imgaug's own global RNG is fork-copied and needs `worker_init`.
+    imgaug's own global RNG is fork-copied and needs `worker_init`. Workers come from a forkserver:
+    a plain fork inside a threaded xdist worker could deadlock (gotcha 10), which read as a flaky timeout.
     """
     from tailcyclenet.loader.sampling import worker_init
 
@@ -467,7 +469,7 @@ def test_workers_do_not_share_a_random_stream(tiny_root):
     ds = PoseDataset(tiny_root / 'mouselike', 'train', cfg)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=1, num_workers=2, collate_fn=pose_collate,
-        sampler=[0, 0, 0, 0], worker_init_fn=worker_init)
+        sampler=[0, 0, 0, 0], worker_init_fn=worker_init, multiprocessing_context='forkserver')
     got = [(float(b.cgroup[0]['ext'].sum()), b.views[0].float().mean().item())
            for b in loader]
     # items 0 and 1 land on different workers; equality would mean one shared stream

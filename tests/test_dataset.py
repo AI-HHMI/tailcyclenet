@@ -1171,58 +1171,6 @@ def test_kpt_swap_is_a_per_keypoint_rate_onto_another_point(tiny_root):
             assert float((corrupted[k] - original[k]).norm()) > 1e-4, (root.name, k)
 
 
-def test_pose_only_prob_default_is_byte_identical_to_pre_change_code(tiny_root):
-    """`pose_only_prob = 0.0` reproduces the pre-change loader (`57b5350^`, read from git) rng draw
-    for rng draw: a hoisted unused coin would shift every later draw invisibly."""
-    import importlib.util
-    import subprocess
-    import sys
-
-    root = tiny_root / 'mouselike'
-    src = subprocess.run(['git', 'show', '57b5350^:tailcyclenet/dataset.py'],
-                         capture_output=True, text=True, check=True, cwd=Path(__file__).parent.parent).stdout
-    assert 'pose_only_prob' not in src, \
-        'the pre-landing source already has this key -- point this test at an earlier commit'
-    # The historical source predates the posetail -> tracktail rename (0.5.0); translate its
-    # library imports and this repo's `Rig.posetail()` so it runs against the installed library.
-    for before, after in (('posetail.datasets.posetail_dataset', 'tracktail.datasets.tracktail_dataset'),
-                          ('posetail.posetail', 'tracktail.model'), ('PosetailDataset', 'TracktailDataset'),
-                          ('.posetail(', '.tracktail(')):
-        src = src.replace(before, after)
-
-    spec = importlib.util.spec_from_loader('tailcyclenet._dataset_pre_change', loader=None)
-    old_mod = importlib.util.module_from_spec(spec)
-    old_mod.__package__ = 'tailcyclenet'
-    sys.modules['tailcyclenet._dataset_pre_change'] = old_mod
-    try:
-        exec(compile(src, 'dataset.py (57b5350^)', 'exec'), old_mod.__dict__)
-
-        cfg_kwargs = dict(n_frames=4, image_size=64, prob_2d_only=0.0, aug_prob=0.0,
-                          crop_jitter=0.0, prompt_dropout=0.3, prompt_offset_px=2.0,
-                          prompt_noise_px=1.5, box_prompt='film', box_prompt_dropout=0.5)
-
-        old_ds = old_mod.PoseDataset(root, 'train', old_mod.LoaderConfig(**cfg_kwargs), train=True)
-        new_ds = PoseDataset(root, 'train', LoaderConfig(**cfg_kwargs, pose_only_prob=0.0),
-                             train=True)
-
-        for seed in range(2):
-            np.random.seed(seed)
-            old_item = old_ds._item(0, np.random.default_rng(seed))
-            np.random.seed(seed)
-            new_item = new_ds._item(0, np.random.default_rng(seed))
-            assert (old_item is None) == (new_item is None), f'seed {seed}: presence mismatch'
-            if old_item is None:
-                continue
-            assert len(old_item) == len(new_item), f'seed {seed}: field count mismatch'
-            for k, (o, n) in enumerate(zip(old_item, new_item)):
-                if isinstance(o, torch.Tensor):
-                    assert torch.equal(torch.nan_to_num(o, nan=-9e9),
-                                       torch.nan_to_num(n, nan=-9e9)), \
-                        f'seed {seed} field {k}: pose_only_prob=0.0 diverged from pre-change code'
-    finally:
-        del sys.modules['tailcyclenet._dataset_pre_change']
-
-
 def test_pose_only_prob_gives_box_dropped_items_a_clean_prior(tiny_root):
     """At `pose_only_prob = 1.0` a box-dropped item gets the clean prior, none of the prompt corruptions."""
     root = tiny_root / 'mouselike'

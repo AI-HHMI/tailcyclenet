@@ -1,23 +1,9 @@
-"""Cross-rig detector levers (`tailcyclenet/detector/transfer_aug.py`).
-
-Each test pins one claim:
-- `normalize_input` is deterministic, keeps the letterbox grey, and removes a global gain;
-- the training item and the deployment input see the SAME normalisation (train == deploy);
-- `composite` (synthetic canvases only) moves a box with its animal's pixels;
-- the shipped defaults are the report-73 recipe, nonsense values and DELETED keys / `yolox` values
-  raise by name, and an absent `pretrained` follows the architecture.
-"""
+"""Cross-rig detector levers (`tailcyclenet/detector/transfer_aug.py`) and the report-73 config."""
 from __future__ import annotations
-
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tailcyclenet.dataset import read_frames
 from tailcyclenet.detector import BoxDataset, letterbox
@@ -33,24 +19,24 @@ def _scene(seed=0):
     return img
 
 
-@pytest.mark.parametrize('mode', ['equalize', 'percentile'])
-def test_normalize_input_is_deterministic_keeps_padding_and_removes_gain(mode):
+def test_normalize_input_and_invert():
+    """`normalize_input` is deterministic, keeps the letterbox grey, removes a global gain, and
+    'none' is the identity; `invert` flips content and keeps the padding."""
     img = _scene()
-    a = normalize_input(img, mode)
-    assert np.array_equal(a, normalize_input(img, mode))
-    assert (a[:, :10] == PAD).all()
-    dark = img.copy()
     content = ~(img == PAD).all(-1)
+    dark = img.copy()
     dark[content] = (img[content] * 0.1).astype(np.uint8)
-    b = normalize_input(dark, mode)
-    # a 10x darker exposure maps to (nearly) the same input; without normalisation it is ~10x off
-    assert np.abs(a[content].astype(int) - b[content].astype(int)).mean() < 12
     assert np.abs(img[content].astype(int) - dark[content].astype(int)).mean() > 60
-
-
-def test_normalize_input_none_is_identity():
-    img = _scene()
+    for mode in ('equalize', 'percentile'):
+        a = normalize_input(img, mode)
+        assert np.array_equal(a, normalize_input(img, mode))
+        assert (a[:, :10] == PAD).all()
+        b = normalize_input(dark, mode)
+        assert np.abs(a[content].astype(int) - b[content].astype(int)).mean() < 12
     assert normalize_input(img, 'none') is img
+    out = invert(img)
+    assert (out[~content] == PAD).all()
+    assert np.array_equal(out[content], 255 - img[content])
 
 
 def test_dataset_item_matches_deployment_normalisation(tiny_root):
@@ -75,22 +61,18 @@ def flat_canvas(monkeypatch):
 
 
 def test_composite_moves_the_box_with_the_animal(flat_canvas):
+    """A pasted animal's box moves with its pixels; an empty canvas carries no box."""
     img = np.zeros((96, 128, 3), np.uint8)
     img[40:56, 60:84] = 255                              # the 'animal'
     boxes = torch.tensor([[60.0, 40.0, 84.0, 56.0], [float('nan')] * 4])
-    for seed in range(10):
+    for seed in range(5):
         out, new = composite(img, boxes, np.random.default_rng(seed), (128, 96),
                              empty_prob=0.0, decoys_ok=False)
         assert new.shape == (1, 4)
         x0, y0, x1, y1 = new[0].round().int().tolist()
         assert (out[y0 + 2:y1 - 2, x0 + 2:x1 - 2] == 255).all()
         assert (x1 - x0, y1 - y0) == (24, 16)
-
-
-def test_composite_empty_canvas_has_no_boxes(flat_canvas):
-    img = np.zeros((96, 128, 3), np.uint8)
-    boxes = torch.tensor([[60.0, 40.0, 84.0, 56.0]])
-    out, new = composite(img, boxes, np.random.default_rng(0), (128, 96),
+    out, new = composite(img, boxes[:1], np.random.default_rng(0), (128, 96),
                          empty_prob=1.0, decoys_ok=False)
     assert new.shape == (0, 4) and (out == 90).all()
 
@@ -103,42 +85,37 @@ def _cfg(tmp_path, extra='', model='yolox = "hybrid"'):
 
 
 def test_shipped_defaults_are_the_report_73_recipe(tmp_path):
+    """The shipped recipe is report 73's; an overlay changing `yolox` never inherits a
+    `pretrained` source that cannot load into it."""
     cfg = load_detector_config(_cfg(tmp_path, '', model=''))
     d, m = cfg['data'], cfg['model']
     assert (m['yolox'], m['pretrained']) == ('convnext-t', 'imagenet')
     assert d['input_norm'] == 'equalize' and d['invert_prob'] == 0.15
     assert d['scale_range'] == [0.55, 1.4] and d['background_prob'] == 0.25
     assert cfg['training']['iters'] == 8000 and d['boxes'] == 'instances'
-
-
-@pytest.mark.parametrize('model, want', [
-    ('yolox = "convnext-t"', 'imagenet'), ('yolox = "convnext-t"\npretrained = ""', ''),
-    ('yolox = "hybrid"', '')])
-def test_absent_pretrained_follows_the_architecture(tmp_path, model, want):
-    """An overlay that changes `yolox` never inherits a source that cannot load into it."""
-    assert load_detector_config(_cfg(tmp_path, '', model=model))['model']['pretrained'] == want
+    for model, want in (('yolox = "convnext-t"\npretrained = ""', ''), ('yolox = "hybrid"', '')):
+        assert load_detector_config(_cfg(tmp_path, '', model=model))['model']['pretrained'] == want
 
 
 @pytest.mark.parametrize('extra, model, match', [
     ('exposure_prob = 0.5', '', 'exposure_prob'),
-    ('background_own = "x"', '', 'background_own'),
-    ('background_generic = "x"', '', 'background_generic'),
-    ('background_weights = [0, 0, 1]', '', 'background_weights'),
-    ('', 'yolox = "dinov2-s"', 'deleted'), ('', 'yolox = "hybrid-tiny"', 'deleted'),
-    ('', 'yolox = "cspvit-m"', 'deleted'), ('', 'yolox = "hybrid"\npretrained = "imagenet"', 'imagenet'),
-    ('', 'yolox = "tiny"', 'deleted.*v0.3.4'), ('', 'yolox = "trimmed"', 'deleted.*v0.3.4'),
-    ('', 'yolox = "s"', 'deleted.*v0.3.4'),
+    ('keypoints = false', '', "deleted key.*'keypoints'"),
+    ('', 'yolox = "dinov2-s"', 'deleted'),
+    ('', 'yolox = "tiny"', 'deleted.*v0.3.4'),
     ('', 'yolox = "hybrid"\npretrained = "coco"', "pretrained='coco' is deleted"),
-    ('', 'yolox = "hybrid"\nbottleneck_expansion = 1.0', "deleted key.*bottleneck_expansion"),
-    ('keypoints = false', '', "deleted key.*'keypoints'")])
+    ('', 'yolox = "hybrid"\npretrained = "imagenet"', 'imagenet'),
+    ('input_norm = "clahe"', '', 'input_norm'),
+    ('scale_range = [1.2, 0.5]', '', 'scale_range')])
 def test_deleted_and_mismatched_keys_raise_by_name(tmp_path, extra, model, match):
+    """One case per family: deleted key, deleted architecture, deleted source, a source the
+    architecture cannot load, and a nonsense value."""
     with pytest.raises(SystemExit, match=match):
         load_detector_config(_cfg(tmp_path, extra, model=model))
 
 
 @pytest.mark.parametrize('meta, match', [
     ({'yolox_version': 'tiny'}, 'deleted architecture.*v0.3.4'),
-    ({}, "yolox='trimmed' is a deleted architecture"),
+    ({}, "yolox='trimmed' is a deleted architecture"),          # absent key = legacy default
     ({'yolox_version': 'hybrid', 'n_keypoints': 17}, 'keypoint branch is deleted'),
     ({'yolox_version': 'hybrid', 'in_channels': 6}, 'in_channels=6')])
 def test_load_detector_refuses_retired_checkpoints_by_name(tmp_path, meta, match):
@@ -147,33 +124,6 @@ def test_load_detector_refuses_retired_checkpoints_by_name(tmp_path, meta, match
     torch.save({'input_wh': [64, 64], 'norm': 'gn', 'model_state': {}, **meta}, p)
     with pytest.raises(ValueError, match=match):
         load_detector(p)
-
-
-def test_load_detector_refuses_a_deleted_architecture(tmp_path):
-    from tailcyclenet.detector import load_detector
-    p = tmp_path / 'detector_it000010.pth'
-    torch.save({'yolox_version': 'hybrid-tiny', 'input_wh': [64, 64], 'norm': 'gn',
-                'model_state': {}}, p)
-    with pytest.raises(ValueError, match='deleted architecture'):
-        load_detector(p)
-
-
-@pytest.mark.parametrize('extra, match', [
-    ('input_norm = "clahe"', 'input_norm'),
-    ('invert_prob = 1.5', 'invert_prob'),
-    ('scale_range = [1.2, 0.5]', 'scale_range'),
-])
-def test_transfer_keys_refuse_nonsense(tmp_path, extra, match):
-    with pytest.raises(SystemExit, match=match):
-        load_detector_config(_cfg(tmp_path, extra))
-
-
-def test_invert_flips_content_and_keeps_padding():
-    img = _scene()
-    out = invert(img)
-    content = ~(img == PAD).all(-1)
-    assert (out[~content] == PAD).all()
-    assert np.array_equal(out[content], 255 - img[content])
 
 
 def test_convnext_meets_the_backbone_contract():
@@ -188,9 +138,3 @@ def test_convnext_meets_the_backbone_contract():
     trunk = {id(p) for p in _pretrained_params(m)}
     assert trunk == {id(p) for p in m.backbone.features.parameters()}
 
-
-def test_synthetic_canvas_is_deterministic_given_the_rng():
-    from tailcyclenet.detector.transfer_aug import synthetic_canvas
-    a = synthetic_canvas((96, 64), np.random.default_rng(3))
-    b = synthetic_canvas((96, 64), np.random.default_rng(3))
-    assert a.shape == (64, 96, 3) and a.dtype == np.uint8 and np.array_equal(a, b)

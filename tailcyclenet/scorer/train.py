@@ -1060,8 +1060,7 @@ def run(config_path, data_path, out: Path, checkpoint: str | None, device,
             fresh = warm_start(model, ckpt_file, base_names=warm_start_names(base_reg))
     fresh = set(fresh) | {n for n, _ in model.named_parameters()
                           if n.startswith(('attn_pool.', 'score_', 'missing_point',
-                                           'precision_head', 'pointwise_', 'frame_pool',
-                                           'frame_loss.'))}
+                                           'precision_head', 'frame_loss.'))}
 
     opt_cfg = dist_utils.scale_optimizer_cfg(config['training']['optimizer'], world)
     if world > 1 and is0:

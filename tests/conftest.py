@@ -156,6 +156,39 @@ def _small_hybrid_detector(monkeypatch):
     monkeypatch.setattr(init, '__defaults__', (8, (1, 1), 8, 4.0, True))
 
 
+@pytest.fixture(scope='session', autouse=True)
+def _small_video_encoder():
+    """Build every test `base` VJEPA encoder at width 128 with random weights.
+
+    The shipped ViT-B is 86M params: each build read ~350 MB of pretrained weights from the hub
+    cache, and each saved pose checkpoint was 350-700 MB. Depth stays 12 (the hierarchical taps
+    are hard-coded for it) and head_dim stays 64 (the RoPE split). Session-scoped so that
+    module-scoped model fixtures are built small too.
+    """
+    from functools import partial
+
+    from torch import nn
+    from tracktail.model import vjepa2
+
+    shipped = vjepa2._make_vjepa2_1_encoder
+
+    def make(model_name='vjepa2_1_vit_large_384', checkpoint_key='target_encoder', img_size=384,
+             patch_size=16, tubelet_size=2, num_frames=64, pretrained=True, **kwargs):
+        if model_name != 'vjepa2_1_vit_base_384':
+            return shipped(model_name, checkpoint_key, img_size, patch_size, tubelet_size,
+                           num_frames, pretrained, **kwargs)
+        return vjepa2.VisionTransformer(
+            patch_size=patch_size, img_size=(img_size, img_size), num_frames=num_frames,
+            tubelet_size=tubelet_size, use_sdpa=True, use_silu=False, wide_silu=True,
+            uniform_power=False, use_rope=True, img_temporal_dim_size=1, interpolate_rope=True,
+            embed_dim=128, depth=12, num_heads=2, mlp_ratio=2, qkv_bias=True,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+
+    vjepa2._make_vjepa2_1_encoder = make
+    yield
+    vjepa2._make_vjepa2_1_encoder = shipped
+
+
 @pytest.fixture(scope='session')
 def tracked_no_assessment_root(tmp_path_factory):
     root = tmp_path_factory.mktemp('tracked_dense')

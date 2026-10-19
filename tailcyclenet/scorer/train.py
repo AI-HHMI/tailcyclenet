@@ -30,7 +30,9 @@ from .contract import (require_scorer_contract, require_scorer_granularity,
                        scorer_checkpoint_granularity, scorer_contract_mismatches)
 from .losses import build_scorer_loss
 from ..config import SCORER_CONFIG, load_config
-from ..dataset import SCORER_PLUMBING, LoaderConfig, PoseDataset, StepSampler, loader_config_from
+from ..loader.config import SCORER_PLUMBING, LoaderConfig, loader_config_from
+from ..loader.dataset import PoseDataset
+from ..loader.sampling import StepSampler
 from ..format import Registry
 from ..memory import peak_gb as _cpu_peak_gb
 from ..pose.checkpoint import warm_start

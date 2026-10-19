@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tailcyclenet.dataset import LoaderConfig, PoseDataset
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
 from tailcyclenet.pose.query_encoder import _tile_to_query_axis
 from tailcyclenet.scorer import build_scorer
 from tailcyclenet.scorer.model import FrameCameraPooling

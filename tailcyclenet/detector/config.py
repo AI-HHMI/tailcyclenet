@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..crop import BOX_SOURCES
+from ..data.crop import BOX_SOURCES
 from .boxes import NMS_CENTER_DIST_SELECT
 from .yolox import ARCHITECTURES, PRETRAINED_TRUNKS
 

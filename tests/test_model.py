@@ -11,7 +11,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, pose_collate
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
+from tailcyclenet.loader.sampling import pose_collate
 from tailcyclenet.pose.model import build_model
 from tailcyclenet.pose.unfreeze import _norms_in_range, apply_staged_unfreeze
 

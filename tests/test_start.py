@@ -12,7 +12,7 @@ from tailcyclenet.format import Registry
 from tailcyclenet.pose.optim import PoseDualOptimizer, build_muon
 from tailcyclenet.pose.train import (KNOWN_TRAINING_KEYS, check_training_keys, has_val_split,
                                 sampler_generator)
-from tailcyclenet.dataset import StepSampler
+from tailcyclenet.loader.sampling import StepSampler
 from tailcyclenet.pose.unfreeze import apply_staged_unfreeze
 
 from tests.test_optim import N_LAST, UNFREEZE_AT, Tiny, _cfg

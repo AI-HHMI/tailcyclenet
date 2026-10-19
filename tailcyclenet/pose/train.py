@@ -22,8 +22,9 @@ import torch
 from .. import distributed as dist_utils
 from ..checkpoints import save_checkpoint, save_run_meta
 from ..config import BASE_CONFIG, check_image_size, load_config
-from ..dataset import (PoseDataset, SpawnHandoff, StepSampler, loader_config_from,
-                       pose_collate, worker_init)
+from ..loader.config import loader_config_from
+from ..loader.dataset import PoseDataset
+from ..loader.sampling import SpawnHandoff, StepSampler, pose_collate, worker_init
 from ..runtime import gpu_peak_gb, init_wandb, launch, log, timed
 from .evaluate import (SMOOTHNESS_KEYS, TRAIN_METRIC_KEYS, TRAIN_METRIC_MODES, brief,
                        drain_smoothness, evaluate, metric_log_values, smoothness_log_values,

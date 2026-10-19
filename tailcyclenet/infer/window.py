@@ -19,9 +19,10 @@ import torch
 
 from tracktail.model.cube import project_points_torch
 
-from .. import crop as cropmod
+from ..data import crop as cropmod
 from .. import memory
-from ..dataset import crop_affine, resize_camera, prior_out_of_bounds
+from ..data.pixels import crop_affine
+from ..data.camera import resize_camera, prior_out_of_bounds
 from ..pose.prompt import self_prompt
 from ..format import Labels, Session
 from ..pose.model import share_scene

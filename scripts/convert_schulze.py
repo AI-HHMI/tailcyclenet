@@ -31,7 +31,7 @@ from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 from tailcyclenet import format as fmt
-from tailcyclenet.crop import crop_box_for_points
+from tailcyclenet.data.crop import crop_box_for_points
 
 SRC_ROOT = Path('/nrs/schulze/Users/Lisanne/Data/sleap_DC_tracking')
 DATASETS = {
@@ -687,7 +687,7 @@ def main() -> None:
     parser.add_argument('--box-pad', type=int, default=2,
                         help='keypoint-extent padding in pixels for derived instances boxes '
                              '(published Schulze roots carry pad 2 as of 2026-09-12; 20 is the '
-                             'pose crop rule\'s own pad (tailcyclenet/crop.py))')
+                             'pose crop rule\'s own pad (tailcyclenet/data/crop.py))')
     args = parser.parse_args()
     if args.box_pad < 0:
         parser.error('--box-pad must be non-negative')

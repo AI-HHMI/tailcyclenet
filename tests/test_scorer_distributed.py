@@ -6,7 +6,9 @@ import sys
 from tailcyclenet import distributed as dist_utils
 from tailcyclenet.scorer import dataset as scorer_dataset
 from tailcyclenet.scorer import train as scorer_train
-from tailcyclenet.dataset import LoaderConfig, PoseDataset, StepSampler, shard_sessions
+from tailcyclenet.loader.config import LoaderConfig
+from tailcyclenet.loader.dataset import PoseDataset
+from tailcyclenet.loader.sampling import StepSampler, shard_sessions
 
 
 class _D(torch.utils.data.Dataset):

@@ -226,10 +226,10 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
                          'metrics.json and the recorded config, and neither the config nor '
                          '--out supplied one.')
 
-    if data.get('boxes', 'instances') not in BOX_SOURCES:
+    if data['boxes'] not in BOX_SOURCES:
         raise SystemExit(f'[data].boxes must be one of {BOX_SOURCES}, got '
                          f'{data["boxes"]!r}.')
-    if model.get('yolox', 'tiny') not in YOLOX_CHOICES:
+    if model['yolox'] not in YOLOX_CHOICES:
         raise SystemExit(f'[model].yolox must be one of {YOLOX_CHOICES}, got '
                          f'{model["yolox"]!r}.')
 
@@ -238,69 +238,62 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
 
     for k in ('iters', 'batch_size', 'num_workers', 'seed', 'eval_every', 'eval_batches',
               'iou_aware_warmup', 'max_pos_per_gt'):
-        train[k] = int(train.get(k, {'iters': 20000, 'batch_size': 16, 'num_workers': 8,
-                                     'seed': 0, 'eval_every': 2000, 'eval_batches': 25,
-                                     'iou_aware_warmup': 2000, 'max_pos_per_gt': 0}[k]))
+        train[k] = int(train[k])
     train['save_every'] = int(train.get('save_every', train['eval_every']))
     if train['save_every'] < 1:
         raise SystemExit('[training].save_every must be >= 1.')
-    train['iou_aware_obj'] = bool(train.get('iou_aware_obj', False))
+    train['iou_aware_obj'] = bool(train['iou_aware_obj'])
     for k in ('min_crop_dim', 'min_box_px', 'max_input_px',
               'val_frames_per_group', 'tile_bg_per_frame'):
-        data[k] = int(data.get(k, {'min_crop_dim': 64, 'min_box_px': 32,
-                                   'max_input_px': 4 * 416 * 416,
-                                   'val_frames_per_group': 8,
-                                   'tile_bg_per_frame': 1}[k]))
+        data[k] = int(data[k])
     for k in ('lr', 'box_weight', 'weight_decay'):
-        train[k] = float(train.get(k, {'lr': 1e-3, 'box_weight': 5.0, 'weight_decay': 5e-4}[k]))
+        train[k] = float(train[k])
     if train['weight_decay'] < 0:
         raise SystemExit(f"[training].weight_decay must be >= 0, got {train['weight_decay']}.")
     train['nms_iou_thresh'] = float(train.get('nms_iou_thresh', 0.5))
     ncd = train.get('nms_center_dist_thresh', 0.5)
     train['nms_center_dist_thresh'] = None if ncd in (None, '', []) else float(ncd)
-    for k, default in (('rotate_deg', 180.0), ('tile_scale', 1.0)):
-        data[k] = float(data.get(k, default))
-    data['augment'] = bool(data.get('augment', True))
-    data['augment_strong'] = bool(data.get('augment_strong', True))
-    data['reduce'] = bool(data.get('reduce', False))
-    data['hflip'] = bool(data.get('hflip', True))
-    data['vflip'] = bool(data.get('vflip', True))
-    data['antialias'] = bool(data.get('antialias', True))
-    data['box_target'] = str(data.get('box_target', 'extent'))
+    for k in ('rotate_deg', 'tile_scale'):
+        data[k] = float(data[k])
+    data['augment'] = bool(data['augment'])
+    data['augment_strong'] = bool(data['augment_strong'])
+    data['reduce'] = bool(data['reduce'])
+    data['hflip'] = bool(data['hflip'])
+    data['vflip'] = bool(data['vflip'])
+    data['antialias'] = bool(data['antialias'])
+    data['box_target'] = str(data['box_target'])
     if data['box_target'] not in ('crop', 'extent'):
         raise SystemExit(f"[data].box_target must be 'crop' or 'extent', got "
                          f"{data['box_target']!r}.")
-    data['grayscale_prob'] = float(data.get('grayscale_prob', 0.2))
+    data['grayscale_prob'] = float(data['grayscale_prob'])
     if not 0.0 <= data['grayscale_prob'] <= 1.0:
         raise SystemExit(f"[data].grayscale_prob must be in [0, 1], got {data['grayscale_prob']}.")
-    data['input_norm'] = str(data.get('input_norm', 'none'))
+    data['input_norm'] = str(data['input_norm'])
     if data['input_norm'] not in ('none', 'equalize', 'percentile'):
         raise SystemExit(f"[data].input_norm must be 'none', 'equalize' or 'percentile', got "
                          f"{data['input_norm']!r}.")
-    data['background_prob'] = float(data.get('background_prob', 0.0))
-    data['invert_prob'] = float(data.get('invert_prob', 0.0))
+    data['background_prob'] = float(data['background_prob'])
+    data['invert_prob'] = float(data['invert_prob'])
     for k in ('background_prob', 'invert_prob'):
         if not 0.0 <= data[k] <= 1.0:
             raise SystemExit(f'[data].{k} must be in [0, 1], got {data[k]}.')
-    sr = data.get('scale_range', [0.8, 1.25])
+    sr = data['scale_range']
     if (not isinstance(sr, (list, tuple)) or len(sr) != 2
             or not 0 < float(sr[0]) <= float(sr[1])):
         raise SystemExit(f'[data].scale_range must be [lo, hi] with 0 < lo <= hi, got {sr!r}.')
     data['scale_range'] = [float(sr[0]), float(sr[1])]
-    af = data.get('annot_frac', None)
+    af = data['annot_frac']
     data['annot_frac'] = None if af in (None, '', []) else float(af)
     if data['annot_frac'] is not None and not 0.0 <= data['annot_frac'] <= 1.0:
         raise SystemExit(f"[data].annot_frac must be in [0, 1], got {data['annot_frac']}.")
     al = data.get('alpha', None)
     data['alpha'] = None if al in (None, '', []) else float(al)
-    data['boxes'] = str(data.get('boxes', 'instances'))
-    bal = data.get('balance_datasets', True)
+    data['boxes'] = str(data['boxes'])
+    bal = data['balance_datasets']
     if not isinstance(bal, bool):
         raise SystemExit(f'[data].balance_datasets must be true or false, got {bal!r}.')
     data['balance_datasets'] = bal
-    by = data.get('boxes_by_dataset', {})
-    if by is None:
-        by = {}
+    by = data['boxes_by_dataset']
     if not isinstance(by, dict):
         raise SystemExit('[data].boxes_by_dataset must be a table of dataset-root name -> box '
                          f'source, got {by!r}.')
@@ -309,7 +302,7 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
         raise SystemExit(f'[data].boxes_by_dataset: values must be one of {BOX_SOURCES}, got '
                          f'{bad}.')
     data['boxes_by_dataset'] = {str(k): str(v) for k, v in by.items()}
-    model['yolox'] = str(model.get('yolox', 'tiny'))
+    model['yolox'] = str(model['yolox'])
 
     pre = model.get('pretrained')
     model['pretrained'] = PRETRAINED_TRUNKS.get(model['yolox'], '') if pre is None else str(pre)
@@ -326,27 +319,27 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
             raise SystemExit(f"[model].yolox={model['yolox']!r} loads {want!r} weights; "
                              f"pretrained={model['pretrained']!r} does not match it.")
 
-    model['p2'] = bool(model.get('p2', False))
+    model['p2'] = bool(model['p2'])
     for key in ('input_wh', 'tile_wh'):
         why = input_size_error(model['yolox'], data[key])
         if why:
             raise SystemExit(f'[data].{key}: {why}')
 
-    train['assignment'] = str(train.get('assignment', 'tal'))
+    train['assignment'] = str(train['assignment'])
     if train['assignment'] not in ('center', 'tal'):
         raise SystemExit(f"[training].assignment must be 'center' or 'tal', got "
                          f"{train['assignment']!r}")
-    train['box_loss'] = str(train.get('box_loss', 'ciou'))
+    train['box_loss'] = str(train['box_loss'])
     if train['box_loss'] not in ('giou', 'ciou'):
         raise SystemExit(f"[training].box_loss must be 'giou' or 'ciou', got "
                          f"{train['box_loss']!r}")
-    train['tal_topk'] = int(train.get('tal_topk', 13))
+    train['tal_topk'] = int(train['tal_topk'])
     train['tal_alpha'] = float(train.get('tal_alpha', 1.0))
     train['tal_beta'] = float(train.get('tal_beta', 6.0))
     if train['tal_topk'] < 1 or train['tal_alpha'] < 0 or train['tal_beta'] < 0:
         raise SystemExit('[training].tal_topk must be >= 1 and tal_alpha/tal_beta must be >= 0')
 
-    train['optimizer'] = str(train.get('optimizer', 'adamw'))
+    train['optimizer'] = str(train['optimizer'])
     if train['optimizer'] not in ('adamw', 'muon'):
         raise SystemExit(f"[training].optimizer must be 'adamw' or 'muon', got "
                          f"{train['optimizer']!r}")
@@ -356,8 +349,8 @@ def load_detector_config(path, out=None, iters=None, device=None) -> dict:
     train['beta1'] = float(train.get('beta1', 0.9))
     train['beta2'] = float(train.get('beta2', 0.95))
 
-    train['shared_head'] = bool(train.get('shared_head', True))
-    train['fpn_upsample'] = str(train.get('fpn_upsample', 'nearest'))
+    train['shared_head'] = bool(train['shared_head'])
+    train['fpn_upsample'] = str(train['fpn_upsample'])
     if train['fpn_upsample'] not in ('nearest', 'bilinear'):
         raise SystemExit(f"[training].fpn_upsample must be 'nearest' or 'bilinear', got "
                          f"{train['fpn_upsample']!r}")

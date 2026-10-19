@@ -7,9 +7,8 @@
 #
 # Blocks: [data] (loader + regression target), [model] (architecture), [training] (schedule).
 # An UNKNOWN KEY IN ANY BLOCK RAISES -- a typo must not silently train at defaults.
-# The cosine schedule itself is not configurable; it never was a flag. `weight_decay` IS a config
-# key (added post-report-42); its code-level fallback for an absent key is 5e-4 (the old hardcoded
-# value, byte-identical), but THIS FILE's own shipped value is 0.01 -- see the key's own comment.
+# The cosine schedule itself is not configurable; it never was a flag. Every key stated here is
+# this file's value only -- `detector/config.py` carries no second default for it.
 
 [data]
 # A dataset root (train/, optionally val/ and test/) OR a folder whose children are dataset roots (one detector across all of them).
@@ -135,7 +134,7 @@ iou_aware_warmup = 2000
 # weight on the GIoU box term (formerly a hardcoded constant -- 5.0); DEFAULTS TO 15.0, the only lever to survive a full-length confirmation AND a same-recipe replicate.
 box_weight = 15.0
 
-# AdamW's DECOUPLED weight decay (p <- p*(1 - lr*wd)); SHIPPED 0.01 PER USER INSTRUCTION, NOT A CONFIRMED WIN (report 42: real but MIXED trade-off, one seed, never replicated); absent-key fallback stays 5e-4, byte-identical.
+# AdamW's DECOUPLED weight decay (p <- p*(1 - lr*wd)); SHIPPED 0.01 PER USER INSTRUCTION, NOT A CONFIRMED WIN (report 42: real but MIXED trade-off, one seed, never replicated); the pre-key hardcoded value was 5e-4.
 weight_decay = 0.01
 
 # the detector-architecture-sweep winning recipe (report 47), confirmed against a matched-iteration tiny+COCO control on all 6 training roots: separate obj/reg head towers (not shared), bilinear FPN upsampling, and a wider TAL positive-anchor pool. Ship together -- measured as one recipe, not swept independently past Wave 1.

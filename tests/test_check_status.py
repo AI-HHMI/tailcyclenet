@@ -1,25 +1,10 @@
 """`scripts/check_status.py`'s structural symlink-farm detection."""
-import importlib.util
-import sys
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parent.parent
-
-
-def _mod():
-    """Load the script as a module."""
-    spec = importlib.util.spec_from_file_location('tcn_check_status',
-                                                  REPO / 'scripts' / 'check_status.py')
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+from scripts import check_status as m
 
 
 def test_a_root_is_a_symlink_farm_only_if_every_split_is(tmp_path):
     """The decision used to be taken on the FIRST split with sessions: a symlinked `train/` hid
     a real `test/` from the audit."""
-    m = _mod()
     real = tmp_path / 'real'
     (real / 's0').mkdir(parents=True)
     (real / 's1').mkdir()

@@ -5,23 +5,16 @@ suffix (one session name appears in train, val AND test, so a suffix applied in 
 split would make one session look like two), and idempotency (a re-run must be a no-op;
 an unexpected entry must stop the build rather than be overwritten).
 """
-import importlib.util
-import sys
 from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
+from scripts import combine_roots
 
 
 @pytest.fixture(scope='module')
 def cr():
-    spec = importlib.util.spec_from_file_location(
-        'tcn_combine_roots', REPO / 'scripts' / 'combine_roots.py')
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    return combine_roots
 
 
 def _root(base, name, sessions):

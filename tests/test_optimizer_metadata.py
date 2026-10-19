@@ -10,7 +10,7 @@ from tests.test_optim import Tiny, _cfg
 
 
 def test_layout_metadata_is_recorded_and_gates_the_resume(tmp_path):
-    """A staged checkpoint records its fresh names, world size and 3 Muon + 2 AdamW named groups;
+    """A staged checkpoint records its fresh names, world size and 3 Muon + 3 AdamW named groups;
     a rebuild routed with the same fresh names resumes, one routed differently does not."""
     cfg = _cfg(muon_warmup_steps=10)
     fresh = {'decoder.mlps.0.weight'}
@@ -25,7 +25,7 @@ def test_layout_metadata_is_recorded_and_gates_the_resume(tmp_path):
     assert layout['schema'] == 'tailcyclenet.optimizer-layout.v1'
     assert set(layout['fresh_names']) == fresh and layout['world_size'] == 2
     groups = layout['groups']
-    assert len(groups['muon']) == 3 and len(groups['adamw']) == 2
+    assert len(groups['muon']) == 3 and len(groups['adamw']) == 3
     assert any('decoder.mlps.0.weight' in g['names'] for g in groups['muon'])
 
     for names, ok in ((set(layout['fresh_names']), True), (set(), False)):

@@ -22,9 +22,12 @@ KNOWN_OPTIMIZER_KEYS = frozenset({
     'muon_adjust_lr_fn',
 })
 
-# The five routes a parameter can take. Order is the order the groups are BUILT in, which is the
+# The six routes a parameter can take. Order is the order the groups are BUILT in, which is the
 # order `load_state_dict` matches them by -- so a resumed run must reconstruct it exactly.
-ROUTES = ('muon_dec', 'muon_fresh', 'muon_enc', 'adamw_base', 'adamw_enc')
+# `adamw_fresh` (the identity table, no-query tokens and other fresh non-matrix params at
+# `kpt_lr`) was added deliberately; a Muon checkpoint from before it has a different group layout
+# and warm-starts (`start.plan_start`) instead of resuming.
+ROUTES = ('muon_dec', 'muon_fresh', 'muon_enc', 'adamw_fresh', 'adamw_base', 'adamw_enc')
 
 # Checkpoint metadata is deliberately versioned: optimizer state matches groups by position,
 # so a name-level layout is needed before state loading can be trusted.
@@ -45,13 +48,16 @@ def embedding_ids(model) -> set[int]:
 
 def route_param(name: str, p, fresh: set[str], embed_ids: set[int]) -> str:
     """Which of `ROUTES` this parameter belongs to -- the single routing rule, shared by build
-    time and the staged unfreeze so the two cannot drift. NEW vs the reference: fresh 2D
-    matrices go to Muon at `kpt_lr`.
+    time and the staged unfreeze so the two cannot drift. NEW vs the reference: fresh params
+    train at `kpt_lr` -- 2D matrices on Muon, the rest (the `nn.Embedding` identity table, the
+    no-query tokens, norms, biases) on AdamW, as under AdamW-SF.
     """
     is2d = (p.ndim == 2 and name.endswith('.weight') and id(p) not in embed_ids)
     is_fresh = name in fresh or name.startswith('query_encoder.kpt_')
     if is2d and is_fresh:
         return 'muon_fresh'
+    if is_fresh:
+        return 'adamw_fresh'
     if is2d and 'scene_encoder.encoder.blocks' in name:
         return 'muon_enc'
     if is2d and ('scene_encoder.kv_proj' in name or any(s in name for s in _DEC_SUBSTR)):
@@ -172,14 +178,16 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
         groups[route_param(name, p, fresh, embed_ids)].append(p)
     muon_dec, muon_enc, muon_fresh = (groups['muon_dec'], groups['muon_enc'],
                                       groups['muon_fresh'])
-    adamw_base, adamw_enc = groups['adamw_base'], groups['adamw_enc']
+    adamw_fresh, adamw_base, adamw_enc = (groups['adamw_fresh'], groups['adamw_base'],
+                                          groups['adamw_enc'])
 
     muon_groups = [{'params': muon_dec, 'lr': lr * muon_scale, 'weight_decay': wd}]
     if muon_fresh:
         muon_groups.append({'params': muon_fresh, 'lr': kpt_lr, 'weight_decay': wd})
     if muon_enc:
         muon_groups.append({'params': muon_enc, 'lr': lr * enc_scale, 'weight_decay': wd})
-    adamw_groups = [{'params': adamw_base, 'lr': lr, 'weight_decay': wd}]
+    adamw_groups = [{'params': adamw_fresh, 'lr': kpt_lr, 'weight_decay': wd},
+                    {'params': adamw_base, 'lr': lr, 'weight_decay': wd}]
     if adamw_enc:
         adamw_groups.append({'params': adamw_enc, 'lr': lr * enc_scale, 'weight_decay': wd})
 
@@ -197,6 +205,7 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
           f'muon_dec {len(muon_dec)} @ {lr * muon_scale:g}, '
           f'muon_fresh {len(muon_fresh)} @ {kpt_lr:g}, '
           f'muon_enc {len(muon_enc)} @ {lr * enc_scale:g} | '
+          f'adamw_fresh {len(adamw_fresh)} @ {kpt_lr:g}, '
           f'adamw_base {len(adamw_base)} @ {lr:g}, adamw_enc {len(adamw_enc)} @ {lr * enc_scale:g}')
     return PoseDualOptimizer(opt_muon, opt_adam, muon_warmup_steps=muon_warmup)
 
@@ -204,7 +213,7 @@ def build_muon(model, fresh: set[str], cfg: dict) -> PoseDualOptimizer:
 def group_lr(route: str, cfg: dict) -> float:
     """The LR a route's group is built at. One place, so the unfreeze cannot pick a different one."""
     lr = float(cfg['learning_rate'])
-    if route == 'muon_fresh':
+    if route in ('muon_fresh', 'adamw_fresh'):
         return float(cfg.get('kpt_lr', lr))
     if route in ('muon_enc', 'adamw_enc'):
         return lr * float(cfg.get('encoder_lr_scale', 1.0))
@@ -364,7 +373,9 @@ def check_resume(opt, state, model=None, metadata: dict | None = None) -> Verdic
             f'{have[0]} + {have[1]}. The group layout changes when the staged encoder unfreeze '
             'fires, so check that [model].video_encoder_requires_grad and '
             '[model].video_encoder_finetune_last_n_layers still hold the values it was trained '
-            'with'))
+            'with. It also changed once, deliberately, when Muon runs gained the `adamw_fresh` '
+            'group (identity table and no-query tokens at kpt_lr): no config resumes a Muon '
+            'checkpoint from before it, so warm-start from it'))
     if dual_opt:
         extra = state.get('_tailcyclenet')
         if not isinstance(extra, dict) or extra.get('schema') != DUAL_STATE_SCHEMA:

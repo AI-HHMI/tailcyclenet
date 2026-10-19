@@ -53,7 +53,8 @@ def chunk_frames(preds, labels, n):
     radii are not exchangeable, which a bootstrap needs them to be. The labels' time axis is not
     the prediction's -- a `--max-frames` prefix must slice labels by the LABELS' own length, or
     every chunk past the first re-scores frames 0..n-1. Frame indices are absolute within the
-    group for both sides. T = 1 is not a usable window. Axis 1 is time only for frame-indexed
+    group for both sides. A trailing one-frame remainder joins the chunk before it, so every
+    frame is scored (T = 1 is a model-input rule, not a scoring one). Axis 1 is time only for frame-indexed
     arrays; `outcome`/`crop` are window-indexed and stay whole. `ext` is (C,T,4,4) -- time on
     axis 1 as well, so the same slicing rule covers it.
     """
@@ -71,10 +72,11 @@ def chunk_frames(preds, labels, n):
             span = np.nanmax(full, axis=2) - np.nanmin(full, axis=2)
             extent = float(np.nanmedian(np.linalg.norm(span, axis=-1)))
         lab_T = int(np.asarray(full).shape[1])
-        for t0 in range(0, T, n):
-            t1 = min(t0 + n, T)
-            if t1 - t0 < 2:
-                continue
+        starts = list(range(0, T, n))
+        if len(starts) > 1 and T - starts[-1] < 2:
+            starts.pop()
+        for i, t0 in enumerate(starts):
+            t1 = starts[i + 1] if i + 1 < len(starts) else T
             sub = {}
             for k, v in out.items():
                 a = np.asarray(v)

@@ -65,3 +65,29 @@ def test_independent_window_eval_keeps_visibility_logits_and_refuses_mota(tmp_pa
 
     with pytest.raises(SystemExit, match='MOTA/IDSW'):
         eval_cli.main([str(out), '--data', str(root), '--split', 'test', '--mota-dist', '20'])
+
+
+def test_chunk_frames_scores_a_trailing_one_frame_remainder():
+    """`--chunk 4` on a 9-frame group scores all 9 frames: the one-frame tail joins the last
+    chunk instead of being dropped (it used to vanish, labels and all)."""
+    import dataclasses
+
+    from tailcyclenet.eval import chunk_frames
+
+    @dataclasses.dataclass
+    class Lab:
+        """The two label fields `chunk_frames` reads."""
+        points3d: np.ndarray
+        points2d: np.ndarray
+
+    T = 9
+    true = np.random.default_rng(0).random((1, T, 3, 2)).astype(np.float32)
+    lab = Lab(points3d=None, points2d=true[..., None, :])
+    preds = {'s/g': {'mode': '2d', 'pred': true.copy()}}
+    p, lb = chunk_frames(preds, {'s/g': (lab, None)}, 4)
+    assert sorted(p) == ['s/g#0', 's/g#4']
+    assert [p[k]['pred'].shape[1] for k in ('s/g#0', 's/g#4')] == [4, 5]
+    assert lb['s/g#4'][0].points2d.shape[1] == 5
+    p8, _ = chunk_frames({'s/g': {'mode': '2d', 'pred': true[:, :8].copy()}},
+                         {'s/g': (Lab(None, true[:, :8, :, None]), None)}, 4)
+    assert [p8[k]['pred'].shape[1] for k in sorted(p8)] == [4, 4]
